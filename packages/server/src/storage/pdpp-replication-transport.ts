@@ -650,20 +650,21 @@ export function createReplicaTransportWorker(deps: {
   }
   /**
    * Keep collecting source operations behind one unresolved publication. The
-   * current manifest reports its typed wait. Only committed manifests and
-   * proven immutable-slot conflicts settle a claimed version; every other
-   * state blocks the next claim by default. Unsupported batches claim no slot.
+   * current manifest reports its typed wait. Only an explicit no-slot
+   * Unsupported batch, a committed manifest, or a proven immutable-slot
+   * conflict frees a claim. Every other or unknown batch state blocks.
    */
   function batchInFlight() {
     return !!db
       .prepare(
-        `SELECT 1 FROM pdpp_transport_batches b WHERE
-          b.prepared=0
-          OR (b.prepared=1 AND NOT EXISTS (
+        `SELECT 1 FROM pdpp_transport_batches b WHERE NOT (
+          b.prepared=-1
+          OR (b.prepared=1 AND EXISTS (
             SELECT 1 FROM pdpp_transport_manifests_out m WHERE m.batch=b.batch
               AND (m.state='published' OR
                 (m.state='quarantined' AND m.outcome='quarantine'
                   AND m.reason='immutable_registration_conflict'))))
+          )
           LIMIT 1`,
       )
       .get();

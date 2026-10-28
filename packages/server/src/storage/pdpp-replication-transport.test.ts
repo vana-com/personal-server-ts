@@ -565,6 +565,19 @@ it("does not resubmit a registration while accepted evidence is temporarily hidd
   await a.cycle();
   const slot = outbox(a)[0]!.slot;
   expect(calls).toEqual([slot]);
+  expect(outbox(a)[0]?.outcome).toBe("wait");
+  const batchesBeforeSuccessor = (
+    a.db.prepare("SELECT count(*) AS n FROM pdpp_transport_batches").get() as {
+      n: number;
+    }
+  ).n;
+  const intentsBeforeSuccessor = (
+    a.db
+      .prepare("SELECT count(*) AS n FROM pdpp_transport_registration_intents")
+      .get() as { n: number }
+  ).n;
+  const putsBeforeSuccessor = net.puts.length;
+  a.put("successor while registration is unresolved", "second");
   a.reopen();
 
   for (let poll = 0; poll < 5; poll++) {
@@ -572,6 +585,26 @@ it("does not resubmit a registration while accepted evidence is temporarily hidd
     await a.cycle();
   }
   expect(calls).toEqual([slot]);
+  expect(outbox(a).map((row) => row.version)).toEqual([1]);
+  expect(
+    (
+      a.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get() as {
+        n: number;
+      }
+    ).n,
+  ).toBe(batchesBeforeSuccessor);
+  expect(
+    (
+      a.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_transport_registration_intents",
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBe(intentsBeforeSuccessor);
+  expect(net.puts).toHaveLength(putsBeforeSuccessor);
 
   const manifest = hidden!;
   const registered = {
@@ -636,6 +669,46 @@ it("S1 blocks a new slot when post-registration evidence retries", async () => {
   ).toBe(1);
 });
 
+it("S2 blocks an unknown prepared state by default", async () => {
+  const net = network();
+  const a = device(net);
+  net.port.encrypt = async () => {
+    throw new Error("preparation unavailable");
+  };
+  a.put("unknown state predecessor", "first");
+  await a.cycle();
+  const predecessor = a.db
+    .prepare("SELECT batch,prepared FROM pdpp_transport_batches")
+    .get() as { batch: string; prepared: number };
+  expect(predecessor.prepared).toBe(0);
+  a.db
+    .prepare("UPDATE pdpp_transport_batches SET prepared=2 WHERE batch=?")
+    .run(predecessor.batch);
+
+  const batchesBeforeSuccessor = (
+    a.db.prepare("SELECT count(*) AS n FROM pdpp_transport_batches").get() as {
+      n: number;
+    }
+  ).n;
+  a.put("successor", "second");
+  await cycles([a], 3);
+
+  expect(
+    (
+      a.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get() as { n: number }
+    ).n,
+  ).toBe(batchesBeforeSuccessor);
+  expect(
+    a.db
+      .prepare("SELECT count(*) AS n FROM pdpp_transport_registration_intents")
+      .get(),
+  ).toEqual({ n: 0 });
+  expect(net.puts).toEqual([]);
+  expect(net.registrations).toEqual([]);
+});
+
 it("S3 keeps a retrying prepared batch ahead of later source operations", async () => {
   const net = network();
   const a = device(net);
@@ -652,7 +725,6 @@ it("S3 keeps a retrying prepared batch ahead of later source operations", async 
       n: number;
     }
   ).n;
-
   a.put("later operation", "second");
   await cycles([a], 3);
 
@@ -683,6 +755,13 @@ it("S3 keeps an uploaded batch ahead of later operations while a fragment retrie
       n: number;
     }
   ).n;
+  const intents = (
+    a.db
+      .prepare("SELECT count(*) AS n FROM pdpp_transport_registration_intents")
+      .get() as { n: number }
+  ).n;
+  const putsBefore = net.puts.length;
+  const putKeys = new Set(net.puts.map(({ key }) => key));
 
   a.put("later operation", "second");
   await cycles([a], 3);
@@ -695,6 +774,18 @@ it("S3 keeps an uploaded batch ahead of later operations while a fragment retrie
     ).n,
   ).toBe(batches);
   expect(outbox(a).map((row) => row.version)).toEqual([1]);
+  expect(
+    (
+      a.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_transport_registration_intents",
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBe(intents);
+  expect(net.puts.slice(putsBefore).every(({ key }) => putKeys.has(key))).toBe(
+    true,
+  );
   expect(net.registrations).toEqual([]);
 });
 
@@ -716,6 +807,17 @@ it("reports a pending predecessor and re-registers that same slot after authorit
   await a.cycle();
   const predecessor = outbox(a)[0]!;
   expect(predecessor.version).toBe(1);
+  const batchesBeforeSuccessor = (
+    a.db.prepare("SELECT count(*) AS n FROM pdpp_transport_batches").get() as {
+      n: number;
+    }
+  ).n;
+  const intentsBeforeSuccessor = (
+    a.db
+      .prepare("SELECT count(*) AS n FROM pdpp_transport_registration_intents")
+      .get() as { n: number }
+  ).n;
+  const putsBeforeSuccessor = net.puts.length;
 
   // Later source operations accumulate without claiming a successor slot.
   a.put("second", "second");
@@ -724,8 +826,28 @@ it("reports a pending predecessor and re-registers that same slot after authorit
     await a.cycle();
   }
   expect(outbox(a).map((row) => row.version)).toEqual([1]);
+  expect(
+    (
+      a.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get() as {
+        n: number;
+      }
+    ).n,
+  ).toBe(batchesBeforeSuccessor);
+  expect(
+    (
+      a.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_transport_registration_intents",
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBe(intentsBeforeSuccessor);
+  expect(net.puts).toHaveLength(putsBeforeSuccessor);
 
-  time += 2_000;
+  const waitingRow = outbox(a).find((row) => row.version === 1)!;
+  time = Math.max(time, waitingRow.next_attempt);
   const status = await a.step();
   const pending = status.waits.find((wait) => wait.id === predecessor.slot);
   expect(pending?.dependency).toMatchObject({
@@ -1632,11 +1754,11 @@ it("finality waits survive restart without inflating a later transient error del
   a.reopen();
   expect(outbox(a).length).toBeGreaterThan(0);
   expect(outbox(a).every((r) => r.attempts === 0)).toBe(true);
+  time = Math.max(time, ...outbox(a).map((row) => row.next_attempt));
   const original = net.port.evidence;
   net.port.evidence = async () => {
     throw new Error("transient RPC");
   };
-  time += 10000;
   await a.cycle();
   expect(
     outbox(a).every((r) => r.attempts === 1 && r.next_attempt <= time + 1000),
@@ -1681,13 +1803,18 @@ it("uses advancing finalized-head hints to wake waiting rows but still verifies 
   await a.cycle();
   await b.cycle();
   // A lying scheduling hint is insufficient to confirm, publish or import.
-  const waiting = outbox(a).at(-1)!;
-  expect(waiting.version).toBe(2);
+  const waitingRows = outbox(a);
+  expect(waitingRows.map(({ version, state }) => [version, state])).toEqual([
+    [1, "published"],
+    [2, "ready"],
+  ]);
   expect(b.get()).toBeUndefined();
-  expect(
-    inbox(b).find((r) => r.slot === waiting.slot)?.manifest_json ?? null,
-  ).toBeNull();
-  expect(waiting.state).toBe("ready");
+  for (const waiting of waitingRows) {
+    const received = inbox(b).find((r) => r.slot === waiting.slot);
+    if (waiting.state === "ready")
+      expect(received?.manifest_json ?? null).toBeNull();
+    else expect(received?.manifest_json).toBeDefined();
+  }
   net.beforePut(() => {});
   net.finalizeAll(148n);
   finalized = 148n;
@@ -1768,7 +1895,7 @@ it("a receiver evidence error after many finality waits starts at one second", a
   net.port.evidence = async () => {
     throw new Error("RPC unavailable");
   };
-  time += 2000;
+  time = Math.max(time, ...waiting.map((row) => row.next_attempt));
   await b.cycle();
   net.port.evidence = original;
   const errors = inbox(b).filter((r) => r.error !== null);

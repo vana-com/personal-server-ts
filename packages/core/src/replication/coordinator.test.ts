@@ -562,15 +562,45 @@ describe("schedule.ts settleReplicaWork", () => {
     expect(state.attempts).toBe(0);
   });
 
-  it("30 finality wait without hints keeps polling at 2s and keeps waitSince", () => {
+  it("30 finality wait without hints grows its interval and keeps waitSince", () => {
     const first = settleReplicaWork(base, finalityWait("123"), T0).state;
     const second = settleReplicaWork(
       first,
       finalityWait("123"),
       T0 + 2000,
     ).state;
-    expect(second.nextEligible).toBe(T0 + 2000 + 2000);
+    expect(second.nextEligible).toBe(T0 + 2000 + 4000);
     expect(second.waitSince).toBe(T0);
+  });
+
+  it("P3 unchanged verified height without hints grows the finality poll", () => {
+    let state = settleReplicaWork(base, finalityWait("123"), T0, {
+      hints: false,
+    }).state;
+    expect(state.nextEligible).toBe(T0 + 2_000);
+
+    state = settleReplicaWork(state, finalityWait("123"), T0 + 2_000, {
+      hints: false,
+    }).state;
+    expect(state.nextEligible).toBe(T0 + 2_000 + 4_000);
+
+    state = settleReplicaWork(state, finalityWait("123"), T0 + 6_000, {
+      hints: false,
+    }).state;
+    expect(state.nextEligible).toBe(T0 + 6_000 + 8_000);
+
+    state = settleReplicaWork(state, finalityWait("123"), T0 + 14_000, {
+      hints: false,
+    }).state;
+    expect(state.nextEligible).toBe(T0 + 14_000 + 16_000);
+
+    const long = settleReplicaWork(
+      { ...state, waitSince: T0 },
+      finalityWait("123"),
+      T0 + 600_000,
+      { hints: false },
+    );
+    expect(long.state.nextEligible).toBe(T0 + 600_000 + 30_000);
   });
 
   it("P1 registration waits without a checked block grow and enter long polling", () => {
@@ -649,7 +679,7 @@ describe("schedule.ts settleReplicaWork", () => {
       finalityWait("50"),
       T0,
     );
-    expect(justUnder.state.nextEligible).toBe(T0 + 2000);
+    expect(justUnder.state.nextEligible).toBe(T0 + 16_000);
     const exact = settleReplicaWork(wait(T0 - 600_000), finalityWait("50"), T0);
     expect(exact.state.nextEligible).toBe(T0 + 30_000);
     const advancedButOld = settleReplicaWork(
@@ -950,8 +980,11 @@ describe("coordinator transitions", () => {
     expect(row(world, "c1").state.nextEligible).toBe(T0 + 5000 + 2000);
 
     await stepAt(world, co, T0 + 7000);
+    expect(row(world, "c1").state.attempts).toBe(0);
+    expect(row(world, "c1").state.nextEligible).toBe(T0 + 15_000);
+    await stepAt(world, co, T0 + 15_000);
     expect(row(world, "c1").state.attempts).toBe(1);
-    expect(row(world, "c1").state.nextEligible).toBe(T0 + 7000 + 1000);
+    expect(row(world, "c1").state.nextEligible).toBe(T0 + 15_000 + 1000);
     // no wait ever inflated the failure count
     expect(
       world.settles

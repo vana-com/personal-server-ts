@@ -714,7 +714,8 @@ describe("07 Retry to Wait does not confuse attempts with waits", () => {
     expect(d.get()).toEqual({ id: "a", text: "record" });
 
     evidence.fail = true;
-    clock.advance(2000);
+    const waitingAgain = logical(d, "pdpp_transport_manifests_out")[0]!;
+    clock.advance(Math.max(0, waitingAgain.nextEligible - clock.now()));
     const t = clock.now();
     await step(d);
     expect(logical(d, "pdpp_transport_manifests_out")[0]).toMatchObject({

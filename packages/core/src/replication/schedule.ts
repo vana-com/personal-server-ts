@@ -137,13 +137,22 @@ export function settleReplicaWork(
       const progressed =
         previous.checkedBlock === null ||
         BigInt(observed) > BigInt(previous.checkedBlock);
-      const slow =
-        (options.hints === true && !progressed) || now - since >= LONG_WAIT_MS;
+      const delay =
+        options.hints === true
+          ? !progressed || now - since >= LONG_WAIT_MS
+            ? FINALITY_SLOW_POLL_MS
+            : FINALITY_POLL_MS
+          : growingWaitDelay(
+              now - since,
+              FINALITY_POLL_MS,
+              FINALITY_BACKOFF_CAP_MS,
+              FINALITY_SLOW_POLL_MS,
+            );
       return {
         outcome,
         state: {
           attempts: 0,
-          nextEligible: now + (slow ? FINALITY_SLOW_POLL_MS : FINALITY_POLL_MS),
+          nextEligible: now + delay,
           waitSince: since,
           checkedBlock: maxHeight(previous.checkedBlock, observed),
         },
