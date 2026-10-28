@@ -443,6 +443,7 @@ export function finalizedReplicaNetwork(owner: string) {
     return bytes;
   };
   const port: ReplicaTransportPort = {
+    encryptedByteLength: (bytes) => bytes,
     encrypt: async (_scope, bytes) => bytes,
     decrypt: async (_scope, bytes) => bytes,
     putFragment: async (f) => {

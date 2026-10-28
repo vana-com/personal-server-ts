@@ -12,6 +12,7 @@ import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/repli
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { replicaScope } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import {
+  authenticatedOwnFork,
   CrashController,
   at,
   binding,
@@ -1609,6 +1610,7 @@ it("33 a temporarily inactive registration is a Wait, not a conflict: no quarant
 function conflictOn(
   net: Network,
   which: (slot: string, first: string) => boolean,
+  local: TransportDevice,
 ) {
   let first: string | undefined;
   const evidence = net.port.evidence;
@@ -1617,16 +1619,7 @@ function conflictOn(
     first ??= slot;
     const e = await evidence(scope, version);
     return which(slot, first)
-      ? {
-          ...e,
-          chain: e.chain && {
-            ...e.chain,
-            currentVersion: String(version),
-            status: "Active" as const,
-            commitment: `0x${"f".repeat(64)}` as const,
-          },
-          pending: false,
-        }
+      ? authenticatedOwnFork(net, local, scope, version)
       : e;
   };
   return {
@@ -1641,7 +1634,7 @@ it("34a report.nextWake comes from durable state: terminal work contributes noth
   holdPending(net, (slot) => isFrom(slot, writerOf(c)));
   await steps(c, 4, 0);
   const a = transportDevice(net, { preexisting: "terminal" });
-  conflictOn(net, (slot) => isFrom(slot, writerOf(a)));
+  conflictOn(net, (slot) => isFrom(slot, writerOf(a)), a);
   // A never reads its own scope, so its only work is the two items under test.
   const list = net.port.list;
   net.port.list = async (cursor) => {
@@ -1655,7 +1648,7 @@ it("34a report.nextWake comes from durable state: terminal work contributes noth
   const terminal = records(a, OUTBOX);
   expect(terminal).toHaveLength(1);
   expect(terminal[0]?.outcome, "the conflicting slot is not terminal").toBe(
-    "quarantine",
+    "wait",
   );
   const waiting = records(a, INBOX).filter((r) => r.outcome === "wait");
   expect(waiting).toHaveLength(1);
@@ -1663,9 +1656,16 @@ it("34a report.nextWake comes from durable state: terminal work contributes noth
   const report = await step(a);
   expect(report, "step returned no report").toBeDefined();
   expect(report?.nextWake).toBe(minDeadline(waiting));
-  expect(early.flatMap((r) => r?.quarantines ?? []).map((q) => q.id)).toEqual(
-    terminal.map((r) => r.id),
-  );
+  expect(
+    early
+      .flatMap((r) => r?.waits ?? [])
+      .filter(
+        (w) =>
+          w.dependency.kind === "registration" &&
+          w.dependency.reason === "own_key_conflict",
+      )
+      .map((w) => w.id),
+  ).toEqual(expect.arrayContaining(terminal.map((r) => r.id)));
 
   a.reopen();
   const reopened = await step(a, { units: 0 });
@@ -1674,13 +1674,16 @@ it("34a report.nextWake comes from durable state: terminal work contributes noth
 
 it("34b a device whose only work is terminal is idle: nextWake is undefined before and after reopen", async () => {
   const net = network();
-  conflictOn(net, () => true);
   net.port.list = async () => ({ points: [], cursor: null });
   const a = transportDevice(net, { preexisting: "terminal" });
+  conflictOn(net, () => true, a);
   await steps(a, 4, 0);
   const rows = records(a, OUTBOX);
   expect(rows).toHaveLength(1);
-  expect(rows[0]?.outcome).toBe("quarantine");
+  expect(rows[0]).toMatchObject({
+    outcome: "wait",
+    reason: "own_key_conflict",
+  });
   const report = await step(a);
   expect(report, "step returned no report").toBeDefined();
   expect(report?.nextWake).toBeUndefined();

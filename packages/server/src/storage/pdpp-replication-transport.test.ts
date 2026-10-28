@@ -262,6 +262,7 @@ function network(realCrypto = false, cap = 8192) {
   // Fast authenticated codec for high-cardinality/fault cases; one oracle below uses real SDK OpenPGP.
   const key = randomBytes(32);
   const fast = {
+    encryptedByteLength: (bytes: number) => bytes + 28,
     async encrypt(_scope: string, bytes: Uint8Array) {
       const iv = randomBytes(12);
       const cipher = createCipheriv("aes-256-gcm", key, iv);
@@ -906,7 +907,7 @@ it("reports a pending predecessor and re-registers that same slot after authorit
   expect(outbox(a).find((row) => row.version === 2)?.state).toBe("published");
 });
 
-it("S4 treats a finalized immutable conflict as a settled predecessor slot", async () => {
+it("S4 a holder lookup mismatch retries and does not free the predecessor slot", async () => {
   const net = network();
   const a = device(net);
   const originalEvidence = net.port.evidence;
@@ -914,6 +915,14 @@ it("S4 treats a finalized immutable conflict as a settled predecessor slot", asy
   net.port.evidence = async (scope, version) => {
     if (version === 1 && !conflictInserted) {
       const slot = slotKey(scope, version);
+      // The new conflict boundary reads the holder before deciding whether
+      // this is a recoverable squat. Supply bytes that disprove this slot.
+      const held = a.db
+        .prepare(
+          "SELECT encrypted FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
+        )
+        .get(scope, version) as { encrypted: Buffer };
+      net.blobs.set(slot, held.encrypted);
       net.chain.set(slot, {
         ...net.chainRow(slot),
         currentVersion: "1",
@@ -929,19 +938,16 @@ it("S4 treats a finalized immutable conflict as a settled predecessor slot", asy
   await a.cycle();
   expect(outbox(a)[0]).toMatchObject({
     version: 1,
-    state: "quarantined",
-    outcome: "quarantine",
-    reason: "immutable_registration_conflict",
+    state: "ready",
+    outcome: "retry",
+    reason: "commitment_mismatch",
   });
 
   a.put("successor after settled conflict", "second");
   await cycles([a], 3);
 
-  expect(outbox(a).map((row) => [row.version, row.state])).toContainEqual([
-    2,
-    "published",
-  ]);
-  expect(net.registrations).toContain(slotKey(a.scope, 2));
+  expect(outbox(a).map((row) => row.version)).toEqual([1]);
+  expect(net.registrations).not.toContain(slotKey(a.scope, 2));
 });
 
 it("P5 backs off absent registration evidence and its waiting successor over two hours", async () => {
@@ -2897,8 +2903,12 @@ it("a cloned writer cannot replace a published slot", async () => {
   clone.put("conflicting clone");
   await cycles([clone, b], 2);
   // The clone claims A's next version, finds another commitment there and stops:
-  // terminal, with no PUT over the published manifest.
-  expect(outbox(clone).find((r) => r.slot === slot)?.state).toBe("quarantined");
+  // A typed owner wait stops the fork, with no PUT over the published manifest.
+  expect(outbox(clone).find((r) => r.slot === slot)).toMatchObject({
+    outcome: "wait",
+    reason: "own_key_conflict",
+    next_attempt: Number.MAX_SAFE_INTEGER,
+  });
   expect(net.puts.filter((p) => p.key === slot)).toHaveLength(1);
   expect(net.blobs.get(slot)).toEqual(published);
   expect(b.get()).toEqual(a.get());
@@ -2978,7 +2988,7 @@ it("holds a soft-deleted slot pending and imports after chain status reactivatio
   expect(net.puts.filter((p) => p.key === slot)).toHaveLength(putCount);
 });
 
-it("quarantines a finalized slot commitment mismatch including a tombstone pair", async () => {
+it("retries an unauthenticated holder mismatch including a tombstone pair", async () => {
   for (const commitment of [
     `0x${"f".repeat(64)}` as const,
     replicaChainCommitment(
@@ -2994,7 +3004,11 @@ it("quarantines a finalized slot commitment mismatch including a tombstone pair"
     net.chain.set(slot, { ...net.chain.get(slot)!, commitment });
     const putCount = net.puts.length;
     await cycles([a], 2);
-    expect(outbox(a).find((r) => r.slot === slot)?.state).toBe("quarantined");
+    expect(outbox(a).find((r) => r.slot === slot)).toMatchObject({
+      state: "ready",
+      outcome: "retry",
+      reason: "commitment_mismatch",
+    });
     expect(net.puts).toHaveLength(putCount);
     expect(net.registrations.filter((s) => s === slot)).toHaveLength(1);
   }

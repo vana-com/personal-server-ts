@@ -305,8 +305,39 @@ export function decodeParsedReplicaFragment(
   return fragment;
 }
 
-/** All returned bytes must be committed before I/O: encryption is randomized. */
-/** The single fragment encoder shared by buffered and streaming publishers. */
+function encodeFragmentPlaintext(fragment: ReplicaFragment): Uint8Array {
+  return new TextEncoder().encode(
+    canonicalJson({
+      version: "1.0",
+      scope: replicaScope(fragment.writer),
+      collectedAt: fragment.collectedAt,
+      data: { fragment },
+    }),
+  );
+}
+
+/** Exact framing size without allocating a base64 content string or encrypting. */
+export function replicaFragmentPlaintextByteLength(
+  input: Omit<
+    ReplicaFragment,
+    "format" | "version" | "chunkDigest" | "content"
+  > & { chunkBytes: number },
+): number {
+  const { chunkBytes, ...fields } = input;
+  return (
+    encodeFragmentPlaintext({
+      ...fields,
+      format: "vana-pdpp-replica-fragment",
+      version: 3,
+      chunkDigest: `sha256:${"0".repeat(64)}`,
+      content: "",
+    }).length +
+    4 * Math.ceil(chunkBytes / 3)
+  );
+}
+
+/** The single fragment encoder shared by buffered and streaming publishers.
+ * Freeze returned bytes before I/O: encryption is randomized. */
 export async function prepareReplicaFragment(input: {
   owner: string;
   writer: string;
@@ -340,14 +371,7 @@ export async function prepareReplicaFragment(input: {
     chunkDigest: replicaDigest(input.chunk),
     content: toBase64(input.chunk),
   });
-  const plaintext = new TextEncoder().encode(
-    canonicalJson({
-      version: "1.0",
-      scope,
-      collectedAt: input.collectedAt,
-      data: { fragment },
-    }),
-  );
+  const plaintext = encodeFragmentPlaintext(fragment);
   // Validate writer/address/order grammar even for locally prepared inputs.
   decodeReplicaFragment(plaintext, scope, input.owner);
   const encrypted = await input.encrypt(scope, plaintext);

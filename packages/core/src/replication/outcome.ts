@@ -19,6 +19,11 @@ export type ReplicaPhase =
 
 /** What a Wait waits for. A key is stable across restarts. */
 export type ReplicaDependency =
+  | {
+      kind: "registration";
+      key: string;
+      reason: "own_key_conflict" | "version_squat";
+    }
   | { kind: "predecessor"; key: string }
   | { kind: "finality"; key: string; checkedBlock: string }
   /** A writer's registration intent is unresolved at this publication slot. */
@@ -205,7 +210,9 @@ export function outcomeReason(outcome: ReplicaPhaseOutcome): string {
     case "progress":
       return outcome.receipt.phase;
     case "wait":
-      return outcome.dependency.kind;
+      return outcome.dependency.kind === "registration"
+        ? outcome.dependency.reason
+        : outcome.dependency.kind;
     case "retry":
       return outcome.problem;
     case "quarantine":

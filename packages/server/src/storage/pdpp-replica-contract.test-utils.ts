@@ -34,13 +34,17 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import {
+  decodeReplicaManifest,
   fragmentReplicaPayload,
   prepareReplicaManifest,
   replicaDigest,
   replicaScope,
   type Predecessor,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
-import type { ReplicaBatchFacts } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
+import {
+  signReplicaBatch,
+  type ReplicaBatchFacts,
+} from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import { createLiteCanonicalStore } from "../../../lite/src/canonical-store.js";
 import type {
   LiteCanonicalPersistence,
@@ -454,6 +458,7 @@ export function network(
   });
   const key = randomBytes(32);
   const fast = {
+    encryptedByteLength: (bytes: number) => bytes + 28,
     async encrypt(scope: string, bytes: Uint8Array) {
       calls.encrypts++;
       if (faults.encrypt) {
@@ -1474,3 +1479,46 @@ export const adapterFactories: Record<
   "Lite SQLite port": (context, provisioned) =>
     liteAdapter("sqlite", context, provisioned),
 };
+
+/** An authenticated local fork, distinct from unavailable/mismatched storage. */
+export async function authenticatedOwnFork(
+  net: Network,
+  d: TransportDevice,
+  scope: string,
+  version: number,
+) {
+  const { currentReplicaWriterIdentity } =
+    await import("./pdpp-replica-writer-identity.js");
+  const row = d.db
+    .prepare(
+      "SELECT plaintext FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
+    )
+    .get(scope, version) as { plaintext: Buffer };
+  const original = decodeReplicaManifest(row.plaintext, scope, owner);
+  const manifest = await prepareReplicaManifest({
+    ...original,
+    version,
+    digest: `sha256:${"f".repeat(64)}`,
+    sign: (facts) =>
+      signReplicaBatch({
+        signer: d.authority.signer,
+        partition: { owner, chainId: 14800, environment: "dev" },
+        seed: currentReplicaWriterIdentity(d.db)!.seed,
+        facts,
+      }),
+    encrypt: net.port.encrypt,
+  });
+  const holder = {
+    owner,
+    scope,
+    version: String(version),
+    dataHash: manifest.dataHash,
+    metadataHash: manifest.metadataHash,
+    deleted: false,
+  };
+  const slot = slotKey(scope, version);
+  net.blobs.set(slot, manifest.encrypted);
+  net.head.set(slot, holder);
+  net.chain.set(slot, net.chainRow(slot, holder));
+  return { head: holder, chain: net.chainRow(slot, holder), pending: false };
+}
