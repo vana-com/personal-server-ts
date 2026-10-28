@@ -29,8 +29,9 @@ one registration.
   manifest is the only registered object: a
   DPv2 AddData at the next version of the writer scope, stored at
   `<scope>/<version>`. The version is a publication slot, not the batch
-  sequence. The slot is claimed when the batch is prepared, so a batch that
-  cannot be framed takes no slot and its successors still publish. A manifest
+  sequence. The slot is reserved with the retained operation snapshot, before
+  encryption. A batch that cannot be framed releases its unused slot and its
+  successors still publish. A manifest
   at version _v_ publishes only after version _v−1_ is published, because
   DataRegistryV2 accepts only `expectedVersion = current + 1`.
 - **Bounds.** One batch covers at most `maxBatchOperations` operations
@@ -150,8 +151,9 @@ sequence, predecessor batch and digest, collection time, payload digest, total
 bytes, fragment count, and the SHA-256 of the ordered fragment list (each
 entry's 32-byte digest, then its length as 8 bytes, big-endian). So no field
 that a receiver reads from a manifest, and not its slot, is outside the
-signature. Prepare claims the scope's next version, signs, and keeps the claim
-only if the version is still next when the manifest commits. Fragments (format
+signature. Retain reserves the next version with its operation snapshot.
+Prepare signs that reserved version and commits its manifest only if the
+version is still next. Fragments (format
 version 3) carry no statement: the signed manifest names their exact bytes.
 
 **Receiver checks**, in §3.4 order. The receiver waits for finality, then
@@ -298,11 +300,12 @@ a new finalized height makes them eligible for the full independent evidence
 check. The verified checked height never moves backwards. A hint supplies no
 commitment authority. A hint ahead of verified evidence uses a 30-second
 non-error cooldown, and waits older than ten minutes use that slow cadence.
-Without hints, waiting rows use a two-second cadence. Actual errors and Gateway
-head disagreements retain exponential backoff (1 second through 1 hour).
+Without hints, finality waits grow from two seconds to sixteen seconds, then
+use thirty seconds after ten minutes. Actual errors and Gateway head
+disagreements retain exponential backoff (1 second through 1 hour).
 Successful waiting or confirmed evidence clears the error streak. One failed
 address cannot monopolize the oldest 50. Preparation has its own durable retry
-state; impossible framing is quarantined. A pending predecessor blocks later
+state; impossible framing is Unsupported and never quarantined. A pending predecessor blocks later
 source batches on that writer's chain, while other writers can advance. The
 current slot's typed wait remains visible; authoritative absence after the
 intent timeout retries that same version and ciphertext. A successor is
@@ -315,8 +318,58 @@ single-BLOB rows remain readable; their native SQLite memory use is not bounded
 by the JavaScript chunk reader. Explicit whole-value read APIs still assemble
 bytes for their callers. Hidden abandoned stages are reclaimed by the next
 worker cycle under the single-process database-writer contract.
-All verified payloads, fragments, failures and receipts remain retained; no compaction,
-retirement or sole-history deletion is implemented.
+Received custody, fragment commitments, failures and receipts remain retained.
+A rebuild may replace or remove an unpublished source payload; the source
+journal and Unsupported operation outcomes remain. No source-history compaction
+or retirement is implemented.
+
+## Preparation recovery
+
+An enabled worker creates `pdpp_transport_preparation` and retains the batch's
+exact operations in `pdpp_transport_operation_outcomes`. The snapshot and export
+cursor commit together. Rebuilds read that snapshot; new journal writes stay
+behind the unresolved batch and cannot enter its replacement payload.
+
+| Preparation state       | Transition                                                                                                                                         |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `preparing`             | The retained batch reserves the next version; preparation succeeds or records a classified failure.                                                |
+| `prep_failed_permanent` | The offending operations have durable Unsupported outcomes; a later step enters `rebuilding`.                                                      |
+| `rebuilding`            | Replace the hidden payload and digest atomically, keeping the batch, sequence and reserved version. Return to `preparing`.                         |
+| `prep_failed_unknown`   | Keep Retry's attempts and deadline, plus a typed preparation wait. Resume preparation or rebuilding after the existing 1-second-to-1-hour backoff. |
+| `prepared`              | The existing fragment, manifest, registration-intent and committed-publication states take over.                                                   |
+| `released`              | An empty batch or impossible framing releases its unused version.                                                                                  |
+
+Only sender-owned input-encoding refusals and the closed resource-cap errors
+are permanent. Per-operation size and blob checks identify the offending
+positions. After an aggregate payload or ciphertext breach, trial prefixes
+identify each operation that crosses the cap, keeping later operations that
+fit. Trial ciphertext is discarded locally; it is never uploaded. Each
+Unsupported row keeps its operation identity and typed reason across restart.
+Exception messages do not become outcome text.
+
+Rebuilding requires no upload attempt or registration intent for that version,
+no stored or attempted outgoing object, and no already-signed successor.
+Before every fragment or manifest PUT, the worker records an upload attempt
+in a door-checked transaction. A crash before the response therefore cannot
+make an uploaded version look safe to rebuild. Conflicting durable evidence
+parks preparation with `Wait(preparation, upload_started)` and preserves the
+original payload and ciphertext; this wait requires owner recovery.
+
+An envelope must contain at least one operation. If every operation is
+Unsupported, the worker removes the empty batch and releases its unused
+version and sequence. The next batch can claim both without a gap. Any older
+retained, unsigned backlog closes that sequence gap in the same transaction.
+Unsupported operation outcomes remain as history. A rebuilt batch blocks all
+successor claims until its manifest commits, just as an unknown Retry does.
+
+Enabled opens also resume main's older retain-phase resource Unsupported
+from the unchanged export cursor, and older `prepared=-2` batches from their
+frozen payloads. The same durable upload and registration checks apply.
+
+The new tables are absent when the worker opens with its default-off flag.
+Flag closure during rebuilding prevents its commit and all later uploads;
+the last committed preparation state remains available on the next enable.
+The existing durable replication-door retirement rules still apply.
 
 ## Host integration and remaining promotion gates
 
@@ -408,10 +461,10 @@ version 1 of a fresh writer scope. It does
 not publish, write storage, register data, or verify the complete two-device
 journey. Live acceptance must still verify repeated PUT of identical
 ciphertext at an existing key after registration failure, and one
-registration per sync against the dev Gateway. Preparation currently
-quarantines any `RangeError`, including a possible allocation failure;
-distinguish runtime errors from impossible framing before promotion.
-Runtime scheduling and Lite publisher wiring remain outside this change.
+registration per sync against the dev Gateway. Generic preparation errors,
+including `RangeError` from encryption, remain Retry with bounded backoff and
+a typed preparation wait. Runtime scheduling and Lite publisher wiring remain
+outside this change.
 
 The in-process oracle uses two file-backed SQLite stores and real receiver
 imports, an encrypted storage fake with a size cap, and independent fake

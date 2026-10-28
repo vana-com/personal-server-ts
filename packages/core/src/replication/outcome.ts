@@ -31,6 +31,8 @@ export type ReplicaDependency =
       /** Next evidence check for a successor waiting on this registration. */
       nextCheckAt?: number;
     }
+  /** Sender preparation cannot proceed; unknown failures still use Retry backoff. */
+  | { kind: "preparation"; key: string; reason: "unknown" | "upload_started" }
   | { kind: "fragments"; key: string }
   | { kind: "mapping"; key: string }
   | { kind: "declaration"; key: string }
@@ -107,8 +109,8 @@ export class ReplicaProblemError extends Error {
 }
 
 /**
- * The only error that may become Unsupported. Thrown where one encrypted
- * fragment is measured larger than the storage cap. The preparer may retry a
+ * A framing Unsupported, separate from sender input and resource admission.
+ * Thrown where encrypted framing exceeds the storage cap. The preparer may retry a
  * smaller chunk size; at the smallest size framing is proven impossible.
  */
 export class ReplicaFramingUnsupported extends Error {
@@ -129,6 +131,7 @@ export class ReplicaFramingUnsupported extends Error {
 }
 
 export type ReplicaAdmission =
+  | { reason: "operation_encoding_unsupported" }
   | {
       reason: "replica_framing_unsupported";
       actual: number;

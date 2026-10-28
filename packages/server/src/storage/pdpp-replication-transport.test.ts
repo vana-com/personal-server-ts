@@ -2101,63 +2101,90 @@ it("H3 prepares, admits and imports one exact maximum honest batch", async () =>
   );
 }, 60000);
 
-it("H4 persists sender resource_unsupported and blocks later writer batches", async () => {
+it("H4 persists sender resource_unsupported, releases the empty batch and permits later writer batches", async () => {
   const net = network();
+  const limits = { maxAggregateCiphertextBytes: 1 };
   const sender = device(net, {
     preexisting: "oversized for configured replication limit",
-    worker: { resourceLimits: { maxAggregateCiphertextBytes: 1 } },
+    worker: { resourceLimits: limits },
   });
   await cycles([sender], 24);
   const refused = sender.db
     .prepare(
-      `SELECT outcome,reason FROM pdpp_transport_batches WHERE prepared=-2`,
+      "SELECT outcome,reason FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
     )
-    .get();
-  expect(refused).toEqual({
-    outcome: "unsupported",
-    reason: "resource_unsupported",
-  });
-  const blockedCount = (
-    sender.db
-      .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
-      .get() as { count: number }
-  ).count;
+    .all();
+  expect(refused.length).toBeGreaterThan(0);
+  expect(
+    refused.every(
+      (row) =>
+        (row as { outcome: string; reason: string }).outcome ===
+          "unsupported" &&
+        (row as { reason: string }).reason === "resource_unsupported",
+    ),
+  ).toBe(true);
+  expect(
+    sender.db.prepare("SELECT state FROM pdpp_transport_preparation").get(),
+  ).toEqual({ state: "released" });
+  expect(net.puts).toHaveLength(0);
+  limits.maxAggregateCiphertextBytes = REPLICA_MAX_AGGREGATE_CIPHERTEXT_BYTES;
+  sender.reopen();
   sender.put("later batch", "later");
   await cycles([sender], 12);
-  expect(
-    (
-      sender.db
-        .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
-        .get() as { count: number }
-    ).count,
-  ).toBe(blockedCount);
-});
-
-async function expectRetainUnsupported(sender: ReturnType<typeof device>) {
-  await cycles([sender], 24);
+  expect(outbox(sender).at(-1)).toMatchObject({
+    version: 1,
+    state: "published",
+  });
   expect(
     sender.db
       .prepare(
-        "SELECT outcome,reason FROM pdpp_transport_phase_state WHERE phase='retain'",
+        "SELECT outcome,reason FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
+      )
+      .all(),
+  ).toEqual(refused);
+});
+
+async function expectOperationUnsupported(
+  sender: ReturnType<typeof device>,
+  limit: string,
+) {
+  await cycles([sender], 24);
+  const refused = sender.db
+    .prepare(
+      "SELECT batch,position,outcome,reason,admission_json FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
+    )
+    .all() as { outcome: string; reason: string; admission_json: string }[];
+  expect(refused.length).toBeGreaterThan(0);
+  for (const row of refused) {
+    expect(row).toMatchObject({
+      outcome: "unsupported",
+      reason: "resource_unsupported",
+    });
+    expect(JSON.parse(row.admission_json)).toMatchObject({
+      reason: "resource_unsupported",
+      limit,
+    });
+  }
+  expect(
+    sender.db
+      .prepare(
+        "SELECT 1 FROM pdpp_transport_batches WHERE outcome IN ('retry','quarantine')",
       )
       .get(),
-  ).toEqual({ outcome: "unsupported", reason: "resource_unsupported" });
-  const batchCount = (
-    sender.db
-      .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
-      .get() as {
-      count: number;
-    }
-  ).count;
+  ).toBeUndefined();
+  const count = outbox(sender).length;
+  sender.reopen();
   sender.put("later writer batch", "later");
   await cycles([sender], 12);
+  expect(outbox(sender).length).toBeGreaterThan(count);
+  expect(outbox(sender).at(-1)?.state).toBe("published");
   expect(
-    (
-      sender.db
-        .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
-        .get() as { count: number }
-    ).count,
-  ).toBe(batchCount);
+    sender.db
+      .prepare(
+        "SELECT batch,position,outcome,reason,admission_json FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
+      )
+      .all(),
+  ).toEqual(refused);
 }
 
 it("H4 persists resource_unsupported for a sender operation-count breach", async () => {
@@ -2176,15 +2203,13 @@ it("H4 persists resource_unsupported for a sender operation-count breach", async
   );
   vi.spyOn(sender.store.replication, "readTailPage").mockImplementation(
     (input) => {
-      const page = readTailPage(input);
-      return {
-        ...page,
-        operations: [...page.operations, ...page.operations],
-      };
+      // Simulate an exporter breaching the requested count with two distinct
+      // real operations, rather than duplicating an operation identity.
+      return readTailPage({ ...input, limit: input.limit + 1 });
     },
   );
 
-  await expectRetainUnsupported(sender);
+  await expectOperationUnsupported(sender, "operation_count");
 });
 
 it("H4 persists resource_unsupported for a sender single-blob breach", async () => {
@@ -2225,7 +2250,7 @@ it("H4 persists resource_unsupported for a sender single-blob breach", async () 
     { method: "export", generation: 1 },
   );
 
-  await expectRetainUnsupported(sender);
+  await expectOperationUnsupported(sender, "single_blob_bytes");
 });
 
 it("H4 persists resource_unsupported for sender aggregate-blob breach", async () => {
@@ -2270,7 +2295,7 @@ it("H4 persists resource_unsupported for sender aggregate-blob breach", async ()
     { method: "export", generation: 1 },
   );
 
-  await expectRetainUnsupported(sender);
+  await expectOperationUnsupported(sender, "aggregate_blob_bytes");
 });
 
 it("H2 derives limits above the honest worst case from the exported write caps", () => {
@@ -3727,4 +3752,206 @@ it("A3b-5 uses the exported default fragment size", async () => {
   } finally {
     spy.mockRestore();
   }
+});
+
+it("A5b-1 one bad op is Unsupported while the other ops commit at the same version and later batches flow", async () => {
+  const net = network();
+  const source = device(net, {
+    worker: { resourceLimits: { maxOperationBytes: 1200 } },
+  });
+  await cycles([source], 4);
+  source.put("good one", "one");
+  source.put("x".repeat(2000), "bad");
+  source.put("good two", "two");
+  await cycles([source], 12);
+  const unsupported = source.db
+    .prepare(
+      "SELECT position,outcome,reason FROM pdpp_transport_operation_outcomes WHERE outcome='unsupported'",
+    )
+    .all();
+  expect(unsupported).toEqual([
+    { position: 1, outcome: "unsupported", reason: "resource_unsupported" },
+  ]);
+  expect(outbox(source).map((row) => [row.version, row.state])).toEqual([
+    [1, "published"],
+    [2, "published"],
+  ]);
+  const receiver = device(net);
+  await cycles([receiver], 12);
+  expect(receiver.get("one")).toEqual(source.get("one"));
+  expect(receiver.get("two")).toEqual(source.get("two"));
+  expect(receiver.get("bad")).toBeUndefined();
+  source.put("later", "later");
+  await cycles([source, receiver], 12);
+  expect(receiver.get("later")).toEqual(source.get("later"));
+  expect(outbox(source).at(-1)?.version).toBe(3);
+});
+
+it("A5b-2 all bad ops release the illegal empty batch and the next batch reuses its version and sequence", async () => {
+  const net = network();
+  const source = device(net, {
+    worker: { resourceLimits: { maxOperationBytes: 1200 } },
+  });
+  await cycles([source], 4);
+  source.put("x".repeat(2000), "bad");
+  await cycles([source], 1);
+  expect(
+    source.db
+      .prepare("SELECT state FROM pdpp_transport_preparation WHERE version=2")
+      .get(),
+  ).toEqual({ state: "prep_failed_permanent" });
+  await cycles([source], 1);
+  expect(
+    source.db
+      .prepare("SELECT state FROM pdpp_transport_preparation WHERE version=2")
+      .get(),
+  ).toEqual({ state: "released" });
+  await cycles([source], 6);
+  expect(
+    source.db
+      .prepare(
+        "SELECT version,state FROM pdpp_transport_preparation WHERE state='released'",
+      )
+      .all(),
+  ).toEqual([{ version: 2, state: "released" }]);
+  expect(
+    source.db
+      .prepare(
+        "SELECT outcome,reason FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
+      )
+      .all(),
+  ).toEqual([{ outcome: "unsupported", reason: "resource_unsupported" }]);
+  expect(outbox(source)).toHaveLength(1);
+  source.put("good", "good");
+  await cycles([source], 8);
+  expect(outbox(source).map((row) => [row.version, row.state])).toEqual([
+    [1, "published"],
+    [2, "published"],
+  ]);
+  const receiver = device(net);
+  await cycles([receiver], 8);
+  expect(receiver.get("good")).toEqual(source.get("good"));
+  expect(receiver.get("bad")).toBeUndefined();
+});
+
+it("A5b-3 unknown preparation failures retain Retry with P backoff to the cap and a visible typed wait", async () => {
+  const net = network();
+  net.port.encrypt = async () => {
+    throw new RangeError("unknown encryption failure");
+  };
+  const source = device(net, { preexisting: "unknown" });
+  const delays: number[] = [];
+  for (let attempt = 1; attempt <= 15; attempt++) {
+    const report = await source.step();
+    const row = source.db
+      .prepare(
+        "SELECT prepared,outcome,reason,attempts,next_attempt FROM pdpp_transport_batches",
+      )
+      .get() as {
+      prepared: number;
+      outcome: string;
+      reason: string;
+      attempts: number;
+      next_attempt: number;
+    };
+    expect(row).toMatchObject({
+      prepared: 0,
+      outcome: "retry",
+      reason: "prepare_failed",
+      attempts: attempt,
+    });
+    expect(report.waits).toContainEqual({
+      id: expect.any(String),
+      phase: "prepare",
+      dependency: {
+        kind: "preparation",
+        key: expect.any(String),
+        reason: "unknown",
+      },
+    });
+    expect(
+      source.db.prepare("SELECT state FROM pdpp_transport_preparation").get(),
+    ).toEqual({ state: "prep_failed_unknown" });
+    delays.push(row.next_attempt - time);
+    expect(delays.at(-1)).toBe(defaultReplicaBackoff(attempt));
+    source.put(`later ${attempt}`, "later");
+    expect(outbox(source)).toHaveLength(0);
+    expect(
+      source.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get(),
+    ).toEqual({ n: 1 });
+    time = row.next_attempt;
+  }
+  expect(delays.at(-1)).toBe(3_600_000);
+  expect(
+    delays.slice(0, 13).every((delay, i) => i === 0 || delay > delays[i - 1]!),
+  ).toBe(true);
+  expect(
+    source.db
+      .prepare(
+        "SELECT 1 FROM pdpp_transport_operation_outcomes WHERE outcome='unsupported'",
+      )
+      .get(),
+  ).toBeUndefined();
+  expect(net.puts).toHaveLength(0);
+});
+
+it("A5b-4 an unknown preparation failure later commits the same version without Unsupported rows", async () => {
+  const net = network();
+  const encrypt = net.port.encrypt;
+  net.port.encrypt = async () => {
+    throw new Error("transient crypto failure");
+  };
+  const source = device(net, { preexisting: "recover" });
+  await source.step();
+  const claim = source.db
+    .prepare("SELECT batch,version FROM pdpp_transport_preparation")
+    .get();
+  source.reopen();
+  net.port.encrypt = encrypt;
+  time += 1000;
+  await cycles([source], 4);
+  expect(
+    source.db
+      .prepare("SELECT batch,version FROM pdpp_transport_preparation")
+      .get(),
+  ).toEqual(claim);
+  expect(outbox(source)[0]).toMatchObject({ version: 1, state: "published" });
+  expect(
+    source.db
+      .prepare("SELECT state,wait_json FROM pdpp_transport_preparation")
+      .get(),
+  ).toEqual({ state: "prepared", wait_json: null });
+  expect(
+    source.db
+      .prepare(
+        "SELECT 1 FROM pdpp_transport_operation_outcomes WHERE outcome='unsupported'",
+      )
+      .get(),
+  ).toBeUndefined();
+});
+
+it("A5b H4 aggregate ciphertext attributes the breach to the bad op and preserves later good ops", async () => {
+  const net = network();
+  const source = device(net, {
+    worker: { resourceLimits: { maxAggregateCiphertextBytes: 4000 } },
+  });
+  await cycles([source], 4);
+  source.put("good one", "one");
+  source.put("x".repeat(5000), "bad");
+  source.put("good two", "two");
+  await cycles([source], 16);
+  expect(
+    source.db
+      .prepare(
+        "SELECT position FROM pdpp_transport_operation_outcomes WHERE outcome='unsupported'",
+      )
+      .all(),
+  ).toEqual([{ position: 1 }]);
+  const receiver = device(net);
+  await cycles([receiver], 8);
+  expect(receiver.get("one")).toEqual(source.get("one"));
+  expect(receiver.get("two")).toEqual(source.get("two"));
+  expect(receiver.get("bad")).toBeUndefined();
 });
