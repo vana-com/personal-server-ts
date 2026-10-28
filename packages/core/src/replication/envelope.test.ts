@@ -136,6 +136,25 @@ describe("profile v1 golden wire vectors", () => {
       encodeReplicaEnvelope({ ...envelope, version: 2 } as never, expected),
     ).toThrow();
   });
+  it("preserves top-level and nested own __proto__ keys when decoding peer JSON", () => {
+    const encoded = vector.encoded.replace(
+      '"data":{"id":"same-key","text":"hello"}',
+      '"data":{"__proto__":{"nested":{"__proto__":{"value":2}}},"id":"same-key","text":"hello"}',
+    );
+
+    const decoded = decodeReplicaEnvelope(encoded, expected);
+    const operation = decoded.operations.find((item) => item.kind === "upsert");
+    expect(operation?.kind).toBe("upsert");
+    if (operation?.kind !== "upsert") throw new Error("missing upsert");
+    expect(Object.hasOwn(operation.data, "__proto__")).toBe(true);
+    expect(Object.hasOwn(operation.data["__proto__"], "nested")).toBe(true);
+    expect(Object.hasOwn(operation.data["__proto__"].nested, "__proto__")).toBe(
+      true,
+    );
+    expect(operation.data["__proto__"].nested["__proto__"]).toEqual({
+      value: 2,
+    });
+  });
   it("rejects malformed JSON and non-JSON data rather than silently coercing bytes", () => {
     expect(() => decodeReplicaEnvelope("{", expected)).toThrow();
     for (const data of [{ id: undefined }, { id: NaN }, { id: BigInt(1) }]) {

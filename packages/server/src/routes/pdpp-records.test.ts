@@ -17,6 +17,7 @@ import {
   type PdppRecordsRouteDeps,
 } from "./pdpp-records.js";
 import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 
 const declarations = createStreamDeclarationRegistry([
   {
@@ -1252,6 +1253,57 @@ describe("pdpp records routes: record ingest ownership", () => {
       id: "pl_1",
     });
   });
+
+  it.each(["memory", "sqlite"] as const)(
+    "preserves top-level and nested __proto__ data on %s ingest",
+    async (backend) => {
+      const store =
+        backend === "memory"
+          ? createMemoryRecordStore()
+          : createTestBoundRecordStore(new Database(":memory:"));
+      const sqliteBinding = backend === "sqlite";
+      const { app } = buildApp(
+        {
+          "owner-tok": {
+            active: true,
+            tokenKind: "owner",
+            subjectId: "sub_1",
+            instanceIds: ["inst_1"],
+          },
+        },
+        {
+          store,
+          ...(sqliteBinding && {
+            bindingStore: store,
+            configuredMethods: new Map([["inst_1", ["test_method"]]]),
+          }),
+        },
+      );
+      try {
+        const res = await app.request(
+          `/streams/playlists/records/ingest${sqliteBinding ? "?method=test_method&binding_generation=1" : ""}`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: "Bearer owner-tok",
+              "Content-Type": "application/json",
+            },
+            body: '{"instance":"inst_1","key":"proto_1","data":{"id":"proto_1","__proto__":{"top":"kept"},"nested":{"__proto__":{"deep":"kept"}}},"emitted_at":"2026-04-01T00:00:00.000Z"}',
+          },
+        );
+
+        expect(res.status).toBe(200);
+        expect(await res.json()).toMatchObject({ accepted: 1, rejected: [] });
+        const data = store.getRecord("inst_1", "playlists", "proto_1")?.data;
+        expect(data && Object.hasOwn(data, "__proto__")).toBe(true);
+        expect(data && Object.hasOwn(data.nested, "__proto__")).toBe(true);
+        expect(data?.["__proto__"]).toEqual({ top: "kept" });
+        expect(data?.nested["__proto__"]).toEqual({ deep: "kept" });
+      } finally {
+        store.close();
+      }
+    },
+  );
 
   it.each([
     ["another subject", "sub_other", "inst_1"],
