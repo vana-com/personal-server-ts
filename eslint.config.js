@@ -20,6 +20,7 @@ export default tseslint.config(
       "packages/core/src/additions/**/*.ts",
       "packages/core/src/replication/**/*.ts",
       "packages/core/src/storage/pdpp-records/completion.ts",
+      "packages/core/src/storage/pdpp-import-job/**/*.ts",
     ],
     ignores: [
       "**/*.test.ts",
