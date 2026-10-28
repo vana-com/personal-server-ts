@@ -429,6 +429,7 @@ function outbox(d: ReturnType<typeof device>) {
       attempts: number;
       next_attempt: number;
       checked_block: string | null;
+      outcome: string | null;
     }[]
   ).map((row) => ({ ...row, slot: slotKey(row.scope, row.version) }));
 }
@@ -587,6 +588,116 @@ it("does not resubmit a registration while accepted evidence is temporarily hidd
   expect(outbox(a).find((row) => row.slot === slot)?.state).toBe("published");
 });
 
+it("S1 blocks a new slot when post-registration evidence retries", async () => {
+  const net = network();
+  const a = device(net);
+  const originalEvidence = net.port.evidence;
+  let evidenceCalls = 0;
+  net.port.evidence = async (scope, version) => {
+    evidenceCalls++;
+    if (evidenceCalls >= 2) throw new Error("evidence lookup unavailable");
+    return originalEvidence(scope, version);
+  };
+
+  a.put("predecessor", "first");
+  await a.cycle();
+  const predecessor = outbox(a)[0]!;
+  expect(predecessor.version).toBe(1);
+  expect(predecessor.outcome).toBe("retry");
+  expect(net.registrations).toEqual([predecessor.slot]);
+
+  const putsBeforeSuccessor = net.puts.length;
+  const batchesBeforeSuccessor = (
+    a.db.prepare("SELECT count(*) AS n FROM pdpp_transport_batches").get() as {
+      n: number;
+    }
+  ).n;
+  a.put("successor", "second");
+  await cycles([a], 3);
+
+  expect(outbox(a).map((row) => row.version)).toEqual([1]);
+  expect(net.registrations).toEqual([predecessor.slot]);
+  expect(net.puts).toHaveLength(putsBeforeSuccessor);
+  expect(
+    (
+      a.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get() as { n: number }
+    ).n,
+  ).toBe(batchesBeforeSuccessor);
+  expect(
+    (
+      a.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_transport_registration_intents",
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBe(1);
+});
+
+it("S3 keeps a retrying prepared batch ahead of later source operations", async () => {
+  const net = network();
+  const a = device(net);
+  net.port.encrypt = async () => {
+    throw new Error("preparation unavailable");
+  };
+  a.put("prepared retry", "first");
+  await a.cycle();
+  expect(
+    a.db.prepare("SELECT prepared,outcome FROM pdpp_transport_batches").get(),
+  ).toMatchObject({ prepared: 0, outcome: "retry" });
+  const batches = (
+    a.db.prepare("SELECT count(*) AS n FROM pdpp_transport_batches").get() as {
+      n: number;
+    }
+  ).n;
+
+  a.put("later operation", "second");
+  await cycles([a], 3);
+
+  expect(
+    (
+      a.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get() as { n: number }
+    ).n,
+  ).toBe(batches);
+  expect(outbox(a)).toEqual([]);
+  expect(net.puts).toEqual([]);
+  expect(net.registrations).toEqual([]);
+});
+
+it("S3 keeps an uploaded batch ahead of later operations while a fragment retries", async () => {
+  const net = network();
+  const a = device(net);
+  net.beforePut((key) => {
+    if (isFragmentKey(key)) net.failPut.add(key);
+  });
+  a.put("fragment retry", "first");
+  await a.cycle();
+  expect(outbox(a)).toHaveLength(1);
+  expect(fragmentsOut(a).some((row) => row.outcome === "retry")).toBe(true);
+  const batches = (
+    a.db.prepare("SELECT count(*) AS n FROM pdpp_transport_batches").get() as {
+      n: number;
+    }
+  ).n;
+
+  a.put("later operation", "second");
+  await cycles([a], 3);
+
+  expect(
+    (
+      a.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get() as { n: number }
+    ).n,
+  ).toBe(batches);
+  expect(outbox(a).map((row) => row.version)).toEqual([1]);
+  expect(net.registrations).toEqual([]);
+});
+
 it("reports a pending predecessor and re-registers that same slot after authoritative absence", async () => {
   const net = network();
   const a = device(net, {
@@ -636,6 +747,126 @@ it("reports a pending predecessor and re-registers that same slot after authorit
   expect(outbox(a).find((row) => row.version === 1)?.state).toBe("published");
   expect(outbox(a).find((row) => row.version === 2)?.state).toBe("published");
 });
+
+it("S4 treats a finalized immutable conflict as a settled predecessor slot", async () => {
+  const net = network();
+  const a = device(net);
+  const originalEvidence = net.port.evidence;
+  let conflictInserted = false;
+  net.port.evidence = async (scope, version) => {
+    if (version === 1 && !conflictInserted) {
+      const slot = slotKey(scope, version);
+      net.chain.set(slot, {
+        ...net.chainRow(slot),
+        currentVersion: "1",
+        status: "Active",
+        commitment: `0x${"4".repeat(64)}`,
+      });
+      conflictInserted = true;
+    }
+    return originalEvidence(scope, version);
+  };
+
+  a.put("conflicting predecessor", "first");
+  await a.cycle();
+  expect(outbox(a)[0]).toMatchObject({
+    version: 1,
+    state: "quarantined",
+    outcome: "quarantine",
+    reason: "immutable_registration_conflict",
+  });
+
+  a.put("successor after settled conflict", "second");
+  await cycles([a], 3);
+
+  expect(outbox(a).map((row) => [row.version, row.state])).toContainEqual([
+    2,
+    "published",
+  ]);
+  expect(net.registrations).toContain(slotKey(a.scope, 2));
+});
+
+it("P5 backs off absent registration evidence and its waiting successor over two hours", async () => {
+  const net = network();
+  const a = device(net);
+  const evidenceAt: number[] = [];
+  const evidenceSlots = new Map<string, number>();
+  const originalEvidence = net.port.evidence;
+  net.port.evidence = async (scope, version) => {
+    const slot = slotKey(scope, version);
+    evidenceSlots.set(slot, (evidenceSlots.get(slot) ?? 0) + 1);
+    evidenceAt.push(time);
+    return originalEvidence(scope, version);
+  };
+  const originalRegister = net.port.register;
+  net.port.register = async (manifest) => {
+    await originalRegister(manifest);
+    const slot = slotKey(manifest.scope, manifest.version);
+    net.head.delete(slot);
+    net.chain.delete(slot);
+  };
+
+  a.put("uncertain predecessor", "first");
+  await a.cycle();
+  const predecessor = outbox(a)[0]!;
+  expect(predecessor.outcome).toBe("wait");
+  const successorBatch = "test-waiting-successor";
+  a.db
+    .prepare(
+      `INSERT INTO pdpp_transport_manifests_out
+        (batch,scope,version,plaintext,encrypted,data_hash,metadata_hash,state,
+         outcome,dependency,next_attempt,wait_since)
+       SELECT ?,scope,version+1,plaintext,encrypted,data_hash,metadata_hash,'ready',
+         'wait',?,next_attempt,wait_since
+       FROM pdpp_transport_manifests_out WHERE batch=?`,
+    )
+    .run(
+      successorBatch,
+      `registration_pending:${predecessor.slot}`,
+      predecessor.batch,
+    );
+  const successorSlot = slotKey(predecessor.scope, predecessor.version + 1);
+  const start = time;
+  const horizon = 2 * 60 * 60 * 1000;
+  let observedLongInterval = false;
+  for (let elapsed = 0; elapsed < horizon; elapsed += 2_000) {
+    time = start + elapsed + 2_000;
+    await a.cycle();
+    const rows = outbox(a);
+    const predecessorRow = rows.find((row) => row.version === 1)!;
+    const successorRow = rows.find((row) => row.version === 2)!;
+    expect(
+      successorRow.next_attempt,
+      `elapsed=${elapsed}, now=${time}, predecessor=${predecessorRow.next_attempt}`,
+    ).toBe(predecessorRow.next_attempt);
+    if (
+      time - start >= 600_000 &&
+      predecessorRow.next_attempt - time === 30_000
+    )
+      observedLongInterval = true;
+  }
+
+  const periodicChecks =
+    Math.ceil(600_000 / 16_000) + Math.ceil((horizon - 600_000) / 30_000);
+  const retryChecks = Math.ceil(horizon / 300_000);
+  expect(
+    evidenceAt.length,
+    JSON.stringify({
+      start,
+      first: evidenceAt.slice(0, 20),
+      last: evidenceAt.slice(-5),
+      rows: outbox(a).map((row) => ({
+        version: row.version,
+        next_attempt: row.next_attempt,
+        wait_since: row.wait_since,
+        checked_block: row.checked_block,
+        outcome: row.outcome,
+      })),
+    }),
+  ).toBeLessThanOrEqual(2 + periodicChecks + retryChecks);
+  expect(evidenceSlots.get(successorSlot) ?? 0).toBe(0);
+  expect(observedLongInterval).toBe(true);
+}, 30_000);
 
 it("aborts later outbound writes when the door closes after a fragment upload", async () => {
   const net = network();
@@ -1126,7 +1357,7 @@ it("holds a successor batch until its predecessor arrives, then imports the reta
   expect(b.get()).toEqual(a.get());
 });
 
-it("a permanently failing preparation does not block publishing a later batch", async () => {
+it("a permanently failing preparation blocks claiming a later version", async () => {
   const net = network();
   const encrypt = net.port.encrypt;
   let stuckBatch: string | undefined;
@@ -1139,11 +1370,29 @@ it("a permanently failing preparation does not block publishing a later batch", 
   const a = device(net);
   a.put("later tail");
   await a.cycle();
+  const first = a.db
+    .prepare("SELECT batch,prepared,outcome FROM pdpp_transport_batches")
+    .get() as { batch: string; prepared: number; outcome: string | null };
+  expect(first).toMatchObject({ prepared: 0, outcome: "retry" });
+  const batchesBeforeSuccessor = (
+    a.db.prepare("SELECT count(*) AS n FROM pdpp_transport_batches").get() as {
+      n: number;
+    }
+  ).n;
   a.reopen();
+  a.put("blocked successor", "second");
   await cycles([a], 3);
-  expect(net.registrations.length).toBeGreaterThan(0);
-  expect(outbox(a).length).toBeGreaterThan(0);
-  expect(outbox(a).every((r) => r.batch !== stuckBatch)).toBe(true);
+  expect(stuckBatch).toBe(first.batch);
+  expect(net.registrations).toEqual([]);
+  expect(outbox(a)).toEqual([]);
+  expect(net.puts).toEqual([]);
+  expect(
+    (
+      a.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get() as { n: number }
+    ).n,
+  ).toBe(batchesBeforeSuccessor);
   expect(
     a.db
       .prepare("SELECT error FROM pdpp_transport_batches WHERE prepared=0")
@@ -1418,20 +1667,13 @@ it("uses advancing finalized-head hints to wake waiting rows but still verifies 
   time += 2000;
   await a.cycle();
   await b.cycle(); // records inclusion hints without checking unchanged finalized slots
-  const waitingRow = outbox(a).at(-1)!;
-  const count = evidence.mock.calls.filter(
-    ([scope, version]) => slotKey(scope, version) === waitingRow.slot,
-  ).length;
+  const count = evidence.mock.calls.length;
   for (let i = 0; i < 5; i++) {
     time += 2000;
     await a.cycle();
     await b.cycle();
   }
-  expect(
-    evidence.mock.calls.filter(
-      ([scope, version]) => slotKey(scope, version) === waitingRow.slot,
-    ),
-  ).toHaveLength(count);
+  expect(evidence.mock.calls).toHaveLength(count);
   a.reopen();
   b.reopen();
   finalized = 140n;
@@ -1676,31 +1918,34 @@ it("bounds repeated high hints and never regresses the verified checked height",
   });
   net.port.evidence = evidence;
   await a.cycle();
-  const waiting = outbox(a)[0]!;
   time += 2000;
   await a.cycle(); // high hint, unchanged verified head: durable cooldown
-  const count = evidence.mock.calls.filter(
-    ([scope, version]) => slotKey(scope, version) === waiting.slot,
-  ).length;
+  const count = evidence.mock.calls.length;
   for (let i = 0; i < 14; i++) {
     time += 2000;
     await a.cycle();
   }
-  expect(
-    evidence.mock.calls.filter(
-      ([scope, version]) => slotKey(scope, version) === waiting.slot,
-    ),
-  ).toHaveLength(count);
+  expect(evidence.mock.calls).toHaveLength(count);
   verified = 120n;
   time += 2000;
   await a.cycle();
   const rows = outbox(a);
   expect(rows.length).toBeGreaterThan(0);
-  expect(rows[0]).toMatchObject({
-    checked_block: "123",
-    attempts: 0,
-    next_attempt: time + 30000,
-  });
+  expect(
+    rows.map(({ slot, checked_block, attempts, next_attempt }) => ({
+      slot,
+      checked_block,
+      attempts,
+      next_attempt,
+    })),
+  ).toEqual(
+    rows.map(({ slot }) => ({
+      slot,
+      checked_block: "123",
+      attempts: 0,
+      next_attempt: time + 30000,
+    })),
+  );
   expect(acceptedSlots(a, a)).toBe(0);
 });
 

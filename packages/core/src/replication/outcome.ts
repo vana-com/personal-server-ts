@@ -28,6 +28,8 @@ export type ReplicaDependency =
       version: number;
       since: number;
       checkedBlock?: string;
+      /** Next evidence check for a successor waiting on this registration. */
+      nextCheckAt?: number;
     }
   | { kind: "fragments"; key: string }
   | { kind: "mapping"; key: string }

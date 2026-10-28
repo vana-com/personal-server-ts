@@ -573,6 +573,48 @@ describe("schedule.ts settleReplicaWork", () => {
     expect(second.waitSince).toBe(T0);
   });
 
+  it("P1 registration waits without a checked block grow and enter long polling", () => {
+    const registrationWait: ReplicaPhaseOutcome = {
+      tag: "wait",
+      dependency: {
+        kind: "registration_pending",
+        key: "scope/1",
+        version: 1,
+        since: T0,
+      },
+    };
+    let state = settleReplicaWork(base, registrationWait, T0).state;
+    expect(state.nextEligible).toBe(T0 + 2_000);
+    state = settleReplicaWork(state, registrationWait, T0 + 2_000).state;
+    expect(state.nextEligible).toBe(T0 + 2_000 + 4_000);
+    state = settleReplicaWork(state, registrationWait, T0 + 6_000).state;
+    expect(state.nextEligible).toBe(T0 + 6_000 + 8_000);
+    state = settleReplicaWork(state, registrationWait, T0 + 14_000).state;
+    expect(state.nextEligible).toBe(T0 + 14_000 + 16_000);
+
+    const long = settleReplicaWork(
+      { ...state, waitSince: T0 },
+      registrationWait,
+      T0 + 600_000,
+    );
+    expect(long.state.nextEligible).toBe(T0 + 600_000 + 30_000);
+  });
+
+  it("P2 a successor waits until its predecessor's next evidence check", () => {
+    const successorWait: ReplicaPhaseOutcome = {
+      tag: "wait",
+      dependency: {
+        kind: "registration_pending",
+        key: "scope/1",
+        version: 1,
+        since: T0,
+        nextCheckAt: T0 + 90_000,
+      },
+    };
+    const { state } = settleReplicaWork(base, successorWait, T0);
+    expect(state.nextEligible).toBe(T0 + 90_000);
+  });
+
   it("30 with hints present and no verified advance the poll is 30s", () => {
     const first = settleReplicaWork(base, finalityWait("123"), T0, {
       hints: true,
@@ -657,23 +699,36 @@ describe("schedule.ts settleReplicaWork", () => {
     expect(retried.checkedBlock).toBe("50");
   });
 
-  it("34 a non-finality wait gets the bounded 60s fallback rescan", () => {
+  it("P3 non-finality waits grow the 60s fallback with a bounded long interval", () => {
     for (const hints of [false, true]) {
       for (const dependency of [
         { kind: "predecessor", key: "w:3" },
         { kind: "mapping", key: "conn-1" },
         { kind: "declaration", key: "src:stream" },
         { kind: "fragments", key: "w:b" },
+        { kind: "blob", key: "w:b:0" },
+        { kind: "reset", key: "w:reset" },
+        { kind: "roster", key: "scope" },
+        { kind: "owner", key: "batch" },
       ] as const) {
-        const { state } = settleReplicaWork(
-          { ...base, attempts: 3 },
-          { tag: "wait", dependency },
+        const wait = { tag: "wait", dependency } as ReplicaPhaseOutcome;
+        const first = settleReplicaWork({ ...base, attempts: 3 }, wait, T0, {
+          hints,
+        });
+        expect(first.state.nextEligible).toBe(T0 + 60_000);
+        const second = settleReplicaWork(first.state, wait, T0 + 60_000, {
+          hints,
+        });
+        expect(second.state.nextEligible).toBe(T0 + 60_000 + 120_000);
+        const long = settleReplicaWork(
+          { ...second.state, waitSince: T0 - 600_000 },
+          wait,
           T0,
           { hints },
         );
-        expect(state.nextEligible).toBe(T0 + 60_000);
-        expect(state.attempts).toBe(0);
-        expect(state.checkedBlock).toBeNull();
+        expect(long.state.nextEligible).toBe(T0 + 600_000);
+        expect(long.state.attempts).toBe(0);
+        expect(long.state.checkedBlock).toBeNull();
       }
     }
   });

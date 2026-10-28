@@ -689,7 +689,7 @@ it("17d an idle step reads no retained history: no canonical reconcile and no qu
 
 // ========================================================================= 18
 
-it("18 per-phase isolation: a preparation backlog does not stop an independent remote batch from importing in one step", async () => {
+it("18 a prepared Retry blocks new local slots but does not stop an independent remote batch from importing", async () => {
   const net = network();
   // Written before the baseline: registration and record travel in one batch.
   const a = transportDevice(net, { preexisting: "remote" });
@@ -707,22 +707,20 @@ it("18 per-phase isolation: a preparation backlog does not stop an independent r
   });
   await stepUntil(b, () => countFor(tally.promote, writerA) >= 1, 12);
 
-  // Sixteen local batches whose encryption is down: a preparation backlog.
+  // Many queued local operations share one claimed slot while encryption is down.
+  const batchesBeforeLocalWrites = batchCount(b);
   net.faults.encrypt = () => new Error("encryption down");
   for (let i = 0; i < 16; i++) b.put(`local ${i}`, `l${i}`);
-  await stepUntil(b, () => batchCount(b) >= 12, 80, 5);
+  await stepUntil(b, () => unpreparedBatches(b) > 0, 80, 5);
+  expect(batchCount(b)).toBe(batchesBeforeLocalWrites + 1);
 
-  // Everything is due now: the whole backlog and the retained remote import.
-  net.faults.encrypt = undefined;
+  // The Retry is due, but local preparation still cannot starve remote import.
   clock.advance(2 * 3_600_000);
   const report = await step(b, { units: 8 });
   expect(b.get("a"), "remote batch starved by the preparation backlog").toEqual(
     a.get("a"),
   );
-  expect(
-    unpreparedBatches(b),
-    "the backlog was not a real backlog",
-  ).toBeGreaterThan(0);
+  expect(unpreparedBatches(b), "the local Retry should remain durable").toBe(1);
   expect(report?.receipts.some((r) => r.phase === "import")).toBe(true);
 });
 

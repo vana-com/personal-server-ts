@@ -28,8 +28,27 @@ export const REPLICA_TERMINAL = Number.MAX_SAFE_INTEGER;
 const FINALITY_POLL_MS = 2_000;
 const FINALITY_SLOW_POLL_MS = 30_000;
 const LONG_WAIT_MS = 600_000;
+const FINALITY_BACKOFF_CAP_MS = 16_000;
+const DEPENDENCY_BACKOFF_CAP_MS = 300_000;
+const DEPENDENCY_LONG_POLL_MS = 600_000;
 /** Dependency waits also rescan on this bound, so a lost wake cannot strand work. */
 export const REPLICA_WAIT_FALLBACK_MS = 60_000;
+
+function growingWaitDelay(
+  age: number,
+  first: number,
+  cap: number,
+  long: number,
+) {
+  if (age >= LONG_WAIT_MS) return long;
+  let interval = first;
+  let elapsed = 0;
+  while (interval < cap && age >= elapsed + interval) {
+    elapsed += interval;
+    interval = Math.min(cap, interval * 2);
+  }
+  return interval;
+}
 
 const maxHeight = (a: string | null, b: string) =>
   a === null || BigInt(b) > BigInt(a) ? b : a;
@@ -58,7 +77,11 @@ export function settleReplicaWork(
         },
       };
     case "wait": {
-      const since = previous.waitSince ?? now;
+      const since =
+        previous.waitSince ??
+        (outcome.dependency.kind === "registration_pending"
+          ? outcome.dependency.since
+          : now);
       if (
         outcome.dependency.kind !== "finality" &&
         outcome.dependency.kind !== "registration_pending"
@@ -67,7 +90,28 @@ export function settleReplicaWork(
           outcome,
           state: {
             attempts: 0,
-            nextEligible: now + REPLICA_WAIT_FALLBACK_MS,
+            nextEligible:
+              now +
+              growingWaitDelay(
+                now - since,
+                REPLICA_WAIT_FALLBACK_MS,
+                DEPENDENCY_BACKOFF_CAP_MS,
+                DEPENDENCY_LONG_POLL_MS,
+              ),
+            waitSince: since,
+            checkedBlock: previous.checkedBlock,
+          },
+        };
+      if (
+        outcome.dependency.kind === "registration_pending" &&
+        outcome.dependency.nextCheckAt !== undefined &&
+        outcome.dependency.nextCheckAt > now
+      )
+        return {
+          outcome,
+          state: {
+            attempts: 0,
+            nextEligible: outcome.dependency.nextCheckAt,
             waitSince: since,
             checkedBlock: previous.checkedBlock,
           },
@@ -78,7 +122,14 @@ export function settleReplicaWork(
           outcome,
           state: {
             attempts: 0,
-            nextEligible: now + FINALITY_POLL_MS,
+            nextEligible:
+              now +
+              growingWaitDelay(
+                now - since,
+                FINALITY_POLL_MS,
+                FINALITY_BACKOFF_CAP_MS,
+                FINALITY_SLOW_POLL_MS,
+              ),
             waitSince: since,
             checkedBlock: previous.checkedBlock,
           },

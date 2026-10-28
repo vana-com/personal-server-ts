@@ -650,18 +650,20 @@ export function createReplicaTransportWorker(deps: {
   }
   /**
    * Keep collecting source operations behind one unresolved publication. The
-   * current manifest reports its typed wait; successors use a version only
-   * after that slot resolves.
+   * current manifest reports its typed wait. Only committed manifests and
+   * proven immutable-slot conflicts settle a claimed version; every other
+   * state blocks the next claim by default. Unsupported batches claim no slot.
    */
   function batchInFlight() {
     return !!db
       .prepare(
         `SELECT 1 FROM pdpp_transport_batches b WHERE
-          (b.prepared=0 AND coalesce(b.outcome,'')<>'retry')
-          OR (b.prepared=1 AND EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m
-            WHERE m.batch=b.batch AND m.state='ready' AND coalesce(m.outcome,'')<>'retry'
-            AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f
-              WHERE f.batch=b.batch AND f.outcome='retry')))
+          b.prepared=0
+          OR (b.prepared=1 AND NOT EXISTS (
+            SELECT 1 FROM pdpp_transport_manifests_out m WHERE m.batch=b.batch
+              AND (m.state='published' OR
+                (m.state='quarantined' AND m.outcome='quarantine'
+                  AND m.reason='immutable_registration_conflict'))))
           LIMIT 1`,
       )
       .get();
@@ -1101,6 +1103,7 @@ export function createReplicaTransportWorker(deps: {
     version: number,
     since: number,
     checkedBlock?: string,
+    nextCheckAt?: number,
   ): ReplicaPhaseOutcome => ({
     tag: "wait",
     dependency: {
@@ -1109,6 +1112,7 @@ export function createReplicaTransportWorker(deps: {
       version,
       since,
       ...(checkedBlock !== undefined && { checkedBlock }),
+      ...(nextCheckAt !== undefined && { nextCheckAt }),
     },
   });
   function recordRegistrationAttempt(
@@ -1166,11 +1170,23 @@ export function createReplicaTransportWorker(deps: {
       if (row.version > 1) {
         const predecessor = db
           .prepare(
-            "SELECT state,checked_block FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
+            "SELECT state,outcome,reason,checked_block,next_attempt FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
           )
           .get(row.scope, row.version - 1) as
-          { state: string; checked_block: string | null } | undefined;
-        if (predecessor?.state !== "published") {
+          | {
+              state: string;
+              outcome: string | null;
+              reason: string | null;
+              checked_block: string | null;
+              next_attempt: number;
+            }
+          | undefined;
+        const predecessorSettled =
+          predecessor?.state === "published" ||
+          (predecessor?.state === "quarantined" &&
+            predecessor.outcome === "quarantine" &&
+            predecessor.reason === "immutable_registration_conflict");
+        if (!predecessorSettled) {
           const intent = registrationIntent(row.scope, row.version - 1);
           return verdict(
             pendingRegistration(
@@ -1178,6 +1194,7 @@ export function createReplicaTransportWorker(deps: {
               row.version - 1,
               intent?.created_at ?? previousWaitSince ?? now(),
               predecessor?.checked_block ?? undefined,
+              predecessor?.next_attempt,
             ),
           );
         }
@@ -1264,7 +1281,6 @@ export function createReplicaTransportWorker(deps: {
           key,
           row.version,
           intent?.created_at ?? previousWaitSince ?? now(),
-          evidence.chain?.blockNumber.toString(),
         ),
       );
     } catch (error) {
@@ -1356,6 +1372,17 @@ export function createReplicaTransportWorker(deps: {
               next,
               item.row.batch,
               item.row.position,
+            );
+          if (item.row.kind === "manifest")
+            db.prepare(
+              `UPDATE pdpp_transport_manifests_out SET next_attempt=?
+               WHERE scope=? AND version>? AND state='ready'
+                 AND dependency=?`,
+            ).run(
+              outcome.tag === "quarantine" ? now() : work.nextEligible,
+              item.row.scope!,
+              item.row.version!,
+              `registration_pending:${slotKey(item.row.scope!, item.row.version!)}`,
             );
         },
         (selected) => {
