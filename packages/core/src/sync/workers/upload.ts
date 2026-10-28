@@ -1,3 +1,4 @@
+import { isMemoryScope } from "../../policy/reserved-scopes.js";
 import { isReplicaScope } from "../../replication/namespace.js";
 import type { DurableAdditionsService } from "../../additions/durable.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
@@ -82,6 +83,8 @@ export interface UploadResult {
 export interface UploadAllOptions {
   batchSize?: number;
   onError?: (entry: IndexEntry, error: Error) => void;
+  /** Clock for the coalesced-scope quiet window. Defaults to the wall clock. */
+  now?: () => Date;
 }
 
 /**
@@ -281,9 +284,121 @@ export async function uploadOne(
 }
 
 /**
+ * Agent-memory scopes (see `isMemoryScope`): every save stores a full snapshot,
+ * so publishing each intermediate one would cost a registration per save.
+ */
+export function isCoalescedScope(scope: string): boolean {
+  return isMemoryScope(scope);
+}
+
+/**
+ * A coalesced scope is published once its newest snapshot has been quiet this
+ * long (saves have stopped) ...
+ */
+export const COALESCE_QUIET_MS = 2 * 60_000;
+/** ... or once its oldest unpublished snapshot has waited this long. */
+export const COALESCE_MAX_WAIT_MS = 10 * 60_000;
+
+interface CoalescedScope {
+  /** The scope's latest local version: what readers serve. */
+  head: IndexEntry;
+  /** Still inside the quiet window: publish on a later pass. */
+  deferred: boolean;
+}
+
+const at = (entry: IndexEntry) => Date.parse(entry.collectedAt);
+const VERSION_PAGE = 200;
+
+/**
+ * One plan per coalesced scope in the batch. The head is the scope's latest
+ * local version (`findEntry`), not the batch's latest. Only the head is ever
+ * published: readers serve the latest version, which is a full state, so an
+ * older unpublished snapshot is never what anyone sees and publishing it would
+ * roll the scope back.
+ */
+function coalescePlan(
+  deps: UploadWorkerDeps,
+  entries: readonly IndexEntry[],
+  nowMs: number,
+): Map<string, CoalescedScope> {
+  const byScope = new Map<string, IndexEntry[]>();
+  for (const entry of entries) {
+    if (!isCoalescedScope(entry.scope)) continue;
+    byScope.set(entry.scope, [...(byScope.get(entry.scope) ?? []), entry]);
+  }
+  const plans = new Map<string, CoalescedScope>();
+  for (const [scope, inBatch] of byScope) {
+    const batchHead = inBatch.reduce((a, b) => (at(b) > at(a) ? b : a));
+    const latest = deps.storage.findEntry?.({ scope });
+    const head = latest && at(latest) >= at(batchHead) ? latest : batchHead;
+    const oldest = Math.min(...inBatch.map(at), at(head));
+    const deferred =
+      head.dataPointId === null &&
+      nowMs - at(head) < COALESCE_QUIET_MS &&
+      nowMs - oldest < COALESCE_MAX_WAIT_MS;
+    plans.set(scope, { head, deferred });
+  }
+  return plans;
+}
+
+/** Every unpublished version of `head`'s scope older than `head`. */
+function olderUnsynced(deps: UploadWorkerDeps, head: IndexEntry): IndexEntry[] {
+  const older: IndexEntry[] = [];
+  for (let offset = 0; ; offset += VERSION_PAGE) {
+    const page = deps.storage.listVersions(head.scope, {
+      limit: VERSION_PAGE,
+      offset,
+    });
+    for (const entry of page) {
+      if (
+        entry.id !== head.id &&
+        entry.dataPointId === null &&
+        at(entry) < at(head)
+      ) {
+        older.push(entry);
+      }
+    }
+    if (page.length < VERSION_PAGE) return older;
+  }
+}
+
+/**
+ * Erase the older unsynced snapshots of a coalesced scope once its newest
+ * snapshot is published. Fenced to the exact rows selected, so a row that
+ * changed since is left alone. A failed erase is logged; the row stays and is
+ * superseded again on the next pass.
+ */
+async function eraseSuperseded(
+  deps: UploadWorkerDeps,
+  entries: readonly IndexEntry[],
+): Promise<void> {
+  for (const entry of entries) {
+    try {
+      await deps.storage.deleteVersion(entry.scope, entry.collectedAt, {
+        id: entry.id,
+        path: entry.path,
+      });
+    } catch (err) {
+      deps.logger.warn(
+        {
+          path: entry.path,
+          scope: entry.scope,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        "Failed to erase a superseded memory snapshot",
+      );
+    }
+  }
+}
+
+/**
  * Process all unsynced entries (dataPointId === null).
  * Processes sequentially to avoid overwhelming storage backend.
  * Returns array of results (skips failures, logs errors).
+ *
+ * Coalesced scopes (see `isCoalescedScope`) publish only their newest
+ * unsynced snapshot in the batch, after a quiet window; the older ones are
+ * erased after it lands.
  */
 export async function uploadAll(
   deps: UploadWorkerDeps,
@@ -291,12 +406,29 @@ export async function uploadAll(
 ): Promise<UploadResult[]> {
   const batchSize = options?.batchSize ?? 50;
   const entries = deps.storage.findUnsynced({ limit: batchSize });
+  const nowMs = (options?.now ?? (() => new Date()))().getTime();
+  const plans = coalescePlan(deps, entries, nowMs);
+  const handled = new Set<string>();
   const results: UploadResult[] = [];
 
   for (const entry of entries) {
+    const plan = plans.get(entry.scope);
+    if (plan) {
+      if (handled.has(entry.scope)) continue;
+      handled.add(entry.scope);
+      if (plan.deferred) continue;
+      if (plan.head.dataPointId !== null) {
+        // The latest version is already published: older unpublished
+        // snapshots are superseded, never published.
+        await eraseSuperseded(deps, olderUnsynced(deps, plan.head));
+        continue;
+      }
+    }
+    const target = plan ? plan.head : entry;
     try {
-      const result = await uploadOne(deps, entry);
+      const result = await uploadOne(deps, target);
       results.push(result);
+      if (plan) await eraseSuperseded(deps, olderUnsynced(deps, plan.head));
     } catch (err) {
       // A dropped orphan is a self-heal, not a failure: the row is already
       // gone, there is nothing to retry, and surfacing it would keep the

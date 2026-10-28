@@ -46,6 +46,8 @@ import {
   type McpSessionPaymentConfig,
   type McpProofReplayStore,
   createMcpDataReadClient,
+  createMcpDataWriteClient,
+  type McpDataWriteClient,
   denyMcpScopeAccessRequest,
   getMcpConnectionView,
   handleMcpStreamableHttpRequest,
@@ -94,6 +96,8 @@ import {
   boundedProofExpiry,
 } from "@opendatalabs/personal-server-ts-core/auth";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
+import type { WriteSessionStore } from "@opendatalabs/personal-server-ts-core/write";
+import { verifyDataWritePolicy } from "@opendatalabs/personal-server-ts-core/policy";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -176,6 +180,15 @@ export interface McpRouteDeps {
    * user. Absent: the agent is told to wait for approval in Vana.
    */
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /**
+   * MCP writes (`remember`): the store the data route redeems write sessions
+   * from, and a dispatcher into the mounted data route. Absent: MCP stays
+   * read-only and `remember` answers write_unavailable.
+   */
+  mcpWrites?: {
+    sessionStore: WriteSessionStore;
+    dispatch(request: Request): Promise<Response>;
+  };
   /** Loopback auth listener port; requests on it are local MCP clients. */
   localApprovalPort?: number;
   /** Main (tunneled) port; a collision with `localApprovalPort` disables local MCP. */
@@ -388,6 +401,38 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
   };
 }
 
+/** Writes as the connection grantee, when the host wired MCP writes. */
+function buildWriteClient(
+  deps: McpRouteDeps,
+  granteeAccount: ReturnType<typeof loadMcpGranteeAccount>,
+  storage: PersonalServerDataApiDeps["storage"],
+): McpDataWriteClient | undefined {
+  const serverOwner = deps.serverOwner;
+  if (!deps.mcpWrites || !serverOwner) return undefined;
+  return createMcpDataWriteClient({
+    serverOrigin: resolveOrigin(deps.serverOrigin),
+    granteeAccount,
+    storage,
+    sessionStore: deps.mcpWrites.sessionStore,
+    dispatch: deps.mcpWrites.dispatch,
+    authorize: async ({ scope, grantId }) => {
+      await verifyDataWritePolicy(
+        {
+          signer: granteeAccount.address,
+          grantId,
+          requestedScope: scope,
+          serverOwner,
+        },
+        {
+          authSessionVerifier: deps.gateway,
+          grantVerifier: deps.gateway,
+          runtimeAvailability: deps.runtimeAvailability,
+        },
+      );
+    },
+  });
+}
+
 /** Shared engine for ordinary MCP connections and authenticated TEE dispatch. */
 export function executeMcpConnectionRequest(
   request: Request,
@@ -399,13 +444,15 @@ export function executeMcpConnectionRequest(
     publicKey: connection.granteePublicKey,
     encryptedPrivateKey: connection.encryptedGranteePrivateKey,
   });
+  const dataApiDeps = buildDataApiDeps(deps);
   return handleMcpStreamableHttpRequest(request, {
     connection,
     readClient: createMcpDataReadClient({
       serverOrigin: resolveOrigin(deps.serverOrigin),
       granteeAccount,
-      dataApiDeps: buildDataApiDeps(deps),
+      dataApiDeps,
     }),
+    writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps.storage),
     activityRecorder: deps.activityRecorder,
     // Denied tool calls are recorded by the wrapper, not the read path.
     reporterDeps: {
@@ -1108,6 +1155,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     const response = await handleMcpStreamableHttpRequest(c.req.raw, {
       connection: record,
       readClient,
+      writeClient: buildWriteClient(deps, granteeAccount, dataApiDeps.storage),
       activityRecorder: deps.activityRecorder,
       requestScopeAccess: async (input) => {
         return requestMcpScopeAccess(
