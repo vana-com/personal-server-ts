@@ -128,8 +128,13 @@ export function createSqliteImportJobCapability(
     VALUES (@job_id, @stream, @record_key, @ord, @key_json, @op, @data, @emitted_at, @digest)
     ON CONFLICT (job_id, stream, record_key) DO NOTHING
   `);
+  // Pages are bounded by rows and by the job's batch bytes: the sizes are read
+  // first, then only the rows that fit (at least one) are loaded.
+  const stagedSizesStmt = db.prepare(
+    "SELECT ord, length(CAST(key_json AS BLOB)) + coalesce(length(CAST(data AS BLOB)), 0) AS bytes FROM pdpp_import_staged WHERE job_id = ? AND ord > ? ORDER BY ord LIMIT ?",
+  );
   const stagedPageStmt = db.prepare(
-    "SELECT stream, record_key, ord, key_json, op, data, emitted_at FROM pdpp_import_staged WHERE job_id = ? AND ord > ? ORDER BY ord LIMIT ?",
+    "SELECT stream, record_key, ord, key_json, op, data, emitted_at FROM pdpp_import_staged WHERE job_id = ? AND ord > ? AND ord <= ? ORDER BY ord",
   );
   const stagedCountStmt = db.prepare(
     "SELECT COUNT(*) AS n FROM pdpp_import_staged WHERE job_id = ?",
@@ -197,12 +202,23 @@ export function createSqliteImportJobCapability(
       let rejected = 0;
       let after = -1;
       for (;;) {
+        const sizes = stagedSizesStmt.all(job.jobId, after, pageSize) as {
+          ord: number;
+          bytes: number;
+        }[];
+        if (sizes.length === 0) break;
+        let last = sizes[0].ord;
+        let bytes = sizes[0].bytes;
+        for (const size of sizes.slice(1)) {
+          bytes += size.bytes;
+          if (bytes > job.batchBytes) break;
+          last = size.ord;
+        }
         const page = stagedPageStmt.all(
           job.jobId,
           after,
-          pageSize,
+          last,
         ) as StagedRowDb[];
-        if (page.length === 0) break;
         after = page[page.length - 1].ord;
         const envelopes: PdppRecordEnvelopeInput[] = page.map((row) => ({
           instance,

@@ -79,7 +79,8 @@ One transaction, all or nothing:
 1. Re-read the job. Committed: return its receipt. Aborted: `job_not_open`.
    `nextSeq` changed: `batch_count_mismatch`.
 2. Check the binding as ingest does.
-3. Apply index rows in `order`, in bounded pages, through the host's ingest
+3. Apply index rows in `order`, in pages bounded by rows and by the job's
+   batch bytes (one row at least), through the host's ingest
    path (`planIngest` against current rows), with its history, arrival and
    blob-claim checks. When replication is enabled, its capture runs in this
    transaction; when it is disabled nothing is captured.
@@ -106,7 +107,27 @@ with `capability_version_mismatch`. Implementations:
   when the host supplies the capability; without it the runtime is unchanged.
 
 `readSpool` is optional; with it, `importSpool` pumps a spool in batches and
-resumes from the job's offset. No whole-file read is reachable from the job.
+resumes from the job's offset. No whole-file read is reachable from the job:
+an ESLint rule rejects whole-file read calls (`readFile`, `readEnvelope`,
+`.text()` and similar) in these modules.
+
+## Memory
+
+Peak memory follows the batch and the largest record, not the export.
+`pdpp-import-jobs-memory.test.ts` imports synthetic exports (small non-ASCII
+messages, one 12 MiB conversation, append-only events, a delete-heavy second
+half) through the Node SQLite adapter in a child with a 160 MB V8 heap cap.
+Measured on 2026-10-28 (Node 24, default 1 MiB batches):
+
+| Export | Records | Batches | Peak sampled heap | Peak RSS |
+| ------ | ------: | ------: | ----------------: | -------: |
+| 32 MB  |  34,555 |      26 |          100.1 MB | 325.3 MB |
+| 128 MB | 163,222 |     123 |           81.0 MB | 355.8 MB |
+| 313 MB | 410,744 |     308 |           58.7 MB | 353.7 MB |
+
+Idle heap is 10 MB and idle RSS 81 MB. Without the giant record, peak heap is
+about 41 MB and peak RSS about 243 MB. CI runs the 32 MB case; set
+`PDPP_IMPORT_MEMORY_SIZES_MB=32,128,313` for the full run.
 
 ## Not in version 1
 
