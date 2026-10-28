@@ -59,6 +59,7 @@ import {
 import { remoteReplicaTestWriter } from "./pdpp-replica-writer-identity.test-utils.js";
 import type { ReplicaTransportPort } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import { encodeReplicaPayload } from "@opendatalabs/personal-server-ts-core/replication/stream";
+import { assembleReplicaStream } from "@opendatalabs/personal-server-ts-core/replication/stream";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { createReplicaStagingStore } from "./pdpp-replica-staging.js";
 import { defaultReplicaBackoff } from "@opendatalabs/personal-server-ts-core/replication/schedule";
@@ -1483,7 +1484,34 @@ it("M4 overlaps per-fragment reservations and admits a batch larger than the bud
   await cycles([source], 24);
   const template = device(net);
   await cycles([template], 24);
-  source.put("x".repeat(20_000));
+  const largeBlob = source.store.storeBlobBytesForInstance({
+    instance: "conn",
+    method: "export",
+    generation: 1,
+    bytes: new Uint8Array(20_000).fill(3),
+    mimeType: "application/octet-stream",
+  });
+  source.store.ingestBatch(
+    [
+      {
+        instance: "conn",
+        stream: "messages",
+        key: "large-blob",
+        emitted_at: at,
+        data: {
+          id: "large-blob",
+          blob_ref: {
+            blob_id: largeBlob.blobId,
+            mime_type: largeBlob.mimeType,
+            size_bytes: 20_000,
+          },
+        },
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "export", generation: 1 },
+  );
   await cycles([source], 24);
   const outbound = source.db
     .prepare(
@@ -1500,6 +1528,13 @@ it("M4 overlaps per-fragment reservations and admits a batch larger than the bud
   expect(manifest.fragments.length).toBeGreaterThan(1);
   const fragmentBytes = manifest.fragments[0]!.bytes;
   const budget = new ReplicaByteBudget(fragmentBytes * 6);
+  let maximumReserved = 0;
+  const reserve = budget.reserve.bind(budget);
+  vi.spyOn(budget, "reserve").mockImplementation((bytes, group) => {
+    const result = reserve(bytes, group);
+    maximumReserved = Math.max(maximumReserved, budget.reserved);
+    return result;
+  });
   expect(outbound.encrypted.length * 4).toBeLessThan(budget.maxBytes / 2);
   const limits = { maxManifestCiphertextBytes: outbound.encrypted.length };
   const a = device(net, {
@@ -1581,7 +1616,11 @@ it("M4 overlaps per-fragment reservations and admits a batch larger than the bud
   await cycles([a, b], 36);
   expect(a.get()).toEqual(source.get());
   expect(b.get()).toEqual(source.get());
+  expect(a.store.getBlobBytes(largeBlob.blobId)).toEqual(
+    new Uint8Array(20_000).fill(3),
+  );
   expect(manifest.totalBytes * 4).toBeGreaterThan(budget.maxBytes);
+  expect(maximumReserved).toBeLessThanOrEqual(budget.maxBytes);
   expect(budget.reserved).toBe(0);
 }, 60000);
 
@@ -1589,8 +1628,15 @@ it("M2 releases a read reservation when stagingStore throws after admission", as
   const net = network();
   const a = device(net, { preexisting: "staging store failure" });
   await cycles([a], 8);
-  const budget = new ReplicaByteBudget(10_000_000);
+  const budget = new ReplicaByteBudget(REPLICA_DEFAULT_BYTE_BUDGET_BYTES);
   let calls = 0;
+  let successfulReservations = 0;
+  const reserve = budget.reserve.bind(budget);
+  vi.spyOn(budget, "reserve").mockImplementation((bytes) => {
+    const result = reserve(bytes);
+    if (typeof result === "function") successfulReservations++;
+    return result;
+  });
   const isReadyToImport = (
     input: Parameters<typeof createReplicaStagingStore>[0],
   ) =>
@@ -1612,13 +1658,63 @@ it("M2 releases a read reservation when stagingStore throws after admission", as
         input: Parameters<typeof createReplicaStagingStore>[0],
       ) => {
         calls++;
-        if (isReadyToImport(input)) throw new Error("staging store failed");
+        if (isReadyToImport(input)) {
+          calls++;
+          throw new Error("staging store failed");
+        }
         return createReplicaStagingStore(input);
       },
     },
   });
   await cycles([b], 12);
-  expect(calls).toBeGreaterThan(1);
+  expect(calls).toBeGreaterThan(0);
+  expect(successfulReservations).toBeGreaterThan(0);
+  expect(budget.reserved).toBe(0);
+});
+
+it("M1 charges and releases an envelope larger than the free budget", async () => {
+  const net = network(false, 64 * 1024);
+  const source = device(net, { chunk: 2000 });
+  await cycles([source], 24);
+  const template = device(net);
+  await cycles([template], 24);
+  source.put("x".repeat(5000));
+  await cycles([source], 80);
+  const budget = new ReplicaByteBudget(8 * 1024);
+  let maximumReserved = 0;
+  const reserve = budget.reserve.bind(budget);
+  vi.spyOn(budget, "reserve").mockImplementation((bytes, group) => {
+    const result = reserve(bytes, group);
+    maximumReserved = Math.max(maximumReserved, budget.reserved);
+    return result;
+  });
+  const receiver = device(net, {
+    copyOf: template,
+    worker: {
+      resourceBudget: budget,
+      resourceLimits: { maxManifestCiphertextBytes: 1024 },
+    },
+  });
+
+  await cycles([receiver], 36);
+
+  const sourceWriter = (
+    source.db
+      .prepare("SELECT writer FROM pdpp_transport_state WHERE id=1")
+      .get() as {
+      writer: string;
+    }
+  ).writer;
+  const oversizedBatch = source.db
+    .prepare("SELECT batch FROM pdpp_transport_batches WHERE total_bytes>5000")
+    .get() as { batch: string };
+  const importedOversized = receiver.db
+    .prepare(
+      "SELECT outcome,reason FROM pdpp_transport_import_work WHERE writer=? AND batch=?",
+    )
+    .get(sourceWriter, oversizedBatch.batch);
+  expect(importedOversized).toMatchObject({ outcome: "progress" });
+  expect(maximumReserved).toBeGreaterThan(budget.maxBytes);
   expect(budget.reserved).toBe(0);
 });
 
@@ -1626,8 +1722,15 @@ it("M2 releases a read reservation when reclaimAdmission throws", async () => {
   const net = network();
   const a = device(net, { preexisting: "reclaim failure" });
   await cycles([a], 8);
-  const budget = new ReplicaByteBudget(10_000_000);
+  const budget = new ReplicaByteBudget(REPLICA_DEFAULT_BYTE_BUDGET_BYTES);
   let calls = 0;
+  let successfulReservations = 0;
+  const reserve = budget.reserve.bind(budget);
+  vi.spyOn(budget, "reserve").mockImplementation((bytes) => {
+    const result = reserve(bytes);
+    if (typeof result === "function") successfulReservations++;
+    return result;
+  });
   const isReadyToImport = (
     input: Parameters<typeof createReplicaStagingStore>[0],
   ) =>
@@ -1650,19 +1753,22 @@ it("M2 releases a read reservation when reclaimAdmission throws", async () => {
       ) => {
         const store = createReplicaStagingStore(input);
         calls++;
-        if (isReadyToImport(input))
+        if (isReadyToImport(input)) {
+          calls++;
           return {
             ...store,
             reclaimAdmission: () => {
               throw new Error("reclaim failed");
             },
           };
+        }
         return store;
       },
     },
   });
   await cycles([b], 12);
-  expect(calls).toBeGreaterThan(1);
+  expect(calls).toBeGreaterThan(0);
+  expect(successfulReservations).toBeGreaterThan(0);
   expect(budget.reserved).toBe(0);
 });
 
@@ -1823,142 +1929,159 @@ it("E1 rejects declared totals before fetching fragments or retaining evidence",
   ).toBe(0);
 });
 
-it("H3 prepares, admits and imports both scaled honest sender bounds", async () => {
-  const run = async (kind: "large-operation" | "operation-count") => {
-    const net = network(false, 64 * 1024);
-    const limits = {
-      maxSourceBlobBytes: 1024,
-      maxRecordJsonBytes: 1024,
-      maxManifestCiphertextBytes: 64 * 1024,
-      maxFragmentCiphertextBytes: 64 * 1024,
-      maxAggregateCiphertextBytes: 256 * 1024,
-      maxFragments: 256,
-      maxEvidenceRows: 256,
-      maxTotalBytes: 64 * 1024,
-      maxOperations: 2,
-      maxOperationBytes: 8 * 1024,
-      maxSingleBlobBytes: 1024,
-      maxBlobTotalBytes: 1024,
-    };
-    const sender = device(net, {
-      cap: 64 * 1024,
-      worker: {
-        maxBatchOperations: 2,
-        maxBatchBytes: 1024,
-        resourceLimits: limits,
-      },
-    });
-    let recordIds: string[];
-    if (kind === "large-operation") {
-      const id = "large-operation";
-      const fixedRecordBytes = new TextEncoder().encode(
-        JSON.stringify({ id, text: "" }),
-      ).length;
-      const maxRecordText = "x".repeat(1024 - fixedRecordBytes);
-      expect(
-        new TextEncoder().encode(JSON.stringify({ id, text: maxRecordText }))
-          .length,
-      ).toBe(1024);
-      const blob = sender.store.storeBlobBytesForInstance({
-        instance: "conn",
-        method: "export",
-        generation: 1,
-        bytes: new Uint8Array(1024).fill(7),
-        mimeType: "application/octet-stream",
-      });
-      recordIds = [id];
-      sender.store.ingestBatch(
-        [
-          {
-            instance: "conn",
-            stream: "messages",
-            key: id,
-            emitted_at: at,
-            data: {
-              id,
-              text: maxRecordText,
-              blob_ref: {
-                blob_id: blob.blobId,
-                mime_type: blob.mimeType,
-                size_bytes: 1024,
-              },
-            },
-          },
-        ],
-        () => "mutable_state",
-        () => ["id"],
-        { method: "export", generation: 1 },
-      );
-    } else {
-      recordIds = ["operation-1", "operation-2"];
-      sender.store.ingestBatch(
-        recordIds.map((id) => ({
-          instance: "conn",
-          stream: "messages",
-          key: id,
-          data: { id, text: "within batch target" },
-          emitted_at: at,
-        })),
-        () => "mutable_state",
-        () => ["id"],
-        { method: "export", generation: 1 },
-      );
-    }
-    await cycles([sender], 24);
-    const batches = sender.db
-      .prepare(
-        `SELECT b.batch,b.total_bytes FROM pdpp_transport_batches b WHERE b.prepared=1 ORDER BY b.total_bytes DESC`,
-      )
-      .all() as { batch: string; total_bytes: number }[];
-    const batch = batches.find((row) => row.total_bytes > 0);
-    expect(batch, `${kind} must be prepared`).toBeDefined();
-    if (!batch) throw new Error("sender did not prepare an honest batch");
-    const outgoing = sender.db
-      .prepare(
-        "SELECT scope,encrypted FROM pdpp_transport_manifests_out WHERE batch=?",
-      )
-      .get(batch.batch) as { scope: string; encrypted: Buffer };
-    const manifest = decodeReplicaManifest(
-      await net.port.decrypt(
-        outgoing.scope,
-        new Uint8Array(outgoing.encrypted),
-      ),
-      outgoing.scope,
-      owner,
-    );
-    const admission = admit(
-      manifest,
-      new ReplicaByteBudget(1_000_000),
-      {
-        repositoryId: `h3-${kind}`,
-        owner,
-        manifestDigest: manifest.digest,
-      },
-      limits,
-    );
-    expect(admission).not.toHaveProperty("kind");
-    if ("kind" in admission) throw new Error("honest scaled batch was refused");
-    const receiver = device(net, {
-      worker: {
-        maxBatchOperations: 2,
-        maxBatchBytes: 1024,
-        resourceLimits: limits,
-      },
-    });
-    await cycles([receiver], 36);
-    for (const id of recordIds)
-      expect(receiver.get(id), `${kind} imports ${id}`).toBeDefined();
-    if (kind === "large-operation") {
-      const record = receiver.get(recordIds[0]!) as {
-        blob_ref: { blob_id: string };
-      };
-      expect(receiver.store.getBlobBytes(record.blob_ref.blob_id)).toEqual(
-        new Uint8Array(1024).fill(7),
-      );
-    }
+it("H3 prepares, admits and imports one exact maximum honest batch", async () => {
+  const net = network(false, 64 * 1024);
+  const limits = {
+    maxSourceBlobBytes: 1024,
+    maxRecordJsonBytes: 1024,
+    maxManifestCiphertextBytes: 64 * 1024,
+    maxFragmentCiphertextBytes: 64 * 1024,
+    maxAggregateCiphertextBytes: 256 * 1024,
+    maxFragments: 256,
+    maxEvidenceRows: 256,
+    maxTotalBytes: 64 * 1024,
+    maxOperations: 2,
+    maxOperationBytes: 8 * 1024,
+    maxSingleBlobBytes: 1024,
+    maxBlobTotalBytes: 1024,
   };
-  await run("large-operation");
-  await run("operation-count");
+  const sender = device(net, {
+    cap: 64 * 1024,
+    worker: {
+      maxBatchOperations: 2,
+      maxBatchBytes: 16 * 1024,
+      resourceLimits: limits,
+    },
+  });
+  await cycles([sender], 12);
+  const id = "large-operation";
+  const blob = sender.store.storeBlobBytesForInstance({
+    instance: "conn",
+    method: "export",
+    generation: 1,
+    bytes: new Uint8Array(1024).fill(7),
+    mimeType: "application/octet-stream",
+  });
+  const fixedRecordBytes = new TextEncoder().encode(
+    JSON.stringify({
+      id,
+      text: "",
+      blob_ref: {
+        blob_id: blob.blobId,
+        mime_type: blob.mimeType,
+        size_bytes: 1024,
+      },
+    }),
+  ).length;
+  const maxRecordText = "x".repeat(1024 - fixedRecordBytes);
+  const maxRecord = {
+    id,
+    text: maxRecordText,
+    blob_ref: {
+      blob_id: blob.blobId,
+      mime_type: blob.mimeType,
+      size_bytes: 1024,
+    },
+  };
+  expect(new TextEncoder().encode(JSON.stringify(maxRecord)).length).toBe(1024);
+  sender.store.ingestBatch(
+    [
+      {
+        instance: "conn",
+        stream: "messages",
+        key: id,
+        emitted_at: at,
+        data: maxRecord,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "export", generation: 1 },
+  );
+  await cycles([sender], 24);
+
+  const batches = sender.db
+    .prepare(
+      "SELECT batch,total_bytes FROM pdpp_transport_batches WHERE prepared=1 AND total_bytes>1000 ORDER BY total_bytes DESC",
+    )
+    .all() as { batch: string; total_bytes: number }[];
+  expect(batches, JSON.stringify(batches)).toHaveLength(1);
+  const batch = batches[0];
+  if (!batch) throw new Error("sender did not prepare the maximum batch");
+  const outgoing = sender.db
+    .prepare(
+      "SELECT scope,encrypted FROM pdpp_transport_manifests_out WHERE batch=?",
+    )
+    .get(batch.batch) as { scope: string; encrypted: Buffer };
+  const manifest = decodeReplicaManifest(
+    await net.port.decrypt(outgoing.scope, new Uint8Array(outgoing.encrypted)),
+    outgoing.scope,
+    owner,
+  );
+  const admission = admit(
+    manifest,
+    new ReplicaByteBudget(1_000_000),
+    {
+      repositoryId: "h3-maximum",
+      owner,
+      manifestDigest: manifest.digest,
+    },
+    limits,
+  );
+  expect(admission).not.toHaveProperty("kind");
+
+  const encryptedFragments = sender.db
+    .prepare(
+      "SELECT encrypted FROM pdpp_transport_fragments_out WHERE batch=? ORDER BY position",
+    )
+    .all(batch.batch) as { encrypted: Buffer }[];
+  const fragments = [];
+  for (let index = 0; index < encryptedFragments.length; index++) {
+    const plaintext = await net.port.decrypt(
+      outgoing.scope,
+      new Uint8Array(encryptedFragments[index]!.encrypted),
+    );
+    fragments.push(
+      (
+        JSON.parse(new TextDecoder().decode(plaintext)) as {
+          data: { fragment: (typeof fragments)[number] };
+        }
+      ).data.fragment,
+    );
+  }
+  const payloadParts: Uint8Array[] = [];
+  for await (const bytes of assembleReplicaStream(async function* () {
+    yield* fragments;
+  }))
+    payloadParts.push(bytes);
+  const payload = JSON.parse(
+    new TextDecoder().decode(Buffer.concat(payloadParts)),
+  ) as {
+    envelope: { operations: { data?: unknown }[] };
+    blobs: { bytes: string }[];
+  };
+  expect(payload.envelope.operations).toHaveLength(2);
+  expect(
+    new TextEncoder().encode(
+      JSON.stringify(
+        payload.envelope.operations.find((operation) => operation.data)!.data,
+      ),
+    ).length,
+  ).toBe(1024);
+  expect(Buffer.from(payload.blobs[0]!.bytes, "base64")).toHaveLength(1024);
+
+  const receiver = device(net, {
+    worker: {
+      maxBatchOperations: 2,
+      maxBatchBytes: 16 * 1024,
+      resourceLimits: limits,
+    },
+  });
+  await cycles([receiver], 36);
+  expect(receiver.get(id)).toBeDefined();
+  expect(receiver.store.getBlobBytes(blob.blobId)).toEqual(
+    new Uint8Array(1024).fill(7),
+  );
 }, 60000);
 
 it("H4 persists sender resource_unsupported and blocks later writer batches", async () => {
@@ -1991,6 +2114,146 @@ it("H4 persists sender resource_unsupported and blocks later writer batches", as
         .get() as { count: number }
     ).count,
   ).toBe(blockedCount);
+});
+
+async function expectRetainUnsupported(sender: ReturnType<typeof device>) {
+  await cycles([sender], 24);
+  expect(
+    sender.db
+      .prepare(
+        "SELECT outcome,reason FROM pdpp_transport_phase_state WHERE phase='retain'",
+      )
+      .get(),
+  ).toEqual({ outcome: "unsupported", reason: "resource_unsupported" });
+  const batchCount = (
+    sender.db
+      .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
+      .get() as {
+      count: number;
+    }
+  ).count;
+  sender.put("later writer batch", "later");
+  await cycles([sender], 12);
+  expect(
+    (
+      sender.db
+        .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
+        .get() as { count: number }
+    ).count,
+  ).toBe(batchCount);
+}
+
+it("H4 persists resource_unsupported for a sender operation-count breach", async () => {
+  const net = network();
+  const sender = device(net, {
+    worker: {
+      maxBatchOperations: 1,
+      resourceLimits: { maxOperations: 1 },
+    },
+  });
+  await cycles([sender], 12);
+  sender.put("first", "first");
+  sender.put("second", "second");
+  const readTailPage = sender.store.replication.readTailPage.bind(
+    sender.store.replication,
+  );
+  vi.spyOn(sender.store.replication, "readTailPage").mockImplementation(
+    (input) => {
+      const page = readTailPage(input);
+      return {
+        ...page,
+        operations: [...page.operations, ...page.operations],
+      };
+    },
+  );
+
+  await expectRetainUnsupported(sender);
+});
+
+it("H4 persists resource_unsupported for a sender single-blob breach", async () => {
+  const net = network();
+  const sender = device(net, {
+    worker: {
+      maxBatchOperations: 2,
+      resourceLimits: { maxOperations: 2, maxSingleBlobBytes: 1 },
+    },
+  });
+  await cycles([sender], 12);
+  const blob = sender.store.storeBlobBytesForInstance({
+    instance: "conn",
+    method: "export",
+    generation: 1,
+    bytes: new Uint8Array([1, 2]),
+    mimeType: "application/octet-stream",
+  });
+  sender.store.ingestBatch(
+    [
+      {
+        instance: "conn",
+        stream: "messages",
+        key: "large-blob",
+        emitted_at: at,
+        data: {
+          id: "large-blob",
+          blob_ref: {
+            blob_id: blob.blobId,
+            mime_type: blob.mimeType,
+            size_bytes: 2,
+          },
+        },
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "export", generation: 1 },
+  );
+
+  await expectRetainUnsupported(sender);
+});
+
+it("H4 persists resource_unsupported for sender aggregate-blob breach", async () => {
+  const net = network();
+  const sender = device(net, {
+    worker: {
+      maxBatchOperations: 2,
+      resourceLimits: {
+        maxOperations: 2,
+        maxSingleBlobBytes: 4,
+        maxBlobTotalBytes: 3,
+      },
+    },
+  });
+  await cycles([sender], 12);
+  const blobs = [1, 2].map((generation) =>
+    sender.store.storeBlobBytesForInstance({
+      instance: "conn",
+      method: "export",
+      generation: 1,
+      bytes: new Uint8Array([generation, generation]),
+      mimeType: "application/octet-stream",
+    }),
+  );
+  sender.store.ingestBatch(
+    blobs.map((blob, index) => ({
+      instance: "conn",
+      stream: "messages",
+      key: `blob-${index}`,
+      emitted_at: at,
+      data: {
+        id: `blob-${index}`,
+        blob_ref: {
+          blob_id: blob.blobId,
+          mime_type: blob.mimeType,
+          size_bytes: 2,
+        },
+      },
+    })),
+    () => "mutable_state",
+    () => ["id"],
+    { method: "export", generation: 1 },
+  );
+
+  await expectRetainUnsupported(sender);
 });
 
 it("H2 derives limits above the honest worst case from the exported write caps", () => {

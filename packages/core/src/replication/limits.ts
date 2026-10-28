@@ -68,6 +68,8 @@ export const REPLICA_MAX_AGGREGATE_CIPHERTEXT_BYTES =
   REPLICA_MAX_FRAGMENTS * (4 + REPLICA_FRAGMENT_OVERHEAD_BYTES);
 /** Four live representations: ciphertext, plaintext, parsed JSON and decoded bytes. */
 export const REPLICA_LIVE_COPY_FACTOR = 4;
+/** The retained JSON string plus its parsed operation tree. */
+export const REPLICA_ENVELOPE_LIVE_COPY_FACTOR = 2;
 /** 100 MiB #500 per-object cap × four copies = 400 MiB, below this budget. */
 export const REPLICA_DEFAULT_BYTE_BUDGET_BYTES = 512 * 1024 * 1024;
 
@@ -121,6 +123,7 @@ export type ResourceRefusal =
 /** Reservation ledger shared by concurrently running replication steps. */
 export class ReplicaByteBudget {
   private reservedBytes = 0;
+  private readonly reservations = new Map<object, number>();
 
   constructor(readonly maxBytes: number) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 0)
@@ -131,18 +134,30 @@ export class ReplicaByteBudget {
     return this.reservedBytes;
   }
 
-  reserve(bytes: number): (() => void) | ResourceRefusal {
+  reserve(bytes: number, group: object = {}): (() => void) | ResourceRefusal {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("invalid replication reservation");
     const availableBytes = this.maxBytes - this.reservedBytes;
-    if (bytes > availableBytes)
+    const groupBytes = this.reservations.get(group) ?? 0;
+    if (bytes > availableBytes && groupBytes !== this.reservedBytes)
       return { kind: "resource_busy", requestedBytes: bytes, availableBytes };
-    this.reservedBytes += bytes;
+    const nextReservedBytes = this.reservedBytes + bytes;
+    const nextGroupBytes = groupBytes + bytes;
+    if (
+      !Number.isSafeInteger(nextReservedBytes) ||
+      !Number.isSafeInteger(nextGroupBytes)
+    )
+      throw new RangeError("replication reservation exhausted");
+    this.reservedBytes = nextReservedBytes;
+    this.reservations.set(group, nextGroupBytes);
     let released = false;
     return () => {
       if (released) return;
       released = true;
       this.reservedBytes -= bytes;
+      const remaining = (this.reservations.get(group) ?? 0) - bytes;
+      if (remaining === 0) this.reservations.delete(group);
+      else this.reservations.set(group, remaining);
     };
   }
 }
@@ -156,7 +171,14 @@ export interface Admission {
   readonly manifestDigest: string;
   readonly payloadBytes: number;
   readonly limitsVersion: number;
-  reserveObject(ciphertextBytes: number): (() => void) | ResourceRefusal;
+  reserveObject(
+    ciphertextBytes: number,
+    reservationGroup?: object,
+  ): (() => void) | ResourceRefusal;
+  reserveEnvelope(
+    jsonBytes: number,
+    reservationGroup?: object,
+  ): (() => void) | ResourceRefusal;
 }
 
 export type AdmissionResult = Admission | ResourceRefusal;
@@ -218,16 +240,25 @@ export function admit(
   )
     return unsupported("total_bytes");
 
+  const reservationGroup = {};
   return Object.freeze({
     [admissionBrand]: true as const,
     admissionId: `${identity.repositoryId}:${identity.owner}:${identity.manifestDigest}`,
     ...identity,
     payloadBytes: manifest.totalBytes,
     limitsVersion: REPLICA_LIMITS_VERSION,
-    reserveObject(ciphertextBytes: number) {
+    reserveObject(ciphertextBytes: number, group = {}) {
       if (!Number.isSafeInteger(ciphertextBytes) || ciphertextBytes < 0)
         throw new RangeError("invalid replica object size");
-      return budget.reserve(ciphertextBytes * REPLICA_LIVE_COPY_FACTOR);
+      return budget.reserve(ciphertextBytes * REPLICA_LIVE_COPY_FACTOR, group);
+    },
+    reserveEnvelope(jsonBytes: number, group = reservationGroup) {
+      if (!Number.isSafeInteger(jsonBytes) || jsonBytes < 0)
+        throw new RangeError("invalid replica envelope size");
+      return budget.reserve(
+        jsonBytes * REPLICA_ENVELOPE_LIVE_COPY_FACTOR,
+        group,
+      );
     },
   });
 }

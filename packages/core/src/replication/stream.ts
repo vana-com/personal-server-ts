@@ -335,11 +335,15 @@ class PayloadCursor {
       }
     }
   }
-  async envelopeTail(limits: ReplicaStreamedLimits): Promise<string> {
+  async envelopeTail(
+    limits: ReplicaStreamedLimits,
+    reserveEnvelopeBytes?: (bytes: number) => void,
+  ): Promise<string> {
     let result = "";
     const operationLimits = new ReplicaOperationLimitScanner(limits);
     while (await this.peek()) {
       const rest = this.window.slice(this.position);
+      reserveEnvelopeBytes?.(encoder.encode(rest).length);
       operationLimits.feed(rest);
       result += rest;
       this.position = this.window.length;
@@ -456,6 +460,7 @@ async function* parsePayload(
   expected?: EnvelopeExpectation,
   limits: ReplicaStreamedLimits = DEFAULT_REPLICA_STREAMED_LIMITS,
   signal?: AbortSignal,
+  reserveEnvelopeBytes?: (bytes: number) => void,
 ): AsyncIterable<PayloadEvent> {
   const cursor = new PayloadCursor(input);
   const blobs: BlobMetadata[] = [];
@@ -504,7 +509,7 @@ async function* parsePayload(
       }
     }
     await cursor.literal('],"envelope":');
-    const encoded = await cursor.envelopeTail(limits);
+    const encoded = await cursor.envelopeTail(limits, reserveEnvelopeBytes);
     const envelope = expected
       ? decodeReplicaEnvelope(encoded, expected)
       : replicaEnvelopeSchema.parse(JSON.parse(encoded));
@@ -553,13 +558,18 @@ export async function inspectReplicaPayload(
     bytes: Uint8Array,
     blobIndex: number,
   ) => void | Promise<void>,
-  options: { limits?: ReplicaStreamedLimits; signal?: AbortSignal } = {},
+  options: {
+    limits?: ReplicaStreamedLimits;
+    signal?: AbortSignal;
+    reserveEnvelopeBytes?: (bytes: number) => void;
+  } = {},
 ): Promise<PayloadInspection> {
   for await (const event of parsePayload(
     factory(),
     expected,
     options.limits,
     options.signal,
+    options.reserveEnvelopeBytes,
   )) {
     if (event.kind === "bytes")
       await stage?.(event.blobId, event.bytes, event.blobIndex);

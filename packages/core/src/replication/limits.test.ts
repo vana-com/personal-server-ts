@@ -101,4 +101,37 @@ describe("replication admission limits", () => {
     if (typeof firstRead === "function") firstRead();
     expect(budget.reserved).toBe(0);
   });
+
+  it("M1 runs an over-budget item alone and refuses concurrent reservations", () => {
+    const budget = new ReplicaByteBudget(20);
+    const first = admit(
+      { totalBytes: 10, fragments: [{ bytes: 10 }] },
+      budget,
+      identity,
+    );
+    const second = admit(
+      { totalBytes: 10, fragments: [{ bytes: 10 }] },
+      budget,
+      { ...identity, manifestDigest: "sha256:other" },
+    );
+    if ("kind" in first || "kind" in second)
+      throw new Error("expected admissions");
+
+    const small = budget.reserve(1);
+    if (typeof small !== "function")
+      throw new Error("expected small reservation");
+    expect(first.reserveEnvelope(11)).toMatchObject({ kind: "resource_busy" });
+    small();
+    const alone = first.reserveEnvelope(11);
+    expect(alone).not.toHaveProperty("kind");
+    if (typeof alone !== "function")
+      throw new Error("expected exclusive reservation");
+    expect(budget.reserved).toBe(22);
+    expect(second.reserveObject(1)).toMatchObject({ kind: "resource_busy" });
+    alone();
+    const afterRelease = second.reserveObject(1);
+    expect(afterRelease).not.toHaveProperty("kind");
+    if (typeof afterRelease === "function") afterRelease();
+    expect(budget.reserved).toBe(0);
+  });
 });

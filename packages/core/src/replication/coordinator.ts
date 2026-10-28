@@ -273,19 +273,24 @@ export function createReplicaCoordinator(input: {
   ): Promise<ReplicaAttempt | undefined> {
     const key = `${handler.phase}\0${item.id}`;
     inflight.add(key);
-    const result = await bounded(
-      (inner) =>
-        handler
-          .run(item, inner)
-          .catch((error: unknown): ReplicaAttempt => ({
-            outcome: retryFromError(error, "unknown"),
-          }))
-          .finally(() => inflight.delete(key)),
-      signal,
-    );
-    if (result === "aborted") return undefined;
-    if (result === "deadline")
+    let running: Promise<ReplicaAttempt> | undefined;
+    const result = await bounded((inner) => {
+      running = handler
+        .run(item, inner)
+        .catch((error: unknown): ReplicaAttempt => ({
+          outcome: retryFromError(error, "unknown"),
+        }))
+        .finally(() => inflight.delete(key));
+      return running;
+    }, signal);
+    if (result === "aborted") {
+      void running?.then((attempt) => attempt.release?.());
+      return undefined;
+    }
+    if (result === "deadline") {
+      void running?.then((attempt) => attempt.release?.());
       return { outcome: { tag: "retry", problem: "deadline_exceeded" } };
+    }
     return result.value;
   }
 
@@ -480,12 +485,16 @@ export function createReplicaCoordinator(input: {
               lastWriter.set(handler.phase, item.writer);
               const attempt = await execute(handler, item, signal);
               if (attempt === undefined) break;
-              record(
-                report,
-                handler.phase,
-                item.id,
-                commit(handler, item, attempt),
-              );
+              try {
+                record(
+                  report,
+                  handler.phase,
+                  item.id,
+                  commit(handler, item, attempt),
+                );
+              } finally {
+                attempt.release?.();
+              }
             }
             if (!admitted) break;
           }

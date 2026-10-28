@@ -122,6 +122,26 @@ describe("S2b attempt-scoped results", () => {
     expect(store.commits).toBe(0);
   });
 
+  it("releases a successful fetch discarded by an immediate abort", async () => {
+    const controller = new AbortController();
+    let releases = 0;
+    const { store, handler } = single(async () => {
+      controller.abort();
+      return {
+        outcome: progress,
+        release: () => releases++,
+      };
+    });
+    const co = createReplicaCoordinator({ phases: [handler] });
+
+    const report = await co.step(T0, controller.signal, { units: 10 });
+    await sleep(0);
+
+    expect(report.receipts).toEqual([]);
+    expect(store.commits).toBe(0);
+    expect(releases).toBe(1);
+  });
+
   it("a plan whose transaction fails persists the commit problem's Retry, without the plan", async () => {
     const { store, handler } = single(async () => ({
       outcome: progress,
