@@ -619,15 +619,12 @@ describe("host-chosen keys", () => {
     ).rejects.toBeInstanceOf(VisibilityEpochConflict);
   });
   it("tells apart rows and evidence that differ only under a __proto__ data key", () => {
-    // The planner's operation parse drops the key before rows exist, so this
-    // states the engine's own comparison and digest directly.
     const withData = (value: string) =>
       ({
         ...a,
-        data: Object.fromEntries([
-          ["id", "a"],
-          ["__proto__", value],
-        ]),
+        data: JSON.parse(
+          `{"id":"a","__proto__":{"nested":{"__proto__":${JSON.stringify(value)}}}}`,
+        ),
       }) as typeof a;
     const id = rowId(C, binding.stream, "a");
     const projection = (value: string): VisibilityProjection => ({
@@ -647,6 +644,18 @@ describe("host-chosen keys", () => {
     expect(evidenceDigest(world, [registration, withData("x")])).not.toBe(
       evidenceDigest(world, [registration, withData("y")]),
     );
+    const applied = projectEvidence(EMPTY_PROJECTION, world, [
+      registration,
+      withData("x"),
+    ]);
+    const row = applied.rows[id];
+    expect(row?.state).toBe("live");
+    if (row?.state !== "live") throw new Error("missing live row");
+    expect(Object.hasOwn(row.winner.data, "__proto__")).toBe(true);
+    expect(
+      Object.hasOwn(row.winner.data["__proto__"].nested, "__proto__"),
+    ).toBe(true);
+    expect(row.winner.data["__proto__"].nested["__proto__"]).toBe("x");
   });
 });
 

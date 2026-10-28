@@ -29,6 +29,7 @@ import {
 } from "./completion.js";
 import {
   canonicalJson,
+  exactJson,
   type RecordOperation,
   type ReplicaOperation,
 } from "./envelope.js";
@@ -889,37 +890,6 @@ export function applyProjectionDelta(
 
 const hash = (text: string) =>
   `sha256:${bytesToHex(sha256(new TextEncoder().encode(text)))}`;
-
-/**
- * Canonical JSON for the values the engine digests and compares: requests,
- * deltas, checkpoints, retained evidence. Same ordering as `canonicalJson`,
- * but it keeps every own key. `canonicalJson` parses with zod, which drops an
- * own `__proto__` key, so values differing only there would share a digest.
- */
-function exactJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    // `map` skips holes, which would encode `new Array(1)` as `[]`.
-    for (let index = 0; index < value.length; index++)
-      if (!Object.hasOwn(value, index))
-        throw new TypeError(`not a JSON value: array hole at ${index}`);
-    return `[${value.map(exactJson).join(",")}]`;
-  }
-  if (value !== null && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${exactJson(record[key])}`)
-      .join(",")}}`;
-  }
-  if (
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "boolean" ||
-    (typeof value === "number" && Number.isFinite(value))
-  )
-    return JSON.stringify(value);
-  throw new TypeError(`not a JSON value: ${typeof value}`);
-}
 
 /**
  * Digest of the facts a projection derives from. It names the evidence SET:

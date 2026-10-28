@@ -31,6 +31,15 @@ const record = {
   recordKey: z.string(),
   emittedAt: token,
 };
+type JsonValue =
+  null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+const jsonRecordSchema = z.custom<Record<string, JsonValue>>(
+  (value) =>
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    isJsonValue(value),
+);
 const blob = z.strictObject({
   blobId: token,
   sha256: digest,
@@ -41,7 +50,7 @@ export const replicaOperationSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     ...record,
     kind: z.literal("upsert"),
-    data: z.record(z.string(), z.json()),
+    data: jsonRecordSchema,
     blobs: z.array(blob),
   }),
   z.strictObject({ ...record, kind: z.literal("delete"), deletedAt: token }),
@@ -100,22 +109,44 @@ export const replicaEnvelopeSchema = z.strictObject({
 });
 export type ReplicaEnvelope = z.infer<typeof replicaEnvelopeSchema>;
 
-/** Built once: `z.json()` constructs a new recursive schema on every call. */
-const jsonValueSchema = z.json();
-/** Canonical JSON for this profile: recursive code-unit key ordering, JSON numbers. */
-export function canonicalJson(value: unknown): string {
-  const json = jsonValueSchema.parse(value);
-  function encode(value: ReturnType<typeof z.json>["_output"]): string {
-    if (Array.isArray(value)) return `[${value.map(encode).join(",")}]`;
-    if (value !== null && typeof value === "object") {
-      return `{${Object.keys(value)
-        .sort()
-        .map((key) => `${JSON.stringify(key)}:${encode(value[key])}`)
-        .join(",")}}`;
-    }
-    return JSON.stringify(value);
+function isJsonValue(value: unknown): value is JsonValue {
+  try {
+    exactJson(value);
+    return true;
+  } catch {
+    return false;
   }
-  return encode(json);
+}
+
+/** Canonical JSON for the profile, preserving every own key at every depth. */
+export function canonicalJson(value: unknown): string {
+  return exactJson(value);
+}
+
+/** Canonical JSON serializer shared by wire encoding and replication digests. */
+export function exactJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    // `map` skips holes, which would encode `new Array(1)` as `[]`.
+    for (let index = 0; index < value.length; index++)
+      if (!Object.hasOwn(value, index))
+        throw new TypeError(`not a JSON value: array hole at ${index}`);
+    return `[${value.map(exactJson).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${exactJson(record[key])}`)
+      .join(",")}}`;
+  }
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  )
+    return JSON.stringify(value);
+  throw new TypeError(`not a JSON value: ${typeof value}`);
 }
 
 export interface EnvelopeExpectation {

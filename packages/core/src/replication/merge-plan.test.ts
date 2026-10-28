@@ -60,6 +60,37 @@ describe("replica merge vectors", () => {
     ]);
     expect(concurrent.records[0].winner?.revision.operationId).toBe("b");
   });
+
+  it("retains __proto__ data and detects distinct operation variants", () => {
+    const data = (value: string) =>
+      JSON.parse(
+        `{"id":"same-key","text":"ok","__proto__":{"value":${JSON.stringify(value)},"nested":{"__proto__":${JSON.stringify(value)}}}}`,
+      ) as Record<string, unknown>;
+    const first = { ...upsert("same-id", 2), data: data("first") };
+    const second = { ...upsert("same-id", 2), data: data("second") };
+
+    const result = planReplicaMerge(context, [registration, first, second]);
+    const equivocation = result.conflicts.find(
+      (issue) => issue.reason === "operation_id_equivocation",
+    );
+    expect(equivocation).toBeDefined();
+    expect(
+      equivocation?.operations.flatMap((operation) =>
+        operation.kind === "upsert" ? [operation.data["__proto__"].value] : [],
+      ),
+    ).toEqual(["first", "second"]);
+    const firstVariant = equivocation?.operations.find(
+      (operation) =>
+        operation.kind === "upsert" &&
+        operation.data["__proto__"].value === "first",
+    );
+    expect(firstVariant?.kind).toBe("upsert");
+    if (firstVariant?.kind !== "upsert") throw new Error("missing variant");
+    expect(Object.hasOwn(firstVariant.data, "__proto__")).toBe(true);
+    expect(
+      Object.hasOwn(firstVariant.data["__proto__"].nested, "__proto__"),
+    ).toBe(true);
+  });
 });
 
 it("quarantines append-only conflicts in all orders; ordinary later writes cannot repair", () => {
