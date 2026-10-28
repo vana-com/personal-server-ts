@@ -21,6 +21,7 @@ import {
   ReplicaResourceBusyError,
   ReplicaResourceLimitError,
   REPLICA_DEFAULT_BYTE_BUDGET_BYTES,
+  REPLICA_DEFAULT_FRAGMENT_BYTES,
   REPLICA_BATCH_OPERATION_LIMIT,
   REPLICA_BATCH_TARGET_BYTES,
   REPLICA_LIVE_COPY_FACTOR,
@@ -1114,7 +1115,7 @@ export function createReplicaTransportWorker(deps: {
       };
       const encrypt = (scope: string, bytes: Uint8Array) =>
         call(signal, () => transport.encrypt(scope, bytes));
-      let chunkBytes = deps.targetChunkBytes ?? 4 * 1024 * 1024;
+      let chunkBytes = deps.targetChunkBytes ?? REPLICA_DEFAULT_FRAGMENT_BYTES;
       let entries: ManifestEntry[] = [];
       let manifest: Awaited<ReturnType<typeof prepareReplicaManifest>>;
       const unsupportedPlan = (error: ReplicaFramingUnsupported) => {
@@ -1176,12 +1177,11 @@ export function createReplicaTransportWorker(deps: {
             db.prepare(
               "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
             ).run(token);
-            // Framing failures may narrow the chunk size; resource-limit
-            // failures become durable Unsupported. Other errors retry.
-            // Unsupported is terminal for this batch only and claims no
-            // version: later batches of this writer still prepare and
-            // publish, and a remote importer holds them as Wait(predecessor)
-            // until an explicit readmitUnsupported() under a new capability.
+            // Resource Unsupported blocks this writer. Framing Unsupported
+            // may narrow the chunk size; if framing remains impossible, it
+            // settles only this batch without claiming a version. Successors
+            // may publish but peers wait for the missing predecessor until
+            // readmitUnsupported() under a new capability. Other errors retry.
             if (error instanceof ReplicaResourceLimitError)
               return resourceUnsupported(batch, error);
             if (!(error instanceof ReplicaFramingUnsupported)) throw error;
@@ -2525,6 +2525,7 @@ export function createReplicaTransportWorker(deps: {
         },
       ];
       try {
+        // Keep both fallible staging calls before the first byte reservation.
         stageStore = stagingStore();
         stageStore.reclaimAdmission(admission);
         const currentStageStore = stageStore;
@@ -2671,9 +2672,12 @@ export function createReplicaTransportWorker(deps: {
         return verdict(retryFromError(error, "import_failed"));
       } finally {
         // A completed but uncommitted handle is a leased orphan after a crash.
-        if (!keepForPlan) stageStore?.abort(admission);
-        if (!transferEnvelopeReservations)
-          for (const release of envelopeReservations) release();
+        try {
+          if (!keepForPlan) stageStore?.abort(admission);
+        } finally {
+          if (!transferEnvelopeReservations)
+            for (const release of envelopeReservations) release();
+        }
       }
     },
     commit: commitIn((outcome, work, item) => {

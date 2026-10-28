@@ -55,13 +55,16 @@ import {
 import {
   admit,
   ReplicaByteBudget,
+  ReplicaResourceLimitError,
 } from "@opendatalabs/personal-server-ts-core/replication/limits";
 import { remoteReplicaTestWriter } from "./pdpp-replica-writer-identity.test-utils.js";
 import type { ReplicaTransportPort } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
+import * as replicaStream from "@opendatalabs/personal-server-ts-core/replication/stream";
 import { encodeReplicaPayload } from "@opendatalabs/personal-server-ts-core/replication/stream";
 import { assembleReplicaStream } from "@opendatalabs/personal-server-ts-core/replication/stream";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { createReplicaStagingStore } from "./pdpp-replica-staging.js";
+import { ReplicaFramingUnsupported } from "@opendatalabs/personal-server-ts-core/replication/outcome";
 import { defaultReplicaBackoff } from "@opendatalabs/personal-server-ts-core/replication/schedule";
 import {
   MAX_BLOB_UPLOAD_BYTES,
@@ -1630,6 +1633,7 @@ it("M2 releases a read reservation when stagingStore throws after admission", as
   await cycles([a], 8);
   const budget = new ReplicaByteBudget(REPLICA_DEFAULT_BYTE_BUDGET_BYTES);
   let calls = 0;
+  let reservedAtThrow: number | undefined;
   let successfulReservations = 0;
   const reserve = budget.reserve.bind(budget);
   vi.spyOn(budget, "reserve").mockImplementation((bytes) => {
@@ -1657,17 +1661,23 @@ it("M2 releases a read reservation when stagingStore throws after admission", as
       createStagingStore: (
         input: Parameters<typeof createReplicaStagingStore>[0],
       ) => {
-        calls++;
-        if (isReadyToImport(input)) {
+        if (calls === 0 && isReadyToImport(input)) {
           calls++;
+          reservedAtThrow = budget.reserved;
+          expect(budget.reserved).toBe(0);
           throw new Error("staging store failed");
         }
         return createReplicaStagingStore(input);
       },
     },
   });
+  for (let i = 0; i < 12 && calls === 0; i++) await cycles([b], 1);
+  expect(calls).toBe(1);
+  expect(reservedAtThrow).toBe(0);
+  expect(budget.reserved).toBe(0);
   await cycles([b], 12);
-  expect(calls).toBeGreaterThan(0);
+  expect(calls).toBe(1);
+  expect(b.get()).toEqual(a.get());
   expect(successfulReservations).toBeGreaterThan(0);
   expect(budget.reserved).toBe(0);
 });
@@ -1724,6 +1734,7 @@ it("M2 releases a read reservation when reclaimAdmission throws", async () => {
   await cycles([a], 8);
   const budget = new ReplicaByteBudget(REPLICA_DEFAULT_BYTE_BUDGET_BYTES);
   let calls = 0;
+  let reservedAtThrow: number | undefined;
   let successfulReservations = 0;
   const reserve = budget.reserve.bind(budget);
   vi.spyOn(budget, "reserve").mockImplementation((bytes) => {
@@ -1752,12 +1763,13 @@ it("M2 releases a read reservation when reclaimAdmission throws", async () => {
         input: Parameters<typeof createReplicaStagingStore>[0],
       ) => {
         const store = createReplicaStagingStore(input);
-        calls++;
-        if (isReadyToImport(input)) {
-          calls++;
+        if (calls === 0 && isReadyToImport(input)) {
           return {
             ...store,
             reclaimAdmission: () => {
+              calls++;
+              reservedAtThrow = budget.reserved;
+              expect(budget.reserved).toBe(0);
               throw new Error("reclaim failed");
             },
           };
@@ -1766,8 +1778,13 @@ it("M2 releases a read reservation when reclaimAdmission throws", async () => {
       },
     },
   });
+  for (let i = 0; i < 12 && calls === 0; i++) await cycles([b], 1);
+  expect(calls).toBe(1);
+  expect(reservedAtThrow).toBe(0);
+  expect(budget.reserved).toBe(0);
   await cycles([b], 12);
-  expect(calls).toBeGreaterThan(0);
+  expect(calls).toBe(1);
+  expect(b.get()).toEqual(a.get());
   expect(successfulReservations).toBeGreaterThan(0);
   expect(budget.reserved).toBe(0);
 });
@@ -3503,5 +3520,211 @@ it("protects a live same-process writer opened through a different directory ali
     unpause();
     await running;
     aliasStore.close();
+  }
+});
+
+it("A3b-1 releases envelope reservations even when staging abort throws and the next oversized import proceeds", async () => {
+  const net = network(false, 64 * 1024);
+  const source = device(net, { chunk: 2000 });
+  await cycles([source], 12);
+  const template = device(net);
+  await cycles([template], 12);
+  source.put("x".repeat(5000));
+  await cycles([source], 24);
+  const budget = new ReplicaByteBudget(8 * 1024);
+  let abortThrows = 0;
+  let heldAtAbort = 0;
+  const receiver = device(net, {
+    copyOf: template,
+    worker: {
+      resourceBudget: budget,
+      resourceLimits: { maxManifestCiphertextBytes: 1024 },
+      createStagingStore(
+        input: Parameters<typeof createReplicaStagingStore>[0],
+      ) {
+        const store = createReplicaStagingStore(input);
+        return {
+          ...store,
+          abort(admission: Parameters<typeof store.abort>[0]) {
+            if (budget.reserved > budget.maxBytes && abortThrows === 0) {
+              abortThrows++;
+              heldAtAbort = budget.reserved;
+              throw new Error("SQLite writer locked during abort");
+            }
+            return store.abort(admission);
+          },
+        };
+      },
+    },
+  });
+  receiver.declarations([]);
+  for (let i = 0; i < 24 && abortThrows === 0; i++) await cycles([receiver], 1);
+  expect(abortThrows).toBe(1);
+  expect(heldAtAbort).toBeGreaterThan(budget.maxBytes);
+  expect(budget.reserved).toBe(0);
+  receiver.declarations(expected.declarations);
+  await cycles([receiver], 24);
+  expect(receiver.get()).toEqual(source.get());
+  expect(budget.reserved).toBe(0);
+});
+
+it.each(["oversized first", "small first"])(
+  "A3b-3 envelope barrier: %s",
+  async (order) => {
+    const net = network(false, 64 * 1024);
+    const source = device(net, { chunk: 2000 });
+    await cycles([source], 12);
+    const template = device(net);
+    await cycles([template], 12);
+    source.put("x".repeat(5000));
+    await cycles([source], 24);
+    const budget = new ReplicaByteBudget(8 * 1024);
+    const options = {
+      copyOf: template,
+      worker: {
+        resourceBudget: budget,
+        resourceLimits: { maxManifestCiphertextBytes: 1024 },
+      },
+    };
+    const a = device(net, options);
+    const b = device(net, options);
+    // B needs only the small baseline; A needs the oversized successor.
+    b.db.prepare("DELETE FROM pdpp_transport_manifests_in").run();
+    let release!: () => void;
+    let started!: () => void;
+    const held = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const inspect = replicaStream.inspectReplicaPayload;
+    let blocked = false;
+    // Publish the small writer before enabling the inspection barrier.
+    const small = device(net);
+    small.put("small", "small");
+    await cycles([small], 12);
+    const spy = vi
+      .spyOn(replicaStream, "inspectReplicaPayload")
+      .mockImplementation(async (...args) => {
+        const payload = await inspect(...args);
+        const large =
+          canonicalJson(payload.envelope).length > budget.maxBytes / 2;
+        if (!blocked && large === (order === "oversized first")) {
+          blocked = true;
+          started();
+          await gate;
+        }
+        return payload;
+      });
+    // A receives a large envelope; B receives a small independent writer's batch.
+    const largeWriter = source.scope;
+    const smallWriter = small.scope;
+    const filter = (d: ReturnType<typeof device>, scope: string) => {
+      d.db
+        .prepare("DELETE FROM pdpp_transport_manifests_in WHERE scope<>?")
+        .run(scope);
+    };
+    // Restrict discovery per receiver without changing what the sender registered.
+    const list = net.port.list;
+    let selected = order === "oversized first" ? largeWriter : smallWriter;
+    net.port.list = async (...args) => {
+      const page = await list(...args);
+      return {
+        ...page,
+        points: page.points.filter((p) => p.scope === selected),
+      };
+    };
+    filter(a, largeWriter);
+    filter(b, smallWriter);
+    const first = order === "oversized first" ? a : b;
+    const second = first === a ? b : a;
+    const running = cycles([first], 12);
+    try {
+      await Promise.race([
+        held,
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("envelope barrier not reached")),
+            3000,
+          ),
+        ),
+      ]);
+      expect(budget.reserved).toBeGreaterThan(0);
+      if (first === a) expect(budget.reserved).toBeGreaterThan(budget.maxBytes);
+      else expect(budget.reserved).toBeLessThan(budget.maxBytes);
+      selected = first === a ? smallWriter : largeWriter;
+      await cycles([second], 12);
+      expect(
+        second.db
+          .prepare(
+            "SELECT 1 FROM pdpp_transport_manifests_in WHERE reason='resource_busy' UNION ALL SELECT 1 FROM pdpp_transport_fragments_in WHERE reason='resource_busy' UNION ALL SELECT 1 FROM pdpp_transport_import_work WHERE reason='resource_busy'",
+          )
+          .get(),
+      ).toBeDefined();
+    } finally {
+      release();
+      await running;
+      spy.mockRestore();
+      net.port.list = list;
+    }
+    await cycles([a, b], 24);
+    expect(a.get()).toEqual(source.get());
+    expect(b.get("small")).toEqual(small.get("small"));
+    expect(budget.reserved).toBe(0);
+  },
+);
+
+it.each(["framing", "resource"])(
+  "A3b-4 preserves the distinct %s Unsupported outcome",
+  async (kind) => {
+    const net = network();
+    const source = device(net, { preexisting: "cannot prepare" });
+    net.port.encrypt = async () => {
+      if (kind === "framing")
+        throw new ReplicaFramingUnsupported(9000, 8192, "manifest_bytes");
+      throw new ReplicaResourceLimitError(
+        "aggregate_ciphertext_bytes",
+        9000,
+        8192,
+      );
+    };
+    await cycles([source], 1);
+    expect(
+      source.db
+        .prepare("SELECT prepared,outcome,reason FROM pdpp_transport_batches")
+        .get(),
+    ).toEqual({
+      prepared: kind === "framing" ? -1 : -2,
+      outcome: "unsupported",
+      reason:
+        kind === "framing"
+          ? "replica_framing_unsupported"
+          : "resource_unsupported",
+    });
+    expect(net.puts).toHaveLength(0);
+    expect(net.registrations).toHaveLength(0);
+  },
+);
+
+it("A3b-5 uses the exported default fragment size", async () => {
+  const net = network(false, 64 * 1024);
+  const inputs: number[] = [];
+  const fragment = replicaStream.fragmentReplicaStream;
+  const spy = vi
+    .spyOn(replicaStream, "fragmentReplicaStream")
+    .mockImplementation((input) => {
+      inputs.push(input.targetChunkBytes!);
+      return fragment(input);
+    });
+  try {
+    const source = device(net, {
+      preexisting: "default chunk",
+      worker: { targetChunkBytes: undefined },
+    });
+    await cycles([source], 1);
+    expect(inputs).toEqual([REPLICA_DEFAULT_FRAGMENT_BYTES]);
+  } finally {
+    spy.mockRestore();
   }
 });
