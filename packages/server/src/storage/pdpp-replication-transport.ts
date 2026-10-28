@@ -13,7 +13,22 @@ import {
   fragmentReplicaStream,
   assembleReplicaStream,
   inspectReplicaPayload,
+  DEFAULT_REPLICA_STREAMED_LIMITS,
 } from "@opendatalabs/personal-server-ts-core/replication/stream";
+import {
+  admit,
+  ReplicaByteBudget,
+  ReplicaResourceBusyError,
+  ReplicaResourceLimitError,
+  REPLICA_DEFAULT_BYTE_BUDGET_BYTES,
+  REPLICA_BATCH_OPERATION_LIMIT,
+  REPLICA_BATCH_TARGET_BYTES,
+  REPLICA_LIVE_COPY_FACTOR,
+  replicaResourceLimits,
+  REPLICA_LIMITS_VERSION,
+  type Admission,
+  type ReplicaResourceLimits,
+} from "@opendatalabs/personal-server-ts-core/replication/limits";
 import {
   canonicalJson,
   decodeReplicaEnvelope,
@@ -107,18 +122,30 @@ import {
   type ReplicaWriterIdentity,
 } from "./pdpp-replica-writer-identity.js";
 import type { createReplicaReceiver } from "./pdpp-replication-receiver.js";
+import {
+  createReplicaStagingStore,
+  STAGED_OBJECT_CLEANUP_BATCH,
+  STAGED_OBJECT_LEASE_MS,
+} from "./pdpp-replica-staging.js";
 
 // One process owns a transport writer per database; other local instances serialize cycles.
 const activeDatabases = new Set<Database | string>();
 const ownedTokens = new Set<string>();
+const processReplicaByteBudget = new ReplicaByteBudget(
+  REPLICA_DEFAULT_BYTE_BUDGET_BYTES,
+);
+
+/** Unattached stages expire after one hour; cleanup deletes at most this many. */
+export const REPLICA_STAGED_OBJECT_LEASE_MS = STAGED_OBJECT_LEASE_MS;
+export const REPLICA_STAGED_OBJECT_CLEANUP_BATCH = STAGED_OBJECT_CLEANUP_BATCH;
 
 /** Default bound on the operations one batch (one registration) covers. */
-export const REPLICA_BATCH_OPERATIONS = 10_000;
+export const REPLICA_BATCH_OPERATIONS = REPLICA_BATCH_OPERATION_LIMIT;
 /**
  * Default bound on the estimated payload bytes of one batch. One operation
  * always fits, so a single larger blob makes a larger batch.
  */
-export const REPLICA_BATCH_BYTES = 32 * 1024 * 1024;
+export const REPLICA_BATCH_BYTES = REPLICA_BATCH_TARGET_BYTES;
 /** The export's page limit. A batch reads several pages. */
 const EXPORT_PAGE = 1000;
 /** New slots one discover pass admits per writer scope. */
@@ -183,6 +210,17 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_import_work (
 CREATE INDEX IF NOT EXISTS pdpp_import_work_dependency ON pdpp_transport_import_work(dependency) WHERE outcome='wait';
 CREATE TABLE IF NOT EXISTS pdpp_transport_phase_state (
  phase TEXT PRIMARY KEY, ${WORK}, fingerprint TEXT);
+`;
+const admissionMigration = `
+CREATE TABLE IF NOT EXISTS pdpp_transport_repository (
+ id INTEGER PRIMARY KEY CHECK(id=1), repository_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pdpp_transport_staged_objects (
+ object_id TEXT PRIMARY KEY, admission_id TEXT NOT NULL, repository_id TEXT NOT NULL,
+ owner TEXT NOT NULL, namespace_key TEXT NOT NULL, created_at INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('receiving','complete','verified','attached','aborted')),
+ size_bytes INTEGER, sha256 TEXT, attached_at INTEGER);
+CREATE INDEX IF NOT EXISTS pdpp_staged_objects_cleanup
+ ON pdpp_transport_staged_objects(state,created_at,object_id);
 `;
 type State = {
   owner: string;
@@ -359,9 +397,25 @@ export function createReplicaTransportWorker(deps: {
   refetchBudget?: number;
   /** Maximum age before a slot with authoritative absence may be resubmitted. */
   registrationIntentTimeoutMs?: number;
+  /** Tests can share a smaller ledger to prove concurrent admission behavior. */
+  resourceBudget?: ReplicaByteBudget;
+  /** Narrow deterministic seam for failures at the staging-store boundary. */
+  createStagingStore?: typeof createReplicaStagingStore;
+  /** Test-scaled bounds; production uses the shared source-derived defaults. */
+  resourceLimits?: Partial<ReplicaResourceLimits>;
 }) {
   const { db, transport } = deps;
   const now = deps.now ?? Date.now;
+  const resourceBudget = deps.resourceBudget ?? processReplicaByteBudget;
+  const resourceLimits = replicaResourceLimits(deps.resourceLimits);
+  const streamedLimits = {
+    ...DEFAULT_REPLICA_STREAMED_LIMITS,
+    maxOperations: resourceLimits.maxOperations,
+    maxOperationBytes: resourceLimits.maxOperationBytes,
+    maxSingleBlobBytes: resourceLimits.maxSingleBlobBytes,
+    maxBlobTotalBytes: resourceLimits.maxBlobTotalBytes,
+    maxPayloadBytes: resourceLimits.maxTotalBytes,
+  };
   const roster = createCachedReplicaRoster(deps.authority.roster, { now });
   const server = deps.authority.signer.address.toLowerCase();
   const registrationIntentTimeout =
@@ -380,6 +434,7 @@ export function createReplicaTransportWorker(deps: {
   if (
     !Number.isSafeInteger(maxOperations) ||
     maxOperations < 1 ||
+    maxOperations > resourceLimits.maxOperations ||
     !Number.isSafeInteger(maxBytes) ||
     maxBytes < 1
   )
@@ -398,6 +453,74 @@ export function createReplicaTransportWorker(deps: {
   let activeStepSignal: AbortSignal | undefined;
   const state = () =>
     db.prepare("SELECT * FROM pdpp_transport_state WHERE id=1").get() as State;
+
+  function ensureAdmissionSchema() {
+    if (!enabled()) return;
+    db.exec(admissionMigration);
+    const columns = db
+      .prepare("PRAGMA table_info(pdpp_transport_manifests_in)")
+      .all() as { name: string }[];
+    if (!columns.some((column) => column.name === "resource_limits_version"))
+      db.exec(
+        "ALTER TABLE pdpp_transport_manifests_in ADD COLUMN resource_limits_version INTEGER",
+      );
+    db.prepare(
+      "INSERT OR IGNORE INTO pdpp_transport_repository (id,repository_id) VALUES (1,?)",
+    ).run(randomUUID());
+    db.prepare(
+      `UPDATE pdpp_transport_manifests_in
+       SET ${RESET_WORK},resource_limits_version=NULL
+       WHERE outcome='unsupported' AND reason='resource_unsupported'
+         AND coalesce(resource_limits_version,0) < ?`,
+    ).run(REPLICA_LIMITS_VERSION);
+    db.prepare(
+      `UPDATE pdpp_transport_import_work SET ${RESET_WORK}
+       WHERE outcome='unsupported' AND reason='resource_unsupported'
+         AND EXISTS (
+           SELECT 1 FROM pdpp_transport_manifests_in m
+           WHERE m.writer=pdpp_transport_import_work.writer
+             AND m.batch=pdpp_transport_import_work.batch
+             AND m.outcome IS NULL
+         )`,
+    ).run();
+  }
+
+  function repositoryId(): string {
+    const row = db
+      .prepare("SELECT repository_id FROM pdpp_transport_repository WHERE id=1")
+      .get() as { repository_id: string } | undefined;
+    if (!row) throw new Error("replication repository identity is missing");
+    return row.repository_id;
+  }
+
+  function stagingStore(injected = true) {
+    if (!enabled()) throw new Error("replication admission is disabled");
+    ensureAdmissionSchema();
+    const createStore = injected
+      ? (deps.createStagingStore ?? createReplicaStagingStore)
+      : createReplicaStagingStore;
+    return createStore({
+      db,
+      repositoryId: repositoryId(),
+      owner: deps.expected().owner,
+      now,
+      assertOpen: () => {
+        const signal = activeStepSignal;
+        if (signal) assertReplicationStepOpen(db, signal);
+        else if (!replicationAdmitted(db))
+          throw new Error("replication door is closed");
+      },
+    });
+  }
+
+  if (enabled()) {
+    ensureAdmissionSchema();
+    if (replicationAdmitted(db)) {
+      const stages = stagingStore(false);
+      stages.cleanup();
+      stages.cleanupAttachedTemporaryBytes();
+    }
+  }
 
   /**
    * One validated authority context for every phase: the expected owner, the
@@ -507,32 +630,34 @@ export function createReplicaTransportWorker(deps: {
       write: (outcome: ReplicaOutcome, work: ReplicaWorkState, item: I) => void,
       isCurrent?: (item: I) => boolean,
     ) =>
-    (item: I, attempt: ReplicaAttempt, settle: ReplicaSettle): ReplicaOutcome =>
+    (
+      item: I,
+      attempt: ReplicaAttempt,
+      settle: ReplicaSettle,
+    ): ReplicaOutcome => {
       // The receiver's own boundary: its plans read and write derived state,
       // which a transaction opened on the raw connection would not refresh.
-      (() => {
-        const signal = activeStepSignal;
-        if (!signal)
-          throw new Error("replication commit outside a worker step");
-        // Check before receiver.atomically raises the capture guard. SQLite
-        // serializes door closure against the transaction once it starts.
-        assertReplicationStepOpen(db, signal);
-        return deps.receiver.atomically(() => {
-          assertReplicationTransactionOpen(db, signal);
-          // A receipt belongs to the exact row state selected by `due`. If a
-          // newer worker changed it while this attempt was in flight, discard
-          // the older receipt and its plan before any projection can advance.
-          if (isCurrent && !isCurrent(item))
-            return {
-              tag: "retry",
-              problem: "storage_failed",
-              nextEligible: item.state.nextEligible,
-            };
-          const settled = settle(attempt.plan?.() ?? attempt.outcome);
-          write(settled.outcome, settled.state, item);
-          return settled.outcome;
-        });
-      })();
+      const signal = activeStepSignal;
+      if (!signal) throw new Error("replication commit outside a worker step");
+      // Check before receiver.atomically raises the capture guard. SQLite
+      // serializes door closure against the transaction once it starts.
+      assertReplicationStepOpen(db, signal);
+      return deps.receiver.atomically(() => {
+        assertReplicationTransactionOpen(db, signal);
+        // A receipt belongs to the exact row state selected by `due`. If a
+        // newer worker changed it while this attempt was in flight, discard
+        // the older receipt and its plan before any projection can advance.
+        if (isCurrent && !isCurrent(item))
+          return {
+            tag: "retry",
+            problem: "storage_failed",
+            nextEligible: item.state.nextEligible,
+          };
+        const settled = settle(attempt.plan?.() ?? attempt.outcome);
+        write(settled.outcome, settled.state, item);
+        return settled.outcome;
+      });
+    };
   /** Network calls stop at the attempt's deadline or the host's abort. */
   const call = <T>(signal: AbortSignal, start: () => Promise<T>) =>
     abortable(signal, async () => {
@@ -709,6 +834,7 @@ export function createReplicaTransportWorker(deps: {
     const seen = new Set<string>();
     let bytes = 0;
     let jsonBytes = 0;
+    let blobTotalBytes = 0;
     let cursor = s.baseline_done
       ? (s.tail_cursor ?? undefined)
       : s.baseline_cursor;
@@ -719,12 +845,55 @@ export function createReplicaTransportWorker(deps: {
         cursor,
         Math.min(EXPORT_PAGE, maxOperations - operations.length),
       );
+      if (page.operations.length > maxOperations - operations.length)
+        throw new ReplicaResourceLimitError(
+          "operation_count",
+          operations.length + page.operations.length,
+          resourceLimits.maxOperations,
+        );
       const trial = new Set(seen);
       let fit = 0;
       let added = 0;
       let addedJson = 0;
+      let addedBlobBytes = 0;
       for (const op of page.operations) {
+        const before = new Set(trial);
         const size = operationBytes(op, trial);
+        const operationJsonBytes = encoder.encode(canonicalJson(op)).length;
+        const newBlobBytes = blobsOf(op).reduce(
+          (total, blob) =>
+            before.has(blob.blobId) ? total : total + blob.sizeBytes,
+          0,
+        );
+        if (
+          operationJsonBytes > resourceLimits.maxOperationBytes ||
+          blobsOf(op).some(
+            (blob) => blob.sizeBytes > resourceLimits.maxSingleBlobBytes,
+          ) ||
+          blobTotalBytes + addedBlobBytes + newBlobBytes >
+            resourceLimits.maxBlobTotalBytes
+        ) {
+          if (operationJsonBytes > resourceLimits.maxOperationBytes)
+            throw new ReplicaResourceLimitError(
+              "operation_bytes",
+              operationJsonBytes,
+              resourceLimits.maxOperationBytes,
+            );
+          const oversizedBlob = blobsOf(op).find(
+            (blob) => blob.sizeBytes > resourceLimits.maxSingleBlobBytes,
+          );
+          if (oversizedBlob)
+            throw new ReplicaResourceLimitError(
+              "single_blob_bytes",
+              oversizedBlob.sizeBytes,
+              resourceLimits.maxSingleBlobBytes,
+            );
+          throw new ReplicaResourceLimitError(
+            "aggregate_blob_bytes",
+            blobTotalBytes + addedBlobBytes + newBlobBytes,
+            resourceLimits.maxBlobTotalBytes,
+          );
+        }
         const fits =
           operations.length + fit === 0 ||
           bytes + added + size.json + size.blobs <= maxBytes ||
@@ -735,6 +904,7 @@ export function createReplicaTransportWorker(deps: {
         fit++;
         added += size.json + size.blobs;
         addedJson += size.json;
+        addedBlobBytes += newBlobBytes;
       }
       const full = fit < page.operations.length;
       if (full && fit === 0) break;
@@ -745,6 +915,7 @@ export function createReplicaTransportWorker(deps: {
       }
       bytes += added;
       jsonBytes += addedJson;
+      blobTotalBytes += addedBlobBytes;
       cursor = next = page.nextAfterSequence;
       hasMore = full || page.hasMore;
       if (full) break;
@@ -771,11 +942,12 @@ export function createReplicaTransportWorker(deps: {
     },
     async run() {
       const s = state();
-      const page = readBatch(s);
       const batch = randomUUID().replaceAll("-", "");
+      let page: ReturnType<typeof readBatch>;
       let digest = "",
         totalBytes = 0;
       try {
+        page = readBatch(s);
         if (page.operations.length) {
           const envelope: ReplicaEnvelope = {
             format: "vana-pdpp-replica",
@@ -793,6 +965,12 @@ export function createReplicaTransportWorker(deps: {
               yield* deps.exporter.readPinnedBlobChunks(id);
             },
           )) {
+            if (totalBytes + bytes.length > resourceLimits.maxTotalBytes)
+              throw new ReplicaResourceLimitError(
+                "total_bytes",
+                totalBytes + bytes.length,
+                resourceLimits.maxTotalBytes,
+              );
             db.transaction(() => writer.write(bytes))();
             hash.update(bytes);
             totalBytes += bytes.length;
@@ -802,6 +980,15 @@ export function createReplicaTransportWorker(deps: {
         }
       } catch (error) {
         deleteBinary(db, "payload", batch);
+        if (error instanceof ReplicaResourceLimitError)
+          return verdict({
+            tag: "unsupported",
+            admission: {
+              reason: "resource_unsupported",
+              limit: error.limit,
+              limitsVersion: REPLICA_LIMITS_VERSION,
+            },
+          });
         throw new ReplicaProblemError("retain_failed", { cause: error });
       }
       // Queue + export cursor commit together with the phase outcome. They
@@ -872,6 +1059,23 @@ export function createReplicaTransportWorker(deps: {
           : `cap:${cap}`,
     };
     return { reason: "replica_framing_unsupported" as const, ...admission };
+  };
+  const resourceUnsupported = (
+    batch: Batch,
+    error: ReplicaResourceLimitError,
+  ) => {
+    const admission = {
+      reason: "resource_unsupported" as const,
+      limit: error.limit,
+      limitsVersion: REPLICA_LIMITS_VERSION,
+    };
+    return withPlan({ tag: "unsupported", admission }, () =>
+      db
+        .prepare(
+          "UPDATE pdpp_transport_batches SET prepared=-2,admission_json=? WHERE batch=?",
+        )
+        .run(canonicalJson(admission), batch.batch),
+    );
   };
   const prepare: ReplicaPhaseHandler<Item<Batch>> = {
     phase: "prepare",
@@ -954,17 +1158,32 @@ export function createReplicaTransportWorker(deps: {
                 bytes: part.encrypted.length,
               });
             }
+            const aggregateCiphertextBytes = entries.reduce(
+              (total, entry) => total + entry.bytes,
+              0,
+            );
+            if (
+              aggregateCiphertextBytes >
+              resourceLimits.maxAggregateCiphertextBytes
+            )
+              throw new ReplicaResourceLimitError(
+                "aggregate_ciphertext_bytes",
+                aggregateCiphertextBytes,
+                resourceLimits.maxAggregateCiphertextBytes,
+              );
             break;
           } catch (error) {
             db.prepare(
               "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
             ).run(token);
-            // Only the typed, measured framing failure narrows the chunk size or
-            // becomes Unsupported. Every other error is a transient Retry.
+            // Framing failures may narrow the chunk size; resource-limit
+            // failures become durable Unsupported. Other errors retry.
             // Unsupported is terminal for this batch only and claims no
             // version: later batches of this writer still prepare and
             // publish, and a remote importer holds them as Wait(predecessor)
             // until an explicit readmitUnsupported() under a new capability.
+            if (error instanceof ReplicaResourceLimitError)
+              return resourceUnsupported(batch, error);
             if (!(error instanceof ReplicaFramingUnsupported)) throw error;
             if (error.dimension === "fragment_bytes" && chunkBytes > 1) {
               chunkBytes = Math.max(1, Math.floor(chunkBytes / 2));
@@ -1005,6 +1224,8 @@ export function createReplicaTransportWorker(deps: {
         db.prepare(
           "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
         ).run(token);
+        if (error instanceof ReplicaResourceLimitError)
+          return resourceUnsupported(batch, error);
         return verdict(retryFromError(error, "prepare_failed"));
       }
       return withPlan(
@@ -1549,6 +1770,8 @@ export function createReplicaTransportWorker(deps: {
     },
     async run(item, signal) {
       const row = item.row;
+      let manifestReservation: (() => void) | undefined;
+      let keepManifestReservation = false;
       const slot: ReplicaSlot = {
         owner: state().owner,
         scope: row.scope,
@@ -1562,6 +1785,12 @@ export function createReplicaTransportWorker(deps: {
         );
         if (replicaRegistrationState(evidence, slot) !== "confirmed")
           return verdict(unconfirmed(evidence, slot));
+        const reserved = resourceBudget.reserve(
+          resourceLimits.maxManifestCiphertextBytes * REPLICA_LIVE_COPY_FACTOR,
+        );
+        if (typeof reserved !== "function")
+          return verdict({ tag: "retry", problem: "resource_busy" });
+        manifestReservation = reserved;
         // Every peer-supplied manifest crosses this one boundary. Bytes that
         // are not the finalized commitment are a refetch, never data, so
         // replacing stored bytes cannot get a real manifest refused; after
@@ -1598,7 +1827,38 @@ export function createReplicaTransportWorker(deps: {
           return refuseSlot(row.slot, authorized.reason);
         if (authorized.tag === "wait")
           return verdict(rosterWait(authorized.server));
+        const admitted = admit(
+          manifest,
+          resourceBudget,
+          {
+            repositoryId: repositoryId(),
+            owner: state().owner,
+            manifestDigest: manifest.digest,
+          },
+          resourceLimits,
+        );
+        if ("kind" in admitted) {
+          if (admitted.kind === "resource_busy")
+            return verdict({ tag: "retry", problem: "resource_busy" });
+          return withPlan(
+            {
+              tag: "unsupported",
+              admission: {
+                reason: "resource_unsupported",
+                limit: admitted.limit,
+                limitsVersion: admitted.limitsVersion,
+              },
+            },
+            () => {
+              db.prepare(
+                `UPDATE pdpp_transport_manifests_in
+                 SET resource_limits_version=? WHERE slot=?`,
+              ).run(admitted.limitsVersion, row.slot);
+            },
+          );
+        }
         const record = factOf(row, evidence, manifest);
+        keepManifestReservation = true;
         return {
           outcome: {
             tag: "progress",
@@ -1638,10 +1898,13 @@ export function createReplicaTransportWorker(deps: {
             record?.();
             return undefined;
           },
+          release: () => manifestReservation?.(),
         };
       } catch (error) {
         // Network and unavailable bytes are retryable; authenticated malformed bytes back off.
         return verdict(retryFromError(error, "download_failed"));
+      } finally {
+        if (!keepManifestReservation) manifestReservation?.();
       }
     },
     commit: commitIn((outcome, work, item) => {
@@ -1706,11 +1969,33 @@ export function createReplicaTransportWorker(deps: {
       const row = item.row;
       const scope = replicaScope(row.writer);
       let fragment: ReplicaFragment;
+      let fragmentReservation: (() => void) | undefined;
+      let keepFragmentReservation = false;
       try {
+        const manifest = manifestOf(row.slot);
+        const admitted = admit(
+          manifest,
+          resourceBudget,
+          {
+            repositoryId: repositoryId(),
+            owner: state().owner,
+            manifestDigest: manifest.digest,
+          },
+          resourceLimits,
+        );
+        if ("kind" in admitted) {
+          if (admitted.kind === "resource_busy")
+            return verdict({ tag: "retry", problem: "resource_busy" });
+          return verdict({ tag: "retry", problem: "resource_busy" });
+        }
+        const reserved = admitted.reserveObject(row.bytes);
+        if (typeof reserved !== "function")
+          return verdict({ tag: "retry", problem: "resource_busy" });
+        fragmentReservation = reserved;
         const receipt = await receiveReplicaFragment({
           scope,
           owner: state().owner,
-          manifest: manifestOf(row.slot),
+          manifest,
           index: row.position,
           maxBytes: row.bytes,
           signal,
@@ -1726,6 +2011,7 @@ export function createReplicaTransportWorker(deps: {
         if (receipt.tag === "refused")
           return quarantineFragment(row, receipt.reason);
         fragment = receipt.fragment;
+        keepFragmentReservation = true;
       } catch (error) {
         if (signal.aborted)
           return verdict(retryFromError(error, "download_failed"));
@@ -1744,16 +2030,22 @@ export function createReplicaTransportWorker(deps: {
           // Preserve the original transient failure.
         }
         return verdict(retryFromError(error, "download_failed"));
+      } finally {
+        if (!keepFragmentReservation) fragmentReservation?.();
       }
-      return withPlan(
-        { tag: "progress", receipt: { phase: "fetch", key: item.id } },
-        () => {
+      return {
+        outcome: {
+          tag: "progress",
+          receipt: { phase: "fetch", key: item.id },
+        },
+        plan: () => {
           db.prepare(
             "UPDATE pdpp_transport_fragments_in SET fragment_json=? WHERE slot=? AND position=?",
           ).run(canonicalJson(fragment), row.slot, row.position);
           wake(`fragments:${fragment.writer}:${fragment.batch}`, now());
         },
-      );
+        release: () => fragmentReservation?.(),
+      };
     },
     commit: commitIn((outcome, work, item) => {
       db.prepare(
@@ -1890,27 +2182,47 @@ export function createReplicaTransportWorker(deps: {
     sequence: number;
   };
   /** Ordered verified fragments of one complete slot, read one row at a time. */
-  function retainedBytes(slot: string) {
-    const positions = (
-      db
-        .prepare(
-          "SELECT position FROM pdpp_transport_fragments_in WHERE slot=? ORDER BY position",
-        )
-        .all(slot) as { position: number }[]
-    ).map((r) => r.position);
+  function retainedBytes(
+    slot: string,
+    admission?: Admission,
+    signal?: AbortSignal,
+    reservationGroup?: object,
+  ) {
+    const positions = db
+      .prepare(
+        "SELECT position,bytes FROM pdpp_transport_fragments_in WHERE slot=? ORDER BY position",
+      )
+      .all(slot) as { position: number; bytes: number }[];
     return () =>
-      assembleReplicaStream(async function* () {
-        for (const position of positions)
-          yield JSON.parse(
-            (
-              db
-                .prepare(
-                  "SELECT fragment_json FROM pdpp_transport_fragments_in WHERE slot=? AND position=?",
-                )
-                .get(slot, position) as { fragment_json: string }
-            ).fragment_json,
-          ) as ReplicaFragment;
-      });
+      assembleReplicaStream(
+        async function* () {
+          for (const row of positions) {
+            const reservation = admission?.reserveObject(
+              row.bytes,
+              reservationGroup,
+            );
+            try {
+              if (admission && typeof reservation !== "function")
+                throw new ReplicaResourceBusyError();
+              yield JSON.parse(
+                (
+                  db
+                    .prepare(
+                      "SELECT fragment_json FROM pdpp_transport_fragments_in WHERE slot=? AND position=?",
+                    )
+                    .get(slot, row.position) as { fragment_json: string }
+                ).fragment_json,
+              ) as ReplicaFragment;
+            } finally {
+              if (typeof reservation === "function") reservation();
+            }
+          }
+        },
+        {
+          ...(admission && { maxBytes: admission.payloadBytes }),
+          ...(signal && { signal }),
+        },
+      );
   }
   /**
    * Fail closed at writer scope (contract H): every retained slot of the
@@ -2159,13 +2471,52 @@ export function createReplicaTransportWorker(deps: {
       if (authorized.tag === "wait")
         return verdict(rosterWait(authorized.server));
       if (authorized.tag === "refused") return refuse(authorized.reason);
-      const staging: string[] = [];
+      const admitted = admit(
+        manifest,
+        resourceBudget,
+        {
+          repositoryId: repositoryId(),
+          owner: state().owner,
+          manifestDigest: manifest.digest,
+        },
+        resourceLimits,
+      );
+      if ("kind" in admitted) {
+        if (admitted.kind === "resource_busy")
+          return verdict({ tag: "retry", problem: "resource_busy" });
+        return withPlan(
+          {
+            tag: "unsupported",
+            admission: {
+              reason: "resource_unsupported",
+              limit: admitted.limit,
+              limitsVersion: admitted.limitsVersion,
+            },
+          },
+          () => {
+            db.prepare(
+              `UPDATE pdpp_transport_manifests_in
+               SET resource_limits_version=? WHERE slot=?`,
+            ).run(admitted.limitsVersion, slot);
+          },
+        );
+      }
+      const admission = admitted;
+      let stageStore: ReturnType<typeof createReplicaStagingStore> | undefined;
+      const stagedObjects = new Map<
+        number,
+        ReturnType<ReturnType<typeof createReplicaStagingStore>["begin"]>
+      >();
       /**
        * Copy custody of this download, if its copy is not retained yet. It
        * commits only inside this attempt's outcome transaction, so a crash
        * or a discarded attempt never leaves custody without its outcome.
        */
       let stage: ((refetch: Refetch) => void) | undefined;
+      let keepForPlan = false;
+      let transferEnvelopeReservations = false;
+      const envelopeReservations: (() => void)[] = [];
+      const envelopeReservationGroup = {};
       // A batch's one registered slot is its copy's one commitment.
       const fragments = [
         {
@@ -2174,6 +2525,9 @@ export function createReplicaTransportWorker(deps: {
         },
       ];
       try {
+        stageStore = stagingStore();
+        stageStore.reclaimAdmission(admission);
+        const currentStageStore = stageStore;
         const copyKey = replicaCopyKey([
           replicaChainCommitment(hashes.data_hash, hashes.metadata_hash),
         ]);
@@ -2181,22 +2535,29 @@ export function createReplicaTransportWorker(deps: {
           .list(pendingId)
           .some((copy) => copy.copyKey === copyKey);
         if (!retained) {
-          const writers = new Map<
-            number,
-            { key: string; writer: ReturnType<typeof binaryWriter> }
-          >();
           const payload = await inspectReplicaPayload(
-            retainedBytes(slot),
+            retainedBytes(slot, admission, signal, envelopeReservationGroup),
             undefined,
             (_blobId, chunk, blobIndex) => {
-              let target = writers.get(blobIndex);
+              let target = stagedObjects.get(blobIndex);
               if (!target) {
-                const key = randomUUID();
-                staging.push(key);
-                target = { key, writer: binaryWriter(db, "staging", key) };
-                writers.set(blobIndex, target);
+                target = currentStageStore.begin(admission);
+                stagedObjects.set(blobIndex, target);
               }
-              db.transaction(() => target.writer.write(chunk))();
+              target.write(chunk);
+            },
+            {
+              limits: streamedLimits,
+              signal,
+              reserveEnvelopeBytes: (bytes) => {
+                const reservation = admission.reserveEnvelope(
+                  bytes,
+                  envelopeReservationGroup,
+                );
+                if (typeof reservation !== "function")
+                  throw new ReplicaResourceBusyError();
+                envelopeReservations.push(reservation);
+              },
             },
           );
           // A discarded attempt stops before it prepares any custody.
@@ -2232,21 +2593,26 @@ export function createReplicaTransportWorker(deps: {
             });
           decodeReplicaEnvelope(canonicalJson(payload.envelope), expected);
           const stagedBlobs = payload.blobs.map((blob, index) => {
-            let target = writers.get(index);
+            let target = stagedObjects.get(index);
             if (!target) {
-              const key = randomUUID();
-              staging.push(key);
-              target = { key, writer: binaryWriter(db, "staging", key) };
+              target = currentStageStore.begin(admission);
+              stagedObjects.set(index, target);
             }
-            if (target.writer.finish() !== blob.sizeBytes)
-              throw new ReplicaProblemError("payload_invalid");
+            const handle = target.complete();
+            currentStageStore.verify(handle, blob);
             return {
               blobId: blob.blobId,
-              key: target.key,
+              handle,
+              expected: blob,
               sizeBytes: blob.sizeBytes,
             };
           });
           stage = (refetch) => {
+            const attached = stagedBlobs.map((blob) => ({
+              blobId: blob.blobId,
+              key: currentStageStore.attach(blob.handle, blob.expected),
+              sizeBytes: blob.sizeBytes,
+            }));
             deps.receiver.copies.stage({
               credential: deps.credential,
               copy: {
@@ -2259,29 +2625,55 @@ export function createReplicaTransportWorker(deps: {
                 envelope: payload.envelope,
                 fragments,
               },
-              stagedBlobs,
+              stagedBlobs: attached,
               refetch,
             });
-            for (const key of staging) deleteBinary(db, "staging", key);
           };
+          keepForPlan = true;
         }
         const plan = stage;
         // The copy decision runs inside the outcome transaction, over the
         // durable copies, facts and disposition it commits with.
+        transferEnvelopeReservations = true;
         return {
           outcome: {
             tag: "progress",
             receipt: { phase: "import", key: id },
           },
           plan: () => decideImport(item.row, manifest, plan),
+          release: () => {
+            for (const release of envelopeReservations) release();
+          },
         };
       } catch (error) {
         stage = undefined;
+        keepForPlan = false;
+        if (error instanceof ReplicaResourceBusyError)
+          return verdict({ tag: "retry", problem: "resource_busy" });
+        if (error instanceof ReplicaResourceLimitError) {
+          return withPlan(
+            {
+              tag: "unsupported",
+              admission: {
+                reason: "resource_unsupported",
+                limit: error.limit,
+                limitsVersion: REPLICA_LIMITS_VERSION,
+              },
+            },
+            () => {
+              db.prepare(
+                `UPDATE pdpp_transport_manifests_in
+                 SET resource_limits_version=? WHERE slot=?`,
+              ).run(REPLICA_LIMITS_VERSION, slot);
+            },
+          );
+        }
         return verdict(retryFromError(error, "import_failed"));
       } finally {
-        // Without a plan to consume it, staging is scratch. A discarded
-        // attempt's staging is reclaimed at the next step start.
-        if (!stage) for (const key of staging) deleteBinary(db, "staging", key);
+        // A completed but uncommitted handle is a leased orphan after a crash.
+        if (!keepForPlan) stageStore?.abort(admission);
+        if (!transferEnvelopeReservations)
+          for (const release of envelopeReservations) release();
       }
     },
     commit: commitIn((outcome, work, item) => {
@@ -2559,12 +2951,28 @@ export function createReplicaTransportWorker(deps: {
       activeStepSignal = lifetime.signal;
       // Under the writer lock: a new identity resets its chain transactionally.
       if (!authority(own.identity)) return idle();
+      const stagedObjects = stagingStore(false);
+      stagedObjects.cleanup();
+      stagedObjects.cleanupAttachedTemporaryBytes();
       // Only this process owns the worker. None of these hidden stages can be published.
       db.transaction(() => {
         db.prepare("DELETE FROM pdpp_transport_staged_fragments").run();
+        const untrackedStages = db
+          .prepare(
+            `SELECT m.blob_id FROM pdpp_binary_manifests m
+             WHERE m.namespace='staging'
+               AND NOT EXISTS (
+                 SELECT 1 FROM pdpp_transport_staged_objects s
+                 WHERE s.namespace_key=m.blob_id
+               )
+             ORDER BY m.blob_id LIMIT ?`,
+          )
+          .all(STAGED_OBJECT_CLEANUP_BATCH) as { blob_id: string }[];
+        for (const row of untrackedStages)
+          deleteBinary(db, "staging", row.blob_id);
         for (const table of ["pdpp_binary_chunks", "pdpp_binary_manifests"]) {
           db.prepare(
-            `DELETE FROM ${table} WHERE namespace='staging' OR (namespace='payload' AND NOT EXISTS (SELECT 1 FROM pdpp_transport_batches b WHERE b.batch=${table}.blob_id))`,
+            `DELETE FROM ${table} WHERE namespace='payload' AND NOT EXISTS (SELECT 1 FROM pdpp_transport_batches b WHERE b.batch=${table}.blob_id)`,
           ).run();
         }
       }).immediate();

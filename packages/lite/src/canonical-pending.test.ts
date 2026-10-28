@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   binding,
   identity,
@@ -7,6 +7,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/fixtures";
 import { createLiteCanonicalStore } from "./canonical-store.js";
 import { createFakeCanonicalPersistence } from "./test-support/canonical-persistence.js";
+import { replicaEnvelopeSchema } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 
 function device() {
   const adapter = createFakeCanonicalPersistence();
@@ -87,6 +88,64 @@ describe("Lite pending visibility", () => {
     expect(await read(make())).toMatchObject({ data: { text: "pending" } });
     expect(await read(make(), "owner")).not.toHaveProperty("confirmation");
   });
+});
+
+it("E9 rejects an oversized raw envelope before schema parsing", async () => {
+  const { make } = device();
+  const store = make();
+  const parse = vi.spyOn(replicaEnvelopeSchema, "parse");
+  const request = pending();
+
+  await expect(
+    store.stagePending({
+      ...request,
+      envelope: {
+        ...request.envelope,
+        padding: "x".repeat(192 * 1024),
+      },
+    }),
+  ).rejects.toThrow("192 KiB");
+  expect(parse).not.toHaveBeenCalled();
+  parse.mockRestore();
+});
+
+it("E10 caps a stageBlob stream at the declared byte length", async () => {
+  const { make } = device();
+  const store = make();
+  const descriptor = {
+    blobId: "sha256:abc",
+    sha256: "sha256:abc",
+    sizeBytes: 1,
+    mimeType: "application/octet-stream",
+  };
+  const chunks = async function* () {
+    yield new Uint8Array([1, 2]);
+  };
+
+  await expect(store.stageBlob(descriptor, chunks())).rejects.toThrow(
+    "staged blob exceeds declared size",
+  );
+});
+
+it("passes cancellation through the Lite stageBlob byte wrapper", async () => {
+  const { make } = device();
+  const store = make();
+  const controller = new AbortController();
+  const descriptor = {
+    blobId: "sha256:abc",
+    sha256: "sha256:abc",
+    sizeBytes: 2,
+    mimeType: "application/octet-stream",
+  };
+  const chunks = async function* () {
+    yield new Uint8Array([1]);
+    controller.abort();
+    yield new Uint8Array([2]);
+  };
+
+  await expect(
+    store.stageBlob(descriptor, chunks(), controller.signal),
+  ).rejects.toThrow();
 });
 
 it.each([

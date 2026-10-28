@@ -55,6 +55,7 @@ export type ReplicaProblem =
   | "head_unavailable"
   | "publish_failed"
   | "download_failed"
+  | "resource_busy"
   | "commitment_mismatch"
   | "payload_invalid"
   | "import_failed"
@@ -127,13 +128,19 @@ export class ReplicaFramingUnsupported extends Error {
   }
 }
 
-export interface ReplicaAdmission {
-  reason: "replica_framing_unsupported";
-  actual: number;
-  limit: number;
-  /** The admitted capability the decision was measured against. */
-  capability: string;
-}
+export type ReplicaAdmission =
+  | {
+      reason: "replica_framing_unsupported";
+      actual: number;
+      limit: number;
+      /** The admitted capability the decision was measured against. */
+      capability: string;
+    }
+  | {
+      reason: "resource_unsupported";
+      limit: string;
+      limitsVersion: number;
+    };
 
 export interface ReplicaQuarantineProof {
   reason:
