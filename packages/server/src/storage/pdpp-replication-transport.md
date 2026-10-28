@@ -313,6 +313,16 @@ current slot's typed wait remains visible; authoritative absence after the
 intent timeout retries that same version and ciphertext. A successor is
 retained only after the predecessor is confirmed.
 
+A12b recovery acts only on authenticated, final facts. A mismatched or
+unavailable holder lookup is Retry, never terminal and never permission to move.
+Initial and final acceptance rechecks use one conservative classifier. Pending,
+unavailable and unknown evidence remain Retry. An unresolved started request
+stays fenced even after an absence snapshot or the retry timeout: dropping an
+ACK does not cancel the gateway request. Only an authenticated immutable foreign
+holder proves the conflicting request cannot still own that particular slot.
+Hash comparisons normalize case. The transaction also rechecks intent and row
+state before releasing claims.
+
 A12b recovery verifies the finalized holder before moving an unaccepted slot.
 A valid statement from our own key with a different batch digest creates a
 terminal `Wait(registration, own_key_conflict)` for the owner. A foreign holder

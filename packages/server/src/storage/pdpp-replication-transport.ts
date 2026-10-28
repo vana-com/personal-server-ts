@@ -2053,12 +2053,59 @@ export function createReplicaTransportWorker(deps: {
       registrationIntent(m.scope, m.version)?.status ?? "",
     ) ||
     (evidence.chain !== null &&
+      evidence.chain.owner.toLowerCase() === state().owner.toLowerCase() &&
+      evidence.chain.scope === m.scope &&
+      evidence.chain.version === String(m.version) &&
       BigInt(evidence.chain.currentVersion) >= BigInt(m.version) &&
       evidence.chain.commitment.toLowerCase() ===
         replicaChainCommitment(m.data_hash, m.metadata_hash).toLowerCase()) ||
     (evidence.head?.version === String(m.version) &&
-      evidence.head.dataHash === m.data_hash &&
-      evidence.head.metadataHash === m.metadata_hash);
+      evidence.head.owner.toLowerCase() === state().owner.toLowerCase() &&
+      evidence.head.scope === m.scope &&
+      !evidence.head.deleted &&
+      evidence.head.dataHash.toLowerCase() === m.data_hash.toLowerCase() &&
+      evidence.head.metadataHash.toLowerCase() ===
+        m.metadata_hash.toLowerCase());
+
+  function registeredHeight(fact: ReplicaRegistrationEvidence, scope: string) {
+    for (const record of [fact.head, fact.chain])
+      if (
+        record &&
+        (record.owner.toLowerCase() !== state().owner.toLowerCase() ||
+          record.scope !== scope)
+      )
+        throw new ReplicaProblemError("registration_unconfirmed");
+    const height = Math.max(
+      Number(fact.chain?.currentVersion ?? 0),
+      Number(fact.head?.version ?? 0),
+    );
+    if (!Number.isSafeInteger(height) || height < 0)
+      throw new ReplicaProblemError("registration_unconfirmed");
+    return height;
+  }
+
+  /** Every pass uses the same classification; a snapshot cannot cancel an in-flight request. */
+  function recoveryDisposition(
+    m: ManifestOut,
+    fact: ReplicaRegistrationEvidence,
+    authenticatedForeign = false,
+  ): "accepted" | "movable" | "retry" {
+    if (m.state !== "ready" && m.state !== "published") return "retry";
+    if (registered(m, fact)) return "accepted";
+    const status = replicaRegistrationState(fact, {
+      owner: state().owner,
+      scope: m.scope,
+      version: m.version,
+      dataHash: m.data_hash,
+      metadataHash: m.metadata_hash,
+    });
+    // An authenticated immutable foreign holder proves that this particular
+    // request cannot ever own its old slot, even if its ACK was lost.
+    if (authenticatedForeign && status === "conflict") return "movable";
+    if (status !== "absent" || registrationIntent(m.scope, m.version))
+      return "retry";
+    return "movable";
+  }
 
   /** Stage signatures without I/O; the outcome transaction moves the entire unaccepted suffix. */
   async function recoverRegistration(
@@ -2085,12 +2132,7 @@ export function createReplicaTransportWorker(deps: {
         evidence.chain?.commitment.toLowerCase(),
     });
     if (received.tag !== "manifest")
-      return verdict(
-        quarantine(
-          "immutable_registration_conflict",
-          slotKey(row.scope, row.version),
-        ),
-      );
+      return verdict({ tag: "retry", problem: "commitment_mismatch" });
     const holder = received.manifest;
     const identity = currentReplicaWriterIdentity(db)!;
     const original = decodeReplicaManifest(
@@ -2135,7 +2177,7 @@ export function createReplicaTransportWorker(deps: {
       );
     const claims = db
       .prepare(
-        `SELECT p.batch,p.version,b.sequence,m.plaintext,m.encrypted,m.data_hash,m.metadata_hash,m.state
+        `SELECT p.batch,p.version,b.sequence,b.prepared,m.plaintext,m.encrypted,m.data_hash,m.metadata_hash,m.state
       FROM pdpp_transport_preparation p JOIN pdpp_transport_batches b ON b.batch=p.batch
       LEFT JOIN pdpp_transport_manifests_out m ON m.batch=p.batch
       WHERE p.version>=? AND p.state<>'released' ORDER BY b.sequence`,
@@ -2144,6 +2186,7 @@ export function createReplicaTransportWorker(deps: {
       batch: string;
       version: number;
       sequence: number;
+      prepared: number;
       plaintext: Buffer | null;
       encrypted: Buffer | null;
       data_hash: Hex;
@@ -2152,11 +2195,13 @@ export function createReplicaTransportWorker(deps: {
     }[];
     const moving: typeof claims = [];
     const accepted: typeof claims = [];
-    let highest = Math.max(
-      Number(evidence.chain!.currentVersion),
-      Number(evidence.head?.version ?? 0),
-    );
+    let highest = registeredHeight(evidence, row.scope);
     for (const claim of claims) {
+      if (
+        ![0, 1, -1, -2].includes(claim.prepared) ||
+        (!claim.plaintext && registrationIntent(row.scope, claim.version))
+      )
+        return verdict({ tag: "retry", problem: "registration_unconfirmed" });
       if (claim.plaintext) {
         const m = { ...claim, scope: row.scope } as ManifestOut;
         const fact =
@@ -2165,37 +2210,24 @@ export function createReplicaTransportWorker(deps: {
             : await call(signal, () =>
                 transport.evidence(row.scope, claim.version),
               );
-        highest = Math.max(
-          highest,
-          Number(fact.chain?.currentVersion ?? 0),
-          Number(fact.head?.version ?? 0),
+        highest = Math.max(highest, registeredHeight(fact, row.scope));
+        const disposition = recoveryDisposition(
+          m,
+          fact,
+          claim.batch === row.batch,
         );
-        if (registered(m, fact)) {
+        if (disposition === "accepted") {
           if (claim.batch === row.batch)
-            return withPlan(registrationWait("version_squat"), () =>
-              setRecovery(row.batch, row.version, "version_squat"),
-            );
+            return verdict({
+              tag: "retry",
+              problem: "registration_unconfirmed",
+            });
+          highest = Math.max(highest, claim.version);
           accepted.push(claim);
           continue;
         }
-        // An unresolved optimistic registration might already be accepted.
-        // No absence/conflict proof means wait; it is never permission to re-sign.
-        if (
-          replicaRegistrationState(fact, {
-            owner: state().owner,
-            scope: row.scope,
-            version: claim.version,
-            dataHash: claim.data_hash,
-            metadataHash: claim.metadata_hash,
-          }) === "pending"
-        )
-          return verdict(
-            pendingRegistration(
-              slotKey(row.scope, claim.version),
-              claim.version,
-              now(),
-            ),
-          );
+        if (disposition !== "movable")
+          return verdict({ tag: "retry", problem: "registration_unconfirmed" });
       }
       moving.push(claim);
     }
@@ -2240,7 +2272,12 @@ export function createReplicaTransportWorker(deps: {
       const fact = await call(signal, () =>
         transport.evidence(row.scope, claim.version),
       );
-      if (registered({ ...claim, scope: row.scope } as ManifestOut, fact))
+      if (
+        recoveryDisposition(
+          { ...claim, scope: row.scope } as ManifestOut,
+          fact,
+        ) !== "movable"
+      )
         return verdict({ tag: "retry", problem: "registration_unconfirmed" });
     }
     return withPlan(
@@ -2257,16 +2294,19 @@ export function createReplicaTransportWorker(deps: {
           const current = preparationOf(claim.batch);
           const held = db
             .prepare(
-              "SELECT version,encrypted FROM pdpp_transport_manifests_out WHERE batch=?",
+              "SELECT version,encrypted,state FROM pdpp_transport_manifests_out WHERE batch=?",
             )
             .get(claim.batch) as
-            { version: number; encrypted: Buffer } | undefined;
+            { version: number; encrypted: Buffer; state: string } | undefined;
           if (
             current?.version !== claim.version ||
             (claim.encrypted &&
               (!held ||
                 held.version !== claim.version ||
+                held.state !== "ready" ||
                 !held.encrypted.equals(claim.encrypted))) ||
+            (claim.batch !== row.batch &&
+              registrationIntent(row.scope, claim.version) !== undefined) ||
             ["accepted", "confirmed"].includes(
               registrationIntent(row.scope, claim.version)?.status ?? "",
             )

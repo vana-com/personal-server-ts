@@ -11,6 +11,7 @@ import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/rep
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import { replicaFragmentKey } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import {
+  authenticatedOwnFork,
   adapterFactories,
   at,
   batchOfPlaintext,
@@ -161,7 +162,11 @@ function instrumentPut(
  * Wrap the port's evidence: fail on demand, count reads per slot. A
  * conflict is a finalized commitment at the slot other than the registered one.
  */
-function instrumentEvidence(net: Network, local?: () => TransportDevice) {
+function instrumentEvidence(
+  net: Network,
+  local?: () => TransportDevice,
+  authenticated = false,
+) {
   const original = net.port.evidence;
   const state = {
     fail: false,
@@ -175,6 +180,8 @@ function instrumentEvidence(net: Network, local?: () => TransportDevice) {
     if (state.fail) throw state.error();
     const evidence = await original(scope, version);
     if (state.conflict?.(slot) && evidence.chain) {
+      if (authenticated && local)
+        return authenticatedOwnFork(net, local(), scope, version);
       if (local && !net.blobs.has(slot)) {
         const held = local()
           .db.prepare(
@@ -783,7 +790,7 @@ describe("08 Wait to Retry on evidence transport failure", () => {
 
 describe("09 Quarantine only with proof", () => {
   for (const source of ["fresh", "wait", "retry"] as const)
-    it(`09 [outbox from ${source}] a finalized slot conflict quarantines with proof; no further put or register`, async () => {
+    it(`09 [outbox from ${source}] a holder commitment mismatch retries without retirement; no further put or register`, async () => {
       const net = network();
       const evidence = instrumentEvidence(net, () => d);
       const puts = instrumentPut(net, {
@@ -809,8 +816,8 @@ describe("09 Quarantine only with proof", () => {
         await at_(d, 1000);
       }
       const row = logical(d, "pdpp_transport_manifests_out")[0]!;
-      expect(row.outcome).toBe("quarantine");
-      expect(row.reason).toBe("immutable_registration_conflict");
+      expect(row.outcome).toBe("retry");
+      expect(row.reason).toBe("commitment_mismatch");
       const putCalls = puts.calls;
       const manifestPuts = () =>
         puts.parts.filter((p) => !p.key.includes("/fragments/")).length;
@@ -819,12 +826,12 @@ describe("09 Quarantine only with proof", () => {
       // happened once. retry: only a fragment put failed, then the conflict.
       expect(manifestPuts()).toBe(source === "wait" ? 1 : 0);
       expect(registrations).toBe(source === "wait" ? 1 : 0);
-      // Restart and duplicate wakes never resurrect it.
+      // Restarts and wakes retry authentication without publishing unverified bytes.
       d.reopen();
       for (let i = 0; i < 4; i++) await at_(d, 3_600_000);
       expect(logical(d, "pdpp_transport_manifests_out")[0]).toMatchObject({
-        outcome: "quarantine",
-        reason: "immutable_registration_conflict",
+        outcome: "retry",
+        reason: "commitment_mismatch",
       });
       expect(puts.calls).toBe(putCalls);
       expect(net.calls.registrations).toHaveLength(registrations);
@@ -947,9 +954,9 @@ describe("10 Unsupported admission is not Quarantine", () => {
 // ======================================================================== 11
 
 describe("11 Terminal outcome replay is inert", () => {
-  it("11 [transport] a progressed, a quarantined and an unsupported item stay byte-identical under replay", async () => {
+  it("11 [transport] a progressed, a terminal own-key wait and an unsupported item stay byte-identical under replay", async () => {
     const net = network();
-    const evidence = instrumentEvidence(net, () => d);
+    const evidence = instrumentEvidence(net, () => d, true);
     stickFirstBatch(net, 8192);
     const d = transportDevice(net, { preexisting: "one" });
     await at_(d, 10000); // batch 1: unsupported
@@ -963,7 +970,7 @@ describe("11 Terminal outcome replay is inert", () => {
         manifestRows(d).find((r) => r.batch === third.batch)?.slot === slot
       );
     };
-    for (let i = 0; i < 3; i++) await at_(d, 10000); // batch 3: quarantine
+    for (let i = 0; i < 3; i++) await at_(d, 10000); // batch 3: terminal own-key wait
 
     const batches = logical(d, "pdpp_transport_batches");
     expect(batches.map((r) => r.outcome)).toEqual([
@@ -973,7 +980,11 @@ describe("11 Terminal outcome replay is inert", () => {
     ]);
     const outbox = logical(d, "pdpp_transport_manifests_out");
     expect(outbox.some((r) => r.outcome === "progress")).toBe(true);
-    expect(outbox.some((r) => r.outcome === "quarantine")).toBe(true);
+    expect(
+      outbox.some(
+        (r) => r.outcome === "wait" && r.reason === "own_key_conflict",
+      ),
+    ).toBe(true);
 
     const tables = [
       "pdpp_transport_batches",
