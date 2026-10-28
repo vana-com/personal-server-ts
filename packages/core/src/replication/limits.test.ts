@@ -15,7 +15,7 @@ const identity = {
 };
 
 describe("replication admission limits", () => {
-  it("reserves declared ciphertext copies and releases once", () => {
+  it("admits a declared batch without reserving it and accounts one read at a time", () => {
     const budget = new ReplicaByteBudget(100);
     const admission = admit(
       { totalBytes: 10, fragments: [{ bytes: 10 }, { bytes: 15 }] },
@@ -25,10 +25,20 @@ describe("replication admission limits", () => {
 
     expect(admission).not.toHaveProperty("kind");
     if ("kind" in admission) throw new Error("expected admission");
-    expect(admission.reservedBytes).toBe(25 * REPLICA_LIVE_COPY_FACTOR);
-    expect(budget.reserved).toBe(admission.reservedBytes);
-    admission.release();
-    admission.release();
+    expect(budget.reserved).toBe(0);
+    const firstRead = admission.reserveObject(20);
+    expect(firstRead).not.toHaveProperty("kind");
+    if (typeof firstRead !== "function")
+      throw new Error("expected first object reservation");
+    expect(budget.reserved).toBe(20 * REPLICA_LIVE_COPY_FACTOR);
+    const secondRead = admission.reserveObject(10);
+    expect(secondRead).toMatchObject({ kind: "resource_busy" });
+    firstRead();
+    firstRead();
+    expect(budget.reserved).toBe(0);
+    const afterRelease = admission.reserveObject(10);
+    expect(afterRelease).not.toHaveProperty("kind");
+    if (typeof afterRelease === "function") afterRelease();
     expect(budget.reserved).toBe(0);
   });
 
@@ -67,7 +77,7 @@ describe("replication admission limits", () => {
   });
 
   it("R6 returns resource_busy when concurrent admissions exceed one process budget", () => {
-    const budget = new ReplicaByteBudget(80);
+    const budget = new ReplicaByteBudget(60);
     const first = admit(
       { totalBytes: 10, fragments: [{ bytes: 10 }] },
       budget,
@@ -80,9 +90,15 @@ describe("replication admission limits", () => {
     );
 
     expect(first).not.toHaveProperty("kind");
-    expect(second).toMatchObject({ kind: "resource_busy" });
+    expect(second).not.toHaveProperty("kind");
+    if ("kind" in first || "kind" in second)
+      throw new Error("expected both manifests admitted");
+    const firstRead = first.reserveObject(10);
+    const secondRead = second.reserveObject(11);
+    expect(firstRead).not.toHaveProperty("kind");
+    expect(secondRead).toMatchObject({ kind: "resource_busy" });
     expect(budget.reserved).toBe(10 * REPLICA_LIVE_COPY_FACTOR);
-    if (!("kind" in first)) first.release();
+    if (typeof firstRead === "function") firstRead();
     expect(budget.reserved).toBe(0);
   });
 });

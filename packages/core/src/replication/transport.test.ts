@@ -16,6 +16,7 @@ import {
 } from "./transport.js";
 import { canonicalJson } from "./envelope.js";
 import { unsignedReplicaBatch } from "./writer-identity.test-utils.js";
+import { assembleReplicaStream } from "./stream.js";
 
 it("fragments a large export without changing bytes or exceeding encrypted cap", async () => {
   const bytes = new TextEncoder().encode("😺large JSON record".repeat(2000));
@@ -43,6 +44,13 @@ it("fragments a large export without changing bytes or exceeding encrypted cap",
   expect(parts.map((p) => p.digest)).toEqual(
     parts.map((p) => replicaDigest(p.encrypted)),
   );
+  const assembled: Uint8Array[] = [];
+  for await (const chunk of assembleReplicaStream(async function* () {
+    for (const part of parts)
+      yield decodeReplicaFragment(part.plaintext, part.scope, "owner");
+  }))
+    assembled.push(chunk);
+  expect(Buffer.concat(assembled)).toEqual(Buffer.from(bytes));
 });
 
 it("binds a manifest to its owner, writer scope and version, and its fragments to the manifest", async () => {

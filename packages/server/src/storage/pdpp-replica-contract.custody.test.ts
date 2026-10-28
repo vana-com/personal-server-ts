@@ -973,9 +973,44 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
         const untyped = records.filter(
           (r) => r.outcome === undefined || r.outcome === null,
         );
-        return untyped.length
+        const out = untyped.length
           ? [`[outcome] ${untyped.length} work records without a typed outcome`]
           : [];
+        const imported = count(
+          b.db,
+          "SELECT count(*) AS n FROM pdpp_transport_imported",
+        );
+        const custodyCopies = count(
+          b.db,
+          "SELECT count(*) AS n FROM pdpp_replica_copies",
+        );
+        const orphanStages = count(
+          b.db,
+          "SELECT count(*) AS n FROM pdpp_transport_staged_objects WHERE state<>'attached'",
+        );
+        const tempBytes = count(
+          b.db,
+          "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace='staging'",
+        );
+        if (imported < 1) out.push("[import] expected at least one receipt");
+        if (custodyCopies !== imported)
+          out.push(
+            `[custody] ${custodyCopies} copies for ${imported} import receipts`,
+          );
+        const duplicateReceipts = count(
+          b.db,
+          `SELECT count(*) AS n FROM (
+             SELECT writer,batch FROM pdpp_transport_imported
+             GROUP BY writer,batch HAVING count(*)<>1
+           )`,
+        );
+        if (duplicateReceipts !== 0)
+          out.push(`[import] ${duplicateReceipts} duplicated batch receipts`);
+        if (orphanStages !== 0)
+          out.push(`[staging] ${orphanStages} unattached stages remain`);
+        if (tempBytes !== 0)
+          out.push(`[staging] ${tempBytes} temporary blobs remain`);
+        return out;
       },
       checkCrashed() {
         const out: Violation[] = [];
@@ -1048,6 +1083,22 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
           journalBefore
         )
           out.push("[echo] receiver journal grew after replay");
+        const receiptCount = count(
+          b.db,
+          "SELECT count(*) AS n FROM pdpp_transport_imported",
+        );
+        if (
+          count(b.db, "SELECT count(*) AS n FROM pdpp_replica_copies") !==
+          receiptCount
+        )
+          out.push("[custody] replay changed the one-copy-per-receipt count");
+        if (
+          count(
+            b.db,
+            "SELECT count(*) AS n FROM pdpp_transport_staged_objects WHERE state<>'attached'",
+          ) !== 0
+        )
+          out.push("[staging] replay left an unattached stage");
         return out;
       },
     };
@@ -1077,7 +1128,7 @@ describe("section C: destination custody and crash boundaries", () => {
     matrixLimit,
   );
   it(
-    "41/42 verified staging and import receipt: no public blob or record without the committed receipt; no orphan staging",
+    "T2 R4/R5 worker crashes: verified-before-attach and attach-before-temp-delete resume with one receipt/custody copy and reclaimed orphans",
     async () => {
       const report = await crashMatrix("41 staged blob import", () =>
         destinationWorld({ blobBytes: 3000, chunk: 1500 }),

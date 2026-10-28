@@ -231,8 +231,16 @@ it("R2 aborts a partially written stream and releases its reservation once", () 
   expect(budget.reserved).toBe(0);
 });
 
-it("R3 makes attach and cleanup mutually exclusive in either transaction order", () => {
-  const db = open();
+it("R3 serializes two-connection attach and cleanup in either transaction order", () => {
+  const directory = mkdtempSync(join(tmpdir(), "replica-stage-r3-"));
+  directories.push(directory);
+  const path = join(directory, "records.sqlite");
+  const db = new Database(path);
+  const contender = new Database(path);
+  db.exec(BINARY_CHUNKS_MIGRATION);
+  contender.exec(BINARY_CHUNKS_MIGRATION);
+  contender.pragma("busy_timeout = 0");
+  databases.push(db, contender);
   let now = 0;
   const store = createReplicaStagingStore({
     db,
@@ -240,14 +248,30 @@ it("R3 makes attach and cleanup mutually exclusive in either transaction order",
     owner: "owner-a",
     now: () => now,
   });
+  const cleanupStore = createReplicaStagingStore({
+    db: contender,
+    repositoryId: "repo-a",
+    owner: "owner-a",
+    now: () => now,
+  });
   const attachWins = stage(store);
   now += store.leaseMs + 1;
-  db.transaction(() => store.attach(attachWins.handle, attachWins.expected))();
-  expect(store.cleanup()).toBe(0);
+  db.exec("BEGIN IMMEDIATE");
+  expect(() => cleanupStore.cleanup()).toThrow(/busy|locked/i);
+  expect(
+    (
+      contender
+        .prepare("SELECT count(*) AS count FROM pdpp_transport_staged_objects")
+        .get() as { count: number }
+    ).count,
+  ).toBe(1);
+  store.attach(attachWins.handle, attachWins.expected);
+  db.exec("COMMIT");
+  expect(cleanupStore.cleanup()).toBe(0);
 
   const cleanupWins = stage(store);
   now += store.leaseMs + 1;
-  expect(store.cleanup()).toBe(1);
+  expect(cleanupStore.cleanup()).toBe(1);
   expect(() =>
     db.transaction(() =>
       store.attach(cleanupWins.handle, cleanupWins.expected),

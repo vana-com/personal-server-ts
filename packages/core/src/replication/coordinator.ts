@@ -35,6 +35,8 @@ export interface ReplicaWorkItem {
 export interface ReplicaAttempt {
   outcome: ReplicaPhaseOutcome;
   plan?: () => ReplicaPhaseOutcome | void;
+  /** Release short-lived resources after this attempt is committed or discarded. */
+  release?: () => void;
 }
 
 /** Turns a verdict into its durable outcome and state, at settlement time. */

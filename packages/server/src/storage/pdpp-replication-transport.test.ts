@@ -11,6 +11,8 @@ import { retireReplication } from "./pdpp-replication-door.js";
 import {
   createReplicaTransportWorker,
   ReplicaCarrierMismatchError,
+  REPLICA_BATCH_OPERATIONS,
+  REPLICA_BATCH_BYTES,
 } from "./pdpp-replication-transport.js";
 import { unprovisionConnection } from "./pdpp-replica-contract.test-utils.js";
 import { binaryWriter, readBinary } from "./pdpp-binary-chunks.js";
@@ -32,7 +34,6 @@ import {
 import {
   REPLICA_MAX_BLOB_BYTES,
   decodeReplicaManifest,
-  decodeReplicaFragment,
   fragmentReplicaPayload,
   replicaDigest,
   replicaFragmentKey,
@@ -42,6 +43,14 @@ import {
 import {
   REPLICA_MAX_OPERATIONS,
   REPLICA_MAX_TOTAL_BYTES,
+  REPLICA_MAX_AGGREGATE_CIPHERTEXT_BYTES,
+  REPLICA_MAX_OPERATION_ENVELOPE_BYTES,
+  REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES,
+  REPLICA_DEFAULT_FRAGMENT_BYTES,
+  REPLICA_DEFAULT_BYTE_BUDGET_BYTES,
+  REPLICA_DEFAULT_LIMITS,
+  REPLICA_LIMITS_VERSION,
+  replicaFramedBytesBound,
 } from "@opendatalabs/personal-server-ts-core/replication/limits";
 import {
   admit,
@@ -49,13 +58,14 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/limits";
 import { remoteReplicaTestWriter } from "./pdpp-replica-writer-identity.test-utils.js";
 import type { ReplicaTransportPort } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
-import {
-  encodeReplicaPayload,
-  assembleReplicaStream,
-  DEFAULT_REPLICA_STREAMED_LIMITS,
-  inspectReplicaPayload,
-} from "@opendatalabs/personal-server-ts-core/replication/stream";
+import { encodeReplicaPayload } from "@opendatalabs/personal-server-ts-core/replication/stream";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import { createReplicaStagingStore } from "./pdpp-replica-staging.js";
+import { defaultReplicaBackoff } from "@opendatalabs/personal-server-ts-core/replication/schedule";
+import {
+  MAX_BLOB_UPLOAD_BYTES,
+  MAX_INGEST_BODY_BYTES,
+} from "../routes/pdpp-records.js";
 
 const owner = "0x0000000000000000000000000000000000000001";
 const sourceId = "https://source.invalid/declaration";
@@ -1412,31 +1422,247 @@ it("E7 retries resource_busy with P backoff, then imports when budget is free", 
   const net = network();
   const a = device(net, { preexisting: "resource busy" });
   await cycles([a], 4);
-  const budget = new ReplicaByteBudget(1_000_000);
-  const release = budget.reserve(budget.maxBytes);
+  const budget = new ReplicaByteBudget(512 * 1024 * 1024);
+  const release = budget.reserve(256 * 1024 * 1024);
   if (typeof release !== "function")
     throw new Error("expected budget reservation");
   const b = device(net, { worker: { resourceBudget: budget } });
-  await cycles([b], 8);
-
-  const busy = b.db
-    .prepare(
-      "SELECT outcome,reason,attempts,next_attempt FROM pdpp_transport_manifests_in WHERE outcome='retry'",
-    )
-    .get() as
-    | {
-        outcome: string;
-        reason: string;
-        attempts: number;
-        next_attempt: number;
-      }
-    | undefined;
-  expect(busy).toMatchObject({ outcome: "retry", reason: "resource_busy" });
-  expect(busy?.attempts).toBeGreaterThan(1);
+  const intervals: { attempt: number; delay: number; next: number }[] = [];
+  for (let attempt = 0; attempt < 64; attempt++) {
+    await b.cycle();
+    const busy = b.db
+      .prepare(
+        "SELECT outcome,reason,attempts,next_attempt FROM pdpp_transport_manifests_in WHERE outcome='retry' AND reason='resource_busy'",
+      )
+      .get() as
+      | {
+          outcome: string;
+          reason: string;
+          attempts: number;
+          next_attempt: number;
+        }
+      | undefined;
+    if (!busy) continue;
+    if (intervals.at(-1)?.next !== busy.next_attempt) {
+      intervals.push({
+        attempt: busy.attempts,
+        delay: busy.next_attempt - time,
+        next: busy.next_attempt,
+      });
+      time = busy.next_attempt;
+    }
+  }
+  expect(intervals.length).toBeGreaterThanOrEqual(3);
+  const pClassCap = defaultReplicaBackoff(Number.MAX_SAFE_INTEGER);
+  expect(
+    intervals
+      .slice(1)
+      .every((at, index) =>
+        intervals[index]!.delay < pClassCap
+          ? at.delay > intervals[index]!.delay
+          : at.delay === pClassCap,
+      ),
+  ).toBe(true);
+  expect(
+    intervals.every(
+      ({ attempt, delay }) => delay === defaultReplicaBackoff(attempt),
+    ),
+  ).toBe(true);
+  expect(intervals.at(-1)?.delay).toBe(pClassCap);
+  expect(intervals.every(({ delay }) => delay <= pClassCap)).toBe(true);
   release();
-
+  time = Math.max(time, ...intervals.map(({ next }) => next));
   await cycles([b], 12);
   expect(b.get()).toEqual(a.get());
+  expect(budget.reserved).toBe(0);
+});
+
+it("M4 overlaps per-fragment reservations and admits a batch larger than the budget", async () => {
+  const net = network(false, 64 * 1024);
+  const source = device(net, { chunk: 3000, cap: 64 * 1024 });
+  await cycles([source], 24);
+  const template = device(net);
+  await cycles([template], 24);
+  source.put("x".repeat(20_000));
+  await cycles([source], 24);
+  const outbound = source.db
+    .prepare(
+      `SELECT m.scope,m.encrypted,b.batch FROM pdpp_transport_manifests_out m
+     JOIN pdpp_transport_batches b ON b.batch=m.batch WHERE b.prepared=1
+     ORDER BY m.version DESC LIMIT 1`,
+    )
+    .get() as { scope: string; encrypted: Buffer; batch: string };
+  const manifest = decodeReplicaManifest(
+    await net.port.decrypt(outbound.scope, new Uint8Array(outbound.encrypted)),
+    outbound.scope,
+    owner,
+  );
+  expect(manifest.fragments.length).toBeGreaterThan(1);
+  const fragmentBytes = manifest.fragments[0]!.bytes;
+  const budget = new ReplicaByteBudget(fragmentBytes * 6);
+  expect(outbound.encrypted.length * 4).toBeLessThan(budget.maxBytes / 2);
+  const limits = { maxManifestCiphertextBytes: outbound.encrypted.length };
+  const a = device(net, {
+    copyOf: template,
+    worker: { resourceBudget: budget, resourceLimits: limits },
+  });
+  const b = device(net, {
+    copyOf: template,
+    worker: { resourceBudget: budget, resourceLimits: limits },
+  });
+  const originalDecrypt = net.port.decrypt.bind(net.port);
+  let releaseFirst!: () => void;
+  let started!: () => void;
+  const firstReadStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const holdFirstRead = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let held = false;
+  net.port.decrypt = async (...args) => {
+    const plaintext = await originalDecrypt(...args);
+    const decoded = JSON.parse(new TextDecoder().decode(plaintext)) as {
+      data?: { fragment?: unknown };
+    };
+    if (!held && decoded.data?.fragment) {
+      held = true;
+      started();
+      await holdFirstRead;
+    }
+    return plaintext;
+  };
+  const firstImport = cycles([a], 12);
+  await Promise.race([
+    firstReadStarted,
+    new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+  ]);
+  if (!held) {
+    releaseFirst();
+    await firstImport;
+    throw new Error(
+      `fragment decrypt barrier was not reached: ${JSON.stringify(
+        a.db
+          .prepare(
+            "SELECT state,outcome,reason FROM pdpp_transport_manifests_in",
+          )
+          .all(),
+      )}`,
+    );
+  }
+  expect(budget.reserved).toBe(fragmentBytes * 4);
+  await cycles([b], 12);
+  const refused = b.db
+    .prepare(
+      `SELECT count(*) AS count FROM pdpp_transport_fragments_in
+     WHERE outcome='retry' AND reason='resource_busy'
+     UNION ALL SELECT count(*) AS count FROM pdpp_transport_manifests_in
+     WHERE outcome='retry' AND reason='resource_busy'`,
+    )
+    .all() as { count: number }[];
+  expect(fragmentBytes * 4).toBeGreaterThan(budget.maxBytes / 2);
+  const refusalRows = b.db
+    .prepare(
+      `SELECT state,outcome,reason FROM pdpp_transport_manifests_in
+     UNION ALL SELECT state,outcome,reason FROM pdpp_transport_fragments_in`,
+    )
+    .all();
+  if (!refused.some((row) => row.count > 0)) {
+    releaseFirst();
+    await firstImport;
+    throw new Error(
+      `second import did not see resource_busy: ${JSON.stringify(refusalRows)}`,
+    );
+  }
+  releaseFirst();
+  await firstImport;
+  net.port.decrypt = originalDecrypt;
+  time += 60_000;
+  await cycles([a, b], 36);
+  expect(a.get()).toEqual(source.get());
+  expect(b.get()).toEqual(source.get());
+  expect(manifest.totalBytes * 4).toBeGreaterThan(budget.maxBytes);
+  expect(budget.reserved).toBe(0);
+}, 60000);
+
+it("M2 releases a read reservation when stagingStore throws after admission", async () => {
+  const net = network();
+  const a = device(net, { preexisting: "staging store failure" });
+  await cycles([a], 8);
+  const budget = new ReplicaByteBudget(10_000_000);
+  let calls = 0;
+  const isReadyToImport = (
+    input: Parameters<typeof createReplicaStagingStore>[0],
+  ) =>
+    Boolean(
+      input.db
+        .prepare(
+          `SELECT 1 FROM pdpp_transport_manifests_in m
+           WHERE m.manifest_json IS NOT NULL AND NOT EXISTS (
+             SELECT 1 FROM pdpp_transport_fragments_in f
+             WHERE f.slot=m.slot AND f.fragment_json IS NULL
+           ) LIMIT 1`,
+        )
+        .get(),
+    );
+  const b = device(net, {
+    worker: {
+      resourceBudget: budget,
+      createStagingStore: (
+        input: Parameters<typeof createReplicaStagingStore>[0],
+      ) => {
+        calls++;
+        if (isReadyToImport(input)) throw new Error("staging store failed");
+        return createReplicaStagingStore(input);
+      },
+    },
+  });
+  await cycles([b], 12);
+  expect(calls).toBeGreaterThan(1);
+  expect(budget.reserved).toBe(0);
+});
+
+it("M2 releases a read reservation when reclaimAdmission throws", async () => {
+  const net = network();
+  const a = device(net, { preexisting: "reclaim failure" });
+  await cycles([a], 8);
+  const budget = new ReplicaByteBudget(10_000_000);
+  let calls = 0;
+  const isReadyToImport = (
+    input: Parameters<typeof createReplicaStagingStore>[0],
+  ) =>
+    Boolean(
+      input.db
+        .prepare(
+          `SELECT 1 FROM pdpp_transport_manifests_in m
+           WHERE m.manifest_json IS NOT NULL AND NOT EXISTS (
+             SELECT 1 FROM pdpp_transport_fragments_in f
+             WHERE f.slot=m.slot AND f.fragment_json IS NULL
+           ) LIMIT 1`,
+        )
+        .get(),
+    );
+  const b = device(net, {
+    worker: {
+      resourceBudget: budget,
+      createStagingStore: (
+        input: Parameters<typeof createReplicaStagingStore>[0],
+      ) => {
+        const store = createReplicaStagingStore(input);
+        calls++;
+        if (isReadyToImport(input))
+          return {
+            ...store,
+            reclaimAdmission: () => {
+              throw new Error("reclaim failed");
+            },
+          };
+        return store;
+      },
+    },
+  });
+  await cycles([b], 12);
+  expect(calls).toBeGreaterThan(1);
   expect(budget.reserved).toBe(0);
 });
 
@@ -1581,7 +1807,7 @@ it("E1 rejects declared totals before fetching fragments or retaining evidence",
     outcome: "unsupported",
     reason: "resource_unsupported",
     state: "ready",
-    resource_limits_version: 1,
+    resource_limits_version: REPLICA_LIMITS_VERSION,
   });
   expect(
     net.gets.filter((key) => key.startsWith(`${scope}/fragments/`)),
@@ -1597,101 +1823,217 @@ it("E1 rejects declared totals before fetching fragments or retaining evidence",
   ).toBe(0);
 });
 
-it("E3 admits the largest batch produced by real Node sender preparation", async () => {
-  const net = network(false, REPLICA_MAX_BLOB_BYTES);
-  const sender = device(net, { cap: REPLICA_MAX_BLOB_BYTES });
-  sender.store.ingestBatch(
-    Array.from({ length: REPLICA_MAX_OPERATIONS - 1 }, (_, index) => ({
-      instance: "conn",
-      stream: "messages",
-      key: `largest-${index}`,
-      data: { id: `largest-${index}`, text: `value-${index}` },
-      emitted_at: at,
-    })),
-    () => "mutable_state",
-    () => ["id"],
-    { method: "export", generation: 1 },
-  );
-  await cycles([sender], 36);
-  const prepared = sender.db
-    .prepare(
-      `SELECT m.batch,m.scope,m.encrypted,m.version
-       FROM pdpp_transport_manifests_out m
-       JOIN pdpp_transport_batches b ON b.batch=m.batch
-       WHERE b.prepared=1 ORDER BY b.total_bytes DESC LIMIT 1`,
-    )
-    .get() as
-    | { batch: string; scope: string; encrypted: Buffer; version: number }
-    | undefined;
-  expect(prepared).toBeDefined();
-  if (!prepared) throw new Error("sender did not prepare a batch");
-
-  const manifest = decodeReplicaManifest(
-    await net.port.decrypt(prepared.scope, new Uint8Array(prepared.encrypted)),
-    prepared.scope,
-    owner,
-  );
-  const ciphertextBytes = manifest.fragments.reduce(
-    (size, fragment) => size + fragment.bytes,
-    0,
-  );
-  const budget = new ReplicaByteBudget(ciphertextBytes * 4);
-  const admission = admit(manifest, budget, {
-    repositoryId: "e3-sender-repository",
-    owner,
-    manifestDigest: manifest.digest,
-  });
-  expect(admission).not.toHaveProperty("kind");
-  if ("kind" in admission) throw new Error("sender produced a refused batch");
-
-  const encryptedFragments = sender.db
-    .prepare(
-      "SELECT encrypted FROM pdpp_transport_fragments_out WHERE batch=? ORDER BY position",
-    )
-    .all(prepared.batch) as { encrypted: Buffer }[];
-  const fragments = await Promise.all(
-    encryptedFragments.map(async ({ encrypted }) => {
-      const plaintext = await net.port.decrypt(
-        prepared.scope,
-        new Uint8Array(encrypted),
+it("H3 prepares, admits and imports both scaled honest sender bounds", async () => {
+  const run = async (kind: "large-operation" | "operation-count") => {
+    const net = network(false, 64 * 1024);
+    const limits = {
+      maxSourceBlobBytes: 1024,
+      maxRecordJsonBytes: 1024,
+      maxManifestCiphertextBytes: 64 * 1024,
+      maxFragmentCiphertextBytes: 64 * 1024,
+      maxAggregateCiphertextBytes: 256 * 1024,
+      maxFragments: 256,
+      maxEvidenceRows: 256,
+      maxTotalBytes: 64 * 1024,
+      maxOperations: 2,
+      maxOperationBytes: 8 * 1024,
+      maxSingleBlobBytes: 1024,
+      maxBlobTotalBytes: 1024,
+    };
+    const sender = device(net, {
+      cap: 64 * 1024,
+      worker: {
+        maxBatchOperations: 2,
+        maxBatchBytes: 1024,
+        resourceLimits: limits,
+      },
+    });
+    let recordIds: string[];
+    if (kind === "large-operation") {
+      const id = "large-operation";
+      const fixedRecordBytes = new TextEncoder().encode(
+        JSON.stringify({ id, text: "" }),
+      ).length;
+      const maxRecordText = "x".repeat(1024 - fixedRecordBytes);
+      expect(
+        new TextEncoder().encode(JSON.stringify({ id, text: maxRecordText }))
+          .length,
+      ).toBe(1024);
+      const blob = sender.store.storeBlobBytesForInstance({
+        instance: "conn",
+        method: "export",
+        generation: 1,
+        bytes: new Uint8Array(1024).fill(7),
+        mimeType: "application/octet-stream",
+      });
+      recordIds = [id];
+      sender.store.ingestBatch(
+        [
+          {
+            instance: "conn",
+            stream: "messages",
+            key: id,
+            emitted_at: at,
+            data: {
+              id,
+              text: maxRecordText,
+              blob_ref: {
+                blob_id: blob.blobId,
+                mime_type: blob.mimeType,
+                size_bytes: 1024,
+              },
+            },
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+        { method: "export", generation: 1 },
       );
-      return decodeReplicaFragment(plaintext, prepared.scope, owner);
-    }),
-  );
-  const payload = await inspectReplicaPayload(
-    () =>
-      assembleReplicaStream(
-        async function* () {
-          yield* fragments;
-        },
-        { maxBytes: admission.payloadBytes },
+    } else {
+      recordIds = ["operation-1", "operation-2"];
+      sender.store.ingestBatch(
+        recordIds.map((id) => ({
+          instance: "conn",
+          stream: "messages",
+          key: id,
+          data: { id, text: "within batch target" },
+          emitted_at: at,
+        })),
+        () => "mutable_state",
+        () => ["id"],
+        { method: "export", generation: 1 },
+      );
+    }
+    await cycles([sender], 24);
+    const batches = sender.db
+      .prepare(
+        `SELECT b.batch,b.total_bytes FROM pdpp_transport_batches b WHERE b.prepared=1 ORDER BY b.total_bytes DESC`,
+      )
+      .all() as { batch: string; total_bytes: number }[];
+    const batch = batches.find((row) => row.total_bytes > 0);
+    expect(batch, `${kind} must be prepared`).toBeDefined();
+    if (!batch) throw new Error("sender did not prepare an honest batch");
+    const outgoing = sender.db
+      .prepare(
+        "SELECT scope,encrypted FROM pdpp_transport_manifests_out WHERE batch=?",
+      )
+      .get(batch.batch) as { scope: string; encrypted: Buffer };
+    const manifest = decodeReplicaManifest(
+      await net.port.decrypt(
+        outgoing.scope,
+        new Uint8Array(outgoing.encrypted),
       ),
-    undefined,
-  );
-  // The baseline connection registration is a separate batch; this tail batch
-  // contains every record operation the configured sender limit can admit.
-  expect(payload.envelope.operations).toHaveLength(REPLICA_MAX_OPERATIONS - 1);
-  expect(payload.envelope.operations.length).toBeLessThanOrEqual(
-    DEFAULT_REPLICA_STREAMED_LIMITS.maxOperations,
-  );
-  expect(
-    Math.max(
-      ...payload.envelope.operations.map(
-        (operation) =>
-          new TextEncoder().encode(canonicalJson(operation)).length,
-      ),
-    ),
-  ).toBeLessThanOrEqual(DEFAULT_REPLICA_STREAMED_LIMITS.maxOperationBytes);
-  expect(
-    payload.blobs.reduce((total, blob) => total + blob.sizeBytes, 0),
-  ).toBeLessThanOrEqual(DEFAULT_REPLICA_STREAMED_LIMITS.maxBlobTotalBytes);
-  expect(admission.payloadBytes).toBeLessThanOrEqual(
-    DEFAULT_REPLICA_STREAMED_LIMITS.maxPayloadBytes,
-  );
-  expect(budget.reserved).toBe(admission.reservedBytes);
-  admission.release();
-  expect(budget.reserved).toBe(0);
+      outgoing.scope,
+      owner,
+    );
+    const admission = admit(
+      manifest,
+      new ReplicaByteBudget(1_000_000),
+      {
+        repositoryId: `h3-${kind}`,
+        owner,
+        manifestDigest: manifest.digest,
+      },
+      limits,
+    );
+    expect(admission).not.toHaveProperty("kind");
+    if ("kind" in admission) throw new Error("honest scaled batch was refused");
+    const receiver = device(net, {
+      worker: {
+        maxBatchOperations: 2,
+        maxBatchBytes: 1024,
+        resourceLimits: limits,
+      },
+    });
+    await cycles([receiver], 36);
+    for (const id of recordIds)
+      expect(receiver.get(id), `${kind} imports ${id}`).toBeDefined();
+    if (kind === "large-operation") {
+      const record = receiver.get(recordIds[0]!) as {
+        blob_ref: { blob_id: string };
+      };
+      expect(receiver.store.getBlobBytes(record.blob_ref.blob_id)).toEqual(
+        new Uint8Array(1024).fill(7),
+      );
+    }
+  };
+  await run("large-operation");
+  await run("operation-count");
 }, 60000);
+
+it("H4 persists sender resource_unsupported and blocks later writer batches", async () => {
+  const net = network();
+  const sender = device(net, {
+    preexisting: "oversized for configured replication limit",
+    worker: { resourceLimits: { maxAggregateCiphertextBytes: 1 } },
+  });
+  await cycles([sender], 24);
+  const refused = sender.db
+    .prepare(
+      `SELECT outcome,reason FROM pdpp_transport_batches WHERE prepared=-2`,
+    )
+    .get();
+  expect(refused).toEqual({
+    outcome: "unsupported",
+    reason: "resource_unsupported",
+  });
+  const blockedCount = (
+    sender.db
+      .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
+      .get() as { count: number }
+  ).count;
+  sender.put("later batch", "later");
+  await cycles([sender], 12);
+  expect(
+    (
+      sender.db
+        .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
+        .get() as { count: number }
+    ).count,
+  ).toBe(blockedCount);
+});
+
+it("H2 derives limits above the honest worst case from the exported write caps", () => {
+  expect(MAX_BLOB_UPLOAD_BYTES).toBe(REPLICA_DEFAULT_LIMITS.maxSourceBlobBytes);
+  expect(MAX_INGEST_BODY_BYTES).toBe(REPLICA_DEFAULT_LIMITS.maxRecordJsonBytes);
+  expect(REPLICA_BATCH_OPERATIONS).toBe(REPLICA_MAX_OPERATIONS);
+  const maximumBlobBase64 = 4 * Math.ceil(MAX_BLOB_UPLOAD_BYTES / 3);
+  const maximumSingleOperation =
+    maximumBlobBase64 +
+    MAX_INGEST_BODY_BYTES +
+    REPLICA_MAX_OPERATION_ENVELOPE_BYTES;
+  const honestPayload =
+    Math.max(
+      REPLICA_BATCH_BYTES + maximumSingleOperation,
+      REPLICA_BATCH_OPERATIONS * REPLICA_BATCH_BYTES,
+    ) + REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES;
+  const fragmentCount = Math.ceil(
+    honestPayload / REPLICA_DEFAULT_FRAGMENT_BYTES,
+  );
+  const honestCiphertext = replicaFramedBytesBound(
+    honestPayload,
+    fragmentCount,
+  );
+
+  expect(REPLICA_MAX_TOTAL_BYTES).toBeGreaterThanOrEqual(honestPayload);
+  expect(REPLICA_MAX_AGGREGATE_CIPHERTEXT_BYTES).toBeGreaterThanOrEqual(
+    honestCiphertext,
+  );
+  expect(REPLICA_DEFAULT_LIMITS.maxOperationBytes).toBeGreaterThanOrEqual(
+    maximumSingleOperation,
+  );
+  expect(REPLICA_DEFAULT_LIMITS.maxSingleBlobBytes).toBeGreaterThanOrEqual(
+    MAX_BLOB_UPLOAD_BYTES,
+  );
+}, 30000);
+
+it("M3 defaults the per-process object budget to 512 MiB", () => {
+  expect(REPLICA_DEFAULT_BYTE_BUDGET_BYTES).toBe(512 * 1024 * 1024);
+  expect(
+    100 * 1024 * 1024 * 4,
+    "the #500 per-object cap times the copy factor fits the budget",
+  ).toBeLessThanOrEqual(REPLICA_DEFAULT_BYTE_BUDGET_BYTES);
+});
 
 it("E1 rejects declared aggregate ciphertext over its limit before fragment GET", async () => {
   const net = network();
@@ -1716,6 +2058,7 @@ it("E1 rejects declared aggregate ciphertext over its limit before fragment GET"
     encrypt: net.port.encrypt,
   });
   const slot = slotKey(scope, version);
+  const resourceLimits = { maxAggregateCiphertextBytes: 1_000_000_000 };
   expect(
     admit(
       decodeReplicaManifest(prepared.plaintext, scope, owner),
@@ -1725,6 +2068,7 @@ it("E1 rejects declared aggregate ciphertext over its limit before fragment GET"
         owner,
         manifestDigest: `sha256:${"3".repeat(64)}`,
       },
+      { ...REPLICA_DEFAULT_LIMITS, ...resourceLimits },
     ),
   ).toMatchObject({
     kind: "resource_unsupported",
@@ -1741,7 +2085,7 @@ it("E1 rejects declared aggregate ciphertext over its limit before fragment GET"
   };
   net.head.set(slot, commitment);
   net.chain.set(slot, { ...net.chainRow(slot, commitment), blockNumber: 123n });
-  const receiver = device(net);
+  const receiver = device(net, { worker: { resourceLimits } });
   await cycles([receiver], 3);
 
   expect(
@@ -1845,7 +2189,7 @@ it("E1 refuses an authenticated payload over the streamed operation limit withou
   };
   net.head.set(slot, commitment);
   net.chain.set(slot, { ...net.chainRow(slot, commitment), blockNumber: 123n });
-  const resourceBudget = new ReplicaByteBudget(100_000_000);
+  const resourceBudget = new ReplicaByteBudget(512 * 1024 * 1024);
   const receiver = device(net, {
     cap: REPLICA_MAX_BLOB_BYTES,
     worker: { resourceBudget },
@@ -1968,7 +2312,7 @@ it("E2 routes an overlength fragment through fragment_mismatch and releases admi
   };
   net.head.set(slot, commitment);
   net.chain.set(slot, { ...net.chainRow(slot, commitment), blockNumber: 123n });
-  const resourceBudget = new ReplicaByteBudget(10_000_000);
+  const resourceBudget = new ReplicaByteBudget(512 * 1024 * 1024);
   let reservations = 0;
   let releases = 0;
   const reserve = resourceBudget.reserve.bind(resourceBudget);

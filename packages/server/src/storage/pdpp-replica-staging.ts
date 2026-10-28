@@ -44,7 +44,6 @@ export function createReplicaStagingStore(input: {
 }) {
   const { db, repositoryId, owner } = input;
   const now = input.now ?? Date.now;
-  const activeReservations = new Map<string, () => void>();
   db.exec(migration);
 
   function handle(data: HandleData): StagedObject {
@@ -71,12 +70,6 @@ export function createReplicaStagingStore(input: {
       | undefined;
   }
 
-  function release(admission: Admission) {
-    const releaseReservation = activeReservations.get(admission.admissionId);
-    activeReservations.delete(admission.admissionId);
-    (releaseReservation ?? admission.release)();
-  }
-
   function removeObject(objectId: string) {
     const row = rowFor(objectId);
     if (!row) return false;
@@ -84,21 +77,12 @@ export function createReplicaStagingStore(input: {
     db.prepare(
       "DELETE FROM pdpp_transport_staged_objects WHERE object_id=?",
     ).run(objectId);
-    releaseAdmissionId(row.admission_id);
     return true;
-  }
-
-  function releaseAdmissionId(admissionId: string) {
-    const releaseReservation = activeReservations.get(admissionId);
-    if (!releaseReservation) return;
-    activeReservations.delete(admissionId);
-    releaseReservation();
   }
 
   function begin(admission: Admission) {
     if (admission.repositoryId !== repositoryId || admission.owner !== owner)
       throw new Error("admission authority mismatch");
-    activeReservations.set(admission.admissionId, admission.release);
     const objectId = randomUUID();
     const namespaceKey = randomUUID();
     const writer = binaryWriter(db, "staging", namespaceKey);
@@ -229,7 +213,6 @@ export function createReplicaStagingStore(input: {
         )
         .all(admission.admissionId) as { object_id: string }[];
       for (const row of rows) removeObject(row.object_id);
-      release(admission);
     }).immediate();
   }
 
@@ -237,8 +220,6 @@ export function createReplicaStagingStore(input: {
   function reclaimAdmission(admission: Admission) {
     if (admission.repositoryId !== repositoryId || admission.owner !== owner)
       throw new Error("admission authority mismatch");
-    if (activeReservations.has(admission.admissionId))
-      throw new Error("admission already has active staged objects");
     return db
       .transaction(() => {
         const rows = db
@@ -302,7 +283,6 @@ export function createReplicaStagingStore(input: {
     reclaimAdmission,
     cleanup,
     cleanupAttachedTemporaryBytes,
-    release,
     leaseMs: STAGED_OBJECT_LEASE_MS,
   };
 }

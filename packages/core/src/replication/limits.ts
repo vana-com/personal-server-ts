@@ -1,27 +1,55 @@
 /** Protocol limits shared by replication senders, admission, and stream readers. */
+import { MAX_DECLARATION_BYTES } from "../pdpp/declaration.js";
+
 export const REPLICA_MAX_FRAGMENTS = 100_000;
 /** vana-storage DEFAULT_MAX_BLOB_SIZE. Compare the actual encrypted request. */
 export const REPLICA_MAX_BLOB_BYTES = 100 * 1024 * 1024;
 /** Per-fragment framing allowance used by the #500 aggregate ciphertext check. */
 export const REPLICA_FRAGMENT_OVERHEAD_BYTES = 4096;
 
-/**
- * The source write APIs cap an ingest body and a blob at 512 MiB. Four times
- * that source cap covers an ingest body plus one base64-encoded maximum blob
- * with room for the rest of the payload; sender preparation enforces this cap.
- */
-export const REPLICA_MAX_TOTAL_BYTES = 4 * 512 * 1024 * 1024;
-/** Node capture already limits a batch to 10,000 operations. */
-export const REPLICA_MAX_OPERATIONS = 10_000;
-/** An operation cannot exceed its enclosing admitted payload. */
-export const REPLICA_MAX_OPERATION_BYTES = REPLICA_MAX_TOTAL_BYTES;
-/** Base64 uses at least as many bytes as decoded blobs; both fit totalBytes. */
-export const REPLICA_MAX_BLOB_TOTAL_BYTES = REPLICA_MAX_TOTAL_BYTES;
-/** Derived from totalBytes for the same reason as the aggregate blob bound. */
-export const REPLICA_MAX_SINGLE_BLOB_BYTES = REPLICA_MAX_TOTAL_BYTES;
+/** Same source-write bounds used by the Node PDPP routes. */
+export const REPLICA_SOURCE_MAX_BLOB_BYTES = 512 * 1024 * 1024;
+export const REPLICA_SOURCE_MAX_RECORD_JSON_BYTES = 512 * 1024 * 1024;
+/** Node capture's persisted batch target and operation count. */
+export const REPLICA_BATCH_TARGET_BYTES = 32 * 1024 * 1024;
+export const REPLICA_BATCH_OPERATION_LIMIT = 10_000;
+/** Node prepares 4 MiB payload chunks before #500 encryption overhead. */
+export const REPLICA_DEFAULT_FRAGMENT_BYTES = 4 * 1024 * 1024;
+export const REPLICA_MAX_OPERATIONS = REPLICA_BATCH_OPERATION_LIMIT;
 /** One retained evidence row is created for each manifest fragment. */
 export const REPLICA_MAX_EVIDENCE_ROWS = REPLICA_MAX_FRAGMENTS;
-export const REPLICA_LIMITS_VERSION = 1;
+export const REPLICA_LIMITS_VERSION = 2;
+
+/**
+ * Operation metadata can repeat the record key and carries declaration-bound
+ * source/method identifiers. Bound that overhead by a second ingest body plus
+ * the largest retained declaration and fixed replication fields.
+ */
+export const REPLICA_MAX_OPERATION_ENVELOPE_BYTES =
+  REPLICA_SOURCE_MAX_RECORD_JSON_BYTES + MAX_DECLARATION_BYTES + 64 * 1024;
+/** The payload-level header is fixed apart from its retained declaration IDs. */
+export const REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES =
+  2 * MAX_DECLARATION_BYTES + 64 * 1024;
+export const REPLICA_MAX_SINGLE_OPERATION_BYTES =
+  4 * Math.ceil(REPLICA_SOURCE_MAX_BLOB_BYTES / 3) +
+  REPLICA_SOURCE_MAX_RECORD_JSON_BYTES +
+  REPLICA_MAX_OPERATION_ENVELOPE_BYTES;
+
+/**
+ * The first operation may exceed the target, then later operations may fill
+ * the target; otherwise every operation fits the target and count is binding.
+ */
+export const REPLICA_MAX_TOTAL_BYTES =
+  Math.max(
+    REPLICA_BATCH_TARGET_BYTES + REPLICA_MAX_SINGLE_OPERATION_BYTES,
+    REPLICA_BATCH_OPERATION_LIMIT * REPLICA_BATCH_TARGET_BYTES,
+  ) + REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES;
+/** Each streamed operation is bounded by the admitted payload that contains it. */
+export const REPLICA_MAX_OPERATION_BYTES = REPLICA_MAX_TOTAL_BYTES;
+/** A blob cannot exceed the actual Node source write cap. */
+export const REPLICA_MAX_SINGLE_BLOB_BYTES = REPLICA_SOURCE_MAX_BLOB_BYTES;
+/** Base64 blob bytes are part of totalBytes, so their sum cannot exceed it. */
+export const REPLICA_MAX_BLOB_TOTAL_BYTES = REPLICA_MAX_TOTAL_BYTES;
 
 /**
  * The maximum encrypted fragment bytes for a payload of `totalBytes` and
@@ -34,11 +62,50 @@ export function replicaFramedBytesBound(totalBytes: number, count: number) {
   );
 }
 
-/**
- * A 512 MiB uploaded blob expands to about 683 MiB of base64; 1 GiB leaves
- * room for its envelope and fragment framing while bounding stored evidence.
- */
-export const REPLICA_MAX_AGGREGATE_CIPHERTEXT_BYTES = 1024 * 1024 * 1024;
+/** Maximum declared encrypted bytes for an honest payload and 100,000 fragments. */
+export const REPLICA_MAX_AGGREGATE_CIPHERTEXT_BYTES =
+  4 * Math.ceil(REPLICA_MAX_TOTAL_BYTES / 3) +
+  REPLICA_MAX_FRAGMENTS * (4 + REPLICA_FRAGMENT_OVERHEAD_BYTES);
+/** Four live representations: ciphertext, plaintext, parsed JSON and decoded bytes. */
+export const REPLICA_LIVE_COPY_FACTOR = 4;
+/** 100 MiB #500 per-object cap × four copies = 400 MiB, below this budget. */
+export const REPLICA_DEFAULT_BYTE_BUDGET_BYTES = 512 * 1024 * 1024;
+
+export interface ReplicaResourceLimits {
+  maxSourceBlobBytes: number;
+  maxRecordJsonBytes: number;
+  maxManifestCiphertextBytes: number;
+  maxFragmentCiphertextBytes: number;
+  maxAggregateCiphertextBytes: number;
+  maxFragments: number;
+  maxEvidenceRows: number;
+  maxTotalBytes: number;
+  maxOperations: number;
+  maxOperationBytes: number;
+  maxSingleBlobBytes: number;
+  maxBlobTotalBytes: number;
+}
+
+export const REPLICA_DEFAULT_LIMITS: ReplicaResourceLimits = Object.freeze({
+  maxSourceBlobBytes: REPLICA_SOURCE_MAX_BLOB_BYTES,
+  maxRecordJsonBytes: REPLICA_SOURCE_MAX_RECORD_JSON_BYTES,
+  maxManifestCiphertextBytes: REPLICA_MAX_BLOB_BYTES,
+  maxFragmentCiphertextBytes: REPLICA_MAX_BLOB_BYTES,
+  maxAggregateCiphertextBytes: REPLICA_MAX_AGGREGATE_CIPHERTEXT_BYTES,
+  maxFragments: REPLICA_MAX_FRAGMENTS,
+  maxEvidenceRows: REPLICA_MAX_EVIDENCE_ROWS,
+  maxTotalBytes: REPLICA_MAX_TOTAL_BYTES,
+  maxOperations: REPLICA_MAX_OPERATIONS,
+  maxOperationBytes: REPLICA_MAX_OPERATION_BYTES,
+  maxSingleBlobBytes: REPLICA_MAX_SINGLE_BLOB_BYTES,
+  maxBlobTotalBytes: REPLICA_MAX_BLOB_TOTAL_BYTES,
+});
+
+export function replicaResourceLimits(
+  overrides: Partial<ReplicaResourceLimits> = {},
+): ReplicaResourceLimits {
+  return Object.freeze({ ...REPLICA_DEFAULT_LIMITS, ...overrides });
+}
 
 export interface DeclaredReplicaManifest {
   totalBytes: number;
@@ -80,9 +147,6 @@ export class ReplicaByteBudget {
   }
 }
 
-// Ciphertext, plaintext, parsed JSON tree, and base64-decoded fragment bytes.
-export const REPLICA_LIVE_COPY_FACTOR = 4;
-
 const admissionBrand: unique symbol = Symbol("ReplicaAdmission");
 export interface Admission {
   readonly [admissionBrand]: true;
@@ -90,11 +154,9 @@ export interface Admission {
   readonly repositoryId: string;
   readonly owner: string;
   readonly manifestDigest: string;
-  readonly ciphertextBytes: number;
   readonly payloadBytes: number;
-  readonly reservedBytes: number;
   readonly limitsVersion: number;
-  release(): void;
+  reserveObject(ciphertextBytes: number): (() => void) | ResourceRefusal;
 }
 
 export type AdmissionResult = Admission | ResourceRefusal;
@@ -112,19 +174,29 @@ export class ReplicaResourceLimitError extends Error {
   }
 }
 
-/** Check manifest-declared totals only and reserve bounded live-copy capacity. */
+export class ReplicaResourceBusyError extends Error {
+  readonly code = "resource_busy";
+
+  constructor() {
+    super("replica object reservation is busy");
+    this.name = "ReplicaResourceBusyError";
+  }
+}
+
+/** Check manifest-declared totals and issue an object-reservation capability. */
 export function admit(
   manifest: DeclaredReplicaManifest,
   budget: ReplicaByteBudget,
   identity: { repositoryId: string; owner: string; manifestDigest: string },
+  limits: ReplicaResourceLimits = REPLICA_DEFAULT_LIMITS,
 ): AdmissionResult {
-  if (manifest.fragments.length > REPLICA_MAX_EVIDENCE_ROWS)
+  if (manifest.fragments.length > limits.maxEvidenceRows)
     return unsupported("retained_evidence_rows");
-  if (manifest.fragments.length > REPLICA_MAX_FRAGMENTS)
+  if (manifest.fragments.length > limits.maxFragments)
     return unsupported("fragment_count");
   if (
     manifest.fragments.some(
-      (fragment) => fragment.bytes > REPLICA_MAX_BLOB_BYTES,
+      (fragment) => fragment.bytes > limits.maxFragmentCiphertextBytes,
     )
   )
     return unsupported("fragment_ciphertext_bytes");
@@ -134,7 +206,7 @@ export function admit(
   );
   if (
     !Number.isSafeInteger(ciphertextBytes) ||
-    ciphertextBytes > REPLICA_MAX_AGGREGATE_CIPHERTEXT_BYTES ||
+    ciphertextBytes > limits.maxAggregateCiphertextBytes ||
     ciphertextBytes >
       replicaFramedBytesBound(manifest.totalBytes, manifest.fragments.length)
   )
@@ -142,22 +214,21 @@ export function admit(
   if (
     !Number.isSafeInteger(manifest.totalBytes) ||
     manifest.totalBytes < 1 ||
-    manifest.totalBytes > REPLICA_MAX_TOTAL_BYTES
+    manifest.totalBytes > limits.maxTotalBytes
   )
     return unsupported("total_bytes");
 
-  const reservedBytes = ciphertextBytes * REPLICA_LIVE_COPY_FACTOR;
-  const release = budget.reserve(reservedBytes);
-  if (typeof release !== "function") return release;
   return Object.freeze({
     [admissionBrand]: true as const,
     admissionId: `${identity.repositoryId}:${identity.owner}:${identity.manifestDigest}`,
     ...identity,
-    ciphertextBytes,
     payloadBytes: manifest.totalBytes,
-    reservedBytes,
     limitsVersion: REPLICA_LIMITS_VERSION,
-    release,
+    reserveObject(ciphertextBytes: number) {
+      if (!Number.isSafeInteger(ciphertextBytes) || ciphertextBytes < 0)
+        throw new RangeError("invalid replica object size");
+      return budget.reserve(ciphertextBytes * REPLICA_LIVE_COPY_FACTOR);
+    },
   });
 }
 

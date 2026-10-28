@@ -222,12 +222,12 @@ export async function* assembleReplicaStream(
       (f.sequence === 1) !== (f.previous === null) ||
       !f.content.length
     )
-      throw new Error("inconsistent replica fragments");
+      throw new ReplicaProblemError("payload_invalid");
     const chunkHash = sha256.create();
     for (let position = 0; position < f.content.length; position += 64 * 1024) {
       const encoded = f.content.slice(position, position + 64 * 1024);
       if (position + encoded.length < f.content.length && encoded.includes("="))
-        throw new Error("noncanonical base64");
+        throw new ReplicaProblemError("payload_invalid");
       const chunk = fromBase64(encoded);
       offset += chunk.length;
       if (
@@ -240,12 +240,13 @@ export async function* assembleReplicaStream(
       yield chunk;
     }
     if (digestOf(chunkHash) !== f.chunkDigest)
-      throw new Error("corrupt replica fragment");
+      throw new ReplicaProblemError("payload_invalid");
     index++;
   }
   if (!first || index !== first.count || offset !== first.totalBytes)
-    throw new Error("incomplete replica batch");
-  if (digestOf(hash) !== first.digest) throw new Error("corrupt replica batch");
+    throw new ReplicaProblemError("payload_invalid");
+  if (digestOf(hash) !== first.digest)
+    throw new ReplicaProblemError("payload_invalid");
 }
 
 // Decode bounded input windows; a caller may supply arbitrarily large source frames.

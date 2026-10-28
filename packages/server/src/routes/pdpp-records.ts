@@ -17,6 +17,10 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
+  REPLICA_SOURCE_MAX_BLOB_BYTES,
+  REPLICA_SOURCE_MAX_RECORD_JSON_BYTES,
+} from "@opendatalabs/personal-server-ts-core/replication/limits";
+import {
   CursorExpiredError,
   InvalidCursorError,
   InvalidCursorSyntaxError,
@@ -39,10 +43,10 @@ import {
   type StreamCompletionFailure,
 } from "../storage/pdpp-stream-completion.js";
 
-export const MAX_BLOB_UPLOAD_BYTES = 512 * 1024 * 1024;
+export const MAX_BLOB_UPLOAD_BYTES = REPLICA_SOURCE_MAX_BLOB_BYTES;
 
 /** 512 MiB — max body size for PDPP record ingest and replace routes. */
-export const MAX_INGEST_BODY_BYTES = 512 * 1024 * 1024;
+export const MAX_INGEST_BODY_BYTES = REPLICA_SOURCE_MAX_RECORD_JSON_BYTES;
 /** 64 KiB of UTF-8 — max body size for the completion metadata route. */
 export const MAX_COMPLETION_BODY_BYTES = 64 * 1024;
 

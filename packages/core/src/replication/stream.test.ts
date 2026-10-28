@@ -176,6 +176,55 @@ it("caps assembled payload bytes at the admitted amount", async () => {
   }).rejects.toMatchObject({ code: "payload_invalid" });
 });
 
+it("T4 rejects missing, duplicate, overlapping, altered and inconsistent fragments", async () => {
+  const bytes = new TextEncoder().encode(
+    "payload whose fragment edges must stay exact".repeat(80),
+  );
+  const parts = await fragmentReplicaPayload({
+    owner: identity.owner,
+    writer: "a".repeat(32),
+    batch: "b".repeat(32),
+    sequence: 1,
+    previous: null,
+    bytes,
+    collectedAt: "2026-10-20T00:00:00.000Z",
+    encrypt: async (_scope, input) => input,
+    targetChunkBytes: 70,
+  });
+  const fragments = parts.map((part) =>
+    decodeReplicaFragment(part.plaintext, part.scope, identity.owner),
+  );
+  const refused = async (value: typeof fragments) => {
+    await expect(async () => {
+      for await (const _chunk of assembleReplicaStream(async function* () {
+        yield* value;
+      }))
+        void _chunk;
+    }).rejects.toMatchObject({ code: "payload_invalid" });
+  };
+
+  await refused(fragments.slice(0, -1));
+  await refused([fragments[0]!, fragments[0]!, ...fragments.slice(2)]);
+  await refused([
+    fragments[0]!,
+    { ...fragments[1]!, offset: fragments[1]!.offset - 1 },
+    ...fragments.slice(2),
+  ]);
+  await refused([
+    fragments[0]!,
+    {
+      ...fragments[1]!,
+      content: `${fragments[1]!.content[0] === "A" ? "B" : "A"}${fragments[1]!.content.slice(1)}`,
+    },
+    ...fragments.slice(2),
+  ]);
+  await refused([
+    fragments[0]!,
+    { ...fragments[1]!, totalBytes: fragments[1]!.totalBytes - 1 },
+    ...fragments.slice(2),
+  ]);
+});
+
 it("E2 aborts on the first byte beyond the declaration and releases admission", async () => {
   const plaintext = new TextEncoder().encode("actual payload");
   const parts = await fragmentReplicaPayload({
@@ -208,6 +257,9 @@ it("E2 aborts on the first byte beyond the declaration and releases admission", 
     },
   );
   if ("kind" in admission) throw new Error("expected admission");
+  const reservation = admission.reserveObject(parts[0]!.encrypted.length);
+  if (typeof reservation !== "function")
+    throw new Error("expected fragment reservation");
 
   try {
     await expect(async () => {
@@ -220,7 +272,7 @@ it("E2 aborts on the first byte beyond the declaration and releases admission", 
         void _chunk;
     }).rejects.toMatchObject({ code: "payload_invalid" });
   } finally {
-    admission.release();
+    reservation();
   }
   expect(budget.reserved).toBe(0);
 });
