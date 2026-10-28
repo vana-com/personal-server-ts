@@ -689,7 +689,7 @@ it("17d an idle step reads no retained history: no canonical reconcile and no qu
 
 // ========================================================================= 18
 
-it("18 per-phase isolation: a preparation backlog does not stop an independent remote batch from importing in one step", async () => {
+it("18 a prepared Retry blocks new local slots but does not stop an independent remote batch from importing", async () => {
   const net = network();
   // Written before the baseline: registration and record travel in one batch.
   const a = transportDevice(net, { preexisting: "remote" });
@@ -707,22 +707,57 @@ it("18 per-phase isolation: a preparation backlog does not stop an independent r
   });
   await stepUntil(b, () => countFor(tally.promote, writerA) >= 1, 12);
 
-  // Sixteen local batches whose encryption is down: a preparation backlog.
+  // This database already contains a large pre-gate preparation backlog.
   net.faults.encrypt = () => new Error("encryption down");
   for (let i = 0; i < 16; i++) b.put(`local ${i}`, `l${i}`);
-  await stepUntil(b, () => batchCount(b) >= 12, 80, 5);
+  await stepUntil(b, () => unpreparedBatches(b) > 0, 80, 5);
+  const targetBacklog = 12;
+  const state = b.db
+    .prepare(
+      "SELECT sequence,previous_json FROM pdpp_transport_state WHERE id=1",
+    )
+    .get() as { sequence: number; previous_json: string | null };
+  let sequence = state.sequence;
+  let previous = state.previous_json;
+  while (unpreparedBatches(b) < targetBacklog) {
+    sequence++;
+    const batch = `legacy-backlog-${sequence}`;
+    const digest = `sha256:${sequence.toString(16).padStart(64, "0")}`;
+    b.db
+      .prepare(
+        `INSERT INTO pdpp_transport_batches
+          (batch,sequence,previous_json,collected_at,digest,total_bytes,
+           prepared,outcome,reason,attempts,next_attempt,wait_since)
+         VALUES (?,?,?,?,?,1,0,'retry','prepare_failed',1,?,?)`,
+      )
+      .run(
+        batch,
+        sequence,
+        previous,
+        new Date(clock.now()).toISOString(),
+        digest,
+        clock.now() + B1,
+        clock.now(),
+      );
+    previous = JSON.stringify({ batch, digest });
+  }
+  b.db
+    .prepare(
+      "UPDATE pdpp_transport_state SET sequence=?,previous_json=? WHERE id=1",
+    )
+    .run(sequence, previous);
+  expect(batchCount(b)).toBeGreaterThanOrEqual(targetBacklog);
+  expect(unpreparedBatches(b)).toBe(targetBacklog);
 
-  // Everything is due now: the whole backlog and the retained remote import.
-  net.faults.encrypt = undefined;
+  // Every retained batch is now due. The preparation phase must not starve import.
   clock.advance(2 * 3_600_000);
   const report = await step(b, { units: 8 });
   expect(b.get("a"), "remote batch starved by the preparation backlog").toEqual(
     a.get("a"),
   );
-  expect(
-    unpreparedBatches(b),
-    "the backlog was not a real backlog",
-  ).toBeGreaterThan(0);
+  expect(unpreparedBatches(b), "the legacy backlog should remain durable").toBe(
+    targetBacklog,
+  );
   expect(report?.receipts.some((r) => r.phase === "import")).toBe(true);
 });
 

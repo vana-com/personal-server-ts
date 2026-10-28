@@ -167,6 +167,24 @@ describe("replication flag off (the default)", () => {
     expect(schemaVersion(db)).toBe(main.schemaVersion);
   });
 
+  it("reopens a flag-off database with main's schema and ordinary write behavior", () => {
+    const path = file();
+    const firstDb = open(path);
+    const first = openRecordStore(firstDb, false);
+    register(first);
+    ingest(first, "before-reopen", "kept while replication is off");
+    first.close();
+
+    const reopenedDb = open(path);
+    const reopened = openRecordStore(reopenedDb, false);
+    expect(schemaOf(reopenedDb)).toEqual(main.objects);
+    expect(schemaVersion(reopenedDb)).toBe(main.schemaVersion);
+    expect(keys(reopened)).toEqual(["before-reopen"]);
+    ingest(reopened, "after-reopen", "still ordinary storage");
+    expect(keys(reopened)).toEqual(["after-reopen", "before-reopen"]);
+    expect(schemaOf(reopenedDb)).toEqual(main.objects);
+  });
+
   it("runs no replica SQL and adds no schema across writes, reads and deletes", () => {
     const seen: string[] = [];
     const db = open();

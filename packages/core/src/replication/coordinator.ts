@@ -129,7 +129,12 @@ export interface ReplicaBudget {
 
 export interface ProgressReport {
   receipts: ReplicaReceipt[];
-  waits: { id: string; phase: ReplicaPhase; dependency: ReplicaDependency }[];
+  waits: {
+    id: string;
+    phase: ReplicaPhase;
+    dependency: ReplicaDependency;
+    ageMs?: number;
+  }[];
   problems: {
     id: string;
     phase: ReplicaPhase;
@@ -360,7 +365,14 @@ export function createReplicaCoordinator(input: {
   ) {
     if (outcome.tag === "progress") report.receipts.push(outcome.receipt);
     else if (outcome.tag === "wait")
-      report.waits.push({ id, phase, dependency: outcome.dependency });
+      report.waits.push({
+        id,
+        phase,
+        dependency: outcome.dependency,
+        ...(outcome.dependency.kind === "registration_pending" && {
+          ageMs: Math.max(0, stepNow - outcome.dependency.since),
+        }),
+      });
     else if (outcome.tag === "retry")
       report.problems.push({
         id,

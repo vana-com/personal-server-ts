@@ -21,6 +21,16 @@ export type ReplicaPhase =
 export type ReplicaDependency =
   | { kind: "predecessor"; key: string }
   | { kind: "finality"; key: string; checkedBlock: string }
+  /** A writer's registration intent is unresolved at this publication slot. */
+  | {
+      kind: "registration_pending";
+      key: string;
+      version: number;
+      since: number;
+      checkedBlock?: string;
+      /** Next evidence check for a successor waiting on this registration. */
+      nextCheckAt?: number;
+    }
   | { kind: "fragments"; key: string }
   | { kind: "mapping"; key: string }
   | { kind: "declaration"; key: string }

@@ -335,7 +335,10 @@ describe("retries and crashes never register twice", () => {
   async function crashWorld() {
     const crash = new CrashController();
     const net = network({ crash });
-    const a = await sender(net, { crash });
+    const a = await sender(net, {
+      crash,
+      worker: { registrationIntentTimeoutMs: 5_000 },
+    });
     const r = transportDevice(net);
     await steps([a, r], 2);
     forget(net);

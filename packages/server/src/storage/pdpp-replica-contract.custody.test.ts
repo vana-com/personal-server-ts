@@ -556,6 +556,7 @@ async function sourceWorld(options: SourceOptions): Promise<World> {
     crash,
     chunk: options.chunk,
     preexisting: options.text,
+    worker: { registrationIntentTimeoutMs: 5_000 },
   });
   const b = transportDevice(net, { chunk: options.chunk });
   const sourceValue = a.get();
@@ -885,7 +886,12 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
   // puts); further cycles only repeat no-op phases before the window opens.
   await cycleAll([a], 2);
   if (options.pageSize) net.pageSize(options.pageSize);
-  const b = transportDevice(net, { chunk, cap: 64 * 1024, crash });
+  const b = transportDevice(net, {
+    chunk,
+    cap: 64 * 1024,
+    crash,
+    worker: { registrationIntentTimeoutMs: 5_000 },
+  });
   const journalBefore = count(
     b.db,
     "SELECT count(*) AS n FROM pdpp_replica_own_writes",

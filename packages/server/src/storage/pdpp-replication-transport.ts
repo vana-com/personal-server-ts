@@ -28,6 +28,7 @@ import {
   replicaWriterOf,
   REPLICA_MAX_BLOB_BYTES,
   type ManifestEntry,
+  type PreparedManifest,
   type ReplicaFragment,
   type ReplicaManifest,
   type Predecessor,
@@ -57,6 +58,11 @@ import {
   type ReplicaPhaseHandler,
   type ReplicaWorkItem,
 } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
+import {
+  assertReplicationStepOpen,
+  assertReplicationTransactionOpen,
+  beginReplicationStep,
+} from "./pdpp-replication-door.js";
 import {
   dependencyKey,
   outcomeReason,
@@ -117,6 +123,8 @@ export const REPLICA_BATCH_BYTES = 32 * 1024 * 1024;
 const EXPORT_PAGE = 1000;
 /** New slots one discover pass admits per writer scope. */
 const DISCOVER_SLOTS = 256;
+/** An unresolved AddData intent is retried only after this bounded window. */
+export const REPLICA_REGISTRATION_INTENT_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** Durable outcome columns shared by every per-item work table. */
 const WORK = `outcome TEXT, reason TEXT, cause_json TEXT, dependency TEXT, error TEXT,
@@ -150,6 +158,12 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_manifests_out (
  batch TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL,
  plaintext BLOB NOT NULL, encrypted BLOB NOT NULL, data_hash TEXT NOT NULL, metadata_hash TEXT NOT NULL,
  state TEXT NOT NULL DEFAULT 'ready', ${WORK}, UNIQUE(scope,version));
+CREATE TABLE IF NOT EXISTS pdpp_transport_registration_intents (
+ scope TEXT NOT NULL, version INTEGER NOT NULL, owner TEXT NOT NULL,
+ manifest_hash TEXT NOT NULL, request_id TEXT NOT NULL UNIQUE,
+ created_at INTEGER NOT NULL, attempted_at INTEGER NOT NULL,
+ attempts INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'unresolved',
+ PRIMARY KEY(scope,version));
 CREATE TABLE IF NOT EXISTS pdpp_transport_manifests_in (
  slot TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL, writer TEXT NOT NULL,
  manifest_json TEXT, data_hash TEXT, metadata_hash TEXT, batch TEXT, sequence INTEGER,
@@ -200,6 +214,9 @@ type Outbound = Work & {
   id: string;
   batch: string;
   position: number;
+  scope: string | null;
+  version: number | null;
+  outcome: string | null;
 };
 type ManifestOut = {
   batch: string;
@@ -340,11 +357,21 @@ export function createReplicaTransportWorker(deps: {
   revalidateIntervalMs?: number;
   /** Completed non-matching re-downloads of a batch before the owner decides. */
   refetchBudget?: number;
+  /** Maximum age before a slot with authoritative absence may be resubmitted. */
+  registrationIntentTimeoutMs?: number;
 }) {
   const { db, transport } = deps;
   const now = deps.now ?? Date.now;
   const roster = createCachedReplicaRoster(deps.authority.roster, { now });
   const server = deps.authority.signer.address.toLowerCase();
+  const registrationIntentTimeout =
+    deps.registrationIntentTimeoutMs ?? REPLICA_REGISTRATION_INTENT_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(registrationIntentTimeout) ||
+    registrationIntentTimeout < 1 ||
+    registrationIntentTimeout > REPLICA_REGISTRATION_INTENT_TIMEOUT_MS
+  )
+    throw new RangeError("invalid registration intent timeout");
   const cap = deps.maxBlobBytes ?? REPLICA_MAX_BLOB_BYTES;
   if (!Number.isSafeInteger(cap) || cap < 1 || cap > REPLICA_MAX_BLOB_BYTES)
     throw new RangeError("invalid storage cap");
@@ -368,6 +395,7 @@ export function createReplicaTransportWorker(deps: {
   db.exec(migration);
   deps.receiver.setPendingEnabled(deps.enabled === true);
   const enabled = () => deps.enabled === true;
+  let activeStepSignal: AbortSignal | undefined;
   const state = () =>
     db.prepare("SELECT * FROM pdpp_transport_state WHERE id=1").get() as State;
 
@@ -477,18 +505,42 @@ export function createReplicaTransportWorker(deps: {
   const commitIn =
     <I extends ReplicaWorkItem>(
       write: (outcome: ReplicaOutcome, work: ReplicaWorkState, item: I) => void,
+      isCurrent?: (item: I) => boolean,
     ) =>
     (item: I, attempt: ReplicaAttempt, settle: ReplicaSettle): ReplicaOutcome =>
       // The receiver's own boundary: its plans read and write derived state,
       // which a transaction opened on the raw connection would not refresh.
-      deps.receiver.atomically(() => {
-        const settled = settle(attempt.plan?.() ?? attempt.outcome);
-        write(settled.outcome, settled.state, item);
-        return settled.outcome;
-      });
+      (() => {
+        const signal = activeStepSignal;
+        if (!signal)
+          throw new Error("replication commit outside a worker step");
+        // Check before receiver.atomically raises the capture guard. SQLite
+        // serializes door closure against the transaction once it starts.
+        assertReplicationStepOpen(db, signal);
+        return deps.receiver.atomically(() => {
+          assertReplicationTransactionOpen(db, signal);
+          // A receipt belongs to the exact row state selected by `due`. If a
+          // newer worker changed it while this attempt was in flight, discard
+          // the older receipt and its plan before any projection can advance.
+          if (isCurrent && !isCurrent(item))
+            return {
+              tag: "retry",
+              problem: "storage_failed",
+              nextEligible: item.state.nextEligible,
+            };
+          const settled = settle(attempt.plan?.() ?? attempt.outcome);
+          write(settled.outcome, settled.state, item);
+          return settled.outcome;
+        });
+      })();
   /** Network calls stop at the attempt's deadline or the host's abort. */
   const call = <T>(signal: AbortSignal, start: () => Promise<T>) =>
-    abortable(signal, start);
+    abortable(signal, async () => {
+      assertReplicationStepOpen(db, signal);
+      const value = await start();
+      assertReplicationStepOpen(db, signal);
+      return value;
+    });
   /** The coordinator's eligibility policy over a work table's columns. */
   const due = (e: ReplicaEligibility) =>
     `${replicaEligibleAtSql(e)} <= ${e.now}`;
@@ -597,21 +649,22 @@ export function createReplicaTransportWorker(deps: {
     );
   }
   /**
-   * A retained batch that is still on its way to a finalized registration and
-   * is not failing. While one exists, new operations accumulate for the next
-   * batch instead of each step cutting its own: a sync costs one
-   * registration. A batch in Retry or Unsupported does not hold the window,
-   * so one failing batch never blocks its successors.
+   * Keep collecting source operations behind one unresolved publication. The
+   * current manifest reports its typed wait. Only an explicit no-slot
+   * Unsupported batch, a committed manifest, or a proven immutable-slot
+   * conflict frees a claim. Every other or unknown batch state blocks.
    */
   function batchInFlight() {
     return !!db
       .prepare(
-        `SELECT 1 FROM pdpp_transport_batches b WHERE
-          (b.prepared=0 AND coalesce(b.outcome,'')<>'retry')
-          OR (b.prepared=1 AND EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m
-            WHERE m.batch=b.batch AND m.state='ready' AND coalesce(m.outcome,'')<>'retry'
-            AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f
-              WHERE f.batch=b.batch AND f.outcome='retry')))
+        `SELECT 1 FROM pdpp_transport_batches b WHERE NOT (
+          b.prepared=-1
+          OR (b.prepared=1 AND EXISTS (
+            SELECT 1 FROM pdpp_transport_manifests_out m WHERE m.batch=b.batch
+              AND (m.state='published' OR
+                (m.state='quarantined' AND m.outcome='quarantine'
+                  AND m.reason='immutable_registration_conflict'))))
+          )
           LIMIT 1`,
       )
       .get();
@@ -1022,22 +1075,85 @@ export function createReplicaTransportWorker(deps: {
   };
 
   // -------------------------------------------------------------- publish
-  /**
-   * Fragment PUTs, and manifests ready to register: every fragment of the
-   * batch is stored and the previous version is published. DPv2 accepts only
-   * the next version, so a writer has at most one registration in flight.
-   */
+  /** Fragment PUTs and manifests ready for ordered registration. */
   const OUTBOUND = `(SELECT 'fragment' AS kind, batch||':'||position AS id, batch, position,
-      attempts,next_attempt,wait_since,checked_block,outcome,dependency
+      NULL AS scope,NULL AS version,attempts,next_attempt,wait_since,checked_block,outcome,dependency
       FROM pdpp_transport_fragments_out WHERE state='ready'
     UNION ALL
     SELECT 'manifest' AS kind, m.scope||'/'||m.version AS id, m.batch, -1 AS position,
-      m.attempts,m.next_attempt,m.wait_since,m.checked_block,m.outcome,m.dependency
+      m.scope,m.version,m.attempts,m.next_attempt,m.wait_since,m.checked_block,m.outcome,m.dependency
       FROM pdpp_transport_manifests_out m WHERE m.state='ready'
-      AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=m.batch AND f.state<>'stored')
-      AND (m.version=1 OR EXISTS (SELECT 1 FROM pdpp_transport_manifests_out p WHERE p.scope=m.scope AND p.version=m.version-1 AND p.state='published')))`;
+      AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=m.batch AND f.state<>'stored'))`;
+  type RegistrationIntent = {
+    owner: string;
+    manifest_hash: string;
+    request_id: string;
+    created_at: number;
+    attempted_at: number;
+    attempts: number;
+    status: string;
+  };
+  const registrationIntent = (scope: string, version: number) =>
+    db
+      .prepare(
+        "SELECT owner,manifest_hash,request_id,created_at,attempted_at,attempts,status FROM pdpp_transport_registration_intents WHERE scope=? AND version=?",
+      )
+      .get(scope, version) as RegistrationIntent | undefined;
+  const pendingRegistration = (
+    key: string,
+    version: number,
+    since: number,
+    checkedBlock?: string,
+    nextCheckAt?: number,
+  ): ReplicaPhaseOutcome => ({
+    tag: "wait",
+    dependency: {
+      kind: "registration_pending",
+      key,
+      version,
+      since,
+      ...(checkedBlock !== undefined && { checkedBlock }),
+      ...(nextCheckAt !== undefined && { nextCheckAt }),
+    },
+  });
+  function recordRegistrationAttempt(
+    expected: ReplicaSlot,
+    encrypted: Uint8Array,
+    signal: AbortSignal,
+  ) {
+    const owner = expected.owner;
+    const manifestHash = `sha256:${createHash("sha256").update(encrypted).digest("hex")}`;
+    const attemptedAt = now();
+    db.transaction(() => {
+      assertReplicationStepOpen(db, signal);
+      const current = registrationIntent(expected.scope, expected.version);
+      if (current) {
+        if (current.owner !== owner || current.manifest_hash !== manifestHash)
+          throw new ReplicaProblemError("publish_failed");
+        db.prepare(
+          "UPDATE pdpp_transport_registration_intents SET attempted_at=?,attempts=attempts+1 WHERE scope=? AND version=? AND status='unresolved'",
+        ).run(attemptedAt, expected.scope, expected.version);
+        return;
+      }
+      db.prepare(
+        `INSERT INTO pdpp_transport_registration_intents
+          (scope,version,owner,manifest_hash,request_id,created_at,attempted_at,attempts,status)
+          VALUES (?,?,?,?,?,?,?,?, 'unresolved')`,
+      ).run(
+        expected.scope,
+        expected.version,
+        owner,
+        manifestHash,
+        randomUUID(),
+        attemptedAt,
+        attemptedAt,
+        1,
+      );
+    }).immediate();
+  }
   async function publishManifest(
     batch: string,
+    previousWaitSince: number | null,
     signal: AbortSignal,
   ): Promise<ReplicaAttempt> {
     const row = db
@@ -1052,12 +1168,71 @@ export function createReplicaTransportWorker(deps: {
       metadataHash: row.metadata_hash,
     };
     try {
+      if (row.version > 1) {
+        const predecessor = db
+          .prepare(
+            "SELECT state,outcome,reason,checked_block,next_attempt FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
+          )
+          .get(row.scope, row.version - 1) as
+          | {
+              state: string;
+              outcome: string | null;
+              reason: string | null;
+              checked_block: string | null;
+              next_attempt: number;
+            }
+          | undefined;
+        const predecessorSettled =
+          predecessor?.state === "published" ||
+          (predecessor?.state === "quarantined" &&
+            predecessor.outcome === "quarantine" &&
+            predecessor.reason === "immutable_registration_conflict");
+        if (!predecessorSettled) {
+          const intent = registrationIntent(row.scope, row.version - 1);
+          return verdict(
+            pendingRegistration(
+              slotKey(row.scope, row.version - 1),
+              row.version - 1,
+              intent?.created_at ?? previousWaitSince ?? now(),
+              predecessor?.checked_block ?? undefined,
+              predecessor?.next_attempt,
+            ),
+          );
+        }
+      }
       let evidence = await call(signal, () =>
         transport.evidence(row.scope, row.version),
       );
       let status = replicaRegistrationState(evidence, expected);
+      if (status === "conflict")
+        return verdict(quarantine("immutable_registration_conflict", key));
+      if (status === "confirmed")
+        return verdict({
+          tag: "progress",
+          receipt: { phase: "publish", key },
+        });
+      let intent = registrationIntent(row.scope, row.version);
+      if (status === "pending")
+        return verdict(
+          tailPending()
+            ? pendingRegistration(
+                key,
+                row.version,
+                intent?.created_at ?? previousWaitSince ?? now(),
+                evidence.chain?.blockNumber.toString(),
+              )
+            : finalityWait(evidence, key),
+        );
       if (status === "absent") {
-        const manifest = {
+        const timestamp = now();
+        if (
+          intent &&
+          timestamp - intent.attempted_at < registrationIntentTimeout
+        )
+          return verdict(
+            pendingRegistration(key, row.version, intent.created_at),
+          );
+        const manifest: PreparedManifest = {
           scope: row.scope,
           version: row.version,
           plaintext: row.plaintext,
@@ -1066,7 +1241,18 @@ export function createReplicaTransportWorker(deps: {
           metadataHash: row.metadata_hash,
         };
         await call(signal, () => transport.put(manifest));
-        await call(signal, () => transport.register(manifest));
+        recordRegistrationAttempt(expected, row.encrypted, signal);
+        try {
+          await call(signal, () => transport.register(manifest));
+        } catch {
+          return verdict(
+            pendingRegistration(
+              key,
+              row.version,
+              intent?.created_at ?? timestamp,
+            ),
+          );
+        }
         evidence = await call(signal, () =>
           transport.evidence(row.scope, row.version),
         );
@@ -1079,7 +1265,25 @@ export function createReplicaTransportWorker(deps: {
           tag: "progress",
           receipt: { phase: "publish", key },
         });
-      return verdict(unconfirmed(evidence, expected));
+      if (status === "pending")
+        return verdict(
+          tailPending()
+            ? pendingRegistration(
+                key,
+                row.version,
+                intent?.created_at ?? previousWaitSince ?? now(),
+                evidence.chain?.blockNumber.toString(),
+              )
+            : finalityWait(evidence, key),
+        );
+      intent = registrationIntent(row.scope, row.version);
+      return verdict(
+        pendingRegistration(
+          key,
+          row.version,
+          intent?.created_at ?? previousWaitSince ?? now(),
+        ),
+      );
     } catch (error) {
       return verdict(retryFromError(error, "publish_failed"));
     }
@@ -1091,7 +1295,12 @@ export function createReplicaTransportWorker(deps: {
       return (
         db
           .prepare(
-            dueWindow(OUTBOUND, "batch", "next_attempt,kind,position", due(e)),
+            dueWindow(
+              OUTBOUND,
+              "batch",
+              "next_attempt,kind,coalesce(version,0),position",
+              due(e),
+            ),
           )
           .all(limit.perWriter, limit.after ?? "", limit.total) as Outbound[]
       ).map((row) => ({
@@ -1105,7 +1314,8 @@ export function createReplicaTransportWorker(deps: {
     },
     async run(item, signal) {
       const row = item.row;
-      if (row.kind === "manifest") return publishManifest(row.batch, signal);
+      if (row.kind === "manifest")
+        return publishManifest(row.batch, row.wait_since, signal);
       try {
         const fragment = db
           .prepare(
@@ -1133,29 +1343,84 @@ export function createReplicaTransportWorker(deps: {
       }
     },
     commit: (item, attempt, settle) =>
-      commitIn<Item<Outbound>>((outcome, work) => {
-        const next =
-          outcome.tag === "progress"
-            ? item.row.kind === "manifest"
-              ? "published"
-              : "stored"
-            : outcome.tag === "quarantine"
-              ? "quarantined"
-              : "ready";
-        if (item.row.kind === "manifest")
-          db.prepare(
-            `UPDATE pdpp_transport_manifests_out SET ${WORK_SET},state=? WHERE batch=?`,
-          ).run(...workValues(outcome, work), next, item.row.batch);
-        else
-          db.prepare(
-            `UPDATE pdpp_transport_fragments_out SET ${WORK_SET},state=? WHERE batch=? AND position=?`,
-          ).run(
-            ...workValues(outcome, work),
-            next,
-            item.row.batch,
-            item.row.position,
+      commitIn<Item<Outbound>>(
+        (outcome, work) => {
+          const next =
+            outcome.tag === "progress"
+              ? item.row.kind === "manifest"
+                ? "published"
+                : "stored"
+              : outcome.tag === "quarantine"
+                ? "quarantined"
+                : "ready";
+          if (item.row.kind === "manifest")
+            db.prepare(
+              `UPDATE pdpp_transport_manifests_out SET ${WORK_SET},state=? WHERE batch=?`,
+            ).run(...workValues(outcome, work), next, item.row.batch);
+          if (item.row.kind === "manifest" && outcome.tag === "progress")
+            db.prepare(
+              "UPDATE pdpp_transport_registration_intents SET status='confirmed' WHERE scope=? AND version=?",
+            ).run(item.row.scope!, item.row.version!);
+          if (item.row.kind === "manifest" && outcome.tag === "quarantine")
+            db.prepare(
+              "UPDATE pdpp_transport_registration_intents SET status='conflict' WHERE scope=? AND version=?",
+            ).run(item.row.scope!, item.row.version!);
+          else
+            db.prepare(
+              `UPDATE pdpp_transport_fragments_out SET ${WORK_SET},state=? WHERE batch=? AND position=?`,
+            ).run(
+              ...workValues(outcome, work),
+              next,
+              item.row.batch,
+              item.row.position,
+            );
+          if (item.row.kind === "manifest")
+            db.prepare(
+              `UPDATE pdpp_transport_manifests_out SET next_attempt=?
+               WHERE scope=? AND version>? AND state='ready'
+                 AND dependency=?`,
+            ).run(
+              outcome.tag === "quarantine" ? now() : work.nextEligible,
+              item.row.scope!,
+              item.row.version!,
+              `registration_pending:${slotKey(item.row.scope!, item.row.version!)}`,
+            );
+        },
+        (selected) => {
+          const row = selected.row;
+          const current =
+            row.kind === "manifest"
+              ? (db
+                  .prepare(
+                    "SELECT state,attempts,next_attempt,wait_since,checked_block,outcome FROM pdpp_transport_manifests_out WHERE batch=?",
+                  )
+                  .get(row.batch) as
+                  | (Work & {
+                      state: string;
+                      outcome: string | null;
+                    })
+                  | undefined)
+              : (db
+                  .prepare(
+                    "SELECT state,attempts,next_attempt,wait_since,checked_block,outcome FROM pdpp_transport_fragments_out WHERE batch=? AND position=?",
+                  )
+                  .get(row.batch, row.position) as
+                  | (Work & {
+                      state: string;
+                      outcome: string | null;
+                    })
+                  | undefined);
+          return (
+            current !== undefined &&
+            current.state === "ready" &&
+            current.attempts === row.attempts &&
+            current.next_attempt === row.next_attempt &&
+            current.wait_since === row.wait_since &&
+            current.checked_block === row.checked_block &&
+            current.outcome === row.outcome
           );
-      })(item, attempt, settle),
+        },
+      )(item, attempt, settle),
     commitProblem: "publish_failed",
     earliest(e) {
       return earliestIn(e, `${OUTBOUND} outbound`);
@@ -2254,40 +2519,45 @@ export function createReplicaTransportWorker(deps: {
       !replicationAdmitted(db)
     )
       return idle();
-    // Writer ids come from this server's own registration. Until it is
-    // registered under the owner, nothing runs.
-    running = true;
-    let own;
+    const lifetime = beginReplicationStep(db, input.signal);
+    let writerToken: string | undefined;
     try {
-      own = await enableReplicaWriterIdentity({
-        db,
-        owner: deps.expected().owner,
-        server,
-        roster,
-        signal: input.signal,
-      });
-    } finally {
-      running = false;
-    }
-    if (own.tag === "refused") return idle();
-    if (own.tag === "waiting")
-      return {
-        ...idle(),
-        waits: [
-          {
-            id: "writer-identity",
-            phase: "retain",
-            dependency: { kind: "roster", key: server },
-          },
-        ],
-        nextWake: now() + REPLICA_WAIT_FALLBACK_MS,
-      };
-    const writerToken = randomUUID();
-    acquireWriter(writerToken);
-    running = true;
-    activeDatabases.add(databaseKey);
-    try {
-      // Under the writer lock: a new identity resets the writer's chain.
+      if (lifetime.signal.aborted) return idle();
+      // Writer ids come from this server's signed registration. Until it is
+      // registered under the owner, no replication phase runs. The same
+      // lifetime signal also stops this read if the door closes mid-step.
+      running = true;
+      let own;
+      try {
+        own = await enableReplicaWriterIdentity({
+          db,
+          owner: deps.expected().owner,
+          server,
+          roster,
+          signal: lifetime.signal,
+        });
+      } finally {
+        running = false;
+      }
+      if (lifetime.signal.aborted || own.tag === "refused") return idle();
+      if (own.tag === "waiting")
+        return {
+          ...idle(),
+          waits: [
+            {
+              id: "writer-identity",
+              phase: "retain",
+              dependency: { kind: "roster", key: server },
+            },
+          ],
+          nextWake: now() + REPLICA_WAIT_FALLBACK_MS,
+        };
+      writerToken = randomUUID();
+      acquireWriter(writerToken);
+      running = true;
+      activeDatabases.add(databaseKey);
+      activeStepSignal = lifetime.signal;
+      // Under the writer lock: a new identity resets its chain transactionally.
       if (!authority(own.identity)) return idle();
       // Only this process owns the worker. None of these hidden stages can be published.
       db.transaction(() => {
@@ -2307,19 +2577,23 @@ export function createReplicaTransportWorker(deps: {
       }
       return await coordinator.step(
         now(),
-        input.signal,
+        lifetime.signal,
         input.budget ?? { units: Number.POSITIVE_INFINITY },
       );
     } finally {
-      running = false;
-      activeDatabases.delete(databaseKey);
-      try {
-        db.prepare(
-          "DELETE FROM pdpp_transport_lock WHERE id=1 AND token=?",
-        ).run(writerToken);
-      } finally {
-        ownedTokens.delete(writerToken);
-      }
+      lifetime.close();
+      activeStepSignal = undefined;
+      if (writerToken) {
+        running = false;
+        activeDatabases.delete(databaseKey);
+        try {
+          db.prepare(
+            "DELETE FROM pdpp_transport_lock WHERE id=1 AND token=?",
+          ).run(writerToken);
+        } finally {
+          ownedTokens.delete(writerToken);
+        }
+      } else running = false;
     }
   }
   return {

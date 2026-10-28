@@ -714,7 +714,8 @@ describe("07 Retry to Wait does not confuse attempts with waits", () => {
     expect(d.get()).toEqual({ id: "a", text: "record" });
 
     evidence.fail = true;
-    clock.advance(2000);
+    const waitingAgain = logical(d, "pdpp_transport_manifests_out")[0]!;
+    clock.advance(Math.max(0, waitingAgain.nextEligible - clock.now()));
     const t = clock.now();
     await step(d);
     expect(logical(d, "pdpp_transport_manifests_out")[0]).toMatchObject({
@@ -1125,10 +1126,12 @@ describe("13 Transient RangeError", () => {
 
     d.put("second", "b");
     clock.advance(500);
-    await step(d); // before the deadline: the successor progresses, the stuck batch does not
+    await step(d); // before the deadline: the claimed slot blocks its successor
     expect(encrypted.filter((b) => b === stuckBatch)).toHaveLength(1);
-    expect(net.calls.registrations.length).toBeGreaterThan(0);
+    expect(net.calls.registrations).toHaveLength(0);
     expect(registeredBatches(d, net)).not.toContain(stuckBatch);
+    expect(batchRows(d)).toHaveLength(1);
+    expect(logical(d, "pdpp_transport_manifests_out")).toHaveLength(0);
     expect(
       logical(d, "pdpp_transport_batches").find((r) => r.id === stuckBatch)
         ?.prepared,
@@ -1145,6 +1148,8 @@ describe("13 Transient RangeError", () => {
     expect(recovered.prepared).toBe(1);
     expect(recovered.outcome).toBe("progress");
     expect(registeredBatches(d, net)).toContain(stuckBatch);
+    await step(d); // the waiting source operation may claim the next slot now
+    expect(net.calls.registrations).toHaveLength(2);
     expect(d.get()).toEqual({ id: "a", text: "first" });
   });
 });

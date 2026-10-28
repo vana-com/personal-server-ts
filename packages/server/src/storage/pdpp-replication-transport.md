@@ -43,10 +43,11 @@ one registration.
   When one commit writes all its blob claims before its records and is
   larger than the bound, most of its blob bytes go out twice. Removing that
   needs a payload that can refer to bytes an earlier batch carried.
-- **Coalescing.** While a batch is on its way to a finalized registration, no
-  new batch is cut; new operations wait for the next one. A batch in Retry or
-  Unsupported does not hold this window, so one failing batch never blocks its
-  successors.
+- **Ordering.** One unresolved registration holds later source operations in
+  the journal; no successor version is claimed yet. The current manifest
+  reports a typed wait with its slot and intent age. After that slot resolves,
+  the worker retains the waiting operations as the next batch. It never skips a
+  version.
 
 Every object uses the existing per-scope key derivation, OpenPGP encryption,
 plaintext keccak commitment, metadata commitment and AddData signature. The
@@ -248,16 +249,24 @@ imported batch identities. One worker per database is the host contract.
    binary payloads.
 3. Store every fragment. A fragment PUT is safe to repeat: the address is the
    content, and nothing refers to it until the manifest is finalized. Then
-   store the manifest and register it once. Before every registration attempt,
-   reconcile the slot. Confirmed evidence must match the owner/scope/version
+   store the manifest and persist a registration intent containing the owner,
+   scope, version, encrypted manifest hash, local request id and attempt time
+   before calling `register()`. The request id is for local correlation; the
+   DataPoint AddData endpoint has no
+   idempotency-key field, so an unresolved intent is not resubmitted until
+   authoritative evidence confirms it or proves absence after the bounded
+   five-minute intent timeout. A pending Gateway head or chain registration
+   remains a typed Wait and does not expire into a second submission. After
+   authoritative absence and timeout, the worker reuses the same slot and
+   exact manifest bytes. Confirmed evidence must match the owner/scope/version
    head to a finalized DataRegistryV2 commitment at that version and Active
-   status. Absence retries the same slot and bytes; pending settlement waits.
-   Only a finalized commitment at the slot that differs from the durable
-   expected hash pair quarantines. A later version is normal: versions append.
-   Gateway disagreement stays pending. A registration response alone does not
-   acknowledge publication, so a lost acknowledgement and its retry register
-   once. A crash between fragment upload and registration leaves only
-   unregistered fragments, which no receiver can reach.
+   status. Only a finalized commitment at the slot that differs from the
+   durable expected hash pair quarantines. A later version is normal: versions
+   append. A registration response alone does not acknowledge publication; a
+   crash or lost acknowledgement is resolved from the durable intent and
+   evidence. SQLite and the Gateway do not share a transaction. A crash
+   between fragment upload and registration leaves only unregistered
+   fragments, which no receiver can reach.
 4. Repeated paginated owner scans list each writer scope with its current
    version. Discovery retains new slots, at most 256 per writer scope per pass,
    before it advances the scan cursor. End-of-scan restarts at page one. A
@@ -293,8 +302,11 @@ Without hints, waiting rows use a two-second cadence. Actual errors and Gateway
 head disagreements retain exponential backoff (1 second through 1 hour).
 Successful waiting or confirmed evidence clears the error streak. One failed
 address cannot monopolize the oldest 50. Preparation has its own durable retry
-state; impossible framing is quarantined. A missing predecessor intentionally
-blocks descendants on that writer's chain, while other writers can advance.
+state; impossible framing is quarantined. A pending predecessor blocks later
+source batches on that writer's chain, while other writers can advance. The
+current slot's typed wait remains visible; authoritative absence after the
+intent timeout retries that same version and ciphertext. A successor is
+retained only after the predecessor is confirmed.
 Each cycle attempts every phase even if an earlier phase fails, then reports
 collected errors so retained imports can advance during a feed outage.
 New large canonical, pinned and received bytes use the same 64 KiB chunk store.
