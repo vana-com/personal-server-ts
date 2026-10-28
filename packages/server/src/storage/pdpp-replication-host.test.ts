@@ -1,0 +1,216 @@
+import Database from "better-sqlite3";
+import { join } from "node:path";
+import { expect, it } from "vitest";
+import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { createTestReplicaSigner } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
+import type { ReplicationTimers } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
+import {
+  at,
+  clock,
+  network,
+  owner,
+  scratchDirectory,
+} from "./pdpp-replica-contract.test-utils.js";
+import { REPLICA_TEST_CHAIN_ID } from "./pdpp-replica-writer-identity.test-utils.js";
+import { createNodeReplication } from "./pdpp-replication-host.js";
+
+const SOURCE = "https://registry.pdpp.dev/connectors/host-test";
+const declaration: DeclarationSnapshot = {
+  source_id: SOURCE,
+  source_kind: "connector" as DeclarationSnapshot["source_kind"],
+  version: "1",
+  digest: "c".repeat(64),
+  streams: [
+    {
+      name: "messages",
+      fields: ["id", "text"],
+      required_fields: ["id"],
+      primary_key: ["id"],
+      schema: {
+        type: "object",
+        properties: { id: { type: "string" }, text: { type: "string" } },
+        required: ["id"],
+      },
+    },
+  ],
+};
+const logger = { info: () => {}, warn: () => {} };
+/** The driver's own timer stays unarmed: the test steps by trigger. */
+const manualTimers: ReplicationTimers = {
+  now: clock.now,
+  setTimeout: () => undefined,
+  clearTimeout: () => {},
+};
+
+function host(
+  net: ReturnType<typeof network>,
+  opts: { chainId?: number; declarations?: DeclarationSnapshot[] } = {},
+) {
+  const db = new Database(join(scratchDirectory("replica-host"), "db.sqlite"));
+  const signer = createTestReplicaSigner();
+  net.roster.register(signer.address, owner);
+  const runtime = createNodeReplication({
+    db,
+    owner,
+    chainId: opts.chainId ?? REPLICA_TEST_CHAIN_ID,
+    declarations: opts.declarations ?? [declaration],
+    serverAccount: signer,
+    ports: () => ({ transport: net.port, roster: net.roster.port }),
+    logger,
+    timers: manualTimers,
+    worker: { now: clock.now, targetChunkBytes: 4000, maxBlobBytes: 8192 },
+  });
+  return { db, runtime };
+}
+
+function started(h: ReturnType<typeof host>) {
+  if (h.runtime.state !== "started") throw new Error(h.runtime.reason);
+  const { store, driver } = h.runtime;
+  store.registerConnection({
+    instance: "conn",
+    sourceId: SOURCE,
+    method: "export",
+    label: "C",
+  });
+  return {
+    ...h.runtime,
+    put(text: string) {
+      store.ingestBatch(
+        [
+          {
+            instance: "conn",
+            stream: "messages",
+            key: "a",
+            data: { id: "a", text },
+            emitted_at: at,
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+        { method: "export", generation: 1 },
+      );
+      void driver.trigger(); // the local-write trigger a host would fire
+    },
+    get: () => store.getRecord("conn", "messages", "a")?.data,
+  };
+}
+
+it("two Node hosts built from retained declarations converge through their drivers", async () => {
+  const net = network();
+  const a = started(host(net));
+  const b = started(host(net));
+  a.driver.start();
+  b.driver.start();
+  a.put("from A");
+  for (let i = 0; i < 12 && b.get()?.text !== "from A"; i++) {
+    clock.advance(10_000);
+    await a.driver.trigger();
+    await b.driver.trigger();
+  }
+  expect(b.get()).toEqual({ id: "a", text: "from A" });
+  // The owner reader sees the record through the receiver's reader port.
+  expect(
+    a.reads("owner").getRecord("conn", "messages", "a")?.data,
+  ).toMatchObject({ text: "from A" });
+  expect(b.driver.status()).toMatchObject({ state: "running" });
+  expect(await a.driver.stop(1_000)).toBe(true);
+  expect(await b.driver.stop(1_000)).toBe(true);
+  expect(a.driver.status().state).toBe("stopped");
+}, 60_000);
+
+/** Step a started host once: its writer identity, then its first baseline. */
+async function baselineOnce(h: ReturnType<typeof host>) {
+  const { driver } = started(h);
+  const settings = () =>
+    h.db.prepare("SELECT 1 FROM pdpp_replica_settings WHERE id = 1").get();
+  expect(settings()).toBeUndefined();
+  driver.start();
+  await driver.trigger();
+  expect(await driver.stop(1_000)).toBe(true);
+  expect(settings()).toBeDefined();
+}
+
+it("a restart with the same declarations reuses the baseline", async () => {
+  const net = network();
+  const first = host(net);
+  await baselineOnce(first);
+  const again = createNodeReplication({
+    db: first.db,
+    owner,
+    chainId: REPLICA_TEST_CHAIN_ID,
+    declarations: [declaration],
+    serverAccount: createTestReplicaSigner(),
+    ports: () => ({ transport: net.port, roster: net.roster.port }),
+    logger,
+    timers: manualTimers,
+  });
+  expect(again.state).toBe("started");
+});
+
+it("waits for the roster before the first baseline", async () => {
+  const net = network();
+  const db = new Database(join(scratchDirectory("replica-host"), "db.sqlite"));
+  // Not registered under the owner: the identity cannot be established yet.
+  const runtime = createNodeReplication({
+    db,
+    owner,
+    chainId: REPLICA_TEST_CHAIN_ID,
+    declarations: [declaration],
+    serverAccount: createTestReplicaSigner(),
+    ports: () => ({ transport: net.port, roster: net.roster.port }),
+    logger,
+    timers: manualTimers,
+  });
+  if (runtime.state !== "started") throw new Error(runtime.reason);
+  runtime.driver.start();
+  const report = await runtime.driver.trigger();
+  expect(report?.waits).toEqual([
+    expect.objectContaining({ id: "writer-identity" }),
+  ]);
+  expect(
+    db.prepare("SELECT 1 FROM pdpp_replica_settings WHERE id = 1").get(),
+  ).toBeUndefined();
+  expect(await runtime.driver.stop(1_000)).toBe(true);
+});
+
+it("blocks without persisting anything it cannot keep", () => {
+  const net = network();
+  const unsupported = host(net, { chainId: 1 });
+  expect(unsupported.runtime).toEqual({
+    state: "blocked",
+    reason: "unsupported_chain:1",
+  });
+  const empty = host(net, { declarations: [] });
+  expect(empty.runtime).toEqual({
+    state: "blocked",
+    reason: "no_retained_declarations",
+  });
+  for (const { db } of [unsupported, empty])
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE name = 'pdpp_replica_settings'",
+        )
+        .get(),
+    ).toBeUndefined();
+});
+
+it("refuses a later, different declaration set on a baselined database", async () => {
+  const net = network();
+  const first = host(net);
+  await baselineOnce(first);
+  const upgraded = createNodeReplication({
+    db: first.db,
+    owner,
+    chainId: REPLICA_TEST_CHAIN_ID,
+    declarations: [{ ...declaration, version: "2" }],
+    serverAccount: createTestReplicaSigner(),
+    ports: () => ({ transport: net.port, roster: net.roster.port }),
+    logger,
+    timers: manualTimers,
+  });
+  expect(upgraded).toEqual({
+    state: "blocked",
+    reason: "replication binding is immutable",
+  });
+});

@@ -98,6 +98,12 @@ import {
   resolveReplication,
 } from "./pdpp/records-bootstrap.js";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
+import {
+  createNodeReplication,
+  createNodeReplicationPorts,
+  NODE_REPLICATION_STOP_GRACE_MS,
+  type NodeReplication,
+} from "./storage/pdpp-replication-host.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
 import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
@@ -146,6 +152,11 @@ export interface ServerContext {
   cleanup: () => Promise<void>;
   /** This boot's replication door, decided before any record store opened. */
   replicationStatus: ReplicationDoorStatus;
+  /**
+   * The replication runtime. Absent unless the door is on. `started` steps
+   * from `startBackgroundServices` until `cleanup`.
+   */
+  replication?: NodeReplication;
 }
 
 export interface CreateServerOptions {
@@ -953,6 +964,52 @@ export async function createServer(
     logger,
   );
 
+  // The replication runtime: receiver, transport worker and coordinator
+  // driver. Only behind an open door; a flag-off boot constructs none of it.
+  // It needs the owner, this server's registered key and the retained
+  // declarations, and never runs in an enclave.
+  let nodeReplication: NodeReplication | undefined;
+  if (replication.enabled) {
+    nodeReplication =
+      !isEnclave &&
+      masterKeySignature &&
+      serverOwner &&
+      serverAccount &&
+      serverSigner &&
+      pdppAuth
+        ? createNodeReplication({
+            db,
+            owner: serverOwner,
+            chainId: config.gateway.chainId,
+            declarations: pdppAuth.retainedDeclarations,
+            serverAccount,
+            ports: (owner) =>
+              createNodeReplicationPorts({
+                config,
+                owner,
+                masterKey: deriveMasterKey(masterKeySignature),
+                storage: createVanaSyncStorageAdapter({
+                  config,
+                  serverOwner,
+                  serverAccount,
+                  reads: "signed",
+                }),
+                gateway: gatewayClient,
+                feed: dataPointFeed,
+                signer: serverSigner,
+              }),
+            logger,
+          })
+        : { state: "blocked", reason: "missing_owner_key_or_declarations" };
+    if (nodeReplication.state === "blocked")
+      logger.warn(
+        { reason: nodeReplication.reason },
+        "Replication is on but cannot run on this boot",
+      );
+  }
+  const replicaHost =
+    nodeReplication?.state === "started" ? nodeReplication : undefined;
+
   if (pdppAuth) {
     registerLegacyDataConnections({
       db,
@@ -981,11 +1038,15 @@ export async function createServer(
     logger,
     configuredMethods: pdppAuth?.configuredMethods,
     replication: replication.enabled,
+    replica: replicaHost && {
+      store: replicaHost.store,
+      reads: replicaHost.reads,
+    },
   });
 
   const pdppConnections = pdppAuth
     ? {
-        store: openRecordStore(db, replication.enabled),
+        store: replicaHost?.store ?? openRecordStore(db, replication.enabled),
         auth: pdppRecords?.auth ?? coLocatedAuthorizationService(pdppAuth),
         ownerSubjectId: serverOwner!,
         connectionMethods: new Map(pdppAuth.connectionMethods),
@@ -1136,6 +1197,12 @@ export async function createServer(
   const cleanup = async () => {
     backgroundClosed = true;
     clearRegistrationPoll();
+    // Before the database closes: abort the running step and let it settle.
+    if (
+      replicaHost &&
+      !(await replicaHost.driver.stop(NODE_REPLICATION_STOP_GRACE_MS))
+    )
+      logger.warn("Replication step did not settle before shutdown");
     derivativeScheduler.stop();
     if (tunnelManager) {
       await tunnelManager.stop();
@@ -1167,7 +1234,10 @@ export async function createServer(
     },
     devToken,
     replicationStatus: replication.status,
+    replication: nodeReplication,
     startBackgroundServices: async () => {
+      // Steps once now, then follows the coordinator's next wake.
+      if (!backgroundClosed) replicaHost?.driver.start();
       // Replay questions a previous run left pending or stale: nothing
       // else reschedules them after a restart (registration and source
       // changes only cover new activity).

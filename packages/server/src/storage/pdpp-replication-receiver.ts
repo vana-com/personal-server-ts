@@ -135,7 +135,8 @@ interface StoredRow {
 }
 
 /**
- * Internal port, deliberately absent from bootstrap and connector routes. The host
+ * Internal port, absent from connector routes. Bootstrap builds it only through
+ * `createNodeReplication`, behind `replication.enabled`. The host
  * must verify a replica-specific credential before returning its owner. A payload,
  * a collector credential, and a source declaration are never authentication.
  * Connection ids are the registered canonical instance ids (the export profile).
