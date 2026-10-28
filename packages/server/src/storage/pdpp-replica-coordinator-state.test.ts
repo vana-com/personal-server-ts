@@ -284,3 +284,47 @@ it("a trigger that corrupts the just-written cursor cannot leave a receipt", () 
     db.close();
   }
 });
+
+it("abort inside a synchronous checkpoint rolls back SQLite receipt and cursor without a fallback Retry", async () => {
+  const h = open();
+  try {
+    h.acquire("a");
+    const port = h.port("a");
+    const controller = new AbortController();
+    const handler: ReplicaPhaseHandler = {
+      phase: "publish",
+      due: () => [
+        {
+          id: "x",
+          phase: "publish",
+          writer: "A",
+          state: { ...initialReplicaWorkState },
+        },
+      ],
+      run: async () => ({
+        outcome: { tag: "progress", receipt: { phase: "publish", key: "x" } },
+        plan: () => {
+          controller.abort();
+        },
+      }),
+      commit(_item, attempt, settle) {
+        const result = settle(attempt.plan?.() ?? attempt.outcome);
+        h.checkpoint(result.outcome.tag);
+        return result.outcome;
+      },
+      earliest: () => 0,
+    };
+    await assert.rejects(
+      createReplicaCoordinator({ state: port, phases: [handler] }).step({
+        now: 1000,
+        budget: { units: 1 },
+        signal: controller.signal,
+      }),
+      { name: "AbortError" },
+    );
+    assert.deepEqual(h.receipts(), []);
+    assert.equal(port.load().version, 0);
+  } finally {
+    h.close();
+  }
+});

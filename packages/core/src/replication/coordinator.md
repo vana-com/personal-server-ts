@@ -69,7 +69,11 @@ after returning a receipt is allowed. A stale owner/revision rejects before
 the plan and is not converted into a fallback Retry. A failed attempt plan may
 roll back and commit one Retry plus one cursor revision in a new transaction.
 
-An abort does **not** advance rotation or persist this attempt's outcome/plan.
+An abort observed before the durable checkpoint commits does **not** advance
+rotation or persist this attempt's outcome/plan. Core rechecks after the run
+promise settles and inside the fenced checkpoint; Node also checks before its
+outer transaction returns. Abort after durable commit (including during resource
+release) does not undo that already-committed receipt or cursor.
 A timeout **does** advance, atomically with its durable `deadline_exceeded`
 Retry; otherwise one hot/hung early writer can monopolize the restart turn.
 Neither decision rewrites PR507's preexisting registration-intent/recovery

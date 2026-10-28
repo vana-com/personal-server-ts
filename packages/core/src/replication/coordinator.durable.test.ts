@@ -373,3 +373,58 @@ it("a late attempt from a lost owner cannot commit a plan or fallback Retry", as
   assert.equal(h.port.load().owner, "b");
   assert.equal(h.port.load().version, 1);
 });
+
+it("an abort between run settlement and checkpoint dispatch discards and releases the result", async () => {
+  for (let depth = 1; depth <= 12; depth++) {
+    const controller = new AbortController();
+    const h = memory();
+    const handler = phase("publish", ["A"], h.receipts);
+    let releases = 0;
+    let committedAfterAbort = false;
+    const abortAfter = (remaining: number): void => {
+      if (remaining) queueMicrotask(() => abortAfter(remaining - 1));
+      else controller.abort();
+    };
+    handler.run = async () => {
+      abortAfter(depth);
+      return {
+        outcome: { tag: "progress", receipt: { phase: "publish", key: "A" } },
+        release: () => {
+          releases++;
+        },
+      };
+    };
+    const commit = handler.commit;
+    handler.commit = (item, attempt, settle) => {
+      committedAfterAbort = controller.signal.aborted;
+      return commit(item, attempt, settle);
+    };
+    await createReplicaCoordinator({ state: h.port, phases: [handler] }).step({
+      now: 1000,
+      budget: { units: 1 },
+      signal: controller.signal,
+    });
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    assert.equal(committedAfterAbort, false, `microtask depth ${depth}`);
+    assert.equal(releases, 1, `release at depth ${depth}`);
+  }
+});
+
+it("abort after the durable commit does not erase its receipt or cursor", async () => {
+  const h = memory();
+  const controller = new AbortController();
+  const handler = phase("publish", ["A"], h.receipts);
+  handler.run = async () => ({
+    outcome: { tag: "progress", receipt: { phase: "publish", key: "A" } },
+    // Resource release is after the port transaction returned successfully.
+    release: () => controller.abort(),
+  });
+  const report = await createReplicaCoordinator({
+    state: h.port,
+    phases: [handler],
+  }).step({ now: 1000, budget: { units: 1 }, signal: controller.signal });
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(report.receipts.length, 1);
+  assert.equal(h.port.load().version, 1);
+  assert.deepEqual(h.receipts, ["publish:A:progress"]);
+});

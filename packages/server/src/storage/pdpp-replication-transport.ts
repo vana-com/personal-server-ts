@@ -3871,7 +3871,11 @@ export function createReplicaTransportWorker(deps: {
         const signal = activeStepSignal;
         if (!signal || !enabled()) throw new ReplicaCoordinatorConflict();
         assertReplicationStepOpen(db, signal);
-        return deps.receiver.atomically(run);
+        return deps.receiver.atomically(() => {
+          const result = run();
+          assertReplicationTransactionOpen(db, signal);
+          return result;
+        });
       },
     }),
     phases: [

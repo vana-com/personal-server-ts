@@ -428,6 +428,7 @@ export function createReplicaCoordinator(input: {
     handler: ReplicaPhaseHandler,
     item: ReplicaWorkItem,
     attempt: ReplicaAttempt,
+    signal: AbortSignal | undefined,
   ): ReplicaOutcome {
     const settle: ReplicaSettle = (verdict) =>
       settleReplicaWork(item.state, verdict, input.clock?.() ?? stepNow, {
@@ -440,7 +441,18 @@ export function createReplicaCoordinator(input: {
         nextPhase: input.phases[(position + 1) % input.phases.length]?.phase,
         writers: { ...state.writers, [handler.phase]: item.writer },
       };
-      const checkpoint = () => handler.commit(item, value, settle);
+      const checkpoint = () => {
+        const assertNotAborted = () => {
+          if (signal?.aborted)
+            throw signal.reason ?? new DOMException("aborted", "AbortError");
+        };
+        assertNotAborted();
+        const result = handler.commit(item, value, settle);
+        // Still inside the durable state port's outer transaction. A plan
+        // may synchronously close the host lifetime; roll back its effects.
+        assertNotAborted();
+        return result;
+      };
       if (input.state) {
         const committed = input.state.commit(state, next, checkpoint);
         state = committed.state;
@@ -453,7 +465,11 @@ export function createReplicaCoordinator(input: {
     try {
       return advance(attempt);
     } catch (error) {
-      if (!attempt.plan || error instanceof ReplicaCoordinatorConflict)
+      if (
+        signal?.aborted ||
+        !attempt.plan ||
+        error instanceof ReplicaCoordinatorConflict
+      )
         throw error;
       return advance({
         outcome: retryFromError(
@@ -599,11 +615,14 @@ export function createReplicaCoordinator(input: {
                 const attempt = await execute(handler, item, signal);
                 if (attempt === undefined) break;
                 try {
+                  // Abort can arrive between the winning run promise and this
+                  // continuation. Discard/release before entering a checkpoint.
+                  if (aborted()) break;
                   record(
                     report,
                     handler.phase,
                     item.id,
-                    commit(handler, item, attempt),
+                    commit(handler, item, attempt, signal),
                   );
                 } finally {
                   attempt.release?.();
