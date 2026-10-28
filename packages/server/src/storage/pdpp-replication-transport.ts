@@ -707,7 +707,11 @@ export function createReplicaTransportWorker(deps: {
         // newer worker changed it while this attempt was in flight, discard
         // the older receipt and its plan before any projection can advance.
         if (isCurrent && !isCurrent(item))
-          throw new ReplicaCoordinatorConflict();
+          return {
+            tag: "retry",
+            problem: "storage_failed",
+            nextEligible: item.state.nextEligible,
+          };
         const settled = settle(attempt.plan?.() ?? attempt.outcome);
         write(settled.outcome, settled.state, item);
         return settled.outcome;

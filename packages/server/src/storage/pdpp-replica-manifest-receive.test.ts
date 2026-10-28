@@ -337,7 +337,7 @@ it("a manifest naming more fragment bytes than its payload needs is manifest_inv
     2,
     encode(fanout),
   );
-  await receiver.step({ units: 100, bytes: 0 });
+  await receiver.step({ units: 100, bytes: 1 }); // smallest budget; every fragment is larger
   expect(rowOf(receiver, slot)).toMatchObject({
     state: "quarantined",
     reason: "manifest_invalid",
@@ -355,7 +355,7 @@ it("fragment reads are charged to the step's byte budget", async () => {
     sign: r.sign,
   });
   const scope = signed.manifest.scope;
-  await receiver.step({ units: 100, bytes: 0 });
+  await receiver.step({ units: 100, bytes: 1 }); // smallest budget; every fragment is larger
   // The manifest is read and its fragments admitted, but none is fetched.
   expect(admitted(receiver, signed.slot)).toBeGreaterThan(0);
   expect(fragmentReads(net, scope)).toEqual([]);
@@ -579,7 +579,7 @@ it("a deep inbox processes at most fifty manifests per step even with a larger h
       )
       .run(slotKey(scope, version), scope, version, writer);
   }
-  await receiver.step({ units: Infinity });
+  await receiver.step({ units: 1_000 }); // larger than the 151 seeded slots
   expect(
     net.calls.evidence.filter((key) => key.startsWith(`${scope}/`)),
   ).toHaveLength(50);

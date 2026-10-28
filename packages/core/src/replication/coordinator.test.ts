@@ -1412,16 +1412,17 @@ describe("coordinator budgets", () => {
 
   it("23 an item larger than the remaining byte budget is deferred: not run, not settled, state intact", async () => {
     const world = newWorld();
-    addRow(world, "big", "import", "A", {
-      bytes: 500,
-      state: { nextEligible: 1 },
-    });
     addRow(world, "s1", "import", "B", {
       bytes: 30,
-      state: { nextEligible: 2 },
+      state: { nextEligible: 1 },
     });
     addRow(world, "s2", "import", "C", {
       bytes: 30,
+      state: { nextEligible: 2 },
+    });
+    // Fits the whole budget but not the 40 bytes left after s1 and s2.
+    addRow(world, "big", "import", "A", {
+      bytes: 90,
       state: { nextEligible: 3 },
     });
     const before = JSON.stringify(row(world, "big"));
@@ -1437,6 +1438,42 @@ describe("coordinator budgets", () => {
     expect(report.problems).toEqual([]);
     expect(report.unsupported).toEqual([]);
     expect(report.nextWake).toBe(T0);
+  });
+
+  it("23 an item larger than the whole byte budget runs alone, then spends the rest", async () => {
+    const world = newWorld();
+    addRow(world, "huge", "import", "A", {
+      bytes: 500,
+      state: { nextEligible: 1 },
+    });
+    addRow(world, "s1", "import", "B", {
+      bytes: 30,
+      state: { nextEligible: 2 },
+    });
+    const first = await stepAt(world, build(world), T0, {
+      units: 10,
+      bytes: 100,
+    });
+    expect(runIds(world)).toEqual(["huge"]);
+    expect(first.nextWake).toBe(T0);
+    await stepAt(world, build(world), T0, { units: 10, bytes: 100 });
+    expect(runIds(world)).toEqual(["huge", "s1"]);
+  });
+
+  it("23 an item larger than the whole byte budget waits for a step no other item charged", async () => {
+    const world = newWorld();
+    addRow(world, "s1", "import", "B", {
+      bytes: 30,
+      state: { nextEligible: 1 },
+    });
+    addRow(world, "huge", "import", "A", {
+      bytes: 500,
+      state: { nextEligible: 2 },
+    });
+    await stepAt(world, build(world), T0, { units: 10, bytes: 100 });
+    expect(runIds(world)).toEqual(["s1"]);
+    await stepAt(world, build(world), T0, { units: 10, bytes: 100 });
+    expect(runIds(world)).toEqual(["s1", "huge"]);
   });
 
   it("23 bytes are charged per run and an exact fit is admitted", async () => {
@@ -2011,21 +2048,22 @@ describe("coordinator nextWake", () => {
       T0 + 20_000,
     );
 
-    // A satisfied dependency makes work due now. Keep that item deferred by
-    // a positive byte budget so this assertion observes, rather than drains it.
-    row(world, "f1").bytes = 2;
+    // A satisfied dependency makes work due now. Pre-aborted steps observe
+    // it without running (and so without draining) it.
     expect(
       fresh.onDependencyChanged(
         dependencyKey({ kind: "finality", key: "S", checkedBlock: "5" }),
         T0,
       ),
     ).toBe(1);
+    const observe = AbortSignal.abort();
     expect(
-      (await stepAt(world, fresh, T0, { units: 1, bytes: 1 })).nextWake,
+      (await stepAt(world, fresh, T0, { units: 1 }, observe)).nextWake,
     ).toBe(T0);
     expect(
-      (await stepAt(world, build(world), T0, { units: 1, bytes: 1 })).nextWake,
+      (await stepAt(world, build(world), T0, { units: 1 }, observe)).nextWake,
     ).toBe(T0);
+    expect(runIds(world)).not.toContain("f1");
   });
 
   it("34 only terminal work means idle (undefined), not a far-future wake", async () => {

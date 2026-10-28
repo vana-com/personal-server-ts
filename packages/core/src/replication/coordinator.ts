@@ -264,9 +264,12 @@ export function createReplicaCoordinator(input: {
     input.perWriter ?? 1,
     input.deadlineMs ?? REPLICA_ATTEMPT_TIMEOUT_MS,
     input.hintRefreshMs ?? 2_000,
-    ...Object.values(input.quantum ?? {}),
   ])
     if (value === undefined || !Number.isSafeInteger(value) || value < 1)
+      throw new RangeError("invalid replica coordinator bound");
+  // A zero quantum leaves its phase idle (as on main); it is still finite.
+  for (const value of Object.values(input.quantum ?? {}))
+    if (value === undefined || !Number.isSafeInteger(value) || value < 0)
       throw new RangeError("invalid replica coordinator bound");
   // setTimeout clamps larger delays to 1ms on Node; never silently accept that.
   if ((input.deadlineMs ?? REPLICA_ATTEMPT_TIMEOUT_MS) > 2_147_483_647)
@@ -540,7 +543,8 @@ export function createReplicaCoordinator(input: {
         };
         stepNow = now;
         let units = budget.units;
-        let bytes = budget.bytes ?? REPLICA_STEP_BYTES;
+        const stepBytes = budget.bytes ?? REPLICA_STEP_BYTES;
+        let bytes = stepBytes;
         let deferred = false;
         const aborted = () => signal?.aborted === true;
         if (!aborted()) await refreshHint(now, signal);
@@ -604,14 +608,22 @@ export function createReplicaCoordinator(input: {
                   (!Number.isSafeInteger(item.bytes) || item.bytes < 0)
                 )
                   throw new RangeError("invalid replica item byte estimate");
-                if (item.bytes !== undefined && item.bytes > bytes) {
+                // An item larger than the whole step budget can never fit. It
+                // runs when no other item has charged bytes in this step, and
+                // spends the rest; otherwise no step would ever serve it.
+                const alone =
+                  item.bytes !== undefined &&
+                  item.bytes > stepBytes &&
+                  bytes === stepBytes;
+                if (item.bytes !== undefined && item.bytes > bytes && !alone) {
                   deferred = true;
                   continue;
                 }
                 admitted++;
                 count++;
                 units--;
-                if (item.bytes !== undefined) bytes -= item.bytes;
+                if (alone) bytes = 0;
+                else if (item.bytes !== undefined) bytes -= item.bytes;
                 const attempt = await execute(handler, item, signal);
                 if (attempt === undefined) break;
                 try {
