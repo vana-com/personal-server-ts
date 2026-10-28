@@ -13,6 +13,8 @@ import {
   fragmentReplicaStream,
   assembleReplicaStream,
   inspectReplicaPayload,
+  replicaPayloadByteLength,
+  hashReplicaBytes,
   DEFAULT_REPLICA_STREAMED_LIMITS,
 } from "@opendatalabs/personal-server-ts-core/replication/stream";
 import {
@@ -1034,17 +1036,83 @@ export function createReplicaTransportWorker(deps: {
       .prepare("SELECT * FROM pdpp_transport_preparation WHERE batch=?")
       .get(batch) as ReplicaPreparation | undefined;
   }
+  /** Released framing claims are history; every other reserved version counts. */
+  function nextPreparationVersion() {
+    return (
+      db
+        .prepare(
+          `SELECT coalesce(max(version),0)+1 AS version FROM (
+      SELECT version FROM pdpp_transport_manifests_out WHERE scope=?
+      UNION ALL SELECT version FROM pdpp_transport_preparation WHERE state<>'released')`,
+        )
+        .get(replicaScope(state().writer)) as { version: number }
+    ).version;
+  }
   function claimPreparation(batch: string) {
-    const { version } = db
-      .prepare(
-        `SELECT coalesce(
-      (SELECT version FROM pdpp_transport_manifests_out WHERE batch=?),
-      (SELECT coalesce(max(version),0)+1 FROM pdpp_transport_manifests_out WHERE scope=?)) AS version`,
-      )
-      .get(batch, replicaScope(state().writer)) as { version: number };
+    if (preparationOf(batch)) return;
+    const manifest = db
+      .prepare("SELECT version FROM pdpp_transport_manifests_out WHERE batch=?")
+      .get(batch) as { version: number } | undefined;
     db.prepare(
-      "INSERT OR IGNORE INTO pdpp_transport_preparation (batch,version,state) VALUES (?,?,'preparing')",
+      "INSERT INTO pdpp_transport_preparation (batch,version,state) VALUES (?,?,'preparing')",
+    ).run(batch, manifest?.version ?? nextPreparationVersion());
+  }
+  function outstandingPreparationClaim(except: string) {
+    return Boolean(
+      db
+        .prepare(
+          `SELECT 1 FROM pdpp_transport_preparation p
+      LEFT JOIN pdpp_transport_batches b ON b.batch=p.batch
+      WHERE p.batch<>? AND p.state<>'released' AND (b.batch IS NULL OR NOT ${batchSettled("b")}) LIMIT 1`,
+        )
+        .get(except),
+    );
+  }
+  /** Reserve readmission atomically; leave outstanding successors free to settle. */
+  function reserveReadmission(batch: string) {
+    if (outstandingPreparationClaim(batch)) return false;
+    const version = nextPreparationVersion();
+    db.prepare(
+      `INSERT INTO pdpp_transport_preparation (batch,version,state) VALUES (?,?,'preparing')
+      ON CONFLICT(batch) DO UPDATE SET version=excluded.version,state='preparing',wait_json=NULL`,
     ).run(batch, version);
+    db.prepare(
+      `UPDATE pdpp_transport_batches SET prepared=0,${RESET_WORK},next_attempt=0 WHERE batch=?`,
+    ).run(batch);
+    return true;
+  }
+  function assertPreparationClaim(
+    batch: string,
+    version: number,
+    signal: AbortSignal,
+  ) {
+    // Claim ownership and the final slot are checked together immediately before
+    // signing. Signing itself is async and never holds a SQLite transaction open.
+    db.transaction(() => {
+      assertReplicationStepOpen(db, signal);
+      const current = preparationOf(batch);
+      const next = (
+        db
+          .prepare(
+            "SELECT coalesce(max(version),0)+1 AS version FROM pdpp_transport_manifests_out WHERE scope=?",
+          )
+          .get(replicaScope(state().writer)) as { version: number }
+      ).version;
+      const claims = (
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_transport_preparation WHERE version=? AND state<>'released'",
+          )
+          .get(version) as { n: number }
+      ).n;
+      if (
+        current?.state !== "preparing" ||
+        current.version !== version ||
+        version !== next ||
+        claims !== 1
+      )
+        throw new ReplicaProblemError("prepare_failed");
+    }).immediate();
   }
   function retainPreparationOperations(
     batch: string,
@@ -1085,16 +1153,14 @@ export function createReplicaTransportWorker(deps: {
     }).immediate();
   }
   /** Never infer safety from prepared=0: legacy state and interrupted PUTs count. */
-  function preparationHasExternalEffects(batch: Batch, version: number) {
+  function preparationOwnEffects(batch: Batch, version: number) {
     return Boolean(
       db
         .prepare(
           `SELECT 1 FROM pdpp_transport_upload_attempts WHERE batch=?
       UNION ALL SELECT 1 FROM pdpp_transport_registration_intents WHERE scope=? AND version=?
       UNION ALL SELECT 1 FROM pdpp_transport_fragments_out WHERE batch=? AND (state<>'ready' OR attempts>0)
-      UNION ALL SELECT 1 FROM pdpp_transport_manifests_out WHERE batch=? AND (state<>'ready' OR attempts>0)
-      UNION ALL SELECT 1 FROM pdpp_transport_manifests_out m JOIN pdpp_transport_batches b ON b.batch=m.batch
-        WHERE b.previous_json IS NOT NULL AND json_extract(b.previous_json,'$.batch')=? LIMIT 1`,
+      UNION ALL SELECT 1 FROM pdpp_transport_manifests_out WHERE batch=? AND (state<>'ready' OR attempts>0) LIMIT 1`,
         )
         .get(
           batch.batch,
@@ -1102,19 +1168,56 @@ export function createReplicaTransportWorker(deps: {
           version,
           batch.batch,
           batch.batch,
-          batch.batch,
         ),
+    );
+  }
+  function preparationHasExternalEffects(batch: Batch, version: number) {
+    return (
+      preparationOwnEffects(batch, version) ||
+      Boolean(
+        db
+          .prepare(
+            `
+      SELECT 1 FROM pdpp_transport_manifests_out m JOIN pdpp_transport_batches b ON b.batch=m.batch
+      WHERE b.sequence>? LIMIT 1`,
+          )
+          .get(batch.sequence),
+      )
+    );
+  }
+  /** Release is legal only at the tail of both durable claim orders. */
+  function preparationIsTail(batch: Batch, version: number) {
+    return (
+      state().sequence === batch.sequence &&
+      !db
+        .prepare(
+          `
+      SELECT 1 FROM pdpp_transport_batches WHERE sequence>?
+      UNION ALL SELECT 1 FROM pdpp_transport_preparation WHERE batch<>? AND state<>'released' AND version>=?
+      UNION ALL SELECT 1 FROM pdpp_transport_manifests_out WHERE scope=? AND batch<>? AND version>=? LIMIT 1`,
+        )
+        .get(
+          batch.sequence,
+          batch.batch,
+          version,
+          replicaScope(state().writer),
+          batch.batch,
+          version,
+        )
     );
   }
   const preparationWait = (
     batch: string,
-    reason: "unknown" | "upload_started",
+    reason: "unknown" | "upload_started" | "all_ops_unsupported",
   ): Extract<ReplicaPhaseOutcome, { tag: "wait" }> => ({
     tag: "wait",
     dependency: { kind: "preparation", key: batch, reason },
   });
-  function blockPreparation(batch: string) {
-    const wait = preparationWait(batch, "upload_started");
+  function blockPreparation(
+    batch: string,
+    reason: "upload_started" | "all_ops_unsupported" = "upload_started",
+  ) {
+    const wait = preparationWait(batch, reason);
     db.prepare(
       "UPDATE pdpp_transport_preparation SET state='prep_failed_permanent',wait_json=? WHERE batch=?",
     ).run(canonicalJson(wait), batch);
@@ -1133,7 +1236,16 @@ export function createReplicaTransportWorker(deps: {
       outcome: { tag: "unsupported", admission },
       plan: () => {
         const preparation = preparationOf(batch.batch)!;
-        if (preparationHasExternalEffects(batch, preparation.version))
+        if (preparationOwnEffects(batch, preparation.version))
+          return blockPreparation(batch.batch);
+        const refused = new Set(positions);
+        const remaining = preparationRows(batch.batch).filter(
+          (row) => !refused.has(row.position),
+        );
+        if (
+          remaining.length &&
+          preparationHasExternalEffects(batch, preparation.version)
+        )
           return blockPreparation(batch.batch);
         if (!positions.length) throw new ReplicaProblemError("prepare_failed");
         for (const position of positions)
@@ -1149,6 +1261,8 @@ export function createReplicaTransportWorker(deps: {
         db.prepare(
           "UPDATE pdpp_transport_batches SET prepared=-2,admission_json=? WHERE batch=?",
         ).run(canonicalJson(admission), batch.batch);
+        if (!remaining.length && !preparationIsTail(batch, preparation.version))
+          return blockPreparation(batch.batch, "all_ops_unsupported");
         db.prepare(
           "UPDATE pdpp_transport_preparation SET state='prep_failed_permanent',wait_json=NULL WHERE batch=?",
         ).run(batch.batch);
@@ -1197,10 +1311,11 @@ export function createReplicaTransportWorker(deps: {
       );
     });
   }
-  /** On a measured aggregate failure, keep a prefix only if its real bytes fit.
-   * The operation crossing the cap is refused; later good operations are tested
-   * against the accepted prefix, so they cannot be blamed for an earlier bad op.
-   * This failure-only path does no network I/O and retains no trial ciphertext.
+  /** Classify with single-op trials plus O(log n) prefix trials: O(n log n) visits.
+   * Prefix search retains measured fitting/failing bounds. Each trial counts
+   * or hashes a fresh stream in memory; only the real rebuild writes bytes.
+   * Refuse individually impossible ops, or one proven aggregate crossing, then
+   * reprepare survivors. An unknown trial error keeps the attempt retryable.
    */
   async function aggregatePreparationFailures(
     batch: Batch,
@@ -1208,53 +1323,82 @@ export function createReplicaTransportWorker(deps: {
     signal: AbortSignal,
     chunkBytes: number,
   ) {
-    const accepted: ReplicaOperation[] = [];
-    const positions: number[] = [];
-    for (const row of preparationRows(batch.batch)) {
-      const op = JSON.parse(row.operation_json!) as ReplicaOperation;
-      const payload = await rebuiltPayload(batch.batch, [...accepted, op]);
-      let exceeds = false;
+    const rows = preparationRows(batch.batch);
+    const operations = rows.map(
+      (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
+    );
+    const exceeds = async (candidates: ReplicaOperation[]) => {
+      const envelope: ReplicaEnvelope = {
+        format: "vana-pdpp-replica",
+        version: 1,
+        owner: state().owner,
+        batchId: batch.batch,
+        operations: candidates,
+      };
+      if (error.limit === "total_bytes")
+        return replicaPayloadByteLength(envelope) > error.maximum;
+      const bytes = () =>
+        encodeReplicaPayload(envelope, async function* (id) {
+          yield* deps.exporter.readPinnedBlobChunks(id);
+        });
       try {
-        if (error.limit === "total_bytes")
-          exceeds = payload.totalBytes > error.maximum;
-        else {
-          let ciphertextBytes = 0;
-          for await (const fragment of fragmentReplicaStream({
-            owner: state().owner,
-            writer: state().writer,
-            batch: batch.batch,
-            sequence: batch.sequence,
-            previous: batch.previous_json
-              ? (JSON.parse(batch.previous_json) as Predecessor)
-              : null,
-            collectedAt: batch.collected_at,
-            digest: payload.digest,
-            totalBytes: payload.totalBytes,
-            bytes: async function* () {
-              yield* readBinaryChunks(db, "payload", payload.key);
-            },
-            encrypt: (scope, bytes) =>
-              call(signal, () => transport.encrypt(scope, bytes)),
-            maxBlobBytes: cap,
-            targetChunkBytes: chunkBytes,
-          }))
-            ciphertextBytes += fragment.encrypted.length;
-          exceeds = ciphertextBytes > error.maximum;
+        const payload = await hashReplicaBytes(bytes);
+        let ciphertextBytes = 0;
+        for await (const fragment of fragmentReplicaStream({
+          owner: state().owner,
+          writer: state().writer,
+          batch: batch.batch,
+          sequence: batch.sequence,
+          previous: batch.previous_json
+            ? (JSON.parse(batch.previous_json) as Predecessor)
+            : null,
+          collectedAt: batch.collected_at,
+          digest: payload.digest,
+          totalBytes: payload.totalBytes,
+          bytes,
+          encrypt: (scope, plaintext) =>
+            call(signal, () => transport.encrypt(scope, plaintext)),
+          maxBlobBytes: cap,
+          targetChunkBytes: chunkBytes,
+        })) {
+          ciphertextBytes += fragment.encrypted.length;
+          if (ciphertextBytes > error.maximum) return true;
         }
+        return false;
       } catch (trialError) {
         if (
-          !(trialError instanceof ReplicaResourceLimitError) ||
-          trialError.limit !== error.limit
+          trialError instanceof ReplicaResourceLimitError &&
+          trialError.limit === error.limit
         )
-          throw trialError;
-        exceeds = true;
-      } finally {
-        deleteBinary(db, "payload", payload.key);
+          return true;
+        throw trialError;
       }
-      if (exceeds) positions.push(row.position);
-      else accepted.push(op);
+    };
+    // Empty encoding is a local lower-bound probe, never an admitted envelope.
+    if (await exceeds([])) return rows.map((row) => row.position);
+    // Numeric length probes are cheap. Full single-op ciphertext proofs are
+    // needed only for an immutable descendant's all-bad classification. The
+    // normal path keeps costly encryption trials logarithmic, not one per op.
+    if (
+      error.limit === "total_bytes" ||
+      preparationHasExternalEffects(batch, preparationOf(batch.batch)!.version)
+    ) {
+      const individuallyUnsupported: number[] = [];
+      for (let index = 0; index < operations.length; index++)
+        if (await exceeds([operations[index]!]))
+          individuallyUnsupported.push(rows[index]!.position);
+      if (individuallyUnsupported.length) return individuallyUnsupported;
     }
-    return positions;
+    // Find the first operation crossing the aggregate cap without rescanning
+    // the growing accepted prefix once per candidate.
+    let accepted = 0;
+    let refused = rows.length;
+    while (refused - accepted > 1) {
+      const middle = Math.floor((accepted + refused) / 2);
+      if (await exceeds(operations.slice(0, middle))) refused = middle;
+      else accepted = middle;
+    }
+    return rows.length ? [rows[refused - 1]!.position] : [];
   }
   async function failedPreparation(
     batch: Batch,
@@ -1268,7 +1412,7 @@ export function createReplicaTransportWorker(deps: {
     if (failure.kind !== "permanent" || !prep)
       return unknownPreparation(batch, error);
     // Refuse before probing or marking ops whenever durable I/O evidence exists.
-    if (preparationHasExternalEffects(batch, prep.version))
+    if (preparationOwnEffects(batch, prep.version))
       return permanentPreparation(batch, failure.admission, []);
     try {
       let positions = failure.positions ?? attributedPositions;
@@ -1317,11 +1461,11 @@ export function createReplicaTransportWorker(deps: {
       return {
         outcome: progress,
         plan: () => {
-          if (preparationHasExternalEffects(batch, prep.version))
+          if (preparationOwnEffects(batch, prep.version))
             return blockPreparation(batch.batch);
-          // Empty envelopes are illegal. Release the unused version and close
-          // its sequence gap; retained successors have not claimed/signed yet.
-          // External effects and already-signed successors were refused above.
+          if (!preparationIsTail(batch, prep.version))
+            return blockPreparation(batch.batch, "all_ops_unsupported");
+          // The unused tail alone may give back its sequence and wire version.
           db.prepare(
             "DELETE FROM pdpp_transport_fragments_out WHERE batch=?",
           ).run(batch.batch);
@@ -1332,21 +1476,9 @@ export function createReplicaTransportWorker(deps: {
           db.prepare("DELETE FROM pdpp_transport_batches WHERE batch=?").run(
             batch.batch,
           );
-          const successors = db
-            .prepare(
-              "SELECT batch,sequence FROM pdpp_transport_batches WHERE sequence>? ORDER BY sequence",
-            )
-            .all(batch.sequence) as { batch: string; sequence: number }[];
-          for (const successor of successors)
-            db.prepare(
-              "UPDATE pdpp_transport_batches SET sequence=sequence-1 WHERE batch=?",
-            ).run(successor.batch);
           db.prepare(
-            "UPDATE pdpp_transport_batches SET previous_json=? WHERE json_extract(previous_json,'$.batch')=?",
-          ).run(batch.previous_json, batch.batch);
-          db.prepare(
-            "UPDATE pdpp_transport_state SET sequence=sequence-1,previous_json=CASE WHEN json_extract(previous_json,'$.batch')=? THEN ? ELSE previous_json END WHERE id=1",
-          ).run(batch.batch, batch.previous_json);
+            "UPDATE pdpp_transport_state SET sequence=?,previous_json=? WHERE id=1",
+          ).run(batch.sequence - 1, batch.previous_json);
           db.prepare(
             "UPDATE pdpp_transport_preparation SET state='released',wait_json=NULL WHERE batch=?",
           ).run(batch.batch);
@@ -1461,25 +1593,35 @@ export function createReplicaTransportWorker(deps: {
           preparation = preparationOf(batch.batch)!;
         }
         if (preparation.state === "released") {
-          // Explicit framing readmission may follow already-published successors.
-          // It claims the next unused wire version, as before this recovery path.
-          const { version } = db
-            .prepare(
-              "SELECT coalesce(max(version),0)+1 AS version FROM pdpp_transport_manifests_out WHERE scope=?",
-            )
-            .get(replicaScope(state().writer)) as { version: number };
-          db.transaction(() => {
-            assertReplicationStepOpen(db, signal);
-            db.prepare(
-              "UPDATE pdpp_transport_preparation SET version=?,state='preparing',wait_json=NULL WHERE batch=?",
-            ).run(version, batch.batch);
-          }).immediate();
-          preparation = {
-            ...preparation,
-            version,
-            state: "preparing",
-            wait_json: null,
-          };
+          // A pre-upgrade readmission may still be queued without a reservation.
+          // Defer it rather than blocking the successor that already owns a slot.
+          const reserved = db
+            .transaction(() => {
+              assertReplicationStepOpen(db, signal);
+              return reserveReadmission(batch.batch);
+            })
+            .immediate();
+          if (!reserved) {
+            const saved = db
+              .prepare(
+                "SELECT admission_json FROM pdpp_transport_batches WHERE batch=?",
+              )
+              .get(batch.batch) as { admission_json: string };
+            const admission = {
+              reason: "replica_framing_unsupported" as const,
+              ...(JSON.parse(saved.admission_json) as {
+                actual: number;
+                limit: number;
+                capability: string;
+              }),
+            };
+            return withPlan({ tag: "unsupported", admission }, () => {
+              db.prepare(
+                "UPDATE pdpp_transport_batches SET prepared=-1 WHERE batch=?",
+              ).run(batch.batch);
+            });
+          }
+          preparation = preparationOf(batch.batch)!;
         }
         if (preparation.wait_json) {
           if (preparation.state === "prep_failed_permanent")
@@ -1648,13 +1790,15 @@ export function createReplicaTransportWorker(deps: {
             ...statement,
             version,
             fragments: entries,
-            sign: (facts) =>
-              signReplicaBatch({
+            sign: (facts) => {
+              assertPreparationClaim(batch.batch, version, signal);
+              return signReplicaBatch({
                 signer: deps.authority.signer,
                 partition: partition(),
                 seed: identity.seed,
                 facts,
-              }),
+              });
+            },
             encrypt,
           });
           if (manifest.encrypted.length > cap)
@@ -3517,12 +3661,21 @@ export function createReplicaTransportWorker(deps: {
      * plain restart never re-admits. Returns the number re-admitted.
      */
     readmitUnsupported(): number {
+      if (!enabled() || !replicationAdmitted(db)) return 0;
       return db
-        .prepare(
-          `UPDATE pdpp_transport_batches SET prepared=0,outcome=NULL,reason=NULL,error=NULL,attempts=0,next_attempt=0
-          WHERE prepared=-1 AND coalesce(json_extract(admission_json,'$.capability'),'') <> ?`,
-        )
-        .run(`cap:${cap}`).changes;
+        .transaction(() => {
+          if (!enabled() || !replicationAdmitted(db)) return 0;
+          // One outstanding admission at a time also permits a repeated framing
+          // refusal to release its unused wire slot before another batch claims it.
+          const row = db
+            .prepare(
+              `SELECT batch FROM pdpp_transport_batches
+          WHERE prepared=-1 AND coalesce(json_extract(admission_json,'$.capability'),'')<>? ORDER BY sequence LIMIT 1`,
+            )
+            .get(`cap:${cap}`) as { batch: string } | undefined;
+          return row && reserveReadmission(row.batch) ? 1 : 0;
+        })
+        .immediate();
     },
     /**
      * Owner decision after storage was repaired: fetch again every slot that

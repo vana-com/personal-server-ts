@@ -3955,3 +3955,132 @@ it("A5b H4 aggregate ciphertext attributes the breach to the bad op and preserve
   expect(receiver.get("two")).toEqual(source.get("two"));
   expect(receiver.get("bad")).toBeUndefined();
 });
+
+it.each(["oversized first", "small first"])(
+  "F5 preloaded envelope barrier requires import resource_busy: %s",
+  async (order) => {
+    const net = network(false, 64 * 1024);
+    const largeSource = device(net, { chunk: 700 });
+    await cycles([largeSource], 8);
+    const template = device(net);
+    await cycles([template], 8);
+    largeSource.put("x".repeat(12000));
+    await cycles([largeSource], 8);
+    const smallSource = device(net);
+    smallSource.put("small", "small");
+    await cycles([smallSource], 8);
+    const budget = new ReplicaByteBudget(16 * 1024);
+    const quantum = { import: 0 };
+    const a = device(net, {
+      copyOf: template,
+      worker: { resourceBudget: budget, quantum },
+    });
+    const b = device(net, {
+      copyOf: template,
+      worker: { resourceBudget: budget, quantum },
+    });
+    const list = net.port.list;
+    let selected = largeSource.scope;
+    net.port.list = async (...args) => {
+      const page = await list(...args);
+      return {
+        ...page,
+        points: page.points.filter((point) => point.scope === selected),
+      };
+    };
+    await cycles([a], 8);
+    selected = smallSource.scope;
+    await cycles([b], 8);
+    for (const [receiver, scope] of [
+      [a, largeSource.scope],
+      [b, smallSource.scope],
+    ] as const) {
+      expect(
+        receiver.db
+          .prepare(
+            "SELECT 1 FROM pdpp_transport_manifests_in WHERE scope=? AND manifest_json IS NOT NULL AND state='ready'",
+          )
+          .get(scope),
+      ).toBeDefined();
+      expect(
+        receiver.db
+          .prepare(
+            "SELECT 1 FROM pdpp_transport_fragments_in f JOIN pdpp_transport_manifests_in m ON m.slot=f.slot WHERE m.scope=? AND f.fragment_json IS NULL",
+          )
+          .get(scope),
+      ).toBeUndefined();
+    }
+    net.port.list = async () => ({ points: [], cursor: null });
+    quantum.import = 50;
+    a.reopen();
+    b.reopen();
+    const reads = net.gets.length;
+    const inspect = replicaStream.inspectReplicaPayload;
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let held = false;
+    const spy = vi
+      .spyOn(replicaStream, "inspectReplicaPayload")
+      .mockImplementation(async (...args) => {
+        const payload = await inspect(...args);
+        const large =
+          new TextEncoder().encode(canonicalJson(payload.envelope)).length * 2 >
+          budget.maxBytes;
+        if (!held && large === (order === "oversized first")) {
+          held = true;
+          entered();
+          await gate;
+        }
+        return payload;
+      });
+    const first = order === "oversized first" ? a : b;
+    const second = first === a ? b : a;
+    const secondScope = second === a ? largeSource.scope : smallSource.scope;
+    const running = first.step();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        barrier,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(new Error("envelope reservation barrier was not reached")),
+            3000,
+          );
+        }),
+      ]);
+      expect(budget.reserved).toBeGreaterThan(0);
+      if (first === a) expect(budget.reserved).toBeGreaterThan(budget.maxBytes);
+      else expect(budget.reserved).toBeLessThan(budget.maxBytes);
+      const report = await second.step();
+      expect(report.problems).toContainEqual(
+        expect.objectContaining({ phase: "import", problem: "resource_busy" }),
+      );
+      expect(
+        second.db
+          .prepare(
+            "SELECT 1 FROM pdpp_transport_import_work w JOIN pdpp_transport_manifests_in m ON m.writer=w.writer AND m.batch=w.batch WHERE m.scope=? AND w.reason='resource_busy'",
+          )
+          .get(secondScope),
+      ).toBeDefined();
+      expect(net.gets).toHaveLength(reads);
+    } finally {
+      if (timer) clearTimeout(timer);
+      release();
+      await running;
+      spy.mockRestore();
+      net.port.list = list;
+    }
+    await cycles([a, b], 16);
+    expect(a.get()).toEqual(largeSource.get());
+    expect(b.get("small")).toEqual(smallSource.get("small"));
+    expect(budget.reserved).toBe(0);
+  },
+  20_000,
+);

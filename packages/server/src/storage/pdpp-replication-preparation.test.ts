@@ -5,6 +5,7 @@ import { ReplicaFramingUnsupported } from "@opendatalabs/personal-server-ts-core
 import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import { replicaDigest } from "@opendatalabs/personal-server-ts-core/replication/transport";
+import * as binaryChunks from "./pdpp-binary-chunks.js";
 import { binaryWriter, readBinary } from "./pdpp-binary-chunks.js";
 import {
   CrashController,
@@ -444,7 +445,7 @@ it("A5b an input that cannot be encoded is Unsupported without rejecting its val
   expect(receiver.get("bad")).toBeUndefined();
 });
 
-it("A5b an empty legacy batch releases its sequence without stranding an unsigned retained successor", async () => {
+it("F1 an empty legacy batch waits without renumbering its unsigned successor", async () => {
   const net = network();
   const quantum = { prepare: 50 };
   const d = transportDevice(net, {
@@ -515,21 +516,26 @@ it("A5b an empty legacy batch releases its sequence without stranding an unsigne
     d.db
       .prepare("SELECT sequence FROM pdpp_transport_batches ORDER BY sequence")
       .all(),
-  ).toEqual([{ sequence: 1 }, { sequence: 2 }]);
+  ).toEqual([{ sequence: 1 }, { sequence: 2 }, { sequence: 3 }]);
   expect(
     d.db
       .prepare(
         "SELECT version,state FROM pdpp_transport_manifests_out ORDER BY version",
       )
       .all(),
-  ).toEqual([
-    { version: 1, state: "published" },
-    { version: 2, state: "published" },
-  ]);
-  const receiver = transportDevice(net);
-  await run(receiver, 4);
-  expect(receiver.get("good")).toEqual(d.get("good"));
-  expect(receiver.get("bad")).toBeUndefined();
+  ).toEqual([{ version: 1, state: "published" }]);
+  const wait = d.db
+    .prepare("SELECT wait_json FROM pdpp_transport_preparation WHERE batch=?")
+    .get(bad.batch) as { wait_json: string };
+  expect(JSON.parse(wait.wait_json)).toEqual({
+    tag: "wait",
+    dependency: {
+      kind: "preparation",
+      key: bad.batch,
+      reason: "all_ops_unsupported",
+    },
+  });
+  expect(d.get("good")).toEqual({ id: "good", text: "legacy successor" });
 });
 
 it("A5b resumes a legacy retain resource Unsupported from the unchanged journal cursor", async () => {
@@ -678,4 +684,465 @@ it("A5b preserves explicit framing readmission after a successor already publish
   await run(receiver, 4);
   expect(receiver.get()).toEqual(d.get());
   expect(receiver.get("next")).toEqual(d.get("next"));
+});
+
+it("F1 non-tail all-bad readmission preserves A-B-C claims and parks later D", async () => {
+  const net = network();
+  const options = {
+    maxBlobBytes: 8192,
+    resourceLimits: { maxAggregateCiphertextBytes: 100_000 },
+  };
+  const d = transportDevice(net, { preexisting: "A", worker: options });
+  const encrypt = net.port.encrypt;
+  let allowA = false;
+  net.port.encrypt = async (scope, bytes) => {
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as {
+      data: {
+        fragment?: { sequence: number };
+        manifest?: { sequence: number };
+      };
+    };
+    const sequence = (value.data.fragment ?? value.data.manifest)!.sequence;
+    if (sequence === 2 || (sequence === 1 && !allowA))
+      throw new ReplicaFramingUnsupported(
+        options.maxBlobBytes + 1,
+        options.maxBlobBytes,
+        "manifest_bytes",
+      );
+    return encrypt(scope, bytes);
+  };
+  await run(d);
+  const a = state(d).batch;
+  d.put("B", "b");
+  await run(d);
+  const b = state(d).batch;
+  d.put("C", "c");
+  await run(d, 3);
+  const c = d.db
+    .prepare(
+      "SELECT b.batch,b.sequence,m.plaintext FROM pdpp_transport_batches b JOIN pdpp_transport_manifests_out m ON m.batch=b.batch WHERE m.version=1",
+    )
+    .get() as { batch: string; sequence: number; plaintext: Buffer };
+  const signedC = JSON.parse(c.plaintext.toString()) as {
+    data: { manifest: { sequence: number; previous: { batch: string } } };
+  };
+  expect(c.sequence).toBe(3);
+  expect(signedC.data.manifest).toMatchObject({
+    sequence: 3,
+    previous: { batch: b },
+  });
+  options.maxBlobBytes = 16384;
+  options.resourceLimits.maxAggregateCiphertextBytes = 1;
+  allowA = true;
+  d.reopen();
+  expect(d.worker.readmitUnsupported()).toBeGreaterThan(0);
+  await run(d, 10);
+  options.resourceLimits.maxAggregateCiphertextBytes = 100_000;
+  d.reopen();
+  d.put("D", "d");
+  await run(d, 5);
+  expect(
+    d.db
+      .prepare("SELECT sequence FROM pdpp_transport_batches WHERE batch=?")
+      .get(c.batch),
+  ).toEqual({ sequence: 3 });
+  const published = d.db
+    .prepare(
+      "SELECT b.sequence,m.plaintext FROM pdpp_transport_batches b JOIN pdpp_transport_manifests_out m ON m.batch=b.batch WHERE m.state='published'",
+    )
+    .all() as { sequence: number; plaintext: Buffer }[];
+  const signedSequences = published.map(
+    (row) =>
+      (
+        JSON.parse(row.plaintext.toString()) as {
+          data: { manifest: { sequence: number } };
+        }
+      ).data.manifest.sequence,
+  );
+  expect(new Set(signedSequences).size).toBe(signedSequences.length);
+  expect(
+    published.every((row, index) => row.sequence === signedSequences[index]),
+  ).toBe(true);
+  const wait = d.db
+    .prepare("SELECT wait_json FROM pdpp_transport_preparation WHERE batch=?")
+    .get(a) as { wait_json: string };
+  expect(JSON.parse(wait.wait_json)).toEqual({
+    tag: "wait",
+    dependency: { kind: "preparation", key: a, reason: "all_ops_unsupported" },
+  });
+  expect(d.get("d")).toEqual({ id: "d", text: "D" });
+  expect(
+    d.db.prepare("SELECT count(*) AS n FROM pdpp_transport_batches").get(),
+  ).toEqual({ n: 3 });
+});
+
+it("F2 readmission defers to an unsigned successor claim and never signs a stale version", async () => {
+  const net = network();
+  const options = { maxBlobBytes: 8192 };
+  const d = transportDevice(net, { preexisting: "A", worker: options });
+  const encrypt = net.port.encrypt;
+  let refuseA = true;
+  let holdB = true;
+  net.port.encrypt = async (scope, bytes) => {
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as {
+      data: {
+        fragment?: { sequence: number };
+        manifest?: { sequence: number };
+      };
+    };
+    const sequence = (value.data.fragment ?? value.data.manifest)!.sequence;
+    if (sequence === 1 && refuseA)
+      throw new ReplicaFramingUnsupported(
+        options.maxBlobBytes + 1,
+        options.maxBlobBytes,
+        "manifest_bytes",
+      );
+    if (sequence === 2 && holdB)
+      throw new Error("unknown B preparation failure");
+    return encrypt(scope, bytes);
+  };
+  await run(d);
+  const a = state(d).batch;
+  d.put("B", "b");
+  await run(d);
+  const b = state(d).batch;
+  expect(state(d)).toMatchObject({ version: 1, state: "prep_failed_unknown" });
+  const sign = d.authority.signer.signTypedData.bind(d.authority.signer);
+  const stale: { sequence: string; version: string; next: number }[] = [];
+  vi.spyOn(d.authority.signer, "signTypedData").mockImplementation(
+    async (input) => {
+      const next = (
+        d.db
+          .prepare(
+            "SELECT coalesce(max(version),0)+1 AS next FROM pdpp_transport_manifests_out",
+          )
+          .get() as { next: number }
+      ).next;
+      if (Number(input.message.version) !== next)
+        stale.push({
+          sequence: String(input.message.sequence),
+          version: String(input.message.version),
+          next,
+        });
+      return sign(input);
+    },
+  );
+  options.maxBlobBytes = 16384;
+  refuseA = false;
+  d.reopen();
+  const readmittedWhileClaimed = d.worker.readmitUnsupported();
+  await run(d, 2);
+  holdB = false;
+  await run(d, 8);
+  expect(stale).toEqual([]);
+  expect(readmittedWhileClaimed).toBe(0);
+  expect(
+    d.db
+      .prepare(
+        "SELECT version,state FROM pdpp_transport_manifests_out WHERE batch=?",
+      )
+      .get(b),
+  ).toEqual({ version: 1, state: "published" });
+  expect(d.worker.readmitUnsupported()).toBe(1);
+  await run(d, 4);
+  expect(
+    d.db
+      .prepare(
+        "SELECT version,state FROM pdpp_transport_manifests_out WHERE batch=?",
+      )
+      .get(a),
+  ).toEqual({ version: 2, state: "published" });
+  expect(net.calls.registrations).toHaveLength(2);
+  expect(new Set(net.calls.registrations).size).toBe(2);
+  d.put("D", "d");
+  await run(d, 3);
+  expect(
+    d.db
+      .prepare(
+        "SELECT version,state FROM pdpp_transport_manifests_out ORDER BY version",
+      )
+      .all(),
+  ).toEqual([
+    { version: 1, state: "published" },
+    { version: 2, state: "published" },
+    { version: 3, state: "published" },
+  ]);
+});
+
+it.each(["payload bytes", "ciphertext bytes"])(
+  "F3 aggregate attribution is bounded at 10000 ops: %s",
+  async (kind) => {
+    const net = network();
+    const d = transportDevice(net);
+    const seed = d.store.replication.readBaselinePage({ limit: 1 })
+      .operations[0]!;
+    const n = 10_000;
+    const operations = Array.from({ length: n }, (_, index) => ({
+      ...seed,
+      revision: {
+        ...seed.revision,
+        counter: index + 1,
+        operationId: index.toString(16).padStart(32, "0"),
+      },
+    }));
+    const fullBytes = replicaStream.replicaPayloadByteLength({
+      format: "vana-pdpp-replica",
+      version: 1,
+      owner,
+      batchId: "0".repeat(32),
+      operations,
+    });
+    const cap = fullBytes - 1;
+    const logarithm = Math.ceil(Math.log2(n));
+    const bound =
+      n * (kind === "payload bytes" ? logarithm + 2 : 2 * logarithm + 3);
+    const chunkBytes = 4 * 1024 * 1024;
+    let ciphertextLimit = 0;
+    if (kind === "ciphertext bytes") {
+      const envelope = {
+        format: "vana-pdpp-replica" as const,
+        version: 1 as const,
+        owner,
+        batchId: "0".repeat(32),
+        operations,
+      };
+      const bytes = () =>
+        replicaStream.encodeReplicaPayload(envelope, async function* () {});
+      const payload = await replicaStream.hashReplicaBytes(bytes);
+      const parts = [];
+      for await (const fragment of replicaStream.fragmentReplicaStream({
+        owner,
+        writer: "a".repeat(32),
+        batch: envelope.batchId,
+        sequence: 1,
+        previous: null,
+        collectedAt: new Date(clock.now()).toISOString(),
+        ...payload,
+        bytes,
+        encrypt: net.port.encrypt,
+        maxBlobBytes: 16 * 1024 * 1024,
+        targetChunkBytes: chunkBytes,
+      }))
+        parts.push(fragment);
+      expect(parts).toHaveLength(1);
+      ciphertextLimit = parts[0]!.encrypted.length - 1;
+    }
+    let encrypts = 0;
+    const encrypt = net.port.encrypt;
+    net.port.encrypt = async (...args) => {
+      encrypts++;
+      if (kind === "ciphertext bytes" && encrypts > logarithm + 3)
+        throw new Error("ciphertext trial count exceeded");
+      return encrypt(...args);
+    };
+    let visits = 0;
+    const encode = replicaStream.encodeReplicaPayload;
+    const length = replicaStream.replicaPayloadByteLength;
+    const account = (count: number) => {
+      visits += count;
+      if (visits > bound) throw new Error("aggregate work bound exceeded");
+    };
+    vi.spyOn(replicaStream, "encodeReplicaPayload").mockImplementation(
+      (envelope, readBlob) => {
+        account(envelope.operations.length);
+        return encode(envelope, readBlob);
+      },
+    );
+    vi.spyOn(replicaStream, "replicaPayloadByteLength").mockImplementation(
+      (envelope) => {
+        account(envelope.operations.length);
+        return length(envelope);
+      },
+    );
+    const worker = createReplicaTransportWorker({
+      db: d.db,
+      enabled: true,
+      receiver: d.receiver,
+      credential,
+      expected: () => ({ owner, declarations: [{ sourceId, binding }] }),
+      transport: net.port,
+      authority: d.authority,
+      now: clock.now,
+      exporter: {
+        ...d.store.replication,
+        readBaselinePage({ afterSequence = 0, limit }) {
+          const selected = operations.slice(
+            afterSequence,
+            afterSequence + limit,
+          );
+          return {
+            operations: selected,
+            nextAfterSequence: afterSequence + selected.length,
+            hasMore: afterSequence + selected.length < n,
+          };
+        },
+        acknowledgeBaselinePage() {},
+      },
+      maxBlobBytes: 16 * 1024 * 1024,
+      targetChunkBytes: chunkBytes,
+      resourceLimits:
+        kind === "payload bytes"
+          ? { maxTotalBytes: cap }
+          : { maxAggregateCiphertextBytes: ciphertextLimit },
+    });
+    await worker.step();
+    expect(visits).toBeLessThanOrEqual(bound);
+    if (kind === "ciphertext bytes")
+      expect(encrypts).toBeLessThanOrEqual(logarithm + 3);
+    expect(unsupported(d)).toEqual([
+      {
+        batch: expect.any(String),
+        position: n - 1,
+        outcome: "unsupported",
+        reason: "resource_unsupported",
+      },
+    ]);
+    expect(net.calls.puts).toHaveLength(0);
+    expect(net.calls.registrations).toHaveLength(0);
+  },
+  60_000,
+);
+
+it("F4 attribution makes zero payload-store writes and never PUTs or registers", async () => {
+  const net = network();
+  const d = transportDevice(net, {
+    preexisting: "x".repeat(5000),
+    worker: { resourceLimits: { maxAggregateCiphertextBytes: 4000 } },
+  });
+  const encrypt = net.port.encrypt;
+  let preparing = false;
+  net.port.encrypt = async (...args) => {
+    preparing = true;
+    return encrypt(...args);
+  };
+  let writes = 0;
+  const writer = binaryChunks.binaryWriter;
+  vi.spyOn(binaryChunks, "binaryWriter").mockImplementation((...args) => {
+    const sink = writer(...args);
+    return {
+      ...sink,
+      write(bytes) {
+        if (preparing && args[1] === "payload") writes++;
+        sink.write(bytes);
+      },
+    };
+  });
+  await d.worker.step();
+  expect(writes).toBe(0);
+  expect(unsupported(d)).toHaveLength(1);
+  expect(net.calls.puts).toHaveLength(0);
+  expect(net.calls.registrations).toHaveLength(0);
+});
+
+it("F3 unknown attribution errors stay Retry without dropping an operation", async () => {
+  const net = network();
+  const d = transportDevice(net, {
+    preexisting: "x".repeat(5000),
+    worker: { resourceLimits: { maxAggregateCiphertextBytes: 4000 } },
+  });
+  const encrypt = net.port.encrypt;
+  net.port.encrypt = async (scope, bytes) => {
+    const payload = JSON.parse(new TextDecoder().decode(bytes)) as {
+      data: { fragment?: { totalBytes: number } };
+    };
+    const full = d.db
+      .prepare(
+        "SELECT total_bytes FROM pdpp_transport_batches ORDER BY sequence LIMIT 1",
+      )
+      .get() as { total_bytes: number };
+    if (
+      payload.data.fragment &&
+      payload.data.fragment.totalBytes < full.total_bytes
+    )
+      throw new RangeError("trial encryption temporarily failed");
+    return encrypt(scope, bytes);
+  };
+  const report = await d.worker.step();
+  expect(report.problems).toContainEqual(
+    expect.objectContaining({
+      phase: "prepare",
+      problem: "prepare_failed",
+      nextEligible: clock.now() + 1000,
+    }),
+  );
+  expect(state(d).state).toBe("prep_failed_unknown");
+  expect(unsupported(d)).toEqual([]);
+  expect(net.calls.puts).toHaveLength(0);
+  net.port.encrypt = encrypt;
+  await run(d, 8);
+  expect(unsupported(d)).toHaveLength(1);
+  expect(
+    d.db.prepare("SELECT state FROM pdpp_transport_manifests_out").get(),
+  ).toEqual({ state: "published" });
+});
+
+it("Q1 all encoding-invalid retained ops become durable Unsupported rather than Retry", async () => {
+  const net = network();
+  const d = transportDevice(net);
+  const read = d.store.replication.readBaselinePage.bind(d.store.replication);
+  vi.spyOn(d.store.replication, "readBaselinePage").mockImplementation(
+    (input) => {
+      const page = read(input);
+      return {
+        ...page,
+        operations: page.operations.map((op) => ({ ...op, owner: "" })),
+      };
+    },
+  );
+  const report = await d.worker.step();
+  expect(report.problems).toEqual([]);
+  expect(report.unsupported).toContainEqual(
+    expect.objectContaining({
+      phase: "prepare",
+      admission: { reason: "operation_encoding_unsupported" },
+    }),
+  );
+  expect(unsupported(d)).toEqual([
+    {
+      batch: expect.any(String),
+      position: 0,
+      outcome: "unsupported",
+      reason: "operation_encoding_unsupported",
+    },
+  ]);
+  await run(d, 4);
+  expect(state(d).state).toBe("released");
+  expect(
+    d.db
+      .prepare("SELECT 1 FROM pdpp_transport_batches WHERE outcome='retry'")
+      .get(),
+  ).toBeUndefined();
+  expect(net.calls.puts).toHaveLength(0);
+  expect(net.calls.registrations).toHaveLength(0);
+});
+
+it("F2 a conflicting durable claim is rejected before signing", async () => {
+  const net = network();
+  const d = transportDevice(net, { preexisting: "claim recheck" });
+  const sign = vi.spyOn(d.authority.signer, "signTypedData");
+  const encrypt = net.port.encrypt;
+  let conflicted = false;
+  net.port.encrypt = async (...args) => {
+    if (!conflicted) {
+      conflicted = true;
+      const claim = state(d);
+      d.db
+        .prepare(
+          "INSERT INTO pdpp_transport_preparation (batch,version,state) VALUES (?,?,'preparing')",
+        )
+        .run("f".repeat(32), claim.version);
+    }
+    return encrypt(...args);
+  };
+  const report = await d.worker.step();
+  expect(conflicted).toBe(true);
+  expect(sign).not.toHaveBeenCalled();
+  expect(report.problems).toContainEqual(
+    expect.objectContaining({ phase: "prepare", problem: "prepare_failed" }),
+  );
+  expect(
+    d.db.prepare("SELECT 1 FROM pdpp_transport_manifests_out").get(),
+  ).toBeUndefined();
+  expect(net.calls.puts).toHaveLength(0);
+  expect(net.calls.registrations).toHaveLength(0);
 });

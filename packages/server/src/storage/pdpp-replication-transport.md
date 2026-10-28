@@ -152,8 +152,10 @@ bytes, fragment count, and the SHA-256 of the ordered fragment list (each
 entry's 32-byte digest, then its length as 8 bytes, big-endian). So no field
 that a receiver reads from a manifest, and not its slot, is outside the
 signature. Retain reserves the next version with its operation snapshot.
-Prepare signs that reserved version and commits its manifest only if the
-version is still next. Fragments (format
+Reservation counts both manifests and every outstanding preparation claim.
+The worker rechecks exclusive slot ownership in an immediate transaction just
+before signing, and checks the next wire version again when retaining the
+manifest. Fragments (format
 version 3) carry no statement: the signed manifest names their exact bytes.
 
 **Receiver checks**, in §3.4 order. The receiver waits for finality, then
@@ -333,34 +335,47 @@ behind the unresolved batch and cannot enter its replacement payload.
 | Preparation state       | Transition                                                                                                                                         |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `preparing`             | The retained batch reserves the next version; preparation succeeds or records a classified failure.                                                |
-| `prep_failed_permanent` | The offending operations have durable Unsupported outcomes; a later step enters `rebuilding`.                                                      |
+| `prep_failed_permanent` | Offending ops have durable Unsupported outcomes; survivors rebuild, a tail empty batch releases, and a non-tail empty batch waits for the owner.   |
 | `rebuilding`            | Replace the hidden payload and digest atomically, keeping the batch, sequence and reserved version. Return to `preparing`.                         |
 | `prep_failed_unknown`   | Keep Retry's attempts and deadline, plus a typed preparation wait. Resume preparation or rebuilding after the existing 1-second-to-1-hour backoff. |
 | `prepared`              | The existing fragment, manifest, registration-intent and committed-publication states take over.                                                   |
 | `released`              | An empty batch or impossible framing releases its unused version.                                                                                  |
 
 Only sender-owned input-encoding refusals and the closed resource-cap errors
-are permanent. Per-operation size and blob checks identify the offending
-positions. After an aggregate payload or ciphertext breach, trial prefixes
-identify each operation that crosses the cap, keeping later operations that
-fit. Trial ciphertext is discarded locally; it is never uploaded. Each
-Unsupported row keeps its operation identity and typed reason across restart.
-Exception messages do not become outcome text.
+are permanent. Per-operation size and blob checks identify offending positions.
+For aggregate limits, the worker measures individual operations, then uses at
+most `ceil(log2(n))` prefix trials to find a cumulative crossing. Serialization
+work is `O(n log n)` in operation visits, with no growing-prefix loop per
+candidate. Length probes count bytes; ciphertext probes hash and encrypt
+streams in memory. Trials never write a payload store, PUT, or register.
+Only the actual rebuild uses a persistent payload writer. Unknown trial errors
+remain Retry and do not discard operations.
 
 Rebuilding requires no upload attempt or registration intent for that version,
-no stored or attempted outgoing object, and no already-signed successor.
-Before every fragment or manifest PUT, the worker records an upload attempt
-in a door-checked transaction. A crash before the response therefore cannot
-make an uploaded version look safe to rebuild. Conflicting durable evidence
-parks preparation with `Wait(preparation, upload_started)` and preserves the
-original payload and ciphertext; this wait requires owner recovery.
+no stored or attempted outgoing object, and no signed descendant anywhere in
+the later chain. Before every fragment or manifest PUT, the worker records an
+upload attempt in a door-checked transaction. A crash before the response
+cannot make an uploaded version look safe to rebuild. Such evidence parks
+preparation with `Wait(preparation, upload_started)` and preserves the original
+payload and ciphertext.
 
-An envelope must contain at least one operation. If every operation is
-Unsupported, the worker removes the empty batch and releases its unused
-version and sequence. The next batch can claim both without a gap. Any older
-retained, unsigned backlog closes that sequence gap in the same transaction.
-Unsupported operation outcomes remain as history. A rebuilt batch blocks all
-successor claims until its manifest commits, just as an unknown Retry does.
+Claimed writer sequences and wire versions are never renumbered. An empty
+batch may release its unused sequence and version only at the tail, with no
+later batch, preparation claim, or manifest holding a claim. Its source journal
+and Unsupported operation outcomes remain. A non-tail all-bad batch keeps its
+payload and claims as `Wait(preparation, all_ops_unsupported)`. This owner wait
+is the existing-contract option: wire envelopes require at least one operation,
+and publishing an empty settlement would need a protocol change. The internal
+encoder can serialize an empty operation array; the decoder still refuses it,
+and filtering every encoding-invalid op records Unsupported rather than Retry.
+
+Framing readmission reserves at most one batch per explicit event. It returns
+zero while another preparation claim is outstanding, so an unsigned successor
+can settle without losing its reserved version. Repeat the explicit event after
+that claim settles. Readmission then reserves the next version above manifests
+and outstanding preparation claims. It never takes an unsigned successor's slot.
+A rebuilt batch and either preparation owner wait block new successor claims;
+unknown Retry retains the existing bounded backoff.
 
 Enabled opens also resume main's older retain-phase resource Unsupported
 from the unchanged export cursor, and older `prepared=-2` batches from their

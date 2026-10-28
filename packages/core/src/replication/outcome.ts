@@ -32,7 +32,11 @@ export type ReplicaDependency =
       nextCheckAt?: number;
     }
   /** Sender preparation cannot proceed; unknown failures still use Retry backoff. */
-  | { kind: "preparation"; key: string; reason: "unknown" | "upload_started" }
+  | {
+      kind: "preparation";
+      key: string;
+      reason: "unknown" | "upload_started" | "all_ops_unsupported";
+    }
   | { kind: "fragments"; key: string }
   | { kind: "mapping"; key: string }
   | { kind: "declaration"; key: string }

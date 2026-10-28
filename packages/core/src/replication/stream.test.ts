@@ -324,3 +324,20 @@ it("enforces streamed operation and blob limits before staging excess bytes", as
   });
   expect(blobStage).toHaveBeenCalledTimes(0);
 });
+
+it("Q1 encodes an empty internal envelope without admitting it as a wire envelope", async () => {
+  const envelope: ReplicaEnvelope = {
+    format: "vana-pdpp-replica",
+    version: 1,
+    owner: identity.owner,
+    batchId: "b".repeat(32),
+    operations: [],
+  };
+  const source = () => encodeReplicaPayload(envelope, async function* () {});
+  const parts: Uint8Array[] = [];
+  for await (const bytes of source()) parts.push(bytes);
+  expect(Buffer.concat(parts).toString()).toBe(
+    canonicalJson({ blobs: [], envelope }),
+  );
+  await expect(inspectReplicaPayload(source, undefined)).rejects.toThrow();
+});
