@@ -10,6 +10,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import { replicaScope } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import {
   CrashController,
   at,
@@ -23,6 +24,7 @@ import {
   expected,
   network,
   owner,
+  slotKey,
   sourceId,
   transportDevice,
   transportInvariantViolations,
@@ -112,27 +114,33 @@ async function waitFor(done: () => boolean, ms: number, label: string) {
 
 const num = (d: TransportDevice, sql: string, ...params: unknown[]) =>
   (d.db.prepare(sql).get(...params) as { n: number }).n;
-const outboxScopes = (d: TransportDevice) =>
+/** The slots of a device's manifests: one registration per batch. */
+const outboxSlots = (d: TransportDevice) =>
   (
     d.db
-      .prepare("SELECT scope FROM pdpp_transport_outbox ORDER BY rowid")
-      .all() as { scope: string }[]
-  ).map((r) => r.scope);
+      .prepare(
+        "SELECT scope||'/'||version AS slot FROM pdpp_transport_manifests_out ORDER BY version",
+      )
+      .all() as { slot: string }[]
+  ).map((r) => r.slot);
 const outboxCount = (d: TransportDevice) =>
-  num(d, "SELECT count(*) AS n FROM pdpp_transport_outbox");
+  num(d, "SELECT count(*) AS n FROM pdpp_transport_manifests_out");
+const fragmentCount = (d: TransportDevice) =>
+  num(d, "SELECT count(*) AS n FROM pdpp_transport_fragments_out");
 const unpublished = (d: TransportDevice) =>
   num(
     d,
-    "SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state<>'published'",
+    "SELECT count(*) AS n FROM pdpp_transport_manifests_out WHERE state<>'published'",
   );
 const batchCount = (d: TransportDevice) =>
   num(d, "SELECT count(*) AS n FROM pdpp_transport_batches");
 const unpreparedBatches = (d: TransportDevice) =>
   num(d, "SELECT count(*) AS n FROM pdpp_transport_batches WHERE prepared<>1");
+/** Received slots whose manifest and every fragment the device holds. */
 const retained = (d: TransportDevice) =>
   num(
     d,
-    "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL",
+    "SELECT count(*) AS n FROM pdpp_transport_manifests_in m WHERE manifest_json IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_in f WHERE f.slot=m.slot AND f.fragment_json IS NULL)",
   );
 const importedReceipts = (d: TransportDevice) =>
   num(d, "SELECT count(*) AS n FROM pdpp_transport_imported");
@@ -158,9 +166,11 @@ const writerOf = (d: TransportDevice) =>
       .prepare("SELECT writer FROM pdpp_transport_state WHERE id=1")
       .get() as { writer: string }
   ).writer;
-const isFrom = (scope: string, writer: string) => scope.includes(`.${writer}_`);
-const evidenceReads = (net: Network, scope: string) =>
-  net.calls.evidence.filter((s) => s === scope).length;
+/** A writer's scope, or a slot or fragment storage key under it. */
+const isFrom = (key: string, writer: string) =>
+  key === replicaScope(writer) || key.startsWith(`${replicaScope(writer)}/`);
+const evidenceReads = (net: Network, slot: string) =>
+  net.calls.evidence.filter((s) => s === slot).length;
 
 interface ImportWork {
   writer: string;
@@ -193,19 +203,34 @@ const records = (d: TransportDevice, table: string) =>
   workRecords(d.db).filter((r) => r.table === table);
 const record = (d: TransportDevice, table: string, id: string) =>
   records(d, table).find((r) => r.id === id);
-const OUTBOX = "pdpp_transport_outbox";
-const INBOX = "pdpp_transport_inbox";
+const OUTBOX = "pdpp_transport_manifests_out";
+const INBOX = "pdpp_transport_manifests_in";
 const BATCHES = "pdpp_transport_batches";
 
 /** Registration that never reaches finalized evidence until finalizeAll(). */
 function holdPending(
   net: Network,
-  when: (scope: string) => boolean = () => true,
+  when: (slot: string) => boolean = () => true,
 ) {
   const put = net.port.put;
-  net.port.put = async (part) => {
-    if (when(part.scope)) net.pending.add(part.scope);
-    return put(part);
+  net.port.put = async (manifest) => {
+    const slot = slotKey(manifest.scope, manifest.version);
+    if (when(slot)) net.pending.add(slot);
+    return put(manifest);
+  };
+}
+/** Take finalized evidence of chosen slots back to pending until restore(). */
+function unfinalize(net: Network, slots: string[]) {
+  const saved = slots.map((slot) => [slot, net.chain.get(slot)!] as const);
+  for (const slot of slots) {
+    net.chain.delete(slot);
+    net.pending.add(slot);
+  }
+  return () => {
+    for (const [slot, row] of saved) {
+      net.pending.delete(slot);
+      net.chain.set(slot, row);
+    }
   };
 }
 
@@ -213,8 +238,8 @@ function holdPending(
 function verifiedHeight(net: Network, initial: bigint) {
   const state = { height: initial };
   const evidence = net.port.evidence;
-  net.port.evidence = async (scope) => {
-    const e = await evidence(scope);
+  net.port.evidence = async (scope, version) => {
+    const e = await evidence(scope, version);
     return {
       ...e,
       chain: e.chain && { ...e.chain, blockNumber: state.height },
@@ -321,6 +346,17 @@ async function publishedWriter(
   return d;
 }
 
+/** A finalized writer with one batch per record plus its registration batch. */
+const batchedWriter = (net: Network, records: number) =>
+  publishedWriter(
+    net,
+    (d) => {
+      for (let i = 0; i < records; i++) d.put(`record ${i}`, `r${i}`);
+    },
+    { pageSize: 1 },
+    4 * records + 8,
+  );
+
 /**
  * Writer whose last two batches carry records a and b (the first batch is its
  * connection registration). The importer does not see the record-a batch
@@ -344,14 +380,16 @@ async function twoBatchRemote(opts: { crash?: CrashController } = {}) {
   expect(all.length).toBeGreaterThanOrEqual(2);
   const batches = all.slice(-2);
   const writer = writerOf(a);
-  const list = net.port.list;
-  net.port.list = async (cursor) => {
-    const page = await list(cursor);
-    return {
-      ...page,
-      scopes: page.scopes.filter((s) => !s.includes(`_${batches[0]!.batch}.`)),
-    };
-  };
+  // All batches share the writer scope; the record-a manifest cannot be read.
+  const hidden = (
+    a.db
+      .prepare(
+        "SELECT scope||'/'||version AS slot FROM pdpp_transport_manifests_out WHERE batch=?",
+      )
+      .get(batches[0]!.batch) as { slot: string }
+  ).slot;
+  net.faults.get = (key) =>
+    key === hidden ? new Error("storage unavailable") : undefined;
   const b = transportDevice(net, { crash: opts.crash });
   return {
     net,
@@ -364,7 +402,7 @@ async function twoBatchRemote(opts: { crash?: CrashController } = {}) {
     /** Every batch the writer published. */
     batchCount: all.length,
     reveal() {
-      net.port.list = list;
+      net.faults.get = undefined;
     },
     /** Discover, download, confirm and evaluate the successor. */
     start: () => steps(b, 4, 0),
@@ -487,7 +525,7 @@ it("16 discovery duplicates and unrelated dependency wakes before the deadline k
   // The feed lists every scope twice on every page.
   net.port.list = async (cursor) => {
     const page = await list(cursor);
-    return { ...page, scopes: [...page.scopes, ...page.scopes] };
+    return { ...page, points: [...page.points, ...page.points] };
   };
   const rowsOf = () => importWorkFor(b, failedBatch);
   const before = rowsOf();
@@ -518,37 +556,17 @@ it("16 discovery duplicates and unrelated dependency wakes before the deadline k
 
 // ========================================================================= 17
 
-it("17a confirmation of many retained ready fragments is budgeted: evidence reads grow by at most k per step", async () => {
+it("17a downloading many finalized slots is budgeted: evidence reads grow by at most k per step", async () => {
   const net = network();
-  holdPending(net);
-  const a = transportDevice(net, {
-    preexisting: "x".repeat(15000),
-    chunk: 500,
-  });
-  await stepUntil(
-    a,
-    () => outboxCount(a) > 0 && net.head.size === outboxCount(a),
-    12,
-    10_000,
-  );
-  const total = outboxCount(a);
-  expect(total).toBeGreaterThan(20);
+  const total = 24;
+  const a = await batchedWriter(net, total);
+  expect(outboxCount(a)).toBe(total + 1);
   // Revalidation of imported slots is a separate sweep that also reads
-  // evidence; space it out so the k-unit budget goes to confirmation.
+  // evidence; space it out so the k-unit budget goes to the downloads.
   const b = transportDevice(net, { worker: { revalidateIntervalMs: 600_000 } });
-  const writerA = writerOf(a);
-  const retainedFromA = () =>
-    num(
-      b,
-      "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND instr(scope, ?) > 0",
-      `.${writerA}_`,
-    );
-  await stepUntil(b, () => retainedFromA() === total, 20, 10_000);
-  expect(b.get("a")).toBeUndefined(); // pending, so nothing is confirmed yet
-  net.finalizeAll();
-
+  const last = `r${total - 1}`;
   const k = 3;
-  for (let i = 0; i < 40 && b.get("a") === undefined; i++) {
+  for (let i = 0; i < 80 && b.get(last) === undefined; i++) {
     clock.advance(10_000);
     const before = net.calls.evidence.length;
     await step(b, { units: k });
@@ -558,22 +576,22 @@ it("17a confirmation of many retained ready fragments is budgeted: evidence read
       `step ${i} read evidence ${used} times with k=${k}`,
     ).toBeLessThanOrEqual(k);
   }
-  expect(b.get("a")).toEqual(a.get("a"));
-});
+  expect(b.get(last)).toEqual(a.get(last));
+}, 30_000);
 
-it("17b revalidation of many imported fragments is budgeted: evidence reads grow by at most k per step", async () => {
+it("17b revalidation of many imported slots is budgeted: evidence reads grow by at most k per step", async () => {
   const net = network();
-  const a = await publishedWriter(net, (d) => d.put("x".repeat(15000), "a"), {
-    chunk: 500,
-  });
+  const total = 24;
+  const a = await batchedWriter(net, total);
+  const last = `r${total - 1}`;
   const b = transportDevice(net);
-  await stepUntil(b, () => b.get("a") !== undefined, 20, 10_000);
+  await stepUntil(b, () => b.get(last) !== undefined, 40, 10_000);
   const imported = num(
     b,
-    "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE state='imported'",
+    "SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE state='imported'",
   );
   expect(imported).toBeGreaterThan(20);
-  expect(b.get("a")).toEqual(a.get("a"));
+  expect(b.get(last)).toEqual(a.get(last));
 
   const k = 3;
   for (let i = 0; i < 6; i++) {
@@ -583,10 +601,10 @@ it("17b revalidation of many imported fragments is budgeted: evidence reads grow
     const used = net.calls.evidence.length - before;
     expect(
       used,
-      `step ${i} revalidated ${used} fragments with k=${k}`,
+      `step ${i} revalidated ${used} slots with k=${k}`,
     ).toBeLessThanOrEqual(k);
   }
-});
+}, 30_000);
 
 it("17c receiver.retry runs at most once per step, never on an idle step, and once per dependency change", async () => {
   const net = network();
@@ -715,7 +733,7 @@ async function fairnessFixture() {
   const a = await publishedWriter(net, (d) => d.put("x".repeat(30000), "a"), {
     chunk: 500,
   });
-  expect(outboxCount(a)).toBeGreaterThan(50);
+  expect(fragmentCount(a)).toBeGreaterThan(50);
   const c = await publishedWriter(net, (d) => d.put("from B", "b"));
   const b = transportDevice(net);
   return { net, a, c, b, writerA: writerOf(a) };
@@ -770,53 +788,33 @@ it("21 repeated due failures of writer A cannot monopolize rounds: B is served, 
 
 // ========================================================================= 20
 
-it("20 parked finality waits are filtered before the runnable quota: a due item progresses with phase quota 1 and parked items are not charged", async () => {
+it("20 parked finality waits are filtered before the runnable quota: a due slot progresses with phase quota 1 and parked slots are not charged", async () => {
   const net = network();
-  const hold = { on: true };
-  holdPending(net, () => hold.on);
-  net.port.list = async () => ({ scopes: [], cursor: null }); // the writer must not read itself
-  const a = transportDevice(net, {
-    preexisting: "x".repeat(60000),
-    chunk: 500,
-    worker: { quantum: { publish: 1 } },
-  });
-  // Publication quantum 1: one fragment per step until every one is parked.
+  const a = await batchedWriter(net, 5);
+  const parked = outboxSlots(a);
+  expect(parked).toHaveLength(6);
+  unfinalize(net, parked);
+  const b = transportDevice(net, { worker: { quantum: { download: 1 } } });
+  // Download quantum 1: one slot per step until every one is parked.
   await stepUntil(
-    a,
-    () => outboxCount(a) > 0 && net.head.size === outboxCount(a),
-    400,
+    b,
+    () => parked.every((slot) => record(b, INBOX, slot)?.outcome === "wait"),
+    40,
   );
-  const parked = outboxScopes(a);
-  expect(parked.length).toBeGreaterThanOrEqual(100);
-  expect(
-    num(
-      a,
-      "SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state='ready'",
-    ),
-  ).toBe(parked.length);
+  // A fresh finalized writer, published without moving the clock.
+  const c = transportDevice(net, { preexisting: "fresh" });
+  await stepUntil(c, () => outboxCount(c) > 0 && unpublished(c) === 0, 8);
+  // From here only B steps.
   const parkedReads = () =>
     net.calls.evidence.filter((s) => parked.includes(s)).length;
   const readsBefore = parkedReads();
-
-  hold.on = false;
-  a.put("fresh", "f");
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 12 && b.get() === undefined; i++) {
     clock.advance(10);
-    await step(a, { units: 3 });
+    await step(b, { units: 3 });
   }
-  const fresh = outboxScopes(a).filter((s) => !parked.includes(s));
-  expect(fresh.length, "the due item never reached the outbox").toBeGreaterThan(
-    0,
-  );
-  expect(
-    num(
-      a,
-      `SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state='published'`,
-    ),
-    "the due item was not published",
-  ).toBe(fresh.length);
+  expect(b.get(), "the due slot was not imported").toEqual(c.get());
   expect(parkedReads(), "parked waits were re-read").toBe(readsBefore);
-  const parkedRows = records(a, OUTBOX).filter((r) => parked.includes(r.id));
+  const parkedRows = records(b, INBOX).filter((r) => parked.includes(r.id));
   expect(parkedRows).toHaveLength(parked.length);
   for (const row of parkedRows) {
     expect(row.attempts).toBe(0);
@@ -830,11 +828,13 @@ it("20 parked finality waits are filtered before the runnable quota: a due item 
 const SNAPSHOT_TABLES = [
   "pdpp_transport_state",
   "pdpp_transport_batches",
-  "pdpp_transport_outbox",
-  "pdpp_transport_inbox",
+  "pdpp_transport_staged_fragments",
+  "pdpp_transport_fragments_out",
+  "pdpp_transport_manifests_out",
+  "pdpp_transport_manifests_in",
+  "pdpp_transport_fragments_in",
   "pdpp_transport_imported",
   "pdpp_transport_import_work",
-  "pdpp_transport_preparing",
   "pdpp_binary_manifests",
   "pdpp_binary_chunks",
   "pdpp_replica_operations",
@@ -910,7 +910,8 @@ it("23 a unit larger than budget.bytes is deferred: nothing is uploaded, no part
       bytes: 10_000_000,
     },
   );
-  expect(net.calls.puts).toHaveLength(outboxCount(a));
+  // Every fragment, then the one manifest of the batch: no truncation.
+  expect(net.calls.puts).toHaveLength(fragmentCount(a) + outboxCount(a));
   expect(transportInvariantViolations(a)).toEqual([]);
 });
 
@@ -922,9 +923,9 @@ it("24 a publication whose put never resolves becomes Retry(deadline_exceeded); 
   const d = transportDevice(net, { worker: { deadlineMs: 50 } });
   d.put("stalled", "l");
   const put = net.port.put;
-  net.port.put = (part) => {
-    const stalled = isFrom(part.scope, writerOf(d));
-    return stalled ? new Promise<never>(() => undefined) : put(part);
+  net.port.put = (manifest) => {
+    const stalled = isFrom(manifest.scope, writerOf(d));
+    return stalled ? new Promise<never>(() => undefined) : put(manifest);
   };
   const reports: (ProgressReport | undefined)[] = [];
   for (let i = 0; i < 12 && d.get("r") === undefined; i++) {
@@ -953,10 +954,13 @@ it("24 a publication whose put never resolves becomes Retry(deadline_exceeded); 
       .flatMap((x) => x?.problems ?? [])
       .some((p) => p.phase === "publish" && p.problem === "deadline_exceeded"),
   ).toBe(true);
+  // Its fragments are stored; its one registration is never reported.
+  const slots = outboxSlots(d);
+  expect(slots).toHaveLength(1);
   expect(
     reports
       .flatMap((x) => x?.receipts ?? [])
-      .filter((x) => x.phase === "publish"),
+      .filter((x) => x.phase === "publish" && slots.includes(x.key)),
   ).toEqual([]);
   expect(net.head.size).toBe(outboxCount(r));
 });
@@ -970,10 +974,10 @@ it("25 host cancellation mid-step leaves only committed state; the cancelled run
   const gate = new Promise<void>((resolve) => (release = resolve));
   let started = false;
   const put = net.port.put;
-  net.port.put = async (part) => {
+  net.port.put = async (manifest) => {
     started = true;
     await gate;
-    return put(part);
+    return put(manifest);
   };
   const stepper = (a.worker as Steppable).step;
   expect(typeof stepper, "worker.step is missing").toBe("function");
@@ -990,7 +994,8 @@ it("25 host cancellation mid-step leaves only committed state; the cancelled run
 
   const tables = [
     "pdpp_transport_batches",
-    "pdpp_transport_outbox",
+    "pdpp_transport_fragments_out",
+    "pdpp_transport_manifests_out",
     "pdpp_transport_state",
   ];
   const frozen = durableSnapshot(a.db, tables);
@@ -1007,9 +1012,19 @@ it("25 host cancellation mid-step leaves only committed state; the cancelled run
       "SELECT count(*) AS n FROM pdpp_transport_batches WHERE prepared=-1",
     ),
   ).toBe(0);
-  const bytes = a.db
-    .prepare("SELECT scope,encrypted FROM pdpp_transport_outbox ORDER BY rowid")
-    .all();
+  const outbound = () => [
+    ...a.db
+      .prepare(
+        "SELECT batch,position,encrypted FROM pdpp_transport_fragments_out ORDER BY rowid",
+      )
+      .all(),
+    ...a.db
+      .prepare(
+        "SELECT scope,version,encrypted FROM pdpp_transport_manifests_out ORDER BY rowid",
+      )
+      .all(),
+  ];
+  const bytes = outbound();
   expect(bytes.length).toBeGreaterThan(0);
 
   release(); // the cancelled call finally returns
@@ -1022,13 +1037,7 @@ it("25 host cancellation mid-step leaves only committed state; the cancelled run
   a.reopen();
   net.port.put = put;
   await stepUntil(a, () => unpublished(a) === 0, 6, 10_000);
-  expect(
-    a.db
-      .prepare(
-        "SELECT scope,encrypted FROM pdpp_transport_outbox ORDER BY rowid",
-      )
-      .all(),
-  ).toEqual(bytes);
+  expect(outbound()).toEqual(bytes);
 });
 
 // ================================================================== 26, 27, 28
@@ -1178,6 +1187,8 @@ async function crashAfterPredecessorCommit(crashAt: number | undefined) {
   const fx = await twoBatchRemote({ crash });
   await fx.start();
   fx.reveal();
+  // Past the hidden download's Retry deadline.
+  clock.advance(10_000);
   crash.arm(crashAt);
   for (let i = 0; i < 12 && !crash.dead; i++) {
     clock.advance(10);
@@ -1353,7 +1364,7 @@ async function retryIsNotBypassedByHint(kind: "publish" | "confirm") {
   let table: string;
   let source: TransportDevice;
   if (kind === "publish") {
-    net.port.list = async () => ({ scopes: [], cursor: null }); // no own inbox
+    net.port.list = async () => ({ points: [], cursor: null }); // no own inbox
     actor = transportDevice(net, { preexisting: "retry me" });
     source = actor;
     await steps(actor, 4, 0);
@@ -1366,8 +1377,8 @@ async function retryIsNotBypassedByHint(kind: "publish" | "confirm") {
     table = INBOX;
   }
   // The record and its registration travel in one single-fragment batch.
-  expect(outboxScopes(source)).toHaveLength(1);
-  const scope = outboxScopes(source)[0]!;
+  expect(outboxSlots(source)).toHaveLength(1);
+  const scope = outboxSlots(source)[0]!;
   expect(record(actor, table, scope)).toMatchObject({
     outcome: "wait",
     attempts: 0,
@@ -1534,13 +1545,13 @@ it("33 a temporarily inactive registration is a Wait, not a conflict: no quarant
   expect(
     num(
       b,
-      "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE state='quarantined'",
+      "SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE state='quarantined'",
     ),
   ).toBe(0);
   expect(
     num(
       a,
-      "SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state='quarantined'",
+      "SELECT count(*) AS n FROM pdpp_transport_manifests_out WHERE state='quarantined'",
     ),
   ).toBe(0);
   expect(net.calls.puts.filter((s) => s === scope)).toHaveLength(puts);
@@ -1559,45 +1570,61 @@ it("33 a temporarily inactive registration is a Wait, not a conflict: no quarant
 
 // ========================================================================== 34
 
-/** Evidence port that reports an immutable-registration conflict for chosen scopes. */
+/** Evidence port that reports a finalized commitment other than the registered one for chosen slots. */
 function conflictOn(
   net: Network,
-  which: (scope: string, first: string) => boolean,
+  which: (slot: string, first: string) => boolean,
 ) {
   let first: string | undefined;
   const evidence = net.port.evidence;
-  net.port.evidence = async (scope) => {
-    first ??= scope;
-    const e = await evidence(scope);
-    return which(scope, first)
+  net.port.evidence = async (scope, version) => {
+    const slot = slotKey(scope, version);
+    first ??= slot;
+    const e = await evidence(scope, version);
+    return which(slot, first)
       ? {
           ...e,
           chain: e.chain && {
             ...e.chain,
-            currentVersion: "9",
+            currentVersion: String(version),
             status: "Active" as const,
+            commitment: `0x${"f".repeat(64)}` as const,
           },
+          pending: false,
         }
       : e;
   };
   return {
-    conflicting: (scope: string) => first !== undefined && which(scope, first),
+    conflicting: (slot: string) => first !== undefined && which(slot, first),
   };
 }
 
 it("34a report.nextWake comes from durable state: terminal work contributes nothing, and a reopened worker computes the same value", async () => {
   const net = network();
-  const conflict = conflictOn(net, (scope, first) => scope === first);
-  holdPending(net, (scope) => !conflict.conflicting(scope));
-  net.port.list = async () => ({ scopes: [], cursor: null }); // keep the inbox out of it
-  const a = transportDevice(net, { preexisting: "x".repeat(3000), chunk: 600 });
+  // C's registration stays pending: a finality wait on A's inbound side.
+  const c = transportDevice(net, { preexisting: "pending remote" });
+  holdPending(net, (slot) => isFrom(slot, writerOf(c)));
+  await steps(c, 4, 0);
+  const a = transportDevice(net, { preexisting: "terminal" });
+  conflictOn(net, (slot) => isFrom(slot, writerOf(a)));
+  // A never reads its own scope, so its only work is the two items under test.
+  const list = net.port.list;
+  net.port.list = async (cursor) => {
+    const page = await list(cursor);
+    return {
+      ...page,
+      points: page.points.filter((p) => !isFrom(p.scope, writerOf(a))),
+    };
+  };
   const early = await steps(a, 6, 0);
-  const rows = records(a, OUTBOX);
-  expect(rows.length).toBeGreaterThan(2);
-  const terminal = rows.filter((r) => r.outcome === "quarantine");
-  const waiting = rows.filter((r) => r.outcome === "wait");
-  expect(terminal, "the conflicting fragment is not terminal").toHaveLength(1);
-  expect(waiting.length).toBe(rows.length - 1);
+  const terminal = records(a, OUTBOX);
+  expect(terminal).toHaveLength(1);
+  expect(terminal[0]?.outcome, "the conflicting slot is not terminal").toBe(
+    "quarantine",
+  );
+  const waiting = records(a, INBOX).filter((r) => r.outcome === "wait");
+  expect(waiting).toHaveLength(1);
+  expect(isFrom(waiting[0]!.id, writerOf(c))).toBe(true);
   const report = await step(a);
   expect(report, "step returned no report").toBeDefined();
   expect(report?.nextWake).toBe(minDeadline(waiting));
@@ -1613,7 +1640,7 @@ it("34a report.nextWake comes from durable state: terminal work contributes noth
 it("34b a device whose only work is terminal is idle: nextWake is undefined before and after reopen", async () => {
   const net = network();
   conflictOn(net, () => true);
-  net.port.list = async () => ({ scopes: [], cursor: null });
+  net.port.list = async () => ({ points: [], cursor: null });
   const a = transportDevice(net, { preexisting: "terminal" });
   await steps(a, 4, 0);
   const rows = records(a, OUTBOX);

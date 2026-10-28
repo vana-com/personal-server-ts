@@ -12,11 +12,6 @@ import {
   upsert,
 } from "@opendatalabs/personal-server-ts-core/replication/fixtures";
 import {
-  replicaChainCommitment,
-  type ReplicaTransportPort,
-} from "@opendatalabs/personal-server-ts-core/replication/dpv2";
-import {
-  fragmentReplicaPayload,
   replicaDigest,
   toBase64,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
@@ -31,6 +26,7 @@ import {
 } from "../storage/pdpp-replica-writer-identity.test-utils.js";
 import {
   approveNarrowConsent,
+  finalizedReplicaNetwork,
   openConsentIssuer,
   openReplicaResourceServer,
 } from "./pdpp-replica-quarantine-fixture.js";
@@ -137,64 +133,19 @@ it.each(["key", "connection"] as const)(
       claim,
       target,
     ];
-    const parts = await fragmentReplicaPayload({
-      owner,
+    const network = finalizedReplicaNetwork(owner);
+    const published = await network.publish({
       writer: remote.writers.transport,
       batch,
-      sequence: 1,
-      previous: null,
       collectedAt: "2026-10-20T00:00:00Z",
+      sign: remote.sign,
       bytes: Buffer.from(
         canonicalJson({
           envelope: envelope(batch, operations),
           blobs: [{ blobId, bytes: toBase64(bytes) }],
         }),
       ),
-      sign: remote.sign,
-      encrypt: async (_scope, value) => value,
     });
-    let conflicted = false;
-    const port: ReplicaTransportPort = {
-      encrypt: async (_scope, value) => value,
-      decrypt: async (_scope, value) => value,
-      put: async () => {},
-      register: async () => {},
-      get: async (id) => parts.find((part) => part.scope === id)!.encrypted,
-      list: async () => ({
-        scopes: parts.map((part) => part.scope),
-        cursor: null,
-      }),
-      evidence: async (id) => {
-        const part = parts.find((part) => part.scope === id)!;
-        return {
-          head: {
-            owner,
-            scope: id,
-            version: "1",
-            dataHash: part.dataHash,
-            metadataHash: part.metadataHash,
-            deleted: false,
-          },
-          chain: {
-            owner,
-            scope: id,
-            version: "1",
-            currentVersion: conflicted ? "9" : "1",
-            status: "Active",
-            commitment: replicaChainCommitment(
-              part.dataHash,
-              part.metadataHash,
-            ),
-            chainId: 14800,
-            registry: `0x${"2".repeat(40)}`,
-            blockNumber: 123n,
-            blockHash: `0x${"3".repeat(64)}`,
-            blockTimestamp: 1000n,
-          },
-          pending: false,
-        };
-      },
-    };
     const transport = createReplicaTransportWorker({
       db,
       enabled: true,
@@ -202,7 +153,7 @@ it.each(["key", "connection"] as const)(
       exporter: store.replication,
       receiver,
       credential,
-      transport: port,
+      transport: network.port,
       authority,
     });
     const issuer = await openConsentIssuer(root, owner, 3600);
@@ -231,12 +182,17 @@ it.each(["key", "connection"] as const)(
         expect(binary.status).toBe(200);
         expect(Buffer.from(await binary.arrayBuffer())).toEqual(bytes);
       }
-      conflicted = true;
+      // The registry finalizes another commitment at the imported slot.
+      const evidence = network.evidence.get(published.slot)!;
+      network.evidence.set(published.slot, {
+        ...evidence,
+        chain: { ...evidence.chain!, commitment: `0x${"f".repeat(64)}` },
+      });
       await transport.cycle();
       expect(
         db
-          .prepare("SELECT state FROM pdpp_transport_inbox WHERE scope=?")
-          .get(parts[0].scope),
+          .prepare("SELECT state FROM pdpp_transport_manifests_in WHERE slot=?")
+          .get(published.slot),
       ).toEqual({ state: "quarantined" });
       expect(
         store.getRecord("conn", "messages", target.recordKey),

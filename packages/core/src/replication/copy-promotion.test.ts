@@ -319,6 +319,7 @@ describe("indexEvidenceFromFacts (D)", () => {
     patch: Partial<Parameters<typeof indexEvidenceFromFacts>[0][number]> = {},
   ) => ({
     ...authority,
+    version: "1",
     currentVersion,
     status: currentVersion === "0" ? "None" : "Active",
     commitment,
@@ -345,13 +346,16 @@ describe("indexEvidenceFromFacts (D)", () => {
       ]),
     ).toEqual({ kind: "committed", commitment: h("a"), eligible: false });
   });
-  it("contradictions are absorbing: two version-1 commitments, a version above 1, a later version 0, a forked block", () => {
+  it("contradictions are absorbing: two slot commitments, facts about two slots, a later absence, a forked block", () => {
     expect(
       indexEvidenceFromFacts([fact(5n, "1", h("a")), fact(6n, "1", h("b"))]),
     ).toEqual({ kind: "contradiction" });
-    expect(indexEvidenceFromFacts([fact(5n, "2", h("a"))])).toEqual({
-      kind: "contradiction",
-    });
+    expect(
+      indexEvidenceFromFacts([
+        fact(5n, "1", h("a")),
+        fact(6n, "1", h("a"), { version: "2" }),
+      ]),
+    ).toEqual({ kind: "contradiction" });
     expect(
       indexEvidenceFromFacts([fact(5n, "1", h("a")), fact(8n, "0", zero)]),
     ).toEqual({ kind: "contradiction" });
@@ -375,6 +379,23 @@ describe("indexEvidenceFromFacts (D)", () => {
         fact(5n, "1", h("a"), { eligible: false }),
       ]),
     ).toEqual({ kind: "committed", commitment: h("a"), eligible: false });
+  });
+  it("versions append: a later current version keeps the slot committed", () => {
+    // Slot 3 of a writer scope; the writer has since appended version 7.
+    const slot = { version: "3", eligible: true };
+    expect(
+      indexEvidenceFromFacts([
+        fact(4n, "2", zero, { ...slot, status: "Active", eligible: false }),
+        fact(5n, "3", h("a"), slot),
+        fact(9n, "7", h("a"), slot),
+      ]),
+    ).toEqual({ kind: "committed", commitment: h("a"), eligible: true });
+    expect(
+      indexEvidenceFromFacts([
+        fact(5n, "3", h("a"), slot),
+        fact(9n, "2", zero, { ...slot, eligible: false }),
+      ]),
+    ).toEqual({ kind: "contradiction" });
   });
   it("an earlier version-0 fact before version 1 is not a contradiction", () => {
     expect(

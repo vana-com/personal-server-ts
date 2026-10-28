@@ -25,12 +25,13 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
   or routes for replication. Neither app enables it
   (`unity-surfaces@9af449a2 apps/desktop/src/hooks/usePersonalServer.ts:871-885`);
   the phone has no replication code.
-- The carrier is DPv2. Each fragment is one vana-storage object at
+- The carrier is DPv2. In #483 each fragment is one vana-storage object at
   `<scope>/1`, one gateway AddData registration at `expectedVersion "1"`, and
   one finalized DataRegistryV2 commitment
   (`packages/core/src/replication/dpv2.ts:80-129`). Scopes are
   `pdpp_replica_v1.<writer>_<batch>.<index>`
-  (`packages/core/src/replication/transport.ts:44-53`).
+  (`packages/core/src/replication/transport.ts:44-53`). Plan item A12
+  replaces this with one registered manifest per sync (section 2).
 - Both writer ids are random: the transport writer token
   (`packages/server/src/storage/pdpp-replication-transport.ts:287-299`) and the
   installation writer used in operation revisions
@@ -57,12 +58,21 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
 Testers use the DPv2 carrier as built. This PR makes no production transport
 decision.
 
-Later: DPv2 costs about two minutes of chain finality per hop (dev median
-122 s, p90 134 s, 2026-10-21) and one registration per fragment (4,310 for one
-101 MiB blob on Lite). That cost may justify a different carrier before
-production. A new carrier is its own design and may need engine changes. Plan
-item A12 replaces per-fragment registration with one registration per device
-sync: a manifest that lists content-addressed fragments.
+Plan item A12 changes the registration count, not the carrier. Each writer
+has one stable scope, `pdpp_replica_v1.<writer>`. A sync is one batch, within
+the batch bounds (default 10,000 operations and 32 MiB). Its fragments are
+stored unregistered at `<scope>/fragments/<sha256>`. One manifest lists them
+by digest and size, carries the batch statement, and is the only registered
+object, at the next version of the scope. A receiver fetches the manifest only
+when its registration is finalized, and checks each fragment against the
+manifest digest before it decrypts it. Details:
+`packages/server/src/storage/pdpp-replication-transport.md`.
+
+Later: DPv2 still costs about two minutes of chain finality per hop (dev
+median 122 s, p90 134 s, 2026-10-21). Before A12 it also cost one registration
+per fragment (4,310 for one 101 MiB blob on Lite); with A12 that blob costs one.
+Finality alone may justify a different carrier before production. A new
+carrier is its own design and may need engine changes.
 
 ## 3. Who may write
 
@@ -159,26 +169,63 @@ PdppReplicaBatch {
   bytes32 serverId;        // gateway registration id of the signer
   string  environment;     // "dev" | "prod"
   bytes16 writerNonce;
+  uint64  version;         // scope version the manifest registers at
   string  batch;
   uint64  sequence;
   bytes32 previous;        // digest of the previous batch, or zero
+  string  previousBatch;   // id of the previous batch, or ""
+  string  collectedAt;
   bytes32 digest;          // sha256 of the assembled batch
   uint64  totalBytes;
-  uint32  count;
+  uint32  count;           // number of fragments
+  bytes32 fragments;       // sha256 of the ordered fragment list
 }
 ```
 
-Fragment format version 2 carries the statement and signature inside the
-encrypted body (version 1 is at `transport.ts:17-34`).
+The fragment list digest is the SHA-256 of each fragment's 32-byte digest
+followed by its length as 8 bytes, big-endian, in index order. The writer
+nonce and server fields derive the writer, and so the scope
+`pdpp_replica_v1.<writer>`. So the statement covers everything a receiver uses
+from the manifest and its slot. The manifest carries the statement and
+signature: it is the one registered object of the batch. Fragments (format
+version 3) carry neither; the signed list names their exact bytes.
 
 ### 3.4 Receiver checks
 
-In this order. Each failure is a typed quarantine of that item only. A batch
-that fails any check never touches writer state, so it cannot occupy a
-sequence or a predecessor slot of a real writer.
+In this order. Steps 1 to 6 apply to the manifest after its registration is
+finalized, and before any fragment is fetched. Step 1 checks its bytes against
+the registered hash. Each fragment is then checked for length and sha256
+against the manifest before it is decrypted. Each failure is a typed quarantine of that
+item only. A batch that fails any check never touches writer state, so it
+cannot occupy a sequence or a predecessor slot of a real writer.
 
-1. Decrypt and decode the fragment.
-2. Recover the signer. It must equal `server`.
+1. The manifest and fragment entry points share `receiveReplicaJson`
+   (`core/src/replication/receive.ts`). Both read with a byte bound and a
+   30-second deadline, propagate cancellation, check the packet profile,
+   decrypt and scan JSON before parsing it. Read the manifest, stopping at
+   the storage cap. Before any KDF runs, refuse any message outside the
+   writers' profile: one v4 password packet with iterated, salted SHA-256 S2K
+   at count byte 224 or less, then one v1 integrity-protected data packet.
+   During decryption refuse compression before inflation. Then refuse
+   plaintext nested deeper than 16 or with more structural tokens than a manifest at the fragment limit needs, before it
+   is parsed. Each refusal is `manifest_invalid`, because no writer makes such
+   bytes and the commitment hashes plaintext the receiver would have to make
+   or parse. Check the plaintext's hash pair against the finalized
+   commitment; a mismatch, or plaintext with no `collectedAt`, retries as
+   `commitment_mismatch`. Only then decode. A wrapper that is not the
+   canonical envelope, a zero fragment length, duplicate fragment hashes,
+   negative, fractional, non-finite or unsafe numeric fields, facts that
+   disagree with each other, entry bytes over the framed bound (§6), or
+   anything else that throws while decoding is `manifest_invalid`. A manifest without a statement is
+   `signature_invalid`. A fragment is checked against its ciphertext commitment
+   before decryption, then crosses the same packet, decrypt and bounded-parse
+   checks. A failed fragment check is `fragment_mismatch`; definitive storage
+   absence is `fragment_missing`. Both quarantine the slot. Transient reads,
+   cancellation and deadlines retry. No fragment is fetched before the manifest
+   is authorized. At most 50 inbox manifests are processed per step, even if
+   the host requests a larger download quantum.
+2. Recover the signer. It must equal `server`, and the statement must sign
+   this manifest at the version it is registered at.
 3. Partition: `statement.owner`, `chainId` and `environment` must equal the
    receiver's. Addresses are compared after normalizing to lowercase.
 4. Roster: the gateway record for `server` must exist, have no `revokedAt`,
@@ -192,8 +239,8 @@ sequence or a predecessor slot of a real writer.
    again on every import attempt, so a batch downloaded before removal is
    refused once the cached answer expires.
 5. Writer ids: derive both ids from `owner`, `server`, `serverId` and
-   `writerNonce`. With DPv2, the writer in the fragment's scope must equal the
-   derived transport writer.
+   `writerNonce`. The writer in the manifest's scope must equal the derived
+   transport writer.
 6. Finalized DPv2 evidence, as today.
 7. Assemble and check `digest`. Every operation's `revision.writerId` must
    equal the derived operation writer. Then import.
@@ -201,7 +248,9 @@ sequence or a predecessor slot of a real writer.
 This implements the receiver's `authenticate` hook. New codes in
 `packages/core/src/replication/outcome.ts`: dependency kind `roster`;
 quarantine reasons `signature_invalid`, `partition_mismatch`,
-`server_not_registered`, `roster_owner_mismatch` and `writer_mismatch`.
+`server_not_registered`, `roster_owner_mismatch` and `writer_mismatch`. Every
+refusal after the commitment check is terminal: authentic bytes do not change
+on retry.
 
 ### 3.5 Removal and re-registration
 
@@ -233,6 +282,13 @@ likely in use. Its first publication is the current-state baseline (section
   fragment. It never accepts forged data, but the overwrite destroys the
   fragment's availability and blocks that writer's later batches until the
   original content is restored. Downloading again cannot repair it.
+- **Another device can take a writer's next version.** Each writer has one
+  scope and registers its next version there. Any registered server of the
+  owner can register its own manifest at that version first. Receivers refuse
+  it (`writer_mismatch` or `signature_invalid`), so forged data is never
+  imported. But the version is taken, so the writer's own manifest there fails
+  with `immutable_registration_conflict` and its later manifests wait behind
+  it. Nothing moves the writer past a taken version yet.
 - **Removed devices can still read.** Every device holds the owner master key,
   and storage reads are public (section 1). A removed device that kept the
   master key can read and decrypt new batches. This must be fixed before
@@ -283,9 +339,23 @@ export interface ReplicaCall {
   /** Stop reading and reject when a response passes this size. */
   maxBytes?: number;
 }
-// put(fragment, call), register(fragment, call), evidence(scope, call),
-// get(scope, call & { maxBytes: number }), list(cursor, call)
+// putFragment(fragment, call), getFragment(scope, digest, call & { maxBytes }),
+// hasFragment(scope, digest, call), put(manifest, call),
+// register(manifest, call), evidence(scope, version, call),
+// get(scope, version, call & { maxBytes: number }), list(cursor, call)
 ```
+
+Today `get` and `getFragment` take `ReplicaRead` (`{ maxBytes, signal }`):
+`get` is bounded by the storage cap and `getFragment` by the manifest entry's
+length. The DPv2 adapter reads only through the storage adapter's
+`downloadBounded`, which stops on `Content-Length` or cancels the stream; it
+refuses at construction a storage adapter without one. Both Vana storage
+adapters, signed and public-read, provide it. An oversize read throws
+`ReplicaObjectRefused`. The fragment existence probe also uses a zero-byte
+bounded read, never `StorageAdapter.exists`, which may buffer a whole object.
+Object reads default to a 30-second deadline, including the probe; the server
+worker also defaults each attempt to 30 seconds. A host can configure the
+worker attempt deadline. Deadline and cancellation failures remain retries.
 
 The adapter must stop its I/O on abort. `abortable` (`coordinator.ts:100-123`)
 only drops a late result. Adapters do not retry; a failure is a verdict the
@@ -446,6 +516,14 @@ There is no blob-size cap.
   Initial values: phone 20 units, 8 MiB, 30 s; Desktop 50 units, 64 MiB, 30 s.
 - **Memory:** at most one fragment per direction in memory. Fragments are
   1 MiB on Lite and 4 MiB on Node.
+- **Receive bound:** a manifest read stops at the storage cap and a fragment
+  read at its entry's length. A received OpenPGP message runs at most one
+  iterated SHA-256 KDF over 16 MiB, and received JSON is at most 16 deep
+  (`REPLICA_MAX_JSON_DEPTH`). Fragment reads count against the step's byte
+  budget. The sum of a manifest's entry bytes must fit
+  `replicaFramedBytesBound(totalBytes, count)` (`transport.ts`): the base64
+  of the signed `totalBytes` plus a fixed per-fragment overhead. This is a
+  consistency bound on what one batch can make a peer fetch, not a size cap.
 - **No permanent stall:** a batch becomes Unsupported only at the protocol
   limit of 100,000 fragments per batch (`transport.ts:11`), about 97 GiB at
   1 MiB fragments. A peer holds a writer's later batches behind an Unsupported

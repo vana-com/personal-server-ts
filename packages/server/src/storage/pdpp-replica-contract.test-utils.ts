@@ -14,6 +14,10 @@ import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
 import {
+  readBoundedResponse,
+  type ByteBudget,
+} from "@opendatalabs/personal-server-ts-core/additions";
+import {
   enableReplicaTestIdentity,
   replicaTestAuthority,
 } from "./pdpp-replica-writer-identity.test-utils.js";
@@ -29,6 +33,14 @@ import {
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
+import {
+  fragmentReplicaPayload,
+  prepareReplicaManifest,
+  replicaDigest,
+  replicaScope,
+  type Predecessor,
+} from "@opendatalabs/personal-server-ts-core/replication/transport";
+import type { ReplicaBatchFacts } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import { createLiteCanonicalStore } from "../../../lite/src/canonical-store.js";
 import type {
   LiteCanonicalPersistence,
@@ -240,7 +252,30 @@ export function crashableDatabase(
 
 // ---------------------------------------------------------------- network
 
-/** Storage cap + DPv2 version guard + independent Gateway head and finalized chain. */
+/** The `<scope>/<version>` key of one registered slot. */
+/** The batch id inside a fragment or manifest plaintext. */
+export function batchOfPlaintext(bytes: Uint8Array) {
+  const data = (
+    JSON.parse(new TextDecoder().decode(bytes)) as {
+      data: { fragment?: { batch: string }; manifest?: { batch: string } };
+    }
+  ).data;
+  return (data.fragment ?? data.manifest)!.batch;
+}
+export const slotKey = (scope: string, version: number | string) =>
+  `${scope}/${version}`;
+const slotParts = (slot: string) => {
+  const at = slot.lastIndexOf("/");
+  return { scope: slot.slice(0, at), version: Number(slot.slice(at + 1)) };
+};
+
+/**
+ * Storage cap + DPv2 version guard + independent Gateway head and finalized
+ * chain. Registry state is kept per slot (`<scope>/<version>`): `head` holds
+ * every slot the Gateway accepted and `chain` every finalized slot. Storage
+ * and its call logs use the exact object keys: manifests at `<scope>/<version>`
+ * and fragments at `<scope>/fragments/<sha256>`.
+ */
 export function network(
   opts: { cap?: number; crash?: CrashController; realCrypto?: boolean } = {},
 ) {
@@ -249,28 +284,39 @@ export function network(
   const blobs = new Map<string, Uint8Array>();
   const head = new Map<string, ReplicaCommitment>();
   const chain = new Map<string, ReplicaFinalizedChainEvidence>();
+  const versionsOf = (map: Map<string, unknown>, scope: string) =>
+    [...map.keys()]
+      .map(slotParts)
+      .filter((p) => p.scope === scope)
+      .map((p) => p.version);
+  const latest = (map: Map<string, unknown>, scope: string) =>
+    Math.max(0, ...versionsOf(map, scope));
+  /** Finalized chain evidence of one slot; absent slots read as zero. */
   const chainRow = (
-    scope: string,
+    slot: string,
     row?: ReplicaCommitment,
-  ): ReplicaFinalizedChainEvidence => ({
-    owner,
-    scope,
-    version: "1",
-    currentVersion: row?.version ?? "0",
-    status: row ? "Active" : "None",
-    commitment: row
-      ? replicaChainCommitment(
-          row.dataHash as `0x${string}`,
-          row.metadataHash as `0x${string}`,
-        )
-      : `0x${"0".repeat(64)}`,
-    chainId: 14800,
-    registry: `0x${"2".repeat(40)}`,
-    blockNumber: 123n,
-    blockHash: `0x${"3".repeat(64)}`,
-    blockTimestamp: 1000n,
-  });
-  /** Scopes whose registration stays out of finalized chain evidence. */
+  ): ReplicaFinalizedChainEvidence => {
+    const { scope, version } = slotParts(slot);
+    return {
+      owner,
+      scope,
+      version: String(version),
+      currentVersion: row ? String(version) : "0",
+      status: row ? "Active" : "None",
+      commitment: row
+        ? replicaChainCommitment(
+            row.dataHash as `0x${string}`,
+            row.metadataHash as `0x${string}`,
+          )
+        : `0x${"0".repeat(64)}`,
+      chainId: 14800,
+      registry: `0x${"2".repeat(40)}`,
+      blockNumber: 123n,
+      blockHash: `0x${"3".repeat(64)}`,
+      blockTimestamp: 1000n,
+    };
+  };
+  /** Slots whose registration stays out of finalized chain evidence. */
   const pending = new Set<string>();
   const calls = {
     puts: [] as string[],
@@ -282,8 +328,8 @@ export function network(
   };
   const faults = {
     put: new Set<string>(),
-    evidence: undefined as undefined | ((scope: string) => unknown),
-    get: undefined as undefined | ((scope: string) => unknown),
+    evidence: undefined as undefined | ((slot: string) => unknown),
+    get: undefined as undefined | ((key: string) => unknown),
     encrypt: undefined as undefined | ((scope: string) => unknown),
     list: undefined as undefined | (() => unknown),
     loseRegistrationResponse: false,
@@ -291,30 +337,35 @@ export function network(
   let pageSize = 1000;
   const storage = {
     async upload(key: string, data: Uint8Array) {
-      const scope = key.slice(0, -2);
       if (data.length > cap) throw new Error("413 storage MAX_BLOB_SIZE");
-      crash?.point(`net-before-put:${scope}`);
-      calls.puts.push(scope);
-      if (faults.put.has(scope)) throw new Error("offline");
-      blobs.set(scope, new Uint8Array(data));
-      crash?.point(`net-after-put:${scope}`);
+      crash?.point(`net-before-put:${key}`);
+      calls.puts.push(key);
+      if (faults.put.has(key)) throw new Error("offline");
+      blobs.set(key, new Uint8Array(data));
+      crash?.point(`net-after-put:${key}`);
       return key;
     },
     urlForKey: (key: string) => key,
     async download(key: string) {
-      const scope = key.slice(0, -2);
-      crash?.point(`net-get:${scope}`);
-      calls.gets.push(scope);
+      crash?.point(`net-get:${key}`);
+      calls.gets.push(key);
       if (faults.get) {
-        const error = faults.get(scope);
+        const error = faults.get(key);
         if (error) throw error;
       }
-      const bytes = blobs.get(scope);
-      if (!bytes) throw new Error("404");
+      const bytes = blobs.get(key);
+      if (!bytes) throw Object.assign(new Error("404"), { status: 404 });
       return new Uint8Array(bytes);
     },
+    /** The production bounded reader over this storage's bytes. */
+    async downloadBounded(key: string, budget: ByteBudget) {
+      return readBoundedResponse(
+        new Response(await storage.download(key)),
+        budget,
+      );
+    },
     delete: async () => false,
-    exists: async () => true,
+    exists: async (key: string) => blobs.has(key),
   };
   const adapter = createDpv2ReplicaTransport({
     owner,
@@ -323,11 +374,12 @@ export function network(
     signer: { signAddData: async () => "0x1234" as const },
     gateway: {
       async registerDataPoint(input) {
-        crash?.point(`net-before-register:${input.scope}`);
-        calls.registrations.push(input.scope);
+        const slot = slotKey(input.scope, input.expectedVersion);
+        crash?.point(`net-before-register:${slot}`);
+        calls.registrations.push(slot);
         const max = Math.max(
-          Number(head.get(input.scope)?.version ?? 0),
-          Number(chain.get(input.scope)?.currentVersion ?? 0),
+          latest(head, input.scope),
+          latest(chain, input.scope),
         );
         if (Number(input.expectedVersion) !== max + 1)
           throw new Error(
@@ -341,15 +393,14 @@ export function network(
           metadataHash: input.metadataHash,
           deleted: false,
         };
-        head.set(input.scope, row);
-        if (!pending.has(input.scope))
-          chain.set(input.scope, chainRow(input.scope, row));
-        crash?.point(`net-after-register:${input.scope}`);
+        head.set(slot, row);
+        if (!pending.has(slot)) chain.set(slot, chainRow(slot, row));
+        crash?.point(`net-after-register:${slot}`);
         if (faults.loseRegistrationResponse) {
           faults.loseRegistrationResponse = false;
           throw new Error("response lost after commit");
         }
-        return { dataPointId: input.scope } as never;
+        return { dataPointId: slot } as never;
       },
     },
     feed: {
@@ -360,30 +411,44 @@ export function network(
           const error = faults.list();
           if (error) throw error;
         }
-        const keys = [...head.keys()]
+        const scopes = [
+          ...new Set([...head.keys()].map((k) => slotParts(k).scope)),
+        ]
           .sort()
-          .filter((key) => cursor === null || key > cursor);
-        const selected = keys.slice(0, pageSize);
+          .filter((scope) => cursor === null || scope > cursor);
+        const selected = scopes.slice(0, pageSize);
         return {
-          dataPoints: selected.map((scope) => ({ scope })) as never,
-          cursor: keys.length > pageSize ? selected.at(-1)! : null,
+          dataPoints: selected.map((scope) => ({
+            scope,
+            expectedVersion: String(latest(head, scope)),
+          })) as never,
+          cursor: scopes.length > pageSize ? selected.at(-1)! : null,
         };
       },
       getDataPoint: async () => {
         throw new Error("head-only lookup must never be used");
       },
     },
-    evidence: async (scope) => {
-      crash?.point(`net-evidence:${scope}`);
-      calls.evidence.push(scope);
+    evidence: async (scope, version) => {
+      const slot = slotKey(scope, version);
+      crash?.point(`net-evidence:${slot}`);
+      calls.evidence.push(slot);
       if (faults.evidence) {
-        const error = faults.evidence(scope);
+        const error = faults.evidence(slot);
         if (error) throw error;
       }
+      const top = latest(head, scope);
+      const final = latest(chain, scope);
+      const known = chain.get(slot);
+      const newest = chain.get(slotKey(scope, final));
       return {
-        head: head.get(scope) ?? null,
-        chain: chain.get(scope) ?? chainRow(scope),
-        pending: pending.has(scope),
+        head: head.get(slotKey(scope, top)) ?? null,
+        chain: {
+          ...(known ?? chainRow(slot)),
+          ...(!known && newest && { status: newest.status }),
+          currentVersion: String(final),
+        },
+        pending: pending.has(slot),
       };
     },
   });
@@ -432,11 +497,15 @@ export function network(
     pending,
     calls,
     faults,
+    /** Accepted registrations per writer scope: what the relayer pays for. */
+    registrationsOf(scope: string) {
+      return versionsOf(head, scope).length;
+    },
     /** Move every pending registration into finalized evidence at a block. */
     finalizeAll(blockNumber = 124n) {
-      for (const scope of pending) {
-        const row = head.get(scope);
-        if (row) chain.set(scope, { ...chainRow(scope, row), blockNumber });
+      for (const slot of pending) {
+        const row = head.get(slot);
+        if (row) chain.set(slot, { ...chainRow(slot, row), blockNumber });
       }
       pending.clear();
     },
@@ -502,6 +571,60 @@ export function network(
 }
 export type Network = ReturnType<typeof network>;
 
+/**
+ * Publish a hand-built batch straight to the network, as another registered
+ * server of the owner could: its fragments unregistered, its manifest at the
+ * next version of `writer`'s scope. `sign` gets the facts of exactly that
+ * manifest and slot, and returns the statement the manifest carries.
+ */
+export async function injectReplicaBatch(
+  net: Network,
+  input: {
+    writer: string;
+    operations: ReplicaOperation[];
+    sign: (facts: ReplicaBatchFacts) => Promise<unknown>;
+    sequence?: number;
+    previous?: Predecessor | null;
+  },
+) {
+  const batch = randomBytes(16).toString("hex");
+  const statement = {
+    owner,
+    writer: input.writer,
+    batch,
+    sequence: input.sequence ?? 1,
+    previous: input.previous ?? null,
+    collectedAt: at,
+  };
+  const bytes = Buffer.from(
+    canonicalJson({ envelope: envelope(input.operations, batch), blobs: [] }),
+  );
+  const fragments = await fragmentReplicaPayload({
+    ...statement,
+    bytes,
+    encrypt: net.port.encrypt,
+  });
+  for (const fragment of fragments) await net.port.putFragment(fragment);
+  const scope = replicaScope(input.writer);
+  const version = net.registrationsOf(scope) + 1;
+  const prepared = await prepareReplicaManifest({
+    ...statement,
+    version,
+    digest: replicaDigest(bytes),
+    totalBytes: bytes.length,
+    fragments: fragments.map((f) => ({
+      digest: f.digest,
+      bytes: f.encrypted.length,
+    })),
+    sign: input.sign,
+    encrypt: net.port.encrypt,
+  });
+  const manifest = { ...prepared, version };
+  await net.port.put(manifest);
+  await net.port.register(manifest);
+  return { batch, slot: slotKey(scope, version), manifest };
+}
+
 // ------------------------------------------------------- transport devices
 
 export type TransportWorker = ReturnType<typeof createReplicaTransportWorker>;
@@ -513,6 +636,7 @@ export function transportDevice(
   opts: {
     chunk?: number;
     cap?: number;
+    /** Operations per batch (worker maxBatchOperations). */
     pageSize?: number;
     enabled?: boolean;
     preexisting?: string;
@@ -590,7 +714,7 @@ export function transportDevice(
       now: clock.now,
       targetChunkBytes: opts.chunk ?? 4000,
       maxBlobBytes: opts.cap ?? 8192,
-      pageSize: opts.pageSize,
+      maxBatchOperations: opts.pageSize,
       ...(opts.worker ?? {}),
     });
   };
@@ -789,17 +913,12 @@ export function workRecords(db: Database.Database): WorkRecord[] {
   ) => {
     const cols = columns(db, table);
     if (!cols.size) return;
-    const pick = cols.has("fragment_json")
-      ? [...cols].filter(
-          (c) =>
-            c !== "fragment_json" &&
-            c !== "plaintext" &&
-            c !== "encrypted" &&
-            c !== "payload",
-        )
-      : [...cols].filter(
-          (c) => c !== "plaintext" && c !== "encrypted" && c !== "payload",
-        );
+    const pick = [...cols].filter(
+      (c) =>
+        !["fragment_json", "manifest_json", "plaintext", "encrypted"].includes(
+          c,
+        ),
+    );
     const rows = db
       .prepare(`SELECT ${pick.join(",")} FROM ${table} ORDER BY rowid`)
       .all() as Record<string, unknown>[];
@@ -832,11 +951,19 @@ export function workRecords(db: Database.Database): WorkRecord[] {
     prepared: row.prepared as number,
     admission: parseJson(row.admission_json),
   }));
-  read("pdpp_transport_outbox", "scope", (row) => ({
-    writer: undefined,
-    ...(row.batch ? {} : {}),
+  read("pdpp_transport_fragments_out", "batch", (row) => ({
+    id: `${String(row.batch)}:${String(row.position)}`,
   }));
-  read("pdpp_transport_inbox", "scope");
+  // A manifest's work id is its slot, the key of its finality dependency.
+  read("pdpp_transport_manifests_out", "batch", (row) => ({
+    id: `${String(row.scope)}/${String(row.version)}`,
+  }));
+  read("pdpp_transport_manifests_in", "slot", (row) => ({
+    writer: row.writer as string,
+  }));
+  read("pdpp_transport_fragments_in", "slot", (row) => ({
+    id: `${String(row.slot)}#${String(row.position)}`,
+  }));
   read("pdpp_transport_import_work", "batch", (row) => ({
     writer: row.writer as string,
   }));
@@ -883,37 +1010,48 @@ export function transportInvariantViolations(d: TransportDevice): string[] {
   const db = d.db;
   const violations: string[] = [];
   const has = (table: string) => columns(db, table).size > 0;
-  if (has("pdpp_transport_inbox")) {
+  if (has("pdpp_transport_manifests_in")) {
     const orphanImported = db
       .prepare(
-        `SELECT scope FROM pdpp_transport_inbox i WHERE state='imported' AND NOT EXISTS (
-          SELECT 1 FROM pdpp_transport_imported m
-          WHERE m.writer=json_extract(i.fragment_json,'$.writer') AND m.batch=json_extract(i.fragment_json,'$.batch'))`,
+        `SELECT slot FROM pdpp_transport_manifests_in i WHERE state='imported' AND NOT EXISTS (
+          SELECT 1 FROM pdpp_transport_imported m WHERE m.writer=i.writer AND m.batch=i.batch)`,
       )
-      .all() as { scope: string }[];
+      .all() as { slot: string }[];
     if (orphanImported.length)
       violations.push(
-        `inbox imported without receipt: ${orphanImported.map((r) => r.scope).join(",")}`,
+        `slot imported without receipt: ${orphanImported.map((r) => r.slot).join(",")}`,
       );
   }
   if (has("pdpp_transport_batches")) {
     const prepared = db
       .prepare(
-        "SELECT batch FROM pdpp_transport_batches b WHERE prepared=1 AND NOT EXISTS (SELECT 1 FROM pdpp_transport_outbox o WHERE o.batch=b.batch)",
+        `SELECT batch FROM pdpp_transport_batches b WHERE prepared=1 AND (
+          NOT EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m WHERE m.batch=b.batch)
+          OR NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=b.batch))`,
       )
       .all() as { batch: string }[];
     if (prepared.length)
       violations.push(
-        `prepared batch without outbox: ${prepared.map((r) => r.batch).join(",")}`,
+        `prepared batch without manifest or fragments: ${prepared.map((r) => r.batch).join(",")}`,
       );
     const unprepared = db
       .prepare(
-        "SELECT DISTINCT o.batch FROM pdpp_transport_outbox o JOIN pdpp_transport_batches b ON b.batch=o.batch WHERE b.prepared<>1",
+        `SELECT DISTINCT o.batch FROM (SELECT batch FROM pdpp_transport_manifests_out UNION ALL SELECT batch FROM pdpp_transport_fragments_out) o
+          JOIN pdpp_transport_batches b ON b.batch=o.batch WHERE b.prepared<>1`,
       )
       .all() as { batch: string }[];
     if (unprepared.length)
       violations.push(
-        `outbox rows for unprepared batch: ${unprepared.map((r) => r.batch).join(",")}`,
+        `outbound rows for unprepared batch: ${unprepared.map((r) => r.batch).join(",")}`,
+      );
+    const versions = db
+      .prepare(
+        "SELECT count(*) AS n, coalesce(max(version),0) AS top FROM pdpp_transport_manifests_out",
+      )
+      .get() as { n: number; top: number };
+    if (versions.n !== versions.top)
+      violations.push(
+        `manifest versions not contiguous: ${versions.n} rows, top ${versions.top}`,
       );
     const state = db
       .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")

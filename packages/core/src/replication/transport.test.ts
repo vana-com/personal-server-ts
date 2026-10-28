@@ -1,10 +1,21 @@
 import { expect, it } from "vitest";
-import { unsignedReplicaBatch } from "./writer-identity.test-utils.js";
 import {
+  decodeReplicaFragment,
+  decodeReplicaManifest,
+  fragmentMatchesManifest,
   fragmentReplicaPayload,
+  prepareReplicaManifest,
+  replicaDigest,
+  replicaFragmentKey,
+  replicaManifestKey,
   replicaScope,
+  replicaWriterOf,
+  replicaManifestFacts,
+  ReplicaManifestUnsigned,
   fromBase64,
 } from "./transport.js";
+import { canonicalJson } from "./envelope.js";
+import { unsignedReplicaBatch } from "./writer-identity.test-utils.js";
 
 it("fragments a large export without changing bytes or exceeding encrypted cap", async () => {
   const bytes = new TextEncoder().encode("😺large JSON record".repeat(2000));
@@ -14,7 +25,6 @@ it("fragments a large export without changing bytes or exceeding encrypted cap",
     batch: "b".repeat(32),
     sequence: 1,
     previous: null,
-    sign: unsignedReplicaBatch,
     bytes,
     collectedAt: "2026-10-20T00:00:00Z",
     encrypt: async (_scope, bytes) =>
@@ -24,14 +34,103 @@ it("fragments a large export without changing bytes or exceeding encrypted cap",
   });
   expect(parts.length).toBeGreaterThan(1);
   expect(parts.every((p) => p.encrypted.length <= 4096)).toBe(true);
-  expect(parts.map((p) => p.scope)).toEqual(
-    parts.map((_, i) => replicaScope("a".repeat(32), "b".repeat(32), i)),
+  // Every fragment is encrypted under its writer's one stable scope and is
+  // addressed by the digest of its own ciphertext.
+  expect(new Set(parts.map((p) => p.scope))).toEqual(
+    new Set([replicaScope("a".repeat(32))]),
+  );
+  expect(parts.map((p) => p.index)).toEqual(parts.map((_, i) => i));
+  expect(parts.map((p) => p.digest)).toEqual(
+    parts.map((p) => replicaDigest(p.encrypted)),
   );
 });
 
+it("binds a manifest to its owner, writer scope and version, and its fragments to the manifest", async () => {
+  const writer = "a".repeat(32);
+  const bytes = new TextEncoder().encode("a JSON record 😺".repeat(300));
+  const base = {
+    owner: "owner",
+    writer,
+    batch: "b".repeat(32),
+    sequence: 2,
+    previous: {
+      batch: "c".repeat(32),
+      digest: replicaDigest(new Uint8Array([1])),
+    },
+    collectedAt: "2026-10-20T00:00:00.000Z",
+  };
+  const parts = await fragmentReplicaPayload({
+    ...base,
+    bytes,
+    targetChunkBytes: 1500,
+    encrypt: async (_scope, bytes) => bytes,
+  });
+  const manifest = await prepareReplicaManifest({
+    ...base,
+    version: 2,
+    digest: replicaDigest(bytes),
+    totalBytes: bytes.length,
+    fragments: parts.map((p) => ({
+      digest: p.digest,
+      bytes: p.encrypted.length,
+    })),
+    sign: unsignedReplicaBatch,
+    encrypt: async (_scope, bytes) => bytes,
+  });
+  const scope = replicaScope(writer);
+  expect(manifest).toMatchObject({ scope, version: 2 });
+  expect(replicaManifestKey(scope, 2)).toBe(`${scope}/2`);
+  expect(replicaFragmentKey(scope, parts[0]!.digest)).toBe(
+    `${scope}/fragments/${parts[0]!.digest.slice(7)}`,
+  );
+  expect(replicaWriterOf(scope)).toBe(writer);
+  expect(replicaWriterOf(`${scope}.0`)).toBeUndefined();
+  const decoded = decodeReplicaManifest(manifest.plaintext, scope, "owner");
+  expect(decoded.fragments).toHaveLength(parts.length);
+  // The statement is signed over this manifest at its version.
+  expect(decoded.authority).toEqual(
+    await unsignedReplicaBatch(replicaManifestFacts(decoded, 2)),
+  );
+  // Without a statement the manifest is unsigned, not malformed.
+  const { authority: _authority, ...bare } = decoded;
+  const wrapper = JSON.parse(new TextDecoder().decode(manifest.plaintext));
+  expect(() =>
+    decodeReplicaManifest(
+      new TextEncoder().encode(
+        canonicalJson({ ...wrapper, data: { manifest: bare } }),
+      ),
+      scope,
+      "owner",
+    ),
+  ).toThrow(ReplicaManifestUnsigned);
+  expect(() =>
+    decodeReplicaManifest(manifest.plaintext, scope, "other"),
+  ).toThrow();
+  expect(() =>
+    decodeReplicaManifest(
+      manifest.plaintext,
+      replicaScope("d".repeat(32)),
+      "owner",
+    ),
+  ).toThrow();
+  const fragments = parts.map((p) =>
+    decodeReplicaFragment(p.plaintext, p.scope, "owner"),
+  );
+  expect(
+    fragments.every((f, i) => fragmentMatchesManifest(f, decoded, i)),
+  ).toBe(true);
+  expect(fragmentMatchesManifest(fragments[1]!, decoded, 0)).toBe(false);
+  expect(
+    fragmentMatchesManifest(
+      { ...fragments[0]!, digest: replicaDigest(new Uint8Array([2])) },
+      decoded,
+      0,
+    ),
+  ).toBe(false);
+});
+
 it("reassembles byte-identical content and rejects missing, overlapping, swapped or tampered frames", async () => {
-  const { assembleReplicaPayload, decodeReplicaFragment } =
-    await import("./transport.js");
+  const { assembleReplicaPayload } = await import("./transport.js");
   const bytes = new TextEncoder().encode("a JSON record 😺".repeat(300));
   const parts = await fragmentReplicaPayload({
     owner: "owner",
@@ -39,7 +138,6 @@ it("reassembles byte-identical content and rejects missing, overlapping, swapped
     batch: "b".repeat(32),
     sequence: 1,
     previous: null,
-    sign: unsignedReplicaBatch,
     bytes,
     collectedAt: "2026-10-20T00:00:00.000Z",
     targetChunkBytes: 1500,
@@ -80,8 +178,7 @@ it("reassembles byte-identical content and rejects missing, overlapping, swapped
 it("reduces fragment size using actual DPv2 encryption overhead", async () => {
   const { encryptWithPassword, decryptWithPassword } =
     await import("@opendatalabs/vana-sdk/browser");
-  const { assembleReplicaPayload, decodeReplicaFragment } =
-    await import("./transport.js");
+  const { assembleReplicaPayload } = await import("./transport.js");
   const bytes = crypto.getRandomValues(new Uint8Array(6500));
   const parts = await fragmentReplicaPayload({
     owner: "owner",
@@ -89,7 +186,6 @@ it("reduces fragment size using actual DPv2 encryption overhead", async () => {
     batch: "b".repeat(32),
     sequence: 1,
     previous: null,
-    sign: unsignedReplicaBatch,
     bytes,
     collectedAt: "2026-10-20T00:00:00.000Z",
     targetChunkBytes: 6500,
@@ -110,7 +206,7 @@ it("reduces fragment size using actual DPv2 encryption overhead", async () => {
   expect(assembleReplicaPayload(decoded)).toEqual(bytes);
 }, 30000);
 
-it("keeps Gateway disagreement pending and quarantines only finalized immutable slot conflicts", async () => {
+it("keeps Gateway disagreement pending and quarantines only a finalized slot commitment conflict", async () => {
   const { replicaRegistrationState, replicaChainCommitment } =
     await import("./dpv2.js");
   const row = {
@@ -137,16 +233,24 @@ it("keeps Gateway disagreement pending and quarantines only finalized immutable 
   const expected = {
     owner: row.owner,
     scope: row.scope,
+    version: 1,
     dataHash: row.dataHash,
     metadataHash: row.metadataHash,
   };
   const evidence = { head: row, chain, pending: false };
+  // A later head and a later finalized version are appends, not conflicts.
   expect(
     replicaRegistrationState(
       { ...evidence, head: { ...row, version: "9" } },
       expected,
     ),
-  ).toBe("pending");
+  ).toBe("confirmed");
+  expect(
+    replicaRegistrationState(
+      { ...evidence, chain: { ...chain, currentVersion: "2" } },
+      expected,
+    ),
+  ).toBe("confirmed");
   expect(replicaRegistrationState(evidence, expected)).toBe("confirmed");
   const absentChain = {
     ...chain,
@@ -165,7 +269,7 @@ it("keeps Gateway disagreement pending and quarantines only finalized immutable 
     { head: null },
     { pending: true },
     { chain: absentChain },
-    { head: { ...row, version: "9" } },
+    { chain: { ...chain, version: "2" } },
     { head: { ...row, owner: "other" } },
     { head: { ...row, scope: "other" } },
     { head: { ...row, deleted: true } },
@@ -181,7 +285,7 @@ it("keeps Gateway disagreement pending and quarantines only finalized immutable 
     expect(
       replicaRegistrationState(
         { ...evidence, ...patch },
-        { owner: row.owner, scope: row.scope },
+        { owner: row.owner, scope: row.scope, version: 1 },
       ),
     ).toBe("pending");
   }
@@ -192,8 +296,14 @@ it("keeps Gateway disagreement pending and quarantines only finalized immutable 
     ),
   ).toBe("pending");
   for (const patch of [
-    { chain: { ...chain, currentVersion: "2" } },
     { chain: { ...chain, commitment: `0x${"c".repeat(64)}` as const } },
+    {
+      chain: {
+        ...chain,
+        currentVersion: "5",
+        commitment: `0x${"c".repeat(64)}` as const,
+      },
+    },
   ]) {
     expect(replicaRegistrationState({ ...evidence, ...patch }, expected)).toBe(
       "conflict",
@@ -203,7 +313,7 @@ it("keeps Gateway disagreement pending and quarantines only finalized immutable 
   expect(
     replicaRegistrationState(
       { ...evidence, chain: { ...chain, commitment: `0x${"d".repeat(64)}` } },
-      { owner: row.owner, scope: row.scope },
+      { owner: row.owner, scope: row.scope, version: 1 },
     ),
   ).toBe("pending");
 });
@@ -237,6 +347,7 @@ it("quarantines a finalized tombstone-at-version-1 against the durable replica h
     replicaRegistrationState(evidence, {
       owner: "owner",
       scope: "scope",
+      version: 1,
       dataHash: `0x${"a".repeat(64)}`,
       metadataHash: `0x${"b".repeat(64)}`,
     }),

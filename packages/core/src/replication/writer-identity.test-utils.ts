@@ -6,10 +6,11 @@ import {
   type ReplicaRosterPort,
   type ReplicaRosterRecord,
 } from "./roster.js";
-import type {
-  ReplicaBatchAuthority,
-  ReplicaBatchFacts,
-  ReplicaBatchSigner,
+import {
+  replicaFragmentListDigest,
+  type ReplicaBatchAuthority,
+  type ReplicaBatchFacts,
+  type ReplicaBatchSigner,
 } from "./writer-identity.js";
 
 const random32 = () =>
@@ -31,14 +32,18 @@ export async function unsignedReplicaBatch(
       serverId: `0x${"0".repeat(64)}`,
       environment: "dev",
       writerNonce: `0x${"0".repeat(32)}`,
+      version: facts.version,
       batch: facts.batch,
       sequence: facts.sequence,
       previous: facts.previous
         ? digest(facts.previous.digest)
         : `0x${"0".repeat(64)}`,
+      previousBatch: facts.previous?.batch ?? "",
+      collectedAt: facts.collectedAt,
       digest: digest(facts.digest),
       totalBytes: facts.totalBytes,
-      count: facts.count,
+      count: facts.fragments.length,
+      fragments: replicaFragmentListDigest(facts.fragments),
     },
     signature: `0x${"0".repeat(130)}`,
   };

@@ -12,11 +12,7 @@ const registry = "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867";
 
 async function main() {
   const owner = privateKeyToAccount(generatePrivateKey()).address;
-  const scope = replicaScope(
-    crypto.randomUUID().replaceAll("-", ""),
-    crypto.randomUUID().replaceAll("-", ""),
-    0,
-  );
+  const scope = replicaScope(crypto.randomUUID().replaceAll("-", ""));
   for (const origin of [gatewayUrl, storageUrl]) {
     const response = await fetch(`${origin}/health`, {
       signal: AbortSignal.timeout(25_000),
@@ -35,8 +31,12 @@ async function main() {
     rpc,
     fetch: (input, init) =>
       fetch(input, { ...init, signal: AbortSignal.timeout(25_000) }),
-  })(scope);
-  const state = replicaRegistrationState(evidence, { owner, scope });
+  })(scope, 1);
+  const state = replicaRegistrationState(evidence, {
+    owner,
+    scope,
+    version: 1,
+  });
   if (state !== "absent") throw new Error(`Fresh owner slot is ${state}`);
   console.log(
     JSON.stringify({

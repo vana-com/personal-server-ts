@@ -1,6 +1,6 @@
 import type { Database } from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { keccak256, type Hex } from "viem";
+import type { Hex } from "viem";
 import { createHash } from "node:crypto";
 import {
   binaryWriter,
@@ -19,16 +19,17 @@ import {
   decodeReplicaEnvelope,
   type EnvelopeExpectation,
   type ReplicaEnvelope,
+  type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
-  decodeReplicaFragment,
-  isReplicaScope,
-  ReplicaFragmentUnsigned,
-  replicaMetadataHash,
+  prepareReplicaManifest,
+  replicaManifestFacts,
+  replicaScope,
+  replicaWriterOf,
   REPLICA_MAX_BLOB_BYTES,
-  REPLICA_SCOPE_PREFIX,
-  type PreparedFragment,
+  type ManifestEntry,
   type ReplicaFragment,
+  type ReplicaManifest,
   type Predecessor,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import {
@@ -36,9 +37,16 @@ import {
   replicaAwaitingFinality,
   replicaRegistrationInactive,
   replicaChainCommitment,
+  ReplicaObjectRefused,
+  type ReplicaSlot,
   type ReplicaTransportPort,
   type ReplicaRegistrationEvidence,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
+import {
+  receiveReplicaManifest,
+  receiveReplicaFragment,
+  REPLICA_RECEIVE_TIMEOUT_MS,
+} from "@opendatalabs/personal-server-ts-core/replication/receive";
 import {
   abortable,
   createReplicaCoordinator,
@@ -59,6 +67,7 @@ import {
   type ReplicaOutcome,
   type ReplicaPhase,
   type ReplicaPhaseOutcome,
+  type ReplicaQuarantineProof,
 } from "@opendatalabs/personal-server-ts-core/replication/outcome";
 import { replicaCopyKey } from "@opendatalabs/personal-server-ts-core/replication/copy-promotion";
 import { REPLICA_REFETCH_BUDGET } from "./pdpp-replica-copies.js";
@@ -80,7 +89,6 @@ import {
   replicaOperationWriterRefusal,
   signReplicaBatch,
   type ReplicaAuthorityRefusal,
-  type ReplicaBatchFacts,
   type ReplicaBatchSigner,
   type ReplicaEnvironment,
   type ReplicaPartition,
@@ -98,6 +106,30 @@ import type { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 const activeDatabases = new Set<Database | string>();
 const ownedTokens = new Set<string>();
 
+/** Default bound on the operations one batch (one registration) covers. */
+export const REPLICA_BATCH_OPERATIONS = 10_000;
+/**
+ * Default bound on the estimated payload bytes of one batch. One operation
+ * always fits, so a single larger blob makes a larger batch.
+ */
+export const REPLICA_BATCH_BYTES = 32 * 1024 * 1024;
+/** The export's page limit. A batch reads several pages. */
+const EXPORT_PAGE = 1000;
+/** New slots one discover pass admits per writer scope. */
+const DISCOVER_SLOTS = 256;
+
+/** Durable outcome columns shared by every per-item work table. */
+const WORK = `outcome TEXT, reason TEXT, cause_json TEXT, dependency TEXT, error TEXT,
+ attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0,
+ wait_since INTEGER, checked_block TEXT`;
+/*
+ * Sender: a retained batch is prepared into content-addressed fragments and
+ * one manifest. Fragments are stored unregistered; the manifest is the one
+ * registration, at the next version of the writer's single scope.
+ * Receiver: each discovered version of a writer scope is a slot. A slot's
+ * manifest is fetched only under finalized evidence, and each fragment is
+ * checked against the manifest's digest before it is decrypted.
+ */
 const migration = `
 CREATE TABLE IF NOT EXISTS pdpp_transport_lock (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pdpp_transport_state (
@@ -106,38 +138,38 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_state (
  tail_cursor INTEGER, sequence INTEGER NOT NULL DEFAULT 0, previous_json TEXT, scan_cursor TEXT);
 CREATE TABLE IF NOT EXISTS pdpp_transport_batches (
  batch TEXT PRIMARY KEY, sequence INTEGER UNIQUE NOT NULL, previous_json TEXT,
- collected_at TEXT NOT NULL, digest TEXT NOT NULL, payload BLOB NOT NULL, prepared INTEGER NOT NULL DEFAULT 0,
- attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0, error TEXT);
-CREATE TABLE IF NOT EXISTS pdpp_transport_outbox (
- scope TEXT PRIMARY KEY, batch TEXT NOT NULL, plaintext BLOB NOT NULL, encrypted BLOB NOT NULL,
- data_hash TEXT NOT NULL, metadata_hash TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'ready',
- attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0, error TEXT);
-CREATE TABLE IF NOT EXISTS pdpp_transport_inbox (
- scope TEXT PRIMARY KEY, fragment_json TEXT, state TEXT NOT NULL DEFAULT 'ready',
- attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0, error TEXT);
+ collected_at TEXT NOT NULL, digest TEXT NOT NULL, total_bytes INTEGER NOT NULL,
+ prepared INTEGER NOT NULL DEFAULT 0, admission_json TEXT, ${WORK});
+CREATE TABLE IF NOT EXISTS pdpp_transport_staged_fragments (
+ token TEXT NOT NULL, position INTEGER NOT NULL, digest TEXT NOT NULL, encrypted BLOB NOT NULL,
+ PRIMARY KEY(token,position));
+CREATE TABLE IF NOT EXISTS pdpp_transport_fragments_out (
+ batch TEXT NOT NULL, position INTEGER NOT NULL, digest TEXT NOT NULL, encrypted BLOB NOT NULL,
+ state TEXT NOT NULL DEFAULT 'ready', ${WORK}, PRIMARY KEY(batch,position));
+CREATE TABLE IF NOT EXISTS pdpp_transport_manifests_out (
+ batch TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL,
+ plaintext BLOB NOT NULL, encrypted BLOB NOT NULL, data_hash TEXT NOT NULL, metadata_hash TEXT NOT NULL,
+ state TEXT NOT NULL DEFAULT 'ready', ${WORK}, UNIQUE(scope,version));
+CREATE TABLE IF NOT EXISTS pdpp_transport_manifests_in (
+ slot TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL, writer TEXT NOT NULL,
+ manifest_json TEXT, data_hash TEXT, metadata_hash TEXT, batch TEXT, sequence INTEGER,
+ state TEXT NOT NULL DEFAULT 'ready', evidence_checked INTEGER NOT NULL DEFAULT 0, ${WORK},
+ UNIQUE(scope,version));
+CREATE TABLE IF NOT EXISTS pdpp_transport_fragments_in (
+ slot TEXT NOT NULL, position INTEGER NOT NULL, digest TEXT NOT NULL, bytes INTEGER NOT NULL,
+ fragment_json TEXT, state TEXT NOT NULL DEFAULT 'ready', ${WORK}, PRIMARY KEY(slot,position));
+CREATE INDEX IF NOT EXISTS pdpp_manifests_in_batch ON pdpp_transport_manifests_in(writer,batch);
+CREATE INDEX IF NOT EXISTS pdpp_manifests_in_checked ON pdpp_transport_manifests_in(evidence_checked) WHERE state='imported';
 CREATE TABLE IF NOT EXISTS pdpp_transport_imported (
  writer TEXT NOT NULL, batch TEXT NOT NULL, sequence INTEGER NOT NULL, digest TEXT NOT NULL,
  PRIMARY KEY(writer,batch), UNIQUE(writer,sequence));
 CREATE TABLE IF NOT EXISTS pdpp_transport_import_work (
  writer TEXT NOT NULL, batch TEXT NOT NULL, sequence INTEGER NOT NULL,
- outcome TEXT, reason TEXT, cause_json TEXT, dependency TEXT, error TEXT,
- attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0,
- wait_since INTEGER, checked_block TEXT, PRIMARY KEY(writer,batch));
+ ${WORK}, refetch_attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(writer,batch));
 CREATE INDEX IF NOT EXISTS pdpp_import_work_dependency ON pdpp_transport_import_work(dependency) WHERE outcome='wait';
 CREATE TABLE IF NOT EXISTS pdpp_transport_phase_state (
- phase TEXT PRIMARY KEY, outcome TEXT, reason TEXT, cause_json TEXT, dependency TEXT, error TEXT,
- attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0,
- wait_since INTEGER, checked_block TEXT, fingerprint TEXT);
+ phase TEXT PRIMARY KEY, ${WORK}, fingerprint TEXT);
 `;
-/** Durable outcome columns shared by every per-item work table. */
-const WORK_COLUMNS: [string, string][] = [
-  ["outcome", "TEXT"],
-  ["reason", "TEXT"],
-  ["cause_json", "TEXT"],
-  ["dependency", "TEXT"],
-  ["wait_since", "INTEGER"],
-  ["checked_block", "TEXT"],
-];
 type State = {
   owner: string;
   writer: string;
@@ -161,18 +193,37 @@ type Batch = Work & {
   collected_at: string;
   digest: string;
   total_bytes: number;
-  legacy: number;
 };
-type Outbox = Work & {
-  scope: string;
+/** One outbound unit: a fragment PUT, or a manifest PUT and registration. */
+type Outbound = Work & {
+  kind: "fragment" | "manifest";
+  id: string;
   batch: string;
-  data_hash: `0x${string}`;
-  metadata_hash: `0x${string}`;
+  position: number;
 };
-type Inbox = Work & {
+type ManifestOut = {
+  batch: string;
   scope: string;
-  data_hash: `0x${string}` | null;
-  metadata_hash: `0x${string}` | null;
+  version: number;
+  plaintext: Buffer;
+  encrypted: Buffer;
+  data_hash: Hex;
+  metadata_hash: Hex;
+};
+type Slot = Work & {
+  slot: string;
+  scope: string;
+  version: number;
+  writer: string;
+  data_hash: Hex | null;
+  metadata_hash: Hex | null;
+};
+type FragmentIn = Work & {
+  slot: string;
+  position: number;
+  digest: string;
+  bytes: number;
+  writer: string;
 };
 type Item<R> = ReplicaWorkItem & { row: R };
 
@@ -201,13 +252,17 @@ function workValues(outcome: ReplicaOutcome, state: ReplicaWorkState) {
 }
 const WORK_SET =
   "outcome=?,reason=?,cause_json=?,dependency=?,error=?,attempts=?,next_attempt=?,wait_since=?,checked_block=?";
-/** Scope format: pdpp_replica_v1.<writer>_<batch>.<index>. */
-const writerOfScope = (scope: string) =>
-  scope.slice(
-    REPLICA_SCOPE_PREFIX.length + 1,
-    REPLICA_SCOPE_PREFIX.length + 33,
-  );
-const SCOPE_WRITER_SQL = `substr(scope,${REPLICA_SCOPE_PREFIX.length + 2},32)`;
+/** A durable quarantine with its closed reason, for a slot or fragment row. */
+const QUARANTINE_SET = (reason: ReplicaQuarantineProof["reason"]) =>
+  `state='quarantined',outcome='quarantine',reason='${reason}',error='${reason}'`;
+/** Column reset that makes a receiver row fresh work again. */
+const RESET_WORK =
+  "outcome=NULL,reason=NULL,cause_json=NULL,dependency=NULL,error=NULL,attempts=0,wait_since=NULL,checked_block=NULL";
+/** A slot's storage and evidence identity: the DPv2 `<scope>/<version>` key. */
+const slotKey = (scope: string, version: number) => `${scope}/${version}`;
+const encoder = new TextEncoder();
+const blobsOf = (op: ReplicaOperation) =>
+  op.kind === "blob-claim" ? [op.blob] : op.kind === "upsert" ? op.blobs : [];
 
 /** The owner binding every phase runs under, validated before any phase. */
 export class ReplicaAuthorityError extends Error {
@@ -217,6 +272,25 @@ export class ReplicaAuthorityError extends Error {
     this.name = "ReplicaAuthorityError";
   }
 }
+
+/**
+ * The database holds state of the earlier carrier (one registration per
+ * fragment). This worker cannot read it, and mixing the two layouts would
+ * corrupt both. Testers start such a database fresh.
+ */
+export class ReplicaCarrierMismatchError extends Error {
+  readonly code = "replica_carrier_mismatch";
+  constructor() {
+    super("replica transport state is from the per-fragment carrier");
+    this.name = "ReplicaCarrierMismatchError";
+  }
+}
+/** Tables only the per-fragment carrier created. */
+const PER_FRAGMENT_TABLES = [
+  "pdpp_transport_outbox",
+  "pdpp_transport_inbox",
+  "pdpp_transport_preparing",
+];
 
 /** Internal experiment only. No bootstrap wiring; false by default. */
 export function createReplicaTransportWorker(deps: {
@@ -246,7 +320,12 @@ export function createReplicaTransportWorker(deps: {
   now?: () => number;
   maxBlobBytes?: number;
   targetChunkBytes?: number;
-  pageSize?: number;
+  /**
+   * Bounds on one batch, so on what one registration covers. A batch closes
+   * at whichever bound it reaches first; it always takes one operation.
+   */
+  maxBatchOperations?: number;
+  maxBatchBytes?: number;
   /** Units per phase per step. Defaults keep today's per-cycle limits. */
   quantum?: Partial<Record<ReplicaPhase, number>>;
   /** Items per writer per phase per step. */
@@ -269,52 +348,25 @@ export function createReplicaTransportWorker(deps: {
   const cap = deps.maxBlobBytes ?? REPLICA_MAX_BLOB_BYTES;
   if (!Number.isSafeInteger(cap) || cap < 1 || cap > REPLICA_MAX_BLOB_BYTES)
     throw new RangeError("invalid storage cap");
+  const maxOperations = deps.maxBatchOperations ?? REPLICA_BATCH_OPERATIONS;
+  const maxBytes = deps.maxBatchBytes ?? REPLICA_BATCH_BYTES;
+  if (
+    !Number.isSafeInteger(maxOperations) ||
+    maxOperations < 1 ||
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1
+  )
+    throw new RangeError("invalid replica batch bounds");
+  if (
+    db
+      .prepare(
+        `SELECT 1 FROM sqlite_master WHERE type='table' AND name IN (${PER_FRAGMENT_TABLES.map(() => "?").join(",")})`,
+      )
+      .get(...PER_FRAGMENT_TABLES)
+  )
+    throw new ReplicaCarrierMismatchError();
   db.exec(migration);
-  const addColumns = (table: string, wanted: [string, string][]) => {
-    const existing = new Set(
-      (
-        db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
-      ).map((c) => c.name),
-    );
-    for (const [name, type] of wanted)
-      if (!existing.has(name))
-        db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
-  };
-  for (const table of [
-    "pdpp_transport_batches",
-    "pdpp_transport_outbox",
-    "pdpp_transport_inbox",
-  ])
-    addColumns(table, WORK_COLUMNS);
-  addColumns("pdpp_transport_batches", [
-    ["total_bytes", "INTEGER"],
-    ["admission_json", "TEXT"],
-  ]);
-  addColumns("pdpp_transport_import_work", [
-    ["refetch_attempts", "INTEGER NOT NULL DEFAULT 0"],
-  ]);
-  addColumns("pdpp_transport_inbox", [
-    ["data_hash", "TEXT"],
-    ["metadata_hash", "TEXT"],
-    ["finalized", "INTEGER NOT NULL DEFAULT 0"],
-    ["evidence_checked", "INTEGER NOT NULL DEFAULT 0"],
-  ]);
-  db.exec(
-    `CREATE TABLE IF NOT EXISTS pdpp_transport_preparing (token TEXT NOT NULL, scope TEXT NOT NULL, batch TEXT NOT NULL, plaintext BLOB NOT NULL, encrypted BLOB NOT NULL, data_hash TEXT NOT NULL, metadata_hash TEXT NOT NULL, PRIMARY KEY(token,scope));`,
-  );
-  // Older workers retained decoded fragments without their verified hash-pair
-  // preimages. Re-download those ready rows; never infer finality from the old JSON.
-  if (deps.enabled === true)
-    db.prepare(
-      `UPDATE pdpp_transport_inbox
-      SET fragment_json=NULL,data_hash=NULL,metadata_hash=NULL,finalized=0,next_attempt=0,error=NULL
-      WHERE state='ready' AND fragment_json IS NOT NULL
-        AND (data_hash IS NULL OR metadata_hash IS NULL)`,
-    ).run();
   deps.receiver.setPendingEnabled(deps.enabled === true);
-  db.exec(
-    "CREATE INDEX IF NOT EXISTS pdpp_inbox_evidence_checked ON pdpp_transport_inbox(evidence_checked) WHERE fragment_json IS NOT NULL AND state='imported'",
-  );
   const enabled = () => deps.enabled === true;
   const state = () =>
     db.prepare("SELECT * FROM pdpp_transport_state WHERE id=1").get() as State;
@@ -350,23 +402,28 @@ export function createReplicaTransportWorker(deps: {
   /**
    * A new writer identity (re-registration, reset or restore) starts its own
    * chain at sequence 1, and its first publication is a full current-state
-   * baseline under the new writer. The old writer's unprepared batches and
-   * unpublished fragments are abandoned: their operations name the old
-   * operation writer, which no receiver accepts from the new one. The
-   * baseline carries their effect instead, so a peer that missed any old
-   * batch still converges. The same transaction switches the writer and pins
-   * the baseline; a crash resumes it from its durable cursor. The rebaseline
-   * is a capture, so the door's fence does not count it as a bypass.
+   * baseline under the new writer, in the new writer's own scope from
+   * version 1. The old writer's batches, fragments and manifests that are
+   * not yet published are abandoned, so its scope gets no new version: their
+   * operations name the old operation writer, which no receiver accepts from
+   * the new one. The baseline carries their effect instead, so a peer that
+   * missed any old batch still converges. The same transaction switches the
+   * writer and pins the baseline; a crash resumes it from its durable
+   * cursor. The rebaseline is a capture, so the door's fence does not count
+   * it as a bypass.
    */
   function startWriter(identity: ReplicaWriterIdentity) {
     const baseline = captureWrites(db, () => deps.exporter.rebaseline());
     db.prepare(
       "UPDATE pdpp_transport_state SET writer=?,sequence=0,previous_json=NULL,baseline_cursor=?,baseline_done=0,tail_cursor=NULL WHERE id=1",
     ).run(identity.transportWriter, baseline?.after ?? 0);
-    db.prepare("DELETE FROM pdpp_transport_batches").run();
-    db.prepare(
-      "UPDATE pdpp_transport_outbox SET state='abandoned' WHERE state='ready'",
-    ).run();
+    for (const table of [
+      "pdpp_transport_batches",
+      "pdpp_transport_staged_fragments",
+      "pdpp_transport_fragments_out",
+      "pdpp_transport_manifests_out",
+    ])
+      db.prepare(`DELETE FROM ${table}`).run();
   }
   /** This receiver's partition: its owner, chain and environment. */
   const partition = (): ReplicaPartition => ({
@@ -374,32 +431,27 @@ export function createReplicaTransportWorker(deps: {
     chainId: deps.authority.chainId,
     environment: deps.authority.environment,
   });
-  const factsOf = (fragment: ReplicaFragment): ReplicaBatchFacts => ({
-    batch: fragment.batch,
-    sequence: fragment.sequence,
-    previous: fragment.previous,
-    digest: fragment.digest,
-    totalBytes: fragment.totalBytes,
-    count: fragment.count,
-  });
-  /** Receiver checks 2-5 (host contract §3.4) for one fragment's statement. */
-  const authorizeFragment = (fragment: ReplicaFragment, signal: AbortSignal) =>
+  /**
+   * Receiver checks 2-5 (host contract §3.4) for the manifest registered at
+   * `slot`: its statement must sign this manifest at this version, and the
+   * writer it derives must be the one the slot's scope names.
+   */
+  const authorizeManifest = (
+    manifest: ReplicaManifest,
+    slot: { writer: string; version: number },
+    signal: AbortSignal,
+  ) =>
     authorizeReplicaBatch({
-      authority: fragment.authority,
-      facts: factsOf(fragment),
-      transportWriter: fragment.writer,
+      authority: manifest.authority,
+      facts: replicaManifestFacts(manifest, slot.version),
+      transportWriter: slot.writer,
       receiver: partition(),
       roster: (address) => roster.server(address, { signal }),
     });
-  const refused = (
-    reason: ReplicaAuthorityRefusal,
-    key: string,
-  ): ReplicaPhaseOutcome => ({ tag: "quarantine", proof: { reason, key } });
   const rosterWait = (address: string): ReplicaPhaseOutcome => ({
     tag: "wait",
     dependency: { kind: "roster", key: address },
   });
-
   /** An attempt with no durable effect besides its outcome. */
   const verdict = (outcome: ReplicaPhaseOutcome): ReplicaAttempt => ({
     outcome,
@@ -414,6 +466,10 @@ export function createReplicaTransportWorker(deps: {
       effect();
     },
   });
+  const quarantine = (
+    reason: ReplicaQuarantineProof["reason"],
+    key: string,
+  ): ReplicaPhaseOutcome => ({ tag: "quarantine", proof: { reason, key } });
   /**
    * Every adapter's commit: in one transaction run this attempt's plan,
    * settle the (possibly refined) verdict and write the item's state.
@@ -466,6 +522,15 @@ export function createReplicaTransportWorker(deps: {
       checkedBlock: String(evidence.chain!.blockNumber),
     },
   });
+  /** The verdict for a slot whose registration is not confirmed yet. */
+  const unconfirmed = (
+    evidence: ReplicaRegistrationEvidence,
+    slot: ReplicaSlot,
+  ): ReplicaPhaseOutcome =>
+    replicaAwaitingFinality(evidence, slot) ||
+    replicaRegistrationInactive(evidence, slot)
+      ? finalityWait(evidence, slotKey(slot.scope, slot.version))
+      : { tag: "retry", problem: "registration_unconfirmed" };
 
   // --------------------------------------------------------------- retain
   const singleton = (phase: ReplicaPhase) =>
@@ -531,6 +596,108 @@ export function createReplicaTransportWorker(deps: {
       }).operations.length > 0
     );
   }
+  /**
+   * A retained batch that is still on its way to a finalized registration and
+   * is not failing. While one exists, new operations accumulate for the next
+   * batch instead of each step cutting its own: a sync costs one
+   * registration. A batch in Retry or Unsupported does not hold the window,
+   * so one failing batch never blocks its successors.
+   */
+  function batchInFlight() {
+    return !!db
+      .prepare(
+        `SELECT 1 FROM pdpp_transport_batches b WHERE
+          (b.prepared=0 AND coalesce(b.outcome,'')<>'retry')
+          OR (b.prepared=1 AND EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m
+            WHERE m.batch=b.batch AND m.state='ready' AND coalesce(m.outcome,'')<>'retry'
+            AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f
+              WHERE f.batch=b.batch AND f.outcome='retry')))
+          LIMIT 1`,
+      )
+      .get();
+  }
+  /**
+   * Wire bytes an operation adds to a payload: its JSON and each new blob.
+   * `shares` is true when it references a blob the payload already carries.
+   */
+  function operationBytes(op: ReplicaOperation, seen: Set<string>) {
+    const json = encoder.encode(canonicalJson(op)).length + 1;
+    let blobs = 0;
+    let shares = false;
+    for (const blob of blobsOf(op))
+      if (seen.has(blob.blobId)) shares = true;
+      else {
+        seen.add(blob.blobId);
+        blobs += 4 * Math.ceil(blob.sizeBytes / 3) + blob.blobId.length + 16;
+      }
+    return { json, blobs, shares };
+  }
+  /**
+   * Read export pages from the cursor until a batch bound is reached or the
+   * export has no more. A page that overflows the byte bound is read again
+   * with a smaller limit, so the cursor ends exactly after the last operation
+   * taken. Baseline and tail operations never share a batch.
+   * Every batch carries the blobs its operations reference. An operation that
+   * only shares blobs already in the batch is bounded by JSON bytes alone:
+   * cutting it into the next batch would send those blobs again.
+   */
+  function readBatch(s: State) {
+    const read = (afterSequence: number | undefined, limit: number) =>
+      s.baseline_done
+        ? deps.exporter.readTailPage({
+            limit,
+            ...(afterSequence === undefined ? {} : { afterSequence }),
+          })
+        : deps.exporter.readBaselinePage({
+            limit,
+            afterSequence: afterSequence ?? s.baseline_cursor,
+          });
+    const operations: ReplicaOperation[] = [];
+    const seen = new Set<string>();
+    let bytes = 0;
+    let jsonBytes = 0;
+    let cursor = s.baseline_done
+      ? (s.tail_cursor ?? undefined)
+      : s.baseline_cursor;
+    let hasMore = true;
+    let next = cursor ?? 0;
+    while (hasMore && operations.length < maxOperations) {
+      let page = read(
+        cursor,
+        Math.min(EXPORT_PAGE, maxOperations - operations.length),
+      );
+      const trial = new Set(seen);
+      let fit = 0;
+      let added = 0;
+      let addedJson = 0;
+      for (const op of page.operations) {
+        const size = operationBytes(op, trial);
+        const fits =
+          operations.length + fit === 0 ||
+          bytes + added + size.json + size.blobs <= maxBytes ||
+          (size.shares &&
+            size.blobs === 0 &&
+            jsonBytes + addedJson + size.json <= maxBytes);
+        if (!fits) break;
+        fit++;
+        added += size.json + size.blobs;
+        addedJson += size.json;
+      }
+      const full = fit < page.operations.length;
+      if (full && fit === 0) break;
+      if (full) page = read(cursor, fit);
+      for (const op of page.operations) {
+        operations.push(op);
+        operationBytes(op, seen);
+      }
+      bytes += added;
+      jsonBytes += addedJson;
+      cursor = next = page.nextAfterSequence;
+      hasMore = full || page.hasMore;
+      if (full) break;
+    }
+    return { operations, next, hasMore };
+  }
   const retain: ReplicaPhaseHandler<Item<Work>> = {
     phase: "retain",
     due(e) {
@@ -538,7 +705,7 @@ export function createReplicaTransportWorker(deps: {
       const at = singletonEligibleAt(row, e);
       if (at === undefined || at > e.now) return [];
       // An idle tail costs one indexed probe and no budget unit.
-      if (!tailPending()) return [];
+      if (batchInFlight() || !tailPending()) return [];
       return [
         {
           id: "retain",
@@ -551,16 +718,7 @@ export function createReplicaTransportWorker(deps: {
     },
     async run() {
       const s = state();
-      const options = { limit: deps.pageSize ?? 50 };
-      const page = s.baseline_done
-        ? deps.exporter.readTailPage({
-            ...options,
-            ...(s.tail_cursor === null ? {} : { afterSequence: s.tail_cursor }),
-          })
-        : deps.exporter.readBaselinePage({
-            ...options,
-            afterSequence: s.baseline_cursor,
-          });
+      const page = readBatch(s);
       const batch = randomUUID().replaceAll("-", "");
       let digest = "",
         totalBytes = 0;
@@ -610,14 +768,13 @@ export function createReplicaTransportWorker(deps: {
             if (!verifyBinary(db, "payload", batch, digest, totalBytes))
               throw new ReplicaProblemError("retain_failed");
             db.prepare(
-              "INSERT INTO pdpp_transport_batches (batch,sequence,previous_json,collected_at,digest,payload,total_bytes) VALUES (?,?,?,?,?,?,?)",
+              "INSERT INTO pdpp_transport_batches (batch,sequence,previous_json,collected_at,digest,total_bytes) VALUES (?,?,?,?,?,?)",
             ).run(
               batch,
               s.sequence + 1,
               s.previous_json,
               new Date(now()).toISOString(),
               digest,
-              new Uint8Array(),
               totalBytes,
             );
             db.prepare(
@@ -627,15 +784,15 @@ export function createReplicaTransportWorker(deps: {
           if (!s.baseline_done) {
             deps.exporter.acknowledgeBaselinePage(
               deps.exporter.getBaselineCheckpoint(),
-              page.nextAfterSequence,
+              page.next,
             );
             db.prepare(
               "UPDATE pdpp_transport_state SET baseline_cursor=?, baseline_done=? WHERE id=1",
-            ).run(page.nextAfterSequence, page.hasMore ? 0 : 1);
+            ).run(page.next, page.hasMore ? 0 : 1);
           } else
             db.prepare(
               "UPDATE pdpp_transport_state SET tail_cursor=? WHERE id=1",
-            ).run(page.nextAfterSequence);
+            ).run(page.next);
         },
       );
     },
@@ -645,31 +802,31 @@ export function createReplicaTransportWorker(deps: {
     commitProblem: "retain_failed",
     earliest(e) {
       return (
-        singletonDeadline("retain", e) ?? (tailPending() ? e.now : undefined)
+        singletonDeadline("retain", e) ??
+        (!batchInFlight() && tailPending() ? e.now : undefined)
       );
     },
   };
 
   // -------------------------------------------------------------- prepare
-  async function* payloadBytes(batch: Batch): AsyncIterable<Uint8Array> {
-    if (!batch.legacy) {
-      yield* readBinaryChunks(db, "payload", batch.batch);
-      return;
-    }
-    // Durable batches retained by older workers remain retryable.
-    const row = db
-      .prepare("SELECT payload FROM pdpp_transport_batches WHERE batch=?")
-      .get(batch.batch) as { payload: Buffer };
-    for (let offset = 0; offset < row.payload.length; offset += 64 * 1024)
-      yield row.payload.subarray(offset, offset + 64 * 1024);
-  }
+  const unsupported = (error: ReplicaFramingUnsupported) => {
+    const admission = {
+      actual: error.actual,
+      limit: error.limit,
+      capability:
+        error.dimension === "fragment_count"
+          ? `fragments:${error.limit}`
+          : `cap:${cap}`,
+    };
+    return { reason: "replica_framing_unsupported" as const, ...admission };
+  };
   const prepare: ReplicaPhaseHandler<Item<Batch>> = {
     phase: "prepare",
     due(e, limit) {
       return (
         db
           .prepare(
-            `SELECT batch,sequence,previous_json,collected_at,digest,attempts,next_attempt,wait_since,checked_block,coalesce(total_bytes,length(payload)) AS total_bytes,total_bytes IS NULL AS legacy FROM pdpp_transport_batches WHERE prepared=0 AND ${due(e)} ORDER BY next_attempt,sequence LIMIT ?`,
+            `SELECT batch,sequence,previous_json,collected_at,digest,total_bytes,attempts,next_attempt,wait_since,checked_block FROM pdpp_transport_batches WHERE prepared=0 AND ${due(e)} ORDER BY next_attempt,sequence LIMIT ?`,
           )
           .all(limit.total) as Batch[]
       ).map((row) => ({
@@ -686,104 +843,115 @@ export function createReplicaTransportWorker(deps: {
       const token = randomUUID();
       const s = state();
       const identity = currentReplicaWriterIdentity(db);
+      const statement = {
+        owner: s.owner,
+        writer: s.writer,
+        batch: batch.batch,
+        sequence: batch.sequence,
+        previous: batch.previous_json
+          ? (JSON.parse(batch.previous_json) as Predecessor)
+          : null,
+        collectedAt: batch.collected_at,
+        digest: batch.digest,
+        totalBytes: batch.total_bytes,
+      };
+      const encrypt = (scope: string, bytes: Uint8Array) =>
+        call(signal, () => transport.encrypt(scope, bytes));
       let chunkBytes = deps.targetChunkBytes ?? 4 * 1024 * 1024;
-      let preparedCount = 0;
+      let entries: ManifestEntry[] = [];
+      let manifest: Awaited<ReturnType<typeof prepareReplicaManifest>>;
+      const unsupportedPlan = (error: ReplicaFramingUnsupported) => {
+        const admission = unsupported(error);
+        return withPlan({ tag: "unsupported", admission }, () =>
+          db
+            .prepare(
+              "UPDATE pdpp_transport_batches SET prepared=-1,admission_json=? WHERE batch=?",
+            )
+            .run(
+              canonicalJson({
+                actual: admission.actual,
+                limit: admission.limit,
+                capability: admission.capability,
+              }),
+              batch.batch,
+            ),
+        );
+      };
       try {
         // Batches belong to the current writer; startWriter drops older ones.
         if (identity?.transportWriter !== s.writer)
           throw new ReplicaProblemError("prepare_failed");
         while (true) {
           try {
-            preparedCount = 0;
+            entries = [];
             for await (const part of fragmentReplicaStream({
-              owner: s.owner,
-              writer: s.writer,
-              batch: batch.batch,
-              sequence: batch.sequence,
-              previous: batch.previous_json
-                ? (JSON.parse(batch.previous_json) as Predecessor)
-                : null,
-              collectedAt: batch.collected_at,
-              digest: batch.digest,
-              totalBytes: batch.total_bytes,
-              bytes: () => payloadBytes(batch),
-              sign: (facts) =>
-                signReplicaBatch({
-                  signer: deps.authority.signer,
-                  partition: partition(),
-                  seed: identity.seed,
-                  facts,
-                }),
-              encrypt: (scope, bytes) =>
-                call(signal, () => transport.encrypt(scope, bytes)),
+              ...statement,
+              bytes: async function* () {
+                yield* readBinaryChunks(db, "payload", batch.batch);
+              },
+              encrypt,
               maxBlobBytes: cap,
               targetChunkBytes: chunkBytes,
             })) {
-              preparedCount++;
               db.prepare(
-                "INSERT INTO pdpp_transport_preparing VALUES (?,?,?,?,?,?,?)",
-              ).run(
-                token,
-                part.scope,
-                batch.batch,
-                part.plaintext,
-                part.encrypted,
-                part.dataHash,
-                part.metadataHash,
-              );
+                "INSERT INTO pdpp_transport_staged_fragments VALUES (?,?,?,?)",
+              ).run(token, part.index, part.digest, part.encrypted);
+              entries.push({
+                digest: part.digest,
+                bytes: part.encrypted.length,
+              });
             }
             break;
           } catch (error) {
             db.prepare(
-              "DELETE FROM pdpp_transport_preparing WHERE token=?",
+              "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
             ).run(token);
             // Only the typed, measured framing failure narrows the chunk size or
             // becomes Unsupported. Every other error is a transient Retry.
-            // Unsupported is terminal for this batch only: later batches of
-            // this writer still prepare and publish, and a remote importer
-            // holds them as Wait(predecessor) until an explicit
-            // readmitUnsupported() under a new capability publishes it.
+            // Unsupported is terminal for this batch only and claims no
+            // version: later batches of this writer still prepare and
+            // publish, and a remote importer holds them as Wait(predecessor)
+            // until an explicit readmitUnsupported() under a new capability.
             if (!(error instanceof ReplicaFramingUnsupported)) throw error;
             if (error.dimension === "fragment_bytes" && chunkBytes > 1) {
               chunkBytes = Math.max(1, Math.floor(chunkBytes / 2));
               continue;
             }
-            return withPlan(
-              {
-                tag: "unsupported",
-                admission: {
-                  reason: "replica_framing_unsupported",
-                  actual: error.actual,
-                  limit: error.limit,
-                  capability:
-                    error.dimension === "fragment_bytes"
-                      ? `cap:${cap}`
-                      : `fragments:${error.limit}`,
-                },
-              },
-              () =>
-                db
-                  .prepare(
-                    "UPDATE pdpp_transport_batches SET prepared=-1,admission_json=? WHERE batch=?",
-                  )
-                  .run(
-                    canonicalJson({
-                      actual: error.actual,
-                      limit: error.limit,
-                      capability:
-                        error.dimension === "fragment_bytes"
-                          ? `cap:${cap}`
-                          : `fragments:${error.limit}`,
-                    }),
-                    batch.batch,
-                  ),
-            );
+            return unsupportedPlan(error);
           }
         }
+        // The statement signs the version, so the batch claims the scope's
+        // next version before signing. The commit plan rechecks the claim.
+        const { version } = db
+          .prepare(
+            "SELECT coalesce(max(version),0)+1 AS version FROM pdpp_transport_manifests_out WHERE scope=?",
+          )
+          .get(replicaScope(s.writer)) as { version: number };
+        manifest = await prepareReplicaManifest({
+          ...statement,
+          version,
+          fragments: entries,
+          sign: (facts) =>
+            signReplicaBatch({
+              signer: deps.authority.signer,
+              partition: partition(),
+              seed: identity.seed,
+              facts,
+            }),
+          encrypt,
+        });
+        if (manifest.encrypted.length > cap)
+          return unsupportedPlan(
+            new ReplicaFramingUnsupported(
+              manifest.encrypted.length,
+              cap,
+              "manifest_bytes",
+            ),
+          );
       } catch (error) {
-        db.prepare("DELETE FROM pdpp_transport_preparing WHERE token=?").run(
-          token,
-        );
+        db.prepare(
+          "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
+        ).run(token);
         return verdict(retryFromError(error, "prepare_failed"));
       }
       return withPlan(
@@ -797,26 +965,48 @@ export function createReplicaTransportWorker(deps: {
           // Concurrent preparation may choose different randomized ciphertext.
           // Only the first committed bytes can go on wire.
           if (!current.prepared) {
-            const retained = db
+            const staged = db
               .prepare(
-                "SELECT count(*) AS count FROM pdpp_transport_preparing WHERE token=?",
+                "SELECT count(*) AS count FROM pdpp_transport_staged_fragments WHERE token=?",
               )
               .get(token) as { count: number };
             if (
-              retained.count !== preparedCount ||
-              preparedCount !== Math.ceil(batch.total_bytes / chunkBytes)
+              staged.count !== entries.length ||
+              entries.length !== Math.ceil(batch.total_bytes / chunkBytes)
             )
               throw new ReplicaProblemError("prepare_failed");
+            // The batch keeps the version it signed only if that is still the
+            // scope's next one, in the same transaction as its manifest, so a
+            // retry or a lost acknowledgement can never register it at a
+            // second version.
+            const { next } = db
+              .prepare(
+                "SELECT coalesce(max(version),0)+1 AS next FROM pdpp_transport_manifests_out WHERE scope=?",
+              )
+              .get(manifest.scope) as { next: number };
+            if (next !== manifest.version)
+              throw new ReplicaProblemError("prepare_failed");
             db.prepare(
-              "INSERT INTO pdpp_transport_outbox (scope,batch,plaintext,encrypted,data_hash,metadata_hash) SELECT scope,batch,plaintext,encrypted,data_hash,metadata_hash FROM pdpp_transport_preparing WHERE token=?",
-            ).run(token);
+              "INSERT INTO pdpp_transport_manifests_out (batch,scope,version,plaintext,encrypted,data_hash,metadata_hash) VALUES (?,?,?,?,?,?,?)",
+            ).run(
+              batch.batch,
+              manifest.scope,
+              manifest.version,
+              manifest.plaintext,
+              manifest.encrypted,
+              manifest.dataHash,
+              manifest.metadataHash,
+            );
+            db.prepare(
+              "INSERT INTO pdpp_transport_fragments_out (batch,position,digest,encrypted) SELECT ?,position,digest,encrypted FROM pdpp_transport_staged_fragments WHERE token=?",
+            ).run(batch.batch, token);
             db.prepare(
               "UPDATE pdpp_transport_batches SET prepared=1 WHERE batch=?",
             ).run(batch.batch);
           }
-          db.prepare("DELETE FROM pdpp_transport_preparing WHERE token=?").run(
-            token,
-          );
+          db.prepare(
+            "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
+          ).run(token);
         },
       );
     },
@@ -832,23 +1022,80 @@ export function createReplicaTransportWorker(deps: {
   };
 
   // -------------------------------------------------------------- publish
-  const publish: ReplicaPhaseHandler<Item<Outbox>> = {
+  /**
+   * Fragment PUTs, and manifests ready to register: every fragment of the
+   * batch is stored and the previous version is published. DPv2 accepts only
+   * the next version, so a writer has at most one registration in flight.
+   */
+  const OUTBOUND = `(SELECT 'fragment' AS kind, batch||':'||position AS id, batch, position,
+      attempts,next_attempt,wait_since,checked_block,outcome,dependency
+      FROM pdpp_transport_fragments_out WHERE state='ready'
+    UNION ALL
+    SELECT 'manifest' AS kind, m.scope||'/'||m.version AS id, m.batch, -1 AS position,
+      m.attempts,m.next_attempt,m.wait_since,m.checked_block,m.outcome,m.dependency
+      FROM pdpp_transport_manifests_out m WHERE m.state='ready'
+      AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=m.batch AND f.state<>'stored')
+      AND (m.version=1 OR EXISTS (SELECT 1 FROM pdpp_transport_manifests_out p WHERE p.scope=m.scope AND p.version=m.version-1 AND p.state='published')))`;
+  async function publishManifest(
+    batch: string,
+    signal: AbortSignal,
+  ): Promise<ReplicaAttempt> {
+    const row = db
+      .prepare("SELECT * FROM pdpp_transport_manifests_out WHERE batch=?")
+      .get(batch) as ManifestOut;
+    const key = slotKey(row.scope, row.version);
+    const expected: ReplicaSlot = {
+      owner: state().owner,
+      scope: row.scope,
+      version: row.version,
+      dataHash: row.data_hash,
+      metadataHash: row.metadata_hash,
+    };
+    try {
+      let evidence = await call(signal, () =>
+        transport.evidence(row.scope, row.version),
+      );
+      let status = replicaRegistrationState(evidence, expected);
+      if (status === "absent") {
+        const manifest = {
+          scope: row.scope,
+          version: row.version,
+          plaintext: row.plaintext,
+          encrypted: row.encrypted,
+          dataHash: row.data_hash,
+          metadataHash: row.metadata_hash,
+        };
+        await call(signal, () => transport.put(manifest));
+        await call(signal, () => transport.register(manifest));
+        evidence = await call(signal, () =>
+          transport.evidence(row.scope, row.version),
+        );
+        status = replicaRegistrationState(evidence, expected);
+      }
+      if (status === "conflict")
+        return verdict(quarantine("immutable_registration_conflict", key));
+      if (status === "confirmed")
+        return verdict({
+          tag: "progress",
+          receipt: { phase: "publish", key },
+        });
+      return verdict(unconfirmed(evidence, expected));
+    } catch (error) {
+      return verdict(retryFromError(error, "publish_failed"));
+    }
+  }
+  const publish: ReplicaPhaseHandler<Item<Outbound>> = {
     phase: "publish",
     due(e, limit) {
       // Parked waits are filtered before LIMIT so they cannot hide fresh or error work.
       return (
         db
           .prepare(
-            dueWindow(
-              `(SELECT rowid AS position,scope,batch,data_hash,metadata_hash,attempts,next_attempt,wait_since,checked_block,outcome,dependency FROM pdpp_transport_outbox WHERE state='ready')`,
-              "batch",
-              "next_attempt,position",
-              due(e),
-            ),
+            dueWindow(OUTBOUND, "batch", "next_attempt,kind,position", due(e)),
           )
-          .all(limit.perWriter, limit.after ?? "", limit.total) as Outbox[]
+          .all(limit.perWriter, limit.after ?? "", limit.total) as Outbound[]
       ).map((row) => ({
-        id: row.scope,
+        id: row.id,
         phase: "publish",
         // Local batches take turns like remote writers do.
         writer: row.batch,
@@ -858,75 +1105,60 @@ export function createReplicaTransportWorker(deps: {
     },
     async run(item, signal) {
       const row = item.row;
-      const expected = {
-        owner: state().owner,
-        scope: row.scope,
-        dataHash: row.data_hash,
-        metadataHash: row.metadata_hash,
-      };
+      if (row.kind === "manifest") return publishManifest(row.batch, signal);
       try {
-        let evidence = await call(signal, () => transport.evidence(row.scope));
-        let status = replicaRegistrationState(evidence, expected);
-        if (status === "absent") {
-          const bytes = db
-            .prepare(
-              "SELECT plaintext,encrypted FROM pdpp_transport_outbox WHERE scope=?",
-            )
-            .get(row.scope) as { plaintext: Buffer; encrypted: Buffer };
-          const part: PreparedFragment = {
-            scope: row.scope,
-            plaintext: bytes.plaintext,
-            encrypted: bytes.encrypted,
-            dataHash: row.data_hash,
-            metadataHash: row.metadata_hash,
-          };
-          await call(signal, () => transport.put(part));
-          await call(signal, () => transport.register(part));
-          evidence = await call(signal, () => transport.evidence(row.scope));
-          status = replicaRegistrationState(evidence, expected);
-        }
-        if (status === "conflict")
-          return verdict({
-            tag: "quarantine",
-            proof: {
-              reason: "immutable_registration_conflict",
-              key: row.scope,
-            },
-          });
-        if (status === "confirmed")
-          return verdict({
-            tag: "progress",
-            receipt: { phase: "publish", key: row.scope },
-          });
-        if (
-          replicaAwaitingFinality(evidence, expected) ||
-          replicaRegistrationInactive(evidence, expected)
-        )
-          return verdict(finalityWait(evidence, row.scope));
-        return verdict({ tag: "retry", problem: "registration_unconfirmed" });
+        const fragment = db
+          .prepare(
+            "SELECT digest,encrypted FROM pdpp_transport_fragments_out WHERE batch=? AND position=?",
+          )
+          .get(row.batch, row.position) as {
+          digest: string;
+          encrypted: Buffer;
+        };
+        // Unregistered and content-addressed: a PUT is safe to repeat, and
+        // nothing references it until the manifest is finalized.
+        await call(signal, () =>
+          transport.putFragment({
+            scope: replicaScope(state().writer),
+            digest: fragment.digest,
+            encrypted: fragment.encrypted,
+          }),
+        );
+        return verdict({
+          tag: "progress",
+          receipt: { phase: "publish", key: row.id },
+        });
       } catch (error) {
         return verdict(retryFromError(error, "publish_failed"));
       }
     },
     commit: (item, attempt, settle) =>
-      commitIn((outcome, work) =>
-        db
-          .prepare(
-            `UPDATE pdpp_transport_outbox SET ${WORK_SET},state=? WHERE scope=?`,
-          )
-          .run(
-            ...workValues(outcome, work),
-            outcome.tag === "progress"
+      commitIn<Item<Outbound>>((outcome, work) => {
+        const next =
+          outcome.tag === "progress"
+            ? item.row.kind === "manifest"
               ? "published"
-              : outcome.tag === "quarantine"
-                ? "quarantined"
-                : "ready",
-            item.id,
-          ),
-      )(item, attempt, settle),
+              : "stored"
+            : outcome.tag === "quarantine"
+              ? "quarantined"
+              : "ready";
+        if (item.row.kind === "manifest")
+          db.prepare(
+            `UPDATE pdpp_transport_manifests_out SET ${WORK_SET},state=? WHERE batch=?`,
+          ).run(...workValues(outcome, work), next, item.row.batch);
+        else
+          db.prepare(
+            `UPDATE pdpp_transport_fragments_out SET ${WORK_SET},state=? WHERE batch=? AND position=?`,
+          ).run(
+            ...workValues(outcome, work),
+            next,
+            item.row.batch,
+            item.row.position,
+          );
+      })(item, attempt, settle),
     commitProblem: "publish_failed",
     earliest(e) {
-      return earliestIn(e, "pdpp_transport_outbox WHERE state='ready'");
+      return earliestIn(e, `${OUTBOUND} outbound`);
     },
   };
 
@@ -948,24 +1180,46 @@ export function createReplicaTransportWorker(deps: {
         : [];
     },
     async run(_item, signal) {
-      let page: { scopes: string[]; cursor: string | null };
+      let page: Awaited<ReturnType<ReplicaTransportPort["list"]>>;
       try {
         page = await call(signal, () => transport.list(state().scan_cursor));
       } catch (error) {
         return verdict(retryFromError(error, "discovery_failed"));
       }
       // Page admissions and its cursor commit together. A null cursor restarts
-      // from page one next step: no timestamp high-water mark can hide a late registration.
+      // from page one next step: no timestamp high-water mark can hide a late
+      // registration. The Gateway version only says how many slots to admit;
+      // each slot is verified against finalized evidence before any fetch.
       return withPlan(
         {
           tag: "progress",
           receipt: { phase: "discover", key: page.cursor ?? "" },
         },
         () => {
-          for (const scope of page.scopes.filter(isReplicaScope))
-            db.prepare(
-              "INSERT OR IGNORE INTO pdpp_transport_inbox (scope) VALUES (?)",
-            ).run(scope);
+          for (const point of page.points) {
+            const writer = replicaWriterOf(point.scope);
+            if (!writer || !/^[1-9][0-9]{0,14}$/.test(point.version)) continue;
+            const known = (
+              db
+                .prepare(
+                  "SELECT coalesce(max(version),0) AS version FROM pdpp_transport_manifests_in WHERE scope=?",
+                )
+                .get(point.scope) as { version: number }
+            ).version;
+            const last = Math.min(
+              Number(point.version),
+              known + DISCOVER_SLOTS,
+            );
+            for (let version = known + 1; version <= last; version++)
+              db.prepare(
+                "INSERT OR IGNORE INTO pdpp_transport_manifests_in (slot,scope,version,writer) VALUES (?,?,?,?)",
+              ).run(
+                slotKey(point.scope, version),
+                point.scope,
+                version,
+                writer,
+              );
+          }
           db.prepare(
             "UPDATE pdpp_transport_state SET scan_cursor=? WHERE id=1",
           ).run(page.cursor);
@@ -983,135 +1237,15 @@ export function createReplicaTransportWorker(deps: {
   };
 
   // ------------------------------------------------------------- download
-  const inboxItem =
+  const slotItem =
     (phase: ReplicaPhase) =>
-    (row: Inbox): Item<Inbox> => ({
-      id: row.scope,
+    (row: Slot): Item<Slot> => ({
+      id: row.slot,
       phase,
-      writer: writerOfScope(row.scope),
+      writer: row.writer,
       state: workState(row),
       row,
     });
-  const download: ReplicaPhaseHandler<Item<Inbox>> = {
-    phase: "download",
-    due(e, limit) {
-      return (
-        db
-          .prepare(
-            dueWindow(
-              `(SELECT rowid AS position,scope,attempts,next_attempt,wait_since,checked_block,outcome,dependency,data_hash,metadata_hash,${SCOPE_WRITER_SQL} AS writer FROM pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NULL)`,
-              "writer",
-              "next_attempt,position",
-              due(e),
-            ),
-          )
-          .all(limit.perWriter, limit.after ?? "", limit.total) as Inbox[]
-      ).map(inboxItem("download"));
-    },
-    async run(item, signal) {
-      const row = item.row;
-      try {
-        const evidence = await call(signal, () =>
-          transport.evidence(row.scope),
-        );
-        const status = replicaRegistrationState(evidence, {
-          owner: state().owner,
-          scope: row.scope,
-        });
-        if (status === "conflict")
-          return verdict({
-            tag: "quarantine",
-            proof: {
-              reason: "immutable_registration_conflict",
-              key: row.scope,
-            },
-          });
-        // Gateway heads may be optimistic. They bind cheap decrypt/hash validation,
-        // but only pinned finalized evidence permits canonical promotion.
-        const head = evidence.head;
-        if (
-          !head ||
-          head.owner.toLowerCase() !== state().owner.toLowerCase() ||
-          head.scope !== row.scope ||
-          head.version !== "1" ||
-          head.deleted
-        )
-          return verdict({ tag: "retry", problem: "head_unavailable" });
-        const encrypted = await call(signal, () => transport.get(row.scope));
-        if (encrypted.length > cap)
-          throw new ReplicaProblemError("download_failed");
-        const plaintext = await call(signal, () =>
-          transport.decrypt(row.scope, encrypted),
-        );
-        let fragment: ReplicaFragment | undefined;
-        let collectedAt: string;
-        try {
-          fragment = decodeReplicaFragment(plaintext, row.scope, state().owner);
-          collectedAt = fragment.collectedAt;
-        } catch (error) {
-          if (!(error instanceof ReplicaFragmentUnsigned)) throw error;
-          collectedAt = error.collectedAt;
-        }
-        const dataHash = keccak256(plaintext);
-        const metadataHash = replicaMetadataHash(
-          row.scope,
-          collectedAt,
-          encrypted.length,
-        );
-        if (dataHash !== head.dataHash || metadataHash !== head.metadataHash)
-          throw new ReplicaProblemError("commitment_mismatch");
-        // Authority runs only on bytes that match the registered commitment,
-        // so replacing stored ciphertext cannot get a real fragment refused.
-        if (!fragment) return verdict(refused("signature_invalid", row.scope));
-        const authorized = await authorizeFragment(fragment, signal);
-        if (authorized.tag === "refused")
-          return verdict(refused(authorized.reason, row.scope));
-        if (authorized.tag === "wait")
-          return verdict(rosterWait(authorized.server));
-        return withPlan(
-          { tag: "progress", receipt: { phase: "download", key: row.scope } },
-          () =>
-            db
-              .prepare(
-                "UPDATE pdpp_transport_inbox SET fragment_json=?,data_hash=?,metadata_hash=? WHERE scope=?",
-              )
-              .run(canonicalJson(fragment), dataHash, metadataHash, row.scope),
-        );
-      } catch (error) {
-        // Network and unavailable bytes are retryable; authenticated malformed bytes back off.
-        return verdict(retryFromError(error, "download_failed"));
-      }
-    },
-    commit: commitIn((outcome, work, item) => {
-      db.prepare(
-        `UPDATE pdpp_transport_inbox SET ${WORK_SET},state=? WHERE scope=?`,
-      ).run(
-        ...workValues(outcome, work),
-        outcome.tag === "quarantine" ? "quarantined" : "ready",
-        item.id,
-      );
-    }),
-    commitProblem: "download_failed",
-    earliest(e) {
-      return earliestIn(
-        e,
-        "pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NULL",
-      );
-    },
-  };
-
-  // ---------------------------------------------- confirm (finality refresh)
-  const batchOfScope = (scope: string) => {
-    const row = db
-      .prepare(
-        "SELECT json_extract(fragment_json,'$.writer') AS writer, json_extract(fragment_json,'$.batch') AS batch FROM pdpp_transport_inbox WHERE scope=?",
-      )
-      .get(scope) as
-      { writer: string | null; batch: string | null } | undefined;
-    return row?.writer && row.batch
-      ? { writer: row.writer, batch: row.batch }
-      : undefined;
-  };
   /** Make matching waits due now. Durable: survives a lost notification. */
   function wake(key: string, at: number) {
     return db
@@ -1120,182 +1254,273 @@ export function createReplicaTransportWorker(deps: {
       )
       .run(at, key, at).changes;
   }
-  const confirm: ReplicaPhaseHandler<Item<Inbox>> = {
-    phase: "confirm",
+  /** A slot whose finalized manifest can never be valid: terminal for that slot only. */
+  const refuseSlot = (
+    slot: string,
+    reason: ReplicaAuthorityRefusal | "manifest_invalid",
+  ) =>
+    withPlan(quarantine(reason, slot), () =>
+      db
+        .prepare(
+          `UPDATE pdpp_transport_manifests_in SET ${QUARANTINE_SET(reason)} WHERE slot=?`,
+        )
+        .run(slot),
+    );
+  const download: ReplicaPhaseHandler<Item<Slot>> = {
+    phase: "download",
     due(e, limit) {
-      // Metadata only: retained fragment bodies stay in SQLite.
       return (
         db
           .prepare(
             dueWindow(
-              `(SELECT rowid AS position,scope,attempts,next_attempt,wait_since,checked_block,outcome,dependency,data_hash,metadata_hash,${SCOPE_WRITER_SQL} AS writer FROM pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NOT NULL AND finalized=0)`,
+              `(SELECT rowid AS position,slot,scope,version,writer,attempts,next_attempt,wait_since,checked_block,outcome,dependency FROM pdpp_transport_manifests_in WHERE state='ready' AND manifest_json IS NULL)`,
               "writer",
-              "next_attempt,position",
+              "next_attempt,version",
               due(e),
             ),
           )
-          .all(limit.perWriter, limit.after ?? "", limit.total) as Inbox[]
-      ).map(inboxItem("confirm"));
+          .all(limit.perWriter, limit.after ?? "", limit.total) as Slot[]
+      ).map(slotItem("download"));
     },
     async run(item, signal) {
-      // Only unfinalized fragments are selected: finalized evidence for a slot
-      // does not change, and revalidation covers imported slots.
       const row = item.row;
+      const slot: ReplicaSlot = {
+        owner: state().owner,
+        scope: row.scope,
+        version: row.version,
+      };
       try {
+        // A manifest is trusted only through its finalized slot commitment,
+        // so nothing is fetched before that commitment exists.
         const evidence = await call(signal, () =>
-          transport.evidence(row.scope),
+          transport.evidence(row.scope, row.version),
         );
-        const expected = {
-          owner: state().owner,
+        if (replicaRegistrationState(evidence, slot) !== "confirmed")
+          return verdict(unconfirmed(evidence, slot));
+        // Every peer-supplied manifest crosses this one boundary. Bytes that
+        // are not the finalized commitment are a refetch, never data, so
+        // replacing stored bytes cannot get a real manifest refused; after
+        // the commitment every failure is terminal. No fragment is fetched
+        // before the manifest is authorized.
+        const receipt = await receiveReplicaManifest({
           scope: row.scope,
-          dataHash: row.data_hash ?? undefined,
-          metadataHash: row.metadata_hash ?? undefined,
-        };
-        const status = replicaRegistrationState(evidence, expected);
-        const record = factOf(row.scope, evidence);
-        // A finalized fact that disagrees with this fragment (or a version
-        // above one) is final for the slot. The batch's copy decision, not
-        // this phase, chooses refetch, owner or terminal.
-        if (
-          (status === "confirmed" || status === "conflict") &&
-          row.data_hash !== null &&
-          row.metadata_hash !== null
-        ) {
-          const of = batchOfScope(row.scope);
-          return withPlan(
-            { tag: "progress", receipt: { phase: "confirm", key: row.scope } },
-            () => {
-              record?.();
+          owner: state().owner,
+          maxBytes: cap,
+          signal,
+          read: (readSignal) =>
+            call(signal, () =>
+              transport.get(row.scope, row.version, {
+                maxBytes: cap,
+                signal: readSignal,
+              }),
+            ),
+          decrypt: (encrypted) =>
+            call(signal, () => transport.decrypt(row.scope, encrypted)),
+          committed: (dataHash, metadataHash) =>
+            replicaRegistrationState(evidence, {
+              ...slot,
+              dataHash,
+              metadataHash,
+            }) === "confirmed",
+        });
+        if (receipt.tag === "refused")
+          return refuseSlot(row.slot, receipt.reason);
+        if (receipt.tag === "mismatch")
+          throw new ReplicaProblemError("commitment_mismatch");
+        const { manifest, dataHash, metadataHash } = receipt;
+        const authorized = await authorizeManifest(manifest, row, signal);
+        if (authorized.tag === "refused")
+          return refuseSlot(row.slot, authorized.reason);
+        if (authorized.tag === "wait")
+          return verdict(rosterWait(authorized.server));
+        const record = factOf(row, evidence, manifest);
+        return {
+          outcome: {
+            tag: "progress",
+            receipt: { phase: "download", key: row.slot },
+          },
+          plan: () => {
+            // A correct writer gives each batch one version. Another slot
+            // naming the same batch is equivocation: only the first is used.
+            const holder = db
+              .prepare(
+                "SELECT slot FROM pdpp_transport_manifests_in WHERE writer=? AND batch=? AND slot<>? AND state<>'quarantined'",
+              )
+              .get(row.writer, manifest.batch, row.slot);
+            if (holder) {
               db.prepare(
-                "UPDATE pdpp_transport_inbox SET finalized=1 WHERE scope=?",
-              ).run(row.scope);
-              if (of) wake(`fragments:${of.writer}:${of.batch}`, now());
-            },
-          );
-        }
-        const waiting =
-          replicaAwaitingFinality(evidence, expected) ||
-          replicaRegistrationInactive(evidence, expected)
-            ? finalityWait(evidence, row.scope)
-            : ({
-                tag: "retry",
-                problem: "registration_unconfirmed",
-              } as const);
-        return record
-          ? withPlan(waiting, () => {
-              record();
-            })
-          : verdict(waiting);
+                `UPDATE pdpp_transport_manifests_in SET ${QUARANTINE_SET("batch_equivocation")} WHERE slot=?`,
+              ).run(row.slot);
+              return quarantine("batch_equivocation", row.slot);
+            }
+            db.prepare(
+              "UPDATE pdpp_transport_manifests_in SET manifest_json=?,data_hash=?,metadata_hash=?,batch=?,sequence=? WHERE slot=?",
+            ).run(
+              canonicalJson(manifest),
+              dataHash,
+              metadataHash,
+              manifest.batch,
+              manifest.sequence,
+              row.slot,
+            );
+            manifest.fragments.forEach((entry, position) =>
+              db
+                .prepare(
+                  "INSERT OR IGNORE INTO pdpp_transport_fragments_in (slot,position,digest,bytes) VALUES (?,?,?,?)",
+                )
+                .run(row.slot, position, entry.digest, entry.bytes),
+            );
+            record?.();
+            return undefined;
+          },
+        };
       } catch (error) {
-        // A hint never shortens this error backoff (see hintAllowsSql).
-        return verdict(retryFromError(error, "evidence_unavailable"));
+        // Network and unavailable bytes are retryable; authenticated malformed bytes back off.
+        return verdict(retryFromError(error, "download_failed"));
       }
     },
     commit: commitIn((outcome, work, item) => {
       db.prepare(
-        `UPDATE pdpp_transport_inbox SET ${WORK_SET},state=? WHERE scope=?`,
-      ).run(
-        ...workValues(outcome, work),
-        outcome.tag === "quarantine" ? "quarantined" : "ready",
-        item.id,
-      );
+        `UPDATE pdpp_transport_manifests_in SET ${WORK_SET} WHERE slot=? AND state='ready'`,
+      ).run(...workValues(outcome, work), item.id);
     }),
-    commitProblem: "evidence_unavailable",
+    commitProblem: "download_failed",
     earliest(e) {
       return earliestIn(
         e,
-        "pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NOT NULL AND finalized=0",
+        "pdpp_transport_manifests_in WHERE state='ready' AND manifest_json IS NULL",
       );
     },
   };
 
-  // ----------------------------------------- revalidate (imported slots)
-  /** Ordered retained fragments of one complete batch, read one row at a time. */
-  function retainedBytes(writer: string, batch: string) {
-    const scopes = db
-      .prepare(
-        `SELECT scope FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND json_extract(fragment_json,'$.writer')=? AND json_extract(fragment_json,'$.batch')=? ORDER BY json_extract(fragment_json,'$.index')`,
-      )
-      .all(writer, batch) as { scope: string }[];
-    return () =>
-      assembleReplicaStream(async function* () {
-        for (const { scope } of scopes)
-          yield JSON.parse(
-            (
-              db
-                .prepare(
-                  "SELECT fragment_json FROM pdpp_transport_inbox WHERE scope=?",
-                )
-                .get(scope) as { fragment_json: string }
-            ).fragment_json,
-          ) as ReplicaFragment;
-      });
-  }
-  /** Retract an imported batch's identities after a proven finalized conflict. */
-  async function quarantineRetained(scope: string) {
-    const fragment = JSON.parse(
+  // ---------------------------------------------------------------- fetch
+  const manifestOf = (slot: string) =>
+    JSON.parse(
       (
         db
           .prepare(
-            "SELECT fragment_json FROM pdpp_transport_inbox WHERE scope=?",
+            "SELECT manifest_json FROM pdpp_transport_manifests_in WHERE slot=?",
           )
-          .get(scope) as { fragment_json: string }
-      ).fragment_json,
-    ) as ReplicaFragment;
-    const entries = db
-      .prepare(
-        "SELECT scope FROM pdpp_transport_inbox WHERE json_extract(fragment_json,'$.writer')=? AND json_extract(fragment_json,'$.batch')=?",
-      )
-      .all(fragment.writer, fragment.batch) as { scope: string }[];
-    // A partially downloaded batch has never authorized canonical data. A
-    // complete retained batch lets the receiver retract only its identities.
-    // Retraction needs the authenticated envelope, not current declaration admission.
-    const payload =
-      entries.length === fragment.count
-        ? await inspectReplicaPayload(
-            retainedBytes(fragment.writer, fragment.batch),
-            undefined,
+          .get(slot) as { manifest_json: string }
+      ).manifest_json,
+    ) as ReplicaManifest;
+  /** A fragment that disproves its slot quarantines the slot with it. */
+  const quarantineFragment = (
+    row: FragmentIn,
+    reason: "fragment_missing" | "fragment_mismatch",
+  ) =>
+    withPlan(quarantine(reason, `${row.slot}#${row.position}`), () =>
+      db
+        .prepare(
+          `UPDATE pdpp_transport_manifests_in SET ${QUARANTINE_SET(reason)} WHERE slot=? AND state='ready'`,
+        )
+        .run(row.slot),
+    );
+  const FETCHABLE = `(SELECT f.rowid AS rowid_,f.slot,f.position,f.digest,f.bytes,m.writer,f.attempts,f.next_attempt,f.wait_since,f.checked_block,f.outcome,f.dependency
+    FROM pdpp_transport_fragments_in f JOIN pdpp_transport_manifests_in m ON m.slot=f.slot
+    WHERE f.state='ready' AND f.fragment_json IS NULL AND m.state='ready')`;
+  const fetchFragment: ReplicaPhaseHandler<Item<FragmentIn>> = {
+    phase: "fetch",
+    due(e, limit) {
+      return (
+        db
+          .prepare(
+            dueWindow(FETCHABLE, "writer", "next_attempt,rowid_", due(e)),
           )
-        : undefined;
-    if (payload && payload.envelope.batchId !== fragment.batch)
-      throw new ReplicaProblemError("payload_invalid");
-    return () => {
-      if (payload)
-        deps.receiver.quarantineImported({
-          credential: deps.credential,
-          envelope: payload.envelope,
+          .all(limit.perWriter, limit.after ?? "", limit.total) as FragmentIn[]
+      ).map((row) => ({
+        id: `${row.slot}#${row.position}`,
+        phase: "fetch",
+        writer: row.writer,
+        state: workState(row),
+        bytes: row.bytes,
+        row,
+      }));
+    },
+    async run(item, signal) {
+      const row = item.row;
+      const scope = replicaScope(row.writer);
+      let fragment: ReplicaFragment;
+      try {
+        const receipt = await receiveReplicaFragment({
+          scope,
+          owner: state().owner,
+          manifest: manifestOf(row.slot),
+          index: row.position,
+          maxBytes: row.bytes,
+          signal,
+          read: (readSignal) =>
+            call(readSignal, () =>
+              transport.getFragment(scope, row.digest, {
+                maxBytes: row.bytes,
+                signal: readSignal,
+              }),
+            ),
+          decrypt: (encrypted) => transport.decrypt(scope, encrypted),
         });
-      for (const entry of entries)
-        db.prepare(
-          "UPDATE pdpp_transport_inbox SET state='quarantined',outcome='quarantine',reason='immutable_registration_conflict',error='immutable_registration_conflict' WHERE scope=?",
-        ).run(entry.scope);
-    };
-  }
+        if (receipt.tag === "refused")
+          return quarantineFragment(row, receipt.reason);
+        fragment = receipt.fragment;
+      } catch (error) {
+        if (signal.aborted)
+          return verdict(retryFromError(error, "download_failed"));
+        if (error instanceof ReplicaObjectRefused)
+          return quarantineFragment(row, "fragment_mismatch");
+        // Only definitive absence proves a missing fragment. Transient read,
+        // deadline and cancellation failures remain retries.
+        try {
+          if (
+            !(await call(signal, () =>
+              transport.hasFragment(scope, row.digest, signal),
+            ))
+          )
+            return quarantineFragment(row, "fragment_missing");
+        } catch {
+          // Preserve the original transient failure.
+        }
+        return verdict(retryFromError(error, "download_failed"));
+      }
+      return withPlan(
+        { tag: "progress", receipt: { phase: "fetch", key: item.id } },
+        () => {
+          db.prepare(
+            "UPDATE pdpp_transport_fragments_in SET fragment_json=? WHERE slot=? AND position=?",
+          ).run(canonicalJson(fragment), row.slot, row.position);
+          wake(`fragments:${fragment.writer}:${fragment.batch}`, now());
+        },
+      );
+    },
+    commit: commitIn((outcome, work, item) => {
+      db.prepare(
+        `UPDATE pdpp_transport_fragments_in SET ${WORK_SET},state=? WHERE slot=? AND position=?`,
+      ).run(
+        ...workValues(outcome, work),
+        outcome.tag === "quarantine" ? "quarantined" : "ready",
+        item.row.slot,
+        item.row.position,
+      );
+    }),
+    commitProblem: "download_failed",
+    earliest(e) {
+      return earliestIn(e, `${FETCHABLE} fetchable`);
+    },
+  };
+
+  // ----------------------------------------- revalidate (imported slots)
   /**
-   * A finalized fact disagrees with an imported slot. A copy-backed batch
-   * records the fact and takes the copy decision, which is terminal for a
-   * disproved promoted copy (contract A, H). A batch imported before copies
-   * existed retracts its identities as before.
+   * A finalized fact disagrees with an imported slot. The batch records the
+   * fact and takes the copy decision, which is terminal for a disproved
+   * promoted copy (contract A, H).
    */
-  async function importedConflict(
-    scope: string,
+  function importedConflict(
+    row: Slot,
     evidence: ReplicaRegistrationEvidence,
-  ): Promise<ReplicaAttempt> {
-    const header = db
-      .prepare(
-        "SELECT json_extract(fragment_json,'$.writer') AS writer, json_extract(fragment_json,'$.batch') AS batch, json_extract(fragment_json,'$.sequence') AS sequence FROM pdpp_transport_inbox WHERE scope=?",
-      )
-      .get(scope) as { writer: string; batch: string; sequence: number };
-    const id = canonicalJson([header.writer, header.batch]);
-    const legacy: ReplicaPhaseOutcome = {
-      tag: "quarantine",
-      proof: { reason: "immutable_registration_conflict", key: scope },
-    };
-    if (!deps.receiver.copies.list(id).length)
-      return withPlan(legacy, await quarantineRetained(scope));
-    const record = factOf(scope, evidence);
+  ): ReplicaAttempt {
+    const manifest = manifestOf(row.slot);
+    const id = canonicalJson([manifest.writer, manifest.batch]);
+    const record = factOf(row, evidence, manifest);
     return {
-      outcome: legacy,
+      outcome: quarantine("immutable_registration_conflict", row.slot),
       plan: () => {
         record?.();
         const decision = deps.receiver.copies.decide(id, {
@@ -1309,117 +1534,49 @@ export function createReplicaTransportWorker(deps: {
           id,
           decision,
         });
-        quarantineWriterFrom(header.writer, header.sequence);
-        return {
-          tag: "quarantine",
-          proof: { reason: "finalized_conflict", key: id },
-        };
+        quarantineWriterFrom(manifest.writer, manifest.sequence);
+        return quarantine("finalized_conflict", id);
       },
     };
   }
-  const revalidate: ReplicaPhaseHandler<Item<Inbox>> = {
+  const revalidate: ReplicaPhaseHandler<Item<Slot>> = {
     phase: "revalidate",
     due(e, limit) {
       // Round-robin by last check, so a fixed prefix cannot starve later slots.
       return (
         db
           .prepare(
-            `SELECT scope,attempts,next_attempt,wait_since,checked_block,data_hash,metadata_hash FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='imported' AND ${due(e)} ORDER BY evidence_checked,rowid LIMIT ?`,
+            `SELECT slot,scope,version,writer,data_hash,metadata_hash,attempts,next_attempt,wait_since,checked_block FROM pdpp_transport_manifests_in WHERE state='imported' AND ${due(e)} ORDER BY evidence_checked,rowid LIMIT ?`,
           )
-          .all(limit.total) as Inbox[]
-      ).map(inboxItem("revalidate"));
+          .all(limit.total) as Slot[]
+      ).map(slotItem("revalidate"));
     },
     async run(item, signal) {
       const row = item.row;
+      const slot: ReplicaSlot = {
+        owner: state().owner,
+        scope: row.scope,
+        version: row.version,
+        dataHash: row.data_hash ?? undefined,
+        metadataHash: row.metadata_hash ?? undefined,
+      };
       try {
-        // A preceding sibling may already have quarantined this batch.
-        const current = db
-          .prepare("SELECT state FROM pdpp_transport_inbox WHERE scope=?")
-          .get(row.scope) as { state: string };
-        if (current.state === "quarantined")
-          return verdict({
-            tag: "quarantine",
-            proof: {
-              reason: "immutable_registration_conflict",
-              key: row.scope,
-            },
-          });
         const evidence = await call(signal, () =>
-          transport.evidence(row.scope),
+          transport.evidence(row.scope, row.version),
         );
-        const status = replicaRegistrationState(evidence, {
-          owner: state().owner,
-          scope: row.scope,
-          ...(row.data_hash &&
-            row.metadata_hash && {
-              dataHash: row.data_hash,
-              metadataHash: row.metadata_hash,
-            }),
-        });
-        if (status === "conflict") return importedConflict(row.scope, evidence);
-        const checked = {
-          tag: "progress" as const,
-          receipt: { phase: "revalidate" as const, key: row.scope },
-        };
+        const status = replicaRegistrationState(evidence, slot);
+        if (status === "conflict") return importedConflict(row, evidence);
         // Only a confirmed check is Progress. Unavailable or inactive evidence
         // is not a successful check (an imported slot stays visible meanwhile).
-        if (status !== "confirmed") {
-          const expected = {
-            owner: state().owner,
-            scope: row.scope,
-            dataHash: row.data_hash ?? undefined,
-            metadataHash: row.metadata_hash ?? undefined,
-          };
-          return verdict(
-            replicaRegistrationInactive(evidence, expected)
-              ? finalityWait(evidence, row.scope)
-              : { tag: "retry", problem: "evidence_unavailable" },
-          );
-        }
-        if (row.data_hash && row.metadata_hash) return verdict(checked);
-        // Upgrade legacy retained rows only after downloading the exact retained
-        // fragment and verifying its hash-pair against finalized evidence.
-        const encrypted = await call(signal, () => transport.get(row.scope));
-        if (encrypted.length > cap)
-          throw new ReplicaProblemError("download_failed");
-        const plaintext = await call(signal, () =>
-          transport.decrypt(row.scope, encrypted),
-        );
-        const fragment = decodeReplicaFragment(
-          plaintext,
-          row.scope,
-          state().owner,
-        );
-        const retained = db
-          .prepare(
-            "SELECT fragment_json FROM pdpp_transport_inbox WHERE scope=?",
-          )
-          .get(row.scope) as { fragment_json: string };
-        if (canonicalJson(fragment) !== retained.fragment_json)
-          throw new ReplicaProblemError("commitment_mismatch");
-        const dataHash = keccak256(plaintext);
-        const metadataHash = replicaMetadataHash(
-          row.scope,
-          fragment.collectedAt,
-          encrypted.length,
-        );
-        const pinned = replicaRegistrationState(evidence, {
-          owner: state().owner,
-          scope: row.scope,
-          dataHash,
-          metadataHash,
-        });
-        // The exact retained bytes disagree with the finalized commitment: the
-        // legacy slot is not the registered data. Withdraw it (finding j).
-        if (pinned === "conflict") return importedConflict(row.scope, evidence);
-        if (pinned !== "confirmed")
-          throw new ReplicaProblemError("commitment_mismatch");
-        return withPlan(checked, () =>
-          db
-            .prepare(
-              "UPDATE pdpp_transport_inbox SET data_hash=?,metadata_hash=? WHERE scope=?",
-            )
-            .run(dataHash, metadataHash, row.scope),
+        if (status === "confirmed")
+          return verdict({
+            tag: "progress",
+            receipt: { phase: "revalidate", key: row.slot },
+          });
+        return verdict(
+          replicaRegistrationInactive(evidence, slot)
+            ? finalityWait(evidence, row.slot)
+            : { tag: "retry", problem: "evidence_unavailable" },
         );
       } catch (error) {
         return verdict(retryFromError(error, "evidence_unavailable"));
@@ -1429,7 +1586,7 @@ export function createReplicaTransportWorker(deps: {
       const checked = (
         db
           .prepare(
-            "SELECT COALESCE(MAX(evidence_checked),0) AS value FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='imported'",
+            "SELECT COALESCE(MAX(evidence_checked),0) AS value FROM pdpp_transport_manifests_in WHERE state='imported'",
           )
           .get() as { value: number }
       ).value;
@@ -1439,9 +1596,13 @@ export function createReplicaTransportWorker(deps: {
         outcome.tag === "progress"
           ? { ...work, nextEligible: now() + interval }
           : work;
-      if (outcome.tag !== "quarantine")
+      if (outcome.tag === "quarantine")
         db.prepare(
-          `UPDATE pdpp_transport_inbox SET ${WORK_SET},evidence_checked=? WHERE scope=?`,
+          `UPDATE pdpp_transport_manifests_in SET ${QUARANTINE_SET("immutable_registration_conflict")} WHERE slot=? AND state='imported'`,
+        ).run(item.id);
+      else
+        db.prepare(
+          `UPDATE pdpp_transport_manifests_in SET ${WORK_SET},evidence_checked=? WHERE slot=?`,
         ).run(...workValues(outcome, next), checked + 1, item.id);
     }),
     commitProblem: "evidence_unavailable",
@@ -1449,34 +1610,54 @@ export function createReplicaTransportWorker(deps: {
       // A sweep on the host's cadence: only Retry and Wait are deadlines.
       return earliestIn(
         e,
-        "pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='imported' AND outcome IN ('retry','wait')",
+        "pdpp_transport_manifests_in WHERE state='imported' AND outcome IN ('retry','wait')",
       );
     },
   };
 
   // --------------------------------------------------------------- import
   type Refetch = { attempts: number; budget: number };
-  type ImportFragment = {
-    scope: string;
-    finalized: number;
-    data_hash: string | null;
-    metadata_hash: string | null;
+  type Group = Work & {
+    slot: string;
+    version: number;
+    writer: string;
+    batch: string;
+    sequence: number;
   };
+  /** Ordered verified fragments of one complete slot, read one row at a time. */
+  function retainedBytes(slot: string) {
+    const positions = (
+      db
+        .prepare(
+          "SELECT position FROM pdpp_transport_fragments_in WHERE slot=? ORDER BY position",
+        )
+        .all(slot) as { position: number }[]
+    ).map((r) => r.position);
+    return () =>
+      assembleReplicaStream(async function* () {
+        for (const position of positions)
+          yield JSON.parse(
+            (
+              db
+                .prepare(
+                  "SELECT fragment_json FROM pdpp_transport_fragments_in WHERE slot=? AND position=?",
+                )
+                .get(slot, position) as { fragment_json: string }
+            ).fragment_json,
+          ) as ReplicaFragment;
+      });
+  }
   /**
-   * Fail closed at writer scope (contract H): every retained fragment of the
+   * Fail closed at writer scope (contract H): every retained slot of the
    * writer from `sequence` on leaves import and revalidation.
    */
   function quarantineWriterFrom(writer: string, sequence: number) {
     db.prepare(
-      "UPDATE pdpp_transport_inbox SET state='quarantined',outcome='quarantine',reason='finalized_conflict',error='finalized_conflict' WHERE fragment_json IS NOT NULL AND json_extract(fragment_json,'$.writer')=? AND json_extract(fragment_json,'$.sequence')>=?",
+      `UPDATE pdpp_transport_manifests_in SET ${QUARANTINE_SET("finalized_conflict")} WHERE writer=? AND sequence>=?`,
     ).run(writer, sequence);
   }
   /** Durable acknowledgement of an imported batch, and its successor's wake. */
-  function acknowledge(
-    group: Group,
-    first: ReplicaFragment,
-    metadata: ImportFragment[],
-  ) {
+  function acknowledge(group: Group, manifest: ReplicaManifest) {
     if (
       !db
         .prepare(
@@ -1487,14 +1668,17 @@ export function createReplicaTransportWorker(deps: {
       db.prepare("INSERT INTO pdpp_transport_imported VALUES (?,?,?,?)").run(
         group.writer,
         group.batch,
-        first.sequence,
-        first.digest,
+        manifest.sequence,
+        manifest.digest,
       );
-    for (const row of metadata)
-      db.prepare(
-        "UPDATE pdpp_transport_inbox SET state='imported',error=NULL WHERE scope=?",
-      ).run(row.scope);
-    wake(`predecessor:${group.writer}:${first.sequence}`, now());
+    db.prepare(
+      "UPDATE pdpp_transport_manifests_in SET state='imported',error=NULL WHERE slot=?",
+    ).run(group.slot);
+    // The receiver retains its own copy: the fragment bodies are scratch now.
+    db.prepare("DELETE FROM pdpp_transport_fragments_in WHERE slot=?").run(
+      group.slot,
+    );
+    wake(`predecessor:${group.writer}:${manifest.sequence}`, now());
   }
   /**
    * The copy decision for one complete download of a batch (contract v3.1
@@ -1503,8 +1687,7 @@ export function createReplicaTransportWorker(deps: {
    */
   function decideImport(
     group: Group,
-    first: ReplicaFragment,
-    metadata: ImportFragment[],
+    manifest: ReplicaManifest,
     stage: ((refetch: Refetch) => void) | undefined,
   ): ReplicaPhaseOutcome {
     const { writer, batch } = group;
@@ -1527,11 +1710,8 @@ export function createReplicaTransportWorker(deps: {
     stage?.(refetch);
     const decision = deps.receiver.copies.decide(id, refetch);
     const terminal = (): ReplicaPhaseOutcome => {
-      quarantineWriterFrom(writer, first.sequence);
-      return {
-        tag: "quarantine",
-        proof: { reason: "finalized_conflict", key: id },
-      };
+      quarantineWriterFrom(writer, manifest.sequence);
+      return quarantine("finalized_conflict", id);
     };
     const progress: ReplicaPhaseOutcome = {
       tag: "progress",
@@ -1555,15 +1735,17 @@ export function createReplicaTransportWorker(deps: {
           "UPDATE pdpp_transport_import_work SET refetch_attempts=refetch_attempts+1 WHERE writer=? AND batch=?",
         ).run(writer, batch);
         const at = now() + defaultReplicaBackoff(refetch.attempts + 1);
-        for (const row of metadata)
-          db.prepare(
-            "UPDATE pdpp_transport_inbox SET fragment_json=NULL,data_hash=NULL,metadata_hash=NULL,finalized=0,state='ready',outcome=NULL,reason=NULL,cause_json=NULL,dependency=NULL,error=NULL,attempts=0,next_attempt=?,wait_since=NULL,checked_block=NULL WHERE scope=?",
-          ).run(at, row.scope);
+        db.prepare("DELETE FROM pdpp_transport_fragments_in WHERE slot=?").run(
+          group.slot,
+        );
+        db.prepare(
+          `UPDATE pdpp_transport_manifests_in SET manifest_json=NULL,data_hash=NULL,metadata_hash=NULL,batch=NULL,sequence=NULL,state='ready',${RESET_WORK},next_attempt=? WHERE slot=?`,
+        ).run(at, group.slot);
         return { tag: "wait", dependency: { kind: "fragments", key } };
       }
       case "reconcile_promoted":
         deps.receiver.copies.apply({ credential, id, decision });
-        acknowledge(group, first, metadata);
+        acknowledge(group, manifest);
         return progress;
       case "promote": {
         const result = deps.receiver.copies.promote({
@@ -1577,65 +1759,59 @@ export function createReplicaTransportWorker(deps: {
             tag: "wait",
             dependency: {
               kind: "predecessor",
-              key: `${writer}:${first.sequence - 1}`,
+              key: `${writer}:${manifest.sequence - 1}`,
             },
           };
-        acknowledge(group, first, metadata);
+        acknowledge(group, manifest);
         return progress;
       }
     }
   }
   /**
-   * The verified finalized fact a scope's evidence carries (contract F2), as
+   * The verified finalized fact a slot's evidence carries (contract F2), as
    * an effect for the caller's outcome transaction. Unavailable evidence
    * (thrown) and a chain object for another owner or slot are not facts.
    * The effect returns true when the fact is new, and then wakes the batch.
    */
   function factOf(
-    scope: string,
+    row: Slot,
     evidence: ReplicaRegistrationEvidence,
+    manifest: ReplicaManifest,
   ): (() => boolean) | undefined {
     const chain = evidence.chain;
-    const header = db
-      .prepare(
-        "SELECT json_extract(fragment_json,'$.writer') AS writer, json_extract(fragment_json,'$.batch') AS batch, json_extract(fragment_json,'$.index') AS position FROM pdpp_transport_inbox WHERE scope=?",
-      )
-      .get(scope) as
-      | { writer: string | null; batch: string | null; position: number | null }
-      | undefined;
     if (
       !chain ||
-      !header?.writer ||
-      !header.batch ||
-      header.position === null ||
       chain.owner.toLowerCase() !== state().owner.toLowerCase() ||
-      chain.scope !== scope ||
-      chain.version !== "1" ||
+      chain.scope !== row.scope ||
+      chain.version !== String(row.version) ||
       !/^(0|[1-9][0-9]*)$/.test(chain.currentVersion)
     )
       return undefined;
-    const { writer, batch, position } = header;
+    const { writer, batch } = manifest;
     return () => {
       const added = deps.receiver.copies.recordFact({
         credential: deps.credential,
         id: canonicalJson([writer, batch]),
-        scope,
-        fragmentIndex: position,
+        scope: row.scope,
+        // A manifest batch has exactly one registered slot.
+        fragmentIndex: 0,
         fact: {
           chainId: chain.chainId,
           registry: chain.registry,
           owner: chain.owner,
+          version: chain.version,
           currentVersion: chain.currentVersion,
           status: chain.status,
           commitment: chain.commitment,
           blockNumber: chain.blockNumber,
           blockHash: chain.blockHash,
-          // Eligibility is the fact's own: Active, with a live head matching
-          // the chain commitment (contract D, I).
+          // Eligibility is the fact's own: Active, with a live head that
+          // agrees with the slot (contract D, I).
           eligible:
             replicaRegistrationState(evidence, {
               owner: state().owner,
-              scope,
+              scope: row.scope,
+              version: row.version,
             }) === "confirmed",
         },
       });
@@ -1646,17 +1822,16 @@ export function createReplicaTransportWorker(deps: {
       return added;
     };
   }
-  type Group = Work & { writer: string; batch: string; sequence: number };
   const importRun: ReplicaPhaseHandler<Item<Group>> = {
     phase: "import",
     due(e, limit) {
-      // JSON metadata only: no retained content strings from incomplete or other groups.
+      // Slot metadata only: no fragment bodies from incomplete or other slots.
       return (
         db
           .prepare(
-            `WITH headers AS MATERIALIZED (SELECT json_extract(fragment_json,'$.writer') AS writer, json_extract(fragment_json,'$.batch') AS batch, json_extract(fragment_json,'$.count') AS expected_count, json_extract(fragment_json,'$.sequence') AS sequence FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='ready'),
-            complete AS (SELECT writer,batch,min(sequence) AS sequence FROM headers GROUP BY writer,batch HAVING count(*)=max(expected_count)),
-            candidates AS (SELECT c.writer,c.batch,c.sequence,coalesce(w.attempts,0) AS attempts,coalesce(w.next_attempt,0) AS next_attempt,w.wait_since,w.checked_block FROM complete c LEFT JOIN pdpp_transport_import_work w ON w.writer=c.writer AND w.batch=c.batch WHERE w.writer IS NULL OR (${replicaEligibleAtSql(e, { outcome: "w.outcome", dependency: "w.dependency", next: "w.next_attempt", since: "w.wait_since", checked: "w.checked_block" })} <= ${e.now} AND coalesce(w.outcome,'') NOT IN ('quarantine','unsupported')))
+            `WITH complete AS (SELECT m.slot,m.version,m.writer,m.batch,m.sequence FROM pdpp_transport_manifests_in m WHERE m.state='ready' AND m.manifest_json IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_in f WHERE f.slot=m.slot AND (f.fragment_json IS NULL OR f.state<>'ready'))),
+            candidates AS (SELECT c.slot,c.version,c.writer,c.batch,c.sequence,coalesce(w.attempts,0) AS attempts,coalesce(w.next_attempt,0) AS next_attempt,w.wait_since,w.checked_block FROM complete c LEFT JOIN pdpp_transport_import_work w ON w.writer=c.writer AND w.batch=c.batch WHERE w.writer IS NULL OR (${replicaEligibleAtSql(e, { outcome: "w.outcome", dependency: "w.dependency", next: "w.next_attempt", since: "w.wait_since", checked: "w.checked_block" })} <= ${e.now} AND coalesce(w.outcome,'') NOT IN ('quarantine','unsupported')))
             SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY writer ORDER BY next_attempt,sequence,batch) AS writer_rank FROM candidates) WHERE writer_rank<=? ORDER BY writer_rank, writer<=?, writer, next_attempt, sequence, batch LIMIT ?`,
           )
           .all(limit.perWriter, limit.after ?? "", limit.total) as Group[]
@@ -1669,50 +1844,30 @@ export function createReplicaTransportWorker(deps: {
       }));
     },
     async run(item, signal) {
-      const { writer, batch } = item.row;
+      const { writer, batch, slot } = item.row;
       const id = item.id;
-      const metadata = db
+      const manifest = manifestOf(slot);
+      const hashes = db
         .prepare(
-          `WITH headers AS MATERIALIZED (SELECT scope,finalized,data_hash,metadata_hash,json_extract(fragment_json,'$.index') AS position,json_extract(fragment_json,'$.writer') AS writer,json_extract(fragment_json,'$.batch') AS batch FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='ready') SELECT scope,finalized,data_hash,metadata_hash,position FROM headers WHERE writer=? AND batch=? ORDER BY position`,
+          "SELECT data_hash,metadata_hash FROM pdpp_transport_manifests_in WHERE slot=?",
         )
-        .all(writer, batch) as ImportFragment[];
-      const first = JSON.parse(
-        (
-          db
-            .prepare(
-              "SELECT fragment_json FROM pdpp_transport_inbox WHERE scope=?",
-            )
-            .get(metadata[0]!.scope) as { fragment_json: string }
-        ).fragment_json,
-      ) as ReplicaFragment;
+        .get(slot) as { data_hash: Hex; metadata_hash: Hex };
       const pendingId = canonicalJson([writer, batch]);
       /** Terminal for this batch; the receiver drops any staged copy of it. */
       const refuse = (
-        proof: { reason: ReplicaAuthorityRefusal | "batch_equivocation" },
-        receiverReason: string = proof.reason,
+        reason: ReplicaAuthorityRefusal | "batch_equivocation",
+        receiverReason: string = reason,
       ) =>
-        withPlan(
-          { tag: "quarantine", proof: { reason: proof.reason, key: id } },
-          () => {
-            deps.receiver.quarantine({
-              credential: deps.credential,
-              id: pendingId,
-              reason: receiverReason,
-            });
-            for (const row of metadata)
-              db.prepare(
-                "UPDATE pdpp_transport_inbox SET state='quarantined',error=? WHERE scope=?",
-              ).run(proof.reason, row.scope);
-          },
-        );
-      // Every import attempt asks the roster again, so a batch admitted at
-      // download on an answer up to REPLICA_ROSTER_MAX_AGE_MS old is
-      // revalidated before it is staged or promoted.
-      const authorized = await authorizeFragment(first, signal);
-      if (authorized.tag === "wait")
-        return verdict(rosterWait(authorized.server));
-      if (authorized.tag === "refused")
-        return refuse({ reason: authorized.reason });
+        withPlan(quarantine(reason, id), () => {
+          deps.receiver.quarantine({
+            credential: deps.credential,
+            id: pendingId,
+            reason: receiverReason,
+          });
+          db.prepare(
+            `UPDATE pdpp_transport_manifests_in SET ${QUARANTINE_SET(reason)} WHERE slot=?`,
+          ).run(slot);
+        });
       const imported = db
         .prepare(
           "SELECT digest,sequence FROM pdpp_transport_imported WHERE writer=? AND batch=?",
@@ -1722,16 +1877,23 @@ export function createReplicaTransportWorker(deps: {
         .prepare(
           "SELECT batch FROM pdpp_transport_imported WHERE writer=? AND sequence=?",
         )
-        .get(writer, first.sequence) as { batch: string } | undefined;
+        .get(writer, manifest.sequence) as { batch: string } | undefined;
       // A different batch reusing an imported writer sequence (or a changed
       // digest) is proven equivocation: terminal, never a hot retry.
       if (
         (imported &&
-          (imported.digest !== first.digest ||
-            imported.sequence !== first.sequence)) ||
+          (imported.digest !== manifest.digest ||
+            imported.sequence !== manifest.sequence)) ||
         (sequenceHolder && sequenceHolder.batch !== batch)
       )
-        return refuse({ reason: "batch_equivocation" }, "batch equivocation");
+        return refuse("batch_equivocation", "batch equivocation");
+      // Every import attempt asks the roster again, so a batch admitted at
+      // download on an answer up to REPLICA_ROSTER_MAX_AGE_MS old is
+      // revalidated before it is staged or promoted.
+      const authorized = await authorizeManifest(manifest, item.row, signal);
+      if (authorized.tag === "wait")
+        return verdict(rosterWait(authorized.server));
+      if (authorized.tag === "refused") return refuse(authorized.reason);
       const staging: string[] = [];
       /**
        * Copy custody of this download, if its copy is not retained yet. It
@@ -1739,18 +1901,17 @@ export function createReplicaTransportWorker(deps: {
        * or a discarded attempt never leaves custody without its outcome.
        */
       let stage: ((refetch: Refetch) => void) | undefined;
-      const fragments = metadata.map((row) => ({
-        dataHash: (row.data_hash ?? "").toLowerCase(),
-        metadataHash: (row.metadata_hash ?? "").toLowerCase(),
-      }));
+      // A batch's one registered slot is its copy's one commitment.
+      const fragments = [
+        {
+          dataHash: hashes.data_hash.toLowerCase(),
+          metadataHash: hashes.metadata_hash.toLowerCase(),
+        },
+      ];
       try {
-        if (fragments.some((f) => !f.dataHash || !f.metadataHash))
-          throw new ReplicaProblemError("payload_invalid");
-        const copyKey = replicaCopyKey(
-          fragments.map((f) =>
-            replicaChainCommitment(f.dataHash as Hex, f.metadataHash as Hex),
-          ),
-        );
+        const copyKey = replicaCopyKey([
+          replicaChainCommitment(hashes.data_hash, hashes.metadata_hash),
+        ]);
         const retained = deps.receiver.copies
           .list(pendingId)
           .some((copy) => copy.copyKey === copyKey);
@@ -1760,7 +1921,7 @@ export function createReplicaTransportWorker(deps: {
             { key: string; writer: ReturnType<typeof binaryWriter> }
           >();
           const payload = await inspectReplicaPayload(
-            retainedBytes(writer, batch),
+            retainedBytes(slot),
             undefined,
             (_blobId, chunk, blobIndex) => {
               let target = writers.get(blobIndex);
@@ -1775,14 +1936,14 @@ export function createReplicaTransportWorker(deps: {
           );
           // A discarded attempt stops before it prepares any custody.
           signal.throwIfAborted();
-          if (payload.envelope.batchId !== first.batch)
+          if (payload.envelope.batchId !== manifest.batch)
             throw new ReplicaProblemError("payload_invalid");
           // Check 7: every operation names the signer's operation writer.
           const misattributed = replicaOperationWriterRefusal(
             payload.envelope.operations,
             authorized.writers,
           );
-          if (misattributed) return refuse({ reason: misattributed });
+          if (misattributed) return refuse(misattributed);
           // Trusted retained declarations, never claims copied from the envelope.
           // An unknown declaration is a dependency the host can supply later.
           const expected = deps.expected();
@@ -1827,9 +1988,9 @@ export function createReplicaTransportWorker(deps: {
                 id: pendingId,
                 writer,
                 batch,
-                sequence: first.sequence,
-                previous: first.previous,
-                envelopeDigest: first.digest,
+                sequence: manifest.sequence,
+                previous: manifest.previous,
+                envelopeDigest: manifest.digest,
                 envelope: payload.envelope,
                 fragments,
               },
@@ -1847,7 +2008,7 @@ export function createReplicaTransportWorker(deps: {
             tag: "progress",
             receipt: { phase: "import", key: id },
           },
-          plan: () => decideImport(item.row, first, metadata, plan),
+          plan: () => decideImport(item.row, manifest, plan),
         };
       } catch (error) {
         stage = undefined;
@@ -2007,7 +2168,7 @@ export function createReplicaTransportWorker(deps: {
       publish,
       discover,
       download,
-      confirm,
+      fetchFragment,
       revalidate,
       importRun,
       reconcile,
@@ -2017,15 +2178,17 @@ export function createReplicaTransportWorker(deps: {
       prepare: 4,
       publish: 50,
       discover: 1,
-      download: 50,
-      confirm: 50,
+      fetch: 50,
       revalidate: 50,
       import: 50,
       reconcile: 1,
       ...deps.quantum,
+      // A host may reduce this quantum, but a deep inbox cannot remove the
+      // per-step memory bound by increasing it (even to Infinity).
+      download: Math.min(50, deps.quantum?.download ?? 50),
     },
     perWriter: deps.perWriter,
-    deadlineMs: deps.deadlineMs,
+    deadlineMs: deps.deadlineMs ?? REPLICA_RECEIVE_TIMEOUT_MS,
     background: ["revalidate"],
     clock: now,
     ...(transport.finality && {
@@ -2128,7 +2291,7 @@ export function createReplicaTransportWorker(deps: {
       if (!authority(own.identity)) return idle();
       // Only this process owns the worker. None of these hidden stages can be published.
       db.transaction(() => {
-        db.prepare("DELETE FROM pdpp_transport_preparing").run();
+        db.prepare("DELETE FROM pdpp_transport_staged_fragments").run();
         for (const table of ["pdpp_binary_chunks", "pdpp_binary_manifests"]) {
           db.prepare(
             `DELETE FROM ${table} WHERE namespace='staging' OR (namespace='payload' AND NOT EXISTS (SELECT 1 FROM pdpp_transport_batches b WHERE b.batch=${table}.blob_id))`,
@@ -2191,6 +2354,33 @@ export function createReplicaTransportWorker(deps: {
           WHERE prepared=-1 AND coalesce(json_extract(admission_json,'$.capability'),'') <> ?`,
         )
         .run(`cap:${cap}`).changes;
+    },
+    /**
+     * Owner decision after storage was repaired: fetch again every slot that
+     * was quarantined for a missing or mismatched fragment. The finalized
+     * manifest still decides which bytes are accepted. Returns the number of
+     * slots re-admitted.
+     */
+    readmitFragments(): number {
+      return db.transaction(() => {
+        const reasons = "('fragment_missing','fragment_mismatch')";
+        const slots = (
+          db
+            .prepare(
+              `SELECT slot FROM pdpp_transport_manifests_in WHERE state='quarantined' AND reason IN ${reasons}`,
+            )
+            .all() as { slot: string }[]
+        ).map((r) => r.slot);
+        for (const slot of slots) {
+          db.prepare(
+            `UPDATE pdpp_transport_fragments_in SET state='ready',fragment_json=NULL,${RESET_WORK},next_attempt=0 WHERE slot=? AND state='quarantined'`,
+          ).run(slot);
+          db.prepare(
+            `UPDATE pdpp_transport_manifests_in SET state='ready',${RESET_WORK},next_attempt=0 WHERE slot=?`,
+          ).run(slot);
+        }
+        return slots.length;
+      })();
     },
     /** A host-observed dependency change (e.g. `mapping:<connection>`). Idempotent. */
     onDependencyChanged(key: string) {

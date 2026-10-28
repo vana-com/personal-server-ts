@@ -12,6 +12,7 @@ import {
   cleanupHarness,
   cycles,
   network,
+  slotKey,
   transportDevice,
   workRecords,
   type TransportDevice,
@@ -81,7 +82,7 @@ it("S2b-1 a late discover result after its deadline never commits, not even with
   clock.advance(10 * B1);
   await within(2000, step(b), "second step");
   expect(
-    num(b, "SELECT count(*) AS n FROM pdpp_transport_inbox"),
+    num(b, "SELECT count(*) AS n FROM pdpp_transport_manifests_in"),
     "late admissions",
   ).toBe(0);
   expect(
@@ -98,21 +99,22 @@ it("S2b-1 a late discover result after its deadline never commits, not even with
   });
 });
 
-it("S2b-2 a late download result after its deadline never retains a fragment", async () => {
+it("S2b-2 a late download result after its deadline never retains a manifest", async () => {
   const net = network();
   await source(net);
   const b = transportDevice(net, { worker: { deadlineMs: 50 } });
   const get = net.port.get;
   const held: (() => void)[] = [];
   const release = () => held.splice(0).forEach((go) => go());
-  net.port.get = (scope) =>
+  net.port.get = (scope, version, read) =>
     new Promise((resolve, reject) => {
-      held.push(() => void get(scope).then(resolve, reject));
+      held.push(() => void get(scope, version, read).then(resolve, reject));
     });
   await within(2000, step(b), "first step");
   const timedOut = workRecords(b.db).filter(
     (r) =>
-      r.table === "pdpp_transport_inbox" && r.reason === "deadline_exceeded",
+      r.table === "pdpp_transport_manifests_in" &&
+      r.reason === "deadline_exceeded",
   );
   expect(timedOut.length).toBeGreaterThan(0);
   net.port.get = async () => {
@@ -125,10 +127,10 @@ it("S2b-2 a late download result after its deadline never retains a fragment", a
   expect(
     num(
       b,
-      "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND instr(scope, ?) > 0",
+      "SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE manifest_json IS NOT NULL AND slot=?",
       timedOut[0]!.id,
     ),
-    "the abandoned download committed its fragment",
+    "the abandoned download committed its manifest",
   ).toBe(0);
 });
 
@@ -146,18 +148,18 @@ it("S2b-3 a finality hint that never settles is bounded by the deadline and neve
 
 it("S2b-4 a slow failure keeps its full backoff from the settlement time", async () => {
   const net = network();
-  net.port.list = async () => ({ scopes: [], cursor: null });
+  net.port.list = async () => ({ points: [], cursor: null });
   const a = transportDevice(net, { preexisting: "record" });
   const evidence = net.port.evidence;
-  net.port.evidence = async (scope) => {
-    await evidence(scope);
+  net.port.evidence = async (scope, version) => {
+    await evidence(scope, version);
     clock.advance(5 * B1); // the RPC took five seconds of wall time
     throw new Error("rpc failed slowly");
   };
   await step(a);
-  // One fragment, one publication attempt: its settlement is the last clock read.
+  // One manifest, one publication attempt: its settlement is the last clock read.
   const rows = workRecords(a.db).filter(
-    (r) => r.table === "pdpp_transport_outbox",
+    (r) => r.table === "pdpp_transport_manifests_out",
   );
   expect(rows).toHaveLength(1);
   expect(rows[0]).toMatchObject({ outcome: "retry", attempts: 1 });
@@ -197,18 +199,19 @@ it("S2b-5 a failed commit transaction persists none of the attempt's effects and
 
 it("S2b-6 nextWake follows eligibility: a hint-parked wait is not 'now', and an outstanding singleton retry is not idle", async () => {
   const net = network();
-  net.port.list = async () => ({ scopes: [], cursor: null });
+  net.port.list = async () => ({ points: [], cursor: null });
   net.port.finality = { head: async () => 100n }; // below the verified height
   const a = transportDevice(net, { preexisting: "record" });
   const put = net.port.put;
-  net.port.put = async (part) => {
-    net.pending.add(part.scope);
-    return put(part);
+  net.port.put = async (manifest) => {
+    net.pending.add(slotKey(manifest.scope, manifest.version));
+    return put(manifest);
   };
   await step(a);
   const parked = workRecords(a.db).filter(
-    (r) => r.table === "pdpp_transport_outbox",
+    (r) => r.table === "pdpp_transport_manifests_out",
   );
+  expect(parked).toHaveLength(1);
   expect(
     parked.every((r) => r.outcome === "wait" && r.checkedBlock === "123"),
   ).toBe(true);
@@ -243,15 +246,15 @@ it("S2b-7 revalidation with unavailable evidence is not reported as Progress", a
   await cycles([b], 4);
   expect(b.get()).toEqual({ id: "a", text: "record" });
   const evidence = net.port.evidence;
-  net.port.evidence = async (scope) => ({
-    ...(await evidence(scope)),
+  net.port.evidence = async (scope, version) => ({
+    ...(await evidence(scope, version)),
     chain: null,
   });
   clock.advance(10 * B1);
   const report = await step(b);
   expect(report.receipts.filter((r) => r.phase === "revalidate")).toEqual([]);
   const rows = workRecords(b.db).filter(
-    (r) => r.table === "pdpp_transport_inbox" && r.state === "imported",
+    (r) => r.table === "pdpp_transport_manifests_in" && r.state === "imported",
   );
   expect(rows.length).toBeGreaterThan(0);
   for (const row of rows)

@@ -70,6 +70,10 @@ export interface StorageAdapter {
   deleteAll?(): Promise<number>;
 }
 
+/** An adapter whose every read stops at a caller's byte budget. */
+export type BoundedStorageAdapter = StorageAdapter &
+  Required<Pick<StorageAdapter, "downloadBounded">>;
+
 /**
  * The upload key already holds different bytes, which the backend kept.
  * Callers decide whether those bytes are theirs (same plaintext, different

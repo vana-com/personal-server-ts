@@ -28,6 +28,10 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import {
+  replicaFragmentKey,
+  replicaScope,
+} from "@opendatalabs/personal-server-ts-core/replication/transport";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
@@ -48,6 +52,7 @@ import {
   workRecords,
   checkpoint,
   pullRequestTier,
+  slotKey,
   type Network,
   type TransportDevice,
 } from "./pdpp-replica-contract.test-utils.js";
@@ -107,32 +112,89 @@ async function cycleAll(devices: TransportDevice[], n = 6, ms = 10_000) {
 }
 
 interface OutboxRow {
+  kind: "fragment" | "manifest";
   batch: string;
   encrypted: string;
   plaintext: string;
   dataHash: string;
   metadataHash: string;
+  version?: number;
   state: string;
 }
+/**
+ * Every outbound object of the device, by storage key: content-addressed
+ * fragments and the one manifest of each batch at its slot.
+ */
 function outboxSnapshot(db: Database.Database): Record<string, OutboxRow> {
-  const rows = db
+  const writer = (
+    db.prepare("SELECT writer FROM pdpp_transport_state WHERE id=1").get() as
+      { writer: string } | undefined
+  )?.writer;
+  const fragments = db
     .prepare(
-      "SELECT scope,batch,hex(encrypted) AS e,hex(plaintext) AS p,data_hash,metadata_hash,state FROM pdpp_transport_outbox ORDER BY scope",
+      "SELECT batch,digest,hex(encrypted) AS e,state FROM pdpp_transport_fragments_out ORDER BY batch,position",
     )
     .all() as Record<string, string>[];
-  return Object.fromEntries(
-    rows.map((r) => [
-      r.scope!,
+  const manifests = db
+    .prepare(
+      "SELECT scope,version,batch,hex(encrypted) AS e,hex(plaintext) AS p,data_hash,metadata_hash,state FROM pdpp_transport_manifests_out ORDER BY version",
+    )
+    .all() as Record<string, string>[];
+  return Object.fromEntries([
+    ...fragments.map((r) => [
+      replicaFragmentKey(replicaScope(writer!), r.digest!),
       {
+        kind: "fragment" as const,
+        batch: r.batch!,
+        encrypted: r.e!.toLowerCase(),
+        plaintext: "",
+        dataHash: r.digest!,
+        metadataHash: "",
+        state: r.state!,
+      },
+    ]),
+    ...manifests.map((r) => [
+      slotKey(r.scope!, Number(r.version)),
+      {
+        kind: "manifest" as const,
         batch: r.batch!,
         encrypted: r.e!.toLowerCase(),
         plaintext: r.p!.toLowerCase(),
         dataHash: r.data_hash!,
         metadataHash: r.metadata_hash!,
+        version: Number(r.version),
         state: r.state!,
       },
     ]),
-  );
+  ]);
+}
+/** A fragment is done once stored; a manifest once its registration is final. */
+const outboundDone = (r: OutboxRow) =>
+  r.state === (r.kind === "manifest" ? "published" : "stored");
+/** Received manifests and fragments the device holds, by work id and storage key. */
+function retainedObjects(db: Database.Database) {
+  const manifests = db
+    .prepare(
+      "SELECT slot FROM pdpp_transport_manifests_in WHERE manifest_json IS NOT NULL",
+    )
+    .all() as { slot: string }[];
+  const fragments = db
+    .prepare(
+      "SELECT f.slot,f.position,f.digest,m.scope FROM pdpp_transport_fragments_in f JOIN pdpp_transport_manifests_in m USING(slot) WHERE f.fragment_json IS NOT NULL",
+    )
+    .all() as {
+    slot: string;
+    position: number;
+    digest: string;
+    scope: string;
+  }[];
+  return [
+    ...manifests.map((r) => ({ id: r.slot, key: r.slot })),
+    ...fragments.map((r) => ({
+      id: `${r.slot}#${r.position}`,
+      key: replicaFragmentKey(r.scope, r.digest),
+    })),
+  ];
 }
 const stableOutbox = (rows: Record<string, OutboxRow>) =>
   Object.fromEntries(
@@ -194,6 +256,11 @@ interface Scenario {
   reads(): unknown;
   /** Convergence digest: no random identifiers. */
   digest(): unknown;
+  /**
+   * A read between the pre-step and final values that is still a committed
+   * state, such as a batch boundary when one window imports several batches.
+   */
+  intermediate?(read: unknown, frame: Frame): boolean;
   /** Contract assertions on the no-crash reference run (once). */
   checkReference?(frame: Frame): Violation[];
   /** Durable-state checks right after process loss, before any resume. */
@@ -396,7 +463,8 @@ async function runSeededMatrix(
     if (read.violation) crashed.push(read.violation);
     else if (
       !isDeepStrictEqual(read.value, before) &&
-      !isDeepStrictEqual(read.value, final)
+      !isDeepStrictEqual(read.value, final) &&
+      !s.intermediate?.(read.value, frame)
     )
       crashed.push(
         `[mixed-read] public reads equal neither the pre-step nor the final value: ${JSON.stringify(read.value)}`,
@@ -534,9 +602,7 @@ async function sourceWorld(options: SourceOptions): Promise<World> {
       digest: () => ({
         batches: batchSnapshot(a.db).length,
         outbox: Object.keys(outboxSnapshot(a.db)).length,
-        published: Object.values(outboxSnapshot(a.db)).every(
-          (r) => r.state === "published",
-        ),
+        published: Object.values(outboxSnapshot(a.db)).every(outboundDone),
         registrations: [...registrationsPerScope(net).values()].sort(),
         destChanges: count(
           b.db,
@@ -650,24 +716,25 @@ async function sourceWorld(options: SourceOptions): Promise<World> {
           out.push(
             `[identity] ${batches.length} batches retained for one local commit`,
           );
-        // One registration per scope, never a rebase.
-        for (const scope of Object.keys(outbox)) {
+        // One registration per manifest slot, none per fragment, never a rebase.
+        for (const [scope, row] of Object.entries(outbox)) {
           const registrations = registrationsPerScope(net).get(scope) ?? 0;
-          if (registrations !== 1)
+          if (registrations !== (row.kind === "manifest" ? 1 : 0))
             out.push(
-              `[publication] ${registrations} registrations for ${scope}`,
+              `[publication] ${registrations} registrations for ${row.kind} ${scope}`,
             );
           const puts = putsPerScope(net).get(scope) ?? 0;
           if (puts < 1 || puts > 2 || puts < (putsAtCrash.get(scope) ?? 0))
             out.push(`[publication] ${puts} PUTs for ${scope}`);
           const head = net.head.get(scope);
           if (
-            !head ||
-            head.version !== "1" ||
-            head.dataHash !== outbox[scope]!.dataHash
+            row.kind === "manifest" &&
+            (!head ||
+              head.version !== String(row.version) ||
+              head.dataHash !== row.dataHash)
           )
             out.push(
-              `[publication] head of ${scope} is not version 1 with the persisted hash`,
+              `[publication] head of ${scope} is not its slot with the persisted hash`,
             );
           if (
             net.blobs.has(scope) &&
@@ -827,6 +894,7 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
   const rewind = checkpoint(net, [b], crash);
   const scenario = (): Scenario => {
     let fetchedAtCrash = new Set<string>();
+    let retained: ReturnType<typeof retainedObjects> = [];
     let getsAtCrash = 0;
     return {
       crash,
@@ -846,6 +914,17 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
         list: publicList(b),
         blob: blobId ? sha(b.store.getBlobBytes(blobId)) : null,
       }),
+      // One writer scope holds every batch, so one window can import several
+      // in sequence. Each import is atomic: a crash shows a prefix of batches.
+      intermediate: (read, frame) => {
+        const now = read as { list: unknown[]; blob: unknown };
+        const end = frame.final as { list: unknown[]; blob: unknown };
+        return (
+          (options.batches ?? 1) > 1 &&
+          now.blob === end.blob &&
+          isDeepStrictEqual(now.list, end.list.slice(0, now.list.length))
+        );
+      },
       digest: () => ({
         imported: (
           b.db
@@ -856,7 +935,16 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
         ).map((r) => r.n),
         inbox: (
           b.db
-            .prepare("SELECT state FROM pdpp_transport_inbox ORDER BY scope")
+            .prepare(
+              "SELECT state FROM pdpp_transport_manifests_in ORDER BY slot",
+            )
+            .all() as { state: string }[]
+        ).map((r) => r.state),
+        fragments: (
+          b.db
+            .prepare(
+              "SELECT state FROM pdpp_transport_fragments_in ORDER BY slot,position",
+            )
             .all() as { state: string }[]
         ).map((r) => r.state),
         changes: count(b.db, "SELECT count(*) AS n FROM pdpp_record_changes"),
@@ -872,7 +960,9 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
       checkReference() {
         // Every durable work item carries a typed outcome after a clean run.
         const records = workRecords(b.db).filter(
-          (r) => r.table !== "pdpp_transport_outbox",
+          (r) =>
+            r.table !== "pdpp_transport_fragments_out" &&
+            r.table !== "pdpp_transport_manifests_out",
         );
         const untyped = records.filter(
           (r) => r.outcome === undefined || r.outcome === null,
@@ -883,15 +973,8 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
       },
       checkCrashed() {
         const out: Violation[] = [];
-        fetchedAtCrash = new Set(
-          (
-            b.db
-              .prepare(
-                "SELECT scope FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL",
-              )
-              .all() as { scope: string }[]
-          ).map((r) => r.scope),
-        );
+        retained = retainedObjects(b.db);
+        fetchedAtCrash = new Set(retained.map((r) => r.key));
         getsAtCrash = net.calls.gets.length;
         // Discovery: an admitted scope is never lost behind an advanced cursor.
         const cursor = (
@@ -901,10 +984,13 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
         if (cursor) {
           const admitted = count(
             b.db,
-            "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE scope<=?",
+            "SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE scope<=?",
             cursor,
           );
-          const listed = [...net.head.keys()].filter((k) => k <= cursor).length;
+          // Discovery admits every version of a listed scope.
+          const listed = [...net.head.keys()].filter(
+            (k) => k.slice(0, k.lastIndexOf("/")) <= cursor,
+          ).length;
           if (admitted !== listed)
             out.push(
               `[discovery] cursor ${cursor} advanced past ${listed - admitted} unadmitted scopes`,
@@ -931,22 +1017,26 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
           )
             out.push(`[outcome] import ${r.id} progress without a receipt`);
         const downloads = workRecords(b.db).filter(
-          (r) => r.table === "pdpp_transport_inbox" && r.outcome === "progress",
+          (r) =>
+            (r.table === "pdpp_transport_manifests_in" ||
+              r.table === "pdpp_transport_fragments_in") &&
+            r.outcome === "progress",
         );
+        const retainedIds = new Set(retained.map((r) => r.id));
         for (const r of downloads)
-          if (!fetchedAtCrash.has(r.id))
+          if (!retainedIds.has(r.id))
             out.push(
-              `[outcome] download ${r.id} progress without retained fragment`,
+              `[outcome] download ${r.id} progress without a retained object`,
             );
         return out;
       },
       checkResumed() {
         const out: Violation[] = [];
-        // Retry needs only missing fragments: retained ones are not fetched again.
+        // Retry needs only missing objects: retained ones are not fetched again.
         const after = net.calls.gets.slice(getsAtCrash);
-        for (const scope of after)
-          if (fetchedAtCrash.has(scope))
-            out.push(`[download] re-fetched retained fragment ${scope}`);
+        for (const key of after)
+          if (fetchedAtCrash.has(key))
+            out.push(`[download] re-fetched retained object ${key}`);
         if (
           count(b.db, "SELECT count(*) AS n FROM pdpp_replica_own_writes") !==
           journalBefore
@@ -1437,9 +1527,13 @@ describe("section C: fences, outcomes and claims", () => {
     await cycleAll([a, b], 6);
     expect(b.get()).toEqual({ id: "a", text: "atomic outcome" });
     const records = workRecords(a.db).filter(
-      (r) => r.table === "pdpp_transport_outbox",
+      (r) =>
+        r.table === "pdpp_transport_fragments_out" ||
+        r.table === "pdpp_transport_manifests_out",
     );
-    expect(records.length).toBeGreaterThan(0);
+    expect(
+      records.filter((r) => r.table === "pdpp_transport_manifests_out"),
+    ).toHaveLength(1);
     for (const r of records) {
       expect(r.outcome).toBe("progress");
       expect(r.reason ?? null).toBeNull();
@@ -1516,8 +1610,9 @@ describe("section C: fences, outcomes and claims", () => {
       ]);
       expect(outcome).toBe("settled");
       const afterDeadline = workRecords(a.db).filter(
-        (r) => r.table === "pdpp_transport_outbox",
+        (r) => r.table === "pdpp_transport_manifests_out",
       );
+      expect(afterDeadline).toHaveLength(1);
       expect(
         afterDeadline.every(
           (r) => r.outcome === "retry" && r.reason === "deadline_exceeded",
@@ -1527,7 +1622,9 @@ describe("section C: fences, outcomes and claims", () => {
       release();
       await sleep(20);
       expect(
-        workRecords(a.db).filter((r) => r.table === "pdpp_transport_outbox"),
+        workRecords(a.db).filter(
+          (r) => r.table === "pdpp_transport_manifests_out",
+        ),
       ).toEqual(afterDeadline);
     } finally {
       release();

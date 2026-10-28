@@ -3,6 +3,7 @@ import {
   authorizeReplicaBatch,
   deriveReplicaWriterId,
   deriveReplicaWriters,
+  replicaFragmentListDigest,
   replicaOperationWriterRefusal,
   signReplicaBatch,
   type ReplicaBatchFacts,
@@ -20,13 +21,19 @@ const partition: ReplicaPartition = {
   chainId: 14800,
   environment: "dev",
 };
+const fragment = (n: string, bytes = 500) => ({
+  digest: `sha256:${n.repeat(64)}`,
+  bytes,
+});
 const facts: ReplicaBatchFacts = {
+  version: 7,
   batch: "b".repeat(32),
   sequence: 2,
   previous: { batch: "c".repeat(32), digest: `sha256:${"d".repeat(64)}` },
+  collectedAt: "2026-10-20T00:00:00.000Z",
   digest: `sha256:${"e".repeat(64)}`,
   totalBytes: 1234,
-  count: 3,
+  fragments: [fragment("1"), fragment("2"), fragment("3", 234)],
 };
 
 describe("writer id derivation", () => {
@@ -63,6 +70,15 @@ describe("writer id derivation", () => {
         "transport",
       ),
     ).toThrow();
+  });
+});
+
+describe("fragment list digest", () => {
+  // Vector computed independently with Python hashlib and struct.pack(">Q").
+  it("pins SHA-256 over each 32-byte digest and 8-byte big-endian length", () => {
+    expect(replicaFragmentListDigest(facts.fragments)).toBe(
+      "0x55fdda17e6672797025caf134f8291b3343c80ccbf4bfd9d738221320cb8a17b",
+    );
   });
 });
 
@@ -144,11 +160,20 @@ describe("authorizeReplicaBatch", () => {
         reason: "signature_invalid",
       });
     for (const patch of [
+      { version: 8 },
       { sequence: 3 },
       { previous: null },
-      { count: 4 },
+      { previous: { ...facts.previous!, batch: "f".repeat(32) } },
+      { collectedAt: "2026-10-21T00:00:00.000Z" },
       { digest: `sha256:${"0".repeat(64)}` },
       { batch: "f".repeat(32) },
+      // The fragment list: one more, one fewer, reordered, resized, replaced.
+      { fragments: [...facts.fragments, fragment("4")] },
+      { fragments: facts.fragments.slice(0, 2) },
+      { fragments: [...facts.fragments].reverse() },
+      { fragments: [fragment("1"), fragment("2"), fragment("3", 235)] },
+      { fragments: [fragment("1"), fragment("2"), fragment("4", 234)] },
+      { fragments: [] },
     ])
       await expect(
         check(device, { facts: { ...facts, ...patch } }),

@@ -34,15 +34,17 @@ async function published(net: Network, text = "remote") {
   const a = transportDevice(net, { preexisting: text });
   await steps(a, 6, 0);
   expect(net.head.size).toBeGreaterThan(0);
-  return { a, scopes: new Set(net.head.keys()) };
+  const slots = new Set(net.head.keys());
+  const scopes = new Set([...slots].map((slot) => slot.split("/")[0]!));
+  return { a, slots, scopes };
 }
 /** Finalized evidence that commits every published slot to another copy. */
-function disproveAll(net: Network, scopes: Set<string>) {
+function disproveAll(net: Network, slots: Set<string>) {
   let n = 0;
-  for (const scope of scopes) {
+  for (const slot of slots) {
     n += 1;
-    net.chain.set(scope, {
-      ...net.chain.get(scope)!,
+    net.chain.set(slot, {
+      ...net.chain.get(slot)!,
       commitment: replicaChainCommitment(hex(1000 + n), hex(2000 + n)),
       blockNumber: 130n,
     });
@@ -66,7 +68,7 @@ const inScopes = (scopes: Set<string>) =>
 
 it("confirm appends verified finalized facts, and polling an unchanged slot adds none", async () => {
   const net = network();
-  const { scopes } = await published(net);
+  const { slots, scopes } = await published(net);
   const b = transportDevice(net);
   await steps(b, 6, 0);
   expect(b.get("a")).toEqual({ id: "a", text: "remote" });
@@ -80,59 +82,62 @@ it("confirm appends verified finalized facts, and polling an unchanged slot adds
       b,
       `SELECT count(*) AS n FROM pdpp_replica_finalized_facts WHERE eligible=1 AND current_version='1' AND scope IN ${inScopes(scopes)}`,
     ),
-  ).toBe(scopes.size);
+  ).toBe(slots.size);
   await steps(b, 6, 60_000);
   expect(num(b, "SELECT count(*) AS n FROM pdpp_replica_finalized_facts")).toBe(
     facts,
   );
 });
 
-it("every copy disproved: refetches spend the budget once each, then Wait(owner) persists across restart; nothing is imported", async () => {
+it("every copy disproved before download: nothing is fetched or trusted, across restart; nothing is imported", async () => {
   const net = network();
-  const { scopes } = await published(net);
-  disproveAll(net, scopes);
-  const b = transportDevice(net, { worker: { refetchBudget: 2 } });
-  const gets = () => net.calls.gets.filter((s) => scopes.has(s)).length;
-  await steps(b, 6, 0);
-  const firstGets = gets();
-  for (let i = 0; i < 12; i++) await steps(b, 1, 70_000);
-  expect(importWork(b)).toEqual([
-    {
-      outcome: "wait",
-      dependency: expect.stringMatching(/^owner:/),
-      refetch_attempts: 2,
-    },
-  ]);
-  // Two refetches each re-downloaded every slot once.
-  expect(gets() - firstGets).toBe(2 * scopes.size);
-  expect(b.get("a")).toBeUndefined();
-  expect(
+  const { slots } = await published(net);
+  // The finalized commitment disagrees with the Gateway head and the stored bytes.
+  disproveAll(net, slots);
+  const b = transportDevice(net);
+  const before = net.calls.gets.length;
+  const gets = () =>
+    net.calls.gets.slice(before).filter((s) => slots.has(s)).length;
+  const received = () =>
     b.db
       .prepare(
-        "SELECT state,reason FROM pdpp_replica_copies WHERE state<>'confirmed'",
+        `SELECT outcome,reason,manifest_json FROM pdpp_transport_manifests_in WHERE slot IN ${inScopes(slots)}`,
       )
-      .all(),
-  ).toEqual([{ state: "quarantined", reason: "copy_conflict" }]);
+      .all();
+  await steps(b, 6, 0);
+  for (let i = 0; i < 12; i++) await steps(b, 1, 70_000);
+  expect(received()).toEqual([
+    {
+      outcome: "retry",
+      reason: "registration_unconfirmed",
+      manifest_json: null,
+    },
+  ]);
+  expect(gets(), "an unconfirmed manifest is never read").toBe(0);
+  expect(importWork(b)).toEqual([]);
+  expect(b.get("a")).toBeUndefined();
   b.reopen();
   for (let i = 0; i < 6; i++) await steps(b, 1, 70_000);
-  expect(importWork(b)[0]).toMatchObject({
-    outcome: "wait",
-    dependency: expect.stringMatching(/^owner:/),
-    refetch_attempts: 2,
-  });
-  expect(gets() - firstGets).toBe(2 * scopes.size);
+  expect(received()).toEqual([
+    {
+      outcome: "retry",
+      reason: "registration_unconfirmed",
+      manifest_json: null,
+    },
+  ]);
+  expect(gets()).toBe(0);
   expect(b.get("a")).toBeUndefined();
 });
 
 it("a contradiction after import is terminal: the batch's connection is withdrawn from both readers and its slots leave revalidation", async () => {
   const net = network();
-  const { scopes } = await published(net);
+  const { slots, scopes } = await published(net);
   const b = transportDevice(net, { worker: { revalidateIntervalMs: 0 } });
   await steps(b, 6, 0);
   expect(b.get("a")).toEqual({ id: "a", text: "remote" });
   const epoch = b.store.replicaIntegrityEpoch(b.instance);
   // A later version-1 fact with another commitment at a new block.
-  disproveAll(net, scopes);
+  disproveAll(net, slots);
   await steps(b, 4, 1_000);
   expect(
     b.db
@@ -149,7 +154,7 @@ it("a contradiction after import is terminal: the batch's connection is withdraw
   expect(
     num(
       b,
-      `SELECT count(*) AS n FROM pdpp_transport_inbox WHERE state<>'quarantined' AND scope IN ${inScopes(scopes)}`,
+      `SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE state<>'quarantined' AND scope IN ${inScopes(scopes)}`,
     ),
   ).toBe(0);
 });

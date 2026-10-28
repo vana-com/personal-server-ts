@@ -19,10 +19,6 @@ import {
   type Predecessor,
 } from "./transport.js";
 import { ReplicaFramingUnsupported } from "./outcome.js";
-import type {
-  ReplicaBatchAuthority,
-  ReplicaBatchFacts,
-} from "./writer-identity.js";
 
 const FRAME_LIMIT = 128 * 1024;
 const BASE64_PIECE = 48 * 1024;
@@ -119,8 +115,6 @@ export async function* fragmentReplicaStream(input: {
   digest: string;
   totalBytes: number;
   bytes: () => AsyncIterable<Uint8Array>;
-  /** Signs the batch statement once, for this framing's fragment count. */
-  sign: (facts: ReplicaBatchFacts) => Promise<ReplicaBatchAuthority>;
   encrypt: (scope: string, bytes: Uint8Array) => Promise<Uint8Array>;
   maxBlobBytes?: number;
   targetChunkBytes?: number;
@@ -144,14 +138,6 @@ export async function* fragmentReplicaStream(input: {
       REPLICA_MAX_FRAGMENTS,
       "fragment_count",
     );
-  const authority = await input.sign({
-    batch: input.batch,
-    sequence: input.sequence,
-    previous: input.previous,
-    digest: input.digest,
-    totalBytes: input.totalBytes,
-    count,
-  });
   const hash = sha256.create();
   let offset = 0;
   let index = 0;
@@ -173,7 +159,6 @@ export async function* fragmentReplicaStream(input: {
           index,
           offset,
           chunk,
-          authority,
         });
         if (prepared.encrypted.length > cap)
           throw new ReplicaFramingUnsupported(prepared.encrypted.length, cap);
@@ -200,7 +185,6 @@ function commonFragment(f: ReplicaFragment): string {
     digest: f.digest,
     totalBytes: f.totalBytes,
     count: f.count,
-    authority: f.authority,
   });
 }
 

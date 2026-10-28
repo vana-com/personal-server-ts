@@ -1984,11 +1984,11 @@ describe("64 [Node SQLite] fence dominance", () => {
 });
 
 // ============================================================================
-// finding j.2 (155a82f0): a NULL-pin legacy slot after a finalized replacement
+// finding j.2 (155a82f0): an imported slot after a finalized replacement
 // ============================================================================
 
-describe("j.2 [Node SQLite transport] legacy NULL-pin slot after a finalized replacement", () => {
-  async function legacyWithReplacement() {
+describe("j.2 [Node SQLite transport] imported slot after a finalized replacement", () => {
+  async function replacedSlot() {
     const net = network();
     const a = transportDevice(net);
     const b = transportDevice(net);
@@ -1996,32 +1996,26 @@ describe("j.2 [Node SQLite transport] legacy NULL-pin slot after a finalized rep
     await cycles([a, b], 8);
     expect(b.get()).toEqual({ id: "a", text: "authentic" });
     const base = epochBase(b.store, b.instance);
-    // An upgraded retained row: pins are NULL, so the commitment is not bound yet.
-    b.db
-      .prepare(
-        "UPDATE pdpp_transport_inbox SET data_hash=NULL, metadata_hash=NULL",
-      )
-      .run();
-    const scopes = (
+    // Every imported slot pins its commitment at download. The manifest
+    // carrier has no NULL-pin rows to upgrade.
+    const slots = (
       b.db
         .prepare(
-          "SELECT scope FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL",
+          "SELECT slot FROM pdpp_transport_manifests_in WHERE manifest_json IS NOT NULL AND data_hash IS NOT NULL",
         )
-        .all() as { scope: string }[]
-    ).map((row) => row.scope);
-    expect(scopes.length).toBeGreaterThan(0);
-    for (const scope of scopes) {
-      const row = net.head.get(scope)!;
+        .all() as { slot: string }[]
+    ).map((row) => row.slot);
+    expect(slots.length).toBeGreaterThan(0);
+    for (const slot of slots) {
+      const row = net.head.get(slot)!;
       const replacement = { ...row, dataHash: `0x${"9".repeat(64)}` as const };
-      net.head.set(scope, replacement);
-      net.chain.set(scope, net.chainRow(scope, replacement));
+      net.head.set(slot, replacement);
+      net.chain.set(slot, net.chainRow(slot, replacement));
     }
     await cycles([b], 6);
     return { b, base };
   }
-  const readSurfaces = (
-    b: Awaited<ReturnType<typeof legacyWithReplacement>>["b"],
-  ) => ({
+  const readSurfaces = (b: Awaited<ReturnType<typeof replacedSlot>>["b"]) => ({
     point: b.store.getRecord(b.instance, "messages", "a"),
     list: b.store.listRecords("messages", {
       instanceIds: [b.instance],
@@ -2033,8 +2027,8 @@ describe("j.2 [Node SQLite transport] legacy NULL-pin slot after a finalized rep
       limit: 10,
     }).data,
   });
-  it("j.2r read side: the legacy slot is ineligible on point, list and changes, across reopen", async () => {
-    const { b } = await legacyWithReplacement();
+  it("j.2r read side: the replaced slot is ineligible on point, list and changes, across reopen", async () => {
+    const { b } = await replacedSlot();
     for (const restart of [false, true]) {
       if (restart) b.reopen();
       const s = readSurfaces(b);
@@ -2044,7 +2038,7 @@ describe("j.2 [Node SQLite transport] legacy NULL-pin slot after a finalized rep
     }
   });
   it("j.2w write side: the withdrawal raises the integrity epoch and survives reopen", async () => {
-    const { b, base } = await legacyWithReplacement();
+    const { b, base } = await replacedSlot();
     const after = epochOf(b.store, b.instance);
     expect(after).toBeGreaterThan(base);
     b.reopen();
