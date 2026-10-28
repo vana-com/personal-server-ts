@@ -312,6 +312,32 @@ source batches on that writer's chain, while other writers can advance. The
 current slot's typed wait remains visible; authoritative absence after the
 intent timeout retries that same version and ciphertext. A successor is
 retained only after the predecessor is confirmed.
+
+A12b recovery verifies the finalized holder before moving an unaccepted slot.
+A valid statement from our own key with a different batch digest creates a
+terminal `Wait(registration, own_key_conflict)` for the owner. A foreign holder
+starts allocation at the gateway's highest registered version plus one. One
+immediate transaction records the holder's committed manifest hash and detection
+time, releases all unaccepted claims from the conflicting slot, and assigns those
+claims consecutive versions in their original order. Signatures and encrypted
+manifests are staged before that transaction; no network call spans it. A crash
+before its commit rolls back the entire move. Batch identity, payload digest,
+writer sequence, predecessor batch/digest pointer and fragment ciphertext stay
+fixed. Receiver predecessor checks use the writer sequence and batch/digest
+pointer (`pdpp-replica-copies.ts`, `predecessorOf`), independently of wire versions.
+
+A successful registration records an accepted intent before reading finality
+again. Accepted or committed batches never move, including a later batch whose
+upload finishes while recovery stages signatures. Reassigned manifests get fresh
+intents; submission verifies that the slot still holds the intended ciphertext.
+Eight recovery transactions per writer scope are allowed within one hour. After
+that, `Wait(registration, version_squat)` uses dependency backoff (60 seconds,
+120 seconds, 240 seconds, capped at 300 seconds; 600 seconds after ten minutes)
+without reading storage or submitting registrations. `retryVersionSquats()` is
+the explicit owner acknowledgement; it succeeds only after the wait deadline
+and when the recovery window has capacity. Both waits remain in step reports
+after restart. Flag-off creates no recovery schema and performs no recovery work.
+
 Each cycle attempts every phase even if an earlier phase fails, then reports
 collected errors so retained imports can advance during a feed outage.
 New large canonical, pinned and received bytes use the same 64 KiB chunk store.

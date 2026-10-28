@@ -41,6 +41,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
   prepareReplicaManifest,
+  decodeReplicaManifest,
+  replicaDigest,
   replicaManifestFacts,
   replicaScope,
   replicaWriterOf,
@@ -164,6 +166,9 @@ const EXPORT_PAGE = 1000;
 const DISCOVER_SLOTS = 256;
 /** An unresolved AddData intent is retried only after this bounded window. */
 export const REPLICA_REGISTRATION_INTENT_TIMEOUT_MS = 5 * 60 * 1000;
+/** Per-writer recovery budget; only explicit owner acknowledgement resumes an exhausted writer. */
+export const REPLICA_VERSION_SQUAT_ATTEMPTS = 8;
+export const REPLICA_VERSION_SQUAT_WINDOW_MS = 60 * 60 * 1000;
 
 /** Durable outcome columns shared by every per-item work table. */
 const WORK = `outcome TEXT, reason TEXT, cause_json TEXT, dependency TEXT, error TEXT,
@@ -224,6 +229,12 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_phase_state (
  phase TEXT PRIMARY KEY, ${WORK}, fingerprint TEXT);
 `;
 const admissionMigration = `
+CREATE TABLE IF NOT EXISTS pdpp_transport_version_squats (
+ scope TEXT NOT NULL, version INTEGER NOT NULL, digest TEXT NOT NULL,
+ detected_at INTEGER NOT NULL, batch TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('squatted','resigning','registering','committed')),
+ PRIMARY KEY(scope,version));
+CREATE TABLE IF NOT EXISTS pdpp_transport_registration_recovery (
+ batch TEXT PRIMARY KEY, version INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('resigning','registering','committed','own_key_conflict','version_squat')));
 CREATE TABLE IF NOT EXISTS pdpp_transport_repository (
  id INTEGER PRIMARY KEY CHECK(id=1), repository_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pdpp_transport_staged_objects (
@@ -277,7 +288,14 @@ type ManifestOut = {
   encrypted: Buffer;
   data_hash: Hex;
   metadata_hash: Hex;
+  state: string;
 };
+type RegistrationRecoveryState =
+  | "resigning"
+  | "registering"
+  | "committed"
+  | "own_key_conflict"
+  | "version_squat";
 type Slot = Work & {
   slot: string;
   scope: string;
@@ -600,6 +618,7 @@ export function createReplicaTransportWorker(deps: {
       "pdpp_transport_preparation",
       "pdpp_transport_operation_outcomes",
       "pdpp_transport_upload_attempts",
+      "pdpp_transport_registration_recovery",
     ])
       db.prepare(`DELETE FROM ${table}`).run();
   }
@@ -1951,12 +1970,20 @@ export function createReplicaTransportWorker(deps: {
     const attemptedAt = now();
     db.transaction(() => {
       assertReplicationStepOpen(db, signal);
+      const held = db
+        .prepare(
+          "SELECT encrypted FROM pdpp_transport_manifests_out WHERE scope=? AND version=? AND state='ready'",
+        )
+        .get(expected.scope, expected.version) as
+        { encrypted: Buffer } | undefined;
+      if (!held || replicaDigest(held.encrypted) !== manifestHash)
+        throw new ReplicaProblemError("publish_failed");
       const current = registrationIntent(expected.scope, expected.version);
       if (current) {
         if (current.owner !== owner || current.manifest_hash !== manifestHash)
           throw new ReplicaProblemError("publish_failed");
         db.prepare(
-          "UPDATE pdpp_transport_registration_intents SET attempted_at=?,attempts=attempts+1 WHERE scope=? AND version=? AND status='unresolved'",
+          "UPDATE pdpp_transport_registration_intents SET attempted_at=?,attempts=attempts+1 WHERE scope=? AND version=? AND status IN ('unresolved','accepted')",
         ).run(attemptedAt, expected.scope, expected.version);
         return;
       }
@@ -1974,7 +2001,317 @@ export function createReplicaTransportWorker(deps: {
         attemptedAt,
         1,
       );
+      if (
+        recoveryOf(
+          (
+            db
+              .prepare(
+                "SELECT batch FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
+              )
+              .get(expected.scope, expected.version) as { batch: string }
+          ).batch,
+        )
+      )
+        db.prepare(
+          "UPDATE pdpp_transport_registration_recovery SET state='registering' WHERE version=? AND batch IN (SELECT batch FROM pdpp_transport_manifests_out WHERE scope=?)",
+        ).run(expected.version, expected.scope);
     }).immediate();
+  }
+  const registrationWait = (
+    reason: "own_key_conflict" | "version_squat",
+  ): ReplicaPhaseOutcome => ({
+    tag: "wait",
+    dependency: { kind: "registration", key: state().writer, reason },
+  });
+  function recoveryOf(batch: string) {
+    return db
+      .prepare(
+        "SELECT version,state FROM pdpp_transport_registration_recovery WHERE batch=?",
+      )
+      .get(batch) as
+      { version: number; state: RegistrationRecoveryState } | undefined;
+  }
+  function setRecovery(
+    batch: string,
+    version: number,
+    status: RegistrationRecoveryState,
+  ) {
+    db.prepare(
+      `INSERT INTO pdpp_transport_registration_recovery (batch,version,state) VALUES (?,?,?)
+      ON CONFLICT(batch) DO UPDATE SET version=excluded.version,state=excluded.state`,
+    ).run(batch, version, status);
+  }
+  const registered = (m: ManifestOut, evidence: ReplicaRegistrationEvidence) =>
+    m.state === "published" ||
+    ["accepted", "confirmed"].includes(
+      registrationIntent(m.scope, m.version)?.status ?? "",
+    ) ||
+    (evidence.chain !== null &&
+      BigInt(evidence.chain.currentVersion) >= BigInt(m.version) &&
+      evidence.chain.commitment.toLowerCase() ===
+        replicaChainCommitment(m.data_hash, m.metadata_hash).toLowerCase()) ||
+    (evidence.head?.version === String(m.version) &&
+      evidence.head.dataHash === m.data_hash &&
+      evidence.head.metadataHash === m.metadata_hash);
+
+  /** Stage signatures without I/O; the outcome transaction moves the entire unaccepted suffix. */
+  async function recoverRegistration(
+    row: ManifestOut,
+    evidence: ReplicaRegistrationEvidence,
+    signal: AbortSignal,
+  ): Promise<ReplicaAttempt> {
+    const received = await receiveReplicaManifest({
+      scope: row.scope,
+      owner: state().owner,
+      maxBytes: cap,
+      signal,
+      read: (readSignal) =>
+        call(signal, () =>
+          transport.get(row.scope, row.version, {
+            maxBytes: cap,
+            signal: readSignal,
+          }),
+        ),
+      decrypt: (bytes) =>
+        call(signal, () => transport.decrypt(row.scope, bytes)),
+      committed: (dataHash, metadataHash) =>
+        replicaChainCommitment(dataHash, metadataHash).toLowerCase() ===
+        evidence.chain?.commitment.toLowerCase(),
+    });
+    if (received.tag !== "manifest")
+      return verdict(
+        quarantine(
+          "immutable_registration_conflict",
+          slotKey(row.scope, row.version),
+        ),
+      );
+    const holder = received.manifest;
+    const identity = currentReplicaWriterIdentity(db)!;
+    const original = decodeReplicaManifest(
+      row.plaintext,
+      row.scope,
+      state().owner,
+    );
+    if (holder.authority.statement.server === identity.seed.server) {
+      const authorized = await authorizeManifest(
+        holder,
+        { writer: state().writer, version: row.version },
+        signal,
+      );
+      if (authorized.tag === "wait")
+        return verdict(rosterWait(authorized.server));
+      if (authorized.tag === "authorized") {
+        if (
+          holder.batch === original.batch &&
+          holder.digest === original.digest
+        )
+          return verdict({
+            tag: "progress",
+            receipt: { phase: "publish", key: slotKey(row.scope, row.version) },
+          });
+        return withPlan(registrationWait("own_key_conflict"), () =>
+          setRecovery(row.batch, row.version, "own_key_conflict"),
+        );
+      }
+    }
+    const attempts = (
+      db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_transport_version_squats WHERE scope=? AND detected_at>=?",
+        )
+        .get(row.scope, now() - REPLICA_VERSION_SQUAT_WINDOW_MS) as {
+        n: number;
+      }
+    ).n;
+    if (attempts >= REPLICA_VERSION_SQUAT_ATTEMPTS)
+      return withPlan(registrationWait("version_squat"), () =>
+        setRecovery(row.batch, row.version, "version_squat"),
+      );
+    const claims = db
+      .prepare(
+        `SELECT p.batch,p.version,b.sequence,m.plaintext,m.encrypted,m.data_hash,m.metadata_hash,m.state
+      FROM pdpp_transport_preparation p JOIN pdpp_transport_batches b ON b.batch=p.batch
+      LEFT JOIN pdpp_transport_manifests_out m ON m.batch=p.batch
+      WHERE p.version>=? AND p.state<>'released' ORDER BY b.sequence`,
+      )
+      .all(row.version) as {
+      batch: string;
+      version: number;
+      sequence: number;
+      plaintext: Buffer | null;
+      encrypted: Buffer | null;
+      data_hash: Hex;
+      metadata_hash: Hex;
+      state: string;
+    }[];
+    const moving: typeof claims = [];
+    const accepted: typeof claims = [];
+    let highest = Math.max(
+      Number(evidence.chain!.currentVersion),
+      Number(evidence.head?.version ?? 0),
+    );
+    for (const claim of claims) {
+      if (claim.plaintext) {
+        const m = { ...claim, scope: row.scope } as ManifestOut;
+        const fact =
+          claim.batch === row.batch
+            ? evidence
+            : await call(signal, () =>
+                transport.evidence(row.scope, claim.version),
+              );
+        highest = Math.max(
+          highest,
+          Number(fact.chain?.currentVersion ?? 0),
+          Number(fact.head?.version ?? 0),
+        );
+        if (registered(m, fact)) {
+          if (claim.batch === row.batch)
+            return withPlan(registrationWait("version_squat"), () =>
+              setRecovery(row.batch, row.version, "version_squat"),
+            );
+          accepted.push(claim);
+          continue;
+        }
+        // An unresolved optimistic registration might already be accepted.
+        // No absence/conflict proof means wait; it is never permission to re-sign.
+        if (
+          replicaRegistrationState(fact, {
+            owner: state().owner,
+            scope: row.scope,
+            version: claim.version,
+            dataHash: claim.data_hash,
+            metadataHash: claim.metadata_hash,
+          }) === "pending"
+        )
+          return verdict(
+            pendingRegistration(
+              slotKey(row.scope, claim.version),
+              claim.version,
+              now(),
+            ),
+          );
+      }
+      moving.push(claim);
+    }
+    const first = highest + 1;
+    if (
+      !Number.isSafeInteger(first + moving.length) ||
+      !moving.some((c) => c.batch === row.batch)
+    )
+      throw new ReplicaProblemError("publish_failed");
+    const staged = new Map<string, PreparedManifest>();
+    for (const [index, claim] of moving.entries()) {
+      if (!claim.plaintext) continue;
+      const manifest = decodeReplicaManifest(
+        claim.plaintext,
+        row.scope,
+        state().owner,
+      );
+      const replacement = await prepareReplicaManifest({
+        ...manifest,
+        version: first + index,
+        // The predecessor is a batch/digest pointer, so moving wire slots leaves
+        // the same valid pointer (and every content-addressed fragment) intact.
+        previous: manifest.previous,
+        sign: (facts) =>
+          signReplicaBatch({
+            signer: deps.authority.signer,
+            partition: partition(),
+            seed: identity.seed,
+            facts,
+          }),
+        encrypt: (scope, bytes) =>
+          call(signal, () => transport.encrypt(scope, bytes)),
+      });
+      if (replacement.encrypted.length > cap)
+        throw new ReplicaProblemError("publish_failed");
+      staged.set(claim.batch, replacement);
+    }
+    // I/O in another already-started upload may have completed while signing.
+    // Recheck acceptance before releasing any claim; no SQLite transaction spans I/O.
+    for (const claim of moving) {
+      if (claim.batch === row.batch || !claim.plaintext) continue;
+      const fact = await call(signal, () =>
+        transport.evidence(row.scope, claim.version),
+      );
+      if (registered({ ...claim, scope: row.scope } as ManifestOut, fact))
+        return verdict({ tag: "retry", problem: "registration_unconfirmed" });
+    }
+    return withPlan(
+      pendingRegistration(
+        slotKey(row.scope, first),
+        first,
+        now(),
+        undefined,
+        now(),
+      ),
+      () => {
+        // commitIn wraps this whole plan, including its outcome, in one immediate transaction.
+        for (const claim of moving) {
+          const current = preparationOf(claim.batch);
+          const held = db
+            .prepare(
+              "SELECT version,encrypted FROM pdpp_transport_manifests_out WHERE batch=?",
+            )
+            .get(claim.batch) as
+            { version: number; encrypted: Buffer } | undefined;
+          if (
+            current?.version !== claim.version ||
+            (claim.encrypted &&
+              (!held ||
+                held.version !== claim.version ||
+                !held.encrypted.equals(claim.encrypted))) ||
+            ["accepted", "confirmed"].includes(
+              registrationIntent(row.scope, claim.version)?.status ?? "",
+            )
+          )
+            throw new ReplicaProblemError("publish_failed");
+        }
+        db.prepare(
+          "INSERT INTO pdpp_transport_version_squats (scope,version,digest,detected_at,batch,state) VALUES (?,?,?,?,?,'squatted')",
+        ).run(row.scope, row.version, received.dataHash, now(), row.batch);
+        // Release every old slot before assigning the suffix, including unsigned claims.
+        for (const claim of moving) {
+          db.prepare(
+            "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
+          ).run(claim.batch);
+          db.prepare(
+            "DELETE FROM pdpp_transport_registration_intents WHERE scope=? AND version=?",
+          ).run(row.scope, claim.version);
+          db.prepare(
+            "DELETE FROM pdpp_transport_upload_attempts WHERE batch=? AND kind='manifest'",
+          ).run(claim.batch);
+          db.prepare(
+            "UPDATE pdpp_transport_preparation SET version=0 WHERE batch=?",
+          ).run(claim.batch);
+        }
+        for (const [index, claim] of moving.entries()) {
+          const version = first + index;
+          const m = staged.get(claim.batch);
+          if (m)
+            db.prepare(
+              "INSERT INTO pdpp_transport_manifests_out (batch,scope,version,plaintext,encrypted,data_hash,metadata_hash) VALUES (?,?,?,?,?,?,?)",
+            ).run(
+              claim.batch,
+              m.scope,
+              m.version,
+              m.plaintext,
+              m.encrypted,
+              m.dataHash,
+              m.metadataHash,
+            );
+          db.prepare(
+            "UPDATE pdpp_transport_preparation SET version=? WHERE batch=?",
+          ).run(version, claim.batch);
+          setRecovery(claim.batch, version, "resigning");
+        }
+        for (const claim of accepted)
+          setRecovery(claim.batch, claim.version, "registering");
+        db.prepare(
+          "UPDATE pdpp_transport_version_squats SET state='resigning' WHERE scope=? AND version=?",
+        ).run(row.scope, row.version);
+      },
+    );
   }
   async function publishManifest(
     batch: string,
@@ -1993,7 +2330,39 @@ export function createReplicaTransportWorker(deps: {
       metadataHash: row.metadata_hash,
     };
     try {
-      if (row.version > 1) {
+      const recovery = recoveryOf(batch);
+      if (
+        recovery?.state === "own_key_conflict" ||
+        recovery?.state === "version_squat"
+      )
+        return verdict(registrationWait(recovery.state));
+      if (recovery) {
+        const prior = db
+          .prepare(
+            `SELECT p.version,m.checked_block,m.next_attempt FROM pdpp_transport_batches b
+          JOIN pdpp_transport_preparation p ON p.batch=b.batch LEFT JOIN pdpp_transport_manifests_out m ON m.batch=b.batch
+          WHERE b.sequence<(SELECT sequence FROM pdpp_transport_batches WHERE batch=?) AND NOT ${batchSettled("b")}
+          ORDER BY b.sequence LIMIT 1`,
+          )
+          .get(batch) as
+          | {
+              version: number;
+              checked_block: string | null;
+              next_attempt: number | null;
+            }
+          | undefined;
+        if (prior)
+          return verdict(
+            pendingRegistration(
+              slotKey(row.scope, prior.version),
+              prior.version,
+              previousWaitSince ?? now(),
+              prior.checked_block ?? undefined,
+              prior.next_attempt ?? undefined,
+            ),
+          );
+      }
+      if (row.version > 1 && !recovery) {
         const predecessor = db
           .prepare(
             "SELECT state,outcome,reason,checked_block,next_attempt FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
@@ -2030,7 +2399,7 @@ export function createReplicaTransportWorker(deps: {
       );
       let status = replicaRegistrationState(evidence, expected);
       if (status === "conflict")
-        return verdict(quarantine("immutable_registration_conflict", key));
+        return await recoverRegistration(row, evidence, signal);
       if (status === "confirmed")
         return verdict({
           tag: "progress",
@@ -2070,6 +2439,12 @@ export function createReplicaTransportWorker(deps: {
         recordRegistrationAttempt(expected, row.encrypted, signal);
         try {
           await call(signal, () => transport.register(manifest));
+          db.transaction(() => {
+            assertReplicationStepOpen(db, signal);
+            db.prepare(
+              "UPDATE pdpp_transport_registration_intents SET status='accepted' WHERE scope=? AND version=? AND manifest_hash=?",
+            ).run(row.scope, row.version, replicaDigest(row.encrypted));
+          }).immediate();
         } catch {
           return verdict(
             pendingRegistration(
@@ -2085,7 +2460,7 @@ export function createReplicaTransportWorker(deps: {
         status = replicaRegistrationState(evidence, expected);
       }
       if (status === "conflict")
-        return verdict(quarantine("immutable_registration_conflict", key));
+        return await recoverRegistration(row, evidence, signal);
       if (status === "confirmed")
         return verdict({
           tag: "progress",
@@ -2186,6 +2561,10 @@ export function createReplicaTransportWorker(deps: {
             ).run(...workValues(outcome, work), next, item.row.batch);
           if (item.row.kind === "manifest" && outcome.tag === "progress")
             db.prepare(
+              "UPDATE pdpp_transport_registration_recovery SET state='committed' WHERE batch=?",
+            ).run(item.row.batch);
+          if (item.row.kind === "manifest" && outcome.tag === "progress")
+            db.prepare(
               "UPDATE pdpp_transport_registration_intents SET status='confirmed' WHERE scope=? AND version=?",
             ).run(item.row.scope!, item.row.version!);
           if (item.row.kind === "manifest" && outcome.tag === "quarantine")
@@ -2219,12 +2598,13 @@ export function createReplicaTransportWorker(deps: {
             row.kind === "manifest"
               ? (db
                   .prepare(
-                    "SELECT state,attempts,next_attempt,wait_since,checked_block,outcome FROM pdpp_transport_manifests_out WHERE batch=?",
+                    "SELECT state,version,attempts,next_attempt,wait_since,checked_block,outcome FROM pdpp_transport_manifests_out WHERE batch=?",
                   )
                   .get(row.batch) as
                   | (Work & {
                       state: string;
                       outcome: string | null;
+                      version: number;
                     })
                   | undefined)
               : (db
@@ -2239,6 +2619,8 @@ export function createReplicaTransportWorker(deps: {
                   | undefined);
           return (
             current !== undefined &&
+            (row.kind !== "manifest" ||
+              ("version" in current && current.version === row.version)) &&
             current.state === "ready" &&
             current.attempts === row.attempts &&
             current.next_attempt === row.next_attempt &&
@@ -3618,6 +4000,32 @@ export function createReplicaTransportWorker(deps: {
             dependency: wait.dependency,
           });
       }
+      for (const row of db
+        .prepare(
+          "SELECT batch,state FROM pdpp_transport_registration_recovery WHERE state IN ('own_key_conflict','version_squat')",
+        )
+        .all() as {
+        batch: string;
+        state: "own_key_conflict" | "version_squat";
+      }[]) {
+        if (
+          !report.waits.some(
+            (entry) =>
+              entry.phase === "publish" &&
+              entry.dependency.kind === "registration" &&
+              entry.dependency.reason === row.state,
+          )
+        )
+          report.waits.push({
+            id: row.batch,
+            phase: "publish",
+            dependency: {
+              kind: "registration",
+              key: state().writer,
+              reason: row.state,
+            },
+          });
+      }
       return report;
     } finally {
       lifetime.close();
@@ -3637,6 +4045,26 @@ export function createReplicaTransportWorker(deps: {
   }
   return {
     step,
+    /** Owner acknowledgement resumes an exhausted writer after its wait and recovery window. */
+    retryVersionSquats(): number {
+      if (!enabled() || !replicationAdmitted(db)) return 0;
+      return db
+        .transaction(() => {
+          if (!enabled() || !replicationAdmitted(db)) return 0;
+          return db
+            .prepare(
+              `UPDATE pdpp_transport_registration_recovery SET state='resigning'
+          WHERE state='version_squat' AND batch IN (SELECT m.batch FROM pdpp_transport_manifests_out m
+            WHERE m.next_attempt<=? AND (SELECT count(*) FROM pdpp_transport_version_squats s WHERE s.scope=m.scope AND s.detected_at>=?)<?)`,
+            )
+            .run(
+              now(),
+              now() - REPLICA_VERSION_SQUAT_WINDOW_MS,
+              REPLICA_VERSION_SQUAT_ATTEMPTS,
+            ).changes;
+        })
+        .immediate();
+    },
     /** Legacy entry point: one unbounded step. Rejects when a whole phase failed. */
     async cycle(): Promise<void> {
       const report = await step();

@@ -1609,6 +1609,7 @@ it("33 a temporarily inactive registration is a Wait, not a conflict: no quarant
 function conflictOn(
   net: Network,
   which: (slot: string, first: string) => boolean,
+  local: TransportDevice,
 ) {
   let first: string | undefined;
   const evidence = net.port.evidence;
@@ -1616,6 +1617,14 @@ function conflictOn(
     const slot = slotKey(scope, version);
     first ??= slot;
     const e = await evidence(scope, version);
+    if (which(slot, first) && !net.blobs.has(slot)) {
+      const held = local.db
+        .prepare(
+          "SELECT encrypted FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
+        )
+        .get(scope, version) as { encrypted: Buffer } | undefined;
+      if (held) net.blobs.set(slot, held.encrypted);
+    }
     return which(slot, first)
       ? {
           ...e,
@@ -1641,7 +1650,7 @@ it("34a report.nextWake comes from durable state: terminal work contributes noth
   holdPending(net, (slot) => isFrom(slot, writerOf(c)));
   await steps(c, 4, 0);
   const a = transportDevice(net, { preexisting: "terminal" });
-  conflictOn(net, (slot) => isFrom(slot, writerOf(a)));
+  conflictOn(net, (slot) => isFrom(slot, writerOf(a)), a);
   // A never reads its own scope, so its only work is the two items under test.
   const list = net.port.list;
   net.port.list = async (cursor) => {
@@ -1674,9 +1683,9 @@ it("34a report.nextWake comes from durable state: terminal work contributes noth
 
 it("34b a device whose only work is terminal is idle: nextWake is undefined before and after reopen", async () => {
   const net = network();
-  conflictOn(net, () => true);
   net.port.list = async () => ({ points: [], cursor: null });
   const a = transportDevice(net, { preexisting: "terminal" });
+  conflictOn(net, () => true, a);
   await steps(a, 4, 0);
   const rows = records(a, OUTBOX);
   expect(rows).toHaveLength(1);

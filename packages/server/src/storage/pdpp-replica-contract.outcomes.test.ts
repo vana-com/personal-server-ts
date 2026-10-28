@@ -161,7 +161,7 @@ function instrumentPut(
  * Wrap the port's evidence: fail on demand, count reads per slot. A
  * conflict is a finalized commitment at the slot other than the registered one.
  */
-function instrumentEvidence(net: Network) {
+function instrumentEvidence(net: Network, local?: () => TransportDevice) {
   const original = net.port.evidence;
   const state = {
     fail: false,
@@ -174,7 +174,15 @@ function instrumentEvidence(net: Network) {
     state.calls.push(slot);
     if (state.fail) throw state.error();
     const evidence = await original(scope, version);
-    if (state.conflict?.(slot) && evidence.chain)
+    if (state.conflict?.(slot) && evidence.chain) {
+      if (local && !net.blobs.has(slot)) {
+        const held = local()
+          .db.prepare(
+            "SELECT encrypted FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
+          )
+          .get(scope, version) as { encrypted: Buffer } | undefined;
+        if (held) net.blobs.set(slot, held.encrypted);
+      }
       return {
         ...evidence,
         chain: {
@@ -185,6 +193,7 @@ function instrumentEvidence(net: Network) {
         },
         pending: false,
       };
+    }
     return evidence;
   };
   return state;
@@ -776,7 +785,7 @@ describe("09 Quarantine only with proof", () => {
   for (const source of ["fresh", "wait", "retry"] as const)
     it(`09 [outbox from ${source}] a finalized slot conflict quarantines with proof; no further put or register`, async () => {
       const net = network();
-      const evidence = instrumentEvidence(net);
+      const evidence = instrumentEvidence(net, () => d);
       const puts = instrumentPut(net, {
         pending: source === "wait",
         fail: (n) =>
@@ -940,7 +949,7 @@ describe("10 Unsupported admission is not Quarantine", () => {
 describe("11 Terminal outcome replay is inert", () => {
   it("11 [transport] a progressed, a quarantined and an unsupported item stay byte-identical under replay", async () => {
     const net = network();
-    const evidence = instrumentEvidence(net);
+    const evidence = instrumentEvidence(net, () => d);
     stickFirstBatch(net, 8192);
     const d = transportDevice(net, { preexisting: "one" });
     await at_(d, 10000); // batch 1: unsupported

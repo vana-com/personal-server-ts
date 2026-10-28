@@ -119,7 +119,7 @@ const blocked = (d: TransportDevice) =>
     )
     .all();
 
-it("first contact: another server's batch under A's transport writer is refused, and can only block A's version", async () => {
+it("first contact: another server's batch under A's transport writer is refused, and A recovers at the next version", async () => {
   const net = network();
   const a = transportDevice(net, { preexisting: "real" });
   const receiver = transportDevice(net);
@@ -134,11 +134,16 @@ it("first contact: another server's batch under A's transport writer is refused,
   await cycles([receiver], 2);
   expect(refusals(receiver, forged)).toEqual(["writer_mismatch"]);
   await cycles([a, receiver], 3);
-  // The forged manifest holds version 1 of A's scope, so A's own version 1
-  // is refused at registration (host contract §3.6). Nothing forged imports.
-  expect(blocked(a)).toEqual([{ version: 1 }]);
-  expect(receiver.get()).toBeUndefined();
-  expect(importedWriters(receiver)).not.toContain(identity(a).transportWriter);
+  // The forgery remains refused while A moves only its unaccepted claim.
+  expect(blocked(a)).toEqual([]);
+  expect(
+    a.db
+      .prepare("SELECT version,state FROM pdpp_transport_manifests_out")
+      .all(),
+  ).toEqual([{ version: 2, state: "published" }]);
+  expect(refusals(receiver, forged)).toEqual(["writer_mismatch"]);
+  expect(receiver.get()).toEqual({ id: "a", text: "real" });
+  expect(importedWriters(receiver)).toContain(identity(a).transportWriter);
 });
 
 it.runIf(nightly)(
@@ -190,8 +195,10 @@ it.runIf(nightly)(
     expect(refusals(receiver, unsigned)).toEqual(["signature_invalid"]);
     expect(refusals(receiver, unregistered)).toEqual(["server_not_registered"]);
     await cycles([a, receiver], 3);
-    expect(blocked(a)).toEqual([{ version: 1 }]);
-    expect(receiver.get()).toBeUndefined();
+    expect(blocked(a)).toEqual([]);
+    expect(refusals(receiver, claimsA)).toEqual(["signature_invalid"]);
+    expect(refusals(receiver, unsigned)).toEqual(["signature_invalid"]);
+    expect(receiver.get()).toEqual({ id: "a", text: "real" });
   },
 );
 
@@ -750,15 +757,15 @@ it.runIf(nightly)(
     await cycles([a, receiver], 4);
     expect(receiver.get()).toEqual({ id: "a", text: "v2" });
     // The copy signs the scope version the original already registered, so
-    // the gateway keeps the original and the copy quarantines its manifest.
+    // the gateway keeps the original and a terminal own-key wait stops the copy.
     expect([...net.head.keys()]).toEqual(registered);
     expect(
       a.db
         .prepare(
-          "SELECT reason FROM pdpp_transport_manifests_out WHERE state='quarantined'",
+          "SELECT reason FROM pdpp_transport_manifests_out WHERE outcome='wait' AND reason='own_key_conflict'",
         )
         .all(),
-    ).toEqual([{ reason: "immutable_registration_conflict" }]);
+    ).toEqual([{ reason: "own_key_conflict" }]);
   },
 );
 

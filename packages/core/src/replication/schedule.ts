@@ -77,6 +77,18 @@ export function settleReplicaWork(
         },
       };
     case "wait": {
+      if (
+        outcome.dependency.kind === "registration" &&
+        outcome.dependency.reason === "own_key_conflict"
+      )
+        return {
+          outcome,
+          state: {
+            ...previous,
+            nextEligible: REPLICA_TERMINAL,
+            waitSince: previous.waitSince ?? now,
+          },
+        };
       const since =
         previous.waitSince ??
         (outcome.dependency.kind === "registration_pending"

@@ -914,6 +914,14 @@ it("S4 treats a finalized immutable conflict as a settled predecessor slot", asy
   net.port.evidence = async (scope, version) => {
     if (version === 1 && !conflictInserted) {
       const slot = slotKey(scope, version);
+      // The new conflict boundary reads the holder before deciding whether
+      // this is a recoverable squat. Supply bytes that disprove this slot.
+      const held = a.db
+        .prepare(
+          "SELECT encrypted FROM pdpp_transport_manifests_out WHERE scope=? AND version=?",
+        )
+        .get(scope, version) as { encrypted: Buffer };
+      net.blobs.set(slot, held.encrypted);
       net.chain.set(slot, {
         ...net.chainRow(slot),
         currentVersion: "1",
@@ -2897,8 +2905,12 @@ it("a cloned writer cannot replace a published slot", async () => {
   clone.put("conflicting clone");
   await cycles([clone, b], 2);
   // The clone claims A's next version, finds another commitment there and stops:
-  // terminal, with no PUT over the published manifest.
-  expect(outbox(clone).find((r) => r.slot === slot)?.state).toBe("quarantined");
+  // A typed owner wait stops the fork, with no PUT over the published manifest.
+  expect(outbox(clone).find((r) => r.slot === slot)).toMatchObject({
+    outcome: "wait",
+    reason: "own_key_conflict",
+    next_attempt: Number.MAX_SAFE_INTEGER,
+  });
   expect(net.puts.filter((p) => p.key === slot)).toHaveLength(1);
   expect(net.blobs.get(slot)).toEqual(published);
   expect(b.get()).toEqual(a.get());
