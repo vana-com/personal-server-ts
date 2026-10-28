@@ -43,6 +43,7 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       db,
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
+      replication: false,
       logger: pino({ level: "silent" }),
       configuredMethods: [
         { sourceId: DECLARATION.source_id, methodId: "spotify" },
@@ -69,6 +70,7 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       db,
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
+      replication: false,
       logger: pino({ level: "silent" }),
       configuredMethods: [
         { sourceId: DECLARATION.source_id, methodId: "spotify" },
@@ -100,6 +102,7 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       db,
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
+      replication: false,
       logger: pino({ level: "silent" }),
       configuredMethods: [
         { sourceId: DECLARATION.source_id, methodId: "spotify" },
@@ -117,6 +120,7 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       db,
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
+      replication: false,
       logger: pino({ level: "silent" }),
       configuredMethods: [
         { sourceId: DECLARATION.source_id, methodId: "spotify" },
@@ -155,6 +159,7 @@ describe("createPdppRecordsDeps: readBlobBytes", () => {
       db,
       serverOwner: SERVER_OWNER,
       resource: "https://ps.example.com",
+      replication: false,
       logger: pino({ level: "silent" }),
     });
     expect(deps).toBeDefined();

@@ -90,11 +90,14 @@ import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
 import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
 import {
   createPdppRecordsDeps,
+  legacyScopeRecords,
   coLocatedAuthorizationService,
   createPdppSyncImporter,
   registerLegacyDataConnections,
+  openRecordStore,
+  resolveReplication,
 } from "./pdpp/records-bootstrap.js";
-import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
+import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
 import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
@@ -141,6 +144,8 @@ export interface ServerContext {
   devToken?: string;
   startBackgroundServices: () => Promise<void>;
   cleanup: () => Promise<void>;
+  /** This boot's replication door, decided before any record store opened. */
+  replicationStatus: ReplicationDoorStatus;
 }
 
 export interface CreateServerOptions {
@@ -940,6 +945,14 @@ export async function createServer(
     tokenStore,
   });
 
+  // The replication door, once per boot and before any record store opens.
+  // A refused re-enable keeps the server ready, with the flag off.
+  const replication = resolveReplication(
+    db,
+    config.replication.enabled,
+    logger,
+  );
+
   if (pdppAuth) {
     registerLegacyDataConnections({
       db,
@@ -949,6 +962,7 @@ export async function createServer(
         .listDistinctScopes()
         .scopes.map(({ scope }) => scope),
       logger,
+      replication: replication.enabled,
     });
   }
 
@@ -966,11 +980,12 @@ export async function createServer(
     resource: effectiveOrigin,
     logger,
     configuredMethods: pdppAuth?.configuredMethods,
+    replication: replication.enabled,
   });
 
   const pdppConnections = pdppAuth
     ? {
-        store: createSqliteRecordStore(db),
+        store: openRecordStore(db, replication.enabled),
         auth: pdppRecords?.auth ?? coLocatedAuthorizationService(pdppAuth),
         ownerSubjectId: serverOwner!,
         connectionMethods: new Map(pdppAuth.connectionMethods),
@@ -1069,7 +1084,7 @@ export async function createServer(
     legacyScopeView: createLegacyScopeView({
       logger,
       authority: createLegacyScopeAuthority(db),
-      records: pdppRecords?.bindingStore,
+      records: pdppRecords && legacyScopeRecords(pdppRecords),
       // Reuse the source-scoped declarations selected by the record server.
       // Declaration schema identity participates in projection revisions and
       // takeover cache keys; staging an upgrade takes effect on the next boot.
@@ -1151,6 +1166,7 @@ export async function createServer(
       effectiveLocalApprovalOrigin = origin;
     },
     devToken,
+    replicationStatus: replication.status,
     startBackgroundServices: async () => {
       // Replay questions a previous run left pending or stale: nothing
       // else reschedules them after a restart (registration and source

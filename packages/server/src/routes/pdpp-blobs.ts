@@ -1,19 +1,35 @@
+import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { resourceMetadataUrlFor } from "./pdpp-records.js";
 import {
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
   type PdppRecordStore,
+  type PdppReplicaReadStore,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
+type BlobReadStore = Pick<
+  PdppReplicaReadStore,
+  "getBlobMeta" | "findBlobReferences" | "getRecord" | "getBlobBytes"
+> & {
+  withReadSnapshot?<T>(read: () => T): T;
+};
 export interface PdppBlobsRouteDeps {
+  /** The canonical store. Bytes are always loaded through the reader port. */
   store: PdppRecordStore;
+  /**
+   * Reader capability that authorizes every blob read. The app host
+   * (`createApp`) always supplies it. Absent only when the route runs without
+   * a host, in tests: then every token class reads `store`.
+   */
+  reads?: (reader: ReplicaReader) => BlobReadStore;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
@@ -49,11 +65,15 @@ function jsonError(
     }),
     ...extraHeaders,
   };
+  if (err instanceof PdppAuthorizationUnavailableError) {
+    headers["Retry-After"] = String(err.retryAfterSeconds);
+  }
   return c.json(err.toJSON(reqId), err.status as never, headers);
 }
 
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
+  const readsFor = deps.reads ?? (() => deps.store);
 
   /**
    * Authorizes a blob fetch through the same path a record read uses (spec §8): finds every
@@ -65,7 +85,16 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   async function authorizeBlobAccess(
     c: Context,
     blobId: string,
-  ): Promise<{ error: Response } | { ok: true }> {
+  ): Promise<
+    | { error: Response }
+    | {
+        ok: true;
+        store: BlobReadStore;
+        meta: NonNullable<ReturnType<BlobReadStore["getBlobMeta"]>>;
+        runIfReadable(read: () => void): boolean;
+        readBytes(): Uint8Array | undefined | Promise<Uint8Array | undefined>;
+      }
+  > {
     const reqId = requestId();
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -82,7 +111,13 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         }),
       };
     }
-    const context = await deps.auth.resolveToken(token);
+    let context;
+    try {
+      context = await deps.auth.resolveToken(token);
+    } catch (error) {
+      if (!(error instanceof PdppAuthorizationUnavailableError)) throw error;
+      return { error: jsonError(c, error, reqId) };
+    }
     if (!context.active) {
       const err = new PdppError("authentication_error", "Invalid access token");
       return { error: jsonError(c, err, reqId) };
@@ -107,94 +142,94 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       }
     }
 
-    const meta = deps.store.getBlobMeta(blobId);
-    if (!meta) {
-      const err = new PdppError(
-        "blob_not_found",
-        "blob_id is unknown or stale",
-      );
-      return { error: jsonError(c, err, reqId) };
-    }
+    const store: BlobReadStore = readsFor(
+      context.tokenKind === "owner" ? "owner" : "grant",
+    );
+    const authorizedMeta = () => {
+      const meta = store.getBlobMeta(blobId);
+      if (!meta) return undefined;
+      const references = store.findBlobReferences(blobId);
+      if (context.tokenKind === "owner") {
+        if (!context.subjectId) return undefined;
+        const currentInstances = deps.instancesForSubject?.(context.subjectId);
+        const sourceInstances = context.sourceId
+          ? (deps.instancesForSource?.(context.subjectId, context.sourceId) ??
+            [])
+          : (currentInstances ?? []);
+        const ownedInstances = context.instanceIds
+          ? context.instanceIds.filter((instance) =>
+              sourceInstances.includes(instance),
+            )
+          : context.sourceId
+            ? sourceInstances
+            : [];
+        return references.some((reference) =>
+          ownedInstances.includes(reference.instance),
+        )
+          ? meta
+          : undefined;
+      }
 
+      for (const reference of references) {
+        const declaration = deps.declarations.forInstance(
+          reference.instance,
+          reference.stream,
+        );
+        let scope;
+        try {
+          scope = resolveReadScope(context, reference.stream, declaration);
+        } catch {
+          continue;
+        }
+        if (!scope.instanceIds.includes(reference.instance)) continue;
+        if (
+          !recordKeyWithinGrantResources(reference.recordKey, scope.streamGrant)
+        )
+          continue;
+        if (!scope.fields?.includes("blob_ref")) continue;
+        const record = store.getRecord(
+          reference.instance,
+          reference.stream,
+          reference.recordKey,
+        );
+        if (
+          !record ||
+          record.deleted ||
+          !recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
+        )
+          continue;
+        return meta;
+      }
+      return undefined;
+    };
+    const inSnapshot = <T>(read: () => T) =>
+      store.withReadSnapshot ? store.withReadSnapshot(read) : read();
+    const meta = inSnapshot(authorizedMeta);
     const notFound = () =>
       jsonError(
         c,
         new PdppError("blob_not_found", "blob_id is unknown or stale"),
         reqId,
       );
-
-    // Identical blob bytes can legitimately be referenced by more than one
-    // record or instance (e.g. re-ingested via a different stream). Access
-    // is granted if ANY visible reference passes its authorization check —
-    // an inaccessible reference must never hide an accessible one.
-    const references = deps.store.findBlobReferences(blobId);
-    if (references.length === 0) return { error: notFound() };
-
-    if (context.tokenKind === "owner") {
-      // Owner tokens carry no grant: current-capability read, scoped to the
-      // owner's selected live instances when the token has an instance list.
-      // A source scope must not widen that explicit selection.
-      // Fail closed: a missing resolver, a missing subjectId, or an empty
-      // owned list must all deny rather than fall back to "visible to
-      // everyone" — mirrors the record routes' `?? []` default.
-      if (!context.subjectId) return { error: notFound() };
-      const currentInstances = deps.instancesForSubject?.(context.subjectId);
-      const sourceInstances = context.sourceId
-        ? (deps.instancesForSource?.(context.subjectId, context.sourceId) ?? [])
-        : (currentInstances ?? []);
-      const ownedInstances = context.instanceIds
-        ? context.instanceIds.filter((instance) =>
-            sourceInstances.includes(instance),
-          )
-        : context.sourceId
-          ? sourceInstances
-          : [];
-      const visible = references.some((reference) =>
-        ownedInstances.includes(reference.instance),
-      );
-      if (!visible) return { error: notFound() };
-      return { ok: true };
-    }
-
-    // Client token: the blob must be referenced by a record this exact
-    // grant can see — instance scope, resources allowlist, time_constraint,
-    // and blob_ref must be in the granted fields for that record's stream.
-    for (const reference of references) {
-      const declaration = deps.declarations.forInstance(
-        reference.instance,
-        reference.stream,
-      );
-      let scope;
-      try {
-        scope = resolveReadScope(context, reference.stream, declaration);
-      } catch {
-        continue;
-      }
-
-      if (!scope.instanceIds.includes(reference.instance)) continue;
-      if (
-        !recordKeyWithinGrantResources(reference.recordKey, scope.streamGrant)
-      ) {
-        continue;
-      }
-      if (!scope.fields?.includes("blob_ref")) continue;
-
-      const record = deps.store.getRecord(
-        reference.instance,
-        reference.stream,
-        reference.recordKey,
-      );
-      if (
-        !record ||
-        !recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
-      ) {
-        continue;
-      }
-
-      return { ok: true };
-    }
-
-    return { error: notFound() };
+    if (!meta) return { error: notFound() };
+    return {
+      ok: true,
+      store,
+      meta,
+      runIfReadable: (read) =>
+        inSnapshot(() => {
+          if (!authorizedMeta()) return false;
+          read();
+          return true;
+        }),
+      readBytes: () => {
+        if (!deps.reads && deps.readBlobBytes)
+          return authorizedMeta() ? deps.readBlobBytes(blobId) : undefined;
+        return inSnapshot(() =>
+          authorizedMeta() ? store.getBlobBytes(blobId) : undefined,
+        );
+      },
+    };
   }
 
   // Hono dispatches HEAD via the GET handler and discards the body, so no separate HEAD handler is
@@ -204,7 +239,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     const authz = await authorizeBlobAccess(c, blobId);
     if ("error" in authz) return authz.error;
 
-    const meta = deps.store.getBlobMeta(blobId)!;
+    const meta = authz.meta;
     const reqId = requestId();
     const headers: Record<string, string> = {
       "Request-Id": reqId,
@@ -218,9 +253,9 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       return c.body(null, 200, headers);
     }
 
-    let bytes: Uint8Array<ArrayBuffer> | undefined;
+    let bytes: Uint8Array | undefined;
     try {
-      bytes = await deps.readBlobBytes?.(blobId);
+      bytes = await authz.readBytes();
     } catch {
       // A throwing reader must not leak past this route to app.ts's generic
       // handler, which returns a different (legacy) error shape. Map it to
@@ -250,7 +285,27 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         reqId,
       );
     }
-    return c.body(bytes, 200, headers);
+    const chunkSize = 64 * 1024;
+    let offset = 0;
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          if (offset >= bytes.byteLength) {
+            controller.close();
+            return;
+          }
+          const end = Math.min(offset + chunkSize, bytes.byteLength);
+          const chunk = bytes.subarray(offset, end);
+          if (!authz.runIfReadable(() => controller.enqueue(chunk))) {
+            controller.error(new Error("blob visibility changed during read"));
+            return;
+          }
+          offset = end;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return c.body(body, 200, headers);
   });
 
   return app;

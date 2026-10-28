@@ -1,4 +1,6 @@
 import { assertSupportedSchemaVersions } from "./schema-versions.js";
+import type { ReplicaCanonicalPort } from "./pdpp-replica-canonical-port.js";
+import type { DeclarationBinding } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
   parseTime,
   timeSortKey,
@@ -669,6 +671,8 @@ export interface SqliteReplaceStreamInput {
   envelopes: PdppRecordEnvelopeInput[];
   primaryKey: string[];
   validateData?: RecordDataValidator;
+  /** The declaration `validateData` validates against (see ingestBatch). */
+  declaration?: DeclarationBinding;
   sourceCollectedAt?: string;
   completionPolicy?: "preserve_if_unchanged";
 }
@@ -679,7 +683,28 @@ export interface SqliteReplaceStreamInput {
  * A readonly database must already have the current schema; no migration,
  * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
-export function createSqliteRecordStore(db: Database): PdppRecordStore & {
+/** Where the store keeps canonical blob bytes. */
+export interface CanonicalBlobBytes {
+  has(blobId: string): boolean;
+  /** The stored bytes, only when they match `meta`'s size and hash. */
+  readVerified(meta: PdppBlobMeta): Uint8Array<ArrayBuffer> | undefined;
+  /** Run first in a blob write transaction. */
+  clearMalformed(blobId: string): void;
+  write(blobId: string, bytes: Uint8Array): void;
+}
+
+export interface SqliteRecordStoreOptions {
+  /**
+   * Replication, built after the canonical schema migrated. Absent, the store
+   * reads and writes only canonical tables. See pdpp-replica-canonical-port.ts.
+   */
+  replica?: (db: Database) => ReplicaCanonicalPort;
+}
+
+export function createSqliteRecordStore(
+  db: Database,
+  options: SqliteRecordStoreOptions = {},
+): PdppRecordStore & {
   transitionClaudeToLive(input: ClaudeTransitionInput): PdppInstanceBinding;
   claudeTransition(instance: string): ClaudeTransition | null;
   listClaudeTransitions(): ClaudeTransition[];
@@ -753,6 +778,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    * since v8 is absent.
    */
   listArrivalOrder(instance: string, stream: string): string[];
+  /** `changesSince` over the subset of `options.instanceIds` a reader may see. */
+  changesSinceForInstances(
+    stream: string,
+    options: ChangesSinceOptions,
+    visibleInstanceIds: string[],
+  ): ChangesSincePage;
 } {
   assertSupportedSchemaVersions(db, PDPP_RECORD_SCHEMA_VERSION);
   // Insert statements call it, so even a readonly handle must register it
@@ -772,6 +803,44 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     migrate(db);
     sweepStaleBlobClaims(db);
   }
+  const replica = options.replica?.(db);
+  /**
+   * Every connection-scoped write enters through this quarantine boundary.
+   * Without replication a top-level call begins the transaction main began:
+   * deferred, so a mutation that writes nothing takes no write lock.
+   * With replication the transaction is immediate and starts from derived
+   * state that matches canonical rows.
+   */
+  const connectionMutation = <T>(
+    instances: string | readonly string[] | (() => readonly string[]),
+    write: () => T,
+    begin: "deferred" | "immediate" = "deferred",
+  ): T => {
+    const run = () => {
+      const ids = typeof instances === "function" ? instances() : instances;
+      for (const instance of new Set(typeof ids === "string" ? [ids] : ids))
+        replica?.assertConnectionWritable(instance);
+      return write();
+    };
+    // Inside an outer transaction better-sqlite3 runs this as a SAVEPOINT, so
+    // a mutator that throws undoes its own writes even if the caller catches
+    // the error and commits. That is what main's per-mutator
+    // `db.transaction` gave every one of these.
+    if (replica) return replica.exclusive(run);
+    const atomic = db.transaction(run);
+    return begin === "immediate" ? atomic.immediate() : atomic();
+  };
+  /** The one mutation main opened with `BEGIN IMMEDIATE`: a stream completion. */
+  const immediateConnectionMutation = <T>(
+    instance: string,
+    write: () => T,
+  ): T => connectionMutation(instance, write, "immediate");
+  /** Replica quarantine filter for read SQL; empty without replication. */
+  const unquarantined = (alias: string) =>
+    replica ? ` AND ${replica.unquarantinedRecordSql(alias)}` : "";
+  /** Without replication a read needs no snapshot beyond its write horizon. */
+  const inReadSnapshot = <T>(read: () => T): T =>
+    replica ? db.transaction(read).deferred() : read();
 
   const nextWriteSeq = db.prepare(
     "UPDATE pdpp_write_clock SET value = value + 1 WHERE id = 1 RETURNING value",
@@ -810,7 +879,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   `);
   const getBlobStmt = db.prepare("SELECT * FROM pdpp_blobs WHERE blob_id = ?");
   const findBlobRefsStmt = db.prepare(
-    "SELECT instance, stream, record_key FROM pdpp_records WHERE blob_id = ? AND deleted = 0",
+    `SELECT r.instance, r.stream, r.record_key FROM pdpp_records r WHERE r.blob_id = ? AND r.deleted = 0${unquarantined("r")}`,
   );
   const insertBlobBytesStmt = db.prepare(
     "INSERT INTO pdpp_blob_bytes (blob_id, bytes) VALUES (@blob_id, @bytes)",
@@ -821,6 +890,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   const dropCompletionStmt = db.prepare(
     "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
   );
+  function dropCompletion(instance: string, stream: string): void {
+    if (dropCompletionStmt.run(instance, stream).changes > 0)
+      replica?.captureInvalidation(instance, stream);
+  }
+
   const noteArrivalStmt = db.prepare(`
     INSERT INTO pdpp_record_arrival (instance, stream, record_key, generation, arrival)
     VALUES (@instance, @stream, @record_key, @generation, (
@@ -869,6 +943,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     primaryKeyFields: (stream: string, instance: string) => string[],
     binding?: { method: string; generation: number },
     validateData?: RecordDataValidator,
+    declarationFor?: (
+      stream: string,
+      instance: string,
+    ) => DeclarationBinding | undefined,
   ): IngestResult {
     const results: IngestOutcome[] = [];
 
@@ -898,11 +976,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         checkBinding(binding.method, generation, envelopes);
       }
       envelopes.forEach((envelope, index) => {
+        const semantics = streamSemantics(envelope.stream, envelope.instance);
+        const primaryKey = primaryKeyFields(envelope.stream, envelope.instance);
         const plan = planIngest(
           index,
           envelope,
-          streamSemantics(envelope.stream, envelope.instance),
-          primaryKeyFields(envelope.stream, envelope.instance),
+          semantics,
+          primaryKey,
           (recordKey) => {
             const row = getCurrentStmt.get(
               envelope.instance,
@@ -958,6 +1038,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           data,
           envelope.emitted_at,
         );
+        replica?.recordWritten(
+          envelope.instance,
+          envelope.stream,
+          recordKey,
+          semantics,
+          primaryKey,
+          declarationFor?.(envelope.stream, envelope.instance),
+        );
         if (data === null) {
           forgetArrivalStmt.run(envelope.instance, envelope.stream, recordKey);
         } else {
@@ -969,9 +1057,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           );
         }
       });
+      replica?.settleLocalWrites();
     });
 
-    runBatch();
+    connectionMutation(
+      envelopes.map((envelope) => envelope.instance),
+      () => runBatch(),
+    );
     return summarizeIngest(results);
   }
 
@@ -994,12 +1086,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     data: Record<string, unknown> | null,
     emittedAt: string,
   ): void {
+    replica?.assertKeyWritable(instance, stream, recordKey);
     const deleted = data === null;
     const version = latestVersion(instance, stream, recordKey) + 1;
     const writtenAt = nextWriteSeq.get() as { value: number };
     // The stream no longer holds what a replace delivered. `replaceStream`
     // writes its own receipt after its writes.
-    dropCompletionStmt.run(instance, stream);
+    dropCompletion(instance, stream);
     const dataJson = deleted ? null : JSON.stringify(data);
     const deletedAt = deleted ? emittedAt : null;
     upsertCurrentStmt.run({
@@ -1050,8 +1143,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     ) {
       throw new TypeError("invalid_completion_policy");
     }
-    return db.transaction((): ReplaceStreamResult => {
+    return connectionMutation(input.instance, (): ReplaceStreamResult => {
       checkInstanceBinding(input.instance, input.method, input.generation);
+      replica?.assertStreamWritable(
+        input.instance,
+        input.stream,
+        input.generation,
+      );
 
       const seen = new Set<string>();
       /** Live keys of the snapshot, in the order it delivered them. */
@@ -1129,6 +1227,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           write.data,
           write.emittedAt,
         );
+        replica?.recordWritten(
+          input.instance,
+          input.stream,
+          write.recordKey,
+          "mutable_state",
+          input.primaryKey,
+          input.declaration,
+        );
       }
       const missing = (
         db
@@ -1145,6 +1251,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           null,
           input.emittedAt,
         );
+        replica?.recordWritten(
+          input.instance,
+          input.stream,
+          record_key,
+          "mutable_state",
+          input.primaryKey,
+          input.declaration,
+        );
       }
       // Desktop rebuilt a fully refreshed stream in emit order, unchanged
       // keys included.
@@ -1154,7 +1268,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       for (const recordKey of snapshotOrder) {
         noteArrival(input.instance, input.stream, recordKey, input.generation);
       }
-      if (!preserved) dropCompletionStmt.run(input.instance, input.stream);
+      if (!preserved) dropCompletion(input.instance, input.stream);
       if (input.sourceCollectedAt !== undefined) {
         db.prepare(
           `INSERT INTO pdpp_stream_completion
@@ -1176,8 +1290,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           ).n,
         );
       }
+      if (input.sourceCollectedAt !== undefined)
+        replica?.captureCompletion(input.instance, input.stream);
+      replica?.settleLocalWrites();
       return { ...summary, applied: true, deleted: missing.length };
-    })();
+    });
   }
 
   // Under `preserve_if_unchanged`: true when this replace writes nothing to
@@ -1303,7 +1420,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     expectedGeneration: number;
     nextMethod: string | null;
   }): { binding: PdppInstanceBinding; alreadyReset: boolean } {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
       const current = ensureBinding(db, input.instance);
       if (current.deleted_at !== null) {
         throw new PdppBindingError("connection_deleted");
@@ -1341,11 +1458,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         resetClock,
         input.instance,
       );
+      replica?.captureLifecycle(input.instance, "connection-reset");
+      replica?.notifyVisibility();
       return {
         binding: toBinding(ensureBinding(db, input.instance)),
         alreadyReset: false,
       };
-    })();
+    });
   }
 
   function transitionWriteClock(): number {
@@ -1392,44 +1511,51 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   }
 
   function confirmClaudeTransition(instance: string, generation: number): void {
-    db.prepare(
-      "UPDATE pdpp_claude_transition SET conversations_covered = 1 WHERE instance = ? AND generation = ?",
-    ).run(instance, generation);
+    connectionMutation(instance, () =>
+      db
+        .prepare(
+          "UPDATE pdpp_claude_transition SET conversations_covered = 1 WHERE instance = ? AND generation = ?",
+        )
+        .run(instance, generation),
+    );
   }
 
   function clearClaudeTransitionScope(scope: string): void {
     if (scope !== "claude.conversations" && scope !== "claude.projects") return;
-    db.transaction(() => {
-      for (const transition of listClaudeTransitions()) {
-        delete transition.snapshots[scope];
-        db.prepare(
-          "UPDATE pdpp_claude_transition SET snapshots_json = ? WHERE instance = ?",
-        ).run(JSON.stringify(transition.snapshots), transition.instance);
-        const streams =
-          scope === "claude.conversations"
-            ? ["conversations", "messages"]
-            : ["projects", "project_documents"];
-        if (Object.keys(transition.snapshots).length === 0)
-          streams.push("account_profile");
-        for (const table of [
-          "pdpp_records",
-          "pdpp_record_changes",
-          "pdpp_stream_completion",
-          "pdpp_record_arrival",
-        ]) {
-          for (const stream of streams)
-            db.prepare(
-              `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
-            ).run(transition.archiveInstance, stream);
-        }
-        db.prepare(
-          `DELETE FROM pdpp_blob_claims WHERE instance = ?
+    connectionMutation(
+      () => listClaudeTransitions().map((transition) => transition.instance),
+      () => {
+        for (const transition of listClaudeTransitions()) {
+          delete transition.snapshots[scope];
+          db.prepare(
+            "UPDATE pdpp_claude_transition SET snapshots_json = ? WHERE instance = ?",
+          ).run(JSON.stringify(transition.snapshots), transition.instance);
+          const streams =
+            scope === "claude.conversations"
+              ? ["conversations", "messages"]
+              : ["projects", "project_documents"];
+          if (Object.keys(transition.snapshots).length === 0)
+            streams.push("account_profile");
+          for (const table of [
+            "pdpp_records",
+            "pdpp_record_changes",
+            "pdpp_stream_completion",
+            "pdpp_record_arrival",
+          ]) {
+            for (const stream of streams)
+              db.prepare(
+                `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
+              ).run(transition.archiveInstance, stream);
+          }
+          db.prepare(
+            `DELETE FROM pdpp_blob_claims WHERE instance = ?
           AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
           AND NOT EXISTS (SELECT 1 FROM pdpp_record_changes c WHERE c.instance = pdpp_blob_claims.instance AND json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id)`,
-        ).run(transition.archiveInstance);
-      }
-      deleteUnclaimedBlobs(db);
-    })();
+          ).run(transition.archiveInstance);
+        }
+        deleteUnclaimedBlobs(db);
+      },
+    );
   }
 
   const STRAVA_SOURCE = "https://registry.pdpp.dev/sources/strava";
@@ -1483,30 +1609,36 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   }
 
   function confirmStravaTransition(instance: string, generation: number): void {
-    db.prepare(
-      "UPDATE pdpp_strava_transition SET activities_covered = 1 WHERE instance = ? AND generation = ?",
-    ).run(instance, generation);
+    connectionMutation(instance, () =>
+      db
+        .prepare(
+          "UPDATE pdpp_strava_transition SET activities_covered = 1 WHERE instance = ? AND generation = ?",
+        )
+        .run(instance, generation),
+    );
   }
 
   /** A takeover reset drops the saved body and its archived rows. */
   function clearStravaTransitionScope(scope: string): void {
     if (!(scope in STRAVA_SCOPE_STREAMS)) return;
     const stream = STRAVA_SCOPE_STREAMS[scope as StravaTransitionScope];
-    db.transaction(() => {
-      for (const transition of listStravaTransitions()) {
-        delete transition.snapshots[scope as StravaTransitionScope];
-        db.prepare(
-          "UPDATE pdpp_strava_transition SET snapshots_json = ? WHERE instance = ?",
-        ).run(JSON.stringify(transition.snapshots), transition.instance);
-        for (const table of ARCHIVED_TABLES) {
-          if (table === "pdpp_blob_claims") continue;
+    connectionMutation(
+      () => listStravaTransitions().map((transition) => transition.instance),
+      () => {
+        for (const transition of listStravaTransitions()) {
+          delete transition.snapshots[scope as StravaTransitionScope];
           db.prepare(
-            `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
-          ).run(transition.archiveInstance, stream);
-        }
-        // Unreadable retained history may still reference any archived blob.
-        db.prepare(
-          `DELETE FROM pdpp_blob_claims WHERE instance = ?
+            "UPDATE pdpp_strava_transition SET snapshots_json = ? WHERE instance = ?",
+          ).run(JSON.stringify(transition.snapshots), transition.instance);
+          for (const table of ARCHIVED_TABLES) {
+            if (table === "pdpp_blob_claims") continue;
+            db.prepare(
+              `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
+            ).run(transition.archiveInstance, stream);
+          }
+          // Unreadable retained history may still reference any archived blob.
+          db.prepare(
+            `DELETE FROM pdpp_blob_claims WHERE instance = ?
           AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
           AND NOT EXISTS (
             SELECT 1 FROM pdpp_record_changes c
@@ -1515,11 +1647,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
                 THEN json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id
                 ELSE c.data IS NOT NULL END
           )`,
-        ).run(transition.archiveInstance);
-      }
-      // A scope reset must retain blobs that unreadable history may reference.
-      collectStartupUnclaimedBlobs(db);
-    })();
+          ).run(transition.archiveInstance);
+        }
+        // A scope reset must retain blobs that unreadable history may reference.
+        collectStartupUnclaimedBlobs(db);
+      },
+    );
   }
 
   /**
@@ -1530,7 +1663,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   function transitionStravaToBrowser(
     input: StravaTransitionInput,
   ): PdppInstanceBinding {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
+      replica?.assertMethodTransitionAllowed();
       const current = getInstanceBinding(input.instance);
       if (current.deletedAt !== null)
         throw new PdppBindingError("connection_deleted");
@@ -1576,13 +1710,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         "UPDATE pdpp_instance_binding SET method = ?, generation = ?, reset_clock = ? WHERE instance = ?",
       ).run(STRAVA_BROWSER_METHOD, generation, clock, input.instance);
       return getInstanceBinding(input.instance);
-    })();
+    });
   }
 
   function transitionClaudeToLive(
     input: ClaudeTransitionInput,
   ): PdppInstanceBinding {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
+      replica?.assertMethodTransitionAllowed();
       const current = getInstanceBinding(input.instance);
       if (current.deletedAt !== null)
         throw new PdppBindingError("connection_deleted");
@@ -1636,7 +1771,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         "UPDATE pdpp_instance_binding SET method = 'anthropic-live', generation = ?, reset_clock = ? WHERE instance = ?",
       ).run(generation, clock, input.instance);
       return getInstanceBinding(input.instance);
-    })();
+    });
   }
 
   function listConnections(sourceId: string): PdppInstanceBinding[] {
@@ -1654,7 +1789,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     method: string;
     label: string;
   }): PdppInstanceBinding {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
       const current = ensureBinding(db, input.instance);
       if (current.deleted_at !== null) {
         throw new PdppBindingError("connection_deleted");
@@ -1672,12 +1807,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       db.prepare(
         "UPDATE pdpp_instance_binding SET source_id = ?, method = ?, label = ? WHERE instance = ?",
       ).run(input.sourceId, input.method, input.label, input.instance);
+      if (current.source_id === null)
+        replica?.captureLifecycle(input.instance, "connection-register");
+      replica?.notifyVisibility();
       return getInstanceBinding(input.instance);
-    })();
+    });
   }
 
   function deleteConnection(instance: string): PdppInstanceBinding {
-    return db.transaction(() => {
+    return connectionMutation(instance, () => {
       const current = ensureBinding(db, instance);
       if (current.deleted_at !== null) return toBinding(current);
       eraseInstanceData(instance);
@@ -1686,8 +1824,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       db.prepare(
         "UPDATE pdpp_instance_binding SET deleted_at = ?, generation = generation + 1, reset_clock = ? WHERE instance = ?",
       ).run(deletedAt, resetClock, instance);
+      replica?.captureLifecycle(instance, "connection-delete");
+      replica?.notifyVisibility();
       return getInstanceBinding(instance);
-    })();
+    });
   }
 
   function eraseInstanceData(instance: string): void {
@@ -1807,160 +1947,167 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     declarations: StreamDeclarationResolver,
   ): { receipts: NativeStreamCompletionReceipt[] } {
     const request = parseCompletionRequest(rawRequest);
-    return db
-      .transaction(() => {
-        const binding = db
-          .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
-          .get(request.instance) as BindingRowDb | undefined;
-        if (!binding || binding.source_id === null) {
-          throw new PdppBindingError("connection_required");
+    return immediateConnectionMutation(request.instance, () => {
+      const binding = db
+        .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
+        .get(request.instance) as BindingRowDb | undefined;
+      if (!binding || binding.source_id === null) {
+        throw new PdppBindingError("connection_required");
+      }
+      if (binding.deleted_at !== null) {
+        throw new PdppBindingError("connection_deleted");
+      }
+      if (binding.source_id !== request.sourceId) {
+        throw new PdppBindingError("source_mismatch");
+      }
+      if (binding.generation !== request.generation) {
+        throw new PdppBindingError("binding_generation_mismatch");
+      }
+      if (binding.method !== request.method) {
+        throw new PdppBindingError("instance_bound_to_other_method");
+      }
+
+      const clock = readWriteClock();
+      const requestedAt = Date.parse(request.sourceCollectedAt);
+      // Validate every stream before the first receipt is written.
+      const writes: { stream: string; kind: "insert" | "update" | "keep" }[] =
+        [];
+      for (const proof of request.streams) {
+        replica?.assertStreamWritable(
+          request.instance,
+          proof.stream,
+          request.generation,
+        );
+        const primaryKey = declarations(request.sourceId, proof.stream);
+        if (primaryKey === undefined) {
+          throw new StreamCompletionError("unknown_stream");
         }
-        if (binding.deleted_at !== null) {
-          throw new PdppBindingError("connection_deleted");
+        if (
+          primaryKey.length === 0 ||
+          !primaryKey.every((field) => typeof field === "string" && field)
+        ) {
+          throw new StreamCompletionError("invalid_declaration");
         }
-        if (binding.source_id !== request.sourceId) {
-          throw new PdppBindingError("source_mismatch");
+        const rows = db
+          .prepare(
+            "SELECT record_key, data FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+          )
+          .all(request.instance, proof.stream) as {
+          record_key: string;
+          data: string;
+        }[];
+        if (rows.length !== proof.liveCount) {
+          throw new StreamCompletionError("snapshot_conflict");
         }
-        if (binding.generation !== request.generation) {
-          throw new PdppBindingError("binding_generation_mismatch");
-        }
-        if (binding.method !== request.method) {
-          throw new PdppBindingError("instance_bound_to_other_method");
+        const digest = liveSnapshotDigest(
+          { ...request, stream: proof.stream },
+          primaryKey,
+          rows.map((row) => ({
+            recordKey: row.record_key,
+            dataJson: row.data,
+          })),
+        );
+        if (digest !== proof.snapshotSha256) {
+          throw new StreamCompletionError("snapshot_conflict");
         }
 
-        const clock = readWriteClock();
-        const requestedAt = Date.parse(request.sourceCollectedAt);
-        // Validate every stream before the first receipt is written.
-        const writes: { stream: string; kind: "insert" | "update" | "keep" }[] =
-          [];
-        for (const proof of request.streams) {
-          const primaryKey = declarations(request.sourceId, proof.stream);
-          if (primaryKey === undefined) {
-            throw new StreamCompletionError("unknown_stream");
-          }
-          if (
-            primaryKey.length === 0 ||
-            !primaryKey.every((field) => typeof field === "string" && field)
-          ) {
-            throw new StreamCompletionError("invalid_declaration");
-          }
-          const rows = db
-            .prepare(
-              "SELECT record_key, data FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
-            )
-            .all(request.instance, proof.stream) as {
-            record_key: string;
-            data: string;
-          }[];
-          if (rows.length !== proof.liveCount) {
-            throw new StreamCompletionError("snapshot_conflict");
-          }
-          const digest = liveSnapshotDigest(
-            { ...request, stream: proof.stream },
-            primaryKey,
-            rows.map((row) => ({
-              recordKey: row.record_key,
-              dataJson: row.data,
-            })),
+        const prior = db
+          .prepare(
+            "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+          )
+          .get(request.instance, proof.stream) as CompletionRowDb | undefined;
+        if (!prior) {
+          writes.push({ stream: proof.stream, kind: "insert" });
+          continue;
+        }
+        // A receipt is deleted by every write that could invalidate it, so a
+        // stored one that disagrees with the live data was tampered with.
+        const native = prior.snapshot_sha256 !== null;
+        if (
+          !receiptInvariantsHold(prior, {
+            method: request.method,
+            generation: request.generation,
+            liveCount: rows.length,
+            clock,
+            lastChange: lastChangeSeq(request.instance, proof.stream),
+            digest: () => digest,
+          })
+        ) {
+          throw new StreamCompletionError("invalid_prior_receipt");
+        }
+        const priorAt = Date.parse(prior.source_collected_at);
+        if (requestedAt < priorAt) {
+          throw new StreamCompletionError("time_conflict");
+        }
+        if (requestedAt === priorAt) {
+          // Same instant: an exact replay keeps its bytes. A digest-less
+          // receipt cannot be relabeled as native proof at its own time.
+          if (!native) throw new StreamCompletionError("time_conflict");
+          writes.push({ stream: proof.stream, kind: "keep" });
+        } else {
+          writes.push({ stream: proof.stream, kind: "update" });
+        }
+      }
+
+      for (const [index, write] of writes.entries()) {
+        const proof = request.streams[index];
+        if (write.kind === "insert") {
+          db.prepare(
+            `INSERT INTO pdpp_stream_completion
+               (instance, stream, method, generation, source_collected_at, write_seq, live_count, snapshot_sha256, collection_time_basis)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            request.instance,
+            proof.stream,
+            request.method,
+            request.generation,
+            request.sourceCollectedAt,
+            clock,
+            proof.liveCount,
+            proof.snapshotSha256,
+            request.collectionTimeBasis,
           );
-          if (digest !== proof.snapshotSha256) {
-            throw new StreamCompletionError("snapshot_conflict");
-          }
+        } else if (write.kind === "update") {
+          db.prepare(
+            `UPDATE pdpp_stream_completion
+                SET source_collected_at = ?, write_seq = ?, snapshot_sha256 = ?, collection_time_basis = ?
+              WHERE instance = ? AND stream = ?`,
+          ).run(
+            request.sourceCollectedAt,
+            clock,
+            proof.snapshotSha256,
+            request.collectionTimeBasis,
+            request.instance,
+            proof.stream,
+          );
+        }
+      }
 
-          const prior = db
+      for (const write of writes) {
+        if (write.kind !== "keep")
+          replica?.captureCompletion(request.instance, write.stream);
+      }
+      return {
+        receipts: request.streams.map((proof) => {
+          const row = db
             .prepare(
               "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
             )
-            .get(request.instance, proof.stream) as CompletionRowDb | undefined;
-          if (!prior) {
-            writes.push({ stream: proof.stream, kind: "insert" });
-            continue;
-          }
-          // A receipt is deleted by every write that could invalidate it, so a
-          // stored one that disagrees with the live data was tampered with.
-          const native = prior.snapshot_sha256 !== null;
-          if (
-            !receiptInvariantsHold(prior, {
-              method: request.method,
-              generation: request.generation,
-              liveCount: rows.length,
-              clock,
-              lastChange: lastChangeSeq(request.instance, proof.stream),
-              digest: () => digest,
-            })
-          ) {
-            throw new StreamCompletionError("invalid_prior_receipt");
-          }
-          const priorAt = Date.parse(prior.source_collected_at);
-          if (requestedAt < priorAt) {
-            throw new StreamCompletionError("time_conflict");
-          }
-          if (requestedAt === priorAt) {
-            // Same instant: an exact replay keeps its bytes. A digest-less
-            // receipt cannot be relabeled as native proof at its own time.
-            if (!native) throw new StreamCompletionError("time_conflict");
-            writes.push({ stream: proof.stream, kind: "keep" });
-          } else {
-            writes.push({ stream: proof.stream, kind: "update" });
-          }
-        }
-
-        for (const [index, write] of writes.entries()) {
-          const proof = request.streams[index];
-          if (write.kind === "insert") {
-            db.prepare(
-              `INSERT INTO pdpp_stream_completion
-               (instance, stream, method, generation, source_collected_at, write_seq, live_count, snapshot_sha256, collection_time_basis)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            ).run(
-              request.instance,
-              proof.stream,
-              request.method,
-              request.generation,
-              request.sourceCollectedAt,
-              clock,
-              proof.liveCount,
-              proof.snapshotSha256,
-              request.collectionTimeBasis,
-            );
-          } else if (write.kind === "update") {
-            db.prepare(
-              `UPDATE pdpp_stream_completion
-                SET source_collected_at = ?, write_seq = ?, snapshot_sha256 = ?, collection_time_basis = ?
-              WHERE instance = ? AND stream = ?`,
-            ).run(
-              request.sourceCollectedAt,
-              clock,
-              proof.snapshotSha256,
-              request.collectionTimeBasis,
-              request.instance,
-              proof.stream,
-            );
-          }
-        }
-
-        return {
-          receipts: request.streams.map((proof) => {
-            const row = db
-              .prepare(
-                "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
-              )
-              .get(request.instance, proof.stream) as CompletionRowDb;
-            return {
-              instance: row.instance,
-              stream: row.stream,
-              method: row.method,
-              generation: row.generation,
-              sourceCollectedAt: row.source_collected_at,
-              writeSeq: row.write_seq,
-              liveCount: row.live_count,
-              snapshotSha256: row.snapshot_sha256 as string,
-              collectionTimeBasis: "host_run_finished" as const,
-            };
-          }),
-        };
-      })
-      .immediate();
+            .get(request.instance, proof.stream) as CompletionRowDb;
+          return {
+            instance: row.instance,
+            stream: row.stream,
+            method: row.method,
+            generation: row.generation,
+            sourceCollectedAt: row.source_collected_at,
+            writeSeq: row.write_seq,
+            liveCount: row.live_count,
+            snapshotSha256: row.snapshot_sha256 as string,
+            collectionTimeBasis: "host_run_finished" as const,
+          };
+        }),
+      };
+    });
   }
 
   function listArrivalOrder(instance: string, stream: string): string[] {
@@ -1981,8 +2128,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     stream: string,
     recordKey: string,
   ): PdppStoredRecord | undefined {
-    const row = getCurrentStmt.get(instance, stream, recordKey) as
-      RecordRowDb | undefined;
+    const row = (
+      replica
+        ? db
+            .prepare(
+              `SELECT r.* FROM pdpp_records r WHERE r.instance=? AND r.stream=? AND r.record_key=?${unquarantined("r")}`,
+            )
+            .get(instance, stream, recordKey)
+        : getCurrentStmt.get(instance, stream, recordKey)
+    ) as RecordRowDb | undefined;
     if (!row || row.deleted) return undefined;
     return toRow(row) as PdppStoredRecord;
   }
@@ -2052,6 +2206,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       )`;
     const params: unknown[] = [stream, ...instanceIds, horizon, horizon];
     if (options.liveOnly) sql += " AND c.deleted = 0";
+    sql += unquarantined("c");
     if (options.after) {
       sql += ` AND (c.emitted_key, c.record_key, c.instance) ${comparison} (?, ?, ?)`;
       params.push(
@@ -2069,6 +2224,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
+    // With replication, one read snapshot: a fence that commits meanwhile
+    // cannot mix into the page or label its cursor with the post-fence epoch.
+    return inReadSnapshot(() => listRecordsAtHorizon(stream, options));
+  }
+  function listRecordsAtHorizon(
+    stream: string,
+    options: ListRecordsOptions,
+  ): ListRecordsPage {
     let startAfter: { val: string; key: string; instance: string } | null =
       null;
     let horizon: number;
@@ -2077,6 +2240,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
       horizon = parseHorizon(payload.horizon);
+      replica?.assertCursorIntegrity(
+        payload,
+        options.instanceIds,
+        options.fields,
+      );
       assertNotResetSince(options.instanceIds, [horizon]);
       startAfter = {
         val: payload.sortValue ?? "",
@@ -2107,6 +2275,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       {
         stream,
         epoch: cursorEpoch(),
+        ...replica?.cursorBinding(options.instanceIds, options.fields),
         horizon: String(horizon),
       },
       (row) =>
@@ -2125,39 +2294,43 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   ): boolean {
     if (streamSemantics === "append_only") return false;
     let result = false;
-    const run = db.transaction(() => {
-      const existing = getCurrentStmt.get(instance, stream, recordKey) as
-        RecordRowDb | undefined;
-      if (!existing || existing.deleted) return;
+    const run = () =>
+      connectionMutation(instance, () => {
+        replica?.assertKeyWritable(instance, stream, recordKey);
+        const existing = getCurrentStmt.get(instance, stream, recordKey) as
+          RecordRowDb | undefined;
+        if (!existing || existing.deleted) return;
 
-      const version = existing.version + 1;
-      const writtenAt = nextWriteSeq.get() as { value: number };
-      dropCompletionStmt.run(instance, stream);
-      upsertCurrentStmt.run({
-        instance,
-        stream,
-        record_key: recordKey,
-        data: null,
-        version,
-        emitted_at: deletedAt,
-        deleted: 1,
-        deleted_at: deletedAt,
-        blob_id: null,
+        const version = existing.version + 1;
+        const writtenAt = nextWriteSeq.get() as { value: number };
+        dropCompletion(instance, stream);
+        upsertCurrentStmt.run({
+          instance,
+          stream,
+          record_key: recordKey,
+          data: null,
+          version,
+          emitted_at: deletedAt,
+          deleted: 1,
+          deleted_at: deletedAt,
+          blob_id: null,
+        });
+        insertHistoryStmt.run({
+          instance,
+          stream,
+          record_key: recordKey,
+          version,
+          data: null,
+          emitted_at: deletedAt,
+          deleted: 1,
+          deleted_at: deletedAt,
+          written_at: writtenAt.value,
+        });
+        replica?.recordWritten(instance, stream, recordKey, streamSemantics);
+        forgetArrivalStmt.run(instance, stream, recordKey);
+        replica?.settleLocalWrites();
+        result = true;
       });
-      insertHistoryStmt.run({
-        instance,
-        stream,
-        record_key: recordKey,
-        version,
-        data: null,
-        emitted_at: deletedAt,
-        deleted: 1,
-        deleted_at: deletedAt,
-        written_at: writtenAt.value,
-      });
-      forgetArrivalStmt.run(instance, stream, recordKey);
-      result = true;
-    });
     run();
     return result;
   }
@@ -2165,6 +2338,30 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   function changesSince(
     stream: string,
     options: ChangesSinceOptions,
+    visibleInstanceIds: string[] = options.instanceIds,
+  ): ChangesSincePage {
+    if (!replica)
+      return changesSinceInSnapshot(
+        stream,
+        options,
+        visibleInstanceIds,
+        undefined,
+      );
+    // A new session allocates its horizon first, in its own write. The rest
+    // reads one snapshot, so a concurrent fence is wholly before or after it.
+    const fresh = options.cursor ? undefined : allocateHorizon();
+    return inReadSnapshot(() =>
+      changesSinceInSnapshot(stream, options, visibleInstanceIds, fresh),
+    );
+  }
+  function allocateHorizon(): number {
+    return (nextWriteSeq.get() as { value: number }).value;
+  }
+  function changesSinceInSnapshot(
+    stream: string,
+    options: ChangesSinceOptions,
+    visibleInstanceIds: string[],
+    freshHorizon: number | undefined,
   ): ChangesSincePage {
     let horizon: number;
     let sinceHorizon: number | null;
@@ -2179,6 +2376,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           ? parseHorizon(payload.sinceHorizon)
           : null;
       offset = parseOffset(payload.offset);
+      replica?.assertCursorIntegrity(
+        payload,
+        options.instanceIds,
+        options.fields,
+      );
     } else if (options.changesSince) {
       let payload;
       try {
@@ -2191,10 +2393,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       if (payload.kind !== "changes_since") throw new InvalidCursorError();
       assertCursorScope(payload, stream);
       sinceHorizon = parseHorizon(payload.horizon);
-      horizon = (nextWriteSeq.get() as { value: number }).value;
+      replica?.assertCursorIntegrity(payload, options.instanceIds, undefined);
+      horizon = freshHorizon ?? allocateHorizon();
     } else {
       sinceHorizon = null;
-      horizon = (nextWriteSeq.get() as { value: number }).value;
+      horizon = freshHorizon ?? allocateHorizon();
     }
 
     assertNotResetSince(options.instanceIds, [
@@ -2202,7 +2405,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       sinceHorizon ?? horizon,
     ]);
 
-    const latestRows = snapshotRows(stream, options.instanceIds, horizon);
+    const visibleIds = [...new Set(visibleInstanceIds)].filter((id) =>
+      options.instanceIds.includes(id),
+    );
+    const latestRows = visibleIds.length
+      ? snapshotRows(stream, visibleIds, horizon)
+      : [];
 
     const changed: PdppRecordRow[] = [];
     for (const entry of latestRows) {
@@ -2274,6 +2482,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             kind: "changes_since",
             stream,
             epoch: cursorEpoch(),
+            ...replica?.cursorBinding(options.instanceIds, options.fields),
             horizon: String(horizon),
             sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
             offset: offset + options.limit,
@@ -2286,6 +2495,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             kind: "changes_since",
             stream,
             epoch: cursorEpoch(),
+            ...replica?.cursorBinding(options.instanceIds, undefined),
             horizon: String(horizon),
             sinceHorizon: null,
             offset: 0,
@@ -2299,7 +2509,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       .prepare(
         // SQLite takes a bare column from the row that holds the single MAX.
         `SELECT stream, COUNT(*) as count, emitted_at as last_updated, MAX(emitted_key)
-         FROM pdpp_records WHERE deleted = 0 AND instance IN (${placeholders})
+         FROM pdpp_records r WHERE deleted = 0 AND instance IN (${placeholders})${unquarantined("r")}
          GROUP BY stream`,
       )
       .all(...instanceIds) as Array<{
@@ -2332,14 +2542,27 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     };
   }
 
+  /** Canonical blob bytes remain in main's `pdpp_blob_bytes` format. */
+  const blobBytes: CanonicalBlobBytes = replica?.blobBytes ?? {
+    has: (blobId) => getBlobBytesStmt.get(blobId) !== undefined,
+    readVerified(meta) {
+      const row = getBlobBytesStmt.get(meta.blobId) as
+        { bytes: Buffer } | undefined;
+      if (!row) return undefined;
+      const stored = new Uint8Array(row.bytes);
+      if (stored.byteLength !== meta.sizeBytes) return undefined;
+      return createHash("sha256").update(stored).digest("hex") === meta.sha256
+        ? (stored as Uint8Array<ArrayBuffer>)
+        : undefined;
+    },
+    clearMalformed: () => {},
+    write: (blobId, bytes) =>
+      insertBlobBytesStmt.run({ blob_id: blobId, bytes: Buffer.from(bytes) }),
+  };
+
   /** True only when a stored bytes row actually hash/size-matches `meta`. */
   function storedBytesVerify(meta: PdppBlobMeta): boolean {
-    const row = getBlobBytesStmt.get(meta.blobId) as
-      { bytes: Buffer } | undefined;
-    if (!row) return false;
-    const stored = new Uint8Array(row.bytes);
-    if (stored.byteLength !== meta.sizeBytes) return false;
-    return createHash("sha256").update(stored).digest("hex") === meta.sha256;
+    return blobBytes.readVerified(meta) !== undefined;
   }
 
   function storeBlobBytes(bytes: Uint8Array, mimeType: string): PdppBlobMeta {
@@ -2358,6 +2581,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     // row" and race to insert, or one could complete a metadata-only row
     // while another concurrently overwrites it.
     const run = db.transaction((): PdppBlobMeta => {
+      blobBytes.clearMalformed(blobId);
       const existing = getBlobMeta(blobId);
 
       if (existing) {
@@ -2368,16 +2592,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         ) {
           throw new BlobConflictError(blobId, existing);
         }
-        const bytesRow = getBlobBytesStmt.get(blobId) as
-          { bytes: Buffer } | undefined;
-        if (!bytesRow) {
+        if (!blobBytes.has(blobId)) {
           // Metadata-only row (legacy/test fixture via putBlobMeta, or a
           // prior write that never got this far): complete it with real
           // bytes now instead of reporting a false "already stored" no-op.
-          insertBlobBytesStmt.run({
-            blob_id: existing.blobId,
-            bytes: Buffer.from(bytes),
-          });
+          blobBytes.write(blobId, bytes);
           return existing;
         }
         if (!storedBytesVerify(existing)) {
@@ -2397,10 +2616,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         size_bytes: candidate.sizeBytes,
         sha256: candidate.sha256,
       });
-      insertBlobBytesStmt.run({
-        blob_id: candidate.blobId,
-        bytes: Buffer.from(bytes),
-      });
+      blobBytes.write(blobId, bytes);
       return candidate;
     });
 
@@ -2414,7 +2630,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     bytes: Uint8Array;
     mimeType: string;
   }): PdppBlobMeta {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
       const binding = ensureBinding(db, input.instance);
       if (binding.deleted_at !== null) {
         throw new PdppBindingError("connection_deleted");
@@ -2434,20 +2650,18 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
          VALUES (?, ?, ?)
          ON CONFLICT (blob_id, instance) DO UPDATE SET generation = excluded.generation`,
       ).run(meta.blobId, input.instance, input.generation);
+      replica?.captureBlob(input.instance, meta.blobId);
+      replica?.notifyVisibility();
       return meta;
-    })();
+    });
   }
 
   function getBlobBytes(blobId: string): Uint8Array<ArrayBuffer> | undefined {
-    const meta = getBlobMeta(blobId);
-    if (!meta) return undefined;
-    const row = getBlobBytesStmt.get(blobId) as { bytes: Buffer } | undefined;
-    if (!row) return undefined;
-    const bytes = new Uint8Array(row.bytes);
-    if (bytes.byteLength !== meta.sizeBytes) return undefined;
-    const actualHash = createHash("sha256").update(bytes).digest("hex");
-    if (actualHash !== meta.sha256) return undefined;
-    return bytes as Uint8Array<ArrayBuffer>;
+    // Verification and assembly share a snapshot.
+    return inReadSnapshot(() => {
+      const meta = getBlobMeta(blobId);
+      return meta ? blobBytes.readVerified(meta) : undefined;
+    });
   }
 
   return {
@@ -2495,26 +2709,31 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         };
       });
     },
-    readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
+    readSnapshot: <T>(read: () => T): T =>
+      replica ? replica.snapshot(read) : db.transaction(read).deferred(),
     writeTransaction: <T>(write: () => T): T =>
-      db.transaction(write).immediate(),
+      replica ? replica.exclusive(write) : db.transaction(write).immediate(),
     resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,
-    replaceStreams: (inputs) =>
-      db.transaction(() => {
+    replaceStreams: (inputs) => {
+      const replaceAll = () => {
         for (const input of inputs) {
           if (!replaceStream(input).applied)
             throw new Error("canonical_batch_rejected");
         }
-      })(),
+      };
+      if (replica) replica.exclusive(replaceAll);
+      else db.transaction(replaceAll)();
+    },
     listStreamCompletions,
     completeStreams,
     listArrivalOrder,
     getRecord,
     listRecords,
     deleteRecord,
-    changesSince,
+    changesSince: (stream, options) => changesSince(stream, options),
+    changesSinceForInstances: changesSince,
     listStreams,
     putBlobMeta: (meta: PdppBlobMeta) =>
       putBlobStmt.run({

@@ -204,6 +204,10 @@
       "types": "./dist/storage/pdpp-records/memory-store.d.ts",
       "import": "./dist/storage/pdpp-records/memory-store.js"
     },
+    "./replication/*": {
+      "types": "./dist/replication/*.d.ts",
+      "import": "./dist/replication/*.js"
+    },
     "./storage/legacy-scope-coverage": {
       "types": "./dist/storage/legacy-scope-coverage.d.ts",
       "import": "./dist/storage/legacy-scope-coverage.js"
@@ -225,8 +229,10 @@
     "@opendatalabs/vana-sdk": "3.23.0-pr.211.36da1d8",
     "ajv2020": "npm:ajv@^8.20.0",
     "minisearch": "^7.2.0",
+    "openpgp": "6.3.0",
     "unpdf": "^1.6.2",
     "viem": "^2.54.2",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "@noble/hashes": "1.8.0"
   }
 }

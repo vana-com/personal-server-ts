@@ -1,3 +1,4 @@
+import type { ReplicationDoorStatus } from "./replication/door.js";
 import {
   buildWeb3SignedHeader,
   type DataFileEnvelope,
@@ -234,6 +235,13 @@ export interface PersonalServerRevokeGrantResult {
 
 export interface PersonalServerHandle {
   readonly kind: PersonalServerKind;
+  /**
+   * The replication door this boot passed, fixed before the handle is
+   * returned. Present only on a server whose storage enforces the door, so
+   * its presence means the door is enforced, whatever the state. A host shows
+   * the opt-in from `never`, and the reason from `refused`.
+   */
+  readonly replication?: { status(): ReplicationDoorStatus };
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
   info(): Promise<PersonalServerInfo>;
   prepareRegistration(

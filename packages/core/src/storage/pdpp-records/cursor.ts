@@ -4,8 +4,25 @@
  * implementations need a shared wire format to stay behaviorally identical.
  */
 
-export interface ListCursorPayload {
+/**
+ * Binding of a token to the query and to the replica integrity fences of the
+ * connections it reads. A backend without replica fences omits both.
+ */
+interface IntegrityBinding {
+  /** Digest of the connection set and field projection the token was minted for. */
+  query?: string;
+  /** Integrity epoch of each read connection when page 1 was served. */
+  integrity?: Record<string, number>;
+  /** Projection epoch seen when the token was minted by replication reads. */
+  visibilityEpoch?: string;
+}
+
+export interface ListCursorPayload extends IntegrityBinding {
   kind: "list";
+  /** Current-view revision. A changed view expires rather than mixes pages. */
+  viewRevision?: string;
+  view?: "owner" | "grant";
+  instanceIds?: string[];
   /** Stream this token was minted for. Absent only on legacy cursors. */
   stream?: string;
   /** Store reset epoch this token was minted in. Absent only on legacy cursors. */
@@ -29,7 +46,7 @@ export interface ListCursorPayload {
   orderKey?: "instant";
 }
 
-export interface ChangesSinceCursorPayload {
+export interface ChangesSinceCursorPayload extends IntegrityBinding {
   kind: "changes_since";
   /** Stream this token was minted for. Absent only on legacy cursors. */
   stream?: string;
@@ -51,6 +68,29 @@ export interface ChangesSinceCursorPayload {
 }
 
 export type CursorPayload = ListCursorPayload | ChangesSinceCursorPayload;
+
+export interface VisibilitySnapshot {
+  readonly visibilityEpoch: string;
+  readonly reader?: string;
+}
+export interface ValidCursor {
+  readonly kind: "valid";
+  readonly payload: CursorPayload;
+}
+export interface Expired {
+  readonly kind: "expired";
+}
+
+/** Old enabled-mode tokens expire because their projection boundary is unknown. */
+export function validateCursor(
+  cursor: string,
+  snapshot: VisibilitySnapshot,
+): ValidCursor | Expired {
+  const payload = decodeCursor(cursor);
+  return payload.visibilityEpoch === snapshot.visibilityEpoch
+    ? { kind: "valid", payload }
+    : { kind: "expired" };
+}
 
 // Base64url encode/decode via the universally-available `atob`/`btoa` + Web
 // text codecs rather than Node's Buffer, so this module stays browser-safe

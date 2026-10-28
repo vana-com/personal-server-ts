@@ -1,4 +1,5 @@
 import { isMemoryScope } from "../../policy/reserved-scopes.js";
+import { isReplicaScope } from "../../replication/namespace.js";
 import type { DurableAdditionsService } from "../../additions/durable.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
@@ -169,6 +170,8 @@ export async function uploadOne(
   deps: UploadWorkerDeps,
   entry: IndexEntry,
 ): Promise<UploadResult> {
+  if (isReplicaScope(entry.scope))
+    throw new Error("replica scopes require immutable transport");
   const {
     storage,
     storageAdapter,

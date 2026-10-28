@@ -187,6 +187,21 @@ export {
 } from "./persistence.js";
 
 export {
+  createLiteCanonicalStore,
+  type LiteCommitReceipt,
+  type LiteReplicaReadOptions,
+  type LiteVisibleRecord,
+  type LiteOperationDraft,
+} from "./canonical-store.js";
+export type {
+  LiteCanonicalPersistence,
+  LiteCanonicalTransaction,
+  LiteBlobDescriptor,
+  LiteStorageEntry,
+  LiteStoragePage,
+} from "./canonical-persistence.js";
+
+export {
   importOuraBrowserRecords,
   type OuraBrowserImportInput,
   type OuraBrowserImportOptions,

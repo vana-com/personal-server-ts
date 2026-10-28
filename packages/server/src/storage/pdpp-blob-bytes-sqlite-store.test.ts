@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { BlobConflictError } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 function sha256Hex(bytes: Uint8Array): string {
@@ -349,4 +350,93 @@ describe("metadata-only completion integrity", () => {
       }
     },
   );
+});
+
+it("reads legacy and chunked blobs together, detects replacement, and removes chunks on connection deletion", () => {
+  const db = new Database(":memory:");
+  // Chunked canonical storage exists only with replication enabled.
+  const store = createReplicaRecordStore(db);
+  try {
+    store.registerConnection({
+      instance: "chunks",
+      sourceId: "https://chunks.invalid/source",
+      method: "export",
+      label: "Chunks",
+    });
+    const legacy = store.storeBlobBytes(
+      new Uint8Array([1, 2, 3]),
+      "application/octet-stream",
+    );
+    const bytes = new Uint8Array(2 * 1024 * 1024).fill(31);
+    const chunked = store.storeBlobBytesForInstance({
+      instance: "chunks",
+      method: "export",
+      generation: 1,
+      bytes,
+      mimeType: "application/octet-stream",
+    });
+    expect(store.getBlobBytes(legacy.blobId)).toEqual(
+      new Uint8Array([1, 2, 3]),
+    );
+    expect(sha256Hex(store.getBlobBytes(chunked.blobId)!)).toBe(
+      sha256Hex(bytes),
+    );
+    db.prepare(
+      "UPDATE pdpp_binary_chunks SET bytes=zeroblob(length(bytes)) WHERE namespace='canonical' AND blob_id=? AND position=0",
+    ).run(chunked.blobId);
+    expect(store.getBlobBytes(chunked.blobId)).toBeUndefined();
+    expect(() =>
+      store.storeBlobBytesForInstance({
+        instance: "chunks",
+        method: "export",
+        generation: 1,
+        bytes,
+        mimeType: "application/octet-stream",
+      }),
+    ).toThrow(BlobConflictError);
+    store.deleteConnection("chunks");
+    expect(
+      (
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=?",
+          )
+          .get(chunked.blobId) as { n: number }
+      ).n,
+    ).toBe(0);
+    expect(
+      (
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=?",
+          )
+          .get(chunked.blobId) as { n: number }
+      ).n,
+    ).toBe(0);
+    expect(store.getBlobBytes(chunked.blobId)).toBeUndefined();
+  } finally {
+    store.close();
+  }
+});
+
+it("rejects an incomplete matching chunk manifest before allocating its declared whole size", () => {
+  const db = new Database(":memory:");
+  // Chunked canonical storage exists only with replication enabled.
+  const store = createReplicaRecordStore(db);
+  try {
+    const blobId = `sha256:${"a".repeat(64)}`;
+    const sizeBytes = 2 ** 40;
+    store.putBlobMeta({
+      blobId,
+      mimeType: "application/octet-stream",
+      sizeBytes,
+      sha256: blobId.slice(7),
+    });
+    db.prepare(
+      "INSERT INTO pdpp_binary_manifests VALUES ('canonical',?,?)",
+    ).run(blobId, sizeBytes);
+    expect(store.getBlobBytes(blobId)).toBeUndefined();
+  } finally {
+    store.close();
+  }
 });
