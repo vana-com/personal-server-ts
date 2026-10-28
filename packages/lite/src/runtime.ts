@@ -116,6 +116,12 @@ import {
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import type { LiteReplicationRuntime } from "./replication-runtime.js";
 import {
+  createPdppImportJobs,
+  type ImportDeclarations,
+  type PdppImportJobCapability,
+  type PdppImportJobs,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-import-job";
+import {
   createDefaultPsLiteAccessLogStore,
   createDefaultPsLiteSaveConfig,
   createDefaultPsLiteTokenStore,
@@ -259,6 +265,16 @@ export interface PsLiteRuntimeOptions {
    * Defaults to a console warning.
    */
   onLegacyProjectionIssue?: (issue: LegacyProjectionIssue) => void;
+  /**
+   * PDPP import jobs (docs/261028-pdpp-import-job.md). When the host's storage
+   * adapter supplies the capability, `runtime.importJobs` runs resumable,
+   * byte-bounded imports against it, bound to `serverOwner`. Absent, the
+   * runtime is unchanged and whole-scope ingest stays the only write path.
+   */
+  importJobs?: {
+    capability: PdppImportJobCapability;
+    declarations: ImportDeclarations;
+  };
 }
 
 export interface PsLiteRuntimeStateCapabilities {
@@ -284,6 +300,8 @@ interface PsLiteRuntimeStoreCapabilities {
 export interface PsLiteRuntime extends RuntimeAvailabilityPort {
   readonly kind: "ps-lite";
   readonly storage: PsLiteStorageAdapter | DataStoragePort;
+  /** Present only when the host supplied the import job capability. */
+  readonly importJobs?: PdppImportJobs;
   activate(): void;
   deactivate(): void;
   fetch(request: Request): Promise<Response>;
@@ -1019,9 +1037,19 @@ export function createPsLiteRuntime(
     return undefined;
   }
 
+  // A missing owner binds no job: every begin is refused as another owner's.
+  const importJobs =
+    options.importJobs &&
+    createPdppImportJobs({
+      ...options.importJobs,
+      owner: ownerAddress() ?? "",
+      now,
+    });
+
   return {
     kind: "ps-lite",
     storage: options.storage,
+    ...(importJobs ? { importJobs } : {}),
     activate() {
       active = true;
       options.syncManager?.start?.();
