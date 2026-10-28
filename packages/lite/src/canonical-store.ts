@@ -37,6 +37,7 @@ import type {
   LiteCanonicalPersistence,
   LiteCanonicalTransaction,
   LiteBlobDescriptor,
+  LiteStagingId,
 } from "./canonical-persistence.js";
 
 export type LiteOperationDraft = ReplicaOperation extends infer T
@@ -701,7 +702,7 @@ export function createLiteCanonicalStore(deps: {
     operations?: LiteOperationDraft[];
     envelope?: unknown;
     credential?: unknown;
-    blobs?: { stagingId: string; descriptor: LiteBlobDescriptor }[];
+    blobs?: { stagingId: LiteStagingId; descriptor: LiteBlobDescriptor }[];
     promotion?: { id: string; fingerprint: string };
   }): Promise<LiteCommitReceipt> {
     enabled();
@@ -1495,20 +1496,21 @@ export function createLiteCanonicalStore(deps: {
       id: string;
       envelope: unknown;
       credential: unknown;
-      blobs?: { stagingId: string; descriptor: LiteBlobDescriptor }[];
+      blobs?: { stagingId: LiteStagingId; descriptor: LiteBlobDescriptor }[];
     }) {
       enabled();
       const context = authenticate(input.credential);
       if (!input.id || input.id.length > 256)
         throw new Error("invalid pending batch id");
+      const rawEncoded = canonicalJson(input.envelope);
+      if (encoder.encode(rawEncoded).length > 192 * 1024)
+        throw new Error("canonical batch exceeds 192 KiB; split before commit");
       const envelope = replicaEnvelopeSchema.parse(input.envelope);
       if (
         envelope.owner !== context.owner ||
         envelope.operations.some((op) => op.owner !== context.owner)
       )
         throw new Error("wrong replica owner");
-      if (encoder.encode(canonicalJson(envelope)).length > 192 * 1024)
-        throw new Error("canonical batch exceeds 192 KiB; split before commit");
       if (planReplicaMerge(context, envelope.operations).rejected.length)
         throw new Error("invalid pending replica operations");
       const fingerprint = digest(envelope);
@@ -1672,13 +1674,13 @@ export function createLiteCanonicalStore(deps: {
     commitLocal: (
       id: string,
       operations: LiteOperationDraft[],
-      blobs?: { stagingId: string; descriptor: LiteBlobDescriptor }[],
+      blobs?: { stagingId: LiteStagingId; descriptor: LiteBlobDescriptor }[],
     ) => commit({ id, operations, blobs }),
     import: (input: {
       id: string;
       envelope: unknown;
       credential: unknown;
-      blobs?: { stagingId: string; descriptor: LiteBlobDescriptor }[];
+      blobs?: { stagingId: LiteStagingId; descriptor: LiteBlobDescriptor }[];
     }) => commit(input),
     /** True when reconcile withdraws this connection from every reader. */
     async isConnectionQuarantined(connectionId: string): Promise<boolean> {
@@ -1918,13 +1920,28 @@ export function createLiteCanonicalStore(deps: {
     async stageBlob(
       descriptor: LiteBlobDescriptor,
       chunks: AsyncIterable<Uint8Array>,
+      signal?: AbortSignal,
     ) {
       enabled();
       await persistence.transaction(async (base) => {
         const tx = trackViews(base);
         await clock(tx);
       });
-      return persistence.stageBlob(descriptor, chunks);
+      let totalBytes = 0;
+      const capped = async function* () {
+        for await (const chunk of chunks) {
+          signal?.throwIfAborted();
+          const next = totalBytes + chunk.length;
+          if (!Number.isSafeInteger(next) || next > descriptor.sizeBytes)
+            throw new Error("staged blob exceeds declared size");
+          totalBytes = next;
+          yield chunk;
+        }
+        signal?.throwIfAborted();
+        if (totalBytes !== descriptor.sizeBytes)
+          throw new Error("staged blob length does not match descriptor");
+      };
+      return persistence.stageBlob(descriptor, capped());
     },
     async *readBlob(blobId: string, options: LiteReplicaReadOptions = {}) {
       enabled();

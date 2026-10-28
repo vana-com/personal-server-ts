@@ -129,56 +129,9 @@ it("binds a manifest to its owner, writer scope and version, and its fragments t
   ).toBe(false);
 });
 
-it("reassembles byte-identical content and rejects missing, overlapping, swapped or tampered frames", async () => {
-  const { assembleReplicaPayload } = await import("./transport.js");
-  const bytes = new TextEncoder().encode("a JSON record 😺".repeat(300));
-  const parts = await fragmentReplicaPayload({
-    owner: "owner",
-    writer: "a".repeat(32),
-    batch: "b".repeat(32),
-    sequence: 1,
-    previous: null,
-    bytes,
-    collectedAt: "2026-10-20T00:00:00.000Z",
-    targetChunkBytes: 1500,
-    encrypt: async (_scope, bytes) => bytes,
-  });
-  const fragments = parts.map((p) =>
-    decodeReplicaFragment(p.plaintext, p.scope, "owner"),
-  );
-  expect(assembleReplicaPayload([...fragments].reverse())).toEqual(bytes);
-  expect(() =>
-    assembleReplicaPayload(
-      fragments.map((f) => ({ ...f, digest: `sha256:${"0".repeat(64)}` })),
-    ),
-  ).toThrow();
-  expect(() => assembleReplicaPayload(fragments.slice(1))).toThrow();
-  expect(() =>
-    assembleReplicaPayload([fragments[0]!, ...fragments.slice(0, -1)]),
-  ).toThrow();
-  for (const mutation of [
-    { offset: 1 },
-    { totalBytes: Number.MAX_SAFE_INTEGER },
-    { batch: "c".repeat(32) },
-    { content: "YQ==" },
-    { count: fragments.length + 1 },
-  ]) {
-    expect(() =>
-      assembleReplicaPayload([
-        { ...fragments[0]!, ...mutation },
-        ...fragments.slice(1),
-      ]),
-    ).toThrow();
-  }
-  expect(() =>
-    decodeReplicaFragment(parts[0]!.plaintext, parts[0]!.scope, "other-owner"),
-  ).toThrow();
-});
-
 it("reduces fragment size using actual DPv2 encryption overhead", async () => {
   const { encryptWithPassword, decryptWithPassword } =
     await import("@opendatalabs/vana-sdk/browser");
-  const { assembleReplicaPayload } = await import("./transport.js");
   const bytes = crypto.getRandomValues(new Uint8Array(6500));
   const parts = await fragmentReplicaPayload({
     owner: "owner",
@@ -203,7 +156,15 @@ it("reduces fragment size using actual DPv2 encryption overhead", async () => {
       ),
     ),
   );
-  expect(assembleReplicaPayload(decoded)).toEqual(bytes);
+  expect(decoded.map((fragment) => fragment.index)).toEqual(
+    parts.map((part) => part.index),
+  );
+  expect(
+    decoded.reduce(
+      (size, fragment) => size + fromBase64(fragment.content).length,
+      0,
+    ),
+  ).toBe(bytes.length);
 }, 30000);
 
 it("keeps Gateway disagreement pending and quarantines only a finalized slot commitment conflict", async () => {

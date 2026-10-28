@@ -4,6 +4,17 @@ import { sha256, keccak256, stringToHex } from "viem";
 import { canonicalJson } from "./envelope.js";
 import { ReplicaFramingUnsupported } from "./outcome.js";
 import {
+  REPLICA_MAX_FRAGMENTS,
+  REPLICA_MAX_BLOB_BYTES,
+  replicaFramedBytesBound,
+} from "./limits.js";
+export {
+  REPLICA_MAX_FRAGMENTS,
+  REPLICA_MAX_BLOB_BYTES,
+  REPLICA_FRAGMENT_OVERHEAD_BYTES,
+  replicaFramedBytesBound,
+} from "./limits.js";
+import {
   replicaBatchAuthoritySchema,
   type ReplicaBatchFacts,
 } from "./writer-identity.js";
@@ -11,16 +22,6 @@ import {
 /** Reserved across ordinary reads, grants, inventory, MCP and legacy sync. */
 import { REPLICA_SCOPE_PREFIX } from "./namespace.js";
 export { REPLICA_SCOPE_PREFIX, isReplicaScope } from "./namespace.js";
-/** Protocol limit on fragments per batch, and so on entries per manifest. */
-export const REPLICA_MAX_FRAGMENTS = 100000;
-/** vana-storage DEFAULT_MAX_BLOB_SIZE. Compare the actual encrypted request. */
-export const REPLICA_MAX_BLOB_BYTES = 100 * 1024 * 1024;
-/**
- * Bytes an encrypted fragment adds to the base64 of its chunk: the envelope,
- * the fragment fields and the OpenPGP framing. Bounds the fragment bytes a
- * manifest may name for its payload length (`replicaFramedBytesBound`).
- */
-export const REPLICA_FRAGMENT_OVERHEAD_BYTES = 4096;
 /** Nesting that no manifest or fragment reaches. */
 export const REPLICA_MAX_JSON_DEPTH = 16;
 /**
@@ -251,13 +252,6 @@ export function parseReplicaJson(plaintext: Uint8Array): ParsedReplicaJson {
  * The most encrypted fragment bytes a batch of `totalBytes` needs in `count`
  * fragments: the base64 of every chunk plus a fixed overhead per fragment.
  */
-export function replicaFramedBytesBound(totalBytes: number, count: number) {
-  return (
-    4 * Math.ceil(totalBytes / 3) +
-    count * (4 + REPLICA_FRAGMENT_OVERHEAD_BYTES)
-  );
-}
-
 /** The facts a manifest at `version` claims; its statement must sign exactly these. */
 export function replicaManifestFacts(
   manifest: Omit<ReplicaManifest, "authority">,
@@ -578,49 +572,4 @@ export async function fragmentReplicaPayload(input: {
     if (chunkSize === 1) throw new ReplicaFramingUnsupported(oversized, cap);
     chunkSize = Math.max(1, Math.floor(chunkSize / 2));
   }
-}
-
-/** Missing, duplicate, overlapping or inconsistent fragments never become importable bytes. */
-export function assembleReplicaPayload(
-  fragments: readonly ReplicaFragment[],
-): Uint8Array {
-  const first = fragments[0];
-  if (!first || fragments.length !== first.count)
-    throw new Error("incomplete replica batch");
-  const sorted = [...fragments].sort((a, b) => a.index - b.index);
-  const chunks = sorted.map((f) => fromBase64(f.content));
-  if (chunks.reduce((n, chunk) => n + chunk.length, 0) !== first.totalBytes)
-    throw new Error("invalid replica batch length");
-  // Check actual retained bytes before allocating any remotely advertised total.
-  const bytes = new Uint8Array(first.totalBytes);
-  let offset = 0;
-  const common = (f: ReplicaFragment) =>
-    canonicalJson({
-      owner: f.owner,
-      writer: f.writer,
-      batch: f.batch,
-      sequence: f.sequence,
-      previous: f.previous,
-      collectedAt: f.collectedAt,
-      digest: f.digest,
-      totalBytes: f.totalBytes,
-      count: f.count,
-    });
-  for (let index = 0; index < sorted.length; index++) {
-    const f = sorted[index]!;
-    const chunk = chunks[index]!;
-    if (
-      common(f) !== common(first) ||
-      f.index !== index ||
-      f.offset !== offset ||
-      replicaDigest(chunk) !== f.chunkDigest ||
-      offset + chunk.length > bytes.length
-    )
-      throw new Error("inconsistent replica fragments");
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  if (offset !== bytes.length || replicaDigest(bytes) !== first.digest)
-    throw new Error("corrupt replica batch");
-  return bytes;
 }

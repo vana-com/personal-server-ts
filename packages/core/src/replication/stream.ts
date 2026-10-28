@@ -19,6 +19,15 @@ import {
   type Predecessor,
 } from "./transport.js";
 import { ReplicaFramingUnsupported } from "./outcome.js";
+import { ReplicaProblemError } from "./outcome.js";
+import {
+  REPLICA_MAX_BLOB_TOTAL_BYTES,
+  REPLICA_MAX_OPERATIONS,
+  REPLICA_MAX_OPERATION_BYTES,
+  REPLICA_MAX_SINGLE_BLOB_BYTES,
+  REPLICA_MAX_TOTAL_BYTES,
+  ReplicaResourceLimitError,
+} from "./limits.js";
 
 const FRAME_LIMIT = 128 * 1024;
 const BASE64_PIECE = 48 * 1024;
@@ -191,6 +200,7 @@ function commonFragment(f: ReplicaFragment): string {
 /** Consume to completion before importing: the final digest is checked at EOF. */
 export async function* assembleReplicaStream(
   fragments: () => AsyncIterable<ReplicaFragment>,
+  options: { maxBytes?: number; signal?: AbortSignal } = {},
 ): AsyncIterable<Uint8Array> {
   let first: ReplicaFragment | undefined;
   let common = "";
@@ -198,6 +208,7 @@ export async function* assembleReplicaStream(
   let offset = 0;
   const hash = sha256.create();
   for await (const value of fragments()) {
+    options.signal?.throwIfAborted();
     const f = replicaFragmentSchema.parse(value);
     if (!first) {
       first = f;
@@ -219,8 +230,11 @@ export async function* assembleReplicaStream(
         throw new Error("noncanonical base64");
       const chunk = fromBase64(encoded);
       offset += chunk.length;
-      if (offset > f.totalBytes)
-        throw new Error("invalid replica batch length");
+      if (
+        offset > f.totalBytes ||
+        (options.maxBytes !== undefined && offset > options.maxBytes)
+      )
+        throw new ReplicaProblemError("payload_invalid");
       chunkHash.update(chunk);
       hash.update(chunk);
       yield chunk;
@@ -320,10 +334,12 @@ class PayloadCursor {
       }
     }
   }
-  async envelopeTail(): Promise<string> {
+  async envelopeTail(limits: ReplicaStreamedLimits): Promise<string> {
     let result = "";
+    const operationLimits = new ReplicaOperationLimitScanner(limits);
     while (await this.peek()) {
       const rest = this.window.slice(this.position);
+      operationLimits.feed(rest);
       result += rest;
       this.position = this.window.length;
     }
@@ -335,8 +351,100 @@ class PayloadCursor {
   }
 }
 
+/** Counts canonical top-level operation items before JSON.parse builds their tree. */
+class ReplicaOperationLimitScanner {
+  private readonly marker = '"operations":[';
+  private searchTail = "";
+  private searching = true;
+  private operations = 0;
+  private inOperation = false;
+  private operationBytes = 0;
+  private depth = 0;
+  private inString = false;
+  private escaped = false;
+
+  constructor(private readonly limits: ReplicaStreamedLimits) {}
+
+  feed(text: string) {
+    if (this.searching) {
+      const combined = this.searchTail + text;
+      const markerAt = combined.indexOf(this.marker);
+      if (markerAt < 0) {
+        this.searchTail = combined.slice(-(this.marker.length - 1));
+        return;
+      }
+      this.searching = false;
+      text = combined.slice(markerAt + this.marker.length);
+    }
+    for (let index = 0; index < text.length; index++) {
+      const character = text[index]!;
+      if (!this.inOperation) {
+        if (character === "{") {
+          this.operations++;
+          if (this.operations > this.limits.maxOperations)
+            throw new ReplicaResourceLimitError(
+              "operation_count",
+              this.operations,
+              this.limits.maxOperations,
+            );
+          this.inOperation = true;
+          this.depth = 1;
+          this.operationBytes = 0;
+          this.inString = false;
+          this.escaped = false;
+        } else continue;
+      }
+
+      this.operationBytes += utf8CharacterBytes(character, text[index + 1]);
+      if (this.operationBytes > this.limits.maxOperationBytes)
+        throw new ReplicaResourceLimitError(
+          "operation_bytes",
+          this.operationBytes,
+          this.limits.maxOperationBytes,
+        );
+
+      if (this.inString) {
+        if (this.escaped) this.escaped = false;
+        else if (character === "\\") this.escaped = true;
+        else if (character === '"') this.inString = false;
+      } else if (character === '"') this.inString = true;
+      else if (character === "{" || character === "[") this.depth++;
+      else if (character === "}" || character === "]") {
+        this.depth--;
+        if (this.depth === 0) this.inOperation = false;
+      }
+    }
+  }
+}
+
+function utf8CharacterBytes(character: string, next?: string) {
+  const code = character.charCodeAt(0);
+  if (code < 0x80) return 1;
+  if (code < 0x800) return 2;
+  if (code >= 0xd800 && code <= 0xdbff && next) {
+    const low = next.charCodeAt(0);
+    if (low >= 0xdc00 && low <= 0xdfff) return 4;
+  }
+  if (code >= 0xdc00 && code <= 0xdfff) return 0;
+  return 3;
+}
+
 type BlobMetadata = { blobId: string; sha256: string; sizeBytes: number };
 type PayloadInspection = { envelope: ReplicaEnvelope; blobs: BlobMetadata[] };
+export interface ReplicaStreamedLimits {
+  maxOperations: number;
+  maxOperationBytes: number;
+  maxSingleBlobBytes: number;
+  maxBlobTotalBytes: number;
+  maxPayloadBytes: number;
+}
+export const DEFAULT_REPLICA_STREAMED_LIMITS: ReplicaStreamedLimits = {
+  maxOperations: REPLICA_MAX_OPERATIONS,
+  maxOperationBytes: REPLICA_MAX_OPERATION_BYTES,
+  maxSingleBlobBytes: REPLICA_MAX_SINGLE_BLOB_BYTES,
+  maxBlobTotalBytes: REPLICA_MAX_BLOB_TOTAL_BYTES,
+  maxPayloadBytes: REPLICA_MAX_TOTAL_BYTES,
+};
 type PayloadEvent =
   | { kind: "bytes"; blobId: string; blobIndex: number; bytes: Uint8Array }
   | { kind: "verified"; payload: PayloadInspection };
@@ -345,9 +453,12 @@ type PayloadEvent =
 async function* parsePayload(
   input: AsyncIterable<Uint8Array>,
   expected?: EnvelopeExpectation,
+  limits: ReplicaStreamedLimits = DEFAULT_REPLICA_STREAMED_LIMITS,
+  signal?: AbortSignal,
 ): AsyncIterable<PayloadEvent> {
   const cursor = new PayloadCursor(input);
   const blobs: BlobMetadata[] = [];
+  let blobTotalBytes = 0;
   try {
     await cursor.literal('{"blobs":[');
     if ((await cursor.peek()) !== "]") {
@@ -358,9 +469,30 @@ async function* parsePayload(
         const hash = sha256.create();
         let sizeBytes = 0;
         for await (const bytes of cursor.base64()) {
+          signal?.throwIfAborted();
           sizeBytes += bytes.length;
-          if (!Number.isSafeInteger(sizeBytes))
-            throw new RangeError("replica binary too large");
+          blobTotalBytes += bytes.length;
+          if (sizeBytes > limits.maxSingleBlobBytes)
+            throw new ReplicaResourceLimitError(
+              "single_blob_bytes",
+              sizeBytes,
+              limits.maxSingleBlobBytes,
+            );
+          if (blobTotalBytes > limits.maxBlobTotalBytes)
+            throw new ReplicaResourceLimitError(
+              "aggregate_blob_bytes",
+              blobTotalBytes,
+              limits.maxBlobTotalBytes,
+            );
+          if (
+            !Number.isSafeInteger(sizeBytes) ||
+            !Number.isSafeInteger(blobTotalBytes)
+          )
+            throw new ReplicaResourceLimitError(
+              "aggregate_blob_bytes",
+              blobTotalBytes,
+              limits.maxBlobTotalBytes,
+            );
           hash.update(bytes);
           yield { kind: "bytes", blobId, blobIndex: blobs.length, bytes };
         }
@@ -371,10 +503,26 @@ async function* parsePayload(
       }
     }
     await cursor.literal('],"envelope":');
-    const encoded = await cursor.envelopeTail();
+    const encoded = await cursor.envelopeTail(limits);
     const envelope = expected
       ? decodeReplicaEnvelope(encoded, expected)
       : replicaEnvelopeSchema.parse(JSON.parse(encoded));
+    if (envelope.operations.length > limits.maxOperations)
+      throw new ReplicaResourceLimitError(
+        "operation_count",
+        envelope.operations.length,
+        limits.maxOperations,
+      );
+    const encoder = new TextEncoder();
+    for (const operation of envelope.operations) {
+      const bytes = encoder.encode(canonicalJson(operation)).length;
+      if (bytes > limits.maxOperationBytes)
+        throw new ReplicaResourceLimitError(
+          "operation_bytes",
+          bytes,
+          limits.maxOperationBytes,
+        );
+    }
     if (canonicalJson(envelope) !== encoded)
       throw new Error("noncanonical replica envelope");
     const declared = descriptors(envelope);
@@ -404,8 +552,14 @@ export async function inspectReplicaPayload(
     bytes: Uint8Array,
     blobIndex: number,
   ) => void | Promise<void>,
+  options: { limits?: ReplicaStreamedLimits; signal?: AbortSignal } = {},
 ): Promise<PayloadInspection> {
-  for await (const event of parsePayload(factory(), expected)) {
+  for await (const event of parsePayload(
+    factory(),
+    expected,
+    options.limits,
+    options.signal,
+  )) {
     if (event.kind === "bytes")
       await stage?.(event.blobId, event.bytes, event.blobIndex);
     else return event.payload;
