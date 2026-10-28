@@ -822,6 +822,54 @@ it("21 repeated due failures of writer A cannot monopolize rounds: B is served, 
   expect(b.get("a")).toBeUndefined();
 });
 
+it("A7a restart before every one-unit turn: hot retain and writer A cannot starve quiet B", async () => {
+  const { b } = await fairnessFixture();
+  const trace: {
+    version: number;
+    nextPhase?: string;
+    writers: Record<string, string>;
+  }[] = [];
+  let previous = 0;
+  // Nine phases, with room for nine service rounds including discovery,
+  // manifest download, fragment fetch and import. Not an I/O/memory bound.
+  for (let turn = 0; turn < 81 && b.get("b") === undefined; turn++) {
+    b.reopen();
+    b.put(`hot-${turn}`, "local-hot");
+    clock.advance(10_000);
+    const report = await step(b, { units: 1, bytes: 64 * 1024 * 1024 });
+    const row = b.db
+      .prepare(
+        "SELECT version,rotation_json FROM pdpp_transport_coordinator WHERE id=1",
+      )
+      .get() as {
+      version: number;
+      rotation_json: string;
+    };
+    const cursor = JSON.parse(row.rotation_json) as {
+      nextPhase?: string;
+      writers: Record<string, string>;
+    };
+    expect(row.version).toBe(previous + 1);
+    previous = row.version;
+    trace.push({ version: row.version, ...cursor });
+    expect(
+      (report?.receipts.length ?? 0) +
+        (report?.waits.filter(
+          (w) => w.phase !== "prepare" && w.phase !== "publish",
+        ).length ?? 0),
+    ).toBeLessThanOrEqual(1);
+  }
+  expect(b.get("b"), JSON.stringify(trace)).toEqual({
+    id: "b",
+    text: "from B",
+  });
+  expect(trace.some((cursor) => cursor.nextPhase === "prepare")).toBe(true);
+  expect(trace.some((cursor) => cursor.writers.fetch !== undefined)).toBe(true);
+  expect(trace.some((cursor) => cursor.writers.import !== undefined)).toBe(
+    true,
+  );
+}, 30_000); // up to 81 reopen-and-step turns
+
 // ========================================================================= 20
 
 it("20 parked finality waits are filtered before the runnable quota: a due slot progresses with phase quota 1 and parked slots are not charged", async () => {
@@ -862,6 +910,7 @@ it("20 parked finality waits are filtered before the runnable quota: a due slot 
 // ========================================================================= 22
 
 const SNAPSHOT_TABLES = [
+  "pdpp_transport_coordinator",
   "pdpp_transport_state",
   "pdpp_transport_batches",
   "pdpp_transport_staged_fragments",
@@ -886,32 +935,28 @@ const netCounts = (net: Network) => ({
   encrypts: net.calls.encrypts,
 });
 
-it("22a zero-unit step on a device with local work performs no evidence/put/get/encrypt call, changes nothing durable, and reports nextWake = now", async () => {
+it("22a zero-unit step on local work rejects before evidence/put/get/encrypt or durable changes", async () => {
   const net = network();
   const a = transportDevice(net);
   await step(a); // initialize writer state
   a.put("more local work", "b");
   const before = durableSnapshot(a.db, SNAPSHOT_TABLES);
   const counts = netCounts(net);
-  const report = await step(a, { units: 0 });
+  await expect(step(a, { units: 0 })).rejects.toThrow(RangeError);
   expect(netCounts(net)).toEqual(counts);
   expect(durableSnapshot(a.db, SNAPSHOT_TABLES)).toEqual(before);
-  expect(report, "step returned no report").toBeDefined();
-  expect(report?.nextWake).toBe(clock.now());
 });
 
-it("22b zero-unit step on a device with remote work performs no network call, changes nothing durable, and reports nextWake = now", async () => {
+it("22b zero-unit step on remote work rejects before network calls or initialization", async () => {
   const net = network();
   const a = await publishedWriter(net, (d) => d.put("remote", "a"));
   const b = transportDevice(net);
-  await step(b, { units: 0 }); // must not even initialize anything
+  await expect(step(b, { units: 0 })).rejects.toThrow(RangeError);
   const before = durableSnapshot(b.db, SNAPSHOT_TABLES);
   const counts = netCounts(net);
-  const report = await step(b, { units: 0 });
+  await expect(step(b, { units: 0 })).rejects.toThrow(RangeError);
   expect(netCounts(net)).toEqual(counts);
   expect(durableSnapshot(b.db, SNAPSHOT_TABLES)).toEqual(before);
-  expect(report, "step returned no report").toBeDefined();
-  expect(report?.nextWake).toBe(clock.now());
   expect(a.get("a")).toBeDefined();
 });
 
@@ -1029,6 +1074,7 @@ it("25 host cancellation mid-step leaves only committed state; the cancelled run
   await within(3000, running, "aborted step");
 
   const tables = [
+    "pdpp_transport_coordinator",
     "pdpp_transport_batches",
     "pdpp_transport_fragments_out",
     "pdpp_transport_manifests_out",
@@ -1668,7 +1714,7 @@ it("34a report.nextWake comes from durable state: terminal work contributes noth
   ).toEqual(expect.arrayContaining(terminal.map((r) => r.id)));
 
   a.reopen();
-  const reopened = await step(a, { units: 0 });
+  const reopened = await step(a, { units: 1 });
   expect(reopened?.nextWake).toBe(report?.nextWake);
 });
 
@@ -1688,7 +1734,7 @@ it("34b a device whose only work is terminal is idle: nextWake is undefined befo
   expect(report, "step returned no report").toBeDefined();
   expect(report?.nextWake).toBeUndefined();
   a.reopen();
-  const reopened = await step(a, { units: 0 });
+  const reopened = await step(a, { units: 1 });
   expect(reopened, "step returned no report").toBeDefined();
   expect(reopened?.nextWake).toBeUndefined();
 });
