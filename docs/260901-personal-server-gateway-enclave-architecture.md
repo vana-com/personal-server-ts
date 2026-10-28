@@ -37,7 +37,7 @@ The master signature stays the root of every data key in v1 by decision (see Com
 
 9. **Gateway is refuse-only.** Before touching plaintext the runtime verifies: the owner-signed grant (signer equals owner; scope, grantee, expiry from the payload); the builder-signed registration with `publicKeyToAddress(publicKey) == granteeAddress == grant.granteeId`; its own owner-signed registration; and revocation state on chain over RPC, falling back to Gateway state within a 5 min staleness window. Today `policy/data-read.ts` trusts Gateway rows and the Gateway supplies the result key. Both change.
 10. **Grants owner-signed.** The `serverSigner.signGrantRegistration` delegate path is removed for the enclave and deprecated for desktop. A Vana-run enclave registered as the user's server must not be able to mint grants.
-11. **Registration nonce and deadline.** The Gateway settles the four-field owner signature into `DataPortabilityServersV2.registerServerWithSignature`, so replay protection is a V3 struct change (`nonce`, `deadline` on registration and deregistration). Bridge: Gateway refuses already-settled signatures and retired epochs; node agent refuses to derive for a retired epoch.
+11. **Registration nonce and deadline.** The Gateway settles the four-field owner signature into `DataPortabilityServersV2.registerServerWithSignature`, so replay protection is a V3 struct change (`nonce`, `deadline` on registration and deregistration). Bridge: Gateway refuses already-settled signatures and retired epochs; the node agent refuses to seal below the Gateway-supplied `minEpoch` floor (no agent-side epoch store in v1; the jobs path relies on Gateway deletion of the sealed secret).
 12. **Revocation** is owner-signed (already true at the Gateway), settled on-chain, deletes the sealed master-signature ciphertext from every store and backup, and retires the KMS path. Re-enable uses path `v2` and a fresh registration.
 13. **Multiple user sandboxes per CVM is the design**, not a v1 compromise. Conditions: node agent small, reviewed, measurement-pinned; public claims about Vana's access match what the node agent can do. No per-user CVM trigger is defined; revisit only if a regulator or Anna's review requires it. Spike 3 (2026-09-02, dstack 0.5.9) fixed the shape: one gVisor `runsc` (ptrace platform) sandbox per user, launched by a small trusted management container that holds the sockets; the sandbox runs as uid 1000 with zero capabilities, read-only root, a 256 MiB tmpfs, and no dstack or Docker socket. Sysbox works for nested Docker but gVisor does not nest inside it on 0.5.9. `runsc` and the PS image are baked and pinned in the compose.
 14. **No data-key rotation in v1**, by decision. See Compromise and rotation.
@@ -53,7 +53,7 @@ The master signature stays the root of every data key in v1 by decision (see Com
 
 19. **Activate on the Gateway row.** Enclave serves once the row exists, marked `confirming`; rolled back if the chain rejects. A job served under a row the chain later rejects is bounded by the owner signature existing.
 20. **Queue on Vercel accepted** with conditions: the wake experiment runs through it. Trigger for a dedicated queue: p95 submit-to-claim above 2 s, sustained 50 jobs/min, or Neon connection exhaustion.
-21. **dstack verified.** Spikes 0 to 3 (2026-09-02, Phala Cloud, dstack 0.5.9; `docs/260902-enclave-spike-results.md`): same wallet and sealing key on a second CVM under one `app_id` and across a compose change; different `app_id` gives a different wallet; a master signature sealed on node A unsealed on node B in 4.9 ms and decrypted a real SDK blob, and the wrong user id failed AAD; gVisor sandbox cold start to `/health` 7.5 s p50, 7.7 s p95 (warm image, PS boot dominated); 119 MiB idle and 136 MiB active per sandbox, a RAM-only ceiling of 240 per `tdx.2xlarge`. Still unverified: hydration for 1 MB and 50 MB owners (needs a non-production Gateway and storage reachable from the CVM), concurrent density, and the wake chain through a Vercel preview.
+21. **dstack verified.** Spikes 0 to 3 (2026-09-02, Phala Cloud, dstack 0.5.9; `docs/260902-enclave-spike-results.md`): same wallet and sealing key on a second CVM under one `app_id` and across a compose change; different `app_id` gives a different wallet; a master signature sealed on node A unsealed on node B in 4.9 ms and decrypted a real SDK blob, and the wrong user id failed AAD; gVisor sandbox cold start to `/health` 7.5 s p50, 7.7 s p95 (warm image, PS boot dominated); 119 MiB idle and 136 MiB active per sandbox, a RAM-only ceiling of 240 per `tdx.2xlarge`. Hydration measured against Moksha (`dp-rpc-dev`, `storage.vana.org`, 1 vCPU): start to sync complete 11.7 s p50 / 15.3 s p95 for 1 MB, 60.7 s p50 / 65.4 s p95 for 50 MB; `/health` answers at about 10 s in both cases, so readiness gates on sync complete, not `/health`. Queue measured on a Vercel preview with a Neon branch (2026-09-02): submit→claim p95 1.6 s at 50 jobs/min with three workers, 3 Neon connections, orphaned job recovered in 15 s; decision 20 stands. Still unverified: concurrent density and the chained wake experiment.
 22. **Manual scaling.** Operator scripts in `personal-server-ts` provision CVMs with dstack tooling and admit or drain them through Gateway operator-only endpoints. No Fleet Director. `data-gateway` has no admin UI; `apps/metrics` is product analytics, not a Gateway console.
 23. **All enclave code in `personal-server-ts`.** No new repo. Agent and PS image ship in one compose, one approved hash.
 24. **Key reuse.** Registered secp256k1 keys serve as ECIES inbox (enclave) and result key (builder). Already shipped in the SDK. Separate keys deferred unless review finds a concrete flaw.
@@ -62,7 +62,7 @@ The master signature stays the root of every data key in v1 by decision (see Com
 
 ### Requires sign-off: reversal of the June browser-PS decision
 
-In June the PS stayed in the browser so Vana never holds user data on its own machines. This design reverses that: Vana-operated hardware holds plaintext transiently inside an attested sandbox and holds the sealed data-unlock secret durably; Vana cannot read either outside the enclave, but Vana operates the enclave and the KMS is Phala's. Consent copy must state the revocation guarantee: revoking deletes Vana's sealed copy of the secret and retires the identity. That guarantee is operational (deletion plus node-agent refusal), not cryptographic; dstack cannot revoke a deterministic key. Anna signs off before this note is final.
+In June the PS stayed in the browser so Vana never holds user data on its own machines. This design reverses that: Vana-operated hardware holds plaintext transiently inside an attested sandbox and holds the sealed data-unlock secret durably; Vana cannot read either outside the enclave, but Vana operates the enclave and the KMS is Phala's. Consent copy must state the revocation guarantee: revoking deletes Vana's sealed copy of the secret and retires the identity. That guarantee is operational (Gateway deletion of the sealed secret plus the seal floor; the jobs path has no agent-side epoch check in v1), not cryptographic; dstack cannot revoke a deterministic key. Anna signs off before this note is final.
 
 ## Components
 
@@ -78,7 +78,7 @@ In June the PS stayed in the browser so Vana never holds user data on its own ma
 
 ## Identity and keys
 
-**Enclave wallet.** `userPsId = keccak256("vana.ps-enclave.v1" || chainId || ownerAddress)`. The node key agent calls dstack v0 `getKey(path)` with `users/{userPsId}/wallet/ethereum/secp256k1/v1`. Verified upstream (Spike 0, `docs/260902-enclave-spike-results.md`): KMS derives the app root key from its root and `app_id` only; the guest derives `HKDF-SHA256(app_root, path)`. `purpose` and `algorithm` do not enter the KDF, so the path string is the only separation. Every CVM with the same `app_id` recovers the same wallet; `compose_hash` and `instance_id` are not inputs. Pin SDK `@phala/dstack-sdk` 0.5.8 and dstack OS 0.5.x: the 0.6 `/v1` API uses a different KDF, so an OS major bump is a re-provisioning event, not a rolling upgrade. Wallet bytes are the raw 32-byte key (not `toViemAccountSecure`), recorded once and never changed.
+**Enclave wallet.** `userPsId = keccak256("vana.ps-enclave.v1" || chainId || ownerAddress)`. The node key agent calls dstack v0 `getKey(path)` with `users/{userPsId}/wallet/ethereum/secp256k1/v{epoch}`. Verified upstream (Spike 0, `docs/260902-enclave-spike-results.md`): KMS derives the app root key from its root and `app_id` only; the guest derives `HKDF-SHA256(app_root, path)`. `purpose` and `algorithm` do not enter the KDF, so the path string is the only separation. Every CVM with the same `app_id` recovers the same wallet; `compose_hash` and `instance_id` are not inputs. Pin SDK `@phala/dstack-sdk` 0.5.8 and dstack OS 0.5.x: the 0.6 `/v1` API uses a different KDF, so an OS major bump is a re-provisioning event, not a rolling upgrade. Wallet bytes are the raw 32-byte key (not `toViemAccountSecure`), recorded once and never changed.
 
 `app_id` is a namespace, not proof of code. Separately require attestation, approved OS image, approved `compose_hash`, pinned image digests. Two ways to pin `app_id`: Phala KMS (`--custom-app-id` with a nonce; Phala's control plane approves compose changes for the workspace) or on-chain KMS (`app_id` is a `DstackApp` contract address; the contract owner calls `addComposeHash`/`removeComposeHash`, and several hashes can be live for rolling upgrades). Decision 26 picks. Second and later nodes are `phala cvms replicate`, not fresh deploys. Persist only public data. Never derive this wallet from the master signature: desktop holds that secret and could impersonate the enclave.
 
@@ -86,7 +86,7 @@ In June the PS stayed in the browser so Vana never holds user data on its own ma
 
 **Data root.** Scope keys derive from the raw 65-byte `vana-master-key-v1` signature (`vana-sdk/.../crypto/keys/derive.ts`), not from any wallet. A different signature strands every blob, so the enclave needs the exact bytes. Desktop already ships them as `VANA_MASTER_KEY_SIGNATURE`.
 
-**Sealing.** The owner surface delivers the signature over an attested channel. Inside the TEE: random per-user content key encrypts the signature; `GetKey("users/{userPsId}/secrets/master-signature/v1")` wraps the content key. Ciphertext is bound to `userPsId` as AAD so a node cannot be tricked into unsealing user A's secret for user B's sandbox. Only ciphertext persists. Wallet path and sealing path are domain-separated. Envelope form makes vendor exit one re-wrap job. On wake the node unwraps in memory and injects `VANA_MASTER_KEY_SIGNATURE` into the sandbox only.
+**Sealing.** The owner surface delivers the signature over an attested channel. Inside the TEE: random per-user content key encrypts the signature; `GetKey("users/{userPsId}/secrets/master-signature/v{epoch}")` wraps the content key. Ciphertext is bound to `${userPsId}/${epoch}` as AAD so a node cannot be tricked into unsealing user A's secret for user B's sandbox. Only ciphertext persists. Wallet path and sealing path are domain-separated. Envelope form makes vendor exit one re-wrap job. On wake the node unwraps in memory and injects `VANA_MASTER_KEY_SIGNATURE` into the sandbox only.
 
 **PS changes required** (`packages/server/src/bootstrap.ts:196-226`): PS never deletes the variable from `process.env` and keeps the raw signature in a closure; the dev UI (default on) serves it to the browser as `psLiteBootstrap`; frpc inherits the full env; `VANA_OWNER_PRIVATE_KEY` is a second secret. The enclave profile disables dev UI and tunnel, scrubs env, never sets the owner key, and any future subprocess uses an allowlisted env, separate UID, restricted `/proc`. JavaScript cannot zeroize; sandbox destruction is the final boundary.
 
@@ -180,7 +180,8 @@ Today: `/health` is process health only and green during reconciliation; PS neve
 2. Node answers a nonce challenge; verifier checks quote, OS/TCB, `app_id`, `compose_hash`, transport key, KMS-root fingerprint.
 3. Node verifies the PS image, runs a KMS derivation canary, heartbeats `ready`.
 4. Operator admits. Gateway alone reserves capacity.
-5. Drain: stop claims, finish, wipe, destroy.
+5. Drain: stop claims, finish, wipe, destroy. Drain is graceful; only a removed node loses its leases (heartbeats refused), which is the recovery lever.
+6. Rolling a compose change: update each CVM in place (`phala deploy --cvm-id`, same `app_id`, so the KMS key and sealed identities survive), register it under a new node id (heartbeats match on `compose_hash`), admit, then drain and remove the old id. A replica inherits its source compose, so replication cannot carry a compose change.
 
 Today: no node, admission, or capacity state exists. KMS authorization and Gateway admission are separate gates; a wrong KMS root looks healthy but derives every wallet wrong, hence the canary. Outer-CVM attestation does not approve the PS image the agent pulls; image digest pinning does.
 
@@ -215,7 +216,7 @@ deploy/dstack        + CVM compose pinning agent + PS digests
 scripts/tee          + provision, admit, drain, list
 ```
 
-Dependency direction: `enclave` imports `server` and `core` public APIs; nothing in `core` or `server` imports `enclave` or touches the dstack socket. The sandbox never receives the dstack socket, host filesystem, Docker socket, or another user's mounts.
+Dependency direction: `enclave` imports only the SDK, viem, noble and the dstack client; it launches the server image by path and never imports `core` or `server`; nothing in `core` or `server` imports `enclave` or touches the dstack socket. The sandbox never receives the dstack socket, host filesystem, Docker socket, or another user's mounts.
 
 ### data-gateway
 
@@ -297,14 +298,18 @@ blobs                = no conditional PUT needed in v1 (single executor per user
 ## Sequencing
 
 1. Derisking slice: `packages/enclave`, enclave profile, `api/v1/jobs`, `api/v1/tee-nodes`, `protocol/jobs`. One node, one test user, one scripted builder, one raw read, sandbox recreated on a second node mid-test.
-2. Identity and consent: `api/v1/identity`, Account signing, consent and Personal Server screens.
+2. Identity and consent: `api/v1/identity`, Account signing, consent and Personal Server screens. Follow-up before GA, not blocking the e2e release: Web external-wallet owners (decision 5) need an Account signing exchange open to Web sessions or a ciphertext-only signing route; v1 Web refuses them (identity contract, section 6.12).
 3. Builder migration: SDK envelope and job flow, DCR to Gateway URL, contracts V3.
-4. Inference: intents, derived-scope grants, DCAP wired, rate limits, receipts.
+4. Inference: intents, derived-scope grants, DCAP wired, rate limits, receipts, on-chain revocation check over RPC with the 5 min Gateway-state staleness fallback (decision 9; the derisking slice checks Gateway `revokedAt` only).
 5. Deprecations.
 
 ### Wake experiment
 
-Done in parts on 2026-09-02 (Spikes 1 to 4, `docs/260902-enclave-spike-results.md`): derivation identical across CVMs and compose updates; local queue submit → claim p95 220 ms at 50 jobs/min with 3 workers, `?wait=25` result p95 534 ms; sandbox cold start 7.5 s p50. Remaining: the same queue numbers on a Vercel preview with a Neon branch (commands in RESULTS.md), and hydration timing with a reachable non-production Gateway and storage. Those two runs close decision 20 and the cold-start estimate.
+Done in parts on 2026-09-02 (Spikes 1 to 4, `docs/260902-enclave-spike-results.md`): derivation identical across CVMs and compose updates; local queue submit → claim p95 220 ms at 50 jobs/min with 3 workers, `?wait=25` result p95 534 ms; sandbox cold start 7.5 s p50. Hydration measured 2026-09-02 (50 MB owner: 65 s p95 to sync complete on 1 vCPU). Queue on a Vercel preview measured the same day (submit→claim p95 1.6 s at 50/min, three workers); decision 20's trigger did not fire, with little margin. Remaining: the chained run (job through the preview queue to a CVM sandbox) once the node agent and job routes are real code.
+
+**Identity flow verified end to end (2026-09-03).** Node agent (`packages/enclave`, registry-free compose in `deploy/dstack`) on two Phala CVMs under one `app_id`, Gateway preview (`api/v1/identity`) with a Neon branch, scripted owner (`scripts/e2e-identity.ts`): prepare, evidence verify against the live KMS root, V2 registration, sealed delivery, idempotency, three negatives, revoke to epoch 2, all pass; a delivery encrypted to node A's evidence key was unsealed by node B through product code. Agent boot to healthy 124 s including CVM boot (install at boot; production pins an image digest). **Chained wake measured (2026-09-03, level B for jobs).** A builder's raw-read job submitted to the Gateway preview was claimed by a node agent on a Phala CVM, which unsealed the owner's signature, booted a gVisor sandbox, hydrated from Moksha, executed the read and returned an encrypted result: cold 22 s mean (19 to 26 s), warm 1.3 s in an already-booted sandbox. Details and defects in `260903-jobs-contract.md`. Still unverified: concurrent density.
+
+**Full e2e passed (2026-09-04).** Real Privy owner (web + Account, Level C identity and owner-signed grant), registered builder, `POST /v1/jobs` on a Gateway preview, gVisor sandbox on a Phala CVM hydrating from the Moksha dev storage host, ECIES result decrypted by the builder: cold 34.8 s, warm 2.1 s; a real builder app (Lorebook) read the same grant through the SDK jobs client in 13 s. Density on `tdx.2xlarge`: 20 concurrent cold sandboxes, 20 of 20 in p95 25 s, so decision 13's `SANDBOX_MAX=20` holds. Details in `docs/260903-jobs-contract.md`.
 
 ## Open
 
@@ -312,7 +317,7 @@ Done in parts on 2026-09-02 (Spikes 1 to 4, `docs/260902-enclave-spike-results.m
 
 Resolved 2026-09-02: owner-approved question intents; blob reads stay public; sealed ciphertext in Gateway Postgres; raw-read version pinned at admission; attestation via Gateway admission plus KMS cert chain; no second wrap; 5 min revocation staleness window.
 
-Step 2 contract (endpoints, SDK types, tables, signing intents, PR order): `260902-identity-contract.md`. Resolved there 2026-09-02: identity endpoints unauthenticated in v1; sealing AAD and key paths carry the epoch; Gateway mirrors SDK identity types with a devDependency shape test.
+Step 2 contract (endpoints, SDK types, tables, signing intents, PR order): `260902-identity-contract.md`. Step 1 slice contract (jobs, tee-nodes, sandbox lifecycle, worker, e2e): `260903-jobs-contract.md`. Resolved there 2026-09-02: identity endpoints unauthenticated in v1; sealing AAD and key paths carry the epoch; Gateway mirrors SDK identity types with a devDependency shape test.
 
 ## Review log
 
