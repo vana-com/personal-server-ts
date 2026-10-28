@@ -26,7 +26,7 @@
 import { generateMcpGrantee } from "./grantee.js";
 import { createGrantContract } from "../contracts/index.js";
 import { isWriteScopeEntry, WRITE_SCOPE_PREFIX } from "../policy/data-write.js";
-import { isSystemScope } from "../policy/reserved-scopes.js";
+import { isMemoryScope, isSystemScope } from "../policy/reserved-scopes.js";
 import {
   ScopeSchema,
   type DataPortabilityGatewayConfig,
@@ -674,8 +674,8 @@ function requirePendingScopeRequest(
 
 /**
  * A scope the owner may approve on a connection: a read scope the SDK accepts,
- * or `write:` plus a concrete one (never a wildcard: a memory write grant names
- * the one scope the agent saves into).
+ * or `write:` plus one concrete agent-memory scope (`memory.<app>`, never a
+ * wildcard). MCP clients only ever write memories.
  */
 function isApprovableScope(scope: string): boolean {
   if (!isWriteScopeEntry(scope)) return ScopeSchema.safeParse(scope).success;
@@ -683,6 +683,7 @@ function isApprovableScope(scope: string): boolean {
   return (
     !target.includes("*") &&
     !isSystemScope(target) &&
+    isMemoryScope(target) &&
     ScopeSchema.safeParse(target).success
   );
 }

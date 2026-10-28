@@ -258,10 +258,16 @@ describe("MCP remember tool", () => {
       scope: string;
       data: Record<string, unknown>;
     };
-    expect(envelope.data.memories).toEqual([
+    // Stored as a PDPP records body; each record names the agent that wrote it.
+    expect(Object.keys(envelope.data).sort()).toEqual([
+      WRITER_ATTRIBUTION_KEY,
+      "records",
+    ]);
+    expect(envelope.data.records).toEqual([
       expect.objectContaining({
         id: result.payload.id,
-        text: "Prefers TypeScript and pnpm for new projects.",
+        content: "Prefers TypeScript and pnpm for new projects.",
+        written_by: t.granteeAddress,
       }),
     ]);
     const writtenBy = envelope.data[WRITER_ATTRIBUTION_KEY] as {
@@ -303,11 +309,132 @@ describe("MCP remember tool", () => {
     expect(replaced.isError).toBe(false);
     expect(replaced.payload).toMatchObject({ replaced: true, memoryCount: 2 });
     const envelope = (await (await t.ownerRead(MEMORY_SCOPE)).json()) as {
-      data: { memories: Array<{ text: string; key?: string }> };
+      data: { records: Array<{ id: string; content: string; key?: string }> };
     };
-    expect(envelope.data.memories.map((m) => m.text)).toEqual([
+    expect(envelope.data.records.map((m) => m.content)).toEqual([
       "Works on the Personal Server.",
       "Editor: Zed.",
+    ]);
+  });
+
+  it("keeps a memory's id when a save under the same key replaces it", async () => {
+    const t = await setup([`write:${MEMORY_SCOPE}`]);
+
+    const first = await t.callTool("remember", {
+      scope: MEMORY_SCOPE,
+      text: "Editor: VS Code.",
+      key: "editor",
+    });
+    const second = await t.callTool("remember", {
+      scope: MEMORY_SCOPE,
+      text: "Editor: Zed.",
+      key: "editor",
+    });
+
+    expect(second.payload.id).toBe(first.payload.id);
+  });
+
+  it("does not save the same memory twice", async () => {
+    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const first = await t.callTool("remember", { text: "Lives in Poland." });
+
+    const again = await t.callTool("remember", { text: "Lives in Poland." });
+
+    expect(again.isError).toBe(false);
+    expect(again.payload).toMatchObject({
+      saved: false,
+      duplicate: true,
+      id: first.payload.id,
+    });
+    const envelope = (await (await t.ownerRead(MEMORY_SCOPE)).json()) as {
+      data: { records: unknown[] };
+    };
+    expect(envelope.data.records).toHaveLength(1);
+  });
+
+  it("forgets a memory by key, and reports a miss without writing", async () => {
+    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    await t.callTool("remember", { text: "Editor: Zed.", key: "editor" });
+    const kept = await t.callTool("remember", { text: "Lives in Poland." });
+
+    const forgotten = await t.callTool("forget", { key: "editor" });
+    const miss = await t.callTool("forget", { key: "editor" });
+
+    expect(forgotten.payload).toMatchObject({
+      forgotten: true,
+      memoryCount: 1,
+    });
+    expect(miss.isError).toBe(true);
+    expect(miss.payload.error).toBe("not_found");
+    const envelope = (await (await t.ownerRead(MEMORY_SCOPE)).json()) as {
+      data: { records: Array<{ id: string }> };
+    };
+    expect(envelope.data.records.map((r) => r.id)).toEqual([kept.payload.id]);
+  });
+
+  it("only saves into memory.<app> scopes, whatever else the connection may write", async () => {
+    const t = await setup(["write:notes.daily"]);
+
+    const result = await t.callTool("remember", {
+      scope: "notes.daily",
+      text: "should not land",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.payload.error).toBe("scope_not_memory");
+  });
+
+  it("forgets only the record matching both id and key when both are given", async () => {
+    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const editor = await t.callTool("remember", {
+      text: "Editor: Zed.",
+      key: "editor",
+    });
+    const city = await t.callTool("remember", {
+      text: "City: Kraków.",
+      key: "city",
+    });
+
+    const result = await t.callTool("forget", {
+      id: city.payload.id,
+      key: "editor",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.payload.error).toBe("not_found");
+    const envelope = (await (await t.ownerRead(MEMORY_SCOPE)).json()) as {
+      data: { records: Array<{ id: string }> };
+    };
+    expect(envelope.data.records.map((r) => r.id)).toEqual([
+      editor.payload.id,
+      city.payload.id,
+    ]);
+  });
+
+  it("converts an earlier memories list to records, keeping ids", async () => {
+    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    expect(
+      (
+        await t.ownerWrite(MEMORY_SCOPE, {
+          memories: [
+            {
+              id: "legacy-1",
+              text: "Prefers pnpm.",
+              savedAt: "2026-10-27T10:00:00.000Z",
+            },
+          ],
+        })
+      ).status,
+    ).toBe(201);
+
+    await t.callTool("remember", { text: "Lives in Poland." });
+
+    const envelope = (await (await t.ownerRead(MEMORY_SCOPE)).json()) as {
+      data: { records: Array<{ id: string; content: string }> };
+    };
+    expect(envelope.data.records.map((r) => [r.id, r.content])).toEqual([
+      ["legacy-1", "Prefers pnpm."],
+      [expect.any(String), "Lives in Poland."],
     ]);
   });
 

@@ -1,4 +1,4 @@
-import { isSystemScope } from "../policy/reserved-scopes.js";
+import { isMemoryScope, isSystemScope } from "../policy/reserved-scopes.js";
 /**
  * MCP tool surface. Phase 1 / §4 of 260604-PLAN-vana-mcp-personal-server.md.
  *
@@ -2014,21 +2014,32 @@ const getScopeFile: McpToolDefinition = {
 };
 
 const REMEMBER_TOOL = "remember";
+const FORGET_TOOL = "forget";
 const REMEMBER_TEXT_MAX_CHARS = 4_000;
 const REMEMBER_KEY_MAX_CHARS = 128;
+const MEMORY_ID_MAX_CHARS = 64;
 /**
- * Every save rewrites the scope's whole memory list (one stored version per
- * save), so the list is bounded to keep each write and each recall small.
+ * Every save stores a new snapshot of the scope's record list, so the list is
+ * bounded by size rather than count. Sync publishes only the newest snapshot of
+ * a memory scope (see `isCoalescedScope` in sync/workers/upload.ts).
  */
-export const MAX_MEMORIES_PER_SCOPE = 1_000;
+export const MEMORY_SCOPE_MAX_BYTES = 20 * 1024 * 1024;
 
-/** One saved memory, as stored in a memory scope's `memories` list. */
-export interface StoredMemory {
+/**
+ * One saved memory: a row of the scope's PDPP `{ records: [...] }` body. Field
+ * names follow the `chatgpt.memories` stream (id, content, created_at,
+ * updated_at) so one declaration can cover both. `id` is stable for the life
+ * of the memory, including when a save under the same `key` replaces it.
+ */
+export interface MemoryRecord {
   id: string;
-  text: string;
-  savedAt: string;
-  /** Saving again under the same key replaces the earlier memory. */
+  content: string;
+  created_at: string;
+  updated_at: string;
+  /** Saving again under the same key replaces this memory. */
   key?: string;
+  /** Address of the agent connection that last wrote this memory. */
+  written_by: string | null;
 }
 
 class RememberRefusal extends Error {
@@ -2038,33 +2049,185 @@ class RememberRefusal extends Error {
   }
 }
 
+/** A save that would only repeat a memory the scope already holds. */
+class DuplicateMemory extends Error {
+  constructor(public readonly record: MemoryRecord) {
+    super("duplicate memory");
+    this.name = "DuplicateMemory";
+  }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
- * The memory list of a stored record. A memory scope holds exactly
- * `{ memories: [...] }`; anything else was written by someone else and is
- * never overwritten by `remember`.
+ * The memory records of a stored body. A memory scope holds exactly
+ * `{ records: [...] }` of memory rows, or the earlier `{ memories: [...] }`
+ * list, which is converted here (ids kept). Anything else was written by
+ * someone else and is never overwritten.
  */
-function storedMemories(
+function storedMemoryRecords(
   scope: string,
   data: Record<string, unknown>,
-): StoredMemory[] {
-  const memories = data.memories;
-  const isMemoryList =
-    Object.keys(data).every((key) => key === "memories") &&
-    Array.isArray(memories) &&
-    memories.every(
+): MemoryRecord[] {
+  const keys = Object.keys(data);
+  if (
+    keys.length === 1 &&
+    Array.isArray(data.records) &&
+    data.records.every(
+      (row) =>
+        isPlainRecord(row) &&
+        typeof row.id === "string" &&
+        typeof row.content === "string",
+    )
+  ) {
+    return data.records as MemoryRecord[];
+  }
+  if (
+    keys.length === 1 &&
+    Array.isArray(data.memories) &&
+    data.memories.every(
       (item) =>
-        typeof item === "object" &&
-        item !== null &&
-        typeof (item as { text?: unknown }).text === "string",
-    );
-  if (!isMemoryList) {
-    throw new RememberRefusal({
-      error: "scope_not_memory",
-      scope,
-      message: `Scope ${scope} holds data that is not a memory list; remember will not overwrite it. Save into another write scope.`,
+        isPlainRecord(item) &&
+        typeof item.id === "string" &&
+        typeof item.text === "string",
+    )
+  ) {
+    return (data.memories as Array<Record<string, unknown>>).map((item) => {
+      const at = typeof item.savedAt === "string" ? item.savedAt : "";
+      return {
+        id: item.id as string,
+        content: item.text as string,
+        created_at: at,
+        updated_at: at,
+        ...(typeof item.key === "string" ? { key: item.key } : {}),
+        written_by: null,
+      };
     });
   }
-  return memories as StoredMemory[];
+  throw new RememberRefusal({
+    error: "scope_not_memory",
+    scope,
+    message: `Scope ${scope} holds data that is not a memory list; it will not be changed. Use another write scope.`,
+  });
+}
+
+/**
+ * The scope a memory tool acts on and the grant that covers it, or the error
+ * result to return. A call may omit `scope` when the connection can write to
+ * exactly one scope.
+ */
+function resolveMemoryTarget(
+  args: Record<string, unknown>,
+  connection: McpConnectionRecord,
+): { scope: string; grantId: string } | { error: McpToolResult } {
+  const writableScopes = uniqueWritableScopes(connection);
+  const namedScope = typeof args.scope === "string" ? args.scope.trim() : "";
+  const onlyScope =
+    writableScopes.length === 1 && !writableScopes[0]!.includes("*")
+      ? writableScopes[0]!
+      : "";
+  const scope = namedScope || onlyScope;
+  if (!scope) {
+    return {
+      error: textResult(
+        {
+          error: "scope_required",
+          writableScopes,
+          message:
+            writableScopes.length === 0
+              ? 'This connection cannot save memories. Call request_scope_access with scopes ["write:memory.<app>"] and ask the user to approve it.'
+              : "Name the scope; this connection can write to more than one.",
+        },
+        true,
+      ),
+    };
+  }
+  if (!isMemoryScope(scope)) {
+    return {
+      error: textResult(
+        {
+          error: "scope_not_memory",
+          scope,
+          message: `Memories live in memory.<app> scopes; ${scope} is not one.`,
+        },
+        true,
+      ),
+    };
+  }
+  const grant = resolveWriteGrantForScope(connection, scope);
+  if (!grant) {
+    const requestScope = `${WRITE_SCOPE_PREFIX}${scope}`;
+    return {
+      error: textResult(
+        {
+          error: "scope_not_granted",
+          scope,
+          requestScope,
+          writableScopes,
+          message: `This connection may not write to ${scope}. Call request_scope_access with scopes ["${requestScope}"] and ask the user to approve it.`,
+        },
+        true,
+      ),
+    };
+  }
+  return { scope, grantId: grant.grantId };
+}
+
+const WRITE_UNAVAILABLE = textResult(
+  {
+    error: "write_unavailable",
+    message: "This Personal Server does not accept MCP writes.",
+  },
+  true,
+);
+
+/** Map a refused or failed memory write to the tool's error result. */
+function memoryWriteError(err: unknown, scope: string): McpToolResult {
+  if (err instanceof RememberRefusal) return textResult(err.body, true);
+  if (err instanceof McpDataWriteError) {
+    const body = err.body as {
+      error?: { errorCode?: string; message?: string } | string;
+      message?: string;
+    } | null;
+    const detail =
+      typeof body?.error === "object" && body.error !== null
+        ? body.error
+        : { errorCode: body?.error, message: body?.message };
+    return textResult(
+      {
+        error:
+          err.status === 401 || err.status === 403
+            ? "unauthorized"
+            : err.status === 412
+              ? "write_conflict"
+              : "write_failed",
+        status: err.status,
+        scope,
+        ...(detail.errorCode ? { errorCode: detail.errorCode } : {}),
+        ...(detail.message ? { message: detail.message } : {}),
+      },
+      true,
+    );
+  }
+  throw err;
+}
+
+function memoryBody(records: MemoryRecord[], scope: string) {
+  const body = { records };
+  if (
+    new TextEncoder().encode(JSON.stringify(body)).byteLength >
+    MEMORY_SCOPE_MAX_BYTES
+  ) {
+    throw new RememberRefusal({
+      error: "memory_full",
+      scope,
+      limitBytes: MEMORY_SCOPE_MAX_BYTES,
+      message: `Scope ${scope} is full. Forget or replace memories to make room.`,
+    });
+  }
+  return body;
 }
 
 const remember: McpToolDefinition = {
@@ -2092,8 +2255,8 @@ const remember: McpToolDefinition = {
       .describe("Saving again with the same key replaces the memory."),
   },
   async handler(args, { connection, writeClient }) {
-    const text = typeof args.text === "string" ? args.text.trim() : "";
-    if (!text) {
+    const content = typeof args.text === "string" ? args.text.trim() : "";
+    if (!content) {
       return textResult(
         { error: "invalid_arguments", message: "text must not be empty." },
         true,
@@ -2103,124 +2266,131 @@ const remember: McpToolDefinition = {
       typeof args.key === "string" && args.key.trim()
         ? args.key.trim()
         : undefined;
-    const writableScopes = uniqueWritableScopes(connection);
-    const namedScope = typeof args.scope === "string" ? args.scope.trim() : "";
-    const onlyScope =
-      writableScopes.length === 1 && !writableScopes[0]!.includes("*")
-        ? writableScopes[0]!
-        : "";
-    const scope = namedScope || onlyScope;
-    if (!scope) {
-      return textResult(
-        {
-          error: "scope_required",
-          writableScopes,
-          message:
-            writableScopes.length === 0
-              ? 'This connection cannot save memories. Call request_scope_access with scopes ["write:memory.<app>"] and ask the user to approve it.'
-              : "Name the scope to save into; this connection can write to more than one.",
-        },
-        true,
-      );
-    }
+    const target = resolveMemoryTarget(args, connection);
+    if ("error" in target) return target.error;
+    const { scope, grantId } = target;
+    if (!writeClient) return WRITE_UNAVAILABLE;
 
-    const grant = resolveWriteGrantForScope(connection, scope);
-    if (!grant) {
-      const requestScope = `${WRITE_SCOPE_PREFIX}${scope}`;
-      return textResult(
-        {
-          error: "scope_not_granted",
-          scope,
-          requestScope,
-          writableScopes,
-          message: `This connection may not save into ${scope}. Call request_scope_access with scopes ["${requestScope}"] and ask the user to approve it.`,
-        },
-        true,
-      );
-    }
-    if (!writeClient) {
-      return textResult(
-        {
-          error: "write_unavailable",
-          message: "This Personal Server does not accept MCP writes.",
-        },
-        true,
-      );
-    }
-
-    const memory: StoredMemory = {
-      id: crypto.randomUUID(),
-      text,
-      savedAt: new Date().toISOString(),
-      ...(key ? { key } : {}),
-    };
+    const now = new Date().toISOString();
+    let saved: MemoryRecord | undefined;
     let replaced = false;
     let memoryCount = 0;
     try {
       await writeClient.updateScope({
         scope,
-        grantId: grant.grantId,
+        grantId,
         update(current) {
-          const existing =
-            current.data === null ? [] : storedMemories(scope, current.data);
-          const kept = key
-            ? existing.filter((item) => item.key !== key)
-            : existing;
-          if (kept.length >= MAX_MEMORIES_PER_SCOPE) {
-            throw new RememberRefusal({
-              error: "memory_full",
-              scope,
-              limit: MAX_MEMORIES_PER_SCOPE,
-              message: `Scope ${scope} already holds ${MAX_MEMORIES_PER_SCOPE} memories. Replace one by key instead.`,
-            });
+          const records =
+            current.data === null
+              ? []
+              : storedMemoryRecords(scope, current.data);
+          const previous = key
+            ? records.find((record) => record.key === key)
+            : undefined;
+          if (!key) {
+            const same = records.find((record) => record.content === content);
+            if (same) throw new DuplicateMemory(same);
           }
-          replaced = kept.length !== existing.length;
+          replaced = previous !== undefined;
+          saved = {
+            id: previous?.id ?? crypto.randomUUID(),
+            content,
+            created_at: previous?.created_at ?? now,
+            updated_at: now,
+            ...(key ? { key } : {}),
+            written_by: connection.granteeAddress,
+          };
           // Newest last: a replaced memory moves to the end, so list order is
           // the order the memories were last saved in.
-          const memories = [...kept, memory];
-          memoryCount = memories.length;
-          return { memories };
+          const next = [
+            ...records.filter((record) => record !== previous),
+            saved,
+          ];
+          memoryCount = next.length;
+          return memoryBody(next, scope);
         },
       });
     } catch (err) {
-      if (err instanceof RememberRefusal) return textResult(err.body, true);
-      if (err instanceof McpDataWriteError) {
-        const body = err.body as {
-          error?: { errorCode?: string; message?: string } | string;
-          message?: string;
-        } | null;
-        const detail =
-          typeof body?.error === "object" && body.error !== null
-            ? body.error
-            : { errorCode: body?.error, message: body?.message };
-        return textResult(
-          {
-            error:
-              err.status === 401 || err.status === 403
-                ? "unauthorized"
-                : err.status === 412
-                  ? "write_conflict"
-                  : "write_failed",
-            status: err.status,
-            scope,
-            ...(detail.errorCode ? { errorCode: detail.errorCode } : {}),
-            ...(detail.message ? { message: detail.message } : {}),
-          },
-          true,
-        );
+      if (err instanceof DuplicateMemory) {
+        return textResult({
+          saved: false,
+          duplicate: true,
+          scope,
+          id: err.record.id,
+          message: "This memory is already saved.",
+        });
       }
-      throw err;
+      return memoryWriteError(err, scope);
     }
 
     return textResult({
       saved: true,
       scope,
-      id: memory.id,
-      savedAt: memory.savedAt,
+      id: saved!.id,
+      savedAt: saved!.updated_at,
       ...(key ? { key } : {}),
       replaced,
       memoryCount,
     });
+  },
+};
+
+const forget: McpToolDefinition = {
+  name: FORGET_TOOL,
+  title: "Forget",
+  description:
+    "Delete a saved memory by id or key. Needs a write:<scope> grant.",
+  inputSchema: {
+    id: z.string().min(1).max(MEMORY_ID_MAX_CHARS).optional(),
+    key: z.string().min(1).max(REMEMBER_KEY_MAX_CHARS).optional(),
+    scope: z.string().min(1).max(SEARCH_SCOPE_MAX_CHARS).optional(),
+  },
+  async handler(args, { connection, writeClient }) {
+    const id = typeof args.id === "string" ? args.id.trim() : "";
+    const key = typeof args.key === "string" ? args.key.trim() : "";
+    if (!id && !key) {
+      return textResult(
+        { error: "invalid_arguments", message: "Pass id or key." },
+        true,
+      );
+    }
+    const target = resolveMemoryTarget(args, connection);
+    if ("error" in target) return target.error;
+    const { scope, grantId } = target;
+    if (!writeClient) return WRITE_UNAVAILABLE;
+
+    let forgotten: string[] = [];
+    let memoryCount = 0;
+    try {
+      await writeClient.updateScope({
+        scope,
+        grantId,
+        update(current) {
+          const records =
+            current.data === null
+              ? []
+              : storedMemoryRecords(scope, current.data);
+          // With both id and key, a record must match both.
+          const matches = (record: MemoryRecord) =>
+            (!id || record.id === id) && (!key || record.key === key);
+          const keep = records.filter((record) => !matches(record));
+          if (keep.length === records.length) {
+            throw new RememberRefusal({
+              error: "not_found",
+              scope,
+              message: "No saved memory matches that id or key.",
+            });
+          }
+          // Reset on every attempt: a 412 retry re-runs this callback.
+          forgotten = records.filter(matches).map((record) => record.id);
+          memoryCount = keep.length;
+          return memoryBody(keep, scope);
+        },
+      });
+    } catch (err) {
+      return memoryWriteError(err, scope);
+    }
+    return textResult({ forgotten: true, scope, ids: forgotten, memoryCount });
   },
 };
 
@@ -2233,4 +2403,5 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
   getScopeFile,
   searchPersonalContext,
   remember,
+  forget,
 ] as const;

@@ -73,6 +73,13 @@ function makeSchema(): Schema {
   };
 }
 
+/** Wire `listVersions` to return the given versions of their scope. */
+function withVersions(deps: UploadWorkerDeps, versions: IndexEntry[]): void {
+  deps.storage.listVersions = vi.fn((scope: string) =>
+    versions.filter((entry) => entry.scope === scope),
+  );
+}
+
 function makeMockDeps(): UploadWorkerDeps {
   const mockStorage: Partial<DataStoragePort> = {
     findUnsynced: vi.fn().mockReturnValue([]),
@@ -356,6 +363,218 @@ describe("upload worker", () => {
       });
       expect(results).toHaveLength(3);
       expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(3);
+    });
+
+    it("publishes only the newest unsynced snapshot of a memory scope and erases the older ones", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const older = makeEntry({
+        id: 11,
+        path: "memory.claude/1.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.000Z",
+        version: 1,
+      });
+      const newer = makeEntry({
+        id: 12,
+        path: "memory.claude/2.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:05.000Z",
+        version: 2,
+      });
+      const other = makeEntry({ id: 3, path: "a/1.json" });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        older,
+        other,
+        newer,
+      ]);
+      withVersions(deps, [older, newer]);
+
+      const results = await uploadAll(deps);
+
+      expect(results.map((r) => r.path).sort()).toEqual([
+        "a/1.json",
+        "memory.claude/2.json",
+      ]);
+      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(2);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.claude",
+        older.collectedAt,
+        { id: older.id, path: older.path },
+      );
+    });
+
+    it("waits for a quiet period before publishing a memory scope, but not longer than the max wait", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const now = new Date("2026-10-27T10:05:00.000Z");
+      const fresh = makeEntry({
+        id: 21,
+        path: "memory.claude/fresh.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:04:30.000Z", // 30 s old: still active
+      });
+      const stale = makeEntry({
+        id: 31,
+        path: "memory.hermes/old.json",
+        scope: "memory.hermes",
+        collectedAt: "2026-10-27T09:50:00.000Z", // oldest unsynced 15 min ago
+      });
+      const staleNewest = makeEntry({
+        id: 32,
+        path: "memory.hermes/new.json",
+        scope: "memory.hermes",
+        collectedAt: "2026-10-27T10:04:50.000Z", // newest is fresh, max wait hit
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        stale,
+        fresh,
+        staleNewest,
+      ]);
+      withVersions(deps, [stale, fresh, staleNewest]);
+
+      const results = await uploadAll(deps, { now: () => now });
+
+      expect(results.map((r) => r.path)).toEqual(["memory.hermes/new.json"]);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledTimes(1);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.hermes",
+        stale.collectedAt,
+        { id: stale.id, path: stale.path },
+      );
+    });
+
+    it("orders memory snapshots by time, not by string, for sub-second stamps", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const older = makeEntry({
+        id: 41,
+        path: "memory.claude/a.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00Z",
+      });
+      const newer = makeEntry({
+        id: 42,
+        path: "memory.claude/b.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.500Z",
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        older,
+        newer,
+      ]);
+      withVersions(deps, [older, newer]);
+
+      const results = await uploadAll(deps);
+
+      expect(results.map((r) => r.path)).toEqual(["memory.claude/b.json"]);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.claude",
+        older.collectedAt,
+        { id: older.id, path: older.path },
+      );
+    });
+
+    it("publishes the scope's latest local version even when it is beyond the batch page", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const inPage = makeEntry({
+        id: 51,
+        path: "memory.claude/old.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.000Z",
+      });
+      const head = makeEntry({
+        id: 59,
+        path: "memory.claude/head.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:09.000Z",
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        inPage,
+      ]);
+      deps.storage.findEntry = vi.fn().mockReturnValue(head);
+      withVersions(deps, [inPage, head]);
+
+      const results = await uploadAll(deps);
+
+      expect(results.map((r) => r.path)).toEqual(["memory.claude/head.json"]);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.claude",
+        inPage.collectedAt,
+        { id: inPage.id, path: inPage.path },
+      );
+    });
+
+    it("erases, and never publishes, unsynced snapshots older than an already-published latest version", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const unsynced = makeEntry({
+        id: 61,
+        path: "memory.claude/local.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.000Z",
+      });
+      const leftover = makeEntry({
+        id: 62,
+        path: "memory.claude/leftover.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:05.000Z",
+      });
+      const publishedHead = makeEntry({
+        id: 69,
+        path: "memory.claude/remote.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:09.000Z",
+        dataPointId: DATA_POINT_ID,
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        unsynced,
+      ]);
+      deps.storage.findEntry = vi.fn().mockReturnValue(publishedHead);
+      // `leftover` is beyond this batch page but still erased.
+      withVersions(deps, [unsynced, leftover, publishedHead]);
+
+      const results = await uploadAll(deps);
+
+      expect(results).toEqual([]);
+      expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+      expect(deps.storage.deleteVersion).toHaveBeenCalledTimes(2);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.claude",
+        leftover.collectedAt,
+        { id: leftover.id, path: leftover.path },
+      );
+    });
+
+    it("keeps older memory snapshots when the newest one fails to publish", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const older = makeEntry({
+        id: 11,
+        path: "memory.claude/1.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.000Z",
+      });
+      const newer = makeEntry({
+        id: 12,
+        path: "memory.claude/2.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:05.000Z",
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        older,
+        newer,
+      ]);
+      (
+        deps.storageAdapter.upload as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(new Error("storage 500"));
+
+      const results = await uploadAll(deps, { onError: vi.fn() });
+
+      expect(results).toHaveLength(0);
+      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+      expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
     });
 
     it("continues on individual entry failure (logs error)", async () => {
