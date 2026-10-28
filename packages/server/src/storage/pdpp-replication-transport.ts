@@ -13,6 +13,8 @@ import {
   fragmentReplicaStream,
   assembleReplicaStream,
   inspectReplicaPayload,
+  replicaPayloadByteLength,
+  hashReplicaBytes,
   DEFAULT_REPLICA_STREAMED_LIMITS,
 } from "@opendatalabs/personal-server-ts-core/replication/stream";
 import {
@@ -21,6 +23,7 @@ import {
   ReplicaResourceBusyError,
   ReplicaResourceLimitError,
   REPLICA_DEFAULT_BYTE_BUDGET_BYTES,
+  REPLICA_DEFAULT_FRAGMENT_BYTES,
   REPLICA_BATCH_OPERATION_LIMIT,
   REPLICA_BATCH_TARGET_BYTES,
   REPLICA_LIVE_COPY_FACTOR,
@@ -127,6 +130,15 @@ import {
   STAGED_OBJECT_CLEANUP_BATCH,
   STAGED_OBJECT_LEASE_MS,
 } from "./pdpp-replica-staging.js";
+
+import {
+  REPLICA_PREPARATION_MIGRATION,
+  classifyReplicaPreparationError,
+  preparationOperationFailures,
+  snapshotReplicaOperation,
+  type ReplicaPreparation,
+  type RetainedPreparationOperation,
+} from "./pdpp-replication-preparation.js";
 
 // One process owns a transport writer per database; other local instances serialize cycles.
 const activeDatabases = new Set<Database | string>();
@@ -239,6 +251,7 @@ type Work = {
   checked_block: string | null;
 };
 type Batch = Work & {
+  prepared: number;
   batch: string;
   sequence: number;
   previous_json: string | null;
@@ -457,6 +470,17 @@ export function createReplicaTransportWorker(deps: {
   function ensureAdmissionSchema() {
     if (!enabled()) return;
     db.exec(admissionMigration);
+    db.exec(REPLICA_PREPARATION_MIGRATION);
+    // #504 refusals have not advanced the source cursor. Let the new per-op
+    // classifier retain that exact pending page, instead of keeping its wedge.
+    db.prepare(
+      `UPDATE pdpp_transport_phase_state SET ${RESET_WORK},next_attempt=0
+      WHERE phase='retain' AND outcome='unsupported' AND reason='resource_unsupported'`,
+    ).run();
+    db.prepare(
+      `UPDATE pdpp_transport_batches SET prepared=0,${RESET_WORK},next_attempt=0
+      WHERE prepared=-2 AND NOT EXISTS (SELECT 1 FROM pdpp_transport_preparation p WHERE p.batch=pdpp_transport_batches.batch)`,
+    ).run();
     const columns = db
       .prepare("PRAGMA table_info(pdpp_transport_manifests_in)")
       .all() as { name: string }[];
@@ -573,6 +597,9 @@ export function createReplicaTransportWorker(deps: {
       "pdpp_transport_staged_fragments",
       "pdpp_transport_fragments_out",
       "pdpp_transport_manifests_out",
+      "pdpp_transport_preparation",
+      "pdpp_transport_operation_outcomes",
+      "pdpp_transport_upload_attempts",
     ])
       db.prepare(`DELETE FROM ${table}`).run();
   }
@@ -641,6 +668,7 @@ export function createReplicaTransportWorker(deps: {
       if (!signal) throw new Error("replication commit outside a worker step");
       // Check before receiver.atomically raises the capture guard. SQLite
       // serializes door closure against the transaction once it starts.
+      if (!enabled()) throw new ReplicaProblemError("prepare_failed");
       assertReplicationStepOpen(db, signal);
       return deps.receiver.atomically(() => {
         assertReplicationTransactionOpen(db, signal);
@@ -661,8 +689,10 @@ export function createReplicaTransportWorker(deps: {
   /** Network calls stop at the attempt's deadline or the host's abort. */
   const call = <T>(signal: AbortSignal, start: () => Promise<T>) =>
     abortable(signal, async () => {
+      if (!enabled()) throw new ReplicaProblemError("prepare_failed");
       assertReplicationStepOpen(db, signal);
       const value = await start();
+      if (!enabled()) throw new ReplicaProblemError("prepare_failed");
       assertReplicationStepOpen(db, signal);
       return value;
     });
@@ -779,27 +809,30 @@ export function createReplicaTransportWorker(deps: {
    * Unsupported batch, a committed manifest, or a proven immutable-slot
    * conflict frees a claim. Every other or unknown batch state blocks.
    */
+  const batchSettled = (b: string) => `(
+    (${b}.prepared=-1 AND NOT EXISTS (SELECT 1 FROM pdpp_transport_preparation p WHERE p.batch=${b}.batch AND p.wait_json IS NOT NULL))
+    OR (${b}.prepared=1 AND NOT EXISTS (SELECT 1 FROM pdpp_transport_preparation p WHERE p.batch=${b}.batch AND p.state<>'prepared')
+      AND EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m WHERE m.batch=${b}.batch
+        AND (m.state='published' OR (m.state='quarantined' AND m.outcome='quarantine' AND m.reason='immutable_registration_conflict')))))`;
   function batchInFlight() {
     return !!db
       .prepare(
-        `SELECT 1 FROM pdpp_transport_batches b WHERE NOT (
-          b.prepared=-1
-          OR (b.prepared=1 AND EXISTS (
-            SELECT 1 FROM pdpp_transport_manifests_out m WHERE m.batch=b.batch
-              AND (m.state='published' OR
-                (m.state='quarantined' AND m.outcome='quarantine'
-                  AND m.reason='immutable_registration_conflict'))))
-          )
-          LIMIT 1`,
+        `SELECT 1 FROM pdpp_transport_batches b WHERE NOT ${batchSettled("b")} LIMIT 1`,
       )
       .get();
   }
+  // A legacy queue can contain several retained batches. It follows the same
+  // claim gate as new journal work, including unknown future predecessor states.
+  const prepareUnblocked = `NOT EXISTS (SELECT 1 FROM pdpp_transport_batches predecessor
+    WHERE predecessor.sequence<b.sequence AND NOT ${batchSettled("predecessor")})`;
   /**
    * Wire bytes an operation adds to a payload: its JSON and each new blob.
    * `shares` is true when it references a blob the payload already carries.
    */
   function operationBytes(op: ReplicaOperation, seen: Set<string>) {
-    const json = encoder.encode(canonicalJson(op)).length + 1;
+    const snapshot = snapshotReplicaOperation(op);
+    if (snapshot.encoding_failed) return { json: 0, blobs: 0, shares: false };
+    const json = encoder.encode(snapshot.operation_json!).length + 1;
     let blobs = 0;
     let shares = false;
     for (const blob of blobsOf(op))
@@ -834,7 +867,6 @@ export function createReplicaTransportWorker(deps: {
     const seen = new Set<string>();
     let bytes = 0;
     let jsonBytes = 0;
-    let blobTotalBytes = 0;
     let cursor = s.baseline_done
       ? (s.tail_cursor ?? undefined)
       : s.baseline_cursor;
@@ -845,55 +877,12 @@ export function createReplicaTransportWorker(deps: {
         cursor,
         Math.min(EXPORT_PAGE, maxOperations - operations.length),
       );
-      if (page.operations.length > maxOperations - operations.length)
-        throw new ReplicaResourceLimitError(
-          "operation_count",
-          operations.length + page.operations.length,
-          resourceLimits.maxOperations,
-        );
       const trial = new Set(seen);
       let fit = 0;
       let added = 0;
       let addedJson = 0;
-      let addedBlobBytes = 0;
       for (const op of page.operations) {
-        const before = new Set(trial);
         const size = operationBytes(op, trial);
-        const operationJsonBytes = encoder.encode(canonicalJson(op)).length;
-        const newBlobBytes = blobsOf(op).reduce(
-          (total, blob) =>
-            before.has(blob.blobId) ? total : total + blob.sizeBytes,
-          0,
-        );
-        if (
-          operationJsonBytes > resourceLimits.maxOperationBytes ||
-          blobsOf(op).some(
-            (blob) => blob.sizeBytes > resourceLimits.maxSingleBlobBytes,
-          ) ||
-          blobTotalBytes + addedBlobBytes + newBlobBytes >
-            resourceLimits.maxBlobTotalBytes
-        ) {
-          if (operationJsonBytes > resourceLimits.maxOperationBytes)
-            throw new ReplicaResourceLimitError(
-              "operation_bytes",
-              operationJsonBytes,
-              resourceLimits.maxOperationBytes,
-            );
-          const oversizedBlob = blobsOf(op).find(
-            (blob) => blob.sizeBytes > resourceLimits.maxSingleBlobBytes,
-          );
-          if (oversizedBlob)
-            throw new ReplicaResourceLimitError(
-              "single_blob_bytes",
-              oversizedBlob.sizeBytes,
-              resourceLimits.maxSingleBlobBytes,
-            );
-          throw new ReplicaResourceLimitError(
-            "aggregate_blob_bytes",
-            blobTotalBytes + addedBlobBytes + newBlobBytes,
-            resourceLimits.maxBlobTotalBytes,
-          );
-        }
         const fits =
           operations.length + fit === 0 ||
           bytes + added + size.json + size.blobs <= maxBytes ||
@@ -904,7 +893,6 @@ export function createReplicaTransportWorker(deps: {
         fit++;
         added += size.json + size.blobs;
         addedJson += size.json;
-        addedBlobBytes += newBlobBytes;
       }
       const full = fit < page.operations.length;
       if (full && fit === 0) break;
@@ -915,7 +903,6 @@ export function createReplicaTransportWorker(deps: {
       }
       bytes += added;
       jsonBytes += addedJson;
-      blobTotalBytes += addedBlobBytes;
       cursor = next = page.nextAfterSequence;
       hasMore = full || page.hasMore;
       if (full) break;
@@ -954,9 +941,10 @@ export function createReplicaTransportWorker(deps: {
             version: 1,
             owner: s.owner,
             batchId: batch,
-            operations: page.operations,
+            operations: page.operations.filter(
+              (op) => !snapshotReplicaOperation(op).encoding_failed,
+            ),
           };
-          decodeReplicaEnvelope(canonicalJson(envelope), deps.expected());
           const writer = binaryWriter(db, "payload", batch);
           const hash = createHash("sha256");
           for await (const bytes of encodeReplicaPayload(
@@ -965,12 +953,6 @@ export function createReplicaTransportWorker(deps: {
               yield* deps.exporter.readPinnedBlobChunks(id);
             },
           )) {
-            if (totalBytes + bytes.length > resourceLimits.maxTotalBytes)
-              throw new ReplicaResourceLimitError(
-                "total_bytes",
-                totalBytes + bytes.length,
-                resourceLimits.maxTotalBytes,
-              );
             db.transaction(() => writer.write(bytes))();
             hash.update(bytes);
             totalBytes += bytes.length;
@@ -980,15 +962,6 @@ export function createReplicaTransportWorker(deps: {
         }
       } catch (error) {
         deleteBinary(db, "payload", batch);
-        if (error instanceof ReplicaResourceLimitError)
-          return verdict({
-            tag: "unsupported",
-            admission: {
-              reason: "resource_unsupported",
-              limit: error.limit,
-              limitsVersion: REPLICA_LIMITS_VERSION,
-            },
-          });
         throw new ReplicaProblemError("retain_failed", { cause: error });
       }
       // Queue + export cursor commit together with the phase outcome. They
@@ -1017,6 +990,7 @@ export function createReplicaTransportWorker(deps: {
               digest,
               totalBytes,
             );
+            retainPreparationOperations(batch, page.operations);
             db.prepare(
               "UPDATE pdpp_transport_state SET sequence=?, previous_json=? WHERE id=1",
             ).run(s.sequence + 1, canonicalJson({ batch, digest }));
@@ -1048,6 +1022,509 @@ export function createReplicaTransportWorker(deps: {
     },
   };
 
+  /** The exact retained operations, independent of later journal writes. */
+  function preparationRows(batch: string) {
+    return db
+      .prepare(
+        `SELECT position,operation_json,encoding_failed
+      FROM pdpp_transport_operation_outcomes WHERE batch=? AND outcome IS NULL ORDER BY position`,
+      )
+      .all(batch) as RetainedPreparationOperation[];
+  }
+  function preparationOf(batch: string) {
+    return db
+      .prepare("SELECT * FROM pdpp_transport_preparation WHERE batch=?")
+      .get(batch) as ReplicaPreparation | undefined;
+  }
+  /** Released framing claims are history; every other reserved version counts. */
+  function nextPreparationVersion() {
+    return (
+      db
+        .prepare(
+          `SELECT coalesce(max(version),0)+1 AS version FROM (
+      SELECT version FROM pdpp_transport_manifests_out WHERE scope=?
+      UNION ALL SELECT version FROM pdpp_transport_preparation WHERE state<>'released')`,
+        )
+        .get(replicaScope(state().writer)) as { version: number }
+    ).version;
+  }
+  function claimPreparation(batch: string) {
+    if (preparationOf(batch)) return;
+    const manifest = db
+      .prepare("SELECT version FROM pdpp_transport_manifests_out WHERE batch=?")
+      .get(batch) as { version: number } | undefined;
+    db.prepare(
+      "INSERT INTO pdpp_transport_preparation (batch,version,state) VALUES (?,?,'preparing')",
+    ).run(batch, manifest?.version ?? nextPreparationVersion());
+  }
+  function outstandingPreparationClaim(except: string) {
+    return Boolean(
+      db
+        .prepare(
+          `SELECT 1 FROM pdpp_transport_preparation p
+      LEFT JOIN pdpp_transport_batches b ON b.batch=p.batch
+      WHERE p.batch<>? AND p.state<>'released' AND (b.batch IS NULL OR NOT ${batchSettled("b")}) LIMIT 1`,
+        )
+        .get(except),
+    );
+  }
+  /** Reserve readmission atomically; leave outstanding successors free to settle. */
+  function reserveReadmission(batch: string) {
+    if (outstandingPreparationClaim(batch)) return false;
+    const version = nextPreparationVersion();
+    db.prepare(
+      `INSERT INTO pdpp_transport_preparation (batch,version,state) VALUES (?,?,'preparing')
+      ON CONFLICT(batch) DO UPDATE SET version=excluded.version,state='preparing',wait_json=NULL`,
+    ).run(batch, version);
+    db.prepare(
+      `UPDATE pdpp_transport_batches SET prepared=0,${RESET_WORK},next_attempt=0 WHERE batch=?`,
+    ).run(batch);
+    return true;
+  }
+  function assertPreparationClaim(
+    batch: string,
+    version: number,
+    signal: AbortSignal,
+  ) {
+    // Claim ownership and the final slot are checked together immediately before
+    // signing. Signing itself is async and never holds a SQLite transaction open.
+    db.transaction(() => {
+      assertReplicationStepOpen(db, signal);
+      const current = preparationOf(batch);
+      const next = (
+        db
+          .prepare(
+            "SELECT coalesce(max(version),0)+1 AS version FROM pdpp_transport_manifests_out WHERE scope=?",
+          )
+          .get(replicaScope(state().writer)) as { version: number }
+      ).version;
+      const claims = (
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_transport_preparation WHERE version=? AND state<>'released'",
+          )
+          .get(version) as { n: number }
+      ).n;
+      if (
+        current?.state !== "preparing" ||
+        current.version !== version ||
+        version !== next ||
+        claims !== 1
+      )
+        throw new ReplicaProblemError("prepare_failed");
+    }).immediate();
+  }
+  function retainPreparationOperations(
+    batch: string,
+    operations: readonly ReplicaOperation[],
+  ) {
+    claimPreparation(batch);
+    const insert = db.prepare(`INSERT INTO pdpp_transport_operation_outcomes
+      (batch,position,operation_json,encoding_failed,writer_id,operation_id) VALUES (?,?,?,?,?,?)`);
+    operations.forEach((op, position) => {
+      const snapshot = snapshotReplicaOperation(op);
+      insert.run(
+        batch,
+        position,
+        snapshot.operation_json,
+        snapshot.encoding_failed,
+        typeof op.revision?.writerId === "string" ? op.revision.writerId : null,
+        typeof op.revision?.operationId === "string"
+          ? op.revision.operationId
+          : null,
+      );
+    });
+  }
+  /** A durable pre-I/O fence also covers a PUT whose result is lost on crash. */
+  function recordUploadAttempt(
+    batch: string,
+    kind: "fragment" | "manifest",
+    position: number,
+    signal: AbortSignal,
+  ) {
+    db.transaction(() => {
+      assertReplicationStepOpen(db, signal);
+      const prep = preparationOf(batch);
+      if (prep && prep.state !== "prepared")
+        throw new ReplicaProblemError("publish_failed");
+      db.prepare(
+        `INSERT OR IGNORE INTO pdpp_transport_upload_attempts (batch,kind,position,started_at) VALUES (?,?,?,?)`,
+      ).run(batch, kind, position, now());
+    }).immediate();
+  }
+  /** Never infer safety from prepared=0: legacy state and interrupted PUTs count. */
+  function preparationOwnEffects(batch: Batch, version: number) {
+    return Boolean(
+      db
+        .prepare(
+          `SELECT 1 FROM pdpp_transport_upload_attempts WHERE batch=?
+      UNION ALL SELECT 1 FROM pdpp_transport_registration_intents WHERE scope=? AND version=?
+      UNION ALL SELECT 1 FROM pdpp_transport_fragments_out WHERE batch=? AND (state<>'ready' OR attempts>0)
+      UNION ALL SELECT 1 FROM pdpp_transport_manifests_out WHERE batch=? AND (state<>'ready' OR attempts>0) LIMIT 1`,
+        )
+        .get(
+          batch.batch,
+          replicaScope(state().writer),
+          version,
+          batch.batch,
+          batch.batch,
+        ),
+    );
+  }
+  function preparationHasExternalEffects(batch: Batch, version: number) {
+    return (
+      preparationOwnEffects(batch, version) ||
+      Boolean(
+        db
+          .prepare(
+            `
+      SELECT 1 FROM pdpp_transport_manifests_out m JOIN pdpp_transport_batches b ON b.batch=m.batch
+      WHERE b.sequence>? LIMIT 1`,
+          )
+          .get(batch.sequence),
+      )
+    );
+  }
+  /** Release is legal only at the tail of both durable claim orders. */
+  function preparationIsTail(batch: Batch, version: number) {
+    return (
+      state().sequence === batch.sequence &&
+      !db
+        .prepare(
+          `
+      SELECT 1 FROM pdpp_transport_batches WHERE sequence>?
+      UNION ALL SELECT 1 FROM pdpp_transport_preparation WHERE batch<>? AND state<>'released' AND version>=?
+      UNION ALL SELECT 1 FROM pdpp_transport_manifests_out WHERE scope=? AND batch<>? AND version>=? LIMIT 1`,
+        )
+        .get(
+          batch.sequence,
+          batch.batch,
+          version,
+          replicaScope(state().writer),
+          batch.batch,
+          version,
+        )
+    );
+  }
+  const preparationWait = (
+    batch: string,
+    reason: "unknown" | "upload_started" | "all_ops_unsupported",
+  ): Extract<ReplicaPhaseOutcome, { tag: "wait" }> => ({
+    tag: "wait",
+    dependency: { kind: "preparation", key: batch, reason },
+  });
+  function blockPreparation(
+    batch: string,
+    reason: "upload_started" | "all_ops_unsupported" = "upload_started",
+  ) {
+    const wait = preparationWait(batch, reason);
+    db.prepare(
+      "UPDATE pdpp_transport_preparation SET state='prep_failed_permanent',wait_json=? WHERE batch=?",
+    ).run(canonicalJson(wait), batch);
+    return wait;
+  }
+  /** Mark first, rebuild in a later durable transition; replay cannot duplicate an outcome. */
+  function permanentPreparation(
+    batch: Batch,
+    admission: Extract<
+      ReplicaPhaseOutcome,
+      { tag: "unsupported" }
+    >["admission"],
+    positions: readonly number[],
+  ): ReplicaAttempt {
+    return {
+      outcome: { tag: "unsupported", admission },
+      plan: () => {
+        const preparation = preparationOf(batch.batch)!;
+        if (preparationOwnEffects(batch, preparation.version))
+          return blockPreparation(batch.batch);
+        const refused = new Set(positions);
+        const remaining = preparationRows(batch.batch).filter(
+          (row) => !refused.has(row.position),
+        );
+        if (
+          remaining.length &&
+          preparationHasExternalEffects(batch, preparation.version)
+        )
+          return blockPreparation(batch.batch);
+        if (!positions.length) throw new ReplicaProblemError("prepare_failed");
+        for (const position of positions)
+          db.prepare(
+            `UPDATE pdpp_transport_operation_outcomes
+          SET outcome='unsupported',reason=?,admission_json=? WHERE batch=? AND position=? AND outcome IS NULL`,
+          ).run(
+            admission.reason,
+            canonicalJson(admission),
+            batch.batch,
+            position,
+          );
+        db.prepare(
+          "UPDATE pdpp_transport_batches SET prepared=-2,admission_json=? WHERE batch=?",
+        ).run(canonicalJson(admission), batch.batch);
+        if (!remaining.length && !preparationIsTail(batch, preparation.version))
+          return blockPreparation(batch.batch, "all_ops_unsupported");
+        db.prepare(
+          "UPDATE pdpp_transport_preparation SET state='prep_failed_permanent',wait_json=NULL WHERE batch=?",
+        ).run(batch.batch);
+      },
+    };
+  }
+  /** Stream a new payload under a temporary key; the rebuild publishes it atomically. */
+  async function rebuiltPayload(batch: string, operations: ReplicaOperation[]) {
+    const key = `rebuild:${randomUUID()}`;
+    const writer = binaryWriter(db, "payload", key);
+    const hash = createHash("sha256");
+    let totalBytes = 0;
+    try {
+      for await (const bytes of encodeReplicaPayload(
+        {
+          format: "vana-pdpp-replica",
+          version: 1,
+          owner: state().owner,
+          batchId: batch,
+          operations,
+        },
+        async function* (id) {
+          yield* deps.exporter.readPinnedBlobChunks(id);
+        },
+      )) {
+        if (!enabled()) throw new ReplicaProblemError("prepare_failed");
+        assertReplicationStepOpen(db, activeStepSignal!);
+        writer.write(bytes);
+        hash.update(bytes);
+        totalBytes += bytes.length;
+      }
+      writer.finish();
+      return { key, digest: `sha256:${hash.digest("hex")}`, totalBytes };
+    } catch (error) {
+      deleteBinary(db, "payload", key);
+      throw error;
+    }
+  }
+  function unknownPreparation(batch: Batch, error: unknown) {
+    return withPlan(retryFromError(error, "prepare_failed"), () => {
+      db.prepare(
+        "UPDATE pdpp_transport_preparation SET state='prep_failed_unknown',wait_json=? WHERE batch=?",
+      ).run(
+        canonicalJson(preparationWait(batch.batch, "unknown")),
+        batch.batch,
+      );
+    });
+  }
+  /** Classify with single-op trials plus O(log n) prefix trials: O(n log n) visits.
+   * Prefix search retains measured fitting/failing bounds. Each trial counts
+   * or hashes a fresh stream in memory; only the real rebuild writes bytes.
+   * Refuse individually impossible ops, or one proven aggregate crossing, then
+   * reprepare survivors. An unknown trial error keeps the attempt retryable.
+   */
+  async function aggregatePreparationFailures(
+    batch: Batch,
+    error: ReplicaResourceLimitError,
+    signal: AbortSignal,
+    chunkBytes: number,
+  ) {
+    const rows = preparationRows(batch.batch);
+    const operations = rows.map(
+      (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
+    );
+    const exceeds = async (candidates: ReplicaOperation[]) => {
+      const envelope: ReplicaEnvelope = {
+        format: "vana-pdpp-replica",
+        version: 1,
+        owner: state().owner,
+        batchId: batch.batch,
+        operations: candidates,
+      };
+      if (error.limit === "total_bytes")
+        return replicaPayloadByteLength(envelope) > error.maximum;
+      const bytes = () =>
+        encodeReplicaPayload(envelope, async function* (id) {
+          yield* deps.exporter.readPinnedBlobChunks(id);
+        });
+      try {
+        const payload = await hashReplicaBytes(bytes);
+        let ciphertextBytes = 0;
+        for await (const fragment of fragmentReplicaStream({
+          owner: state().owner,
+          writer: state().writer,
+          batch: batch.batch,
+          sequence: batch.sequence,
+          previous: batch.previous_json
+            ? (JSON.parse(batch.previous_json) as Predecessor)
+            : null,
+          collectedAt: batch.collected_at,
+          digest: payload.digest,
+          totalBytes: payload.totalBytes,
+          bytes,
+          encrypt: (scope, plaintext) =>
+            call(signal, () => transport.encrypt(scope, plaintext)),
+          maxBlobBytes: cap,
+          targetChunkBytes: chunkBytes,
+        })) {
+          ciphertextBytes += fragment.encrypted.length;
+          if (ciphertextBytes > error.maximum) return true;
+        }
+        return false;
+      } catch (trialError) {
+        if (
+          trialError instanceof ReplicaResourceLimitError &&
+          trialError.limit === error.limit
+        )
+          return true;
+        throw trialError;
+      }
+    };
+    // Empty encoding is a local lower-bound probe, never an admitted envelope.
+    if (await exceeds([])) return rows.map((row) => row.position);
+    // Numeric length probes are cheap. Full single-op ciphertext proofs are
+    // needed only for an immutable descendant's all-bad classification. The
+    // normal path keeps costly encryption trials logarithmic, not one per op.
+    if (
+      error.limit === "total_bytes" ||
+      preparationHasExternalEffects(batch, preparationOf(batch.batch)!.version)
+    ) {
+      const individuallyUnsupported: number[] = [];
+      for (let index = 0; index < operations.length; index++)
+        if (await exceeds([operations[index]!]))
+          individuallyUnsupported.push(rows[index]!.position);
+      if (individuallyUnsupported.length) return individuallyUnsupported;
+    }
+    // Find the first operation crossing the aggregate cap without rescanning
+    // the growing accepted prefix once per candidate.
+    let accepted = 0;
+    let refused = rows.length;
+    while (refused - accepted > 1) {
+      const middle = Math.floor((accepted + refused) / 2);
+      if (await exceeds(operations.slice(0, middle))) refused = middle;
+      else accepted = middle;
+    }
+    return rows.length ? [rows[refused - 1]!.position] : [];
+  }
+  async function failedPreparation(
+    batch: Batch,
+    error: unknown,
+    signal: AbortSignal,
+    chunkBytes = deps.targetChunkBytes ?? REPLICA_DEFAULT_FRAGMENT_BYTES,
+    attributedPositions?: readonly number[],
+  ): Promise<ReplicaAttempt> {
+    const failure = classifyReplicaPreparationError(error);
+    const prep = preparationOf(batch.batch);
+    if (failure.kind !== "permanent" || !prep)
+      return unknownPreparation(batch, error);
+    // Refuse before probing or marking ops whenever durable I/O evidence exists.
+    if (preparationOwnEffects(batch, prep.version))
+      return permanentPreparation(batch, failure.admission, []);
+    try {
+      let positions = failure.positions ?? attributedPositions;
+      if (
+        !positions &&
+        error instanceof ReplicaResourceLimitError &&
+        (error.limit === "aggregate_ciphertext_bytes" ||
+          error.limit === "total_bytes")
+      )
+        positions = await aggregatePreparationFailures(
+          batch,
+          error,
+          signal,
+          chunkBytes,
+        );
+      if (positions?.length)
+        return permanentPreparation(batch, failure.admission, positions);
+    } catch (trialError) {
+      return unknownPreparation(batch, trialError);
+    }
+    // A typed error without attributable operations cannot justify dropping data.
+    return unknownPreparation(batch, error);
+  }
+
+  async function rebuildPreparation(
+    batch: Batch,
+    prep: ReplicaPreparation,
+  ): Promise<ReplicaAttempt> {
+    const progress: ReplicaPhaseOutcome = {
+      tag: "progress",
+      receipt: { phase: "prepare", key: batch.batch },
+    };
+    const rows = preparationRows(batch.batch);
+    if (prep.state === "prep_failed_permanent" && rows.length)
+      return {
+        outcome: progress,
+        plan: () => {
+          if (preparationHasExternalEffects(batch, prep.version))
+            return blockPreparation(batch.batch);
+          db.prepare(
+            "UPDATE pdpp_transport_preparation SET state='rebuilding' WHERE batch=?",
+          ).run(batch.batch);
+        },
+      };
+    if (!rows.length)
+      return {
+        outcome: progress,
+        plan: () => {
+          if (preparationOwnEffects(batch, prep.version))
+            return blockPreparation(batch.batch);
+          if (!preparationIsTail(batch, prep.version))
+            return blockPreparation(batch.batch, "all_ops_unsupported");
+          // The unused tail alone may give back its sequence and wire version.
+          db.prepare(
+            "DELETE FROM pdpp_transport_fragments_out WHERE batch=?",
+          ).run(batch.batch);
+          db.prepare(
+            "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
+          ).run(batch.batch);
+          deleteBinary(db, "payload", batch.batch);
+          db.prepare("DELETE FROM pdpp_transport_batches WHERE batch=?").run(
+            batch.batch,
+          );
+          db.prepare(
+            "UPDATE pdpp_transport_state SET sequence=?,previous_json=? WHERE id=1",
+          ).run(batch.sequence - 1, batch.previous_json);
+          db.prepare(
+            "UPDATE pdpp_transport_preparation SET state='released',wait_json=NULL WHERE batch=?",
+          ).run(batch.batch);
+        },
+      };
+    const payload = await rebuiltPayload(
+      batch.batch,
+      rows.map((row) => JSON.parse(row.operation_json!) as ReplicaOperation),
+    );
+    return {
+      outcome: progress,
+      plan: () => {
+        if (preparationHasExternalEffects(batch, prep.version))
+          return blockPreparation(batch.batch);
+        db.prepare(
+          "DELETE FROM pdpp_transport_fragments_out WHERE batch=?",
+        ).run(batch.batch);
+        db.prepare(
+          "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
+        ).run(batch.batch);
+        deleteBinary(db, "payload", batch.batch);
+        for (const table of ["pdpp_binary_chunks", "pdpp_binary_manifests"])
+          db.prepare(
+            `UPDATE ${table} SET blob_id=? WHERE namespace='payload' AND blob_id=?`,
+          ).run(batch.batch, payload.key);
+        db.prepare(
+          `UPDATE pdpp_transport_batches SET prepared=0,digest=?,total_bytes=?,admission_json=NULL WHERE batch=?`,
+        ).run(payload.digest, payload.totalBytes, batch.batch);
+        const previous = canonicalJson({
+          batch: batch.batch,
+          digest: payload.digest,
+        });
+        db.prepare(
+          "UPDATE pdpp_transport_state SET previous_json=? WHERE id=1 AND json_extract(previous_json,'$.batch')=?",
+        ).run(previous, batch.batch);
+        db.prepare(
+          "UPDATE pdpp_transport_batches SET previous_json=? WHERE json_extract(previous_json,'$.batch')=?",
+        ).run(previous, batch.batch);
+        db.prepare(
+          "UPDATE pdpp_transport_preparation SET state='preparing',wait_json=NULL WHERE batch=?",
+        ).run(batch.batch);
+      },
+      release: () => deleteBinary(db, "payload", payload.key),
+    };
+  }
+
   // -------------------------------------------------------------- prepare
   const unsupported = (error: ReplicaFramingUnsupported) => {
     const admission = {
@@ -1060,30 +1537,17 @@ export function createReplicaTransportWorker(deps: {
     };
     return { reason: "replica_framing_unsupported" as const, ...admission };
   };
-  const resourceUnsupported = (
-    batch: Batch,
-    error: ReplicaResourceLimitError,
-  ) => {
-    const admission = {
-      reason: "resource_unsupported" as const,
-      limit: error.limit,
-      limitsVersion: REPLICA_LIMITS_VERSION,
-    };
-    return withPlan({ tag: "unsupported", admission }, () =>
-      db
-        .prepare(
-          "UPDATE pdpp_transport_batches SET prepared=-2,admission_json=? WHERE batch=?",
-        )
-        .run(canonicalJson(admission), batch.batch),
-    );
-  };
   const prepare: ReplicaPhaseHandler<Item<Batch>> = {
     phase: "prepare",
     due(e, limit) {
       return (
         db
           .prepare(
-            `SELECT batch,sequence,previous_json,collected_at,digest,total_bytes,attempts,next_attempt,wait_since,checked_block FROM pdpp_transport_batches WHERE prepared=0 AND ${due(e)} ORDER BY next_attempt,sequence LIMIT ?`,
+            `SELECT b.* FROM pdpp_transport_batches b WHERE ${prepareUnblocked} AND
+              ((b.prepared=0 AND ${due(e)}) OR (b.prepared=-2 AND EXISTS (
+                SELECT 1 FROM pdpp_transport_preparation p WHERE p.batch=b.batch AND
+                  ((p.state IN ('prep_failed_permanent','rebuilding') AND p.wait_json IS NULL)
+                  OR (p.state='prep_failed_unknown' AND ${due(e)}))))) ORDER BY b.next_attempt,b.sequence LIMIT ?`,
           )
           .all(limit.total) as Batch[]
       ).map((row) => ({
@@ -1097,192 +1561,321 @@ export function createReplicaTransportWorker(deps: {
     },
     async run(item, signal) {
       const batch = item.row;
-      const token = randomUUID();
-      const s = state();
-      const identity = currentReplicaWriterIdentity(db);
-      const statement = {
-        owner: s.owner,
-        writer: s.writer,
-        batch: batch.batch,
-        sequence: batch.sequence,
-        previous: batch.previous_json
-          ? (JSON.parse(batch.previous_json) as Predecessor)
-          : null,
-        collectedAt: batch.collected_at,
-        digest: batch.digest,
-        totalBytes: batch.total_bytes,
-      };
-      const encrypt = (scope: string, bytes: Uint8Array) =>
-        call(signal, () => transport.encrypt(scope, bytes));
-      let chunkBytes = deps.targetChunkBytes ?? 4 * 1024 * 1024;
-      let entries: ManifestEntry[] = [];
-      let manifest: Awaited<ReturnType<typeof prepareReplicaManifest>>;
-      const unsupportedPlan = (error: ReplicaFramingUnsupported) => {
-        const admission = unsupported(error);
-        return withPlan({ tag: "unsupported", admission }, () =>
-          db
+      try {
+        let preparation = preparationOf(batch.batch);
+        // Upgrade a legacy retained batch from its frozen payload, never from the journal.
+        if (
+          !preparation ||
+          !db
             .prepare(
-              "UPDATE pdpp_transport_batches SET prepared=-1,admission_json=? WHERE batch=?",
+              "SELECT 1 FROM pdpp_transport_operation_outcomes WHERE batch=? LIMIT 1",
             )
-            .run(
+            .get(batch.batch)
+        ) {
+          db.transaction(() => {
+            assertReplicationStepOpen(db, signal);
+            claimPreparation(batch.batch);
+          }).immediate();
+          const payload = await inspectReplicaPayload(
+            () =>
+              (async function* () {
+                yield* readBinaryChunks(db, "payload", batch.batch);
+              })(),
+            undefined,
+          );
+          db.transaction(() => {
+            assertReplicationStepOpen(db, signal);
+            retainPreparationOperations(
+              batch.batch,
+              payload.envelope.operations,
+            );
+          }).immediate();
+          preparation = preparationOf(batch.batch)!;
+        }
+        if (preparation.state === "released") {
+          // A pre-upgrade readmission may still be queued without a reservation.
+          // Defer it rather than blocking the successor that already owns a slot.
+          const reserved = db
+            .transaction(() => {
+              assertReplicationStepOpen(db, signal);
+              return reserveReadmission(batch.batch);
+            })
+            .immediate();
+          if (!reserved) {
+            const saved = db
+              .prepare(
+                "SELECT admission_json FROM pdpp_transport_batches WHERE batch=?",
+              )
+              .get(batch.batch) as { admission_json: string };
+            const admission = {
+              reason: "replica_framing_unsupported" as const,
+              ...(JSON.parse(saved.admission_json) as {
+                actual: number;
+                limit: number;
+                capability: string;
+              }),
+            };
+            return withPlan({ tag: "unsupported", admission }, () => {
+              db.prepare(
+                "UPDATE pdpp_transport_batches SET prepared=-1 WHERE batch=?",
+              ).run(batch.batch);
+            });
+          }
+          preparation = preparationOf(batch.batch)!;
+        }
+        if (preparation.wait_json) {
+          if (preparation.state === "prep_failed_permanent")
+            return verdict(
+              JSON.parse(preparation.wait_json) as ReplicaPhaseOutcome,
+            );
+        }
+        if (
+          preparation.state === "prep_failed_unknown" &&
+          batch.prepared === -2
+        ) {
+          db.transaction(() => {
+            assertReplicationStepOpen(db, signal);
+            db.prepare(
+              "UPDATE pdpp_transport_preparation SET state='rebuilding',wait_json=NULL WHERE batch=?",
+            ).run(batch.batch);
+          }).immediate();
+          preparation = {
+            ...preparation,
+            state: "rebuilding",
+            wait_json: null,
+          };
+        }
+        if (
+          preparation.state === "prep_failed_permanent" ||
+          preparation.state === "rebuilding"
+        )
+          return await rebuildPreparation(batch, preparation);
+        db.transaction(() => {
+          assertReplicationStepOpen(db, signal);
+          db.prepare(
+            "UPDATE pdpp_transport_preparation SET state='preparing',wait_json=NULL WHERE batch=?",
+          ).run(batch.batch);
+        }).immediate();
+        const rows = preparationRows(batch.batch);
+        const failures = preparationOperationFailures(rows, resourceLimits);
+        if (failures)
+          return failedPreparation(
+            batch,
+            failures.error,
+            signal,
+            undefined,
+            failures.positions,
+          );
+        if (batch.total_bytes > resourceLimits.maxTotalBytes)
+          return failedPreparation(
+            batch,
+            new ReplicaResourceLimitError(
+              "total_bytes",
+              batch.total_bytes,
+              resourceLimits.maxTotalBytes,
+            ),
+            signal,
+          );
+        decodeReplicaEnvelope(
+          canonicalJson({
+            format: "vana-pdpp-replica",
+            version: 1,
+            owner: state().owner,
+            batchId: batch.batch,
+            operations: rows.map(
+              (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
+            ),
+          }),
+          deps.expected(),
+        );
+        const token = randomUUID();
+        const s = state();
+        const identity = currentReplicaWriterIdentity(db);
+        const statement = {
+          owner: s.owner,
+          writer: s.writer,
+          batch: batch.batch,
+          sequence: batch.sequence,
+          previous: batch.previous_json
+            ? (JSON.parse(batch.previous_json) as Predecessor)
+            : null,
+          collectedAt: batch.collected_at,
+          digest: batch.digest,
+          totalBytes: batch.total_bytes,
+        };
+        const encrypt = (scope: string, bytes: Uint8Array) =>
+          call(signal, () => transport.encrypt(scope, bytes));
+        let chunkBytes =
+          deps.targetChunkBytes ?? REPLICA_DEFAULT_FRAGMENT_BYTES;
+        let entries: ManifestEntry[] = [];
+        let manifest: Awaited<ReturnType<typeof prepareReplicaManifest>>;
+        const unsupportedPlan = (error: ReplicaFramingUnsupported) => {
+          const admission = unsupported(error);
+          return withPlan({ tag: "unsupported", admission }, () => {
+            db.prepare(
+              "UPDATE pdpp_transport_preparation SET state='released',wait_json=NULL WHERE batch=?",
+            ).run(batch.batch);
+            db.prepare(
+              "UPDATE pdpp_transport_batches SET prepared=-1,admission_json=? WHERE batch=?",
+            ).run(
               canonicalJson({
                 actual: admission.actual,
                 limit: admission.limit,
                 capability: admission.capability,
               }),
               batch.batch,
-            ),
-        );
-      };
-      try {
-        // Batches belong to the current writer; startWriter drops older ones.
-        if (identity?.transportWriter !== s.writer)
-          throw new ReplicaProblemError("prepare_failed");
-        while (true) {
-          try {
-            entries = [];
-            for await (const part of fragmentReplicaStream({
-              ...statement,
-              bytes: async function* () {
-                yield* readBinaryChunks(db, "payload", batch.batch);
-              },
-              encrypt,
-              maxBlobBytes: cap,
-              targetChunkBytes: chunkBytes,
-            })) {
-              db.prepare(
-                "INSERT INTO pdpp_transport_staged_fragments VALUES (?,?,?,?)",
-              ).run(token, part.index, part.digest, part.encrypted);
-              entries.push({
-                digest: part.digest,
-                bytes: part.encrypted.length,
-              });
-            }
-            const aggregateCiphertextBytes = entries.reduce(
-              (total, entry) => total + entry.bytes,
-              0,
             );
-            if (
-              aggregateCiphertextBytes >
-              resourceLimits.maxAggregateCiphertextBytes
-            )
-              throw new ReplicaResourceLimitError(
-                "aggregate_ciphertext_bytes",
-                aggregateCiphertextBytes,
-                resourceLimits.maxAggregateCiphertextBytes,
+          });
+        };
+        try {
+          // Batches belong to the current writer; startWriter drops older ones.
+          if (identity?.transportWriter !== s.writer)
+            throw new ReplicaProblemError("prepare_failed");
+          while (true) {
+            try {
+              entries = [];
+              for await (const part of fragmentReplicaStream({
+                ...statement,
+                bytes: async function* () {
+                  yield* readBinaryChunks(db, "payload", batch.batch);
+                },
+                encrypt,
+                maxBlobBytes: cap,
+                targetChunkBytes: chunkBytes,
+              })) {
+                db.prepare(
+                  "INSERT INTO pdpp_transport_staged_fragments VALUES (?,?,?,?)",
+                ).run(token, part.index, part.digest, part.encrypted);
+                entries.push({
+                  digest: part.digest,
+                  bytes: part.encrypted.length,
+                });
+              }
+              const aggregateCiphertextBytes = entries.reduce(
+                (total, entry) => total + entry.bytes,
+                0,
               );
-            break;
-          } catch (error) {
-            db.prepare(
-              "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
-            ).run(token);
-            // Framing failures may narrow the chunk size; resource-limit
-            // failures become durable Unsupported. Other errors retry.
-            // Unsupported is terminal for this batch only and claims no
-            // version: later batches of this writer still prepare and
-            // publish, and a remote importer holds them as Wait(predecessor)
-            // until an explicit readmitUnsupported() under a new capability.
-            if (error instanceof ReplicaResourceLimitError)
-              return resourceUnsupported(batch, error);
-            if (!(error instanceof ReplicaFramingUnsupported)) throw error;
-            if (error.dimension === "fragment_bytes" && chunkBytes > 1) {
-              chunkBytes = Math.max(1, Math.floor(chunkBytes / 2));
-              continue;
+              if (
+                aggregateCiphertextBytes >
+                resourceLimits.maxAggregateCiphertextBytes
+              )
+                throw new ReplicaResourceLimitError(
+                  "aggregate_ciphertext_bytes",
+                  aggregateCiphertextBytes,
+                  resourceLimits.maxAggregateCiphertextBytes,
+                );
+              break;
+            } catch (error) {
+              db.prepare(
+                "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
+              ).run(token);
+              // Resource Unsupported blocks this writer through its durable
+              // rebuild; it never quarantines. Framing Unsupported
+              // may narrow the chunk size; if framing remains impossible, it
+              // settles only this batch without claiming a version. Successors
+              // may publish but peers wait for the missing predecessor until
+              // readmitUnsupported() under a new capability. Other errors retry.
+              if (!(error instanceof ReplicaFramingUnsupported)) throw error;
+              if (error.dimension === "fragment_bytes" && chunkBytes > 1) {
+                chunkBytes = Math.max(1, Math.floor(chunkBytes / 2));
+                continue;
+              }
+              return unsupportedPlan(error);
             }
-            return unsupportedPlan(error);
           }
-        }
-        // The statement signs the version, so the batch claims the scope's
-        // next version before signing. The commit plan rechecks the claim.
-        const { version } = db
-          .prepare(
-            "SELECT coalesce(max(version),0)+1 AS version FROM pdpp_transport_manifests_out WHERE scope=?",
-          )
-          .get(replicaScope(s.writer)) as { version: number };
-        manifest = await prepareReplicaManifest({
-          ...statement,
-          version,
-          fragments: entries,
-          sign: (facts) =>
-            signReplicaBatch({
-              signer: deps.authority.signer,
-              partition: partition(),
-              seed: identity.seed,
-              facts,
-            }),
-          encrypt,
-        });
-        if (manifest.encrypted.length > cap)
-          return unsupportedPlan(
-            new ReplicaFramingUnsupported(
-              manifest.encrypted.length,
-              cap,
-              "manifest_bytes",
-            ),
-          );
-      } catch (error) {
-        db.prepare(
-          "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
-        ).run(token);
-        if (error instanceof ReplicaResourceLimitError)
-          return resourceUnsupported(batch, error);
-        return verdict(retryFromError(error, "prepare_failed"));
-      }
-      return withPlan(
-        { tag: "progress", receipt: { phase: "prepare", key: batch.batch } },
-        () => {
-          const current = db
-            .prepare(
-              "SELECT prepared FROM pdpp_transport_batches WHERE batch=?",
-            )
-            .get(batch.batch) as { prepared: number };
-          // Concurrent preparation may choose different randomized ciphertext.
-          // Only the first committed bytes can go on wire.
-          if (!current.prepared) {
-            const staged = db
-              .prepare(
-                "SELECT count(*) AS count FROM pdpp_transport_staged_fragments WHERE token=?",
-              )
-              .get(token) as { count: number };
-            if (
-              staged.count !== entries.length ||
-              entries.length !== Math.ceil(batch.total_bytes / chunkBytes)
-            )
-              throw new ReplicaProblemError("prepare_failed");
-            // The batch keeps the version it signed only if that is still the
-            // scope's next one, in the same transaction as its manifest, so a
-            // retry or a lost acknowledgement can never register it at a
-            // second version.
-            const { next } = db
-              .prepare(
-                "SELECT coalesce(max(version),0)+1 AS next FROM pdpp_transport_manifests_out WHERE scope=?",
-              )
-              .get(manifest.scope) as { next: number };
-            if (next !== manifest.version)
-              throw new ReplicaProblemError("prepare_failed");
-            db.prepare(
-              "INSERT INTO pdpp_transport_manifests_out (batch,scope,version,plaintext,encrypted,data_hash,metadata_hash) VALUES (?,?,?,?,?,?,?)",
-            ).run(
-              batch.batch,
-              manifest.scope,
-              manifest.version,
-              manifest.plaintext,
-              manifest.encrypted,
-              manifest.dataHash,
-              manifest.metadataHash,
+          // Sign the durably reserved version. The commit plan rechecks that
+          // this is still the scope's next slot before retaining ciphertext.
+          const version = preparation.version;
+          manifest = await prepareReplicaManifest({
+            ...statement,
+            version,
+            fragments: entries,
+            sign: (facts) => {
+              assertPreparationClaim(batch.batch, version, signal);
+              return signReplicaBatch({
+                signer: deps.authority.signer,
+                partition: partition(),
+                seed: identity.seed,
+                facts,
+              });
+            },
+            encrypt,
+          });
+          if (manifest.encrypted.length > cap)
+            return unsupportedPlan(
+              new ReplicaFramingUnsupported(
+                manifest.encrypted.length,
+                cap,
+                "manifest_bytes",
+              ),
             );
-            db.prepare(
-              "INSERT INTO pdpp_transport_fragments_out (batch,position,digest,encrypted) SELECT ?,position,digest,encrypted FROM pdpp_transport_staged_fragments WHERE token=?",
-            ).run(batch.batch, token);
-            db.prepare(
-              "UPDATE pdpp_transport_batches SET prepared=1 WHERE batch=?",
-            ).run(batch.batch);
-          }
+        } catch (error) {
           db.prepare(
             "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
           ).run(token);
-        },
-      );
+          return failedPreparation(batch, error, signal, chunkBytes);
+        }
+        return withPlan(
+          { tag: "progress", receipt: { phase: "prepare", key: batch.batch } },
+          () => {
+            const current = db
+              .prepare(
+                "SELECT prepared FROM pdpp_transport_batches WHERE batch=?",
+              )
+              .get(batch.batch) as { prepared: number };
+            // Concurrent preparation may choose different randomized ciphertext.
+            // Only the first committed bytes can go on wire.
+            if (!current.prepared) {
+              const staged = db
+                .prepare(
+                  "SELECT count(*) AS count FROM pdpp_transport_staged_fragments WHERE token=?",
+                )
+                .get(token) as { count: number };
+              if (
+                staged.count !== entries.length ||
+                entries.length !== Math.ceil(batch.total_bytes / chunkBytes)
+              )
+                throw new ReplicaProblemError("prepare_failed");
+              // The batch keeps the version it signed only if that is still the
+              // scope's next one, in the same transaction as its manifest, so a
+              // retry or a lost acknowledgement can never register it at a
+              // second version.
+              const { next } = db
+                .prepare(
+                  "SELECT coalesce(max(version),0)+1 AS next FROM pdpp_transport_manifests_out WHERE scope=?",
+                )
+                .get(manifest.scope) as { next: number };
+              if (next !== manifest.version)
+                throw new ReplicaProblemError("prepare_failed");
+              db.prepare(
+                "INSERT INTO pdpp_transport_manifests_out (batch,scope,version,plaintext,encrypted,data_hash,metadata_hash) VALUES (?,?,?,?,?,?,?)",
+              ).run(
+                batch.batch,
+                manifest.scope,
+                manifest.version,
+                manifest.plaintext,
+                manifest.encrypted,
+                manifest.dataHash,
+                manifest.metadataHash,
+              );
+              db.prepare(
+                "INSERT INTO pdpp_transport_fragments_out (batch,position,digest,encrypted) SELECT ?,position,digest,encrypted FROM pdpp_transport_staged_fragments WHERE token=?",
+              ).run(batch.batch, token);
+              db.prepare(
+                "UPDATE pdpp_transport_batches SET prepared=1 WHERE batch=?",
+              ).run(batch.batch);
+              db.prepare(
+                "UPDATE pdpp_transport_preparation SET state='prepared',wait_json=NULL WHERE batch=?",
+              ).run(batch.batch);
+            }
+            db.prepare(
+              "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
+            ).run(token);
+          },
+        );
+      } catch (error) {
+        return failedPreparation(batch, error, signal);
+      }
     },
     commit: commitIn((outcome, work, item) => {
       db.prepare(
@@ -1291,7 +1884,18 @@ export function createReplicaTransportWorker(deps: {
     }),
     commitProblem: "prepare_failed",
     earliest(e) {
-      return earliestIn(e, "pdpp_transport_batches WHERE prepared=0");
+      if (
+        db
+          .prepare(
+            `SELECT 1 FROM pdpp_transport_batches b JOIN pdpp_transport_preparation p ON p.batch=b.batch WHERE ${prepareUnblocked} AND b.prepared=-2 AND p.state IN ('prep_failed_permanent','rebuilding') AND p.wait_json IS NULL LIMIT 1`,
+          )
+          .get()
+      )
+        return e.now;
+      return earliestIn(
+        e,
+        `pdpp_transport_batches b WHERE ${prepareUnblocked} AND (b.prepared=0 OR (b.prepared=-2 AND EXISTS (SELECT 1 FROM pdpp_transport_preparation p WHERE p.batch=b.batch AND p.state='prep_failed_unknown')))`,
+      );
     },
   };
 
@@ -1299,11 +1903,11 @@ export function createReplicaTransportWorker(deps: {
   /** Fragment PUTs and manifests ready for ordered registration. */
   const OUTBOUND = `(SELECT 'fragment' AS kind, batch||':'||position AS id, batch, position,
       NULL AS scope,NULL AS version,attempts,next_attempt,wait_since,checked_block,outcome,dependency
-      FROM pdpp_transport_fragments_out WHERE state='ready'
+      FROM pdpp_transport_fragments_out WHERE state='ready' AND NOT EXISTS (SELECT 1 FROM pdpp_transport_preparation p WHERE p.batch=pdpp_transport_fragments_out.batch AND p.state<>'prepared')
     UNION ALL
     SELECT 'manifest' AS kind, m.scope||'/'||m.version AS id, m.batch, -1 AS position,
       m.scope,m.version,m.attempts,m.next_attempt,m.wait_since,m.checked_block,m.outcome,m.dependency
-      FROM pdpp_transport_manifests_out m WHERE m.state='ready'
+      FROM pdpp_transport_manifests_out m WHERE m.state='ready' AND NOT EXISTS (SELECT 1 FROM pdpp_transport_preparation p WHERE p.batch=m.batch AND p.state<>'prepared')
       AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=m.batch AND f.state<>'stored'))`;
   type RegistrationIntent = {
     owner: string;
@@ -1461,6 +2065,7 @@ export function createReplicaTransportWorker(deps: {
           dataHash: row.data_hash,
           metadataHash: row.metadata_hash,
         };
+        recordUploadAttempt(batch, "manifest", -1, signal);
         await call(signal, () => transport.put(manifest));
         recordRegistrationAttempt(expected, row.encrypted, signal);
         try {
@@ -1548,6 +2153,7 @@ export function createReplicaTransportWorker(deps: {
         };
         // Unregistered and content-addressed: a PUT is safe to repeat, and
         // nothing references it until the manifest is finalized.
+        recordUploadAttempt(row.batch, "fragment", row.position, signal);
         await call(signal, () =>
           transport.putFragment({
             scope: replicaScope(state().writer),
@@ -2525,6 +3131,7 @@ export function createReplicaTransportWorker(deps: {
         },
       ];
       try {
+        // Keep both fallible staging calls before the first byte reservation.
         stageStore = stagingStore();
         stageStore.reclaimAdmission(admission);
         const currentStageStore = stageStore;
@@ -2671,9 +3278,12 @@ export function createReplicaTransportWorker(deps: {
         return verdict(retryFromError(error, "import_failed"));
       } finally {
         // A completed but uncommitted handle is a leased orphan after a crash.
-        if (!keepForPlan) stageStore?.abort(admission);
-        if (!transferEnvelopeReservations)
-          for (const release of envelopeReservations) release();
+        try {
+          if (!keepForPlan) stageStore?.abort(admission);
+        } finally {
+          if (!transferEnvelopeReservations)
+            for (const release of envelopeReservations) release();
+        }
       }
     },
     commit: commitIn((outcome, work, item) => {
@@ -2983,11 +3593,32 @@ export function createReplicaTransportWorker(deps: {
           "UPDATE pdpp_transport_import_work SET next_attempt=? WHERE outcome='wait' AND (dependency LIKE 'mapping:%' OR dependency LIKE 'declaration:%') AND next_attempt>?",
         ).run(now(), now());
       }
-      return await coordinator.step(
+      const report = await coordinator.step(
         now(),
         lifetime.signal,
         input.budget ?? { units: Number.POSITIVE_INFINITY },
       );
+      for (const row of db
+        .prepare(
+          "SELECT batch,wait_json FROM pdpp_transport_preparation WHERE wait_json IS NOT NULL",
+        )
+        .all() as { batch: string; wait_json: string }[]) {
+        const wait = JSON.parse(row.wait_json) as Extract<
+          ReplicaPhaseOutcome,
+          { tag: "wait" }
+        >;
+        if (
+          !report.waits.some(
+            (entry) => entry.id === row.batch && entry.phase === "prepare",
+          )
+        )
+          report.waits.push({
+            id: row.batch,
+            phase: "prepare",
+            dependency: wait.dependency,
+          });
+      }
+      return report;
     } finally {
       lifetime.close();
       activeStepSignal = undefined;
@@ -3030,12 +3661,21 @@ export function createReplicaTransportWorker(deps: {
      * plain restart never re-admits. Returns the number re-admitted.
      */
     readmitUnsupported(): number {
+      if (!enabled() || !replicationAdmitted(db)) return 0;
       return db
-        .prepare(
-          `UPDATE pdpp_transport_batches SET prepared=0,outcome=NULL,reason=NULL,error=NULL,attempts=0,next_attempt=0
-          WHERE prepared=-1 AND coalesce(json_extract(admission_json,'$.capability'),'') <> ?`,
-        )
-        .run(`cap:${cap}`).changes;
+        .transaction(() => {
+          if (!enabled() || !replicationAdmitted(db)) return 0;
+          // One outstanding admission at a time also permits a repeated framing
+          // refusal to release its unused wire slot before another batch claims it.
+          const row = db
+            .prepare(
+              `SELECT batch FROM pdpp_transport_batches
+          WHERE prepared=-1 AND coalesce(json_extract(admission_json,'$.capability'),'')<>? ORDER BY sequence LIMIT 1`,
+            )
+            .get(`cap:${cap}`) as { batch: string } | undefined;
+          return row && reserveReadmission(row.batch) ? 1 : 0;
+        })
+        .immediate();
     },
     /**
      * Owner decision after storage was repaired: fetch again every slot that

@@ -55,13 +55,16 @@ import {
 import {
   admit,
   ReplicaByteBudget,
+  ReplicaResourceLimitError,
 } from "@opendatalabs/personal-server-ts-core/replication/limits";
 import { remoteReplicaTestWriter } from "./pdpp-replica-writer-identity.test-utils.js";
 import type { ReplicaTransportPort } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
+import * as replicaStream from "@opendatalabs/personal-server-ts-core/replication/stream";
 import { encodeReplicaPayload } from "@opendatalabs/personal-server-ts-core/replication/stream";
 import { assembleReplicaStream } from "@opendatalabs/personal-server-ts-core/replication/stream";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { createReplicaStagingStore } from "./pdpp-replica-staging.js";
+import { ReplicaFramingUnsupported } from "@opendatalabs/personal-server-ts-core/replication/outcome";
 import { defaultReplicaBackoff } from "@opendatalabs/personal-server-ts-core/replication/schedule";
 import {
   MAX_BLOB_UPLOAD_BYTES,
@@ -1630,6 +1633,7 @@ it("M2 releases a read reservation when stagingStore throws after admission", as
   await cycles([a], 8);
   const budget = new ReplicaByteBudget(REPLICA_DEFAULT_BYTE_BUDGET_BYTES);
   let calls = 0;
+  let reservedAtThrow: number | undefined;
   let successfulReservations = 0;
   const reserve = budget.reserve.bind(budget);
   vi.spyOn(budget, "reserve").mockImplementation((bytes) => {
@@ -1657,17 +1661,23 @@ it("M2 releases a read reservation when stagingStore throws after admission", as
       createStagingStore: (
         input: Parameters<typeof createReplicaStagingStore>[0],
       ) => {
-        calls++;
-        if (isReadyToImport(input)) {
+        if (calls === 0 && isReadyToImport(input)) {
           calls++;
+          reservedAtThrow = budget.reserved;
+          expect(budget.reserved).toBe(0);
           throw new Error("staging store failed");
         }
         return createReplicaStagingStore(input);
       },
     },
   });
+  for (let i = 0; i < 12 && calls === 0; i++) await cycles([b], 1);
+  expect(calls).toBe(1);
+  expect(reservedAtThrow).toBe(0);
+  expect(budget.reserved).toBe(0);
   await cycles([b], 12);
-  expect(calls).toBeGreaterThan(0);
+  expect(calls).toBe(1);
+  expect(b.get()).toEqual(a.get());
   expect(successfulReservations).toBeGreaterThan(0);
   expect(budget.reserved).toBe(0);
 });
@@ -1724,6 +1734,7 @@ it("M2 releases a read reservation when reclaimAdmission throws", async () => {
   await cycles([a], 8);
   const budget = new ReplicaByteBudget(REPLICA_DEFAULT_BYTE_BUDGET_BYTES);
   let calls = 0;
+  let reservedAtThrow: number | undefined;
   let successfulReservations = 0;
   const reserve = budget.reserve.bind(budget);
   vi.spyOn(budget, "reserve").mockImplementation((bytes) => {
@@ -1752,12 +1763,13 @@ it("M2 releases a read reservation when reclaimAdmission throws", async () => {
         input: Parameters<typeof createReplicaStagingStore>[0],
       ) => {
         const store = createReplicaStagingStore(input);
-        calls++;
-        if (isReadyToImport(input)) {
-          calls++;
+        if (calls === 0 && isReadyToImport(input)) {
           return {
             ...store,
             reclaimAdmission: () => {
+              calls++;
+              reservedAtThrow = budget.reserved;
+              expect(budget.reserved).toBe(0);
               throw new Error("reclaim failed");
             },
           };
@@ -1766,8 +1778,13 @@ it("M2 releases a read reservation when reclaimAdmission throws", async () => {
       },
     },
   });
+  for (let i = 0; i < 12 && calls === 0; i++) await cycles([b], 1);
+  expect(calls).toBe(1);
+  expect(reservedAtThrow).toBe(0);
+  expect(budget.reserved).toBe(0);
   await cycles([b], 12);
-  expect(calls).toBeGreaterThan(0);
+  expect(calls).toBe(1);
+  expect(b.get()).toEqual(a.get());
   expect(successfulReservations).toBeGreaterThan(0);
   expect(budget.reserved).toBe(0);
 });
@@ -2084,63 +2101,90 @@ it("H3 prepares, admits and imports one exact maximum honest batch", async () =>
   );
 }, 60000);
 
-it("H4 persists sender resource_unsupported and blocks later writer batches", async () => {
+it("H4 persists sender resource_unsupported, releases the empty batch and permits later writer batches", async () => {
   const net = network();
+  const limits = { maxAggregateCiphertextBytes: 1 };
   const sender = device(net, {
     preexisting: "oversized for configured replication limit",
-    worker: { resourceLimits: { maxAggregateCiphertextBytes: 1 } },
+    worker: { resourceLimits: limits },
   });
   await cycles([sender], 24);
   const refused = sender.db
     .prepare(
-      `SELECT outcome,reason FROM pdpp_transport_batches WHERE prepared=-2`,
+      "SELECT outcome,reason FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
     )
-    .get();
-  expect(refused).toEqual({
-    outcome: "unsupported",
-    reason: "resource_unsupported",
-  });
-  const blockedCount = (
-    sender.db
-      .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
-      .get() as { count: number }
-  ).count;
+    .all();
+  expect(refused.length).toBeGreaterThan(0);
+  expect(
+    refused.every(
+      (row) =>
+        (row as { outcome: string; reason: string }).outcome ===
+          "unsupported" &&
+        (row as { reason: string }).reason === "resource_unsupported",
+    ),
+  ).toBe(true);
+  expect(
+    sender.db.prepare("SELECT state FROM pdpp_transport_preparation").get(),
+  ).toEqual({ state: "released" });
+  expect(net.puts).toHaveLength(0);
+  limits.maxAggregateCiphertextBytes = REPLICA_MAX_AGGREGATE_CIPHERTEXT_BYTES;
+  sender.reopen();
   sender.put("later batch", "later");
   await cycles([sender], 12);
-  expect(
-    (
-      sender.db
-        .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
-        .get() as { count: number }
-    ).count,
-  ).toBe(blockedCount);
-});
-
-async function expectRetainUnsupported(sender: ReturnType<typeof device>) {
-  await cycles([sender], 24);
+  expect(outbox(sender).at(-1)).toMatchObject({
+    version: 1,
+    state: "published",
+  });
   expect(
     sender.db
       .prepare(
-        "SELECT outcome,reason FROM pdpp_transport_phase_state WHERE phase='retain'",
+        "SELECT outcome,reason FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
+      )
+      .all(),
+  ).toEqual(refused);
+});
+
+async function expectOperationUnsupported(
+  sender: ReturnType<typeof device>,
+  limit: string,
+) {
+  await cycles([sender], 24);
+  const refused = sender.db
+    .prepare(
+      "SELECT batch,position,outcome,reason,admission_json FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
+    )
+    .all() as { outcome: string; reason: string; admission_json: string }[];
+  expect(refused.length).toBeGreaterThan(0);
+  for (const row of refused) {
+    expect(row).toMatchObject({
+      outcome: "unsupported",
+      reason: "resource_unsupported",
+    });
+    expect(JSON.parse(row.admission_json)).toMatchObject({
+      reason: "resource_unsupported",
+      limit,
+    });
+  }
+  expect(
+    sender.db
+      .prepare(
+        "SELECT 1 FROM pdpp_transport_batches WHERE outcome IN ('retry','quarantine')",
       )
       .get(),
-  ).toEqual({ outcome: "unsupported", reason: "resource_unsupported" });
-  const batchCount = (
-    sender.db
-      .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
-      .get() as {
-      count: number;
-    }
-  ).count;
+  ).toBeUndefined();
+  const count = outbox(sender).length;
+  sender.reopen();
   sender.put("later writer batch", "later");
   await cycles([sender], 12);
+  expect(outbox(sender).length).toBeGreaterThan(count);
+  expect(outbox(sender).at(-1)?.state).toBe("published");
   expect(
-    (
-      sender.db
-        .prepare("SELECT count(*) AS count FROM pdpp_transport_batches")
-        .get() as { count: number }
-    ).count,
-  ).toBe(batchCount);
+    sender.db
+      .prepare(
+        "SELECT batch,position,outcome,reason,admission_json FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
+      )
+      .all(),
+  ).toEqual(refused);
 }
 
 it("H4 persists resource_unsupported for a sender operation-count breach", async () => {
@@ -2159,15 +2203,13 @@ it("H4 persists resource_unsupported for a sender operation-count breach", async
   );
   vi.spyOn(sender.store.replication, "readTailPage").mockImplementation(
     (input) => {
-      const page = readTailPage(input);
-      return {
-        ...page,
-        operations: [...page.operations, ...page.operations],
-      };
+      // Simulate an exporter breaching the requested count with two distinct
+      // real operations, rather than duplicating an operation identity.
+      return readTailPage({ ...input, limit: input.limit + 1 });
     },
   );
 
-  await expectRetainUnsupported(sender);
+  await expectOperationUnsupported(sender, "operation_count");
 });
 
 it("H4 persists resource_unsupported for a sender single-blob breach", async () => {
@@ -2208,7 +2250,7 @@ it("H4 persists resource_unsupported for a sender single-blob breach", async () 
     { method: "export", generation: 1 },
   );
 
-  await expectRetainUnsupported(sender);
+  await expectOperationUnsupported(sender, "single_blob_bytes");
 });
 
 it("H4 persists resource_unsupported for sender aggregate-blob breach", async () => {
@@ -2253,7 +2295,7 @@ it("H4 persists resource_unsupported for sender aggregate-blob breach", async ()
     { method: "export", generation: 1 },
   );
 
-  await expectRetainUnsupported(sender);
+  await expectOperationUnsupported(sender, "aggregate_blob_bytes");
 });
 
 it("H2 derives limits above the honest worst case from the exported write caps", () => {
@@ -3505,3 +3547,540 @@ it("protects a live same-process writer opened through a different directory ali
     aliasStore.close();
   }
 });
+
+it("A3b-1 releases envelope reservations even when staging abort throws and the next oversized import proceeds", async () => {
+  const net = network(false, 64 * 1024);
+  const source = device(net, { chunk: 2000 });
+  await cycles([source], 12);
+  const template = device(net);
+  await cycles([template], 12);
+  source.put("x".repeat(5000));
+  await cycles([source], 24);
+  const budget = new ReplicaByteBudget(8 * 1024);
+  let abortThrows = 0;
+  let heldAtAbort = 0;
+  const receiver = device(net, {
+    copyOf: template,
+    worker: {
+      resourceBudget: budget,
+      resourceLimits: { maxManifestCiphertextBytes: 1024 },
+      createStagingStore(
+        input: Parameters<typeof createReplicaStagingStore>[0],
+      ) {
+        const store = createReplicaStagingStore(input);
+        return {
+          ...store,
+          abort(admission: Parameters<typeof store.abort>[0]) {
+            if (budget.reserved > budget.maxBytes && abortThrows === 0) {
+              abortThrows++;
+              heldAtAbort = budget.reserved;
+              throw new Error("SQLite writer locked during abort");
+            }
+            return store.abort(admission);
+          },
+        };
+      },
+    },
+  });
+  receiver.declarations([]);
+  for (let i = 0; i < 24 && abortThrows === 0; i++) await cycles([receiver], 1);
+  expect(abortThrows).toBe(1);
+  expect(heldAtAbort).toBeGreaterThan(budget.maxBytes);
+  expect(budget.reserved).toBe(0);
+  receiver.declarations(expected.declarations);
+  await cycles([receiver], 24);
+  expect(receiver.get()).toEqual(source.get());
+  expect(budget.reserved).toBe(0);
+});
+
+it.each(["oversized first", "small first"])(
+  "A3b-3 envelope barrier: %s",
+  async (order) => {
+    const net = network(false, 64 * 1024);
+    const source = device(net, { chunk: 2000 });
+    await cycles([source], 12);
+    const template = device(net);
+    await cycles([template], 12);
+    source.put("x".repeat(5000));
+    await cycles([source], 24);
+    const budget = new ReplicaByteBudget(8 * 1024);
+    const options = {
+      copyOf: template,
+      worker: {
+        resourceBudget: budget,
+        resourceLimits: { maxManifestCiphertextBytes: 1024 },
+      },
+    };
+    const a = device(net, options);
+    const b = device(net, options);
+    // B needs only the small baseline; A needs the oversized successor.
+    b.db.prepare("DELETE FROM pdpp_transport_manifests_in").run();
+    let release!: () => void;
+    let started!: () => void;
+    const held = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const inspect = replicaStream.inspectReplicaPayload;
+    let blocked = false;
+    // Publish the small writer before enabling the inspection barrier.
+    const small = device(net);
+    small.put("small", "small");
+    await cycles([small], 12);
+    const spy = vi
+      .spyOn(replicaStream, "inspectReplicaPayload")
+      .mockImplementation(async (...args) => {
+        const payload = await inspect(...args);
+        const large =
+          canonicalJson(payload.envelope).length > budget.maxBytes / 2;
+        if (!blocked && large === (order === "oversized first")) {
+          blocked = true;
+          started();
+          await gate;
+        }
+        return payload;
+      });
+    // A receives a large envelope; B receives a small independent writer's batch.
+    const largeWriter = source.scope;
+    const smallWriter = small.scope;
+    const filter = (d: ReturnType<typeof device>, scope: string) => {
+      d.db
+        .prepare("DELETE FROM pdpp_transport_manifests_in WHERE scope<>?")
+        .run(scope);
+    };
+    // Restrict discovery per receiver without changing what the sender registered.
+    const list = net.port.list;
+    let selected = order === "oversized first" ? largeWriter : smallWriter;
+    net.port.list = async (...args) => {
+      const page = await list(...args);
+      return {
+        ...page,
+        points: page.points.filter((p) => p.scope === selected),
+      };
+    };
+    filter(a, largeWriter);
+    filter(b, smallWriter);
+    const first = order === "oversized first" ? a : b;
+    const second = first === a ? b : a;
+    const running = cycles([first], 12);
+    try {
+      await Promise.race([
+        held,
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("envelope barrier not reached")),
+            3000,
+          ),
+        ),
+      ]);
+      expect(budget.reserved).toBeGreaterThan(0);
+      if (first === a) expect(budget.reserved).toBeGreaterThan(budget.maxBytes);
+      else expect(budget.reserved).toBeLessThan(budget.maxBytes);
+      selected = first === a ? smallWriter : largeWriter;
+      await cycles([second], 12);
+      expect(
+        second.db
+          .prepare(
+            "SELECT 1 FROM pdpp_transport_manifests_in WHERE reason='resource_busy' UNION ALL SELECT 1 FROM pdpp_transport_fragments_in WHERE reason='resource_busy' UNION ALL SELECT 1 FROM pdpp_transport_import_work WHERE reason='resource_busy'",
+          )
+          .get(),
+      ).toBeDefined();
+    } finally {
+      release();
+      await running;
+      spy.mockRestore();
+      net.port.list = list;
+    }
+    await cycles([a, b], 24);
+    expect(a.get()).toEqual(source.get());
+    expect(b.get("small")).toEqual(small.get("small"));
+    expect(budget.reserved).toBe(0);
+  },
+);
+
+it.each(["framing", "resource"])(
+  "A3b-4 preserves the distinct %s Unsupported outcome",
+  async (kind) => {
+    const net = network();
+    const source = device(net, { preexisting: "cannot prepare" });
+    net.port.encrypt = async () => {
+      if (kind === "framing")
+        throw new ReplicaFramingUnsupported(9000, 8192, "manifest_bytes");
+      throw new ReplicaResourceLimitError(
+        "aggregate_ciphertext_bytes",
+        9000,
+        8192,
+      );
+    };
+    await cycles([source], 1);
+    expect(
+      source.db
+        .prepare("SELECT prepared,outcome,reason FROM pdpp_transport_batches")
+        .get(),
+    ).toEqual({
+      prepared: kind === "framing" ? -1 : -2,
+      outcome: "unsupported",
+      reason:
+        kind === "framing"
+          ? "replica_framing_unsupported"
+          : "resource_unsupported",
+    });
+    expect(net.puts).toHaveLength(0);
+    expect(net.registrations).toHaveLength(0);
+  },
+);
+
+it("A3b-5 uses the exported default fragment size", async () => {
+  const net = network(false, 64 * 1024);
+  const inputs: number[] = [];
+  const fragment = replicaStream.fragmentReplicaStream;
+  const spy = vi
+    .spyOn(replicaStream, "fragmentReplicaStream")
+    .mockImplementation((input) => {
+      inputs.push(input.targetChunkBytes!);
+      return fragment(input);
+    });
+  try {
+    const source = device(net, {
+      preexisting: "default chunk",
+      worker: { targetChunkBytes: undefined },
+    });
+    await cycles([source], 1);
+    expect(inputs).toEqual([REPLICA_DEFAULT_FRAGMENT_BYTES]);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+it("A5b-1 one bad op is Unsupported while the other ops commit at the same version and later batches flow", async () => {
+  const net = network();
+  const source = device(net, {
+    worker: { resourceLimits: { maxOperationBytes: 1200 } },
+  });
+  await cycles([source], 4);
+  source.put("good one", "one");
+  source.put("x".repeat(2000), "bad");
+  source.put("good two", "two");
+  await cycles([source], 12);
+  const unsupported = source.db
+    .prepare(
+      "SELECT position,outcome,reason FROM pdpp_transport_operation_outcomes WHERE outcome='unsupported'",
+    )
+    .all();
+  expect(unsupported).toEqual([
+    { position: 1, outcome: "unsupported", reason: "resource_unsupported" },
+  ]);
+  expect(outbox(source).map((row) => [row.version, row.state])).toEqual([
+    [1, "published"],
+    [2, "published"],
+  ]);
+  const receiver = device(net);
+  await cycles([receiver], 12);
+  expect(receiver.get("one")).toEqual(source.get("one"));
+  expect(receiver.get("two")).toEqual(source.get("two"));
+  expect(receiver.get("bad")).toBeUndefined();
+  source.put("later", "later");
+  await cycles([source, receiver], 12);
+  expect(receiver.get("later")).toEqual(source.get("later"));
+  expect(outbox(source).at(-1)?.version).toBe(3);
+});
+
+it("A5b-2 all bad ops release the illegal empty batch and the next batch reuses its version and sequence", async () => {
+  const net = network();
+  const source = device(net, {
+    worker: { resourceLimits: { maxOperationBytes: 1200 } },
+  });
+  await cycles([source], 4);
+  source.put("x".repeat(2000), "bad");
+  await cycles([source], 1);
+  expect(
+    source.db
+      .prepare("SELECT state FROM pdpp_transport_preparation WHERE version=2")
+      .get(),
+  ).toEqual({ state: "prep_failed_permanent" });
+  await cycles([source], 1);
+  expect(
+    source.db
+      .prepare("SELECT state FROM pdpp_transport_preparation WHERE version=2")
+      .get(),
+  ).toEqual({ state: "released" });
+  await cycles([source], 6);
+  expect(
+    source.db
+      .prepare(
+        "SELECT version,state FROM pdpp_transport_preparation WHERE state='released'",
+      )
+      .all(),
+  ).toEqual([{ version: 2, state: "released" }]);
+  expect(
+    source.db
+      .prepare(
+        "SELECT outcome,reason FROM pdpp_transport_operation_outcomes WHERE outcome IS NOT NULL",
+      )
+      .all(),
+  ).toEqual([{ outcome: "unsupported", reason: "resource_unsupported" }]);
+  expect(outbox(source)).toHaveLength(1);
+  source.put("good", "good");
+  await cycles([source], 8);
+  expect(outbox(source).map((row) => [row.version, row.state])).toEqual([
+    [1, "published"],
+    [2, "published"],
+  ]);
+  const receiver = device(net);
+  await cycles([receiver], 8);
+  expect(receiver.get("good")).toEqual(source.get("good"));
+  expect(receiver.get("bad")).toBeUndefined();
+});
+
+it("A5b-3 unknown preparation failures retain Retry with P backoff to the cap and a visible typed wait", async () => {
+  const net = network();
+  net.port.encrypt = async () => {
+    throw new RangeError("unknown encryption failure");
+  };
+  const source = device(net, { preexisting: "unknown" });
+  const delays: number[] = [];
+  for (let attempt = 1; attempt <= 15; attempt++) {
+    const report = await source.step();
+    const row = source.db
+      .prepare(
+        "SELECT prepared,outcome,reason,attempts,next_attempt FROM pdpp_transport_batches",
+      )
+      .get() as {
+      prepared: number;
+      outcome: string;
+      reason: string;
+      attempts: number;
+      next_attempt: number;
+    };
+    expect(row).toMatchObject({
+      prepared: 0,
+      outcome: "retry",
+      reason: "prepare_failed",
+      attempts: attempt,
+    });
+    expect(report.waits).toContainEqual({
+      id: expect.any(String),
+      phase: "prepare",
+      dependency: {
+        kind: "preparation",
+        key: expect.any(String),
+        reason: "unknown",
+      },
+    });
+    expect(
+      source.db.prepare("SELECT state FROM pdpp_transport_preparation").get(),
+    ).toEqual({ state: "prep_failed_unknown" });
+    delays.push(row.next_attempt - time);
+    expect(delays.at(-1)).toBe(defaultReplicaBackoff(attempt));
+    source.put(`later ${attempt}`, "later");
+    expect(outbox(source)).toHaveLength(0);
+    expect(
+      source.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get(),
+    ).toEqual({ n: 1 });
+    time = row.next_attempt;
+  }
+  expect(delays.at(-1)).toBe(3_600_000);
+  expect(
+    delays.slice(0, 13).every((delay, i) => i === 0 || delay > delays[i - 1]!),
+  ).toBe(true);
+  expect(
+    source.db
+      .prepare(
+        "SELECT 1 FROM pdpp_transport_operation_outcomes WHERE outcome='unsupported'",
+      )
+      .get(),
+  ).toBeUndefined();
+  expect(net.puts).toHaveLength(0);
+});
+
+it("A5b-4 an unknown preparation failure later commits the same version without Unsupported rows", async () => {
+  const net = network();
+  const encrypt = net.port.encrypt;
+  net.port.encrypt = async () => {
+    throw new Error("transient crypto failure");
+  };
+  const source = device(net, { preexisting: "recover" });
+  await source.step();
+  const claim = source.db
+    .prepare("SELECT batch,version FROM pdpp_transport_preparation")
+    .get();
+  source.reopen();
+  net.port.encrypt = encrypt;
+  time += 1000;
+  await cycles([source], 4);
+  expect(
+    source.db
+      .prepare("SELECT batch,version FROM pdpp_transport_preparation")
+      .get(),
+  ).toEqual(claim);
+  expect(outbox(source)[0]).toMatchObject({ version: 1, state: "published" });
+  expect(
+    source.db
+      .prepare("SELECT state,wait_json FROM pdpp_transport_preparation")
+      .get(),
+  ).toEqual({ state: "prepared", wait_json: null });
+  expect(
+    source.db
+      .prepare(
+        "SELECT 1 FROM pdpp_transport_operation_outcomes WHERE outcome='unsupported'",
+      )
+      .get(),
+  ).toBeUndefined();
+});
+
+it("A5b H4 aggregate ciphertext attributes the breach to the bad op and preserves later good ops", async () => {
+  const net = network();
+  const source = device(net, {
+    worker: { resourceLimits: { maxAggregateCiphertextBytes: 4000 } },
+  });
+  await cycles([source], 4);
+  source.put("good one", "one");
+  source.put("x".repeat(5000), "bad");
+  source.put("good two", "two");
+  await cycles([source], 16);
+  expect(
+    source.db
+      .prepare(
+        "SELECT position FROM pdpp_transport_operation_outcomes WHERE outcome='unsupported'",
+      )
+      .all(),
+  ).toEqual([{ position: 1 }]);
+  const receiver = device(net);
+  await cycles([receiver], 8);
+  expect(receiver.get("one")).toEqual(source.get("one"));
+  expect(receiver.get("two")).toEqual(source.get("two"));
+  expect(receiver.get("bad")).toBeUndefined();
+});
+
+it.each(["oversized first", "small first"])(
+  "F5 preloaded envelope barrier requires import resource_busy: %s",
+  async (order) => {
+    const net = network(false, 64 * 1024);
+    const largeSource = device(net, { chunk: 700 });
+    await cycles([largeSource], 8);
+    const template = device(net);
+    await cycles([template], 8);
+    largeSource.put("x".repeat(12000));
+    await cycles([largeSource], 8);
+    const smallSource = device(net);
+    smallSource.put("small", "small");
+    await cycles([smallSource], 8);
+    const budget = new ReplicaByteBudget(16 * 1024);
+    const quantum = { import: 0 };
+    const a = device(net, {
+      copyOf: template,
+      worker: { resourceBudget: budget, quantum },
+    });
+    const b = device(net, {
+      copyOf: template,
+      worker: { resourceBudget: budget, quantum },
+    });
+    const list = net.port.list;
+    let selected = largeSource.scope;
+    net.port.list = async (...args) => {
+      const page = await list(...args);
+      return {
+        ...page,
+        points: page.points.filter((point) => point.scope === selected),
+      };
+    };
+    await cycles([a], 8);
+    selected = smallSource.scope;
+    await cycles([b], 8);
+    for (const [receiver, scope] of [
+      [a, largeSource.scope],
+      [b, smallSource.scope],
+    ] as const) {
+      expect(
+        receiver.db
+          .prepare(
+            "SELECT 1 FROM pdpp_transport_manifests_in WHERE scope=? AND manifest_json IS NOT NULL AND state='ready'",
+          )
+          .get(scope),
+      ).toBeDefined();
+      expect(
+        receiver.db
+          .prepare(
+            "SELECT 1 FROM pdpp_transport_fragments_in f JOIN pdpp_transport_manifests_in m ON m.slot=f.slot WHERE m.scope=? AND f.fragment_json IS NULL",
+          )
+          .get(scope),
+      ).toBeUndefined();
+    }
+    net.port.list = async () => ({ points: [], cursor: null });
+    quantum.import = 50;
+    a.reopen();
+    b.reopen();
+    const reads = net.gets.length;
+    const inspect = replicaStream.inspectReplicaPayload;
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let held = false;
+    const spy = vi
+      .spyOn(replicaStream, "inspectReplicaPayload")
+      .mockImplementation(async (...args) => {
+        const payload = await inspect(...args);
+        const large =
+          new TextEncoder().encode(canonicalJson(payload.envelope)).length * 2 >
+          budget.maxBytes;
+        if (!held && large === (order === "oversized first")) {
+          held = true;
+          entered();
+          await gate;
+        }
+        return payload;
+      });
+    const first = order === "oversized first" ? a : b;
+    const second = first === a ? b : a;
+    const secondScope = second === a ? largeSource.scope : smallSource.scope;
+    const running = first.step();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        barrier,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(new Error("envelope reservation barrier was not reached")),
+            3000,
+          );
+        }),
+      ]);
+      expect(budget.reserved).toBeGreaterThan(0);
+      if (first === a) expect(budget.reserved).toBeGreaterThan(budget.maxBytes);
+      else expect(budget.reserved).toBeLessThan(budget.maxBytes);
+      const report = await second.step();
+      expect(report.problems).toContainEqual(
+        expect.objectContaining({ phase: "import", problem: "resource_busy" }),
+      );
+      expect(
+        second.db
+          .prepare(
+            "SELECT 1 FROM pdpp_transport_import_work w JOIN pdpp_transport_manifests_in m ON m.writer=w.writer AND m.batch=w.batch WHERE m.scope=? AND w.reason='resource_busy'",
+          )
+          .get(secondScope),
+      ).toBeDefined();
+      expect(net.gets).toHaveLength(reads);
+    } finally {
+      if (timer) clearTimeout(timer);
+      release();
+      await running;
+      spy.mockRestore();
+      net.port.list = list;
+    }
+    await cycles([a, b], 16);
+    expect(a.get()).toEqual(largeSource.get());
+    expect(b.get("small")).toEqual(smallSource.get("small"));
+    expect(budget.reserved).toBe(0);
+  },
+  20_000,
+);
