@@ -2,11 +2,16 @@ import { resolveGrantForRawScopeResource } from "./resources.js";
 import { describe, expect, it, vi } from "vitest";
 import { McpActivityRecorder } from "./activity.js";
 import {
+  connectionDataScopes,
   MAX_MCP_TOOL_TIMEOUT_MS,
   MCP_TOOLS,
   resolveGrantForScope,
 } from "./tools.js";
-import { handleMcpStreamableHttpRequest } from "./server.js";
+import {
+  handleMcpHandshake,
+  handleMcpStreamableHttpRequest,
+  MCP_SERVER_INSTRUCTIONS,
+} from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
@@ -59,6 +64,22 @@ function createMinimalReadClient(
 }
 
 describe("mcp/tools", () => {
+  it("names the data scope behind each write grant, so hydration fetches what remember rewrites", () => {
+    const connection = {
+      ...createConnection(),
+      grants: [
+        { grantId: "g1", scopes: ["memory.*", "write:memory.claude"] },
+        { grantId: "g2", scopes: ["write:memory.claude", "instagram.*"] },
+      ],
+    };
+
+    expect(connectionDataScopes(connection)).toEqual([
+      "instagram.*",
+      "memory.*",
+      "memory.claude",
+    ]);
+  });
+
   it("keeps the MCP tools/list response parseable and under the tunnel budget", async () => {
     const response = await handleMcpStreamableHttpRequest(
       new Request("http://localhost/mcp/test-token", {
@@ -83,10 +104,61 @@ describe("mcp/tools", () => {
     expect(response.status).toBe(200);
     const body = await response.text();
     expect(() => JSON.parse(body)).not.toThrow();
-    // Budget raised from 4000 when list_scope_blocks was added; the point is
-    // that tools/list stays small enough to cross the relay in one go, not the
+    // Budget raised from 4000 when list_scope_blocks was added, from 5000 when
+    // remember was added and from 5500 when forget was added; the point is that
+    // tools/list stays small enough to cross the relay in one go, not the
     // exact number.
-    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(5000);
+    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(6000);
+  });
+
+  it("tells the client in initialize to use remember proactively, on the full and handshake paths", async () => {
+    const initialize = () =>
+      new Request("http://localhost/mcp/test-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "claude-ai", version: "1.0.0" },
+          },
+        }),
+      });
+
+    const full = await handleMcpStreamableHttpRequest(initialize(), {
+      connection: createConnection(),
+      readClient: createMinimalReadClient(),
+    });
+    const handshake = await handleMcpHandshake(initialize());
+
+    for (const response of [full, handshake]) {
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        result: { instructions?: string };
+      };
+      expect(body.result.instructions).toBe(MCP_SERVER_INSTRUCTIONS);
+    }
+    // Without these, Claude saved "I'm training for a half marathon" to its
+    // own built-in memory instead of calling remember.
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("remember");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("without being asked");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("built-in memory");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("search_personal_context");
+    expect(MCP_SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(600);
+  });
+
+  it("describes remember as proactive, bounded and grant-gated", () => {
+    const { description } = getTool("remember");
+    expect(description).toContain("without being asked");
+    expect(description).toContain("secrets");
+    expect(description).toContain("write:<scope>");
+    expect(description.length).toBeLessThanOrEqual(260);
   });
 
   it("advertises no timeoutMs larger than the dispatcher will allow", async () => {

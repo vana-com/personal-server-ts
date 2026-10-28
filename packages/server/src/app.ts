@@ -46,6 +46,7 @@ import { enclaveMcpRoutes } from "./routes/enclave-mcp.js";
 import { enclaveFleetRoutes } from "./routes/enclave-fleet.js";
 import {
   McpActivityRecorder,
+  connectionDataScopes,
   createInMemoryMcpConnectionStore,
   createInMemoryMcpOAuthAuthorizationStore,
   type McpConnectionStore,
@@ -684,6 +685,13 @@ export function createApp(deps: AppDeps): Hono {
     activityRecorder: mcpActivityRecorder,
     localApprovalPort: deps.localApprovalPort,
     serverPort: deps.serverPort,
+    // `remember` writes through the mounted POST /v1/data/:scope route under
+    // a write session in the same store that route redeems builder sessions
+    // from, so an MCP write runs the builder write policy end to end.
+    mcpWrites: {
+      sessionStore: writeSessionStore,
+      dispatch: async (request: Request) => app.fetch(request),
+    },
   };
 
   app.route("/", mcpOAuthRoutes(mcpRouteDeps));
@@ -717,9 +725,7 @@ export function createApp(deps: AppDeps): Hono {
         accessToken: deps.accessToken,
         serverOwner: deps.serverOwner,
         execute: async (request, connection) => {
-          await deps.mcpHydrateScopes?.([
-            ...new Set(connection.grants.flatMap((grant) => grant.scopes)),
-          ]);
+          await deps.mcpHydrateScopes?.(connectionDataScopes(connection));
           return executeMcpConnectionRequest(request, connection, mcpRouteDeps);
         },
       }),
