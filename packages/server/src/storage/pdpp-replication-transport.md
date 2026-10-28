@@ -369,13 +369,24 @@ behind the unresolved batch and cannot enter its replacement payload.
 
 Only sender-owned input-encoding refusals and the closed resource-cap errors
 are permanent. Per-operation size and blob checks identify offending positions.
-For aggregate limits, the worker measures individual operations, then uses at
-most `ceil(log2(n))` prefix trials to find a cumulative crossing. Serialization
-work is `O(n log n)` in operation visits, with no growing-prefix loop per
-candidate. Length probes count bytes; ciphertext probes hash and encrypt
-streams in memory. Trials never write a payload store, PUT, or register.
-Only the actual rebuild uses a persistent payload writer. Unknown trial errors
-remain Retry and do not discard operations.
+For aggregate limits, one pass counts each operation's canonical JSON and each
+new blob's metadata and base64 bytes. An operation that crosses the cap becomes
+Unsupported and contributes no bytes or blob claims to later candidates; later
+operations that fit are kept. Ciphertext sizing groups fragments with equal
+index and offset digit widths, using the same fragment encoder and the codec's
+exact `encryptedByteLength` capability. Numeric field widths bound the groups;
+no accepted prefix is re-encoded or encrypted for each candidate. The DPv2
+capability sizes the SDK's uncompressed AES-256 SKESKv4/SEIPDv1 profile, including
+both variable packet-length headers. Prepared fragment sizes must agree with
+that capability. A custom codec without exact sizing stays Retry on aggregate
+ciphertext failure rather than guessing which operations to discard.
+
+One empty-envelope ciphertext trial keeps unknown crypto errors retryable.
+Trials never write a payload store, PUT, or register. Only the actual rebuild
+uses a persistent payload writer. The 10,000-operation multi-crossing tests
+bound attribution to eight encodes per input operation, eight times the input
+bytes through encoding or encryption, and sixteen payload-encode or encrypt
+calls. The original last-only crossing and unknown-error tests remain.
 
 Rebuilding requires no upload attempt or registration intent for that version,
 no stored or attempted outgoing object, and no signed descendant anywhere in

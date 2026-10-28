@@ -262,6 +262,7 @@ function network(realCrypto = false, cap = 8192) {
   // Fast authenticated codec for high-cardinality/fault cases; one oracle below uses real SDK OpenPGP.
   const key = randomBytes(32);
   const fast = {
+    encryptedByteLength: (bytes: number) => bytes + 28,
     async encrypt(_scope: string, bytes: Uint8Array) {
       const iv = randomBytes(12);
       const cipher = createCipheriv("aes-256-gcm", key, iv);

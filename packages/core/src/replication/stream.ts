@@ -11,6 +11,7 @@ import {
   toBase64,
   fromBase64,
   prepareReplicaFragment,
+  replicaFragmentPlaintextByteLength,
   replicaFragmentSchema,
   REPLICA_MAX_BLOB_BYTES,
   REPLICA_MAX_FRAGMENTS,
@@ -56,6 +57,115 @@ export function replicaPayloadByteLength(envelope: ReplicaEnvelope): number {
   if (!Number.isSafeInteger(length))
     throw new RangeError("replica payload length exhausted");
   return length;
+}
+
+/** Greedy attribution in one pass. A refused op contributes neither bytes nor blobs. */
+export function replicaPayloadOperationCrossings(
+  envelope: ReplicaEnvelope,
+  exceeds: (payloadBytes: number) => boolean,
+): number[] {
+  let bytes = replicaPayloadByteLength({ ...envelope, operations: [] });
+  if (exceeds(bytes)) return envelope.operations.map((_, index) => index);
+  const acceptedBlobs = new Set<string>();
+  const refused: number[] = [];
+  let accepted = 0;
+  for (const [index, op] of envelope.operations.entries()) {
+    const blobs = new Map(
+      descriptors({ ...envelope, operations: [op] })
+        .filter((blob) => !acceptedBlobs.has(blob.blobId))
+        .map((blob) => [blob.blobId, blob]),
+    );
+    let contribution =
+      encoder.encode(canonicalJson(op)).length + (accepted ? 1 : 0);
+    let blobCount = acceptedBlobs.size;
+    for (const blob of blobs.values()) {
+      contribution +=
+        encoder.encode(canonicalJson({ blobId: blob.blobId, bytes: "" }))
+          .length +
+        4 * Math.ceil(blob.sizeBytes / 3) +
+        (blobCount++ ? 1 : 0);
+    }
+    const next = bytes + contribution;
+    if (!Number.isSafeInteger(next))
+      throw new RangeError("replica payload length exhausted");
+    if (exceeds(next)) {
+      refused.push(index);
+      continue;
+    }
+    bytes = next;
+    accepted++;
+    for (const id of blobs.keys()) acceptedBlobs.add(id);
+  }
+  return refused;
+}
+
+/** Size the uncompressed stream by groups with equal index/offset digit widths.
+ * At most twice the numeric field width groups, independent of payload length;
+ * no fragment content is allocated, encoded or encrypted during a size probe.
+ */
+export function replicaStreamCiphertextByteLength(
+  input: {
+    owner: string;
+    writer: string;
+    batch: string;
+    sequence: number;
+    previous: Predecessor | null;
+    collectedAt: string;
+    digest: string;
+    totalBytes: number;
+    targetChunkBytes: number;
+  },
+  encryptedByteLength: (plaintextBytes: number) => number,
+): number {
+  const { targetChunkBytes, ...statement } = input;
+  if (
+    !Number.isSafeInteger(input.totalBytes) ||
+    input.totalBytes < 1 ||
+    !Number.isSafeInteger(targetChunkBytes) ||
+    targetChunkBytes < 1
+  )
+    throw new RangeError("invalid replica stream size");
+  const full = Math.floor(input.totalBytes / targetChunkBytes);
+  const count = Math.ceil(input.totalBytes / targetChunkBytes);
+  if (count > REPLICA_MAX_FRAGMENTS)
+    throw new ReplicaFramingUnsupported(
+      count,
+      REPLICA_MAX_FRAGMENTS,
+      "fragment_count",
+    );
+  const size = (index: number, chunkBytes: number) => {
+    const result = encryptedByteLength(
+      replicaFragmentPlaintextByteLength({
+        ...statement,
+        count,
+        index,
+        offset: index * targetChunkBytes,
+        chunkBytes,
+      }),
+    );
+    if (!Number.isSafeInteger(result) || result < 1)
+      throw new RangeError("invalid replica ciphertext size");
+    return result;
+  };
+  let total = 0;
+  for (let index = 0; index < full;) {
+    const end =
+      index === 0
+        ? 1
+        : Math.min(
+            full,
+            10 ** String(index).length,
+            Math.ceil(
+              10 ** String(index * targetChunkBytes).length / targetChunkBytes,
+            ),
+          );
+    total += (end - index) * size(index, targetChunkBytes);
+    index = end;
+  }
+  if (full < count) total += size(full, input.totalBytes % targetChunkBytes);
+  if (!Number.isSafeInteger(total))
+    throw new RangeError("replica ciphertext length exhausted");
+  return total;
 }
 
 /** Byte-identical to the Node payload, including descriptor order and deduplication. */

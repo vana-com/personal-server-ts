@@ -116,6 +116,10 @@ export interface ReplicaTransportPort {
   owner?: string;
   finality?: ReplicaFinalityHints;
   encrypt(scope: string, plaintext: Uint8Array): Promise<Uint8Array>;
+  /** Exact size for this uncompressed codec, independent of content and randomness.
+   * Without this capability, aggregate attribution stays Retry rather than
+   * guessing which operations are permanently unsupported. */
+  encryptedByteLength?: (plaintextBytes: number) => number;
   /**
    * Refuses a message outside the writers' OpenPGP profile before its KDF
    * runs, and a compressed message, so the plaintext is never larger than
@@ -151,6 +155,24 @@ export interface ReplicaTransportPort {
     points: { scope: string; version: string }[];
     cursor: string | null;
   }>;
+}
+
+/** SDK binary literal + AES-256 SKESKv4 / SEIPDv1, without compression or AEAD. */
+export function replicaOpenPgpCiphertextByteLength(
+  plaintextBytes: number,
+): number {
+  if (
+    !Number.isSafeInteger(plaintextBytes) ||
+    plaintextBytes < 0 ||
+    plaintextBytes > 0xffffffff - 128
+  )
+    throw new RangeError("invalid replica plaintext length");
+  // New-format packet: tag, one/two/five length octets, then body.
+  const packet = (body: number) =>
+    1 + (body < 192 ? 1 : body < 8384 ? 2 : 5) + body;
+  // 48-byte encrypted session-key packet; binary literal has a six-byte
+  // header; SEIPDv1 has version(1), CFB prefix(18), MDC header/hash(22).
+  return 48 + packet(41 + packet(6 + plaintextBytes));
 }
 
 /** Uses existing DPv2 crypto, storage keying, AddData signing and owner feed. No file-head rebase. */
@@ -206,6 +228,7 @@ export function createDpv2ReplicaTransport(deps: {
     owner: deps.owner,
     finality: deps.finality,
     encrypt: (scope, bytes) => encryptWithPassword(bytes, password(scope)),
+    encryptedByteLength: replicaOpenPgpCiphertextByteLength,
     decrypt: (scope, bytes) => decryptUncompressed(bytes, password(scope)),
     evidence: deps.evidence,
     async putFragment(fragment) {

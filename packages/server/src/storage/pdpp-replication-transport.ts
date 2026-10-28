@@ -13,7 +13,8 @@ import {
   fragmentReplicaStream,
   assembleReplicaStream,
   inspectReplicaPayload,
-  replicaPayloadByteLength,
+  replicaPayloadOperationCrossings,
+  replicaStreamCiphertextByteLength,
   hashReplicaBytes,
   DEFAULT_REPLICA_STREAMED_LIMITS,
 } from "@opendatalabs/personal-server-ts-core/replication/stream";
@@ -1330,11 +1331,8 @@ export function createReplicaTransportWorker(deps: {
       );
     });
   }
-  /** Classify with single-op trials plus O(log n) prefix trials: O(n log n) visits.
-   * Prefix search retains measured fitting/failing bounds. Each trial counts
-   * or hashes a fresh stream in memory; only the real rebuild writes bytes.
-   * Refuse individually impossible ops, or one proven aggregate crossing, then
-   * reprepare survivors. An unknown trial error keeps the attempt retryable.
+  /** One read-only trial preserves unknown-error classification. Every crossing
+   * is then attributed by incremental payload bytes and the codec's exact size.
    */
   async function aggregatePreparationFailures(
     batch: Batch,
@@ -1343,26 +1341,26 @@ export function createReplicaTransportWorker(deps: {
     chunkBytes: number,
   ) {
     const rows = preparationRows(batch.batch);
-    const operations = rows.map(
-      (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
-    );
-    const exceeds = async (candidates: ReplicaOperation[]) => {
-      const envelope: ReplicaEnvelope = {
-        format: "vana-pdpp-replica",
-        version: 1,
-        owner: state().owner,
-        batchId: batch.batch,
-        operations: candidates,
-      };
-      if (error.limit === "total_bytes")
-        return replicaPayloadByteLength(envelope) > error.maximum;
+    const envelope: ReplicaEnvelope = {
+      format: "vana-pdpp-replica",
+      version: 1,
+      owner: state().owner,
+      batchId: batch.batch,
+      operations: rows.map(
+        (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
+      ),
+    };
+    if (error.limit === "aggregate_ciphertext_bytes") {
+      // An unknown crypto failure in a trial remains Retry; no outcome
+      // is persisted until the whole attribution pass completes.
       const bytes = () =>
-        encodeReplicaPayload(envelope, async function* (id) {
-          yield* deps.exporter.readPinnedBlobChunks(id);
-        });
+        encodeReplicaPayload(
+          { ...envelope, operations: [] },
+          async function* () {},
+        );
+      const empty = await hashReplicaBytes(bytes);
+      let measured = 0;
       try {
-        const payload = await hashReplicaBytes(bytes);
-        let ciphertextBytes = 0;
         for await (const fragment of fragmentReplicaStream({
           owner: state().owner,
           writer: state().writer,
@@ -1372,52 +1370,54 @@ export function createReplicaTransportWorker(deps: {
             ? (JSON.parse(batch.previous_json) as Predecessor)
             : null,
           collectedAt: batch.collected_at,
-          digest: payload.digest,
-          totalBytes: payload.totalBytes,
+          ...empty,
           bytes,
           encrypt: (scope, plaintext) =>
             call(signal, () => transport.encrypt(scope, plaintext)),
           maxBlobBytes: cap,
           targetChunkBytes: chunkBytes,
-        })) {
-          ciphertextBytes += fragment.encrypted.length;
-          if (ciphertextBytes > error.maximum) return true;
-        }
-        return false;
+        }))
+          measured += fragment.encrypted.length;
       } catch (trialError) {
         if (
           trialError instanceof ReplicaResourceLimitError &&
           trialError.limit === error.limit
         )
-          return true;
+          return rows.map((row) => row.position);
         throw trialError;
       }
+      if (measured > error.maximum) return rows.map((row) => row.position);
+      if (!transport.encryptedByteLength)
+        throw new ReplicaProblemError("prepare_failed");
+    }
+    const sizes = new Map<number, number>();
+    const exceeds = (payloadBytes: number) => {
+      if (error.limit === "total_bytes") return payloadBytes > error.maximum;
+      let ciphertext = sizes.get(payloadBytes);
+      if (ciphertext === undefined) {
+        ciphertext = replicaStreamCiphertextByteLength(
+          {
+            owner: state().owner,
+            writer: state().writer,
+            batch: batch.batch,
+            sequence: batch.sequence,
+            previous: batch.previous_json
+              ? (JSON.parse(batch.previous_json) as Predecessor)
+              : null,
+            collectedAt: batch.collected_at,
+            digest: batch.digest,
+            totalBytes: payloadBytes,
+            targetChunkBytes: chunkBytes,
+          },
+          transport.encryptedByteLength!,
+        );
+        sizes.set(payloadBytes, ciphertext);
+      }
+      return ciphertext > error.maximum;
     };
-    // Empty encoding is a local lower-bound probe, never an admitted envelope.
-    if (await exceeds([])) return rows.map((row) => row.position);
-    // Numeric length probes are cheap. Full single-op ciphertext proofs are
-    // needed only for an immutable descendant's all-bad classification. The
-    // normal path keeps costly encryption trials logarithmic, not one per op.
-    if (
-      error.limit === "total_bytes" ||
-      preparationHasExternalEffects(batch, preparationOf(batch.batch)!.version)
-    ) {
-      const individuallyUnsupported: number[] = [];
-      for (let index = 0; index < operations.length; index++)
-        if (await exceeds([operations[index]!]))
-          individuallyUnsupported.push(rows[index]!.position);
-      if (individuallyUnsupported.length) return individuallyUnsupported;
-    }
-    // Find the first operation crossing the aggregate cap without rescanning
-    // the growing accepted prefix once per candidate.
-    let accepted = 0;
-    let refused = rows.length;
-    while (refused - accepted > 1) {
-      const middle = Math.floor((accepted + refused) / 2);
-      if (await exceeds(operations.slice(0, middle))) refused = middle;
-      else accepted = middle;
-    }
-    return rows.length ? [rows[refused - 1]!.position] : [];
+    return replicaPayloadOperationCrossings(envelope, exceeds).map(
+      (index) => rows[index]!.position,
+    );
   }
   async function failedPreparation(
     batch: Batch,
@@ -1762,6 +1762,12 @@ export function createReplicaTransportWorker(deps: {
                 maxBlobBytes: cap,
                 targetChunkBytes: chunkBytes,
               })) {
+                if (
+                  transport.encryptedByteLength &&
+                  transport.encryptedByteLength(part.plaintext.length) !==
+                    part.encrypted.length
+                )
+                  throw new ReplicaProblemError("prepare_failed");
                 db.prepare(
                   "INSERT INTO pdpp_transport_staged_fragments VALUES (?,?,?,?)",
                 ).run(token, part.index, part.digest, part.encrypted);

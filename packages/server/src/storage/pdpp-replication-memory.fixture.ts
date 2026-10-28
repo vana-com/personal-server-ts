@@ -125,6 +125,7 @@ if (mode === "seed") {
     join(directory, createHash("sha256").update(key).digest("hex"));
   const transport: ReplicaTransportPort = {
     // Crypto scratch is bounded by fragment size. The worker still validates every fragment and commitment.
+    encryptedByteLength: (bytes) => bytes,
     encrypt: async (_scope, bytes) => new Uint8Array(bytes),
     decrypt: async (_scope, bytes) => new Uint8Array(bytes),
     async evidence(scope, version) {

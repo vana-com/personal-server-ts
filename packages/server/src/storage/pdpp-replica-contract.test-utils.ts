@@ -454,6 +454,7 @@ export function network(
   });
   const key = randomBytes(32);
   const fast = {
+    encryptedByteLength: (bytes: number) => bytes + 28,
     async encrypt(scope: string, bytes: Uint8Array) {
       calls.encrypts++;
       if (faults.encrypt) {
