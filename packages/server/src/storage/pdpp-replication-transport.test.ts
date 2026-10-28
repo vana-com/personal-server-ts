@@ -606,18 +606,17 @@ it("reports a pending predecessor and re-registers that same slot after authorit
   const predecessor = outbox(a)[0]!;
   expect(predecessor.version).toBe(1);
 
-  // Later captured work can be retained while v1 remains pending.
+  // Later source operations accumulate without claiming a successor slot.
   a.put("second", "second");
   for (let poll = 0; poll < 8; poll++) {
     time += 1_000;
     await a.cycle();
   }
-  expect(outbox(a).map((row) => row.version)).toContain(2);
+  expect(outbox(a).map((row) => row.version)).toEqual([1]);
 
   time += 2_000;
   const status = await a.step();
-  const successor = outbox(a).find((row) => row.version === 2)!;
-  const pending = status.waits.find((wait) => wait.id === successor.slot);
+  const pending = status.waits.find((wait) => wait.id === predecessor.slot);
   expect(pending?.dependency).toMatchObject({
     kind: "registration_pending",
     version: 1,

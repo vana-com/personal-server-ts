@@ -28,6 +28,7 @@ import {
   replicaWriterOf,
   REPLICA_MAX_BLOB_BYTES,
   type ManifestEntry,
+  type PreparedManifest,
   type ReplicaFragment,
   type ReplicaManifest,
   type Predecessor,
@@ -156,7 +157,6 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_fragments_out (
 CREATE TABLE IF NOT EXISTS pdpp_transport_manifests_out (
  batch TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL,
  plaintext BLOB NOT NULL, encrypted BLOB NOT NULL, data_hash TEXT NOT NULL, metadata_hash TEXT NOT NULL,
- state TEXT NOT NULL DEFAULT 'ready', ${WORK}, UNIQUE(scope,version));
  state TEXT NOT NULL DEFAULT 'ready', ${WORK}, UNIQUE(scope,version));
 CREATE TABLE IF NOT EXISTS pdpp_transport_registration_intents (
  scope TEXT NOT NULL, version INTEGER NOT NULL, owner TEXT NOT NULL,
@@ -649,6 +649,24 @@ export function createReplicaTransportWorker(deps: {
     );
   }
   /**
+   * Keep collecting source operations behind one unresolved publication. The
+   * current manifest reports its typed wait; successors use a version only
+   * after that slot resolves.
+   */
+  function batchInFlight() {
+    return !!db
+      .prepare(
+        `SELECT 1 FROM pdpp_transport_batches b WHERE
+          (b.prepared=0 AND coalesce(b.outcome,'')<>'retry')
+          OR (b.prepared=1 AND EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m
+            WHERE m.batch=b.batch AND m.state='ready' AND coalesce(m.outcome,'')<>'retry'
+            AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f
+              WHERE f.batch=b.batch AND f.outcome='retry')))
+          LIMIT 1`,
+      )
+      .get();
+  }
+  /**
    * Wire bytes an operation adds to a payload: its JSON and each new blob.
    * `shares` is true when it references a blob the payload already carries.
    */
@@ -737,7 +755,7 @@ export function createReplicaTransportWorker(deps: {
       const at = singletonEligibleAt(row, e);
       if (at === undefined || at > e.now) return [];
       // An idle tail costs one indexed probe and no budget unit.
-      if (!tailPending()) return [];
+      if (batchInFlight() || !tailPending()) return [];
       return [
         {
           id: "retain",
@@ -834,7 +852,8 @@ export function createReplicaTransportWorker(deps: {
     commitProblem: "retain_failed",
     earliest(e) {
       return (
-        singletonDeadline("retain", e) ?? (tailPending() ? e.now : undefined)
+        singletonDeadline("retain", e) ??
+        (!batchInFlight() && tailPending() ? e.now : undefined)
       );
     },
   };
@@ -1177,12 +1196,14 @@ export function createReplicaTransportWorker(deps: {
       let intent = registrationIntent(row.scope, row.version);
       if (status === "pending")
         return verdict(
-          pendingRegistration(
-            key,
-            row.version,
-            intent?.created_at ?? previousWaitSince ?? now(),
-            evidence.chain?.blockNumber.toString(),
-          ),
+          tailPending()
+            ? pendingRegistration(
+                key,
+                row.version,
+                intent?.created_at ?? previousWaitSince ?? now(),
+                evidence.chain?.blockNumber.toString(),
+              )
+            : finalityWait(evidence, key),
         );
       if (status === "absent") {
         const timestamp = now();
@@ -1226,6 +1247,17 @@ export function createReplicaTransportWorker(deps: {
           tag: "progress",
           receipt: { phase: "publish", key },
         });
+      if (status === "pending")
+        return verdict(
+          tailPending()
+            ? pendingRegistration(
+                key,
+                row.version,
+                intent?.created_at ?? previousWaitSince ?? now(),
+                evidence.chain?.blockNumber.toString(),
+              )
+            : finalityWait(evidence, key),
+        );
       intent = registrationIntent(row.scope, row.version);
       return verdict(
         pendingRegistration(

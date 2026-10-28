@@ -43,11 +43,11 @@ one registration.
   When one commit writes all its blob claims before its records and is
   larger than the bound, most of its blob bytes go out twice. Removing that
   needs a payload that can refer to bytes an earlier batch carried.
-- **Ordering.** Later retained batches may queue while an earlier registration
-  is unresolved. Each prepared manifest claims its version durably, and
-  version _v_ waits on version _v−1_; the worker never skips a slot. A pending
-  predecessor is reported with its version and the time its registration
-  intent began.
+- **Ordering.** One unresolved registration holds later source operations in
+  the journal; no successor version is claimed yet. The current manifest
+  reports a typed wait with its slot and intent age. After that slot resolves,
+  the worker retains the waiting operations as the next batch. It never skips a
+  version.
 
 Every object uses the existing per-scope key derivation, OpenPGP encryption,
 plaintext keccak commitment, metadata commitment and AddData signature. The
@@ -302,10 +302,11 @@ Without hints, waiting rows use a two-second cadence. Actual errors and Gateway
 head disagreements retain exponential backoff (1 second through 1 hour).
 Successful waiting or confirmed evidence clears the error streak. One failed
 address cannot monopolize the oldest 50. Preparation has its own durable retry
-state; impossible framing is quarantined. A pending predecessor blocks
-descendants on that writer's chain, while other writers can advance. The worker
-rechecks it; authoritative absence after the intent timeout retries that same
-version and ciphertext, then descendants proceed only after confirmation.
+state; impossible framing is quarantined. A pending predecessor blocks later
+source batches on that writer's chain, while other writers can advance. The
+current slot's typed wait remains visible; authoritative absence after the
+intent timeout retries that same version and ciphertext. A successor is
+retained only after the predecessor is confirmed.
 Each cycle attempts every phase even if an earlier phase fails, then reports
 collected errors so retained imports can advance during a feed outage.
 New large canonical, pinned and received bytes use the same 64 KiB chunk store.
