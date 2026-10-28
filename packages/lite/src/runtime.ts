@@ -114,6 +114,7 @@ import {
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
+import type { LiteReplicationRuntime } from "./replication-runtime.js";
 import {
   createDefaultPsLiteAccessLogStore,
   createDefaultPsLiteSaveConfig,
@@ -246,6 +247,12 @@ export interface PsLiteRuntimeOptions {
    * returns a structured snapshot useful for debugging stuck approval pages.
    */
   diagnostics?: DiagnosticsRecorder;
+  /**
+   * Record replication (host contract §4.4). `activate` resumes it and
+   * `deactivate` pauses it; owner-only `GET /v1/replication/status` and
+   * `POST /v1/replication/sync` expose it. Absent means off.
+   */
+  replication?: LiteReplicationRuntime;
   /**
    * Called when a legacy scope cannot be projected from stored PDPP records
    * (the stored body is then served) or is projected with rows left out.
@@ -1019,11 +1026,13 @@ export function createPsLiteRuntime(
       active = true;
       options.syncManager?.start?.();
       options.derivatives?.scheduler.start();
+      options.replication?.resume();
     },
     deactivate() {
       active = false;
       void options.syncManager?.stop?.();
       options.derivatives?.scheduler.stop();
+      void options.replication?.pause();
     },
     isAvailable() {
       return active;
@@ -1146,8 +1155,48 @@ export function createPsLiteRuntime(
           return jsonResponse(snapshot);
         }
 
+        if (url.pathname === "/v1/replication/status") {
+          if (request.method !== "GET")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          await auth.authorizeOwner(request);
+          return jsonResponse(
+            options.replication?.status() ?? { state: "off" },
+          );
+        }
+
         if (!active) {
           return unavailableResponse();
+        }
+
+        if (url.pathname === "/v1/replication/sync") {
+          if (request.method !== "POST")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          await auth.authorizeOwner(request);
+          const status = options.replication?.status() ?? { state: "off" };
+          if (status.state !== "on")
+            return jsonResponse(
+              {
+                error: {
+                  code: 409,
+                  errorCode: "REPLICATION_NOT_RUNNING",
+                  message: "Replication is not running",
+                },
+                status,
+              },
+              { status: 409 },
+            );
+          // "Sync now" starts a step and answers at once; the step may run
+          // up to its deadline. Its outcome shows in the status.
+          void options.replication!.trigger("sync_now");
+          return jsonResponse({ accepted: true, status }, { status: 202 });
         }
 
         if (url.pathname === "/v1/import/oura-browser/requirements") {
