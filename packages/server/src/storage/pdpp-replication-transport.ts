@@ -43,6 +43,7 @@ import {
   type ReplicaEnvelope,
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import { resolveDeclaration } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import {
   prepareReplicaFragment,
   prepareReplicaManifest,
@@ -598,6 +599,37 @@ export function createReplicaTransportWorker(deps: {
   }
 
   /**
+   * What this device's own operations may name: the host's trusted set plus
+   * every binding the journal retained, and a version of a retained stream
+   * that a rebaseline copied from a peer's operation (`resolveDeclaration`
+   * compatible). An operation captured before a rebinding keeps its binding
+   * and still publishes, even from a host that passes only its current
+   * bindings. A missing or incompatible binding is never published.
+   */
+  function ownBindings(
+    operations: readonly ReplicaOperation[],
+  ): EnvelopeExpectation {
+    const expected = deps.expected();
+    const retained = [
+      ...expected.declarations,
+      ...deps.exporter.declarationHistory(),
+    ];
+    return {
+      owner: expected.owner,
+      declarations: [
+        ...retained,
+        ...operations.flatMap((op) =>
+          "declaration" in op &&
+          resolveDeclaration(retained, op.sourceId, op.declaration).status ===
+            "compatible"
+            ? [{ sourceId: op.sourceId, binding: op.declaration }]
+            : [],
+        ),
+      ],
+    };
+  }
+
+  /**
    * One validated authority context for every phase: the expected owner, the
    * persisted binding, the transport port's owner and the writer identity's
    * owner must agree. Checked before any phase runs, so a wrong-owner reopen
@@ -636,10 +668,16 @@ export function createReplicaTransportWorker(deps: {
    * missed any old batch still converges. The same transaction switches the
    * writer and pins the baseline; a crash resumes it from its durable
    * cursor. The rebaseline is a capture, so the door's fence does not count
-   * it as a bypass.
+   * it as a bypass. It copies each record and completion from the operation
+   * the receiver's merge chose for it, so the baseline carries only what this
+   * device's trust accepted.
    */
   function startWriter(identity: ReplicaWriterIdentity) {
-    const baseline = captureWrites(db, () => deps.exporter.rebaseline());
+    const baseline = captureWrites(db, () =>
+      deps.exporter.rebaseline(
+        deps.receiver.explainState({ credential: deps.credential }),
+      ),
+    );
     db.prepare(
       "UPDATE pdpp_transport_state SET writer=?,sequence=0,previous_json=NULL,baseline_cursor=?,baseline_done=0,tail_cursor=NULL WHERE id=1",
     ).run(identity.transportWriter, baseline?.after ?? 0);
@@ -1840,17 +1878,18 @@ export function createReplicaTransportWorker(deps: {
             ),
             signal,
           );
+        const own = rows.map(
+          (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
+        );
         decodeReplicaEnvelope(
           canonicalJson({
             format: "vana-pdpp-replica",
             version: 1,
             owner: state().owner,
             batchId: batch.batch,
-            operations: rows.map(
-              (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
-            ),
+            operations: own,
           }),
-          deps.expected(),
+          ownBindings(own),
         );
         const s = state();
         const identity = currentReplicaWriterIdentity(db);
@@ -3515,6 +3554,24 @@ export function createReplicaTransportWorker(deps: {
     wake(`predecessor:${group.writer}:${manifest.sequence}`, now());
   }
   /**
+   * The declarations operations name that the host does not retain, with how
+   * the merge resolves each (`resolveDeclaration`).
+   */
+  function unretainedDeclarations(operations: readonly ReplicaOperation[]) {
+    const retained = deps.expected().declarations;
+    return operations.flatMap((op) => {
+      if (!("declaration" in op)) return [];
+      const { status } = resolveDeclaration(
+        retained,
+        op.sourceId,
+        op.declaration,
+      );
+      return status === "retained"
+        ? []
+        : [{ sourceId: op.sourceId, binding: op.declaration, status }];
+    });
+  }
+  /**
    * The copy decision for one complete download of a batch (contract v3.1
    * §3 "Coordinator step"). Runs inside the import outcome transaction, over
    * the durable copies, facts and disposition it commits with.
@@ -3596,6 +3653,25 @@ export function createReplicaTransportWorker(deps: {
               key: `${writer}:${manifest.sequence - 1}`,
             },
           };
+        // Operations under a missing or incompatible declaration are now
+        // retained but pending: reconcile reports them (host contract §4.5).
+        // A compatible version applies with the batch and needs no reconcile.
+        const promoted = db
+          .prepare(
+            "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
+          )
+          .get(id, decision.copyKey) as { envelope_json: string } | undefined;
+        const untrusted = promoted
+          ? unretainedDeclarations(
+              (JSON.parse(promoted.envelope_json) as ReplicaEnvelope)
+                .operations,
+            ).find((entry) => entry.status !== "compatible")
+          : undefined;
+        if (untrusted)
+          reconcile.wake?.(
+            `declaration:${untrusted.sourceId}:${untrusted.binding.stream}`,
+            now(),
+          );
         acknowledge(group, manifest);
         return progress;
       }
@@ -3828,28 +3904,22 @@ export function createReplicaTransportWorker(deps: {
             authorized.writers,
           );
           if (misattributed) return refuse(misattributed);
-          // Trusted retained declarations, never claims copied from the envelope.
-          // An unknown declaration is a dependency the host can supply later.
+          // Trusted retained declarations, never claims copied from the
+          // envelope. An operation under a declaration this host does not
+          // retain (another version of a retained stream, a stream it does
+          // not declare yet, or an incompatible shape) is retained without
+          // trust, and the merge decides it. It must not stop the writer's
+          // chain, or one upgrade would hold back every later batch of that
+          // writer (host contract §4.5).
           const expected = deps.expected();
-          const missing = payload.envelope.operations.find(
-            (op) =>
-              "declaration" in op &&
-              !expected.declarations.some(
-                (entry) =>
-                  entry.sourceId === op.sourceId &&
-                  canonicalJson(entry.binding) ===
-                    canonicalJson(op.declaration),
-              ),
+          const unretained = unretainedDeclarations(
+            payload.envelope.operations,
           );
-          if (missing && "declaration" in missing)
-            return verdict({
-              tag: "wait",
-              dependency: {
-                kind: "declaration",
-                key: `${missing.sourceId}:${missing.declaration.stream}`,
-              },
-            });
-          decodeReplicaEnvelope(canonicalJson(payload.envelope), expected);
+          // Decoded only for shape; trust is decided by the merge.
+          decodeReplicaEnvelope(canonicalJson(payload.envelope), {
+            owner: expected.owner,
+            declarations: [...expected.declarations, ...unretained],
+          });
           const stagedBlobs = payload.blobs.map((blob, index) => {
             let target = stagedObjects.get(index);
             if (!target) {
@@ -3990,6 +4060,16 @@ export function createReplicaTransportWorker(deps: {
           found.push({
             kind: "declaration",
             key: `${op.sourceId}:${op.declaration.stream}`,
+          });
+        // This device retains another shape of that stream, and a rebinding
+        // cannot change a retained shape: only the owner can resolve it.
+        else if (
+          issue.reason === "incompatible_declaration" &&
+          "declaration" in op
+        )
+          found.push({
+            kind: "owner",
+            key: `declaration:${op.sourceId}:${op.declaration.stream}`,
           });
         else
           found.push({

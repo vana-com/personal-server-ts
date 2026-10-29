@@ -124,15 +124,17 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   signer; the baseline carries their effect. A peer that missed the old
   writer's batches (refused after re-registration, never published, or
   written between a gateway change and the next step) therefore converges.
-  Each re-issued record and completion takes the order of the highest
-  retained operation, own or received, with the same key and effect (record
-  data, tombstone, or completion snapshot): its counter, plus that
-  operation's writer and operation id as `revision.origin` (or its origin, if
-  it was itself a re-issue). `compareRevisions` orders by counter, then the
-  origin's ids, then the operation's own, so the re-issue wins and loses
-  exactly where the original does. A state no retained operation explains
-  takes a new counter. The rebaseline runs inside the door's capture guard. A
-  crash during the baseline resumes from its durable cursor.
+  Each re-issued record and completion takes the order of the operation the
+  receiver's merge chose for it (`explainState`), when that operation has the
+  same effect (record data, tombstone, or completion snapshot): its counter,
+  plus that operation's writer and operation id as `revision.origin` (or its
+  origin, if it was itself a re-issue), and its declaration.
+  `compareRevisions` orders by counter, then the origin's ids, then the
+  operation's own, so the re-issue wins and loses exactly where the original
+  does. A live record or completion the merge does not explain takes a new
+  counter. A tombstone the merge does not explain is not published: it only
+  hides a row on this device. The rebaseline runs inside the door's capture
+  guard. A crash during the baseline resumes from its durable cursor.
 - Every step checks the replication door first. The roster read writes
   nothing; the identity write (establish or rotate) checks the door in its own
   transaction and refuses once it is closed, and the writer switch and
