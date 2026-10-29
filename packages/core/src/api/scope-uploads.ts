@@ -39,6 +39,10 @@ import { sha256Hex } from "../contracts/binary.js";
 import { VersionSupersededError } from "../contracts/data.js";
 import { hasReservedLineageKey } from "../lineage/lineage.js";
 import { hasReservedWriterKey } from "../write/attribution.js";
+import {
+  preparedScopeUploadText,
+  type PreparedScopeUploadBatch,
+} from "./scope-upload-batches.js";
 
 /**
  * Largest batch body accepted, in UTF-8 bytes. Callers send far smaller
@@ -97,6 +101,13 @@ export interface ScopeUploadRegistry {
     seq: number;
     /** The raw batch body: `{"items":[...]}`. */
     text: string;
+  }): Promise<{ seq: number; items: number; replay: boolean }>;
+  /** Optional for existing custom registries; never reachable from HTTP. */
+  appendPrepared?(input: {
+    scope: string;
+    uploadId: string;
+    seq: number;
+    batch: PreparedScopeUploadBatch;
   }): Promise<{ seq: number; items: number; replay: boolean }>;
   commit(input: {
     scope: string;
@@ -229,6 +240,62 @@ export function createScopeUploadRegistry(
     });
   }
 
+  /** Both transports use precisely the same ordering and failure boundary. */
+  async function appendBatch(
+    input: { scope: string; uploadId: string; seq: number },
+    batch: {
+      byteLength(): number;
+      digest(): Promise<string>;
+      read(): { text: string; items: number };
+    },
+  ): Promise<{ seq: number; items: number; replay: boolean }> {
+    const upload = find(input.scope, input.uploadId);
+    return serialized(upload, async () => {
+      if (!Number.isSafeInteger(input.seq) || input.seq < 0) {
+        throw invalid("Batch number must be a non-negative integer");
+      }
+      if (batch.byteLength() > maxBatchBytes) {
+        throw new ScopeUploadError(
+          413,
+          "BATCH_TOO_LARGE",
+          `Batch exceeds ${maxBatchBytes} bytes`,
+        );
+      }
+      const digest = await batch.digest();
+      const latest = upload.batches - 1;
+      if (input.seq === latest && upload.latestDigest !== null) {
+        if (upload.latestDigest !== digest) {
+          throw new ScopeUploadError(
+            409,
+            "BATCH_CONFLICT",
+            `Batch ${input.seq} was already received with a different body`,
+          );
+        }
+        return { seq: input.seq, items: 0, replay: true };
+      }
+      if (input.seq < latest) {
+        throw new ScopeUploadError(
+          409,
+          "BATCH_OUT_OF_ORDER",
+          `Batch ${input.seq} is older than batch ${latest}, the only one that can be replayed`,
+        );
+      }
+      if (input.seq !== upload.batches) {
+        throw new ScopeUploadError(
+          409,
+          "BATCH_OUT_OF_ORDER",
+          `Expected batch ${upload.batches}, got ${input.seq}`,
+        );
+      }
+      const { text, items } = batch.read();
+      await upload.writer.write((upload.items > 0 ? "," : "") + text);
+      upload.batches += 1;
+      upload.latestDigest = digest;
+      upload.items += items;
+      return { seq: input.seq, items, replay: false };
+    });
+  }
+
   return {
     maxBatchBytes,
 
@@ -309,70 +376,47 @@ export function createScopeUploadRegistry(
     },
 
     async append(input) {
-      const upload = find(input.scope, input.uploadId);
-      return serialized(upload, async () => {
-        if (!Number.isSafeInteger(input.seq) || input.seq < 0) {
-          throw invalid("Batch number must be a non-negative integer");
-        }
-        if (textEncoder.encode(input.text).byteLength > maxBatchBytes) {
-          throw new ScopeUploadError(
-            413,
-            "BATCH_TOO_LARGE",
-            `Batch exceeds ${maxBatchBytes} bytes`,
-          );
-        }
-        const digest = await sha256Hex(textEncoder.encode(input.text));
-        const latest = upload.batches - 1;
-        if (input.seq === latest && upload.latestDigest !== null) {
-          if (upload.latestDigest !== digest) {
-            throw new ScopeUploadError(
-              409,
-              "BATCH_CONFLICT",
-              `Batch ${input.seq} was already received with a different body`,
+      return appendBatch(input, {
+        byteLength: () => textEncoder.encode(input.text).byteLength,
+        digest: () => sha256Hex(textEncoder.encode(input.text)),
+        read() {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(input.text);
+          } catch {
+            throw invalid("Batch body must be valid JSON");
+          }
+          const batch = objectBody(parsed, "batch");
+          if (
+            Object.keys(batch).length !== 1 ||
+            !Array.isArray(batch.items) ||
+            batch.items.length === 0
+          ) {
+            throw invalid(
+              'Batch body must be {"items": [...]} with at least one item',
             );
           }
-          return { seq: input.seq, items: 0, replay: true };
-        }
-        if (input.seq < latest) {
-          throw new ScopeUploadError(
-            409,
-            "BATCH_OUT_OF_ORDER",
-            `Batch ${input.seq} is older than batch ${latest}, the only one that can be replayed`,
-          );
-        }
-        if (input.seq !== upload.batches) {
-          throw new ScopeUploadError(
-            409,
-            "BATCH_OUT_OF_ORDER",
-            `Expected batch ${upload.batches}, got ${input.seq}`,
-          );
-        }
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(input.text);
-        } catch {
-          throw invalid("Batch body must be valid JSON");
-        }
-        const batch = objectBody(parsed, "batch");
-        if (
-          Object.keys(batch).length !== 1 ||
-          !Array.isArray(batch.items) ||
-          batch.items.length === 0
-        ) {
-          throw invalid(
-            'Batch body must be {"items": [...]} with at least one item',
-          );
-        }
-        const items = batch.items as unknown[];
-        // One copy of the batch as text, then nothing retained.
-        const text =
-          (upload.items > 0 ? "," : "") +
-          items.map((item) => JSON.stringify(item)).join(",");
-        await upload.writer.write(text);
-        upload.batches += 1;
-        upload.latestDigest = digest;
-        upload.items += items.length;
-        return { seq: input.seq, items: items.length, replay: false };
+          const items = batch.items as unknown[];
+          return {
+            text: items.map((item) => JSON.stringify(item)).join(","),
+            items: items.length,
+          };
+        },
+      });
+    },
+
+    async appendPrepared(input) {
+      // Validate the opaque identity before trusting any public descriptor.
+      let text: string;
+      try {
+        text = preparedScopeUploadText(input.batch);
+      } catch {
+        throw invalid("Unrecognized scope upload batch");
+      }
+      return appendBatch(input, {
+        byteLength: () => input.batch.byteLength,
+        digest: async () => input.batch.bodySha256,
+        read: () => ({ text, items: input.batch.items }),
       });
     },
 
