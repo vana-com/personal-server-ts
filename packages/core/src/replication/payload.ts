@@ -150,6 +150,63 @@ export async function* readReplicaPayload(
   await run(assertNoExcess(key, position));
 }
 
+/** Where a chunked read resumes: a chunk row and a byte offset inside it. */
+export interface ReplicaPayloadCursor {
+  position: number;
+  offset: number;
+}
+
+/**
+ * Exactly `length` bytes of the payload under `key` from `from`, and the
+ * cursor after them. Rows may have any length, so a caller that reads a
+ * payload in parts keeps the returned cursor and never seeks by arithmetic.
+ * Memory is `length`.
+ */
+export function* readReplicaPayloadWindow(
+  key: string,
+  from: ReplicaPayloadCursor,
+  length: number,
+): ReplicaEffect<{ bytes: Uint8Array; next: ReplicaPayloadCursor }> {
+  const size = yield* replicaPayloadLength(key);
+  if (
+    size === undefined ||
+    !Number.isSafeInteger(length) ||
+    length < 1 ||
+    !Number.isSafeInteger(from.position) ||
+    from.position < 0 ||
+    !Number.isSafeInteger(from.offset) ||
+    from.offset < 0
+  )
+    throw new Error("missing binary bytes");
+  const bytes = new Uint8Array(length);
+  let filled = 0;
+  let { position, offset } = from;
+  while (filled < length) {
+    const row = yield* sql.get<{ bytes: Uint8Array }>(
+      "SELECT bytes FROM pdpp_binary_chunks WHERE namespace=? AND blob_id=? AND position=?",
+      NAMESPACE,
+      key,
+      position,
+    );
+    if (
+      !row ||
+      !row.bytes.length ||
+      row.bytes.length > REPLICA_PAYLOAD_CHUNK_BYTES ||
+      offset >= row.bytes.length
+    )
+      throw new Error("corrupt binary chunks");
+    const take = Math.min(row.bytes.length - offset, length - filled);
+    bytes.set(row.bytes.subarray(offset, offset + take), filled);
+    filled += take;
+    offset += take;
+    if (offset === row.bytes.length) {
+      position++;
+      offset = 0;
+    }
+  }
+  return { bytes, next: { position, offset } };
+}
+
 /** In the caller's transaction: do the bytes under `key` hash to `digest`? */
 export function* verifyReplicaPayload(
   key: string,

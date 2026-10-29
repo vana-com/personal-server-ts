@@ -53,6 +53,13 @@ export interface ReplicaWorkItem {
   state: ReplicaWorkState;
   /** Admission estimate for byte budgets. */
   bytes?: number;
+  /**
+   * The resumable unit this attempt covers, e.g. the next fragment of a
+   * batch. A step admits an item once per part, so an item that commits one
+   * unit per attempt can take further units in the same step, each charged
+   * on its own. Runs of one item never overlap, whatever their part.
+   */
+  part?: string;
 }
 
 /**
@@ -750,11 +757,16 @@ export function createAsyncReplicaCoordinator<C>(
               units,
             );
             let count = 0;
+            // Items deferred for bytes in this phase. Each one widens the next
+            // due() page by one, so an item that does not fit cannot hide the
+            // items behind it (another writer's work that fits). Bounded by the
+            // phase quantum, so a backlog of oversized items stays a bounded scan.
+            let skipped = 0;
             // Refilled rounds: each due() call admits at most perWriter items per
             // writer, so one writer's backlog cannot fill a phase's quantum.
             while (count < cap && units > 0 && !aborted()) {
               const selected = handler.due(selection(), {
-                total: cap - count,
+                total: cap - count + skipped,
                 perWriter: input.perWriter ?? 1,
                 after: state.writers[handler.phase],
               });
@@ -763,15 +775,18 @@ export function createAsyncReplicaCoordinator<C>(
                 (isPromiseLike(selected) ? await selected : selected).filter(
                   (item: ReplicaWorkItem) => {
                     const key = `${handler.phase}\0${item.id}`;
-                    return !inflight.has(key) && !ran.has(key);
+                    return (
+                      !inflight.has(key) &&
+                      !ran.has(`${key}\0${item.part ?? ""}`)
+                    );
                   },
                 ),
               );
               let admitted = 0;
+              let deferredHere = 0;
               for (const item of items) {
                 if (count >= cap || units <= 0 || aborted()) break;
-                const key = `${handler.phase}\0${item.id}`;
-                ran.add(key);
+                ran.add(`${handler.phase}\0${item.id}\0${item.part ?? ""}`);
                 if (
                   item.bytes !== undefined &&
                   (!Number.isSafeInteger(item.bytes) || item.bytes < 0)
@@ -789,6 +804,7 @@ export function createAsyncReplicaCoordinator<C>(
                   bytes === stepBytes;
                 if (item.bytes !== undefined && item.bytes > bytes && !alone) {
                   deferred = true;
+                  deferredHere++;
                   continue;
                 }
                 admitted++;
@@ -813,7 +829,10 @@ export function createAsyncReplicaCoordinator<C>(
                   attempt.release?.();
                 }
               }
-              if (!admitted) break;
+              skipped += deferredHere;
+              if (admitted) continue;
+              // Nothing fit: look past the deferred items, within the bound.
+              if (!deferredHere || skipped > quantum(handler.phase)) break;
             }
             spent.set(handler.phase, used + count);
           }

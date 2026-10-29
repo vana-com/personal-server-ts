@@ -277,34 +277,6 @@ export function createReplicaCanonicalPort(db: Database) {
     admitReplication(db);
     ensureReplicaSchema(db);
     db.exec(CANONICAL_CHUNKS_TRIGGER);
-    // Older replication builds stored large canonical blobs only in the
-    // replica chunk tables. Materialize those bytes in main's canonical table
-    // before a flag-off or main build can be used to read the database.
-    db.transaction(() => {
-      const missing = db
-        .prepare(
-          `SELECT m.blob_id, b.size_bytes, b.sha256
-           FROM pdpp_binary_manifests m
-           JOIN pdpp_blobs b ON b.blob_id = m.blob_id
-           LEFT JOIN pdpp_blob_bytes c ON c.blob_id = m.blob_id
-           WHERE m.namespace = 'canonical' AND c.blob_id IS NULL`,
-        )
-        .all() as { blob_id: string; size_bytes: number; sha256: string }[];
-      for (const blob of missing) {
-        if (
-          !verifyBinary(
-            db,
-            "canonical",
-            blob.blob_id,
-            `sha256:${blob.sha256}`,
-            blob.size_bytes,
-          )
-        )
-          continue;
-        const bytes = readBinary(db, "canonical", blob.blob_id);
-        if (bytes) writeCanonicalBinary(db, blob.blob_id, bytes);
-      }
-    }).immediate();
   }
   const writerId = (
     db
@@ -314,9 +286,11 @@ export function createReplicaCanonicalPort(db: Database) {
   // Captured operations name the derived operation writer. Before the first
   // enable they name the installation writer and stay local: no receiver
   // accepts them, and enabling refuses a journal that has them.
+  let journalObserver: (() => void) | undefined;
   const journal = createReplicationJournal(
     db,
     () => currentReplicaWriterIdentity(db)?.operationWriter ?? writerId,
+    () => journalObserver?.(),
   );
   const insertLocalWrite = db.prepare(`
     INSERT INTO pdpp_replica_own_writes
@@ -595,6 +569,15 @@ export function createReplicaCanonicalPort(db: Database) {
       writeBoundary = write;
       readBoundary = read;
     },
+    /**
+     * Called for each operation appended to the local journal (a record,
+     * blob, completion or lifecycle write; never an import), inside the
+     * write's transaction. The observer must defer its effect past the
+     * transaction: a rolled-back write may still have called it.
+     */
+    setReplicaJournalObserver(observer: () => void) {
+      journalObserver = observer;
+    },
     /** Called for each locally written key when the store settles, inside the write's transaction. */
     setReplicaLocalWriteObserver(
       observer: (instance: string, stream: string, recordKey: string) => void,
@@ -665,6 +648,7 @@ export function createReplicaRecordStore(
     setReplicaVisibilityObserver: r.setReplicaVisibilityObserver,
     setReplicaWriteBoundary: r.setReplicaWriteBoundary,
     setReplicaLocalWriteObserver: r.setReplicaLocalWriteObserver,
+    setReplicaJournalObserver: r.setReplicaJournalObserver,
     replicaIntegrityEpoch: r.replicaIntegrityEpoch,
     replicaVisibilityEpoch: r.replicaVisibilityEpoch,
     fenceReplicaConnection: r.fenceReplicaConnection,

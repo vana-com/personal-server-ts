@@ -201,6 +201,8 @@ export function createNodeReplication(input: {
     onError: (error) =>
       input.logger.warn({ err: error }, "Replication step failed"),
   });
+  // A committed own write schedules a step soon, not at the next wake.
+  store.setReplicaJournalObserver(() => driver.localWrite());
   return {
     state: "started",
     store,

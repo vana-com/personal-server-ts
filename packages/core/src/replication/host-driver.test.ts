@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ProgressReport } from "./coordinator.js";
 import {
   createReplicationDriver,
+  REPLICA_LOCAL_WRITE_DEBOUNCE_MS,
   REPLICA_STEP_ERROR_DELAY_MS,
   REPLICA_WAKE_MAX_MS,
   REPLICA_WAKE_MIN_MS,
@@ -335,5 +336,84 @@ describe("createReplicationDriver", () => {
     expect(await driver.stop(0)).toBe(true);
     expect(clock.armed()).toEqual([]);
     await expect(driver.stop(-1)).rejects.toThrow(RangeError);
+  });
+
+  it("a local write steps within the debounce window, not at the idle wake", async () => {
+    const clock = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    const driver = createReplicationDriver({
+      stepper,
+      budget,
+      timers: clock.timers,
+    });
+    driver.localWrite(); // not running: nothing to schedule
+    expect(clock.armed()).toEqual([]);
+    driver.start();
+    steps[0]!.done.resolve(report(undefined));
+    await flush();
+    expect(clock.armed()).toEqual([REPLICA_WAKE_MAX_MS]);
+    driver.localWrite();
+    expect(clock.armed()).toEqual([
+      REPLICA_LOCAL_WRITE_DEBOUNCE_MS,
+      REPLICA_WAKE_MAX_MS,
+    ]);
+    clock.advance(REPLICA_LOCAL_WRITE_DEBOUNCE_MS - 1);
+    expect(steps).toHaveLength(1);
+    clock.advance(1);
+    expect(steps).toHaveLength(2);
+    // The debounced step replaced the idle wake.
+    expect(clock.armed()).toEqual([]);
+    steps[1]!.done.resolve(report(undefined));
+    await flush();
+    expect(clock.armed()).toEqual([REPLICA_WAKE_MAX_MS]);
+  });
+
+  it("a burst of local writes shares one step; continuous writes cannot postpone it", async () => {
+    const clock = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    const driver = createReplicationDriver({
+      stepper,
+      budget,
+      timers: clock.timers,
+      localWriteDebounceMs: 500,
+    });
+    driver.start();
+    steps[0]!.done.resolve(report(undefined));
+    await flush();
+    for (let i = 0; i < 5; i++) {
+      driver.localWrite();
+      clock.advance(100);
+    }
+    expect(steps).toHaveLength(2);
+    expect(clock.armed()).toEqual([]);
+    // A write while that step runs gets its own debounced step after it.
+    driver.localWrite();
+    expect(clock.armed()).toEqual([500]);
+    steps[1]!.done.resolve(report(undefined));
+    await flush();
+    clock.advance(500);
+    expect(steps).toHaveLength(3);
+  });
+
+  it("stop clears a pending local-write step and rejects an invalid debounce", async () => {
+    const clock = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    const driver = createReplicationDriver({
+      stepper,
+      budget,
+      timers: clock.timers,
+    });
+    driver.start();
+    steps[0]!.done.resolve(report(undefined));
+    await flush();
+    driver.localWrite();
+    expect(await driver.stop(0)).toBe(true);
+    expect(clock.armed()).toEqual([]);
+    clock.advance(REPLICA_LOCAL_WRITE_DEBOUNCE_MS);
+    expect(steps).toHaveLength(1);
+    for (const bad of [0, -1, 1.5, Infinity])
+      expect(() =>
+        createReplicationDriver({ stepper, budget, localWriteDebounceMs: bad }),
+      ).toThrow(RangeError);
   });
 });
