@@ -19,6 +19,7 @@ import {
   cleanupHarness,
   clock,
   network,
+  slotKey,
   transportDevice,
   type TransportDevice,
 } from "./pdpp-replica-contract.test-utils.js";
@@ -82,7 +83,17 @@ function sizeOf(value: unknown): number {
   return 0;
 }
 
-type Access = { sql: string; args: unknown[] };
+/** Bytes of the binary columns of one row. */
+function bytesOf(row: unknown): number {
+  if (!row || typeof row !== "object") return 0;
+  return Object.values(row).reduce<number>(
+    (sum, value) => sum + (value instanceof Uint8Array ? value.byteLength : 0),
+    0,
+  );
+}
+
+/** One statement call, and the rows and binary bytes it handed back. */
+type Access = { sql: string; args: unknown[]; rows: number; bytes: number };
 
 /**
  * Meter every statement the database runs from now on: its SQL and bound
@@ -103,16 +114,24 @@ function meter(db: Database.Database) {
         )
           return typeof value === "function" ? value.bind(target) : value;
         return (...args: unknown[]) => {
-          accesses.push({ sql, args });
+          const access: Access = { sql, args, rows: 0, bytes: 0 };
+          accesses.push(access);
           largest = Math.max(largest, sizeOf(args));
           const result = value.apply(target, args);
+          const handed = (row: unknown) => {
+            access.rows++;
+            access.bytes += bytesOf(row);
+          };
           if (property !== "iterate") {
             largest = Math.max(largest, sizeOf(result));
+            if (property === "all") (result as unknown[]).forEach(handed);
+            else if (property === "get" && result !== undefined) handed(result);
             return result;
           }
           return (function* () {
             for (const row of result as Iterable<unknown>) {
               largest = Math.max(largest, sizeOf(row));
+              handed(row);
               yield row;
             }
           })();
@@ -539,4 +558,86 @@ it("a pinned blob outlives its canonical record until export no longer needs it"
   for (const chunk of from.store.replication.readPinnedBlobChunks(id))
     reopened += chunk.length;
   expect(reopened).toBe(BLOB_BYTES);
+}, 120_000);
+
+it("a discover pass over a long own history reads only versions above what it has seen", async () => {
+  const { net, from, to } = pair();
+  await settle(from, to);
+  const id = writeBlob(from, pattern(2 * MiB, 51), "large");
+  await exchange(from, to, [id]);
+  // Model a device with a long publishing history: thousands of published
+  // own versions, registered at the Gateway.
+  const slots = ownSlots(from);
+  const top = Math.max(...slots.map((slot) => slot.version));
+  const scope = slots.find((slot) => slot.version === top)!.scope;
+  const registered = net.head.get(slotKey(scope, top))!;
+  const HISTORY = 5000;
+  const claim = from.db.prepare(
+    "INSERT INTO pdpp_transport_manifests_out (batch,scope,version,plaintext,encrypted,data_hash,metadata_hash,state) VALUES (?,?,?,x'',x'','','','published')",
+  );
+  from.db.transaction(() => {
+    for (let version = top + 1; version <= top + HISTORY; version++) {
+      claim.run(`history-${version}`, scope, version);
+      net.head.set(slotKey(scope, version), {
+        ...registered,
+        version: String(version),
+      });
+    }
+  })();
+  // One pass learns the history.
+  clock.advance(60_000);
+  await from.step(BUDGET);
+  const reads = meter(from.db);
+  const lists = net.calls.lists;
+  for (let i = 0; i < 3; i++) {
+    clock.advance(60_000);
+    await from.step(BUDGET);
+  }
+  expect(net.calls.lists).toBeGreaterThan(lists);
+  const history = reads.accesses
+    .filter((access) => /pdpp_transport_manifests_(in|out)/.test(access.sql))
+    .reduce((rows, access) => rows + access.rows, 0);
+  expect(history).toBeLessThan(100);
+  expect(
+    from.db
+      .prepare(
+        "SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE scope=?",
+      )
+      .get(scope),
+  ).toEqual({ n: 0 });
+}, 120_000);
+
+it("compaction verifies a leftover copy across steps, within each step's byte budget", async () => {
+  const { from, to } = pair();
+  await settle(from, to);
+  const source = pattern(2 * MiB, 52);
+  const id = writeBlob(from, source, "large");
+  await exchange(from, to, [id]);
+  // An earlier build kept a received copy of a blob canonical storage holds.
+  to.db.exec(
+    `INSERT OR IGNORE INTO pdpp_binary_chunks SELECT 'received', blob_id, position, bytes FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';
+     INSERT OR IGNORE INTO pdpp_binary_manifests SELECT 'received', blob_id, size_bytes FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id='${id}';`,
+  );
+  to.crashReopen();
+  const small = { units: 20, bytes: MiB };
+  const reads = meter(to.db);
+  const chunkBytes = () =>
+    reads.accesses
+      .filter((access) => /pdpp_binary_chunks/.test(access.sql))
+      .reduce((bytes, access) => bytes + access.bytes, 0);
+  const perStep: number[] = [];
+  for (
+    let i = 0;
+    i < 40 && (blobStorage(to).namespaces.received ?? 0) > 0;
+    i++
+  ) {
+    const before = chunkBytes();
+    clock.advance(10_000);
+    await to.step(small);
+    perStep.push(chunkBytes() - before);
+  }
+  expect(blobStorage(to).namespaces.received ?? 0).toBe(0);
+  expect(perStep.length).toBeGreaterThan(1);
+  expect(Math.max(...perStep)).toBeLessThanOrEqual(small.bytes);
+  expect(sha256(to.store.getBlobBytes(id)!)).toBe(sha256(source));
 }, 120_000);

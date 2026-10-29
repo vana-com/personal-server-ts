@@ -80,6 +80,7 @@ import {
   createReplicaCoordinator,
   ReplicaCoordinatorConflict,
   REPLICA_REPORT_LIMIT,
+  REPLICA_STEP_BYTES,
   validateReplicaStep,
   type ReplicaAttempt,
   type ReplicaSettle,
@@ -189,8 +190,8 @@ export const REPLICA_BATCH_BYTES = REPLICA_BATCH_TARGET_BYTES;
 const EXPORT_PAGE = 1000;
 /** New slots one discover pass admits per writer scope. */
 const DISCOVER_SLOTS = 256;
-/** Each costs one verified read of the blob. */
-const COMPACT_BLOBS_PER_STEP = 4;
+/** Canonical bytes a step may verify toward compaction, at most a quarter of its budget. */
+const COMPACT_BYTES_PER_STEP = 4 * 1024 * 1024;
 /** An unresolved AddData intent is retried only after this bounded window. */
 export const REPLICA_REGISTRATION_INTENT_TIMEOUT_MS = 5 * 60 * 1000;
 /** Per-writer recovery budget; only explicit owner acknowledgement resumes an exhausted writer. */
@@ -243,6 +244,8 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_manifests_in (
 CREATE TABLE IF NOT EXISTS pdpp_transport_fragments_in (
  slot TEXT NOT NULL, position INTEGER NOT NULL, digest TEXT NOT NULL, bytes INTEGER NOT NULL,
  fragment_json TEXT, state TEXT NOT NULL DEFAULT 'ready', ${WORK}, PRIMARY KEY(slot,position));
+CREATE TABLE IF NOT EXISTS pdpp_transport_discover_floor (
+ scope TEXT PRIMARY KEY, version INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS pdpp_manifests_in_batch ON pdpp_transport_manifests_in(writer,batch);
 CREATE INDEX IF NOT EXISTS pdpp_manifests_in_checked ON pdpp_transport_manifests_in(evidence_checked) WHERE state='imported';
 CREATE TABLE IF NOT EXISTS pdpp_transport_imported (
@@ -684,6 +687,15 @@ export function createReplicaTransportWorker(deps: {
     db.prepare(
       "UPDATE pdpp_transport_state SET writer=?,sequence=0,previous_json=NULL,baseline_cursor=?,baseline_done=0,tail_cursor=NULL WHERE id=1",
     ).run(identity.transportWriter, baseline?.after ?? 0);
+    // The old writer's claims stop being this device's own: its published
+    // batches are history a peer, and this device, may still need. Lower
+    // each floor below them so discovery admits them (`releaseClaim`).
+    db.prepare(
+      `UPDATE pdpp_transport_discover_floor SET version=min(version,(
+         SELECT min(o.version)-1 FROM pdpp_transport_manifests_out o
+         WHERE o.scope=pdpp_transport_discover_floor.scope))
+       WHERE scope IN (SELECT scope FROM pdpp_transport_manifests_out)`,
+    ).run();
     for (const table of [
       "pdpp_transport_batches",
       "pdpp_transport_staged_fragments",
@@ -1561,9 +1573,7 @@ export function createReplicaTransportWorker(deps: {
             return blockPreparation(batch.batch, "all_ops_unsupported");
           // The unused tail alone may give back its sequence and wire version.
           discardPreparedFragments(batch.batch);
-          db.prepare(
-            "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
-          ).run(batch.batch);
+          releaseClaim(batch.batch);
           deleteBinary(db, "payload", batch.batch);
           db.prepare("DELETE FROM pdpp_transport_batches WHERE batch=?").run(
             batch.batch,
@@ -1586,9 +1596,7 @@ export function createReplicaTransportWorker(deps: {
         if (preparationHasExternalEffects(batch, prep.version))
           return blockPreparation(batch.batch);
         discardPreparedFragments(batch.batch);
-        db.prepare(
-          "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
-        ).run(batch.batch);
+        releaseClaim(batch.batch);
         deleteBinary(db, "payload", batch.batch);
         for (const table of ["pdpp_binary_chunks", "pdpp_binary_manifests"])
           db.prepare(
@@ -1701,6 +1709,21 @@ export function createReplicaTransportWorker(deps: {
     return true;
   }
   /** Drop an unpublished batch's fragments and its cursor. */
+  /**
+   * Give back a batch's claimed version. Discovery treats versions up to a
+   * scope's floor as claimed or admitted, so the floor drops below this one;
+   * a later pass admits it if another writer registers it.
+   */
+  function releaseClaim(batch: string) {
+    db.prepare(
+      `UPDATE pdpp_transport_discover_floor
+       SET version=min(version,(SELECT version-1 FROM pdpp_transport_manifests_out WHERE batch=@batch))
+       WHERE scope=(SELECT scope FROM pdpp_transport_manifests_out WHERE batch=@batch)`,
+    ).run({ batch });
+    db.prepare("DELETE FROM pdpp_transport_manifests_out WHERE batch=?").run(
+      batch,
+    );
+  }
   function discardPreparedFragments(batch: string) {
     db.prepare("DELETE FROM pdpp_transport_fragments_out WHERE batch=?").run(
       batch,
@@ -2554,9 +2577,7 @@ export function createReplicaTransportWorker(deps: {
         ).run(row.scope, row.version, received.dataHash, now(), row.batch);
         // Release every old slot before assigning the suffix, including unsigned claims.
         for (const claim of moving) {
-          db.prepare(
-            "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
-          ).run(claim.batch);
+          releaseClaim(claim.batch);
           db.prepare(
             "DELETE FROM pdpp_transport_registration_intents WHERE scope=? AND version=?",
           ).run(row.scope, claim.version);
@@ -3002,45 +3023,36 @@ export function createReplicaTransportWorker(deps: {
             if (!writer || !/^[1-9][0-9]{0,14}$/.test(point.version)) continue;
             // This device's own slots are canonical here already; importing
             // them would only add a custody copy. Skip every version it
-            // claims, published or not. A claim that loses its version to a
-            // squat is released (`recoverRegistration`), and the next pass
-            // admits the gap, so admission walks own scopes from version 1.
-            const own = new Set(
+            // claims, published or not. Every version up to the scope's
+            // floor is claimed or admitted, so a pass reads only versions
+            // above it. Releasing a claim lowers the floor (`releaseClaim`),
+            // and the next pass admits the gap if another writer took it.
+            const head = Number(point.version);
+            const floor =
               (
                 db
                   .prepare(
-                    "SELECT version FROM pdpp_transport_manifests_out WHERE scope=?",
+                    "SELECT version FROM pdpp_transport_discover_floor WHERE scope=?",
                   )
-                  .all(point.scope) as { version: number }[]
+                  .get(point.scope) as { version: number } | undefined
+              )?.version ?? 0;
+            const covered = new Set(
+              (
+                db
+                  .prepare(
+                    `SELECT version FROM pdpp_transport_manifests_out WHERE scope=@scope AND version>@floor AND version<=@head
+                     UNION ALL SELECT version FROM pdpp_transport_manifests_in WHERE scope=@scope AND version>@floor AND version<=@head`,
+                  )
+                  .all({ scope: point.scope, floor, head }) as {
+                  version: number;
+                }[]
               ).map((row) => row.version),
             );
-            const known = own.size
-              ? 0
-              : (
-                  db
-                    .prepare(
-                      "SELECT coalesce(max(version),0) AS version FROM pdpp_transport_manifests_in WHERE scope=?",
-                    )
-                    .get(point.scope) as { version: number }
-                ).version;
-            const seen = own.size
-              ? new Set(
-                  (
-                    db
-                      .prepare(
-                        "SELECT version FROM pdpp_transport_manifests_in WHERE scope=?",
-                      )
-                      .all(point.scope) as { version: number }[]
-                  ).map((row) => row.version),
-                )
-              : new Set<number>();
             let admitted = 0;
-            for (
-              let version = known + 1;
-              version <= Number(point.version) && admitted < DISCOVER_SLOTS;
-              version++
-            ) {
-              if (own.has(version) || seen.has(version)) continue;
+            let version = floor + 1;
+            for (; version <= head; version++) {
+              if (covered.has(version)) continue;
+              if (admitted === DISCOVER_SLOTS) break;
               db.prepare(
                 "INSERT OR IGNORE INTO pdpp_transport_manifests_in (slot,scope,version,writer) VALUES (?,?,?,?)",
               ).run(
@@ -3051,6 +3063,9 @@ export function createReplicaTransportWorker(deps: {
               );
               admitted++;
             }
+            db.prepare(
+              "INSERT INTO pdpp_transport_discover_floor (scope,version) VALUES (?,?) ON CONFLICT(scope) DO UPDATE SET version=excluded.version",
+            ).run(point.scope, version - 1);
           }
           db.prepare(
             "UPDATE pdpp_transport_state SET scan_cursor=? WHERE id=1",
@@ -4456,9 +4471,19 @@ export function createReplicaTransportWorker(deps: {
         }
         sweepPublished();
       }).immediate();
-      // Storage earlier builds kept twice shrinks a few blobs per step.
-      for (let i = 0; i < COMPACT_BLOBS_PER_STEP; i++)
-        if (!deps.receiver.atomically(() => compactor.step())) break;
+      // Storage earlier builds kept twice shrinks within a share of the
+      // step's bytes; a large blob takes several steps.
+      let compactBytes = Math.min(
+        COMPACT_BYTES_PER_STEP,
+        Math.floor((context.budget.bytes ?? REPLICA_STEP_BYTES) / 4),
+      );
+      while (compactBytes > 0) {
+        const read = deps.receiver.atomically(() =>
+          compactor.step(compactBytes),
+        );
+        if (!read) break;
+        compactBytes -= read;
+      }
       const current = dependencyFingerprint();
       if (current !== fingerprint) {
         fingerprint = current;

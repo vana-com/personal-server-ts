@@ -481,47 +481,37 @@ export function readBinary(
 }
 
 /**
- * Bring blobs an earlier build stored more than once down to one copy, a few
- * blobs per call. Each candidate costs one verified read; the caller runs
- * each `step` in its own write transaction. A copy goes only when canonical
- * storage holds the blob and it verifies:
+ * Bring blobs an earlier build stored more than once down to one copy. The
+ * caller runs each `step` in its own write transaction. A
+ * copy goes only when canonical storage holds the blob and it verifies:
  *
  * - a received custody copy (the receiver now moves it at promotion);
  * - main's whole row of a large blob that also has the chunk form;
  * - a capture pin's own copy, which becomes a pin row that references the
  *   canonical chunks (`captureBlob`).
  *
- * A candidate that fails verification is skipped for the compactor's life,
- * so one corrupt blob cannot hold back the rest. Once a search finds nothing,
- * the compactor stops for good: current writes keep one copy, so only a
- * database an earlier build wrote has work, and an idle step then reads none
- * of these tables.
+ * Verification reads a bounded number of chunks per call, so a large blob
+ * is verified across calls. The hash in progress lives in memory: after a
+ * restart that blob is verified again from its start. A canonical whole row
+ * up to 1 MiB verifies in one call; a larger one has no bounded read and is
+ * skipped. A candidate that fails verification is skipped for the
+ * compactor's life, so one corrupt blob cannot hold back the rest. Once a
+ * search finds nothing, the compactor stops for good: current writes keep
+ * one copy, so only a database an earlier build wrote has work, and an idle
+ * step then reads none of these tables.
  */
 export function createBinaryCompactor(db: Database) {
   const skipped = new Set<string>();
   let exhausted = false;
-  const canonicalVerifies = (id: string) => {
-    const meta = db
-      .prepare(
-        "SELECT size_bytes AS size, sha256 FROM pdpp_blobs WHERE blob_id=?",
-      )
-      .get(id) as { size: number; sha256: string } | undefined;
-    return (
-      !!meta &&
-      verifyBinary(db, "canonical", id, `sha256:${meta.sha256}`, meta.size)
-    );
-  };
-  const kinds = [
-    {
-      kind: "received",
+  const kinds = {
+    received: {
       candidates: `SELECT blob_id FROM pdpp_binary_manifests WHERE namespace='received'
         UNION SELECT blob_id FROM ${legacy.received}`,
       compact(id: string) {
         deleteBinaryCopy(db, "received", id);
       },
     },
-    {
-      kind: "whole",
+    whole: {
       candidates: `SELECT c.blob_id FROM ${legacy.canonical} c
         JOIN pdpp_binary_manifests m ON m.namespace='canonical' AND m.blob_id=c.blob_id
         WHERE m.size_bytes > ${CANONICAL_INLINE_BYTES}`,
@@ -529,45 +519,149 @@ export function createBinaryCompactor(db: Database) {
         db.prepare(`DELETE FROM ${legacy.canonical} WHERE blob_id=?`).run(id);
       },
     },
-    {
-      kind: "pinned",
+    pinned: {
       candidates: `SELECT p.blob_id FROM pdpp_binary_manifests p
         JOIN pdpp_binary_manifests m ON m.namespace='canonical' AND m.blob_id=p.blob_id
         WHERE p.namespace='pinned'`,
       compact(id: string) {
+        // Export may have released the pin since verification began.
+        if (binaryLength(db, "pinned", id) === undefined) return;
         db.prepare(
           "INSERT OR IGNORE INTO pdpp_replica_blob_pins VALUES (?)",
         ).run(id);
         deleteBinary(db, "pinned", id);
       },
     },
-  ] as const;
+  } as const;
+  type Kind = keyof typeof kinds;
+  let current:
+    | {
+        kind: Kind;
+        id: string;
+        size: number;
+        digest: string;
+        hash: ReturnType<typeof createHash>;
+        position: number;
+        read: number;
+      }
+    | undefined;
   /** The next blob to compact, or undefined when none is left. */
-  function next(): { kind: string; id: string } | undefined {
-    for (const { kind, candidates } of kinds) {
+  function next(): { kind: Kind; id: string } | undefined {
+    for (const kind of Object.keys(kinds) as Kind[]) {
       const rows = db
         .prepare(
-          `SELECT blob_id FROM (${candidates}) WHERE blob_id IN (SELECT blob_id FROM pdpp_blobs) ORDER BY blob_id`,
+          `SELECT blob_id FROM (${kinds[kind].candidates}) WHERE blob_id IN (SELECT blob_id FROM pdpp_blobs) ORDER BY blob_id LIMIT ?`,
         )
-        .all() as { blob_id: string }[];
+        .all(skipped.size + 1) as { blob_id: string }[];
       const row = rows.find((row) => !skipped.has(`${kind}:${row.blob_id}`));
       if (row) return { kind, id: row.blob_id };
     }
     return undefined;
   }
+  /**
+   * Begin verifying the next candidate. A canonical whole row up to 1 MiB
+   * verifies at once; larger whole rows have no bounded read and are skipped.
+   * Returns the bytes read, or undefined when no candidate is left.
+   */
+  function begin(): number | undefined {
+    const candidate = next();
+    if (!candidate) return undefined;
+    const key = `${candidate.kind}:${candidate.id}`;
+    const meta = db
+      .prepare(
+        "SELECT size_bytes AS size, sha256 FROM pdpp_blobs WHERE blob_id=?",
+      )
+      .get(candidate.id) as { size: number; sha256: string } | undefined;
+    const size = binaryLength(db, "canonical", candidate.id);
+    if (!meta || size !== meta.size) {
+      skipped.add(key);
+      return 0;
+    }
+    const digest = `sha256:${meta.sha256}`;
+    const chunked = db
+      .prepare(
+        "SELECT 1 FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=?",
+      )
+      .get(candidate.id);
+    if (!chunked) {
+      if (
+        size <= CANONICAL_INLINE_BYTES &&
+        verifyBinary(db, "canonical", candidate.id, digest, size)
+      )
+        kinds[candidate.kind].compact(candidate.id);
+      else skipped.add(key);
+      return size;
+    }
+    current = {
+      ...candidate,
+      size,
+      digest,
+      hash: createHash("sha256"),
+      position: 0,
+      read: 0,
+    };
+    return 0;
+  }
+  /** Hash up to `bytes` more of the current blob; compact it once verified. */
+  function advance(bytes: number): number {
+    const blob = current!;
+    const rows = db
+      .prepare(
+        "SELECT position, bytes FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=? AND position>=? ORDER BY position",
+      )
+      .iterate(blob.id, blob.position) as Iterable<{
+      position: number;
+      bytes: Buffer;
+    }>;
+    let read = 0;
+    let corrupt = true;
+    for (const row of rows) {
+      corrupt =
+        row.position !== blob.position ||
+        !row.bytes.length ||
+        row.bytes.length > BINARY_CHUNK_BYTES ||
+        blob.read + row.bytes.length > blob.size;
+      if (corrupt || (read && read + row.bytes.length > bytes)) break;
+      blob.hash.update(row.bytes);
+      blob.position++;
+      blob.read += row.bytes.length;
+      read += row.bytes.length;
+      if (blob.read === blob.size) break;
+    }
+    const key = `${blob.kind}:${blob.id}`;
+    if (corrupt) {
+      skipped.add(key);
+      current = undefined;
+    } else if (blob.read === blob.size) {
+      current = undefined;
+      if (
+        `sha256:${blob.hash.digest("hex")}` === blob.digest &&
+        binaryLength(db, "canonical", blob.id) === blob.size
+      )
+        kinds[blob.kind].compact(blob.id);
+      else skipped.add(key);
+    }
+    return Math.max(read, 1);
+  }
   return {
-    /** Compact one blob; false when none is left. Call it in a write transaction. */
-    step(): boolean {
-      if (exhausted) return false;
-      const candidate = next();
-      if (!candidate) {
-        exhausted = true;
-        return false;
+    /**
+     * Read up to about `bytes` of canonical storage toward compacting the
+     * next copy. Returns the bytes read; 0 when nothing is left or `bytes`
+     * is under one chunk. Call it in a write transaction.
+     */
+    step(bytes: number): number {
+      if (exhausted || bytes < BINARY_CHUNK_BYTES) return 0;
+      if (!current) {
+        const read = begin();
+        if (read === undefined) {
+          exhausted = true;
+          return 0;
+        }
+        // A whole row verified at once, or a skipped candidate: count at
+        // least one byte, so a caller's loop over its share always ends.
+        if (!current) return Math.max(read, 1);
       }
-      const kind = kinds.find((k) => k.kind === candidate.kind)!;
-      if (canonicalVerifies(candidate.id)) kind.compact(candidate.id);
-      else skipped.add(`${candidate.kind}:${candidate.id}`);
-      return true;
+      return advance(bytes);
     },
   };
 }

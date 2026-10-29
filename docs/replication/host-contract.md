@@ -683,16 +683,19 @@ There is no blob-size cap.
   moves into canonical storage instead of being copied (see Promotion).
 - **No custody of an own batch:** discovery skips every version the device
   published itself, in any state, so a device never downloads or imports its
-  own batch. The first step of a process deletes inbox rows that an earlier
+  own batch. A per-scope floor marks the versions already claimed or
+  admitted, so a pass reads only newer versions; releasing a claim lowers
+  the floor. The first step of a process deletes inbox rows that an earlier
   build admitted for the device's own published batches.
 - **One local copy per blob:** a blob larger than 1 MiB is stored once, as
   chunks. A local write stores chunks only, with no whole-row copy. A pin of a
   chunked canonical blob is a row in `pdpp_replica_blob_pins` that references
   the canonical chunks. If canonical storage later replaces or drops the blob,
   a trigger moves the chunks to the pinned namespace first, so the pin keeps
-  its bytes. Each step compacts at most 4 copies left by earlier builds
-  (received copies, whole rows of chunked blobs, and pinned copies of chunked
-  canonical blobs) after it verifies the canonical copy.
+  its bytes. Copies left by earlier builds (received copies, whole rows of
+  chunked blobs, and pinned copies of chunked canonical blobs) go after the
+  canonical copy verifies. A step verifies at most a quarter of its byte
+  budget, up to 4 MiB, so a large blob takes several steps.
 - **Promotion:** the receiver verifies a received blob larger than 1 MiB and
   moves its chunks into canonical storage in one transaction. It assembles no
   whole value and keeps no received copy. When canonical storage already holds

@@ -378,8 +378,9 @@ batch's registration is finalized, the publish commit drops its payload and
 fragment ciphertext; fragment digests and the manifest remain. Hidden abandoned stages are reclaimed by the next
 worker cycle under the single-process database-writer contract.
 The import commit deletes the inbox fragment bodies, and discovery never
-admits the device's own batches. Each worker step compacts at most 4 storage
-copies left by earlier builds. Fragment commitments, failures and receipts
+admits the device's own batches; a per-scope floor keeps an idle pass from
+reading old versions. Storage copies left by earlier builds are compacted
+within a quarter of each step's byte budget, up to 4 MiB. Fragment commitments, failures and receipts
 remain retained.
 A rebuild may replace or remove an unpublished source payload; the source
 journal and Unsupported operation outcomes remain. No source-history compaction
