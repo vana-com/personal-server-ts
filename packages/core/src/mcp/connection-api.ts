@@ -362,6 +362,21 @@ export interface RequestMcpScopeAccessOutput {
   readToken?: string;
 }
 
+/**
+ * An agent asking to save memories (`write:memory.<app>`) also asks to read
+ * that scope, so one owner approval lets it recall what it saved. Without the
+ * read entry, `remember` succeeds but `read_scope` and search never see it.
+ */
+function withMemoryReadScopes(scopes: readonly string[]): string[] {
+  const expanded = new Set(scopes);
+  for (const scope of scopes) {
+    if (!isWriteScopeEntry(scope)) continue;
+    const target = scope.slice(WRITE_SCOPE_PREFIX.length);
+    if (isMemoryScope(target) && !target.includes("*")) expanded.add(target);
+  }
+  return [...expanded].sort();
+}
+
 export async function requestMcpScopeAccess(
   input: { connectionId: string; scopes: string[]; reason?: string },
   options: { store: McpConnectionStore; now?: () => Date },
@@ -372,9 +387,9 @@ export async function requestMcpScopeAccess(
   const readTokenExpiresAt = new Date(
     nowMs(options.now) + MCP_SCOPE_REQUEST_READ_TOKEN_TTL_MS,
   ).toISOString();
-  const inputScopes = Array.from(
-    new Set(input.scopes.map((scope) => scope.trim()).filter(Boolean)),
-  ).sort();
+  const inputScopes = withMemoryReadScopes(
+    input.scopes.map((scope) => scope.trim()).filter(Boolean),
+  );
   const updated = await options.store.mutate(input.connectionId, (existing) => {
     if (existing.status !== "approved") {
       throw new McpConnectionStateError(
