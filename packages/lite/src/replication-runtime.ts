@@ -99,6 +99,9 @@ export function createLiteReplicationRuntime(input: {
     onError: input.onError,
   });
   let pausing: Promise<boolean> | undefined;
+  // Bumped synchronously by every resume, pause and stop. A resume queued
+  // behind a pause starts only if no later call has superseded it.
+  let lifecycle = 0;
   return {
     status() {
       const { state, ...rest } = driver.status();
@@ -107,14 +110,19 @@ export function createLiteReplicationRuntime(input: {
     trigger: () => driver.trigger(),
     wake: (dependency) => driver.wake(dependency),
     resume() {
+      const mine = ++lifecycle;
       // A resume during a pause waits for it, so the old step settles first.
-      if (pausing) void pausing.then(() => driver.start());
+      if (pausing)
+        void pausing.then(() => {
+          if (mine === lifecycle) driver.start();
+        });
       else driver.start();
     },
     async pause() {
       await this.stop(LITE_REPLICATION_PAUSE_GRACE_MS);
     },
     async stop(graceMs) {
+      lifecycle++;
       const stopping = driver.stop(graceMs);
       pausing = stopping;
       try {

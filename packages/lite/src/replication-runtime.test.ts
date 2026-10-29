@@ -155,6 +155,52 @@ describe("createLiteReplicationRuntime", () => {
     expect(scripted.budgets).toHaveLength(2);
   });
 
+  it("a resume queued behind a pause does not override a later pause", async () => {
+    const scripted = createScriptedReplicationEngine([report()], {
+      stepMs: 60_000,
+    });
+    const runtime = createLiteReplicationRuntime({
+      door: on,
+      config,
+      engine: scripted.engine,
+      timers: manualTimers,
+    });
+    runtime.resume();
+    expect(scripted.budgets).toHaveLength(1);
+    // Neither pause has settled the aborted first step when resume and the
+    // second pause are issued.
+    const firstPause = runtime.pause();
+    runtime.resume();
+    const secondPause = runtime.pause();
+    await Promise.all([firstPause, secondPause]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scripted.budgets).toHaveLength(1);
+    expect(runtime.status()).toMatchObject({
+      state: "paused",
+      stepping: false,
+    });
+  });
+
+  it("a resume queued behind a pause still starts when nothing supersedes it", async () => {
+    const scripted = createScriptedReplicationEngine([report()], {
+      stepMs: 60_000,
+    });
+    const runtime = createLiteReplicationRuntime({
+      door: on,
+      config,
+      engine: scripted.engine,
+      timers: manualTimers,
+    });
+    runtime.resume();
+    const pause = runtime.pause();
+    runtime.resume();
+    await pause;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scripted.budgets).toHaveLength(2);
+    expect(runtime.status()).toMatchObject({ state: "on", stepping: true });
+    expect(await runtime.stop(1_000)).toBe(true);
+  });
+
   it("aborts a step at the configured deadline", async () => {
     const scripted = createScriptedReplicationEngine([report()], {
       stepMs: 60_000,
@@ -434,5 +480,51 @@ describe("in-memory LiteReplicaObjectTransfers", () => {
     const first = memory.port.download({ url, maxBytes: 9 }, call());
     expect(await code(memory.port.probe({ url }, call()))).toBe("busy");
     expect(await code(first)).toBe("ok");
+  });
+
+  it("discards the stage of a download cancelled after it staged", async () => {
+    const { port: persistence, stagedBytes } = createMemoryReplicaPersistence();
+    const memory = createMemoryReplicaObjectTransfers(persistence);
+    const url = "https://storage.invalid/o";
+    memory.objects.set(url, new Uint8Array([1, 2, 3]));
+    const controller = new AbortController();
+    const download = memory.port.download(
+      { url, maxBytes: 9 },
+      { signal: controller.signal, deadlineMs: 30_000 },
+    );
+    controller.abort();
+    await expect(download).rejects.toMatchObject({ code: "cancelled" });
+    expect(stagedBytes()).toBe(0);
+  });
+
+  it("caps unattached stages in aggregate until they are discarded or attached", async () => {
+    const { port: persistence, stagedBytes } = createMemoryReplicaPersistence(
+      undefined,
+      { maxStagedBytes: 10 },
+    );
+    const stage = (size: number) =>
+      persistence.stageBytes(
+        (async function* () {
+          yield new Uint8Array(size).fill(1);
+        })(),
+      );
+    const first = await stage(6);
+    await expect(stage(5)).rejects.toMatchObject({ code: "storage-full" });
+    expect(stagedBytes()).toBe(6);
+    const second = await stage(4);
+    expect(stagedBytes()).toBe(10);
+    persistence.discardBytes(first);
+    expect(stagedBytes()).toBe(4);
+    const third = await stage(6);
+    // Attaching publishes a stage, so it stops counting against the cap.
+    await persistence.transaction((tx) =>
+      tx.attachBytes(second, {
+        length: 4,
+        sha256: sha256(new Uint8Array(4).fill(1)).slice(2),
+      }),
+    );
+    expect(stagedBytes()).toBe(6);
+    persistence.discardBytes(third);
+    expect(stagedBytes()).toBe(0);
   });
 });

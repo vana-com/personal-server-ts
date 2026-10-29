@@ -25,10 +25,17 @@ import {
 
 const FRAME_BYTES = 128 * 1024;
 const VALUE_BYTES = 256 * 1024;
+/** Unattached staged bytes the reference holds at once, as the native side does. */
+export const MEMORY_STAGED_BYTES_CAP = 32 * 1024 * 1024;
 
 export interface MemoryReplicaDisk extends FakeCanonicalDisk {
   bytes: Map<string, Uint8Array>;
 }
+/** The persistence port plus the stage release a cancelled transfer needs. */
+export type MemoryReplicaPersistencePort = LiteReplicaPersistence & {
+  /** Drop an unattached stage. A no-op for an unknown or attached id. */
+  discardBytes(id: string): void;
+};
 export const memoryReplicaDisk = (): MemoryReplicaDisk => ({
   ...fakeCanonicalDisk(),
   bytes: new Map(),
@@ -40,17 +47,28 @@ const sha256Of = (bytes: Uint8Array) => sha256(bytes).slice(2);
  * `LiteReplicaPersistence` over maps. Transactions run one at a time on a
  * copy and replace the disk only when the callback resolves, so a throw
  * rolls back rows, blobs and bytes together. Staged bytes stay invisible
- * until a transaction attaches them.
+ * until a transaction attaches them. Unattached stages share one byte cap
+ * (`maxStagedBytes`): a stage that would pass it fails `storage-full`, so an
+ * abandoned stage costs space until `discardBytes` releases it.
  */
-export function createMemoryReplicaPersistence(disk = memoryReplicaDisk()) {
+export function createMemoryReplicaPersistence(
+  disk = memoryReplicaDisk(),
+  opts: { maxStagedBytes?: number } = {},
+) {
+  const maxStagedBytes = opts.maxStagedBytes ?? MEMORY_STAGED_BYTES_CAP;
   const staged = new Map<string, Uint8Array>();
+  const stagedTotal = () => {
+    let total = 0;
+    for (const value of staged.values()) total += value.length;
+    return total;
+  };
   const stagedBlobs = new Map<
     string,
     Awaited<ReturnType<typeof collectStagedBlob>>
   >();
   let queue = Promise.resolve();
   let failBeforeCommit = false;
-  const port: LiteReplicaPersistence = {
+  const port: MemoryReplicaPersistencePort = {
     transaction<T>(run: (tx: LiteReplicaTransaction) => Promise<T>) {
       const work = queue.then(async () => {
         const rows = new Map(disk.rows);
@@ -130,9 +148,12 @@ export function createMemoryReplicaPersistence(disk = memoryReplicaDisk()) {
     async stageBytes(chunks) {
       const parts: Uint8Array[] = [];
       let size = 0;
+      const others = stagedTotal();
       for await (const part of chunks) {
         if (part.length > FRAME_BYTES)
           throw new Error("native frame exceeds 128 KiB");
+        if (others + size + part.length > maxStagedBytes)
+          throw new LiteReplicaTransferError("storage-full");
         parts.push(part.slice());
         size += part.length;
       }
@@ -151,10 +172,15 @@ export function createMemoryReplicaPersistence(disk = memoryReplicaDisk()) {
       if (!value) throw new Error("missing attached bytes");
       yield* frames(value);
     },
+    discardBytes(id) {
+      staged.delete(id);
+    },
   };
   return {
     port,
     disk,
+    /** Unattached staged bytes, for tests. */
+    stagedBytes: stagedTotal,
     /** The next transaction throws after its callback, before it commits. */
     failNextCommit() {
       failBeforeCommit = true;
@@ -172,22 +198,30 @@ function* frames(bytes: Uint8Array) {
  * Native object I/O over a map of URL to bytes, staging downloads into
  * `persistence` and uploading its attached bytes. At most `maxTransfers` run
  * at once; one more fails `busy`, as the native gate refuses rather than
- * queueing. An aborted call fails `cancelled` and stages nothing.
+ * queueing. An aborted call fails `cancelled` and leaves no stage behind:
+ * a stage made before the abort is discarded.
  */
 export function createMemoryReplicaObjectTransfers(
-  persistence: LiteReplicaPersistence,
+  persistence: MemoryReplicaPersistencePort,
   opts: { maxTransfers?: number } = {},
 ) {
   const objects = new Map<string, Uint8Array>();
   const maxTransfers = opts.maxTransfers ?? 2;
   let active = 0;
-  async function transfer<T>(signal: AbortSignal, run: () => Promise<T>) {
+  async function transfer<T>(
+    signal: AbortSignal,
+    run: () => Promise<T>,
+    discard?: (result: T) => void,
+  ) {
     if (signal.aborted) throw new LiteReplicaTransferError("cancelled");
     if (active >= maxTransfers) throw new LiteReplicaTransferError("busy");
     active++;
     try {
       const result = await run();
-      if (signal.aborted) throw new LiteReplicaTransferError("cancelled");
+      if (signal.aborted) {
+        discard?.(result);
+        throw new LiteReplicaTransferError("cancelled");
+      }
       return result;
     } finally {
       active--;
@@ -195,23 +229,27 @@ export function createMemoryReplicaObjectTransfers(
   }
   const port: LiteReplicaObjectTransfers = {
     download({ url, maxBytes, expected }, { signal }) {
-      return transfer(signal, async () => {
-        const value = objects.get(url);
-        if (!value) throw new LiteReplicaTransferError("not-found");
-        if (value.length > maxBytes)
-          throw new LiteReplicaTransferError("too-large");
-        const info = { length: value.length, sha256: sha256Of(value) };
-        if (expected && expected.length !== info.length)
-          throw new LiteReplicaTransferError("length-mismatch");
-        if (expected && expected.sha256 !== info.sha256)
-          throw new LiteReplicaTransferError("digest-mismatch");
-        const stagingId = await persistence.stageBytes(
-          (async function* () {
-            yield* frames(value);
-          })(),
-        );
-        return { stagingId, ...info };
-      });
+      return transfer(
+        signal,
+        async () => {
+          const value = objects.get(url);
+          if (!value) throw new LiteReplicaTransferError("not-found");
+          if (value.length > maxBytes)
+            throw new LiteReplicaTransferError("too-large");
+          const info = { length: value.length, sha256: sha256Of(value) };
+          if (expected && expected.length !== info.length)
+            throw new LiteReplicaTransferError("length-mismatch");
+          if (expected && expected.sha256 !== info.sha256)
+            throw new LiteReplicaTransferError("digest-mismatch");
+          const stagingId = await persistence.stageBytes(
+            (async function* () {
+              yield* frames(value);
+            })(),
+          );
+          return { stagingId, ...info };
+        },
+        (staged) => persistence.discardBytes(staged.stagingId),
+      );
     },
     probe({ url }, { signal }) {
       return transfer(signal, async () => objects.has(url));
