@@ -97,3 +97,46 @@ describe("PS-Lite scope inventory", () => {
     );
   });
 });
+
+describe("PS-Lite runtime errors", () => {
+  it("logs the cause of a 500 outside the data routes", async () => {
+    const logger = { error: vi.fn() };
+    const accessLogStore = createMemoryPsLiteAccessLogStore();
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      gateway: createMockPsLiteGateway(),
+      accessLogReader: accessLogStore,
+      accessLogWriter: accessLogStore,
+      tokenStore: createMemoryPsLiteTokenStore(),
+      saveConfig: async () => {},
+      stateCapabilities: { config: "memory" },
+      auth: {
+        ...createBearerTokenPsLiteAuth({
+          ownerToken: "owner-token",
+          builderToken: "builder-token",
+        }),
+        async authorizeOwner() {
+          throw new Error("session store unreadable");
+        },
+      },
+      logger,
+      active: true,
+    });
+
+    const res = await runtime.fetch(
+      new Request("https://ps.local/v1/import/oura-browser", {
+        method: "POST",
+        headers: { Authorization: "Bearer owner-token" },
+        body: "{}",
+      }),
+    );
+
+    expect(res.status).toBe(500);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: expect.objectContaining({ message: "session store unreadable" }),
+      }),
+      expect.any(String),
+    );
+  });
+});
