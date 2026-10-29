@@ -358,7 +358,9 @@ fallback. While the receiver has queued work the phase stays due and runs one
 page per step; `pdpp_transport_reconcile_pass` keeps the pass's earliest Wait
 dependency across pages and restart, and the last page reports it. Each page
 reserves its bytes times `REPLICA_ENVELOPE_LIVE_COPY_FACTOR` from the shared
-byte budget. A refusal is `Retry(resource_busy)` with backoff; a page larger
+byte budget. A refusal is `Retry(resource_busy)` with backoff, and queued
+pages do not override that backoff; after it, the open pass continues rather
+than starting again. A page larger
 than the whole budget runs when no other work holds bytes. With nothing queued
 and nothing outstanding the phase is never due and reads no retained history.
 New large canonical, pinned and received bytes use the same 64 KiB chunk store.

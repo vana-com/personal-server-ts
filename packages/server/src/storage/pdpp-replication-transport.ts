@@ -3804,6 +3804,23 @@ export function createReplicaTransportWorker(deps: {
       dependencyKey(x).localeCompare(dependencyKey(y)),
     )[0];
   }
+  /**
+   * Whether the reconcile phase runs now, and whether it starts a new pass.
+   * A Retry inside an open pass keeps its backoff and then continues the
+   * pass; a changed fingerprint or a due Wait starts a new one.
+   */
+  function reconcileDue(
+    row: ReturnType<typeof singleton>,
+    e: ReplicaEligibility,
+  ): { restart: boolean; run: boolean } {
+    const eligible = (singletonEligibleAt(row, e) ?? Infinity) <= e.now;
+    const retrying = row.outcome === "retry";
+    if (row.fingerprint !== fingerprint) return { restart: true, run: true };
+    if (retrying && !eligible) return { restart: false, run: false };
+    const resume = retrying && openPass() !== undefined;
+    if (eligible && !resume) return { restart: true, run: true };
+    return { restart: false, run: resume || deps.receiver.reconcileQueued() };
+  }
   /** The dependency a pass reported so far; absent when no pass is open. */
   function openPass(): { dependency: ReplicaDependency | null } | undefined {
     const row = db
@@ -3830,10 +3847,8 @@ export function createReplicaTransportWorker(deps: {
     phase: "reconcile",
     due(e) {
       const row = singleton("reconcile");
-      const restart =
-        row.fingerprint !== fingerprint ||
-        (singletonEligibleAt(row, e) ?? Infinity) <= e.now;
-      return restart || deps.receiver.reconcileQueued()
+      const { restart, run } = reconcileDue(row, e);
+      return run
         ? [
             {
               id: "reconcile",
@@ -3901,7 +3916,9 @@ export function createReplicaTransportWorker(deps: {
     commitProblem: "reconcile_failed",
     earliest(e) {
       const row = singleton("reconcile");
-      if (row.fingerprint !== fingerprint || deps.receiver.reconcileQueued())
+      if (row.fingerprint !== fingerprint) return e.now;
+      // Queued pages are due now, unless a Retry is backing off.
+      if (row.outcome !== "retry" && deps.receiver.reconcileQueued())
         return e.now;
       return singletonEligibleAt(row, e);
     },

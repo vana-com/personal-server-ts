@@ -428,3 +428,47 @@ it("a database whose retained history predates the reconciler state is reconcile
   expect(d.receiver.reconcileQueued()).toBe(false);
   expect([text(d, "k1"), text(d, "k2")]).toEqual([undefined, "two"]);
 });
+
+it("a completion becomes available when its last dependency arrives, even one that changes no key or connection decision", () => {
+  const source = device();
+  source.store.replaceStream({
+    instance: "conn_a",
+    stream: "messages",
+    method: "collector",
+    generation: 1,
+    emittedAt: at,
+    envelopes: [
+      {
+        instance: "conn_a",
+        stream: "messages",
+        key: "a",
+        data: { id: "a", text: "snapshot" },
+        emitted_at: at,
+      },
+    ],
+    primaryKey: ["id"],
+    sourceCollectedAt: at,
+  });
+  const operations = [
+    ...source.store.replication.readBaselinePage({ limit: 1000 }).operations,
+    ...source.store.replication.readTailPage({ limit: 1000 }).operations,
+  ];
+  const completion = operations.find((op) => op.kind === "stream-complete")!;
+  const register = operations.find((op) => op.kind === "connection-register")!;
+  expect(
+    completion.kind === "stream-complete" &&
+      completion.dependencies.some(
+        (dependency) =>
+          dependency.operationId === register.revision.operationId,
+      ),
+  ).toBe(true);
+  const target = device();
+  // The local registration already makes the connection active, so the
+  // remote one changes no decision: only the dependency index finds the
+  // completion that waits on it.
+  target.send(operations.filter((op) => op !== register));
+  expect(target.store.listStreamCompletions("conn_a")).toEqual([]);
+  target.send([register]);
+  expect(target.store.listStreamCompletions("conn_a")).toHaveLength(1);
+  expect(text(target, "a")).toBe("snapshot");
+});

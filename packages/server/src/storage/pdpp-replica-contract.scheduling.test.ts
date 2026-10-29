@@ -749,9 +749,56 @@ it("17f a reconcile page reserves its bytes from the shared budget: busy while o
     busy?.problems.filter((p) => p.phase === "reconcile").map((p) => p.problem),
   ).toEqual(["resource_busy"]);
   expect(tally.retry, "a refused page loads nothing").toBe(calls);
+  // The Retry keeps its backoff: steps inside it make no reconcile attempt.
+  for (let i = 0; i < 3; i++) {
+    clock.advance(10);
+    const quiet = await step(b);
+    expect(quiet?.problems.filter((p) => p.phase === "reconcile")).toEqual([]);
+    expect(quiet?.nextWake ?? Infinity).toBeGreaterThan(clock.now());
+  }
+  expect(tally.retry).toBe(calls);
   held();
   await stepUntil(b, () => tally.retry > calls, 10, B1);
   expect(budget.reserved, "every page released its bytes").toBe(0);
+
+  // A refusal in the middle of a pass backs off, then continues that pass
+  // instead of starting it again.
+  const small = transportDevice(net, {
+    worker: {
+      resourceBudget: budget,
+      reconcilePage: { operations: 5, bytes: 64 * 1024 },
+    },
+  });
+  const tallySmall = newTally();
+  instrument(small, tallySmall);
+  small.receiver.import({ credential, envelope: envelope(remoteHistory(60)) });
+  await stepUntil(small, () => !small.receiver.reconcileQueued(), 100, 10_000);
+  const passes = tallySmall.retry;
+  notify(small, `declaration:${sourceId}:messages`);
+  await steps(small, 2, 10);
+  expect(tallySmall.retry).toBe(passes + 1);
+  expect(small.receiver.reconcileQueued()).toBe(true);
+  const blocker = budget.reserve(64 * MiB - 64 * 1024);
+  if (typeof blocker !== "function")
+    throw new Error("setup reservation refused");
+  const refused = await step(small);
+  expect(
+    refused?.problems
+      .filter((p) => p.phase === "reconcile")
+      .map((p) => p.problem),
+  ).toEqual(["resource_busy"]);
+  // Queued pages do not override the backoff.
+  for (let i = 0; i < 3; i++) {
+    clock.advance(10);
+    const quiet = await step(small);
+    expect(quiet?.problems.filter((p) => p.phase === "reconcile")).toEqual([]);
+  }
+  blocker();
+  await stepUntil(small, () => !small.receiver.reconcileQueued(), 100, B1);
+  expect(tallySmall.retry, "the pass continued, it did not restart").toBe(
+    passes + 1,
+  );
+  expect(budget.reserved).toBe(0);
 
   // A page larger than the whole budget still runs when nothing else holds
   // bytes: one oversized unit of work proceeds alone, as in A3.

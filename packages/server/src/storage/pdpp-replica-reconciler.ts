@@ -33,6 +33,8 @@ import { operationExpressions as X } from "./pdpp-replica-visibility-view.js";
  *   expanded to the connection's keys once, not on every import.
  * - blockers: keys with an unresolved issue; a completion of their stream
  *   cannot be available.
+ * - dependencies: the operation ids each stream's retained completions pin,
+ *   so an operation that arrives, or gains a variant, re-queues them.
  * - queue: work not yet reconciled. `background` marks entries of a paged
  *   pass that an import does not have to finish.
  */
@@ -42,6 +44,8 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_reconcile_bindings (instance TEXT NOT NU
 CREATE TABLE IF NOT EXISTS pdpp_replica_reconcile_equivocations (instance TEXT NOT NULL, writer TEXT NOT NULL, operation_id TEXT NOT NULL, PRIMARY KEY (instance, writer, operation_id));
 CREATE TABLE IF NOT EXISTS pdpp_replica_reconcile_connections (instance TEXT PRIMARY KEY, decision_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pdpp_replica_reconcile_blockers (instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL, PRIMARY KEY (instance, stream, record_key));
+CREATE TABLE IF NOT EXISTS pdpp_replica_reconcile_dependencies (writer TEXT NOT NULL, operation_id TEXT NOT NULL, instance TEXT NOT NULL, stream TEXT NOT NULL, PRIMARY KEY (writer, operation_id, instance, stream));
+CREATE INDEX IF NOT EXISTS pdpp_replica_reconcile_dependencies_stream ON pdpp_replica_reconcile_dependencies (instance, stream);
 CREATE TABLE IF NOT EXISTS pdpp_replica_reconcile_queue (kind INTEGER NOT NULL, instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL, expand INTEGER NOT NULL DEFAULT 0, background INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (kind, instance, stream, record_key));
 CREATE INDEX IF NOT EXISTS pdpp_replica_reconcile_queue_order ON pdpp_replica_reconcile_queue (background, kind, instance, stream, record_key);
 ${["pdpp_replica_operations", "pdpp_replica_received"]
@@ -306,6 +310,14 @@ export function createReplicaReconciler(deps: {
             .changes > 0
         )
           enqueue(CONNECTION, instance);
+    // Completions that pin this operation id: it arrived, or it has another
+    // variant now. Either can change their availability.
+    enqueueAll(
+      COMPLETION,
+      "SELECT instance, stream, '' AS record_key FROM pdpp_replica_reconcile_dependencies WHERE writer = ? AND operation_id = ?",
+      [op.revision.writerId, op.revision.operationId],
+      false,
+    );
     mark(op);
   }
   /**
@@ -596,6 +608,17 @@ export function createReplicaReconciler(deps: {
           [instance, instance],
           options.background,
         );
+      // Only mapped connections' variants count toward a dependency, so a
+      // change here can change completions of other connections too.
+      enqueueAll(
+        COMPLETION,
+        `SELECT DISTINCT d.instance, d.stream, '' AS record_key FROM pdpp_replica_reconcile_dependencies d WHERE d.instance <> ? AND EXISTS (${RETAINED.map(
+          (table) =>
+            `SELECT 1 FROM ${table} WHERE ${X.writer} = d.writer AND ${X.operation_id} = d.operation_id AND ${X.instance} = ?`,
+        ).join(" UNION ALL ")})`,
+        [instance, instance, instance],
+        options.background,
+      );
     }
     sql(
       "INSERT INTO pdpp_replica_reconcile_connections VALUES (?, ?) ON CONFLICT(instance) DO UPDATE SET decision_json = excluded.decision_json",
@@ -838,6 +861,15 @@ export function createReplicaReconciler(deps: {
       `${X.kind} IN ${COMPLETIONS} AND ${X.instance} = ? AND ${X.stream} = ?`,
       [instance, stream],
     );
+    sql(
+      "DELETE FROM pdpp_replica_reconcile_dependencies WHERE instance = ? AND stream = ?",
+    ).run(instance, stream);
+    for (const op of all)
+      if (op.kind === "stream-complete")
+        for (const dependency of op.dependencies)
+          sql(
+            "INSERT OR IGNORE INTO pdpp_replica_reconcile_dependencies VALUES (?, ?, ?, ?)",
+          ).run(dependency.writerId, dependency.operationId, instance, stream);
     for (const op of all)
       if (!trusted(op))
         plan.pending.push({ reason: "missing_declaration", operations: [op] });
