@@ -9,7 +9,8 @@
  *
  * Each call is counted. A call's modeled bridge time is a fixed cost per call
  * (the stdio bridge measured 0.31 ms per read and 0.50 ms per scan) plus the
- * SQLite time this double spends answering it.
+ * SQLite time this double spends answering it. A value over 256 KiB also
+ * counts the chunk calls (`value`) that read it.
  */
 import Database from "better-sqlite3";
 import type { LiteStoragePage } from "../../packages/lite/src/canonical-persistence.js";
@@ -17,6 +18,9 @@ import type { LiteCanonicalReadView } from "../../packages/lite/src/import-job.j
 
 const PAGE_ENTRIES = 100;
 const PAGE_BYTES = 512 * 1024;
+/** Larger values are answered `{large}` and read in chunks of `CHUNK_UNITS`. */
+const INLINE_BYTES = 256 * 1024;
+const CHUNK_UNITS = 131_072;
 const utf8 = new TextEncoder();
 
 export interface CallStats {
@@ -79,8 +83,22 @@ export function createImportHostDouble(path: string, callMs: number) {
   function read(jobId: string, key: string): string | undefined {
     const staged = getStaged.get(jobId, key) as
       { v: string | null } | undefined;
-    if (staged) return staged.v ?? undefined;
-    return (getCanonical.get(key) as { v: string } | undefined)?.v;
+    if (staged) return chunked(staged.v ?? undefined);
+    return chunked((getCanonical.get(key) as { v: string } | undefined)?.v);
+  }
+  /** Counts the `import.entries.value` calls a large value costs. */
+  function chunked<T extends string | undefined>(value: T): T {
+    if (
+      value !== undefined &&
+      value.length * 3 > INLINE_BYTES &&
+      utf8.encode(value).byteLength > INLINE_BYTES
+    ) {
+      const s = stats.get("value") ?? { calls: 0, items: 0, sqliteMs: 0 };
+      s.calls += Math.ceil(value.length / CHUNK_UNITS);
+      s.items += 1;
+      stats.set("value", s);
+    }
+    return value;
   }
 
   /** `after` is exclusive; the empty string sorts before every key. */
@@ -130,7 +148,7 @@ export function createImportHostDouble(path: string, callMs: number) {
             break;
           }
           bytes += size;
-          entries.push({ key, value });
+          entries.push({ key, value: chunked(value) });
         }
         last = key;
       }

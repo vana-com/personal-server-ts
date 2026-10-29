@@ -10,7 +10,8 @@
  *
  * The native store is `host-double.ts`. Reported: encoder CPU (process CPU
  * during encoding, less the double's SQLite time), modeled bridge time of
- * the encoder's reads, and their sum, which the 60 s target bounds.
+ * the encoder's reads, and their sum, which the 60 s target bounds; the
+ * staging and publish wall times, and their sum.
  * `--reference 1` also saves each batch with Lite's own `commitLocal` into a
  * second store and compares the canonical entries after publication.
  */
@@ -281,8 +282,9 @@ await engine.begin({
 });
 const status = await importSpool(engine, jobId, capability.readSpool!);
 const stageMs = performance.now() - started;
-clearInterval(sampler);
 await engine.commit({ jobId, batches: status.job.nextSeq });
+const totalMs = performance.now() - started;
+clearInterval(sampler);
 
 function digestCanonical(db: typeof host.db) {
   const hash = createHash("sha256");
@@ -305,11 +307,15 @@ const result: Record<string, unknown> = {
   batchedReads: batched,
   callMs,
   stageWallMs: Math.round(stageMs),
+  publishWallMs: Math.round(totalMs - stageMs),
+  totalWallMs: Math.round(totalMs),
   encodeWallMs: Math.round(encodeWallMs),
   encodeCpuMs: Math.round(encodeCpuMs),
   bridgeMs: Math.round(bridgeMs),
   encodePlusReadsMs: Math.round(encodeCpuMs + bridgeMs),
   peakJsHeapMb: Math.round(peakHeap / 1024 / 1024),
+  peakRssMb: Math.round(process.resourceUsage().maxRSS / 1024),
+  carriedUnits: encoder.carriedUnits(),
   calls: Object.fromEntries(
     [...host.stats].map(([op, s]) => [
       op,
