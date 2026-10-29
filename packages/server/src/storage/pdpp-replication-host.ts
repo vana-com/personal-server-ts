@@ -222,6 +222,7 @@ export function createNodeReplication(input: {
           server: input.serverAccount.address,
           roster: ports.roster,
           signal: step.signal,
+          timers: input.timers,
         });
         if (step.signal.aborted || own.tag === "refused") return idle();
         if (own.tag === "waiting")

@@ -21,8 +21,11 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
   builds the receiver, transport worker and driver through
   `createNodeReplication` (`packages/server/src/storage/pdpp-replication-host.ts`)
   and steps them from `startBackgroundServices` until `cleanup`. Lite has a canonical
-  store (`packages/lite/src/canonical-store.ts:224`) but no transport, runtime
-  or routes for replication. Neither app enables it
+  store (`packages/lite/src/canonical-store.ts:224`), the host ports
+  (`packages/lite/src/replication-ports.ts`), a runtime and owner-only
+  status/sync routes (`packages/lite/src/replication-runtime.ts`), but no
+  phase engine: its runtime reports `blocked: "no_engine"` and never steps.
+  Neither app enables it
   (`unity-surfaces@9af449a2 apps/desktop/src/hooks/usePersonalServer.ts:871-885`);
   the phone has no replication code.
 - The carrier is DPv2. In #483 each fragment is one vana-storage object at
@@ -385,9 +388,23 @@ worker attempt deadline. Deadline and cancellation failures remain retries.
 
 The adapter must stop its I/O on abort. `abortable` (`coordinator.ts:100-123`)
 only drops a late result. Adapters do not retry; a failure is a verdict the
-coordinator settles. On the phone the adapter is the WebView's `fetch`, because
-decryption runs in JS anyway; 1 MiB fragments fit the 1 MiB native record limit
+coordinator settles.
+
+On the phone, storage object I/O is native, not the WebView's `fetch`. The host
+implements `LiteReplicaObjectTransfers` (`packages/lite/src/replication-ports.ts`)
+over its bridge operations `replica.download`, `replica.probe`,
+`replica.upload` and `replica.cancel`
+(unity-surfaces PR #1971, `apps/mobile-shell/lib/replication/native_replica_transport.dart`).
+A download streams into a native byte stage that a canonical transaction
+attaches (§4.3), and an upload streams attached bytes, so object bytes never
+cross the bridge as one message. The native side has fixed capacity: a
+transfer that does not fit fails `busy` instead of queueing, and the
+coordinator defers it. Abort maps to `replica.cancel`, and each transfer
+carries its own deadline. JS still encrypts and decrypts, one fragment at a
+time; 1 MiB fragments fit the 1 MiB native record limit
 (`unity-surfaces@9af449a2 apps/mobile-shell/lib/ps/native_ps_store.dart:11`).
+The Lite engine builds core's `ReplicaTransportPort` over these transfers;
+gateway calls (register, evidence, feed) are not yet assigned to either side.
 
 The roster is one more port:
 
@@ -407,16 +424,18 @@ allows values of at most 256 KiB, and its blob methods take record blob claims
 (`:3-6`), so they do not fit fragments. Lite adds byte storage:
 
 ```ts
+/** `sha256` is 64 lowercase hex characters, no `sha256:` prefix. */
+export interface LiteReplicaBytesInfo {
+  length: number;
+  sha256: string;
+}
 export interface LiteReplicaBytes {
   /** <=128 KiB frames. The native side computes length and SHA-256. */
   stageBytes(chunks: AsyncIterable<Uint8Array>): Promise<string>;
   readBytes(id: string): AsyncIterable<Uint8Array>;
 }
 export interface LiteReplicaTransaction extends LiteCanonicalTransaction {
-  attachBytes(
-    stagingId: string,
-    expected: { length: number; sha256: string },
-  ): Promise<void>;
+  attachBytes(stagingId: string, expected: LiteReplicaBytesInfo): Promise<void>;
   releaseBytes(id: string): Promise<void>;
 }
 ```
@@ -463,6 +482,16 @@ implements this timer, single-flight `trigger`, `wake` and `stop(graceMs)` for
 both hosts. Node wires it in `pdpp-replication-host.ts`; Node fires no
 local-write trigger yet, so a local write waits for the next coordinator wake
 (at most 15 min).
+
+PS-Lite wraps the same driver in `createLiteReplicationRuntime`
+(`packages/lite/src/replication-runtime.ts`): `resume` on foreground,
+`pause` on background, `trigger(reason)` for the other triggers, and a step
+deadline from `limits.step.deadlineMs`. `createPsLiteRuntime` calls `resume`
+and `pause` from `activate` and `deactivate` and serves owner-only
+`GET /v1/replication/status` and `POST /v1/replication/sync` (202, the step
+runs after the answer; 409 when replication is not running). Its status is
+the driver's (`stepping`, `lastStepAt`, `nextWakeAt`, last-step counts), not
+yet the peer, pending and server fields above.
 
 | Concern              | Owner        | Where                                                |
 | -------------------- | ------------ | ---------------------------------------------------- |

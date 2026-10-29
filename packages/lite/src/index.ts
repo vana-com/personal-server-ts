@@ -200,6 +200,30 @@ export type {
   LiteStorageEntry,
   LiteStoragePage,
 } from "./canonical-persistence.js";
+export {
+  LITE_MAX_FRAGMENT_BYTES,
+  LITE_REPLICATION_LIMITS,
+  LiteReplicaTransferError,
+  replicationBootConfigProblem,
+  type LiteReplicaBytes,
+  type LiteReplicaBytesInfo,
+  type LiteReplicaNetwork,
+  type LiteReplicaObjectTransfers,
+  type LiteReplicaTransferCall,
+  type LiteReplicaTransferFailure,
+  type LiteReplicaPersistence,
+  type LiteReplicaTransaction,
+  type LiteReplicationEngine,
+  type LiteReplicationTrigger,
+  type ReplicationBootConfig,
+  type ReplicationLimits,
+} from "./replication-ports.js";
+export {
+  LITE_REPLICATION_PAUSE_GRACE_MS,
+  createLiteReplicationRuntime,
+  type LiteReplicationRuntime,
+  type LiteReplicationStatus,
+} from "./replication-runtime.js";
 
 export {
   importOuraBrowserRecords,

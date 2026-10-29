@@ -11,6 +11,8 @@ import {
   type ReplicaWriterRotation,
   type ReplicaWriterSeed,
 } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
+import { REPLICA_ATTEMPT_TIMEOUT_MS } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
+import type { ReplicationTimers } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import {
   ReplicationRefusedError,
   type ReplicationRefusal,
@@ -241,11 +243,57 @@ export type ReplicaWriterIdentityState =
   | { tag: "refused"; reason: ReplicationRefusal };
 
 /**
+ * One bounded roster read. A gateway that never answers must not hold the
+ * single-flight step, so the read races a deadline: on it the lookup's signal
+ * aborts, the late answer is dropped and the read counts as unavailable,
+ * which `enableReplicaWriterIdentity` already settles as a Wait. The host's
+ * own abort is forwarded to the lookup.
+ */
+async function readRoster(input: {
+  roster: ReplicaRosterPort;
+  server: string;
+  signal?: AbortSignal;
+  deadlineMs: number;
+  timers: Pick<ReplicationTimers, "setTimeout" | "clearTimeout">;
+}): Promise<ReplicaRosterRecord | null> {
+  const lookup = new AbortController();
+  const forward = () => lookup.abort(input.signal!.reason);
+  if (input.signal?.aborted) forward();
+  else input.signal?.addEventListener("abort", forward, { once: true });
+  let timer: unknown;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = input.timers.setTimeout(() => {
+      const error = new DOMException("replica roster deadline", "TimeoutError");
+      lookup.abort(error);
+      reject(new ReplicaRosterUnavailableError({ cause: error }));
+    }, input.deadlineMs);
+  });
+  try {
+    return await Promise.race([
+      input.roster.server(input.server.toLowerCase() as `0x${string}`, {
+        signal: lookup.signal,
+      }),
+      deadline,
+    ]);
+  } finally {
+    input.timers.clearTimeout(timer);
+    input.signal?.removeEventListener("abort", forward);
+  }
+}
+
+const defaultTimers: Pick<ReplicationTimers, "setTimeout" | "clearTimeout"> = {
+  setTimeout: (run, ms) => globalThis.setTimeout(run, ms),
+  clearTimeout: (handle) =>
+    globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+/**
  * Enable step: read this server's own roster record and establish or
  * update the identity from it. Waits while the server is not registered,
  * revoked, or registered under another owner. While the roster is
- * unavailable an existing identity stays usable; a missing one waits. The
- * roster read writes nothing; if the door closes during it, the identity
+ * unavailable an existing identity stays usable; a missing one waits. A read
+ * that outlasts `deadlineMs` (default: the coordinator's attempt deadline)
+ * counts as unavailable. The roster read writes nothing; if the door closes during it, the identity
  * write refuses.
  */
 export async function enableReplicaWriterIdentity(input: {
@@ -254,13 +302,18 @@ export async function enableReplicaWriterIdentity(input: {
   server: string;
   roster: ReplicaRosterPort;
   signal?: AbortSignal;
+  deadlineMs?: number;
+  timers?: Pick<ReplicationTimers, "setTimeout" | "clearTimeout">;
 }): Promise<ReplicaWriterIdentityState> {
   let record: ReplicaRosterRecord | null;
   try {
-    record = await input.roster.server(
-      input.server.toLowerCase() as `0x${string}`,
-      { signal: input.signal },
-    );
+    record = await readRoster({
+      roster: input.roster,
+      server: input.server,
+      signal: input.signal,
+      deadlineMs: input.deadlineMs ?? REPLICA_ATTEMPT_TIMEOUT_MS,
+      timers: input.timers ?? defaultTimers,
+    });
   } catch (error) {
     if (!(error instanceof ReplicaRosterUnavailableError)) throw error;
     const current = currentReplicaWriterIdentity(input.db);

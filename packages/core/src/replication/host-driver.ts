@@ -95,6 +95,11 @@ export function replicaWakeDelay(
 export function createReplicationDriver(input: {
   stepper: ReplicationStepper;
   budget: ReplicaBudget;
+  /**
+   * Abort a step that runs longer than this. The coordinator settles the
+   * running attempt as a retry; checkpoints already committed stay.
+   */
+  deadlineMs?: number;
   timers?: ReplicationTimers;
   onReport?: (report: ProgressReport) => void;
   onError?: (error: unknown) => void;
@@ -102,11 +107,17 @@ export function createReplicationDriver(input: {
   const timers = input.timers ?? defaultTimers;
   // Reject an invalid host budget at construction, not on the first timer.
   validateReplicaStep({ now: 0, budget: input.budget });
+  if (
+    input.deadlineMs !== undefined &&
+    (!Number.isSafeInteger(input.deadlineMs) || input.deadlineMs < 1)
+  )
+    throw new RangeError("invalid replication step deadline");
   let state: ReplicationDriverStatus["state"] = "stopped";
   let timer: unknown;
   let nextWakeAt: number | undefined;
   let running: Promise<ProgressReport | undefined> | undefined;
   let controller: AbortController | undefined;
+  let deadline: unknown;
   let again = false;
   let lastStepAt: number | undefined;
   let last: ReplicationDriverStatus["last"];
@@ -127,12 +138,22 @@ export function createReplicationDriver(input: {
   }
 
   async function run(): Promise<ProgressReport | undefined> {
-    controller = new AbortController();
+    const step = (controller = new AbortController());
+    deadline =
+      input.deadlineMs === undefined
+        ? undefined
+        : timers.setTimeout(
+            () =>
+              step.abort(
+                new DOMException("replication step deadline", "TimeoutError"),
+              ),
+            input.deadlineMs,
+          );
     nextDelay = REPLICA_WAKE_MAX_MS;
     try {
       const report = await input.stepper.step({
         budget: input.budget,
-        signal: controller.signal,
+        signal: step.signal,
       });
       lastStepAt = timers.now();
       lastError = undefined;
@@ -161,6 +182,8 @@ export function createReplicationDriver(input: {
    * promise, leaving the driver stalled for good.
    */
   function settle() {
+    if (deadline !== undefined) timers.clearTimeout(deadline);
+    deadline = undefined;
     controller = undefined;
     running = undefined;
     if (state === "running") {

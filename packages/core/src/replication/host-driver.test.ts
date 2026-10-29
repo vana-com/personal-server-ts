@@ -248,6 +248,34 @@ describe("createReplicationDriver", () => {
     expect(driver.status().lastError).toBeUndefined();
   });
 
+  it("aborts a step that passes its deadline and clears the deadline after a step", async () => {
+    const clock = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    expect(() =>
+      createReplicationDriver({ stepper, budget, deadlineMs: 0 }),
+    ).toThrow(RangeError);
+    const driver = createReplicationDriver({
+      stepper,
+      budget,
+      deadlineMs: 30_000,
+      timers: clock.timers,
+    });
+    driver.start();
+    expect(clock.armed()).toEqual([30_000]);
+    clock.advance(30_000);
+    expect(steps[0]!.signal.aborted).toBe(true);
+    expect((steps[0]!.signal.reason as DOMException).name).toBe("TimeoutError");
+    steps[0]!.done.resolve(report(undefined));
+    await flush();
+    // Only the idle wake remains; the spent deadline is gone.
+    expect(clock.armed()).toEqual([REPLICA_WAKE_MAX_MS]);
+    void driver.trigger();
+    steps[1]!.done.resolve(report(undefined));
+    await flush();
+    expect(steps[1]!.signal.aborted).toBe(false);
+    expect(clock.armed()).toEqual([REPLICA_WAKE_MAX_MS]);
+  });
+
   it("stop aborts the running step, waits for it to settle and arms nothing", async () => {
     const clock = fakeTimers();
     const { stepper, steps } = manualStepper();
