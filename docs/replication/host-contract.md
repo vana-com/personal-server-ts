@@ -599,21 +599,23 @@ There is no blob-size cap.
 
 ### 6.1 Engine work the step bound needs
 
-The engine cannot meet these bounds today. Preparation advertises the bytes of
-the whole batch (`pdpp-replication-transport.ts:579`). An item larger than an
-explicit byte budget is deferred until a budget fits it (`coordinator.ts`), so
-on the phone a batch over 8 MiB never publishes until item 1 below lands. Preparation also frames a whole batch in one run and discards partial
-work on error (`pdpp-replication-transport.ts:590-627`).
+An item larger than an explicit byte budget is deferred until a budget fits it
+(`coordinator.ts`). Items 1 and 3 below have landed: preparation advertises one
+fragment and commits each fragment with a durable cursor, so a 200 MiB batch
+prepares under the phone's 8 MiB budget and a restart continues at the lost
+fragment (`pdpp-replication-fragment-admission.test.ts`). Items 2 and 4 remain.
 
 Plan item A7 (the bounded coordinator) owns these changes, and builds on the
 atomic checkpoints of A5:
 
-1. **Bounded admission:** an item advertises the bytes of its next resumable
-   unit, at most one fragment, not the whole batch.
+1. **Bounded admission (landed):** an item advertises the bytes of its next
+   resumable unit, at most one fragment, not the whole batch. The item's
+   `part` names that unit, so a step admits the item once per unit.
 2. **Resumable retention and hashing:** capturing a batch's payload and
    computing its digest continue across steps from a durable checkpoint.
-3. **Resumable preparation:** each framed and encrypted fragment is committed
-   with a cursor, so a restart continues from the last fragment.
+3. **Resumable preparation (landed):** each framed and encrypted fragment is
+   committed with a cursor, so a restart continues from the last fragment.
+   The final attempt still checks the whole payload digest in one read.
 4. **Resumable import staging:** inbound fragments are staged as they arrive,
    and assembly reads them across steps.
 5. **Kept as today:** the whole-batch digest check before import, and atomic

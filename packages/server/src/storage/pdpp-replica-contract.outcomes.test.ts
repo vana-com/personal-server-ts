@@ -342,8 +342,10 @@ describe("02 Progress to the next phase is atomic", () => {
   it("02 preparation receipt and publish work commit together at every crash point of the prepare transaction", async () => {
     const reference = await prepareRun(undefined);
     const trace = [...reference.crash.trace];
+    // Each fragment commits with the preparation cursor; the manifest and
+    // the prepare receipt commit together after the last one.
     const firstPreparing = trace.findIndex((l) =>
-      l.includes("insert:pdpp_transport_staged_fragments"),
+      l.includes("insert:pdpp_transport_fragments_out"),
     );
     const firstOutbox = trace.findIndex((l) =>
       l.includes("insert:pdpp_transport_manifests_out"),
@@ -358,9 +360,23 @@ describe("02 Progress to the next phase is atomic", () => {
     reference.d.close();
     cleanupHarness();
 
+    // The first fragment's commit, then the last fragment's commit through
+    // the manifest commit. Middle fragments commit the same way as these.
+    const lastFragment = trace.findLastIndex(
+      (l, i) =>
+        i < firstOutbox && l.includes("insert:pdpp_transport_fragments_out"),
+    );
+    const firstCommit = trace.findIndex(
+      (l, i) => i > firstPreparing && l === "commit",
+    );
     const points: number[] = [];
-    for (let i = firstPreparing - 1; i <= commit + 2; i++)
-      if (i >= 0 && i < trace.length) points.push(i);
+    for (let i = firstPreparing - 1; i <= firstCommit + 1; i++) points.push(i);
+    for (let i = lastFragment - 2; i <= commit + 2; i++) points.push(i);
+    const unique = [...new Set(points)].filter(
+      (i) => i >= 0 && i < trace.length,
+    );
+    points.splice(0, points.length, ...unique);
+    expect(lastFragment).toBeGreaterThan(firstCommit);
     expect(points.length).toBeGreaterThan(6);
 
     for (const point of points) {
@@ -385,10 +401,17 @@ describe("02 Progress to the next phase is atomic", () => {
           expect(manifest, where).toHaveLength(1);
           expect(batch.outcome, `${where}: prepare receipt`).toBe("progress");
         } else {
-          expect(mine, where).toHaveLength(0);
+          // Only a committed prefix of fragments, never a manifest.
+          expect(
+            mine.map((o) => o.position).sort((a, b) => a - b),
+            where,
+          ).toEqual([...Array(mine.length).keys()]);
+          expect(mine.length, where).toBeLessThanOrEqual(fragments);
           expect(manifest, where).toHaveLength(0);
           expect(batch.prepared, where).toBe(0);
-          expect(batch.outcome, where).not.toBe("progress");
+          // A committed fragment settles as progress; the batch is not prepared.
+          if (mine.length === 0)
+            expect(batch.outcome, where).not.toBe("progress");
         }
       }
       // Resume twice. Hashes stay stable and nothing duplicates.

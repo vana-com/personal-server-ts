@@ -139,6 +139,66 @@ export function* readBinaryChunks(
     throw new Error("excess binary chunks");
 }
 
+/** Where a chunked read resumes: a chunk row and a byte offset inside it. */
+export interface BinaryCursor {
+  position: number;
+  offset: number;
+}
+
+/**
+ * Read exactly `length` bytes of chunked (manifest) bytes from `from`, and
+ * return them with the cursor after them. Rows may have any length, so a
+ * caller that reads a value in parts keeps the returned cursor; it never
+ * seeks by arithmetic. Memory is `length`. Legacy whole-row values are not
+ * supported: only namespaces without a legacy table use this.
+ */
+export function readBinaryWindow(
+  db: Database,
+  namespace: BinaryNamespace,
+  id: string,
+  from: BinaryCursor,
+  length: number,
+): { bytes: Uint8Array; next: BinaryCursor } {
+  if (legacy[namespace]) throw new Error("legacy binary windows unsupported");
+  const size = binaryLength(db, namespace, id);
+  if (
+    size === undefined ||
+    !Number.isSafeInteger(length) ||
+    length < 1 ||
+    !Number.isSafeInteger(from.position) ||
+    from.position < 0 ||
+    !Number.isSafeInteger(from.offset) ||
+    from.offset < 0
+  )
+    throw new Error("missing binary bytes");
+  const bytes = new Uint8Array(length);
+  const read = db.prepare(
+    "SELECT bytes FROM pdpp_binary_chunks WHERE namespace=? AND blob_id=? AND position=?",
+  );
+  let filled = 0;
+  let { position, offset } = from;
+  while (filled < length) {
+    const row = read.get(namespace, id, position) as
+      { bytes: Buffer } | undefined;
+    if (
+      !row ||
+      !row.bytes.length ||
+      row.bytes.length > BINARY_CHUNK_BYTES ||
+      offset >= row.bytes.length
+    )
+      throw new Error("corrupt binary chunks");
+    const take = Math.min(row.bytes.length - offset, length - filled);
+    bytes.set(row.bytes.subarray(offset, offset + take), filled);
+    filled += take;
+    offset += take;
+    if (offset === row.bytes.length) {
+      position++;
+      offset = 0;
+    }
+  }
+  return { bytes, next: { position, offset } };
+}
+
 export function verifyBinary(
   db: Database,
   namespace: BinaryNamespace,

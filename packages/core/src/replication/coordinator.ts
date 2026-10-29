@@ -24,6 +24,13 @@ export interface ReplicaWorkItem {
   state: ReplicaWorkState;
   /** Admission estimate for byte budgets. */
   bytes?: number;
+  /**
+   * The resumable unit this attempt covers, e.g. the next fragment of a
+   * batch. A step admits an item once per part, so an item that commits one
+   * unit per attempt can take further units in the same step, each charged
+   * on its own. Runs of one item never overlap, whatever their part.
+   */
+  part?: string;
 }
 
 /**
@@ -595,14 +602,16 @@ export function createReplicaCoordinator(input: {
                   })
                   .filter((item) => {
                     const key = `${handler.phase}\0${item.id}`;
-                    return !inflight.has(key) && !ran.has(key);
+                    return (
+                      !inflight.has(key) &&
+                      !ran.has(`${key}\0${item.part ?? ""}`)
+                    );
                   }),
               );
               let admitted = 0;
               for (const item of items) {
                 if (count >= cap || units <= 0 || aborted()) break;
-                const key = `${handler.phase}\0${item.id}`;
-                ran.add(key);
+                ran.add(`${handler.phase}\0${item.id}\0${item.part ?? ""}`);
                 if (
                   item.bytes !== undefined &&
                   (!Number.isSafeInteger(item.bytes) || item.bytes < 0)
