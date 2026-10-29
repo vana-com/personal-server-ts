@@ -18,6 +18,7 @@ import type { ReplicationStepper } from "@opendatalabs/personal-server-ts-core/r
 import type { ReplicaEnvironment } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import type { ReplicaSql } from "@opendatalabs/personal-server-ts-core/replication/effects";
 import type {
+  LiteBlobDescriptor,
   LiteCanonicalPersistence,
   LiteCanonicalTransaction,
 } from "./canonical-persistence.js";
@@ -107,6 +108,15 @@ export interface LiteReplicaTransaction extends LiteCanonicalTransaction {
   attachBytes(stagingId: string, expected: LiteReplicaBytesInfo): Promise<void>;
   /** Drop attached bytes when this transaction commits. Absent ids are a no-op. */
   releaseBytes(id: string): Promise<void>;
+  /**
+   * Publish attached bytes `bytesId` as the canonical blob `expected` in THIS
+   * transaction, as `attachBlob` does for a staged blob: the native side
+   * checks length and SHA-256 against the descriptor. The bytes stay
+   * attached under `bytesId` until released. A received blob's descriptor
+   * is trusted only after its whole payload is verified, which is after its
+   * bytes were staged, so received blobs take this path.
+   */
+  publishBlob(bytesId: string, expected: LiteBlobDescriptor): Promise<void>;
   /**
    * Replication's relational state in THIS transaction (§4.3): the phase
    * engine's `pdpp_transport_*` and `pdpp_replica_*` tables, in the same
@@ -225,9 +235,9 @@ export interface LiteReplicaNetwork {
 
 /**
  * The replication phase engine over the ports above: one finite step of
- * prepare, publish, discover, download, import and reconcile. PS supplies it,
- * not the host. PS-Lite has none yet; until it does the runtime reports
- * `blocked: "no_engine"` and never steps.
+ * prepare, publish, discover, download, import and reconcile. PS supplies it
+ * (`createLiteReplicaEngine`, `replication-engine.ts`), not the host. Without
+ * one the runtime reports `blocked: "no_engine"` and never steps.
  */
 export type LiteReplicationEngine = ReplicationStepper;
 

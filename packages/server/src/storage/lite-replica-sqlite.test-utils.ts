@@ -72,7 +72,7 @@ export function createSqliteLiteReplicaPersistence(
   let failBeforeCommit = false;
   let closed = false;
 
-  const port: LiteReplicaPersistence = {
+  const port: LiteReplicaPersistence & { discardBytes(id: string): void } = {
     transaction<T>(run: (tx: LiteReplicaTransaction) => Promise<T>) {
       const work = queue.then(async () => {
         if (closed) throw new Error("native store closed");
@@ -178,6 +178,21 @@ export function createSqliteLiteReplicaPersistence(
             live();
             db.prepare("DELETE FROM lite_bytes WHERE id=?").run(id);
           },
+          async publishBlob(bytesId, expected) {
+            live();
+            const held = db
+              .prepare("SELECT bytes FROM lite_bytes WHERE id=?")
+              .get(bytesId) as { bytes: Buffer } | undefined;
+            if (!held) throw new Error("unknown attached bytes");
+            if (
+              held.bytes.length !== expected.sizeBytes ||
+              `sha256:${hex(held.bytes)}` !== expected.sha256
+            )
+              throw new Error("attached bytes do not match blob");
+            db.prepare(
+              "INSERT OR IGNORE INTO lite_blobs (blob_id,descriptor_json,bytes) VALUES (?,?,?)",
+            ).run(expected.blobId, canonicalJson(expected), held.bytes);
+          },
           sql,
         };
         db.exec("BEGIN IMMEDIATE");
@@ -226,6 +241,10 @@ export function createSqliteLiteReplicaPersistence(
       const id = globalThis.crypto.randomUUID();
       staged.set(id, bytes);
       return id;
+    },
+    /** Drop an unattached stage, as a cancelled transfer does. */
+    discardBytes(id) {
+      staged.delete(id);
     },
     async *readBytes(id) {
       const row = db

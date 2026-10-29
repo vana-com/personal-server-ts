@@ -188,6 +188,7 @@ export {
 
 export {
   createLiteCanonicalStore,
+  litePendingFingerprint,
   type LiteCommitReceipt,
   type LiteReplicaReadOptions,
   type LiteVisibleRecord,
@@ -223,6 +224,14 @@ export {
   acquireLiteReplicaOwner,
   createLiteReplicaCoordinatorState,
 } from "./replication-coordinator-state.js";
+export {
+  createLiteReplicaEngine,
+  type LiteReplicaEngineInput,
+} from "./replication-engine.js";
+export {
+  LITE_REPLICA_TRANSFER_DEADLINE_MS,
+  createLiteReplicaStorage,
+} from "./replication-storage.js";
 export {
   LITE_REPLICATION_PAUSE_GRACE_MS,
   createLiteReplicationRuntime,

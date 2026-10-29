@@ -121,6 +121,20 @@ export function createMemoryReplicaPersistence(
           async releaseBytes(id) {
             bytes.delete(id);
           },
+          async publishBlob(bytesId, expected) {
+            const value = bytes.get(bytesId);
+            if (!value) throw new Error("unknown attached bytes");
+            if (
+              value.length !== expected.sizeBytes ||
+              `sha256:${sha256Of(value)}` !== expected.sha256
+            )
+              throw new Error("attached bytes do not match blob");
+            if (!blobs.has(expected.blobId))
+              blobs.set(expected.blobId, {
+                descriptor: structuredClone(expected),
+                bytes: value,
+              });
+          },
           sql: noSql,
         };
         const result = await run(tx);
@@ -224,13 +238,18 @@ function* frames(bytes: Uint8Array) {
  * queueing. An aborted call fails `cancelled` and leaves no stage behind:
  * a stage made before the abort is discarded. A transfer still running at its
  * `deadlineMs` fails `timeout`, frees its capacity at once and discards the
- * stage it makes late.
+ * stage it makes late. Uploads are write-once per URL, as vana-storage keys
+ * are.
  */
 export function createMemoryReplicaObjectTransfers(
   persistence: MemoryReplicaPersistencePort,
-  opts: { maxTransfers?: number } = {},
+  opts: {
+    maxTransfers?: number;
+    /** The object store, e.g. shared with a Node writer's storage. */
+    objects?: Map<string, Uint8Array>;
+  } = {},
 ) {
-  const objects = new Map<string, Uint8Array>();
+  const objects = opts.objects ?? new Map<string, Uint8Array>();
   const maxTransfers = opts.maxTransfers ?? 2;
   let active = 0;
   async function transfer<T>(
@@ -316,6 +335,10 @@ export function createMemoryReplicaObjectTransfers(
           value.set(part, offset);
           offset += part.length;
         }
+        // Storage keys are write-once: different bytes are a conflict.
+        const stored = objects.get(url);
+        if (stored && sha256Of(stored) !== sha256Of(value))
+          throw new LiteReplicaTransferError("http-status", "409 Conflict");
         objects.set(url, value);
         return { status: 201 };
       });

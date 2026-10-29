@@ -174,6 +174,9 @@ async function changedViews(tx: LiteCanonicalTransaction) {
 }
 const digest = (value: unknown) =>
   `sha256:${sha256(toBytes(canonicalJson(value))).slice(2)}`;
+/** The fingerprint `stagePending` and `pendingBatch` report for an envelope. */
+export const litePendingFingerprint = (envelope: unknown) =>
+  digest(replicaEnvelopeSchema.parse(envelope));
 // Fixed-size internal keys fit the existing native 512-character key bound.
 const keyDigest = (value: unknown) => digest(value).slice(7);
 const operationId = (op: ReplicaOperation) =>
@@ -1710,6 +1713,32 @@ export function createLiteCanonicalStore(deps: {
         await refreshPreview(tx, id, context);
         await advanceChanged(tx, [id]);
         await put(tx, "clock", current);
+      });
+    },
+    /**
+     * Replication's writer identity (host contract §3.2): local operations
+     * from now on name `writerId`. Allowed only before the first local
+     * operation, so no operation ever names two writers; afterwards only the
+     * same writer is accepted.
+     */
+    async bindWriter(writerId: string) {
+      enabled();
+      if (!writerId) throw new Error("invalid replica writer");
+      await persistence.transaction(async (base) => {
+        const tx = trackViews(base);
+        const current = await clock(tx);
+        if (current.writerId === writerId) return;
+        if (current.sequence !== 0)
+          throw new Error("replica writer requires a fresh journal");
+        await put(tx, "clock", { ...current, writerId });
+      });
+    },
+    /** A staged pending batch's state and fingerprint, if any. */
+    async pendingBatch(id: string) {
+      enabled();
+      return persistence.transaction(async (tx) => {
+        const batch = await get<PendingBatch>(tx, pendingKey(id));
+        return batch && { state: batch.state, fingerprint: batch.fingerprint };
       });
     },
     commitLocal: (
