@@ -131,8 +131,10 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   origin, if it was itself a re-issue), and its declaration.
   `compareRevisions` orders by counter, then the origin's ids, then the
   operation's own, so the re-issue wins and loses exactly where the original
-  does. A state the merge does not explain takes a new counter. The rebaseline runs inside the door's capture guard. A
-  crash during the baseline resumes from its durable cursor.
+  does. A live record or completion the merge does not explain takes a new
+  counter. A tombstone the merge does not explain is not published: it only
+  hides a row on this device. The rebaseline runs inside the door's capture
+  guard. A crash during the baseline resumes from its durable cursor.
 - Every step checks the replication door first. The roster read writes
   nothing; the identity write (establish or rotate) checks the door in its own
   transaction and refuses once it is closed, and the writer switch and

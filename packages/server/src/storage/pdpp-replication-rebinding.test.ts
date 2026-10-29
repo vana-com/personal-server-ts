@@ -536,6 +536,77 @@ describe("writer rotation after a rebinding", () => {
     expect(view(c, ["x"])).toEqual({ x: "same" });
   }, 60_000);
 
+  it("a rotated writer never publishes a delete for a row it only hides", async () => {
+    const net = network();
+    const a = transportDevice(net);
+    const b = transportDevice(net);
+    a.put("q1", "q");
+    a.put("w1", "w");
+    remove(a, "w");
+    a.put("w2", "w");
+    a.put("v1", "v");
+    a.put("d1", "d");
+    await cycles([a, b], 6);
+    remove(b, "d");
+    await cycles([a, b], 6);
+    const ids = ["q", "w", "v", "d"];
+    expect(view(a, ids)).toEqual({ q: "q1", w: "w2", v: "v1", d: null });
+    const received = (id: string) =>
+      (
+        b.db
+          .prepare("SELECT operation_json FROM pdpp_replica_received")
+          .all() as { operation_json: string }[]
+      )
+        .map((row) => JSON.parse(row.operation_json) as ReplicaOperation)
+        .filter(
+          (op): op is Extract<ReplicaOperation, { kind: "upsert" }> =>
+            op.kind === "upsert" && op.recordKey === id,
+        )
+        .at(-1)!;
+
+    // B hides q by a key quarantine, and w and v by withdrawal: each has a
+    // newer upsert whose blob bytes B never receives. w was deleted and
+    // re-created before, so B also holds an older delete of it.
+    b.receiver.quarantineImported({
+      credential,
+      envelope: envelope([received("q")], "conflict"),
+    });
+    const writer = journalOf(a)[0].revision.writerId;
+    const unready = ["w", "v"].map((id, i) => {
+      const op = received(id);
+      const sha256 = `sha256:${String(i).repeat(64)}`;
+      return {
+        ...op,
+        data: { ...op.data, text: `${id}3` },
+        blobs: [
+          { blobId: sha256, sha256, mimeType: "text/plain", sizeBytes: 3 },
+        ],
+        revision: {
+          counter: op.revision.counter + 100,
+          writerId: writer,
+          operationId: randomUUID(),
+        },
+      };
+    });
+    b.receiver.import({ credential, envelope: envelope(unready, "unready") });
+    expect(view(b, ids)).toEqual({ q: null, w: null, v: null, d: null });
+
+    rotateReplicaWriterIdentity(b.db);
+    await cycles([b], 4);
+    const copier = journalOf(b).at(-1)!.revision.writerId;
+    const deletes = journalOf(b)
+      .filter((op) => op.revision.writerId === copier && op.kind === "delete")
+      .map((op) => (op as { recordKey: string }).recordKey);
+    expect(deletes).toEqual(["d"]);
+
+    // A, and a fresh C that reads every writer, keep each row B hides.
+    const c = transportDevice(net);
+    await cycles([a, b, c], 10);
+    const kept = { q: "q1", w: "w2", v: "v1", d: null };
+    expect(view(a, ids)).toEqual(kept);
+    expect(view(c, ids)).toEqual(kept);
+  }, 60_000);
+
   it("a rotated writer keeps the order of the completion the merge chose", async () => {
     const net = network();
     const a = transportDevice(net);

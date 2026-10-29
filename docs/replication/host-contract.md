@@ -132,16 +132,20 @@ The derivation uses only the signer's identity and the nonce, not scope names,
 so it carries over unchanged to a per-sync manifest (A12).
 
 A new identity (re-registration, reset, restore or clone) publishes a full
-current-state baseline before its tail: every live record, every tombstone,
-every blob claim and every completion, signed under the new writer ids. So a
+current-state baseline before its tail: every live record, every deleted
+record's tombstone, every blob claim and every completion, signed under the new
+writer ids. So a
 peer that missed old batches, whether refused, never published, or written
 between a gateway change and the next worker step, still converges. Each
 re-issued record and completion orders exactly as the retained operation whose
 effect it copies, own or a peer's: it keeps that operation's counter and names
 its writer and operation id in the signed `revision.origin`, which
 `compareRevisions` reads before the re-issue's own ids. So a re-issue never
-overrides a newer write and never loses a tie the original won. A state no
-retained operation explains takes a new counter, like a local write. The
+overrides a newer write and never loses a tie the original won. A live
+record or completion no retained operation explains takes a new counter, like
+a local write. A tombstone no delete explains is not published: it hides a row
+locally (a withdrawal, a key quarantine, a declaration wait, a reset), and no
+one deleted that row. The
 baseline is published in the usual bounded, fragmented batches and resumes
 from its durable cursor after a crash. A worker step first checks the
 replication door (`replicationAdmitted`): once it is closed, the step does no
@@ -556,8 +560,10 @@ chose for it: the receiver's reconcile returns the winner each shown row or
 tombstone was written from, and each available completion (`explainState`).
 An operation the merge rejected or keeps pending never explains canonical
 state, even when it has a higher revision and the same data, so its binding is
-never copied. The transport publishes this device's own operations under a
-retained or compatible binding. A stream that a rebinding retired keeps its
+never copied. A tombstone is copied only from the delete the merge chose, so
+a row this device hides is never published as a delete. The transport
+publishes this device's own operations under a retained or compatible
+binding. A stream that a rebinding retired keeps its
 rows and tombstones: the rebaseline captures them under their latest retained
 binding.
 
@@ -569,8 +575,6 @@ Known limits:
   with an unknown schema. Its operations are compatible with the current
   binding, so they validate by key only until a host supplies that schema.
 - Lite needs the same history-aware context.
-- A row the merge does not explain, such as one hidden by a withdrawal or a
-  key quarantine, is captured as a tombstone with a new counter.
 
 ## 5. Opt-in and the one-way door
 

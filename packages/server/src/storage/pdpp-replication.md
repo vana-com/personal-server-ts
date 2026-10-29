@@ -99,7 +99,8 @@ current-state capture under the current writer, adds it to the baseline
 membership, moves the checkpoint to just before it and the watermark to its
 end. Earlier membership is never removed. Each record and completion in the
 capture keeps the order and binding of the operation the merge chose for it,
-which the caller passes in.
+which the caller passes in. A tombstone that no chosen delete explains only
+hides a row on this device, so the rebaseline leaves it out.
 
 ## Evidence and limits
 

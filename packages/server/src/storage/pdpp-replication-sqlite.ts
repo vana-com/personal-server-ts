@@ -231,7 +231,8 @@ export function createReplicationJournal(
    * state, when it has the same effect: the counter, and that operation (or
    * its own origin) as origin. It also keeps that operation's declaration, so
    * after a rebinding it validates exactly where the original did. With
-   * none, the state is a new write and takes a new counter.
+   * none, the state is a new write and takes a new counter; a rebaseline
+   * skips a tombstone with none (`captureRecord`).
    */
   function reissued(value: WithoutRevision<ReplicaOperation>):
     | {
@@ -352,14 +353,20 @@ export function createReplicationJournal(
       )
       .get(instance, stream, recordKey) as Row;
     if (row.deleted) {
-      if (identity.declaration.semantics === "append_only")
-        throw new Error("append-only replication tombstone");
-      append({
+      const tombstone = {
         ...identity,
-        kind: "delete",
+        kind: "delete" as const,
         emittedAt: row.emitted_at,
         deletedAt: row.deleted_at!,
-      });
+      };
+      // A rebaseline copies a tombstone only from the delete the merge chose.
+      // Any other tombstone hides a row locally (a withdrawal, a key
+      // quarantine, a declaration wait, a reset): no one deleted it, and
+      // publishing it would delete the row on every peer.
+      if (reissue && !reissued(tombstone)) return;
+      if (identity.declaration.semantics === "append_only")
+        throw new Error("append-only replication tombstone");
+      append(tombstone);
     } else {
       const data = JSON.parse(row.data!);
       if (
@@ -683,7 +690,8 @@ export function createReplicationJournal(
    * Only the operation the merge chose explains a state (`explaining`). A
    * higher operation with the same effect may be one the merge rejected or
    * keeps pending; copying its order or binding would publish a baseline
-   * that a peer with this device's trust refuses.
+   * that a peer with this device's trust refuses. A tombstone no delete
+   * explains only hides a row here, so it is not re-issued.
    */
   function rebaseline(
     explaining: readonly ReplicaOperation[],
