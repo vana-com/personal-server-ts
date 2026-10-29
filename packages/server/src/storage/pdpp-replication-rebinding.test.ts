@@ -27,6 +27,7 @@ import {
   ensureReplicaSchema,
 } from "./pdpp-replica-canonical-port.js";
 import { REPLICA_BINDING_HISTORY_MIGRATION } from "./pdpp-replication-sqlite.js";
+import { rotateReplicaWriterIdentity } from "./pdpp-replica-writer-identity.js";
 
 afterEach(cleanupHarness);
 
@@ -356,6 +357,99 @@ describe("two-writer rebinding traces", () => {
     expect(view(a, ["a", "b"])).toEqual(view(b, ["a", "b"]));
     expect(generation(a)).toBe(2);
     expect(generation(b)).toBe(2);
+  }, 60_000);
+});
+
+describe("writer rotation after a rebinding", () => {
+  const reshaped = {
+    sourceId,
+    binding: {
+      ...binding,
+      digest: `sha256:${"9".repeat(64)}`,
+      semantics: "append_only" as const,
+    },
+  };
+  const notes = {
+    sourceId,
+    binding: {
+      ...binding,
+      digest: `sha256:${"8".repeat(64)}`,
+      stream: "notes",
+    },
+  };
+
+  it("a v1 device that applied a peer's v2 writes still publishes after its writer rotates", async () => {
+    const net = network();
+    const a = transportDevice(net);
+    const b = transportDevice(net);
+    a.put("x1", "x");
+    await cycles([a, b], 6);
+    rebind(a, [v2]);
+    a.put("x2", "x");
+    await cycles([a, b], 6);
+    expect(view(b, ["x"])).toEqual({ x: "x2" });
+
+    // B's canonical x is now explained by A's v2 operation. B never retains
+    // v2, so its new baseline must still be publishable.
+    rotateReplicaWriterIdentity(b.db);
+    b.put("y1", "y");
+    await cycles([a, b], 8);
+    expect(view(a, ["x", "y"])).toEqual({ x: "x2", y: "y1" });
+    const c = transportDevice(net);
+    await cycles([a, b, c], 8);
+    expect(view(c, ["x", "y"])).toEqual({ x: "x2", y: "y1" });
+    expect(generation(b)).toBe(1);
+  }, 60_000);
+
+  it("a rotated writer never reissues a pending operation's declaration", async () => {
+    const net = network();
+    const a = transportDevice(net);
+    const b = transportDevice(net);
+    const c = transportDevice(net, { declarations: [reshaped] });
+    a.put("same", "x");
+    await cycles([a, b], 6);
+    // C, with another shape of the stream, writes the same data at x later,
+    // at a higher revision. B keeps it pending as incompatible.
+    for (const id of ["c1", "c2", "c3"])
+      putIn(c, c.instance, id, id, "append_only");
+    putIn(c, c.instance, "x", "same", "append_only");
+    await cycles([c, b], 8);
+    expect(reconcileWait(b)).toBe(`owner:declaration:${sourceId}:messages`);
+
+    rotateReplicaWriterIdentity(b.db);
+    b.put("y1", "y");
+    await cycles([a, b], 8);
+    expect(view(a, ["x", "y"])).toEqual({ x: "same", y: "y1" });
+    const d = transportDevice(net);
+    await cycles([b, d], 8);
+    expect(view(d, ["x", "y"])).toEqual({ x: "same", y: "y1" });
+  }, 60_000);
+
+  it("a retired stream keeps its rows and tombstones through a writer rotation", async () => {
+    const net = network();
+    const a = transportDevice(net, { declarations: [v1, notes] });
+    const b = transportDevice(net, { declarations: [v1, notes] });
+    a.put("k1", "k");
+    a.put("gone", "g");
+    await cycles([a, b], 6);
+    expect(view(b, ["k", "g"])).toEqual({ k: "k1", g: "gone" });
+
+    // The delete is never published by the old writer: only the new
+    // baseline can carry it.
+    remove(a, "g");
+    rebind(a, [notes]);
+    rotateReplicaWriterIdentity(a.db);
+    a.reopen();
+    a.declarations([notes, ...a.store.replication.declarationHistory()]);
+    await cycles([a, b], 10);
+    expect(view(b, ["k", "g"])).toEqual({ k: "k1", g: null });
+    // A later boot and rotation still capture the retired stream.
+    rotateReplicaWriterIdentity(a.db);
+    a.reopen();
+    const c = transportDevice(net, { declarations: [v1, notes] });
+    await cycles([a, c], 10);
+    expect(view(c, ["k", "g"])).toEqual({ k: "k1", g: null });
+    expect(view(a, ["k", "g"])).toEqual({ k: "k1", g: null });
   }, 60_000);
 });
 

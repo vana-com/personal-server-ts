@@ -594,17 +594,31 @@ export function createReplicaTransportWorker(deps: {
 
   /**
    * What this device's own operations may name: the host's trusted set plus
-   * every binding the journal retained. An operation captured before a
-   * rebinding keeps its binding and still publishes, even from a host that
-   * passes only its current bindings.
+   * every binding the journal retained, and a version of a retained stream
+   * that a rebaseline copied from a peer's operation (`resolveDeclaration`
+   * compatible). An operation captured before a rebinding keeps its binding
+   * and still publishes, even from a host that passes only its current
+   * bindings. A missing or incompatible binding is never published.
    */
-  function ownBindings(): EnvelopeExpectation {
+  function ownBindings(
+    operations: readonly ReplicaOperation[],
+  ): EnvelopeExpectation {
     const expected = deps.expected();
+    const retained = [
+      ...expected.declarations,
+      ...deps.exporter.declarationHistory(),
+    ];
     return {
       owner: expected.owner,
       declarations: [
-        ...expected.declarations,
-        ...deps.exporter.declarationHistory(),
+        ...retained,
+        ...operations.flatMap((op) =>
+          "declaration" in op &&
+          resolveDeclaration(retained, op.sourceId, op.declaration).status ===
+            "compatible"
+            ? [{ sourceId: op.sourceId, binding: op.declaration }]
+            : [],
+        ),
       ],
     };
   }
@@ -1740,17 +1754,18 @@ export function createReplicaTransportWorker(deps: {
             ),
             signal,
           );
+        const own = rows.map(
+          (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
+        );
         decodeReplicaEnvelope(
           canonicalJson({
             format: "vana-pdpp-replica",
             version: 1,
             owner: state().owner,
             batchId: batch.batch,
-            operations: rows.map(
-              (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
-            ),
+            operations: own,
           }),
-          ownBindings(),
+          ownBindings(own),
         );
         const token = randomUUID();
         const s = state();

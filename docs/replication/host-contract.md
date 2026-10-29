@@ -550,6 +550,15 @@ An operation whose binding this device does not retain is resolved by
 Nothing is lost or resurrected: a pending operation takes part in the merge
 only once it resolves.
 
+A new writer identity rebaselines current state (`rebaseline`). Each copied
+record or completion keeps the order and binding of the highest retained
+operation with the same effect, chosen only among operations that resolve as
+retained or compatible by the same rule. A pending operation never explains
+canonical state, so its binding is never copied. The transport publishes this
+device's own operations under a retained or compatible binding. A stream that
+a rebinding retired keeps its rows and tombstones: the rebaseline captures them
+under their latest retained binding.
+
 Known limits:
 
 - A compatible version validates by key only: this device cannot check its

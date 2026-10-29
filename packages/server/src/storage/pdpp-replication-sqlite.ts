@@ -19,6 +19,7 @@ import {
   type ReplicaRevision,
 } from "@opendatalabs/personal-server-ts-core/replication/revision";
 import { planReplicaRebinding } from "@opendatalabs/personal-server-ts-core/replication/rebinding";
+import { resolveDeclaration } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import {
   replicaSchemaDigest,
   type ReplicaStreamSchema,
@@ -202,11 +203,25 @@ export function createReplicationJournal(
       generation: generation ?? binding.generation,
     };
   }
+  /** Every binding this database retains: current plus earlier generations. */
+  const retainedDeclarations = () => [
+    ...config()!.declarations,
+    ...declarationHistory(),
+  ];
+  /**
+   * The binding a capture writes under: the current one for the stream. A
+   * rebaseline also captures streams a rebinding retired, whose rows and
+   * tombstones a new writer must still carry: their latest retained binding.
+   * The re-issued operation then keeps the binding of the operation whose
+   * effect it copies (`reissued`).
+   */
   function declaration(instance: string, stream: string): DeclarationBinding {
     const identity = base(instance);
-    const found = config()!.declarations.find(
-      (e) => e.sourceId === identity.sourceId && e.binding.stream === stream,
-    );
+    const matches = (e: { sourceId: string; binding: DeclarationBinding }) =>
+      e.sourceId === identity.sourceId && e.binding.stream === stream;
+    const found =
+      config()!.declarations.find(matches) ??
+      (reissue ? declarationHistory().filter(matches).at(-1) : undefined);
     if (!found) throw new Error(`missing retained declaration: ${stream}`);
     return found.binding;
   }
@@ -688,6 +703,11 @@ export function createReplicationJournal(
       )
       .get();
     reissue = new Map();
+    // Only an operation that applies here can explain canonical state: one
+    // under a retained or compatible binding. A pending (missing or
+    // incompatible) declaration is never copied, or the new writer could not
+    // publish its baseline.
+    const retained = retainedDeclarations();
     for (const { operation_json } of db
       .prepare(
         `SELECT operation_json FROM pdpp_replica_operations${received ? " UNION ALL SELECT operation_json FROM pdpp_replica_received" : ""}`,
@@ -696,6 +716,12 @@ export function createReplicationJournal(
       const op = JSON.parse(operation_json) as ReplicaOperation;
       const key = reissueKey(op);
       if (key === undefined || !("declaration" in op)) continue;
+      const { status } = resolveDeclaration(
+        retained,
+        op.sourceId,
+        op.declaration,
+      );
+      if (status === "missing" || status === "incompatible") continue;
       const effects =
         reissue.get(key) ??
         new Map<
