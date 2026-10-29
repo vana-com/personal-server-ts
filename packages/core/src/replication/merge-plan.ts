@@ -100,7 +100,9 @@ export function planReplicaMerge(
     reason: MergeIssueReason,
     operations: ReplicaOperation[],
   ) => bucket.push({ reason, operations });
-  const byId = new Map<string, Map<string, ReplicaOperation>>();
+  // Serializing whole operations is the plan's main cost, so only ids seen
+  // more than once compare content.
+  const byId = new Map<string, ReplicaOperation[]>();
   /** Every owned operation, equivocated variants included. */
   const evidence: ReplicaOperation[] = [];
   for (const raw of input) {
@@ -114,19 +116,32 @@ export function planReplicaMerge(
       operation.revision.operationId,
     ]);
     evidence.push(operation);
-    const variants = byId.get(id) ?? new Map();
-    variants.set(canonicalJson(operation), operation);
-    byId.set(id, variants);
+    const same = byId.get(id) ?? [];
+    same.push(operation);
+    byId.set(id, same);
   }
+  const declarationJson = new Map<
+    MergeContext["declarations"][number],
+    string
+  >();
+  const bindingJson = (entry: MergeContext["declarations"][number]) => {
+    let json = declarationJson.get(entry);
+    if (json === undefined)
+      declarationJson.set(entry, (json = canonicalJson(entry.binding)));
+    return json;
+  };
   const blockedConnections = new Set<string>();
   const operations: ReplicaOperation[] = [];
-  for (const variants of byId.values()) {
-    if (variants.size > 1) {
-      const colliding = [...variants.values()];
-      issue(result.conflicts, "operation_id_equivocation", colliding);
-      for (const operation of colliding)
+  for (const same of byId.values()) {
+    const variants =
+      same.length === 1
+        ? same
+        : [...new Map(same.map((op) => [canonicalJson(op), op])).values()];
+    if (variants.length > 1) {
+      issue(result.conflicts, "operation_id_equivocation", variants);
+      for (const operation of variants)
         blockedConnections.add(connectionKey(operation));
-    } else operations.push([...variants.values()][0]);
+    } else operations.push(variants[0]);
   }
   const connections = new Map<string, ReplicaOperation[]>();
   for (const operation of operations) {
@@ -183,10 +198,12 @@ export function planReplicaMerge(
         issue(result.pending, "missing_generation_reset", [operation]);
         continue;
       }
+      let declared: string | undefined;
       const declaration = context.declarations.find(
         (entry) =>
           entry.sourceId === operation.sourceId &&
-          canonicalJson(entry.binding) === canonicalJson(operation.declaration),
+          bindingJson(entry) ===
+            (declared ??= canonicalJson(operation.declaration)),
       );
       if (!declaration) {
         issue(result.pending, "missing_declaration", [operation]);
@@ -230,16 +247,18 @@ export function planReplicaMerge(
       const bindings = new Set(
         candidates.map((op) => canonicalJson(op.declaration)),
       );
-      const content = new Set(
-        candidates.map((op) =>
-          canonicalJson(
-            op.kind === "upsert" ? { data: op.data, blobs: op.blobs } : null,
+      // Content only matters to append-only streams.
+      const contentDiffers = () =>
+        new Set(
+          candidates.map((op) =>
+            canonicalJson(
+              op.kind === "upsert" ? { data: op.data, blobs: op.blobs } : null,
+            ),
           ),
-        ),
-      );
+        ).size > 1;
       const quarantined =
         bindings.size > 1 ||
-        (first.declaration.semantics === "append_only" && content.size > 1);
+        (first.declaration.semantics === "append_only" && contentDiffers());
       if (quarantined)
         issue(
           result.conflicts,
