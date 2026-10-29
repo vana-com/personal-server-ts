@@ -21,10 +21,11 @@ const KIB_PER_MIB = 1024;
  *    WORKER_ALLOWANCE_KIB above the process's startup peak, measured before
  *    promotion.
  *
- * 2. Replicated promotion writes main's whole `pdpp_blob_bytes` row, which
- *    costs what main's own blob write costs. It must cost no more than that
- *    plus PROMOTION_MARGIN_KIB. Main's whole row is the rollback format, so
- *    the comparison deliberately mirrors it.
+ * 2. Replicated promotion copies the verified chunks into canonical chunks,
+ *    64 KiB at a time, and assembles no whole value. Its growth must stay
+ *    under PROMOTION_ALLOWANCE_KIB at every size, both alone and inside the
+ *    worker. Main's own blob write holds the whole blob; it is measured for
+ *    comparison only.
  *
  * WORKER_ALLOWANCE_KIB is the worker's own growth above startup, measured on
  * Node 22.21.1. The typical growth is about 164 MiB at both 32 and 128 MiB.
@@ -39,7 +40,15 @@ const KIB_PER_MIB = 1024;
  */
 const WORKER_ALLOWANCE_KIB =
   (Number(process.versions.node.split(".")[0]) <= 22 ? 208 : 448) * KIB_PER_MIB;
-const PROMOTION_MARGIN_KIB = 16 * KIB_PER_MIB;
+/**
+ * Chunked promotion's growth does not follow blob size: on Node 24.22.1 it
+ * measured 32, 62, 60 and 59 MiB at 32, 128, 256 and 512 MiB. The level is
+ * freed 64 KiB chunk buffers waiting for garbage collection; each value
+ * SQLite hands over is one chunk (pdpp-replication-blob-storage.test.ts).
+ * The whole-value promotion this replaced grew 124 MiB at 32 MiB and 452 MiB
+ * at 128 MiB, so it fails at every size.
+ */
+const PROMOTION_ALLOWANCE_KIB = 80 * KIB_PER_MIB;
 
 type Measurement = { size: number; deltaKiB: number };
 type WorkerMeasurement = {
@@ -107,19 +116,18 @@ it("smoke-guards transport-worker RSS at 32, 64 and 128 MiB blobs (coarse, not a
     }
   }
   console.log("replica memory", results);
-  for (const { sizeMiB, worker, promote, plain } of results) {
+  for (const { sizeMiB, worker, promote } of results) {
     expect(worker.published, `${sizeMiB} MiB`).toBeGreaterThan(0);
     expect(
       worker.workerPeakKiB - worker.startKiB,
       `${sizeMiB} MiB worker phases`,
     ).toBeLessThan(WORKER_ALLOWANCE_KIB);
-    expect(
-      promote.deltaKiB,
-      `${sizeMiB} MiB promotion vs main plain write`,
-    ).toBeLessThanOrEqual(plain.deltaKiB + PROMOTION_MARGIN_KIB);
+    expect(promote.deltaKiB, `${sizeMiB} MiB promotion`).toBeLessThan(
+      PROMOTION_ALLOWANCE_KIB,
+    );
     expect(
       worker.peakRssKiB - worker.workerPeakKiB,
-      `${sizeMiB} MiB in-worker promotion vs main plain write`,
-    ).toBeLessThanOrEqual(plain.deltaKiB + PROMOTION_MARGIN_KIB);
+      `${sizeMiB} MiB in-worker promotion`,
+    ).toBeLessThan(PROMOTION_ALLOWANCE_KIB);
   }
 }, 900000);

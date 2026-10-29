@@ -101,21 +101,6 @@ if (mode === "seed") {
   store.close();
 } else if (mode === "measure" || mode === "probe") {
   const startKiB = maxRssKiB();
-  // Backfill guard: opening the source runs the canonical port's chunk-only
-  // backfill when a manifest has no whole row. The seed writes main's whole
-  // row, so check that read-only before any writable open can touch it.
-  const preflight = new Database(join(directory, "source.sqlite"), {
-    readonly: true,
-    fileMustExist: true,
-  });
-  const seeded = readFileSync(join(directory, "blob-id"), "utf8");
-  if (
-    !preflight
-      .prepare("SELECT 1 FROM pdpp_blob_bytes WHERE blob_id=?")
-      .get(seeded)
-  )
-    throw new Error("seed lacks main's whole row; open would backfill");
-  preflight.close();
   const source = open("source"),
     destination = open("destination");
   // Every registered version of each scope, in order: versions append.

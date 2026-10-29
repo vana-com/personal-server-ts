@@ -277,34 +277,6 @@ export function createReplicaCanonicalPort(db: Database) {
     admitReplication(db);
     ensureReplicaSchema(db);
     db.exec(CANONICAL_CHUNKS_TRIGGER);
-    // Older replication builds stored large canonical blobs only in the
-    // replica chunk tables. Materialize those bytes in main's canonical table
-    // before a flag-off or main build can be used to read the database.
-    db.transaction(() => {
-      const missing = db
-        .prepare(
-          `SELECT m.blob_id, b.size_bytes, b.sha256
-           FROM pdpp_binary_manifests m
-           JOIN pdpp_blobs b ON b.blob_id = m.blob_id
-           LEFT JOIN pdpp_blob_bytes c ON c.blob_id = m.blob_id
-           WHERE m.namespace = 'canonical' AND c.blob_id IS NULL`,
-        )
-        .all() as { blob_id: string; size_bytes: number; sha256: string }[];
-      for (const blob of missing) {
-        if (
-          !verifyBinary(
-            db,
-            "canonical",
-            blob.blob_id,
-            `sha256:${blob.sha256}`,
-            blob.size_bytes,
-          )
-        )
-          continue;
-        const bytes = readBinary(db, "canonical", blob.blob_id);
-        if (bytes) writeCanonicalBinary(db, blob.blob_id, bytes);
-      }
-    }).immediate();
   }
   const writerId = (
     db
