@@ -104,11 +104,13 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   `roster` dependency on its own address) until the server is registered under
   the owner and not revoked. If the roster is unavailable, a server that already
   has an identity continues with it; a server without one waits.
-- The first identity requires an empty replica journal. A database that
+- On Node, the first identity requires an empty replica journal. A database that
   captured operations under the old random installation writer id fails with
   `replica_identity_requires_fresh_journal`: **dev databases start fresh.**
   Operations captured before the first identity keep that local id; receivers
-  refuse them, so they never leave the device.
+  refuse them, so they never leave the device. Lite has no such rule: it
+  re-exports its canonical state under the first identity (Lite
+  `rebaseline`), so local writes made before the first enable publish.
 - A new registration id for the same address (re-registration) starts a new
   incarnation with a new nonce at the next step.
 - After a replication reset, a new database, or a restore or clone, the host

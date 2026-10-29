@@ -325,12 +325,6 @@ likely in use. Its first publication is the current-state baseline (section
   and storage reads are public (section 1). A removed device that kept the
   master key can read and decrypt new batches. This must be fixed before
   production.
-- **A phone must enable before its first local write.** The Lite canonical
-  clock binds the writer id at the first enable, only while the local journal
-  is empty. A phone that wrote locally before replication refuses with
-  `replica_identity_requires_fresh_journal`. A new registration or nonce
-  after local writes refuses the same way. Lite has no rebaseline yet (Node
-  re-captures current state under the new writer).
 - **Account can derive keys.** Account infrastructure can regenerate the
   master-key signature
   (`unity-surfaces@9af449a2 apps/mobile-shell/lib/auth/owner_device_signer.dart:7-18`),
@@ -480,6 +474,30 @@ side must provide:
   checks length and SHA-256 against the descriptor and publishes the blob in
   the same transaction, as `attachBlob` does. The bytes stay attached until
   `releaseBytes`.
+
+A new writer identity (the first enable, or a rotation) re-exports the
+canonical state into the outbox (`rebaseline` in `canonical-store.ts`), so a
+phone that wrote before it enabled still publishes those rows. Each row and
+completion copies the operation the merge chose for it and keeps its counter,
+origin and declaration (core `rebaseline.ts`). Lite keeps no binding history,
+so a row the merge does not explain, such as one whose stream the host no
+longer declares, is skipped.
+
+Bounded growth on the phone:
+
+- **Outbox.** Once a batch's manifest registration is confirmed on the
+  gateway, the engine calls `exporter.acknowledgePublished(next)` in the same
+  transaction, and Lite drops its outbox entries below `next`. Node keeps its
+  journal: rebaseline, completion dependencies and receiver merges read it.
+- **Orphaned bytes.** `attachBytes` records the id in
+  `pdpp_lite_replica_transient`, and `releaseBytes` removes it, in the same
+  transaction. A crash between them leaves the id listed, and the next step
+  releases every listed id before it stages anything.
+- **Refused batches.** A received batch the canonical store refuses
+  (`LiteCanonicalRefusal`: over the batch or partition bound, wrong owner,
+  binding mismatch, reused commit id, blob metadata conflict) cannot import on
+  a retry. The engine records it terminal with reason `canonical_<reason>`
+  and quarantines that writer from that batch. Other writers keep importing.
 
 The engine runs every storage effect in its own native transaction. One idle
 step takes about 40 transactions; the step that publishes or imports takes
