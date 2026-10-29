@@ -589,6 +589,11 @@ export function createReplicaCoordinator(input: {
               units,
             );
             let count = 0;
+            // Items deferred for bytes in this phase. Each one widens the next
+            // due() page by one, so an item that does not fit cannot hide the
+            // items behind it (another writer's work that fits). Bounded by the
+            // phase quantum, so a backlog of oversized items stays a bounded scan.
+            let skipped = 0;
             // Refilled rounds: each due() call admits at most perWriter items per
             // writer, so one writer's backlog cannot fill a phase's quantum.
             while (count < cap && units > 0 && !aborted()) {
@@ -596,7 +601,7 @@ export function createReplicaCoordinator(input: {
                 handler.phase,
                 handler
                   .due(selection(), {
-                    total: cap - count,
+                    total: cap - count + skipped,
                     perWriter: input.perWriter ?? 1,
                     after: state.writers[handler.phase],
                   })
@@ -609,6 +614,7 @@ export function createReplicaCoordinator(input: {
                   }),
               );
               let admitted = 0;
+              let deferredHere = 0;
               for (const item of items) {
                 if (count >= cap || units <= 0 || aborted()) break;
                 ran.add(`${handler.phase}\0${item.id}\0${item.part ?? ""}`);
@@ -629,6 +635,7 @@ export function createReplicaCoordinator(input: {
                   bytes === stepBytes;
                 if (item.bytes !== undefined && item.bytes > bytes && !alone) {
                   deferred = true;
+                  deferredHere++;
                   continue;
                 }
                 admitted++;
@@ -652,7 +659,10 @@ export function createReplicaCoordinator(input: {
                   attempt.release?.();
                 }
               }
-              if (!admitted) break;
+              skipped += deferredHere;
+              if (admitted) continue;
+              // Nothing fit: look past the deferred items, within the bound.
+              if (!deferredHere || skipped > quantum(handler.phase)) break;
             }
             spent.set(handler.phase, used + count);
           }
