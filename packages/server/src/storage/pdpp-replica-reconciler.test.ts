@@ -472,3 +472,85 @@ it("a completion becomes available when its last dependency arrives, even one th
   expect(target.store.listStreamCompletions("conn_a")).toHaveLength(1);
   expect(text(target, "a")).toBe("snapshot");
 });
+
+it("page budgets count UTF-8 bytes: a pass over multibyte records takes the pages its byte size needs", () => {
+  const d = device();
+  // 300 CJK characters: 300 UTF-16 code units, 900 UTF-8 bytes.
+  const wide = "記".repeat(300);
+  d.send([
+    registration(),
+    ...Array.from({ length: 120 }, (_, i) => upsert(`k${i}`, `${wide}${i}`)),
+  ]);
+  const stored = d.db
+    .prepare(
+      "SELECT operation_json AS json FROM pdpp_replica_received WHERE operation_json LIKE '%\"upsert\"%'",
+    )
+    .all() as { json: string }[];
+  const sizes = stored.map((row) => Buffer.byteLength(row.json, "utf8"));
+  expect(stored).toHaveLength(120);
+  expect(sizes[0]).toBeGreaterThan(stored[0]!.json.length + 500);
+  const total = sizes.reduce((sum, size) => sum + size, 0);
+  // One entry may overrun a page: a key's variant and its lifecycle.
+  const entry = Math.max(...sizes) + 2048;
+  const page = { operations: 10_000, bytes: 12_000 };
+  let pages = 0;
+  for (let done = false; !done; pages++) {
+    expect(pages, "the pass must finish").toBeLessThan(200);
+    done = d.receiver.reconcileStep({
+      credential,
+      page,
+      restart: pages === 0,
+    }).complete;
+  }
+  // Each page loads at most page.bytes plus one entry of UTF-8.
+  expect(pages).toBeGreaterThanOrEqual(
+    Math.floor(total / (page.bytes + entry)),
+  );
+});
+
+it("a completion reads its stream's live rows once", () => {
+  const source = device();
+  source.store.replaceStream({
+    instance: "conn_a",
+    stream: "messages",
+    method: "collector",
+    generation: 1,
+    emittedAt: at,
+    envelopes: [
+      {
+        instance: "conn_a",
+        stream: "messages",
+        key: "a",
+        data: { id: "a", text: "snapshot" },
+        emitted_at: at,
+      },
+    ],
+    primaryKey: ["id"],
+    sourceCollectedAt: at,
+  });
+  const operations = [
+    ...source.store.replication.readBaselinePage({ limit: 1000 }).operations,
+    ...source.store.replication.readTailPage({ limit: 1000 }).operations,
+  ];
+  const target = device();
+  let reads = 0;
+  const prepare = target.db.prepare.bind(target.db);
+  target.db.prepare = ((source: string) => {
+    const statement = prepare(source);
+    if (
+      source.startsWith(
+        "SELECT record_key AS recordKey, data AS dataJson FROM pdpp_records",
+      )
+    ) {
+      const all = statement.all.bind(statement);
+      statement.all = ((...params: unknown[]) => {
+        reads++;
+        return all(...params);
+      }) as typeof statement.all;
+    }
+    return statement;
+  }) as typeof target.db.prepare;
+  target.send(operations);
+  expect(target.store.listStreamCompletions("conn_a")).toHaveLength(1);
+  expect(reads).toBe(1);
+});

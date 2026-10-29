@@ -190,10 +190,11 @@ export function createReplicaReconciler(deps: {
     ).all(...params, ...params) as { operation_json: string }[];
     rows.sort((a, b) => compareText(a.operation_json, b.operation_json));
     for (const row of rows) {
+      const bytes = Buffer.byteLength(row.operation_json, "utf8");
       meter.operations++;
-      meter.bytes += row.operation_json.length;
+      meter.bytes += bytes;
       stats.operations++;
-      stats.bytes += row.operation_json.length;
+      stats.bytes += bytes;
     }
     return rows.map((row) => JSON.parse(row.operation_json) as T);
   }
@@ -882,10 +883,11 @@ export function createReplicaReconciler(deps: {
     if (!events.length) return;
     const first = events[0];
     const { generation } = first;
+    let liveRows: { recordKey: string; dataJson: string }[] | undefined;
     const loadLiveRows = () =>
-      sql(
+      (liveRows ??= sql(
         "SELECT record_key AS recordKey, data AS dataJson FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
-      ).all(instance, stream) as { recordKey: string; dataJson: string }[];
+      ).all(instance, stream) as { recordKey: string; dataJson: string }[]);
     const available = completionAvailability({
       connection,
       connectionId: instance,
@@ -904,7 +906,7 @@ export function createReplicaReconciler(deps: {
             .map((row) => row.digest),
         ),
       ],
-      // Read only once every cheaper condition holds.
+      // Read once, and only once every cheaper condition holds.
       get liveRows() {
         return loadLiveRows();
       },
