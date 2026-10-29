@@ -1039,10 +1039,20 @@ export function transportInvariantViolations(d: TransportDevice): string[] {
       violations.push(
         `prepared batch without manifest or fragments: ${prepared.map((r) => r.batch).join(",")}`,
       );
+    // An unprepared batch has no manifest. Its fragments are exactly the
+    // ones its preparation cursor has committed (positions 0..next-1); the
+    // OUTBOUND view hides them from publish until the batch is prepared.
+    const progress = has("pdpp_transport_preparation_progress")
+      ? "(SELECT next_index FROM pdpp_transport_preparation_progress p WHERE p.batch=b.batch)"
+      : "NULL";
     const unprepared = db
       .prepare(
-        `SELECT DISTINCT o.batch FROM (SELECT batch FROM pdpp_transport_manifests_out UNION ALL SELECT batch FROM pdpp_transport_fragments_out) o
-          JOIN pdpp_transport_batches b ON b.batch=o.batch WHERE b.prepared<>1`,
+        `SELECT b.batch FROM pdpp_transport_batches b WHERE b.prepared<>1 AND (
+          EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m WHERE m.batch=b.batch)
+          OR (SELECT count(*) FROM pdpp_transport_fragments_out f WHERE f.batch=b.batch)
+            <> coalesce(${progress}, 0)
+          OR EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=b.batch
+            AND (f.position < 0 OR f.position >= coalesce(${progress}, 0))))`,
       )
       .all() as { batch: string }[];
     if (unprepared.length)
