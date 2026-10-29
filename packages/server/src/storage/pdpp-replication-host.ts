@@ -52,11 +52,13 @@ import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import { enableReplicaWriterIdentity } from "./pdpp-replica-writer-identity.js";
 
-/** Desktop step bound (host contract §6): 50 units, 64 MiB. */
-export const NODE_REPLICATION_BUDGET: ReplicaBudget = {
-  units: 50,
-  bytes: 64 * 1024 * 1024,
-};
+/**
+ * Desktop step bound (host contract §6): 50 units, 64 MiB. Bytes stay
+ * omitted so the coordinator's 64 MiB default applies, under which a batch
+ * larger than the whole step still runs alone; an explicit 64 MiB would
+ * defer it forever.
+ */
+export const NODE_REPLICATION_BUDGET: ReplicaBudget = { units: 50 };
 /** How long shutdown waits for an aborted step before closing storage. */
 export const NODE_REPLICATION_STOP_GRACE_MS = 5_000;
 
