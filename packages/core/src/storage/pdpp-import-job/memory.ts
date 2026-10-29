@@ -94,7 +94,7 @@ export function createMemoryImportJobCapability(
   const fault = options.fault ?? (() => {});
   const pageSize = options.pageSize ?? 256;
   const bindings = new Map<string, Binding>();
-  let rows = new Map<string, MemoryImportRow>();
+  const rows = new Map<string, MemoryImportRow>();
   const history: MemoryImportRow[] = [];
   const outbox: MemoryImportOutboxEntry[] = [];
   const completions = new Map<string, MemoryImportCompletion>();
@@ -238,6 +238,16 @@ export function createMemoryImportJobCapability(
           "completion_failed",
           `stream ${proof.stream}: the live set differs from the proof`,
         );
+      // As the store: a receipt survives when no row changed, and a proof
+      // collected earlier than it cannot replace it.
+      const prior = completions.get(`${instance}\0${proof.stream}`);
+      if (
+        prior &&
+        !touched.has(proof.stream) &&
+        Date.parse(input.completion!.sourceCollectedAt) <
+          Date.parse(prior.sourceCollectedAt)
+      )
+        throw new ImportJobError("completion_failed", "time_conflict");
       proven.push({
         instance,
         stream: proof.stream,
@@ -265,7 +275,9 @@ export function createMemoryImportJobCapability(
 
     fault("publish:before-commit");
     assertPublishable();
-    rows = next;
+    // Only this connection's rows: another one may have been erased meanwhile.
+    for (const [key, row] of next)
+      if (row.instance === instance) rows.set(key, row);
     history.push(...written);
     outbox.push(...captured);
     for (const stream of touched) completions.delete(`${instance}\0${stream}`);
