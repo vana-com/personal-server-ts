@@ -314,9 +314,11 @@ export function createReplicaCanonicalPort(db: Database) {
   // Captured operations name the derived operation writer. Before the first
   // enable they name the installation writer and stay local: no receiver
   // accepts them, and enabling refuses a journal that has them.
+  let journalObserver: (() => void) | undefined;
   const journal = createReplicationJournal(
     db,
     () => currentReplicaWriterIdentity(db)?.operationWriter ?? writerId,
+    () => journalObserver?.(),
   );
   const insertLocalWrite = db.prepare(`
     INSERT INTO pdpp_replica_own_writes
@@ -595,6 +597,15 @@ export function createReplicaCanonicalPort(db: Database) {
       writeBoundary = write;
       readBoundary = read;
     },
+    /**
+     * Called for each operation appended to the local journal (a record,
+     * blob, completion or lifecycle write; never an import), inside the
+     * write's transaction. The observer must defer its effect past the
+     * transaction: a rolled-back write may still have called it.
+     */
+    setReplicaJournalObserver(observer: () => void) {
+      journalObserver = observer;
+    },
     /** Called for each locally written key when the store settles, inside the write's transaction. */
     setReplicaLocalWriteObserver(
       observer: (instance: string, stream: string, recordKey: string) => void,
@@ -665,6 +676,7 @@ export function createReplicaRecordStore(
     setReplicaVisibilityObserver: r.setReplicaVisibilityObserver,
     setReplicaWriteBoundary: r.setReplicaWriteBoundary,
     setReplicaLocalWriteObserver: r.setReplicaLocalWriteObserver,
+    setReplicaJournalObserver: r.setReplicaJournalObserver,
     replicaIntegrityEpoch: r.replicaIntegrityEpoch,
     replicaVisibilityEpoch: r.replicaVisibilityEpoch,
     fenceReplicaConnection: r.fenceReplicaConnection,

@@ -478,10 +478,13 @@ user taps "Sync now". The phone runs only in the foreground: on `inactive`,
 `paused` or `hidden` the host aborts the step and stops scheduling.
 
 `createReplicationDriver` (`packages/core/src/replication/host-driver.ts`)
-implements this timer, single-flight `trigger`, `wake` and `stop(graceMs)` for
-both hosts. Node wires it in `pdpp-replication-host.ts`; Node fires no
-local-write trigger yet, so a local write waits for the next coordinator wake
-(at most 15 min).
+implements this timer, single-flight `trigger`, `wake`, `localWrite` and
+`stop(graceMs)` for both hosts. `localWrite` steps within
+`REPLICA_LOCAL_WRITE_DEBOUNCE_MS` (2 s) of the first write after the last
+debounced step; later writes join that step and do not postpone it. Node wires
+the driver in `pdpp-replication-host.ts` and calls `localWrite` from the
+journal: each own operation appended to the local journal (never an import)
+schedules a step.
 
 PS-Lite wraps the same driver in `createLiteReplicationRuntime`
 (`packages/lite/src/replication-runtime.ts`): `resume` on foreground,
