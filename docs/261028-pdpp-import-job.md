@@ -26,17 +26,22 @@ abort(jobId)                              -> nothing staged stays
 ```
 
 - **Binding.** A job is bound to the server owner, one connection (PDPP
-  instance), its source id, method and generation. `begin` refuses a binding
+  instance), its source id, method and generation. Every operation reads the
+  current owner and compares it with the job's stored owner (and
+  `connectorState` with the owner of the job that wrote the state); while
+  the owner is missing or empty every operation fails `owner_mismatch`. `begin` refuses a binding
   that differs from the store's current one. The adapter checks it again
   inside the publication transaction, so a connection reset or deletion
-  during the run makes the job unpublishable (`binding_generation_mismatch`).
+  during the run makes the job unpublishable (`binding_mismatch`).
 - **Spool.** UTF-8 lines, one JSON record per line (`pdpp-ndjson-v1`):
   `{stream, key, data, emitted_at, op}`. The host writes the spool once and
   never changes it. A batch is a run of whole lines, exactly the spool bytes
   `[spoolStart, spoolEnd)`; `spoolStart` must equal the job's `spoolOffset`.
 - **Batches.** Default 1 MiB, at most 4 MiB. A single record may exceed the
   budget up to 16 MiB, alone in its batch; a larger line fails with
-  `record_too_large` before it is parsed. One batch per job is in flight.
+  `record_too_large` before it is parsed. One batch per job is in flight,
+  queued or running: a second append fails `job_busy` at once, before its
+  text is held, and is safe to retry after the first settles.
 - **Digests and receipts.** Each batch carries the SHA-256 of its bytes; the
   engine verifies it. Each staged operation carries
   `sha256(canonicalJson([stream, recordKey, op, data, emittedAt]))`. A batch
@@ -47,7 +52,12 @@ abort(jobId)                              -> nothing staged stays
   After process loss the host reads the spool from that offset. No scope is
   replayed.
 - **Commit.** `batches` must equal the durable batch count, so a lost append
-  cannot publish a short job. A retried commit returns the stored receipt.
+  cannot publish a short job. The whole spool must be consumed: at least one
+  durable batch, `spoolOffset == spool.byteLength`, and receipts that chain
+  from byte 0 to the end; otherwise `spool_incomplete`, and no completion or
+  cursor is written. `begin` refuses an empty spool. The adapter checks the
+  offset again inside the publication transaction. A retried commit returns
+  the stored receipt.
 - **Abort.** Drops staged rows. A committed job stays committed.
 
 ## Rules the engine owns

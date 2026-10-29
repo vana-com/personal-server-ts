@@ -11,6 +11,7 @@ import {
   IMPORT_JOB_DEFAULT_BATCH_BYTES,
   IMPORT_JOB_MAX_BATCH_BYTES,
   IMPORT_JOB_MAX_CONNECTOR_STATE_BYTES,
+  IMPORT_JOB_MAX_IN_FLIGHT,
   IMPORT_JOB_MAX_LISTED_REJECTIONS,
   IMPORT_JOB_MAX_RECORD_BYTES,
   ImportJobError,
@@ -105,8 +106,10 @@ export function createPdppImportJobs(
   }
   const now = () => (options.now ?? (() => new Date()))().toISOString();
 
-  // One request per job at a time: IMPORT_JOB_MAX_IN_FLIGHT.
+  // One request per job at a time. Appends are also admitted at most
+  // IMPORT_JOB_MAX_IN_FLIGHT per job, queued or running (see `append`).
   const queues = new Map<string, Promise<unknown>>();
+  const appendsAdmitted = new Map<unknown, number>();
   function exclusive<T>(jobId: string, step: () => Promise<T>): Promise<T> {
     const previous = queues.get(jobId) ?? Promise.resolve();
     const run = previous.then(step, step);
@@ -288,8 +291,24 @@ export function createPdppImportJobs(
     batch: ImportBatchInput,
   ): Promise<ImportBatchReceipt & { replay: boolean }> {
     if (!object(batch)) throw invalid("batch must be an object");
-    const job0 = await readJob(batch.jobId);
-    return exclusive(job0.jobId, () => appendLocked(batch));
+    // Admission is decided before the first await, so a refused payload is
+    // never held: IMPORT_JOB_MAX_IN_FLIGHT bounds the batch text in memory.
+    const jobId = batch.jobId;
+    const admitted = appendsAdmitted.get(jobId) ?? 0;
+    if (admitted >= IMPORT_JOB_MAX_IN_FLIGHT)
+      throw new ImportJobError(
+        "job_busy",
+        "another append of this job is in flight",
+      );
+    appendsAdmitted.set(jobId, admitted + 1);
+    try {
+      const job0 = await readJob(jobId);
+      return await exclusive(job0.jobId, () => appendLocked(batch));
+    } finally {
+      const left = (appendsAdmitted.get(jobId) ?? 1) - 1;
+      if (left > 0) appendsAdmitted.set(jobId, left);
+      else appendsAdmitted.delete(jobId);
+    }
   }
 
   async function appendLocked(

@@ -33,7 +33,10 @@ export const IMPORT_JOB_MAX_BATCH_BYTES = 4 * 1024 * 1024;
  * batch with `record_too_large` before it is parsed.
  */
 export const IMPORT_JOB_MAX_RECORD_BYTES = 16 * 1024 * 1024;
-/** Batches one job may have in flight. Appends of one job run one at a time. */
+/**
+ * Batches one job may have in flight, queued or running. Appends of one job
+ * run one at a time; an append beyond this limit fails `job_busy` at once.
+ */
 export const IMPORT_JOB_MAX_IN_FLIGHT = 1;
 /** Largest connector state committed with a job, in UTF-8 bytes. */
 export const IMPORT_JOB_MAX_CONNECTOR_STATE_BYTES = 64 * 1024;
@@ -335,6 +338,8 @@ export type ImportJobErrorCode =
   | "state_too_large"
   /** Commit before every spool byte is in a durable batch (added after b5f53725). */
   | "spool_incomplete"
+  /** An append beyond `IMPORT_JOB_MAX_IN_FLIGHT`; retry after the pending one (added after b5f53725). */
+  | "job_busy"
   | "completion_failed";
 
 export class ImportJobError extends Error {

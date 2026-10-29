@@ -433,6 +433,56 @@ describe("PDPP import job engine (in-memory adapter)", () => {
       });
   });
 
+  it("holds at most one append payload per job and refuses the rest as busy", async () => {
+    const { capability, begin, spool } = await setup();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let held = 0;
+    const gated = {
+      ...capability,
+      stageBatch: async (
+        input: Parameters<typeof capability.stageBatch>[0],
+      ) => {
+        held++;
+        await gate;
+        return capability.stageBatch(input);
+      },
+    };
+    const jobs = createPdppImportJobs({
+      capability: gated,
+      declarations,
+      owner: OWNER,
+    });
+    await jobs.begin(begin);
+    const firstLineEnd = spool.bytes.indexOf(0x0a) + 1;
+    const line = spool.bytes.subarray(0, firstLineEnd);
+    const batch = {
+      jobId: "job-1",
+      seq: 0,
+      text: new TextDecoder().decode(line),
+      sha256: await sha256HexOf(line),
+      spoolStart: 0,
+      spoolEnd: firstLineEnd,
+    };
+    const first = jobs.append(batch);
+    const extra = Array.from({ length: 32 }, () => jobs.append(batch));
+    const outcomes = await Promise.allSettled(extra);
+    expect(outcomes.every((o) => o.status === "rejected")).toBe(true);
+    for (const outcome of outcomes)
+      expect((outcome as PromiseRejectedResult).reason).toMatchObject({
+        code: "job_busy",
+      });
+    while (held === 0) await new Promise((resolve) => setImmediate(resolve));
+    expect(held).toBe(1);
+    await expect(jobs.append(batch)).rejects.toMatchObject({
+      code: "job_busy",
+    });
+    release();
+    expect((await first).replay).toBe(false);
+    // The slot frees once the held append settles; a retry is then admitted.
+    expect(await jobs.append(batch)).toMatchObject({ replay: true });
+  });
+
   it("refuses an adapter of another contract version", () => {
     const capability = createMemoryImportJobCapability({ contractVersion: 2 });
     expect(() =>
