@@ -121,9 +121,10 @@ separate from current runtime state/token/MCP keys.
    (`LITE_CANONICAL_BATCH_BYTES`); 7b must enforce that before
    constructing/parsing a bridge body. Split batches at record boundaries; do
    not split record identity or alter declared data. A received replica
-   envelope has no whole-size bound: the store keeps it in 128 KiB parts and
-   bounds its header, operation count and each operation
-   (`LITE_CANONICAL_MAX_OPERATION_BYTES`) before parsing it.
+   envelope has no whole-size bound: the store keeps it in 128 KiB parts, keeps
+   each pending blob descriptor in its own value, and bounds its header,
+   operation count and each operation (`LITE_CANONICAL_MAX_OPERATION_BYTES`)
+   before parsing it.
 3. **Staged, verified blob chunks.** `stageBlob(descriptor, chunks)` sends
    backpressured frames of at most 128 KiB into native staging chunk rows. Hash
    incrementally natively and verify exact length, SHA-256, content-derived id,

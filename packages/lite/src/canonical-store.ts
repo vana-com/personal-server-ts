@@ -116,7 +116,8 @@ interface PendingBatch {
   parts?: number;
   state: "pending" | "quarantined" | "confirmed";
   reason?: string;
-  blobs: LiteBlobDescriptor[];
+  /** Batches staged before `pendingBlobKey` rows keep descriptors here. */
+  blobs?: LiteBlobDescriptor[];
 }
 const pendingKey = (id: string) => `pending-batches/${keyDigest(id)}`;
 /**
@@ -151,6 +152,24 @@ async function checkLayout(tx: LiteCanonicalTransaction) {
 const pendingPartKey = (id: string, part: number) =>
   `pending-envelopes/${keyDigest(id)}/${String(part).padStart(8, "0")}`;
 const PENDING_PART_BYTES = 128 * 1024;
+/**
+ * One blob descriptor of a pending batch per value, so a batch of many small
+ * blob claims never builds one value above the native bound.
+ */
+const pendingBlobKey = (id: string, blobId: string) =>
+  `pending-batch-blobs/${keyDigest(id)}/${keyDigest(blobId)}`;
+/** A pending batch's blob descriptors, from either storage. */
+async function* pendingBlobsOf(
+  tx: LiteCanonicalTransaction,
+  batch: Pick<PendingBatch, "id" | "blobs">,
+): AsyncIterable<LiteBlobDescriptor> {
+  yield* batch.blobs ?? [];
+  for await (const entry of scan(
+    tx,
+    `pending-batch-blobs/${keyDigest(batch.id)}/`,
+  ))
+    yield JSON.parse(entry.value) as LiteBlobDescriptor;
+}
 /** Bump when a derived pending index changes; older databases need `retry`. */
 const PENDING_INDEX_VERSION = 3;
 const PREVIEW_BLOB_REFS = "preview-blob-refs/";
@@ -1143,10 +1162,10 @@ export function createLiteCanonicalStore(deps: {
       >();
       const full = new Set<string>();
       if (input.promotion)
-        for (const blob of (await get<PendingBatch>(
+        for await (const blob of pendingBlobsOf(
           tx,
-          pendingKey(input.promotion.id),
-        ))!.blobs)
+          (await get<PendingBatch>(tx, pendingKey(input.promotion.id)))!,
+        ))
           if (await confirmBlob(tx, blob.blobId))
             newlyConfirmed.push(blob.blobId);
       for (const blobId of newlyConfirmed)
@@ -1679,7 +1698,7 @@ export function createLiteCanonicalStore(deps: {
             `pending-index/retained-connections/${keyDigest(id)}`,
           );
     }
-    for (const blob of batch.blobs) {
+    for await (const blob of pendingBlobsOf(tx, batch)) {
       const path = `pending-blob-active/${keyDigest(blob.blobId)}/${keyDigest(batch.id)}`;
       if (active) await put(tx, path, true);
       else await tx.delete(path);
@@ -1861,14 +1880,13 @@ export function createLiteCanonicalStore(deps: {
         if (prior && prior.state !== "pending")
           return { fingerprint, state: prior.state };
         for (const op of envelope.operations) await mapping(tx, op);
+        const claims = new Set(
+          envelope.operations.flatMap((op) =>
+            op.kind === "blob-claim" ? [canonicalJson(op.blob)] : [],
+          ),
+        );
         for (const blob of input.blobs ?? []) {
-          if (
-            !envelope.operations.some(
-              (op) =>
-                op.kind === "blob-claim" &&
-                canonicalJson(op.blob) === canonicalJson(blob.descriptor),
-            )
-          )
+          if (!claims.has(canonicalJson(blob.descriptor)))
             throw new Error("pending blob requires matching claim");
           if (
             (await tx.blob(blob.descriptor.blobId)) &&
@@ -1888,15 +1906,12 @@ export function createLiteCanonicalStore(deps: {
             `pending-blobs/${keyDigest(blob.descriptor.blobId)}`,
             true,
           );
+          await put(
+            tx,
+            pendingBlobKey(input.id, blob.descriptor.blobId),
+            blob.descriptor,
+          );
         }
-        const blobs = [
-          ...new Map(
-            [
-              ...(prior?.blobs ?? []),
-              ...(input.blobs ?? []).map((blob) => blob.descriptor),
-            ].map((blob) => [blob.blobId, blob]),
-          ).values(),
-        ];
         // A restaged batch keeps the envelope it stored first.
         const parts = prior
           ? undefined
@@ -1908,7 +1923,6 @@ export function createLiteCanonicalStore(deps: {
           id: input.id,
           fingerprint,
           state: "pending",
-          blobs,
           ...(parts && { parts: parts.length }),
         };
         await put(tx, path, batch);

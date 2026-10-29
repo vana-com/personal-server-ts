@@ -502,7 +502,8 @@ Bounded growth on the phone:
   merge chose) is separate work.
 - **Large received batches.** A Node batch targets 32 MiB. Lite keeps a
   received envelope, its copy and its fetched fragments in parts below the
-  per-call SQL bound (`LITE_REPLICA_SQL_BYTES`) and imports it in one native
+  per-call SQL bound (`LITE_REPLICA_SQL_BYTES`), each of its blob descriptors
+  in its own value, and imports it in one native
   transaction under one receipt. Only each operation is bounded
   (`LITE_CANONICAL_MAX_OPERATION_BYTES`), because the store keeps it as one
   value. A larger operation is held `resource_unsupported` until a build

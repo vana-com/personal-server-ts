@@ -2084,3 +2084,71 @@ it("does not serve confirmed blob bytes claimed only under a binding conflict", 
       })(),
     ).rejects.toThrow("missing committed blob");
 });
+
+it("E9c stages and promotes a batch of 1,800 small blob claims within the native value bound", async () => {
+  const { sha256 } = await import("viem");
+  const { make } = device();
+  const store = make();
+  await provision(store);
+  const blobs = [];
+  const claims = [];
+  for (let index = 0; index < 1_800; index++) {
+    const bytes = new TextEncoder().encode(`blob ${index}`);
+    const hash = `sha256:${sha256(bytes).slice(2)}`;
+    const descriptor = {
+      blobId: hash,
+      sha256: hash,
+      mimeType: "text/plain",
+      sizeBytes: bytes.length,
+    };
+    const stagingId = await store.stageBlob(
+      descriptor,
+      (async function* () {
+        yield bytes;
+      })(),
+    );
+    blobs.push({ stagingId, descriptor, bytes });
+    claims.push({
+      ...identity,
+      kind: "blob-claim" as const,
+      revision: {
+        counter: 2 + index,
+        writerId: "device-a",
+        operationId: `claim-${index}`,
+      },
+      blob: descriptor,
+    });
+  }
+  // The descriptors alone are above one native value.
+  expect(
+    new TextEncoder().encode(JSON.stringify(blobs.map((b) => b.descriptor)))
+      .length,
+  ).toBeGreaterThan(256 * 1024);
+  const last = blobs.at(-1)!;
+  const record = upsert("blob", 2 + blobs.length);
+  record.blobs = [last.descriptor];
+  record.data.blob_ref = { blob_id: last.descriptor.blobId };
+  const request = pending();
+  request.envelope.operations = [registration, ...claims, record];
+  const staged = await store.stagePending({
+    ...request,
+    blobs: blobs.map(({ stagingId, descriptor }) => ({
+      stagingId,
+      descriptor,
+    })),
+  });
+  await store.promotePending({
+    id: request.id,
+    credential: "replica",
+    fingerprint: staged.fingerprint,
+  });
+  const parts: Uint8Array[] = [];
+  for await (const part of make().readBlob(last.descriptor.blobId, {
+    reader: "grant",
+  }))
+    parts.push(part);
+  expect(parts).toEqual([last.bytes]);
+  expect(await read(make())).toMatchObject({
+    data: { blob_ref: { blob_id: last.descriptor.blobId } },
+  });
+}, 60_000);
