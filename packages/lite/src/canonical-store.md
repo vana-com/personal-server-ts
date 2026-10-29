@@ -10,8 +10,8 @@ remain unchanged. Whether those provisional policies become final remains open.
 Use the existing owner-partitioned **native SQLite database**, with chunked BLOB
 staging and atomic reference publication in that same database. This extends
 `PsNativeStore`; it adds no database engine or browser persistence dependency.
-Canonical rows, original operations, local mutation journal, ordered outbox,
-clock and import receipt share one serializable commit. Native blob staging is
+Canonical rows, original operations, the local operation log, clock and import
+receipt share one serializable commit. Native blob staging is
 invisible until that commit publishes a verified descriptor and chunk reference.
 
 Evidence is the read-only Unity `origin/dev` tree at
@@ -52,11 +52,10 @@ fragmentation code; it is not a maximum native blob size.
 `canonical-persistence.ts` is the native adapter contract. `canonical-store.ts`
 provides trusted host connection provisioning, local operation drafts with a
 persisted installation writer/clock, replica-authenticated import, canonical point
-reads, bounded journal/outbox reads and cumulative outbox acknowledgment. Local
+reads, bounded log/outbox reads and cumulative outbox acknowledgment. Local
 record decisions call the existing `planIngest`; all replica winner/conflict
-selection calls `planReplicaMerge`. Mutation values use the shared
-`CanonicalMutation` contract. Imported operations never enter the local journal
-or outbox. A receipt acknowledges **durable retention**, not stream availability.
+selection calls `planReplicaMerge`. Imported operations never enter the local
+log or outbox. A receipt acknowledges **durable retention**, not stream availability.
 It does not issue or replicate grants.
 
 The caller supplies a stable local request id. Its fingerprint prevents a changed
@@ -77,11 +76,23 @@ lifecycle, blob-claim, equivocation and provisioning changes can scan all keys i
 a connection, with bounded pages. Native transaction duration for that scan is
 not yet measured.
 
-Outbox entries are immutable operation pointers ordered by local sequence, so a
-new request whose id sorts before an old cursor cannot disappear. Only a trusted
+Each local operation writes one `log/<sequence>` entry,
+`{batchId, operationKey, sequence, rowVersion?}`. `operationKey` points at the
+retained operation, so the log holds no operation or row bytes; `rowVersion` is
+the record row's version after that write. The outbox is the log after the
+`outbox-ack` sequence, so a new request whose id sorts before an old cursor
+cannot disappear. Only a trusted
 publisher may acknowledge a contiguous prefix **after** #429's persist-before-I/O,
-immutable-fragment and authoritative-settlement requirements hold. CAS ack drops
-outbox pointers; it does not delete journal/history. This PR does not wire a Lite
+immutable-fragment and authoritative-settlement requirements hold. CAS ack moves
+`outbox-ack`; it deletes no log entry. `readLogPage` reads acknowledged entries
+too; `readOutboxPage` never does.
+
+`canonical-layout-version` is 2. Layout 1 stored a full copy of each local
+operation under `journal/`, a pointer under `outbox/` and a row copy under
+`mutations/`. A store whose layout is not 2 refuses every call with an error
+that names the layout; it never reads both layouts. No production database
+holds layout 1, so there is no migration: clear a development store and import
+again. This PR does not wire a Lite
 publisher or claim that an envelope pointer is an encrypted DPv2 fragment.
 
 ## Exact native contract for slice 7b
@@ -145,9 +156,11 @@ The shared store fixtures execute the existing Node canonical SQLite receiver,
 Lite with the crash fake, and Lite over a real disk SQLite port. They cover the
 same mutable vectors, deletes/resets, generation gaps, append-only conflict,
 equivocation, owner checks, duplicate delivery and received blob bytes after
-restart. Lite fault cases inject record/blob/journal/outbox/import failures,
+restart. Lite fault cases inject record/blob/log/import failures,
 before-commit rollback and after-commit lost acknowledgment. A multi-write case
-checks each journal entry's original value. Reducer differential tests compare
+checks each log entry's row version. `canonical-layout.test.ts` pins the
+publisher's outbox pages and every non-log entry for a fixed write sequence to
+digests recorded on layout 1. Reducer differential tests compare
 bounded evidence with the full planner across deterministic permutations; a
 retained history above 4 MiB still materializes without deleting losers.
 The shared lifecycle cases also check invalid resets, same-content new-generation
@@ -202,7 +215,7 @@ or upgrade it.
 
 `stagePending({id, envelope, credential, blobs?})` retains an authenticated,
 structure-checked batch under `pending-batches/`, separate from canonical operation
-indexes, rows, convergence counters, journals and outbox. It returns the canonical
+indexes, rows, convergence counters and the log. It returns the canonical
 JSON SHA-256 `fingerprint`. The transport host must decrypt and verify incoming
 transport hashes before this call. Blob attachment verifies staged bytes through
 the persistence port; a separate pending visibility gate hides those immutable
@@ -271,8 +284,8 @@ initializes per-connection canonical and preview revision receipts, including
 when version-one derived indexes already exist.
 This one-time write-side upgrade reads retained pending-batch metadata;
 preview-mode reads fail explicitly until it completes.
-Pending work never advances the canonical clock. Journal, mutation and outbox
-exports read canonical state only.
+Pending work never advances the canonical clock. Log and outbox reads see
+canonical state only.
 
 The pending tests exercise the public store API with the crash fake, including
 reopen, interrupted promotion rollback, all four reader policy combinations,
