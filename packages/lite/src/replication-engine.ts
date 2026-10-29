@@ -612,13 +612,18 @@ export function createLiteReplicaEngine(
         if (pending?.state === "pending")
           yield* store((s) => s.quarantinePending({ id, credential, reason }));
       },
-      *retry({ credential }) {
+      // One step runs the whole pass, a connection per store transaction,
+      // so no page is ever left queued.
+      *reconcileStep({ credential }) {
         let after: string | undefined;
         do {
           after = (yield* store((s) => s.retry({ credential, after }))).after;
         } while (after !== undefined);
         // The canonical store does not report what still waits.
-        return { pending: [] };
+        return { plan: { pending: [] }, complete: true };
+      },
+      *reconcileQueued() {
+        return false;
       },
       copies: {
         list: (id) => copies.copies(id),
