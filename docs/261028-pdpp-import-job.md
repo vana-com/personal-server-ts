@@ -69,7 +69,13 @@ The adapter never decides an outcome. The engine (`createPdppImportJobs`):
   key encoding, key against declared primary key, declared schema,
   append-only deletes). Refused lines are listed in the receipt and never
   staged;
-- computes `recordKey = encodeRecordKey(key)` and the operation digest.
+- computes `recordKey = encodeRecordKey(key)` and the operation digest;
+- refuses a batch whose record has `data.blob_ref` (`blob_ref_unsupported`).
+  The blob claim is checked against the store at publication, after the
+  index kept only the latest operation of a key, so an edit with an
+  unclaimed blob would drop the earlier valid version that line-by-line
+  ingest keeps. The job cannot pass that batch; the host aborts it and uses
+  the old path until blob staging exists.
 
 ## Latest-operation index
 

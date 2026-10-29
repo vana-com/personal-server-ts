@@ -377,6 +377,8 @@ export type ImportJobErrorCode =
   | "spool_incomplete"
   /** An append beyond `IMPORT_JOB_MAX_IN_FLIGHT`; retry after the pending one (added after b5f53725). */
   | "job_busy"
+  /** A record with `data.blob_ref`; version 1 stages no blobs (added after b5f53725). */
+  | "blob_ref_unsupported"
   | "completion_failed";
 
 export class ImportJobError extends Error {

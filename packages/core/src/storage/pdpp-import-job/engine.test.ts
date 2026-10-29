@@ -660,6 +660,35 @@ describe("PDPP import job engine (in-memory adapter)", () => {
     expect(IMPORT_JOB_MAX_RECORD_BYTES).toBe(16 * 1024 * 1024);
   });
 
+  it("refuses a blob reference, whose claim check would run after the index collapses", async () => {
+    // Line-by-line ingest keeps "first" when the edit's blob is unclaimed;
+    // the index would keep only the edit and then reject it at publication.
+    const [first, edit] = importVectorRecords().filter(
+      (record) => record.key === "m2",
+    );
+    const { capability, begin, engine } = await setup([
+      first!,
+      {
+        ...edit!,
+        data: { ...edit!.data, blob_ref: { blob_id: "blob-unclaimed" } },
+      },
+    ]);
+    const jobs = engine();
+    await jobs.begin(begin);
+    await expect(
+      importSpool(jobs, "job-1", capability.readSpool!),
+    ).rejects.toMatchObject({ code: "blob_ref_unsupported" });
+    // The refused batch stages nothing, and the job cannot publish past it.
+    const status = await jobs.status("job-1");
+    expect(status.job.state).toBe("open");
+    expect(status.job.nextSeq).toBe(1);
+    expect(capability.stagedCount("job-1")).toBe(1);
+    await expect(
+      jobs.commit({ jobId: "job-1", batches: 1, connectorState: "{}" }),
+    ).rejects.toMatchObject({ code: "spool_incomplete" });
+    expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
+  });
+
   it("refuses a batch that names another instance", async () => {
     const { capability, begin, engine } = await setup([
       { ...importVectorRecords()[0], instance: "someone-else" },

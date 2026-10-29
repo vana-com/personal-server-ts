@@ -73,6 +73,14 @@ function count(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+/** `data.blob_ref.blob_id`, as the record stores read it. */
+function blobId(data: unknown): string | undefined {
+  const ref = object(data) ? data.blob_ref : undefined;
+  return object(ref) && typeof ref.blob_id === "string"
+    ? ref.blob_id
+    : undefined;
+}
+
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -455,6 +463,14 @@ export function createPdppImportJobs(
       const op = envelope.op === "delete" ? "delete" : "upsert";
       const recordKey = encodeRecordKey(envelope.key);
       const data = op === "upsert" ? envelope.data : null;
+      // A blob claim is checked against the store at publication, after the
+      // index kept only the latest operation of the key, so a rejected edit
+      // would drop an earlier valid version. Version 1 stages no blobs.
+      if (blobId(data))
+        throw new ImportJobError(
+          "blob_ref_unsupported",
+          `line ${line} references a blob; import jobs do not stage blobs`,
+        );
       operations.push({
         order: job.nextOrder + operations.length,
         stream,
