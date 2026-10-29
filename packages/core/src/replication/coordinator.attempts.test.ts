@@ -96,11 +96,11 @@ describe("S2b attempt-scoped results", () => {
       return { outcome: { tag: "retry", problem: "download_failed" } };
     });
     const co = createReplicaCoordinator({ phases: [handler], deadlineMs: 20 });
-    const first = await co.step(T0, undefined, { units: 10 });
+    const first = await co.step({ now: T0, budget: { units: 10 } });
     expect(first.problems[0]?.problem).toBe("deadline_exceeded");
     release();
     await sleep(10);
-    await co.step(T0 + 10_000, undefined, { units: 10 });
+    await co.step({ now: T0 + 10_000, budget: { units: 10 } });
     expect(effects).toEqual([]);
     expect(store.outcome).toMatchObject({
       tag: "retry",
@@ -115,7 +115,11 @@ describe("S2b attempt-scoped results", () => {
     );
     const co = createReplicaCoordinator({ phases: [handler] });
     const controller = new AbortController();
-    const step = co.step(T0, controller.signal, { units: 10 });
+    const step = co.step({
+      now: T0,
+      signal: controller.signal,
+      budget: { units: 10 },
+    });
     controller.abort();
     const report = await step;
     expect(report.receipts).toEqual([]);
@@ -134,7 +138,11 @@ describe("S2b attempt-scoped results", () => {
     });
     const co = createReplicaCoordinator({ phases: [handler] });
 
-    const report = await co.step(T0, controller.signal, { units: 10 });
+    const report = await co.step({
+      now: T0,
+      signal: controller.signal,
+      budget: { units: 10 },
+    });
     await sleep(0);
 
     expect(report.receipts).toEqual([]);
@@ -150,7 +158,7 @@ describe("S2b attempt-scoped results", () => {
       },
     }));
     const co = createReplicaCoordinator({ phases: [handler] });
-    const report = await co.step(T0, undefined, { units: 10 });
+    const report = await co.step({ now: T0, budget: { units: 10 } });
     expect(report.receipts).toEqual([]);
     expect(report.problems).toMatchObject([
       { problem: "download_failed", nextEligible: T0 + 1000 },
@@ -171,7 +179,7 @@ describe("S2b attempt-scoped results", () => {
       }),
     }));
     const co = createReplicaCoordinator({ phases: [handler] });
-    const report = await co.step(T0, undefined, { units: 10 });
+    const report = await co.step({ now: T0, budget: { units: 10 } });
     expect(report.waits).toMatchObject([{ dependency: { kind: "mapping" } }]);
     expect(store.outcome?.tag).toBe("wait");
   });
@@ -188,7 +196,7 @@ describe("S2b the coordinator's clock", () => {
       phases: [handler],
       clock: () => clock.now,
     });
-    const report = await co.step(T0, undefined, { units: 10 });
+    const report = await co.step({ now: T0, budget: { units: 10 } });
     expect(store.state.nextEligible).toBe(T0 + 5_000 + 1_000);
     expect(report.nextWake).toBe(T0 + 6_000);
   });
@@ -209,8 +217,8 @@ describe("S2b hints are bounded and optional", () => {
       },
     });
     const started = Date.now();
-    await co.step(T0, undefined, { units: 10 });
-    await co.step(T0 + 10_000, undefined, { units: 10 });
+    await co.step({ now: T0, budget: { units: 10 } });
+    await co.step({ now: T0 + 10_000, budget: { units: 10 } });
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(reads).toBe(1);
     expect(store.outcome?.tag).toBe("progress");

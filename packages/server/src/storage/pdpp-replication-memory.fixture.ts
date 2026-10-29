@@ -274,7 +274,9 @@ if (mode === "seed") {
     destination.store.close();
     process.exit(0);
   }
-  for (let cycle = 0; cycle < 12; cycle++) {
+  // cycle() steps with the finite default byte budget (64 MiB), so a
+  // 128 MiB blob takes more steps than the old unbounded cycle did.
+  for (let cycle = 0; cycle < 48; cycle++) {
     await a.cycle();
     await b.cycle();
     if (destination.store.getRecord("conn", "messages", "large")) break;

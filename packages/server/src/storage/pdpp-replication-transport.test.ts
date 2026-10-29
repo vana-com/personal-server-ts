@@ -886,7 +886,10 @@ it("reports a pending predecessor and re-registers that same slot after authorit
   const waitingRow = outbox(a).find((row) => row.version === 1)!;
   time = Math.max(time, waitingRow.next_attempt);
   const status = await a.step();
-  const pending = status.waits.find((wait) => wait.id === predecessor.slot);
+  // Report order follows the persisted phase rotation; select the publish wait.
+  const pending = status.waits.find(
+    (wait) => wait.id === predecessor.slot && wait.phase === "publish",
+  );
   expect(pending?.dependency).toMatchObject({
     kind: "registration_pending",
     version: 1,

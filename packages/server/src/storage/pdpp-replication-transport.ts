@@ -72,6 +72,9 @@ import {
 import {
   abortable,
   createReplicaCoordinator,
+  ReplicaCoordinatorConflict,
+  REPLICA_REPORT_LIMIT,
+  validateReplicaStep,
   type ReplicaAttempt,
   type ReplicaSettle,
   type ProgressReport,
@@ -79,6 +82,10 @@ import {
   type ReplicaPhaseHandler,
   type ReplicaWorkItem,
 } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
+import {
+  createSqliteReplicaCoordinatorState,
+  REPLICA_COORDINATOR_SCHEMA,
+} from "./pdpp-replica-coordinator-state.js";
 import {
   assertReplicationStepOpen,
   assertReplicationTransactionOpen,
@@ -483,12 +490,14 @@ export function createReplicaTransportWorker(deps: {
   deps.receiver.setPendingEnabled(deps.enabled === true);
   const enabled = () => deps.enabled === true;
   let activeStepSignal: AbortSignal | undefined;
+  let coordinatorOwner: string | undefined;
   const state = () =>
     db.prepare("SELECT * FROM pdpp_transport_state WHERE id=1").get() as State;
 
   function ensureAdmissionSchema() {
     if (!enabled()) return;
     db.exec(admissionMigration);
+    db.exec(REPLICA_COORDINATOR_SCHEMA);
     db.exec(REPLICA_PREPARATION_MIGRATION);
     // #504 refusals have not advanced the source cursor. Let the new per-op
     // classifier retain that exact pending page, instead of keeping its wedge.
@@ -686,10 +695,11 @@ export function createReplicaTransportWorker(deps: {
       // which a transaction opened on the raw connection would not refresh.
       const signal = activeStepSignal;
       if (!signal) throw new Error("replication commit outside a worker step");
-      // Check before receiver.atomically raises the capture guard. SQLite
-      // serializes door closure against the transaction once it starts.
+      // The coordinator's outer transaction has already raised the capture
+      // guard. Keep the pre-transaction check for direct adapter callers.
       if (!enabled()) throw new ReplicaProblemError("prepare_failed");
-      assertReplicationStepOpen(db, signal);
+      if (db.inTransaction) assertReplicationTransactionOpen(db, signal);
+      else assertReplicationStepOpen(db, signal);
       return deps.receiver.atomically(() => {
         assertReplicationTransactionOpen(db, signal);
         // A receipt belongs to the exact row state selected by `due`. If a
@@ -3857,6 +3867,20 @@ export function createReplicaTransportWorker(deps: {
   };
 
   const coordinator = createReplicaCoordinator({
+    state: createSqliteReplicaCoordinatorState({
+      db,
+      owner: () => coordinatorOwner,
+      atomically: (run) => {
+        const signal = activeStepSignal;
+        if (!signal || !enabled()) throw new ReplicaCoordinatorConflict();
+        assertReplicationStepOpen(db, signal);
+        return deps.receiver.atomically(() => {
+          const result = run();
+          assertReplicationTransactionOpen(db, signal);
+          return result;
+        });
+      },
+    }),
     phases: [
       retain,
       prepare,
@@ -3934,12 +3958,22 @@ export function createReplicaTransportWorker(deps: {
   });
 
   /**
-   * One bounded coordinator step. The authority context is validated before any
+   * Node wrapper for core step({now,budget,signal}). The optional clock and
+   * budget use finite host defaults; this is not a whole-I/O/history bound.
+   * The authority context is validated before any
    * phase; a mismatch rejects the step without encrypt, network or receiver calls.
    */
   async function step(
-    input: { budget?: ReplicaBudget; signal?: AbortSignal } = {},
+    input: { now?: number; budget?: ReplicaBudget; signal?: AbortSignal } = {},
   ): Promise<ProgressReport> {
+    const context = {
+      now: input.now ?? now(),
+      // Bytes omitted: the coordinator's 64 MiB default, under which a batch
+      // larger than the whole budget still runs alone.
+      budget: input.budget ?? { units: 256 },
+      signal: input.signal,
+    };
+    validateReplicaStep(context);
     // A closed door stops replication for good: no identity, capture or
     // publish work.
     if (
@@ -3984,6 +4018,7 @@ export function createReplicaTransportWorker(deps: {
         };
       writerToken = randomUUID();
       acquireWriter(writerToken);
+      coordinatorOwner = writerToken;
       running = true;
       activeDatabases.add(databaseKey);
       activeStepSignal = lifetime.signal;
@@ -4021,16 +4056,29 @@ export function createReplicaTransportWorker(deps: {
           "UPDATE pdpp_transport_import_work SET next_attempt=? WHERE outcome='wait' AND (dependency LIKE 'mapping:%' OR dependency LIKE 'declaration:%') AND next_attempt>?",
         ).run(now(), now());
       }
-      const report = await coordinator.step(
-        now(),
-        lifetime.signal,
-        input.budget ?? { units: Number.POSITIVE_INFINITY },
-      );
+      const report = await coordinator.step({
+        ...context,
+        signal: lifetime.signal,
+      });
+      const diagnosticRoom = () =>
+        REPLICA_REPORT_LIMIT -
+        report.receipts.length -
+        report.waits.length -
+        report.problems.length -
+        report.quarantines.length -
+        report.unsupported.length;
       for (const row of db
         .prepare(
-          "SELECT batch,wait_json FROM pdpp_transport_preparation WHERE wait_json IS NOT NULL",
+          "SELECT batch,wait_json FROM pdpp_transport_preparation WHERE wait_json IS NOT NULL ORDER BY batch LIMIT ?",
         )
-        .all() as { batch: string; wait_json: string }[]) {
+        .all(REPLICA_REPORT_LIMIT + 1) as {
+        batch: string;
+        wait_json: string;
+      }[]) {
+        if (diagnosticRoom() <= 0) {
+          report.diagnosticsTruncated = true;
+          break;
+        }
         const wait = JSON.parse(row.wait_json) as Extract<
           ReplicaPhaseOutcome,
           { tag: "wait" }
@@ -4048,12 +4096,16 @@ export function createReplicaTransportWorker(deps: {
       }
       for (const row of db
         .prepare(
-          "SELECT batch,state FROM pdpp_transport_registration_recovery WHERE state IN ('own_key_conflict','version_squat')",
+          "SELECT batch,state FROM pdpp_transport_registration_recovery WHERE state IN ('own_key_conflict','version_squat') ORDER BY batch LIMIT ?",
         )
-        .all() as {
+        .all(REPLICA_REPORT_LIMIT + 1) as {
         batch: string;
         state: "own_key_conflict" | "version_squat";
       }[]) {
+        if (diagnosticRoom() <= 0) {
+          report.diagnosticsTruncated = true;
+          break;
+        }
         if (
           !report.waits.some(
             (entry) =>
@@ -4076,6 +4128,7 @@ export function createReplicaTransportWorker(deps: {
     } finally {
       lifetime.close();
       activeStepSignal = undefined;
+      coordinatorOwner = undefined;
       if (writerToken) {
         running = false;
         activeDatabases.delete(databaseKey);
@@ -4111,7 +4164,7 @@ export function createReplicaTransportWorker(deps: {
         })
         .immediate();
     },
-    /** Legacy entry point: one unbounded step. Rejects when a whole phase failed. */
+    /** Legacy entry point: one finite default step. Rejects when a whole phase failed. */
     async cycle(): Promise<void> {
       const report = await step();
       const failed = report.problems.filter((p) =>

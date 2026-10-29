@@ -125,11 +125,83 @@ export function abortable<T>(
 }
 
 export interface ReplicaBudget {
+  /** Positive safe integer. Counts admitted attempts, not all storage work. */
   units: number;
+  /** Positive safe integer; omitted means the finite default below. */
   bytes?: number;
 }
 
+export const REPLICA_STEP_BYTES = 64 * 1024 * 1024;
+export const REPLICA_REPORT_LIMIT = 256;
+export const REPLICA_ATTEMPT_TIMEOUT_MS = 30_000;
+
+export interface ReplicaStep {
+  /** Nonnegative safe-integer milliseconds on the host's scheduling clock. */
+  now: number;
+  budget: ReplicaBudget;
+  signal?: AbortSignal;
+}
+
+/** Validate before storage, hints, selection or any other effect. */
+export function validateReplicaStep(context: ReplicaStep): void {
+  if (
+    !context ||
+    typeof context !== "object" ||
+    !context.budget ||
+    typeof context.budget !== "object"
+  )
+    throw new RangeError("invalid replica step context");
+  if (!Number.isSafeInteger(context.now) || context.now < 0)
+    throw new RangeError("invalid replica step clock");
+  for (const value of [
+    context.budget.units,
+    context.budget.bytes === undefined
+      ? REPLICA_STEP_BYTES
+      : context.budget.bytes,
+  ])
+    if (!Number.isSafeInteger(value) || value < 1)
+      throw new RangeError("invalid replica step budget");
+}
+
+/** Stable phase names survive a reordered host construction across restart. */
+export interface ReplicaRotation {
+  nextPhase?: ReplicaPhase;
+  writers: Partial<Record<ReplicaPhase, string>>;
+}
+
+export interface ReplicaCoordinatorState extends ReplicaRotation {
+  /** Opaque exclusive-owner fence, never a PID or wall-clock lease in core. */
+  owner: string;
+  /** Monotonic compare-and-swap revision within this durable repository. */
+  version: number;
+}
+
+export class ReplicaCoordinatorConflict extends Error {
+  constructor() {
+    super("replica coordinator ownership or revision changed");
+    this.name = "ReplicaCoordinatorConflict";
+  }
+}
+
+/**
+ * A host adapter must use the SAME transaction for `checkpoint` and rotation.
+ * Check current ownership and revision before calling checkpoint, and again
+ * before commit. On any throw, neither the checkpoint nor cursor may persist.
+ * The callback is synchronous and must not escape or run after commit returns.
+ * Lite may supply this port only after passing the shared adapter contract.
+ */
+export interface ReplicaCoordinatorStatePort {
+  load(): ReplicaCoordinatorState;
+  commit<T>(
+    expected: ReplicaCoordinatorState,
+    next: ReplicaRotation,
+    checkpoint: () => T,
+  ): { state: ReplicaCoordinatorState; result: T };
+}
+
 export interface ProgressReport {
+  /** Diagnostics may be incomplete because the fixed entry cap was reached. */
+  diagnosticsTruncated?: boolean;
   receipts: ReplicaReceipt[];
   waits: {
     id: string;
@@ -168,8 +240,10 @@ const HINT_TIMEOUT_MS = 2_000;
  */
 export function createReplicaCoordinator(input: {
   phases: ReplicaPhaseHandler[];
+  /** Required for restart fairness; omission is an in-memory-only test seam. */
+  state?: ReplicaCoordinatorStatePort;
   quantum?: Partial<Record<ReplicaPhase, number>>;
-  /** Items per writer per phase per step. Defaults to the phase quantum. */
+  /** Items per writer in one selection round. Defaults to one. */
   perWriter?: number;
   backoff?: ReplicaBackoff;
   /** Settlement clock. Defaults to the step's `now`. */
@@ -177,7 +251,7 @@ export function createReplicaCoordinator(input: {
   /** Optional finalized-head hint, read at most every `hintRefreshMs`. */
   hint?: ReplicaHintPort;
   hintRefreshMs?: number;
-  /** Per-run deadline, also bounding a hint read. A late result is discarded. */
+  /** Positive integer per-run timeout in ms (default 30s); late results are discarded. */
   deadlineMs?: number;
   /**
    * Sweeps that are never finished (e.g. revalidating imported slots). Under
@@ -186,18 +260,35 @@ export function createReplicaCoordinator(input: {
    */
   background?: readonly ReplicaPhase[];
 }) {
+  for (const value of [
+    input.perWriter ?? 1,
+    input.deadlineMs ?? REPLICA_ATTEMPT_TIMEOUT_MS,
+    input.hintRefreshMs ?? 2_000,
+  ])
+    if (value === undefined || !Number.isSafeInteger(value) || value < 1)
+      throw new RangeError("invalid replica coordinator bound");
+  // A zero quantum leaves its phase idle (as on main); it is still finite.
+  for (const value of Object.values(input.quantum ?? {}))
+    if (value === undefined || !Number.isSafeInteger(value) || value < 0)
+      throw new RangeError("invalid replica coordinator bound");
+  // setTimeout clamps larger delays to 1ms on Node; never silently accept that.
+  if ((input.deadlineMs ?? REPLICA_ATTEMPT_TIMEOUT_MS) > 2_147_483_647)
+    throw new RangeError("invalid replica attempt timeout");
+  if (
+    new Set(input.phases.map((phase) => phase.phase)).size !==
+    input.phases.length
+  )
+    throw new RangeError("duplicate replica phase");
   const quantum = (phase: ReplicaPhase) =>
     input.quantum?.[phase] ?? DEFAULT_QUANTUM;
   /** Items whose run has not settled. A timed-out run blocks redispatch until it ends. */
   const inflight = new Set<string>();
-  /** Rotating start writer per phase, so a replenishing writer cannot keep first place. */
-  const lastWriter = new Map<ReplicaPhase, string>();
-  /**
-   * Service cursor over phases for finite budgets. A step that runs out of
-   * units resumes at the first phase it could not serve, so every phase is
-   * reached within ceil(phases / units) steps however busy earlier phases are.
-   */
-  let startPhase = 0;
+  let state: ReplicaCoordinatorState = {
+    owner: "memory",
+    version: 0,
+    writers: {},
+  };
+  let stepping = false;
 
   function interleave<I extends ReplicaWorkItem>(
     phase: ReplicaPhase,
@@ -210,7 +301,7 @@ export function createReplicaCoordinator(input: {
       else groups.set(item.writer, [item]);
     }
     const writers = [...groups.keys()];
-    const last = lastWriter.get(phase);
+    const last = state.writers[phase];
     const offset = last === undefined ? 0 : writers.indexOf(last) + 1;
     const rotated = [...writers.slice(offset), ...writers.slice(0, offset)];
     const ordered: I[] = [];
@@ -229,7 +320,7 @@ export function createReplicaCoordinator(input: {
   async function bounded<T>(
     start: (signal: AbortSignal) => Promise<T>,
     signal: AbortSignal | undefined,
-    deadlineMs = input.deadlineMs,
+    deadlineMs = input.deadlineMs ?? REPLICA_ATTEMPT_TIMEOUT_MS,
   ): Promise<{ value: T } | "deadline" | "aborted"> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -340,26 +431,55 @@ export function createReplicaCoordinator(input: {
     handler: ReplicaPhaseHandler,
     item: ReplicaWorkItem,
     attempt: ReplicaAttempt,
+    signal: AbortSignal | undefined,
   ): ReplicaOutcome {
     const settle: ReplicaSettle = (verdict) =>
       settleReplicaWork(item.state, verdict, input.clock?.() ?? stepNow, {
         backoff: input.backoff,
         hints: input.hint !== undefined,
       });
+    const advance = (value: ReplicaAttempt): ReplicaOutcome => {
+      const position = input.phases.indexOf(handler);
+      const next: ReplicaRotation = {
+        nextPhase: input.phases[(position + 1) % input.phases.length]?.phase,
+        writers: { ...state.writers, [handler.phase]: item.writer },
+      };
+      const checkpoint = () => {
+        const assertNotAborted = () => {
+          if (signal?.aborted)
+            throw signal.reason ?? new DOMException("aborted", "AbortError");
+        };
+        assertNotAborted();
+        const result = handler.commit(item, value, settle);
+        // Still inside the durable state port's outer transaction. A plan
+        // may synchronously close the host lifetime; roll back its effects.
+        assertNotAborted();
+        return result;
+      };
+      if (input.state) {
+        const committed = input.state.commit(state, next, checkpoint);
+        state = committed.state;
+        return committed.result;
+      }
+      const result = checkpoint();
+      state = { ...state, ...next, version: state.version + 1 };
+      return result;
+    };
     try {
-      return handler.commit(item, attempt, settle);
+      return advance(attempt);
     } catch (error) {
-      if (!attempt.plan) throw error;
-      return handler.commit(
-        item,
-        {
-          outcome: retryFromError(
-            error,
-            handler.commitProblem ?? "storage_failed",
-          ),
-        },
-        settle,
-      );
+      if (
+        signal?.aborted ||
+        !attempt.plan ||
+        error instanceof ReplicaCoordinatorConflict
+      )
+        throw error;
+      return advance({
+        outcome: retryFromError(
+          error,
+          handler.commitProblem ?? "storage_failed",
+        ),
+      });
     }
   }
   let stepNow = 0;
@@ -370,6 +490,17 @@ export function createReplicaCoordinator(input: {
     id: string,
     outcome: ReplicaOutcome,
   ) {
+    if (
+      report.receipts.length +
+        report.waits.length +
+        report.problems.length +
+        report.quarantines.length +
+        report.unsupported.length >=
+      REPLICA_REPORT_LIMIT
+    ) {
+      report.diagnosticsTruncated = true;
+      return;
+    }
     if (outcome.tag === "progress") report.receipts.push(outcome.receipt);
     else if (outcome.tag === "wait")
       report.waits.push({
@@ -394,130 +525,147 @@ export function createReplicaCoordinator(input: {
   }
 
   return {
-    async step(
-      now: number,
-      signal: AbortSignal | undefined,
-      budget: ReplicaBudget,
-    ): Promise<ProgressReport> {
-      const report: ProgressReport = {
-        receipts: [],
-        waits: [],
-        problems: [],
-        quarantines: [],
-        unsupported: [],
-        nextWake: undefined,
-      };
-      stepNow = now;
-      let units = Math.max(0, budget.units);
-      let bytes = budget.bytes ?? Number.POSITIVE_INFINITY;
-      let deferred = false;
-      const aborted = () => signal?.aborted === true;
-      await refreshHint(now, signal);
-      // Selection reads the clock when it selects, so work a phase finished
-      // earlier in this step (settled at a later clock reading) is eligible.
-      const selection = () =>
-        eligibility(Math.max(now, input.clock?.() ?? now));
-      // An unbounded step keeps pipeline order, so prepared work publishes in
-      // the same step. A finite step starts at the service cursor.
-      const finite = Number.isFinite(units);
-      const first = finite ? startPhase % Math.max(1, input.phases.length) : 0;
-      const phases = [
-        ...input.phases.slice(first),
-        ...input.phases.slice(0, first),
-      ];
-      // Default: the next step starts one phase later (stable tie-breaking).
-      let unserved: number | undefined;
-      // A finite budget reserves a fair share per phase before any phase may
-      // spend leftovers, so an early phase cannot take every unit.
-      const share = finite
-        ? Math.max(1, Math.floor(units / Math.max(1, phases.length)))
-        : Number.POSITIVE_INFINITY;
-      const spent = new Map<ReplicaPhase, number>();
-      const ran = new Set<string>();
-      const background = new Set(input.background ?? []);
-      const leftovers = [
-        ...phases.filter((handler) => !background.has(handler.phase)),
-        ...phases.filter((handler) => background.has(handler.phase)),
-      ];
-      for (const pass of [0, 1]) {
-        for (const [position, handler] of (pass === 0
-          ? phases
-          : leftovers
-        ).entries()) {
-          if (pass === 0 && units <= 0 && unserved === undefined)
-            unserved = position;
-          const used = spent.get(handler.phase) ?? 0;
-          const cap = Math.min(
-            quantum(handler.phase) - used,
-            pass === 0 ? share : units,
-            units,
-          );
-          let count = 0;
-          // Refilled rounds: each due() call admits at most perWriter items per
-          // writer, so one writer's backlog cannot fill a phase's quantum.
-          while (count < cap && units > 0 && !aborted()) {
-            const items = interleave(
-              handler.phase,
-              handler
-                .due(selection(), {
-                  total: cap - count,
-                  perWriter: input.perWriter ?? 1,
-                  after: lastWriter.get(handler.phase),
-                })
-                .filter((item) => {
-                  const key = `${handler.phase}\0${item.id}`;
-                  return !inflight.has(key) && !ran.has(key);
-                }),
+    async step(context: ReplicaStep): Promise<ProgressReport> {
+      validateReplicaStep(context);
+      if (stepping) throw new ReplicaCoordinatorConflict();
+      stepping = true;
+      try {
+        const { now, signal, budget } = context;
+        // No in-memory cursor from a prior instance is authoritative.
+        if (input.state) state = input.state.load();
+        const report: ProgressReport = {
+          receipts: [],
+          waits: [],
+          problems: [],
+          quarantines: [],
+          unsupported: [],
+          nextWake: undefined,
+        };
+        stepNow = now;
+        let units = budget.units;
+        const stepBytes = budget.bytes ?? REPLICA_STEP_BYTES;
+        let bytes = stepBytes;
+        let deferred = false;
+        const aborted = () => signal?.aborted === true;
+        if (!aborted()) await refreshHint(now, signal);
+        // Selection reads the clock when it selects, so work a phase finished
+        // earlier in this step (settled at a later clock reading) is eligible.
+        const selection = () =>
+          eligibility(Math.max(now, input.clock?.() ?? now));
+        const first = Math.max(
+          0,
+          input.phases.findIndex((phase) => phase.phase === state.nextPhase),
+        );
+        const phases = [
+          ...input.phases.slice(first),
+          ...input.phases.slice(0, first),
+        ];
+        // A finite budget reserves a fair share per phase before any phase may
+        // spend leftovers, so an early phase cannot take every unit.
+        const share = Math.max(
+          1,
+          Math.floor(units / Math.max(1, phases.length)),
+        );
+        const spent = new Map<ReplicaPhase, number>();
+        const ran = new Set<string>();
+        const background = new Set(input.background ?? []);
+        const leftovers = [
+          ...phases.filter((handler) => !background.has(handler.phase)),
+          ...phases.filter((handler) => background.has(handler.phase)),
+        ];
+        for (const pass of [0, 1]) {
+          for (const handler of pass === 0 ? phases : leftovers) {
+            const used = spent.get(handler.phase) ?? 0;
+            const cap = Math.min(
+              quantum(handler.phase) - used,
+              pass === 0 ? share : units,
+              units,
             );
-            let admitted = 0;
-            for (const item of items) {
-              if (count >= cap || units <= 0 || aborted()) break;
-              const key = `${handler.phase}\0${item.id}`;
-              ran.add(key);
-              if (item.bytes !== undefined && item.bytes > bytes) {
-                deferred = true;
-                continue;
+            let count = 0;
+            // Refilled rounds: each due() call admits at most perWriter items per
+            // writer, so one writer's backlog cannot fill a phase's quantum.
+            while (count < cap && units > 0 && !aborted()) {
+              const items = interleave(
+                handler.phase,
+                handler
+                  .due(selection(), {
+                    total: cap - count,
+                    perWriter: input.perWriter ?? 1,
+                    after: state.writers[handler.phase],
+                  })
+                  .filter((item) => {
+                    const key = `${handler.phase}\0${item.id}`;
+                    return !inflight.has(key) && !ran.has(key);
+                  }),
+              );
+              let admitted = 0;
+              for (const item of items) {
+                if (count >= cap || units <= 0 || aborted()) break;
+                const key = `${handler.phase}\0${item.id}`;
+                ran.add(key);
+                if (
+                  item.bytes !== undefined &&
+                  (!Number.isSafeInteger(item.bytes) || item.bytes < 0)
+                )
+                  throw new RangeError("invalid replica item byte estimate");
+                // Under the omitted (default) budget an item larger than the
+                // whole step can never fit. It runs when no other item has
+                // charged bytes in this step, and spends the rest, as the
+                // unbounded default on main ran it. An explicit budget defers
+                // it until the host gives a budget it fits.
+                const alone =
+                  budget.bytes === undefined &&
+                  item.bytes !== undefined &&
+                  item.bytes > stepBytes &&
+                  bytes === stepBytes;
+                if (item.bytes !== undefined && item.bytes > bytes && !alone) {
+                  deferred = true;
+                  continue;
+                }
+                admitted++;
+                count++;
+                units--;
+                if (alone) bytes = 0;
+                else if (item.bytes !== undefined) bytes -= item.bytes;
+                const attempt = await execute(handler, item, signal);
+                if (attempt === undefined) break;
+                try {
+                  // Abort can arrive between the winning run promise and this
+                  // continuation. Discard/release before entering a checkpoint.
+                  if (aborted()) break;
+                  record(
+                    report,
+                    handler.phase,
+                    item.id,
+                    commit(handler, item, attempt, signal),
+                  );
+                } finally {
+                  attempt.release?.();
+                }
               }
-              admitted++;
-              count++;
-              units--;
-              if (item.bytes !== undefined) bytes -= item.bytes;
-              lastWriter.set(handler.phase, item.writer);
-              const attempt = await execute(handler, item, signal);
-              if (attempt === undefined) break;
-              try {
-                record(
-                  report,
-                  handler.phase,
-                  item.id,
-                  commit(handler, item, attempt),
-                );
-              } finally {
-                attempt.release?.();
-              }
+              if (!admitted) break;
             }
-            if (!admitted) break;
+            spent.set(handler.phase, used + count);
           }
-          spent.set(handler.phase, used + count);
         }
+        // The same eligibility as selection, read after this step's commits.
+        const after = eligibility(input.clock?.() ?? now);
+        let wake: number | undefined;
+        for (const handler of input.phases) {
+          const next = handler.earliest(after);
+          if (next !== undefined && (wake === undefined || next < wake))
+            wake = next;
+        }
+        // Already due (e.g. the budget ran out) is reported as `now`.
+        report.nextWake = deferred
+          ? now
+          : wake === undefined
+            ? undefined
+            : Math.max(wake, now);
+        return report;
+      } finally {
+        stepping = false;
       }
-      if (finite && input.phases.length)
-        startPhase = (first + (unserved ?? 1)) % input.phases.length;
-      // The same eligibility as selection, read after this step's commits.
-      const after = eligibility(input.clock?.() ?? now);
-      let wake: number | undefined;
-      for (const handler of input.phases) {
-        const next = handler.earliest(after);
-        if (next !== undefined && (wake === undefined || next < wake))
-          wake = next;
-      }
-      // Already due (e.g. the budget ran out) is reported as `now`.
-      report.nextWake = deferred
-        ? now
-        : wake === undefined
-          ? undefined
-          : Math.max(wake, now);
-      return report;
     },
     onDependencyChanged(key: string, now: number): number {
       let woken = 0;

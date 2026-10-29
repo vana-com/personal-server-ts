@@ -4,7 +4,7 @@ import type {
   ReplicaPhaseHandler,
   ReplicaWorkItem,
 } from "./coordinator.js";
-import { createReplicaCoordinator } from "./coordinator.js";
+import { createReplicaCoordinator, REPLICA_STEP_BYTES } from "./coordinator.js";
 import type {
   ReplicaDependency,
   ReplicaOutcome,
@@ -309,7 +309,7 @@ function stepAt(
   signal?: AbortSignal,
 ): Promise<ProgressReport> {
   world.clock.now = now;
-  return co.step(now, signal, budget);
+  return co.step({ now, signal, budget });
 }
 
 const runIds = (world: World) => world.runs.map((r) => r.id);
@@ -1367,30 +1367,30 @@ describe("coordinator budgets", () => {
     expect(world.runs.filter((r) => r.phase === "publish")).toHaveLength(7);
   });
 
-  it("22 units: 0 runs nothing, settles nothing and reports nextWake === now when work is due", async () => {
+  it("22 units: 0 is rejected before selection or settlement", async () => {
     const world = newWorld();
     addRow(world, "p1", "publish", "A");
     addRow(world, "i1", "import", "B", { state: { nextEligible: 12 } });
     const snapshot = JSON.stringify([...world.rows.values()]);
-    const report = await stepAt(world, build(world), T0, { units: 0 });
+    await expect(stepAt(world, build(world), T0, { units: 0 })).rejects.toThrow(
+      RangeError,
+    );
     expect(world.runs).toEqual([]);
     expect(world.settles).toEqual([]);
     expect(JSON.stringify([...world.rows.values()])).toBe(snapshot);
-    expect(report.receipts).toEqual([]);
-    expect(report.nextWake).toBe(T0);
   });
 
-  it("22 units: 0 with only future work reports the earliest deadline, and idle reports undefined", async () => {
+  it("22 positive finite budget reports the earliest deadline, and idle reports undefined", async () => {
     const world = newWorld();
     addRow(world, "p1", "publish", "A", { state: { nextEligible: T0 + 500 } });
     addRow(world, "i1", "import", "B", { state: { nextEligible: T0 + 300 } });
     const co = build(world);
-    expect((await stepAt(world, co, T0, { units: 0 })).nextWake).toBe(T0 + 300);
+    expect((await stepAt(world, co, T0, { units: 1 })).nextWake).toBe(T0 + 300);
     const empty = newWorld();
     expect(
       (
         await stepAt(empty, build(empty, { phases: ["publish"] }), T0, {
-          units: 0,
+          units: 1,
         })
       ).nextWake,
     ).toBeUndefined();
@@ -1412,16 +1412,17 @@ describe("coordinator budgets", () => {
 
   it("23 an item larger than the remaining byte budget is deferred: not run, not settled, state intact", async () => {
     const world = newWorld();
-    addRow(world, "big", "import", "A", {
-      bytes: 500,
-      state: { nextEligible: 1 },
-    });
     addRow(world, "s1", "import", "B", {
       bytes: 30,
-      state: { nextEligible: 2 },
+      state: { nextEligible: 1 },
     });
     addRow(world, "s2", "import", "C", {
       bytes: 30,
+      state: { nextEligible: 2 },
+    });
+    // Fits the whole budget but not the 40 bytes left after s1 and s2.
+    addRow(world, "big", "import", "A", {
+      bytes: 90,
       state: { nextEligible: 3 },
     });
     const before = JSON.stringify(row(world, "big"));
@@ -1437,6 +1438,57 @@ describe("coordinator budgets", () => {
     expect(report.problems).toEqual([]);
     expect(report.unsupported).toEqual([]);
     expect(report.nextWake).toBe(T0);
+  });
+
+  it("23 under the default budget an item larger than the whole step runs alone, then spends the rest", async () => {
+    const world = newWorld();
+    addRow(world, "huge", "import", "A", {
+      bytes: REPLICA_STEP_BYTES + 1,
+      state: { nextEligible: 1 },
+    });
+    addRow(world, "s1", "import", "B", {
+      bytes: 30,
+      state: { nextEligible: 2 },
+    });
+    const first = await stepAt(world, build(world), T0, { units: 10 });
+    expect(runIds(world)).toEqual(["huge"]);
+    expect(first.nextWake).toBe(T0);
+    await stepAt(world, build(world), T0, { units: 10 });
+    expect(runIds(world)).toEqual(["huge", "s1"]);
+  });
+
+  it("23 under the default budget an oversized item waits for a step no other item charged", async () => {
+    const world = newWorld();
+    addRow(world, "s1", "import", "B", {
+      bytes: 30,
+      state: { nextEligible: 1 },
+    });
+    addRow(world, "huge", "import", "A", {
+      bytes: REPLICA_STEP_BYTES + 1,
+      state: { nextEligible: 2 },
+    });
+    await stepAt(world, build(world), T0, { units: 10 });
+    expect(runIds(world)).toEqual(["s1"]);
+    await stepAt(world, build(world), T0, { units: 10 });
+    expect(runIds(world)).toEqual(["s1", "huge"]);
+  });
+
+  it("23 under an explicit budget an item larger than the whole budget stays deferred", async () => {
+    const world = newWorld();
+    addRow(world, "huge", "import", "A", {
+      bytes: 500,
+      state: { nextEligible: 1 },
+    });
+    for (let i = 0; i < 2; i++) {
+      const report = await stepAt(world, build(world), T0, {
+        units: 10,
+        bytes: 100,
+      });
+      expect(runIds(world)).toEqual([]);
+      expect(report.nextWake).toBe(T0);
+    }
+    await stepAt(world, build(world), T0, { units: 10, bytes: 500 });
+    expect(runIds(world)).toEqual(["huge"]);
   });
 
   it("23 bytes are charged per run and an exact fit is admitted", async () => {
@@ -1459,7 +1511,7 @@ describe("coordinator budgets", () => {
     expect(row(world, "c").done).toBe(false);
   });
 
-  it("23 no byte budget means no byte limit", async () => {
+  it("23 omitted byte budget uses a finite default large enough for admitted work", async () => {
     const world = newWorld();
     addRow(world, "big", "import", "A", { bytes: 10_000_000 });
     await stepAt(world, build(world), T0, { units: 1 });
@@ -2007,21 +2059,26 @@ describe("coordinator nextWake", () => {
     expect(report.nextWake).toBe(T0 + 20_000);
 
     const fresh = build(world);
-    expect((await stepAt(world, fresh, T0, { units: 0 })).nextWake).toBe(
+    expect((await stepAt(world, fresh, T0, { units: 1 })).nextWake).toBe(
       T0 + 20_000,
     );
 
-    // a satisfied dependency makes work due now
+    // A satisfied dependency makes work due now. Pre-aborted steps observe
+    // it without running (and so without draining) it.
     expect(
       fresh.onDependencyChanged(
         dependencyKey({ kind: "finality", key: "S", checkedBlock: "5" }),
         T0,
       ),
     ).toBe(1);
-    expect((await stepAt(world, fresh, T0, { units: 0 })).nextWake).toBe(T0);
-    expect((await stepAt(world, build(world), T0, { units: 0 })).nextWake).toBe(
-      T0,
-    );
+    const observe = AbortSignal.abort();
+    expect(
+      (await stepAt(world, fresh, T0, { units: 1 }, observe)).nextWake,
+    ).toBe(T0);
+    expect(
+      (await stepAt(world, build(world), T0, { units: 1 }, observe)).nextWake,
+    ).toBe(T0);
+    expect(runIds(world)).not.toContain("f1");
   });
 
   it("34 only terminal work means idle (undefined), not a far-future wake", async () => {

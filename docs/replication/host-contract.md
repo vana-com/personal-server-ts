@@ -539,10 +539,9 @@ There is no blob-size cap.
 ### 6.1 Engine work the step bound needs
 
 The engine cannot meet these bounds today. Preparation advertises the bytes of
-the whole batch (`pdpp-replication-transport.ts:579`), and the coordinator
-skips any item larger than the remaining byte budget (`coordinator.ts:458`).
-So on the phone, a batch over 8 MiB is deferred on every step and never makes
-progress. Preparation also frames a whole batch in one run and discards partial
+the whole batch (`pdpp-replication-transport.ts:579`). An item larger than an
+explicit byte budget is deferred until a budget fits it (`coordinator.ts`), so
+on the phone a batch over 8 MiB never publishes until item 1 below lands. Preparation also frames a whole batch in one run and discards partial
 work on error (`pdpp-replication-transport.ts:590-627`).
 
 Plan item A7 (the bounded coordinator) owns these changes, and builds on the
