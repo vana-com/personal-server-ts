@@ -13,6 +13,7 @@ import {
   LiteReplicaTransferError,
   type LiteReplicaObjectTransfers,
   type LiteReplicaPersistence,
+  type LiteReplicaSql,
   type LiteReplicaTransaction,
   type LiteReplicaTransferCall,
   type LiteReplicationEngine,
@@ -120,6 +121,7 @@ export function createMemoryReplicaPersistence(
           async releaseBytes(id) {
             bytes.delete(id);
           },
+          sql: noSql,
         };
         const result = await run(tx);
         if (failBeforeCommit) {
@@ -197,6 +199,17 @@ export function createMemoryReplicaPersistence(
     },
   };
 }
+
+/**
+ * The map double has no relational store. The phase engine needs one; run it
+ * on the SQLite double (`server/src/storage/lite-replica-sqlite.test-utils.ts`).
+ */
+const noSql: LiteReplicaSql = {
+  get: () => Promise.reject(new Error("memory replica double has no SQL")),
+  all: () => Promise.reject(new Error("memory replica double has no SQL")),
+  run: () => Promise.reject(new Error("memory replica double has no SQL")),
+  exec: () => Promise.reject(new Error("memory replica double has no SQL")),
+};
 
 function* frames(bytes: Uint8Array) {
   if (bytes.length === 0) yield new Uint8Array(0);

@@ -212,12 +212,17 @@ export {
   type LiteReplicaTransferCall,
   type LiteReplicaTransferFailure,
   type LiteReplicaPersistence,
+  type LiteReplicaSql,
   type LiteReplicaTransaction,
   type LiteReplicationEngine,
   type LiteReplicationTrigger,
   type ReplicationBootConfig,
   type ReplicationLimits,
 } from "./replication-ports.js";
+export {
+  acquireLiteReplicaOwner,
+  createLiteReplicaCoordinatorState,
+} from "./replication-coordinator-state.js";
 export {
   LITE_REPLICATION_PAUSE_GRACE_MS,
   createLiteReplicationRuntime,

@@ -16,6 +16,7 @@
 import type { ReplicaRosterPort } from "@opendatalabs/personal-server-ts-core/replication/roster";
 import type { ReplicationStepper } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import type { ReplicaEnvironment } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
+import type { ReplicaSql } from "@opendatalabs/personal-server-ts-core/replication/effects";
 import type {
   LiteCanonicalPersistence,
   LiteCanonicalTransaction,
@@ -106,7 +107,32 @@ export interface LiteReplicaTransaction extends LiteCanonicalTransaction {
   attachBytes(stagingId: string, expected: LiteReplicaBytesInfo): Promise<void>;
   /** Drop attached bytes when this transaction commits. Absent ids are a no-op. */
   releaseBytes(id: string): Promise<void>;
+  /**
+   * Replication's relational state in THIS transaction (§4.3): the phase
+   * engine's `pdpp_transport_*` and `pdpp_replica_*` tables, in the same
+   * native SQLite database as the canonical rows. PS sends only its own
+   * fixed statements; parameters never carry more than one canonical value.
+   */
+  readonly sql: LiteReplicaSql;
 }
+
+/** `ReplicaSql` answered asynchronously over the bridge. */
+export interface LiteReplicaSql extends ReplicaSql {
+  get(
+    sql: string,
+    params: readonly LiteReplicaSqlValue[],
+  ): Promise<Record<string, unknown> | undefined>;
+  all(
+    sql: string,
+    params: readonly LiteReplicaSqlValue[],
+  ): Promise<Record<string, unknown>[]>;
+  run(
+    sql: string,
+    params: readonly LiteReplicaSqlValue[],
+  ): Promise<{ changes: number }>;
+  exec(sql: string): Promise<void>;
+}
+type LiteReplicaSqlValue = Parameters<ReplicaSql["get"]>[1][number];
 
 /** The canonical native transaction, widened to replica bytes. */
 export interface LiteReplicaPersistence
