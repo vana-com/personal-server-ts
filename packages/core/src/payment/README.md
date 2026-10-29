@@ -11,3 +11,7 @@ A different Account's app, missing attribution or an unlinked data-owner wallet 
 The setting is wired through Node's config/bootstrap and data/MCP routes, and PS-Lite's data API. It does not disable payment globally. CLI and Desktop require a Personal Server build carrying this change and this setting; existing published runtime pins do not acquire the behavior from an Account deployment alone. PS-Lite installations with payment disabled already serve all granted reads free and cannot prove a selective exemption. Hosted/enclave workers, inference billing and independent servers are not established by the local dev candidate; they must adopt an authoritative policy before claiming the same guarantee.
 
 This waives read-time data access payment, not unrelated transaction gas, storage, inference or registration costs incurred elsewhere. It creates no grant, funding allocation, credit or cross-network data transfer. Moksha test-credit funding (BUI-945) keeps normal fee metering and is independent of this exemption.
+
+## Dev runtime delivery
+
+The `dev` branch uses the existing prerelease workflow to publish an exact `0.0.1-canary.<commit>` server runtime. It is based on the current runtime baseline; the historical `develop` branch is not the payment runtime. Dev consumers must pin that canary and derive `payment.ownAppAccountUrl` from their dev Account configuration. Production consumers retain their stable pins until separately authorized. Publishing a Personal Server dev runtime does not release `vana-cli`.
