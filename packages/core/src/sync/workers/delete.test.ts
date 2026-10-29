@@ -64,6 +64,10 @@ function makePending(): PendingBlobDeletionStore {
     list: vi.fn(() => store.list()),
     add: vi.fn((keys) => store.add(keys)),
     remove: vi.fn((keys) => store.remove(keys)),
+    plannedThrough: vi.fn((scope) => store.plannedThrough!(scope)),
+    enqueue: vi.fn((scope, keys, through) =>
+      store.enqueue!(scope, keys, through),
+    ),
   };
 }
 
@@ -1083,5 +1087,192 @@ describe("deleteScope read-side memory", () => {
     );
     await deleteScope(never, SCOPE);
     expect(unregistered.markDeleted).not.toHaveBeenCalled();
+  });
+});
+
+describe("repeated DELETE of a scope whose blob deletion is still in progress", () => {
+  const VERSIONS = 40;
+  const range = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => String(from + i));
+
+  /** A storage that remembers which blobs exist and answers 404 once gone. */
+  function makeRemote() {
+    const stored = new Set(range(1, VERSIONS));
+    const sends: string[][] = [];
+    let tombstoned = false;
+    const deleteData = makeDeleteData({
+      tombstone: vi.fn(async () => {
+        const status = tombstoned ? "already-deleted" : "tombstoned";
+        tombstoned = true;
+        return {
+          status,
+          dataPointId: DATA_POINT_ID,
+          version: String(VERSIONS),
+          deletedAt: DELETED_AT,
+        } as const;
+      }),
+      deleteBlobVersions: vi.fn(async (_scope: string, versions: string[]) => {
+        sends.push([...versions]);
+        const deleted = versions.filter((v) => stored.has(v));
+        for (const v of deleted) stored.delete(v);
+        return {
+          deleted,
+          missing: versions.filter((v) => !deleted.includes(v)),
+          failed: [],
+        };
+      }),
+    });
+    return { deleteData, stored, sends };
+  }
+
+  it("resumes from the queue instead of replanning from version 1", async () => {
+    const remote = makeRemote();
+    const deps = makeDeps({ deleteData: remote.deleteData });
+
+    const first = await deleteScope(deps, SCOPE);
+    expect(remote.sends).toEqual([range(1, BLOB_DELETE_BATCH_SIZE)]);
+    expect(first.steps.storage).toMatchObject({
+      status: "deferred",
+      blobsPending: VERSIONS - BLOB_DELETE_BATCH_SIZE,
+    });
+
+    const second = await deleteScope(deps, SCOPE);
+
+    // No already-confirmed key is sent again; the pass continues the queue.
+    expect(remote.sends).toEqual([
+      range(1, BLOB_DELETE_BATCH_SIZE),
+      range(BLOB_DELETE_BATCH_SIZE + 1, 2 * BLOB_DELETE_BATCH_SIZE),
+    ]);
+    expect(second.steps.gateway).toMatchObject({
+      status: "ok",
+      reason: "already-deleted",
+    });
+    expect(second.steps.storage).toEqual({
+      status: "deferred",
+      blobsDeleted: BLOB_DELETE_BATCH_SIZE,
+      blobsMissing: 0,
+      blobsPending: VERSIONS - 2 * BLOB_DELETE_BATCH_SIZE,
+    });
+    expect(second.pendingBlobDeletion).toBe(true);
+    // One range, advanced in place: no overlapping marker re-adds 16..40.
+    expect(await deps.pendingBlobDeletions!.list()).toEqual([
+      {
+        scope: SCOPE,
+        version: null,
+        range: {
+          from: String(2 * BLOB_DELETE_BATCH_SIZE + 1),
+          to: String(VERSIONS),
+        },
+      },
+    ]);
+  });
+
+  it("drains on sync cycles without client calls, then reports completion and sends nothing", async () => {
+    const remote = makeRemote();
+    const deps = makeDeps({ deleteData: remote.deleteData });
+
+    await deleteScope(deps, SCOPE);
+    // Sync cycles drain the rest without further DELETE calls.
+    for (let cycle = 0; cycle < 5; cycle++) {
+      await retryPendingBlobDeletions({
+        deleteData: deps.deleteData,
+        pendingBlobDeletions: deps.pendingBlobDeletions,
+        logger: makeLogger(),
+      });
+    }
+    expect(remote.stored.size).toBe(0);
+    expect(await deps.pendingBlobDeletions!.list()).toEqual([]);
+    const sentSoFar = remote.sends.flat();
+    expect(sentSoFar).toHaveLength(VERSIONS);
+
+    const again = await deleteScope(deps, SCOPE);
+
+    expect(remote.sends.flat()).toEqual(sentSoFar);
+    expect(again.steps.storage).toEqual({
+      status: "ok",
+      blobsDeleted: 0,
+      blobsMissing: 0,
+      blobsPending: 0,
+    });
+    expect(again.pendingBlobDeletion).toBe(false);
+  });
+
+  it("finishes every key exactly once when the client keeps repeating DELETE", async () => {
+    const remote = makeRemote();
+    const deps = makeDeps({ deleteData: remote.deleteData });
+
+    let result = await deleteScope(deps, SCOPE);
+    for (let call = 0; call < 10 && result.pendingBlobDeletion; call++) {
+      result = await deleteScope(deps, SCOPE);
+    }
+
+    expect(result.pendingBlobDeletion).toBe(false);
+    expect(result.steps.storage.status).toBe("ok");
+    expect(remote.stored.size).toBe(0);
+    expect(remote.sends.flat()).toEqual(range(1, VERSIONS));
+  });
+
+  it("plans only the versions above the last planned tombstone after a re-add and a new delete", async () => {
+    const remote = makeRemote();
+    const deps = makeDeps({ deleteData: remote.deleteData });
+    let result = await deleteScope(deps, SCOPE);
+    for (let call = 0; call < 10 && result.pendingBlobDeletion; call++) {
+      result = await deleteScope(deps, SCOPE);
+    }
+    const before = remote.sends.flat().length;
+    (remote.deleteData.tombstone as ReturnType<typeof vi.fn>).mockResolvedValue(
+      {
+        status: "tombstoned",
+        dataPointId: DATA_POINT_ID,
+        version: String(VERSIONS + 2),
+        deletedAt: DELETED_AT,
+      },
+    );
+
+    await deleteScope(deps, SCOPE);
+
+    expect(remote.sends.flat().slice(before)).toEqual([
+      String(VERSIONS + 1),
+      String(VERSIONS + 2),
+    ]);
+  });
+});
+
+describe("repeated DELETE when the marker store cannot record the watermark", () => {
+  it("still reports the scope's queued work as pending instead of done", async () => {
+    const store = createMemoryPendingBlobDeletionStore();
+    await store.add([
+      { scope: SCOPE, version: null, range: { from: "31", to: "40" } },
+    ]);
+    const pending: PendingBlobDeletionStore = {
+      list: () => store.list(),
+      add: (keys) => store.add(keys),
+      remove: (keys) => store.remove(keys),
+      plannedThrough: () => store.plannedThrough!(SCOPE),
+      enqueue: async () => {
+        throw new Error("ENOSPC");
+      },
+    };
+    const deps = makeDeps({ pendingBlobDeletions: pending });
+    (deps.deleteData!.tombstone as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "already-deleted",
+      dataPointId: DATA_POINT_ID,
+      version: "40",
+      deletedAt: DELETED_AT,
+    });
+
+    const result = await deleteScope(deps, SCOPE);
+
+    // Nothing above 40 is owed, but 31..40 is still durably queued.
+    expect(versionsSent(deps.deleteData!)).toEqual([range(31, 40)]);
+    expect(result.steps.storage.status).not.toBe("ok");
+    expect(result.pendingBlobDeletion).toBe(true);
+    expect(await store.list()).toEqual([
+      { scope: SCOPE, version: null, range: { from: "31", to: "40" } },
+    ]);
+
+    function range(from: number, to: number) {
+      return Array.from({ length: to - from + 1 }, (_, i) => String(from + i));
+    }
   });
 });
