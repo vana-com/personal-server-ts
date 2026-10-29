@@ -23,9 +23,12 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
   and steps them from `startBackgroundServices` until `cleanup`. Lite has a canonical
   store (`packages/lite/src/canonical-store.ts:224`), the host ports
   (`packages/lite/src/replication-ports.ts`), a runtime and owner-only
-  status/sync routes (`packages/lite/src/replication-runtime.ts`), but no
-  phase engine: its runtime reports `blocked: "no_engine"` and never steps.
-  Neither app enables it
+  status/sync routes (`packages/lite/src/replication-runtime.ts`) and the
+  phase engine (`createLiteReplicaEngine`,
+  `packages/lite/src/replication-engine.ts`). Node and Lite run the same
+  phase logic (`packages/core/src/replication/engine.ts`). The runtime
+  reports `blocked: "no_engine"` until its host passes an engine; no host
+  does yet. Neither app enables it
   (`unity-surfaces@9af449a2 apps/desktop/src/hooks/usePersonalServer.ts:871-885`);
   the phone has no replication code.
 - The carrier is DPv2. In #483 each fragment is one vana-storage object at
@@ -322,6 +325,12 @@ likely in use. Its first publication is the current-state baseline (section
   and storage reads are public (section 1). A removed device that kept the
   master key can read and decrypt new batches. This must be fixed before
   production.
+- **A phone must enable before its first local write.** The Lite canonical
+  clock binds the writer id at the first enable, only while the local journal
+  is empty. A phone that wrote locally before replication refuses with
+  `replica_identity_requires_fresh_journal`. A new registration or nonce
+  after local writes refuses the same way. Lite has no rebaseline yet (Node
+  re-captures current state under the new writer).
 - **Account can derive keys.** Account infrastructure can regenerate the
   master-key signature
   (`unity-surfaces@9af449a2 apps/mobile-shell/lib/auth/owner_device_signer.dart:7-18`),
@@ -403,8 +412,13 @@ coordinator defers it. Abort maps to `replica.cancel`, and each transfer
 carries its own deadline. JS still encrypts and decrypts, one fragment at a
 time; 1 MiB fragments fit the 1 MiB native record limit
 (`unity-surfaces@9af449a2 apps/mobile-shell/lib/ps/native_ps_store.dart:11`).
-The Lite engine builds core's `ReplicaTransportPort` over these transfers;
-gateway calls (register, evidence, feed) are not yet assigned to either side.
+The Lite engine builds core's `ReplicaTransportPort` from core's DPv2
+transport over `createLiteReplicaStorage`
+(`packages/lite/src/replication-storage.ts`), which moves fragment and
+manifest bytes through these transfers. Gateway calls (register, evidence,
+the owner feed) and the roster read stay in PS JS core, over Lite's HTTP
+client, as on Node. Native code carries only bulk replica object bytes; it
+has no gateway, signing or replication-state logic.
 
 The roster is one more port:
 
@@ -437,8 +451,39 @@ export interface LiteReplicaBytes {
 export interface LiteReplicaTransaction extends LiteCanonicalTransaction {
   attachBytes(stagingId: string, expected: LiteReplicaBytesInfo): Promise<void>;
   releaseBytes(id: string): Promise<void>;
+  /** Publish attached bytes as the canonical blob `expected`, in THIS tx. */
+  publishBlob(bytesId: string, expected: LiteBlobDescriptor): Promise<void>;
+  /** The engine's relational state, in THIS tx. */
+  readonly sql: LiteReplicaSql; // get, all, run, exec
 }
 ```
+
+The phase engine keeps its state in relational tables (`pdpp_transport_*`,
+`pdpp_replica_*`), so the native transaction also answers SQL. The native
+side must provide:
+
+- **One database, one transaction.** The tables live in the same SQLite
+  database as the canonical rows, blobs and replica bytes. One `transaction`
+  commits or rolls back all of them together.
+- **SQLite 3.25 or later, with JSON1.** The engine uses window functions,
+  `INSERT ... ON CONFLICT DO UPDATE`, `json_extract`, triggers, and reads
+  `sqlite_master` and `PRAGMA table_info`.
+- **Fixed statements only.** PS sends only its own statements. Parameters are
+  text, integers, `null` or bytes; a byte value is at most one fragment
+  (1 MiB). An absent row is `undefined` (a bridge `null` is accepted).
+- **Savepoints.** `SAVEPOINT`, `RELEASE` and `ROLLBACK TO` sent through `sql`
+  must also cover the transaction's key-value, blob and byte writes. The
+  import of a received batch runs in a savepoint, so a refused import rolls
+  back alone.
+- **`publishBlob`.** A received blob arrives as replica bytes, verified only
+  after the whole payload is, so it cannot use `stageBlob`. `publishBlob`
+  checks length and SHA-256 against the descriptor and publishes the blob in
+  the same transaction, as `attachBlob` does. The bytes stay attached until
+  `releaseBytes`.
+
+The engine runs every storage effect in its own native transaction. One idle
+step takes about 40 transactions; the step that publishes or imports takes
+more (about 110 in the two-writer trace).
 
 ### 4.4 Runtime, scheduler and status
 

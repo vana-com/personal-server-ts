@@ -95,9 +95,12 @@ rewrite old data or require a non-forward schema conversion. Older code that
 ignores it does not acquire restart-fairness guarantees.
 
 Omitting `state` from core is an in-memory-only fixture seam, not a durable host
-configuration. Lite must provide its own transactional ownership adapter and
-pass `replicaCoordinatorStateContract` on real native storage before runtime
-enablement. Node's PID-based recovery is not a portable native lifecycle model.
+configuration. Lite's ownership adapter is `createLiteReplicaCoordinatorState`
+(`packages/lite/src/replication-coordinator-state.ts`), an asynchronous port
+over the native transaction. It passes `replicaCoordinatorStateContract` over
+a SQLite-backed test double; it must pass again on real native storage
+before runtime enablement. Node's PID-based recovery is not a portable native
+lifecycle model.
 
 ## Proofs and remaining gates
 
