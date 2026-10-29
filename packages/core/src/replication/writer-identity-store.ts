@@ -69,6 +69,24 @@ export class ReplicaWriterIdentityError extends Error {
   }
 }
 
+/**
+ * What a boot rotation that threw means (host contract §3.2): a database
+ * without an identity yet (`no_identity`; its first identity draws a new
+ * nonce anyway) or a closed door (`replication_off`). `undefined` for a real
+ * failure, which the host rethrows.
+ */
+export function replicaWriterRotationOutcome(
+  error: unknown,
+): "no_identity" | "replication_off" | undefined {
+  if (
+    error instanceof ReplicaWriterIdentityError &&
+    error.code === "replica_identity_not_registered"
+  )
+    return "no_identity";
+  if (error instanceof ReplicationRefusedError) return "replication_off";
+  return undefined;
+}
+
 /** The current identity, or undefined before the first enable. */
 export function* currentReplicaWriterIdentity(): ReplicaEffect<
   ReplicaWriterIdentity | undefined

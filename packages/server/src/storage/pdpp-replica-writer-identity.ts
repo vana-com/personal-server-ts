@@ -15,7 +15,6 @@ import type {
   ReplicaWriterIdentityHost,
   ReplicaWriterIdentityState,
 } from "@opendatalabs/personal-server-ts-core/replication/writer-identity-store";
-import { ReplicationRefusedError } from "@opendatalabs/personal-server-ts-core/replication/door";
 import type { ReplicaWriterRotation } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import { replicationAdmitted } from "./pdpp-replication-door.js";
 import { nodeReplicaContext } from "./pdpp-replica-sql.js";
@@ -113,12 +112,8 @@ export function rotateReplicaWriterIdentityAtBoot(
     rotateReplicaWriterIdentity(db);
     return "rotated";
   } catch (error) {
-    if (
-      error instanceof identity.ReplicaWriterIdentityError &&
-      error.code === "replica_identity_not_registered"
-    )
-      return "no_identity";
-    if (error instanceof ReplicationRefusedError) return "replication_off";
+    const outcome = identity.replicaWriterRotationOutcome(error);
+    if (outcome) return outcome;
     throw error;
   }
 }

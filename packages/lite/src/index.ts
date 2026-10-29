@@ -237,7 +237,15 @@ export {
 export {
   LITE_REPLICA_TRANSFER_DEADLINE_MS,
   createLiteReplicaStorage,
+  type LiteReplicaUploadHeaders,
 } from "./replication-storage.js";
+export {
+  createLiteReplication,
+  liteTargetChunkBytes,
+  liteVanaReplicaObjects,
+  type LiteReplication,
+  type LiteReplicationInput,
+} from "./replication-host.js";
 export {
   LITE_REPLICATION_PAUSE_GRACE_MS,
   createLiteReplicationRuntime,

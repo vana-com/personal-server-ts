@@ -98,9 +98,9 @@ import {
   resolveReplication,
 } from "./pdpp/records-bootstrap.js";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
+import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import {
   createNodeReplication,
-  createNodeReplicationPorts,
   NODE_REPLICATION_STOP_GRACE_MS,
   type NodeReplication,
 } from "./storage/pdpp-replication-host.js";
@@ -1006,7 +1006,7 @@ export async function createServer(
             declarations: pdppAuth.retainedDeclarations,
             serverAccount,
             ports: (owner) =>
-              createNodeReplicationPorts({
+              createReplicationNetworkPorts({
                 config,
                 owner,
                 masterKey: deriveMasterKey(masterKeySignature),

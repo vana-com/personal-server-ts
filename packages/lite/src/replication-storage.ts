@@ -56,6 +56,13 @@ export async function reclaimLiteTransientBytes(tx: LiteReplicaTransaction) {
   return rows.length;
 }
 
+/** Headers for one upload, computed over its exact body before it is staged. */
+export type LiteReplicaUploadHeaders = (request: {
+  method: "PUT";
+  url: string;
+  body: Uint8Array;
+}) => Record<string, string> | Promise<Record<string, string>>;
+
 /** A storage failure the DPv2 transport reads as definitive absence. */
 const notFound = (url: string) =>
   Object.assign(new Error(`replica object not found: ${url}`), {
@@ -67,8 +74,8 @@ export function createLiteReplicaStorage(input: {
   transfers: LiteReplicaObjectTransfers;
   /** The object URL of a storage key (the inverse of the storage layout). */
   urlForKey(key: string): string;
-  /** Upload headers, e.g. storage authorization. */
-  headers?: () => Record<string, string>;
+  /** Upload headers, e.g. storage authorization over the exact body. */
+  headers?: LiteReplicaUploadHeaders;
   deadlineMs?: number;
 }): BoundedStorageAdapter {
   const { persistence, transfers } = input;
@@ -122,6 +129,8 @@ export function createLiteReplicaStorage(input: {
      */
     async upload(key, data) {
       const url = input.urlForKey(key);
+      const headers =
+        (await input.headers?.({ method: "PUT", url, body: data })) ?? {};
       const id = await persistence.stageBytes(
         (async function* () {
           yield* frames(data);
@@ -131,7 +140,7 @@ export function createLiteReplicaStorage(input: {
       try {
         const controller = new AbortController();
         await transfers.upload(
-          { url, method: "PUT", headers: input.headers?.() ?? {}, bytesId: id },
+          { url, method: "PUT", headers, bytesId: id },
           { signal: controller.signal, deadlineMs: deadline() },
         );
       } catch (error) {

@@ -26,9 +26,13 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
   status/sync routes (`packages/lite/src/replication-runtime.ts`) and the
   phase engine (`createLiteReplicaEngine`,
   `packages/lite/src/replication-engine.ts`). Node and Lite run the same
-  phase logic (`packages/core/src/replication/engine.ts`). The runtime
-  reports `blocked: "no_engine"` until its host passes an engine; no host
-  does yet. Neither app enables it
+  phase logic (`packages/core/src/replication/engine.ts`). Both hosts take
+  the partition, declaration bindings and DPv2 network ports from
+  `packages/core/src/replication/host-ports.ts`. A phone shell builds Lite
+  replication with `createLiteReplication`
+  (`packages/lite/src/replication-host.ts`) from native persistence and a
+  `LiteReplicaObjectTransfers` adapter; with the door or config off it
+  builds no ports. No shell calls it yet. Neither app enables it
   (`unity-surfaces@9af449a2 apps/desktop/src/hooks/usePersonalServer.ts:871-885`);
   the phone has no replication code.
 - The carrier is DPv2. In #483 each fragment is one vana-storage object at
