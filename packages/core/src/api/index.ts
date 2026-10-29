@@ -94,6 +94,7 @@ import {
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
+import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
@@ -1709,6 +1710,7 @@ async function handleScopeUploadRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
   parts: string[],
+  prepared?: PreparedScopeUploadBatch,
 ): Promise<Response> {
   const route = (() => {
     if (parts.length === 2) return { kind: "begin", method: "POST" } as const;
@@ -1779,12 +1781,47 @@ async function handleScopeUploadRequest(
       }
       case "append": {
         const seqText = decodePathPart(parts[4]);
-        const appended = await uploads.append({
+        const input = {
           scope,
           uploadId: decodePathPart(parts[2]),
           seq: /^\d{1,9}$/.test(seqText) ? Number(seqText) : Number.NaN,
-          text: await request.text(),
-        });
+        };
+        let appended: { seq: number; items: number; replay: boolean };
+        if (prepared) {
+          if (!uploads.appendPrepared) {
+            throw new ScopeUploadError(
+              501,
+              "UPLOAD_UNSUPPORTED",
+              "This server cannot append prepared batches",
+            );
+          }
+          // Authenticate the small commitment on EVERY append, with the
+          // existing owner gate. Bulk bytes never cross a Request boundary.
+          const body = await readBody();
+          if (
+            body === null ||
+            typeof body !== "object" ||
+            Array.isArray(body) ||
+            Object.keys(body).length !== 1 ||
+            (body as { bodySha256?: unknown }).bodySha256 !==
+              prepared.bodySha256
+          ) {
+            throw new ScopeUploadError(
+              400,
+              "INVALID_UPLOAD",
+              "Prepared batch commitment does not match",
+            );
+          }
+          appended = await uploads.appendPrepared({
+            ...input,
+            batch: prepared,
+          });
+        } else {
+          appended = await uploads.append({
+            ...input,
+            text: await request.text(),
+          });
+        }
         return jsonResponse(appended, {
           status: appended.replay ? 200 : 201,
         });
@@ -1834,6 +1871,34 @@ async function handleScopeUploadRequest(
     }
     throw err;
   }
+}
+
+/**
+ * In-process bulk transport, deliberately not dispatched by the HTTP router.
+ * The Request carries only a signed digest commitment, not the item envelope.
+ * It authenticates the same method, URI and owner as a remote append.
+ */
+export async function handlePersonalServerScopeUploadAppend(
+  request: Request,
+  deps: PersonalServerDataApiDeps,
+  batch: PreparedScopeUploadBatch,
+): Promise<Response> {
+  return withApiErrors(async () => {
+    const url = new URL(request.url);
+    if (!url.pathname.startsWith("/v1/data/")) {
+      return errorResponse(404, "NOT_FOUND", "Unknown upload route");
+    }
+    const pathname = stripBasePath(url.pathname, "/v1/data");
+    const parts = pathname.split("/").filter(Boolean);
+    if (
+      parts.length !== 5 ||
+      parts[1] !== "uploads" ||
+      parts[3] !== "batches"
+    ) {
+      return errorResponse(404, "NOT_FOUND", "Unknown upload route");
+    }
+    return handleScopeUploadRequest(request, deps, parts, batch);
+  });
 }
 
 export async function handlePersonalServerDataRequest(
@@ -3064,3 +3129,8 @@ export {
   type ScopeUploadRegistry,
   type ScopeUploadRegistryOptions,
 } from "./scope-uploads.js";
+
+export {
+  prepareScopeUploadBatches,
+  type PreparedScopeUploadBatch,
+} from "./scope-upload-batches.js";

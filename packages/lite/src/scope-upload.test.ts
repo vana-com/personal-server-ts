@@ -7,11 +7,15 @@
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
-import { createScopeUploadRegistry } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  createScopeUploadRegistry,
+  prepareScopeUploadBatches,
+} from "@opendatalabs/personal-server-ts-core/api";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   createBearerTokenPsLiteAuth,
   createPsLiteRuntime,
+  type PsLiteAuthAdapter,
   type PsLiteRuntime,
 } from "./runtime.js";
 import {
@@ -35,6 +39,10 @@ const JSON_OWNER = { ...OWNER, "Content-Type": "application/json" };
 async function createRuntime(
   fileStore: PsLiteDataFileStore,
   persistence: PsLitePersistenceAdapter = createMemoryPsLitePersistence(),
+  auth: PsLiteAuthAdapter = createBearerTokenPsLiteAuth({
+    ownerToken: "owner-token",
+    builderToken: "builder-token",
+  }),
 ): Promise<PsLiteRuntime> {
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   return createPsLiteRuntime({
@@ -49,10 +57,7 @@ async function createRuntime(
     tokenStore: createMemoryPsLiteTokenStore(),
     saveConfig: async () => {},
     stateCapabilities: { config: "memory" },
-    auth: createBearerTokenPsLiteAuth({
-      ownerToken: "owner-token",
-      builderToken: "builder-token",
-    }),
+    auth,
     active: true,
   });
 }
@@ -100,6 +105,74 @@ async function seedOldVersion(runtime: PsLiteRuntime) {
 }
 
 describe("streamed scope uploads", () => {
+  it("preserves full HTTP bodies for custom auth adapters without commitment support", async () => {
+    const owner = createBearerTokenPsLiteAuth({
+      ownerToken: "owner-token",
+      builderToken: "builder-token",
+    });
+    const bodies: string[] = [];
+    const runtime = await createRuntime(
+      createMemoryPsLiteStagedFileStore(),
+      createMemoryPsLitePersistence(),
+      {
+        authorizeBuilderList: owner.authorizeBuilderList,
+        authorizeBuilderRead: owner.authorizeBuilderRead,
+        async authorizeOwner(request) {
+          bodies.push(await request.clone().text());
+          return owner.authorizeOwner(request);
+        },
+      },
+    );
+    expect(runtime.appendScopeUpload).toBeUndefined();
+    const id = await begin(runtime);
+    await call(runtime, "PUT", `/uploads/${id}/batches/0`, {
+      items: [{ id: "custom-auth" }],
+    });
+    expect(bodies.at(-1)).toBe('{"items":[{"id":"custom-auth"}]}');
+    await call(runtime, "DELETE", `/uploads/${id}`);
+  });
+
+  it("gates every direct append by owner auth, commitment and runtime availability", async () => {
+    const runtime = await createRuntime(createMemoryPsLiteStagedFileStore());
+    const id = await begin(runtime);
+    const batches = [];
+    for await (const batch of prepareScopeUploadBatches(
+      [{ id: "direct" }],
+      1024,
+    ))
+      batches.push(batch);
+    const batch = batches[0]!;
+    const append = (
+      headers: Record<string, string>,
+      digest = batch.bodySha256,
+    ) =>
+      runtime.appendScopeUpload!(
+        new Request(
+          `https://ps.local/v1/data/${SCOPE}/uploads/${id}/batches/0`,
+          {
+            method: "PUT",
+            headers,
+            body: JSON.stringify({ bodySha256: digest }),
+          },
+        ),
+        batch,
+      );
+    expect((await append({})).status).toBe(401);
+    // A builder token is not the owner: NOT_OWNER, as on the HTTP route.
+    expect(
+      (await append({ Authorization: "Bearer builder-token" })).status,
+    ).toBe(401);
+    expect((await append(JSON_OWNER, "wrong-digest")).status).toBe(400);
+    expect((await append(JSON_OWNER)).status).toBe(201);
+    expect((await append({})).status).toBe(401); // replay is not an auth bypass
+    expect((await append(JSON_OWNER)).status).toBe(200);
+    runtime.deactivate();
+    expect((await append(JSON_OWNER)).status).toBe(503);
+    runtime.activate();
+    await call(runtime, "DELETE", `/uploads/${id}`);
+    expect((await append(JSON_OWNER)).status).toBe(410);
+  });
+
   it("makes the batches visible as one new version only at commit", async () => {
     const runtime = await createRuntime(createMemoryPsLiteStagedFileStore());
     const old = await seedOldVersion(runtime);
