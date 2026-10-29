@@ -24,7 +24,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 
-/** Inert until beginBaseline commits. Never wired into production bootstrap. */
+/** Inert until beginBaseline commits; only `createNodeReplication` begins it. */
 export const REPLICATION_MIGRATION =
   BINARY_CHUNKS_MIGRATION +
   `

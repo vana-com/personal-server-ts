@@ -98,6 +98,14 @@ import {
   resolveReplication,
 } from "./pdpp/records-bootstrap.js";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
+import {
+  createNodeReplication,
+  createNodeReplicationPorts,
+  NODE_REPLICATION_STOP_GRACE_MS,
+  type NodeReplication,
+} from "./storage/pdpp-replication-host.js";
+import type { ReplicaWriterRotation } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
+import { rotateReplicaWriterIdentityAtBoot } from "./storage/pdpp-replica-writer-identity.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
 import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
@@ -146,6 +154,13 @@ export interface ServerContext {
   cleanup: () => Promise<void>;
   /** This boot's replication door, decided before any record store opened. */
   replicationStatus: ReplicationDoorStatus;
+  /**
+   * The replication runtime. Absent unless the door is on. `started` steps
+   * from `startBackgroundServices` until `cleanup`.
+   */
+  replication?: NodeReplication;
+  /** What this boot did with `rotateReplicaWriterIdentity`. */
+  replicaWriterRotation: ReplicaWriterRotation;
 }
 
 export interface CreateServerOptions {
@@ -210,6 +225,13 @@ export interface CreateServerOptions {
   mcpGrantTtlSeconds?: number;
   profile?: "standard" | "enclave";
   serverAccount?: ServerAccount;
+  /**
+   * Rotate the replica writer identity before this boot writes anything
+   * (host contract §3.2). A host sets it when this database may be a copy:
+   * a restore, a clone, or a reinstall onto existing data. PS cannot detect
+   * a copy itself. Ignored unless replication runs in this boot.
+   */
+  rotateReplicaWriterIdentity?: boolean;
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -952,6 +974,63 @@ export async function createServer(
     config.replication.enabled,
     logger,
   );
+  // A copied database must not continue its original's writer sequences.
+  // Before any store of this boot captures a write.
+  const replicaWriterRotation = rotateReplicaWriterIdentityAtBoot(db, {
+    requested: options?.rotateReplicaWriterIdentity === true,
+    replicationEnabled: replication.enabled,
+  });
+  if (replicaWriterRotation !== "not_requested")
+    logger.info(
+      { replicaWriterRotation },
+      "Replica writer identity rotation requested by the host",
+    );
+
+  // The replication runtime: receiver, transport worker and coordinator
+  // driver. Only behind an open door; a flag-off boot constructs none of it.
+  // It needs the owner, this server's registered key and the retained
+  // declarations, and never runs in an enclave.
+  let nodeReplication: NodeReplication | undefined;
+  if (replication.enabled) {
+    nodeReplication =
+      !isEnclave &&
+      masterKeySignature &&
+      serverOwner &&
+      serverAccount &&
+      serverSigner &&
+      pdppAuth
+        ? createNodeReplication({
+            db,
+            owner: serverOwner,
+            chainId: config.gateway.chainId,
+            declarations: pdppAuth.retainedDeclarations,
+            serverAccount,
+            ports: (owner) =>
+              createNodeReplicationPorts({
+                config,
+                owner,
+                masterKey: deriveMasterKey(masterKeySignature),
+                storage: createVanaSyncStorageAdapter({
+                  config,
+                  serverOwner,
+                  serverAccount,
+                  reads: "signed",
+                }),
+                gateway: gatewayClient,
+                feed: dataPointFeed,
+                signer: serverSigner,
+              }),
+            logger,
+          })
+        : { state: "blocked", reason: "missing_owner_key_or_declarations" };
+    if (nodeReplication.state === "blocked")
+      logger.warn(
+        { reason: nodeReplication.reason },
+        "Replication is on but cannot run on this boot",
+      );
+  }
+  const replicaHost =
+    nodeReplication?.state === "started" ? nodeReplication : undefined;
 
   if (pdppAuth) {
     registerLegacyDataConnections({
@@ -981,11 +1060,15 @@ export async function createServer(
     logger,
     configuredMethods: pdppAuth?.configuredMethods,
     replication: replication.enabled,
+    replica: replicaHost && {
+      store: replicaHost.store,
+      reads: replicaHost.reads,
+    },
   });
 
   const pdppConnections = pdppAuth
     ? {
-        store: openRecordStore(db, replication.enabled),
+        store: replicaHost?.store ?? openRecordStore(db, replication.enabled),
         auth: pdppRecords?.auth ?? coLocatedAuthorizationService(pdppAuth),
         ownerSubjectId: serverOwner!,
         connectionMethods: new Map(pdppAuth.connectionMethods),
@@ -1136,6 +1219,12 @@ export async function createServer(
   const cleanup = async () => {
     backgroundClosed = true;
     clearRegistrationPoll();
+    // Before the database closes: abort the running step and let it settle.
+    if (
+      replicaHost &&
+      !(await replicaHost.driver.stop(NODE_REPLICATION_STOP_GRACE_MS))
+    )
+      logger.warn("Replication step did not settle before shutdown");
     derivativeScheduler.stop();
     if (tunnelManager) {
       await tunnelManager.stop();
@@ -1167,7 +1256,11 @@ export async function createServer(
     },
     devToken,
     replicationStatus: replication.status,
+    replication: nodeReplication,
+    replicaWriterRotation,
     startBackgroundServices: async () => {
+      // Steps once now, then follows the coordinator's next wake.
+      if (!backgroundClosed) replicaHost?.driver.start();
       // Replay questions a previous run left pending or stale: nothing
       // else reschedules them after a restart (registration and source
       // changes only cover new activity).

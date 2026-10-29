@@ -34,6 +34,35 @@ describe("pending blob deletion store", () => {
     expect(await store.list()).toEqual([A1]);
   });
 
+  it("records work and the planned watermark in one write, and only ever raises the watermark", async () => {
+    const writes: unknown[] = [];
+    const store = createPendingBlobDeletionStore({
+      read: async () =>
+        (writes.at(-1) as {
+          keys: PendingBlobDeletion[];
+          planned: Record<string, string>;
+        } | null) ?? null,
+      write: async (keys, planned) => {
+        writes.push(structuredClone({ keys, planned }));
+      },
+    });
+    const range = {
+      scope: "a.b",
+      version: null,
+      range: { from: "16", to: "40" },
+    };
+
+    expect(await store.plannedThrough!("a.b")).toBeNull();
+    await store.enqueue!("a.b", [range], "40");
+    expect(writes).toEqual([{ keys: [range], planned: { "a.b": "40" } }]);
+
+    await store.enqueue!("a.b", [], "12");
+    await store.remove([range]);
+    expect(await store.plannedThrough!("a.b")).toBe("40");
+    expect(await store.list()).toEqual([]);
+    expect(writes).toHaveLength(2);
+  });
+
   it("persists through the host kv and tolerates a missing/garbage value", async () => {
     let persisted: PendingBlobDeletion[] | null = null;
     const kv = {
@@ -46,7 +75,7 @@ describe("pending blob deletion store", () => {
 
     expect(await store.list()).toEqual([]);
     await store.add([A1]);
-    expect(kv.write).toHaveBeenCalledWith([A1]);
+    expect(kv.write).toHaveBeenCalledWith([A1], {});
     expect(await store.list()).toEqual([A1]);
 
     persisted = [
