@@ -32,9 +32,23 @@ export interface LiteCanonicalTransaction {
   blob(blobId: string): Promise<LiteBlobDescriptor | undefined>;
 }
 
+/** The largest canonical value the native store keeps, in UTF-8 bytes. */
+export const LITE_CANONICAL_MAX_VALUE_BYTES = 256 * 1024;
+/**
+ * The largest operation the store keeps: it retains each operation, and the
+ * row it decides, as one native value. The margin covers the row's fields
+ * beside the record data. A received larger operation is held as
+ * `resource_unsupported` (core `maxOperationBytes`); a build that raises this
+ * bound must also raise core `REPLICA_LIMITS_VERSION` so held batches return.
+ */
+export const LITE_CANONICAL_MAX_OPERATION_BYTES =
+  LITE_CANONICAL_MAX_VALUE_BYTES - 8 * 1024;
+/** A local batch: the caller splits larger writes at record boundaries. */
+export const LITE_CANONICAL_BATCH_BYTES = 192 * 1024;
+
 /**
  * Slice 7b implements this over PsNativeStore, not browser storage. Each scan is
- * <=100 entries and <=512 KiB; individual values <=256 KiB. An oversized entry
+ * <=100 entries and <=512 KiB; individual values <=LITE_CANONICAL_MAX_VALUE_BYTES. An oversized entry
  * throws, never truncates. Roll back on callback error, bridge loss or host kill.
  */
 export interface LiteCanonicalPersistence {

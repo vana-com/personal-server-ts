@@ -2,37 +2,59 @@ import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
 import type { ServerAccount } from "../../keys/server-account.js";
 import { StoredBlobConflictError, type StorageAdapter } from "./interface.js";
 
-/** SDK 3.x couples routing and authentication origins. This adapter supplies the
- * explicit audience needed by preview workers without rewriting a signed claim. */
-export function createAudienceVanaAdapter(input: {
+interface VanaBlobNamespace {
   endpoint: string;
   audience: string;
   chainId: number;
   owner: string;
   signer: Pick<ServerAccount, "signMessage">;
-}): StorageAdapter {
+}
+
+/**
+ * The URL layout and Web3Signed authorization of one owner's blobs. A host
+ * that moves the bytes itself (PS-Lite native transfers) signs with this, so
+ * its requests match the adapter below.
+ */
+export function vanaBlobRequests(input: VanaBlobNamespace) {
   const prefix = `${input.endpoint}/v1/chains/${input.chainId}/blobs/${input.owner}/`;
-  const urlForKey = (key: string) =>
-    prefix + key.split("/").map(encodeURIComponent).join("/");
   function validate(url: string) {
     const parsed = new URL(url);
     if (!parsed.href.startsWith(prefix) || /%(?:2f|5c)/i.test(parsed.pathname))
       throw new Error("Blob URL does not match configured namespace");
     return parsed;
   }
+  return {
+    urlForKey: (key: string) =>
+      prefix + key.split("/").map(encodeURIComponent).join("/"),
+    validate,
+    authorization: (
+      method: "PUT" | "GET" | "DELETE",
+      url: string,
+      body?: Uint8Array,
+    ) =>
+      buildWeb3SignedHeader({
+        aud: input.audience,
+        method,
+        uri: validate(url).pathname,
+        body,
+        signMessage: (message) => input.signer.signMessage(message),
+      }),
+  };
+}
+
+/** SDK 3.x couples routing and authentication origins. This adapter supplies the
+ * explicit audience needed by preview workers without rewriting a signed claim. */
+export function createAudienceVanaAdapter(
+  input: VanaBlobNamespace,
+): StorageAdapter {
+  const { urlForKey, validate, authorization: sign } = vanaBlobRequests(input);
   async function request(
     url: string,
     method: "PUT" | "GET" | "DELETE",
     body?: Uint8Array,
   ) {
     const parsed = validate(url);
-    const authorization = await buildWeb3SignedHeader({
-      aud: input.audience,
-      method,
-      uri: parsed.pathname,
-      body,
-      signMessage: (message) => input.signer.signMessage(message),
-    });
+    const authorization = await sign(method, url, body);
     const response = await fetch(parsed.href, {
       method,
       headers: {

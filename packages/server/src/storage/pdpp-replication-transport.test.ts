@@ -1139,7 +1139,7 @@ it("fragments large JSON and resumes a partial download in reverse/duplicate lis
   const b = device(net, { chunk: 1800 });
   await cycles([b], 2);
   const retained = fragmentsIn(b).filter(
-    (r) => r.slot === slot && r.fragment_json,
+    (r) => r.slot === slot && r.fragment_json !== null,
   );
   expect(retained).toHaveLength(2);
   b.reopen();

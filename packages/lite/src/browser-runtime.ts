@@ -1,5 +1,18 @@
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { resolveLiteReplication } from "./replication-door.js";
+import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
+import { createGatewayDataPointFeed } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  createLiteReplication,
+  liteVanaReplicaObjects,
+  type LiteReplication,
+} from "./replication-host.js";
+import type {
+  LiteReplicaObjectTransfers,
+  LiteReplicaPersistence,
+  ReplicationBootConfig,
+} from "./replication-ports.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
@@ -15,7 +28,10 @@ import type {
   DataPointFeedPort,
   DataStoragePort,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
+import {
+  createGatewayClient,
+  deriveMasterKey,
+} from "@opendatalabs/vana-sdk/browser";
 import {
   createInMemoryWriteProofReplayStore,
   createInMemoryWriteSessionStore,
@@ -94,6 +110,21 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    */
   dataPointFeed?: DataPointFeedPort;
   /**
+   * The host's replication ports (host contract §4): native persistence
+   * with replica support and native object transfers. With the door on and
+   * `config.enabled`, this factory builds replication over them and passes
+   * its runtime as `replication`; otherwise it builds none of it.
+   */
+  replicaHost?: {
+    config: ReplicationBootConfig;
+    persistence: LiteReplicaPersistence;
+    transfers: LiteReplicaObjectTransfers;
+    /** The retained declarations the host's canonical store serves. */
+    declarations: readonly DeclarationSnapshot[];
+    /** The host cannot rule out that this database is a copy (§3.2). */
+    rotateWriterIdentity?: boolean;
+  };
+  /**
    * Inject host-owned persistence ports (Mobile native SQLite/filesystem) in
    * place of the browser IndexedDB defaults, without giving up this factory's
    * identity/config/sync/auth/signer composition. This is all-or-nothing:
@@ -116,6 +147,8 @@ export interface IndexedDbPsLiteRuntime {
   derivatives: PsLiteRuntimeOptions["derivatives"];
   /** This boot's replication door, from `resolveLiteReplication`. */
   replication: ReplicationDoorStatus;
+  /** Replication built over `replicaHost`, when the host passed it. */
+  replicationHost?: LiteReplication;
 }
 
 export async function createIndexedDbPsLiteRuntime(
@@ -193,6 +226,7 @@ export async function createIndexedDbPsLiteRuntime(
     requestSigner,
   });
   let syncManager = options.syncManager ?? null;
+  let dataPointFeed = options.dataPointFeed;
   let scopeDeletions = options.scopeDeletions;
   let additions = options.additions;
   let runtimeRef: PsLiteRuntime | null = null;
@@ -257,7 +291,38 @@ export async function createIndexedDbPsLiteRuntime(
     additions = sync.additions ?? additions;
     syncManager = sync.syncManager;
     scopeDeletions = sync.scopeDeletions;
+    dataPointFeed = sync.dataPointFeed;
   }
+  const replicationHost = options.replicaHost
+    ? await createLiteReplication({
+        ...options.replicaHost,
+        door: replication,
+        serverAccount: identity.account,
+        objects: liteVanaReplicaObjects({
+          config,
+          owner: serverOwner,
+          signer: identity.account,
+        }),
+        network: (owner, objectStorage) =>
+          createReplicationNetworkPorts({
+            config,
+            owner,
+            masterKey: deriveMasterKey(options.ownerSignature),
+            storage: objectStorage,
+            gateway,
+            feed:
+              dataPointFeed ??
+              createGatewayDataPointFeed({ gatewayUrl: config.gateway.url }),
+            // The registered server key, as on Node; never the owner signer.
+            signer: createServerSigner(identity.account, {
+              chainId: config.gateway.chainId,
+              contracts: config.gateway.contracts,
+            }),
+          }),
+        onError: (error) =>
+          options.logger?.warn({ err: error }, "Replication step failed"),
+      })
+    : undefined;
   const runtimeAvailability = {
     isAvailable: () => runtimeRef?.isAvailable() ?? Boolean(options.active),
   };
@@ -306,6 +371,7 @@ export async function createIndexedDbPsLiteRuntime(
     });
   const runtime = createPsLiteRuntime({
     ...options,
+    replication: replicationHost?.runtime ?? options.replication,
     auth,
     serverOrigin,
     writeSessionStore,
@@ -352,5 +418,6 @@ export async function createIndexedDbPsLiteRuntime(
     syncManager,
     derivatives,
     replication,
+    replicationHost,
   };
 }

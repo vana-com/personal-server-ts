@@ -16,7 +16,9 @@
 import type { ReplicaRosterPort } from "@opendatalabs/personal-server-ts-core/replication/roster";
 import type { ReplicationStepper } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import type { ReplicaEnvironment } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
+import type { ReplicaSql } from "@opendatalabs/personal-server-ts-core/replication/effects";
 import type {
+  LiteBlobDescriptor,
   LiteCanonicalPersistence,
   LiteCanonicalTransaction,
 } from "./canonical-persistence.js";
@@ -48,6 +50,28 @@ export const LITE_REPLICATION_LIMITS: ReplicationLimits = {
 export const LITE_MAX_FRAGMENT_BYTES = 1024 * 1024;
 
 /**
+ * The most one `sql` call may carry in its parameters or return in its rows
+ * (§4.3): one fragment-sized value plus statement and row overhead. The
+ * native side fails a larger call with `too-large`, so replication state
+ * that can grow past it is kept in rows below it.
+ */
+export const LITE_REPLICA_SQL_BYTES = LITE_MAX_FRAGMENT_BYTES + 64 * 1024;
+
+/**
+ * The fixed bytes an encrypted fragment adds to its plaintext, beyond the
+ * base64 growth of 4/3: envelope framing plus encryption overhead.
+ */
+const FRAGMENT_FRAMING_BYTES = 4100;
+
+/**
+ * The plaintext chunk that encrypts to at most `fragmentBytes`. The native
+ * store keeps a fragment as one value, so the encrypted size is the bound.
+ */
+export function liteTargetChunkBytes(fragmentBytes: number) {
+  return Math.floor(((fragmentBytes - FRAGMENT_FRAMING_BYTES) * 3) / 4);
+}
+
+/**
  * Why a boot configuration cannot run, or `undefined` when it can. PS refuses
  * an invalid value rather than clamping it.
  */
@@ -63,6 +87,8 @@ export function replicationBootConfigProblem(
     !positive(config.chainId) ||
     !positive(fragmentBytes) ||
     fragmentBytes > LITE_MAX_FRAGMENT_BYTES ||
+    // A fragment must fit its framing and at least one plaintext byte.
+    liteTargetChunkBytes(fragmentBytes) < 1 ||
     !positive(step.units) ||
     !positive(step.bytes) ||
     !positive(step.deadlineMs)
@@ -106,7 +132,41 @@ export interface LiteReplicaTransaction extends LiteCanonicalTransaction {
   attachBytes(stagingId: string, expected: LiteReplicaBytesInfo): Promise<void>;
   /** Drop attached bytes when this transaction commits. Absent ids are a no-op. */
   releaseBytes(id: string): Promise<void>;
+  /**
+   * Publish attached bytes `bytesId` as the canonical blob `expected` in THIS
+   * transaction, as `attachBlob` does for a staged blob: the native side
+   * checks length and SHA-256 against the descriptor. The bytes stay
+   * attached under `bytesId` until released. A received blob's descriptor
+   * is trusted only after its whole payload is verified, which is after its
+   * bytes were staged, so received blobs take this path.
+   */
+  publishBlob(bytesId: string, expected: LiteBlobDescriptor): Promise<void>;
+  /**
+   * Replication's relational state in THIS transaction (§4.3): the phase
+   * engine's `pdpp_transport_*` and `pdpp_replica_*` tables, in the same
+   * native SQLite database as the canonical rows. PS sends only its own
+   * fixed statements; parameters never carry more than one canonical value.
+   */
+  readonly sql: LiteReplicaSql;
 }
+
+/** `ReplicaSql` answered asynchronously over the bridge. */
+export interface LiteReplicaSql extends ReplicaSql {
+  get(
+    sql: string,
+    params: readonly LiteReplicaSqlValue[],
+  ): Promise<Record<string, unknown> | undefined>;
+  all(
+    sql: string,
+    params: readonly LiteReplicaSqlValue[],
+  ): Promise<Record<string, unknown>[]>;
+  run(
+    sql: string,
+    params: readonly LiteReplicaSqlValue[],
+  ): Promise<{ changes: number }>;
+  exec(sql: string): Promise<void>;
+}
+type LiteReplicaSqlValue = Parameters<ReplicaSql["get"]>[1][number];
 
 /** The canonical native transaction, widened to replica bytes. */
 export interface LiteReplicaPersistence
@@ -199,9 +259,9 @@ export interface LiteReplicaNetwork {
 
 /**
  * The replication phase engine over the ports above: one finite step of
- * prepare, publish, discover, download, import and reconcile. PS supplies it,
- * not the host. PS-Lite has none yet; until it does the runtime reports
- * `blocked: "no_engine"` and never steps.
+ * prepare, publish, discover, download, import and reconcile. PS supplies it
+ * (`createLiteReplicaEngine`, `replication-engine.ts`), not the host. Without
+ * one the runtime reports `blocked: "no_engine"` and never steps.
  */
 export type LiteReplicationEngine = ReplicationStepper;
 

@@ -325,6 +325,43 @@ it("enforces streamed operation and blob limits before staging excess bytes", as
   expect(blobStage).toHaveBeenCalledTimes(0);
 });
 
+it("bounds each streamed operation, not the sum of all operations", async () => {
+  const operations = Array.from({ length: 40 }, (_, index) =>
+    upsert(`small-${index}`, index + 2),
+  );
+  const envelope: ReplicaEnvelope = {
+    format: "vana-pdpp-replica",
+    version: 1,
+    owner: identity.owner,
+    batchId: "d".repeat(32),
+    operations: [...operations, { ...registration }],
+  };
+  const largest = Math.max(
+    ...envelope.operations.map((operation) => canonicalJson(operation).length),
+  );
+  const total = envelope.operations.reduce(
+    (sum, operation) => sum + canonicalJson(operation).length,
+    0,
+  );
+  expect(total).toBeGreaterThan(4 * largest);
+  const source = () => encodeReplicaPayload(envelope, async function* () {});
+  const limits = (maxOperationBytes: number) => ({
+    limits: { ...DEFAULT_REPLICA_STREAMED_LIMITS, maxOperationBytes },
+  });
+
+  await expect(
+    inspectReplicaPayload(source, undefined, vi.fn(), limits(largest)),
+  ).resolves.toMatchObject({
+    envelope: { operations: envelope.operations },
+  });
+  await expect(
+    inspectReplicaPayload(source, undefined, vi.fn(), limits(largest - 1)),
+  ).rejects.toMatchObject({
+    code: "replica_resource_limit_exceeded",
+    limit: "operation_bytes",
+  });
+});
+
 it("Q1 encodes an empty internal envelope without admitting it as a wire envelope", async () => {
   const envelope: ReplicaEnvelope = {
     format: "vana-pdpp-replica",

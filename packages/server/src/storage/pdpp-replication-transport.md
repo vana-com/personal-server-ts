@@ -4,6 +4,12 @@
 `enabled` option defaults to false. It is absent from server bootstrap, HTTP
 routes and Lite. This change does not enable production replication.
 
+The worker is the Node host of core's phase engine
+(`packages/core/src/replication/engine.ts`). PS-Lite runs the same engine
+through `createLiteReplicaEngine` (`packages/lite/src/replication-engine.ts`).
+The phase order, SQL and outcomes below live in core; this file binds them to
+better-sqlite3.
+
 ## Wire and authority
 
 A device sync is one batch, up to the batch bounds below, and one batch costs
@@ -98,11 +104,13 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   `roster` dependency on its own address) until the server is registered under
   the owner and not revoked. If the roster is unavailable, a server that already
   has an identity continues with it; a server without one waits.
-- The first identity requires an empty replica journal. A database that
+- On Node, the first identity requires an empty replica journal. A database that
   captured operations under the old random installation writer id fails with
   `replica_identity_requires_fresh_journal`: **dev databases start fresh.**
   Operations captured before the first identity keep that local id; receivers
-  refuse them, so they never leave the device.
+  refuse them, so they never leave the device. Lite has no such rule: it
+  re-exports its canonical state under the first identity (Lite
+  `rebaseline`), so local writes made before the first enable publish.
 - A new registration id for the same address (re-registration) starts a new
   incarnation with a new nonce at the next step.
 - After a replication reset, a new database, or a restore or clone, the host
@@ -550,8 +558,8 @@ journey. Live acceptance must still verify repeated PUT of identical
 ciphertext at an existing key after registration failure, and one
 registration per sync against the dev Gateway. Generic preparation errors,
 including `RangeError` from encryption, remain Retry with bounded backoff and
-a typed preparation wait. Runtime scheduling and Lite publisher wiring remain
-outside this change.
+a typed preparation wait. Host wiring of the Lite engine remains outside
+this change.
 
 The in-process oracle uses two file-backed SQLite stores and real receiver
 imports, an encrypted storage fake with a size cap, and independent fake
