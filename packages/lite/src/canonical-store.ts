@@ -97,6 +97,17 @@ interface LogEntry {
 }
 const logKey = (sequence: number) =>
   `log/${String(sequence).padStart(16, "0")}`;
+/** A store with a clock was created by some layout; it must be this one. */
+async function checkLayout(tx: LiteCanonicalTransaction) {
+  if ((await tx.get("clock")) === undefined) return;
+  const layout = (await get<number>(tx, LAYOUT_KEY)) ?? 1;
+  if (layout !== LAYOUT_VERSION)
+    throw new Error(
+      layout > LAYOUT_VERSION
+        ? `canonical layout ${layout} is newer than this build (${LAYOUT_VERSION})`
+        : `canonical layout ${layout} is no longer supported (this build reads ${LAYOUT_VERSION}); clear the canonical store and import again`,
+    );
+}
 /** Bump when a derived pending index changes; older databases need `retry`. */
 const PENDING_INDEX_VERSION = 3;
 const PREVIEW_BLOB_REFS = "preview-blob-refs/";
@@ -275,7 +286,18 @@ export function createLiteCanonicalStore(deps: {
   visibilityPolicy?: ReplicaVisibilityPolicy;
   newId?: () => string;
 }) {
-  const persistence = deps.persistence;
+  // Every transaction checks the stored layout first, so no reader or
+  // writer can reach entries of another layout.
+  const persistence: LiteCanonicalPersistence = {
+    transaction: (run) =>
+      deps.persistence.transaction(async (tx) => {
+        await checkLayout(tx);
+        return run(tx);
+      }),
+    stageBlob: (descriptor, chunks) =>
+      deps.persistence.stageBlob(descriptor, chunks),
+    readBlob: (blobId) => deps.persistence.readBlob(blobId),
+  };
   const newId = deps.newId ?? (() => globalThis.crypto.randomUUID());
   function enabled() {
     if (deps.enabled !== true)
@@ -290,16 +312,7 @@ export function createLiteCanonicalStore(deps: {
       throw new Error("immutable canonical owner binding");
     await put(tx, "owner", context.owner);
     const stored = await get<Clock>(tx, "clock");
-    if (stored) {
-      const layout = (await get<number>(tx, LAYOUT_KEY)) ?? 1;
-      if (layout !== LAYOUT_VERSION)
-        throw new Error(
-          layout > LAYOUT_VERSION
-            ? `canonical layout ${layout} is newer than this build (${LAYOUT_VERSION})`
-            : `canonical layout ${layout} is no longer supported (this build reads ${LAYOUT_VERSION}); clear the canonical store and import again`,
-        );
-      return stored;
-    }
+    if (stored) return stored;
     const initial = { writerId: newId(), counter: 0, sequence: 0 };
     await put(tx, "clock", initial);
     await put(tx, LAYOUT_KEY, LAYOUT_VERSION);

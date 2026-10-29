@@ -231,6 +231,13 @@ describe("Lite canonical outbox", () => {
         () => store.readLogPage(),
         () => store.acknowledgeOutbox(0, 1),
         () => store.readRecord(identity.connectionId, binding.stream, "k0"),
+        () => store.readStreamCompletions(identity.connectionId),
+        () => store.isConnectionQuarantined(identity.connectionId),
+        () =>
+          store.provisionConnection(identity.connectionId, {
+            sourceId: identity.sourceId,
+            methodId: identity.methodId,
+          }),
         () => store.commitLocal("b2", [record("k2", "two")]),
       ])
         await expect(call()).rejects.toThrow(message);
