@@ -221,6 +221,33 @@ describe("createReplicationDriver", () => {
     expect(driver.status().lastError).toBeUndefined();
   });
 
+  it("a step that throws synchronously is retried after the error delay", async () => {
+    const clock = fakeTimers();
+    let calls = 0;
+    const driver = createReplicationDriver({
+      stepper: {
+        step() {
+          calls += 1;
+          if (calls === 1) throw new Error("store closed");
+          return Promise.resolve(report(undefined));
+        },
+      },
+      budget,
+      timers: clock.timers,
+    });
+    driver.start();
+    await flush();
+    expect(calls).toBe(1);
+    expect(driver.status().stepping).toBe(false);
+    expect(driver.status().lastError).toBe("store closed");
+    expect(clock.armed()).toEqual([REPLICA_STEP_ERROR_DELAY_MS]);
+    clock.advance(REPLICA_STEP_ERROR_DELAY_MS);
+    await flush();
+    expect(calls).toBe(2);
+    expect(driver.status().stepping).toBe(false);
+    expect(driver.status().lastError).toBeUndefined();
+  });
+
   it("stop aborts the running step, waits for it to settle and arms nothing", async () => {
     const clock = fakeTimers();
     const { stepper, steps } = manualStepper();

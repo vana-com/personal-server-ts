@@ -111,6 +111,8 @@ export function createReplicationDriver(input: {
   let lastStepAt: number | undefined;
   let last: ReplicationDriverStatus["last"];
   let lastError: string | undefined;
+  /** The wake delay the running step chose; read by `settle`. */
+  let nextDelay = REPLICA_WAKE_MAX_MS;
 
   function arm(delay: number) {
     if (timer !== undefined) timers.clearTimeout(timer);
@@ -126,7 +128,7 @@ export function createReplicationDriver(input: {
 
   async function run(): Promise<ProgressReport | undefined> {
     controller = new AbortController();
-    let delay = REPLICA_WAKE_MAX_MS;
+    nextDelay = REPLICA_WAKE_MAX_MS;
     try {
       const report = await input.stepper.step({
         budget: input.budget,
@@ -141,23 +143,31 @@ export function createReplicationDriver(input: {
         quarantines: report.quarantines.length,
         unsupported: report.unsupported.length,
       };
-      delay = replicaWakeDelay(report.nextWake, timers.now());
+      nextDelay = replicaWakeDelay(report.nextWake, timers.now());
       input.onReport?.(report);
       return report;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
-      delay = REPLICA_STEP_ERROR_DELAY_MS;
+      nextDelay = REPLICA_STEP_ERROR_DELAY_MS;
       input.onError?.(error);
       return undefined;
-    } finally {
-      controller = undefined;
-      running = undefined;
-      if (state === "running") {
-        if (again) {
-          again = false;
-          void trigger();
-        } else arm(delay);
-      }
+    }
+  }
+
+  /**
+   * Runs after `trigger` has assigned `running`, so a stepper that throws
+   * before its first await still clears it. Doing this inside `run` would
+   * clear `running` first and then have `trigger` overwrite it with a settled
+   * promise, leaving the driver stalled for good.
+   */
+  function settle() {
+    controller = undefined;
+    running = undefined;
+    if (state === "running") {
+      if (again) {
+        again = false;
+        void trigger();
+      } else arm(nextDelay);
     }
   }
 
@@ -170,8 +180,10 @@ export function createReplicationDriver(input: {
     if (timer !== undefined) timers.clearTimeout(timer);
     timer = undefined;
     nextWakeAt = undefined;
-    running = run();
-    return running;
+    const current = run();
+    running = current;
+    void current.then(settle, settle);
+    return current;
   }
 
   return {
