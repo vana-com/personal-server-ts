@@ -4,6 +4,7 @@ import {
   readBinaryChunks,
   verifyBinary,
   copyBinary,
+  deleteBinary,
 } from "./pdpp-binary-chunks.js";
 import type { Database } from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
@@ -295,6 +296,22 @@ export function createReplicationJournal(
       sizeBytes: meta.size_bytes,
     };
   }
+  const chunkedCanonical = (blobId: string) =>
+    db
+      .prepare(
+        "SELECT 1 FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=?",
+      )
+      .get(blobId) !== undefined;
+  /** Where a pin's bytes are: its own copy, or the canonical chunks it references. */
+  function pinnedNamespace(blobId: string): "pinned" | "canonical" {
+    return binaryLength(db, "pinned", blobId) === undefined &&
+      db
+        .prepare("SELECT 1 FROM pdpp_replica_blob_pins WHERE blob_id=?")
+        .get(blobId) !== undefined &&
+      chunkedCanonical(blobId)
+      ? "canonical"
+      : "pinned";
+  }
   function captureBlob(instance: string, blobId: string) {
     if (!settings()) return;
     const identity = base(instance);
@@ -308,7 +325,17 @@ export function createReplicationJournal(
     const blob = blobDescriptor(blobId);
     if (!verifyBinary(db, "canonical", blobId, blob.sha256, blob.sizeBytes))
       throw new Error("unverified replication blob bytes");
-    if (binaryLength(db, "pinned", blobId) === undefined)
+    // A large canonical blob is chunks only; the pin references them, and
+    // they become the pinned copy if canonical storage drops the blob
+    // (`pinReferenceKeepsBytes`). A pinned copy of such a blob, left when
+    // canonical storage dropped it before, becomes a reference again. Main's
+    // whole row has no such hook, so a small blob keeps its own pinned copy.
+    if (chunkedCanonical(blobId)) {
+      db.prepare("INSERT OR IGNORE INTO pdpp_replica_blob_pins VALUES (?)").run(
+        blobId,
+      );
+      deleteBinary(db, "pinned", blobId);
+    } else if (binaryLength(db, "pinned", blobId) === undefined)
       copyBinary(db, "canonical", blobId, "pinned");
     else if (!verifyBinary(db, "pinned", blobId, blob.sha256, blob.sizeBytes))
       throw new Error("corrupt pinned replica bytes");
@@ -788,14 +815,15 @@ export function createReplicationJournal(
       }).immediate();
     },
     readPinnedBlobChunks(blobId) {
-      return readBinaryChunks(db, "pinned", blobId);
+      return readBinaryChunks(db, pinnedNamespace(blobId), blobId);
     },
     readPinnedBlobBytes(blobId) {
-      const size = binaryLength(db, "pinned", blobId);
+      const namespace = pinnedNamespace(blobId);
+      const size = binaryLength(db, namespace, blobId);
       if (size === undefined) return undefined;
       const bytes = new Uint8Array(size);
       let offset = 0;
-      for (const chunk of readBinaryChunks(db, "pinned", blobId)) {
+      for (const chunk of readBinaryChunks(db, namespace, blobId)) {
         bytes.set(chunk, offset);
         offset += chunk.length;
       }

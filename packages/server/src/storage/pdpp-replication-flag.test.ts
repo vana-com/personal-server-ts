@@ -250,20 +250,9 @@ describe("replication flag on", () => {
     expect(storeBytes(writer, bytes).blobId).toBe(blob.blobId);
     writerDb.close();
 
+    // An enabled store writes a large blob in the chunk form only.
     const canonicalDb = open(path);
-    expect(
-      (
-        canonicalDb
-          .prepare(
-            "SELECT length(bytes) AS size FROM pdpp_blob_bytes WHERE blob_id = ?",
-          )
-          .get(blob.blobId) as { size: number }
-      ).size,
-    ).toBe(bytes.byteLength);
-    // Replication promotes a large blob in the chunk form only. Model that.
-    canonicalDb
-      .prepare("DELETE FROM pdpp_blob_bytes WHERE blob_id = ?")
-      .run(blob.blobId);
+    expect(wholeRow(canonicalDb, blob.blobId)).toBeUndefined();
     canonicalDb.close();
 
     // An enabled open keeps it chunk-only, and its readers accept that form.

@@ -245,6 +245,9 @@ export function createReplicaReceiver(deps: {
         blob.sizeBytes,
         blob.sha256.slice(7),
       );
+      // The received copy stays: it is custody for every retained
+      // operation that names the blob, applied or withheld, and canonical
+      // collection does not count those operations (host contract §6).
       if (binaryLength(db, "canonical", blob.blobId) !== undefined) {
         if (
           !verifyBinary(
