@@ -14,6 +14,7 @@ import {
   type LiteReplicaObjectTransfers,
   type LiteReplicaPersistence,
   type LiteReplicaTransaction,
+  type LiteReplicaTransferCall,
   type LiteReplicationEngine,
 } from "../replication-ports.js";
 import {
@@ -208,7 +209,9 @@ function* frames(bytes: Uint8Array) {
  * `persistence` and uploading its attached bytes. At most `maxTransfers` run
  * at once; one more fails `busy`, as the native gate refuses rather than
  * queueing. An aborted call fails `cancelled` and leaves no stage behind:
- * a stage made before the abort is discarded.
+ * a stage made before the abort is discarded. A transfer still running at its
+ * `deadlineMs` fails `timeout`, frees its capacity at once and discards the
+ * stage it makes late.
  */
 export function createMemoryReplicaObjectTransfers(
   persistence: MemoryReplicaPersistencePort,
@@ -218,28 +221,52 @@ export function createMemoryReplicaObjectTransfers(
   const maxTransfers = opts.maxTransfers ?? 2;
   let active = 0;
   async function transfer<T>(
-    signal: AbortSignal,
+    call: LiteReplicaTransferCall,
     run: () => Promise<T>,
     discard?: (result: T) => void,
   ) {
+    const { signal, deadlineMs } = call;
     if (signal.aborted) throw new LiteReplicaTransferError("cancelled");
     if (active >= maxTransfers) throw new LiteReplicaTransferError("busy");
     active++;
+    let held = true;
+    const release = () => {
+      if (held) active--;
+      held = false;
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const work = run();
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        // As the native side does at its deadline: free the capacity now and
+        // drop what the late transfer stages.
+        timedOut = true;
+        release();
+        reject(new LiteReplicaTransferError("timeout"));
+      }, deadlineMs);
+    });
     try {
-      const result = await run();
+      const result = await Promise.race([work, deadline]);
       if (signal.aborted) {
         discard?.(result);
         throw new LiteReplicaTransferError("cancelled");
       }
       return result;
     } finally {
-      active--;
+      clearTimeout(timer);
+      release();
+      if (timedOut)
+        void work.then(
+          (late) => discard?.(late),
+          () => {},
+        );
     }
   }
   const port: LiteReplicaObjectTransfers = {
-    download({ url, maxBytes, expected }, { signal }) {
+    download({ url, maxBytes, expected }, call) {
       return transfer(
-        signal,
+        call,
         async () => {
           const value = objects.get(url);
           if (!value) throw new LiteReplicaTransferError("not-found");
@@ -260,11 +287,11 @@ export function createMemoryReplicaObjectTransfers(
         (staged) => persistence.discardBytes(staged.stagingId),
       );
     },
-    probe({ url }, { signal }) {
-      return transfer(signal, async () => objects.has(url));
+    probe({ url }, call) {
+      return transfer(call, async () => objects.has(url));
     },
-    upload({ url, bytesId }, { signal }) {
-      return transfer(signal, async () => {
+    upload({ url, bytesId }, call) {
+      return transfer(call, async () => {
         const parts: Uint8Array[] = [];
         for await (const part of persistence.readBytes(bytesId))
           parts.push(part);

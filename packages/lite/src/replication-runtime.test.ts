@@ -513,6 +513,50 @@ describe("in-memory LiteReplicaObjectTransfers", () => {
     expect(await code(first)).toBe("ok");
   });
 
+  it("times out a download at its deadline, frees its capacity and discards the late stage", async () => {
+    const memory = createMemoryReplicaPersistence();
+    const slow: typeof memory.port = {
+      ...memory.port,
+      async stageBytes(chunks) {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return memory.port.stageBytes(chunks);
+      },
+    };
+    const transfers = createMemoryReplicaObjectTransfers(slow, {
+      maxTransfers: 1,
+    });
+    const url = "https://storage.invalid/o";
+    transfers.objects.set(url, new Uint8Array([1, 2, 3]));
+    const code = (promise: Promise<unknown>) =>
+      promise.then(
+        () => "ok",
+        (error: unknown) =>
+          error instanceof LiteReplicaTransferError ? error.code : error,
+      );
+    const download = transfers.port.download(
+      { url, maxBytes: 9 },
+      { signal: new AbortController().signal, deadlineMs: 20 },
+    );
+    expect(await code(download)).toBe("timeout");
+    // The one slot is free again although the stage is still being made.
+    expect(await code(transfers.port.probe({ url }, call()))).toBe("ok");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(memory.stagedBytes()).toBe(0);
+  });
+
+  it("does not time out a transfer that finishes inside its deadline", async () => {
+    const memory = createMemoryReplicaPersistence();
+    const transfers = createMemoryReplicaObjectTransfers(memory.port);
+    const url = "https://storage.invalid/o";
+    transfers.objects.set(url, new Uint8Array([1, 2, 3]));
+    const got = await transfers.port.download(
+      { url, maxBytes: 9 },
+      { signal: new AbortController().signal, deadlineMs: 5_000 },
+    );
+    expect(got.length).toBe(3);
+    expect(memory.stagedBytes()).toBe(3);
+  });
+
   it("discards the stage of a download cancelled after it staged", async () => {
     const { port: persistence, stagedBytes } = createMemoryReplicaPersistence();
     const memory = createMemoryReplicaObjectTransfers(persistence);

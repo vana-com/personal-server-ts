@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { expect, it } from "vitest";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createTestReplicaSigner } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
+import { REPLICA_ATTEMPT_TIMEOUT_MS } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import type { ReplicationTimers } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import {
   at,
@@ -170,6 +171,72 @@ it("waits for the roster before the first baseline", async () => {
   expect(
     db.prepare("SELECT 1 FROM pdpp_replica_settings WHERE id = 1").get(),
   ).toBeUndefined();
+  expect(await runtime.driver.stop(1_000)).toBe(true);
+});
+
+it("a roster that hangs on the first enable waits and is read again", async () => {
+  const net = network();
+  const db = new Database(join(scratchDirectory("replica-host"), "db.sqlite"));
+  const signer = createTestReplicaSigner();
+  net.roster.register(signer.address, owner);
+  let hang = true;
+  const lookups: AbortSignal[] = [];
+  // Timers the test fires by hand, so the roster deadline is observable.
+  const pending = new Map<number, { ms: number; run: () => void }>();
+  let nextTimer = 0;
+  const timers: ReplicationTimers = {
+    now: clock.now,
+    setTimeout: (run, ms) => {
+      pending.set(++nextTimer, { ms, run });
+      return nextTimer;
+    },
+    clearTimeout: (handle) => pending.delete(handle as number),
+  };
+  const runtime = createNodeReplication({
+    db,
+    owner,
+    chainId: REPLICA_TEST_CHAIN_ID,
+    declarations: [declaration],
+    serverAccount: signer,
+    ports: () => ({
+      transport: net.port,
+      roster: {
+        server: (address, call) => {
+          if (!hang) return net.roster.port.server(address, call);
+          lookups.push(call!.signal!);
+          return new Promise(() => {});
+        },
+      },
+    }),
+    logger,
+    timers,
+    worker: { now: clock.now },
+  });
+  if (runtime.state !== "started") throw new Error(runtime.reason);
+  runtime.driver.start();
+  const first = runtime.driver.trigger();
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(runtime.driver.status().stepping).toBe(true);
+  const deadline = [...pending.values()].find(
+    (timer) => timer.ms === REPLICA_ATTEMPT_TIMEOUT_MS,
+  );
+  expect(deadline).toBeDefined();
+  deadline!.run();
+  // `trigger` joined the first step, so one more runs right after it; by
+  // then the gateway answers again.
+  hang = false;
+  const report = await first;
+  expect(report?.waits).toEqual([
+    expect.objectContaining({ id: "writer-identity" }),
+  ]);
+  expect(lookups).toHaveLength(1);
+  expect(lookups[0]!.aborted).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  // The next step read the roster again and went on to the baseline.
+  expect(runtime.driver.status().stepping).toBe(false);
+  expect(
+    db.prepare("SELECT 1 FROM pdpp_replica_settings WHERE id = 1").get(),
+  ).toBeDefined();
   expect(await runtime.driver.stop(1_000)).toBe(true);
 });
 
