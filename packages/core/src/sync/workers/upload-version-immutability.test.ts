@@ -31,6 +31,14 @@ import { createVanaSyncStorageAdapter } from "../../storage/adapters/vana.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
 import type { Logger } from "../../logger/index.js";
 import { uploadOne } from "./upload.js";
+import {
+  deleteScope,
+  retryPendingBlobDeletions,
+  type DeleteScopeDeps,
+} from "./delete.js";
+import { createGatewayDeleteDataPort } from "../delete-data-port.js";
+import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
+import { createInventoryTombstoneFinality } from "../tombstone-finality.js";
 import type { FencedPublicationPort } from "../../publication/publish.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
 
@@ -168,8 +176,15 @@ class Registry {
   beforeRegister?: () => Promise<void>;
   afterCommit?: () => void;
 
+  /** The head skips a failed row, as the gateway's rollback does. */
   head(): DataPointRecord | null {
-    const top = [...this.versions.keys()].sort((a, b) => (a < b ? 1 : -1))[0];
+    const top = [...this.versions.keys()]
+      .filter(
+        (version) =>
+          (this.versions.get(version) as { status?: string }).status !==
+          "failed",
+      )
+      .sort((a, b) => (a < b ? 1 : -1))[0];
     return top === undefined ? null : this.versions.get(top)!;
   }
 
@@ -593,6 +608,121 @@ describe("upload worker against write-once storage", () => {
       deletedAt: "2026-10-21T01:00:00Z",
     });
     expect(registry.versions.size).toBe(2);
+  });
+
+  // #521 review (P1): a second tombstone queued while the re-add is in
+  // flight, cleaned up before it settles, then failed and rolled back. The
+  // gateway's DELETE route answers "already deleted" over a tombstone head;
+  // the review's emulated interleaving queues one anyway, and so does this.
+  it("with production wiring, a failed second tombstone cannot leave a re-add committed to another writer's bytes", async () => {
+    registry.deleteScope();
+    Object.assign(registry.versions.get(1n)!, { status: "finalized" });
+    const content = envelope("re-added by A");
+    const r = await replica(content, 1);
+    r.storage.entries[0]!.afterTombstoneVersion = 1;
+
+    const productionDelete = createGatewayDeleteDataPort({
+      gatewayUrl: "https://gateway.test",
+      dataPointFeed: {
+        getDataPoint: async () => null,
+        listDataPointsByOwner: vi.fn(),
+      },
+      serverOwner: OWNER,
+      signer,
+      storage: {
+        endpoint: ENDPOINT,
+        chainId: CHAIN_ID,
+        signMessage: (message) => owner.signMessage({ message }),
+      },
+    });
+    const inventoryPage = async (
+      _scope: string,
+      paging: { after?: string } = {},
+    ) => {
+      const after = BigInt(paging.after ?? "0");
+      const rows = [...registry.versions.entries()]
+        .filter(([version]) => version > after)
+        .sort(([a], [b]) => (a < b ? -1 : 1));
+      return {
+        data: {
+          versions: rows.map(([version, record]) => ({
+            expectedVersion: version.toString(),
+            dataHash: record.dataHash,
+            metadataHash: record.metadataHash,
+            status: (record as { status?: string }).status ?? "pending",
+            addedAt: record.addedAt,
+            isTombstone: record.dataHash === TOMBSTONE_DATA_HASH,
+          })),
+        },
+        pagination: { limit: 1000, hasMore: false, nextAfter: null },
+      };
+    };
+    const cleanup: DeleteScopeDeps = {
+      storage: createMemoryDataStorage(),
+      serverOwner: OWNER,
+      deleteData: {
+        tombstone: async () => {
+          registry.deleteScope();
+          const head = registry.head()!;
+          return {
+            status: "tombstoned",
+            dataPointId: DATA_POINT_ID,
+            version: head.expectedVersion,
+            deletedAt: (head as { deletedAt?: string }).deletedAt ?? null,
+          };
+        },
+        deleteBlobVersions: productionDelete.deleteBlobVersions,
+      },
+      pendingBlobDeletions: createMemoryPendingBlobDeletionStore(),
+      dataPointFeed: {
+        getDataPoint: async () => registry.head(),
+        listDataPointsByOwner: vi.fn(),
+      },
+      tombstoneFinality: createInventoryTombstoneFinality({
+        page: inventoryPage as never,
+      }),
+      logger,
+    };
+
+    let bPutStatus: number | undefined;
+    registry.beforeRegister = async () => {
+      // 1. A observed tombstone v1 with ingest marker 1 and uploaded its
+      //    ciphertext at v2; its registration is about to be sent.
+      expect(blobs.blobs.has(blobs.keyFor(2))).toBe(true);
+      // 2. A second deletion queues tombstone v2 and its cleanup runs (the
+      //    delete's own pass and a later sync cycle's retry). B then writes
+      //    different ciphertext to key v2.
+      await deleteScope(cleanup, SCOPE);
+      await retryPendingBlobDeletions(cleanup);
+      const bBytes = await encryptWithPassword(
+        plaintextOf(envelope("other writer B")),
+        scopeKeyHex,
+      );
+      bPutStatus = (
+        await fetch(`${ENDPOINT}${blobs.keyFor(2)}`, {
+          method: "PUT",
+          body: bBytes,
+        })
+      ).status;
+      // 3. The second tombstone fails; rollback restores the v1 head.
+      Object.assign(registry.versions.get(2n)!, { status: "failed" });
+    };
+
+    // 4. A's registration recovers the failed v2 slot.
+    await upload(r, production);
+    await retryPendingBlobDeletions(cleanup);
+
+    expect(r.storage.entries[0]).toMatchObject({
+      version: 2,
+      dataPointId: DATA_POINT_ID,
+    });
+    expect(bPutStatus).toBe(409);
+    const stored = await decryptWithPassword(
+      blobs.blobs.get(blobs.keyFor(2))!,
+      scopeKeyHex,
+    );
+    expect(keccak256(stored)).toBe(registry.versions.get(2n)!.dataHash);
+    expect(registry.versions.get(2n)!.dataHash).toBe(hashOf(content));
   });
 
   it.each([
