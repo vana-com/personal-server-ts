@@ -30,6 +30,7 @@ import {
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
+  handlePersonalServerScopeUploadAppend,
   createScopeUploadRegistry,
   handleOuraCollectionRequirementsRequest,
   handlePersonalServerGrantsRequest,
@@ -39,6 +40,7 @@ import {
   type PersonalServerReadAuthInput,
   type PersonalServerReadAuthResult,
   type PersonalServerReadFulfillmentReporter,
+  type PreparedScopeUploadBatch,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   handlePersonalServerDerivativesRequest,
@@ -130,7 +132,14 @@ export type PsLiteReadAuthInput = PersonalServerReadAuthInput;
 
 export type PsLiteReadAuthResult = PersonalServerReadAuthResult;
 
-export type PsLiteAuthAdapter = PersonalServerApiAuthPort;
+export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
+  /**
+   * Opt in only when owner authorization does not interpret application body
+   * fields. Direct uploads authenticate a digest commitment instead of items.
+   * Existing/custom adapters without this flag retain their HTTP body contract.
+   */
+  supportsScopeUploadCommitments?: true;
+}
 
 export interface PsLiteRuntimeOptions {
   storage: PsLiteStorageAdapter | DataStoragePort;
@@ -271,6 +280,11 @@ export interface PsLiteRuntime extends RuntimeAvailabilityPort {
   activate(): void;
   deactivate(): void;
   fetch(request: Request): Promise<Response>;
+  /** Optional direct bulk transport; older/custom runtimes keep HTTP. */
+  appendScopeUpload?(
+    request: Request,
+    batch: PreparedScopeUploadBatch,
+  ): Promise<Response>;
 }
 
 /**
@@ -543,6 +557,7 @@ export function createBearerTokenPsLiteAuth(
     assertBearerToken(request, options.ownerToken, true);
   };
   return {
+    supportsScopeUploadCommitments: true,
     authorizeOwner,
     ...(options.writeSessions
       ? writeSessionAuthMethods(options.writeSessions, authorizeOwner)
@@ -621,6 +636,7 @@ export function createWeb3SignedPsLiteAuth(
     }
   };
   return {
+    supportsScopeUploadCommitments: true,
     authorizeOwner,
     ...(options.writeSessions
       ? writeSessionAuthMethods(
@@ -1012,6 +1028,21 @@ export function createPsLiteRuntime(
     isAvailable() {
       return active;
     },
+    ...(auth.supportsScopeUploadCommitments
+      ? {
+          async appendScopeUpload(
+            request: Request,
+            batch: PreparedScopeUploadBatch,
+          ) {
+            if (!active) return unavailableResponse();
+            return handlePersonalServerScopeUploadAppend(
+              request,
+              { storage: dataStorage, auth, accessLogWriter, scopeUploads },
+              batch,
+            );
+          },
+        }
+      : {}),
     async fetch(request: Request) {
       return withProtocolErrors(async () => {
         const url = new URL(request.url);

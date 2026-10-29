@@ -247,6 +247,86 @@ describe("startPersonalServer lite handle", () => {
     );
   });
 
+  it("serializes each bulk item once, parses none, and reuses bytes after a lost reply", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const runtime = createRuntime(gateway, storage);
+    let attempts = 0;
+    let bulkFetches = 0;
+    const commitments: string[] = [];
+    const ps = await startPersonalServer({
+      runtime: {
+        ...runtime,
+        async fetch(request) {
+          if (request.method === "PUT") bulkFetches += 1;
+          return runtime.fetch(request);
+        },
+        async appendScopeUpload(request, batch) {
+          commitments.push(await request.clone().text());
+          const response = await runtime.appendScopeUpload!(request, batch);
+          attempts += 1;
+          if (attempts === 1)
+            throw new TypeError("reply lost after persistence");
+          return response;
+        },
+      },
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const upload = await ps.openScopeUpload!("notes.entries", {
+      signMessage: ownerWallet.signMessage,
+    });
+    const items = Array.from({ length: 4 }, (_, i) => ({
+      marker: `count-item-${i}`,
+      text: "π😀",
+    }));
+    // Inject observers at the real JSON operations, not at a second model
+    // of the upload. On the old path each marker appears in 3 stringifies
+    // (sizing, HTTP body, persistence) and in the server's batch parse.
+    const stringify = vi.spyOn(JSON, "stringify");
+    const parse = vi.spyOn(JSON, "parse");
+    let serialized = 0;
+    let parsed = 0;
+    try {
+      await upload.append(items);
+      serialized = stringify.mock.results.reduce(
+        (n, result) =>
+          n +
+          (typeof result.value === "string"
+            ? (result.value.match(/count-item-\d/g)?.length ?? 0)
+            : 0),
+        0,
+      );
+      parsed = parse.mock.calls.reduce(
+        (n, [text]) => n + (text.match(/count-item-\d/g)?.length ?? 0),
+        0,
+      );
+    } finally {
+      stringify.mockRestore();
+      parse.mockRestore();
+    }
+    expect(serialized).toBe(items.length);
+    expect(parsed).toBe(0);
+    expect(attempts).toBe(2);
+    expect(bulkFetches).toBe(0);
+    expect(commitments).toHaveLength(2);
+    expect(commitments[0]).toBe(commitments[1]);
+    expect(commitments[0]).not.toContain("count-item-");
+    await expect(upload.commit()).resolves.toMatchObject({
+      records: items.length,
+    });
+    await expect(
+      ps.readData("notes.entries", {
+        auth: { signMessage: ownerWallet.signMessage },
+      }),
+    ).resolves.toMatchObject({ data: { records: items } });
+  });
+
   it("never serializes more than one batch of a large append at once", async () => {
     const gateway = createGateway();
     const storage = await createPersistentPsLiteStorage(
@@ -334,6 +414,9 @@ describe("startPersonalServer lite handle", () => {
     let failures = 2;
     const flaky = {
       ...runtime,
+      // Exercise the supported fallback transport independently of the new
+      // direct append path; its retry contract must not change.
+      appendScopeUpload: undefined,
       fetch(request: Request) {
         const isSecondBatch =
           request.method === "PUT" &&
@@ -370,6 +453,55 @@ describe("startPersonalServer lite handle", () => {
     await expect(ps.readData("notes.entries", { auth })).resolves.toMatchObject(
       { data: { records: [first, second] } },
     );
+  });
+
+  it("poisons a partially failed direct append until abort", async () => {
+    const gateway = createGateway();
+    const files = createMemoryPsLiteStagedFileStore();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      files,
+    );
+    const runtime = createRuntime(gateway, storage);
+    let failures = 2;
+    const ps = await startPersonalServer({
+      runtime: {
+        ...runtime,
+        appendScopeUpload(request, batch) {
+          if (
+            new URL(request.url).pathname.endsWith("/batches/1") &&
+            failures > 0
+          ) {
+            failures -= 1;
+            return Promise.reject(new TypeError("direct append failed"));
+          }
+          return runtime.appendScopeUpload!(request, batch);
+        },
+      },
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    const items = [
+      { id: 0, text: "a".repeat(600_000) },
+      { id: 1, text: "b".repeat(600_000) },
+    ];
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    await expect(upload.append(items)).rejects.toThrow("direct append failed");
+    await expect(upload.append(items)).rejects.toMatchObject({
+      errorCode: "UPLOAD_FAILED",
+    });
+    await expect(upload.commit()).rejects.toMatchObject({
+      errorCode: "UPLOAD_FAILED",
+    });
+    expect(files.files.size).toBe(0);
+    await upload.abort();
+    const retry = await ps.openScopeUpload!("notes.entries", auth);
+    await retry.append(items);
+    await expect(retry.commit()).resolves.toMatchObject({ records: 2 });
+    expect(files.files.size).toBe(1);
   });
 
   it("exposes typed data and sync helpers through the public handle", async () => {

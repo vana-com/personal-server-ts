@@ -39,6 +39,10 @@ import {
 } from "@opendatalabs/personal-server-ts-core/client";
 import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
 import {
+  prepareScopeUploadBatches,
+  type PreparedScopeUploadBatch,
+} from "@opendatalabs/personal-server-ts-core/api";
+import {
   createGatewayClient,
   type DataFileEnvelope,
   type GatewayClient,
@@ -358,8 +362,49 @@ export async function startPersonalServer(
       seq += 1;
     }
 
+    async function sendPreparedBatch(
+      batch: PreparedScopeUploadBatch,
+    ): Promise<void> {
+      const batchPath = `${path}/batches/${seq}`;
+      const sendPrepared = async () => {
+        const request = await createOwnerRequest({
+          origin,
+          path: batchPath,
+          method: "PUT",
+          body: { bodySha256: batch.bodySha256 },
+          authOptions: uploadOptions,
+          headers: {
+            "Content-Type": "application/json",
+            ...uploadOptions.headers,
+          },
+        });
+        return parsePersonalServerJsonResponse(
+          await runtime.appendScopeUpload!(request, batch),
+          "scope upload batch",
+        );
+      };
+      try {
+        await sendPrepared();
+      } catch (err) {
+        if (err instanceof PersonalServerClientError) throw err;
+        // Retain the immutable batch, not the source objects: a lost reply
+        // must replay the very same bytes without serializing them again.
+        await sendPrepared();
+      }
+      seq += 1;
+    }
+
     /** Group items into batches by their own encoded size, one at a time. */
     async function appendItems(items: unknown[]): Promise<void> {
+      if (runtime.appendScopeUpload) {
+        for await (const batch of prepareScopeUploadBatches(
+          items,
+          batchBytes,
+        )) {
+          await sendPreparedBatch(batch);
+        }
+        return;
+      }
       const encoder = new TextEncoder();
       const frameBytes = encoder.encode('{"items":[]}').byteLength;
       let batch: unknown[] = [];
