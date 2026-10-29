@@ -359,8 +359,16 @@ export function copyBinaryToCanonical(
  * chunk form, so a flag-off or plain main build can read it. One blob per
  * transaction; each costs one whole value in memory. Run it only when
  * replication is retired: an enabled store keeps large blobs chunk-only.
+ * A first enable that stopped after the door committed, before the replica
+ * schema, left no chunk store, so there is nothing to write.
  */
 export function materializeCanonicalBinaries(db: Database): number {
+  const chunkStore = db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdpp_binary_manifests'",
+    )
+    .get();
+  if (!chunkStore) return 0;
   const missing = db
     .prepare(
       `SELECT m.blob_id, b.size_bytes, b.sha256
