@@ -78,8 +78,11 @@ function object(value: unknown): value is Record<string, unknown> {
 export interface PdppImportJobsOptions {
   capability: PdppImportJobCapability;
   declarations: ImportDeclarations;
-  /** The authenticated server owner. Jobs bound to anyone else are refused. */
-  owner: string;
+  /**
+   * The authenticated server owner, read on every operation. Jobs bound to
+   * anyone else are refused, and so is every operation while it is empty.
+   */
+  owner: string | (() => string | undefined);
   now?: () => Date;
 }
 
@@ -93,7 +96,13 @@ export function createPdppImportJobs(
       `import job adapter implements contract ${String(capability.contractVersion)}, engine requires ${PDPP_IMPORT_JOB_CONTRACT_VERSION}`,
     );
   }
-  const owner = options.owner.toLowerCase();
+  function currentOwner(): string {
+    const value =
+      typeof options.owner === "function" ? options.owner() : options.owner;
+    if (!nonEmpty(value))
+      throw new ImportJobError("owner_mismatch", "no server owner is bound");
+    return value.toLowerCase();
+  }
   const now = () => (options.now ?? (() => new Date()))().toISOString();
 
   // One request per job at a time: IMPORT_JOB_MAX_IN_FLIGHT.
@@ -115,9 +124,29 @@ export function createPdppImportJobs(
   async function readJob(jobId: unknown): Promise<ImportJobRecord> {
     if (typeof jobId !== "string" || !JOB_ID.test(jobId))
       throw invalid("jobId must match [A-Za-z0-9._:-]{1,128}");
+    const owner = currentOwner();
     const job = await capability.readJob(jobId);
     if (!job) throw new ImportJobError("job_not_found");
+    if (job.binding.owner !== owner) throw new ImportJobError("owner_mismatch");
     return job;
+  }
+
+  /** Every spool byte is in a durable batch, and the receipts chain from 0 to the end. */
+  async function assertSpoolConsumed(job: ImportJobRecord): Promise<void> {
+    const incomplete = () =>
+      new ImportJobError(
+        "spool_incomplete",
+        `durable batches cover ${job.spoolOffset} of ${job.spool.byteLength} spool bytes`,
+      );
+    if (job.nextSeq < 1 || job.spoolOffset !== job.spool.byteLength)
+      throw incomplete();
+    let end = 0;
+    for (let seq = 0; seq < job.nextSeq; seq++) {
+      const receipt = await capability.readBatchReceipt(job.jobId, seq);
+      if (!receipt || receipt.spoolStart !== end) throw incomplete();
+      end = receipt.spoolEnd;
+    }
+    if (end !== job.spool.byteLength) throw incomplete();
   }
 
   function status(job: ImportJobRecord): ImportJobStatus {
@@ -169,6 +198,7 @@ export function createPdppImportJobs(
       !nonEmpty(spool.id) ||
       spool.format !== PDPP_IMPORT_SPOOL_FORMAT ||
       !count(spool.byteLength) ||
+      spool.byteLength < 1 ||
       typeof spool.sha256 !== "string" ||
       !SHA256_HEX.test(spool.sha256)
     )
@@ -189,7 +219,7 @@ export function createPdppImportJobs(
       batchBytes > IMPORT_JOB_MAX_BATCH_BYTES
     )
       throw invalid(`batchBytes must be 1..${IMPORT_JOB_MAX_BATCH_BYTES}`);
-    if (binding.owner.toLowerCase() !== owner)
+    if (binding.owner.toLowerCase() !== currentOwner())
       throw new ImportJobError("owner_mismatch");
     for (const stream of streams) {
       if (!declarations.forInstance(binding.instance, stream))
@@ -453,6 +483,7 @@ export function createPdppImportJobs(
           "batch_count_mismatch",
           `the job holds ${job.nextSeq} durable batches`,
         );
+      await assertSpoolConsumed(job);
       let connectorStateSha256: string | null = null;
       if (input.connectorState !== undefined) {
         if (typeof input.connectorState !== "string")
@@ -515,6 +546,14 @@ export function createPdppImportJobs(
     status: async (jobId) => status(await readJob(jobId)),
     commit,
     abort,
-    connectorState: (instance) => capability.readConnectorState(instance),
+    async connectorState(instance) {
+      const owner = currentOwner();
+      const state = await capability.readConnectorState(instance);
+      if (!state) return undefined;
+      const job = await capability.readJob(state.jobId);
+      if (!job || job.binding.owner !== owner)
+        throw new ImportJobError("owner_mismatch");
+      return state;
+    },
   };
 }

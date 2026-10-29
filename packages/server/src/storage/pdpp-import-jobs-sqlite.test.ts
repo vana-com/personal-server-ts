@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -373,6 +374,43 @@ describe("Node SQLite import job adapter", () => {
     await expect(
       jobs.commit({ jobId: "job-1", batches: status.job.nextSeq }),
     ).rejects.toMatchObject({ code: "job_not_open" });
+    expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
+  });
+
+  it("refuses to publish a zero-batch or prefix-only job, even called directly", async () => {
+    const { capability, jobs, begin, db } = await prepare();
+    await jobs.begin(begin);
+    const publishNow = async () =>
+      capability.publish({
+        job: (await jobs.status("job-1")).job,
+        connectorState: '{"cursor":"end"}',
+        connectorStateSha256: null,
+        committedAt: "2026-10-28T00:00:00.000Z",
+        declarations,
+      });
+    await expect(publishNow()).rejects.toMatchObject({
+      code: "spool_incomplete",
+    });
+    const window = await capability.readSpool!(begin.spool, 0, 256);
+    const end = window.lastIndexOf(0x0a) + 1;
+    const text = new TextDecoder().decode(window.subarray(0, end));
+    await jobs.append({
+      jobId: "job-1",
+      seq: 0,
+      text,
+      sha256: createHash("sha256")
+        .update(window.subarray(0, end))
+        .digest("hex"),
+      spoolStart: 0,
+      spoolEnd: end,
+    });
+    await expect(publishNow()).rejects.toMatchObject({
+      code: "spool_incomplete",
+    });
+    await expect(
+      jobs.commit({ jobId: "job-1", batches: 1, connectorState: "{}" }),
+    ).rejects.toMatchObject({ code: "spool_incomplete" });
+    expect(count(db, "SELECT COUNT(*) AS n FROM pdpp_records")).toBe(0);
     expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
   });
 

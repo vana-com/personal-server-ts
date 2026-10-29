@@ -177,6 +177,8 @@ export function createSqliteImportJobCapability(
       if (job.state !== "open") throw new ImportJobError("job_not_open");
       if (job.nextSeq !== input.job.nextSeq)
         throw new ImportJobError("batch_count_mismatch");
+      if (job.nextSeq < 1 || job.spoolOffset !== job.spool.byteLength)
+        throw new ImportJobError("spool_incomplete");
       const { instance, sourceId, method, generation } = job.binding;
       const binding = store.getInstanceBinding(instance);
       if (

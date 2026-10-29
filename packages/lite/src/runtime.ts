@@ -1037,12 +1037,12 @@ export function createPsLiteRuntime(
     return undefined;
   }
 
-  // A missing owner binds no job: every begin is refused as another owner's.
+  // The owner is read on every job operation; while it is missing, all refuse.
   const importJobs =
     options.importJobs &&
     createPdppImportJobs({
       ...options.importJobs,
-      owner: ownerAddress() ?? "",
+      owner: () => ownerAddress(),
       now,
     });
 

@@ -110,4 +110,25 @@ describe("PS Lite import jobs", () => {
       runtime.importJobs!.begin(beginInput(spool)),
     ).rejects.toMatchObject({ code: "owner_mismatch" });
   });
+
+  it("refuses every operation on an owned job when the runtime has no owner", async () => {
+    const { capability, spool } = await vectorCapability();
+    const owned = createTestRuntime({
+      serverOwner: IMPORT_VECTOR_OWNER,
+      importJobs: { capability, declarations: importVectorDeclarations },
+    }).importJobs!;
+    await owned.begin(beginInput(spool));
+    const status = await importSpool(owned, "job-1", capability.readSpool!);
+    const unowned = createTestRuntime({
+      importJobs: { capability, declarations: importVectorDeclarations },
+    }).importJobs!;
+    for (const call of [
+      () => unowned.status("job-1"),
+      () => unowned.commit({ jobId: "job-1", batches: status.job.nextSeq }),
+      () => unowned.abort("job-1"),
+      () => unowned.connectorState(IMPORT_VECTOR_INSTANCE),
+    ])
+      await expect(call()).rejects.toMatchObject({ code: "owner_mismatch" });
+    expect((await owned.status("job-1")).job.state).toBe("open");
+  });
 });

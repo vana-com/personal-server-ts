@@ -333,6 +333,8 @@ export type ImportJobErrorCode =
   | "spool_offset_mismatch"
   | "batch_count_mismatch"
   | "state_too_large"
+  /** Commit before every spool byte is in a durable batch (added after b5f53725). */
+  | "spool_incomplete"
   | "completion_failed";
 
 export class ImportJobError extends Error {

@@ -309,6 +309,130 @@ describe("PDPP import job engine (in-memory adapter)", () => {
     ).rejects.toMatchObject({ code: "batch_count_mismatch" });
   });
 
+  it("never publishes a zero-batch or prefix-only job", async () => {
+    const { capability, begin, engine, spool } = await setup();
+    const jobs = engine();
+    await expect(
+      jobs.begin({
+        ...begin,
+        jobId: "empty",
+        spool: { ...begin.spool, byteLength: 0 },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await jobs.begin(begin);
+    const completion = {
+      sourceCollectedAt: "2026-10-28T00:00:00.000Z",
+      streams: [
+        {
+          stream: "events",
+          liveRecordCount: 0,
+          liveSnapshotDigest: `sha256:${"0".repeat(64)}`,
+        },
+      ],
+    };
+    await expect(
+      jobs.commit({
+        jobId: "job-1",
+        batches: 0,
+        connectorState: '{"cursor":"end"}',
+        completion,
+      }),
+    ).rejects.toMatchObject({ code: "spool_incomplete" });
+    const firstLineEnd = spool.bytes.indexOf(0x0a) + 1;
+    const line = spool.bytes.subarray(0, firstLineEnd);
+    await jobs.append({
+      jobId: "job-1",
+      seq: 0,
+      text: new TextDecoder().decode(line),
+      sha256: await sha256HexOf(line),
+      spoolStart: 0,
+      spoolEnd: firstLineEnd,
+    });
+    await expect(
+      jobs.commit({
+        jobId: "job-1",
+        batches: 1,
+        connectorState: '{"cursor":"end"}',
+      }),
+    ).rejects.toMatchObject({ code: "spool_incomplete" });
+    // The adapter refuses a prefix job too, whoever calls it.
+    const job = (await jobs.status("job-1")).job;
+    await expect(
+      capability.publish({
+        job,
+        connectorState: '{"cursor":"end"}',
+        connectorStateSha256: null,
+        committedAt: "2026-10-28T00:00:00.000Z",
+        declarations,
+      }),
+    ).rejects.toMatchObject({ code: "spool_incomplete" });
+    expect(await jobs.connectorState(INSTANCE)).toBeUndefined();
+    expect(adapterLive(capability)).toEqual({});
+    expect(capability.completion(INSTANCE, "events")).toBeUndefined();
+    expect((await jobs.status("job-1")).job.state).toBe("open");
+  });
+
+  it("checks the job's stored owner on every operation and refuses an empty owner", async () => {
+    const { capability, begin, engine, spool } = await setup();
+    const jobs = engine();
+    await jobs.begin(begin);
+    const firstLineEnd = spool.bytes.indexOf(0x0a) + 1;
+    const line = spool.bytes.subarray(0, firstLineEnd);
+    const batch = {
+      jobId: "job-1",
+      seq: 0,
+      text: new TextDecoder().decode(line),
+      sha256: await sha256HexOf(line),
+      spoolStart: 0,
+      spoolEnd: firstLineEnd,
+    };
+    const other = createPdppImportJobs({
+      capability,
+      declarations,
+      owner: "0xother",
+    });
+    const missing = createPdppImportJobs({
+      capability,
+      declarations,
+      owner: () => undefined,
+    });
+    const empty = createPdppImportJobs({ capability, declarations, owner: "" });
+    for (const stranger of [other, missing, empty]) {
+      await expect(stranger.append(batch)).rejects.toMatchObject({
+        code: "owner_mismatch",
+      });
+      await expect(stranger.status("job-1")).rejects.toMatchObject({
+        code: "owner_mismatch",
+      });
+      await expect(
+        stranger.commit({ jobId: "job-1", batches: 0 }),
+      ).rejects.toMatchObject({ code: "owner_mismatch" });
+      await expect(stranger.abort("job-1")).rejects.toMatchObject({
+        code: "owner_mismatch",
+      });
+    }
+    for (const unbound of [missing, empty])
+      await expect(unbound.begin(begin)).rejects.toMatchObject({
+        code: "owner_mismatch",
+      });
+    expect((await jobs.status("job-1")).job.state).toBe("open");
+    expect(capability.stagedCount("job-1")).toBe(0);
+
+    const status = await importSpool(jobs, "job-1", capability.readSpool!);
+    await jobs.commit({
+      jobId: "job-1",
+      batches: status.job.nextSeq,
+      connectorState: '{"cursor":"end"}',
+    });
+    expect((await jobs.connectorState(INSTANCE))?.state).toBe(
+      '{"cursor":"end"}',
+    );
+    for (const stranger of [other, missing, empty])
+      await expect(stranger.connectorState(INSTANCE)).rejects.toMatchObject({
+        code: "owner_mismatch",
+      });
+  });
+
   it("refuses an adapter of another contract version", () => {
     const capability = createMemoryImportJobCapability({ contractVersion: 2 });
     expect(() =>
