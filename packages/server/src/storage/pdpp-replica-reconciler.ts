@@ -6,7 +6,9 @@ import {
   type RecordOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
+  declarationWait,
   planReplicaMerge,
+  resolveDeclaration,
   type MergeContext,
   type MergeIssue,
   type ReplicaMergePlan,
@@ -751,7 +753,7 @@ export function createReplicaReconciler(deps: {
       ...keyPlan.pending,
       ...keyPlan.conflicts,
       ...keyPlan.rejected,
-    ].some((issue) => issue.reason !== "missing_declaration");
+    ].some((issue) => !declarationWait(issue.reason));
     const local = effects.binding(instance)!;
     for (const record of keyPlan.records) {
       const { generation } = record.identity;
@@ -792,7 +794,7 @@ export function createReplicaReconciler(deps: {
     );
     for (const issue of [...keyPlan.pending, ...keyPlan.rejected]) {
       if (
-        issue.reason !== "missing_declaration" &&
+        !declarationWait(issue.reason) &&
         issue.reason !== "invalid_record_data"
       )
         continue;
@@ -853,12 +855,9 @@ export function createReplicaReconciler(deps: {
     if (!local?.source_id) return;
     const mapping = { sourceId: local.source_id, methodId: local.method ?? "" };
     const { context, plan } = run;
-    const trusted = (op: CompletionEvent) =>
-      context.declarations.some(
-        (d) =>
-          d.sourceId === op.sourceId &&
-          canonicalJson(d.binding) === canonicalJson(op.declaration),
-      );
+    const resolution = (op: CompletionEvent) =>
+      resolveDeclaration(context.declarations, op.sourceId, op.declaration)
+        .status;
     const all = retained<CompletionEvent>(
       `${X.kind} IN ${COMPLETIONS} AND ${X.instance} = ? AND ${X.stream} = ?`,
       [instance, stream],
@@ -872,9 +871,14 @@ export function createReplicaReconciler(deps: {
           sql(
             "INSERT OR IGNORE INTO pdpp_replica_reconcile_dependencies VALUES (?, ?, ?, ?)",
           ).run(dependency.writerId, dependency.operationId, instance, stream);
-    for (const op of all)
-      if (!trusted(op))
-        plan.pending.push({ reason: "missing_declaration", operations: [op] });
+    for (const op of all) {
+      const status = resolution(op);
+      if (status === "missing" || status === "incompatible")
+        plan.pending.push({
+          reason: `${status}_declaration`,
+          operations: [op],
+        });
+    }
     if (!all.length) return;
     const connection = connectionFromFacts(
       context,

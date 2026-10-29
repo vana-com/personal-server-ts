@@ -41,6 +41,7 @@ import {
   type ReplicaEnvelope,
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import { resolveDeclaration } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import {
   prepareReplicaManifest,
   decodeReplicaManifest,
@@ -3336,24 +3337,28 @@ export function createReplicaTransportWorker(deps: {
     wake(`predecessor:${group.writer}:${manifest.sequence}`, now());
   }
   /**
+   * The declarations operations name that the host does not retain, with how
+   * the merge resolves each (`resolveDeclaration`).
+   */
+  function unretainedDeclarations(operations: readonly ReplicaOperation[]) {
+    const retained = deps.expected().declarations;
+    return operations.flatMap((op) => {
+      if (!("declaration" in op)) return [];
+      const { status } = resolveDeclaration(
+        retained,
+        op.sourceId,
+        op.declaration,
+      );
+      return status === "retained"
+        ? []
+        : [{ sourceId: op.sourceId, binding: op.declaration, status }];
+    });
+  }
+  /**
    * The copy decision for one complete download of a batch (contract v3.1
    * §3 "Coordinator step"). Runs inside the import outcome transaction, over
    * the durable copies, facts and disposition it commits with.
    */
-  /** The declarations operations name that the host does not trust yet. */
-  function untrustedDeclarations(operations: readonly ReplicaOperation[]) {
-    const trusted = deps.expected().declarations;
-    return operations.flatMap((op) =>
-      "declaration" in op &&
-      !trusted.some(
-        (entry) =>
-          entry.sourceId === op.sourceId &&
-          canonicalJson(entry.binding) === canonicalJson(op.declaration),
-      )
-        ? [{ sourceId: op.sourceId, binding: op.declaration }]
-        : [],
-    );
-  }
   function decideImport(
     group: Group,
     manifest: ReplicaManifest,
@@ -3431,19 +3436,20 @@ export function createReplicaTransportWorker(deps: {
               key: `${writer}:${manifest.sequence - 1}`,
             },
           };
-        // Operations under an untrusted declaration are now retained but
-        // pending: reconcile reports that wait (host contract §4.5).
+        // Operations under a missing or incompatible declaration are now
+        // retained but pending: reconcile reports them (host contract §4.5).
+        // A compatible version applies with the batch and needs no reconcile.
         const promoted = db
           .prepare(
             "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
           )
           .get(id, decision.copyKey) as { envelope_json: string } | undefined;
-        const [untrusted] = promoted
-          ? untrustedDeclarations(
+        const untrusted = promoted
+          ? unretainedDeclarations(
               (JSON.parse(promoted.envelope_json) as ReplicaEnvelope)
                 .operations,
-            )
-          : [];
+            ).find((entry) => entry.status !== "compatible")
+          : undefined;
         if (untrusted)
           reconcile.wake?.(
             `declaration:${untrusted.sourceId}:${untrusted.binding.stream}`,
@@ -3683,17 +3689,19 @@ export function createReplicaTransportWorker(deps: {
           if (misattributed) return refuse(misattributed);
           // Trusted retained declarations, never claims copied from the
           // envelope. An operation under a declaration this host does not
-          // trust (a peer upgraded first, or added a connector) is retained
-          // without trust: the merge keeps it pending and reconcile reports
-          // the declaration wait until the host supplies it. It must not stop
-          // the writer's chain, or one upgrade would hold back every later
-          // batch of that writer (host contract §4.5).
+          // retain (another version of a retained stream, a stream it does
+          // not declare yet, or an incompatible shape) is retained without
+          // trust, and the merge decides it. It must not stop the writer's
+          // chain, or one upgrade would hold back every later batch of that
+          // writer (host contract §4.5).
           const expected = deps.expected();
-          const untrusted = untrustedDeclarations(payload.envelope.operations);
+          const unretained = unretainedDeclarations(
+            payload.envelope.operations,
+          );
           // Decoded only for shape; trust is decided by the merge.
           decodeReplicaEnvelope(canonicalJson(payload.envelope), {
             owner: expected.owner,
-            declarations: [...expected.declarations, ...untrusted],
+            declarations: [...expected.declarations, ...unretained],
           });
           const stagedBlobs = payload.blobs.map((blob, index) => {
             let target = stagedObjects.get(index);
@@ -3835,6 +3843,16 @@ export function createReplicaTransportWorker(deps: {
           found.push({
             kind: "declaration",
             key: `${op.sourceId}:${op.declaration.stream}`,
+          });
+        // This device retains another shape of that stream, and a rebinding
+        // cannot change a retained shape: only the owner can resolve it.
+        else if (
+          issue.reason === "incompatible_declaration" &&
+          "declaration" in op
+        )
+          found.push({
+            kind: "owner",
+            key: `declaration:${op.sourceId}:${op.declaration.stream}`,
           });
         else
           found.push({

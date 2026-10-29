@@ -647,6 +647,8 @@ export function transportDevice(
     preexisting?: string;
     crash?: CrashController;
     instance?: string;
+    /** The bindings this device baselines with and trusts (default `expected`). */
+    declarations?: (typeof expected)["declarations"];
     /** Extra worker deps, passed through (e.g. coordinator quanta). */
     worker?: Record<string, unknown>;
   } = {},
@@ -691,8 +693,8 @@ export function transportDevice(
     nonce: `0x${randomBytes(16).toString("hex")}`,
   });
   if (opts.preexisting) put(opts.preexisting);
-  store.replication.beginBaseline(expected);
-  let declarations = expected.declarations;
+  let declarations = opts.declarations ?? expected.declarations;
+  store.replication.beginBaseline({ owner, declarations });
   let receiver: Receiver;
   const make = () => {
     receiver = createReplicaReceiver({

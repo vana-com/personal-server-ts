@@ -886,20 +886,25 @@ function completedReplica() {
   return all(source);
 }
 
-it("keeps unknown-declaration invalidation pending without erasing a trusted completion", () => {
+it("keeps an incompatible-declaration invalidation pending without erasing a trusted completion", () => {
   const d = device();
   send(d, completedReplica());
   const receipt = d.store.listStreamCompletions("conn_a");
   expect(receipt).toHaveLength(1);
+  // Another shape of the retained stream: refused, never applied.
   const invalidation: ReplicaOperation = {
     ...registration(),
     kind: "stream-invalidate",
     revision: { counter: 100, writerId: "unknown", operationId: "invalidate" },
-    declaration: { ...binding, digest: `sha256:${"c".repeat(64)}` },
+    declaration: {
+      ...binding,
+      digest: `sha256:${"c".repeat(64)}`,
+      semantics: "append_only",
+    },
   };
   const plan = send(d, [invalidation]);
   expect(
-    plan.pending.some((issue) => issue.reason === "missing_declaration"),
+    plan.pending.some((issue) => issue.reason === "incompatible_declaration"),
   ).toBe(true);
   expect(d.store.listStreamCompletions("conn_a")).toEqual(receipt);
   d.reopen();

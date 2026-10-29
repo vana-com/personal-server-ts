@@ -99,7 +99,13 @@ const importDeclarationWaits = (d: TransportDevice) =>
     )
     .all().length;
 
-function putIn(d: TransportDevice, instance: string, id: string, text: string) {
+function putIn(
+  d: TransportDevice,
+  instance: string,
+  id: string,
+  text: string,
+  semantics: "mutable_state" | "append_only" = "mutable_state",
+) {
   d.store.ingestBatch(
     [
       {
@@ -110,14 +116,14 @@ function putIn(d: TransportDevice, instance: string, id: string, text: string) {
         emitted_at: at,
       },
     ],
-    () => "mutable_state",
+    () => semantics,
     () => ["id"],
     { method: "export", generation: 1 },
   );
 }
 
 describe("two-writer rebinding traces", () => {
-  it("upgrade on one device first: the other keeps its chain, then converges when it upgrades", async () => {
+  it("upgrade on one device first: the other applies the new version by key and both converge", async () => {
     const net = network();
     const a = transportDevice(net);
     const b = transportDevice(net);
@@ -134,30 +140,17 @@ describe("two-writer rebinding traces", () => {
     b.put("c1", "c");
     await cycles([a, b], 8);
 
-    // A trusts both versions, so it takes B's v1 write.
-    expect(view(a, ["a", "b", "c", "x"])).toEqual({
-      a: "a2",
-      b: "b2",
-      c: "c1",
-      x: null,
-    });
-    // B imported A's v2 batch but cannot validate it yet: it stays pending
-    // (no loss), the wait sits on reconcile, and A's chain is not stopped.
-    expect(view(b, ["a", "b", "c", "x"])).toEqual({
-      a: "a1",
-      b: null,
-      c: "c1",
-      x: "x1",
-    });
-    expect(reconcileWait(b)).toBe(`declaration:${sourceId}:messages`);
+    // A trusts both versions, so it takes B's v1 write. B does not retain v2
+    // but retains its shape, so it applies A's v2 operations, validated by
+    // key, without a wait and without stopping A's chain.
+    const mixed = { a: "a2", b: "b2", c: "c1", x: null };
+    expect(view(a, ["a", "b", "c", "x"])).toEqual(mixed);
+    expect(view(b, ["a", "b", "c", "x"])).toEqual(mixed);
+    expect(reconcileWait(b)).toBeNull();
     expect(importDeclarationWaits(b)).toBe(0);
-    // A later v2 batch from A is imported too, not held behind the first.
-    a.put("b3", "b");
-    await cycles([a, b], 6);
-    expect(importDeclarationWaits(b)).toBe(0);
-    expect(view(b, ["b"])).toEqual({ b: null });
 
     rebind(b, [v2]);
+    a.put("b3", "b");
     b.put("c2", "c");
     await cycles([a, b], 8);
     const final = { a: "a2", b: "b3", c: "c2", x: null };
@@ -166,6 +159,87 @@ describe("two-writer rebinding traces", () => {
     expect(reconcileWait(b)).toBeNull();
     expect(writtenVersions(b)).toContain("1");
     expect(writtenVersions(b).at(-1)).toBe("2");
+  }, 60_000);
+
+  it("a device joins with only the new version: it takes the peer's older-version history", async () => {
+    const net = network();
+    const a = transportDevice(net);
+    // v1 history: writes, an overwrite and a delete.
+    a.put("old", "a");
+    a.put("kept v1", "k");
+    a.put("x1", "x");
+    a.put("y1", "y");
+    remove(a, "y");
+    a.put("o1", "o");
+    a.put("o2", "o");
+    await cycles([a], 4);
+    // v2 writes on top: an overwrite and a delete of v1 records, a new one.
+    rebind(a, [v2]);
+    a.put("new", "a");
+    remove(a, "x");
+    a.put("n2", "n");
+    await cycles([a], 4);
+    expect(writtenVersions(a)).toEqual(expect.arrayContaining(["1", "2"]));
+
+    const b = transportDevice(net, { declarations: [v2] });
+    await cycles([a, b], 10);
+    const ids = ["a", "k", "x", "y", "o", "n"];
+    const all = {
+      a: "new",
+      k: "kept v1",
+      x: null,
+      y: null,
+      o: "o2",
+      n: "n2",
+    };
+    expect(view(a, ids)).toEqual(all);
+    expect(view(b, ids)).toEqual(all);
+    expect(reconcileWait(b)).toBeNull();
+    expect(importDeclarationWaits(b)).toBe(0);
+    // B trusts v1 only through A's operations; its own journal never retains it.
+    expect(b.store.replication.declarationHistory()).toEqual([v2]);
+
+    // B writes over a v1 record and deletes another; A takes both.
+    b.put("from B", "k");
+    remove(b, "o");
+    await cycles([a, b], 8);
+    const after = { ...all, k: "from B", o: null };
+    expect(view(a, ids)).toEqual(after);
+    expect(view(b, ids)).toEqual(after);
+    expect(writtenVersions(b)).toEqual(["2", "2"]);
+  }, 60_000);
+
+  it("an incompatible shape of a retained stream is refused on both sides with an owner wait", async () => {
+    const net = network();
+    const reshaped = {
+      sourceId,
+      binding: {
+        ...binding,
+        digest: `sha256:${"9".repeat(64)}`,
+        semantics: "append_only" as const,
+      },
+    };
+    const a = transportDevice(net, { declarations: [reshaped] });
+    const b = transportDevice(net, { declarations: [v2] });
+    putIn(a, a.instance, "a", "a1", "append_only");
+    b.put("b1", "b");
+    await cycles([a, b], 8);
+    // Neither applies the other's records, and each reports the refusal as
+    // a wait only the owner can resolve, not a declaration wait.
+    expect(view(b, ["a", "b"])).toEqual({ a: null, b: "b1" });
+    expect(view(a, ["a", "b"])).toEqual({ a: "a1", b: null });
+    const refused = `owner:declaration:${sourceId}:messages`;
+    expect(reconcileWait(b)).toBe(refused);
+    expect(reconcileWait(a)).toBe(refused);
+    // The writer's chain is not stopped: a later batch still imports.
+    putIn(a, a.instance, "c", "c1", "append_only");
+    await cycles([a, b], 6);
+    expect(importDeclarationWaits(b)).toBe(0);
+    expect(view(b, ["c"])).toEqual({ c: null });
+    // The refusal is durable: a rebinding to that shape is refused too.
+    expect(() =>
+      b.store.replication.beginBaseline({ owner, declarations: [reshaped] }),
+    ).toThrow(/changed its semantics or primary key/);
   }, 60_000);
 
   it("upgrade on both devices at once: concurrent writes under the new binding converge", async () => {
@@ -219,13 +293,13 @@ describe("two-writer rebinding traces", () => {
     expect(writtenVersions(a)).toEqual(expect.arrayContaining(["1", "2"]));
     await cycles([a, b], 8);
     const ids = ["s", "p", "j", "n"];
-    // B (v1 only) applies every v1 operation, including the delete; the v2
-    // write waits for B's upgrade.
+    // B (v1 only) applies every v1 operation, including the delete, and the
+    // v2 write by key.
     expect(view(b, ids)).toEqual({
       s: null,
       p: "published v1",
       j: "journaled v1",
-      n: null,
+      n: "after v2",
     });
     // The host refreshes its trusted set with the retained history.
     a.declarations([v2, ...a.store.replication.declarationHistory()]);
@@ -258,10 +332,11 @@ describe("two-writer rebinding traces", () => {
     putIn(a, "conn2", "n", "new source");
     a.put("a2", "a");
     await cycles([a, b], 8);
-    // B does not know the connector or its declaration: its records wait,
-    // and the rest of A's batch applies.
+    // B does not know the connector or its declaration: its records wait on
+    // reconcile, and the rest of A's batch applies.
     expect(view(b, ["a"])).toEqual({ a: "a2" });
     expect(b.store.getRecord("conn2", "messages", "n")).toBeUndefined();
+    expect(reconcileWait(b)).toBe("mapping:conn2");
     expect(importDeclarationWaits(b)).toBe(0);
     b.put("b1", "b");
     await cycles([a, b], 6);

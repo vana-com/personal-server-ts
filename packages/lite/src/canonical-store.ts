@@ -7,6 +7,7 @@ import {
   type RecordOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
+  declarationWait,
   planReplicaMerge,
   type MergeContext,
 } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
@@ -451,7 +452,7 @@ export function createLiteCanonicalStore(deps: {
           if (certify) {
             const issues = planReplicaMerge(context, [...lifecycle, op]);
             unresolved ||= [...issues.pending, ...issues.rejected].some(
-              (issue) => issue.reason !== "missing_declaration",
+              (issue) => !declarationWait(issue.reason),
             );
           }
           if (provisionalRemoval && op.generation >= sourceGeneration) {

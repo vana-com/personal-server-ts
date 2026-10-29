@@ -18,6 +18,7 @@ export const REPLICA_POLICY = {
   retainLosers: true,
   laterUpsertResurrects: true,
   declarationVersions: "same-shape-versions-merge-by-revision",
+  carriedDeclarations: "same-shape-versions-trusted-by-key",
   appendOnlyConflict: "quarantine-until-separately-authorized-repair",
   authorization: "single-issuer-data-and-connection-evidence-only",
 } as const;
@@ -47,6 +48,7 @@ export type MergeIssueReason =
   | "missing_generation_reset"
   | "old_generation"
   | "missing_declaration"
+  | "incompatible_declaration"
   | "append_only_delete"
   | "invalid_record_data"
   | "incompatible_record_declaration"
@@ -79,6 +81,54 @@ export interface ReplicaMergePlan {
   rejected: MergeIssue[];
   pending: MergeIssue[];
   suppressed: MergeIssue[];
+}
+
+/**
+ * An operation pending on its declaration (missing or incompatible) never
+ * applies, so it neither certifies nor withdraws a stream's completion.
+ */
+export const declarationWait = (reason: MergeIssueReason) =>
+  reason === "missing_declaration" || reason === "incompatible_declaration";
+
+/** How a device treats the binding an operation carries (`resolveDeclaration`). */
+export type DeclarationResolution<T> =
+  | { status: "retained"; declaration: T }
+  | { status: "compatible" }
+  | { status: "incompatible" }
+  | { status: "missing" };
+
+/**
+ * A retained binding validates its operations against its own schema. A
+ * binding this device does not retain, but with the shape
+ * (`declarationShape`) of a retained binding of the same source, is
+ * compatible: another version of a stream this device already trusts, which
+ * a peer of the same owner wrote under and signed into its batch. Its schema
+ * is not known here, so its operations validate by primary key only. A
+ * binding of a retained stream with another shape is incompatible and never
+ * applies. Any other binding is missing: it names a stream this device does
+ * not declare yet, and its operations wait.
+ */
+export function resolveDeclaration<
+  T extends { sourceId: string; binding: DeclarationBinding },
+>(
+  declarations: readonly T[],
+  sourceId: string,
+  binding: DeclarationBinding,
+): DeclarationResolution<T> {
+  const stream = declarations.filter(
+    (entry) =>
+      entry.sourceId === sourceId && entry.binding.stream === binding.stream,
+  );
+  const exact = stream.find(
+    (entry) => canonicalJson(entry.binding) === canonicalJson(binding),
+  );
+  if (exact) return { status: "retained", declaration: exact };
+  if (!stream.length) return { status: "missing" };
+  return stream.some(
+    (entry) => declarationShape(entry.binding) === declarationShape(binding),
+  )
+    ? { status: "compatible" }
+    : { status: "incompatible" };
 }
 
 /**
@@ -188,18 +238,22 @@ export function planReplicaMerge(
         issue(result.pending, "missing_generation_reset", [operation]);
         continue;
       }
-      const declaration = context.declarations.find(
-        (entry) =>
-          entry.sourceId === operation.sourceId &&
-          canonicalJson(entry.binding) === canonicalJson(operation.declaration),
+      const resolved = resolveDeclaration(
+        context.declarations,
+        operation.sourceId,
+        operation.declaration,
       );
-      if (!declaration) {
-        issue(result.pending, "missing_declaration", [operation]);
+      if (resolved.status === "missing" || resolved.status === "incompatible") {
+        issue(result.pending, `${resolved.status}_declaration`, [operation]);
         continue;
       }
+      const validateData =
+        resolved.status === "retained"
+          ? resolved.declaration.validateData
+          : () => true;
       if (
         operation.kind === "delete" &&
-        declaration.binding.semantics === "append_only"
+        operation.declaration.semantics === "append_only"
       ) {
         issue(result.rejected, "append_only_delete", [operation]);
         continue;
@@ -210,9 +264,8 @@ export function planReplicaMerge(
           valid =
             computeRecordKeyFromData(
               operation.data,
-              declaration.binding.primaryKey,
-            ) === operation.recordKey &&
-            declaration.validateData(operation.data);
+              operation.declaration.primaryKey,
+            ) === operation.recordKey && validateData(operation.data);
         } catch {
           /* Invalid data/key cannot enter winner selection. */
         }

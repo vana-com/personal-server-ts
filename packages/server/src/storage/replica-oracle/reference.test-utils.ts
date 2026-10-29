@@ -95,11 +95,26 @@ function compareRevision(a: ReplicaOperation, b: ReplicaOperation): number {
 const isRecord = (op: ReplicaOperation): op is RecordOperation =>
   op.kind === "upsert" || op.kind === "delete";
 
-function declared(world: RefWorld, op: RecordOperation) {
+/**
+ * The exact binding is retained, or another version of the same stream is:
+ * same source, stream, semantics and primary key. A peer carries the older
+ * version in its operations; it validates by key here (as `validData` does).
+ */
+function retained(world: RefWorld, op: RecordOperation) {
   return world.declarations.some(
     (d) =>
       d.sourceId === op.sourceId &&
       canonicalJson(d.binding) === canonicalJson(op.declaration),
+  );
+}
+function declared(world: RefWorld, op: RecordOperation) {
+  return world.declarations.some(
+    (d) =>
+      d.sourceId === op.sourceId &&
+      d.binding.stream === op.declaration.stream &&
+      d.binding.semantics === op.declaration.semantics &&
+      canonicalJson(d.binding.primaryKey) ===
+        canonicalJson(op.declaration.primaryKey),
   );
 }
 function validData(op: RecordOperation): boolean {
@@ -359,7 +374,7 @@ export function refLocalWritable(
   return (
     status === "active" &&
     op.generation === generation &&
-    declared(world, op) &&
+    retained(world, op) &&
     validData(op)
   );
 }

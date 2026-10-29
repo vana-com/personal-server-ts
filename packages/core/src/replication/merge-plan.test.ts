@@ -281,8 +281,76 @@ it("fails closed for incompatible method, source and declaration evidence", () =
   ]);
   expect(conflict.records[0].quarantined).toBe(true);
   expect(conflict.conflicts[0].reason).toBe("incompatible_record_declaration");
-  const unknown = planReplicaMerge(context, [registration, otherDeclaration]);
+  // Not retained, but a retained stream has another shape: never applies.
+  const incompatible = planReplicaMerge(context, [
+    registration,
+    otherDeclaration,
+  ]);
+  expect(incompatible.records).toEqual([]);
+  expect(incompatible.pending[0].reason).toBe("incompatible_declaration");
+  // A stream with no retained binding at all waits for its declaration.
+  const undeclared = {
+    ...otherDeclaration,
+    declaration: { ...reshaped, stream: "other-stream" },
+  };
+  const unknown = planReplicaMerge(context, [registration, undeclared]);
   expect(unknown.pending[0].reason).toBe("missing_declaration");
+});
+
+it("applies a carried version of a retained stream by key, without its schema", () => {
+  // A peer still holds an older version this device never retained: same
+  // stream, semantics and key, another digest, version and schema.
+  const carried = {
+    ...binding,
+    digest: `sha256:${"e".repeat(64)}`,
+    version: "0.9.0",
+    schemaDigest: `sha256:${"f".repeat(64)}`,
+  };
+  const strict = {
+    ...context,
+    declarations: context.declarations.map((entry) => ({
+      ...entry,
+      validateData: () => false,
+    })),
+  };
+  const old = (operationId: string, counter: number, data = {}) => ({
+    ...upsert(operationId, counter, operationId, "device-b"),
+    declaration: carried,
+    data: { id: "same-key", text: operationId, ...data },
+  });
+  // The retained schema would reject this data; the carried version's schema
+  // is unknown, so the key alone decides.
+  const applied = planReplicaMerge(strict, [registration, old("older", 2)]);
+  expect(applied.pending).toEqual([]);
+  expect(applied.records[0].winner).toEqual(old("older", 2));
+  // A key that does not match the data is still rejected.
+  const wrongKey = { ...old("bad-key", 3), recordKey: "other-key" };
+  expect(
+    planReplicaMerge(strict, [registration, wrongKey]).rejected[0].reason,
+  ).toBe("invalid_record_data");
+  // It merges by revision with the retained version, and a delete under the
+  // carried version stays a delete.
+  const merged = assertPermutations([
+    registration,
+    old("older", 2),
+    upsert("newer", 3),
+  ]);
+  expect(merged.records[0].winner).toEqual(upsert("newer", 3));
+  const removal: ReplicaOperation = {
+    ...identity,
+    kind: "delete",
+    declaration: carried,
+    recordKey: "same-key",
+    emittedAt: "2026-10-20T00:00:00Z",
+    deletedAt: "2026-10-20T00:00:00Z",
+    revision: { counter: 4, writerId: "device-b", operationId: "removed" },
+  };
+  const deleted = assertPermutations([
+    registration,
+    upsert("newer", 3),
+    removal,
+  ]);
+  expect(deleted.records[0].winner?.kind).toBe("delete");
 });
 
 it("merges versions of one declared stream by revision, each valid under its own schema", () => {

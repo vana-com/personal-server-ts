@@ -527,22 +527,36 @@ stream with the same shape merge by revision. The transport encodes this
 device's own operations against the retained history too, so an operation
 captured before a rebinding still publishes.
 
-A batch that names a declaration this device does not trust yet (a peer
-upgraded first, or added a connector) imports. Its operations stay pending,
-reconcile reports a `declaration` wait, and the writer's later batches keep
-importing. When the host supplies the declaration, the trusted set changes and
-reconcile applies them. Nothing is lost or resurrected: a pending operation
-takes part in the merge only once it validates.
+An operation whose binding this device does not retain is resolved by
+`resolveDeclaration` in `merge-plan.ts`:
+
+- Compatible: a retained binding of the same source has the same shape. The
+  operation is another version of a stream this device already trusts, for
+  example a v1 write that a peer made before it upgraded to the v2 this device
+  joined with. Its batch passed the same owner, roster and signature checks as
+  every other batch, so it applies. Its schema is not known here, so it
+  validates by primary key only. Nothing is journaled; the binding stays
+  trusted through the operations that carry it.
+- Missing: no retained binding of that source has that stream (a peer added a
+  connector). The batch imports, its operations stay pending, reconcile
+  reports a `declaration` wait, and the writer's later batches keep importing.
+  When the host supplies the declaration, reconcile applies them.
+- Incompatible: a retained binding of that stream has another shape. The
+  operations stay pending as `incompatible_declaration` and never apply. A
+  rebinding cannot change a retained shape, so reconcile reports an `owner`
+  wait keyed `declaration:<source>:<stream>`. The writer's later batches keep
+  importing.
+
+Nothing is lost or resurrected: a pending operation takes part in the merge
+only once it resolves.
 
 Known limits:
 
-- A device that joins after a peer upgraded receives older-version operations
-  it cannot validate until its host supplies that declaration. They stay
-  pending. Carrying schemas in-band or fetching them by digest is follow-up
-  work.
+- A compatible version validates by key only: this device cannot check its
+  data against that version's schema.
 - A database baselined before generations gets generation 1 and a history
-  with an unknown schema. Until a host supplies that schema, operations under
-  it validate by key only.
+  with an unknown schema. Its operations are compatible with the current
+  binding, so they validate by key only until a host supplies that schema.
 - Lite needs the same history-aware context.
 
 ## 5. Opt-in and the one-way door

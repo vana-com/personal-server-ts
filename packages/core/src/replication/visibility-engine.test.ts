@@ -273,8 +273,24 @@ describe("completion availability", () => {
     ).toEqual({ operation: newer });
   });
 
+  it("takes a completion under another version of the retained stream", () => {
+    const carried = { ...binding, version: "2" };
+    const newer = {
+      ...completion([registration, a, b], [a.data, b.data], 12),
+      declaration: carried,
+    };
+    expect(completionAvailability({ ...facts, events: [done, newer] })).toEqual(
+      { operation: newer },
+    );
+  });
+
   it("ignores events under a declaration the host does not trust", () => {
-    const untrusted = { ...binding, version: "2" };
+    // Another shape of the retained stream: incompatible, never trusted.
+    const untrusted = {
+      ...binding,
+      version: "2",
+      semantics: "append_only" as const,
+    };
     expect(
       completionAvailability({
         ...facts,
