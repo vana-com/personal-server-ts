@@ -1,4 +1,5 @@
 import type { ReplicationDoorStatus } from "./replication/door.js";
+import type { ReplicaWriterRotation } from "./replication/writer-identity.js";
 import {
   buildWeb3SignedHeader,
   type DataFileEnvelope,
@@ -240,8 +241,14 @@ export interface PersonalServerHandle {
    * returned. Present only on a server whose storage enforces the door, so
    * its presence means the door is enforced, whatever the state. A host shows
    * the opt-in from `never`, and the reason from `refused`.
+   * `writerRotation` is what this boot did with the host's request to
+   * rotate the writer identity (host contract §3.2); absent on a runtime
+   * that cannot rotate at boot.
    */
-  readonly replication?: { status(): ReplicationDoorStatus };
+  readonly replication?: {
+    status(): ReplicationDoorStatus;
+    writerRotation?(): ReplicaWriterRotation;
+  };
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
   info(): Promise<PersonalServerInfo>;
   prepareRegistration(

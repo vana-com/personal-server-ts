@@ -23,6 +23,23 @@ export const REPLICA_WRITER_DOMAIN = "vana-pdpp-replica-writer-v1";
 export type ReplicaWriterRole = "transport" | "operation";
 export type ReplicaEnvironment = "dev" | "prod";
 
+/**
+ * Declared by a runtime that rotates the writer identity at boot when the
+ * host asks (host contract §3.2). A host checks it before it relies on the
+ * rotation.
+ */
+export const REPLICA_WRITER_ROTATION_CONTRACT = "replica-writer-rotation-v1";
+
+/**
+ * What a boot did with the host's rotation request. `rotated`: a new nonce
+ * before any write of this boot. `no_identity`: this database has no writer
+ * identity yet, so its first one gets a new nonce anyway. `replication_off`:
+ * replication does not run in this boot (flag off or a closed door), so
+ * there is no writer to rotate. `not_requested`: the host did not ask.
+ */
+export type ReplicaWriterRotation =
+  "rotated" | "no_identity" | "replication_off" | "not_requested";
+
 const address = z.string().regex(/^0x[0-9a-f]{40}$/);
 const bytes32 = z.string().regex(/^0x[0-9a-f]{64}$/);
 const bytes16 = z.string().regex(/^0x[0-9a-f]{32}$/);

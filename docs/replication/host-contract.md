@@ -160,6 +160,32 @@ replication door is closed, rotation throws `ReplicationRefusedError` and
 writes nothing; that database never replicates again, so the host may ignore
 the refusal.
 
+**How a host asks.** A host does not open the database itself. It passes
+`rotateReplicaWriterIdentity: true` to `createServer` or `startPersonalServer`
+for a boot in which the database may be a copy. PS rotates after the
+replication door and before any store of that boot captures a write, then
+reports what it did as `handle.replication.writerRotation()`:
+
+| Outcome           | Meaning                                                                     |
+| ----------------- | --------------------------------------------------------------------------- |
+| `rotated`         | New nonce under the same registration, before any write of this boot.       |
+| `no_identity`     | No writer identity yet. The first identity draws a new nonce anyway.        |
+| `replication_off` | Replication does not run in this boot (flag off or closed door). No writer. |
+| `not_requested`   | The host did not ask.                                                       |
+
+A runtime that does this exports `REPLICA_WRITER_ROTATION_CONTRACT`
+(`"replica-writer-rotation-v1"`). A host must not treat a copy as handled until
+the runtime reports one of the first three outcomes. Lite has no writer
+identity yet; A10 must take the same request in the Lite boot options
+(`replication.rotateWriterIdentity`), apply it before the first capture, and
+report the same outcome in `psReady` as `replication.writerRotation`.
+
+Copy detection belongs to the host. The hosts keep a random device binding in
+the platform keystore (OS keychain, Android Keystore, iOS Keychain
+this-device-only) and a copy of it next to the database, and ask for a rotation
+whenever the two differ. The rule and the paths it covers are in
+`unity-surfaces contracts/replica-writer-binding/`.
+
 ### 3.3 The batch statement
 
 The server key signs an EIP-712 statement for each batch (domain
