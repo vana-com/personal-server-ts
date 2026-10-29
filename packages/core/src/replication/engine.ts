@@ -87,6 +87,7 @@ import {
   abortable,
   createAsyncReplicaCoordinator,
   REPLICA_REPORT_LIMIT,
+  REPLICA_STEP_BYTES,
   validateReplicaStep,
   type AsyncReplicaCoordinatorStatePort,
   type AsyncReplicaPhaseHandler,
@@ -260,6 +261,7 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_fragments_in (
 CREATE TABLE IF NOT EXISTS pdpp_transport_fragment_parts (
  slot TEXT NOT NULL, position INTEGER NOT NULL, part INTEGER NOT NULL, json TEXT NOT NULL,
  PRIMARY KEY(slot,position,part));
+CREATE TABLE IF NOT EXISTS pdpp_transport_discover_floor (scope TEXT PRIMARY KEY, version INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS pdpp_manifests_in_batch ON pdpp_transport_manifests_in(writer,batch);
 CREATE INDEX IF NOT EXISTS pdpp_manifests_in_checked ON pdpp_transport_manifests_in(evidence_checked) WHERE state='imported';
 CREATE TABLE IF NOT EXISTS pdpp_transport_imported (
@@ -668,6 +670,8 @@ export interface ReplicaEngineHost<C extends ReplicaEffectContext> {
    * delete staged bytes that no staged-object row tracks.
    */
   sweepStages(): ReplicaEffect<void, C>;
+  /** Reclaim redundant host-specific canonical copies within the byte budget. */
+  compactCanonical?(bytes: number): ReplicaEffect<void, C>;
   exporter: ReplicaEngineExporter<C>;
   receiver: ReplicaEngineReceiver<C>;
   /**
@@ -992,6 +996,10 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
       identity.transportWriter,
       baseline?.after ?? 0,
     );
+    yield* sql.run(`UPDATE pdpp_transport_discover_floor SET version=min(version,(
+      SELECT min(o.version)-1 FROM pdpp_transport_manifests_out o
+      WHERE o.scope=pdpp_transport_discover_floor.scope))
+      WHERE scope IN (SELECT scope FROM pdpp_transport_manifests_out)`);
     for (const table of [
       "pdpp_transport_batches",
       "pdpp_transport_staged_fragments",
@@ -1931,10 +1939,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
             return yield* blockPreparation(batch.batch, "all_ops_unsupported");
           // The unused tail alone may give back its sequence and wire version.
           yield* discardPreparedFragments(batch.batch);
-          yield* sql.run(
-            "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
-            batch.batch,
-          );
+          yield* releaseClaim(batch.batch);
           yield* deleteReplicaPayload(batch.batch);
           yield* sql.run(
             "DELETE FROM pdpp_transport_batches WHERE batch=?",
@@ -1961,10 +1966,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
         if (yield* preparationHasExternalEffects(batch, prep.version))
           return yield* blockPreparation(batch.batch);
         yield* discardPreparedFragments(batch.batch);
-        yield* sql.run(
-          "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
-          batch.batch,
-        );
+        yield* releaseClaim(batch.batch);
         yield* deleteReplicaPayload(batch.batch);
         for (const table of ["pdpp_binary_chunks", "pdpp_binary_manifests"])
           yield* sql.run(
@@ -3023,10 +3025,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
         );
         // Release every old slot before assigning the suffix, including unsigned claims.
         for (const claim of moving) {
-          yield* sql.run(
-            "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
-            claim.batch,
-          );
+          yield* releaseClaim(claim.batch);
           yield* sql.run(
             "DELETE FROM pdpp_transport_registration_intents WHERE scope=? AND version=?",
             row.scope,
@@ -3288,6 +3287,20 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
       batch,
     );
   }
+  /** Revisit a released slot if another writer registers it. */
+  function* releaseClaim(batch: string): Fx<void> {
+    yield* sql.run(
+      `UPDATE pdpp_transport_discover_floor
+      SET version=min(version,(SELECT version-1 FROM pdpp_transport_manifests_out WHERE batch=?))
+      WHERE scope=(SELECT scope FROM pdpp_transport_manifests_out WHERE batch=?)`,
+      batch,
+      batch,
+    );
+    yield* sql.run(
+      "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
+      batch,
+    );
+  }
   /** Reclaim batches finalized before reclaim existed. Once per engine. */
   let reclaimSwept = false;
   function* sweepPublished(): Fx<void> {
@@ -3298,6 +3311,18 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
          OR EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=m.batch AND length(f.encrypted)>0))`,
     );
     for (const { batch } of batches) yield* reclaimPublished(batch);
+    const ownAdmissions = `SELECT i.slot FROM pdpp_transport_manifests_in i
+      JOIN pdpp_transport_manifests_out o ON o.scope=i.scope AND o.version=i.version AND o.state='published'
+      WHERE (i.state='ready' AND i.manifest_json IS NULL) OR (i.state='imported' AND i.batch=o.batch)`;
+    yield* sql.run(
+      `DELETE FROM pdpp_transport_fragment_parts WHERE slot IN (${ownAdmissions})`,
+    );
+    yield* sql.run(
+      `DELETE FROM pdpp_transport_fragments_in WHERE slot IN (${ownAdmissions})`,
+    );
+    yield* sql.run(
+      `DELETE FROM pdpp_transport_manifests_in WHERE slot IN (${ownAdmissions})`,
+    );
     reclaimSwept = true;
   }
   const publish: Handler<Item<Outbound>> = {
@@ -3498,15 +3523,30 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
             const pointWriter = replicaWriterOf(point.scope);
             if (!pointWriter || !/^[1-9][0-9]{0,14}$/.test(point.version))
               continue;
-            const known = (yield* sql.get<{ version: number }>(
-              "SELECT coalesce(max(version),0) AS version FROM pdpp_transport_manifests_in WHERE scope=?",
-              point.scope,
-            ))!.version;
-            const last = Math.min(
-              Number(point.version),
-              known + DISCOVER_SLOTS,
+            // Every version through the floor is claimed or admitted.
+            const head = Number(point.version);
+            const floor =
+              (yield* sql.get<{ version: number }>(
+                "SELECT version FROM pdpp_transport_discover_floor WHERE scope=?",
+                point.scope,
+              ))?.version ?? 0;
+            const covered = new Set(
+              (yield* sql.all<{ version: number }>(
+                `SELECT version FROM pdpp_transport_manifests_out WHERE scope=? AND version>? AND version<=?
+               UNION ALL SELECT version FROM pdpp_transport_manifests_in WHERE scope=? AND version>? AND version<=?`,
+                point.scope,
+                floor,
+                head,
+                point.scope,
+                floor,
+                head,
+              )).map((row) => row.version),
             );
-            for (let version = known + 1; version <= last; version++)
+            let admitted = 0;
+            let version = floor + 1;
+            for (; version <= head; version++) {
+              if (covered.has(version)) continue;
+              if (admitted === DISCOVER_SLOTS) break;
               yield* sql.run(
                 "INSERT OR IGNORE INTO pdpp_transport_manifests_in (slot,scope,version,writer) VALUES (?,?,?,?)",
                 slotKey(point.scope, version),
@@ -3514,6 +3554,13 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
                 version,
                 pointWriter,
               );
+              admitted++;
+            }
+            yield* sql.run(
+              "INSERT INTO pdpp_transport_discover_floor (scope,version) VALUES (?,?) ON CONFLICT(scope) DO UPDATE SET version=excluded.version",
+              point.scope,
+              version - 1,
+            );
           }
           yield* sql.run(
             "UPDATE pdpp_transport_state SET scan_cursor=? WHERE id=1",
@@ -5003,6 +5050,13 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
               `DELETE FROM ${table} WHERE namespace='payload' AND NOT EXISTS (SELECT 1 FROM pdpp_transport_batches b WHERE b.batch=${table}.blob_id)`,
             );
           yield* sweepPublished();
+          if (host.compactCanonical)
+            yield* host.compactCanonical(
+              Math.min(
+                4 * 1024 * 1024,
+                Math.floor((context.budget.bytes ?? REPLICA_STEP_BYTES) / 4),
+              ),
+            );
         })(),
       );
       const current = await query(dependencyFingerprint());

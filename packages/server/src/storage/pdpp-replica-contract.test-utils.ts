@@ -1037,6 +1037,22 @@ export function transportInvariantViolations(d: TransportDevice): string[] {
         `slot imported without receipt: ${orphanImported.map((r) => r.slot).join(",")}`,
       );
   }
+  if (has("pdpp_transport_discover_floor")) {
+    // Discovery reads only versions above a scope's floor, so every version
+    // at or below it must be claimed here or admitted.
+    const gaps = db
+      .prepare(
+        `SELECT f.scope FROM pdpp_transport_discover_floor f WHERE f.version <> (
+          SELECT count(*) FROM (
+            SELECT version FROM pdpp_transport_manifests_out WHERE scope=f.scope AND version BETWEEN 1 AND f.version
+            UNION SELECT version FROM pdpp_transport_manifests_in WHERE scope=f.scope AND version BETWEEN 1 AND f.version))`,
+      )
+      .all() as { scope: string }[];
+    if (gaps.length)
+      violations.push(
+        `discover floor above an unadmitted version: ${gaps.map((r) => r.scope).join(",")}`,
+      );
+  }
   if (has("pdpp_transport_batches")) {
     const prepared = db
       .prepare(

@@ -20,7 +20,7 @@ import {
   type ReplicaEffectContext,
 } from "@opendatalabs/personal-server-ts-core/replication/effects";
 import { ReplicaCoordinatorConflict } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
-import { deleteBinary } from "./pdpp-binary-chunks.js";
+import { deleteBinary, createBinaryCompactor } from "./pdpp-binary-chunks.js";
 import { createSqliteReplicaCoordinatorState } from "./pdpp-replica-coordinator-state.js";
 import { nodeReplicaContext } from "./pdpp-replica-sql.js";
 import {
@@ -119,7 +119,12 @@ export function createReplicaTransportWorker(
     ownedTokens.add(token);
   }
 
+  const compactor = createBinaryCompactor(db);
   const host: ReplicaEngineHost<C> = {
+    compactCanonical: (bytes) =>
+      sync(() => {
+        compactor.step(bytes);
+      }),
     run,
     immediate: (effect) =>
       sync(() => db.transaction(() => run(effect)).immediate()),

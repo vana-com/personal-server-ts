@@ -370,6 +370,24 @@ describe("PS-Lite replication engine with a Node writer", () => {
       slot.slice(0, slot.lastIndexOf("/")),
     );
     expect(new Set(scopes).size).toBe(2);
+    for (const db of [node.db, lite.native().db]) {
+      expect(
+        db
+          .prepare(
+            `SELECT count(*) AS n FROM pdpp_transport_manifests_in i
+        JOIN pdpp_transport_manifests_out o ON i.scope=o.scope AND i.version=o.version`,
+          )
+          .get(),
+      ).toEqual({ n: 0 });
+      expect(
+        db
+          .prepare(
+            `SELECT count(*) AS n FROM pdpp_transport_fragment_parts p
+        JOIN pdpp_transport_manifests_in i ON i.slot=p.slot WHERE i.state='imported'`,
+          )
+          .get(),
+      ).toEqual({ n: 0 });
+    }
   });
 
   it("imports a Node record's blob as a canonical blob on the phone", async () => {
