@@ -1325,7 +1325,9 @@ describe("59 [Node SQLite] finding e (#428 F1)", () => {
         `crash point ${i} (${probe.trace[i]}): epoch moves iff the withdrawal committed (withdrawn=${withdrawn})`,
       ).toBe(withdrawn);
     }
-  }, 30_000); // one seeded store per process-loss point
+    // One seeded store per process-loss point. The reconciler's queue and
+    // facts commit in the same transactions: 72 points, 41 without them.
+  }, 120_000);
   it("59b read side: an in-flight changes cursor and a terminal token both expire; a fresh session never returns b's payload; history stays", () => {
     const d = seeded();
     const page1 = d.changes({ limit: 1 });

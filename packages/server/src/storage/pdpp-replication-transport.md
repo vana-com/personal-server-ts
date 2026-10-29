@@ -350,6 +350,19 @@ after restart. Flag-off creates no recovery schema and performs no recovery work
 
 Each cycle attempts every phase even if an earlier phase fails, then reports
 collected errors so retained imports can advance during a feed outage.
+The reconcile phase calls `receiver.reconcileStep` with one page
+(`REPLICA_RECONCILE_PAGE`: 2,000 retained operations or 8 MiB of their JSON).
+A full pass starts only when a dependency changed: the fingerprint moved, a
+host notification woke it, or an outstanding Wait reached its bounded
+fallback. While the receiver has queued work the phase stays due and runs one
+page per step; `pdpp_transport_reconcile_pass` keeps the pass's earliest Wait
+dependency across pages and restart, and the last page reports it. Each page
+reserves its bytes times `REPLICA_ENVELOPE_LIVE_COPY_FACTOR` from the shared
+byte budget. A refusal is `Retry(resource_busy)` with backoff, and queued
+pages do not override that backoff; after it, the open pass continues rather
+than starting again. A page larger
+than the whole budget runs when no other work holds bytes. With nothing queued
+and nothing outstanding the phase is never due and reads no retained history.
 New large canonical, pinned and received bytes use the same 64 KiB chunk store.
 Receiver reconciliation re-hashes actual chunks on every retry. Existing
 single-BLOB rows remain readable; their native SQLite memory use is not bounded

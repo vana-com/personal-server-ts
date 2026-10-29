@@ -88,7 +88,8 @@ const LIFECYCLE =
 const recordChanged =
   "(OLD.version IS NOT NEW.version OR OLD.data IS NOT NEW.data OR OLD.emitted_at IS NOT NEW.emitted_at OR OLD.deleted IS NOT NEW.deleted OR OLD.deleted_at IS NOT NEW.deleted_at OR OLD.blob_id IS NOT NEW.blob_id)";
 // Retained operations are indexed in place by these expressions; no copy of their JSON.
-const operationExpressions = {
+// The receiver's reconciler queries the same indexes, so it reads them from here.
+export const operationExpressions = {
   instance: "json_extract(operation_json,'$.connectionId')",
   stream: "json_extract(operation_json,'$.declaration.stream')",
   record_key: "json_extract(operation_json,'$.recordKey')",
