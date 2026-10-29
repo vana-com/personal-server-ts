@@ -56,7 +56,10 @@ import {
   createSqliteRecordStore,
   PdppBindingError,
 } from "../storage/pdpp-records-sqlite-store.js";
-import { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
+import {
+  createReplicaRecordStore,
+  type ReplicaRecordStore,
+} from "../storage/pdpp-replica-canonical-port.js";
 import { retireReplication } from "../storage/pdpp-replication-door.js";
 import {
   ReplicationRefusedError,
@@ -111,7 +114,7 @@ export function resolveReplication(
 
 export interface PdppRecordsDeps {
   store: PdppRecordStore;
-  /** See `AppDeps.pdpp.reads`. This boot has no replica receiver. */
+  /** See `AppDeps.pdpp.reads`. */
   reads: PdppReplicaReads;
   bindingStore: ReturnType<typeof createSqliteRecordStore>;
   configuredMethods: Map<string, string[]>;
@@ -178,6 +181,12 @@ export interface CreatePdppRecordsDepsOptions {
   configuredMethods?: { sourceId: string; methodId: string }[];
   /** `config.replication.enabled`; see `openRecordStore`. */
   replication: boolean;
+  /**
+   * The running replication host's store and reader port. The resource
+   * server then writes through the receiver's store instance and reads
+   * through `receiver.readStore`. Absent: its own store, read directly.
+   */
+  replica?: { store: ReplicaRecordStore; reads: PdppReplicaReads };
 }
 
 /** Restore account-one registry rows for legacy scopes before Desktop reads the registry. */
@@ -284,7 +293,8 @@ export function createPdppRecordsDeps(
     methodIds.push(configured.methodId);
     configuredMethods.set(source.sourceId, methodIds);
   }
-  const store = openRecordStore(options.db, options.replication);
+  const store =
+    options.replica?.store ?? openRecordStore(options.db, options.replication);
 
   // Register account 1 only for an empty source registry. Never add a legacy
   // fallback beside a connection that the owner already registered.
@@ -384,8 +394,8 @@ export function createPdppRecordsDeps(
 
   return {
     store,
-    // No replica receiver on this boot: every reader reads the canonical store.
-    reads: () => store,
+    // Without a replica receiver every reader reads the canonical store.
+    reads: options.replica?.reads ?? (() => store),
     bindingStore: store,
     configuredMethods,
     auth: coLocatedAuthorizationService(pdppAuth),

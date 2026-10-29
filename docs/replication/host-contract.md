@@ -17,10 +17,10 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
 ## 1. What exists today
 
 - `replication.enabled` defaults to `false`
-  (`packages/core/src/schemas/server-config.ts:54-59`). Bootstrap uses it only
-  to open the record store (`packages/server/src/bootstrap.ts:953-976`), and
-  "This boot has no replica receiver"
-  (`packages/server/src/pdpp/records-bootstrap.ts:78`). Lite has a canonical
+  (`packages/core/src/schemas/server-config.ts:54-59`). With it on, bootstrap
+  builds the receiver, transport worker and driver through
+  `createNodeReplication` (`packages/server/src/storage/pdpp-replication-host.ts`)
+  and steps them from `startBackgroundServices` until `cleanup`. Lite has a canonical
   store (`packages/lite/src/canonical-store.ts:224`) but no transport, runtime
   or routes for replication. Neither app enables it
   (`unity-surfaces@9af449a2 apps/desktop/src/hooks/usePersonalServer.ts:871-885`);
@@ -431,6 +431,12 @@ The host calls `step`, then arms one timer at `nextWake`, clamped to 1 s to
 comes to the foreground, a local write commits, the network returns, or the
 user taps "Sync now". The phone runs only in the foreground: on `inactive`,
 `paused` or `hidden` the host aborts the step and stops scheduling.
+
+`createReplicationDriver` (`packages/core/src/replication/host-driver.ts`)
+implements this timer, single-flight `trigger`, `wake` and `stop(graceMs)` for
+both hosts. Node wires it in `pdpp-replication-host.ts`; Node fires no
+local-write trigger yet, so a local write waits for the next coordinator wake
+(at most 15 min).
 
 | Concern              | Owner        | Where                                                |
 | -------------------- | ------------ | ---------------------------------------------------- |
