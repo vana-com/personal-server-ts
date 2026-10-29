@@ -20,6 +20,7 @@ import {
   ImportJobError,
   PDPP_IMPORT_JOB_CONTRACT_VERSION,
   PDPP_IMPORT_SPOOL_FORMAT,
+  sealedSpool,
   type ImportBatchInput,
   type ImportBatchReceipt,
   type ImportCanonicalBatch,
@@ -30,6 +31,7 @@ import {
   type ImportJobRecord,
   type ImportJobStatus,
   type ImportRejection,
+  type ImportSpoolSeal,
   type ImportStagedOperation,
   type PdppImportJobCapability,
   type PdppImportJobs,
@@ -70,6 +72,18 @@ function invalid(message: string): ImportJobError {
 
 function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+function validSeal(value: {
+  byteLength?: unknown;
+  sha256?: unknown;
+}): value is ImportSpoolSeal {
+  return (
+    count(value.byteLength) &&
+    value.byteLength >= 1 &&
+    typeof value.sha256 === "string" &&
+    SHA256_HEX.test(value.sha256)
+  );
 }
 
 function count(value: unknown): value is number {
@@ -169,9 +183,10 @@ export function createPdppImportJobs(
     const incomplete = () =>
       new ImportJobError(
         "spool_incomplete",
-        `durable batches cover ${job.spoolOffset} of ${job.spool.byteLength} spool bytes`,
+        `durable batches cover ${job.spoolOffset} of ${job.spool.byteLength ?? "an open spool's"} bytes`,
       );
-    if (job.nextSeq < 1 || job.spoolOffset !== job.spool.byteLength)
+    const spool = sealedSpool(job.spool);
+    if (!spool || job.nextSeq < 1 || job.spoolOffset !== spool.byteLength)
       throw incomplete();
     let end = 0;
     for (let seq = 0; seq < job.nextSeq; seq++) {
@@ -179,7 +194,7 @@ export function createPdppImportJobs(
       if (!receipt || receipt.spoolStart !== end) throw incomplete();
       end = receipt.spoolEnd;
     }
-    if (end !== job.spool.byteLength) throw incomplete();
+    if (end !== spool.byteLength) throw incomplete();
   }
 
   function status(job: ImportJobRecord): ImportJobStatus {
@@ -230,13 +245,13 @@ export function createPdppImportJobs(
       !object(spool) ||
       !nonEmpty(spool.id) ||
       spool.format !== PDPP_IMPORT_SPOOL_FORMAT ||
-      !count(spool.byteLength) ||
-      spool.byteLength < 1 ||
-      typeof spool.sha256 !== "string" ||
-      !SHA256_HEX.test(spool.sha256)
+      !(
+        (spool.byteLength === undefined && spool.sha256 === undefined) ||
+        validSeal(spool)
+      )
     )
       throw invalid(
-        `spool needs id, format ${PDPP_IMPORT_SPOOL_FORMAT}, byteLength and sha256`,
+        `spool needs id, format ${PDPP_IMPORT_SPOOL_FORMAT}, and byteLength with sha256 unless it is open`,
       );
     if (
       !Array.isArray(streams) ||
@@ -270,12 +285,15 @@ export function createPdppImportJobs(
         method: binding.method,
         generation: binding.generation,
       },
-      spool: {
-        id: spool.id,
-        format: spool.format,
-        byteLength: spool.byteLength,
-        sha256: spool.sha256,
-      },
+      spool:
+        spool.byteLength === undefined
+          ? { id: spool.id, format: spool.format }
+          : {
+              id: spool.id,
+              format: spool.format,
+              byteLength: spool.byteLength,
+              sha256: spool.sha256,
+            },
       streams: [...streams].sort(),
       batchBytes,
     };
@@ -345,7 +363,7 @@ export function createPdppImportJobs(
     batch: ImportBatchInput,
   ): Promise<ImportBatchReceipt & { replay: boolean }> {
     const job = await readJob(batch.jobId);
-    const { seq, text, sha256, spoolStart, spoolEnd } = batch;
+    const { seq, text, sha256, spoolStart, spoolEnd, seal } = batch;
     if (
       !count(seq) ||
       typeof text !== "string" ||
@@ -355,6 +373,8 @@ export function createPdppImportJobs(
       !count(spoolEnd)
     )
       throw invalid("batch needs seq, text, sha256, spoolStart and spoolEnd");
+    if (seal !== undefined && !validSeal(seal))
+      throw invalid("seal needs byteLength and sha256");
     if (seq < job.nextSeq) {
       const stored = await capability.readBatchReceipt(job.jobId, seq);
       if (
@@ -375,11 +395,26 @@ export function createPdppImportJobs(
         "batch_out_of_order",
         `expected batch ${job.nextSeq}, got ${seq}`,
       );
+    const sealed = sealedSpool(job.spool);
+    if (
+      seal &&
+      (sealed
+        ? seal.byteLength !== sealed.byteLength || seal.sha256 !== sealed.sha256
+        : seal.byteLength !== spoolEnd)
+    )
+      throw new ImportJobError(
+        "spool_offset_mismatch",
+        sealed
+          ? "seal differs from the job's spool"
+          : "the sealing batch must end at the spool's byteLength",
+      );
+    // The spool's length, once known: stored, or sealed by this batch.
+    const spoolLength = sealed?.byteLength ?? seal?.byteLength;
     const bytes = encoder.encode(text);
     if (
       spoolStart !== job.spoolOffset ||
       spoolEnd - spoolStart !== bytes.byteLength ||
-      spoolEnd > job.spool.byteLength ||
+      (spoolLength !== undefined && spoolEnd > spoolLength) ||
       bytes.byteLength === 0
     )
       throw new ImportJobError(
@@ -389,7 +424,7 @@ export function createPdppImportJobs(
     const lines = text.split("\n");
     // Whole lines only; the spool's last line may lack its newline.
     if (lines[lines.length - 1] === "") lines.pop();
-    else if (spoolEnd !== job.spool.byteLength)
+    else if (spoolEnd !== spoolLength)
       throw invalid("a batch must end at a line break");
     if (bytes.byteLength > job.batchBytes) {
       if (lines.length !== 1)
@@ -506,6 +541,7 @@ export function createPdppImportJobs(
     };
     const next: ImportJobRecord = {
       ...job,
+      ...(sealed || !seal ? {} : { spool: { ...job.spool, ...seal } }),
       nextSeq: seq + 1,
       nextOrder: job.nextOrder + operations.length,
       spoolOffset: spoolEnd,

@@ -3,7 +3,9 @@
  *
  * A connector run's records reach the canonical store through one job:
  * `begin`, then numbered `append` batches read from an immutable spool, then
- * `commit` (one atomic publication) or `abort`. The Personal Server engine
+ * `commit` (one atomic publication) or `abort`. A job may begin on a spool the
+ * host is still writing (`ImportOpenSpoolHandle`), so batches stage while the
+ * connector downloads; the batch that ends the spool seals it. The Personal Server engine
  * (`createPdppImportJobs`) owns every rule: owner and connection binding,
  * record identity, declaration checks, operation digests and idempotency.
  * A storage adapter implements `PdppImportJobCapability`; it only persists
@@ -66,6 +68,28 @@ export interface ImportSpoolHandle {
 }
 
 /**
+ * A spool the host is still writing. Bytes already written never change; the
+ * length and digest are unknown until the batch that ends the spool carries
+ * them (`ImportBatchInput.seal`). Until then every batch ends at a line break.
+ */
+export interface ImportOpenSpoolHandle {
+  id: string;
+  format: typeof PDPP_IMPORT_SPOOL_FORMAT;
+  byteLength?: never;
+  sha256?: never;
+}
+
+/** The length and digest that end an open spool. */
+export type ImportSpoolSeal = Pick<ImportSpoolHandle, "byteLength" | "sha256">;
+
+/** The spool's handle once its length and digest are known. */
+export function sealedSpool(
+  spool: ImportSpoolHandle | ImportOpenSpoolHandle,
+): ImportSpoolHandle | undefined {
+  return spool.byteLength === undefined ? undefined : spool;
+}
+
+/**
  * One spool line. `instance` is optional and, when present, must equal the
  * job's instance; the engine always stores the job's instance.
  */
@@ -82,7 +106,7 @@ export interface ImportJobBeginInput {
   /** Caller-chosen stable id, `[A-Za-z0-9._:-]{1,128}`. A retried begin reuses it. */
   jobId: string;
   binding: ImportJobBinding;
-  spool: ImportSpoolHandle;
+  spool: ImportSpoolHandle | ImportOpenSpoolHandle;
   /** Streams this job may write; each must be declared for the instance. */
   streams: string[];
   /** UTF-8 bytes per batch; default `IMPORT_JOB_DEFAULT_BATCH_BYTES`. */
@@ -98,7 +122,8 @@ export interface ImportJobRecord {
   /** SHA-256 of the canonical begin input. A changed retry of the same id is refused. */
   fingerprint: string;
   binding: ImportJobBinding;
-  spool: ImportSpoolHandle;
+  /** Open until the batch that ends it is durable; a commit needs it sealed. */
+  spool: ImportSpoolHandle | ImportOpenSpoolHandle;
   streams: string[];
   batchBytes: number;
   state: ImportJobState;
@@ -129,6 +154,12 @@ export interface ImportBatchInput {
   /** Must equal the job's `spoolOffset`. */
   spoolStart: number;
   spoolEnd: number;
+  /**
+   * Only on the batch that ends an open spool: its `byteLength` must equal
+   * `spoolEnd`. The job stores the sealed handle with this batch. On a sealed
+   * spool it must equal the stored length and digest.
+   */
+  seal?: ImportSpoolSeal;
 }
 
 export interface ImportRejection {
@@ -372,7 +403,7 @@ export interface PdppImportJobCapability {
    * only at the end of the spool. Never reads the whole spool at once.
    */
   readSpool?(
-    spool: ImportSpoolHandle,
+    spool: ImportSpoolHandle | ImportOpenSpoolHandle,
     offset: number,
     maxBytes: number,
   ): Promise<Uint8Array>;

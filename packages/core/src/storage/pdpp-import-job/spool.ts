@@ -1,21 +1,31 @@
 /**
- * Pumps an immutable spool into an open job in byte-bounded batches, from
- * the job's durable offset. Never holds more than one batch (or one record
- * up to `IMPORT_JOB_MAX_RECORD_BYTES`) of the spool.
+ * Pumps a spool into an open job in byte-bounded batches, from the job's
+ * durable offset. Never holds more than one batch (or one record up to
+ * `IMPORT_JOB_MAX_RECORD_BYTES`) of the spool.
+ *
+ * An open spool (`ImportOpenSpoolHandle`) needs `available` or `seal`:
+ * - `available`: the bytes the host has written so far. Only full batches go
+ *   in, each followed by at least one written byte, so the cuts equal those of
+ *   the sealed spool and the batch that ends the spool is still to come.
+ * - `seal`: the host wrote the last byte. The rest goes in; its last batch
+ *   carries the seal.
  */
 
 import {
   IMPORT_JOB_MAX_RECORD_BYTES,
   ImportJobError,
+  sealedSpool,
   type ImportBatchReceipt,
   type ImportJobStatus,
+  type ImportOpenSpoolHandle,
   type ImportSpoolHandle,
+  type ImportSpoolSeal,
   type PdppImportJobs,
 } from "./contract.js";
 import { sha256HexOf } from "./engine.js";
 
 export type ImportSpoolRead = (
-  spool: ImportSpoolHandle,
+  spool: ImportSpoolHandle | ImportOpenSpoolHandle,
   offset: number,
   maxBytes: number,
 ) => Promise<Uint8Array>;
@@ -23,7 +33,7 @@ export type ImportSpoolRead = (
 const NEWLINE = 0x0a;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
-/** Appends every remaining batch of the job's spool. Returns the final status. */
+/** Appends every batch the spool holds now. Returns the final status. */
 export async function importSpool(
   jobs: PdppImportJobs,
   jobId: string,
@@ -31,25 +41,52 @@ export async function importSpool(
   options: {
     onBatch?: (receipt: ImportBatchReceipt) => void;
     maxRecordBytes?: number;
+    /** Open spool only: bytes written so far. */
+    available?: number;
+    /** Open spool only: the length and digest of the finished spool. */
+    seal?: ImportSpoolSeal;
   } = {},
 ): Promise<ImportJobStatus> {
   const maxRecordBytes = options.maxRecordBytes ?? IMPORT_JOB_MAX_RECORD_BYTES;
   let current = await jobs.status(jobId);
   if (!current.resume) return current;
   const { spool, batchBytes } = current.job;
+  const sealed = sealedSpool(spool);
+  if (
+    sealed &&
+    options.seal &&
+    (options.seal.byteLength !== sealed.byteLength ||
+      options.seal.sha256 !== sealed.sha256)
+  )
+    throw new ImportJobError(
+      "invalid_request",
+      "seal differs from the job's spool",
+    );
+  const seal = sealed ? undefined : options.seal;
+  // Bytes known to be written, and whether they are the whole spool.
+  const end = sealed?.byteLength ?? seal?.byteLength ?? options.available;
+  if (end === undefined)
+    throw new ImportJobError(
+      "invalid_request",
+      "an open spool needs `available` or `seal`",
+    );
+  const final = sealed !== undefined || seal !== undefined;
   let { seq, spoolOffset: offset } = current.resume;
-  while (offset < spool.byteLength) {
-    const remaining = spool.byteLength - offset;
+  while (offset < end) {
+    const remaining = end - offset;
+    // A growing spool waits for more than one batch, so the cut is the one a
+    // sealed spool gets and written bytes follow it.
+    if (!final && remaining <= batchBytes) break;
     let chunk = await read(spool, offset, Math.min(batchBytes, remaining));
     if (chunk.byteLength === 0)
       throw new ImportJobError(
         "invalid_request",
         "spool ended before its byteLength",
       );
-    const end = chunk.lastIndexOf(NEWLINE);
-    if (end >= 0) {
-      chunk = chunk.subarray(0, end + 1);
-    } else if (offset + chunk.byteLength < spool.byteLength) {
+    const newline = chunk.lastIndexOf(NEWLINE);
+    if (newline >= 0) {
+      chunk = chunk.subarray(0, newline + 1);
+    } else if (!final || offset + chunk.byteLength < end) {
       // One record larger than the batch budget: read it alone, bounded.
       const window = await read(
         spool,
@@ -60,9 +97,15 @@ export async function importSpool(
       const length =
         lineEnd >= 0
           ? lineEnd + 1
-          : offset + window.byteLength === spool.byteLength
+          : final && offset + window.byteLength === end
             ? window.byteLength
             : -1;
+      // Its end is not written yet.
+      if (
+        !final &&
+        (length < 0 ? remaining <= maxRecordBytes : offset + length >= end)
+      )
+        break;
       if (length < 0 || length > maxRecordBytes)
         throw new ImportJobError(
           "record_too_large",
@@ -79,16 +122,18 @@ export async function importSpool(
         `spool bytes at ${offset} are not UTF-8`,
       );
     }
+    const spoolEnd = offset + chunk.byteLength;
     const receipt = await jobs.append({
       jobId,
       seq,
       text,
       sha256: await sha256HexOf(chunk),
       spoolStart: offset,
-      spoolEnd: offset + chunk.byteLength,
+      spoolEnd,
+      ...(seal && spoolEnd === end ? { seal } : {}),
     });
     options.onBatch?.(receipt);
-    offset += chunk.byteLength;
+    offset = spoolEnd;
     seq += 1;
   }
   current = await jobs.status(jobId);

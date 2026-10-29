@@ -37,6 +37,14 @@ abort(jobId)                              -> nothing staged stays
   `{stream, key, data, emitted_at, op}`. The host writes the spool once and
   never changes it. A batch is a run of whole lines, exactly the spool bytes
   `[spoolStart, spoolEnd)`; `spoolStart` must equal the job's `spoolOffset`.
+- **Open spool.** A job may begin on a spool the host is still writing:
+  the handle has no `byteLength` or `sha256`. Batches stage while the
+  connector downloads; each ends at a line break. The batch that ends the
+  spool carries `seal: {byteLength, sha256}` and the job stores the sealed
+  handle with it. A commit before the seal is `spool_incomplete`.
+  `importSpool` with `available` appends only full batches that written bytes
+  follow, so the cuts equal those of the sealed spool; with `seal` it appends
+  the rest.
 - **Batches.** Default 1 MiB, at most 4 MiB. A single record may exceed the
   budget up to 16 MiB, alone in its batch; a larger line fails with
   `record_too_large` before it is parsed. One batch per job is in flight,
