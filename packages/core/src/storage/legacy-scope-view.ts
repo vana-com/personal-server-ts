@@ -190,6 +190,19 @@ export interface LegacyScopeAuthority {
     canonicalCursor: string,
   ): boolean;
   isReset(scope: string): boolean;
+  /**
+   * The canonical re-add marker of `scope` for one connection generation:
+   * the tombstone version that EVERY one of `streams` acknowledged when a
+   * proven full replacement (a completion receipt) of it was written after
+   * this server knew that tombstone. Null when any stream has no marker.
+   * Absent: no marker store, so no canonical re-add (fail closed).
+   */
+  canonicalReaddVersion?(
+    scope: string,
+    instance: string,
+    generation: number,
+    streams: readonly string[],
+  ): string | null;
   cachedVerdict(
     scope: string,
     instance: string,
@@ -287,20 +300,30 @@ export type LegacyScopeRefusal =
  */
 export type LegacyScopeDeletion = "file" | "canonical";
 
+/**
+ * Canonical re-add evidence decided with the body, in the same snapshot as
+ * the connection selection: the tombstone version every stream backing the
+ * scope acknowledged with a proven full replacement written after it (see
+ * `LegacyScopeAuthority.canonicalReaddVersion`). Null or absent: none.
+ */
+export interface LegacyScopeReadd {
+  canonicalReadd?: string | null;
+}
+
 export type LegacyScopeLatest =
   /** Not canonical: the existing storage answers, exactly as before. */
-  | { kind: "file"; deletion: LegacyScopeDeletion }
-  | {
+  | ({ kind: "file"; deletion: LegacyScopeDeletion } & LegacyScopeReadd)
+  | ({
       kind: "canonical";
       envelope: DataFileEnvelope;
       /** Opaque, stable while the rows and receipts do not change. */
       revision: string;
-    }
+    } & LegacyScopeReadd)
   | { kind: "refused"; refusal: LegacyScopeRefusal };
 
 export type LegacyScopeListing =
-  | { kind: "file"; deletion: LegacyScopeDeletion }
-  | { kind: "canonical"; collectedAt: string }
+  | ({ kind: "file"; deletion: LegacyScopeDeletion } & LegacyScopeReadd)
+  | ({ kind: "canonical"; collectedAt: string } & LegacyScopeReadd)
   | { kind: "refused" };
 
 /**
@@ -311,6 +334,31 @@ export function deletionHistoryOf(
   body: LegacyScopeLatest | LegacyScopeListing,
 ): LegacyScopeDeletion {
   return body.kind === "file" ? body.deletion : "canonical";
+}
+
+/**
+ * The tombstone version a canonical body's re-add marker acknowledges, or
+ * null. Only meaningful when `deletionHistoryOf(body)` is `canonical`.
+ */
+export function canonicalReaddOf(
+  body: LegacyScopeLatest | LegacyScopeListing,
+): string | null {
+  return body.kind === "refused" ? null : (body.canonicalReadd ?? null);
+}
+
+/** Present only when a marker exists, so bodies without one keep their shape. */
+function withReadd(readd: string | null): LegacyScopeReadd {
+  return readd === null ? {} : { canonicalReadd: readd };
+}
+
+/**
+ * Bound scopes whose binding for `method` reads `stream`: the scopes a
+ * write of that stream through that method can re-add.
+ */
+export function legacyScopesBackedBy(method: string, stream: string): string[] {
+  return boundScopes().filter((scope) =>
+    scopeMethods(scope).get(method)?.includes(stream),
+  );
 }
 
 /** Before the deletion history is attached. */
@@ -329,7 +377,7 @@ export interface LegacyScopeViewPort {
   /** Bound scopes under `scopePrefix` that `listingFor` lists as canonical. */
   listCanonicalScopes(
     scopePrefix: string | undefined,
-  ): { scope: string; collectedAt: string }[];
+  ): ({ scope: string; collectedAt: string } & LegacyScopeReadd)[];
   /**
    * True when connection rows make a legacy-only deletion unsafe: deleting
    * the file would let them appear. Not the deletion history of a read; see
@@ -450,6 +498,22 @@ export function createLegacyScopeView(
   /** Decided with the body: connection rows serve the scope, or they do not. */
   function deletionFor(decision: Decision): LegacyScopeDeletion {
     return decision.kind === "file" ? "file" : "canonical";
+  }
+
+  /**
+   * The selected connection's re-add marker, read in the decision's
+   * snapshot. A refused decision selects no connection and has none.
+   */
+  function readdFor(scope: string, decision: Decision): string | null {
+    if (decision.kind !== "canonical") return null;
+    return (
+      authority.canonicalReaddVersion?.(
+        scope,
+        decision.selection.instance,
+        decision.generation,
+        decision.streams,
+      ) ?? null
+    );
   }
 
   /**
@@ -596,9 +660,15 @@ export function createLegacyScopeView(
     return authority.readSnapshot((): LegacyScopeListing => {
       const decision = decide(scope);
       const listed = chooseListing(scope, decision);
-      return listed.kind === "file"
-        ? { kind: "file", deletion: deletionFor(decision) }
-        : listed;
+      const readd = withReadd(readdFor(scope, decision));
+      if (listed.kind === "file") {
+        return {
+          kind: "file",
+          deletion: deletionFor(decision),
+          ...readd,
+        };
+      }
+      return listed.kind === "canonical" ? { ...listed, ...readd } : listed;
     });
   }
 
@@ -754,6 +824,7 @@ export function createLegacyScopeView(
       return {
         reset: authority.isReset(scope),
         decision,
+        canonicalReadd: readdFor(scope, decision),
         retainedEntityLoss:
           decision.kind === "canonical" && ouraHasRetainedEntityLoss(decision),
         legacyHead: authority.eligibleLegacyHead(scope),
@@ -1319,22 +1390,36 @@ export function createLegacyScopeView(
     async readLatest(scope) {
       const initial = readDecision(scope);
       const body = await chooseBody(scope, initial);
-      return body.kind === "file"
-        ? { kind: "file", deletion: deletionFor(initial.decision) }
+      if (body.kind === "file") {
+        return {
+          kind: "file",
+          deletion: deletionFor(initial.decision),
+          ...withReadd(initial.canonicalReadd),
+        };
+      }
+      return body.kind === "canonical"
+        ? { ...body, ...withReadd(initial.canonicalReadd) }
         : body;
     },
 
     listingFor,
 
     listCanonicalScopes(scopePrefix) {
-      const listed: { scope: string; collectedAt: string }[] = [];
+      const listed: ({
+        scope: string;
+        collectedAt: string;
+      } & LegacyScopeReadd)[] = [];
       for (const scope of boundScopes()) {
         if (scopePrefix !== undefined && !scope.startsWith(scopePrefix)) {
           continue;
         }
         const listing = listingFor(scope);
         if (listing.kind === "canonical") {
-          listed.push({ scope, collectedAt: listing.collectedAt });
+          listed.push({
+            scope,
+            collectedAt: listing.collectedAt,
+            ...withReadd(listing.canonicalReadd ?? null),
+          });
         }
       }
       return listed;

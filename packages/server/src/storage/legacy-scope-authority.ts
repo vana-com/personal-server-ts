@@ -4,6 +4,7 @@ import type {
   LegacyScopeHead,
   LegacyCoverageVerdict,
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
+import { canonicalReaddVersion } from "./canonical-readd-markers.js";
 
 interface VerdictRow {
   scope: string;
@@ -216,6 +217,10 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
 
     isReset(scope) {
       return isReset(scope);
+    },
+
+    canonicalReaddVersion(scope, instance, generation, streams) {
+      return canonicalReaddVersion(db, scope, instance, generation, streams);
     },
 
     cachedVerdict(

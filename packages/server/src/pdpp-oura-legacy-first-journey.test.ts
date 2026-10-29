@@ -638,7 +638,7 @@ async function writePdpp(
   days: Day[],
   at: string,
   token?: string,
-  options?: { instance?: string; method?: string },
+  options?: { instance?: string; method?: string; complete?: boolean },
 ) {
   vi.setSystemTime(new Date(at));
   const t = token ?? (await ownerPdppToken());
@@ -1019,6 +1019,194 @@ describe("deletion history and the legacy file that is served", () => {
       (await listing.json()) as { scopes: { scope: string }[] }
     ).scopes.map((entry) => entry.scope);
     expect(listed).toEqual(expect.arrayContaining([...SCOPES]));
+  });
+});
+
+describe("a scope deleted while legacy-only, then reconnected through a canonical method", () => {
+  beforeEach(() => {
+    LEGACY_TS = false;
+  });
+
+  /** The gateway's view of the scopes: live, or a tombstone at `version`. */
+  let tombstone: { version: string; deletedAt: string } | null;
+
+  /**
+   * Desktop 29 Oct (GitHub reconnect): the owner deleted the scopes while
+   * only legacy files existed, re-imported them (file re-add on top of the
+   * tombstone). Dev builds and stable continuity pins configure the method
+   * as ordinary (no opt-in), so the connector's rows make the scope
+   * canonical-owned.
+   */
+  async function deleteWhileLegacyOnly(): Promise<void> {
+    tombstone = null;
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope }) =>
+        tombstone
+          ? {
+              id: "synthetic-point",
+              ownerAddress,
+              scope,
+              dataHash: `0x${"00".repeat(32)}`,
+              metadataHash: `0x${"00".repeat(32)}`,
+              expectedVersion: tombstone.version,
+              addedAt: "2026-09-01T00:00:00Z",
+              deletedAt: tombstone.deletedAt,
+            }
+          : null,
+    };
+    await ctx!.cleanup();
+    ctx = await boot(["oura-browser"], dataPointFeed, []);
+    await writeLegacy(DAYS, T_LEGACY);
+    expect(await readAll()).toEqual(ALL(FILE));
+    // The owner deletes the scopes while only the legacy files exist; the
+    // cached live verdict goes stale.
+    tombstone = { version: "1", deletedAt: "2026-10-14T12:00:00Z" };
+    vi.setSystemTime(new Date("2026-10-14T12:00:00Z"));
+    for (const scope of SCOPES) {
+      expect((await observe(scope)).owner.status).toBe(410);
+    }
+  }
+
+  async function reimportFile(): Promise<void> {
+    // Re-import: the file is a re-add on top of tombstone 1 and is served.
+    await writeLegacy([{ n: 7, score: 71 }], T_LEGACY_NEWER);
+    expect(await readAll()).toEqual(ALL(FILE));
+  }
+
+  async function listedScopes(): Promise<string[]> {
+    const listing = await ctx!.app.request("/v1/data", {
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(listing.status).toBe(200);
+    return (
+      (await listing.json()) as { scopes: { scope: string }[] }
+    ).scopes.map((entry) => entry.scope);
+  }
+
+  it("serves the re-added scope once post-deletion connection rows exist", async () => {
+    await deleteWhileLegacyOnly();
+    await reimportFile();
+
+    // The reconnected connector then fully replaces every stream.
+    await writePdpp([{ n: 8, score: 81 }], "2026-10-17T00:00:00Z");
+    const after = await readAll();
+    for (const scope of SCOPES) {
+      expect.soft(after[scope], scope).not.toMatch(/^410/);
+    }
+    // Every stream proves the re-add, so the connector's rows are the body.
+    for (const scope of SCOPES) {
+      const read = (await observe(scope)).builder;
+      expect(read.source).toBe("canonical");
+      expect(dayRows(read, scope).map((row) => row.score)).toEqual([81]);
+    }
+    // The inventory agrees with the read: the source is connected.
+    expect(await listedScopes()).toEqual(expect.arrayContaining([...SCOPES]));
+  });
+
+  it("keeps the re-add after a later partial write of a proven stream", async () => {
+    await deleteWhileLegacyOnly();
+    await reimportFile();
+    await writePdpp([{ n: 8, score: 81 }], "2026-10-17T00:00:00Z");
+    // A later unproven write lands on top of rows that were already fully
+    // replaced after the tombstone; it cannot bring back pre-deletion rows.
+    await writePdpp([{ n: 9, score: 91 }], "2026-10-18T00:00:00Z", undefined, {
+      complete: false,
+    });
+    const after = await readAll();
+    for (const scope of SCOPES) {
+      expect.soft(after[scope], scope).not.toMatch(/^410/);
+    }
+  });
+
+  it("keeps answering 410 when the post-deletion rows are unproven", async () => {
+    await deleteWhileLegacyOnly();
+    await reimportFile();
+    // A replace without source_collected_at writes no completion receipt.
+    await writePdpp([{ n: 8, score: 81 }], "2026-10-17T00:00:00Z", undefined, {
+      complete: false,
+    });
+    expect(await readAll()).toEqual(ALL("410 null"));
+    const listed = await listedScopes();
+    for (const scope of SCOPES) expect(listed).not.toContain(scope);
+  });
+
+  it("re-adds only the scopes whose every stream was fully replaced after the tombstone", async () => {
+    await deleteWhileLegacyOnly();
+    await reimportFile();
+    vi.setSystemTime(new Date("2026-10-17T00:00:00Z"));
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "sleep",
+      pdppRows("oura.sleep", [{ n: 8, score: 81 }]),
+      "2026-10-17T00:00:00Z",
+    );
+    for (const scope of ["oura.readiness", "oura.activity"] as const) {
+      await replace(
+        token,
+        STREAM_OF[scope],
+        pdppRows(scope, [{ n: 8, score: 81 }]),
+        "2026-10-17T00:00:00Z",
+        { complete: false },
+      );
+    }
+    const after = await readAll();
+    expect(after["oura.sleep"]).not.toMatch(/^410/);
+    expect(after["oura.readiness"]).toBe("410 null");
+    expect(after["oura.activity"]).toBe("410 null");
+  });
+
+  it("lets a newer tombstone win over the canonical re-add", async () => {
+    await deleteWhileLegacyOnly();
+    await reimportFile();
+    await writePdpp([{ n: 8, score: 81 }], "2026-10-17T00:00:00Z");
+    expect(await readAll()).not.toEqual(ALL("410 null"));
+
+    // The owner deletes the scopes again elsewhere; the gateway now holds a
+    // later tombstone than the one the rows acknowledged.
+    tombstone = { version: "3", deletedAt: "2026-10-20T00:00:00Z" };
+    vi.setSystemTime(new Date("2026-10-20T00:00:00Z"));
+    expect(await readAll()).toEqual(ALL("410 null"));
+    const listed = await listedScopes();
+    for (const scope of SCOPES) expect(listed).not.toContain(scope);
+  });
+
+  it("never lets proven rows written before the tombstone authorize the scope", async () => {
+    tombstone = null;
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope }) =>
+        tombstone
+          ? {
+              id: "synthetic-point",
+              ownerAddress,
+              scope,
+              dataHash: `0x${"00".repeat(32)}`,
+              metadataHash: `0x${"00".repeat(32)}`,
+              expectedVersion: tombstone.version,
+              addedAt: "2026-09-01T00:00:00Z",
+              deletedAt: tombstone.deletedAt,
+            }
+          : null,
+    };
+    await ctx!.cleanup();
+    ctx = await boot(["oura-browser"], dataPointFeed, []);
+    await writeLegacy(DAYS, T_LEGACY);
+    // The connector proves every stream while no deletion is known.
+    await writePdpp([{ n: 8, score: 81 }], T_PDPP);
+    expect(await readAll()).not.toEqual(ALL("410 null"));
+
+    // The owner then deletes the scopes elsewhere.
+    tombstone = { version: "1", deletedAt: "2026-10-16T00:00:00Z" };
+    vi.setSystemTime(new Date("2026-10-16T00:00:00Z"));
+    expect(await readAll()).toEqual(ALL("410 null"));
+    // A re-imported file does not revive the canonical body, and neither do
+    // the receipts written before the tombstone.
+    await writeLegacy([{ n: 7, score: 71 }], "2026-10-16T06:00:00Z");
+    expect(await readAll()).toEqual(ALL("410 null"));
+    const listed = await listedScopes();
+    for (const scope of SCOPES) expect(listed).not.toContain(scope);
   });
 });
 
