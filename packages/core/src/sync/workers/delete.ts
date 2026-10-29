@@ -612,9 +612,13 @@ async function deleteScopeBlobs(
   let work = withUnknown(unplannedWork(scope, plan, null));
   let store: PendingBlobDeletionStore | null =
     deps.pendingBlobDeletions ?? null;
+  // This scope's markers already in the durable store before this call.
+  let queuedBefore: PendingBlobDeletion[] = [];
   if (store) {
     try {
-      const through = await resumePoint(store, scope, await store.list());
+      const markers = await store.list();
+      queuedBefore = markers.filter((m) => m.scope === scope);
+      const through = await resumePoint(store, scope, markers);
       work = withUnknown(unplannedWork(scope, plan, through));
       await recordPlannedWork(store, scope, work, plan.range?.to ?? null);
     } catch (markerErr) {
@@ -625,11 +629,14 @@ async function deleteScopeBlobs(
       store = null;
     }
   }
-  // Without a durable marker store this pass still sends its batch; what it
-  // cannot send is reported, not recorded.
+  // Without a usable marker store this pass still sends a batch, taken from
+  // the scope's queue as last read plus the new work. The new work it cannot
+  // send is reported, not recorded; the durable queue keeps its old markers
+  // untouched, so that work is still owed and reported as pending.
   const recorded = store !== null;
   const passStore = store ?? createMemoryPendingBlobDeletionStore();
-  if (!recorded) await passStore.add(work);
+  if (!recorded) await passStore.add([...queuedBefore, ...work]);
+  const durablyOwed = recorded ? 0 : countPendingKeys(queuedBefore);
 
   let outcome: ScopePassOutcome;
   let remainingKeys: number;
@@ -651,16 +658,17 @@ async function deleteScopeBlobs(
     );
     return {
       step: { status: "failed", error: message },
-      pending: recorded ? 1 : 0,
+      pending: recorded || durablyOwed > 0 ? 1 : 0,
     };
   }
-  if (!recorded && remainingKeys > 0) {
+  if (!recorded && remainingKeys > durablyOwed) {
     logger.error(
       { scope, keys: remainingKeys },
       "Blob deletions left unfinished with no marker store to retry them",
     );
   }
-  const pending = recorded ? remainingKeys : 0;
+  if (!recorded) remainingKeys = Math.max(remainingKeys, durablyOwed);
+  const pending = recorded ? remainingKeys : durablyOwed;
   const counts = {
     blobsDeleted: outcome.deleted.length,
     blobsMissing: outcome.missing.length,

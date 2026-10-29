@@ -1237,3 +1237,42 @@ describe("repeated DELETE of a scope whose blob deletion is still in progress", 
     ]);
   });
 });
+
+describe("repeated DELETE when the marker store cannot record the watermark", () => {
+  it("still reports the scope's queued work as pending instead of done", async () => {
+    const store = createMemoryPendingBlobDeletionStore();
+    await store.add([
+      { scope: SCOPE, version: null, range: { from: "31", to: "40" } },
+    ]);
+    const pending: PendingBlobDeletionStore = {
+      list: () => store.list(),
+      add: (keys) => store.add(keys),
+      remove: (keys) => store.remove(keys),
+      plannedThrough: () => store.plannedThrough!(SCOPE),
+      enqueue: async () => {
+        throw new Error("ENOSPC");
+      },
+    };
+    const deps = makeDeps({ pendingBlobDeletions: pending });
+    (deps.deleteData!.tombstone as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "already-deleted",
+      dataPointId: DATA_POINT_ID,
+      version: "40",
+      deletedAt: DELETED_AT,
+    });
+
+    const result = await deleteScope(deps, SCOPE);
+
+    // Nothing above 40 is owed, but 31..40 is still durably queued.
+    expect(versionsSent(deps.deleteData!)).toEqual([range(31, 40)]);
+    expect(result.steps.storage.status).not.toBe("ok");
+    expect(result.pendingBlobDeletion).toBe(true);
+    expect(await store.list()).toEqual([
+      { scope: SCOPE, version: null, range: { from: "31", to: "40" } },
+    ]);
+
+    function range(from: number, to: number) {
+      return Array.from({ length: to - from + 1 }, (_, i) => String(from + i));
+    }
+  });
+});
