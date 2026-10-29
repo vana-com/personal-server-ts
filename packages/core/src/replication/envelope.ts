@@ -12,6 +12,15 @@ export const declarationBindingSchema = z.strictObject({
   schemaDigest: digest,
 });
 export type DeclarationBinding = z.infer<typeof declarationBindingSchema>;
+/**
+ * What a binding contributes to record identity: stream, semantics and
+ * ordered primary key. Two bindings of one source with the same shape are
+ * versions of one stream (a declaration upgrade). Their operations merge by
+ * revision, and each one validates against its own schema.
+ */
+export function declarationShape(binding: DeclarationBinding): string {
+  return canonicalJson([binding.stream, binding.semantics, binding.primaryKey]);
+}
 const base = {
   owner: token,
   sourceId: token,

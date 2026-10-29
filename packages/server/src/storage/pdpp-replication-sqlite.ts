@@ -14,10 +14,12 @@ import {
   type DeclarationBinding,
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import type { ReplicaRevision } from "@opendatalabs/personal-server-ts-core/replication/revision";
+import { planReplicaRebinding } from "@opendatalabs/personal-server-ts-core/replication/rebinding";
 import {
-  compareRevisions,
-  type ReplicaRevision,
-} from "@opendatalabs/personal-server-ts-core/replication/revision";
+  replicaSchemaDigest,
+  type ReplicaStreamSchema,
+} from "@opendatalabs/personal-server-ts-core/replication/host-config";
 import {
   computeRecordKeyFromData,
   type StreamSemantics,
@@ -45,10 +47,40 @@ CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_replace BEFORE INSERT ON pdpp_repli
 export const REPLICA_BLOB_CLAIM_INDEX_MIGRATION = `
 CREATE INDEX IF NOT EXISTS pdpp_replica_blob_claim_idx ON pdpp_replica_operations (json_extract(operation_json, '$.connectionId'), json_extract(operation_json, '$.generation'), json_extract(operation_json, '$.blob.blobId')) WHERE json_extract(operation_json, '$.kind') = 'blob-claim';
 `;
+/**
+ * Binding generations (host contract §4.5). Generation 1 is the first
+ * baseline's binding set; each rebinding adds the next. The history keeps
+ * every binding any generation retained, with the stream schema its
+ * operations validate against: SQL NULL when unknown (a database baselined
+ * before this table existed, until a host supplies it), the JSON text `null`
+ * when the stream declares none.
+ */
+export const REPLICA_BINDING_HISTORY_MIGRATION = `
+CREATE TABLE IF NOT EXISTS pdpp_replica_binding_generations (generation INTEGER PRIMARY KEY CHECK (generation > 0), config_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pdpp_replica_declaration_history (source_id TEXT NOT NULL, binding_json TEXT NOT NULL, schema_json TEXT, first_generation INTEGER NOT NULL, PRIMARY KEY (source_id, binding_json));
+INSERT OR IGNORE INTO pdpp_replica_binding_generations SELECT 1, config_json FROM pdpp_replica_settings WHERE id = 1;
+INSERT OR IGNORE INTO pdpp_replica_declaration_history SELECT json_extract(d.value, '$.sourceId'), json_extract(d.value, '$.binding'), NULL, 1 FROM pdpp_replica_settings s, json_each(s.config_json, '$.declarations') d WHERE s.id = 1;
+`;
 export interface BaselineConfiguration {
   owner: string;
-  /** Trusted retained bindings, not supplied by connector ingest. Missing entries fail closed. */
-  declarations: { sourceId: string; binding: DeclarationBinding }[];
+  /**
+   * Trusted retained bindings, not supplied by connector ingest. Missing
+   * entries fail closed. `schema` is the stream schema the binding's
+   * `schemaDigest` names; the history keeps it so peers' operations under
+   * this binding stay valid after a later rebinding.
+   */
+  declarations: {
+    sourceId: string;
+    binding: DeclarationBinding;
+    schema?: ReplicaStreamSchema;
+  }[];
+}
+/** One binding a generation of this database retained. */
+export interface ReplicaDeclarationHistoryEntry {
+  sourceId: string;
+  binding: DeclarationBinding;
+  /** Absent when this database never received it (see the migration). */
+  schema?: ReplicaStreamSchema;
 }
 export interface ReplicaPageOptions {
   afterSequence?: number;
@@ -60,16 +92,28 @@ export interface ReplicaPage {
   hasMore: boolean;
 }
 export interface ReplicationExport {
+  /**
+   * The first call baselines. A later call with another binding set rebinds
+   * (`planReplicaRebinding`): a new binding generation, no operations. A
+   * changed owner, or a changed shape of a retained stream, is refused.
+   */
   beginBaseline(config: BaselineConfiguration): { watermark: number };
+  /** Every binding any generation retained, oldest generation first. */
+  declarationHistory(): ReplicaDeclarationHistoryEntry[];
+  /** The current binding generation; 0 before the first baseline. */
+  bindingGeneration(): number;
   readBaselinePage(options: ReplicaPageOptions): ReplicaPage;
   readTailPage(options: ReplicaPageOptions): ReplicaPage;
   getBaselineCheckpoint(): number;
   /**
    * A new writer identity re-captures the current state under its own writer
-   * as a new baseline (see `rebaseline` below). Undefined before a baseline
-   * began.
+   * as a new baseline (see `rebaseline` below). `explaining` are the
+   * operations the merge chose for that state (`explainState` on the
+   * receiver). Undefined before a baseline began.
    */
-  rebaseline(): { after: number } | undefined;
+  rebaseline(
+    explaining: readonly ReplicaOperation[],
+  ): { after: number } | undefined;
   /** CAS acknowledgment after the page is durable at its consumer; retry is idempotent. */
   acknowledgeBaselinePage(expected: number, next: number): void;
   readPinnedBlobBytes(blobId: string): Uint8Array | undefined;
@@ -160,33 +204,52 @@ export function createReplicationJournal(
       generation: generation ?? binding.generation,
     };
   }
+  /**
+   * The binding a capture writes under: the current one for the stream. A
+   * rebaseline also captures streams a rebinding retired, whose rows and
+   * tombstones a new writer must still carry: their latest retained binding.
+   * The re-issued operation then keeps the binding of the operation whose
+   * effect it copies (`reissued`).
+   */
   function declaration(instance: string, stream: string): DeclarationBinding {
     const identity = base(instance);
-    const found = config()!.declarations.find(
-      (e) => e.sourceId === identity.sourceId && e.binding.stream === stream,
-    );
+    const matches = (e: { sourceId: string; binding: DeclarationBinding }) =>
+      e.sourceId === identity.sourceId && e.binding.stream === stream;
+    const found =
+      config()!.declarations.find(matches) ??
+      (reissue ? declarationHistory().filter(matches).at(-1) : undefined);
     if (!found) throw new Error(`missing retained declaration: ${stream}`);
     return found.binding;
   }
   /**
-   * While a rebaseline runs: the highest retained revision, own or received,
-   * of each record and completion (`reissueKey`) and effect.
+   * While a rebaseline runs: the operation that explains each record and
+   * completion (`reissueKey`), the one the merge chose.
    */
-  let reissue: Map<string, Map<string, ReplicaRevision>> | undefined;
+  let reissue:
+    | Map<string, Extract<ReplicaOperation, { declaration: unknown }>>
+    | undefined;
   /**
-   * A re-issued operation takes the order of the highest retained operation
-   * with the same key and effect: the counter, and that operation (or its own
-   * origin) as origin. With none, the state is a new write and takes a new
-   * counter.
+   * A re-issued operation takes the order of the operation that explains its
+   * state, when it has the same effect: the counter, and that operation (or
+   * its own origin) as origin. It also keeps that operation's declaration, so
+   * after a rebinding it validates exactly where the original did. With
+   * none, the state is a new write and takes a new counter; a rebaseline
+   * skips a tombstone with none (`captureRecord`).
    */
-  function reissued(
-    value: WithoutRevision<ReplicaOperation>,
-  ): Pick<ReplicaRevision, "counter" | "origin"> | undefined {
+  function reissued(value: WithoutRevision<ReplicaOperation>):
+    | {
+        revision: Pick<ReplicaRevision, "counter" | "origin">;
+        declaration: DeclarationBinding;
+      }
+    | undefined {
     const key = reissueKey(value);
-    const found = key && reissue?.get(key)?.get(effect(value));
-    if (!found) return undefined;
-    const { counter, writerId, operationId, origin } = found;
-    return { counter, origin: origin ?? { writerId, operationId } };
+    const found = key === undefined ? undefined : reissue?.get(key);
+    if (!found || effect(found) !== effect(value)) return undefined;
+    const { counter, writerId, operationId, origin } = found.revision;
+    return {
+      revision: { counter, origin: origin ?? { writerId, operationId } },
+      declaration: found.declaration,
+    };
   }
   function append(value: WithoutRevision<ReplicaOperation>): ReplicaOperation {
     if (!db.inTransaction)
@@ -197,13 +260,15 @@ export function createReplicationJournal(
     if (!Number.isSafeInteger(prior.counter + 1))
       throw new Error("replication counter exhausted");
     const counter = prior.counter + 1;
+    const copy = reissued(value);
     const operation = replicaOperationSchema.parse({
       ...value,
+      ...(copy && { declaration: copy.declaration }),
       revision: {
         counter,
         writerId: writerId(),
         operationId: randomUUID(),
-        ...reissued(value),
+        ...copy?.revision,
       },
     });
     db.prepare("UPDATE pdpp_replica_clock SET counter = ? WHERE id = 1").run(
@@ -291,14 +356,20 @@ export function createReplicationJournal(
       )
       .get(instance, stream, recordKey) as Row;
     if (row.deleted) {
-      if (identity.declaration.semantics === "append_only")
-        throw new Error("append-only replication tombstone");
-      append({
+      const tombstone = {
         ...identity,
-        kind: "delete",
+        kind: "delete" as const,
         emittedAt: row.emitted_at,
         deletedAt: row.deleted_at!,
-      });
+      };
+      // A rebaseline copies a tombstone only from the delete the merge chose.
+      // Any other tombstone hides a row locally (a withdrawal, a key
+      // quarantine, a declaration wait, a reset): no one deleted it, and
+      // publishing it would delete the row on every peer.
+      if (reissue && !reissued(tombstone)) return;
+      if (identity.declaration.semantics === "append_only")
+        throw new Error("append-only replication tombstone");
+      append(tombstone);
     } else {
       const data = JSON.parse(row.data!);
       if (
@@ -467,6 +538,53 @@ export function createReplicationJournal(
       .all() as { instance: string; stream: string }[])
       captureCompletion(row.instance, row.stream);
   }
+  function declarationHistory(): ReplicaDeclarationHistoryEntry[] {
+    return (
+      db
+        .prepare(
+          "SELECT source_id, binding_json, schema_json FROM pdpp_replica_declaration_history ORDER BY first_generation, source_id, binding_json",
+        )
+        .all() as {
+        source_id: string;
+        binding_json: string;
+        schema_json: string | null;
+      }[]
+    ).map((row) => ({
+      sourceId: row.source_id,
+      binding: JSON.parse(row.binding_json) as DeclarationBinding,
+      ...(row.schema_json === null
+        ? {}
+        : { schema: JSON.parse(row.schema_json) as ReplicaStreamSchema }),
+    }));
+  }
+  function bindingGeneration(): number {
+    return (
+      db
+        .prepare(
+          "SELECT coalesce(max(generation), 0) AS generation FROM pdpp_replica_binding_generations",
+        )
+        .get() as { generation: number }
+    ).generation;
+  }
+  /**
+   * Add `entries` to the history at `generation`, and record a schema the
+   * history did not know. A schema must match its binding's digest.
+   */
+  function retainDeclarations(
+    entries: BaselineConfiguration["declarations"],
+    generation: number,
+  ) {
+    const insert = db.prepare(
+      "INSERT INTO pdpp_replica_declaration_history VALUES (?, ?, ?, ?) ON CONFLICT (source_id, binding_json) DO UPDATE SET schema_json = coalesce(schema_json, excluded.schema_json)",
+    );
+    for (const entry of entries)
+      insert.run(
+        entry.sourceId,
+        canonicalJson(entry.binding),
+        entry.schema === undefined ? null : canonicalJson(entry.schema),
+        generation,
+      );
+  }
   function beginBaseline(input: BaselineConfiguration) {
     // Validate before persisting; canonical order makes identical retries stable.
     const normalized = {
@@ -483,6 +601,14 @@ export function createReplicationJournal(
     );
     if (new Set(keys).size !== keys.length)
       throw new Error("duplicate retained declaration");
+    for (const e of input.declarations)
+      if (
+        e.schema !== undefined &&
+        replicaSchemaDigest(e.schema) !== e.binding.schemaDigest
+      )
+        throw new Error(
+          `retained declaration schema does not match its digest: ${e.sourceId} stream ${e.binding.stream}`,
+        );
     return db
       .transaction(() => {
         // Method transitions are not journaled, so a replica could not follow them.
@@ -499,13 +625,39 @@ export function createReplicationJournal(
           );
         const prior = settings();
         if (prior) {
-          if (prior.config_json !== canonicalJson(normalized))
-            throw new Error("replication binding is immutable");
+          const current = JSON.parse(
+            prior.config_json,
+          ) as BaselineConfiguration;
+          if (current.owner !== normalized.owner)
+            throw new Error("replication owner is immutable");
+          const plan = planReplicaRebinding(
+            current.declarations,
+            declarationHistory(),
+            normalized.declarations,
+          );
+          if (plan.tag === "refused") throw new Error(plan.reason);
+          let generation = bindingGeneration();
+          if (plan.tag === "rebind") {
+            // Nothing is journaled: every operation names its own binding,
+            // and the older ones stay trusted (rebinding.ts).
+            generation += 1;
+            db.prepare(
+              "UPDATE pdpp_replica_settings SET config_json = ? WHERE id = 1",
+            ).run(canonicalJson(normalized));
+            db.prepare(
+              "INSERT INTO pdpp_replica_binding_generations VALUES (?, ?)",
+            ).run(generation, canonicalJson(normalized));
+          }
+          retainDeclarations(input.declarations, generation);
           return { watermark: prior.watermark };
         }
         db.prepare(
           "INSERT INTO pdpp_replica_settings (id, config_json, watermark) VALUES (1, ?, 0)",
         ).run(canonicalJson(normalized));
+        db.prepare(
+          "INSERT INTO pdpp_replica_binding_generations VALUES (1, ?)",
+        ).run(canonicalJson(normalized));
+        retainDeclarations(input.declarations, 1);
         // A legacy orphan is a migration error, never an omitted row.
         const orphan = db
           .prepare(
@@ -537,31 +689,24 @@ export function createReplicationJournal(
    * newer write, and never loses a tie the original won. A peer's operation
    * is re-issued the same way: the new writer signs it, its origin keeps the
    * peer's order. Lifecycle and blob-claim operations take new counters.
+   *
+   * Only the operation the merge chose explains a state (`explaining`). A
+   * higher operation with the same effect may be one the merge rejected or
+   * keeps pending; copying its order or binding would publish a baseline
+   * that a peer with this device's trust refuses. A tombstone no delete
+   * explains only hides a row here, so it is not re-issued.
    */
-  function rebaseline(): { after: number } | undefined {
+  function rebaseline(
+    explaining: readonly ReplicaOperation[],
+  ): { after: number } | undefined {
     if (!settings()) return undefined;
     const { counter: after } = db
       .prepare("SELECT counter FROM pdpp_replica_clock")
       .get() as { counter: number };
-    const received = db
-      .prepare(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_received'",
-      )
-      .get();
     reissue = new Map();
-    for (const { operation_json } of db
-      .prepare(
-        `SELECT operation_json FROM pdpp_replica_operations${received ? " UNION ALL SELECT operation_json FROM pdpp_replica_received" : ""}`,
-      )
-      .iterate() as Iterable<{ operation_json: string }>) {
-      const op = JSON.parse(operation_json) as ReplicaOperation;
+    for (const op of explaining) {
       const key = reissueKey(op);
-      if (key === undefined) continue;
-      const effects = reissue.get(key) ?? new Map<string, ReplicaRevision>();
-      reissue.set(key, effects);
-      const prior = effects.get(effect(op));
-      if (!prior || compareRevisions(op.revision, prior) > 0)
-        effects.set(effect(op), op.revision);
+      if (key !== undefined && "declaration" in op) reissue.set(key, op);
     }
     try {
       captureCurrentState();
@@ -611,7 +756,10 @@ export function createReplicationJournal(
   }
   const exporter: ReplicationExport = {
     beginBaseline,
-    rebaseline: () => db.transaction(rebaseline).immediate(),
+    declarationHistory,
+    bindingGeneration,
+    rebaseline: (explaining) =>
+      db.transaction(() => rebaseline(explaining)).immediate(),
     readBaselinePage: (options) => page(options, true),
     readTailPage: (options) => page(options, false),
     getBaselineCheckpoint: () => {

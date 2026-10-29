@@ -349,29 +349,50 @@ describe("frozen reference vectors", () => {
     expect(rows(project([register(), claim, wrongSize], bytes))).toEqual({});
   });
 
-  it("missing declarations hold a key; a later declaration applies or conflicts", () => {
+  it("another version of a declared shape applies; another shape holds a key, or conflicts once declared", () => {
     const prior = project([register(), put("p", 2, "k1", "v1")]);
     const v2 = put("q", 3, "k1", "v2", { binding: mutableV2 });
-    const held = project(
+    // A version this world does not declare, with the declared shape: a peer
+    // carried it, and the newer revision wins by key.
+    const carried = project(
       [register(), put("p", 2, "k1", "v1"), v2],
       world(),
       prior,
     );
-    expect(rows(held)).toEqual({ [at("k1")]: live("v1") });
+    expect(rows(carried)).toEqual({ [at("k1")]: live("v2") });
     const both = world({
       declarations: [
         ...world().declarations,
         { sourceId: source, binding: mutableV2 },
       ],
     });
+    // Declaring it too changes nothing: versions of one shape are a rebinding.
     expect(
-      rows(project([register(), put("p", 2, "k1", "v1"), v2], both, held)),
+      rows(project([register(), put("p", 2, "k1", "v1"), v2], both, carried)),
     ).toEqual({
-      [at("k1")]: tomb,
+      [at("k1")]: live("v2"),
     });
     expect(winnerText([register(), put("p", 2, "k1", "v1"), v2], both)).toEqual(
-      ["quarantined"],
+      ["v2"],
     );
+    // Another shape (here, semantics) is not declared: it holds the key.
+    const reshaped = { ...mutableV2, semantics: "append_only" as const };
+    const other = put("q", 3, "k1", "v2", { binding: reshaped });
+    expect(
+      rows(
+        project([register(), put("p", 2, "k1", "v1"), other], world(), prior),
+      ),
+    ).toEqual({ [at("k1")]: live("v1") });
+    // Declared as well, it names another record: the key conflicts.
+    const reshapedWorld = world({
+      declarations: [
+        ...world().declarations,
+        { sourceId: source, binding: reshaped },
+      ],
+    });
+    expect(
+      winnerText([register(), put("p", 2, "k1", "v1"), other], reshapedWorld),
+    ).toEqual(["quarantined"]);
   });
 
   it("terminal quarantine and connection deletion withdraw; local writes are refused", () => {

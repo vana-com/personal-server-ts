@@ -641,6 +641,10 @@ export function createLiteReplicaEngine(
           yield* store((s) => s.rebaseline(identity.operationWriter));
         return undefined;
       },
+      // Lite keeps no binding history: it publishes under current bindings.
+      *declarationHistory() {
+        return [];
+      },
       acknowledgePublished: (next) =>
         store((s) => s.acknowledgePublished(next)),
       readPinnedBlobChunks: (blobId) => persistence.readBlob(blobId),

@@ -116,6 +116,7 @@ import {
   type CopyDecision,
   type FinalizedFact,
 } from "./copy-promotion.js";
+import { replicaCopyEnvelope } from "./copies.js";
 import {
   defaultReplicaBackoff,
   REPLICA_TERMINAL,
@@ -137,7 +138,7 @@ import {
   type ReplicaWriterSeed,
 } from "./writer-identity.js";
 import type { ReplicationRefusal } from "./door.js";
-import type { ReplicaMergePlan } from "./merge-plan.js";
+import { resolveDeclaration, type ReplicaMergePlan } from "./merge-plan.js";
 import {
   sql,
   type ReplicaEffect,
@@ -475,6 +476,16 @@ export interface ReplicaEngineExporter<C> {
   ): ReplicaEffect<void, C>;
   /** A new writer re-captures current state as its baseline. */
   rebaseline(): ReplicaEffect<{ after: number } | undefined, C>;
+  /**
+   * Every binding this host retained for its own operations, beyond the
+   * current expected set (Node: `pdpp_replica_declaration_history`). An
+   * operation captured before a rebinding keeps its binding and still
+   * publishes. A host without binding history returns none.
+   */
+  declarationHistory(): ReplicaEffect<
+    readonly EnvelopeExpectation["declarations"][number][],
+    C
+  >;
   /**
    * The gateway confirmed the registration of a tail batch: every local
    * operation up to `next` (a tail cursor) is published. A host with an
@@ -2268,6 +2279,9 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
           })(),
         );
         const rows = await query(preparationRows(batch.batch));
+        const own = rows.map(
+          (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
+        );
         const failures = preparationOperationFailures(rows, resourceLimits);
         if (failures)
           return failedPreparation(
@@ -2293,11 +2307,9 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
             version: 1,
             owner: owner(),
             batchId: batch.batch,
-            operations: rows.map(
-              (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
-            ),
+            operations: own,
           }),
-          deps.expected(),
+          ownBindings(own, await query(exporter.declarationHistory())),
         );
         const identity = await query(host.identity.current());
         const statement = preparationStatement(batch);
@@ -4185,6 +4197,17 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
               key: `${groupWriter}:${manifest.sequence - 1}`,
             },
           };
+        // Operations under a missing or incompatible declaration are now
+        // retained but pending: reconcile reports them (host contract §4.5).
+        // A compatible version applies with the batch and needs no reconcile.
+        const untrusted = unretainedDeclarations(
+          (yield* replicaCopyEnvelope<C>(id, decision.copyKey)).operations,
+        ).find((entry) => entry.status !== "compatible");
+        if (untrusted)
+          yield* wakeReconcile(
+            `declaration:${untrusted.sourceId}:${untrusted.binding.stream}`,
+            now(),
+          );
         yield* acknowledge(group, manifest);
         return progress;
       }
@@ -4437,28 +4460,22 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
             authorized.writers,
           );
           if (misattributed) return refuse(misattributed);
-          // Trusted retained declarations, never claims copied from the envelope.
-          // An unknown declaration is a dependency the host can supply later.
+          // Trusted retained declarations, never claims copied from the
+          // envelope. An operation under a declaration this host does not
+          // retain (another version of a retained stream, a stream it does
+          // not declare yet, or an incompatible shape) is retained without
+          // trust, and the merge decides it. It must not stop the writer's
+          // chain, or one upgrade would hold back every later batch of that
+          // writer (host contract §4.5).
           const expected = deps.expected();
-          const missing = payload.envelope.operations.find(
-            (op) =>
-              "declaration" in op &&
-              !expected.declarations.some(
-                (entry) =>
-                  entry.sourceId === op.sourceId &&
-                  canonicalJson(entry.binding) ===
-                    canonicalJson(op.declaration),
-              ),
+          const unretained = unretainedDeclarations(
+            payload.envelope.operations,
           );
-          if (missing && "declaration" in missing)
-            return verdict({
-              tag: "wait",
-              dependency: {
-                kind: "declaration",
-                key: `${missing.sourceId}:${missing.declaration.stream}`,
-              },
-            });
-          decodeReplicaEnvelope(canonicalJson(payload.envelope), expected);
+          // Decoded only for shape; trust is decided by the merge.
+          decodeReplicaEnvelope(canonicalJson(payload.envelope), {
+            owner: expected.owner,
+            declarations: [...expected.declarations, ...unretained],
+          });
           const stagedBlobs: {
             blobId: string;
             handle: unknown;
@@ -4601,6 +4618,71 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
     );
   }
   let fingerprint = "";
+  /**
+   * What this device's own operations may name: the host's trusted set plus
+   * every binding it retained, and a version of a retained stream that a
+   * rebaseline copied from a peer's operation (`resolveDeclaration`
+   * compatible). A missing or incompatible binding is never published.
+   */
+  function ownBindings(
+    operations: readonly ReplicaOperation[],
+    history: EnvelopeExpectation["declarations"],
+  ): EnvelopeExpectation {
+    const expected = deps.expected();
+    const retained = [...expected.declarations, ...history];
+    return {
+      owner: expected.owner,
+      declarations: [
+        ...retained,
+        ...operations.flatMap((op) =>
+          "declaration" in op &&
+          resolveDeclaration(retained, op.sourceId, op.declaration).status ===
+            "compatible"
+            ? [{ sourceId: op.sourceId, binding: op.declaration }]
+            : [],
+        ),
+      ],
+    };
+  }
+  /**
+   * The declarations operations name that the host does not retain, with how
+   * the merge resolves each (`resolveDeclaration`).
+   */
+  function unretainedDeclarations(operations: readonly ReplicaOperation[]) {
+    const retained = deps.expected().declarations;
+    return operations.flatMap((op) => {
+      if (!("declaration" in op)) return [];
+      const { status } = resolveDeclaration(
+        retained,
+        op.sourceId,
+        op.declaration,
+      );
+      return status === "retained"
+        ? []
+        : [{ sourceId: op.sourceId, binding: op.declaration, status }];
+    });
+  }
+  /**
+   * Bring the reconcile phase forward to `at`. A declaration notification can
+   * change validation of any retained operation; other keys matter only when
+   * they are what it waits on. Returns how many phases it woke.
+   */
+  function* wakeReconcile(key: string, at: number): Fx<number> {
+    const row = yield* singleton("reconcile");
+    const outstanding = (yield* sql.get<{ dependency: string | null }>(
+      "SELECT dependency FROM pdpp_transport_phase_state WHERE phase='reconcile'",
+    ))?.dependency;
+    if (
+      row.next_attempt <= at ||
+      (!key.startsWith("declaration:") && key !== outstanding)
+    )
+      return 0;
+    yield* sql.run(
+      "UPDATE pdpp_transport_phase_state SET next_attempt=? WHERE phase='reconcile'",
+      at,
+    );
+    return 1;
+  }
   /** The first unmet dependency a reconcile reported, in a stable order. */
   function pendingDependency(
     plan: Pick<ReplicaMergePlan, "pending">,
@@ -4614,6 +4696,16 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
           found.push({
             kind: "declaration",
             key: `${op.sourceId}:${op.declaration.stream}`,
+          });
+        // This device retains another shape of that stream, and a rebinding
+        // cannot change a retained shape: only the owner can resolve it.
+        else if (
+          issue.reason === "incompatible_declaration" &&
+          "declaration" in op
+        )
+          found.push({
+            kind: "owner",
+            key: `declaration:${op.sourceId}:${op.declaration.stream}`,
           });
         else
           found.push({
@@ -4756,28 +4848,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
         })(),
       );
     },
-    wake(key, at) {
-      return query(
-        (function* () {
-          const row = yield* singleton("reconcile");
-          const outstanding = (yield* sql.get<{ dependency: string | null }>(
-            "SELECT dependency FROM pdpp_transport_phase_state WHERE phase='reconcile'",
-          ))?.dependency;
-          // A declaration notification can change validation of any retained
-          // operation; other keys matter only when they are what it waits on.
-          if (
-            row.next_attempt <= at ||
-            (!key.startsWith("declaration:") && key !== outstanding)
-          )
-            return 0;
-          yield* sql.run(
-            "UPDATE pdpp_transport_phase_state SET next_attempt=? WHERE phase='reconcile'",
-            at,
-          );
-          return 1;
-        })(),
-      );
-    },
+    wake: (key, at) => query(wakeReconcile(key, at)),
   };
 
   const coordinator = createAsyncReplicaCoordinator({

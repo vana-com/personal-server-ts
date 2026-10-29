@@ -225,7 +225,15 @@ export function createReplicaTransportWorker(
       getBaselineCheckpoint: () => sync(() => exporter.getBaselineCheckpoint()),
       acknowledgeBaselinePage: (expected, next) =>
         sync(() => exporter.acknowledgeBaselinePage(expected, next)),
-      rebaseline: () => sync(() => exporter.rebaseline()),
+      // The receiver's merge chose these operations for current state; the
+      // baseline copies only what this device's trust accepted.
+      rebaseline: () =>
+        sync(() =>
+          exporter.rebaseline(
+            receiver.explainState({ credential: deps.credential }),
+          ),
+        ),
+      declarationHistory: () => sync(() => exporter.declarationHistory()),
       // Node's journal is append-only and stays: rebaseline and completion
       // dependencies read it (`pdpp-replication-sqlite.ts`).
       acknowledgePublished: () => sync(() => undefined),

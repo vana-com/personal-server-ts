@@ -16,6 +16,7 @@ import type {
   ReplicaBudget,
 } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import { REPLICA_WAIT_FALLBACK_MS } from "@opendatalabs/personal-server-ts-core/replication/schedule";
+import { replicaDeclarationContext } from "@opendatalabs/personal-server-ts-core/replication/host-config";
 import {
   planReplicationHost,
   type ReplicationNetworkPorts,
@@ -84,23 +85,31 @@ export function createNodeReplication(input: {
 }): NodeReplication {
   const plan = planReplicationHost(input);
   if (plan.state === "blocked") return plan;
-  const { owner, environment, context } = plan;
+  const { owner, environment } = plan;
+  let context = plan.context;
   let ports: ReplicationNetworkPorts;
   const store = createReplicaRecordStore(input.db);
-  const baseline = () =>
-    store.replication.beginBaseline({
+  // After a baseline or rebinding, trust every binding the database retained
+  // (host contract §4.5): own operations in flight and peers that have not
+  // upgraded yet still name the older ones.
+  const baseline = () => {
+    store.replication.beginBaseline({ owner, declarations: context.current });
+    context = replicaDeclarationContext(
       owner,
-      declarations: [...context.expected.declarations],
-    });
+      input.declarations,
+      store.replication.declarationHistory(),
+    );
+  };
   const baselined = () =>
     input.db
       .prepare("SELECT 1 FROM pdpp_replica_settings WHERE id = 1")
       .get() !== undefined;
   try {
     ports = input.ports(owner);
-    // An existing baseline must match now: idempotent for the same bindings,
-    // refused for different ones. A first baseline waits for the writer
-    // identity (see `stepper`).
+    // An existing baseline takes this boot's bindings now: idempotent for the
+    // same set, a new binding generation for an upgraded or added
+    // declaration, refused for a changed stream shape. A first baseline waits
+    // for the writer identity (see `stepper`).
     if (baselined()) baseline();
   } catch (error) {
     return {

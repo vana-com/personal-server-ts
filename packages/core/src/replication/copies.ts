@@ -203,6 +203,36 @@ type FactRow = {
   eligible: number;
 };
 
+/**
+ * A copy's envelope. Copies staged before the parts table keep it in
+ * `envelope_json`; later copies leave that empty and keep it in parts.
+ */
+export function* replicaCopyEnvelope<C extends ReplicaEffectContext>(
+  id: string,
+  copyKey: string,
+): ReplicaEffect<ReplicaEnvelope, C> {
+  const whole = yield* sql.get<{ envelope_json: string }>(
+    "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
+    id,
+    copyKey,
+  );
+  if (!whole) throw new Error("unknown replica copy");
+  if (whole.envelope_json)
+    return JSON.parse(whole.envelope_json) as ReplicaEnvelope;
+  let json = "";
+  for (let part = 0; ; part++) {
+    const row = yield* sql.get<{ json: string }>(
+      "SELECT json FROM pdpp_replica_copy_envelope_parts WHERE id=? AND copy_key=? AND part=?",
+      id,
+      copyKey,
+      part,
+    );
+    if (!row) break;
+    json += row.json;
+  }
+  return JSON.parse(json) as ReplicaEnvelope;
+}
+
 export function replicaCopies<C extends ReplicaEffectContext>(
   host: ReplicaCopiesHost<C>,
 ) {
@@ -213,32 +243,8 @@ export function replicaCopies<C extends ReplicaEffectContext>(
       `SELECT ${ROW_COLUMNS} FROM pdpp_replica_copies WHERE id=? ORDER BY copy_key`,
       id,
     );
-  /**
-   * A copy's envelope. Copies staged before the parts table keep it in
-   * `envelope_json`; later copies leave that empty and keep it in parts.
-   */
-  function* envelopeOf(id: string, copyKey: string): Fx<ReplicaEnvelope> {
-    const whole = yield* sql.get<{ envelope_json: string }>(
-      "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
-      id,
-      copyKey,
-    );
-    if (!whole) throw new Error("unknown replica copy");
-    if (whole.envelope_json)
-      return JSON.parse(whole.envelope_json) as ReplicaEnvelope;
-    let json = "";
-    for (let part = 0; ; part++) {
-      const row = yield* sql.get<{ json: string }>(
-        "SELECT json FROM pdpp_replica_copy_envelope_parts WHERE id=? AND copy_key=? AND part=?",
-        id,
-        copyKey,
-        part,
-      );
-      if (!row) break;
-      json += row.json;
-    }
-    return JSON.parse(json) as ReplicaEnvelope;
-  }
+  const envelopeOf = (id: string, copyKey: string) =>
+    replicaCopyEnvelope<C>(id, copyKey);
   const dispositionRow = (id: string): Fx<DispositionRow | undefined> =>
     sql.get<DispositionRow>(
       "SELECT * FROM pdpp_replica_batch_disposition WHERE id=?",
