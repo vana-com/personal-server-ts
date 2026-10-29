@@ -3,7 +3,10 @@
  * what it decides. See docs/261028-pdpp-import-job.md.
  */
 
-import { isCompletionTime } from "../pdpp-records/completion.js";
+import {
+  StreamCompletionError,
+  parseCompletionRequest,
+} from "../pdpp-records/completion.js";
 import { canonicalJson, planIngest } from "../pdpp-records/ingest-plan.js";
 import { encodeRecordKey } from "../pdpp-records/record-key.js";
 import type { PdppRecordEnvelopeInput } from "../pdpp-records/types.js";
@@ -557,18 +560,27 @@ export function createPdppImportJobs(
       }
       const completion = input.completion;
       if (completion !== undefined) {
+        const message =
+          "completion needs sourceCollectedAt and distinct full_stream proofs for job streams";
+        if (!object(completion)) throw invalid(message);
+        // The store's own shape rules, so every adapter refuses what it refuses.
+        try {
+          parseCompletionRequest({
+            ...job.binding,
+            sourceCollectedAt: completion.sourceCollectedAt,
+            collectionTimeBasis: "host_run_finished",
+            streams: completion.streams,
+          });
+        } catch (error) {
+          if (error instanceof StreamCompletionError) throw invalid(message);
+          throw error;
+        }
         if (
-          !object(completion) ||
-          !isCompletionTime(completion.sourceCollectedAt) ||
-          !Array.isArray(completion.streams) ||
-          completion.streams.length === 0 ||
-          !completion.streams.every(
-            (proof) => object(proof) && job.streams.includes(proof.stream),
+          !completion.streams.every((proof) =>
+            job.streams.includes(proof.stream),
           )
         )
-          throw invalid(
-            "completion needs sourceCollectedAt and proofs for job streams",
-          );
+          throw invalid(message);
       }
       await assertBinding(job);
       return capability.publish({

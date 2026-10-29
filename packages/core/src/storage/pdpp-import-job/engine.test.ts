@@ -606,6 +606,107 @@ describe("PDPP import job engine (in-memory adapter)", () => {
     }
   });
 
+  it("publication leaves another connection's reset in place", async () => {
+    const OTHER = "conn-other-1";
+    const anyInstance = {
+      ...declarations,
+      forInstance: (_instance: string, stream: string) =>
+        declarations.forInstance(INSTANCE, stream),
+    };
+    let armed = false;
+    let fired = false;
+    const { capability, begin } = await setup(undefined, {
+      onFault: (point) => {
+        if (point !== "publish:before-commit" || !armed || fired) return;
+        fired = true;
+        capability.resetConnection(OTHER);
+      },
+    });
+    capability.registerConnection({
+      instance: OTHER,
+      sourceId: SOURCE,
+      method: METHOD,
+    });
+    const jobs = createPdppImportJobs({
+      capability,
+      declarations: anyInstance,
+      owner: OWNER,
+    });
+    const other = { ...begin, jobId: "job-other" };
+    other.binding = { ...begin.binding, instance: OTHER };
+    await jobs.begin(other);
+    const done = await importSpool(jobs, "job-other", capability.readSpool!);
+    await jobs.commit({ jobId: "job-other", batches: done.job.nextSeq });
+    expect(capability.rows(OTHER, "conversations").length).toBeGreaterThan(0);
+
+    armed = true;
+    await jobs.begin(begin);
+    const status = await importSpool(jobs, "job-1", capability.readSpool!);
+    await jobs.commit({ jobId: "job-1", batches: status.job.nextSeq });
+    expect(fired).toBe(true);
+    for (const stream of STREAMS)
+      expect(capability.rows(OTHER, stream)).toEqual([]);
+    expect(adapterLive(capability)).toEqual(oracleLive(importVectorRecords()));
+  });
+
+  it("refuses a malformed completion proof and an older completion of unchanged rows", async () => {
+    const snapshotSha256 = await conversationsDigest();
+    const proof = {
+      stream: "conversations",
+      coverage: "full_stream" as const,
+      liveCount: 2,
+      snapshotSha256,
+    };
+    const at = "2026-10-28T12:00:00.000Z";
+    for (const streams of [
+      [{ ...proof, coverage: "partial" }],
+      [proof, proof],
+      [{ ...proof, liveCount: -1 }],
+      [{ ...proof, snapshotSha256: "not-a-digest" }],
+    ]) {
+      const { capability, begin, engine } = await setup();
+      const jobs = engine();
+      await jobs.begin(begin);
+      const status = await importSpool(jobs, "job-1", capability.readSpool!);
+      await expect(
+        jobs.commit({
+          jobId: "job-1",
+          batches: status.job.nextSeq,
+          completion: { sourceCollectedAt: at, streams } as never,
+        }),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+    }
+
+    const { capability, begin, engine } = await setup();
+    const jobs = engine();
+    await jobs.begin(begin);
+    let status = await importSpool(jobs, "job-1", capability.readSpool!);
+    await jobs.commit({
+      jobId: "job-1",
+      batches: status.job.nextSeq,
+      completion: { sourceCollectedAt: at, streams: [proof] },
+    });
+    // The same export again changes no rows, so the receipt stays and an
+    // earlier collection time cannot replace it.
+    await jobs.begin({ ...begin, jobId: "job-2" });
+    status = await importSpool(jobs, "job-2", capability.readSpool!);
+    await expect(
+      jobs.commit({
+        jobId: "job-2",
+        batches: status.job.nextSeq,
+        connectorState: "{}",
+        completion: {
+          sourceCollectedAt: "2026-10-28T11:00:00.000Z",
+          streams: [proof],
+        },
+      }),
+    ).rejects.toMatchObject({ code: "completion_failed" });
+    expect(capability.completion(INSTANCE, "conversations")).toMatchObject({
+      sourceCollectedAt: at,
+    });
+    expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
+  });
+
   it("a reset aborts open jobs and erases the cursor; the engine ignores an older generation's cursor", async () => {
     const { capability, begin, engine } = await setup();
     const jobs = engine();

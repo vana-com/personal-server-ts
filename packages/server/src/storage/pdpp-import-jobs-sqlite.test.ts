@@ -20,6 +20,7 @@ import {
   type ImportSpoolRecord,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-import-job";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import {
   createSqliteImportJobCapability,
@@ -372,6 +373,131 @@ describe("Node SQLite import job adapter", () => {
         createSqliteImportJobCapability(db, store, { pageSize }),
       ).toThrow(expect.objectContaining({ code: "invalid_request" }));
     db.close();
+  });
+
+  it("bounds a publication page by every text column it loads", async () => {
+    const emitted_at = `2026-10-28T00:00:00.000Z${" ".repeat(200)}`;
+    const records = Array.from({ length: 6 }, (_, index) => ({
+      stream: "events",
+      key: `e${index}`,
+      data: { id: `e${index}` },
+      emitted_at,
+    }));
+    const spool = await buildImportSpool(records);
+    writeFileSync(join(dir, `${spool.handle.id}.ndjson`), spool.bytes);
+    const db = new Database(join(dir, "pages.db"));
+    const store = createSqliteRecordStore(db);
+    store.registerConnection({
+      instance: INSTANCE,
+      sourceId: SOURCE,
+      method: METHOD,
+      label: "ChatGPT",
+    });
+    const pages: number[][] = [];
+    const capability = createSqliteImportJobCapability(
+      db,
+      {
+        ...store,
+        ingestBatch: (envelopes, ...rest) => {
+          pages.push(
+            envelopes.map((envelope) =>
+              Buffer.byteLength(
+                envelope.stream +
+                  JSON.stringify(envelope.key) +
+                  JSON.stringify(envelope.data) +
+                  envelope.emitted_at,
+              ),
+            ),
+          );
+          return store.ingestBatch(envelopes, ...rest);
+        },
+      },
+      { spoolPath: (handle) => join(dir, `${handle.id}.ndjson`) },
+    );
+    const jobs = createPdppImportJobs({
+      capability,
+      declarations,
+      owner: OWNER,
+    });
+    const begin: ImportJobBeginInput = {
+      jobId: "job-1",
+      binding: {
+        owner: OWNER,
+        instance: INSTANCE,
+        sourceId: SOURCE,
+        method: METHOD,
+        generation: 1,
+      },
+      spool: spool.handle,
+      streams: STREAMS,
+      batchBytes: 256,
+    };
+    await jobs.begin(begin);
+    const status = await importSpool(jobs, "job-1", capability.readSpool!);
+    await jobs.commit({ jobId: "job-1", batches: status.job.nextSeq });
+    expect(pages.flat()).toHaveLength(6);
+    for (const page of pages)
+      if (page.length > 1)
+        expect(page.reduce((sum, bytes) => sum + bytes, 0)).toBeLessThanOrEqual(
+          256,
+        );
+    db.close();
+  });
+
+  it("refuses a malformed proof and an older completion of unchanged rows, like the memory oracle", async () => {
+    const { store, capability, jobs, begin } = await prepare();
+    const live = importVectorRecords().filter(
+      (record) => record.stream === "conversations",
+    );
+    const proof = {
+      stream: "conversations",
+      coverage: "full_stream" as const,
+      liveCount: live.length,
+      snapshotSha256: liveSnapshotDigest(
+        {
+          sourceId: SOURCE,
+          instance: INSTANCE,
+          method: METHOD,
+          generation: 1,
+          stream: "conversations",
+        },
+        ["id"],
+        live.map((record) => ({
+          recordKey: String(record.key),
+          dataJson: JSON.stringify(record.data),
+        })),
+      ),
+    };
+    const at = "2026-10-28T12:00:00.000Z";
+    await jobs.begin(begin);
+    let status = await importSpool(jobs, "job-1", capability.readSpool!);
+    await expect(
+      jobs.commit({
+        jobId: "job-1",
+        batches: status.job.nextSeq,
+        completion: { sourceCollectedAt: at, streams: [proof, proof] },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await jobs.commit({
+      jobId: "job-1",
+      batches: status.job.nextSeq,
+      completion: { sourceCollectedAt: at, streams: [proof] },
+    });
+    await jobs.begin({ ...begin, jobId: "job-2" });
+    status = await importSpool(jobs, "job-2", capability.readSpool!);
+    await expect(
+      jobs.commit({
+        jobId: "job-2",
+        batches: status.job.nextSeq,
+        completion: {
+          sourceCollectedAt: "2026-10-28T11:00:00.000Z",
+          streams: [proof],
+        },
+      }),
+    ).rejects.toMatchObject({ code: "completion_failed" });
+    expect(
+      store.listStreamCompletions(INSTANCE).map((receipt) => receipt.stream),
+    ).toEqual(["conversations"]);
   });
 
   it("abort leaves nothing visible", async () => {
