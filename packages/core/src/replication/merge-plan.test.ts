@@ -259,24 +259,96 @@ it("fails closed for incompatible method, source and declaration evidence", () =
   expect(
     assertPermutations([registration, upsert("a", 2), otherSource]).records,
   ).toEqual([]);
-  const alternate = { ...binding, version: "2" };
+  // Another shape (here the primary key) makes the same key name two records.
+  const reshaped = { ...binding, version: "2", primaryKey: ["text"] };
   const otherDeclaration = {
     ...upsert("new-declaration", 3),
-    declaration: alternate,
+    declaration: reshaped,
+    recordKey: "same-key",
+    data: { id: "x", text: "same-key" },
   };
   const both = {
     ...context,
     declarations: [
       ...context.declarations,
-      { ...context.declarations[0], binding: alternate },
+      { ...context.declarations[0], binding: reshaped },
     ],
   };
-  expect(
-    planReplicaMerge(both, [registration, upsert("a", 2), otherDeclaration])
-      .records[0].quarantined,
-  ).toBe(true);
+  const conflict = planReplicaMerge(both, [
+    registration,
+    upsert("a", 2),
+    otherDeclaration,
+  ]);
+  expect(conflict.records[0].quarantined).toBe(true);
+  expect(conflict.conflicts[0].reason).toBe("incompatible_record_declaration");
   const unknown = planReplicaMerge(context, [registration, otherDeclaration]);
   expect(unknown.pending[0].reason).toBe("missing_declaration");
+});
+
+it("merges versions of one declared stream by revision, each valid under its own schema", () => {
+  // A rebinding: the same stream, semantics and key under a new version and
+  // schema. Neither version's writes quarantine the other's.
+  const upgraded = {
+    ...binding,
+    digest: `sha256:${"c".repeat(64)}`,
+    version: "2.0.0",
+    schemaDigest: `sha256:${"d".repeat(64)}`,
+  };
+  const versions = {
+    ...context,
+    declarations: [
+      ...context.declarations,
+      {
+        sourceId: identity.sourceId,
+        binding: upgraded,
+        // The new schema requires a field the old data lacks.
+        validateData: (data: Record<string, unknown>) =>
+          typeof data.text === "string" && typeof data.lang === "string",
+      },
+    ],
+  };
+  const v2 = (operationId: string, counter: number, writerId = "device-a") => ({
+    ...upsert(operationId, counter, operationId, writerId),
+    declaration: upgraded,
+    data: { id: "same-key", text: operationId, lang: "en" },
+  });
+  const assertVersions = (operations: ReplicaOperation[]) => {
+    const expected = planReplicaMerge(versions, operations);
+    for (const order of permutations(operations))
+      expect(planReplicaMerge(versions, [...order, ...order])).toEqual(
+        expected,
+      );
+    return expected;
+  };
+  // A device still on 1.0.0 wrote last: its value wins over the upgraded one.
+  const older = assertVersions([
+    registration,
+    v2("upgraded", 2),
+    upsert("not-upgraded", 3, "not-upgraded", "device-b"),
+  ]);
+  expect(older.conflicts).toEqual([]);
+  expect(older.records[0].quarantined).toBe(false);
+  expect(older.records[0].winner?.revision.operationId).toBe("not-upgraded");
+  expect(older.records[0].losers.map((op) => op.revision.operationId)).toEqual([
+    "upgraded",
+  ]);
+  // The upgraded write is newer: it wins; the 1.0.0 value is retained.
+  const newer = assertVersions([
+    registration,
+    upsert("a", 2),
+    v2("upgraded", 3, "device-b"),
+  ]);
+  expect(newer.records[0].winner?.declaration).toEqual(upgraded);
+  // Old data is not checked against the new schema, nor new data against old.
+  expect(newer.rejected).toEqual([]);
+  // A delete under one version and a later upsert under the other: the
+  // ordinary resurrection rule, nothing version specific.
+  const deleted = assertVersions([
+    registration,
+    v2("upgraded", 2),
+    { ...mutableVectors[2], revision: { ...mutableVectors[2].revision } },
+  ]);
+  expect(deleted.records[0].winner?.kind).toBe("delete");
 });
 
 it("rejects wrong owner, invalid schema and primary key, and never orders by emitted time", () => {

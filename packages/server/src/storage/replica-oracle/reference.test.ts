@@ -349,7 +349,7 @@ describe("frozen reference vectors", () => {
     expect(rows(project([register(), claim, wrongSize], bytes))).toEqual({});
   });
 
-  it("missing declarations hold a key; a later declaration applies or conflicts", () => {
+  it("missing declarations hold a key; a later declaration applies, or conflicts on another shape", () => {
     const prior = project([register(), put("p", 2, "k1", "v1")]);
     const v2 = put("q", 3, "k1", "v2", { binding: mutableV2 });
     const held = project(
@@ -364,14 +364,28 @@ describe("frozen reference vectors", () => {
         { sourceId: source, binding: mutableV2 },
       ],
     });
+    // Another version of the same stream shape is a rebinding: the newer
+    // revision wins.
     expect(
       rows(project([register(), put("p", 2, "k1", "v1"), v2], both, held)),
     ).toEqual({
-      [at("k1")]: tomb,
+      [at("k1")]: live("v2"),
     });
     expect(winnerText([register(), put("p", 2, "k1", "v1"), v2], both)).toEqual(
-      ["quarantined"],
+      ["v2"],
     );
+    // Another shape (here, semantics) names another record: the key conflicts.
+    const reshaped = { ...mutableV2, semantics: "append_only" as const };
+    const other = put("q", 3, "k1", "v2", { binding: reshaped });
+    const reshapedWorld = world({
+      declarations: [
+        ...world().declarations,
+        { sourceId: source, binding: reshaped },
+      ],
+    });
+    expect(
+      winnerText([register(), put("p", 2, "k1", "v1"), other], reshapedWorld),
+    ).toEqual(["quarantined"]);
   });
 
   it("terminal quarantine and connection deletion withdraw; local writes are refused", () => {

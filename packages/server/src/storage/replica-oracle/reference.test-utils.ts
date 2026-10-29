@@ -230,12 +230,15 @@ function keyedCandidates(
 }
 
 /**
- * A key's candidates conflict when they name two declarations, or when an
- * append-only key carries two contents. A conflict hides the key for good.
+ * A key's candidates conflict when they name two declaration shapes (stream,
+ * semantics, primary key), or when an append-only key carries two contents.
+ * Two versions of one shape are one record. A conflict hides the key for good.
  */
 function keyConflicted(candidates: readonly RecordOperation[]) {
   const bindings = new Set(
-    candidates.map((op) => canonicalJson(op.declaration)),
+    candidates.map(({ declaration: d }) =>
+      canonicalJson([d.stream, d.semantics, d.primaryKey]),
+    ),
   );
   const contents = new Set(
     candidates.map((op) =>

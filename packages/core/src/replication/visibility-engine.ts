@@ -29,6 +29,7 @@ import {
 } from "./completion.js";
 import {
   canonicalJson,
+  declarationShape,
   exactJson,
   type RecordOperation,
   type ReplicaOperation,
@@ -651,7 +652,8 @@ export interface CompletionFacts {
 /**
  * The available completion, or null. Available means: the connection is
  * active on the events' generation, no key of the stream is quarantined, the
- * events under declarations the host trusts name exactly one declaration,
+ * events under declarations the host trusts name exactly one declaration
+ * shape (`declarationShape`),
  * the newest of those events is a completion, every dependency has exactly one retained variant with the
  * pinned digest, nothing touching the stream is unresolved, and the live rows
  * match the declared count and snapshot digest.
@@ -677,7 +679,9 @@ export function completionAvailability(
     facts.unresolved
   )
     return null;
-  if (new Set(events.map((op) => canonicalJson(op.declaration))).size > 1)
+  // Versions of one declared stream (a rebinding) certify one stream; a
+  // changed shape does not.
+  if (new Set(events.map((op) => declarationShape(op.declaration))).size > 1)
     return null;
   const declaration = trusted(first)!;
   const completion = selectStreamCompletion(events);

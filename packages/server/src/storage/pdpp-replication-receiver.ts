@@ -25,6 +25,7 @@ import type {
 import { createHash } from "node:crypto";
 import {
   canonicalJson,
+  declarationShape,
   replicaEnvelopeSchema,
   type ReplicaOperation,
   type RecordOperation,
@@ -386,7 +387,7 @@ export function createReplicaReceiver(deps: {
   store.setReplicaVisibilityObserver(view.flush);
   store.setReplicaWriteBoundary(view.exclusive, view.snapshot);
   // A local write journals under the retained declaration. When retained
-  // evidence for its key already names another declaration, or the stream is
+  // evidence for its key already names another declaration shape, or the stream is
   // append-only and the content differs, the write completes a conflict. The
   // merge must quarantine the key now, not at the next import. This is only a
   // trigger: `reconcile` alone decides, so the check may over-approximate.
@@ -398,8 +399,8 @@ export function createReplicaReceiver(deps: {
         )
         .all(instance, stream, recordKey) as { operation_json: string }[]
     ).map((row) => JSON.parse(row.operation_json) as RecordOperation);
-    const declarations = new Set(
-      retainedForKey.map((op) => canonicalJson(op.declaration)),
+    const shapes = new Set(
+      retainedForKey.map((op) => declarationShape(op.declaration)),
     );
     const contents = new Set(
       retainedForKey.map((op) =>
@@ -409,7 +410,7 @@ export function createReplicaReceiver(deps: {
       ),
     );
     if (
-      declarations.size > 1 ||
+      shapes.size > 1 ||
       (contents.size > 1 &&
         retainedForKey.some((op) => op.declaration.semantics === "append_only"))
     ) {

@@ -1,5 +1,9 @@
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
-import { canonicalJson, replicaOperationSchema } from "./envelope.js";
+import {
+  canonicalJson,
+  declarationShape,
+  replicaOperationSchema,
+} from "./envelope.js";
 import type {
   DeclarationBinding,
   RecordOperation,
@@ -13,6 +17,7 @@ export const REPLICA_POLICY = {
   mutableOrder: "lamport-writer-operation",
   retainLosers: true,
   laterUpsertResurrects: true,
+  declarationVersions: "same-shape-versions-merge-by-revision",
   appendOnlyConflict: "quarantine-until-separately-authorized-repair",
   authorization: "single-issuer-data-and-connection-evidence-only",
 } as const;
@@ -227,8 +232,10 @@ export function planReplicaMerge(
     for (const candidates of records.values()) {
       candidates.sort((a, b) => compareRevisions(a.revision, b.revision));
       const first = candidates[0];
-      const bindings = new Set(
-        candidates.map((op) => canonicalJson(op.declaration)),
+      // Versions of one declared stream are one record (a rebinding); only a
+      // changed shape makes the same record key name two records.
+      const shapes = new Set(
+        candidates.map((op) => declarationShape(op.declaration)),
       );
       const content = new Set(
         candidates.map((op) =>
@@ -238,12 +245,12 @@ export function planReplicaMerge(
         ),
       );
       const quarantined =
-        bindings.size > 1 ||
+        shapes.size > 1 ||
         (first.declaration.semantics === "append_only" && content.size > 1);
       if (quarantined)
         issue(
           result.conflicts,
-          bindings.size > 1
+          shapes.size > 1
             ? "incompatible_record_declaration"
             : "append_only_content_conflict",
           candidates,

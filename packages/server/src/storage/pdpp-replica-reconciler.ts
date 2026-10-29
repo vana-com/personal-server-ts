@@ -1,6 +1,7 @@
 import type { Database, Statement } from "better-sqlite3";
 import {
   canonicalJson,
+  declarationShape,
   type ReplicaOperation,
   type RecordOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
@@ -936,7 +937,7 @@ export function createReplicaReconciler(deps: {
       "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
     ).run(instance, stream);
     // Diagnostics only: the engine already decided.
-    if (new Set(events.map((op) => canonicalJson(op.declaration))).size > 1)
+    if (new Set(events.map((op) => declarationShape(op.declaration))).size > 1)
       plan.conflicts.push({
         reason: "incompatible_completion_declaration",
         operations: events,
