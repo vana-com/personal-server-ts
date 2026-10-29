@@ -303,8 +303,11 @@ export function copyBinary(
 }
 
 /**
- * Main's whole-value row owns canonical bytes the server writes from a value
- * it already holds. A large value also gets a chunk copy for the transport.
+ * Write canonical bytes the server holds as one value, in one form only. A
+ * value up to CANONICAL_INLINE_BYTES (one Lite fragment) is main's whole row.
+ * A larger one is chunks only: the transport and capture's pin read those
+ * chunks, and the flag-off boot that retires replication writes main's row
+ * (`materializeCanonicalBinaries`).
  */
 export function writeCanonicalBinary(
   db: Database,
@@ -312,6 +315,14 @@ export function writeCanonicalBinary(
   bytes: Uint8Array,
 ): void {
   deleteBinary(db, "canonical", id);
+  if (bytes.length > CANONICAL_INLINE_BYTES) {
+    db.prepare(`DELETE FROM ${legacy.canonical} WHERE blob_id=?`).run(id);
+    const writer = binaryWriter(db, "canonical", id);
+    for (let offset = 0; offset < bytes.length; offset += BINARY_CHUNK_BYTES)
+      writer.write(bytes.subarray(offset, offset + BINARY_CHUNK_BYTES));
+    writer.finish();
+    return;
+  }
   const view = Buffer.from(
     bytes.buffer as ArrayBuffer,
     bytes.byteOffset,
@@ -321,11 +332,6 @@ export function writeCanonicalBinary(
     `INSERT INTO ${legacy.canonical} (blob_id, bytes) VALUES (?, ?)
      ON CONFLICT(blob_id) DO UPDATE SET bytes = excluded.bytes`,
   ).run(id, view);
-  if (bytes.length <= CANONICAL_INLINE_BYTES) return;
-  const writer = binaryWriter(db, "canonical", id);
-  for (let offset = 0; offset < bytes.length; offset += BINARY_CHUNK_BYTES)
-    writer.write(bytes.subarray(offset, offset + BINARY_CHUNK_BYTES));
-  writer.finish();
 }
 
 /**
@@ -352,6 +358,52 @@ export function copyBinaryToCanonical(
   const bytes = readBinary(db, from, sourceId);
   if (!bytes) throw new Error("missing binary bytes");
   writeCanonicalBinary(db, targetId, bytes);
+}
+
+/**
+ * Make verified bytes in `from` the canonical copy, and leave none in `from`,
+ * in the caller's transaction. Large chunked bytes change namespace in place:
+ * no byte is written. The manifest is deleted and inserted, not updated, so
+ * the visibility view's manifest triggers see both namespaces change.
+ */
+export function moveBinaryToCanonical(
+  db: Database,
+  from: BinaryNamespace,
+  id: string,
+): void {
+  const size = binaryLength(db, from, id);
+  if (size === undefined) throw new Error("missing binary bytes");
+  const chunked =
+    db
+      .prepare(
+        "SELECT 1 FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
+      )
+      .get(from, id) !== undefined;
+  if (size > CANONICAL_INLINE_BYTES && chunked) {
+    db.prepare(`DELETE FROM ${legacy.canonical} WHERE blob_id=?`).run(id);
+    deleteBinary(db, "canonical", id);
+    db.prepare(
+      "DELETE FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
+    ).run(from, id);
+    db.prepare(
+      "UPDATE pdpp_binary_chunks SET namespace='canonical' WHERE namespace=? AND blob_id=?",
+    ).run(from, id);
+    db.prepare(
+      "INSERT INTO pdpp_binary_manifests VALUES ('canonical',?,?)",
+    ).run(id, size);
+  } else copyBinaryToCanonical(db, from, id);
+  deleteBinaryCopy(db, from, id);
+}
+
+/** Delete a namespace's copy in both forms: chunks and the legacy whole row. */
+export function deleteBinaryCopy(
+  db: Database,
+  namespace: BinaryNamespace,
+  id: string,
+): void {
+  deleteBinary(db, namespace, id);
+  const table = legacy[namespace];
+  if (table) db.prepare(`DELETE FROM ${table} WHERE blob_id=?`).run(id);
 }
 
 /**
@@ -426,4 +478,96 @@ export function readBinary(
     return undefined;
   }
   return result;
+}
+
+/**
+ * Bring blobs an earlier build stored more than once down to one copy, a few
+ * blobs per call. Each candidate costs one verified read; the caller runs
+ * each `step` in its own write transaction. A copy goes only when canonical
+ * storage holds the blob and it verifies:
+ *
+ * - a received custody copy (the receiver now moves it at promotion);
+ * - main's whole row of a large blob that also has the chunk form;
+ * - a capture pin's own copy, which becomes a pin row that references the
+ *   canonical chunks (`captureBlob`).
+ *
+ * A candidate that fails verification is skipped for the compactor's life,
+ * so one corrupt blob cannot hold back the rest. Once a search finds nothing,
+ * the compactor stops for good: current writes keep one copy, so only a
+ * database an earlier build wrote has work, and an idle step then reads none
+ * of these tables.
+ */
+export function createBinaryCompactor(db: Database) {
+  const skipped = new Set<string>();
+  let exhausted = false;
+  const canonicalVerifies = (id: string) => {
+    const meta = db
+      .prepare(
+        "SELECT size_bytes AS size, sha256 FROM pdpp_blobs WHERE blob_id=?",
+      )
+      .get(id) as { size: number; sha256: string } | undefined;
+    return (
+      !!meta &&
+      verifyBinary(db, "canonical", id, `sha256:${meta.sha256}`, meta.size)
+    );
+  };
+  const kinds = [
+    {
+      kind: "received",
+      candidates: `SELECT blob_id FROM pdpp_binary_manifests WHERE namespace='received'
+        UNION SELECT blob_id FROM ${legacy.received}`,
+      compact(id: string) {
+        deleteBinaryCopy(db, "received", id);
+      },
+    },
+    {
+      kind: "whole",
+      candidates: `SELECT c.blob_id FROM ${legacy.canonical} c
+        JOIN pdpp_binary_manifests m ON m.namespace='canonical' AND m.blob_id=c.blob_id
+        WHERE m.size_bytes > ${CANONICAL_INLINE_BYTES}`,
+      compact(id: string) {
+        db.prepare(`DELETE FROM ${legacy.canonical} WHERE blob_id=?`).run(id);
+      },
+    },
+    {
+      kind: "pinned",
+      candidates: `SELECT p.blob_id FROM pdpp_binary_manifests p
+        JOIN pdpp_binary_manifests m ON m.namespace='canonical' AND m.blob_id=p.blob_id
+        WHERE p.namespace='pinned'`,
+      compact(id: string) {
+        db.prepare(
+          "INSERT OR IGNORE INTO pdpp_replica_blob_pins VALUES (?)",
+        ).run(id);
+        deleteBinary(db, "pinned", id);
+      },
+    },
+  ] as const;
+  /** The next blob to compact, or undefined when none is left. */
+  function next(): { kind: string; id: string } | undefined {
+    for (const { kind, candidates } of kinds) {
+      const rows = db
+        .prepare(
+          `SELECT blob_id FROM (${candidates}) WHERE blob_id IN (SELECT blob_id FROM pdpp_blobs) ORDER BY blob_id`,
+        )
+        .all() as { blob_id: string }[];
+      const row = rows.find((row) => !skipped.has(`${kind}:${row.blob_id}`));
+      if (row) return { kind, id: row.blob_id };
+    }
+    return undefined;
+  }
+  return {
+    /** Compact one blob; false when none is left. Call it in a write transaction. */
+    step(): boolean {
+      if (exhausted) return false;
+      const candidate = next();
+      if (!candidate) {
+        exhausted = true;
+        return false;
+      }
+      const kind = kinds.find((k) => k.kind === candidate.kind)!;
+      if (canonicalVerifies(candidate.id)) kind.compact(candidate.id);
+      else skipped.add(`${candidate.kind}:${candidate.id}`);
+      return true;
+    },
+  };
 }

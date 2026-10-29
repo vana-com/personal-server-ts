@@ -2113,8 +2113,14 @@ for (const delivery of [
         blobs: [{ blobId: blob.blobId, bytes }],
       });
     receiver.retry({ credential: "replica-secret" });
-    // The bytes that arrived are chunks, not legacy rows.
-    const namespace = delivery === "pending carrier" ? "pending" : "received";
+    // The bytes that arrived are chunks, not legacy rows. conn_b's upsert is
+    // promoted, so its received chunks move to canonical storage: one copy.
+    const namespace =
+      delivery === "pending carrier"
+        ? "pending"
+        : delivery === "unrelated connection"
+          ? "canonical"
+          : "received";
     expect(
       target.db
         .prepare(
@@ -3983,9 +3989,10 @@ it.each([
   },
 );
 
-// A repair write adds a legacy row in a namespace whose manifest is
-// malformed. The read side vetoes on the manifest even beside a legacy row,
-// so the write clears the malformed manifest in its own transaction.
+// A repair write over a namespace whose manifest is malformed. The read side
+// vetoes on the manifest even beside a legacy row, so the write clears it in
+// its own transaction. Canonical repair adds main's row. A received copy of a
+// blob canonical storage holds is redundant, so a re-import drops it.
 it.each([
   ["received", -1],
   ["received", 1.5],
@@ -4045,6 +4052,13 @@ it.each([
           receiver.readStore({ reader }).getBlobBytes(blob.blobId)?.length,
       );
     expect(served()).toEqual([3, 3]);
+    if (namespace === "received") {
+      // Promotion kept no received copy. Model one an earlier build kept.
+      const kept = binaryWriter(target.db, "received", blob.blobId);
+      kept.write(bytes);
+      kept.finish();
+      expect(served()).toEqual([3, 3]);
+    }
     if (namespace === "canonical") {
       // Promotion stores a blob this small inline; store it chunked, as
       // canonical storage holds a blob over 1 MiB.
@@ -4064,8 +4078,7 @@ it.each([
         .run(value, namespace, blob.blobId).changes;
     expect(size(malformed)).toBe(1);
     expect(served()).toEqual([undefined, undefined]);
-    // Supported writes of the same valid bytes add a legacy row and clear the
-    // malformed manifest.
+    // Supported writes of the same valid bytes clear the malformed manifest.
     if (namespace === "received")
       receiver.import({
         credential: "replica-secret",
@@ -4086,7 +4099,7 @@ it.each([
           `SELECT count(*) AS n FROM ${namespace === "received" ? "pdpp_replica_received_bytes" : "pdpp_blob_bytes"} WHERE blob_id=?`,
         )
         .get(blob.blobId),
-    ).toEqual({ n: 1 });
+    ).toEqual({ n: namespace === "received" ? 0 : 1 });
     expect(size(3)).toBe(0);
     expect(served()).toEqual([3, 3]);
   },

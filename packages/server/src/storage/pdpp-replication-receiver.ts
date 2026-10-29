@@ -5,7 +5,8 @@ import {
   binaryWriter,
   verifyBinary,
   copyBinary,
-  copyBinaryToCanonical,
+  deleteBinaryCopy,
+  moveBinaryToCanonical,
   deleteBinary,
   readBinaryChunks,
   type BinaryNamespace,
@@ -245,6 +246,8 @@ export function createReplicaReceiver(deps: {
         blob.sizeBytes,
         blob.sha256.slice(7),
       );
+      // Canonical storage keeps the one copy. A received copy moves there,
+      // or goes when canonical already holds the blob (host contract §6).
       if (binaryLength(db, "canonical", blob.blobId) !== undefined) {
         if (
           !verifyBinary(
@@ -256,7 +259,8 @@ export function createReplicaReceiver(deps: {
           )
         )
           throw new Error("corrupt canonical blob bytes");
-      } else copyBinaryToCanonical(db, verifiedBytes(blob)!, blob.blobId);
+        deleteBinaryCopy(db, "received", blob.blobId);
+      } else moveBinaryToCanonical(db, verifiedBytes(blob)!, blob.blobId);
       db.prepare(
         "INSERT INTO pdpp_blob_claims VALUES (?, ?, ?) ON CONFLICT(blob_id, instance) DO UPDATE SET generation = excluded.generation",
       ).run(blob.blobId, operation.connectionId, operation.generation);
@@ -714,9 +718,21 @@ export function createReplicaReceiver(deps: {
     input: ImportBlobs,
   ): ReplicaMergePlan {
     for (const op of envelope.operations) validateMapping(op);
+    // A blob canonical storage already holds needs no received copy; drop
+    // one an earlier build kept, malformed or not.
+    const canonical = (blobId: string, size: number) => {
+      if (
+        binaryLength(db, "canonical", blobId) !== size ||
+        !verifyBinary(db, "canonical", blobId, blobId, size)
+      )
+        return false;
+      deleteBinaryCopy(db, "received", blobId);
+      return true;
+    };
     for (const blob of input.blobs ?? []) {
       if (hash(blob.bytes) !== blob.blobId)
         throw new Error("corrupt replica blob bytes");
+      if (canonical(blob.blobId, blob.bytes.length)) continue;
       clearMalformedManifest(db, "received", blob.blobId);
       if (binaryLength(db, "received", blob.blobId) !== undefined) {
         if (
@@ -744,6 +760,7 @@ export function createReplicaReceiver(deps: {
       const from = blob.namespace ?? "staging";
       if (!verifyBinary(db, from, blob.key, blob.blobId, blob.sizeBytes))
         throw new Error("corrupt replica blob bytes");
+      if (canonical(blob.blobId, blob.sizeBytes)) continue;
       clearMalformedManifest(db, "received", blob.blobId);
       if (binaryLength(db, "received", blob.blobId) !== undefined) {
         if (

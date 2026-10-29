@@ -672,18 +672,33 @@ There is no blob-size cap.
   1 MiB fragments. A peer holds a writer's later batches behind an Unsupported
   one (`pdpp-replication-transport.ts:628-666`), so no tester limit may produce
   one.
-- **Reclaim instead of a lifetime cap (sender side landed):** when a batch's
-  registration is finalized, the transaction that marks its manifest
-  published also drops the batch payload and every fragment's ciphertext. The
-  fragment rows keep their digests and the manifest keeps the lengths. A
-  worker's first step does the same for batches finalized by an earlier
-  build. `pdpp-replication-blob-storage.test.ts` proves that no outbound
-  phase reads the dropped bytes, across later batches and a restart. Not yet
-  done: the receiver keeps its received custody copy and inbox fragment JSON
-  after import.
-- **Promotion:** the receiver copies a verified blob larger than 1 MiB into
-  canonical storage 64 KiB at a time and stores it once, in the chunk form.
-  It assembles no whole value.
+- **Reclaim instead of a lifetime cap:** when a batch's registration is
+  finalized, the transaction that marks its manifest published also drops the
+  batch payload and every fragment's ciphertext. The fragment rows keep their
+  digests and the manifest keeps the lengths. A worker's first step does the
+  same for batches finalized by an earlier build.
+  `pdpp-replication-blob-storage.test.ts` proves that no outbound phase reads
+  the dropped bytes, across later batches and a restart. On the receiver, the
+  import transaction deletes the inbox fragment bodies, and a received blob
+  moves into canonical storage instead of being copied (see Promotion).
+- **No custody of an own batch:** discovery skips every version the device
+  published itself, in any state, so a device never downloads or imports its
+  own batch. The first step of a process deletes inbox rows that an earlier
+  build admitted for the device's own published batches.
+- **One local copy per blob:** a blob larger than 1 MiB is stored once, as
+  chunks. A local write stores chunks only, with no whole-row copy. A pin of a
+  chunked canonical blob is a row in `pdpp_replica_blob_pins` that references
+  the canonical chunks. If canonical storage later replaces or drops the blob,
+  a trigger moves the chunks to the pinned namespace first, so the pin keeps
+  its bytes. Each step compacts at most 4 copies left by earlier builds
+  (received copies, whole rows of chunked blobs, and pinned copies of chunked
+  canonical blobs) after it verifies the canonical copy.
+- **Promotion:** the receiver verifies a received blob larger than 1 MiB and
+  moves its chunks into canonical storage in one transaction. It assembles no
+  whole value and keeps no received copy. When canonical storage already holds
+  the blob, the receiver verifies canonical and deletes the received copy.
+- **Free pages:** SQLite keeps freed pages in its freelist, so deleted blobs
+  do not shrink the database file. Later writes reuse those pages.
 
 ### 6.1 Engine work the step bound needs
 

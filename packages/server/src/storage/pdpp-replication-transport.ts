@@ -8,6 +8,7 @@ import {
   readBinaryWindow,
   deleteBinary,
   verifyBinary,
+  createBinaryCompactor,
 } from "./pdpp-binary-chunks.js";
 import {
   encodeReplicaPayload,
@@ -188,6 +189,8 @@ export const REPLICA_BATCH_BYTES = REPLICA_BATCH_TARGET_BYTES;
 const EXPORT_PAGE = 1000;
 /** New slots one discover pass admits per writer scope. */
 const DISCOVER_SLOTS = 256;
+/** Each costs one verified read of the blob. */
+const COMPACT_BLOBS_PER_STEP = 4;
 /** An unresolved AddData intent is retried only after this bounded window. */
 export const REPLICA_REGISTRATION_INTENT_TIMEOUT_MS = 5 * 60 * 1000;
 /** Per-writer recovery budget; only explicit owner acknowledgement resumes an exhausted writer. */
@@ -2781,7 +2784,11 @@ export function createReplicaTransportWorker(deps: {
       "UPDATE pdpp_transport_fragments_out SET encrypted=x'' WHERE batch=? AND length(encrypted)>0",
     ).run(batch);
   }
-  /** Reclaim batches finalized before reclaim existed. Once per process. */
+  const compactor = createBinaryCompactor(db);
+  /**
+   * Reclaim batches finalized before reclaim existed, and admissions of this
+   * device's own slots. Once per process.
+   */
   let reclaimSwept = false;
   function sweepPublished() {
     if (reclaimSwept) return;
@@ -2793,6 +2800,18 @@ export function createReplicaTransportWorker(deps: {
       )
       .all() as { batch: string }[];
     for (const { batch } of batches) reclaimPublished(batch);
+    // Earlier builds admitted this device's own published slots. Drop the
+    // admissions that are unfetched or already imported; one in flight
+    // finishes and goes at the next start.
+    const ownAdmissions = `SELECT i.slot FROM pdpp_transport_manifests_in i
+      JOIN pdpp_transport_manifests_out o ON o.scope=i.scope AND o.version=i.version AND o.state='published'
+      WHERE (i.state='ready' AND i.manifest_json IS NULL) OR (i.state='imported' AND i.batch=o.batch)`;
+    db.prepare(
+      `DELETE FROM pdpp_transport_fragments_in WHERE slot IN (${ownAdmissions})`,
+    ).run();
+    db.prepare(
+      `DELETE FROM pdpp_transport_manifests_in WHERE slot IN (${ownAdmissions})`,
+    ).run();
     reclaimSwept = true;
   }
   const publish: ReplicaPhaseHandler<Item<Outbound>> = {
@@ -2981,18 +3000,47 @@ export function createReplicaTransportWorker(deps: {
           for (const point of page.points) {
             const writer = replicaWriterOf(point.scope);
             if (!writer || !/^[1-9][0-9]{0,14}$/.test(point.version)) continue;
-            const known = (
-              db
-                .prepare(
-                  "SELECT coalesce(max(version),0) AS version FROM pdpp_transport_manifests_in WHERE scope=?",
-                )
-                .get(point.scope) as { version: number }
-            ).version;
-            const last = Math.min(
-              Number(point.version),
-              known + DISCOVER_SLOTS,
+            // This device's own slots are canonical here already; importing
+            // them would only add a custody copy. Skip every version it
+            // claims, published or not. A claim that loses its version to a
+            // squat is released (`recoverRegistration`), and the next pass
+            // admits the gap, so admission walks own scopes from version 1.
+            const own = new Set(
+              (
+                db
+                  .prepare(
+                    "SELECT version FROM pdpp_transport_manifests_out WHERE scope=?",
+                  )
+                  .all(point.scope) as { version: number }[]
+              ).map((row) => row.version),
             );
-            for (let version = known + 1; version <= last; version++)
+            const known = own.size
+              ? 0
+              : (
+                  db
+                    .prepare(
+                      "SELECT coalesce(max(version),0) AS version FROM pdpp_transport_manifests_in WHERE scope=?",
+                    )
+                    .get(point.scope) as { version: number }
+                ).version;
+            const seen = own.size
+              ? new Set(
+                  (
+                    db
+                      .prepare(
+                        "SELECT version FROM pdpp_transport_manifests_in WHERE scope=?",
+                      )
+                      .all(point.scope) as { version: number }[]
+                  ).map((row) => row.version),
+                )
+              : new Set<number>();
+            let admitted = 0;
+            for (
+              let version = known + 1;
+              version <= Number(point.version) && admitted < DISCOVER_SLOTS;
+              version++
+            ) {
+              if (own.has(version) || seen.has(version)) continue;
               db.prepare(
                 "INSERT OR IGNORE INTO pdpp_transport_manifests_in (slot,scope,version,writer) VALUES (?,?,?,?)",
               ).run(
@@ -3001,6 +3049,8 @@ export function createReplicaTransportWorker(deps: {
                 version,
                 writer,
               );
+              admitted++;
+            }
           }
           db.prepare(
             "UPDATE pdpp_transport_state SET scan_cursor=? WHERE id=1",
@@ -4406,6 +4456,9 @@ export function createReplicaTransportWorker(deps: {
         }
         sweepPublished();
       }).immediate();
+      // Storage earlier builds kept twice shrinks a few blobs per step.
+      for (let i = 0; i < COMPACT_BLOBS_PER_STEP; i++)
+        if (!deps.receiver.atomically(() => compactor.step())) break;
       const current = dependencyFingerprint();
       if (current !== fingerprint) {
         fingerprint = current;

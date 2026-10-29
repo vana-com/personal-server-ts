@@ -309,3 +309,234 @@ it("a step drops the bulk bytes of a batch that was finalized before reclaim exi
     BINARY_CHUNK_BYTES,
   );
 }, 120_000);
+
+/** Every byte a device keeps for blobs, by where it is kept. */
+function blobStorage(device: TransportDevice) {
+  const sum = (sql: string) =>
+    (device.db.prepare(sql).get() as { n: number | null }).n ?? 0;
+  const table = (name: string) =>
+    device.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+      .get(name) !== undefined;
+  const namespaces = Object.fromEntries(
+    (
+      device.db
+        .prepare(
+          "SELECT namespace, sum(length(bytes)) AS n FROM pdpp_binary_chunks GROUP BY namespace",
+        )
+        .all() as { namespace: string; n: number }[]
+    ).map((row) => [row.namespace, row.n]),
+  ) as Record<string, number>;
+  const rows = {
+    whole: sum("SELECT sum(length(bytes)) AS n FROM pdpp_blob_bytes"),
+    receivedRows: table("pdpp_replica_received_bytes")
+      ? sum("SELECT sum(length(bytes)) AS n FROM pdpp_replica_received_bytes")
+      : 0,
+    pinnedRows: table("pdpp_replica_blob_bytes")
+      ? sum("SELECT sum(length(bytes)) AS n FROM pdpp_replica_blob_bytes")
+      : 0,
+    pendingRows: table("pdpp_replica_pending_bytes")
+      ? sum("SELECT sum(length(bytes)) AS n FROM pdpp_replica_pending_bytes")
+      : 0,
+    inbox: sum(
+      "SELECT sum(length(fragment_json)) AS n FROM pdpp_transport_fragments_in",
+    ),
+    outbox: sum(
+      "SELECT sum(length(encrypted)) AS n FROM pdpp_transport_fragments_out",
+    ),
+  };
+  const total =
+    Object.values(namespaces).reduce((a, b) => a + b, 0) +
+    Object.values(rows).reduce((a, b) => a + b, 0);
+  return { namespaces, ...rows, total };
+}
+
+/** The (scope, version) slots this device registered for its own batches. */
+function ownSlots(device: TransportDevice) {
+  return device.db
+    .prepare("SELECT scope, version FROM pdpp_transport_manifests_out")
+    .all() as { scope: string; version: number }[];
+}
+
+async function exchange(a: TransportDevice, b: TransportDevice, ids: string[]) {
+  const done = () =>
+    ids.every((id) => arrived(a, id) && arrived(b, id)) &&
+    [a, b].every(
+      (device) =>
+        (
+          device.db
+            .prepare(
+              "SELECT count(*) AS n FROM pdpp_transport_manifests_out WHERE state<>'published'",
+            )
+            .get() as { n: number }
+        ).n === 0,
+    );
+  for (let i = 0; i < 300 && !done(); i++) {
+    clock.advance(10_000);
+    await a.step(BUDGET);
+    await b.step(BUDGET);
+  }
+  expect(done()).toBe(true);
+  // A few idle steps, so any late work (sweeps, revalidation) also runs.
+  await settle(a, b, 4);
+}
+
+it("a device never takes custody of its own published batch", async () => {
+  const { from, to } = pair();
+  await settle(from, to);
+  const reads = meter(from.db);
+  const id = writeBlob(from, pattern(BLOB_BYTES, 44), "large");
+  await exchange(from, to, [id]);
+  reads.stop();
+  const own = ownSlots(from);
+  expect(own.length).toBeGreaterThan(0);
+  const scopes = new Set(own.map((slot) => slot.scope));
+  // Discovery never admits an own slot, so nothing downloads or imports it.
+  const admitted = reads.accesses.filter(
+    ({ sql, args }) =>
+      /INSERT[^]*INTO pdpp_transport_manifests_in/.test(sql) &&
+      scopes.has(args[1] as string),
+  );
+  expect(admitted).toEqual([]);
+  expect(
+    from.db
+      .prepare(
+        "SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE scope IN (SELECT scope FROM pdpp_transport_manifests_out)",
+      )
+      .get(),
+  ).toEqual({ n: 0 });
+  expect(blobStorage(from).namespaces.received ?? 0).toBe(0);
+}, 120_000);
+
+it("keeps one copy of each blob after a two-way exchange, and no custody copy of a canonical blob", async () => {
+  const { from, to } = pair();
+  await settle(from, to);
+  const sourceA = pattern(BLOB_BYTES, 45);
+  const sourceB = pattern(BLOB_BYTES, 46);
+  const a = writeBlob(from, sourceA, "from-a");
+  const b = writeBlob(to, sourceB, "from-b");
+  await exchange(from, to, [a, b]);
+  for (const device of [from, to]) {
+    const stored = blobStorage(device);
+    // Two blobs, each stored once, in the chunk form; nothing else.
+    expect(stored).toMatchObject({
+      namespaces: { canonical: 2 * BLOB_BYTES },
+      whole: 0,
+      receivedRows: 0,
+      pinnedRows: 0,
+      pendingRows: 0,
+      inbox: 0,
+      outbox: 0,
+      total: 2 * BLOB_BYTES,
+    });
+    for (const [id, source] of [
+      [a, sourceA],
+      [b, sourceB],
+    ] as const) {
+      expect(sha256(device.store.getBlobBytes(id)!)).toBe(sha256(source));
+      expect(
+        sha256(
+          device.receiver.readStore({ reader: "grant" }).getBlobBytes(id)!,
+        ),
+      ).toBe(sha256(source));
+    }
+  }
+}, 120_000);
+
+it("a received blob moves into canonical storage: promotion writes no blob bytes", async () => {
+  const { from, to } = pair();
+  await settle(from, to);
+  const id = writeBlob(from, pattern(BLOB_BYTES, 47), "large");
+  const writes = meter(to.db);
+  for (let i = 0; i < 300 && !arrived(to, id); i++) {
+    clock.advance(10_000);
+    await from.step(BUDGET);
+    await to.step(BUDGET);
+  }
+  writes.stop();
+  expect(arrived(to, id)).toBe(true);
+  // Chunk bytes written per namespace while the blob was received.
+  const written: Record<string, number> = {};
+  for (const { sql, args } of writes.accesses)
+    if (/INSERT[^]*INTO pdpp_binary_chunks/.test(sql) && args[1] === id)
+      written[args[0] as string] =
+        (written[args[0] as string] ?? 0) + sizeOf(args[3]);
+  expect(written.canonical ?? 0).toBe(0);
+  expect(written.received ?? 0).toBeLessThanOrEqual(BLOB_BYTES);
+}, 120_000);
+
+it("a step drops custody bytes and own-slot admissions that an earlier build kept", async () => {
+  const { from, to } = pair();
+  await settle(from, to);
+  const id = writeBlob(from, pattern(2 * MiB, 48), "large");
+  await exchange(from, to, [id]);
+  // Model a database an earlier build left: a received copy of a blob that
+  // canonical storage holds, and an unimported admission of an own slot.
+  to.db.exec(
+    `INSERT OR IGNORE INTO pdpp_binary_chunks SELECT 'received', blob_id, position, bytes FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';
+     INSERT OR IGNORE INTO pdpp_binary_manifests SELECT 'received', blob_id, size_bytes FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id='${id}';`,
+  );
+  const own = ownSlots(from)[0]!;
+  from.db
+    .prepare(
+      "INSERT OR IGNORE INTO pdpp_transport_manifests_in (slot,scope,version,writer) VALUES (?,?,?,?)",
+    )
+    .run(`${own.scope}:${own.version}`, own.scope, own.version, "own");
+  expect(blobStorage(to).namespaces.received).toBe(2 * MiB);
+  to.crashReopen();
+  from.crashReopen();
+  clock.advance(10_000);
+  await to.step(BUDGET);
+  await from.step(BUDGET);
+  expect(blobStorage(to).namespaces.received ?? 0).toBe(0);
+  expect(sha256(to.store.getBlobBytes(id)!)).toBe(sha256(pattern(2 * MiB, 48)));
+  expect(
+    from.db
+      .prepare(
+        "SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE scope=?",
+      )
+      .get(own.scope),
+  ).toEqual({ n: 0 });
+}, 120_000);
+
+it("a local large blob is stored once, and capture's pin references that copy", async () => {
+  const { from, to } = pair();
+  await settle(from, to);
+  const source = pattern(BLOB_BYTES, 49);
+  const id = writeBlob(from, source, "large");
+  expect(canonicalOnDisk(from, id)).toEqual({ whole: 0, chunked: BLOB_BYTES });
+  expect(blobStorage(from)).toMatchObject({
+    namespaces: { canonical: BLOB_BYTES },
+    total: BLOB_BYTES,
+  });
+  // The pin serves export from the canonical copy.
+  const pinned = createHash("sha256");
+  for (const chunk of from.store.replication.readPinnedBlobChunks(id))
+    pinned.update(chunk);
+  expect(pinned.digest("hex")).toBe(sha256(source));
+  await exchange(from, to, [id]);
+  expect(sha256(to.store.getBlobBytes(id)!)).toBe(sha256(source));
+}, 120_000);
+
+it("a pinned blob outlives its canonical record until export no longer needs it", async () => {
+  const { from } = pair();
+  const source = pattern(BLOB_BYTES, 50);
+  const id = writeBlob(from, source, "large");
+  // Deleting the connection collects its unclaimed blobs at once.
+  from.store.deleteConnection(from.instance);
+  expect(from.store.getBlobBytes(id)).toBeUndefined();
+  const pinned = createHash("sha256");
+  let size = 0;
+  for (const chunk of from.store.replication.readPinnedBlobChunks(id)) {
+    pinned.update(chunk);
+    size += chunk.length;
+  }
+  expect(size).toBe(BLOB_BYTES);
+  expect(pinned.digest("hex")).toBe(sha256(source));
+  // A reopen collects again; the pin still holds.
+  from.reopen();
+  let reopened = 0;
+  for (const chunk of from.store.replication.readPinnedBlobChunks(id))
+    reopened += chunk.length;
+  expect(reopened).toBe(BLOB_BYTES);
+}, 120_000);
