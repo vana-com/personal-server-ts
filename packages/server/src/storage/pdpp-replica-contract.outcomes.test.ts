@@ -9,7 +9,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
-import { replicaFragmentKey } from "@opendatalabs/personal-server-ts-core/replication/transport";
+import {
+  replicaDigest,
+  replicaFragmentKey,
+} from "@opendatalabs/personal-server-ts-core/replication/transport";
 import {
   authenticatedOwnFork,
   adapterFactories,
@@ -427,10 +430,20 @@ describe("02 Progress to the next phase is atomic", () => {
           (o) => o.batch === before.batch && o.position === before.position,
         );
         expect(now?.digest, where).toEqual(before.digest);
-        expect(
-          Buffer.compare(now?.encrypted as Buffer, before.encrypted as Buffer),
-          where,
-        ).toBe(0);
+        expect(replicaDigest(before.encrypted as Buffer), where).toBe(
+          before.digest,
+        );
+        // A finalized batch drops its fragment bytes; the digest pins them.
+        const held = now?.encrypted as Buffer;
+        if (held.length)
+          expect(Buffer.compare(held, before.encrypted as Buffer), where).toBe(
+            0,
+          );
+        else
+          expect(
+            manifestRows(d).find((m) => m.batch === before.batch)?.state,
+            where,
+          ).toBe("published");
       }
       const finalManifests = manifestRows(d);
       expect(finalManifests, where).toHaveLength(1);
@@ -641,9 +654,16 @@ describe("05 Due to Retry and Retry to Progress", () => {
     expect(puts.parts[1]!.encrypted).toEqual(puts.parts[0]!.encrypted);
     expect(net.blobs.get(puts.parts[0]!.key)).toEqual(puts.parts[0]!.encrypted);
     const done = fragmentRows(d)[0]!;
+    // The stored object is the original ciphertext. The batch is finalized,
+    // so the sender dropped its copy and keeps the digest.
     expect(
-      Buffer.compare(done.encrypted as Buffer, original.encrypted as Buffer),
+      Buffer.compare(
+        Buffer.from(puts.parts[0]!.encrypted),
+        original.encrypted as Buffer,
+      ),
     ).toBe(0);
+    expect(done.digest).toBe(original.digest);
+    expect((done.encrypted as Buffer).length).toBe(0);
     expect(done.state).toBe("stored");
     expect(logical(d, "pdpp_transport_fragments_out")[0]).toMatchObject({
       outcome: "progress",

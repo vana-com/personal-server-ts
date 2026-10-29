@@ -2729,6 +2729,33 @@ export function createReplicaTransportWorker(deps: {
       return verdict(retryFromError(error, "publish_failed"));
     }
   }
+  /**
+   * The batch's registration is finalized: drop its payload and fragment
+   * ciphertext in the caller's transaction (host contract §6, "Reclaim").
+   * The fragment rows keep their digests and the manifest keeps every
+   * fragment's length, which is all later chain decisions read. No outbound
+   * phase selects a published batch's fragments or payload again.
+   */
+  function reclaimPublished(batch: string) {
+    deleteBinary(db, "payload", batch);
+    db.prepare(
+      "UPDATE pdpp_transport_fragments_out SET encrypted=x'' WHERE batch=? AND length(encrypted)>0",
+    ).run(batch);
+  }
+  /** Reclaim batches finalized before reclaim existed. Once per process. */
+  let reclaimSwept = false;
+  function sweepPublished() {
+    if (reclaimSwept) return;
+    const batches = db
+      .prepare(
+        `SELECT m.batch FROM pdpp_transport_manifests_out m WHERE m.state='published'
+         AND (EXISTS (SELECT 1 FROM pdpp_binary_manifests p WHERE p.namespace='payload' AND p.blob_id=m.batch)
+           OR EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=m.batch AND length(f.encrypted)>0))`,
+      )
+      .all() as { batch: string }[];
+    for (const { batch } of batches) reclaimPublished(batch);
+    reclaimSwept = true;
+  }
   const publish: ReplicaPhaseHandler<Item<Outbound>> = {
     phase: "publish",
     due(e, limit) {
@@ -2803,10 +2830,12 @@ export function createReplicaTransportWorker(deps: {
             db.prepare(
               "UPDATE pdpp_transport_registration_recovery SET state='committed' WHERE batch=?",
             ).run(item.row.batch);
-          if (item.row.kind === "manifest" && outcome.tag === "progress")
+          if (item.row.kind === "manifest" && outcome.tag === "progress") {
             db.prepare(
               "UPDATE pdpp_transport_registration_intents SET status='confirmed' WHERE scope=? AND version=?",
             ).run(item.row.scope!, item.row.version!);
+            reclaimPublished(item.row.batch);
+          }
           if (item.row.kind === "manifest" && outcome.tag === "quarantine")
             db.prepare(
               "UPDATE pdpp_transport_registration_intents SET status='conflict' WHERE scope=? AND version=?",
@@ -4295,6 +4324,7 @@ export function createReplicaTransportWorker(deps: {
             `DELETE FROM ${table} WHERE namespace='payload' AND NOT EXISTS (SELECT 1 FROM pdpp_transport_batches b WHERE b.batch=${table}.blob_id)`,
           ).run();
         }
+        sweepPublished();
       }).immediate();
       const current = dependencyFingerprint();
       if (current !== fingerprint) {

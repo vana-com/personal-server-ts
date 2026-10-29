@@ -561,9 +561,14 @@ build or plain `main`, fires a trigger and sets the flag. The triggers add
 objects next to main's tables; the rollback test (`flag.test.ts:367`) must be
 extended to prove that main still opens and writes such a database.
 
-Before the door closes, the host opens the store once with the flag on. That
-open restores the plain blob row for blobs written by the earlier chunk-only
-build (`flag.test.ts:198-238`).
+Replication stores a promoted blob larger than 1 MiB only as chunks. The
+flag-off boot that closes the door writes main's plain blob row for each such
+blob before any store opens (`retireReplication`,
+`materializeCanonicalBinaries`; `flag.test.ts`, "keeps large blobs readable
+through flag-off and plain main stores"). A plain `main` build that opens the
+database without that boot reads those blobs as unavailable: their records
+and metadata are present, and a later flag-off boot of a replication build
+restores the bytes.
 
 Confirmation copy:
 
@@ -593,12 +598,18 @@ There is no blob-size cap.
   1 MiB fragments. A peer holds a writer's later batches behind an Unsupported
   one (`pdpp-replication-transport.ts:628-666`), so no tester limit may produce
   one.
-- **Reclaim instead of a lifetime cap:** the outbox keeps plaintext and
-  ciphertext and the batch table keeps the payload
-  (`pdpp-replication-transport.ts:79-110`). After a batch's registration is
-  finalized, PS drops those bytes and keeps hashes and metadata. A test must
-  prove that no outbound phase reads them after that point. After import, PS
-  drops inbox bytes.
+- **Reclaim instead of a lifetime cap (sender side landed):** when a batch's
+  registration is finalized, the transaction that marks its manifest
+  published also drops the batch payload and every fragment's ciphertext. The
+  fragment rows keep their digests and the manifest keeps the lengths. A
+  worker's first step does the same for batches finalized by an earlier
+  build. `pdpp-replication-blob-storage.test.ts` proves that no outbound
+  phase reads the dropped bytes, across later batches and a restart. Not yet
+  done: the receiver keeps its received custody copy and inbox fragment JSON
+  after import.
+- **Promotion:** the receiver copies a verified blob larger than 1 MiB into
+  canonical storage 64 KiB at a time and stores it once, in the chunk form.
+  It assembles no whole value.
 
 ### 6.1 Engine work the step bound needs
 

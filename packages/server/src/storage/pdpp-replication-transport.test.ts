@@ -575,10 +575,17 @@ it("resumes uncertain publication with identical durable ciphertext, adopting on
   expect(outbox(a).map((r) => r.encrypted)).toEqual(
     original.map((r) => r.encrypted),
   );
-  expect(fragmentsOut(a).map((r) => r.encrypted)).toEqual(
-    fragments.map((r) => r.encrypted),
+  expect(fragmentsOut(a).map((r) => r.digest)).toEqual(
+    fragments.map((r) => r.digest),
   );
   expect(outbox(a).every((r) => r.state === "published")).toBe(true);
+  // Finalized: the sender dropped its fragment copies, and storage holds the
+  // original ciphertext at each digest.
+  expect(fragmentsOut(a).every((r) => r.encrypted.length === 0)).toBe(true);
+  for (const r of fragments)
+    expect(
+      Buffer.from(net.blobs.get(replicaFragmentKey(a.scope, r.digest))!),
+    ).toEqual(r.encrypted);
   expect(net.registrations.filter((s) => s === original[0]!.slot)).toHaveLength(
     1,
   );
@@ -2058,11 +2065,17 @@ it("H3 prepares, admits and imports one exact maximum honest batch", async () =>
   );
   expect(admission).not.toHaveProperty("kind");
 
-  const encryptedFragments = sender.db
-    .prepare(
-      "SELECT encrypted FROM pdpp_transport_fragments_out WHERE batch=? ORDER BY position",
-    )
-    .all(batch.batch) as { encrypted: Buffer }[];
+  // The batch is finalized, so the sender keeps only each fragment's digest;
+  // the ciphertext is the stored object at that digest.
+  const encryptedFragments = (
+    sender.db
+      .prepare(
+        "SELECT digest FROM pdpp_transport_fragments_out WHERE batch=? ORDER BY position",
+      )
+      .all(batch.batch) as { digest: string }[]
+  ).map((row) => ({
+    encrypted: net.blobs.get(replicaFragmentKey(outgoing.scope, row.digest))!,
+  }));
   const fragments = [];
   for (let index = 0; index < encryptedFragments.length; index++) {
     const plaintext = await net.port.decrypt(
@@ -3341,6 +3354,8 @@ it("rolls staged binary and import acknowledgement back together, then retries w
 it("reclaims only hidden crash staging on restart and preserves committed payloads", async () => {
   const net = network();
   const a = device(net);
+  // Registrations stay unfinalized, so committed payloads are still needed.
+  net.beforePut((key) => net.pending.add(key));
   a.put("retained");
   await a.cycle();
   const { binaryWriter } = await import("./pdpp-binary-chunks.js");

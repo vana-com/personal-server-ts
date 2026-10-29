@@ -366,8 +366,12 @@ and nothing outstanding the phase is never due and reads no retained history.
 New large canonical, pinned and received bytes use the same 64 KiB chunk store.
 Receiver reconciliation re-hashes actual chunks on every retry. Existing
 single-BLOB rows remain readable; their native SQLite memory use is not bounded
-by the JavaScript chunk reader. Explicit whole-value read APIs still assemble
-bytes for their callers. Hidden abandoned stages are reclaimed by the next
+by the JavaScript chunk reader. Replicated promotion of a blob larger than
+1 MiB copies chunks into canonical chunks and writes no whole row; the
+flag-off boot that retires replication writes main's row for those blobs.
+Explicit whole-value read APIs still assemble bytes for their callers. When a
+batch's registration is finalized, the publish commit drops its payload and
+fragment ciphertext; fragment digests and the manifest remain. Hidden abandoned stages are reclaimed by the next
 worker cycle under the single-process database-writer contract.
 Received custody, fragment commitments, failures and receipts remain retained.
 A rebuild may replace or remove an unpublished source payload; the source
