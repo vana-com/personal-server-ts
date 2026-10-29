@@ -27,11 +27,14 @@ import {
   type LiteCommitReceipt,
   type LiteOperationDraft,
 } from "./canonical-store.js";
-import type {
-  LiteBlobDescriptor,
-  LiteCanonicalTransaction,
-  LiteStorageEntry,
-  LiteStoragePage,
+import {
+  LITE_CANONICAL_BATCH_BYTES,
+  LITE_CANONICAL_MAX_OPERATION_BYTES,
+  LITE_CANONICAL_MAX_VALUE_BYTES,
+  type LiteBlobDescriptor,
+  type LiteCanonicalTransaction,
+  type LiteStorageEntry,
+  type LiteStoragePage,
 } from "./canonical-persistence.js";
 
 export * from "@opendatalabs/personal-server-ts-core/storage/pdpp-import-job";
@@ -72,9 +75,7 @@ export interface LiteCanonicalEncodedBatch {
 
 /** Items per `getMany`/`scanMany` call (the native store's read bound). */
 export const LITE_IMPORT_READ_MANY_MAX = 500;
-/** The same limits the native bridge applies to values and commit batches. */
-const VALUE_BYTES = 256 * 1024;
-const PART_BYTES = 192 * 1024;
+/** The native store's page bounds; a page always holds its first entry. */
 const PAGE_ENTRIES = 100;
 const PAGE_BYTES = 512 * 1024;
 /** Passes over guessed answers before the last pass reads directly. */
@@ -162,7 +163,11 @@ async function mergedPage(
     let bytes = 0;
     for (const entry of merged) {
       const size = utf8.encode(entry.value).byteLength;
-      if (entries.length === PAGE_ENTRIES || bytes + size > PAGE_BYTES) break;
+      if (
+        entries.length === PAGE_ENTRIES ||
+        (entries.length && bytes + size > PAGE_BYTES)
+      )
+        break;
       entries.push(entry);
       bytes += size;
     }
@@ -186,8 +191,8 @@ function captureTransaction(
       return base.get(key);
     },
     async put(key, value) {
-      if (utf8.encode(value).byteLength > VALUE_BYTES)
-        throw new RangeError("canonical value exceeds 256 KiB");
+      if (utf8.encode(value).byteLength > LITE_CANONICAL_MAX_VALUE_BYTES)
+        throw new RangeError("canonical value exceeds 18 MiB");
       overlay.set(key, value);
     },
     async delete(key) {
@@ -402,8 +407,8 @@ export function createLiteCanonicalImportEncoder(
 
   /**
    * One import batch as `commitLocal` parts of at most 192 KiB, with ids
-   * `import:<jobId>:<seq>:<part>`. Every operation needs its stream's
-   * retained declaration binding.
+   * `import:<jobId>:<seq>:<part>`. A larger operation is a part alone, up to
+   * 17 MiB. Every operation needs its stream's retained declaration binding.
    */
   function importBatchParts(input: {
     job: Pick<ImportJobRecord, "jobId" | "binding">;
@@ -452,12 +457,12 @@ export function createLiteCanonicalImportEncoder(
           : { ...base, kind: "delete", deletedAt: operation.emittedAt }
       ) as LiteOperationDraft;
       const size = utf8.encode(canonicalJson(draft)).byteLength + 1;
-      if (size + 2 > PART_BYTES)
+      if (size + 1 > LITE_CANONICAL_MAX_OPERATION_BYTES)
         throw new ImportJobError(
           "record_too_large",
-          `one operation is ${size} bytes; a canonical part holds ${PART_BYTES}`,
+          `one operation is ${size + 1} bytes; a canonical part holds ${LITE_CANONICAL_MAX_OPERATION_BYTES}`,
         );
-      if (bytes + size > PART_BYTES) flush();
+      if (bytes + size > LITE_CANONICAL_BATCH_BYTES) flush();
       current.push(draft);
       bytes += size;
     }

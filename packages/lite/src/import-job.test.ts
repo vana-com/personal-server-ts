@@ -94,6 +94,15 @@ function importOperations(): ImportStagedOperation[] {
   return operations;
 }
 
+/** `operation` with a text field of about `chars` UTF-8 bytes. */
+const large = (operation: ImportStagedOperation, chars: number) => ({
+  ...operation,
+  dataJson: JSON.stringify({
+    id: operation.recordKey,
+    text: "é·x".repeat(Math.ceil(chars / 5)),
+  }),
+});
+
 /** A view over `rows` that counts its calls; optionally with the batched reads. */
 function countingView(
   rows: Map<string, string>,
@@ -450,30 +459,109 @@ describe("Lite canonical import encoder", () => {
     expect(before.rows.get("clock")).not.toBe(encoded.fence.value);
   });
 
-  it("refuses an operation that cannot fit one canonical part", () => {
+  it("puts an operation over 192 KiB alone in its own part", () => {
     const encoder = createLiteCanonicalImportEncoder({ context });
-    const big = importOperations()[0];
+    const [a, b, c] = importOperations();
+    const parts = encoder.importBatchParts({
+      job: importJob,
+      seq: 0,
+      operations: [a!, large(b!, 300_000), c!],
+      bindingFor: () => binding,
+    });
+    expect(
+      parts.map((part) => part.operations.map((op) => op.recordKey)),
+    ).toEqual([["m0"], ["m1"], ["m2"]]);
+  });
+
+  it("refuses an operation over the 17 MiB a canonical part can hold", () => {
+    const encoder = createLiteCanonicalImportEncoder({ context });
     expect(() =>
       encoder.importBatchParts({
-        job: {
-          jobId: "job-1",
-          binding: {
-            owner: identity.owner,
-            instance: identity.connectionId,
-            sourceId: identity.sourceId,
-            method: identity.methodId,
-            generation: identity.generation,
-          },
-        },
+        job: importJob,
         seq: 0,
-        operations: [
-          {
-            ...big,
-            dataJson: JSON.stringify({ id: "m0", text: "x".repeat(200_000) }),
-          },
-        ],
+        operations: [large(importOperations()[0]!, 17 * 1024 * 1024)],
         bindingFor: () => binding,
       }),
     ).toThrow(expect.objectContaining({ code: "record_too_large" }));
   });
+
+  it.each([{ batched: true }, { batched: false }])(
+    "encodes records over 192 KiB and 512 KiB byte-identical to commitLocal (batched $batched)",
+    async ({ batched }) => {
+      const before = await registeredDisk();
+      const small = importOperations().slice(0, 6);
+      const batches = [
+        [
+          small[0]!,
+          large(small[1]!, 300_000),
+          small[2]!,
+          large(small[3]!, 700_000),
+          small[4]!,
+        ],
+        // Edit both large records (one grows, one shrinks) and add one.
+        [large(small[3]!, 900_000), small[1]!, small[5]!],
+      ];
+      const written = { rows: new Map(before.rows), blobs: new Map() };
+      const store = createLiteCanonicalStore({
+        persistence: createFakeCanonicalPersistence(written).port,
+        enabled: true,
+        context,
+        authenticateReplica: () => undefined,
+        newId: ids("op"),
+      });
+      const encoder = createLiteCanonicalImportEncoder({
+        context,
+        newId: ids("op"),
+      });
+      const staged = new Map(before.rows);
+      let operations = 0;
+      for (const [seq, batch] of batches.entries()) {
+        const parts = encoder.importBatchParts({
+          job: importJob,
+          seq,
+          operations: batch,
+          bindingFor: () => binding,
+        });
+        const receipts = [];
+        for (const part of parts)
+          receipts.push(await store.commitLocal(part.id, part.operations));
+        const encoded = await encoder.encode(
+          countingView(staged, { batched }).view,
+          parts,
+        );
+        expect(encoded.parts.map((part) => part.receipt)).toEqual(receipts);
+        applyEntries(staged, encoded.entries);
+        operations += batch.length;
+      }
+      expect([...staged].sort()).toEqual([...written.rows].sort());
+      const sizes = [...staged.values()].map(
+        (value) => new TextEncoder().encode(value).byteLength,
+      );
+      expect(sizes.filter((size) => size > 512 * 1024).length).toBeGreaterThan(
+        0,
+      );
+
+      // The outbox pages past each large operation instead of stalling on it.
+      const reader = createLiteCanonicalStore({
+        persistence: createFakeCanonicalPersistence({
+          rows: staged,
+          blobs: new Map(),
+        }).port,
+        enabled: true,
+        context,
+        authenticateReplica: () => undefined,
+      });
+      const sequences: number[] = [];
+      for (let after = 0, pages = 0; pages < 50; pages++) {
+        const page = await reader.readOutboxPage(after);
+        sequences.push(...page.entries.map((entry) => entry.sequence));
+        if (!page.hasMore) break;
+        after = page.nextAfterSequence;
+      }
+      // The registration plus every imported operation, in order.
+      expect(sequences).toEqual(
+        Array.from({ length: operations + 1 }, (_, i) => i + 1),
+      );
+    },
+  );
 });
