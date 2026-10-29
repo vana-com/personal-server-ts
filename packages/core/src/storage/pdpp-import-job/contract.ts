@@ -261,9 +261,44 @@ export interface ImportPublishInput {
  * may expose staged data to readers. Errors are `ImportJobError`s with the
  * listed codes, or the host's own binding/storage errors.
  */
+/** One canonical key/value write of a native store. `value: null` deletes the key. */
+export interface ImportCanonicalEntry {
+  key: string;
+  value: string | null;
+}
+
+/**
+ * How an adapter publishes (additive after b5f53725). Absent means
+ * `{ mode: "transactional-apply", outbox: "captured-in-transaction" }`, the
+ * version 1 behaviour of the Node SQLite and memory adapters.
+ */
+export interface ImportPublicationProfile {
+  /**
+   * - `transactional-apply`: `publish` applies the staged index through the
+   *   host's ingest rules inside one transaction (the `publish` steps below).
+   * - `native-staged-copy`: `stageBatch` also stores the batch's encoded
+   *   canonical entries (`canonical`) in an invisible staging table of the
+   *   same database, in the same transaction as the receipt. `publish` is one
+   *   native set-based copy (`INSERT … SELECT`) from that table into the
+   *   canonical tables, together with connector state, completion receipts,
+   *   the commit receipt and deletion of the staging rows. The copy never
+   *   re-encodes; the engine requires `encodeBatch` for this mode.
+   */
+  mode: "transactional-apply" | "native-staged-copy";
+  /**
+   * - `captured-in-transaction`: replica capture writes its outbox rows, with
+   *   their payloads, inside the publish transaction.
+   * - `by-reference`: an outbox entry names the committed operation
+   *   (`{ batchId, operationKey, sequence }` in the Lite canonical store) and
+   *   never copies record bytes.
+   */
+  outbox: "captured-in-transaction" | "by-reference";
+}
+
 export interface PdppImportJobCapability {
   /** Must equal `PDPP_IMPORT_JOB_CONTRACT_VERSION`. */
   readonly contractVersion: number;
+  readonly publication?: ImportPublicationProfile;
   readBinding(instance: string): Promise<ImportBindingSnapshot>;
   /** Insert if absent. Returns the stored row, which may be an older one with this id. */
   createJob(job: ImportJobRecord): Promise<ImportJobRecord>;
@@ -279,6 +314,8 @@ export interface PdppImportJobCapability {
     job: ImportJobRecord;
     receipt: ImportBatchReceipt;
     operations: ImportStagedOperation[];
+    /** Present exactly for `native-staged-copy`: store these in the same transaction. */
+    canonical?: { entries: ImportCanonicalEntry[] };
   }): Promise<ImportBatchReceipt>;
   readBatchReceipt(
     jobId: string,

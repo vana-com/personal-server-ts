@@ -483,6 +483,69 @@ describe("PDPP import job engine (in-memory adapter)", () => {
     expect(await jobs.append(batch)).toMatchObject({ replay: true });
   });
 
+  it("stages encoded canonical entries with each batch for a native staged copy", async () => {
+    const { capability, begin, spool } = await setup();
+    const native = {
+      ...capability,
+      publication: {
+        mode: "native-staged-copy",
+        outbox: "by-reference",
+      } as const,
+    };
+    expect(() =>
+      createPdppImportJobs({ capability: native, declarations, owner: OWNER }),
+    ).toThrow(expect.objectContaining({ code: "invalid_request" }));
+    expect(() =>
+      createPdppImportJobs({
+        capability,
+        declarations,
+        owner: OWNER,
+        encodeBatch: async () => ({ entries: [] }),
+      }),
+    ).toThrow(expect.objectContaining({ code: "invalid_request" }));
+
+    const encoded: number[] = [];
+    const staged: unknown[] = [];
+    const jobs = createPdppImportJobs({
+      capability: {
+        ...native,
+        stageBatch: (input) => {
+          staged.push(input.canonical);
+          return capability.stageBatch(input);
+        },
+      },
+      declarations,
+      owner: OWNER,
+      encodeBatch: async ({ seq, operations }) => {
+        encoded.push(seq);
+        return {
+          entries: operations.map((op) => ({
+            key: `rows/${op.recordKey}`,
+            value: op.dataJson,
+          })),
+        };
+      },
+    });
+    await jobs.begin(begin);
+    const firstLineEnd = spool.bytes.indexOf(0x0a) + 1;
+    const line = spool.bytes.subarray(0, firstLineEnd);
+    const batch = {
+      jobId: "job-1",
+      seq: 0,
+      text: new TextDecoder().decode(line),
+      sha256: await sha256HexOf(line),
+      spoolStart: 0,
+      spoolEnd: firstLineEnd,
+    };
+    await jobs.append(batch);
+    await jobs.append(batch);
+    // A replay answers from the durable receipt; it never re-encodes.
+    expect(encoded).toEqual([0]);
+    expect(staged).toEqual([
+      { entries: [expect.objectContaining({ key: expect.any(String) })] },
+    ]);
+  });
+
   it("refuses an adapter of another contract version", () => {
     const capability = createMemoryImportJobCapability({ contractVersion: 2 });
     expect(() =>

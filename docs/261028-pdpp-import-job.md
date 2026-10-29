@@ -116,6 +116,30 @@ with `capability_version_mismatch`. Implementations:
 - Lite: `createPsLiteRuntime({ importJobs })` exposes `runtime.importJobs`
   when the host supplies the capability; without it the runtime is unchanged.
 
+`publication` (optional; absent means the version 1 behaviour above) says
+how an adapter publishes:
+
+- `mode: "native-staged-copy"`: `stageBatch` stores the batch's encoded
+  canonical entries (`canonical.entries`) in an invisible staging table of
+  the same database, in the receipt's transaction. `publish` is one native
+  set-based copy (`INSERT … SELECT`) into the canonical tables, with
+  connector state, completion and commit receipts, and deletion of the
+  staging rows, in one transaction. The engine requires `encodeBatch` for
+  this mode and refuses it for any other; it calls it once per durable batch.
+- `outbox: "by-reference"`: an outbox entry names the committed operation
+  (`{batchId, operationKey, sequence}` in the Lite canonical store) and
+  carries no record bytes. `captured-in-transaction` is the Node SQLite
+  behaviour.
+
+The encoder is `createLiteCanonicalImportEncoder` in
+`@opendatalabs/personal-server-ts-lite/import-job`, which also re-exports
+this module, `planIngest` and `encodeLiveSnapshotDigestInput`. It runs the
+real `commitLocal` write path over a read view (the host answers from the
+job's staged entries over its committed entries) and captures the writes,
+so its entries are the keys and values Lite would write, byte for byte
+(`packages/lite/src/import-job.test.ts`). `importBatchParts` splits one
+import batch into `commitLocal` parts of at most 192 KiB.
+
 `readSpool` is optional; with it, `importSpool` pumps a spool in batches and
 resumes from the job's offset. No whole-file read is reachable from the job:
 an ESLint rule rejects whole-file read calls (`readFile`, `readEnvelope`,

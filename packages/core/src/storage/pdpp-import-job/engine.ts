@@ -19,6 +19,7 @@ import {
   PDPP_IMPORT_SPOOL_FORMAT,
   type ImportBatchInput,
   type ImportBatchReceipt,
+  type ImportCanonicalEntry,
   type ImportCommitInput,
   type ImportCommitReceipt,
   type ImportDeclarations,
@@ -85,6 +86,17 @@ export interface PdppImportJobsOptions {
    */
   owner: string | (() => string | undefined);
   now?: () => Date;
+  /**
+   * Required by, and only allowed with, a `native-staged-copy` adapter: the
+   * exact canonical entries of one validated batch (the Lite encoder,
+   * `@opendatalabs/personal-server-ts-lite/import-job`). Called once per
+   * durable batch; a replayed batch answers from its receipt.
+   */
+  encodeBatch?: (input: {
+    job: ImportJobRecord;
+    seq: number;
+    operations: readonly ImportStagedOperation[];
+  }) => Promise<{ entries: ImportCanonicalEntry[] }>;
 }
 
 export function createPdppImportJobs(
@@ -97,6 +109,13 @@ export function createPdppImportJobs(
       `import job adapter implements contract ${String(capability.contractVersion)}, engine requires ${PDPP_IMPORT_JOB_CONTRACT_VERSION}`,
     );
   }
+  const nativeCopy = capability.publication?.mode === "native-staged-copy";
+  if (nativeCopy !== Boolean(options.encodeBatch))
+    throw invalid(
+      nativeCopy
+        ? "a native-staged-copy adapter needs encodeBatch"
+        : "encodeBatch is only for a native-staged-copy adapter",
+    );
   function currentOwner(): string {
     const value =
       typeof options.owner === "function" ? options.owner() : options.owner;
@@ -479,6 +498,9 @@ export function createPdppImportJobs(
       job: next,
       receipt,
       operations,
+      ...(options.encodeBatch
+        ? { canonical: await options.encodeBatch({ job, seq, operations }) }
+        : {}),
     });
     if (stored.sha256 !== sha256)
       throw new ImportJobError(

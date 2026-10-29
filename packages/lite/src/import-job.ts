@@ -17,6 +17,7 @@ import {
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import {
   ImportJobError,
+  type ImportCanonicalEntry,
   type ImportJobRecord,
   type ImportStagedOperation,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-import-job";
@@ -36,10 +37,7 @@ import type {
 export * from "@opendatalabs/personal-server-ts-core/storage/pdpp-import-job";
 
 /** One canonical KV write. `value: null` deletes the key. */
-export interface LiteCanonicalEntry {
-  key: string;
-  value: string | null;
-}
+export type LiteCanonicalEntry = ImportCanonicalEntry;
 
 /**
  * What the encoder reads. For a job, the host answers from the job's staged
