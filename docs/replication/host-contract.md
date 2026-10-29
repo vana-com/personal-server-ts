@@ -501,10 +501,11 @@ Bounded growth on the phone:
   read it. Compaction (keep unpublished operations and the operations the
   merge chose) is separate work.
 - **Large received batches.** A Node batch targets 32 MiB. Lite keeps a
-  received envelope, its copy and its fetched fragments in parts below the
-  per-call SQL bound (`LITE_REPLICA_SQL_BYTES`), each of its blob descriptors
-  in its own value, and imports it in one native
-  transaction under one receipt. Only each operation is bounded
+  received envelope, its copy (envelope and blob descriptors) and its fetched
+  fragments in parts below the per-call SQL bound (`LITE_REPLICA_SQL_BYTES`),
+  each of its pending blob descriptors in its own value, and imports it in one
+  native transaction under one receipt. Preparing a local batch reads its
+  operations in pages below the same bound. Only each operation is bounded
   (`LITE_CANONICAL_MAX_OPERATION_BYTES`), because the store keeps it as one
   value. A larger operation is held `resource_unsupported` until a build
   raises the bound and `REPLICA_LIMITS_VERSION` with it.

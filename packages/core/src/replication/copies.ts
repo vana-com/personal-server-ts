@@ -56,6 +56,11 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_copy_envelope_parts (
   json TEXT NOT NULL,
   PRIMARY KEY (id, copy_key, part)
 );
+CREATE TABLE IF NOT EXISTS pdpp_replica_copy_blob_parts (
+  id TEXT NOT NULL, copy_key TEXT NOT NULL, part INTEGER NOT NULL,
+  json TEXT NOT NULL,
+  PRIMARY KEY (id, copy_key, part)
+);
 CREATE TABLE IF NOT EXISTS pdpp_replica_copy_rejects (
   id TEXT NOT NULL, reject_key TEXT NOT NULL, claimed_copy_key TEXT,
   reason TEXT NOT NULL, received_at INTEGER NOT NULL,
@@ -176,12 +181,11 @@ type Row = {
   fragment_count: number;
   fragment_commitments_json: string;
   envelope_digest: string;
-  blobs_json: string;
   state: "pending" | "confirmed" | "quarantined";
   reason: "copy_conflict" | "finalized_conflict" | null;
 };
 const ROW_COLUMNS =
-  "id,copy_key,writer_id,batch_id,sequence,previous_json,fragment_count,fragment_commitments_json,envelope_digest,blobs_json,state,reason";
+  "id,copy_key,writer_id,batch_id,sequence,previous_json,fragment_count,fragment_commitments_json,envelope_digest,state,reason";
 type DispositionRow = {
   writer_id: string;
   sequence: number;
@@ -233,6 +237,37 @@ export function* replicaCopyEnvelope<C extends ReplicaEffectContext>(
   return JSON.parse(json) as ReplicaEnvelope;
 }
 
+/**
+ * A copy's blob descriptors as JSON. Copies staged before the parts table
+ * keep them in `blobs_json`; later copies leave that empty and keep them in
+ * parts, so a batch of many small blobs never builds one SQL value above
+ * the phone's bound.
+ */
+function* copyBlobsJson<C extends ReplicaEffectContext>(
+  id: string,
+  copyKey: string,
+): ReplicaEffect<string, C> {
+  const whole = yield* sql.get<{ blobs_json: string }>(
+    "SELECT blobs_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
+    id,
+    copyKey,
+  );
+  if (!whole) throw new Error("unknown replica copy");
+  if (whole.blobs_json) return whole.blobs_json;
+  let json = "";
+  for (let part = 0; ; part++) {
+    const row = yield* sql.get<{ json: string }>(
+      "SELECT json FROM pdpp_replica_copy_blob_parts WHERE id=? AND copy_key=? AND part=?",
+      id,
+      copyKey,
+      part,
+    );
+    if (!row) break;
+    json += row.json;
+  }
+  return json;
+}
+
 export function replicaCopies<C extends ReplicaEffectContext>(
   host: ReplicaCopiesHost<C>,
 ) {
@@ -245,6 +280,11 @@ export function replicaCopies<C extends ReplicaEffectContext>(
     );
   const envelopeOf = (id: string, copyKey: string) =>
     replicaCopyEnvelope<C>(id, copyKey);
+  const blobsOf = function* (id: string, copyKey: string) {
+    return JSON.parse(
+      yield* copyBlobsJson<C>(id, copyKey),
+    ) as StagedCopy["blobs"];
+  };
   const dispositionRow = (id: string): Fx<DispositionRow | undefined> =>
     sql.get<DispositionRow>(
       "SELECT * FROM pdpp_replica_batch_disposition WHERE id=?",
@@ -337,7 +377,7 @@ export function replicaCopies<C extends ReplicaEffectContext>(
       yield* host.preview.show(
         id,
         yield* envelopeOf(id, row.copy_key),
-        row.blobs_json,
+        yield* copyBlobsJson<C>(id, row.copy_key),
       );
     } else
       yield* host.preview.hide(
@@ -497,7 +537,7 @@ export function replicaCopies<C extends ReplicaEffectContext>(
           yield* terminate(copy.id, "finalized_conflict");
       } else {
         yield* sql.run(
-          "INSERT INTO pdpp_replica_copies VALUES (?,?,?,?,?,?,?,?,?,'',?,'pending',NULL)",
+          "INSERT INTO pdpp_replica_copies VALUES (?,?,?,?,?,?,?,?,?,'','','pending',NULL)",
           copy.id,
           copyKey,
           copy.writer,
@@ -507,8 +547,18 @@ export function replicaCopies<C extends ReplicaEffectContext>(
           copy.fragments.length,
           canonicalJson(commitments),
           copy.envelopeDigest,
-          canonicalJson(copy.blobs),
         );
+        for (const [part, json] of replicaTextParts(
+          canonicalJson(copy.blobs),
+          REPLICA_TEXT_PART_BYTES,
+        ).entries())
+          yield* sql.run(
+            "INSERT INTO pdpp_replica_copy_blob_parts VALUES (?,?,?,?)",
+            copy.id,
+            copyKey,
+            part,
+            json,
+          );
         const parts = replicaTextParts(
           canonicalJson(copy.envelope),
           REPLICA_TEXT_PART_BYTES,
@@ -659,7 +709,7 @@ export function replicaCopies<C extends ReplicaEffectContext>(
       }
       // The import runs in a savepoint: an invariant violation inside it
       // rolls back the import alone, and the terminal transition commits.
-      const blobs = JSON.parse(row.blobs_json) as StagedCopy["blobs"];
+      const blobs = yield* blobsOf(input.id, copyKey);
       try {
         yield* host.savepoint(
           host.importEnvelope(
@@ -691,15 +741,11 @@ export function replicaCopies<C extends ReplicaEffectContext>(
         row.envelope_digest,
       );
       yield* syncPreview(input.id);
-      const kept = new Set(
-        (yield* rows(input.id))
-          .filter((r) => r.copy_key !== copyKey)
-          .flatMap((r) =>
-            (JSON.parse(r.blobs_json) as StagedCopy["blobs"]).map(
-              (b) => b.blobId,
-            ),
-          ),
-      );
+      const kept = new Set<string>();
+      for (const r of yield* rows(input.id))
+        if (r.copy_key !== copyKey)
+          for (const b of yield* blobsOf(input.id, r.copy_key))
+            kept.add(b.blobId);
       yield* host.releaseBytes(
         input.id,
         blobs.map((b) => b.blobId).filter((b) => !kept.has(b)),
