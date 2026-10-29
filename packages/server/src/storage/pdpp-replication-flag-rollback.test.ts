@@ -171,6 +171,9 @@ describe("a database used with replication on, then opened plain", () => {
     ).toEqual([]);
 
     const before = replicaState(db);
+    // The reconciler's durable queue and facts are among the rows that must
+    // not move.
+    expect(Object.keys(before)).toContain("pdpp_replica_reconcile_queue");
     ingest(plain, "d");
     ingest(plain, "a"); // rewrite
     expect(

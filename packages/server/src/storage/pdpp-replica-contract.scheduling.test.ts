@@ -11,6 +11,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { replicaScope } from "@opendatalabs/personal-server-ts-core/replication/transport";
+import { ReplicaByteBudget } from "@opendatalabs/personal-server-ts-core/replication/limits";
 import {
   authenticatedOwnFork,
   CrashController,
@@ -296,7 +297,7 @@ function instrument(d: TransportDevice, tally: Tally, hooks: Hooks = {}) {
   const copies = receiver.copies;
   const stage = copies.stage.bind(copies);
   const promote = copies.promote.bind(copies);
-  const retry = receiver.retry.bind(receiver);
+  const reconcileStep = receiver.reconcileStep.bind(receiver);
   vi.spyOn(copies, "stage").mockImplementation((input) => {
     const call = idParts(input.copy.id);
     tally.stage.push(call);
@@ -309,9 +310,10 @@ function instrument(d: TransportDevice, tally: Tally, hooks: Hooks = {}) {
     hooks.beforePromote?.(call);
     return promote(input);
   });
-  vi.spyOn(receiver, "retry").mockImplementation((input) => {
-    tally.retry++;
-    return retry(input);
+  // A full reconcile pass over retained history starts with `restart`.
+  vi.spyOn(receiver, "reconcileStep").mockImplementation((input) => {
+    if (input.restart) tally.retry++;
+    return reconcileStep(input);
   });
 }
 
@@ -607,7 +609,7 @@ it("17b revalidation of many imported slots is budgeted: evidence reads grow by 
   }
 }, 30_000);
 
-it("17c receiver.retry runs at most once per step, never on an idle step, and once per dependency change", async () => {
+it("17c a full reconcile pass starts at most once per step, never on an idle step, and once per dependency change", async () => {
   const net = network();
   const a = await publishedWriter(net, (d) => d.put("reconcile me", "a"));
   const b = transportDevice(net);
@@ -622,7 +624,7 @@ it("17c receiver.retry runs at most once per step, never on an idle step, and on
     clock.advance(10);
     await step(b);
   }
-  expect(tally.retry - base, "idle steps ran receiver.retry").toBe(0);
+  expect(tally.retry - base, "idle steps started a reconcile pass").toBe(0);
 
   // With nothing outstanding there is no timer either: ten idle minutes run
   // no canonical reconcile (it reads all retained history).
@@ -630,7 +632,7 @@ it("17c receiver.retry runs at most once per step, never on an idle step, and on
     clock.advance(30_000);
     await step(b);
   }
-  expect(tally.retry - base, "an idle timer ran receiver.retry").toBe(0);
+  expect(tally.retry - base, "an idle timer started a reconcile pass").toBe(0);
 
   // A dependency change runs it exactly once: a notified declaration change,
   // then a local mapping change found by the durable fingerprint.
@@ -682,10 +684,137 @@ it("17d an idle step reads no retained history: no canonical reconcile and no qu
   const base = tally.retry;
   await steps(b, 5, 10_000);
   expect(sql.length, "the idle steps ran no SQL at all").toBeGreaterThan(0);
-  expect(tally.retry - base, "an idle step ran receiver.retry").toBe(0);
+  expect(tally.retry - base, "an idle step started a reconcile pass").toBe(0);
   expect(
     sql.filter((source) => source.includes("pdpp_replica_received")),
   ).toEqual([]);
+});
+
+it("17e a reconcile pass runs one bounded page per step, survives a declaration change mid-pass, and goes idle when done", async () => {
+  const net = network();
+  const page = { operations: 10, bytes: 64 * 1024 };
+  const b = transportDevice(net, { worker: { reconcilePage: page } });
+  const tally = newTally();
+  instrument(b, tally);
+  b.receiver.import({ credential, envelope: envelope(remoteHistory(200)) });
+  // The first step's pass (a new fingerprint) is itself paged.
+  await stepUntil(b, () => !b.receiver.reconcileQueued(), 100, 10_000);
+
+  const base = tally.retry;
+  notify(b, `declaration:${sourceId}:messages`);
+  const loads: number[] = [];
+  for (let i = 0; i < 200 && (i === 0 || b.receiver.reconcileQueued()); i++) {
+    // A second change in the middle of the pass starts it again.
+    if (i === 5) notify(b, `declaration:${sourceId}:messages`);
+    const before = b.receiver.reconcileStats().operations;
+    clock.advance(10);
+    await step(b);
+    loads.push(b.receiver.reconcileStats().operations - before);
+  }
+  expect(b.receiver.reconcileQueued(), "the pass never finished").toBe(false);
+  expect(tally.retry - base, "two dependency changes, two passes").toBe(2);
+  // 200 keys at 10 operations a page: at least 20 steps after the restart,
+  // none over a page plus one key's evidence and the connection's lifecycle.
+  expect(loads.length).toBeGreaterThanOrEqual(25);
+  expect(Math.max(...loads)).toBeLessThanOrEqual(page.operations + 3);
+  expect(b.get("r0")).toEqual({ id: "r0", text: "remote 0" });
+
+  const after = b.receiver.reconcileStats().operations;
+  await steps(b, 5, 30_000);
+  expect(b.receiver.reconcileStats().operations, "idle after the pass").toBe(
+    after,
+  );
+  expect(tally.retry - base).toBe(2);
+}, 30_000);
+
+it("17f a reconcile page reserves its bytes from the shared budget: busy while others hold it, alone when it is the only holder", async () => {
+  const net = network();
+  const MiB = 1024 * 1024;
+  const budget = new ReplicaByteBudget(64 * MiB);
+  const page = { operations: 2_000, bytes: 8 * MiB };
+  const b = transportDevice(net, {
+    worker: { resourceBudget: budget, reconcilePage: page },
+  });
+  const tally = newTally();
+  instrument(b, tally);
+  b.receiver.import({ credential, envelope: envelope(remoteHistory(20)) });
+  await steps(b, 3, 10_000);
+
+  const held = budget.reserve(60 * MiB);
+  if (typeof held !== "function") throw new Error("setup reservation refused");
+  const calls = tally.retry;
+  notify(b, `declaration:${sourceId}:messages`);
+  const busy = await step(b);
+  expect(
+    busy?.problems.filter((p) => p.phase === "reconcile").map((p) => p.problem),
+  ).toEqual(["resource_busy"]);
+  expect(tally.retry, "a refused page loads nothing").toBe(calls);
+  // The Retry keeps its backoff: steps inside it make no reconcile attempt.
+  for (let i = 0; i < 3; i++) {
+    clock.advance(10);
+    const quiet = await step(b);
+    expect(quiet?.problems.filter((p) => p.phase === "reconcile")).toEqual([]);
+    expect(quiet?.nextWake ?? Infinity).toBeGreaterThan(clock.now());
+  }
+  expect(tally.retry).toBe(calls);
+  held();
+  await stepUntil(b, () => tally.retry > calls, 10, B1);
+  expect(budget.reserved, "every page released its bytes").toBe(0);
+
+  // A refusal in the middle of a pass backs off, then continues that pass
+  // instead of starting it again.
+  const small = transportDevice(net, {
+    worker: {
+      resourceBudget: budget,
+      reconcilePage: { operations: 5, bytes: 64 * 1024 },
+    },
+  });
+  const tallySmall = newTally();
+  instrument(small, tallySmall);
+  small.receiver.import({ credential, envelope: envelope(remoteHistory(60)) });
+  await stepUntil(small, () => !small.receiver.reconcileQueued(), 100, 10_000);
+  const passes = tallySmall.retry;
+  notify(small, `declaration:${sourceId}:messages`);
+  await steps(small, 2, 10);
+  expect(tallySmall.retry).toBe(passes + 1);
+  expect(small.receiver.reconcileQueued()).toBe(true);
+  const blocker = budget.reserve(64 * MiB - 64 * 1024);
+  if (typeof blocker !== "function")
+    throw new Error("setup reservation refused");
+  const refused = await step(small);
+  expect(
+    refused?.problems
+      .filter((p) => p.phase === "reconcile")
+      .map((p) => p.problem),
+  ).toEqual(["resource_busy"]);
+  // Queued pages do not override the backoff.
+  for (let i = 0; i < 3; i++) {
+    clock.advance(10);
+    const quiet = await step(small);
+    expect(quiet?.problems.filter((p) => p.phase === "reconcile")).toEqual([]);
+  }
+  blocker();
+  await stepUntil(small, () => !small.receiver.reconcileQueued(), 100, B1);
+  expect(tallySmall.retry, "the pass continued, it did not restart").toBe(
+    passes + 1,
+  );
+  expect(budget.reserved).toBe(0);
+
+  // A page larger than the whole budget still runs when nothing else holds
+  // bytes: one oversized unit of work proceeds alone, as in A3.
+  const tiny = new ReplicaByteBudget(1024);
+  const c = transportDevice(net, {
+    worker: { resourceBudget: tiny, reconcilePage: page },
+  });
+  const tallyC = newTally();
+  instrument(c, tallyC);
+  c.receiver.import({ credential, envelope: envelope(remoteHistory(20)) });
+  await steps(c, 3, 10_000);
+  notify(c, `declaration:${sourceId}:messages`);
+  const report = await step(c);
+  expect(report?.problems.filter((p) => p.phase === "reconcile")).toEqual([]);
+  expect(tallyC.retry).toBeGreaterThanOrEqual(1);
+  expect(tiny.reserved).toBe(0);
 });
 
 // ========================================================================= 18
