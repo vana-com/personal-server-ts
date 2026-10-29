@@ -74,7 +74,6 @@ import {
   createReplicaCoordinator,
   ReplicaCoordinatorConflict,
   REPLICA_REPORT_LIMIT,
-  REPLICA_STEP_BYTES,
   validateReplicaStep,
   type ReplicaAttempt,
   type ReplicaSettle,
@@ -3969,7 +3968,9 @@ export function createReplicaTransportWorker(deps: {
   ): Promise<ProgressReport> {
     const context = {
       now: input.now ?? now(),
-      budget: input.budget ?? { units: 256, bytes: REPLICA_STEP_BYTES },
+      // Bytes omitted: the coordinator's 64 MiB default, under which a batch
+      // larger than the whole budget still runs alone.
+      budget: input.budget ?? { units: 256 },
       signal: input.signal,
     };
     validateReplicaStep(context);
