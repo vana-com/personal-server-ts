@@ -47,6 +47,7 @@ import {
   type ServerContext,
 } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
+import { liveSnapshotDigest } from "./storage/pdpp-stream-completion.js";
 import type * as LegacyScopeViewModule from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 
 /**
@@ -1170,6 +1171,84 @@ describe("a scope deleted while legacy-only, then reconnected through a canonica
     expect(await readAll()).toEqual(ALL("410 null"));
     const listed = await listedScopes();
     for (const scope of SCOPES) expect(listed).not.toContain(scope);
+  });
+
+  /** Native completion of every Oura stream over the rows stored now. */
+  async function completeAll(token: string, at: string): Promise<void> {
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    let streams: Record<string, unknown>[];
+    try {
+      streams = SCOPES.map((scope) => {
+        const stream = STREAM_OF[scope];
+        const rows = db
+          .prepare(
+            "SELECT record_key AS recordKey, data AS dataJson FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+          )
+          .all(accountOne, stream) as { recordKey: string; dataJson: string }[];
+        return {
+          stream,
+          coverage: "full_stream",
+          live_count: rows.length,
+          snapshot_sha256: liveSnapshotDigest(
+            {
+              sourceId: OURA,
+              instance: accountOne,
+              method: "oura-browser",
+              generation: 1,
+              stream,
+            },
+            ["id"],
+            rows,
+          ),
+        };
+      });
+    } finally {
+      db.close();
+    }
+    const response = await ctx!.app.request(
+      "/v1/records/completions?method=oura-browser&binding_generation=1",
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: OURA,
+          instance: accountOne,
+          source_collected_at: at,
+          collection_time_basis: "host_run_finished",
+          streams,
+        }),
+      },
+    );
+    expect(response.status, await response.clone().text()).toBe(200);
+  }
+
+  it("never lets a replayed completion from before the tombstone authorize the scope", async () => {
+    tombstone = null;
+    await deleteWhileLegacyOnly();
+    tombstone = null;
+    // Reboot on the same data with the gateway live again; the history keeps
+    // tombstone 1 but the tracker does not stand under it.
+    vi.setSystemTime(new Date("2026-10-15T00:00:00Z"));
+    await writePdpp([{ n: 8, score: 81 }], "2026-10-15T00:00:00Z", undefined, {
+      complete: false,
+    });
+    // The host proves the stored rows before the scope is deleted again.
+    const token = await ownerPdppToken();
+    await completeAll(token, "2026-10-15T00:00:00.000Z");
+
+    tombstone = { version: "2", deletedAt: "2026-10-16T00:00:00Z" };
+    vi.setSystemTime(new Date("2026-10-16T00:00:00Z"));
+    expect(await readAll()).toEqual(ALL("410 null"));
+    // An exact replay keeps the old receipt: it proves nothing new.
+    await completeAll(await ownerPdppToken(), "2026-10-15T00:00:00.000Z");
+    expect(await readAll()).toEqual(ALL("410 null"));
+
+    // A later full collection does prove the re-add.
+    await completeAll(await ownerPdppToken(), "2026-10-16T06:00:00.000Z");
+    expect(await readAll()).not.toEqual(ALL("410 null"));
   });
 
   it("never lets proven rows written before the tombstone authorize the scope", async () => {

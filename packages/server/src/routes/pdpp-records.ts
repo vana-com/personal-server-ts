@@ -42,6 +42,7 @@ import {
   StreamCompletionError,
   type StreamCompletionFailure,
 } from "../storage/pdpp-stream-completion.js";
+import type { StreamCompletionReceipt } from "../storage/pdpp-records-sqlite-store.js";
 import type {
   CanonicalReaddIntent,
   CanonicalReaddMarkers,
@@ -423,6 +424,39 @@ function logApiError(
           : { message: String(err) },
     },
     "PDPP resource server error",
+  );
+}
+
+type ReceiptIdentity = {
+  stream: string;
+  writeSeq: number;
+  sourceCollectedAt: string;
+};
+
+/** Receipts stored now; undefined when this store cannot list them. */
+function receiptsOf(
+  bindingStore: NonNullable<PdppRecordsRouteDeps["bindingStore"]>,
+  instance: string,
+): StreamCompletionReceipt[] | undefined {
+  return bindingStore.listStreamCompletions?.(instance);
+}
+
+/**
+ * Receipts this write created or replaced. One identical to a receipt stored
+ * before the write (an exact completion replay) is not fresh evidence.
+ */
+function freshReceipts<T extends ReceiptIdentity>(
+  prior: readonly ReceiptIdentity[],
+  after: readonly T[],
+): T[] {
+  return after.filter(
+    (receipt) =>
+      !prior.some(
+        (old) =>
+          old.stream === receipt.stream &&
+          old.writeSeq === receipt.writeSeq &&
+          old.sourceCollectedAt === receipt.sourceCollectedAt,
+      ),
   );
 }
 
@@ -1582,6 +1616,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           sourceCollectedAt === undefined
             ? undefined
             : acknowledgeReadd(deps, method, [stream]);
+        const priorReceipts = readdIntent
+          ? receiptsOf(bindingStore, instance)
+          : undefined;
         const result = bindingStore.replaceStream({
           instance,
           stream,
@@ -1608,15 +1645,18 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             };
           }),
         });
-        if (result.applied && readdIntent) {
+        if (result.applied && readdIntent && priorReceipts) {
           recordReadd(
             deps,
             readdIntent,
-            (bindingStore.listStreamCompletions?.(instance) ?? []).filter(
-              (receipt) =>
-                receipt.stream === stream &&
-                receipt.method === method &&
-                receipt.generation === generation,
+            freshReceipts(
+              priorReceipts,
+              (receiptsOf(bindingStore, instance) ?? []).filter(
+                (receipt) =>
+                  receipt.stream === stream &&
+                  receipt.method === method &&
+                  receipt.generation === generation,
+              ),
             ),
           );
         }
@@ -1810,6 +1850,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             (entry) => entry.stream as string,
           ),
         );
+        const priorReceipts = readdIntent
+          ? receiptsOf(bindingStore, wire.instance)
+          : undefined;
         const result = completeStreams(
           {
             instance: wire.instance,
@@ -1829,7 +1872,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           (sourceId, stream) =>
             deps.declarations.get(stream, sourceId)?.primaryKey,
         );
-        if (readdIntent) recordReadd(deps, readdIntent, result.receipts);
+        if (readdIntent && priorReceipts) {
+          // An exact replay keeps the prior receipt; it proves nothing new.
+          recordReadd(
+            deps,
+            readdIntent,
+            freshReceipts(priorReceipts, result.receipts),
+          );
+        }
         return c.json(
           {
             receipts: result.receipts.map((receipt) => ({
