@@ -12,6 +12,15 @@ export const declarationBindingSchema = z.strictObject({
   schemaDigest: digest,
 });
 export type DeclarationBinding = z.infer<typeof declarationBindingSchema>;
+/**
+ * What a binding contributes to record identity: stream, semantics and
+ * ordered primary key. Two bindings of one source with the same shape are
+ * versions of one stream (a declaration upgrade). Their operations merge by
+ * revision, and each one validates against its own schema.
+ */
+export function declarationShape(binding: DeclarationBinding): string {
+  return canonicalJson([binding.stream, binding.semantics, binding.primaryKey]);
+}
 const base = {
   owner: token,
   sourceId: token,
@@ -188,4 +197,36 @@ export function encodeReplicaEnvelope(
   return canonicalJson(
     decodeReplicaEnvelope(canonicalJson(envelope), expected),
   );
+}
+
+/**
+ * UTF-8 bytes per stored part of long replication text (a copy's envelope,
+ * a received fragment). A phone's SQL call carries or returns about 1 MiB
+ * at most (PS-Lite `LITE_REPLICA_SQL_BYTES`), and Node batches target
+ * 32 MiB in 4 MiB fragments, so such text is kept in rows of parts.
+ */
+export const REPLICA_TEXT_PART_BYTES = 512 * 1024;
+
+/**
+ * `text` in order, cut into parts of at most `maxBytes` UTF-8 bytes. A
+ * cut never falls inside a surrogate pair, so each part is valid text.
+ */
+export function replicaTextParts(text: string, maxBytes: number): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let bytes = 0;
+  for (let index = 0; index < text.length;) {
+    const code = text.codePointAt(index)!;
+    const units = code > 0xffff ? 2 : 1;
+    const size = code < 0x80 ? 1 : code < 0x800 ? 2 : code > 0xffff ? 4 : 3;
+    if (bytes + size > maxBytes) {
+      parts.push(text.slice(start, index));
+      start = index;
+      bytes = 0;
+    }
+    bytes += size;
+    index += units;
+  }
+  parts.push(text.slice(start));
+  return parts;
 }

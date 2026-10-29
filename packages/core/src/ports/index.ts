@@ -474,6 +474,30 @@ export interface PendingBlobDeletion {
   scope: string;
   version: string | null;
   range?: { from: string; to: string };
+  /**
+   * The tombstone version whose finality frees this key (see
+   * `TombstoneFinalityPort`). A range is gated by its own `range.to`; an
+   * exact key recorded without a gate is gated by its own version.
+   */
+  tombstoneVersion?: string;
+}
+
+/**
+ * When a storage key may be freed. A tombstone the gateway has queued but not
+ * finalized can still fail; the gateway then rolls the head back and lets a
+ * writer recover the failed slot. Freeing a key before that is ruled out lets
+ * another writer put different bytes under a slot that is later registered.
+ */
+export interface TombstoneFinalityPort {
+  /**
+   * The highest registry version at or above `atOrAbove` that holds a
+   * finalized tombstone, or null when none does yet. Keys at or below a
+   * finalized tombstone can never be claimed by a registration again.
+   */
+  finalizedTombstoneAtOrAbove(
+    scope: string,
+    atOrAbove: string,
+  ): Promise<string | null>;
 }
 
 /**
@@ -487,6 +511,24 @@ export interface PendingBlobDeletionStore {
   list(): Promise<PendingBlobDeletion[]>;
   add(keys: PendingBlobDeletion[]): Promise<void>;
   remove(keys: PendingBlobDeletion[]): Promise<void>;
+  /**
+   * Highest tombstone version whose covered registry range (versions 1..v)
+   * this store has already taken on for `scope`: every key in it is either
+   * confirmed deleted or still queued here. A repeated delete of the scope
+   * plans only above it, so it resumes instead of starting over at version 1.
+   * Null when nothing was planned (or the store predates the watermark).
+   */
+  plannedThrough?(scope: string): Promise<string | null>;
+  /**
+   * Add `keys` and raise the scope's planned watermark to `through` in one
+   * atomic write, so a crash can never record the watermark without the work
+   * it stands for.
+   */
+  enqueue?(
+    scope: string,
+    keys: PendingBlobDeletion[],
+    through: string | null,
+  ): Promise<void>;
 }
 
 // FeeVerifier was the pre-X402 hook that gated reads on grant.paymentStatus

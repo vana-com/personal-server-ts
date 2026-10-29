@@ -134,6 +134,7 @@ export interface ReplicaTransportPort {
   /** Store an unregistered fragment at its content address. */
   putFragment(
     fragment: Pick<PreparedFragment, "scope" | "digest" | "encrypted">,
+    signal?: AbortSignal,
   ): Promise<void>;
   getFragment(
     scope: string,
@@ -146,7 +147,7 @@ export interface ReplicaTransportPort {
     digest: string,
     signal?: AbortSignal,
   ): Promise<boolean>;
-  put(manifest: PreparedManifest): Promise<void>;
+  put(manifest: PreparedManifest, signal?: AbortSignal): Promise<void>;
   /** The batch's single AddData registration, at version `manifest.version`. */
   register(manifest: PreparedManifest): Promise<void>;
   get(scope: string, version: number, read: ReplicaRead): Promise<Uint8Array>;
@@ -231,10 +232,11 @@ export function createDpv2ReplicaTransport(deps: {
     encryptedByteLength: replicaOpenPgpCiphertextByteLength,
     decrypt: (scope, bytes) => decryptUncompressed(bytes, password(scope)),
     evidence: deps.evidence,
-    async putFragment(fragment) {
+    async putFragment(fragment, signal) {
       await deps.storage.upload(
         replicaFragmentKey(fragment.scope, fragment.digest),
         fragment.encrypted,
+        signal,
       );
     },
     getFragment: (scope, digest, read) =>
@@ -251,10 +253,11 @@ export function createDpv2ReplicaTransport(deps: {
         throw error;
       }
     },
-    async put(manifest) {
+    async put(manifest, signal) {
       await deps.storage.upload(
         replicaManifestKey(manifest.scope, manifest.version),
         manifest.encrypted,
+        signal,
       );
     },
     async register(manifest) {

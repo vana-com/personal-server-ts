@@ -21,6 +21,12 @@ export const REPLICA_WAKE_MIN_MS = 1_000;
 export const REPLICA_WAKE_MAX_MS = 15 * 60_000;
 /** Delay after a step that threw (a bug or a closed store, never a verdict). */
 export const REPLICA_STEP_ERROR_DELAY_MS = 60_000;
+/**
+ * A committed local write steps within this window. Writes inside the window
+ * share its one step, so a connector run steps at most once per window
+ * instead of once per page.
+ */
+export const REPLICA_LOCAL_WRITE_DEBOUNCE_MS = 2_000;
 
 /** One finite step. Node's transport worker and PS-Lite's runtime implement it. */
 export interface ReplicationStepper {
@@ -65,6 +71,13 @@ export interface ReplicationDriver {
   trigger(): Promise<ProgressReport | undefined>;
   /** Forward a dependency change to the stepper, then trigger. */
   wake(key: string): void;
+  /**
+   * A local write committed (or may have: a rolled-back write may call it
+   * too). Steps within the debounce window. The window starts at the first
+   * write after the last debounced step and is not extended by later writes,
+   * so continuous writes cannot postpone the step.
+   */
+  localWrite(): void;
   status(): ReplicationDriverStatus;
   /**
    * Stop scheduling, abort the running step and wait at most `graceMs` for
@@ -95,18 +108,37 @@ export function replicaWakeDelay(
 export function createReplicationDriver(input: {
   stepper: ReplicationStepper;
   budget: ReplicaBudget;
+  /**
+   * Abort a step that runs longer than this. The coordinator settles the
+   * running attempt as a retry; checkpoints already committed stay.
+   */
+  deadlineMs?: number;
   timers?: ReplicationTimers;
   onReport?: (report: ProgressReport) => void;
   onError?: (error: unknown) => void;
+  /** Positive milliseconds; defaults to REPLICA_LOCAL_WRITE_DEBOUNCE_MS. */
+  localWriteDebounceMs?: number;
 }): ReplicationDriver {
   const timers = input.timers ?? defaultTimers;
   // Reject an invalid host budget at construction, not on the first timer.
   validateReplicaStep({ now: 0, budget: input.budget });
+  if (
+    input.deadlineMs !== undefined &&
+    (!Number.isSafeInteger(input.deadlineMs) || input.deadlineMs < 1)
+  )
+    throw new RangeError("invalid replication step deadline");
+  const debounceMs =
+    input.localWriteDebounceMs ?? REPLICA_LOCAL_WRITE_DEBOUNCE_MS;
+  if (!Number.isSafeInteger(debounceMs) || debounceMs < 1)
+    throw new RangeError("invalid replication local-write debounce");
+  /** The pending debounced local-write step, separate from the wake timer. */
+  let writeTimer: unknown;
   let state: ReplicationDriverStatus["state"] = "stopped";
   let timer: unknown;
   let nextWakeAt: number | undefined;
   let running: Promise<ProgressReport | undefined> | undefined;
   let controller: AbortController | undefined;
+  let deadline: unknown;
   let again = false;
   let lastStepAt: number | undefined;
   let last: ReplicationDriverStatus["last"];
@@ -127,12 +159,22 @@ export function createReplicationDriver(input: {
   }
 
   async function run(): Promise<ProgressReport | undefined> {
-    controller = new AbortController();
+    const step = (controller = new AbortController());
+    deadline =
+      input.deadlineMs === undefined
+        ? undefined
+        : timers.setTimeout(
+            () =>
+              step.abort(
+                new DOMException("replication step deadline", "TimeoutError"),
+              ),
+            input.deadlineMs,
+          );
     nextDelay = REPLICA_WAKE_MAX_MS;
     try {
       const report = await input.stepper.step({
         budget: input.budget,
-        signal: controller.signal,
+        signal: step.signal,
       });
       lastStepAt = timers.now();
       lastError = undefined;
@@ -161,6 +203,8 @@ export function createReplicationDriver(input: {
    * promise, leaving the driver stalled for good.
    */
   function settle() {
+    if (deadline !== undefined) timers.clearTimeout(deadline);
+    deadline = undefined;
     controller = undefined;
     running = undefined;
     if (state === "running") {
@@ -197,6 +241,13 @@ export function createReplicationDriver(input: {
       input.stepper.onDependencyChanged?.(key);
       void trigger();
     },
+    localWrite() {
+      if (state !== "running" || writeTimer !== undefined) return;
+      writeTimer = timers.setTimeout(() => {
+        writeTimer = undefined;
+        void trigger();
+      }, debounceMs);
+    },
     status: () => ({
       state,
       stepping: running !== undefined,
@@ -213,6 +264,8 @@ export function createReplicationDriver(input: {
       again = false;
       if (timer !== undefined) timers.clearTimeout(timer);
       timer = undefined;
+      if (writeTimer !== undefined) timers.clearTimeout(writeTimer);
+      writeTimer = undefined;
       nextWakeAt = undefined;
       const current = running;
       controller?.abort(new DOMException("replication stopped", "AbortError"));

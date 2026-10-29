@@ -4,6 +4,8 @@ import {
   BINARY_CHUNK_BYTES,
   BINARY_CHUNKS_MIGRATION,
   readBinaryChunks,
+  readBinaryWindow,
+  type BinaryCursor,
 } from "./pdpp-binary-chunks.js";
 
 const MiB = 1024 * 1024;
@@ -86,3 +88,57 @@ it.each([32, 128])(
     );
   },
 );
+
+it("readBinaryWindow reads rows of any length in parts by cursor", () => {
+  const db = new Database(":memory:");
+  db.exec(BINARY_CHUNKS_MIGRATION);
+  // Rows of any length up to a full chunk, as a copy of short writes leaves them.
+  const rows = [5, 300, 3, 9];
+  const all = Buffer.alloc(rows.reduce((a, b) => a + b, 0));
+  for (let i = 0; i < all.length; i++) all[i] = (i * 13) & 255;
+  let offset = 0;
+  for (const [position, length] of rows.entries()) {
+    db.prepare("INSERT INTO pdpp_binary_chunks VALUES (?,?,?,?)").run(
+      "payload",
+      "p",
+      position,
+      all.subarray(offset, offset + length),
+    );
+    offset += length;
+  }
+  db.prepare("INSERT INTO pdpp_binary_manifests VALUES (?,?,?)").run(
+    "payload",
+    "p",
+    all.length,
+  );
+  for (const window of [1, 4, 7, 1000, all.length]) {
+    const parts: Buffer[] = [];
+    let cursor: BinaryCursor = { position: 0, offset: 0 };
+    for (let read = 0; read < all.length;) {
+      const length = Math.min(window, all.length - read);
+      const { bytes, next } = readBinaryWindow(
+        db,
+        "payload",
+        "p",
+        cursor,
+        length,
+      );
+      expect(bytes.length).toBe(length);
+      parts.push(Buffer.from(bytes));
+      cursor = next;
+      read += length;
+    }
+    expect(Buffer.concat(parts).equals(all)).toBe(true);
+    expect(cursor).toEqual({ position: rows.length, offset: 0 });
+  }
+  // Past the end, a missing value and a legacy namespace all throw.
+  expect(() =>
+    readBinaryWindow(db, "payload", "p", { position: 3, offset: 0 }, 10),
+  ).toThrow("corrupt binary chunks");
+  expect(() =>
+    readBinaryWindow(db, "payload", "q", { position: 0, offset: 0 }, 1),
+  ).toThrow("missing binary bytes");
+  expect(() =>
+    readBinaryWindow(db, "canonical", "p", { position: 0, offset: 0 }, 1),
+  ).toThrow("legacy binary windows unsupported");
+});

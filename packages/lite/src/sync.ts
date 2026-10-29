@@ -1,4 +1,7 @@
-import { type DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
+import {
+  createVersionInventoryClient,
+  type DurableAdditionsService,
+} from "@opendatalabs/personal-server-ts-core/additions";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
@@ -9,9 +12,12 @@ import {
 import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
+  createInventoryTombstoneFinality,
   createPendingBlobDeletionStore,
   createScopeDeletionTracker,
+  normalizePendingBlobDeletionPlanned,
   normalizePendingBlobDeletions,
+  type PendingBlobDeletionPlanned,
   type ScopeDeletionTracker,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
@@ -59,6 +65,8 @@ interface PsLitePendingBlobDeletionsState {
   /** Exact (scope, version) keys; `scopes` is the pre-key format. */
   keys?: PendingBlobDeletion[];
   scopes?: string[];
+  /** Per-scope planned-through watermark (see the core marker store). */
+  planned?: PendingBlobDeletionPlanned;
 }
 
 interface PsLiteSyncCursorState {
@@ -153,12 +161,15 @@ export function createPsLitePendingBlobDeletionStore(
         PENDING_BLOB_DELETIONS_KEY,
       );
       if (!state) return null;
-      return normalizePendingBlobDeletions(state.keys ?? state.scopes);
+      return {
+        keys: normalizePendingBlobDeletions(state.keys ?? state.scopes),
+        planned: normalizePendingBlobDeletionPlanned(state.planned),
+      };
     },
-    async write(keys) {
+    async write(keys, planned) {
       await stateStore.set<PsLitePendingBlobDeletionsState>(
         PENDING_BLOB_DELETIONS_KEY,
-        { keys },
+        { keys, planned },
       );
     },
   });
@@ -342,6 +353,22 @@ export async function createPsLiteSyncManager(
   const pendingBlobDeletions = createPsLitePendingBlobDeletionStore(
     options.stateStore,
   );
+  // Blob deletes wait for the covering tombstone to be finalized. The
+  // inventory accepts the owner or a registered server of the owner: the
+  // same account that signs storage requests.
+  const tombstoneFinality = createInventoryTombstoneFinality(
+    createVersionInventoryClient({
+      gatewayUrl: options.config.gateway.url,
+      ownerAddress: serverOwner,
+      ownerSigner: ownerRequestSigner ?? {
+        signRequest: (params) =>
+          buildWeb3SignedHeader({
+            ...params,
+            signMessage: (message: string) => syncAccount.signMessage(message),
+          }),
+      },
+    }),
+  );
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
@@ -375,6 +402,7 @@ export async function createPsLiteSyncManager(
     {
       deleteData,
       pendingBlobDeletions,
+      tombstoneFinality,
       async canSync() {
         if (options.ownerSyncSigner) return { ok: true };
         try {

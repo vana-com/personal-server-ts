@@ -12,7 +12,10 @@ import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/rep
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import { ReplicationRefusedError } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import { openRecordStore } from "../pdpp/records-bootstrap.js";
+import {
+  openRecordStore,
+  resolveReplication,
+} from "../pdpp/records-bootstrap.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import {
   REPLICA_MIGRATIONS,
@@ -21,6 +24,28 @@ import {
 } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { REPLICA_BLOB_CLAIM_INDEX_MIGRATION } from "./pdpp-replication-sqlite.js";
+
+const quiet = { warn: () => {} };
+/** Length of main's whole canonical row for a blob, if it has one. */
+const wholeRow = (db: Database.Database, blobId: string) =>
+  (
+    db
+      .prepare(
+        "SELECT length(bytes) AS size FROM pdpp_blob_bytes WHERE blob_id = ?",
+      )
+      .get(blobId) as { size: number } | undefined
+  )?.size;
+const canonicalChunks = (db: Database.Database, blobId: string) =>
+  (
+    db
+      .prepare(
+        "SELECT count(*) AS n FROM pdpp_binary_chunks WHERE namespace = 'canonical' AND blob_id = ?",
+      )
+      .get(blobId) as { n: number }
+  ).n;
+/** Whole-blob equality. `toEqual` walks a 2 MiB array element by element. */
+const sameBytes = (actual: Uint8Array | undefined, expected: Uint8Array) =>
+  actual !== undefined && Buffer.from(actual).equals(Buffer.from(expected));
 
 interface SchemaObject {
   type: string;
@@ -225,35 +250,31 @@ describe("replication flag on", () => {
     expect(storeBytes(writer, bytes).blobId).toBe(blob.blobId);
     writerDb.close();
 
+    // An enabled store writes a large blob in the chunk form only.
     const canonicalDb = open(path);
-    expect(
-      (
-        canonicalDb
-          .prepare(
-            "SELECT length(bytes) AS size FROM pdpp_blob_bytes WHERE blob_id = ?",
-          )
-          .get(blob.blobId) as { size: number }
-      ).size,
-    ).toBe(bytes.byteLength);
-    // Model a database written by the earlier chunk-only implementation. The
-    // next flagged open restores main's canonical row before rollback.
-    canonicalDb
-      .prepare("DELETE FROM pdpp_blob_bytes WHERE blob_id = ?")
-      .run(blob.blobId);
+    expect(wholeRow(canonicalDb, blob.blobId)).toBeUndefined();
     canonicalDb.close();
 
-    const repairDb = open(path);
-    openRecordStore(repairDb, true);
-    repairDb.close();
+    // An enabled open keeps it chunk-only, and its readers accept that form.
+    const onDb = open(path);
+    expect(
+      sameBytes(openRecordStore(onDb, true).getBlobBytes(blob.blobId), bytes),
+    ).toBe(true);
+    expect(wholeRow(onDb, blob.blobId)).toBeUndefined();
+    onDb.close();
 
+    // The flag-off boot retires replication and writes main's row.
     const offDb = open(path);
+    expect(resolveReplication(offDb, false, quiet).status.state).toBe("off");
+    expect(wholeRow(offDb, blob.blobId)).toBe(bytes.byteLength);
+    expect(canonicalChunks(offDb, blob.blobId)).toBe(0);
     const off = openRecordStore(offDb, false);
-    expect(off.getBlobBytes(blob.blobId)).toEqual(bytes);
+    expect(sameBytes(off.getBlobBytes(blob.blobId), bytes)).toBe(true);
     offDb.close();
 
     const mainDb = open(path);
     const mainStore = createSqliteRecordStore(mainDb);
-    expect(mainStore.getBlobBytes(blob.blobId)).toEqual(bytes);
+    expect(sameBytes(mainStore.getBlobBytes(blob.blobId), bytes)).toBe(true);
     mainDb.close();
   }, 30_000);
 
@@ -295,26 +316,24 @@ describe("replication flag on", () => {
     });
     receiverDb.close();
 
-    // Promotion writes main's whole row itself; no startup repair runs between
-    // the import and the rollback, so replication never solely owns the bytes.
-    const plainDb = open(path);
-    expect(
-      (
-        plainDb
-          .prepare(
-            "SELECT length(bytes) AS size FROM pdpp_blob_bytes WHERE blob_id = ?",
-          )
-          .get(blob.blobId) as { size: number } | undefined
-      )?.size,
-    ).toBe(bytes.byteLength);
-    const plainStore = createSqliteRecordStore(plainDb);
-    expect(plainStore.getBlobBytes(blob.blobId)).toEqual(bytes);
-    plainDb.close();
+    // Promotion stores the large blob once, in the chunk form.
+    const chunkDb = open(path);
+    expect(wholeRow(chunkDb, blob.blobId)).toBeUndefined();
+    expect(canonicalChunks(chunkDb, blob.blobId)).toBeGreaterThan(0);
+    chunkDb.close();
 
+    // The flag-off boot writes main's row before any plain store reads it.
     const offDb = open(path);
-    expect(openRecordStore(offDb, false).getBlobBytes(blob.blobId)).toEqual(
-      bytes,
-    );
+    resolveReplication(offDb, false, quiet);
+    expect(
+      sameBytes(openRecordStore(offDb, false).getBlobBytes(blob.blobId), bytes),
+    ).toBe(true);
+    offDb.close();
+    const plainDb = open(path);
+    expect(wholeRow(plainDb, blob.blobId)).toBe(bytes.byteLength);
+    const plainStore = createSqliteRecordStore(plainDb);
+    expect(sameBytes(plainStore.getBlobBytes(blob.blobId), bytes)).toBe(true);
+    plainDb.close();
   }, 30_000);
 
   it("applies the replica schema when the store opens, not before", () => {

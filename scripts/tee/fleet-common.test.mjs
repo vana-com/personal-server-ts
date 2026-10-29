@@ -26,7 +26,7 @@ const manifest = JSON.parse(
       "deploy",
       "dstack",
       "fleets",
-      "preview-prod5.json",
+      "moksha-prod5.json",
     ),
     "utf8",
   ),

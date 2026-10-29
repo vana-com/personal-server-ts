@@ -58,11 +58,15 @@ export {
   createGatewayDeleteDataPort,
   type GatewayDeleteDataPortOptions,
 } from "./delete-data-port.js";
+export { createInventoryTombstoneFinality } from "./tombstone-finality.js";
 export {
   createMemoryPendingBlobDeletionStore,
   createPendingBlobDeletionStore,
+  normalizePendingBlobDeletionPlanned,
   normalizePendingBlobDeletions,
   type PendingBlobDeletionKv,
+  type PendingBlobDeletionPlanned,
+  type PendingBlobDeletionState,
 } from "./pending-blob-deletions.js";
 export { computeDataPointId } from "./data-point-id.js";
 export {

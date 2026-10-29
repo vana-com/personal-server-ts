@@ -537,12 +537,7 @@ for (const [name, factory] of Object.entries({
   sqlite: sqlitePort,
 }))
   describe(`Lite ${name} crash oracle`, () => {
-    for (const point of [
-      "record",
-      "journal",
-      "outbox",
-      "before-commit",
-    ] as const)
+    for (const point of ["record", "log", "before-commit"] as const)
       it(`rolls back a local batch interrupted at ${point}`, async () => {
         const device = await liteDevice(factory);
         await device.send([registration]);
@@ -559,10 +554,8 @@ for (const [name, factory] of Object.entries({
         ).rejects.toThrow(`interrupted:${point}`);
         device.reopen();
         expect(await device.read()).toBeUndefined();
-        expect((await device.store.readPage("journal")).entries).toHaveLength(
-          0,
-        );
-        expect((await device.store.readPage("outbox")).entries).toHaveLength(0);
+        expect((await device.store.readLogPage()).entries).toHaveLength(0);
+        expect((await device.store.readOutboxPage()).entries).toHaveLength(0);
         await device.store.commitLocal("local", [draft(upsert("one", 2))]);
         device.reopen();
         expect(await device.read()).toMatchObject({ data: { text: "one" } });
@@ -578,8 +571,8 @@ for (const [name, factory] of Object.entries({
       const first = await device.store.commitLocal("local", ops);
       const second = await device.store.commitLocal("local", ops);
       expect(first).toEqual(second);
-      expect((await device.store.readPage("journal")).entries).toHaveLength(2);
-      expect((await device.store.readPage("outbox")).entries).toHaveLength(2);
+      expect((await device.store.readLogPage()).entries).toHaveLength(2);
+      expect((await device.store.readOutboxPage()).entries).toHaveLength(2);
       expect(await device.read()).toMatchObject({ version: 1 });
       await expect(
         device.store.commitLocal("local", [draft(upsert("changed", 3))]),
@@ -598,28 +591,28 @@ for (const [name, factory] of Object.entries({
       device.reopen();
       await device.send(ops, "import");
       expect(await device.read()).toMatchObject({ version: 1 });
-      expect((await device.store.readPage("outbox")).entries).toHaveLength(0);
-      expect((await device.store.readPage("journal")).entries).toHaveLength(0);
+      expect((await device.store.readOutboxPage()).entries).toHaveLength(0);
+      expect((await device.store.readLogPage()).entries).toHaveLength(0);
     });
-    it("keeps each intermediate local mutation's original value", async () => {
+    it("logs each intermediate local write with its row version", async () => {
       const device = await liteDevice(factory);
       await device.store.commitLocal("local", [
         draft(registration),
         draft(upsert("one", 2)),
         draft(upsert("two", 3)),
       ]);
-      const mutations = (await device.store.readPage("mutations")).entries.map(
-        (entry) => JSON.parse(entry.value),
+      const records = (await device.store.readLogPage()).entries.filter(
+        (entry) => entry.operation.kind === "upsert",
       );
-      expect(mutations.map((mutation) => mutation.value.data.text)).toEqual([
-        "one",
-        "two",
-      ]);
-      expect(mutations.map((mutation) => mutation.value.version)).toEqual([
-        1, 2,
-      ]);
+      expect(
+        records.map(
+          (entry) =>
+            entry.operation.kind === "upsert" && entry.operation.data.text,
+        ),
+      ).toEqual(["one", "two"]);
+      expect(records.map((entry) => entry.rowVersion)).toEqual([1, 2]);
     });
-    it("does not journal or publish equal-content local retries", async () => {
+    it("does not log or publish equal-content local retries", async () => {
       const device = await liteDevice(factory);
       await device.store.commitLocal("first", [
         draft(registration),
@@ -629,7 +622,7 @@ for (const [name, factory] of Object.entries({
         draft(upsert("different-id", 3, "one")),
       ]);
       expect(result.operationCount).toBe(0);
-      expect((await device.store.readPage("outbox")).entries).toHaveLength(2);
+      expect((await device.store.readOutboxPage()).entries).toHaveLength(2);
       expect(await device.read()).toMatchObject({ version: 1 });
     });
     for (const point of ["blob", "record", "import", "after-commit"] as const)
@@ -782,7 +775,7 @@ for (const [name, factory] of Object.entries({
       await expect(
         device.store.commitLocal("invalid", [draft(upsert("late", 4))]),
       ).rejects.toThrow("violates replica contract");
-      expect((await device.store.readPage("outbox")).entries).toHaveLength(0);
+      expect((await device.store.readOutboxPage()).entries).toHaveLength(0);
     });
     it("orders the outbox by commit sequence even when request ids sort backwards", async () => {
       const device = await liteDevice(factory);
@@ -807,7 +800,7 @@ for (const [name, factory] of Object.entries({
       await expect(device.store.acknowledgeOutbox(0, 3)).rejects.toThrow(
         "conflict",
       );
-      expect((await device.store.readPage("journal")).entries).toHaveLength(3);
+      expect((await device.store.readLogPage()).entries).toHaveLength(3);
     });
     it("retries the same imported batch after its missing blob bytes arrive", async () => {
       const device = await liteDevice(factory);

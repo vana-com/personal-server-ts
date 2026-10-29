@@ -1,5 +1,5 @@
 /** Protocol limits shared by replication senders, admission, and stream readers. */
-import { MAX_DECLARATION_BYTES } from "../pdpp/declaration.js";
+import { MAX_DECLARATION_BYTES } from "../pdpp/declaration-limits.js";
 
 export const REPLICA_MAX_FRAGMENTS = 100_000;
 /** vana-storage DEFAULT_MAX_BLOB_SIZE. Compare the actual encrypted request. */

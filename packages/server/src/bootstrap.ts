@@ -73,6 +73,7 @@ import { createSyncCursor } from "./sync-cursor.js";
 import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
+  createInventoryTombstoneFinality,
   createScopeDeletionTracker,
   createSyncManager,
   type PdppImporter,
@@ -98,12 +99,14 @@ import {
   resolveReplication,
 } from "./pdpp/records-bootstrap.js";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
+import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import {
   createNodeReplication,
-  createNodeReplicationPorts,
   NODE_REPLICATION_STOP_GRACE_MS,
   type NodeReplication,
 } from "./storage/pdpp-replication-host.js";
+import type { ReplicaWriterRotation } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
+import { rotateReplicaWriterIdentityAtBoot } from "./storage/pdpp-replica-writer-identity.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
 import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
@@ -157,6 +160,8 @@ export interface ServerContext {
    * from `startBackgroundServices` until `cleanup`.
    */
   replication?: NodeReplication;
+  /** What this boot did with `rotateReplicaWriterIdentity`. */
+  replicaWriterRotation: ReplicaWriterRotation;
 }
 
 export interface CreateServerOptions {
@@ -221,6 +226,13 @@ export interface CreateServerOptions {
   mcpGrantTtlSeconds?: number;
   profile?: "standard" | "enclave";
   serverAccount?: ServerAccount;
+  /**
+   * Rotate the replica writer identity before this boot writes anything
+   * (host contract §3.2). A host sets it when this database may be a copy:
+   * a restore, a clone, or a reinstall onto existing data. PS cannot detect
+   * a copy itself. Ignored unless replication runs in this boot.
+   */
+  rotateReplicaWriterIdentity?: boolean;
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -838,11 +850,24 @@ export async function createServer(
     const pendingBlobDeletions = createFilePendingBlobDeletionStore(
       pendingBlobDeletionsPath,
     );
+    // Blob deletes wait for the covering tombstone to be finalized, read from
+    // the signed version inventory (owner or registered-server signer).
+    const tombstoneFinality =
+      deleteData && additionsInventorySigner
+        ? createInventoryTombstoneFinality(
+            createVersionInventoryClient({
+              gatewayUrl: config.gateway.url,
+              ownerAddress: serverOwner,
+              ownerSigner: additionsInventorySigner,
+            }),
+          )
+        : undefined;
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
       deleteData,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
+      tombstoneFinality,
       transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {
         try {
@@ -963,6 +988,17 @@ export async function createServer(
     config.replication.enabled,
     logger,
   );
+  // A copied database must not continue its original's writer sequences.
+  // Before any store of this boot captures a write.
+  const replicaWriterRotation = rotateReplicaWriterIdentityAtBoot(db, {
+    requested: options?.rotateReplicaWriterIdentity === true,
+    replicationEnabled: replication.enabled,
+  });
+  if (replicaWriterRotation !== "not_requested")
+    logger.info(
+      { replicaWriterRotation },
+      "Replica writer identity rotation requested by the host",
+    );
 
   // The replication runtime: receiver, transport worker and coordinator
   // driver. Only behind an open door; a flag-off boot constructs none of it.
@@ -984,7 +1020,7 @@ export async function createServer(
             declarations: pdppAuth.retainedDeclarations,
             serverAccount,
             ports: (owner) =>
-              createNodeReplicationPorts({
+              createReplicationNetworkPorts({
                 config,
                 owner,
                 masterKey: deriveMasterKey(masterKeySignature),
@@ -1235,6 +1271,7 @@ export async function createServer(
     devToken,
     replicationStatus: replication.status,
     replication: nodeReplication,
+    replicaWriterRotation,
     startBackgroundServices: async () => {
       // Steps once now, then follows the coordinator's next wake.
       if (!backgroundClosed) replicaHost?.driver.start();

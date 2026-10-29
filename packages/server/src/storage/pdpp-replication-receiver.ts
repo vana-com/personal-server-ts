@@ -25,6 +25,7 @@ import type {
 import { createHash } from "node:crypto";
 import {
   canonicalJson,
+  declarationShape,
   replicaEnvelopeSchema,
   type ReplicaOperation,
   type RecordOperation,
@@ -244,6 +245,9 @@ export function createReplicaReceiver(deps: {
         blob.sizeBytes,
         blob.sha256.slice(7),
       );
+      // The received copy stays: it is custody for every retained
+      // operation that names the blob, applied or withheld, and canonical
+      // collection does not count those operations (host contract §6).
       if (binaryLength(db, "canonical", blob.blobId) !== undefined) {
         if (
           !verifyBinary(
@@ -386,7 +390,7 @@ export function createReplicaReceiver(deps: {
   store.setReplicaVisibilityObserver(view.flush);
   store.setReplicaWriteBoundary(view.exclusive, view.snapshot);
   // A local write journals under the retained declaration. When retained
-  // evidence for its key already names another declaration, or the stream is
+  // evidence for its key already names another declaration shape, or the stream is
   // append-only and the content differs, the write completes a conflict. The
   // merge must quarantine the key now, not at the next import. This is only a
   // trigger: `reconcile` alone decides, so the check may over-approximate.
@@ -398,8 +402,8 @@ export function createReplicaReceiver(deps: {
         )
         .all(instance, stream, recordKey) as { operation_json: string }[]
     ).map((row) => JSON.parse(row.operation_json) as RecordOperation);
-    const declarations = new Set(
-      retainedForKey.map((op) => canonicalJson(op.declaration)),
+    const shapes = new Set(
+      retainedForKey.map((op) => declarationShape(op.declaration)),
     );
     const contents = new Set(
       retainedForKey.map((op) =>
@@ -409,7 +413,7 @@ export function createReplicaReceiver(deps: {
       ),
     );
     if (
-      declarations.size > 1 ||
+      shapes.size > 1 ||
       (contents.size > 1 &&
         retainedForKey.some((op) => op.declaration.semantics === "append_only"))
     ) {
@@ -1368,15 +1372,33 @@ export function createReplicaReceiver(deps: {
       authorize(input.credential);
       return view.exclusive(() => {
         if (input.restart) reconciler.beginPass();
-        const result = reconciler.drain({ background: true, page: input.page });
+        const { plan, complete } = reconciler.drain({
+          background: true,
+          page: input.page,
+        });
         view.flush();
-        return result;
+        return { plan, complete };
       });
     },
     /** Whether reconcile work is queued. Reads no retained history. */
     reconcileQueued: (): boolean => reconciler.queued(),
     /** Retained evidence reconcile has loaded, cumulatively. For bounds tests. */
     reconcileStats: () => reconciler.stats(),
+    /**
+     * Reconcile, then return the operations that explain canonical state: the
+     * merge's winner for each shown row and tombstone, and each available
+     * completion. A new writer's rebaseline copies order and binding only
+     * from these (host contract §4.5).
+     */
+    explainState(input: { credential: unknown }): ReplicaOperation[] {
+      authorize(input.credential);
+      return view.exclusive(() => {
+        reconciler.beginPass();
+        const { explaining } = reconciler.drain({ background: true });
+        view.flush();
+        return explaining;
+      });
+    },
   };
   return api;
 }

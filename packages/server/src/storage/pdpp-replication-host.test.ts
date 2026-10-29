@@ -1,9 +1,13 @@
 import Database from "better-sqlite3";
 import { join } from "node:path";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createTestReplicaSigner } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
-import type { ReplicationTimers } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
+import { REPLICA_ATTEMPT_TIMEOUT_MS } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
+import {
+  REPLICA_LOCAL_WRITE_DEBOUNCE_MS,
+  type ReplicationTimers,
+} from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import {
   at,
   clock,
@@ -42,9 +46,56 @@ const manualTimers: ReplicationTimers = {
   clearTimeout: () => {},
 };
 
+/** Timers on the shared test clock; the test runs the due ones. */
+function clockTimers() {
+  let next = 1;
+  const pending = new Map<
+    number,
+    { at: number; ms: number; run: () => void }
+  >();
+  const timers: ReplicationTimers = {
+    now: clock.now,
+    setTimeout(run, ms) {
+      pending.set(next, { at: clock.now() + ms, ms, run });
+      return next++;
+    },
+    clearTimeout: (handle) => pending.delete(handle as number),
+  };
+  return {
+    timers,
+    /** Delays of the timers armed since the last call. */
+    armedSince: (() => {
+      let seen = 0;
+      return () => {
+        const fresh = [...pending.entries()]
+          .filter(([id]) => id > seen)
+          .map(([, t]) => t.ms);
+        seen = next - 1;
+        return fresh;
+      };
+    })(),
+    runDue() {
+      for (const [id, t] of [...pending])
+        if (t.at <= clock.now()) {
+          pending.delete(id);
+          t.run();
+        }
+    },
+  };
+}
+
+async function settled(driver: { status(): { stepping: boolean } }) {
+  while (driver.status().stepping)
+    await new Promise((resolve) => setImmediate(resolve));
+}
+
 function host(
   net: ReturnType<typeof network>,
-  opts: { chainId?: number; declarations?: DeclarationSnapshot[] } = {},
+  opts: {
+    chainId?: number;
+    declarations?: DeclarationSnapshot[];
+    timers?: ReplicationTimers;
+  } = {},
 ) {
   const db = new Database(join(scratchDirectory("replica-host"), "db.sqlite"));
   const signer = createTestReplicaSigner();
@@ -57,7 +108,7 @@ function host(
     serverAccount: signer,
     ports: () => ({ transport: net.port, roster: net.roster.port }),
     logger,
-    timers: manualTimers,
+    timers: opts.timers ?? manualTimers,
     worker: { now: clock.now, targetChunkBytes: 4000, maxBlobBytes: 8192 },
   });
   return { db, runtime };
@@ -74,7 +125,8 @@ function started(h: ReturnType<typeof host>) {
   });
   return {
     ...h.runtime,
-    put(text: string) {
+    /** A committed local write, with no explicit trigger. */
+    write(text: string) {
       store.ingestBatch(
         [
           {
@@ -89,7 +141,10 @@ function started(h: ReturnType<typeof host>) {
         () => ["id"],
         { method: "export", generation: 1 },
       );
-      void driver.trigger(); // the local-write trigger a host would fire
+    },
+    put(text: string) {
+      this.write(text);
+      void driver.trigger();
     },
     get: () => store.getRecord("conn", "messages", "a")?.data,
   };
@@ -116,6 +171,41 @@ it("two Node hosts built from retained declarations converge through their drive
   expect(await a.driver.stop(1_000)).toBe(true);
   expect(await b.driver.stop(1_000)).toBe(true);
   expect(a.driver.status().state).toBe("stopped");
+}, 60_000);
+
+it("a committed local write steps within the debounce window; an import does not", async () => {
+  const net = network();
+  const timersA = clockTimers();
+  const a = started(host(net, { timers: timersA.timers }));
+  const b = started(host(net));
+  a.driver.start();
+  b.driver.start();
+  await settled(a.driver);
+  await settled(b.driver);
+  // The first baseline journals operations: drain the step it scheduled.
+  clock.advance(REPLICA_LOCAL_WRITE_DEBOUNCE_MS);
+  timersA.runDue();
+  await settled(a.driver);
+  const wroteA = vi.spyOn(a.driver, "localWrite");
+  const wroteB = vi.spyOn(b.driver, "localWrite");
+  timersA.armedSince();
+  a.write("from A");
+  expect(wroteA).toHaveBeenCalled();
+  // Only the debounced step: the idle wake is still 15 min away.
+  expect(timersA.armedSince()).toEqual([REPLICA_LOCAL_WRITE_DEBOUNCE_MS]);
+  clock.advance(REPLICA_LOCAL_WRITE_DEBOUNCE_MS);
+  // A steps only on its own timers from here.
+  for (let i = 0; i < 12 && b.get()?.text !== "from A"; i++) {
+    timersA.runDue();
+    await settled(a.driver);
+    await b.driver.trigger();
+    clock.advance(10_000);
+  }
+  expect(b.get()).toEqual({ id: "a", text: "from A" });
+  // Imports never append to the journal, so they never schedule a step.
+  expect(wroteB).not.toHaveBeenCalled();
+  expect(await a.driver.stop(1_000)).toBe(true);
+  expect(await b.driver.stop(1_000)).toBe(true);
 }, 60_000);
 
 /** Step a started host once: its writer identity, then its first baseline. */
@@ -173,6 +263,72 @@ it("waits for the roster before the first baseline", async () => {
   expect(await runtime.driver.stop(1_000)).toBe(true);
 });
 
+it("a roster that hangs on the first enable waits and is read again", async () => {
+  const net = network();
+  const db = new Database(join(scratchDirectory("replica-host"), "db.sqlite"));
+  const signer = createTestReplicaSigner();
+  net.roster.register(signer.address, owner);
+  let hang = true;
+  const lookups: AbortSignal[] = [];
+  // Timers the test fires by hand, so the roster deadline is observable.
+  const pending = new Map<number, { ms: number; run: () => void }>();
+  let nextTimer = 0;
+  const timers: ReplicationTimers = {
+    now: clock.now,
+    setTimeout: (run, ms) => {
+      pending.set(++nextTimer, { ms, run });
+      return nextTimer;
+    },
+    clearTimeout: (handle) => pending.delete(handle as number),
+  };
+  const runtime = createNodeReplication({
+    db,
+    owner,
+    chainId: REPLICA_TEST_CHAIN_ID,
+    declarations: [declaration],
+    serverAccount: signer,
+    ports: () => ({
+      transport: net.port,
+      roster: {
+        server: (address, call) => {
+          if (!hang) return net.roster.port.server(address, call);
+          lookups.push(call!.signal!);
+          return new Promise(() => {});
+        },
+      },
+    }),
+    logger,
+    timers,
+    worker: { now: clock.now },
+  });
+  if (runtime.state !== "started") throw new Error(runtime.reason);
+  runtime.driver.start();
+  const first = runtime.driver.trigger();
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(runtime.driver.status().stepping).toBe(true);
+  const deadline = [...pending.values()].find(
+    (timer) => timer.ms === REPLICA_ATTEMPT_TIMEOUT_MS,
+  );
+  expect(deadline).toBeDefined();
+  deadline!.run();
+  // `trigger` joined the first step, so one more runs right after it; by
+  // then the gateway answers again.
+  hang = false;
+  const report = await first;
+  expect(report?.waits).toEqual([
+    expect.objectContaining({ id: "writer-identity" }),
+  ]);
+  expect(lookups).toHaveLength(1);
+  expect(lookups[0]!.aborted).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  // The next step read the roster again and went on to the baseline.
+  expect(runtime.driver.status().stepping).toBe(false);
+  expect(
+    db.prepare("SELECT 1 FROM pdpp_replica_settings WHERE id = 1").get(),
+  ).toBeDefined();
+  expect(await runtime.driver.stop(1_000)).toBe(true);
+});
+
 it("blocks without persisting anything it cannot keep", () => {
   const net = network();
   const unsupported = host(net, { chainId: 1 });
@@ -195,22 +351,41 @@ it("blocks without persisting anything it cannot keep", () => {
     ).toBeUndefined();
 });
 
-it("refuses a later, different declaration set on a baselined database", async () => {
+it("rebinds an upgraded declaration on a baselined database and refuses a reshaped one", async () => {
   const net = network();
   const first = host(net);
   await baselineOnce(first);
-  const upgraded = createNodeReplication({
-    db: first.db,
-    owner,
-    chainId: REPLICA_TEST_CHAIN_ID,
-    declarations: [{ ...declaration, version: "2" }],
-    serverAccount: createTestReplicaSigner(),
-    ports: () => ({ transport: net.port, roster: net.roster.port }),
-    logger,
-    timers: manualTimers,
-  });
-  expect(upgraded).toEqual({
+  const boot = (declarations: DeclarationSnapshot[]) =>
+    createNodeReplication({
+      db: first.db,
+      owner,
+      chainId: REPLICA_TEST_CHAIN_ID,
+      declarations,
+      serverAccount: createTestReplicaSigner(),
+      ports: () => ({ transport: net.port, roster: net.roster.port }),
+      logger,
+      timers: manualTimers,
+    });
+  const generation = () =>
+    first.db
+      .prepare(
+        "SELECT max(generation) AS g FROM pdpp_replica_binding_generations",
+      )
+      .get() as { g: number };
+  const upgraded = { ...declaration, version: "2", digest: "d".repeat(64) };
+  expect(boot([upgraded]).state).toBe("started");
+  expect(generation()).toEqual({ g: 2 });
+  // The same bindings again are idempotent.
+  expect(boot([upgraded]).state).toBe("started");
+  expect(generation()).toEqual({ g: 2 });
+  const reshaped = {
+    ...upgraded,
+    version: "3",
+    streams: [{ ...upgraded.streams[0], primary_key: ["text"] }],
+  };
+  expect(boot([reshaped])).toEqual({
     state: "blocked",
-    reason: "replication binding is immutable",
+    reason: `replication rebinding refused: ${SOURCE} stream messages changed its semantics or primary key`,
   });
+  expect(generation()).toEqual({ g: 2 });
 });

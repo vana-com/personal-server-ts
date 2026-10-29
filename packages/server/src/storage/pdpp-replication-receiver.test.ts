@@ -38,7 +38,12 @@ const declarations: MergeContext["declarations"] = [
 ];
 const directories: string[] = [];
 const devices: ReturnType<typeof device>[] = [];
-function device(registered = true, entries = declarations) {
+function device(
+  registered = true,
+  entries = declarations,
+  /** The bindings it writes under; it trusts every one of `entries`. */
+  current = entries,
+) {
   const directory = mkdtempSync(join(tmpdir(), "pdpp-receiver-"));
   directories.push(directory);
   const path = join(directory, "db.sqlite");
@@ -53,7 +58,7 @@ function device(registered = true, entries = declarations) {
     });
   store.replication.beginBaseline({
     ...config,
-    declarations: entries.map(({ sourceId, binding }) => ({
+    declarations: current.map(({ sourceId, binding }) => ({
       sourceId,
       binding,
     })),
@@ -426,6 +431,81 @@ it("requires verified claimed blob bytes before exposing an imported record", as
     target.store.replication.readTailPage({ limit: 100 }).operations,
   ).toEqual([]);
 });
+
+// Received bytes are custody for the operations that name them. Canonical
+// collection counts only canonical claims, so a verified canonical copy is
+// no reason to drop them: an operation withheld here has no claim yet.
+it.each([
+  ["inline", 2],
+  ["chunked", 2 * 1024 * 1024 + 7],
+])(
+  "keeps a withheld operation's received bytes after the local copy of the same blob is collected (%s)",
+  (_form, size) => {
+    const source = device(),
+      target = device(false);
+    const bytes = new Uint8Array(size).map((_, i) => (i * 7 + 3) & 255);
+    const write = (d: ReturnType<typeof device>, instance: string) =>
+      d.store.storeBlobBytesForInstance({
+        instance,
+        method: "collector",
+        generation: 1,
+        bytes,
+        mimeType: "application/octet-stream",
+      });
+    const blob = write(source, "conn_a");
+    source.store.ingestBatch(
+      [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          emitted_at: at,
+          data: {
+            id: "a",
+            blob_ref: {
+              blob_id: blob.blobId,
+              mime_type: blob.mimeType,
+              size_bytes: size,
+            },
+          },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    target.store.registerConnection({
+      instance: "conn_local",
+      sourceId,
+      method: "collector",
+      label: "L",
+    });
+    expect(write(target, "conn_local").blobId).toBe(blob.blobId);
+    // conn_a has no local mapping on the target, so every operation of it,
+    // the blob claim included, is withheld.
+    expect(
+      target.receiver.import({
+        credential: "replica-secret",
+        envelope: batch(all(source)),
+        blobs: [{ blobId: blob.blobId, bytes }],
+      }).pending.length,
+    ).toBeGreaterThan(0);
+    expect(value(target)).toBeUndefined();
+    target.store.deleteConnection("conn_local");
+    expect(target.store.getBlobBytes(blob.blobId)).toBeUndefined();
+    target.reopen();
+    target.store.registerConnection({
+      instance: "conn_a",
+      sourceId,
+      method: "collector",
+      label: "A",
+    });
+    target.receiver.retry({ credential: "replica-secret" });
+    expect(value(target)?.data.id).toBe("a");
+    expect(target.store.getBlobBytes(blob.blobId)).toEqual(bytes);
+  },
+  30_000,
+);
 
 it("quarantines append-only conflicting content instead of selecting a winner", () => {
   const appendBinding = { ...binding, semantics: "append_only" as const };
@@ -881,20 +961,25 @@ function completedReplica() {
   return all(source);
 }
 
-it("keeps unknown-declaration invalidation pending without erasing a trusted completion", () => {
+it("keeps an incompatible-declaration invalidation pending without erasing a trusted completion", () => {
   const d = device();
   send(d, completedReplica());
   const receipt = d.store.listStreamCompletions("conn_a");
   expect(receipt).toHaveLength(1);
+  // Another shape of the retained stream: refused, never applied.
   const invalidation: ReplicaOperation = {
     ...registration(),
     kind: "stream-invalidate",
     revision: { counter: 100, writerId: "unknown", operationId: "invalidate" },
-    declaration: { ...binding, digest: `sha256:${"c".repeat(64)}` },
+    declaration: {
+      ...binding,
+      digest: `sha256:${"c".repeat(64)}`,
+      semantics: "append_only",
+    },
   };
   const plan = send(d, [invalidation]);
   expect(
-    plan.pending.some((issue) => issue.reason === "missing_declaration"),
+    plan.pending.some((issue) => issue.reason === "incompatible_declaration"),
   ).toBe(true);
   expect(d.store.listStreamCompletions("conn_a")).toEqual(receipt);
   d.reopen();
@@ -902,11 +987,16 @@ it("keeps unknown-declaration invalidation pending without erasing a trusted com
   expect(d.store.listStreamCompletions("conn_a")).toEqual(receipt);
 });
 
-it("makes competing known declaration completions unavailable instead of overwriting one by iteration order", () => {
+it("makes competing known declaration shapes unavailable instead of overwriting one by iteration order", () => {
   const operations = completedReplica();
   const d = device();
   send(d, operations);
-  const competing = { ...binding, digest: `sha256:${"c".repeat(64)}` };
+  // Another shape of the stream (its semantics), not another version.
+  const competing = {
+    ...binding,
+    digest: `sha256:${"c".repeat(64)}`,
+    semantics: "append_only" as const,
+  };
   d.declare([
     ...declarations,
     { sourceId, binding: competing, validateData: () => true },
@@ -925,6 +1015,74 @@ it("makes competing known declaration completions unavailable instead of overwri
   send(d, second);
   expect(value(d)).toBeUndefined();
   expect(d.store.listStreamCompletions("conn_a")).toEqual([]);
+});
+
+it("takes a newer version's records and completion after a peer rebinds the stream", () => {
+  const source = device();
+  const replace = (text: string) =>
+    source.store.replaceStream({
+      instance: "conn_a",
+      stream: "messages",
+      method: "collector",
+      generation: 1,
+      emittedAt: at,
+      envelopes: [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          data: { id: "a", text },
+          emitted_at: at,
+        },
+      ],
+      primaryKey: ["id"],
+      sourceCollectedAt: at,
+    });
+  replace("snapshot");
+  const before = all(source);
+  const upgraded = {
+    ...binding,
+    digest: `sha256:${"c".repeat(64)}`,
+    version: "2",
+  };
+  source.store.replication.beginBaseline({
+    owner: "owner",
+    declarations: [{ sourceId, binding: upgraded }],
+  });
+  replace("upgraded");
+  const after = all(source).slice(before.length);
+  // The rebinding journaled nothing; the new writes name the new version.
+  const versions = after.flatMap((op) =>
+    "declaration" in op ? [op.declaration.version] : [],
+  );
+  expect(versions.length).toBeGreaterThan(1);
+  expect(new Set(versions)).toEqual(new Set(["2"]));
+  const trusting = [
+    ...declarations,
+    {
+      sourceId,
+      binding: upgraded,
+      validateData: (data: Record<string, unknown>) =>
+        typeof data.id === "string",
+    },
+  ];
+  const inOrder = device(true, trusting, declarations);
+  send(inOrder, before);
+  expect(value(inOrder)?.data.text).toBe("snapshot");
+  expect(inOrder.store.listStreamCompletions("conn_a")).toHaveLength(1);
+  send(inOrder, after);
+  const reversed = device(true, trusting, declarations);
+  send(reversed, after);
+  send(reversed, before);
+  // `writeSeq` counts local writes, so it depends on arrival order.
+  const completions = (d: { store: typeof source.store }) =>
+    d.store
+      .listStreamCompletions("conn_a")
+      .map(({ writeSeq: _local, ...completion }) => completion);
+  for (const d of [inOrder, reversed]) {
+    expect(value(d)?.data.text).toBe("upgraded");
+    expect(completions(d)).toEqual(completions(source));
+  }
 });
 
 it("makes a completion unavailable, not the import a failure, when live rows do not fit its declaration's key", () => {

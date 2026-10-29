@@ -9,3 +9,4 @@ export {
   createVanaSyncStorageAdapter,
   resolveVanaStorageEndpoint,
 } from "./vana.js";
+export { vanaBlobRequests } from "./vana-audience.js";

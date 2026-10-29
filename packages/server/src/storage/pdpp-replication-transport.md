@@ -4,6 +4,12 @@
 `enabled` option defaults to false. It is absent from server bootstrap, HTTP
 routes and Lite. This change does not enable production replication.
 
+The worker is the Node host of core's phase engine
+(`packages/core/src/replication/engine.ts`). PS-Lite runs the same engine
+through `createLiteReplicaEngine` (`packages/lite/src/replication-engine.ts`).
+The phase order, SQL and outcomes below live in core; this file binds them to
+better-sqlite3.
+
 ## Wire and authority
 
 A device sync is one batch, up to the batch bounds below, and one batch costs
@@ -98,11 +104,13 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   `roster` dependency on its own address) until the server is registered under
   the owner and not revoked. If the roster is unavailable, a server that already
   has an identity continues with it; a server without one waits.
-- The first identity requires an empty replica journal. A database that
+- On Node, the first identity requires an empty replica journal. A database that
   captured operations under the old random installation writer id fails with
   `replica_identity_requires_fresh_journal`: **dev databases start fresh.**
   Operations captured before the first identity keep that local id; receivers
-  refuse them, so they never leave the device.
+  refuse them, so they never leave the device. Lite has no such rule: it
+  re-exports its canonical state under the first identity (Lite
+  `rebaseline`), so local writes made before the first enable publish.
 - A new registration id for the same address (re-registration) starts a new
   incarnation with a new nonce at the next step.
 - After a replication reset, a new database, or a restore or clone, the host
@@ -124,15 +132,17 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   signer; the baseline carries their effect. A peer that missed the old
   writer's batches (refused after re-registration, never published, or
   written between a gateway change and the next step) therefore converges.
-  Each re-issued record and completion takes the order of the highest
-  retained operation, own or received, with the same key and effect (record
-  data, tombstone, or completion snapshot): its counter, plus that
-  operation's writer and operation id as `revision.origin` (or its origin, if
-  it was itself a re-issue). `compareRevisions` orders by counter, then the
-  origin's ids, then the operation's own, so the re-issue wins and loses
-  exactly where the original does. A state no retained operation explains
-  takes a new counter. The rebaseline runs inside the door's capture guard. A
-  crash during the baseline resumes from its durable cursor.
+  Each re-issued record and completion takes the order of the operation the
+  receiver's merge chose for it (`explainState`), when that operation has the
+  same effect (record data, tombstone, or completion snapshot): its counter,
+  plus that operation's writer and operation id as `revision.origin` (or its
+  origin, if it was itself a re-issue), and its declaration.
+  `compareRevisions` orders by counter, then the origin's ids, then the
+  operation's own, so the re-issue wins and loses exactly where the original
+  does. A live record or completion the merge does not explain takes a new
+  counter. A tombstone the merge does not explain is not published: it only
+  hides a row on this device. The rebaseline runs inside the door's capture
+  guard. A crash during the baseline resumes from its durable cursor.
 - Every step checks the replication door first. The roster read writes
   nothing; the identity write (establish or rotate) checks the door in its own
   transaction and refuses once it is closed, and the writer switch and
@@ -366,10 +376,20 @@ and nothing outstanding the phase is never due and reads no retained history.
 New large canonical, pinned and received bytes use the same 64 KiB chunk store.
 Receiver reconciliation re-hashes actual chunks on every retry. Existing
 single-BLOB rows remain readable; their native SQLite memory use is not bounded
-by the JavaScript chunk reader. Explicit whole-value read APIs still assemble
-bytes for their callers. Hidden abandoned stages are reclaimed by the next
+by the JavaScript chunk reader. Canonical storage holds a blob larger than
+1 MiB once: a local write writes chunks only, a pin of chunked canonical bytes
+is a reference row, and replicated promotion copies received chunks into
+canonical chunks. The received copy stays as custody. The flag-off boot that
+retires replication writes main's row for those blobs.
+Explicit whole-value read APIs still assemble bytes for their callers. When a
+batch's registration is finalized, the publish commit drops its payload and
+fragment ciphertext; fragment digests and the manifest remain. Hidden abandoned stages are reclaimed by the next
 worker cycle under the single-process database-writer contract.
-Received custody, fragment commitments, failures and receipts remain retained.
+The import commit deletes the inbox fragment bodies, and discovery never
+admits the device's own batches; a per-scope floor keeps an idle pass from
+reading old versions. Storage copies left by earlier builds are compacted
+within a quarter of each step's byte budget, up to 4 MiB. Received custody,
+fragment commitments, failures and receipts remain retained.
 A rebuild may replace or remove an unpublished source payload; the source
 journal and Unsupported operation outcomes remain. No source-history compaction
 or retirement is implemented.
@@ -538,8 +558,8 @@ journey. Live acceptance must still verify repeated PUT of identical
 ciphertext at an existing key after registration failure, and one
 registration per sync against the dev Gateway. Generic preparation errors,
 including `RangeError` from encryption, remain Retry with bounded backoff and
-a typed preparation wait. Runtime scheduling and Lite publisher wiring remain
-outside this change.
+a typed preparation wait. Host wiring of the Lite engine remains outside
+this change.
 
 The in-process oracle uses two file-backed SQLite stores and real receiver
 imports, an encrypted storage fake with a size cap, and independent fake

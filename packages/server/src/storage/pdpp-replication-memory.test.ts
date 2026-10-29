@@ -21,25 +21,41 @@ const KIB_PER_MIB = 1024;
  *    WORKER_ALLOWANCE_KIB above the process's startup peak, measured before
  *    promotion.
  *
- * 2. Replicated promotion writes main's whole `pdpp_blob_bytes` row, which
- *    costs what main's own blob write costs. It must cost no more than that
- *    plus PROMOTION_MARGIN_KIB. Main's whole row is the rollback format, so
- *    the comparison deliberately mirrors it.
+ * 2. Replicated promotion copies the verified chunks into canonical chunks,
+ *    64 KiB at a time, and assembles no whole value. Its growth must stay
+ *    under PROMOTION_ALLOWANCE_KIB at every size, both alone and inside the
+ *    worker. Main's own blob write holds the whole blob; it is measured for
+ *    comparison only.
  *
- * WORKER_ALLOWANCE_KIB is the worker's own growth above startup, measured on
- * Node 22.21.1. The typical growth is about 164 MiB at both 32 and 128 MiB.
- * Some runs spike to about 188 to 192 MiB inside the worker phases, so the
- * allowance is the worst observed value plus 16 MiB of headroom. It is not
- * meant to scale with blob size. The growth it covers is fragment churn, one
- * 3 MiB fragment in flight at a time.
+ * WORKER_ALLOWANCE_KIB is the worker's own growth above startup. It is not
+ * meant to scale with blob size: the growth it covers is fragment churn, one
+ * 3 MiB fragment in flight at a time. It is set from CI's spread on Node 22:
+ * 105 samples from 35 CI runs on 2026-10-29 (32, 64 and 128 MiB; main and
+ * eight branches) had a median of 158 MiB, a p95 of 178 MiB and a maximum of
+ * 227 MiB. The spikes do not follow blob size or branch: the three samples
+ * over 208 MiB came at 32 and 64 MiB, two of them on a branch that does not
+ * touch replication. The allowance is that maximum plus about 29 MiB.
+ *
+ * A spike is transient, so a size whose first sample exceeds the allowance is
+ * measured once more in a fresh process, and the lower sample counts. A
+ * worker that retains blob-sized memory fails both samples.
  *
  * Newer Node releases retain more freed buffers before returning them to the
  * OS. On Node 24.22.1 the same growth is about 358 to 394 MiB at 32, 64 and
- * 128 MiB. The absolute allowance therefore depends on the Node major.
+ * 128 MiB (local runs; CI runs Node 22). The absolute allowance therefore
+ * depends on the Node major.
  */
 const WORKER_ALLOWANCE_KIB =
-  (Number(process.versions.node.split(".")[0]) <= 22 ? 208 : 448) * KIB_PER_MIB;
-const PROMOTION_MARGIN_KIB = 16 * KIB_PER_MIB;
+  (Number(process.versions.node.split(".")[0]) <= 22 ? 256 : 448) * KIB_PER_MIB;
+/**
+ * Chunked promotion's growth does not follow blob size: on Node 24.22.1 it
+ * measured 32, 62, 60 and 59 MiB at 32, 128, 256 and 512 MiB. The level is
+ * freed 64 KiB chunk buffers waiting for garbage collection; each value
+ * SQLite hands over is one chunk (pdpp-replication-blob-storage.test.ts).
+ * The whole-value promotion this replaced grew 124 MiB at 32 MiB and 452 MiB
+ * at 128 MiB, so it fails at every size.
+ */
+const PROMOTION_ALLOWANCE_KIB = 80 * KIB_PER_MIB;
 
 type Measurement = { size: number; deltaKiB: number };
 type WorkerMeasurement = {
@@ -74,6 +90,22 @@ function runFixture(mode: string, directory: string, sizeBytes: number) {
   return child.stdout;
 }
 
+const workerGrowthKiB = (worker: WorkerMeasurement) =>
+  worker.workerPeakKiB - worker.startKiB;
+
+/** A worker sample in a fresh seeded directory, for the one re-measure. */
+function measureWorker(sizeBytes: number): WorkerMeasurement {
+  const directory = mkdtempSync(join(memoryRoot, "replica-memory-"));
+  try {
+    runFixture("seed", directory, sizeBytes);
+    return JSON.parse(
+      runFixture("measure", directory, sizeBytes),
+    ) as WorkerMeasurement;
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 it("smoke-guards transport-worker RSS at 32, 64 and 128 MiB blobs (coarse, not a size-independence proof)", () => {
   const results: {
     sizeMiB: number;
@@ -88,7 +120,14 @@ it("smoke-guards transport-worker RSS at 32, 64 and 128 MiB blobs (coarse, not a
     const plainDirectory = mkdtempSync(join(memoryRoot, "replica-plain-"));
     try {
       runFixture("seed", directory, sizeBytes);
-      const worker = JSON.parse(runFixture("measure", directory, sizeBytes));
+      let worker = JSON.parse(
+        runFixture("measure", directory, sizeBytes),
+      ) as WorkerMeasurement;
+      if (workerGrowthKiB(worker) >= WORKER_ALLOWANCE_KIB) {
+        const again = measureWorker(sizeBytes);
+        console.log("replica memory re-measure", { sizeMiB, worker, again });
+        if (workerGrowthKiB(again) < workerGrowthKiB(worker)) worker = again;
+      }
       const promote = JSON.parse(
         runFixture("promote", promoteDirectory, sizeBytes),
       );
@@ -107,19 +146,18 @@ it("smoke-guards transport-worker RSS at 32, 64 and 128 MiB blobs (coarse, not a
     }
   }
   console.log("replica memory", results);
-  for (const { sizeMiB, worker, promote, plain } of results) {
+  for (const { sizeMiB, worker, promote } of results) {
     expect(worker.published, `${sizeMiB} MiB`).toBeGreaterThan(0);
     expect(
-      worker.workerPeakKiB - worker.startKiB,
+      workerGrowthKiB(worker),
       `${sizeMiB} MiB worker phases`,
     ).toBeLessThan(WORKER_ALLOWANCE_KIB);
-    expect(
-      promote.deltaKiB,
-      `${sizeMiB} MiB promotion vs main plain write`,
-    ).toBeLessThanOrEqual(plain.deltaKiB + PROMOTION_MARGIN_KIB);
+    expect(promote.deltaKiB, `${sizeMiB} MiB promotion`).toBeLessThan(
+      PROMOTION_ALLOWANCE_KIB,
+    );
     expect(
       worker.peakRssKiB - worker.workerPeakKiB,
-      `${sizeMiB} MiB in-worker promotion vs main plain write`,
-    ).toBeLessThanOrEqual(plain.deltaKiB + PROMOTION_MARGIN_KIB);
+      `${sizeMiB} MiB in-worker promotion`,
+    ).toBeLessThan(PROMOTION_ALLOWANCE_KIB);
   }
 }, 900000);

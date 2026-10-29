@@ -1,5 +1,6 @@
 export {
   OURA_LEGACY_TAKEOVER_CONTRACT,
+  REPLICA_WRITER_ROTATION_CONTRACT,
   STRAVA_BROWSER_TRANSITION_CONTRACT,
 } from "@opendatalabs/personal-server-ts-server";
 export {
