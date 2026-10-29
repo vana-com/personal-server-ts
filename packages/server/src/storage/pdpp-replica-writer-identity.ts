@@ -8,6 +8,7 @@ import {
   deriveReplicaWriters,
   randomReplicaWriterNonce,
   replicaWriterSeedSchema,
+  type ReplicaWriterRotation,
   type ReplicaWriterSeed,
 } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import {
@@ -200,6 +201,34 @@ export function rotateReplicaWriterIdentity(
       });
     })
     .immediate();
+}
+
+/**
+ * The boot step for a host's rotation request (host contract §3.2). A host
+ * asks when it cannot rule out that this database is a copy: a restore, a
+ * clone, a reinstall onto existing data. `replicationEnabled` is this boot's
+ * result from the replication door. Run it after the door and before any
+ * record store of this boot captures a write. A database without an identity
+ * yet reports `no_identity`: its first identity draws a new nonce anyway.
+ */
+export function rotateReplicaWriterIdentityAtBoot(
+  db: Database,
+  input: { requested: boolean; replicationEnabled: boolean },
+): ReplicaWriterRotation {
+  if (!input.requested) return "not_requested";
+  if (!input.replicationEnabled) return "replication_off";
+  try {
+    rotateReplicaWriterIdentity(db);
+    return "rotated";
+  } catch (error) {
+    if (
+      error instanceof ReplicaWriterIdentityError &&
+      error.code === "replica_identity_not_registered"
+    )
+      return "no_identity";
+    if (error instanceof ReplicationRefusedError) return "replication_off";
+    throw error;
+  }
 }
 
 export type ReplicaWriterIdentityState =
