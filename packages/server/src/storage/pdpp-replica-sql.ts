@@ -6,6 +6,12 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/replication/effects";
 
 const statements = new WeakMap<Database, Map<string, Statement>>();
+/**
+ * Prepared statements kept per database, least recently used first out.
+ * Some engine queries embed the step's clock in their text, so an unbounded
+ * cache would grow by a few statements every step.
+ */
+export const REPLICA_STATEMENT_CACHE_SIZE = 256;
 
 /** better-sqlite3 binds Buffers; a plain Uint8Array becomes a view of the same bytes. */
 const bind = (params: readonly ReplicaSqlValue[]) =>
@@ -21,7 +27,11 @@ export function nodeReplicaSql(db: Database): ReplicaSql {
   if (!cache) statements.set(db, (cache = new Map()));
   const prepared = (text: string) => {
     let statement = cache.get(text);
-    if (!statement) cache.set(text, (statement = db.prepare(text)));
+    if (statement) cache.delete(text);
+    else statement = db.prepare(text);
+    cache.set(text, statement);
+    if (cache.size > REPLICA_STATEMENT_CACHE_SIZE)
+      cache.delete(cache.keys().next().value!);
     return statement;
   };
   return {
