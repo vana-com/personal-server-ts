@@ -14,12 +14,8 @@ import {
   type DeclarationBinding,
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
-import {
-  compareRevisions,
-  type ReplicaRevision,
-} from "@opendatalabs/personal-server-ts-core/replication/revision";
+import type { ReplicaRevision } from "@opendatalabs/personal-server-ts-core/replication/revision";
 import { planReplicaRebinding } from "@opendatalabs/personal-server-ts-core/replication/rebinding";
-import { resolveDeclaration } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import {
   replicaSchemaDigest,
   type ReplicaStreamSchema,
@@ -111,10 +107,13 @@ export interface ReplicationExport {
   getBaselineCheckpoint(): number;
   /**
    * A new writer identity re-captures the current state under its own writer
-   * as a new baseline (see `rebaseline` below). Undefined before a baseline
-   * began.
+   * as a new baseline (see `rebaseline` below). `explaining` are the
+   * operations the merge chose for that state (`explainState` on the
+   * receiver). Undefined before a baseline began.
    */
-  rebaseline(): { after: number } | undefined;
+  rebaseline(
+    explaining: readonly ReplicaOperation[],
+  ): { after: number } | undefined;
   /** CAS acknowledgment after the page is durable at its consumer; retry is idempotent. */
   acknowledgeBaselinePage(expected: number, next: number): void;
   readPinnedBlobBytes(blobId: string): Uint8Array | undefined;
@@ -203,11 +202,6 @@ export function createReplicationJournal(
       generation: generation ?? binding.generation,
     };
   }
-  /** Every binding this database retains: current plus earlier generations. */
-  const retainedDeclarations = () => [
-    ...config()!.declarations,
-    ...declarationHistory(),
-  ];
   /**
    * The binding a capture writes under: the current one for the stream. A
    * rebaseline also captures streams a rebinding retired, whose rows and
@@ -226,24 +220,18 @@ export function createReplicationJournal(
     return found.binding;
   }
   /**
-   * While a rebaseline runs: the highest retained revision, own or received,
-   * of each record and completion (`reissueKey`) and effect.
+   * While a rebaseline runs: the operation that explains each record and
+   * completion (`reissueKey`), the one the merge chose.
    */
   let reissue:
-    | Map<
-        string,
-        Map<
-          string,
-          { revision: ReplicaRevision; declaration: DeclarationBinding }
-        >
-      >
+    | Map<string, Extract<ReplicaOperation, { declaration: unknown }>>
     | undefined;
   /**
-   * A re-issued operation takes the order of the highest retained operation
-   * with the same key and effect: the counter, and that operation (or its own
-   * origin) as origin. It also keeps that operation's declaration, so after a
-   * rebinding it validates exactly where the original did. With none, the
-   * state is a new write and takes a new counter.
+   * A re-issued operation takes the order of the operation that explains its
+   * state, when it has the same effect: the counter, and that operation (or
+   * its own origin) as origin. It also keeps that operation's declaration, so
+   * after a rebinding it validates exactly where the original did. With
+   * none, the state is a new write and takes a new counter.
    */
   function reissued(value: WithoutRevision<ReplicaOperation>):
     | {
@@ -252,8 +240,8 @@ export function createReplicationJournal(
       }
     | undefined {
     const key = reissueKey(value);
-    const found = key && reissue?.get(key)?.get(effect(value));
-    if (!found) return undefined;
+    const found = key === undefined ? undefined : reissue?.get(key);
+    if (!found || effect(found) !== effect(value)) return undefined;
     const { counter, writerId, operationId, origin } = found.revision;
     return {
       revision: { counter, origin: origin ?? { writerId, operationId } },
@@ -691,50 +679,23 @@ export function createReplicationJournal(
    * newer write, and never loses a tie the original won. A peer's operation
    * is re-issued the same way: the new writer signs it, its origin keeps the
    * peer's order. Lifecycle and blob-claim operations take new counters.
+   *
+   * Only the operation the merge chose explains a state (`explaining`). A
+   * higher operation with the same effect may be one the merge rejected or
+   * keeps pending; copying its order or binding would publish a baseline
+   * that a peer with this device's trust refuses.
    */
-  function rebaseline(): { after: number } | undefined {
+  function rebaseline(
+    explaining: readonly ReplicaOperation[],
+  ): { after: number } | undefined {
     if (!settings()) return undefined;
     const { counter: after } = db
       .prepare("SELECT counter FROM pdpp_replica_clock")
       .get() as { counter: number };
-    const received = db
-      .prepare(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_received'",
-      )
-      .get();
     reissue = new Map();
-    // Only an operation that applies here can explain canonical state: one
-    // under a retained or compatible binding. A pending (missing or
-    // incompatible) declaration is never copied, or the new writer could not
-    // publish its baseline.
-    const retained = retainedDeclarations();
-    for (const { operation_json } of db
-      .prepare(
-        `SELECT operation_json FROM pdpp_replica_operations${received ? " UNION ALL SELECT operation_json FROM pdpp_replica_received" : ""}`,
-      )
-      .iterate() as Iterable<{ operation_json: string }>) {
-      const op = JSON.parse(operation_json) as ReplicaOperation;
+    for (const op of explaining) {
       const key = reissueKey(op);
-      if (key === undefined || !("declaration" in op)) continue;
-      const { status } = resolveDeclaration(
-        retained,
-        op.sourceId,
-        op.declaration,
-      );
-      if (status === "missing" || status === "incompatible") continue;
-      const effects =
-        reissue.get(key) ??
-        new Map<
-          string,
-          { revision: ReplicaRevision; declaration: DeclarationBinding }
-        >();
-      reissue.set(key, effects);
-      const prior = effects.get(effect(op));
-      if (!prior || compareRevisions(op.revision, prior.revision) > 0)
-        effects.set(effect(op), {
-          revision: op.revision,
-          declaration: op.declaration,
-        });
+      if (key !== undefined && "declaration" in op) reissue.set(key, op);
     }
     try {
       captureCurrentState();
@@ -786,7 +747,8 @@ export function createReplicationJournal(
     beginBaseline,
     declarationHistory,
     bindingGeneration,
-    rebaseline: () => db.transaction(rebaseline).immediate(),
+    rebaseline: (explaining) =>
+      db.transaction(() => rebaseline(explaining)).immediate(),
     readBaselinePage: (options) => page(options, true),
     readTailPage: (options) => page(options, false),
     getBaselineCheckpoint: () => {

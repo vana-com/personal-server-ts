@@ -5,15 +5,21 @@
  * bindings, then a trusted set of those bindings plus every retained one.
  */
 import Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { DeclarationBinding } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import type {
+  DeclarationBinding,
+  ReplicaOperation,
+} from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { replicaSchemaDigest } from "@opendatalabs/personal-server-ts-core/replication/host-config";
 import {
   at,
   binding,
   cleanupHarness,
+  credential,
   cycles,
+  envelope,
   network,
   owner,
   scratchDirectory,
@@ -28,6 +34,7 @@ import {
 } from "./pdpp-replica-canonical-port.js";
 import { REPLICA_BINDING_HISTORY_MIGRATION } from "./pdpp-replication-sqlite.js";
 import { rotateReplicaWriterIdentity } from "./pdpp-replica-writer-identity.js";
+import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 
 afterEach(cleanupHarness);
 
@@ -81,6 +88,23 @@ function writtenVersions(d: TransportDevice) {
       .all() as { v: string | null }[]
   ).flatMap((row) => (row.v === null ? [] : [row.v]));
 }
+
+/** Every operation the device's own journal wrote, in journal order. */
+const journalOf = (d: TransportDevice) =>
+  (
+    d.db
+      .prepare(
+        "SELECT operation_json FROM pdpp_replica_operations ORDER BY sequence",
+      )
+      .all() as { operation_json: string }[]
+  ).map((row) => JSON.parse(row.operation_json) as ReplicaOperation);
+
+/** The device's own operations on one record, in journal order. */
+const recordOperations = (d: TransportDevice, id: string) =>
+  journalOf(d).filter(
+    (op): op is Extract<ReplicaOperation, { kind: "upsert" | "delete" }> =>
+      (op.kind === "upsert" || op.kind === "delete") && op.recordKey === id,
+  );
 
 /** The dependency the reconcile phase waits on, if any. */
 const reconcileWait = (d: TransportDevice) =>
@@ -450,6 +474,118 @@ describe("writer rotation after a rebinding", () => {
     await cycles([a, c], 10);
     expect(view(c, ["k", "g"])).toEqual({ k: "k1", g: null });
     expect(view(a, ["k", "g"])).toEqual({ k: "k1", g: null });
+  }, 60_000);
+
+  it("a rotated writer copies each row from the operation the merge chose", async () => {
+    // v2 requires `lang`. B, and later C, retain v1 and v2 and check it.
+    const lang = (b: DeclarationBinding, data: Record<string, unknown>) =>
+      typeof data.id === "string" &&
+      (b.version !== "2" || typeof data.lang === "string");
+    const net = network();
+    const a = transportDevice(net);
+    const b = transportDevice(net, { validateData: lang });
+    b.put("same", "x");
+    await cycles([a, b], 6);
+    rebind(b, [v2]);
+    // Peer A sends the same data under v2 without `lang`, at a higher
+    // revision. B keeps that operation but rejects its data, so B's v1
+    // operation stays the winner.
+    const [original] = recordOperations(b, "x");
+    const rejected: ReplicaOperation = {
+      ...original,
+      declaration: v2.binding,
+      revision: {
+        counter: original.revision.counter + 10,
+        writerId: journalOf(a)[0].revision.writerId,
+        operationId: randomUUID(),
+      },
+    };
+    const plan = b.receiver.import({
+      credential,
+      envelope: envelope([rejected], "peer-v2"),
+    });
+    expect(plan.rejected.map((issue) => issue.reason)).toEqual([
+      "invalid_record_data",
+    ]);
+    expect(original.declaration).toEqual(v1.binding);
+    expect(view(b, ["x"])).toEqual({ x: "same" });
+
+    rotateReplicaWriterIdentity(b.db);
+    await cycles([b], 4);
+    const copy = recordOperations(b, "x").at(-1)!;
+    expect(copy.revision.writerId).not.toBe(original.revision.writerId);
+    expect(copy.declaration).toEqual(v1.binding);
+    expect(copy.revision.counter).toBe(original.revision.counter);
+    expect(copy.revision.origin).toEqual({
+      writerId: original.revision.writerId,
+      operationId: original.revision.operationId,
+    });
+
+    // A fresh peer with B's trust receives only the new baseline.
+    const c = transportDevice(net, { validateData: lang });
+    rebind(c, [v2]);
+    c.receiver.import({
+      credential,
+      envelope: envelope(
+        journalOf(b).filter(
+          (op) => op.revision.writerId === copy.revision.writerId,
+        ),
+        "rebaseline",
+      ),
+    });
+    expect(view(c, ["x"])).toEqual({ x: "same" });
+  }, 60_000);
+
+  it("a rotated writer keeps the order of the completion the merge chose", async () => {
+    const net = network();
+    const a = transportDevice(net);
+    const b = transportDevice(net);
+    b.put("x1", "x");
+    const scope = {
+      sourceId,
+      instance: b.instance,
+      method: "export",
+      generation: 1,
+      stream: "messages",
+    };
+    b.store.completeStreams(
+      {
+        instance: b.instance,
+        sourceId,
+        method: "export",
+        generation: 1,
+        sourceCollectedAt: at,
+        collectionTimeBasis: "host_run_finished",
+        streams: [
+          {
+            stream: "messages",
+            coverage: "full_stream",
+            liveCount: 1,
+            snapshotSha256: liveSnapshotDigest(
+              scope,
+              ["id"],
+              [{ recordKey: "x", dataJson: '{"id":"x","text":"x1"}' }],
+            ),
+          },
+        ],
+      },
+      () => ["id"],
+    );
+    await cycles([a, b], 6);
+    const completions = () =>
+      journalOf(b).filter((op) => op.kind === "stream-complete");
+    const [original] = completions();
+    expect(original).toBeDefined();
+
+    rotateReplicaWriterIdentity(b.db);
+    await cycles([a, b], 6);
+    const copy = completions().at(-1)!;
+    expect(copy.revision.writerId).not.toBe(original.revision.writerId);
+    expect(copy.revision.counter).toBe(original.revision.counter);
+    expect(copy.revision.origin).toEqual({
+      writerId: original.revision.writerId,
+      operationId: original.revision.operationId,
+    });
   }, 60_000);
 });
 

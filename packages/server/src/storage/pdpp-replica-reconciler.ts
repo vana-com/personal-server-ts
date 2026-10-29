@@ -788,6 +788,7 @@ export function createReplicaReconciler(deps: {
       }
       if (shown?.kind === "upsert") effects.persistBlobs(shown);
       effects.write(instance, stream, recordKey, shown);
+      if (shown) run.explaining.push(shown);
     }
     const materialized = new Set(
       keyPlan.records.map((record) => canonicalJson(record.identity)),
@@ -935,6 +936,7 @@ export function createReplicaReconciler(deps: {
         native ? completion.snapshotSha256.slice(7) : null,
         native ? "host_run_finished" : null,
       );
+      run.explaining.push(completion);
       return;
     }
     sql(
@@ -962,6 +964,11 @@ export function createReplicaReconciler(deps: {
     plan: ReplicaMergePlan;
     /** Connections whose connection-level issues this run already reported. */
     reported: Set<string>;
+    /**
+     * The operations this run wrote canonical state from: each shown row's or
+     * tombstone's winner and each persisted completion, in run order.
+     */
+    explaining: ReplicaOperation[];
   }
   /**
    * Reconcile queued work. `background: false` leaves a paged pass's entries
@@ -972,6 +979,7 @@ export function createReplicaReconciler(deps: {
   function drain(input: { background: boolean; page?: ReplicaReconcilePage }): {
     plan: ReplicaMergePlan;
     complete: boolean;
+    explaining: ReplicaOperation[];
   } {
     ingest();
     const run: Run = {
@@ -984,6 +992,7 @@ export function createReplicaReconciler(deps: {
         suppressed: [],
       },
       reported: new Set(),
+      explaining: [],
     };
     meter = { operations: 0, bytes: 0 };
     // Retained evidence does not change during a drain: ingest ran above.
@@ -1026,7 +1035,11 @@ export function createReplicaReconciler(deps: {
         );
       else reconcileCompletion(entry.instance, entry.stream, background, run);
     }
-    return { plan: normalize(run.plan), complete: !queued() };
+    return {
+      plan: normalize(run.plan),
+      complete: !queued(),
+      explaining: run.explaining,
+    };
   }
   function queued(): boolean {
     return !!sql("SELECT 1 FROM pdpp_replica_reconcile_queue LIMIT 1").get();

@@ -30,6 +30,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import {
   canonicalJson,
+  type DeclarationBinding,
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
@@ -649,6 +650,11 @@ export function transportDevice(
     instance?: string;
     /** The bindings this device baselines with and trusts (default `expected`). */
     declarations?: (typeof expected)["declarations"];
+    /** The receiver's data check per binding (default: a string `id`). */
+    validateData?: (
+      binding: DeclarationBinding,
+      data: Record<string, unknown>,
+    ) => boolean;
     /** Extra worker deps, passed through (e.g. coordinator quanta). */
     worker?: Record<string, unknown>;
   } = {},
@@ -706,7 +712,9 @@ export function transportDevice(
         declarations.map((d) => ({
           ...d,
           validateData: (data: Record<string, unknown>) =>
-            typeof data.id === "string",
+            opts.validateData
+              ? opts.validateData(d.binding, data)
+              : typeof data.id === "string",
         })),
     });
     return createReplicaTransportWorker({

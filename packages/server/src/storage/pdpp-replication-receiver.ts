@@ -1369,15 +1369,33 @@ export function createReplicaReceiver(deps: {
       authorize(input.credential);
       return view.exclusive(() => {
         if (input.restart) reconciler.beginPass();
-        const result = reconciler.drain({ background: true, page: input.page });
+        const { plan, complete } = reconciler.drain({
+          background: true,
+          page: input.page,
+        });
         view.flush();
-        return result;
+        return { plan, complete };
       });
     },
     /** Whether reconcile work is queued. Reads no retained history. */
     reconcileQueued: (): boolean => reconciler.queued(),
     /** Retained evidence reconcile has loaded, cumulatively. For bounds tests. */
     reconcileStats: () => reconciler.stats(),
+    /**
+     * Reconcile, then return the operations that explain canonical state: the
+     * merge's winner for each shown row and tombstone, and each available
+     * completion. A new writer's rebaseline copies order and binding only
+     * from these (host contract §4.5).
+     */
+    explainState(input: { credential: unknown }): ReplicaOperation[] {
+      authorize(input.credential);
+      return view.exclusive(() => {
+        reconciler.beginPass();
+        const { explaining } = reconciler.drain({ background: true });
+        view.flush();
+        return explaining;
+      });
+    },
   };
   return api;
 }

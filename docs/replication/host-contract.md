@@ -551,13 +551,15 @@ Nothing is lost or resurrected: a pending operation takes part in the merge
 only once it resolves.
 
 A new writer identity rebaselines current state (`rebaseline`). Each copied
-record or completion keeps the order and binding of the highest retained
-operation with the same effect, chosen only among operations that resolve as
-retained or compatible by the same rule. A pending operation never explains
-canonical state, so its binding is never copied. The transport publishes this
-device's own operations under a retained or compatible binding. A stream that
-a rebinding retired keeps its rows and tombstones: the rebaseline captures them
-under their latest retained binding.
+record or completion keeps the order and binding of the operation the merge
+chose for it: the receiver's reconcile returns the winner each shown row or
+tombstone was written from, and each available completion (`explainState`).
+An operation the merge rejected or keeps pending never explains canonical
+state, even when it has a higher revision and the same data, so its binding is
+never copied. The transport publishes this device's own operations under a
+retained or compatible binding. A stream that a rebinding retired keeps its
+rows and tombstones: the rebaseline captures them under their latest retained
+binding.
 
 Known limits:
 
@@ -567,6 +569,8 @@ Known limits:
   with an unknown schema. Its operations are compatible with the current
   binding, so they validate by key only until a host supplies that schema.
 - Lite needs the same history-aware context.
+- A row the merge does not explain, such as one hidden by a withdrawal or a
+  key quarantine, is captured as a tombstone with a new counter.
 
 ## 5. Opt-in and the one-way door
 

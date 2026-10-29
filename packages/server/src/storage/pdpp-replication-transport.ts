@@ -662,10 +662,16 @@ export function createReplicaTransportWorker(deps: {
    * missed any old batch still converges. The same transaction switches the
    * writer and pins the baseline; a crash resumes it from its durable
    * cursor. The rebaseline is a capture, so the door's fence does not count
-   * it as a bypass.
+   * it as a bypass. It copies each record and completion from the operation
+   * the receiver's merge chose for it, so the baseline carries only what this
+   * device's trust accepted.
    */
   function startWriter(identity: ReplicaWriterIdentity) {
-    const baseline = captureWrites(db, () => deps.exporter.rebaseline());
+    const baseline = captureWrites(db, () =>
+      deps.exporter.rebaseline(
+        deps.receiver.explainState({ credential: deps.credential }),
+      ),
+    );
     db.prepare(
       "UPDATE pdpp_transport_state SET writer=?,sequence=0,previous_json=NULL,baseline_cursor=?,baseline_done=0,tail_cursor=NULL WHERE id=1",
     ).run(identity.transportWriter, baseline?.after ?? 0);
