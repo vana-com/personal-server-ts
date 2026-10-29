@@ -29,22 +29,15 @@ import {
   type ReplicaOperation,
   type RecordOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
-import {
-  planReplicaMerge,
-  type MergeContext,
-  type ReplicaMergePlan,
+import type {
+  MergeContext,
+  ReplicaMergePlan,
 } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
-import { selectStreamCompletion } from "@opendatalabs/personal-server-ts-core/replication/completion";
+import { blobReady } from "@opendatalabs/personal-server-ts-core/replication/visibility-engine";
 import {
-  blobReady,
-  completionAvailability,
-  connectionFromFacts,
-  contradictsMapping,
-  indexEvidence,
-  recordRow,
-  type ConnectionMapping,
-  type ConnectionProjection,
-} from "@opendatalabs/personal-server-ts-core/replication/visibility-engine";
+  createReplicaReconciler,
+  type ReplicaReconcilePage,
+} from "./pdpp-replica-reconciler.js";
 import { replicaOperationDigest } from "./pdpp-replication-sqlite.js";
 import type { ReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 
@@ -121,10 +114,6 @@ type Binding = {
   deleted_at: string | null;
 };
 type BlobDescriptor = Extract<ReplicaOperation, { kind: "blob-claim" }>["blob"];
-type CompletionEvent = Extract<
-  ReplicaOperation,
-  { kind: "stream-complete" | "stream-invalidate" }
->;
 interface StoredRow {
   data: string | null;
   version: number;
@@ -213,15 +202,6 @@ export function createReplicaReceiver(deps: {
         .run(instance).changes > 0;
     if (hidden) store.fenceReplicaConnection(instance);
     return hidden;
-  }
-  function retained(): ReplicaOperation[] {
-    return (
-      db
-        .prepare(
-          "SELECT operation_json FROM pdpp_replica_operations UNION SELECT operation_json FROM pdpp_replica_received",
-        )
-        .all() as { operation_json: string }[]
-    ).map((row) => JSON.parse(row.operation_json));
   }
   const hash = (bytes: Uint8Array) =>
     `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -367,347 +347,6 @@ export function createReplicaReceiver(deps: {
       "UPDATE pdpp_record_arrival_clock SET value = value + 1 WHERE id = 1",
     ).run();
   }
-  /** The host mapping of a connection, or undefined while unprovisioned. */
-  function mappingOf(id: string): ConnectionMapping | undefined {
-    const local = binding(id);
-    return local?.source_id
-      ? { sourceId: local.source_id, methodId: local.method ?? "" }
-      : undefined;
-  }
-  /**
-   * Adapter around the core engine. The engine decides each provisioned
-   * connection's eligibility, which rows show and which completions are
-   * available; this function persists those decisions in the canonical
-   * tables and keeps Node's lifecycle fences.
-   *
-   * Node withdraws a terminal connection through its quarantine fact, which
-   * readers apply, and not by deciding its rows: rows keep following the
-   * evidence. So eligibility is judged here without the terminal fact, and
-   * completions with it.
-   */
-  function reconcile(): ReplicaMergePlan {
-    const all = retained();
-    const context = { owner, declarations: deps.declarations() };
-    const index = indexEvidence(all);
-    const statuses = new Map<string, ConnectionProjection>();
-    for (const id of new Set(all.map((op) => op.connectionId))) {
-      const ops = all.filter((op) => op.connectionId === id);
-      const mapping = mappingOf(id);
-      // An unprovisioned connection whose evidence names two bindings
-      // contradicts any mapping the host can provision later.
-      const facts = index.connectionFacts(id, {
-        mapping: mapping ?? {
-          sourceId: ops[0].sourceId,
-          methodId: ops[0].methodId,
-        },
-        terminal: false,
-        appliedGeneration: binding(id)?.generation ?? 1,
-      });
-      // A retained disagreement is a durable, connection-scoped fact, never
-      // a throw that would block every import and retry (#428 F2). It holds
-      // even when terminal quarantine or equivocation outranks it (#426).
-      if (contradictsMapping(facts))
-        recordBindingConflict(id, ops, facts.mapping, !mapping);
-      if (mapping) statuses.set(id, connectionFromFacts(context, facts));
-    }
-    const unavailable: ReplicaOperation[] = [];
-    const eligible = all.filter((op) => {
-      const connection = statuses.get(op.connectionId);
-      if (!connection) unavailable.push(op);
-      return connection !== undefined && !bindingConflict(connection);
-    });
-    // Variants that share a revision with eligible evidence enter the plan,
-    // so the planner never materializes one side of an equivocation. Their
-    // connections are unprovisioned or conflicted, so it shows none of them.
-    const revisionKey = (op: ReplicaOperation) =>
-      canonicalJson([op.revision.writerId, op.revision.operationId]);
-    const included = new Set(eligible);
-    const eligibleRevisions = new Set(eligible.map(revisionKey));
-    const colliding = all.filter(
-      (op) => !included.has(op) && eligibleRevisions.has(revisionKey(op)),
-    );
-    const plan = planReplicaMerge(context, [...eligible, ...colliding]);
-    if (unavailable.length)
-      plan.pending.push({
-        reason: "missing_local_connection",
-        operations: unavailable,
-      });
-    // Lifecycle evidence gates canonical state, but never creates a connection or
-    // changes its acquisition method. Only the local authority provisions that.
-    for (const [id, connection] of statuses) {
-      if (bindingConflict(connection)) continue;
-      const local = binding(id)!;
-      const deleted = connection.status === "deleted";
-      const blocked = connection.status === "withdrawn";
-      const reset =
-        connection.status === "active" &&
-        connection.generation > local.generation;
-      const newlyBlocked = blocked && quarantineConnection(id);
-      // A receiver-derived deletion can become equivocated later. Retract only
-      // that derived marker; an actual local deletion remains in the merge set.
-      const retractDeletion =
-        !deleted && local.deleted_at === "replica-deleted";
-      if (deleted || blocked || reset) {
-        for (const row of db
-          .prepare(
-            "SELECT stream,record_key FROM pdpp_records WHERE instance = ? AND deleted = 0",
-          )
-          .all(id) as { stream: string; record_key: string }[])
-          write(id, row.stream, row.record_key, null);
-        db.prepare("DELETE FROM pdpp_stream_completion WHERE instance = ?").run(
-          id,
-        );
-        db.prepare("DELETE FROM pdpp_blob_claims WHERE instance = ?").run(id);
-      }
-      if (
-        (deleted && local.deleted_at === null) ||
-        reset ||
-        newlyBlocked ||
-        retractDeletion
-      ) {
-        // Even an empty reset must expire a token at the old write horizon.
-        const { value: fence } = db
-          .prepare(
-            "UPDATE pdpp_write_clock SET value = value + 1 WHERE id = 1 RETURNING value",
-          )
-          .get() as { value: number };
-        db.prepare(
-          "UPDATE pdpp_instance_binding SET generation = ?, deleted_at = ?, reset_clock = ? WHERE instance = ?",
-        ).run(
-          reset ? connection.generation : local.generation,
-          deleted
-            ? (local.deleted_at ?? "replica-deleted")
-            : retractDeletion
-              ? null
-              : local.deleted_at,
-          fence,
-          id,
-        );
-      }
-    }
-    for (const record of plan.records) {
-      const { connectionId, stream, recordKey, generation } = record.identity;
-      const local = binding(connectionId)!;
-      if (local.deleted_at || generation !== local.generation) continue;
-      if (record.quarantined)
-        quarantineKey(connectionId, generation, stream, recordKey);
-      if (isRecordQuarantined(connectionId, stream, recordKey)) {
-        write(connectionId, stream, recordKey, null);
-        continue;
-      }
-      // `write` turns a withdrawal into a tombstone only for a stored row, so
-      // the engine's "no prior row" case is the same as a withdrawal here.
-      const row = recordRow(undefined, record, (op) =>
-        blobReady(op, eligible, verifiedBlobs(op.blobs)),
-      );
-      const shown = row && row.state !== "withdrawn" ? row.winner : null;
-      if (record.winner?.kind === "upsert" && !shown)
-        plan.pending.push({
-          reason: "missing_or_invalid_blob",
-          operations: [record.winner],
-        });
-      if (shown?.kind === "upsert") persistBlobs(shown);
-      write(connectionId, stream, recordKey, shown);
-    }
-    const materialized = new Set(
-      plan.records.map((record) => canonicalJson(record.identity)),
-    );
-    for (const issue of [...plan.pending, ...plan.rejected]) {
-      if (
-        issue.reason !== "missing_declaration" &&
-        issue.reason !== "invalid_record_data"
-      )
-        continue;
-      for (const op of issue.operations) {
-        if (op.kind !== "upsert" && op.kind !== "delete") continue;
-        const identity = {
-          owner: op.owner,
-          sourceId: op.sourceId,
-          connectionId: op.connectionId,
-          generation: op.generation,
-          stream: op.declaration.stream,
-          recordKey: op.recordKey,
-        };
-        if (
-          binding(op.connectionId)?.generation === op.generation &&
-          !materialized.has(canonicalJson(identity))
-        )
-          write(op.connectionId, op.declaration.stream, op.recordKey, null);
-      }
-    }
-    reconcileCompletions(all, plan, index, context);
-    return plan;
-  }
-  function bindingConflict(
-    connection: ConnectionProjection,
-  ): connection is Extract<ConnectionProjection, { status: "withdrawn" }> & {
-    reason: "local_mapping_conflict" | "source_binding_conflict";
-  } {
-    return (
-      connection.status === "withdrawn" &&
-      (connection.reason === "local_mapping_conflict" ||
-        connection.reason === "source_binding_conflict")
-    );
-  }
-  /** Persist the engine's binding conflict with the evidence that shows it. */
-  function recordBindingConflict(
-    id: string,
-    ops: readonly ReplicaOperation[],
-    mapping: ConnectionMapping,
-    unprovisioned: boolean,
-  ) {
-    const disagreeing = ops.find(
-      (op) =>
-        op.sourceId !== mapping.sourceId || op.methodId !== mapping.methodId,
-    )!;
-    store.markReplicaBindingConflict(
-      unprovisioned
-        ? {
-            connectionId: id,
-            reason: "source_binding_conflict",
-            evidence: [
-              ...new Set(ops.map((op) => `${op.sourceId} ${op.methodId}`)),
-            ]
-              .sort()
-              .slice(0, 8),
-          }
-        : {
-            connectionId: id,
-            reason: "local_mapping_conflict",
-            evidence: {
-              sourceId: disagreeing.sourceId,
-              methodId: disagreeing.methodId,
-              revision: disagreeing.revision,
-            },
-          },
-    );
-  }
-  /**
-   * Persist the engine's completion availability for every provisioned
-   * stream with completion evidence at its connection's generation. The
-   * terminal quarantine fact applies here, unlike to rows.
-   */
-  function reconcileCompletions(
-    all: readonly ReplicaOperation[],
-    plan: ReplicaMergePlan,
-    index: ReturnType<typeof indexEvidence>,
-    context: MergeContext,
-  ) {
-    const issues = [...plan.pending, ...plan.conflicts, ...plan.rejected];
-    const variantDigests = index.variantDigests(
-      (id) => mappingOf(id) !== undefined,
-    );
-    const trusted = (op: CompletionEvent) =>
-      context.declarations.some(
-        (d) =>
-          d.sourceId === op.sourceId &&
-          canonicalJson(d.binding) === canonicalJson(op.declaration),
-      );
-    const visible = new Map<string, ConnectionProjection>();
-    const grouped = new Map<string, CompletionEvent[]>();
-    for (const op of all) {
-      if (op.kind !== "stream-complete" && op.kind !== "stream-invalidate")
-        continue;
-      const mapping = mappingOf(op.connectionId);
-      if (!mapping) continue;
-      if (!trusted(op))
-        plan.pending.push({ reason: "missing_declaration", operations: [op] });
-      if (!visible.has(op.connectionId))
-        visible.set(
-          op.connectionId,
-          connectionFromFacts(
-            context,
-            index.connectionFacts(op.connectionId, {
-              mapping,
-              terminal: !!db
-                .prepare(
-                  "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ?",
-                )
-                .get(op.connectionId),
-              appliedGeneration: binding(op.connectionId)!.generation,
-            }),
-          ),
-        );
-      if (visible.get(op.connectionId)!.generation !== op.generation) continue;
-      const key = canonicalJson([op.connectionId, op.declaration.stream]);
-      grouped.set(key, [...(grouped.get(key) ?? []), op]);
-    }
-    for (const events of grouped.values()) {
-      const first = events[0];
-      const { connectionId, generation } = first;
-      const stream = first.declaration.stream;
-      const connection = visible.get(connectionId)!;
-      const available = completionAvailability({
-        connection,
-        connectionId,
-        events,
-        declarations: context.declarations,
-        quarantinedKey: !!db
-          .prepare(
-            "SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND generation = ? AND stream = ? LIMIT 1",
-          )
-          .get(connectionId, generation, stream),
-        unresolved: issues.some(
-          (issue) =>
-            issue.reason !== "missing_declaration" &&
-            issue.operations.some(
-              (op) =>
-                op.connectionId === connectionId &&
-                (!("declaration" in op) || op.declaration.stream === stream),
-            ),
-        ),
-        variantDigests,
-        liveRows: db
-          .prepare(
-            "SELECT record_key AS recordKey, data AS dataJson FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
-          )
-          .all(connectionId, stream) as {
-          recordKey: string;
-          dataJson: string;
-        }[],
-      });
-      if (available) {
-        const completion = available.operation;
-        const seq = (
-          db.prepare("SELECT value FROM pdpp_write_clock").get() as {
-            value: number;
-          }
-        ).value;
-        const native = completion.proof.kind === "native";
-        db.prepare(
-          "INSERT INTO pdpp_stream_completion (instance,stream,method,generation,source_collected_at,write_seq,live_count,snapshot_sha256,collection_time_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance,stream) DO UPDATE SET method=excluded.method,generation=excluded.generation,source_collected_at=excluded.source_collected_at,write_seq=excluded.write_seq,live_count=excluded.live_count,snapshot_sha256=excluded.snapshot_sha256,collection_time_basis=excluded.collection_time_basis WHERE method IS NOT excluded.method OR generation IS NOT excluded.generation OR source_collected_at IS NOT excluded.source_collected_at OR live_count IS NOT excluded.live_count OR snapshot_sha256 IS NOT excluded.snapshot_sha256 OR collection_time_basis IS NOT excluded.collection_time_basis",
-        ).run(
-          connectionId,
-          stream,
-          first.methodId,
-          generation,
-          completion.sourceCollectedAt,
-          seq,
-          completion.liveCount,
-          native ? completion.snapshotSha256.slice(7) : null,
-          native ? "host_run_finished" : null,
-        );
-        continue;
-      }
-      db.prepare(
-        "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
-      ).run(connectionId, stream);
-      // Diagnostics only: the engine already decided.
-      if (new Set(events.map((op) => canonicalJson(op.declaration))).size > 1)
-        plan.conflicts.push({
-          reason: "incompatible_completion_declaration",
-          operations: events,
-        });
-      else {
-        const completion = selectStreamCompletion(events);
-        if (completion)
-          plan.pending.push({
-            reason: "unverified_completion",
-            operations: [completion],
-          });
-      }
-    }
-  }
   function isRecordQuarantined(
     instance: string,
     stream: string,
@@ -719,6 +358,21 @@ export function createReplicaReceiver(deps: {
       )
       .get(instance, stream, key);
   }
+  const reconciler = createReplicaReconciler({
+    db,
+    owner,
+    declarations: deps.declarations,
+    effects: {
+      binding,
+      write,
+      quarantineKey,
+      quarantineConnection,
+      isRecordQuarantined,
+      verifiedBlobs,
+      persistBlobs,
+      markBindingConflict: (input) => store.markReplicaBindingConflict(input),
+    },
+  });
   const view = createReplicaVisibilityView({
     db,
     owner,
@@ -757,8 +411,10 @@ export function createReplicaReceiver(deps: {
       declarations.size > 1 ||
       (contents.size > 1 &&
         retainedForKey.some((op) => op.declaration.semantics === "append_only"))
-    )
-      reconcile();
+    ) {
+      reconciler.touchKey(instance, stream, recordKey);
+      reconciler.drain({ background: false });
+    }
   });
   function includesPending(reader: ReplicaReader = "grant") {
     return (
@@ -1029,6 +685,7 @@ export function createReplicaReceiver(deps: {
    */
   function withdrawConnection(instance: string) {
     quarantineConnection(instance);
+    reconciler.touchConnection(instance);
     for (const row of db
       .prepare(
         "SELECT stream,record_key FROM pdpp_records WHERE instance = ? AND deleted = 0",
@@ -1107,7 +764,14 @@ export function createReplicaReceiver(deps: {
         "UPDATE pdpp_replica_clock SET counter = MAX(counter, ?) WHERE id = 1",
       ).run(op.revision.counter);
     }
-    const plan = reconcile();
+    // Only what this envelope can change is reconciled, duplicates included:
+    // the plan reports them again after a lost acknowledgement.
+    reconciler.touch(envelope.operations);
+    reconciler.touchBlobs([
+      ...(input.blobs ?? []).map((blob) => blob.blobId),
+      ...(input.stagedBlobs ?? []).map((blob) => blob.blobId),
+    ]);
+    const { plan } = reconciler.drain({ background: false });
     view.flush();
     return plan;
   }
@@ -1135,7 +799,7 @@ export function createReplicaReceiver(deps: {
     // No canonical tombstones: they would destroy the rows a lifted
     // quarantine, or a conflicted owner's local projection, still needs.
     quarantineConnection(instance) {
-      quarantineConnection(instance);
+      if (quarantineConnection(instance)) reconciler.touchConnection(instance);
     },
     preview: {
       show(id, envelope, blobsJson) {
@@ -1666,7 +1330,8 @@ export function createReplicaReceiver(deps: {
     reconcileDeclarations(input: { credential: unknown }): ReplicaMergePlan {
       authorize(input.credential);
       return view.exclusive(() => {
-        const plan = reconcile();
+        reconciler.beginPass();
+        const { plan } = reconciler.drain({ background: true });
         view.reconcileAll();
         return plan;
       });
@@ -1679,14 +1344,38 @@ export function createReplicaReceiver(deps: {
     atomically<T>(run: () => T): T {
       return view.exclusive(run);
     },
+    /** A full reconcile pass over retained history, finished in this call. */
     retry(input: { credential: unknown }): ReplicaMergePlan {
       authorize(input.credential);
       return view.exclusive(() => {
-        const plan = reconcile();
+        reconciler.beginPass();
+        const { plan } = reconciler.drain({ background: true });
         view.flush();
         return plan;
       });
     },
+    /**
+     * One bounded page of reconcile work. `restart` first queues a full pass,
+     * as `retry` does; later pages continue it. `complete` is true when no
+     * work is queued. The plan lists only this page's issues.
+     */
+    reconcileStep(input: {
+      credential: unknown;
+      page: ReplicaReconcilePage;
+      restart?: boolean;
+    }): { plan: ReplicaMergePlan; complete: boolean } {
+      authorize(input.credential);
+      return view.exclusive(() => {
+        if (input.restart) reconciler.beginPass();
+        const result = reconciler.drain({ background: true, page: input.page });
+        view.flush();
+        return result;
+      });
+    },
+    /** Whether reconcile work is queued. Reads no retained history. */
+    reconcileQueued: (): boolean => reconciler.queued(),
+    /** Retained evidence reconcile has loaded, cumulatively. For bounds tests. */
+    reconcileStats: () => reconciler.stats(),
   };
   return api;
 }

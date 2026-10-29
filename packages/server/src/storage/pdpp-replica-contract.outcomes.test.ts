@@ -262,14 +262,17 @@ describe("01 Progress with retained custody, not premature availability", () => 
     expect(b.get()).toBeUndefined();
     let retries = 0;
     const receiver = b.receiver;
-    const originalRetry = receiver.retry.bind(receiver);
-    receiver.retry = ((input) => {
-      retries++;
-      return originalRetry(input);
-    }) as typeof receiver.retry;
+    const originalStep = receiver.reconcileStep.bind(receiver);
+    receiver.reconcileStep = ((input) => {
+      if (input.restart) retries++;
+      return originalStep(input);
+    }) as typeof receiver.reconcileStep;
     for (let i = 0; i < 5; i++) await at_(b, 1000); // inside the 60 s fallback
     // At most the one post-restart rebuild; never one retry per step.
-    expect(retries, "receiver.retry runs only when due").toBeLessThanOrEqual(1);
+    expect(
+      retries,
+      "a reconcile pass starts only when due",
+    ).toBeLessThanOrEqual(1);
     const parked = retries;
     clock.advance(60000);
     const again = await step(b);

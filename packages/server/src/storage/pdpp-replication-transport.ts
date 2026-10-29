@@ -28,6 +28,7 @@ import {
   REPLICA_BATCH_OPERATION_LIMIT,
   REPLICA_BATCH_TARGET_BYTES,
   REPLICA_LIVE_COPY_FACTOR,
+  REPLICA_ENVELOPE_LIVE_COPY_FACTOR,
   replicaResourceLimits,
   REPLICA_LIMITS_VERSION,
   type Admission,
@@ -157,6 +158,17 @@ const processReplicaByteBudget = new ReplicaByteBudget(
   REPLICA_DEFAULT_BYTE_BUDGET_BYTES,
 );
 
+/**
+ * One reconcile attempt's work: retained operations it may load, and their
+ * JSON bytes. The attempt reserves the bytes, times the live-copy factor,
+ * from the process byte budget. A single key larger than a page still runs
+ * alone.
+ */
+export const REPLICA_RECONCILE_PAGE = {
+  operations: 2_000,
+  bytes: 8 * 1024 * 1024,
+} as const;
+
 /** Unattached stages expire after one hour; cleanup deletes at most this many. */
 export const REPLICA_STAGED_OBJECT_LEASE_MS = STAGED_OBJECT_LEASE_MS;
 export const REPLICA_STAGED_OBJECT_CLEANUP_BATCH = STAGED_OBJECT_CLEANUP_BATCH;
@@ -235,6 +247,8 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_import_work (
 CREATE INDEX IF NOT EXISTS pdpp_import_work_dependency ON pdpp_transport_import_work(dependency) WHERE outcome='wait';
 CREATE TABLE IF NOT EXISTS pdpp_transport_phase_state (
  phase TEXT PRIMARY KEY, ${WORK}, fingerprint TEXT);
+CREATE TABLE IF NOT EXISTS pdpp_transport_reconcile_pass (
+ id INTEGER PRIMARY KEY CHECK(id=1), dependency_json TEXT);
 `;
 const admissionMigration = `
 CREATE TABLE IF NOT EXISTS pdpp_transport_version_squats (
@@ -442,10 +456,13 @@ export function createReplicaTransportWorker(deps: {
   createStagingStore?: typeof createReplicaStagingStore;
   /** Test-scaled bounds; production uses the shared source-derived defaults. */
   resourceLimits?: Partial<ReplicaResourceLimits>;
+  /** Test-scaled reconcile page; production uses `REPLICA_RECONCILE_PAGE`. */
+  reconcilePage?: { operations: number; bytes: number };
 }) {
   const { db, transport } = deps;
   const now = deps.now ?? Date.now;
   const resourceBudget = deps.resourceBudget ?? processReplicaByteBudget;
+  const reconcilePage = deps.reconcilePage ?? REPLICA_RECONCILE_PAGE;
   const resourceLimits = replicaResourceLimits(deps.resourceLimits);
   const streamedLimits = {
     ...DEFAULT_REPLICA_STREAMED_LIMITS,
@@ -3787,18 +3804,36 @@ export function createReplicaTransportWorker(deps: {
       dependencyKey(x).localeCompare(dependencyKey(y)),
     )[0];
   }
+  /** The dependency a pass reported so far; absent when no pass is open. */
+  function openPass(): { dependency: ReplicaDependency | null } | undefined {
+    const row = db
+      .prepare(
+        "SELECT dependency_json FROM pdpp_transport_reconcile_pass WHERE id=1",
+      )
+      .get() as { dependency_json: string | null } | undefined;
+    return (
+      row && {
+        dependency: row.dependency_json && JSON.parse(row.dependency_json),
+      }
+    );
+  }
   /**
-   * Canonical reconcile of retained history. It reads every retained
-   * operation, so it runs only when a dependency changed: the fingerprint
-   * moved, a host notification woke it, or an outstanding Wait reached its
-   * bounded fallback. With nothing outstanding it is never due on a timer.
+   * Canonical reconcile of retained history, in bounded pages. A full pass
+   * starts only when a dependency changed: the fingerprint moved, a host
+   * notification woke it, or an outstanding Wait reached its bounded
+   * fallback. Each attempt then does one page, and the phase stays due while
+   * the receiver has queued work. With nothing queued and nothing
+   * outstanding it is never due on a timer, and its probe reads no retained
+   * history.
    */
-  const reconcile: ReplicaPhaseHandler<Item<Work>> = {
+  const reconcile: ReplicaPhaseHandler<Item<Work> & { restart: boolean }> = {
     phase: "reconcile",
     due(e) {
       const row = singleton("reconcile");
-      return row.fingerprint !== fingerprint ||
-        (singletonEligibleAt(row, e) ?? Infinity) <= e.now
+      const restart =
+        row.fingerprint !== fingerprint ||
+        (singletonEligibleAt(row, e) ?? Infinity) <= e.now;
+      return restart || deps.receiver.reconcileQueued()
         ? [
             {
               id: "reconcile",
@@ -3806,13 +3841,20 @@ export function createReplicaTransportWorker(deps: {
               writer: "",
               state: workState(row),
               row,
+              restart,
+              bytes: reconcilePage.bytes,
             },
           ]
         : [];
     },
-    async run() {
+    async run(item) {
+      const release = resourceBudget.reserve(
+        reconcilePage.bytes * REPLICA_ENVELOPE_LIVE_COPY_FACTOR,
+      );
+      if (typeof release !== "function")
+        return { outcome: { tag: "retry", problem: "resource_busy" } };
       // The canonical commit runs inside this attempt's outcome transaction:
-      // the plan reconciles and returns the verdict its result implies.
+      // the plan reconciles one page and returns the verdict it implies.
       const seen = fingerprint;
       return {
         outcome: {
@@ -3820,17 +3862,36 @@ export function createReplicaTransportWorker(deps: {
           receipt: { phase: "reconcile", key: seen },
         },
         plan: () => {
-          const plan = deps.receiver.retry({ credential: deps.credential });
-          const dependency = pendingDependency(plan);
+          const { plan, complete } = deps.receiver.reconcileStep({
+            credential: deps.credential,
+            page: reconcilePage,
+            restart: item.restart,
+          });
+          const pass = item.restart ? { dependency: null } : openPass();
+          if (!pass) return undefined; // Evidence work outside a pass waits on nothing.
+          const dependency = [pass.dependency, pendingDependency(plan)]
+            .filter((found): found is ReplicaDependency => !!found)
+            .sort((x, y) =>
+              dependencyKey(x).localeCompare(dependencyKey(y)),
+            )[0];
+          if (!complete) {
+            db.prepare(
+              "INSERT INTO pdpp_transport_reconcile_pass VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET dependency_json=excluded.dependency_json",
+            ).run(dependency ? JSON.stringify(dependency) : null);
+            return undefined;
+          }
+          db.prepare("DELETE FROM pdpp_transport_reconcile_pass").run();
           return dependency ? { tag: "wait", dependency } : undefined;
         },
+        release,
       };
     },
     commit: commitIn((outcome, work) =>
       settleSingleton(
         "reconcile",
         outcome,
-        // With nothing outstanding it waits for a dependency change only.
+        // With nothing outstanding it waits for a dependency change only;
+        // queued pages keep it due without a timer.
         outcome.tag === "progress"
           ? { ...work, nextEligible: REPLICA_TERMINAL }
           : work,
@@ -3840,7 +3901,8 @@ export function createReplicaTransportWorker(deps: {
     commitProblem: "reconcile_failed",
     earliest(e) {
       const row = singleton("reconcile");
-      if (row.fingerprint !== fingerprint) return e.now;
+      if (row.fingerprint !== fingerprint || deps.receiver.reconcileQueued())
+        return e.now;
       return singletonEligibleAt(row, e);
     },
     wake(key, at) {
