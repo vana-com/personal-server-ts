@@ -47,6 +47,7 @@ import {
 import {
   createLiteReplicaStorage,
   type LiteReplicaUploadHeaders,
+  type LiteTransientBytesInUse,
 } from "./replication-storage.js";
 
 /**
@@ -172,6 +173,7 @@ export async function createLiteReplication(
   if (plan.environment !== config.environment)
     return inert("blocked", "environment_mismatch");
   const { owner, context } = plan;
+  const inUse: LiteTransientBytesInUse = new Set();
   let network: ReplicationNetworkPorts;
   try {
     network = input.network(
@@ -181,6 +183,7 @@ export async function createLiteReplication(
         transfers: input.transfers,
         urlForKey: input.objects.urlForKey,
         headers: input.objects.headers,
+        inUse,
       }),
     );
   } catch (error) {
@@ -198,6 +201,7 @@ export async function createLiteReplication(
   };
   const engine = createLiteReplicaEngine({
     persistence: input.persistence,
+    transientBytesInUse: inUse,
     canonical: trusted,
     engine: {
       enabled: true,

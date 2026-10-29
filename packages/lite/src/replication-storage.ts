@@ -41,19 +41,38 @@ export const LITE_REPLICA_TRANSIENT_MIGRATION =
   "CREATE TABLE IF NOT EXISTS pdpp_lite_replica_transient (id TEXT PRIMARY KEY)";
 
 /**
- * Release every transient replica byte left attached, in the caller's
- * transaction. Only safe while no transfer of this adapter runs: the engine
- * calls it under its writer lock, before a step's first transfer.
+ * Attached replica byte ids whose transfer this process still runs. A
+ * cancelled step stops waiting for its transfer before the native call
+ * settles, so the next step can start while the bytes are still in use; the
+ * transfer releases them itself when it settles.
  */
-export async function reclaimLiteTransientBytes(tx: LiteReplicaTransaction) {
+export type LiteTransientBytesInUse = Set<string>;
+
+/**
+ * Release every transient replica byte left attached, in the caller's
+ * transaction, except those `inUse`. The engine calls it under its writer
+ * lock, before a step's first transfer.
+ */
+export async function reclaimLiteTransientBytes(
+  tx: LiteReplicaTransaction,
+  inUse: ReadonlySet<string> = new Set(),
+) {
   await tx.sql.exec(LITE_REPLICA_TRANSIENT_MIGRATION);
   const rows = await tx.sql.all(
     "SELECT id FROM pdpp_lite_replica_transient",
     [],
   );
-  for (const row of rows) await tx.releaseBytes(row.id as string);
-  await tx.sql.run("DELETE FROM pdpp_lite_replica_transient", []);
-  return rows.length;
+  let released = 0;
+  for (const row of rows) {
+    const id = row.id as string;
+    if (inUse.has(id)) continue;
+    await tx.releaseBytes(id);
+    await tx.sql.run("DELETE FROM pdpp_lite_replica_transient WHERE id=?", [
+      id,
+    ]);
+    released += 1;
+  }
+  return released;
 }
 
 /** Headers for one upload, computed over its exact body before it is staged. */
@@ -77,8 +96,11 @@ export function createLiteReplicaStorage(input: {
   /** Upload headers, e.g. storage authorization over the exact body. */
   headers?: LiteReplicaUploadHeaders;
   deadlineMs?: number;
+  /** Shared with the engine's reclaim (`reclaimLiteTransientBytes`). */
+  inUse?: LiteTransientBytesInUse;
 }): BoundedStorageAdapter {
   const { persistence, transfers } = input;
+  const inUse = input.inUse ?? new Set<string>();
   const deadline = (budget?: ByteBudget) =>
     Math.max(
       1,
@@ -87,22 +109,35 @@ export function createLiteReplicaStorage(input: {
         budget?.remainingMilliseconds ?? Infinity,
       ),
     );
-  const attach = (id: string, length: number, digest: string) =>
-    persistence.transaction(async (tx) => {
-      await tx.sql.exec(LITE_REPLICA_TRANSIENT_MIGRATION);
-      await tx.attachBytes(id, { length, sha256: digest });
-      await tx.sql.run(
-        "INSERT OR IGNORE INTO pdpp_lite_replica_transient (id) VALUES (?)",
-        [id],
-      );
-    });
-  const release = (id: string) =>
-    persistence.transaction(async (tx) => {
-      await tx.releaseBytes(id);
-      await tx.sql.run("DELETE FROM pdpp_lite_replica_transient WHERE id=?", [
-        id,
-      ]);
-    });
+  /** Marks `id` in use until `release`, so no reclaim takes it meanwhile. */
+  const attach = async (id: string, length: number, digest: string) => {
+    inUse.add(id);
+    try {
+      await persistence.transaction(async (tx) => {
+        await tx.sql.exec(LITE_REPLICA_TRANSIENT_MIGRATION);
+        await tx.attachBytes(id, { length, sha256: digest });
+        await tx.sql.run(
+          "INSERT OR IGNORE INTO pdpp_lite_replica_transient (id) VALUES (?)",
+          [id],
+        );
+      });
+    } catch (error) {
+      inUse.delete(id);
+      throw error;
+    }
+  };
+  const release = async (id: string) => {
+    try {
+      await persistence.transaction(async (tx) => {
+        await tx.releaseBytes(id);
+        await tx.sql.run("DELETE FROM pdpp_lite_replica_transient WHERE id=?", [
+          id,
+        ]);
+      });
+    } finally {
+      inUse.delete(id);
+    }
+  };
   async function read(id: string) {
     const parts: Uint8Array[] = [];
     let size = 0;
@@ -127,7 +162,7 @@ export function createLiteReplicaStorage(input: {
      * Write-once: the native upload of different bytes to a stored key
      * fails with HTTP 409, which is `StoredBlobConflictError`.
      */
-    async upload(key, data) {
+    async upload(key, data, signal) {
       const url = input.urlForKey(key);
       const headers =
         (await input.headers?.({ method: "PUT", url, body: data })) ?? {};
@@ -138,10 +173,12 @@ export function createLiteReplicaStorage(input: {
       );
       await attach(id, data.length, sha256(data).slice(2));
       try {
-        const controller = new AbortController();
         await transfers.upload(
           { url, method: "PUT", headers, bytesId: id },
-          { signal: controller.signal, deadlineMs: deadline() },
+          {
+            signal: signal ?? new AbortController().signal,
+            deadlineMs: deadline(),
+          },
         );
       } catch (error) {
         if (

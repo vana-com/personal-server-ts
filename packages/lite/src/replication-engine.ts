@@ -171,6 +171,8 @@ export interface LiteReplicaEngineInput {
   };
   /** Host-independent engine configuration (transport, authority, limits). */
   engine: ReplicaEngineConfig;
+  /** The storage adapter's bytes in use (`createLiteReplicaStorage`). */
+  transientBytesInUse?: ReadonlySet<string>;
 }
 
 /** The core engine on Lite, plus the writer rotation a host calls itself. */
@@ -604,7 +606,11 @@ export function createLiteReplicaEngine(
         reclaimAdmission: () => 0,
         cleanup: () => 0,
         cleanupAttachedTemporaryBytes: () =>
-          run(inTx(reclaimLiteTransientBytes)),
+          run(
+            inTx((tx) =>
+              reclaimLiteTransientBytes(tx, input.transientBytesInUse),
+            ),
+          ),
       };
     },
     // Lite staging keeps no rows that could lose their bytes.

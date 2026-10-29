@@ -3215,7 +3215,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
           metadataHash: row.metadata_hash,
         };
         await recordUploadAttempt(batch, "manifest", -1, signal);
-        await call(signal, () => transport.put(manifest));
+        await call(signal, () => transport.put(manifest, signal));
         await recordRegistrationAttempt(expected, row.encrypted, signal);
         try {
           await call(signal, () => transport.register(manifest));
@@ -3345,11 +3345,14 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
         // nothing references it until the manifest is finalized.
         await recordUploadAttempt(row.batch, "fragment", row.position, signal);
         await call(signal, () =>
-          transport.putFragment({
-            scope: replicaScope(writer()),
-            digest: fragment.digest,
-            encrypted: fragment.encrypted,
-          }),
+          transport.putFragment(
+            {
+              scope: replicaScope(writer()),
+              digest: fragment.digest,
+              encrypted: fragment.encrypted,
+            },
+            signal,
+          ),
         );
         return verdict({
           tag: "progress",

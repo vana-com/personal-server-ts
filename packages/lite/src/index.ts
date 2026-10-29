@@ -238,6 +238,7 @@ export {
   LITE_REPLICA_TRANSFER_DEADLINE_MS,
   createLiteReplicaStorage,
   type LiteReplicaUploadHeaders,
+  type LiteTransientBytesInUse,
 } from "./replication-storage.js";
 export {
   createLiteReplication,

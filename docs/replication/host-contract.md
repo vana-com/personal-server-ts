@@ -489,7 +489,10 @@ phone that wrote before it enabled still publishes those rows. Each row and
 completion copies the operation the merge chose for it and keeps its counter,
 origin and declaration (core `rebaseline.ts`). Lite keeps no binding history,
 so a row the merge does not explain, such as one whose stream the host no
-longer declares, is skipped.
+longer declares, is skipped. A completion depends on every re-exported
+record of its stream, so a large stream's completion can outgrow one
+operation (`LITE_CANONICAL_MAX_OPERATION_BYTES`); it is skipped too, and the
+stream is not certified complete from the new writer.
 
 Bounded growth on the phone:
 
@@ -512,7 +515,10 @@ Bounded growth on the phone:
 - **Orphaned bytes.** `attachBytes` records the id in
   `pdpp_lite_replica_transient`, and `releaseBytes` removes it, in the same
   transaction. A crash between them leaves the id listed, and the next step
-  releases every listed id before it stages anything.
+  releases every listed id before it stages anything, except ids whose
+  transfer this process still runs. A pause or step deadline cancels the
+  native transfer through the attempt's signal, but the step stops waiting
+  before the native call settles; that transfer releases its own bytes.
 - **Refused batches.** A received batch the canonical store refuses
   (`LiteCanonicalRefusal`: over the header, count or partition bound, wrong owner,
   binding mismatch, reused commit id, blob metadata conflict) cannot import on
