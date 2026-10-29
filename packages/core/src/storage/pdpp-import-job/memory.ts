@@ -117,20 +117,27 @@ export function createMemoryImportJobCapability(
     const job = jobs.get(input.job.jobId);
     if (!job) throw new ImportJobError("job_not_found");
     if (job.state === "committed" && job.commit) return clone(job.commit);
-    if (job.state !== "open") throw new ImportJobError("job_not_open");
-    if (job.nextSeq !== input.job.nextSeq)
-      throw new ImportJobError("batch_count_mismatch");
-    if (job.nextSeq < 1 || job.spoolOffset !== job.spool.byteLength)
-      throw new ImportJobError("spool_incomplete");
+    // Checked again at the commit point: reset and abort do not wait for
+    // this writer, and publication awaits while it hashes proofs.
+    const assertPublishable = () => {
+      const stored = jobs.get(job.jobId);
+      if (!stored || stored.state !== "open")
+        throw new ImportJobError("job_not_open");
+      if (stored.nextSeq !== input.job.nextSeq)
+        throw new ImportJobError("batch_count_mismatch");
+      if (stored.nextSeq < 1 || stored.spoolOffset !== stored.spool.byteLength)
+        throw new ImportJobError("spool_incomplete");
+      const binding = bindings.get(stored.binding.instance);
+      if (
+        !binding ||
+        binding.deleted ||
+        binding.method !== stored.binding.method ||
+        binding.generation !== stored.binding.generation
+      )
+        throw new ImportJobError("binding_mismatch");
+    };
+    assertPublishable();
     const { instance, method, generation, sourceId } = job.binding;
-    const binding = bindings.get(instance);
-    if (
-      !binding ||
-      binding.deleted ||
-      binding.method !== method ||
-      binding.generation !== generation
-    )
-      throw new ImportJobError("binding_mismatch");
 
     const next = new Map(rows);
     const written: MemoryImportRow[] = [];
@@ -257,6 +264,7 @@ export function createMemoryImportJobCapability(
     };
 
     fault("publish:before-commit");
+    assertPublishable();
     rows = next;
     history.push(...written);
     outbox.push(...captured);
@@ -371,6 +379,24 @@ export function createMemoryImportJobCapability(
     },
   };
 
+  /** What the store's erase does for import data: open jobs abort, staged rows and the cursor go. */
+  function eraseInstance(instance: string) {
+    for (const [key, row] of rows)
+      if (row.instance === instance) rows.delete(key);
+    for (const [jobId, job] of jobs) {
+      if (job.binding.instance !== instance) continue;
+      indexes.delete(jobId);
+      if (job.state === "open")
+        jobs.set(jobId, {
+          ...job,
+          state: "aborted",
+          abortReason: "connection_reset",
+          updatedAt: new Date().toISOString(),
+        });
+    }
+    connectorStates.delete(instance);
+  }
+
   return Object.assign(capability, {
     registerConnection(input: {
       instance: string;
@@ -384,15 +410,16 @@ export function createMemoryImportJobCapability(
         deleted: false,
       });
     },
-    /** A connection reset: the generation advances and its rows go. */
+    /** A connection reset: the generation advances and its data goes. */
     resetConnection(instance: string) {
-      const binding = bindings.get(instance)!;
-      binding.generation += 1;
-      for (const [key, row] of rows)
-        if (row.instance === instance) rows.delete(key);
+      bindings.get(instance)!.generation += 1;
+      eraseInstance(instance);
     },
     deleteConnection(instance: string) {
-      bindings.get(instance)!.deleted = true;
+      const binding = bindings.get(instance)!;
+      binding.deleted = true;
+      binding.generation += 1;
+      eraseInstance(instance);
     },
     /** Current rows of one stream, tombstones included, sorted by key. */
     rows(instance: string, stream: string): MemoryImportRow[] {

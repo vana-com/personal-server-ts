@@ -59,6 +59,13 @@ abort(jobId)                              -> nothing staged stays
   offset again inside the publication transaction. A retried commit returns
   the stored receipt.
 - **Abort.** Drops staged rows. A committed job stays committed.
+- **Reset and deletion.** Erasing a connection erases its import data in the
+  same transaction: open jobs abort (`connection_reset`), staged rows and the
+  committed cursor go (the SQLite store runs adapter erasers registered with
+  `onEraseInstance`). The engine also returns no connector state whose
+  generation is not the binding's current one, for an adapter that has not
+  erased it yet. A publication re-checks the job and binding at its commit
+  point, so a reset or abort that lands while it runs wins.
 
 ## Rules the engine owns
 

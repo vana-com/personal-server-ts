@@ -32,6 +32,7 @@ async function setup(
     replication?: boolean;
     batchBytes?: number;
     faults?: Map<MemoryImportFaultPoint, number>;
+    onFault?: (point: MemoryImportFaultPoint) => void;
   } = {},
 ) {
   const spool = await buildImportSpool(records);
@@ -40,6 +41,7 @@ async function setup(
     replication: options.replication,
     spools: new Map([[spool.handle.id, spool.bytes]]),
     fault: (point) => {
+      options.onFault?.(point);
       const remaining = faults.get(point);
       if (remaining === undefined) return;
       if (remaining === 0) {
@@ -279,9 +281,10 @@ describe("PDPP import job engine (in-memory adapter)", () => {
     await jobs.begin(begin);
     const status = await importSpool(jobs, "job-1", capability.readSpool!);
     capability.resetConnection(INSTANCE);
+    // The reset aborted the job; publication also re-checks the binding.
     await expect(
       jobs.commit({ jobId: "job-1", batches: status.job.nextSeq }),
-    ).rejects.toMatchObject({ code: "binding_mismatch" });
+    ).rejects.toMatchObject({ code: "job_not_open" });
     expect(adapterLive(capability)).toEqual({});
     // A new job of the new generation is a separate binding.
     await expect(jobs.begin(begin)).resolves.toBeDefined();
@@ -544,6 +547,64 @@ describe("PDPP import job engine (in-memory adapter)", () => {
     expect(staged).toEqual([
       { entries: [expect.objectContaining({ key: expect.any(String) })] },
     ]);
+  });
+
+  it("a reset or abort that lands while publication awaits is not overwritten", async () => {
+    for (const race of ["reset", "abort"] as const) {
+      let fired = false;
+      // `publish:before-commit` runs after publication's awaits (proof
+      // hashing) and before it commits: the window another writer can use.
+      const { capability, begin, engine } = await setup(undefined, {
+        onFault: (point) => {
+          if (point !== "publish:before-commit" || fired) return;
+          fired = true;
+          if (race === "reset") capability.resetConnection(INSTANCE);
+          else
+            void capability.abort("job-1", "other", "2026-10-28T00:00:00.000Z");
+        },
+      });
+      const jobs = engine();
+      await jobs.begin(begin);
+      const status = await importSpool(jobs, "job-1", capability.readSpool!);
+      await expect(
+        jobs.commit({
+          jobId: "job-1",
+          batches: status.job.nextSeq,
+          connectorState: '{"cursor":"end"}',
+        }),
+      ).rejects.toMatchObject({ code: "job_not_open" });
+      expect(fired).toBe(true);
+      expect(adapterLive(capability)).toEqual({});
+      expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
+    }
+  });
+
+  it("a reset aborts open jobs and erases the cursor; the engine ignores an older generation's cursor", async () => {
+    const { capability, begin, engine } = await setup();
+    const jobs = engine();
+    await jobs.begin(begin);
+    const status = await importSpool(jobs, "job-1", capability.readSpool!);
+    await jobs.commit({
+      jobId: "job-1",
+      batches: status.job.nextSeq,
+      connectorState: '{"cursor":"end"}',
+    });
+    const kept = (await capability.readConnectorState(INSTANCE))!;
+    await jobs.begin({ ...begin, jobId: "job-2" });
+    capability.resetConnection(INSTANCE);
+    expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
+    expect((await jobs.status("job-2")).job).toMatchObject({
+      state: "aborted",
+      abortReason: "connection_reset",
+    });
+    expect(capability.stagedCount("job-2")).toBe(0);
+    // An adapter that kept the old cursor must not hand it out.
+    const stale = createPdppImportJobs({
+      capability: { ...capability, readConnectorState: async () => kept },
+      declarations,
+      owner: OWNER,
+    });
+    expect(await stale.connectorState(INSTANCE)).toBeUndefined();
   });
 
   it("refuses an adapter of another contract version", () => {

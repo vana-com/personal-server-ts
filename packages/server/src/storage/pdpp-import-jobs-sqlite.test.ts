@@ -414,22 +414,29 @@ describe("Node SQLite import job adapter", () => {
     expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
   });
 
-  it("a reset during the run refuses publication and writes nothing", async () => {
+  it("a reset during the run aborts the job and drops what it staged", async () => {
     const { store, capability, jobs, begin, db } = await prepare();
     await jobs.begin(begin);
     const status = await importSpool(jobs, "job-1", capability.readSpool!);
+    expect(
+      count(db, "SELECT COUNT(*) AS n FROM pdpp_import_staged"),
+    ).toBeGreaterThan(0);
+    const job = (await capability.readJob("job-1"))!;
     store.resetInstanceBinding({
       instance: INSTANCE,
       expectedMethod: METHOD,
       expectedGeneration: 1,
       nextMethod: METHOD,
     });
+    expect(count(db, "SELECT COUNT(*) AS n FROM pdpp_import_staged")).toBe(0);
+    expect((await jobs.status("job-1")).job).toMatchObject({
+      state: "aborted",
+      abortReason: "connection_reset",
+    });
     await expect(
       jobs.commit({ jobId: "job-1", batches: status.job.nextSeq }),
-    ).rejects.toMatchObject({ code: "binding_mismatch" });
-    expect(count(db, "SELECT COUNT(*) AS n FROM pdpp_records")).toBe(0);
-    // Publication re-checks the binding inside its transaction, too.
-    const job = (await capability.readJob("job-1"))!;
+    ).rejects.toMatchObject({ code: "job_not_open" });
+    // Publication re-checks the job inside its transaction, too.
     await expect(
       capability.publish({
         job,
@@ -437,7 +444,40 @@ describe("Node SQLite import job adapter", () => {
         committedAt: "2026-10-28T00:00:00.000Z",
         declarations,
       }),
-    ).rejects.toMatchObject({ code: "binding_mismatch" });
+    ).rejects.toMatchObject({ code: "job_not_open" });
+    expect(count(db, "SELECT COUNT(*) AS n FROM pdpp_records")).toBe(0);
+  });
+
+  it("a reset or deletion erases the committed cursor with the connection's data", async () => {
+    for (const erase of ["reset", "delete"] as const) {
+      const { store, capability, jobs, begin, db } = await prepare();
+      await jobs.begin(begin);
+      const status = await importSpool(jobs, "job-1", capability.readSpool!);
+      await jobs.commit({
+        jobId: "job-1",
+        batches: status.job.nextSeq,
+        connectorState: '{"cursor":"end"}',
+      });
+      expect((await jobs.connectorState(INSTANCE))?.state).toBe(
+        '{"cursor":"end"}',
+      );
+      if (erase === "reset")
+        store.resetInstanceBinding({
+          instance: INSTANCE,
+          expectedMethod: METHOD,
+          expectedGeneration: 1,
+          nextMethod: METHOD,
+        });
+      else store.deleteConnection(INSTANCE);
+      expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
+      expect(await jobs.connectorState(INSTANCE)).toBeUndefined();
+      expect(
+        count(db, "SELECT COUNT(*) AS n FROM pdpp_import_connector_state"),
+      ).toBe(0);
+      expect((await jobs.status("job-1")).job.state).toBe("committed");
+      db.close();
+      rmSync(join(dir, "records.db"), { force: true });
+    }
   });
 
   it("captures replication with publication only when enabled; flag off leaves no replica schema", async () => {

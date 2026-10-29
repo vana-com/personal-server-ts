@@ -610,6 +610,11 @@ export function createPdppImportJobs(
       const job = await capability.readJob(state.jobId);
       if (!job || job.binding.owner !== owner)
         throw new ImportJobError("owner_mismatch");
+      // A reset or deletion erased what this cursor describes; an adapter
+      // that has not erased it yet must not hand it out.
+      const binding = await capability.readBinding(instance);
+      if (binding.deleted || binding.generation !== state.generation)
+        return undefined;
       return state;
     },
   };

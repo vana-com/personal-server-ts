@@ -28,7 +28,11 @@ import {
 
 type SqliteRecordStore = Pick<
   ReturnType<typeof createSqliteRecordStore>,
-  "ingestBatch" | "getInstanceBinding" | "writeTransaction" | "completeStreams"
+  | "ingestBatch"
+  | "getInstanceBinding"
+  | "writeTransaction"
+  | "completeStreams"
+  | "onEraseInstance"
 >;
 
 export type SqliteImportFaultPoint =
@@ -106,6 +110,12 @@ export function createSqliteImportJobCapability(
   );
   const insertJobStmt = db.prepare(
     "INSERT INTO pdpp_import_jobs (job_id, instance, state, record) VALUES (?, ?, ?, ?) ON CONFLICT (job_id) DO NOTHING",
+  );
+  const instanceJobsStmt = db.prepare(
+    "SELECT record FROM pdpp_import_jobs WHERE instance = ?",
+  );
+  const deleteConnectorStateStmt = db.prepare(
+    "DELETE FROM pdpp_import_connector_state WHERE instance = ?",
   );
   const updateJobStmt = db.prepare(
     "UPDATE pdpp_import_jobs SET state = ?, record = ? WHERE job_id = ?",
@@ -305,6 +315,24 @@ export function createSqliteImportJobCapability(
     fault("publish:after-commit");
     return result;
   }
+
+  // A reset or deletion erases the connection's data, so it also erases what
+  // its import jobs staged and the cursor they committed. Open jobs abort.
+  store.onEraseInstance((instance) => {
+    const rows = instanceJobsStmt.all(instance) as { record: string }[];
+    for (const row of rows) {
+      const job = JSON.parse(row.record) as ImportJobRecord;
+      dropStagedStmt.run(job.jobId);
+      if (job.state === "open")
+        writeJob({
+          ...job,
+          state: "aborted",
+          abortReason: "connection_reset",
+          updatedAt: new Date().toISOString(),
+        });
+    }
+    deleteConnectorStateStmt.run(instance);
+  });
 
   return {
     contractVersion: PDPP_IMPORT_JOB_CONTRACT_VERSION,
