@@ -131,4 +131,45 @@ describe("PS Lite import jobs", () => {
       await expect(call()).rejects.toMatchObject({ code: "owner_mismatch" });
     expect((await owned.status("job-1")).job.state).toBe("open");
   });
+
+  it("passes the host's batch encoder to a native staged-copy capability", async () => {
+    const { capability, spool } = await vectorCapability();
+    const staged: unknown[] = [];
+    const native = {
+      ...capability,
+      publication: {
+        mode: "native-staged-copy",
+        outbox: "by-reference",
+      } as const,
+      stageBatch: (input: Parameters<typeof capability.stageBatch>[0]) => {
+        staged.push(input.canonical);
+        return capability.stageBatch(input);
+      },
+    };
+    const runtime = createTestRuntime({
+      serverOwner: IMPORT_VECTOR_OWNER,
+      importJobs: {
+        capability: native,
+        declarations: importVectorDeclarations,
+        encodeBatch: async ({ operations }) => ({
+          entries: operations.map((op) => ({
+            key: op.recordKey,
+            value: op.dataJson,
+          })),
+        }),
+      },
+    });
+    await runtime.importJobs!.begin(beginInput(spool));
+    const status = await importSpool(
+      runtime.importJobs!,
+      "job-1",
+      capability.readSpool!,
+    );
+    expect(staged).toHaveLength(status.job.nextSeq);
+    expect(
+      staged.every((batch) =>
+        Array.isArray((batch as { entries: unknown }).entries),
+      ),
+    ).toBe(true);
+  });
 });

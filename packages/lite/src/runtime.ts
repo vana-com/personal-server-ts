@@ -117,9 +117,8 @@ import type { PsLiteStorageCapabilities } from "./storage.js";
 import type { LiteReplicationRuntime } from "./replication-runtime.js";
 import {
   createPdppImportJobs,
-  type ImportDeclarations,
-  type PdppImportJobCapability,
   type PdppImportJobs,
+  type PdppImportJobsOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-import-job";
 import {
   createDefaultPsLiteAccessLogStore,
@@ -270,11 +269,12 @@ export interface PsLiteRuntimeOptions {
    * adapter supplies the capability, `runtime.importJobs` runs resumable,
    * byte-bounded imports against it, bound to `serverOwner`. Absent, the
    * runtime is unchanged and whole-scope ingest stays the only write path.
+   * A `native-staged-copy` capability needs `encodeBatch`.
    */
-  importJobs?: {
-    capability: PdppImportJobCapability;
-    declarations: ImportDeclarations;
-  };
+  importJobs?: Pick<
+    PdppImportJobsOptions,
+    "capability" | "declarations" | "encodeBatch"
+  >;
 }
 
 export interface PsLiteRuntimeStateCapabilities {
