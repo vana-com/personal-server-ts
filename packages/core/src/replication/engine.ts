@@ -1460,13 +1460,31 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
     },
   };
 
-  /** The exact retained operations, independent of later journal writes. */
-  function preparationRows(batch: string) {
-    return sql.all<RetainedPreparationOperation>(
-      `SELECT position,operation_json,encoding_failed
-      FROM pdpp_transport_operation_outcomes WHERE batch=? AND outcome IS NULL ORDER BY position`,
-      batch,
-    );
+  /**
+   * The exact retained operations, independent of later journal writes. Read
+   * in pages that start below REPLICA_TEXT_PART_BYTES of operation JSON, so
+   * one call returns that much plus at most one operation: a batch can hold
+   * far more than one phone SQL call carries.
+   */
+  function* preparationRows(batch: string): Fx<RetainedPreparationOperation[]> {
+    const rows: RetainedPreparationOperation[] = [];
+    for (let after = -1; ;) {
+      const page = yield* sql.all<RetainedPreparationOperation>(
+        `SELECT position,operation_json,encoding_failed FROM (
+          SELECT position,operation_json,encoding_failed,
+            sum(length(CAST(coalesce(operation_json,'') AS BLOB))) OVER (ORDER BY position)
+              - length(CAST(coalesce(operation_json,'') AS BLOB)) AS before
+          FROM pdpp_transport_operation_outcomes
+          WHERE batch=? AND outcome IS NULL AND position>?)
+        WHERE before<? ORDER BY position`,
+        batch,
+        after,
+        REPLICA_TEXT_PART_BYTES,
+      );
+      if (!page.length) return rows;
+      rows.push(...page);
+      after = page.at(-1)!.position;
+    }
   }
   function preparationOf(batch: string) {
     return sql.get<ReplicaPreparation>(

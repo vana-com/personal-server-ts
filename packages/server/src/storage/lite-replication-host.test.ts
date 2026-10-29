@@ -354,3 +354,27 @@ function stepping(replication: { runtime: LiteReplication["runtime"] }) {
   const status = replication.runtime.status();
   return "stepping" in status && status.stepping;
 }
+
+it("publishes and imports one batch of local writes larger than a phone SQL call", async () => {
+  const net = network();
+  const pa = phone(net, "phone-big-a");
+  const pb = phone(net, "phone-big-b");
+  // The factory's own chunk size and blob cap, as a shell gets them.
+  const engine = { now: clock.now };
+  const a = await device(await createLiteReplication(pa.input({ engine })));
+  const b = await device(await createLiteReplication(pb.input({ engine })));
+  await a.cycle();
+  await b.cycle();
+  // Twelve local commits of 100 KiB: one outbound batch above 1 MiB.
+  const text = (i: number) => `${i} ${"x".repeat(100 * 1024)}`;
+  for (let i = 0; i < 12; i++) await a.put(text(i), `big-${i}`);
+  for (let i = 0; i < 20 && (await b.get("big-11")) === undefined; i++) {
+    clock.advance(10_000);
+    await a.cycle();
+    await b.cycle();
+  }
+  for (const i of [0, 11])
+    expect(await b.get(`big-${i}`)).toEqual({ id: `big-${i}`, text: text(i) });
+  pa.native.close();
+  pb.native.close();
+}, 120_000);
