@@ -482,10 +482,13 @@ user taps "Sync now". The phone runs only in the foreground: on `inactive`,
 `paused` or `hidden` the host aborts the step and stops scheduling.
 
 `createReplicationDriver` (`packages/core/src/replication/host-driver.ts`)
-implements this timer, single-flight `trigger`, `wake` and `stop(graceMs)` for
-both hosts. Node wires it in `pdpp-replication-host.ts`; Node fires no
-local-write trigger yet, so a local write waits for the next coordinator wake
-(at most 15 min).
+implements this timer, single-flight `trigger`, `wake`, `localWrite` and
+`stop(graceMs)` for both hosts. `localWrite` steps within
+`REPLICA_LOCAL_WRITE_DEBOUNCE_MS` (2 s) of the first write after the last
+debounced step; later writes join that step and do not postpone it. Node wires
+the driver in `pdpp-replication-host.ts` and calls `localWrite` from the
+journal: each own operation appended to the local journal (never an import)
+schedules a step.
 
 PS-Lite wraps the same driver in `createLiteReplicationRuntime`
 (`packages/lite/src/replication-runtime.ts`): `resume` on foreground,
@@ -632,9 +635,14 @@ build or plain `main`, fires a trigger and sets the flag. The triggers add
 objects next to main's tables; the rollback test (`flag.test.ts:367`) must be
 extended to prove that main still opens and writes such a database.
 
-Before the door closes, the host opens the store once with the flag on. That
-open restores the plain blob row for blobs written by the earlier chunk-only
-build (`flag.test.ts:198-238`).
+Replication stores a promoted blob larger than 1 MiB only as chunks. The
+flag-off boot that closes the door writes main's plain blob row for each such
+blob before any store opens (`retireReplication`,
+`materializeCanonicalBinaries`; `flag.test.ts`, "keeps large blobs readable
+through flag-off and plain main stores"). A plain `main` build that opens the
+database without that boot reads those blobs as unavailable: their records
+and metadata are present, and a later flag-off boot of a replication build
+restores the bytes.
 
 Confirmation copy:
 
@@ -664,30 +672,38 @@ There is no blob-size cap.
   1 MiB fragments. A peer holds a writer's later batches behind an Unsupported
   one (`pdpp-replication-transport.ts:628-666`), so no tester limit may produce
   one.
-- **Reclaim instead of a lifetime cap:** the outbox keeps plaintext and
-  ciphertext and the batch table keeps the payload
-  (`pdpp-replication-transport.ts:79-110`). After a batch's registration is
-  finalized, PS drops those bytes and keeps hashes and metadata. A test must
-  prove that no outbound phase reads them after that point. After import, PS
-  drops inbox bytes.
+- **Reclaim instead of a lifetime cap (sender side landed):** when a batch's
+  registration is finalized, the transaction that marks its manifest
+  published also drops the batch payload and every fragment's ciphertext. The
+  fragment rows keep their digests and the manifest keeps the lengths. A
+  worker's first step does the same for batches finalized by an earlier
+  build. `pdpp-replication-blob-storage.test.ts` proves that no outbound
+  phase reads the dropped bytes, across later batches and a restart. Not yet
+  done: the receiver keeps its received custody copy and inbox fragment JSON
+  after import.
+- **Promotion:** the receiver copies a verified blob larger than 1 MiB into
+  canonical storage 64 KiB at a time and stores it once, in the chunk form.
+  It assembles no whole value.
 
 ### 6.1 Engine work the step bound needs
 
-The engine cannot meet these bounds today. Preparation advertises the bytes of
-the whole batch (`pdpp-replication-transport.ts:579`). An item larger than an
-explicit byte budget is deferred until a budget fits it (`coordinator.ts`), so
-on the phone a batch over 8 MiB never publishes until item 1 below lands. Preparation also frames a whole batch in one run and discards partial
-work on error (`pdpp-replication-transport.ts:590-627`).
+An item larger than an explicit byte budget is deferred until a budget fits it
+(`coordinator.ts`). Items 1 and 3 below have landed: preparation advertises one
+fragment and commits each fragment with a durable cursor, so a 200 MiB batch
+prepares under the phone's 8 MiB budget and a restart continues at the lost
+fragment (`pdpp-replication-fragment-admission.test.ts`). Items 2 and 4 remain.
 
 Plan item A7 (the bounded coordinator) owns these changes, and builds on the
 atomic checkpoints of A5:
 
-1. **Bounded admission:** an item advertises the bytes of its next resumable
-   unit, at most one fragment, not the whole batch.
+1. **Bounded admission (landed):** an item advertises the bytes of its next
+   resumable unit, at most one fragment, not the whole batch. The item's
+   `part` names that unit, so a step admits the item once per unit.
 2. **Resumable retention and hashing:** capturing a batch's payload and
    computing its digest continue across steps from a durable checkpoint.
-3. **Resumable preparation:** each framed and encrypted fragment is committed
-   with a cursor, so a restart continues from the last fragment.
+3. **Resumable preparation (landed):** each framed and encrypted fragment is
+   committed with a cursor, so a restart continues from the last fragment.
+   The final attempt still checks the whole payload digest in one read.
 4. **Resumable import staging:** inbound fragments are staged as they arrive,
    and assembly reads them across steps.
 5. **Kept as today:** the whole-batch digest check before import, and atomic

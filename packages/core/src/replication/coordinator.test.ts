@@ -75,6 +75,9 @@ interface Row {
   phase: ReplicaPhase;
   writer: string;
   bytes?: number;
+  /** Units of a multi-part item: each progress commits one part. */
+  parts?: number;
+  part: number;
   state: ReplicaWorkState;
   done: boolean;
   terminal: "quarantine" | "unsupported" | null;
@@ -134,13 +137,19 @@ function addRow(
   id: string,
   phase: ReplicaPhase,
   writer: string,
-  patch: { state?: Partial<ReplicaWorkState>; bytes?: number } = {},
+  patch: {
+    state?: Partial<ReplicaWorkState>;
+    bytes?: number;
+    parts?: number;
+  } = {},
 ): Row {
   const row: Row = {
     id,
     phase,
     writer,
     ...(patch.bytes === undefined ? {} : { bytes: patch.bytes }),
+    ...(patch.parts === undefined ? {} : { parts: patch.parts }),
+    part: 0,
     state: { ...initialReplicaWorkState, ...patch.state },
     done: false,
     terminal: null,
@@ -208,6 +217,7 @@ function handlerFor(world: World, phase: ReplicaPhase): ReplicaPhaseHandler {
           writer: r.writer,
           state: structuredClone(r.state),
           ...(r.bytes === undefined ? {} : { bytes: r.bytes }),
+          ...(r.parts === undefined ? {} : { part: String(r.part) }),
         });
       }
       return out;
@@ -245,7 +255,9 @@ function handlerFor(world: World, phase: ReplicaPhase): ReplicaPhaseHandler {
       };
       target.state = structuredClone(state);
       target.lastOutcome = structuredClone(outcome);
-      if (outcome.tag === "progress") target.done = true;
+      if (outcome.tag === "progress")
+        target.done =
+          target.parts === undefined || ++target.part >= target.parts;
       if (outcome.tag === "quarantine" || outcome.tag === "unsupported")
         target.terminal = outcome.tag;
       if (outcome.tag === "wait")
@@ -1509,6 +1521,28 @@ describe("coordinator budgets", () => {
     expect(runIds(world).sort()).toEqual(["a", "b"]);
     expect(report.nextWake).toBe(T0);
     expect(row(world, "c").done).toBe(false);
+  });
+
+  it("23 a multi-part item takes one part per admission, each charged on its own", async () => {
+    const world = newWorld();
+    addRow(world, "blob", "prepare", "A", { bytes: 40, parts: 6 });
+    addRow(world, "whole", "prepare", "B", { bytes: 40 });
+    const co = build(world);
+    const first = await stepAt(world, co, T0, { units: 10, bytes: 100 });
+    // Two parts of "blob" and "whole" would charge 120: one part waits.
+    expect(runIds(world).sort()).toEqual(["blob", "whole"]);
+    expect(row(world, "blob").part).toBe(1);
+    expect(first.nextWake).toBe(T0);
+    world.runs.length = 0;
+    await stepAt(world, co, T0 + 1, { units: 10, bytes: 100 });
+    expect(runIds(world)).toEqual(["blob", "blob"]);
+    world.runs.length = 0;
+    await stepAt(world, co, T0 + 2, { units: 10, bytes: 100 });
+    expect(runIds(world)).toEqual(["blob", "blob"]);
+    expect(row(world, "blob").done).toBe(false);
+    expect(row(world, "blob").part).toBe(5);
+    await stepAt(world, co, T0 + 3, { units: 1, bytes: 100 });
+    expect(row(world, "blob").done).toBe(true);
   });
 
   it("23 omitted byte budget uses a finite default large enough for admitted work", async () => {

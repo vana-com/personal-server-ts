@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import {
   binaryWriter,
   readBinaryChunks,
+  readBinaryWindow,
   deleteBinary,
   verifyBinary,
 } from "./pdpp-binary-chunks.js";
@@ -25,6 +26,7 @@ import {
   ReplicaResourceLimitError,
   REPLICA_DEFAULT_BYTE_BUDGET_BYTES,
   REPLICA_DEFAULT_FRAGMENT_BYTES,
+  REPLICA_MAX_FRAGMENTS,
   REPLICA_BATCH_OPERATION_LIMIT,
   REPLICA_BATCH_TARGET_BYTES,
   REPLICA_LIVE_COPY_FACTOR,
@@ -43,6 +45,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { resolveDeclaration } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import {
+  prepareReplicaFragment,
   prepareReplicaManifest,
   decodeReplicaManifest,
   replicaDigest,
@@ -267,6 +270,9 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_staged_objects (
  size_bytes INTEGER, sha256 TEXT, attached_at INTEGER);
 CREATE INDEX IF NOT EXISTS pdpp_staged_objects_cleanup
  ON pdpp_transport_staged_objects(state,created_at,object_id);
+CREATE TABLE IF NOT EXISTS pdpp_transport_preparation_progress (
+ batch TEXT PRIMARY KEY, statement TEXT NOT NULL, chunk_bytes INTEGER NOT NULL,
+ next_index INTEGER NOT NULL, source_position INTEGER NOT NULL, source_offset INTEGER NOT NULL);
 `;
 type State = {
   owner: string;
@@ -681,6 +687,7 @@ export function createReplicaTransportWorker(deps: {
       "pdpp_transport_fragments_out",
       "pdpp_transport_manifests_out",
       "pdpp_transport_preparation",
+      "pdpp_transport_preparation_progress",
       "pdpp_transport_operation_outcomes",
       "pdpp_transport_upload_attempts",
       "pdpp_transport_registration_recovery",
@@ -1550,9 +1557,7 @@ export function createReplicaTransportWorker(deps: {
           if (!preparationIsTail(batch, prep.version))
             return blockPreparation(batch.batch, "all_ops_unsupported");
           // The unused tail alone may give back its sequence and wire version.
-          db.prepare(
-            "DELETE FROM pdpp_transport_fragments_out WHERE batch=?",
-          ).run(batch.batch);
+          discardPreparedFragments(batch.batch);
           db.prepare(
             "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
           ).run(batch.batch);
@@ -1577,9 +1582,7 @@ export function createReplicaTransportWorker(deps: {
       plan: () => {
         if (preparationHasExternalEffects(batch, prep.version))
           return blockPreparation(batch.batch);
-        db.prepare(
-          "DELETE FROM pdpp_transport_fragments_out WHERE batch=?",
-        ).run(batch.batch);
+        discardPreparedFragments(batch.batch);
         db.prepare(
           "DELETE FROM pdpp_transport_manifests_out WHERE batch=?",
         ).run(batch.batch);
@@ -1610,6 +1613,121 @@ export function createReplicaTransportWorker(deps: {
   }
 
   // -------------------------------------------------------------- prepare
+  /*
+   * Preparation is resumable (host contract §6.1 items 1 and 3). One attempt
+   * frames and encrypts one fragment and commits it with a cursor, so a batch
+   * of any size is admitted one fragment at a time and a restart resumes after
+   * the last committed fragment. The last attempt checks the whole payload,
+   * signs the manifest and marks the batch prepared. Fragments wait in
+   * pdpp_transport_fragments_out, which publish ignores until the preparation
+   * is 'prepared'. The cursor names the statement it framed: a rebuilt
+   * payload or any other statement starts again from fragment 0.
+   */
+  type PreparationProgress = {
+    statement: string;
+    chunk_bytes: number;
+    next_index: number;
+    /** The payload chunk row and the offset in it where the next fragment starts. */
+    source_position: number;
+    source_offset: number;
+  };
+  function preparationStatement(batch: Batch) {
+    const s = state();
+    return {
+      owner: s.owner,
+      writer: s.writer,
+      batch: batch.batch,
+      sequence: batch.sequence,
+      previous: batch.previous_json
+        ? (JSON.parse(batch.previous_json) as Predecessor)
+        : null,
+      collectedAt: batch.collected_at,
+      digest: batch.digest,
+      totalBytes: batch.total_bytes,
+    };
+  }
+  function preparationProgress(batch: Batch): PreparationProgress {
+    const statement = canonicalJson(preparationStatement(batch));
+    const row = db
+      .prepare(
+        "SELECT statement,chunk_bytes,next_index,source_position,source_offset FROM pdpp_transport_preparation_progress WHERE batch=?",
+      )
+      .get(batch.batch) as PreparationProgress | undefined;
+    return row?.statement === statement
+      ? row
+      : {
+          statement,
+          chunk_bytes: deps.targetChunkBytes ?? REPLICA_DEFAULT_FRAGMENT_BYTES,
+          next_index: 0,
+          source_position: 0,
+          source_offset: 0,
+        };
+  }
+  function savePreparationProgress(batch: string, next: PreparationProgress) {
+    db.prepare(
+      `INSERT INTO pdpp_transport_preparation_progress (batch,statement,chunk_bytes,next_index,source_position,source_offset) VALUES (?,?,?,?,?,?)
+      ON CONFLICT(batch) DO UPDATE SET statement=excluded.statement,chunk_bytes=excluded.chunk_bytes,next_index=excluded.next_index,source_position=excluded.source_position,source_offset=excluded.source_offset`,
+    ).run(
+      batch,
+      next.statement,
+      next.chunk_bytes,
+      next.next_index,
+      next.source_position,
+      next.source_offset,
+    );
+  }
+  /**
+   * In a plan: false when the batch is no longer unprepared (nothing to do).
+   * Throws when its cursor moved since this attempt read it, so a stale
+   * attempt never commits a second fragment at one position.
+   */
+  function preparationCurrent(batch: Batch, started: PreparationProgress) {
+    const row = db
+      .prepare("SELECT * FROM pdpp_transport_batches WHERE batch=?")
+      .get(batch.batch) as Batch | undefined;
+    if (!row || row.prepared !== 0) return false;
+    const current = preparationProgress(row);
+    if (
+      current.statement !== started.statement ||
+      current.chunk_bytes !== started.chunk_bytes ||
+      current.next_index !== started.next_index ||
+      current.source_position !== started.source_position ||
+      current.source_offset !== started.source_offset
+    )
+      throw new ReplicaProblemError("prepare_failed");
+    return true;
+  }
+  /** Drop an unpublished batch's fragments and its cursor. */
+  function discardPreparedFragments(batch: string) {
+    db.prepare("DELETE FROM pdpp_transport_fragments_out WHERE batch=?").run(
+      batch,
+    );
+    db.prepare(
+      "DELETE FROM pdpp_transport_preparation_progress WHERE batch=?",
+    ).run(batch);
+  }
+  /**
+   * Admission of a batch's next prepare attempt: the base64 content of its
+   * next fragment, and nothing for the final attempt, whose payload check
+   * streams. A rebuild streams the payload like retain and is not charged.
+   */
+  function preparationAdmission(batch: Batch) {
+    const progress = preparationProgress(batch);
+    const offset = progress.next_index * progress.chunk_bytes;
+    // A failed attempt leaves the cursor, so the batch waits for the next step.
+    const part = `${progress.chunk_bytes}:${progress.next_index}`;
+    if (batch.prepared !== 0) return { part };
+    return {
+      part,
+      bytes:
+        offset >= batch.total_bytes
+          ? 0
+          : 4 *
+            Math.ceil(
+              Math.min(progress.chunk_bytes, batch.total_bytes - offset) / 3,
+            ),
+    };
+  }
   const unsupported = (error: ReplicaFramingUnsupported) => {
     const admission = {
       actual: error.actual,
@@ -1639,7 +1757,7 @@ export function createReplicaTransportWorker(deps: {
         phase: "prepare",
         writer: "",
         state: workState(row),
-        bytes: row.total_bytes,
+        ...preparationAdmission(row),
         row,
       }));
     },
@@ -1773,27 +1891,16 @@ export function createReplicaTransportWorker(deps: {
           }),
           ownBindings(own),
         );
-        const token = randomUUID();
         const s = state();
         const identity = currentReplicaWriterIdentity(db);
-        const statement = {
-          owner: s.owner,
-          writer: s.writer,
-          batch: batch.batch,
-          sequence: batch.sequence,
-          previous: batch.previous_json
-            ? (JSON.parse(batch.previous_json) as Predecessor)
-            : null,
-          collectedAt: batch.collected_at,
-          digest: batch.digest,
-          totalBytes: batch.total_bytes,
-        };
+        const statement = preparationStatement(batch);
         const encrypt = (scope: string, bytes: Uint8Array) =>
           call(signal, () => transport.encrypt(scope, bytes));
-        let chunkBytes =
-          deps.targetChunkBytes ?? REPLICA_DEFAULT_FRAGMENT_BYTES;
-        let entries: ManifestEntry[] = [];
-        let manifest: Awaited<ReturnType<typeof prepareReplicaManifest>>;
+        const progress = preparationProgress(batch);
+        const receipt: ReplicaPhaseOutcome = {
+          tag: "progress",
+          receipt: { phase: "prepare", key: batch.batch },
+        };
         const unsupportedPlan = (error: ReplicaFramingUnsupported) => {
           const admission = unsupported(error);
           return withPlan({ tag: "unsupported", admission }, () => {
@@ -1810,74 +1917,154 @@ export function createReplicaTransportWorker(deps: {
               }),
               batch.batch,
             );
+            discardPreparedFragments(batch.batch);
           });
         };
         try {
           // Batches belong to the current writer; startWriter drops older ones.
           if (identity?.transportWriter !== s.writer)
             throw new ReplicaProblemError("prepare_failed");
-          while (true) {
+          const count = Math.ceil(batch.total_bytes / progress.chunk_bytes);
+          if (count > REPLICA_MAX_FRAGMENTS)
+            return unsupportedPlan(
+              new ReplicaFramingUnsupported(
+                count,
+                REPLICA_MAX_FRAGMENTS,
+                "fragment_count",
+              ),
+            );
+          if (progress.next_index < count) {
+            // One fragment: read its window, frame, encrypt, commit with the cursor.
+            const index = progress.next_index;
+            const offset = index * progress.chunk_bytes;
+            const window = readBinaryWindow(
+              db,
+              "payload",
+              batch.batch,
+              {
+                position: progress.source_position,
+                offset: progress.source_offset,
+              },
+              Math.min(progress.chunk_bytes, batch.total_bytes - offset),
+            );
+            let part: Awaited<ReturnType<typeof prepareReplicaFragment>>;
+            let framing: ReplicaFramingUnsupported | undefined;
             try {
-              entries = [];
-              for await (const part of fragmentReplicaStream({
+              part = await prepareReplicaFragment({
                 ...statement,
-                bytes: async function* () {
-                  yield* readBinaryChunks(db, "payload", batch.batch);
-                },
+                count,
+                index,
+                offset,
+                chunk: window.bytes,
                 encrypt,
-                maxBlobBytes: cap,
-                targetChunkBytes: chunkBytes,
-              })) {
-                if (
-                  transport.encryptedByteLength &&
-                  transport.encryptedByteLength(part.plaintext.length) !==
-                    part.encrypted.length
-                )
-                  throw new ReplicaProblemError("prepare_failed");
-                db.prepare(
-                  "INSERT INTO pdpp_transport_staged_fragments VALUES (?,?,?,?)",
-                ).run(token, part.index, part.digest, part.encrypted);
-                entries.push({
-                  digest: part.digest,
-                  bytes: part.encrypted.length,
-                });
-              }
-              const aggregateCiphertextBytes = entries.reduce(
-                (total, entry) => total + entry.bytes,
-                0,
-              );
-              if (
-                aggregateCiphertextBytes >
-                resourceLimits.maxAggregateCiphertextBytes
-              )
-                throw new ReplicaResourceLimitError(
-                  "aggregate_ciphertext_bytes",
-                  aggregateCiphertextBytes,
-                  resourceLimits.maxAggregateCiphertextBytes,
+              });
+              if (part.encrypted.length > cap)
+                framing = new ReplicaFramingUnsupported(
+                  part.encrypted.length,
+                  cap,
                 );
-              break;
             } catch (error) {
-              db.prepare(
-                "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
-              ).run(token);
-              // Resource Unsupported blocks this writer through its durable
-              // rebuild; it never quarantines. Framing Unsupported
-              // may narrow the chunk size; if framing remains impossible, it
-              // settles only this batch without claiming a version. Successors
-              // may publish but peers wait for the missing predecessor until
-              // readmitUnsupported() under a new capability. Other errors retry.
               if (!(error instanceof ReplicaFramingUnsupported)) throw error;
-              if (error.dimension === "fragment_bytes" && chunkBytes > 1) {
-                chunkBytes = Math.max(1, Math.floor(chunkBytes / 2));
-                continue;
-              }
-              return unsupportedPlan(error);
+              framing = error;
             }
+            if (framing) {
+              // Resource Unsupported blocks this writer through its durable
+              // rebuild; it never quarantines. Framing Unsupported may narrow
+              // the chunk size; the batch then starts again from fragment 0.
+              // If framing remains impossible, it settles only this batch
+              // without claiming a version. Successors may publish but peers
+              // wait for the missing predecessor until readmitUnsupported()
+              // under a new capability. Other errors retry.
+              if (
+                framing.dimension === "fragment_bytes" &&
+                progress.chunk_bytes > 1
+              )
+                return withPlan(receipt, () => {
+                  if (!preparationCurrent(batch, progress)) return;
+                  discardPreparedFragments(batch.batch);
+                  savePreparationProgress(batch.batch, {
+                    statement: progress.statement,
+                    chunk_bytes: Math.max(
+                      1,
+                      Math.floor(progress.chunk_bytes / 2),
+                    ),
+                    next_index: 0,
+                    source_position: 0,
+                    source_offset: 0,
+                  });
+                });
+              return unsupportedPlan(framing);
+            }
+            if (
+              transport.encryptedByteLength &&
+              transport.encryptedByteLength(part!.plaintext.length) !==
+                part!.encrypted.length
+            )
+              throw new ReplicaProblemError("prepare_failed");
+            const prepared = part!;
+            // One fragment's receipt; the batch's own comes with its manifest.
+            const fragmentReceipt: ReplicaPhaseOutcome = {
+              tag: "progress",
+              receipt: { phase: "prepare", key: `${batch.batch}:${index}` },
+            };
+            return withPlan(fragmentReceipt, () => {
+              // Randomized ciphertext: only the first committed fragment at
+              // this cursor can go on wire.
+              if (!preparationCurrent(batch, progress)) return;
+              if (index === 0) discardPreparedFragments(batch.batch);
+              db.prepare(
+                "INSERT INTO pdpp_transport_fragments_out (batch,position,digest,encrypted) VALUES (?,?,?,?)",
+              ).run(batch.batch, index, prepared.digest, prepared.encrypted);
+              savePreparationProgress(batch.batch, {
+                statement: progress.statement,
+                chunk_bytes: progress.chunk_bytes,
+                next_index: index + 1,
+                source_position: window.next.position,
+                source_offset: window.next.offset,
+              });
+            });
           }
+          // Every fragment is committed. The single-run stream checked the
+          // whole-batch digest at EOF; check that the retained payload is
+          // still the one the fragments were read from, in one streaming pass.
+          if (
+            !verifyBinary(
+              db,
+              "payload",
+              batch.batch,
+              batch.digest,
+              batch.total_bytes,
+            )
+          )
+            throw new Error("corrupt replica batch");
+          const entries = db
+            .prepare(
+              "SELECT digest,length(encrypted) AS bytes FROM pdpp_transport_fragments_out WHERE batch=? ORDER BY position",
+            )
+            .all(batch.batch) as ManifestEntry[];
+          // A committed fragment went missing: start the batch again.
+          if (entries.length !== count)
+            return withPlan({ tag: "retry", problem: "prepare_failed" }, () => {
+              if (preparationCurrent(batch, progress))
+                discardPreparedFragments(batch.batch);
+            });
+          const aggregateCiphertextBytes = entries.reduce(
+            (total, entry) => total + entry.bytes,
+            0,
+          );
+          if (
+            aggregateCiphertextBytes >
+            resourceLimits.maxAggregateCiphertextBytes
+          )
+            throw new ReplicaResourceLimitError(
+              "aggregate_ciphertext_bytes",
+              aggregateCiphertextBytes,
+              resourceLimits.maxAggregateCiphertextBytes,
+            );
           // Sign the durably reserved version. The commit plan rechecks that
           // this is still the scope's next slot before retaining ciphertext.
           const version = preparation.version;
-          manifest = await prepareReplicaManifest({
+          const manifest = await prepareReplicaManifest({
             ...statement,
             version,
             fragments: entries,
@@ -1900,70 +2087,50 @@ export function createReplicaTransportWorker(deps: {
                 "manifest_bytes",
               ),
             );
-        } catch (error) {
-          db.prepare(
-            "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
-          ).run(token);
-          return failedPreparation(batch, error, signal, chunkBytes);
-        }
-        return withPlan(
-          { tag: "progress", receipt: { phase: "prepare", key: batch.batch } },
-          () => {
-            const current = db
+          return withPlan(receipt, () => {
+            if (!preparationCurrent(batch, progress)) return;
+            const stored = db
               .prepare(
-                "SELECT prepared FROM pdpp_transport_batches WHERE batch=?",
+                "SELECT count(*) AS count,coalesce(max(position),-1) AS last FROM pdpp_transport_fragments_out WHERE batch=?",
               )
-              .get(batch.batch) as { prepared: number };
-            // Concurrent preparation may choose different randomized ciphertext.
-            // Only the first committed bytes can go on wire.
-            if (!current.prepared) {
-              const staged = db
-                .prepare(
-                  "SELECT count(*) AS count FROM pdpp_transport_staged_fragments WHERE token=?",
-                )
-                .get(token) as { count: number };
-              if (
-                staged.count !== entries.length ||
-                entries.length !== Math.ceil(batch.total_bytes / chunkBytes)
+              .get(batch.batch) as { count: number; last: number };
+            if (stored.count !== count || stored.last !== count - 1)
+              throw new ReplicaProblemError("prepare_failed");
+            // The batch keeps the version it signed only if that is still the
+            // scope's next one, in the same transaction as its manifest, so a
+            // retry or a lost acknowledgement can never register it at a
+            // second version.
+            const { next } = db
+              .prepare(
+                "SELECT coalesce(max(version),0)+1 AS next FROM pdpp_transport_manifests_out WHERE scope=?",
               )
-                throw new ReplicaProblemError("prepare_failed");
-              // The batch keeps the version it signed only if that is still the
-              // scope's next one, in the same transaction as its manifest, so a
-              // retry or a lost acknowledgement can never register it at a
-              // second version.
-              const { next } = db
-                .prepare(
-                  "SELECT coalesce(max(version),0)+1 AS next FROM pdpp_transport_manifests_out WHERE scope=?",
-                )
-                .get(manifest.scope) as { next: number };
-              if (next !== manifest.version)
-                throw new ReplicaProblemError("prepare_failed");
-              db.prepare(
-                "INSERT INTO pdpp_transport_manifests_out (batch,scope,version,plaintext,encrypted,data_hash,metadata_hash) VALUES (?,?,?,?,?,?,?)",
-              ).run(
-                batch.batch,
-                manifest.scope,
-                manifest.version,
-                manifest.plaintext,
-                manifest.encrypted,
-                manifest.dataHash,
-                manifest.metadataHash,
-              );
-              db.prepare(
-                "INSERT INTO pdpp_transport_fragments_out (batch,position,digest,encrypted) SELECT ?,position,digest,encrypted FROM pdpp_transport_staged_fragments WHERE token=?",
-              ).run(batch.batch, token);
-              db.prepare(
-                "UPDATE pdpp_transport_batches SET prepared=1 WHERE batch=?",
-              ).run(batch.batch);
-              db.prepare(
-                "UPDATE pdpp_transport_preparation SET state='prepared',wait_json=NULL WHERE batch=?",
-              ).run(batch.batch);
-            }
+              .get(manifest.scope) as { next: number };
+            if (next !== manifest.version)
+              throw new ReplicaProblemError("prepare_failed");
             db.prepare(
-              "DELETE FROM pdpp_transport_staged_fragments WHERE token=?",
-            ).run(token);
-          },
-        );
+              "INSERT INTO pdpp_transport_manifests_out (batch,scope,version,plaintext,encrypted,data_hash,metadata_hash) VALUES (?,?,?,?,?,?,?)",
+            ).run(
+              batch.batch,
+              manifest.scope,
+              manifest.version,
+              manifest.plaintext,
+              manifest.encrypted,
+              manifest.dataHash,
+              manifest.metadataHash,
+            );
+            db.prepare(
+              "UPDATE pdpp_transport_batches SET prepared=1 WHERE batch=?",
+            ).run(batch.batch);
+            db.prepare(
+              "UPDATE pdpp_transport_preparation SET state='prepared',wait_json=NULL WHERE batch=?",
+            ).run(batch.batch);
+            db.prepare(
+              "DELETE FROM pdpp_transport_preparation_progress WHERE batch=?",
+            ).run(batch.batch);
+          });
+        } catch (error) {
+          return failedPreparation(batch, error, signal, progress.chunk_bytes);
+        }
       } catch (error) {
         return failedPreparation(batch, error, signal);
       }
@@ -1971,7 +2138,7 @@ export function createReplicaTransportWorker(deps: {
     commit: commitIn((outcome, work, item) => {
       db.prepare(
         `UPDATE pdpp_transport_batches SET ${WORK_SET} WHERE batch=?`,
-      ).run(...workValues(outcome, work), item.id);
+      ).run(...workValues(outcome, work), item.row.batch);
     }),
     commitProblem: "prepare_failed",
     earliest(e) {
@@ -2601,6 +2768,33 @@ export function createReplicaTransportWorker(deps: {
       return verdict(retryFromError(error, "publish_failed"));
     }
   }
+  /**
+   * The batch's registration is finalized: drop its payload and fragment
+   * ciphertext in the caller's transaction (host contract §6, "Reclaim").
+   * The fragment rows keep their digests and the manifest keeps every
+   * fragment's length, which is all later chain decisions read. No outbound
+   * phase selects a published batch's fragments or payload again.
+   */
+  function reclaimPublished(batch: string) {
+    deleteBinary(db, "payload", batch);
+    db.prepare(
+      "UPDATE pdpp_transport_fragments_out SET encrypted=x'' WHERE batch=? AND length(encrypted)>0",
+    ).run(batch);
+  }
+  /** Reclaim batches finalized before reclaim existed. Once per process. */
+  let reclaimSwept = false;
+  function sweepPublished() {
+    if (reclaimSwept) return;
+    const batches = db
+      .prepare(
+        `SELECT m.batch FROM pdpp_transport_manifests_out m WHERE m.state='published'
+         AND (EXISTS (SELECT 1 FROM pdpp_binary_manifests p WHERE p.namespace='payload' AND p.blob_id=m.batch)
+           OR EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=m.batch AND length(f.encrypted)>0))`,
+      )
+      .all() as { batch: string }[];
+    for (const { batch } of batches) reclaimPublished(batch);
+    reclaimSwept = true;
+  }
   const publish: ReplicaPhaseHandler<Item<Outbound>> = {
     phase: "publish",
     due(e, limit) {
@@ -2675,10 +2869,12 @@ export function createReplicaTransportWorker(deps: {
             db.prepare(
               "UPDATE pdpp_transport_registration_recovery SET state='committed' WHERE batch=?",
             ).run(item.row.batch);
-          if (item.row.kind === "manifest" && outcome.tag === "progress")
+          if (item.row.kind === "manifest" && outcome.tag === "progress") {
             db.prepare(
               "UPDATE pdpp_transport_registration_intents SET status='confirmed' WHERE scope=? AND version=?",
             ).run(item.row.scope!, item.row.version!);
+            reclaimPublished(item.row.batch);
+          }
           if (item.row.kind === "manifest" && outcome.tag === "quarantine")
             db.prepare(
               "UPDATE pdpp_transport_registration_intents SET status='conflict' WHERE scope=? AND version=?",
@@ -4053,7 +4249,8 @@ export function createReplicaTransportWorker(deps: {
     ] as ReplicaPhaseHandler[],
     quantum: {
       retain: 1,
-      prepare: 4,
+      // One prepare unit is one fragment, as for publish and fetch.
+      prepare: 50,
       publish: 50,
       discover: 1,
       fetch: 50,
@@ -4207,6 +4404,7 @@ export function createReplicaTransportWorker(deps: {
             `DELETE FROM ${table} WHERE namespace='payload' AND NOT EXISTS (SELECT 1 FROM pdpp_transport_batches b WHERE b.batch=${table}.blob_id)`,
           ).run();
         }
+        sweepPublished();
       }).immediate();
       const current = dependencyFingerprint();
       if (current !== fingerprint) {

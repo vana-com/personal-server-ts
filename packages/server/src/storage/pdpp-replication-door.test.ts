@@ -21,7 +21,10 @@ import {
 } from "../pdpp/records-bootstrap.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
-import { REPLICATION_DOOR_PROBE } from "./pdpp-replication-door.js";
+import {
+  admitReplication,
+  REPLICATION_DOOR_PROBE,
+} from "./pdpp-replication-door.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 
@@ -259,6 +262,26 @@ describe("the door after replication was on", () => {
     expect(fenceTriggers(path)).toBe(0);
     expect(boot(path, true)).toEqual(refused);
     expect(boot(path, false)).toEqual({ state: "off" });
+  });
+
+  it("a first enable lost after the door commits, before the replica schema: a flag-off boot still starts", () => {
+    const path = file();
+    boot(path, false, (store) => (register(store), ingest(store, "a")));
+    const db = open(path);
+    admitReplication(db);
+    db.close();
+    const tables = open(path);
+    expect(
+      tables
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pdpp_binary_manifests'",
+        )
+        .get(),
+    ).toBeUndefined();
+    tables.close();
+    expect(boot(path, false)).toEqual({ state: "off" });
+    expect(boot(path, true)).toEqual(refused);
+    boot(path, false, (store) => expect(keys(store)).toEqual(["a"]));
   });
 
   it("downgrade: a build without capture that writes closes the door", () => {

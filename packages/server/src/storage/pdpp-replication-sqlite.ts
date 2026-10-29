@@ -177,6 +177,8 @@ export function createReplicationJournal(
   db: Database,
   /** Read per operation, inside its canonical transaction. */
   writerId: () => string,
+  /** Called after each own operation is appended, inside its transaction. */
+  appended?: () => void,
 ) {
   const settings = () =>
     db.prepare("SELECT * FROM pdpp_replica_settings WHERE id = 1").get() as
@@ -277,6 +279,7 @@ export function createReplicationJournal(
       canonicalJson(operation),
       replicaOperationDigest(operation),
     );
+    appended?.();
     return operation;
   }
   function blobDescriptor(blobId: string) {

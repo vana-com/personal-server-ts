@@ -1,10 +1,13 @@
 import Database from "better-sqlite3";
 import { join } from "node:path";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createTestReplicaSigner } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
 import { REPLICA_ATTEMPT_TIMEOUT_MS } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
-import type { ReplicationTimers } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
+import {
+  REPLICA_LOCAL_WRITE_DEBOUNCE_MS,
+  type ReplicationTimers,
+} from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import {
   at,
   clock,
@@ -43,9 +46,56 @@ const manualTimers: ReplicationTimers = {
   clearTimeout: () => {},
 };
 
+/** Timers on the shared test clock; the test runs the due ones. */
+function clockTimers() {
+  let next = 1;
+  const pending = new Map<
+    number,
+    { at: number; ms: number; run: () => void }
+  >();
+  const timers: ReplicationTimers = {
+    now: clock.now,
+    setTimeout(run, ms) {
+      pending.set(next, { at: clock.now() + ms, ms, run });
+      return next++;
+    },
+    clearTimeout: (handle) => pending.delete(handle as number),
+  };
+  return {
+    timers,
+    /** Delays of the timers armed since the last call. */
+    armedSince: (() => {
+      let seen = 0;
+      return () => {
+        const fresh = [...pending.entries()]
+          .filter(([id]) => id > seen)
+          .map(([, t]) => t.ms);
+        seen = next - 1;
+        return fresh;
+      };
+    })(),
+    runDue() {
+      for (const [id, t] of [...pending])
+        if (t.at <= clock.now()) {
+          pending.delete(id);
+          t.run();
+        }
+    },
+  };
+}
+
+async function settled(driver: { status(): { stepping: boolean } }) {
+  while (driver.status().stepping)
+    await new Promise((resolve) => setImmediate(resolve));
+}
+
 function host(
   net: ReturnType<typeof network>,
-  opts: { chainId?: number; declarations?: DeclarationSnapshot[] } = {},
+  opts: {
+    chainId?: number;
+    declarations?: DeclarationSnapshot[];
+    timers?: ReplicationTimers;
+  } = {},
 ) {
   const db = new Database(join(scratchDirectory("replica-host"), "db.sqlite"));
   const signer = createTestReplicaSigner();
@@ -58,7 +108,7 @@ function host(
     serverAccount: signer,
     ports: () => ({ transport: net.port, roster: net.roster.port }),
     logger,
-    timers: manualTimers,
+    timers: opts.timers ?? manualTimers,
     worker: { now: clock.now, targetChunkBytes: 4000, maxBlobBytes: 8192 },
   });
   return { db, runtime };
@@ -75,7 +125,8 @@ function started(h: ReturnType<typeof host>) {
   });
   return {
     ...h.runtime,
-    put(text: string) {
+    /** A committed local write, with no explicit trigger. */
+    write(text: string) {
       store.ingestBatch(
         [
           {
@@ -90,7 +141,10 @@ function started(h: ReturnType<typeof host>) {
         () => ["id"],
         { method: "export", generation: 1 },
       );
-      void driver.trigger(); // the local-write trigger a host would fire
+    },
+    put(text: string) {
+      this.write(text);
+      void driver.trigger();
     },
     get: () => store.getRecord("conn", "messages", "a")?.data,
   };
@@ -117,6 +171,41 @@ it("two Node hosts built from retained declarations converge through their drive
   expect(await a.driver.stop(1_000)).toBe(true);
   expect(await b.driver.stop(1_000)).toBe(true);
   expect(a.driver.status().state).toBe("stopped");
+}, 60_000);
+
+it("a committed local write steps within the debounce window; an import does not", async () => {
+  const net = network();
+  const timersA = clockTimers();
+  const a = started(host(net, { timers: timersA.timers }));
+  const b = started(host(net));
+  a.driver.start();
+  b.driver.start();
+  await settled(a.driver);
+  await settled(b.driver);
+  // The first baseline journals operations: drain the step it scheduled.
+  clock.advance(REPLICA_LOCAL_WRITE_DEBOUNCE_MS);
+  timersA.runDue();
+  await settled(a.driver);
+  const wroteA = vi.spyOn(a.driver, "localWrite");
+  const wroteB = vi.spyOn(b.driver, "localWrite");
+  timersA.armedSince();
+  a.write("from A");
+  expect(wroteA).toHaveBeenCalled();
+  // Only the debounced step: the idle wake is still 15 min away.
+  expect(timersA.armedSince()).toEqual([REPLICA_LOCAL_WRITE_DEBOUNCE_MS]);
+  clock.advance(REPLICA_LOCAL_WRITE_DEBOUNCE_MS);
+  // A steps only on its own timers from here.
+  for (let i = 0; i < 12 && b.get()?.text !== "from A"; i++) {
+    timersA.runDue();
+    await settled(a.driver);
+    await b.driver.trigger();
+    clock.advance(10_000);
+  }
+  expect(b.get()).toEqual({ id: "a", text: "from A" });
+  // Imports never append to the journal, so they never schedule a step.
+  expect(wroteB).not.toHaveBeenCalled();
+  expect(await a.driver.stop(1_000)).toBe(true);
+  expect(await b.driver.stop(1_000)).toBe(true);
 }, 60_000);
 
 /** Step a started host once: its writer identity, then its first baseline. */
