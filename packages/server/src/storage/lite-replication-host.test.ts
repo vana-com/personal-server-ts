@@ -8,6 +8,10 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createDpv2ReplicaTransport } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import { replicaDeclarationContext } from "@opendatalabs/personal-server-ts-core/replication/host-config";
+import {
+  REPLICA_LOCAL_WRITE_DEBOUNCE_MS,
+  type ReplicationTimers,
+} from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import type { ReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import { createTestReplicaSigner } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
 import type { BoundedStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
@@ -306,3 +310,47 @@ it("rotates the writer identity at boot when the shell asks", async () => {
   expect(plain.rotation).toBe("not_requested");
   pa.native.close();
 });
+
+it("a local commit steps within the debounce window", async () => {
+  const net = network();
+  const pa = phone(net, "phone-write");
+  const armed: { ms: number; run: () => void }[] = [];
+  const timers: ReplicationTimers = {
+    now: clock.now,
+    setTimeout(run, ms) {
+      armed.push({ ms, run });
+      return armed.length;
+    },
+    clearTimeout: () => {},
+  };
+  const replication = started(
+    await createLiteReplication(pa.input({ timers })),
+  );
+  const a = await device(replication);
+  // Stopped: a write schedules nothing.
+  await a.put("before start", "x");
+  expect(armed).toEqual([]);
+  replication.runtime.resume();
+  while (replication.runtime.status().state === "on" && stepping(replication))
+    await new Promise((resolve) => setImmediate(resolve));
+  armed.length = 0;
+  const before = replication.runtime.status();
+  await a.put("from a", "a");
+  // Only the debounced step: the idle wake was armed before the write.
+  expect(armed.map((t) => t.ms)).toEqual([REPLICA_LOCAL_WRITE_DEBOUNCE_MS]);
+  clock.advance(REPLICA_LOCAL_WRITE_DEBOUNCE_MS);
+  armed[0]!.run();
+  while (stepping(replication))
+    await new Promise((resolve) => setImmediate(resolve));
+  expect(replication.runtime.status()).toMatchObject({
+    lastStepAt: clock.now(),
+  });
+  expect(before).not.toMatchObject({ lastStepAt: clock.now() });
+  expect(await replication.runtime.stop(1_000)).toBe(true);
+  pa.native.close();
+});
+
+function stepping(replication: { runtime: LiteReplication["runtime"] }) {
+  const status = replication.runtime.status();
+  return "stepping" in status && status.stepping;
+}

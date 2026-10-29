@@ -375,6 +375,8 @@ export function createLiteCanonicalStore(deps: {
   enabled?: boolean;
   visibilityPolicy?: ReplicaVisibilityPolicy;
   newId?: () => string;
+  /** Called after each local batch commits, so replication steps soon. */
+  localCommitted?: () => void;
 }) {
   // Every transaction checks the stored layout first, so no reader or
   // writer can reach entries of another layout.
@@ -2046,7 +2048,11 @@ export function createLiteCanonicalStore(deps: {
       id: string,
       operations: LiteOperationDraft[],
       blobs?: { stagingId: LiteStagingId; descriptor: LiteBlobDescriptor }[],
-    ) => commit({ id, operations, blobs }),
+    ) =>
+      commit({ id, operations, blobs }).then((receipt) => {
+        deps.localCommitted?.();
+        return receipt;
+      }),
     import: (input: {
       id: string;
       envelope: unknown;

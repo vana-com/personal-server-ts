@@ -217,6 +217,14 @@ export async function createLiteReplication(
   const rotation = input.rotateWriterIdentity
     ? await rotateAtBoot(engine)
     : "not_requested";
+  const runtime = createLiteReplicationRuntime({
+    door,
+    config,
+    engine,
+    timers: input.timers,
+    onReport: input.onReport,
+    onError: input.onError,
+  });
   return {
     state: "started",
     engine,
@@ -224,16 +232,11 @@ export async function createLiteReplication(
       persistence: input.persistence,
       enabled: true,
       ...trusted,
+      // A committed own write steps soon, not at the next wake (Node: #517).
+      localCommitted: () => runtime.localWrite(),
     }),
     rotation,
-    runtime: createLiteReplicationRuntime({
-      door,
-      config,
-      engine,
-      timers: input.timers,
-      onReport: input.onReport,
-      onError: input.onError,
-    }),
+    runtime,
   };
 }
 

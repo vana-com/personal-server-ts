@@ -565,9 +565,12 @@ schedules a step.
 
 PS-Lite wraps the same driver in `createLiteReplicationRuntime`
 (`packages/lite/src/replication-runtime.ts`): `resume` on foreground,
-`pause` on background, `trigger(reason)` for the other triggers, and a step
-deadline from `limits.step.deadlineMs`. `createPsLiteRuntime` calls `resume`
-and `pause` from `activate` and `deactivate` and serves owner-only
+`pause` on background, `trigger(reason)` for the other triggers, `localWrite`,
+and a step deadline from `limits.step.deadlineMs`. The canonical store that
+`createLiteReplication` returns calls `localWrite` after each `commitLocal`;
+imports run through the engine's own store and never call it.
+`createPsLiteRuntime` calls `resume` and `pause` from `activate` and
+`deactivate` and serves owner-only
 `GET /v1/replication/status` and `POST /v1/replication/sync` (202, the step
 runs after the answer; 409 when replication is not running). Its status is
 the driver's (`stepping`, `lastStepAt`, `nextWakeAt`, last-step counts), not
