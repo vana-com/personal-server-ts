@@ -32,11 +32,13 @@ import {
   type ReplicaReader,
   type ReplicaVisibilityPolicy,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
-import type {
-  LiteCanonicalPersistence,
-  LiteCanonicalTransaction,
-  LiteBlobDescriptor,
-  LiteStagingId,
+import {
+  LITE_CANONICAL_BATCH_BYTES,
+  LITE_CANONICAL_MAX_OPERATION_BYTES,
+  type LiteCanonicalPersistence,
+  type LiteCanonicalTransaction,
+  type LiteBlobDescriptor,
+  type LiteStagingId,
 } from "./canonical-persistence.js";
 
 export type LiteOperationDraft = ReplicaOperation extends infer T
@@ -194,6 +196,10 @@ const operationPath = (op: ReplicaOperation) => {
   return `${connectionPrefix(op.connectionId)}${suffix}${digest(op)}`;
 };
 const maxWindowBytes = 4 * 1024 * 1024;
+/** A local batch is at most 192 KiB, or one operation alone up to 17 MiB. */
+const localBatchFits = (operations: number, bytes: number) =>
+  bytes <= LITE_CANONICAL_BATCH_BYTES ||
+  (operations === 1 && bytes <= LITE_CANONICAL_MAX_OPERATION_BYTES);
 const encoder = new TextEncoder();
 
 async function get<T>(
@@ -256,7 +262,8 @@ async function logPage(
     const operation = await tx.get(entry.operationKey);
     if (!operation) throw new Error("missing immutable outbox operation");
     bytes += encoder.encode(operation).length;
-    if (bytes > 512 * 1024) break;
+    // A page holds its first operation whatever its size.
+    if (entries.length && bytes > 512 * 1024) break;
     entries.push({
       ...entry,
       operation: replicaOperationSchema.parse(JSON.parse(operation)),
@@ -798,7 +805,12 @@ export function createLiteCanonicalStore(deps: {
       throw new Error("wrong replica owner");
     // A local request id also fences the original, unrevised inputs after lost ack.
     const encoded = canonicalJson(local ? input.operations : envelope);
-    if (encoder.encode(encoded).length > 192 * 1024)
+    const bytes = encoder.encode(encoded).length;
+    if (
+      local
+        ? !localBatchFits(input.operations!.length, bytes)
+        : bytes > LITE_CANONICAL_BATCH_BYTES
+    )
       throw new Error("canonical batch exceeds 192 KiB; split before commit");
     const fingerprint = `sha256:${sha256(toBytes(encoded)).slice(2)}`;
     return persistence.transaction(async (base) => {
