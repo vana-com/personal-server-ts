@@ -18,6 +18,7 @@ import {
 import {
   createLiteCanonicalImportEncoder,
   encodeLiveSnapshotDigestInput,
+  LITE_IMPORT_READ_MANY_MAX,
   planIngest,
   type ImportStagedOperation,
   type LiteCanonicalReadView,
@@ -93,6 +94,76 @@ function importOperations(): ImportStagedOperation[] {
   return operations;
 }
 
+/** A view over `rows` that counts its calls; optionally with the batched reads. */
+function countingView(
+  rows: Map<string, string>,
+  options: { batched?: boolean; answer?: number } = {},
+) {
+  const calls = { get: 0, scan: 0, getMany: 0, scanMany: 0 };
+  const page = (prefix: string, after?: string) =>
+    storagePage(
+      [...rows]
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([key, value]) => ({ key, value })),
+      after,
+    );
+  // A host may answer a leading part of a batched read.
+  const leading = <T>(items: T[]) => items.slice(0, options.answer);
+  const view: LiteCanonicalReadView = {
+    get: async (key) => (calls.get++, rows.get(key)),
+    scan: async (prefix, after) => (calls.scan++, page(prefix, after)),
+    ...(options.batched
+      ? {
+          getMany: async (keys: string[]) => {
+            calls.getMany++;
+            expect(keys.length).toBeLessThanOrEqual(LITE_IMPORT_READ_MANY_MAX);
+            return leading(keys).map((key) => rows.get(key));
+          },
+          scanMany: async (scans: { prefix: string; after?: string }[]) => {
+            calls.scanMany++;
+            expect(scans.length).toBeLessThanOrEqual(LITE_IMPORT_READ_MANY_MAX);
+            return leading(scans).map((scan) => page(scan.prefix, scan.after));
+          },
+        }
+      : {}),
+  };
+  return { view, calls };
+}
+
+const importJob = {
+  jobId: "job-1",
+  binding: {
+    owner: identity.owner,
+    instance: identity.connectionId,
+    sourceId: identity.sourceId,
+    method: identity.methodId,
+    generation: identity.generation,
+  },
+};
+
+/** Three batches: new records, then edits and deletes of earlier ones. */
+function importBatches(): ImportStagedOperation[][] {
+  const all = importOperations();
+  const edits = all.slice(0, 120).map((operation, i) => ({
+    ...operation,
+    dataJson:
+      i % 3 === 0
+        ? operation.dataJson
+        : JSON.stringify({ id: operation.recordKey, text: `edit ${i}` }),
+  }));
+  return [all.slice(0, 150), all.slice(150), edits];
+}
+
+/** Applies a batch's entries the way a native staged copy does. */
+function applyEntries(
+  rows: Map<string, string>,
+  entries: { key: string; value: string | null }[],
+) {
+  for (const entry of entries)
+    if (entry.value === null) rows.delete(entry.key);
+    else rows.set(entry.key, entry.value);
+}
+
 describe("Lite canonical import encoder", () => {
   it("re-exports the shared rules a native copy must not re-implement", () => {
     expect(typeof planIngest).toBe("function");
@@ -159,6 +230,183 @@ describe("Lite canonical import encoder", () => {
         "operationKey",
         "sequence",
       ]);
+  });
+
+  it.each([
+    { name: "whole answers", answer: undefined },
+    { name: "one item per batched answer", answer: 1 },
+  ])(
+    "encodes consecutive batches with batched reads, byte-identical to commitLocal ($name)",
+    async ({ answer }) => {
+      const before = await registeredDisk();
+      const batches = importBatches();
+      const bindingFor = () => binding;
+
+      // The existing Lite write path, every part of every batch in order.
+      const written = { rows: new Map(before.rows), blobs: new Map() };
+      const store = createLiteCanonicalStore({
+        persistence: createFakeCanonicalPersistence(written).port,
+        enabled: true,
+        context,
+        authenticateReplica: () => undefined,
+        newId: ids("op"),
+      });
+      const encoder = createLiteCanonicalImportEncoder({
+        context,
+        newId: ids("op"),
+      });
+      const plain = createLiteCanonicalImportEncoder({
+        context,
+        newId: ids("op"),
+      });
+      const staged = new Map(before.rows);
+      const plainStaged = new Map(before.rows);
+      const batchedCalls = { get: 0, scan: 0, getMany: 0, scanMany: 0 };
+      let plainCalls = 0;
+      for (const [seq, operations] of batches.entries()) {
+        const parts = encoder.importBatchParts({
+          job: importJob,
+          seq,
+          operations,
+          bindingFor,
+        });
+        const receipts = [];
+        for (const part of parts)
+          receipts.push(await store.commitLocal(part.id, part.operations));
+
+        const batched = countingView(staged, { batched: true, answer });
+        const encoded = await encoder.encode(batched.view, parts);
+        expect(encoded.parts.map((part) => part.receipt)).toEqual(receipts);
+        applyEntries(staged, encoded.entries);
+        for (const key of Object.keys(
+          batchedCalls,
+        ) as (keyof typeof batchedCalls)[])
+          batchedCalls[key] += batched.calls[key];
+
+        const reference = countingView(plainStaged);
+        applyEntries(
+          plainStaged,
+          (await plain.encode(reference.view, parts)).entries,
+        );
+        plainCalls += reference.calls.get + reference.calls.scan;
+      }
+      expect([...staged].sort()).toEqual([...written.rows].sort());
+      expect([...plainStaged].sort()).toEqual([...written.rows].sort());
+      // Reads go through the batched ops, not one call per key.
+      expect(batchedCalls.get + batchedCalls.scan).toBe(0);
+      if (answer === undefined)
+        expect(batchedCalls.getMany + batchedCalls.scanMany).toBeLessThan(
+          plainCalls / 20,
+        );
+    },
+  );
+
+  it("re-encodes over the true answers when a canonical write lands between batches", async () => {
+    const before = await registeredDisk();
+    const [first, second] = importBatches();
+    const bindingFor = () => binding;
+    const written = { rows: new Map(before.rows), blobs: new Map() };
+    const store = createLiteCanonicalStore({
+      persistence: createFakeCanonicalPersistence(written).port,
+      enabled: true,
+      context,
+      authenticateReplica: () => undefined,
+      newId: ids("op"),
+    });
+    const other = (disk: { rows: Map<string, string> }) =>
+      createLiteCanonicalStore({
+        persistence: createFakeCanonicalPersistence({
+          rows: disk.rows,
+          blobs: new Map(),
+        }).port,
+        enabled: true,
+        context,
+        authenticateReplica: () => undefined,
+        newId: ids("other"),
+      });
+    // A live write of a record the second batch also writes, plus a new one.
+    const intervening = [
+      draft(upsert("other-op", 1, "written meanwhile")),
+      draft({
+        ...upsert("other-m200", 2),
+        recordKey: "m200",
+        data: { id: "m200", text: "live m200" },
+      }),
+    ];
+    const encoder = createLiteCanonicalImportEncoder({
+      context,
+      newId: ids("op"),
+    });
+    const staged = new Map(before.rows);
+    for (const [seq, operations] of [first, second].entries()) {
+      if (seq === 1) {
+        await other(written).commitLocal("live", intervening);
+        await other({ rows: staged }).commitLocal("live", intervening);
+      }
+      const parts = encoder.importBatchParts({
+        job: importJob,
+        seq,
+        operations,
+        bindingFor,
+      });
+      const receipts = [];
+      for (const part of parts)
+        receipts.push(await store.commitLocal(part.id, part.operations));
+      const encoded = await encoder.encode(
+        countingView(staged, { batched: true }).view,
+        parts,
+      );
+      expect(encoded.parts.map((part) => part.receipt)).toEqual(receipts);
+      expect(encoded.fence.value).toBe(staged.get("clock"));
+      applyEntries(staged, encoded.entries);
+    }
+    expect([...staged].sort()).toEqual([...written.rows].sort());
+  });
+
+  it("pages a prefix the batch itself filled past one page, as commitLocal does", async () => {
+    const before = await registeredDisk();
+    // Many versions of one record keep its revision prefix over 100 entries.
+    const operations = Array.from({ length: 105 }, (_, i) => ({
+      ...importOperations()[0]!,
+      order: i,
+      dataJson: JSON.stringify({ id: "m0", text: `version ${i}` }),
+    }));
+    const written = { rows: new Map(before.rows), blobs: new Map() };
+    const store = createLiteCanonicalStore({
+      persistence: createFakeCanonicalPersistence(written).port,
+      enabled: true,
+      context,
+      authenticateReplica: () => undefined,
+      newId: ids("op"),
+    });
+    const encoder = createLiteCanonicalImportEncoder({
+      context,
+      newId: ids("op"),
+    });
+    const staged = new Map(before.rows);
+    {
+      const parts = encoder.importBatchParts({
+        job: importJob,
+        seq: 0,
+        operations,
+        bindingFor: () => binding,
+      });
+      const receipts = [];
+      for (const part of parts)
+        receipts.push(await store.commitLocal(part.id, part.operations));
+      const encoded = await encoder.encode(
+        countingView(staged, { batched: true }).view,
+        parts,
+      );
+      expect(encoded.parts.map((part) => part.receipt)).toEqual(receipts);
+      applyEntries(staged, encoded.entries);
+      // The record's revision prefix outgrew one 100-entry page.
+      const revisions = encoded.entries.filter((entry) =>
+        /^entries\/[^/]+\/records\//.test(entry.key),
+      );
+      expect(revisions.length).toBeGreaterThan(100);
+    }
+    expect([...staged].sort()).toEqual([...written.rows].sort());
   });
 
   it("fences the batch on the clock it encoded against", async () => {
