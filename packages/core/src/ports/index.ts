@@ -487,6 +487,24 @@ export interface PendingBlobDeletionStore {
   list(): Promise<PendingBlobDeletion[]>;
   add(keys: PendingBlobDeletion[]): Promise<void>;
   remove(keys: PendingBlobDeletion[]): Promise<void>;
+  /**
+   * Highest tombstone version whose covered registry range (versions 1..v)
+   * this store has already taken on for `scope`: every key in it is either
+   * confirmed deleted or still queued here. A repeated delete of the scope
+   * plans only above it, so it resumes instead of starting over at version 1.
+   * Null when nothing was planned (or the store predates the watermark).
+   */
+  plannedThrough?(scope: string): Promise<string | null>;
+  /**
+   * Add `keys` and raise the scope's planned watermark to `through` in one
+   * atomic write, so a crash can never record the watermark without the work
+   * it stands for.
+   */
+  enqueue?(
+    scope: string,
+    keys: PendingBlobDeletion[],
+    through: string | null,
+  ): Promise<void>;
 }
 
 // FeeVerifier was the pre-X402 hook that gated reads on grant.paymentStatus
