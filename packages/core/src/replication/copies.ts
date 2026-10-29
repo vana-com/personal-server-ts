@@ -9,7 +9,12 @@
  */
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
-import { canonicalJson, type ReplicaEnvelope } from "./envelope.js";
+import {
+  canonicalJson,
+  REPLICA_TEXT_PART_BYTES,
+  replicaTextParts,
+  type ReplicaEnvelope,
+} from "./envelope.js";
 import {
   decideCopyPromotion,
   indexEvidenceFromFacts,
@@ -45,6 +50,11 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_copies (
   reason TEXT CHECK (reason IS NULL OR reason IN ('copy_conflict','finalized_conflict')),
   CHECK ((state = 'quarantined') = (reason IS NOT NULL)),
   PRIMARY KEY (id, copy_key)
+);
+CREATE TABLE IF NOT EXISTS pdpp_replica_copy_envelope_parts (
+  id TEXT NOT NULL, copy_key TEXT NOT NULL, part INTEGER NOT NULL,
+  json TEXT NOT NULL,
+  PRIMARY KEY (id, copy_key, part)
 );
 CREATE TABLE IF NOT EXISTS pdpp_replica_copy_rejects (
   id TEXT NOT NULL, reject_key TEXT NOT NULL, claimed_copy_key TEXT,
@@ -166,11 +176,12 @@ type Row = {
   fragment_count: number;
   fragment_commitments_json: string;
   envelope_digest: string;
-  envelope_json: string;
   blobs_json: string;
   state: "pending" | "confirmed" | "quarantined";
   reason: "copy_conflict" | "finalized_conflict" | null;
 };
+const ROW_COLUMNS =
+  "id,copy_key,writer_id,batch_id,sequence,previous_json,fragment_count,fragment_commitments_json,envelope_digest,blobs_json,state,reason";
 type DispositionRow = {
   writer_id: string;
   sequence: number;
@@ -196,11 +207,38 @@ export function replicaCopies<C extends ReplicaEffectContext>(
   host: ReplicaCopiesHost<C>,
 ) {
   type Fx<T> = ReplicaEffect<T, C>;
+  // Without the envelope: a phone's SQL call returns at most about 1 MiB.
   const rows = (id: string): Fx<Row[]> =>
     sql.all<Row>(
-      "SELECT * FROM pdpp_replica_copies WHERE id=? ORDER BY copy_key",
+      `SELECT ${ROW_COLUMNS} FROM pdpp_replica_copies WHERE id=? ORDER BY copy_key`,
       id,
     );
+  /**
+   * A copy's envelope. Copies staged before the parts table keep it in
+   * `envelope_json`; later copies leave that empty and keep it in parts.
+   */
+  function* envelopeOf(id: string, copyKey: string): Fx<ReplicaEnvelope> {
+    const whole = yield* sql.get<{ envelope_json: string }>(
+      "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
+      id,
+      copyKey,
+    );
+    if (!whole) throw new Error("unknown replica copy");
+    if (whole.envelope_json)
+      return JSON.parse(whole.envelope_json) as ReplicaEnvelope;
+    let json = "";
+    for (let part = 0; ; part++) {
+      const row = yield* sql.get<{ json: string }>(
+        "SELECT json FROM pdpp_replica_copy_envelope_parts WHERE id=? AND copy_key=? AND part=?",
+        id,
+        copyKey,
+        part,
+      );
+      if (!row) break;
+      json += row.json;
+    }
+    return JSON.parse(json) as ReplicaEnvelope;
+  }
   const dispositionRow = (id: string): Fx<DispositionRow | undefined> =>
     sql.get<DispositionRow>(
       "SELECT * FROM pdpp_replica_batch_disposition WHERE id=?",
@@ -292,7 +330,7 @@ export function replicaCopies<C extends ReplicaEffectContext>(
       const row = pending[0]!;
       yield* host.preview.show(
         id,
-        JSON.parse(row.envelope_json) as ReplicaEnvelope,
+        yield* envelopeOf(id, row.copy_key),
         row.blobs_json,
       );
     } else
@@ -355,16 +393,9 @@ export function replicaCopies<C extends ReplicaEffectContext>(
     const connections = new Set<string>();
     for (const batch of chain) {
       if (batch.state === "promoted" && batch.promoted_copy_key) {
-        const promoted = yield* sql.get<{ envelope_json: string }>(
-          "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
-          batch.id,
-          batch.promoted_copy_key,
-        );
-        if (promoted)
-          for (const op of (
-            JSON.parse(promoted.envelope_json) as ReplicaEnvelope
-          ).operations)
-            connections.add(op.connectionId);
+        for (const op of (yield* envelopeOf(batch.id, batch.promoted_copy_key))
+          .operations)
+          connections.add(op.connectionId);
       }
       if (batch.state !== "terminal")
         yield* sql.run(
@@ -458,9 +489,9 @@ export function replicaCopies<C extends ReplicaEffectContext>(
           existing.fragment_commitments_json !== canonicalJson(commitments)
         )
           yield* terminate(copy.id, "finalized_conflict");
-      } else
+      } else {
         yield* sql.run(
-          "INSERT INTO pdpp_replica_copies VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',NULL)",
+          "INSERT INTO pdpp_replica_copies VALUES (?,?,?,?,?,?,?,?,?,'',?,'pending',NULL)",
           copy.id,
           copyKey,
           copy.writer,
@@ -470,9 +501,21 @@ export function replicaCopies<C extends ReplicaEffectContext>(
           copy.fragments.length,
           canonicalJson(commitments),
           copy.envelopeDigest,
-          canonicalJson(copy.envelope),
           canonicalJson(copy.blobs),
         );
+        const parts = replicaTextParts(
+          canonicalJson(copy.envelope),
+          REPLICA_TEXT_PART_BYTES,
+        );
+        for (const [part, json] of parts.entries())
+          yield* sql.run(
+            "INSERT INTO pdpp_replica_copy_envelope_parts VALUES (?,?,?,?)",
+            copy.id,
+            copyKey,
+            part,
+            json,
+          );
+      }
       // A later batch of a terminal writer chain is terminal on staging (H).
       const earlierTerminal = yield* sql.get(
         "SELECT 1 FROM pdpp_replica_batch_disposition WHERE writer_id=? AND sequence<? AND state='terminal' LIMIT 1",
@@ -614,7 +657,7 @@ export function replicaCopies<C extends ReplicaEffectContext>(
       try {
         yield* host.savepoint(
           host.importEnvelope(
-            JSON.parse(row.envelope_json) as ReplicaEnvelope,
+            yield* envelopeOf(input.id, copyKey),
             blobs,
             input.id,
           ),

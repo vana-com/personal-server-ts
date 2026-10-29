@@ -8,6 +8,7 @@ import {
 import { createLiteCanonicalStore } from "./canonical-store.js";
 import { createFakeCanonicalPersistence } from "./test-support/canonical-persistence.js";
 import { replicaEnvelopeSchema } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import { REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES } from "@opendatalabs/personal-server-ts-core/replication/limits";
 
 function device() {
   const adapter = createFakeCanonicalPersistence();
@@ -101,12 +102,56 @@ it("E9 rejects an oversized raw envelope before schema parsing", async () => {
       ...request,
       envelope: {
         ...request.envelope,
-        padding: "x".repeat(192 * 1024),
+        padding: "x".repeat(REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES),
       },
     }),
-  ).rejects.toThrow("192 KiB");
+  ).rejects.toMatchObject({ reason: "batch_too_large" });
   expect(parse).not.toHaveBeenCalled();
   parse.mockRestore();
+});
+
+it("E9b stages and promotes a received envelope above 192 KiB within the native value bound", async () => {
+  const { make } = device();
+  const store = make();
+  await provision(store);
+  const operations = Array.from({ length: 300 }, (_, index) => ({
+    ...upsert(`large-${index}`, 100 + index, `${index} ${"x".repeat(1000)}`),
+    recordKey: `key-${index}`,
+    data: { id: `key-${index}`, text: `${index} ${"x".repeat(1000)}` },
+  }));
+  const request = pending();
+  const envelope = {
+    ...request.envelope,
+    operations: [registration, ...operations],
+  };
+  expect(JSON.stringify(envelope).length).toBeGreaterThan(256 * 1024);
+
+  const staged = await store.stagePending({ ...request, envelope });
+  await store.promotePending({
+    id: request.id,
+    credential: "replica",
+    fingerprint: staged.fingerprint,
+  });
+  for (const index of [0, 299])
+    expect(
+      await make().readRecord(
+        identity.connectionId,
+        binding.stream,
+        `key-${index}`,
+        { reader: "grant" },
+      ),
+    ).toMatchObject({ data: { text: `${index} ${"x".repeat(1000)}` } });
+
+  await expect(
+    store.stagePending({
+      ...request,
+      id: "oversized-operation",
+      envelope: {
+        ...envelope,
+        operations: [registration, upsert("big", 2, "y".repeat(256 * 1024))],
+      },
+    }),
+  ).rejects.toMatchObject({ reason: "operation_too_large" });
 });
 
 it("E10 caps a stageBlob stream at the declared byte length", async () => {

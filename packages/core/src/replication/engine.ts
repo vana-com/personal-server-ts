@@ -46,6 +46,8 @@ import {
 import {
   canonicalJson,
   decodeReplicaEnvelope,
+  REPLICA_TEXT_PART_BYTES,
+  replicaTextParts,
   type EnvelopeExpectation,
   type ReplicaEnvelope,
   type ReplicaOperation,
@@ -248,6 +250,9 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_manifests_in (
 CREATE TABLE IF NOT EXISTS pdpp_transport_fragments_in (
  slot TEXT NOT NULL, position INTEGER NOT NULL, digest TEXT NOT NULL, bytes INTEGER NOT NULL,
  fragment_json TEXT, state TEXT NOT NULL DEFAULT 'ready', ${WORK}, PRIMARY KEY(slot,position));
+CREATE TABLE IF NOT EXISTS pdpp_transport_fragment_parts (
+ slot TEXT NOT NULL, position INTEGER NOT NULL, part INTEGER NOT NULL, json TEXT NOT NULL,
+ PRIMARY KEY(slot,position,part));
 CREATE INDEX IF NOT EXISTS pdpp_manifests_in_batch ON pdpp_transport_manifests_in(writer,batch);
 CREATE INDEX IF NOT EXISTS pdpp_manifests_in_checked ON pdpp_transport_manifests_in(evidence_checked) WHERE state='imported';
 CREATE TABLE IF NOT EXISTS pdpp_transport_imported (
@@ -3282,6 +3287,39 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
       row,
     });
   /** Make matching waits due now. Durable: survives a lost notification. */
+  /**
+   * A received fragment's JSON. Fragments fetched before the parts table
+   * keep it in `fragment_json`; later ones leave that empty and use parts.
+   */
+  function* fragmentJson(slot: string, position: number): Fx<string> {
+    const whole = yield* sql.get<{ fragment_json: string | null }>(
+      "SELECT fragment_json FROM pdpp_transport_fragments_in WHERE slot=? AND position=?",
+      slot,
+      position,
+    );
+    if (whole?.fragment_json) return whole.fragment_json;
+    let json = "";
+    for (let part = 0; ; part++) {
+      const row = yield* sql.get<{ json: string }>(
+        "SELECT json FROM pdpp_transport_fragment_parts WHERE slot=? AND position=? AND part=?",
+        slot,
+        position,
+        part,
+      );
+      if (!row) return json;
+      json += row.json;
+    }
+  }
+  function* dropFragments(slot: string): Fx<void> {
+    yield* sql.run(
+      "DELETE FROM pdpp_transport_fragment_parts WHERE slot=?",
+      slot,
+    );
+    yield* sql.run(
+      "DELETE FROM pdpp_transport_fragments_in WHERE slot=?",
+      slot,
+    );
+  }
   function* wake(key: string, at: number): Fx<number> {
     return (yield* sql.run(
       "UPDATE pdpp_transport_import_work SET next_attempt=? WHERE outcome='wait' AND dependency=? AND next_attempt>?",
@@ -3601,9 +3639,26 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
           receipt: { phase: "fetch", key: item.id },
         },
         plan: function* () {
-          yield* sql.run(
-            "UPDATE pdpp_transport_fragments_in SET fragment_json=? WHERE slot=? AND position=?",
+          // In parts: a Node fragment is 4 MiB, a phone SQL value 1 MiB.
+          const parts = replicaTextParts(
             canonicalJson(fragment),
+            REPLICA_TEXT_PART_BYTES,
+          );
+          yield* sql.run(
+            "DELETE FROM pdpp_transport_fragment_parts WHERE slot=? AND position=?",
+            row.slot,
+            row.position,
+          );
+          for (const [part, json] of parts.entries())
+            yield* sql.run(
+              "INSERT INTO pdpp_transport_fragment_parts VALUES (?,?,?,?)",
+              row.slot,
+              row.position,
+              part,
+              json,
+            );
+          yield* sql.run(
+            "UPDATE pdpp_transport_fragments_in SET fragment_json='' WHERE slot=? AND position=?",
             row.slot,
             row.position,
           );
@@ -3774,13 +3829,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
               if (admission && typeof reservation !== "function")
                 throw new ReplicaResourceBusyError();
               yield JSON.parse(
-                (await query(
-                  sql.get<{ fragment_json: string }>(
-                    "SELECT fragment_json FROM pdpp_transport_fragments_in WHERE slot=? AND position=?",
-                    slot,
-                    row.position,
-                  ),
-                ))!.fragment_json,
+                await query(fragmentJson(slot, row.position)),
               ) as ReplicaFragment;
             } finally {
               if (typeof reservation === "function") reservation();
@@ -3825,10 +3874,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
       group.slot,
     );
     // The receiver retains its own copy: the fragment bodies are scratch now.
-    yield* sql.run(
-      "DELETE FROM pdpp_transport_fragments_in WHERE slot=?",
-      group.slot,
-    );
+    yield* dropFragments(group.slot);
     yield* wake(`predecessor:${group.writer}:${manifest.sequence}`, now());
   }
   /**
@@ -3889,10 +3935,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
           batch,
         );
         const at = now() + defaultReplicaBackoff(refetch.attempts + 1);
-        yield* sql.run(
-          "DELETE FROM pdpp_transport_fragments_in WHERE slot=?",
-          group.slot,
-        );
+        yield* dropFragments(group.slot);
         yield* sql.run(
           `UPDATE pdpp_transport_manifests_in SET manifest_json=NULL,data_hash=NULL,metadata_hash=NULL,batch=NULL,sequence=NULL,state='ready',${RESET_WORK},next_attempt=? WHERE slot=?`,
           at,
@@ -4814,6 +4857,11 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
               `SELECT slot FROM pdpp_transport_manifests_in WHERE state='quarantined' AND reason IN ${reasons}`,
             )).map((r) => r.slot);
             for (const slot of slots) {
+              yield* sql.run(
+                "DELETE FROM pdpp_transport_fragment_parts WHERE slot=? AND position IN (SELECT position FROM pdpp_transport_fragments_in WHERE slot=? AND state='quarantined')",
+                slot,
+                slot,
+              );
               yield* sql.run(
                 `UPDATE pdpp_transport_fragments_in SET state='ready',fragment_json=NULL,${RESET_WORK},next_attempt=0 WHERE slot=? AND state='quarantined'`,
                 slot,

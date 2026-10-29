@@ -195,15 +195,19 @@ export {
   type LiteVisibleRecord,
   type LiteOperationDraft,
 } from "./canonical-store.js";
-export type {
-  LiteCanonicalPersistence,
-  LiteCanonicalTransaction,
-  LiteBlobDescriptor,
-  LiteStorageEntry,
-  LiteStoragePage,
+export {
+  LITE_CANONICAL_BATCH_BYTES,
+  LITE_CANONICAL_MAX_OPERATION_BYTES,
+  LITE_CANONICAL_MAX_VALUE_BYTES,
+  type LiteCanonicalPersistence,
+  type LiteCanonicalTransaction,
+  type LiteBlobDescriptor,
+  type LiteStorageEntry,
+  type LiteStoragePage,
 } from "./canonical-persistence.js";
 export {
   LITE_MAX_FRAGMENT_BYTES,
+  LITE_REPLICA_SQL_BYTES,
   LITE_REPLICATION_LIMITS,
   LiteReplicaTransferError,
   replicationBootConfigProblem,

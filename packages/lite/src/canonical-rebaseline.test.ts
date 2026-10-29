@@ -15,6 +15,7 @@ import {
   createLiteCanonicalStore,
   LiteCanonicalRefusal,
 } from "./canonical-store.js";
+import { LITE_CANONICAL_MAX_OPERATION_BYTES } from "./canonical-persistence.js";
 import {
   createFakeCanonicalPersistence,
   fakeCanonicalDisk,
@@ -257,16 +258,31 @@ describe("Lite canonical rebaseline", () => {
     });
   });
 
-  it("refuses a received batch over the canonical bound with a typed reason", async () => {
+  it("imports a received batch over 192 KiB and refuses an operation over the value bound", async () => {
     const { store } = await written();
     const large = Array.from({ length: 4 }, (_, i) => ({
       ...record(`x${i}`, "x".repeat(60_000)),
       revision: { counter: 60 + i, writerId: "device-b", operationId: `x${i}` },
     }));
+    await expect(
+      store.import({
+        id: "large",
+        credential: "replica",
+        envelope: envelope(large),
+      }),
+    ).resolves.toBeDefined();
+    const oversized = {
+      ...record("y", "y".repeat(LITE_CANONICAL_MAX_OPERATION_BYTES)),
+      revision: { counter: 70, writerId: "device-b", operationId: "y" },
+    };
     const refusal = await store
-      .import({ id: "large", credential: "replica", envelope: envelope(large) })
+      .import({
+        id: "oversized",
+        credential: "replica",
+        envelope: envelope([oversized]),
+      })
       .catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(LiteCanonicalRefusal);
-    expect(refusal).toMatchObject({ reason: "batch_too_large" });
+    expect(refusal).toMatchObject({ reason: "operation_too_large" });
   });
 });

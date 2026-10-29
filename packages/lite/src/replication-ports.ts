@@ -50,6 +50,14 @@ export const LITE_REPLICATION_LIMITS: ReplicationLimits = {
 export const LITE_MAX_FRAGMENT_BYTES = 1024 * 1024;
 
 /**
+ * The most one `sql` call may carry in its parameters or return in its rows
+ * (§4.3): one fragment-sized value plus statement and row overhead. The
+ * native side fails a larger call with `too-large`, so replication state
+ * that can grow past it is kept in rows below it.
+ */
+export const LITE_REPLICA_SQL_BYTES = LITE_MAX_FRAGMENT_BYTES + 64 * 1024;
+
+/**
  * Why a boot configuration cannot run, or `undefined` when it can. PS refuses
  * an invalid value rather than clamping it.
  */

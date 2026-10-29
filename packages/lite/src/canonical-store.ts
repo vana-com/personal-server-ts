@@ -2,6 +2,7 @@ import {
   canonicalJson,
   replicaEnvelopeSchema,
   replicaOperationSchema,
+  replicaTextParts,
   type ReplicaOperation,
   type ReplicaEnvelope,
   type RecordOperation,
@@ -15,6 +16,10 @@ import {
   type PdppRecordRow,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records/portable";
 import { sha256, toBytes } from "viem";
+import {
+  REPLICA_MAX_OPERATIONS,
+  REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES,
+} from "@opendatalabs/personal-server-ts-core/replication/limits";
 import { createReplicaRecordReducer } from "@opendatalabs/personal-server-ts-core/replication/record-reducer";
 import {
   reissuedFrom,
@@ -37,11 +42,13 @@ import {
   type ReplicaReader,
   type ReplicaVisibilityPolicy,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
-import type {
-  LiteCanonicalPersistence,
-  LiteCanonicalTransaction,
-  LiteBlobDescriptor,
-  LiteStagingId,
+import {
+  LITE_CANONICAL_BATCH_BYTES,
+  LITE_CANONICAL_MAX_OPERATION_BYTES,
+  type LiteCanonicalPersistence,
+  type LiteCanonicalTransaction,
+  type LiteBlobDescriptor,
+  type LiteStagingId,
 } from "./canonical-persistence.js";
 
 /**
@@ -54,6 +61,7 @@ export class LiteCanonicalRefusal extends Error {
   constructor(
     readonly reason:
       | "batch_too_large"
+      | "operation_too_large"
       | "wrong_owner"
       | "connection_binding_mismatch"
       | "partition_too_large"
@@ -101,7 +109,10 @@ export type LiteVisibleRecord = PdppRecordRow;
 interface PendingBatch {
   id: string;
   fingerprint: string;
-  envelope: ReplicaEnvelope;
+  /** Batches staged before envelope parts keep the envelope here. */
+  envelope?: ReplicaEnvelope;
+  /** How many `pendingPartKey` values hold the canonical envelope JSON. */
+  parts?: number;
   state: "pending" | "quarantined" | "confirmed";
   reason?: string;
   blobs: LiteBlobDescriptor[];
@@ -135,6 +146,10 @@ async function checkLayout(tx: LiteCanonicalTransaction) {
         : `canonical layout ${layout} is no longer supported (this build reads ${LAYOUT_VERSION}); clear the canonical store and import again`,
     );
 }
+/** A Node batch targets 32 MiB, so a pending envelope is kept in parts. */
+const pendingPartKey = (id: string, part: number) =>
+  `pending-envelopes/${keyDigest(id)}/${String(part).padStart(8, "0")}`;
+const PENDING_PART_BYTES = 128 * 1024;
 /** Bump when a derived pending index changes; older databases need `retry`. */
 const PENDING_INDEX_VERSION = 3;
 const PREVIEW_BLOB_REFS = "preview-blob-refs/";
@@ -298,6 +313,48 @@ async function logPage(
     nextAfterSequence: entries.at(-1)?.sequence ?? reported,
     hasMore: page.after !== undefined || entries.length < page.entries.length,
   };
+}
+
+/**
+ * Bounds a received envelope part by part before schema parsing builds it:
+ * its header, its operation count and each operation. The whole envelope has
+ * no bound, because the store keeps it in parts.
+ */
+function refuseOversizedEnvelope(raw: unknown) {
+  const { operations, ...header } = (raw ?? {}) as { operations?: unknown };
+  if (
+    encoder.encode(canonicalJson(header)).length >
+      REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES ||
+    (Array.isArray(operations) && operations.length > REPLICA_MAX_OPERATIONS)
+  )
+    throw new LiteCanonicalRefusal(
+      "batch_too_large",
+      "replica envelope exceeds its header or operation count bound",
+    );
+  if (Array.isArray(operations))
+    for (const op of operations)
+      if (
+        encoder.encode(canonicalJson(op)).length >
+        LITE_CANONICAL_MAX_OPERATION_BYTES
+      )
+        throw new LiteCanonicalRefusal(
+          "operation_too_large",
+          "replica operation exceeds the native value bound",
+        );
+}
+/** A pending batch's envelope, from its parts or as staged before them. */
+async function pendingEnvelope(
+  tx: LiteCanonicalTransaction,
+  batch: PendingBatch,
+): Promise<ReplicaEnvelope> {
+  if (batch.envelope) return batch.envelope;
+  let json = "";
+  for (let part = 0; part < (batch.parts ?? 0); part++) {
+    const text = await tx.get(pendingPartKey(batch.id, part));
+    if (text === undefined) throw new Error("pending envelope part missing");
+    json += text;
+  }
+  return replicaEnvelopeSchema.parse(JSON.parse(json));
 }
 
 /**
@@ -1011,6 +1068,7 @@ export function createLiteCanonicalStore(deps: {
       (!local && deps.authenticateReplica(input.credential) !== context.owner)
     )
       throw new Error("replica authority required for owner");
+    if (!local) refuseOversizedEnvelope(input.envelope);
     const envelope = local
       ? undefined
       : replicaEnvelopeSchema.parse(input.envelope);
@@ -1022,7 +1080,7 @@ export function createLiteCanonicalStore(deps: {
       throw new LiteCanonicalRefusal("wrong_owner", "wrong replica owner");
     // A local request id also fences the original, unrevised inputs after lost ack.
     const encoded = canonicalJson(local ? input.operations : envelope);
-    if (encoder.encode(encoded).length > 192 * 1024)
+    if (local && encoder.encode(encoded).length > LITE_CANONICAL_BATCH_BYTES)
       throw new LiteCanonicalRefusal(
         "batch_too_large",
         "canonical batch exceeds 192 KiB; split before commit",
@@ -1540,7 +1598,7 @@ export function createLiteCanonicalStore(deps: {
       string,
       Map<string, { stream: string; key: string }>
     >();
-    for (const op of batch.envelope.operations) {
+    for (const op of (await pendingEnvelope(tx, batch)).operations) {
       await put(
         tx,
         `pending-index/retained-connections/${keyDigest(op.connectionId)}`,
@@ -1776,12 +1834,7 @@ export function createLiteCanonicalStore(deps: {
       const context = authenticate(input.credential);
       if (!input.id || input.id.length > 256)
         throw new Error("invalid pending batch id");
-      const rawEncoded = canonicalJson(input.envelope);
-      if (encoder.encode(rawEncoded).length > 192 * 1024)
-        throw new LiteCanonicalRefusal(
-          "batch_too_large",
-          "canonical batch exceeds 192 KiB; split before commit",
-        );
+      refuseOversizedEnvelope(input.envelope);
       const envelope = replicaEnvelopeSchema.parse(input.envelope);
       if (
         envelope.owner !== context.owner ||
@@ -1841,15 +1894,22 @@ export function createLiteCanonicalStore(deps: {
             ].map((blob) => [blob.blobId, blob]),
           ).values(),
         ];
+        // A restaged batch keeps the envelope it stored first.
+        const parts = prior
+          ? undefined
+          : replicaTextParts(canonicalJson(envelope), PENDING_PART_BYTES);
+        for (const [part, text] of (parts ?? []).entries())
+          await tx.put(pendingPartKey(input.id, part), text);
         const batch: PendingBatch = {
+          ...prior,
           id: input.id,
-          envelope,
           fingerprint,
           state: "pending",
           blobs,
+          ...(parts && { parts: parts.length }),
         };
         await put(tx, path, batch);
-        await indexPending(tx, batch, true, context);
+        await indexPending(tx, { ...batch, envelope }, true, context);
         return { fingerprint, state: "pending" as const };
       });
     },
@@ -1886,12 +1946,12 @@ export function createLiteCanonicalStore(deps: {
         }
         if (value.state === "quarantined")
           throw new Error("pending batch quarantined");
-        return value;
+        return pendingEnvelope(tx, value);
       });
       if (!batch) throw new Error("divergent finalized commitment");
       return commit({
         id: input.id,
-        envelope: batch.envelope,
+        envelope: batch,
         credential: input.credential,
         promotion: input,
       });

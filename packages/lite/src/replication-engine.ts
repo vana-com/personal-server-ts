@@ -57,11 +57,12 @@ import {
   type ReplicaEnvelope,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { Admission } from "@opendatalabs/personal-server-ts-core/replication/limits";
-import type {
-  LiteBlobDescriptor,
-  LiteCanonicalPersistence,
-  LiteCanonicalTransaction,
-  LiteStagingId,
+import {
+  LITE_CANONICAL_MAX_OPERATION_BYTES,
+  type LiteBlobDescriptor,
+  type LiteCanonicalPersistence,
+  type LiteCanonicalTransaction,
+  type LiteStagingId,
 } from "./canonical-persistence.js";
 import {
   createLiteCanonicalStore,
@@ -738,7 +739,17 @@ export function createLiteReplicaEngine(
   // Constructing does no storage work: the first call creates the engine,
   // which migrates. A runtime that is off never calls it.
   let created: ReplicaEngine | undefined;
-  const engine = () => (created ??= createReplicaEngine(host, config));
+  // The phone admits no operation its canonical store cannot retain.
+  const maxOperationBytes = Math.min(
+    config.resourceLimits?.maxOperationBytes ??
+      LITE_CANONICAL_MAX_OPERATION_BYTES,
+    LITE_CANONICAL_MAX_OPERATION_BYTES,
+  );
+  const engine = () =>
+    (created ??= createReplicaEngine(host, {
+      ...config,
+      resourceLimits: { ...config.resourceLimits, maxOperationBytes },
+    }));
   return {
     rotateWriter: (request = {}) =>
       run(
