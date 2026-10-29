@@ -38,7 +38,12 @@ const declarations: MergeContext["declarations"] = [
 ];
 const directories: string[] = [];
 const devices: ReturnType<typeof device>[] = [];
-function device(registered = true, entries = declarations) {
+function device(
+  registered = true,
+  entries = declarations,
+  /** The bindings it writes under; it trusts every one of `entries`. */
+  current = entries,
+) {
   const directory = mkdtempSync(join(tmpdir(), "pdpp-receiver-"));
   directories.push(directory);
   const path = join(directory, "db.sqlite");
@@ -53,7 +58,7 @@ function device(registered = true, entries = declarations) {
     });
   store.replication.beginBaseline({
     ...config,
-    declarations: entries.map(({ sourceId, binding }) => ({
+    declarations: current.map(({ sourceId, binding }) => ({
       sourceId,
       binding,
     })),
@@ -902,11 +907,16 @@ it("keeps unknown-declaration invalidation pending without erasing a trusted com
   expect(d.store.listStreamCompletions("conn_a")).toEqual(receipt);
 });
 
-it("makes competing known declaration completions unavailable instead of overwriting one by iteration order", () => {
+it("makes competing known declaration shapes unavailable instead of overwriting one by iteration order", () => {
   const operations = completedReplica();
   const d = device();
   send(d, operations);
-  const competing = { ...binding, digest: `sha256:${"c".repeat(64)}` };
+  // Another shape of the stream (its semantics), not another version.
+  const competing = {
+    ...binding,
+    digest: `sha256:${"c".repeat(64)}`,
+    semantics: "append_only" as const,
+  };
   d.declare([
     ...declarations,
     { sourceId, binding: competing, validateData: () => true },
@@ -925,6 +935,74 @@ it("makes competing known declaration completions unavailable instead of overwri
   send(d, second);
   expect(value(d)).toBeUndefined();
   expect(d.store.listStreamCompletions("conn_a")).toEqual([]);
+});
+
+it("takes a newer version's records and completion after a peer rebinds the stream", () => {
+  const source = device();
+  const replace = (text: string) =>
+    source.store.replaceStream({
+      instance: "conn_a",
+      stream: "messages",
+      method: "collector",
+      generation: 1,
+      emittedAt: at,
+      envelopes: [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          data: { id: "a", text },
+          emitted_at: at,
+        },
+      ],
+      primaryKey: ["id"],
+      sourceCollectedAt: at,
+    });
+  replace("snapshot");
+  const before = all(source);
+  const upgraded = {
+    ...binding,
+    digest: `sha256:${"c".repeat(64)}`,
+    version: "2",
+  };
+  source.store.replication.beginBaseline({
+    owner: "owner",
+    declarations: [{ sourceId, binding: upgraded }],
+  });
+  replace("upgraded");
+  const after = all(source).slice(before.length);
+  // The rebinding journaled nothing; the new writes name the new version.
+  const versions = after.flatMap((op) =>
+    "declaration" in op ? [op.declaration.version] : [],
+  );
+  expect(versions.length).toBeGreaterThan(1);
+  expect(new Set(versions)).toEqual(new Set(["2"]));
+  const trusting = [
+    ...declarations,
+    {
+      sourceId,
+      binding: upgraded,
+      validateData: (data: Record<string, unknown>) =>
+        typeof data.id === "string",
+    },
+  ];
+  const inOrder = device(true, trusting, declarations);
+  send(inOrder, before);
+  expect(value(inOrder)?.data.text).toBe("snapshot");
+  expect(inOrder.store.listStreamCompletions("conn_a")).toHaveLength(1);
+  send(inOrder, after);
+  const reversed = device(true, trusting, declarations);
+  send(reversed, after);
+  send(reversed, before);
+  // `writeSeq` counts local writes, so it depends on arrival order.
+  const completions = (d: { store: typeof source.store }) =>
+    d.store
+      .listStreamCompletions("conn_a")
+      .map(({ writeSeq: _local, ...completion }) => completion);
+  for (const d of [inOrder, reversed]) {
+    expect(value(d)?.data.text).toBe("upgraded");
+    expect(completions(d)).toEqual(completions(source));
+  }
 });
 
 it("makes a completion unavailable, not the import a failure, when live rows do not fit its declaration's key", () => {

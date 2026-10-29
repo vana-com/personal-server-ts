@@ -36,8 +36,13 @@ immutable acquisition method, generation, and persisted revision. Record
 identity adds stream and canonical record key. The trusted retained declaration
 binds its digest, version, schema digest, semantics and ordered primary key.
 The host supplies data validation against that exact retained schema; unknown
-declarations stay pending during merge. The decoder requires an exact known
-binding. It does not fetch declarations or verify their digest itself.
+declarations stay pending during merge. Versions of one stream with the same
+shape (stream, semantics, primary key; `declarationShape`) are one record set:
+they merge by revision, and each operation validates against its own schema. A
+key whose candidates name two shapes is quarantined. `rebinding.ts` decides
+what a changed set of retained declarations does to a database. The decoder
+requires an exact known binding. It does not fetch declarations or verify their
+digest itself.
 
 Connection registration starts generation 1. A reset advances exactly one
 generation and retains the method; incompatible methods or sources fail closed.

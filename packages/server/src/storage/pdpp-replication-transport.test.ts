@@ -1346,10 +1346,18 @@ it("keeps unknown declarations pending and refuses wrong owner/declaration bindi
   b.declarations([]);
   await b.cycle();
   expect(b.get()).toBeUndefined();
-  // The unknown declaration is a durable Wait on the batch's import work.
+  // The batch imports; its operations stay pending, and the unknown
+  // declaration is a durable Wait on the reconcile, not on the writer's chain.
   expect(
     importWork(b).some((r) => r.dependency?.startsWith("declaration:")),
-  ).toBe(true);
+  ).toBe(false);
+  expect(
+    b.db
+      .prepare(
+        "SELECT dependency FROM pdpp_transport_phase_state WHERE phase='reconcile'",
+      )
+      .get(),
+  ).toEqual({ dependency: expect.stringMatching(/^declaration:/) });
   b.declarations(expected.declarations);
   await cycles([b], 2);
   expect(b.get()).toEqual(a.get());
@@ -1802,9 +1810,14 @@ it("E8 re-evaluates an older resource_unsupported outcome after the limits versi
   const net = network();
   const a = device(net, { preexisting: "recheck limits" });
   await cycles([a], 12);
+  a.put("tail record", "tail");
+  await cycles([a], 12);
+  // B retains the second batch while its predecessor is unreachable.
+  const [first] = outbox(a);
+  net.failGet.add(first!.slot);
   const b = device(net);
-  b.declarations([]);
   await cycles([b], 12);
+  expect(b.get()).toBeUndefined();
   const retained = b.db
     .prepare(
       `SELECT m.slot,m.writer,m.batch FROM pdpp_transport_manifests_in m
@@ -1828,7 +1841,7 @@ it("E8 re-evaluates an older resource_unsupported outcome after the limits versi
        WHERE writer=? AND batch=?`,
     )
     .run(retained.writer, retained.batch);
-  b.declarations(expected.declarations);
+  net.failGet.clear();
   b.reopen();
 
   expect(
@@ -1840,6 +1853,7 @@ it("E8 re-evaluates an older resource_unsupported outcome after the limits versi
   ).toEqual({ outcome: null, resource_limits_version: null });
   await cycles([b], 12);
   expect(b.get()).toEqual(a.get());
+  expect(b.get("tail")).toEqual(a.get("tail"));
 });
 
 it("is disabled by default and rejects a configured limit above the real storage cap", async () => {
@@ -3576,9 +3590,19 @@ it("A3b-1 releases envelope reservations even when staging abort throws and the 
   const budget = new ReplicaByteBudget(8 * 1024);
   let abortThrows = 0;
   let heldAtAbort = 0;
+  // The first import that holds more than the budget fails once after
+  // reading its payload, so staging aborts with every reservation held.
+  let failed = false;
   const receiver = device(net, {
     copyOf: template,
     worker: {
+      expected: () => {
+        if (!failed && budget.reserved > budget.maxBytes) {
+          failed = true;
+          throw new Error("transient import failure");
+        }
+        return expected;
+      },
       resourceBudget: budget,
       resourceLimits: { maxManifestCiphertextBytes: 1024 },
       createStagingStore(
@@ -3599,12 +3623,10 @@ it("A3b-1 releases envelope reservations even when staging abort throws and the 
       },
     },
   });
-  receiver.declarations([]);
   for (let i = 0; i < 24 && abortThrows === 0; i++) await cycles([receiver], 1);
   expect(abortThrows).toBe(1);
   expect(heldAtAbort).toBeGreaterThan(budget.maxBytes);
   expect(budget.reserved).toBe(0);
-  receiver.declarations(expected.declarations);
   await cycles([receiver], 24);
   expect(receiver.get()).toEqual(source.get());
   expect(budget.reserved).toBe(0);

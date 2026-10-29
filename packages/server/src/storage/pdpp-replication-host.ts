@@ -143,18 +143,24 @@ export function createNodeReplication(input: {
   const environment = replicaEnvironmentForChain(input.chainId);
   if (!environment)
     return { state: "blocked", reason: `unsupported_chain:${input.chainId}` };
-  // The first baseline freezes the binding set. Never freeze an empty one.
+  // The first baseline starts binding generation 1. Never start an empty one.
   if (input.declarations.length === 0)
     return { state: "blocked", reason: "no_retained_declarations" };
   const owner = replicaPartitionOwner(input.owner) as `0x${string}`;
   let context: ReturnType<typeof replicaDeclarationContext>;
   let ports: NodeReplicationPorts;
   const store = createReplicaRecordStore(input.db);
-  const baseline = () =>
-    store.replication.beginBaseline({
+  // After a baseline or rebinding, trust every binding the database retained
+  // (host contract §4.5): own operations in flight and peers that have not
+  // upgraded yet still name the older ones.
+  const baseline = () => {
+    store.replication.beginBaseline({ owner, declarations: context.current });
+    context = replicaDeclarationContext(
       owner,
-      declarations: [...context.expected.declarations],
-    });
+      input.declarations,
+      store.replication.declarationHistory(),
+    );
+  };
   const baselined = () =>
     input.db
       .prepare("SELECT 1 FROM pdpp_replica_settings WHERE id = 1")
@@ -162,9 +168,10 @@ export function createNodeReplication(input: {
   try {
     context = replicaDeclarationContext(owner, input.declarations);
     ports = input.ports(owner);
-    // An existing baseline must match now: idempotent for the same bindings,
-    // refused for different ones. A first baseline waits for the writer
-    // identity (see `stepper`).
+    // An existing baseline takes this boot's bindings now: idempotent for the
+    // same set, a new binding generation for an upgraded or added
+    // declaration, refused for a changed stream shape. A first baseline waits
+    // for the writer identity (see `stepper`).
     if (baselined()) baseline();
   } catch (error) {
     return {

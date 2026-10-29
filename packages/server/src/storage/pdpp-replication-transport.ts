@@ -592,6 +592,23 @@ export function createReplicaTransportWorker(deps: {
   }
 
   /**
+   * What this device's own operations may name: the host's trusted set plus
+   * every binding the journal retained. An operation captured before a
+   * rebinding keeps its binding and still publishes, even from a host that
+   * passes only its current bindings.
+   */
+  function ownBindings(): EnvelopeExpectation {
+    const expected = deps.expected();
+    return {
+      owner: expected.owner,
+      declarations: [
+        ...expected.declarations,
+        ...deps.exporter.declarationHistory(),
+      ],
+    };
+  }
+
+  /**
    * One validated authority context for every phase: the expected owner, the
    * persisted binding, the transport port's owner and the writer identity's
    * owner must agree. Checked before any phase runs, so a wrong-owner reopen
@@ -1732,7 +1749,7 @@ export function createReplicaTransportWorker(deps: {
               (row) => JSON.parse(row.operation_json!) as ReplicaOperation,
             ),
           }),
-          deps.expected(),
+          ownBindings(),
         );
         const token = randomUUID();
         const s = state();
@@ -3323,6 +3340,20 @@ export function createReplicaTransportWorker(deps: {
    * §3 "Coordinator step"). Runs inside the import outcome transaction, over
    * the durable copies, facts and disposition it commits with.
    */
+  /** The declarations operations name that the host does not trust yet. */
+  function untrustedDeclarations(operations: readonly ReplicaOperation[]) {
+    const trusted = deps.expected().declarations;
+    return operations.flatMap((op) =>
+      "declaration" in op &&
+      !trusted.some(
+        (entry) =>
+          entry.sourceId === op.sourceId &&
+          canonicalJson(entry.binding) === canonicalJson(op.declaration),
+      )
+        ? [{ sourceId: op.sourceId, binding: op.declaration }]
+        : [],
+    );
+  }
   function decideImport(
     group: Group,
     manifest: ReplicaManifest,
@@ -3400,6 +3431,24 @@ export function createReplicaTransportWorker(deps: {
               key: `${writer}:${manifest.sequence - 1}`,
             },
           };
+        // Operations under an untrusted declaration are now retained but
+        // pending: reconcile reports that wait (host contract §4.5).
+        const promoted = db
+          .prepare(
+            "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
+          )
+          .get(id, decision.copyKey) as { envelope_json: string } | undefined;
+        const [untrusted] = promoted
+          ? untrustedDeclarations(
+              (JSON.parse(promoted.envelope_json) as ReplicaEnvelope)
+                .operations,
+            )
+          : [];
+        if (untrusted)
+          reconcile.wake?.(
+            `declaration:${untrusted.sourceId}:${untrusted.binding.stream}`,
+            now(),
+          );
         acknowledge(group, manifest);
         return progress;
       }
@@ -3632,28 +3681,20 @@ export function createReplicaTransportWorker(deps: {
             authorized.writers,
           );
           if (misattributed) return refuse(misattributed);
-          // Trusted retained declarations, never claims copied from the envelope.
-          // An unknown declaration is a dependency the host can supply later.
+          // Trusted retained declarations, never claims copied from the
+          // envelope. An operation under a declaration this host does not
+          // trust (a peer upgraded first, or added a connector) is retained
+          // without trust: the merge keeps it pending and reconcile reports
+          // the declaration wait until the host supplies it. It must not stop
+          // the writer's chain, or one upgrade would hold back every later
+          // batch of that writer (host contract §4.5).
           const expected = deps.expected();
-          const missing = payload.envelope.operations.find(
-            (op) =>
-              "declaration" in op &&
-              !expected.declarations.some(
-                (entry) =>
-                  entry.sourceId === op.sourceId &&
-                  canonicalJson(entry.binding) ===
-                    canonicalJson(op.declaration),
-              ),
-          );
-          if (missing && "declaration" in missing)
-            return verdict({
-              tag: "wait",
-              dependency: {
-                kind: "declaration",
-                key: `${missing.sourceId}:${missing.declaration.stream}`,
-              },
-            });
-          decodeReplicaEnvelope(canonicalJson(payload.envelope), expected);
+          const untrusted = untrustedDeclarations(payload.envelope.operations);
+          // Decoded only for shape; trust is decided by the merge.
+          decodeReplicaEnvelope(canonicalJson(payload.envelope), {
+            owner: expected.owner,
+            declarations: [...expected.declarations, ...untrusted],
+          });
           const stagedBlobs = payload.blobs.map((blob, index) => {
             let target = stagedObjects.get(index);
             if (!target) {

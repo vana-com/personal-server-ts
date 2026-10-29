@@ -262,22 +262,41 @@ it("blocks without persisting anything it cannot keep", () => {
     ).toBeUndefined();
 });
 
-it("refuses a later, different declaration set on a baselined database", async () => {
+it("rebinds an upgraded declaration on a baselined database and refuses a reshaped one", async () => {
   const net = network();
   const first = host(net);
   await baselineOnce(first);
-  const upgraded = createNodeReplication({
-    db: first.db,
-    owner,
-    chainId: REPLICA_TEST_CHAIN_ID,
-    declarations: [{ ...declaration, version: "2" }],
-    serverAccount: createTestReplicaSigner(),
-    ports: () => ({ transport: net.port, roster: net.roster.port }),
-    logger,
-    timers: manualTimers,
-  });
-  expect(upgraded).toEqual({
+  const boot = (declarations: DeclarationSnapshot[]) =>
+    createNodeReplication({
+      db: first.db,
+      owner,
+      chainId: REPLICA_TEST_CHAIN_ID,
+      declarations,
+      serverAccount: createTestReplicaSigner(),
+      ports: () => ({ transport: net.port, roster: net.roster.port }),
+      logger,
+      timers: manualTimers,
+    });
+  const generation = () =>
+    first.db
+      .prepare(
+        "SELECT max(generation) AS g FROM pdpp_replica_binding_generations",
+      )
+      .get() as { g: number };
+  const upgraded = { ...declaration, version: "2", digest: "d".repeat(64) };
+  expect(boot([upgraded]).state).toBe("started");
+  expect(generation()).toEqual({ g: 2 });
+  // The same bindings again are idempotent.
+  expect(boot([upgraded]).state).toBe("started");
+  expect(generation()).toEqual({ g: 2 });
+  const reshaped = {
+    ...upgraded,
+    version: "3",
+    streams: [{ ...upgraded.streams[0], primary_key: ["text"] }],
+  };
+  expect(boot([reshaped])).toEqual({
     state: "blocked",
-    reason: "replication binding is immutable",
+    reason: `replication rebinding refused: ${SOURCE} stream messages changed its semantics or primary key`,
   });
+  expect(generation()).toEqual({ g: 2 });
 });

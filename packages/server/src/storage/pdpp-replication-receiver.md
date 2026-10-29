@@ -2,7 +2,7 @@
 
 `createReplicaReceiver` is an internal SQLite port. With `replication.enabled`, the server bootstrap constructs it through `createNodeReplication` (`pdpp-replication-host.ts`); a flag-off boot does not. The host supplies the database's owner, a replica-specific credential verifier, and retained declaration bindings with validators for their exact schemas. The verifier must establish the owner independently of the envelope and must refuse collector credentials. This slice supplies no credential issuance or network transport.
 
-Call `store.replication.beginBaseline` before importing. Its immutable owner binding must match the receiver. The receiver combines original local baseline/tail operations with durably retained imports, then calls the core `planReplicaMerge`. Imported operations retain their original writer, operation ID, counter and payload. They never enter either outbound journal. The local Lamport clock advances beyond observed imports before a later local mutation.
+Call `store.replication.beginBaseline` before importing. Its immutable owner must match the receiver. The receiver combines original local baseline/tail operations with durably retained imports, then calls the core `planReplicaMerge`. Imported operations retain their original writer, operation ID, counter and payload. They never enter either outbound journal. The local Lamport clock advances beyond observed imports before a later local mutation.
 
 ## Local authority
 

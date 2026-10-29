@@ -14,13 +14,15 @@ Missing source, method or declaration metadata fails the whole baseline. An
 operator must resolve legacy orphan rows before enabling replication; the export
 never guesses identity from a stream name or silently skips a row.
 
-An immediate SQLite transaction persists the immutable owner/declaration binding,
+An immediate SQLite transaction persists the immutable owner and binding generation 1,
 allocates original replica revisions, writes pinned operation values and blob
 bytes, records every baseline member, and commits a watermark. Other DB handles
 cannot commit a write inside this fence. A writer that ran earlier is included;
 a writer that runs later sees the persisted configuration and captures a tail
 operation in its canonical transaction. Repeating enablement returns the same
-watermark. A different configuration is refused. The original Slice 1 journal is
+watermark. A different owner is refused. Changed declarations start a new
+binding generation and journal nothing; every retained binding stays trusted
+(host contract §4.5). A changed stream shape is refused. The original Slice 1 journal is
 retained as local mutation evidence; its offsets do not become replica revisions.
 
 The baseline includes all current rows, including record tombstones, all bound

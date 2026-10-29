@@ -502,6 +502,49 @@ yet the peer, pending and server fields above.
 | Stopping I/O         | Adapter      | Honours the signal                                   |
 | Durable effects      | Phase commit | One transaction per verdict (`coordinator.ts:52-88`) |
 
+### 4.5 Declaration upgrades and new connectors
+
+Every operation names the exact declaration binding it was written under
+(digest, version, stream, semantics, primary key, schema digest). A binding is
+therefore its own version tag, and a rebinding journals nothing.
+
+On each boot the host passes its retained declarations. `beginBaseline`
+compares them with the database's current binding generation
+(`rebinding.ts`):
+
+- The same bindings: nothing changes.
+- An upgraded declaration or an added connector: the database starts the next
+  binding generation, writes new operations under the new bindings, and keeps
+  every earlier binding in `pdpp_replica_declaration_history` with its schema.
+- A changed stream shape (semantics or primary key) of any retained stream:
+  refused. The database keeps its generation and the host reports the reason.
+- Another owner: refused (`replication owner is immutable`).
+
+The host trusts its current bindings plus the history
+(`replicaDeclarationContext(owner, snapshots, history)`), so older operations,
+own or received, still validate against their own schema. Versions of one
+stream with the same shape merge by revision. The transport encodes this
+device's own operations against the retained history too, so an operation
+captured before a rebinding still publishes.
+
+A batch that names a declaration this device does not trust yet (a peer
+upgraded first, or added a connector) imports. Its operations stay pending,
+reconcile reports a `declaration` wait, and the writer's later batches keep
+importing. When the host supplies the declaration, the trusted set changes and
+reconcile applies them. Nothing is lost or resurrected: a pending operation
+takes part in the merge only once it validates.
+
+Known limits:
+
+- A device that joins after a peer upgraded receives older-version operations
+  it cannot validate until its host supplies that declaration. They stay
+  pending. Carrying schemas in-band or fetching them by digest is follow-up
+  work.
+- A database baselined before generations gets generation 1 and a history
+  with an unknown schema. Until a host supplies that schema, operations under
+  it validate by key only.
+- Lite needs the same history-aware context.
+
 ## 5. Opt-in and the one-way door
 
 ### 5.1 Entitlement and per-device state
