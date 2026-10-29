@@ -111,6 +111,26 @@ function adapterLive(
   return live;
 }
 
+async function conversationsDigest() {
+  const rows = importVectorRecords()
+    .filter((record) => record.stream === "conversations")
+    .map((record) => ({
+      recordKey: encodeRecordKey(record.key),
+      dataJson: JSON.stringify(record.data),
+    }));
+  return liveSnapshotDigestAsync(
+    {
+      sourceId: SOURCE,
+      instance: INSTANCE,
+      method: METHOD,
+      generation: 1,
+      stream: "conversations",
+    },
+    ["id"],
+    rows,
+  );
+}
+
 describe("PDPP import job engine (in-memory adapter)", () => {
   it("publishes the same live set as line-by-line ingest", async () => {
     const { capability, begin, engine } = await setup();
@@ -642,24 +662,7 @@ describe("PDPP import job engine (in-memory adapter)", () => {
 
   it("stores a completion receipt only when the proof matches, atomically", async () => {
     const at = "2026-10-28T12:00:00.000Z";
-    const records = importVectorRecords().filter(
-      (record) => record.stream === "conversations",
-    );
-    const rows = records.map((record) => ({
-      recordKey: encodeRecordKey(record.key),
-      dataJson: JSON.stringify(record.data),
-    }));
-    const snapshotSha256 = await liveSnapshotDigestAsync(
-      {
-        sourceId: SOURCE,
-        instance: INSTANCE,
-        method: METHOD,
-        generation: 1,
-        stream: "conversations",
-      },
-      ["id"],
-      rows,
-    );
+    const snapshotSha256 = await conversationsDigest();
     for (const proof of [
       { liveCount: 2, snapshotSha256 },
       { liveCount: 2, snapshotSha256: "f".repeat(64) },
@@ -692,6 +695,35 @@ describe("PDPP import job engine (in-memory adapter)", () => {
         expect(adapterLive(capability)).toEqual({});
         expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
       }
+    }
+  });
+
+  it("a reset or deletion erases the completion receipts with the rows", async () => {
+    const snapshotSha256 = await conversationsDigest();
+    for (const erase of ["resetConnection", "deleteConnection"] as const) {
+      const { capability, begin, engine } = await setup();
+      const jobs = engine();
+      await jobs.begin(begin);
+      const status = await importSpool(jobs, "job-1", capability.readSpool!);
+      await jobs.commit({
+        jobId: "job-1",
+        batches: status.job.nextSeq,
+        connectorState: "{}",
+        completion: {
+          sourceCollectedAt: "2026-10-28T12:00:00.000Z",
+          streams: [
+            {
+              stream: "conversations",
+              coverage: "full_stream",
+              liveCount: 2,
+              snapshotSha256,
+            },
+          ],
+        },
+      });
+      expect(capability.completion(INSTANCE, "conversations")).toBeDefined();
+      capability[erase](INSTANCE);
+      expect(capability.completion(INSTANCE, "conversations")).toBeUndefined();
     }
   });
 

@@ -379,10 +379,12 @@ export function createMemoryImportJobCapability(
     },
   };
 
-  /** What the store's erase does for import data: open jobs abort, staged rows and the cursor go. */
+  /** What the store's erase does for import data: open jobs abort; rows, completions, staged rows and the cursor go. */
   function eraseInstance(instance: string) {
     for (const [key, row] of rows)
       if (row.instance === instance) rows.delete(key);
+    for (const key of completions.keys())
+      if (key.startsWith(`${instance}\0`)) completions.delete(key);
     for (const [jobId, job] of jobs) {
       if (job.binding.instance !== instance) continue;
       indexes.delete(jobId);
