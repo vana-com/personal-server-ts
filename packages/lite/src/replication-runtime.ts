@@ -98,7 +98,9 @@ export function createLiteReplicationRuntime(input: {
     onReport: input.onReport,
     onError: input.onError,
   });
-  let pausing: Promise<boolean> | undefined;
+  // Every stop still settling. A queued resume waits for all of them: an
+  // older, longer stop would otherwise stop the driver the resume restarted.
+  const pausing = new Set<Promise<boolean>>();
   // Bumped synchronously by every resume, pause and stop. A resume queued
   // behind a pause starts only if no later call has superseded it.
   let lifecycle = 0;
@@ -112,8 +114,8 @@ export function createLiteReplicationRuntime(input: {
     resume() {
       const mine = ++lifecycle;
       // A resume during a pause waits for it, so the old step settles first.
-      if (pausing)
-        void pausing.then(() => {
+      if (pausing.size)
+        void Promise.allSettled([...pausing]).then(() => {
           if (mine === lifecycle) driver.start();
         });
       else driver.start();
@@ -124,11 +126,11 @@ export function createLiteReplicationRuntime(input: {
     async stop(graceMs) {
       lifecycle++;
       const stopping = driver.stop(graceMs);
-      pausing = stopping;
+      pausing.add(stopping);
       try {
         return await stopping;
       } finally {
-        if (pausing === stopping) pausing = undefined;
+        pausing.delete(stopping);
       }
     },
   };

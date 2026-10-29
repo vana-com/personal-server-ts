@@ -57,6 +57,9 @@ export function createMemoryReplicaPersistence(
 ) {
   const maxStagedBytes = opts.maxStagedBytes ?? MEMORY_STAGED_BYTES_CAP;
   const staged = new Map<string, Uint8Array>();
+  // Bytes of stages still being consumed: reserved so that two concurrent
+  // stages cannot both fit a cap only one fits.
+  let inFlight = 0;
   const stagedTotal = () => {
     let total = 0;
     for (const value of staged.values()) total += value.length;
@@ -148,14 +151,19 @@ export function createMemoryReplicaPersistence(
     async stageBytes(chunks) {
       const parts: Uint8Array[] = [];
       let size = 0;
-      const others = stagedTotal();
-      for await (const part of chunks) {
-        if (part.length > FRAME_BYTES)
-          throw new Error("native frame exceeds 128 KiB");
-        if (others + size + part.length > maxStagedBytes)
-          throw new LiteReplicaTransferError("storage-full");
-        parts.push(part.slice());
-        size += part.length;
+      try {
+        for await (const part of chunks) {
+          if (part.length > FRAME_BYTES)
+            throw new Error("native frame exceeds 128 KiB");
+          if (stagedTotal() + inFlight + part.length > maxStagedBytes)
+            throw new LiteReplicaTransferError("storage-full");
+          parts.push(part.slice());
+          size += part.length;
+          inFlight += part.length;
+        }
+      } catch (error) {
+        inFlight -= size;
+        throw error;
       }
       const value = new Uint8Array(size);
       let offset = 0;
@@ -164,6 +172,7 @@ export function createMemoryReplicaPersistence(
         offset += part.length;
       }
       const id = globalThis.crypto.randomUUID();
+      inFlight -= size;
       staged.set(id, value);
       return id;
     },

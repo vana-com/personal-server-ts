@@ -201,6 +201,37 @@ describe("createLiteReplicationRuntime", () => {
     expect(await runtime.stop(1_000)).toBe(true);
   });
 
+  it("a resume waits for every overlapping stop, not only the latest", async () => {
+    let release!: () => void;
+    const steps: number[] = [];
+    const runtime = createLiteReplicationRuntime({
+      door: on,
+      config,
+      engine: {
+        // Ignores its abort signal until the test lets the step go.
+        async step() {
+          steps.push(steps.length);
+          if (steps.length === 1)
+            await new Promise<void>((resolve) => (release = resolve));
+          return report();
+        },
+      },
+    });
+    runtime.resume();
+    expect(steps).toHaveLength(1);
+    const longStop = runtime.stop(5_000);
+    // The short stop gives up first; a resume after it must still wait for
+    // the long one, or the long one would stop the restarted driver.
+    expect(await runtime.stop(0)).toBe(false);
+    runtime.resume();
+    release();
+    expect(await longStop).toBe(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(runtime.status()).toMatchObject({ state: "on" });
+    expect(steps).toHaveLength(2);
+    expect(await runtime.stop(1_000)).toBe(true);
+  });
+
   it("aborts a step at the configured deadline", async () => {
     const scripted = createScriptedReplicationEngine([report()], {
       stepMs: 60_000,
@@ -495,6 +526,48 @@ describe("in-memory LiteReplicaObjectTransfers", () => {
     controller.abort();
     await expect(download).rejects.toMatchObject({ code: "cancelled" });
     expect(stagedBytes()).toBe(0);
+  });
+
+  it("reserves bytes of stages still arriving against the cap", async () => {
+    const { port: persistence, stagedBytes } = createMemoryReplicaPersistence(
+      undefined,
+      { maxStagedBytes: 10 },
+    );
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const slow = persistence.stageBytes(
+      (async function* () {
+        yield new Uint8Array(8);
+        await held;
+      })(),
+    );
+    // Let the first stage take its 8 bytes before the second starts.
+    await new Promise((resolve) => setImmediate(resolve));
+    await expect(
+      persistence.stageBytes(
+        (async function* () {
+          yield new Uint8Array(8);
+        })(),
+      ),
+    ).rejects.toMatchObject({ code: "storage-full" });
+    release();
+    await slow;
+    expect(stagedBytes()).toBe(8);
+    // A failed stage releases its reservation.
+    await expect(
+      persistence.stageBytes(
+        (async function* () {
+          yield new Uint8Array(2);
+          yield new Uint8Array(1);
+        })(),
+      ),
+    ).rejects.toMatchObject({ code: "storage-full" });
+    await persistence.stageBytes(
+      (async function* () {
+        yield new Uint8Array(2);
+      })(),
+    );
+    expect(stagedBytes()).toBe(10);
   });
 
   it("caps unattached stages in aggregate until they are discarded or attached", async () => {
