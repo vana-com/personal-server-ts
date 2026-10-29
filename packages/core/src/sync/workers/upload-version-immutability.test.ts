@@ -517,9 +517,9 @@ describe("upload worker against write-once storage", () => {
   });
 
   // Desktop 29-10: delete a scope, import it again. The index row carries
-  // after_tombstone_version from ingest; no fence adapter exists for the
-  // deployed gateway, so the re-add used to stay unsynced forever.
-  it("with production wiring, registers an ingest-acknowledged re-add strictly after the tombstone", async () => {
+  // after_tombstone_version from ingest; crossing it still needs the gateway
+  // fence so another deletion cannot invalidate the publication mid-flight.
+  it("with a fence, registers an ingest-acknowledged re-add strictly after the tombstone", async () => {
     await upload(await replica(envelope("original"), 1), production);
     registry.deleteScope();
     // The gateway lets a same-version POST rewrite a pending row. The re-add
@@ -529,7 +529,7 @@ describe("upload worker against write-once storage", () => {
     const r = await replica(content, 1);
     r.storage.entries[0]!.afterTombstoneVersion = 2;
 
-    await upload(r, production);
+    await upload(r, { feed: true });
 
     expect(registry.versions.get(2n)).toMatchObject({
       dataHash: TOMBSTONE_DATA_HASH,
@@ -548,13 +548,13 @@ describe("upload worker against write-once storage", () => {
     expect(keccak256(stored)).toBe(hashOf(content));
   });
 
-  it("with production wiring, refuses a re-add whose acknowledgement is not the observed tombstone", async () => {
+  it("with a fence, refuses a re-add whose acknowledgement is not the observed tombstone", async () => {
     registry.deleteScope();
     const r = await replica(envelope("re-added"), 1);
     // Acknowledges a tombstone version the registry never showed.
     r.storage.entries[0]!.afterTombstoneVersion = 5;
 
-    await expect(upload(r, production)).rejects.toMatchObject({
+    await expect(upload(r, { feed: true })).rejects.toMatchObject({
       code: "NEEDS_FENCED_PUBLICATION",
       reason: "tombstone was not acknowledged by this publication",
     });
@@ -574,8 +574,37 @@ describe("upload worker against write-once storage", () => {
     expect(registry.versions.size).toBe(1);
   });
 
-  it("with production wiring, a second delete that lands during the re-add wins", async () => {
+  it("refuses an unfenced re-add before cleanup can replace its stored bytes", async () => {
     registry.deleteScope();
+    registry.pendingRefresh = true;
+    const r = await replica(envelope("re-added"), 1);
+    r.storage.entries[0]!.afterTombstoneVersion = 1;
+    registry.beforeRegister = async () => {
+      registry.deleteScope();
+      // The second delete covers v2, where this re-add just put its bytes.
+      blobs.blobs.delete(blobs.keyFor(2));
+      // Another stale writer reserves the freed key before this registration.
+      await vanaAdapter().upload(
+        `${SCOPE}/2`,
+        await encryptWithPassword(
+          plaintextOf(envelope("other writer")),
+          scopeKeyHex,
+        ),
+      );
+    };
+
+    await expect(upload(r, production)).rejects.toMatchObject({
+      code: "NEEDS_FENCED_PUBLICATION",
+      reason: "publication crosses a deletion",
+    });
+    expect(blobs.puts).toEqual([]);
+    expect(registry.head()?.dataHash).toBe(TOMBSTONE_DATA_HASH);
+    expect(r.storage.entries[0]?.dataPointId).toBeNull();
+  });
+
+  it("with a fence, a second pending delete that lands during the re-add wins", async () => {
+    registry.deleteScope();
+    registry.pendingRefresh = true;
     const r = await replica(envelope("re-added"), 1);
     r.storage.entries[0]!.afterTombstoneVersion = 1;
     let deleted = false;
@@ -585,8 +614,8 @@ describe("upload worker against write-once storage", () => {
       registry.deleteScope();
     };
 
-    await expect(upload(r, production)).rejects.toMatchObject({
-      name: "DeletedScopeEntryError",
+    await expect(upload(r, { feed: true })).rejects.toMatchObject({
+      message: "Gateway error: 409 PUBLICATION_FENCE_CHANGED",
     });
     expect(registry.versions.get(2n)).toMatchObject({
       dataHash: TOMBSTONE_DATA_HASH,

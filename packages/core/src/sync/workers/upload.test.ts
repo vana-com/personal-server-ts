@@ -889,41 +889,18 @@ describe("upload worker", () => {
       );
     });
 
-    it("publishes an ingest-acknowledged re-add strictly after the observed tombstone without a fence", async () => {
-      const deps = withFeed(makeMockDeps(), {
-        deletedAt: DELETED_AT,
-        expectedVersion: "4",
-      });
-      const entry = makeEntry({ afterTombstoneVersion: 4 });
-
-      await uploadOne(deps, entry);
-
-      expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
-      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
-        `${SCOPE}/5`,
-        expect.any(Uint8Array),
-      );
-      expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
-      expect(deps.gateway.registerDataPoint).toHaveBeenCalledWith(
-        expect.objectContaining({ expectedVersion: "5" }),
-      );
-      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
-        entry.path,
-        5,
-      );
-    });
-
-    it("still requires fencing for a re-add whose marker is not the observed tombstone", async () => {
+    it("requires fencing for a deliberate re-add after an observed tombstone", async () => {
       const deps = withFeed(makeMockDeps(), {
         deletedAt: DELETED_AT,
         expectedVersion: "4",
       });
       await expect(
-        uploadOne(deps, makeEntry({ afterTombstoneVersion: 7 })),
+        uploadOne(deps, makeEntry({ afterTombstoneVersion: 4 })),
       ).rejects.toMatchObject({
         code: "NEEDS_FENCED_PUBLICATION",
-        reason: "tombstone was not acknowledged by this publication",
+        retryable: true,
       });
+      expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
       expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
       expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
     });

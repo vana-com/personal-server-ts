@@ -249,9 +249,6 @@ export async function uploadOne(
           entry.afterTombstoneVersion == null
             ? undefined
             : BigInt(entry.afterTombstoneVersion),
-        // The marker is written at ingest, after the owner deleted the scope
-        // and imported it again: a deliberate re-add, not a recovery.
-        deletionAcknowledgedAtIngest: entry.afterTombstoneVersion != null,
       });
   const { dataPointId, url, sizeBytes } = proof;
   if (!entry.dataPointId) {
