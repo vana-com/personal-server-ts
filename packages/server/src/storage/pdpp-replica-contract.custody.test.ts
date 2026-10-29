@@ -1055,12 +1055,16 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
             { scan_cursor: string | null } | undefined
         )?.scan_cursor;
         if (cursor) {
+          // Discovery admits every version of a listed scope, except the
+          // device's own slots, which it never imports.
           const admitted = count(
             b.db,
-            "SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE scope<=?",
+            `SELECT (SELECT count(*) FROM pdpp_transport_manifests_in WHERE scope<=?)
+              + (SELECT count(*) FROM pdpp_transport_manifests_out o WHERE o.scope<=?
+                 AND NOT EXISTS (SELECT 1 FROM pdpp_transport_manifests_in i WHERE i.scope=o.scope AND i.version=o.version)) AS n`,
+            cursor,
             cursor,
           );
-          // Discovery admits every version of a listed scope.
           const listed = [...net.head.keys()].filter(
             (k) => k.slice(0, k.lastIndexOf("/")) <= cursor,
           ).length;

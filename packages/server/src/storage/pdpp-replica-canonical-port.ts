@@ -98,6 +98,9 @@ BEGIN SELECT RAISE(ABORT, 'local write log is append-only'); END;
   REPLICA_WRITER_IDENTITY_MIGRATION,
   // Binding generations and declaration history (host contract §4.5).
   REPLICA_BINDING_HISTORY_MIGRATION,
+  // Capture pins that reference canonical chunks instead of copying them.
+  // See `pinReferenceKeepsBytes`.
+  `CREATE TABLE IF NOT EXISTS pdpp_replica_blob_pins (blob_id TEXT PRIMARY KEY);`,
 ];
 
 /**
@@ -135,7 +138,13 @@ export function ensureReplicaSchema(db: Database): void {
     // connection that enabled replication, so remove it.
     db.exec("DROP TRIGGER IF EXISTS pdpp_canonical_chunks_delete");
     // A plain open can delete a blob without clearing its replica chunks.
-    // Clear what such deletes left, on every enabled open.
+    // Clear what such deletes left, on every enabled open; a pin keeps them.
+    const orphans = `SELECT blob_id FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs)`;
+    const keep = pinReferenceKeepsBytes("@id").map((sql) => db.prepare(sql));
+    for (const { blob_id } of db.prepare(orphans).all() as {
+      blob_id: string;
+    }[])
+      for (const statement of keep) statement.run({ id: blob_id });
     db.exec(`
       DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs);
       DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs);
@@ -144,12 +153,27 @@ export function ensureReplicaSchema(db: Database): void {
 }
 
 /**
+ * A capture pin of a large blob references its canonical chunks; it holds no
+ * copy (`captureBlob`). Before canonical storage drops such a blob, its
+ * chunks change namespace to `pinned`, so export can still read them. No byte
+ * is copied, and the pin row goes: the pinned copy now holds the bytes.
+ */
+function pinReferenceKeepsBytes(id: string): string[] {
+  const pinOnly = `EXISTS (SELECT 1 FROM pdpp_replica_blob_pins WHERE blob_id=${id}) AND NOT EXISTS (SELECT 1 FROM pdpp_binary_manifests WHERE namespace='pinned' AND blob_id=${id})`;
+  return [
+    `UPDATE pdpp_binary_chunks SET namespace='pinned' WHERE namespace='canonical' AND blob_id=${id} AND ${pinOnly};`,
+    `INSERT INTO pdpp_binary_manifests SELECT 'pinned',blob_id,size_bytes FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=${id} AND ${pinOnly};`,
+    `DELETE FROM pdpp_replica_blob_pins WHERE blob_id=${id} AND EXISTS (SELECT 1 FROM pdpp_binary_manifests WHERE namespace='pinned' AND blob_id=${id});`,
+  ];
+}
+
+/**
  * Deleting a canonical blob deletes its replica chunks. TEMP, so it lives on
  * the connection that enabled replication and never fires for a plain open's
  * writes; a plain open leaves the chunks, and the next enabled open clears
  * them (see `ensureReplicaSchema`).
  */
-const CANONICAL_CHUNKS_TRIGGER = `CREATE TEMP TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END`;
+const CANONICAL_CHUNKS_TRIGGER = `CREATE TEMP TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN ${pinReferenceKeepsBytes("OLD.blob_id").join(" ")} DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END`;
 
 function assertReplicaSchema(db: Database): void {
   const row = db

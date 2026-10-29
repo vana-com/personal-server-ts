@@ -432,6 +432,81 @@ it("requires verified claimed blob bytes before exposing an imported record", as
   ).toEqual([]);
 });
 
+// Received bytes are custody for the operations that name them. Canonical
+// collection counts only canonical claims, so a verified canonical copy is
+// no reason to drop them: an operation withheld here has no claim yet.
+it.each([
+  ["inline", 2],
+  ["chunked", 2 * 1024 * 1024 + 7],
+])(
+  "keeps a withheld operation's received bytes after the local copy of the same blob is collected (%s)",
+  (_form, size) => {
+    const source = device(),
+      target = device(false);
+    const bytes = new Uint8Array(size).map((_, i) => (i * 7 + 3) & 255);
+    const write = (d: ReturnType<typeof device>, instance: string) =>
+      d.store.storeBlobBytesForInstance({
+        instance,
+        method: "collector",
+        generation: 1,
+        bytes,
+        mimeType: "application/octet-stream",
+      });
+    const blob = write(source, "conn_a");
+    source.store.ingestBatch(
+      [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          emitted_at: at,
+          data: {
+            id: "a",
+            blob_ref: {
+              blob_id: blob.blobId,
+              mime_type: blob.mimeType,
+              size_bytes: size,
+            },
+          },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    target.store.registerConnection({
+      instance: "conn_local",
+      sourceId,
+      method: "collector",
+      label: "L",
+    });
+    expect(write(target, "conn_local").blobId).toBe(blob.blobId);
+    // conn_a has no local mapping on the target, so every operation of it,
+    // the blob claim included, is withheld.
+    expect(
+      target.receiver.import({
+        credential: "replica-secret",
+        envelope: batch(all(source)),
+        blobs: [{ blobId: blob.blobId, bytes }],
+      }).pending.length,
+    ).toBeGreaterThan(0);
+    expect(value(target)).toBeUndefined();
+    target.store.deleteConnection("conn_local");
+    expect(target.store.getBlobBytes(blob.blobId)).toBeUndefined();
+    target.reopen();
+    target.store.registerConnection({
+      instance: "conn_a",
+      sourceId,
+      method: "collector",
+      label: "A",
+    });
+    target.receiver.retry({ credential: "replica-secret" });
+    expect(value(target)?.data.id).toBe("a");
+    expect(target.store.getBlobBytes(blob.blobId)).toEqual(bytes);
+  },
+  30_000,
+);
+
 it("quarantines append-only conflicting content instead of selecting a winner", () => {
   const appendBinding = { ...binding, semantics: "append_only" as const };
   const entries = [

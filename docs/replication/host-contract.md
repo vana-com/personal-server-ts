@@ -23,9 +23,16 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
   and steps them from `startBackgroundServices` until `cleanup`. Lite has a canonical
   store (`packages/lite/src/canonical-store.ts:224`), the host ports
   (`packages/lite/src/replication-ports.ts`), a runtime and owner-only
-  status/sync routes (`packages/lite/src/replication-runtime.ts`), but no
-  phase engine: its runtime reports `blocked: "no_engine"` and never steps.
-  Neither app enables it
+  status/sync routes (`packages/lite/src/replication-runtime.ts`) and the
+  phase engine (`createLiteReplicaEngine`,
+  `packages/lite/src/replication-engine.ts`). Node and Lite run the same
+  phase logic (`packages/core/src/replication/engine.ts`). Both hosts take
+  the partition, declaration bindings and DPv2 network ports from
+  `packages/core/src/replication/host-ports.ts`. A phone shell builds Lite
+  replication with `createLiteReplication`
+  (`packages/lite/src/replication-host.ts`) from native persistence and a
+  `LiteReplicaObjectTransfers` adapter; with the door or config off it
+  builds no ports. No shell calls it yet. Neither app enables it
   (`unity-surfaces@9af449a2 apps/desktop/src/hooks/usePersonalServer.ts:871-885`);
   the phone has no replication code.
 - The carrier is DPv2. In #483 each fragment is one vana-storage object at
@@ -407,8 +414,13 @@ coordinator defers it. Abort maps to `replica.cancel`, and each transfer
 carries its own deadline. JS still encrypts and decrypts, one fragment at a
 time; 1 MiB fragments fit the 1 MiB native record limit
 (`unity-surfaces@9af449a2 apps/mobile-shell/lib/ps/native_ps_store.dart:11`).
-The Lite engine builds core's `ReplicaTransportPort` over these transfers;
-gateway calls (register, evidence, feed) are not yet assigned to either side.
+The Lite engine builds core's `ReplicaTransportPort` from core's DPv2
+transport over `createLiteReplicaStorage`
+(`packages/lite/src/replication-storage.ts`), which moves fragment and
+manifest bytes through these transfers. Gateway calls (register, evidence,
+the owner feed) and the roster read stay in PS JS core, over Lite's HTTP
+client, as on Node. Native code carries only bulk replica object bytes; it
+has no gateway, signing or replication-state logic.
 
 The roster is one more port:
 
@@ -441,8 +453,81 @@ export interface LiteReplicaBytes {
 export interface LiteReplicaTransaction extends LiteCanonicalTransaction {
   attachBytes(stagingId: string, expected: LiteReplicaBytesInfo): Promise<void>;
   releaseBytes(id: string): Promise<void>;
+  /** Publish attached bytes as the canonical blob `expected`, in THIS tx. */
+  publishBlob(bytesId: string, expected: LiteBlobDescriptor): Promise<void>;
+  /** The engine's relational state, in THIS tx. */
+  readonly sql: LiteReplicaSql; // get, all, run, exec
 }
 ```
+
+The phase engine keeps its state in relational tables (`pdpp_transport_*`,
+`pdpp_replica_*`), so the native transaction also answers SQL. The native
+side must provide:
+
+- **One database, one transaction.** The tables live in the same SQLite
+  database as the canonical rows, blobs and replica bytes. One `transaction`
+  commits or rolls back all of them together.
+- **SQLite 3.25 or later, with JSON1.** The engine uses window functions,
+  `INSERT ... ON CONFLICT DO UPDATE`, `json_extract`, triggers, and reads
+  `sqlite_master` and `PRAGMA table_info`.
+- **Fixed statements only.** PS sends only its own statements. Parameters are
+  text, integers, `null` or bytes; a byte value is at most one fragment
+  (1 MiB). An absent row is `undefined` (a bridge `null` is accepted).
+- **Savepoints.** `SAVEPOINT`, `RELEASE` and `ROLLBACK TO` sent through `sql`
+  must also cover the transaction's key-value, blob and byte writes. The
+  import of a received batch runs in a savepoint, so a refused import rolls
+  back alone.
+- **`publishBlob`.** A received blob arrives as replica bytes, verified only
+  after the whole payload is, so it cannot use `stageBlob`. `publishBlob`
+  checks length and SHA-256 against the descriptor and publishes the blob in
+  the same transaction, as `attachBlob` does. The bytes stay attached until
+  `releaseBytes`.
+
+A new writer identity (the first enable, or a rotation) re-exports the
+canonical state into the outbox (`rebaseline` in `canonical-store.ts`), so a
+phone that wrote before it enabled still publishes those rows. Each row and
+completion copies the operation the merge chose for it and keeps its counter,
+origin and declaration (core `rebaseline.ts`). Lite keeps no binding history,
+so a row the merge does not explain, such as one whose stream the host no
+longer declares, is skipped. A completion depends on every re-exported
+record of its stream, so a large stream's completion can outgrow one
+operation (`LITE_CANONICAL_MAX_OPERATION_BYTES`); it is skipped too, and the
+stream is not certified complete from the new writer.
+
+Bounded growth on the phone:
+
+- **Outbox.** Once a batch's manifest registration is confirmed on the
+  gateway, the engine calls `exporter.acknowledgePublished(next)` in the same
+  transaction, and Lite moves `outbox-ack` to `next`. Neither host deletes
+  published operations yet: the Node journal and the Lite `log/` keep
+  history, because rebaseline, completion dependencies and receiver merges
+  read it. Compaction (keep unpublished operations and the operations the
+  merge chose) is separate work.
+- **Large received batches.** A Node batch targets 32 MiB. Lite keeps a
+  received envelope, its copy (envelope and blob descriptors) and its fetched
+  fragments in parts below the per-call SQL bound (`LITE_REPLICA_SQL_BYTES`),
+  each of its pending blob descriptors in its own value, and imports it in one
+  native transaction under one receipt. Preparing a local batch reads its
+  operations in pages below the same bound. Only each operation is bounded
+  (`LITE_CANONICAL_MAX_OPERATION_BYTES`), because the store keeps it as one
+  value. A larger operation is held `resource_unsupported` until a build
+  raises the bound and `REPLICA_LIMITS_VERSION` with it.
+- **Orphaned bytes.** `attachBytes` records the id in
+  `pdpp_lite_replica_transient`, and `releaseBytes` removes it, in the same
+  transaction. A crash between them leaves the id listed, and the next step
+  releases every listed id before it stages anything, except ids whose
+  transfer this process still runs. A pause or step deadline cancels the
+  native transfer through the attempt's signal, but the step stops waiting
+  before the native call settles; that transfer releases its own bytes.
+- **Refused batches.** A received batch the canonical store refuses
+  (`LiteCanonicalRefusal`: over the header, count or partition bound, wrong owner,
+  binding mismatch, reused commit id, blob metadata conflict) cannot import on
+  a retry. The engine records it terminal with reason `canonical_<reason>`
+  and quarantines that writer from that batch. Other writers keep importing.
+
+The engine runs every storage effect in its own native transaction. One idle
+step takes about 40 transactions; the step that publishes or imports takes
+more (about 110 in the two-writer trace).
 
 ### 4.4 Runtime, scheduler and status
 
@@ -492,9 +577,12 @@ schedules a step.
 
 PS-Lite wraps the same driver in `createLiteReplicationRuntime`
 (`packages/lite/src/replication-runtime.ts`): `resume` on foreground,
-`pause` on background, `trigger(reason)` for the other triggers, and a step
-deadline from `limits.step.deadlineMs`. `createPsLiteRuntime` calls `resume`
-and `pause` from `activate` and `deactivate` and serves owner-only
+`pause` on background, `trigger(reason)` for the other triggers, `localWrite`,
+and a step deadline from `limits.step.deadlineMs`. The canonical store that
+`createLiteReplication` returns calls `localWrite` after each `commitLocal`;
+imports run through the engine's own store and never call it.
+`createPsLiteRuntime` calls `resume` and `pause` from `activate` and
+`deactivate` and serves owner-only
 `GET /v1/replication/status` and `POST /v1/replication/sync` (202, the step
 runs after the answer; 409 when replication is not running). Its status is
 the driver's (`stepping`, `lastStepAt`, `nextWakeAt`, last-step counts), not
@@ -672,18 +760,42 @@ There is no blob-size cap.
   1 MiB fragments. A peer holds a writer's later batches behind an Unsupported
   one (`pdpp-replication-transport.ts:628-666`), so no tester limit may produce
   one.
-- **Reclaim instead of a lifetime cap (sender side landed):** when a batch's
-  registration is finalized, the transaction that marks its manifest
-  published also drops the batch payload and every fragment's ciphertext. The
-  fragment rows keep their digests and the manifest keeps the lengths. A
-  worker's first step does the same for batches finalized by an earlier
-  build. `pdpp-replication-blob-storage.test.ts` proves that no outbound
-  phase reads the dropped bytes, across later batches and a restart. Not yet
-  done: the receiver keeps its received custody copy and inbox fragment JSON
-  after import.
+- **Reclaim instead of a lifetime cap:** when a batch's registration is
+  finalized, the transaction that marks its manifest published also drops the
+  batch payload and every fragment's ciphertext. The fragment rows keep their
+  digests and the manifest keeps the lengths. A worker's first step does the
+  same for batches finalized by an earlier build. Both hosts do this in the shared engine (`engine.ts`).
+  `pdpp-replication-blob-storage.test.ts` proves that no outbound phase reads
+  the dropped bytes, across later batches and a restart. On the receiver, the
+  import transaction deletes the inbox fragment bodies.
+- **No custody of an own batch:** discovery skips every version the device
+  published itself, in any state, so a device never downloads or imports its
+  own batch. A per-scope floor marks the versions already claimed or
+  admitted, so a pass reads only newer versions; releasing a claim lowers
+  the floor. The first step of a process deletes inbox rows that an earlier
+  build admitted for the device's own published batches.
+- **One canonical copy per blob:** canonical storage holds a blob larger than
+  1 MiB once, as chunks. A local write stores chunks only, with no whole-row
+  copy. A pin of a chunked canonical blob is a row in `pdpp_replica_blob_pins`
+  that references the canonical chunks. If canonical storage later replaces
+  or drops the blob, a trigger moves the chunks to the pinned namespace
+  first, so the pin keeps its bytes; when the blob returns to canonical
+  storage, the next capture turns that pinned copy into a reference again.
+  Copies left by earlier builds (whole rows of chunked blobs, and pinned
+  copies of chunked canonical blobs) go after the canonical copy verifies. A
+  step verifies at most a quarter of its byte budget, up to 4 MiB, so a large
+  blob takes several steps.
+- **Received custody stays:** the received copy is custody for every
+  retained operation that names the blob, applied or withheld. Canonical
+  collection counts only canonical claims, so a withheld operation would
+  lose its bytes if the received copy went when canonical storage held the
+  blob. A received blob therefore costs two local copies until custody has
+  an owner that canonical collection respects.
 - **Promotion:** the receiver copies a verified blob larger than 1 MiB into
   canonical storage 64 KiB at a time and stores it once, in the chunk form.
   It assembles no whole value.
+- **Free pages:** SQLite keeps freed pages in its freelist, so deleted blobs
+  do not shrink the database file. Later writes reuse those pages.
 
 ### 6.1 Engine work the step bound needs
 
@@ -691,7 +803,8 @@ An item larger than an explicit byte budget is deferred until a budget fits it
 (`coordinator.ts`). Items 1 and 3 below have landed: preparation advertises one
 fragment and commits each fragment with a durable cursor, so a 200 MiB batch
 prepares under the phone's 8 MiB budget and a restart continues at the lost
-fragment (`pdpp-replication-fragment-admission.test.ts`). Items 2 and 4 remain.
+fragment (`pdpp-replication-fragment-admission.test.ts`). The cursor lives in
+the shared engine, so Lite prepares the same way. Items 2 and 4 remain.
 
 Plan item A7 (the bounded coordinator) owns these changes, and builds on the
 atomic checkpoints of A5:
