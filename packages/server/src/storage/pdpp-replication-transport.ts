@@ -226,6 +226,9 @@ export function createReplicaTransportWorker(
       acknowledgeBaselinePage: (expected, next) =>
         sync(() => exporter.acknowledgeBaselinePage(expected, next)),
       rebaseline: () => sync(() => exporter.rebaseline()),
+      // Node's journal is append-only and stays: rebaseline and completion
+      // dependencies read it (`pdpp-replication-sqlite.ts`).
+      acknowledgePublished: () => sync(() => undefined),
       readPinnedBlobChunks: (blobId) => exporter.readPinnedBlobChunks(blobId),
     },
     receiver: {

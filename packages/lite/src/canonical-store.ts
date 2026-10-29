@@ -17,6 +17,11 @@ import {
 import { sha256, toBytes } from "viem";
 import { createReplicaRecordReducer } from "@opendatalabs/personal-server-ts-core/replication/record-reducer";
 import {
+  reissuedFrom,
+  replicaOperationEffect,
+  replicaUpsertEffect,
+} from "@opendatalabs/personal-server-ts-core/replication/rebaseline";
+import {
   operationDigest,
   type CompletionOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/completion";
@@ -38,6 +43,28 @@ import type {
   LiteBlobDescriptor,
   LiteStagingId,
 } from "./canonical-persistence.js";
+
+/**
+ * A refusal that the batch's content or the store's immutable state decides:
+ * the same input fails the same way on every retry. A replica import that
+ * throws it stops retrying (`ReplicaCopyRefused` on the engine host).
+ */
+export class LiteCanonicalRefusal extends Error {
+  readonly code = "lite_canonical_refused";
+  constructor(
+    readonly reason:
+      | "batch_too_large"
+      | "wrong_owner"
+      | "connection_binding_mismatch"
+      | "partition_too_large"
+      | "commit_id_reused"
+      | "blob_metadata_conflict",
+    message: string,
+  ) {
+    super(message);
+    this.name = "LiteCanonicalRefusal";
+  }
+}
 
 export type LiteOperationDraft = ReplicaOperation extends infer T
   ? T extends ReplicaOperation
@@ -235,7 +262,8 @@ async function operations(
   for await (const entry of scan(tx, prefix)) {
     bytes += encoder.encode(entry.value).length;
     if (bytes > maxWindowBytes)
-      throw new Error(
+      throw new LiteCanonicalRefusal(
+        "partition_too_large",
         "replica merge partition exceeds 4 MiB; native repair required",
       );
     result.push(replicaOperationSchema.parse(JSON.parse(entry.value)));
@@ -280,6 +308,8 @@ async function logPage(
  */
 /** Absorbing terminal-batch fact per connection (contract v3.1 A, H). */
 const CONNECTION_QUARANTINE = "connection-quarantine/";
+/** Operations a writer change re-exported, which their log entries point at. */
+const REEXPORTED = "reexported/";
 
 export function createLiteCanonicalStore(deps: {
   persistence: LiteCanonicalPersistence;
@@ -331,7 +361,10 @@ export function createLiteCanonicalStore(deps: {
       local &&
       (local.sourceId !== op.sourceId || local.methodId !== op.methodId)
     )
-      throw new Error("replica connection source or method mismatch");
+      throw new LiteCanonicalRefusal(
+        "connection_binding_mismatch",
+        "replica connection source or method mismatch",
+      );
     return local;
   }
   async function retain(
@@ -414,7 +447,10 @@ export function createLiteCanonicalStore(deps: {
     if (!engineBlobReady(op, claims, verified)) return false;
     for (const blob of op.blobs)
       if (canonicalJson(await tx.blob(blob.blobId)) !== canonicalJson(blob))
-        throw new Error("replica blob metadata conflict");
+        throw new LiteCanonicalRefusal(
+          "blob_metadata_conflict",
+          "replica blob metadata conflict",
+        );
     return true;
   }
   /**
@@ -768,6 +804,191 @@ export function createLiteCanonicalStore(deps: {
     for (const [stream, operation] of available)
       await put(tx, `${prefix}${keyDigest(stream)}`, operation);
   }
+  /**
+   * The current canonical state as new local operations of `writerId`, in
+   * the outbox, after skipping every unpublished one: lifecycle, blob
+   * claims, records and tombstones, then certified completions, per
+   * provisioned connection. Each record and completion copies the
+   * operation the merge chose for it (core `rebaseline.ts`): the copy keeps
+   * its counter, origin and declaration, so it orders against every other
+   * writer exactly as the original. Lifecycle and claims take new counters.
+   * Each copy is kept under `reexported/`, like any logged operation;
+   * canonical state does not change. A row the merge does not explain, such
+   * as one whose stream this store no longer declares, is not re-exported
+   * (`skipped`): Lite keeps no binding history to write it under.
+   */
+  async function reexport(
+    tx: LiteCanonicalTransaction,
+    current: Clock,
+    writerId: string,
+    context: MergeContext,
+  ) {
+    // Skip every unpublished entry: the new writer's chain carries its
+    // effect instead. The log keeps them.
+    await put(tx, "outbox-ack", current.sequence);
+    current.writerId = writerId;
+    let reissued = 0;
+    let skipped = 0;
+    const issue = async (
+      draft: LiteOperationDraft,
+      copy?: Extract<ReplicaOperation, { declaration: unknown }>,
+    ): Promise<ReplicaOperation> => {
+      const kept = copy && reissuedFrom(copy);
+      if (!kept && !Number.isSafeInteger(current.counter + 1))
+        throw new Error("replication counter exhausted");
+      const counter = kept ? kept.revision.counter : current.counter + 1;
+      const op = replicaOperationSchema.parse({
+        ...draft,
+        ...(kept && { declaration: kept.declaration }),
+        revision: {
+          counter,
+          writerId,
+          operationId: newId(),
+          ...(kept && { origin: kept.revision.origin }),
+        },
+      });
+      current.counter = Math.max(current.counter, counter);
+      current.sequence += 1;
+      const sequence = String(current.sequence).padStart(16, "0");
+      await put(tx, `${REEXPORTED}${sequence}`, op);
+      const entry: LogEntry = {
+        batchId: `rebaseline/${writerId}`,
+        operationKey: `${REEXPORTED}${sequence}`,
+        sequence: current.sequence,
+      };
+      if (op.kind === "upsert" || op.kind === "delete") {
+        const row = await get<PdppRecordRow>(
+          tx,
+          rowKey(op.connectionId, op.declaration.stream, op.recordKey),
+        );
+        if (row) entry.rowVersion = row.version;
+      }
+      await put(tx, logKey(current.sequence), entry);
+      reissued += 1;
+      return op;
+    };
+    for await (const entry of scan(tx, "retained-connections/")) {
+      const id = JSON.parse(entry.value) as string;
+      const d = keyDigest(id);
+      const mapped = await get<Connection>(tx, `connections/${d}`);
+      if (!mapped) continue;
+      const { connection, lifecycle } = await connectionState(tx, id, context);
+      if (connection.status !== "active" && connection.status !== "deleted")
+        continue;
+      const generation = connection.generation;
+      const base = {
+        owner: context.owner,
+        sourceId: mapped.sourceId,
+        connectionId: id,
+        methodId: mapped.methodId,
+      };
+      // What a completion of each stream depends on: the new writer's
+      // lifecycle and claims, and its operations of that stream.
+      const shared: ReplicaOperation[] = [];
+      const byStream = new Map<string, ReplicaOperation[]>();
+      shared.push(
+        await issue({
+          ...base,
+          generation: 1,
+          kind: "connection-register",
+        } as LiteOperationDraft),
+      );
+      for (let next = 2; next <= generation; next++)
+        shared.push(
+          await issue({
+            ...base,
+            generation: next,
+            kind: "connection-reset",
+            previousGeneration: next - 1,
+          } as LiteOperationDraft),
+        );
+      if (connection.status === "deleted")
+        shared.push(
+          await issue({
+            ...base,
+            generation,
+            kind: "connection-delete",
+          } as LiteOperationDraft),
+        );
+      const claimed = new Set<string>();
+      const claim = async (blob: LiteBlobDescriptor) => {
+        if (claimed.has(blob.blobId)) return;
+        claimed.add(blob.blobId);
+        shared.push(
+          await issue({
+            ...base,
+            generation,
+            kind: "blob-claim",
+            blob,
+          } as LiteOperationDraft),
+        );
+      };
+      for await (const entry of scan(tx, `${connectionPrefix(id)}claims/`)) {
+        const op = replicaOperationSchema.parse(JSON.parse(entry.value));
+        if (
+          op.kind === "blob-claim" &&
+          op.generation === generation &&
+          (await tx.blob(op.blob.blobId)) &&
+          (await get(tx, `confirmed-blobs/${keyDigest(op.blob.blobId)}`))
+        )
+          await claim(op.blob);
+      }
+      for await (const entry of scan(tx, `rows/${d}/`)) {
+        const row = JSON.parse(entry.value) as PdppRecordRow;
+        const reducer = createReplicaRecordReducer(context, lifecycle);
+        for await (const variant of scan(
+          tx,
+          `${connectionPrefix(id)}records/${recordId(row.stream, row.recordKey)}/`,
+        )) {
+          const op = replicaOperationSchema.parse(JSON.parse(variant.value));
+          if (op.kind !== "upsert" && op.kind !== "delete")
+            throw new Error("invalid record partition");
+          reducer.push(op);
+        }
+        // The operation the merge chose explains the row.
+        const source = reducer.record?.winner;
+        if (
+          !source ||
+          replicaOperationEffect(source) !==
+            (row.deleted ? "delete" : replicaUpsertEffect(row.data))
+        ) {
+          skipped += 1;
+          continue;
+        }
+        if (source.kind === "upsert")
+          for (const blob of source.blobs) await claim(blob);
+        const { revision: _, ...draft } = source;
+        const op = await issue(
+          { ...draft, ...base, generation } as LiteOperationDraft,
+          source,
+        );
+        byStream.set(row.stream, [...(byStream.get(row.stream) ?? []), op]);
+      }
+      for await (const entry of scan(tx, `stream-completions/${d}/`)) {
+        const certified = replicaOperationSchema.parse(JSON.parse(entry.value));
+        if (certified.kind !== "stream-complete") continue;
+        // The certified completion is the one the merge chose.
+        const { revision: _, ...draft } = certified;
+        await issue(
+          {
+            ...draft,
+            ...base,
+            generation,
+            dependencies: [
+              ...shared,
+              ...(byStream.get(certified.declaration.stream) ?? []),
+            ].map((op) => ({
+              writerId: op.revision.writerId,
+              operationId: op.revision.operationId,
+              digest: operationDigest(op),
+            })),
+          } as LiteOperationDraft,
+          certified,
+        );
+      }
+    }
+    return { reissued, skipped };
+  }
   async function commit(input: {
     id: string;
     operations?: LiteOperationDraft[];
@@ -798,11 +1019,14 @@ export function createLiteCanonicalStore(deps: {
       (envelope.owner !== context.owner ||
         envelope.operations.some((op) => op.owner !== context.owner))
     )
-      throw new Error("wrong replica owner");
+      throw new LiteCanonicalRefusal("wrong_owner", "wrong replica owner");
     // A local request id also fences the original, unrevised inputs after lost ack.
     const encoded = canonicalJson(local ? input.operations : envelope);
     if (encoder.encode(encoded).length > 192 * 1024)
-      throw new Error("canonical batch exceeds 192 KiB; split before commit");
+      throw new LiteCanonicalRefusal(
+        "batch_too_large",
+        "canonical batch exceeds 192 KiB; split before commit",
+      );
     const fingerprint = `sha256:${sha256(toBytes(encoded)).slice(2)}`;
     return persistence.transaction(async (base) => {
       const tx = trackViews(base);
@@ -837,7 +1061,10 @@ export function createLiteCanonicalStore(deps: {
       }>(tx, receiptKey);
       if (prior) {
         if (prior.fingerprint !== fingerprint)
-          throw new Error("commit id reused with different content");
+          throw new LiteCanonicalRefusal(
+            "commit_id_reused",
+            "commit id reused with different content",
+          );
         if (local) return prior.receipt;
         // Retry imports can supply formerly absent bytes/declarations. Retaining
         // exact operations again is idempotent; canonical writes compare content.
@@ -882,7 +1109,10 @@ export function createLiteCanonicalStore(deps: {
           });
         } else op = replicaOperationSchema.parse(raw);
         if (op.owner !== context.owner)
-          throw new Error("wrong operation owner");
+          throw new LiteCanonicalRefusal(
+            "wrong_owner",
+            "wrong operation owner",
+          );
         const mapped = await mapping(tx, op);
         if (local && !mapped)
           throw new Error("local connection must be provisioned by host");
@@ -1548,13 +1778,16 @@ export function createLiteCanonicalStore(deps: {
         throw new Error("invalid pending batch id");
       const rawEncoded = canonicalJson(input.envelope);
       if (encoder.encode(rawEncoded).length > 192 * 1024)
-        throw new Error("canonical batch exceeds 192 KiB; split before commit");
+        throw new LiteCanonicalRefusal(
+          "batch_too_large",
+          "canonical batch exceeds 192 KiB; split before commit",
+        );
       const envelope = replicaEnvelopeSchema.parse(input.envelope);
       if (
         envelope.owner !== context.owner ||
         envelope.operations.some((op) => op.owner !== context.owner)
       )
-        throw new Error("wrong replica owner");
+        throw new LiteCanonicalRefusal("wrong_owner", "wrong replica owner");
       if (planReplicaMerge(context, envelope.operations).rejected.length)
         throw new Error("invalid pending replica operations");
       const fingerprint = digest(envelope);
@@ -1565,7 +1798,10 @@ export function createLiteCanonicalStore(deps: {
         const path = pendingKey(input.id);
         const prior = await get<PendingBatch>(tx, path);
         if (prior && prior.fingerprint !== fingerprint)
-          throw new Error("pending id reused with different content");
+          throw new LiteCanonicalRefusal(
+            "commit_id_reused",
+            "pending id reused with different content",
+          );
         if (prior && prior.state !== "pending")
           return { fingerprint, state: prior.state };
         for (const op of envelope.operations) await mapping(tx, op);
@@ -1717,20 +1953,25 @@ export function createLiteCanonicalStore(deps: {
     },
     /**
      * Replication's writer identity (host contract §3.2): local operations
-     * from now on name `writerId`. Allowed only before the first local
-     * operation, so no operation ever names two writers; afterwards only the
-     * same writer is accepted.
+     * from now on name `writerId`. The first time a writer binds, every
+     * unpublished local operation is dropped from the outbox and the current
+     * canonical state is re-exported under it (`reexport`), so a phone with
+     * local writes before its first enable, or after a writer rotation,
+     * still converges. Binding the writer already exported is a no-op.
      */
-    async bindWriter(writerId: string) {
+    async rebaseline(writerId: string) {
       enabled();
       if (!writerId) throw new Error("invalid replica writer");
-      await persistence.transaction(async (base) => {
+      return persistence.transaction(async (base) => {
         const tx = trackViews(base);
-        const current = await clock(tx);
-        if (current.writerId === writerId) return;
-        if (current.sequence !== 0)
-          throw new Error("replica writer requires a fresh journal");
-        await put(tx, "clock", { ...current, writerId });
+        const context = deps.context();
+        const current = await clock(tx, context);
+        if ((await get<string>(tx, "export-writer")) === writerId)
+          return undefined;
+        const result = await reexport(tx, current, writerId, context);
+        await put(tx, "export-writer", writerId);
+        await put(tx, "clock", current);
+        return result;
       });
     },
     /** A staged pending batch's state and fingerprint, if any. */
@@ -1970,6 +2211,25 @@ export function createLiteCanonicalStore(deps: {
         if (actual === next) return;
         if (actual !== expected || next > current.sequence)
           throw new Error("outbox acknowledgment conflict");
+        await put(tx, "outbox-ack", next);
+      });
+    },
+    /**
+     * The engine published every outbox operation up to `next` and the
+     * gateway confirmed its registration: move the outbox past them. The log
+     * keeps every entry. Monotonic; a lower or repeated acknowledgment is a
+     * no-op.
+     */
+    async acknowledgePublished(next: number) {
+      enabled();
+      if (!Number.isSafeInteger(next) || next < 0)
+        throw new Error("invalid outbox acknowledgment");
+      await persistence.transaction(async (base) => {
+        const tx = trackViews(base);
+        const current = await clock(tx);
+        if (next > current.sequence)
+          throw new Error("outbox acknowledgment conflict");
+        if (next <= ((await get<number>(tx, "outbox-ack")) ?? 0)) return;
         await put(tx, "outbox-ack", next);
       });
     },

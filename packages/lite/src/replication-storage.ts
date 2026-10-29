@@ -18,6 +18,7 @@ import {
   LiteReplicaTransferError,
   type LiteReplicaObjectTransfers,
   type LiteReplicaPersistence,
+  type LiteReplicaTransaction,
 } from "./replication-ports.js";
 
 const FRAME_BYTES = 128 * 1024;
@@ -28,6 +29,31 @@ function* frames(bytes: Uint8Array) {
   if (bytes.length === 0) yield new Uint8Array(0);
   for (let i = 0; i < bytes.length; i += FRAME_BYTES)
     yield bytes.subarray(i, i + FRAME_BYTES);
+}
+
+/**
+ * Replica bytes this adapter attached and has not released yet. A row
+ * commits with the attach and leaves with the release, so bytes a crash
+ * left attached between them stay listed until the engine reclaims them
+ * (`reclaimLiteTransientBytes`).
+ */
+export const LITE_REPLICA_TRANSIENT_MIGRATION =
+  "CREATE TABLE IF NOT EXISTS pdpp_lite_replica_transient (id TEXT PRIMARY KEY)";
+
+/**
+ * Release every transient replica byte left attached, in the caller's
+ * transaction. Only safe while no transfer of this adapter runs: the engine
+ * calls it under its writer lock, before a step's first transfer.
+ */
+export async function reclaimLiteTransientBytes(tx: LiteReplicaTransaction) {
+  await tx.sql.exec(LITE_REPLICA_TRANSIENT_MIGRATION);
+  const rows = await tx.sql.all(
+    "SELECT id FROM pdpp_lite_replica_transient",
+    [],
+  );
+  for (const row of rows) await tx.releaseBytes(row.id as string);
+  await tx.sql.run("DELETE FROM pdpp_lite_replica_transient", []);
+  return rows.length;
 }
 
 /** A storage failure the DPv2 transport reads as definitive absence. */
@@ -55,11 +81,21 @@ export function createLiteReplicaStorage(input: {
       ),
     );
   const attach = (id: string, length: number, digest: string) =>
-    persistence.transaction((tx) =>
-      tx.attachBytes(id, { length, sha256: digest }),
-    );
+    persistence.transaction(async (tx) => {
+      await tx.sql.exec(LITE_REPLICA_TRANSIENT_MIGRATION);
+      await tx.attachBytes(id, { length, sha256: digest });
+      await tx.sql.run(
+        "INSERT OR IGNORE INTO pdpp_lite_replica_transient (id) VALUES (?)",
+        [id],
+      );
+    });
   const release = (id: string) =>
-    persistence.transaction((tx) => tx.releaseBytes(id));
+    persistence.transaction(async (tx) => {
+      await tx.releaseBytes(id);
+      await tx.sql.run("DELETE FROM pdpp_lite_replica_transient WHERE id=?", [
+        id,
+      ]);
+    });
   async function read(id: string) {
     const parts: Uint8Array[] = [];
     let size = 0;

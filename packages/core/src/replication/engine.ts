@@ -464,6 +464,12 @@ export interface ReplicaEngineExporter<C> {
   ): ReplicaEffect<void, C>;
   /** A new writer re-captures current state as its baseline. */
   rebaseline(): ReplicaEffect<{ after: number } | undefined, C>;
+  /**
+   * The gateway confirmed the registration of a tail batch: every local
+   * operation up to `next` (a tail cursor) is published. A host with an
+   * outbox drops them; called in order, possibly more than once.
+   */
+  acknowledgePublished(next: number): ReplicaEffect<void, C>;
   readPinnedBlobChunks(
     blobId: string,
   ): Iterable<Uint8Array> | AsyncIterable<Uint8Array>;
@@ -806,6 +812,16 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
     if (!columns.some((column) => column.name === "resource_limits_version"))
       yield* sql.exec(
         "ALTER TABLE pdpp_transport_manifests_in ADD COLUMN resource_limits_version INTEGER",
+      );
+    // The tail cursor after a tail batch's operations; NULL for a baseline
+    // batch and for batches retained before this column.
+    if (
+      !(yield* sql.all<{ name: string }>(
+        "PRAGMA table_info(pdpp_transport_batches)",
+      )).some((column) => column.name === "export_next")
+    )
+      yield* sql.exec(
+        "ALTER TABLE pdpp_transport_batches ADD COLUMN export_next INTEGER",
       );
     yield* sql.run(
       "INSERT OR IGNORE INTO pdpp_transport_repository (id,repository_id) VALUES (1,?)",
@@ -1370,13 +1386,14 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
             if (!(yield* verifyReplicaPayload(batch, digest, totalBytes)))
               throw new ReplicaProblemError("retain_failed");
             yield* sql.run(
-              "INSERT INTO pdpp_transport_batches (batch,sequence,previous_json,collected_at,digest,total_bytes) VALUES (?,?,?,?,?,?)",
+              "INSERT INTO pdpp_transport_batches (batch,sequence,previous_json,collected_at,digest,total_bytes,export_next) VALUES (?,?,?,?,?,?,?)",
               batch,
               s.sequence + 1,
               s.previous_json,
               new Date(now()).toISOString(),
               digest,
               totalBytes,
+              s.baseline_done ? page.next : null,
             );
             yield* retainPreparationOperations(batch, page.operations);
             yield* sql.run(
@@ -3108,12 +3125,21 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
               "UPDATE pdpp_transport_registration_recovery SET state='committed' WHERE batch=?",
               item.row.batch,
             );
-          if (item.row.kind === "manifest" && outcome.tag === "progress")
+          if (item.row.kind === "manifest" && outcome.tag === "progress") {
             yield* sql.run(
               "UPDATE pdpp_transport_registration_intents SET status='confirmed' WHERE scope=? AND version=?",
               item.row.scope!,
               item.row.version!,
             );
+            // The batch is durable on the gateway: its operations leave the
+            // host's outbox in the same transaction.
+            const exported = yield* sql.get<{ export_next: number | null }>(
+              "SELECT export_next FROM pdpp_transport_batches WHERE batch=?",
+              item.row.batch,
+            );
+            if (exported?.export_next != null)
+              yield* exporter.acknowledgePublished(exported.export_next);
+          }
           if (item.row.kind === "manifest" && outcome.tag === "quarantine")
             yield* sql.run(
               "UPDATE pdpp_transport_registration_intents SET status='conflict' WHERE scope=? AND version=?",

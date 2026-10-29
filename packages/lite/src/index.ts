@@ -188,6 +188,7 @@ export {
 
 export {
   createLiteCanonicalStore,
+  LiteCanonicalRefusal,
   litePendingFingerprint,
   type LiteCommitReceipt,
   type LiteReplicaReadOptions,
@@ -226,6 +227,7 @@ export {
 } from "./replication-coordinator-state.js";
 export {
   createLiteReplicaEngine,
+  type LiteReplicaEngine,
   type LiteReplicaEngineInput,
 } from "./replication-engine.js";
 export {

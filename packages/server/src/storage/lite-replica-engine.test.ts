@@ -52,6 +52,7 @@ class SimulatedCrash extends Error {}
 function crashable(inner: LiteReplicaPersistence) {
   let count = 0;
   let crashAt: number | undefined;
+  let crashAtRelease = false;
   let dead = false;
   const alive = () => {
     if (dead) throw new SimulatedCrash("process lost");
@@ -62,9 +63,23 @@ function crashable(inner: LiteReplicaPersistence) {
       const index = ++count;
       return inner.transaction(async (tx) => {
         alive();
-        const result = await run(tx);
+        let released = false;
+        const view = crashAtRelease
+          ? new Proxy(tx, {
+              get(target, key) {
+                if (key === "releaseBytes")
+                  return (id: string) => {
+                    released = true;
+                    return target.releaseBytes(id);
+                  };
+                const value = Reflect.get(target, key) as unknown;
+                return typeof value === "function" ? value.bind(target) : value;
+              },
+            })
+          : tx;
+        const result = await run(view);
         alive();
-        if (index === crashAt) {
+        if (index === crashAt || released) {
           dead = true;
           throw new SimulatedCrash(`crash at transaction ${index}`);
         }
@@ -81,6 +96,10 @@ function crashable(inner: LiteReplicaPersistence) {
     count: () => count,
     crashAfter(k: number) {
       crashAt = count + k;
+    },
+    /** Die in the first transaction that releases replica bytes. */
+    crashAtRelease() {
+      crashAtRelease = true;
     },
     get dead() {
       return dead;
@@ -110,6 +129,8 @@ async function liteDevice(net: Network, opts: { enabled?: boolean } = {}) {
   net.roster.register(authority.signer.address, owner);
   let native = createSqliteLiteReplicaPersistence(path);
   let process = crashable(native.port);
+  // Registrations fail while offline: retained batches stay unpublished.
+  let offline = false;
   const open = () => {
     const persistence = process.port;
     const canonical = createLiteCanonicalStore({
@@ -149,7 +170,11 @@ async function liteDevice(net: Network, opts: { enabled?: boolean } = {}) {
       };
     const transport: ReplicaTransportPort = {
       ...net.port,
-      register: guarded(net.port.register),
+      register: guarded((...args: Parameters<typeof net.port.register>) =>
+        offline
+          ? Promise.reject(new Error("gateway unreachable"))
+          : net.port.register(...args),
+      ),
       evidence: guarded(net.port.evidence),
       list: guarded(net.port.list),
       putFragment: guarded(bytes.putFragment),
@@ -195,6 +220,18 @@ async function liteDevice(net: Network, opts: { enabled?: boolean } = {}) {
       return process;
     },
     native: () => native,
+    offline(value: boolean) {
+      offline = value;
+    },
+    /** Log entries past the outbox acknowledgment: not yet published. */
+    outbox: () =>
+      native.db
+        .prepare(
+          `SELECT count(*) AS n FROM lite_kv WHERE key LIKE 'log/%'
+             AND CAST(substr(key, 5) AS INTEGER) >
+               COALESCE((SELECT CAST(value AS INTEGER) FROM lite_kv WHERE key='outbox-ack'), 0)`,
+        )
+        .get(),
     /**
      * A local write. The first one also registers the connection. Writes
      * name the writer bound at the first enable, so they come after it.
@@ -453,4 +490,187 @@ describe("PS-Lite replication engine with a Node writer", () => {
       );
     },
   );
+});
+
+/** Records `prefix0..prefix{n-1}` as one host holds them. */
+async function records(
+  device: { get(id: string): unknown },
+  prefix: string,
+  n: number,
+) {
+  const found: Record<string, unknown> = {};
+  for (let i = 0; i < n; i++)
+    found[`${prefix}${i}`] = await device.get(`${prefix}${i}`);
+  return found;
+}
+const written = (prefix: string, text: string, n: number) =>
+  Object.fromEntries(
+    Array.from({ length: n }, (_, i) => [
+      `${prefix}${i}`,
+      { id: `${prefix}${i}`, text: `${text} ${i}` },
+    ]),
+  );
+
+describe("PS-Lite replication engine: writer changes and bounded storage", () => {
+  const N = 6;
+
+  /**
+   * Team phones already hold data when replication turns on, and a restore,
+   * clone or reinstall rotates the writer (host contract §3.2). Each time
+   * the phone re-exports its canonical state under the new writer: the
+   * records written before the first enable, and the ones the old writer
+   * retained but never published.
+   */
+  it("converges a phone's writes from before its first enable and across a writer rotation", async () => {
+    const net = network();
+    const node = transportDevice(net);
+    const lite = await liteDevice(net);
+    for (let i = 0; i < N; i++) await lite.put(`before enable ${i}`, `r${i}`);
+    await run([node, lite]);
+    expect(await records(node, "r", N)).toEqual(
+      written("r", "before enable", N),
+    );
+
+    // The old writer retains these but the gateway never registers them.
+    lite.offline(true);
+    for (let i = 0; i < N; i++) await lite.put(`unpublished ${i}`, `s${i}`);
+    await run([node, lite], 4);
+    expect(await records(node, "s", N)).toEqual(
+      Object.fromEntries(
+        Array.from({ length: N }, (_, i) => [`s${i}`, undefined]),
+      ),
+    );
+    const scopes = () =>
+      new Set(
+        net.calls.registrations.map((slot) =>
+          slot.slice(0, slot.lastIndexOf("/")),
+        ),
+      );
+    const before = scopes();
+
+    await lite.engine.rotateWriter();
+    lite.offline(false);
+    await run([node, lite]);
+    expect(await records(node, "s", N)).toEqual(written("s", "unpublished", N));
+    expect(await records(node, "r", N)).toEqual(
+      written("r", "before enable", N),
+    );
+    // The new writer published under its own scope.
+    expect(scopes().size).toBe(before.size + 1);
+
+    // A peer that joins after the rotation converges too.
+    const late = transportDevice(net);
+    await run([node, lite, late]);
+    expect(await records(late, "s", N)).toEqual(written("s", "unpublished", N));
+    expect(await records(late, "r", N)).toEqual(
+      written("r", "before enable", N),
+    );
+  }, 60_000);
+
+  /**
+   * Steady use must not grow the phone's outbox: once the gateway confirms
+   * a batch's registration, its operations leave the outbox. Node keeps its
+   * append-only journal (rebaseline and completions read it); what it
+   * publishes leaves no batch waiting for registration.
+   */
+  it("empties the phone's outbox once the gateway confirms what it published", async () => {
+    const net = network();
+    const node = transportDevice(net);
+    const lite = await liteDevice(net);
+    await lite.cycle();
+    for (let round = 0; round < 3; round++) {
+      for (let i = 0; i < N; i++)
+        await lite.put(`round ${round} ${i}`, `r${i}`);
+      node.put(`node round ${round}`, "n");
+      await run([node, lite], 6);
+      expect(lite.outbox()).toEqual({ n: 0 });
+    }
+    expect(await records(node, "r", N)).toEqual(written("r", "round 2", N));
+    for (const db of [node.db, lite.native().db])
+      expect(
+        db
+          .prepare(
+            `SELECT count(*) AS n FROM pdpp_transport_batches b
+             WHERE NOT EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m
+               JOIN pdpp_transport_registration_intents i ON i.scope=m.scope AND i.version=m.version
+               WHERE m.batch=b.batch AND m.state='published' AND i.status='confirmed')`,
+          )
+          .get(),
+      ).toEqual({ n: 0 });
+  }, 60_000);
+
+  /**
+   * A Node batch over the phone's 192 KiB canonical batch bound fails the
+   * same way on every attempt. The phone refuses it once, quarantines its
+   * writer from that batch on, and keeps importing other writers.
+   */
+  it("quarantines a batch the phone can never import and keeps importing other writers", async () => {
+    const net = network();
+    const poison = transportDevice(net);
+    const other = transportDevice(net);
+    const lite = await liteDevice(net);
+    await lite.cycle();
+    for (let i = 0; i < 4; i++) poison.put("x".repeat(60_000), `p${i}`);
+    other.put("from another writer", "q");
+    await run([poison, other, lite]);
+    expect(await lite.get("q")).toEqual({
+      id: "q",
+      text: "from another writer",
+    });
+    expect(await lite.get("p0")).toBeUndefined();
+    const db = lite.native().db;
+    expect(
+      db
+        .prepare(
+          "SELECT state, terminal_reason AS reason FROM pdpp_replica_batch_disposition WHERE state='terminal'",
+        )
+        .all(),
+    ).toEqual([{ state: "terminal", reason: "canonical_batch_too_large" }]);
+    expect(
+      db
+        .prepare(
+          "SELECT DISTINCT state, reason FROM pdpp_transport_manifests_in WHERE state='quarantined'",
+        )
+        .all(),
+    ).toEqual([{ state: "quarantined", reason: "finalized_conflict" }]);
+    // Later work of the other writer still flows.
+    other.put("still flowing", "q2");
+    await run([poison, other, lite], 6);
+    expect(await lite.get("q2")).toEqual({ id: "q2", text: "still flowing" });
+  }, 60_000);
+
+  /**
+   * Process loss after an upload attached its staged bytes and before it
+   * released them: the attach committed, the release did not. The next step
+   * reclaims the bytes before it transfers anything.
+   */
+  it("reclaims replica bytes an upload crash left attached", async () => {
+    const net = network();
+    const node = transportDevice(net);
+    const lite = await liteDevice(net);
+    await lite.cycle();
+    await lite.put("crash mid upload", "u");
+    lite.process.crashAtRelease();
+    for (let i = 0; i < 4 && !lite.process.dead; i++) {
+      clock.advance(10_000);
+      await lite.cycle().catch((error: unknown) => {
+        if (!lite.process.dead) throw error;
+      });
+    }
+    expect(lite.process.dead).toBe(true);
+    const bytes = () =>
+      lite.native().db.prepare("SELECT count(*) AS n FROM lite_bytes").get();
+    // The orphan: attached, never released.
+    expect(bytes()).not.toEqual({ n: 0 });
+    lite.crashReopen();
+    await run([node, lite]);
+    expect(node.get("u")).toEqual({ id: "u", text: "crash mid upload" });
+    expect(bytes()).toEqual({ n: 0 });
+    expect(
+      lite
+        .native()
+        .db.prepare("SELECT count(*) AS n FROM pdpp_lite_replica_transient")
+        .get(),
+    ).toEqual({ n: 0 });
+  }, 60_000);
 });

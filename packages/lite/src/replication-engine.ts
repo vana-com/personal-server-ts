@@ -10,10 +10,10 @@
  *   promoted copy imports through the canonical store.
  * - Received blob bytes are replica bytes attached in the outcome
  *   transaction, then published as canonical blobs with `tx.publishBlob`.
- *
- * Not supported yet: a writer change after local writes (no Lite rebaseline:
- * the identity then refuses with `replica_identity_requires_fresh_journal`),
- * and retained baselines (a new Lite writer starts from an empty journal).
+ * - A new writer (first enable with local writes, rotation) re-exports the
+ *   canonical state into the outbox (canonical `rebaseline`, core
+ *   `rebaseline.ts` rules), so the baseline is empty and the tail carries it.
+ * - The outbox drops what the gateway confirmed (`acknowledgePublished`).
  */
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import type { ReplicaVisibilityPolicy } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
@@ -39,16 +39,18 @@ import { REPLICA_LOCK_SCHEMA } from "@opendatalabs/personal-server-ts-core/repli
 import { REPLICA_PAYLOAD_MIGRATION } from "@opendatalabs/personal-server-ts-core/replication/payload";
 import {
   REPLICA_COPY_MIGRATION,
+  ReplicaCopyRefused,
   replicaCopies,
   type StagedCopy,
 } from "@opendatalabs/personal-server-ts-core/replication/copies";
 import { REPLICA_REFETCH_BUDGET } from "@opendatalabs/personal-server-ts-core/replication/copy-promotion";
 import {
   REPLICA_WRITER_IDENTITY_MIGRATION,
-  ReplicaWriterIdentityError,
   currentReplicaWriterIdentity,
   enableReplicaWriterIdentity,
   establishReplicaWriterIdentity,
+  rotateReplicaWriterIdentity,
+  type ReplicaWriterIdentity,
 } from "@opendatalabs/personal-server-ts-core/replication/writer-identity-store";
 import {
   replicaEnvelopeSchema,
@@ -63,8 +65,13 @@ import type {
 } from "./canonical-persistence.js";
 import {
   createLiteCanonicalStore,
+  LiteCanonicalRefusal,
   litePendingFingerprint,
 } from "./canonical-store.js";
+import {
+  LITE_REPLICA_TRANSIENT_MIGRATION,
+  reclaimLiteTransientBytes,
+} from "./replication-storage.js";
 import { createLiteReplicaCoordinatorState } from "./replication-coordinator-state.js";
 import type {
   LiteReplicaPersistence,
@@ -165,9 +172,19 @@ export interface LiteReplicaEngineInput {
   engine: ReplicaEngineConfig;
 }
 
+/** The core engine on Lite, plus the writer rotation a host calls itself. */
+export interface LiteReplicaEngine extends ReplicaEngine {
+  /**
+   * A new nonce under the same registration, after a restore, clone or
+   * reinstall (host contract §3.2). Call it before the engine steps again;
+   * the next step re-exports the canonical state under the new writer.
+   */
+  rotateWriter(input?: { nonce?: string }): Promise<ReplicaWriterIdentity>;
+}
+
 export function createLiteReplicaEngine(
   input: LiteReplicaEngineInput,
-): ReplicaEngine {
+): LiteReplicaEngine {
   const { persistence, canonical, engine: config } = input;
   const now = config.now ?? (() => Date.now());
   let migrated: Promise<void> | undefined;
@@ -180,6 +197,7 @@ export function createLiteReplicaEngine(
           REPLICA_COPY_MIGRATION,
           REPLICA_WRITER_IDENTITY_MIGRATION,
           LITE_REPLICA_CUSTODY_MIGRATION,
+          LITE_REPLICA_TRANSIENT_MIGRATION,
         ])
           await tx.sql.exec(migration);
       })
@@ -273,27 +291,43 @@ export function createLiteReplicaEngine(
     });
   }
 
+  /** A promoted copy into canonical state, from its pending preview if any. */
+  function* importCanonical(
+    envelope: ReplicaEnvelope,
+    blobs: StagedCopy["blobs"],
+    id: string,
+  ): Fx<void> {
+    const fingerprint = litePendingFingerprint(envelope);
+    const pending = yield* store((s) => s.pendingBatch(id));
+    if (pending?.state === "pending" && pending.fingerprint === fingerprint)
+      yield* store((s) =>
+        s.promotePending({ id, credential: config.credential, fingerprint }),
+      );
+    else {
+      const attached = yield* blobsFor(id, envelope, blobs, false);
+      yield* store((s) =>
+        s.import({
+          id,
+          envelope,
+          credential: config.credential,
+          blobs: attached,
+        }),
+      );
+    }
+  }
+
   const copies = replicaCopies<Tx>({
     get owner() {
       return canonical.context().owner;
     },
     *importEnvelope(envelope, blobs, id) {
-      const fingerprint = litePendingFingerprint(envelope);
-      const pending = yield* store((s) => s.pendingBatch(id));
-      if (pending?.state === "pending" && pending.fingerprint === fingerprint)
-        yield* store((s) =>
-          s.promotePending({ id, credential: config.credential, fingerprint }),
-        );
-      else {
-        const attached = yield* blobsFor(id, envelope, blobs, false);
-        yield* store((s) =>
-          s.import({
-            id,
-            envelope,
-            credential: config.credential,
-            blobs: attached,
-          }),
-        );
+      try {
+        yield* importCanonical(envelope, blobs, id);
+      } catch (error) {
+        // The same batch fails the same way again: stop retrying it.
+        if (error instanceof LiteCanonicalRefusal)
+          throw new ReplicaCopyRefused(`canonical_${error.reason}`);
+        throw error;
       }
     },
     quarantineConnection: (connectionId) =>
@@ -329,14 +363,20 @@ export function createLiteReplicaEngine(
           JSON.parse(blobsJson) as StagedCopy["blobs"],
           true,
         );
-        yield* store((s) =>
-          s.stagePending({
-            id,
-            envelope,
-            credential: config.credential,
-            blobs,
-          }),
-        );
+        try {
+          yield* store((s) =>
+            s.stagePending({
+              id,
+              envelope,
+              credential: config.credential,
+              blobs,
+            }),
+          );
+        } catch (error) {
+          // No preview for a batch the store refuses; promotion fails
+          // closed on it (`importEnvelope`).
+          if (!(error instanceof LiteCanonicalRefusal)) throw error;
+        }
       },
       *hide(id, state) {
         const pending = yield* store((s) => s.pendingBatch(id));
@@ -462,20 +502,15 @@ export function createLiteReplicaEngine(
                     admitted: function* () {
                       return true;
                     },
-                    // The canonical clock enforces this when it binds the writer.
+                    // Local writes before the first identity are re-exported
+                    // under it (canonical `rebaseline`).
                     journalEmpty: function* () {
                       return true;
                     },
                   },
                   { owner: request.owner, server: request.server, record },
                 );
-                try {
-                  yield* store((s) => s.bindWriter(identity.operationWriter));
-                } catch {
-                  throw new ReplicaWriterIdentityError(
-                    "replica_identity_requires_fresh_journal",
-                  );
-                }
+                yield* store((s) => s.rebaseline(identity.operationWriter));
                 return identity;
               })(),
             ),
@@ -562,17 +597,21 @@ export function createLiteReplicaEngine(
             writer.fail(new Error("staged object aborted"));
           open.delete(admission);
         },
-        // Unattached native stages are discarded by the host; none outlive it.
+        // Unattached native stages are discarded by the host; none outlive
+        // it. Bytes the storage adapter attached and a crash kept from its
+        // release are reclaimed before the step's first transfer.
         reclaimAdmission: () => 0,
         cleanup: () => 0,
-        cleanupAttachedTemporaryBytes: () => 0,
+        cleanupAttachedTemporaryBytes: () =>
+          run(inTx(reclaimLiteTransientBytes)),
       };
     },
     // Lite staging keeps no rows that could lose their bytes.
     *sweepStages() {},
     exporter: {
-      // A Lite writer starts from an empty journal (bindWriter), so its
-      // baseline is empty and every local operation is in the tail.
+      // A new Lite writer re-exports its state into the outbox
+      // (`rebaseline`), so its baseline is empty and every operation is in
+      // the tail.
       *readBaselinePage({ afterSequence }) {
         return {
           operations: [],
@@ -593,9 +632,16 @@ export function createLiteReplicaEngine(
         return 0;
       },
       *acknowledgeBaselinePage() {},
+      // `establish` already re-exported for the current identity; this is
+      // a no-op unless the writer changed since.
       *rebaseline() {
+        const identity = yield* currentReplicaWriterIdentity();
+        if (identity)
+          yield* store((s) => s.rebaseline(identity.operationWriter));
         return undefined;
       },
+      acknowledgePublished: (next) =>
+        store((s) => s.acknowledgePublished(next)),
       readPinnedBlobChunks: (blobId) => persistence.readBlob(blobId),
     },
     receiver: {
@@ -694,6 +740,17 @@ export function createLiteReplicaEngine(
   let created: ReplicaEngine | undefined;
   const engine = () => (created ??= createReplicaEngine(host, config));
   return {
+    rotateWriter: (request = {}) =>
+      run(
+        rotateReplicaWriterIdentity(
+          {
+            *admitted() {
+              return door.admitted();
+            },
+          },
+          request,
+        ),
+      ),
     get ready() {
       return engine().ready;
     },
