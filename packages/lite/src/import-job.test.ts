@@ -3,6 +3,7 @@ import {
   binding,
   identity,
   registration,
+  upsert,
 } from "@opendatalabs/personal-server-ts-core/replication/fixtures";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
@@ -158,6 +159,48 @@ describe("Lite canonical import encoder", () => {
         "operationKey",
         "sequence",
       ]);
+  });
+
+  it("fences the batch on the clock it encoded against", async () => {
+    const before = await registeredDisk();
+    const job = {
+      jobId: "job-1",
+      binding: {
+        owner: identity.owner,
+        instance: identity.connectionId,
+        sourceId: identity.sourceId,
+        method: identity.methodId,
+        generation: identity.generation,
+      },
+    };
+    const encoder = createLiteCanonicalImportEncoder({
+      context,
+      newId: ids("op"),
+    });
+    const parts = encoder.importBatchParts({
+      job,
+      seq: 0,
+      operations: importOperations().slice(0, 5),
+      bindingFor: () => binding,
+    });
+    const encoded = await encoder.encode(viewOf(before.rows), parts);
+    expect(encoded.fence).toEqual({
+      key: "clock",
+      value: before.rows.get("clock"),
+    });
+    // Any canonical commit before publication moves the clock, so a native
+    // copy that compares it refuses the stale entries.
+    const store = createLiteCanonicalStore({
+      persistence: createFakeCanonicalPersistence(before).port,
+      enabled: true,
+      context,
+      authenticateReplica: () => undefined,
+      newId: ids("other"),
+    });
+    await store.commitLocal("intervening", [
+      draft(upsert("other-op", 1, "written meanwhile")),
+    ]);
+    expect(before.rows.get("clock")).not.toBe(encoded.fence.value);
   });
 
   it("refuses an operation that cannot fit one canonical part", () => {

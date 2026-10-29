@@ -503,7 +503,10 @@ describe("PDPP import job engine (in-memory adapter)", () => {
         capability,
         declarations,
         owner: OWNER,
-        encodeBatch: async () => ({ entries: [] }),
+        encodeBatch: async () => ({
+          entries: [],
+          fence: { key: "clock", value: null },
+        }),
       }),
     ).toThrow(expect.objectContaining({ code: "invalid_request" }));
 
@@ -526,6 +529,7 @@ describe("PDPP import job engine (in-memory adapter)", () => {
             key: `rows/${op.recordKey}`,
             value: op.dataJson,
           })),
+          fence: { key: "clock", value: null },
         };
       },
     });
@@ -545,7 +549,10 @@ describe("PDPP import job engine (in-memory adapter)", () => {
     // A replay answers from the durable receipt; it never re-encodes.
     expect(encoded).toEqual([0]);
     expect(staged).toEqual([
-      { entries: [expect.objectContaining({ key: expect.any(String) })] },
+      {
+        entries: [expect.objectContaining({ key: expect.any(String) })],
+        fence: { key: "clock", value: null },
+      },
     ]);
   });
 

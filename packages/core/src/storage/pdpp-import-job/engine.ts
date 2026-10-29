@@ -19,7 +19,7 @@ import {
   PDPP_IMPORT_SPOOL_FORMAT,
   type ImportBatchInput,
   type ImportBatchReceipt,
-  type ImportCanonicalEntry,
+  type ImportCanonicalBatch,
   type ImportCommitInput,
   type ImportCommitReceipt,
   type ImportDeclarations,
@@ -104,7 +104,7 @@ export interface PdppImportJobsOptions {
     job: ImportJobRecord;
     seq: number;
     operations: readonly ImportStagedOperation[];
-  }) => Promise<{ entries: ImportCanonicalEntry[] }>;
+  }) => Promise<ImportCanonicalBatch>;
 }
 
 export function createPdppImportJobs(

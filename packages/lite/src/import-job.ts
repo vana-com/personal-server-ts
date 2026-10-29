@@ -18,6 +18,7 @@ import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replica
 import {
   ImportJobError,
   type ImportCanonicalEntry,
+  type ImportCanonicalFence,
   type ImportJobRecord,
   type ImportStagedOperation,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-import-job";
@@ -54,6 +55,8 @@ export interface LiteCanonicalReadView {
 export interface LiteCanonicalEncodedBatch {
   /** Sorted by key; the final value of every key the batch wrote. */
   entries: LiteCanonicalEntry[];
+  /** The clock the entries were encoded against (`ImportCanonicalFence`). */
+  fence: ImportCanonicalFence;
   /** One `commitLocal` receipt per part, in order. */
   parts: { id: string; receipt: LiteCommitReceipt }[];
 }
@@ -64,6 +67,8 @@ const PART_BYTES = 192 * 1024;
 const PAGE_ENTRIES = 100;
 const PAGE_BYTES = 512 * 1024;
 const utf8 = new TextEncoder();
+/** Every record-writing canonical commit advances it (`canonical-store.ts`). */
+const CLOCK_KEY = "clock";
 
 /** A transaction over `view` that keeps its writes in `overlay`. */
 function captureTransaction(
@@ -147,6 +152,10 @@ export function createLiteCanonicalImportEncoder(
     parts: { id: string; operations: LiteOperationDraft[] }[],
   ): Promise<LiteCanonicalEncodedBatch> {
     const overlay = new Map<string, string | null>();
+    const fence = {
+      key: CLOCK_KEY,
+      value: (await view.get(CLOCK_KEY)) ?? null,
+    };
     const persistence: LiteCanonicalPersistence = {
       transaction: (run) => run(captureTransaction(view, overlay)),
       stageBlob: () =>
@@ -172,6 +181,7 @@ export function createLiteCanonicalImportEncoder(
       entries: [...overlay.entries()]
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
         .map(([key, value]) => ({ key, value })),
+      fence,
       parts: receipts,
     };
   }

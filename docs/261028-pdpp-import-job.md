@@ -139,6 +139,11 @@ how an adapter publishes:
   connector state, completion and commit receipts, and deletion of the
   staging rows, in one transaction. The engine requires `encodeBatch` for
   this mode and refuses it for any other; it calls it once per durable batch.
+  Each batch also carries `canonical.fence`, the clock value it was encoded
+  against. Entries encoded against an older state would overwrite later
+  writes, so `publish` refuses `canonical_moved` unless the committed clock
+  still equals batch 0's fence and no other canonical transaction committed
+  since batch 0 was staged; the host aborts and starts the job again.
 - `outbox: "by-reference"`: an outbox entry names the committed operation
   (`{batchId, operationKey, sequence}` in the Lite canonical store) and
   carries no record bytes. `captured-in-transaction` is the Node SQLite

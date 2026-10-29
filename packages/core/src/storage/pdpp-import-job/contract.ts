@@ -268,6 +268,23 @@ export interface ImportCanonicalEntry {
 }
 
 /**
+ * What a batch's canonical entries were encoded against: the value of one
+ * canonical key (the Lite clock, which every record-writing commit advances)
+ * as the encoder read it. A later batch reads it through the job's staged
+ * entries, so batch 0's fence is the job's base.
+ */
+export interface ImportCanonicalFence {
+  key: string;
+  value: string | null;
+}
+
+/** One batch's encoded entries and the fence they hold only against. */
+export interface ImportCanonicalBatch {
+  entries: ImportCanonicalEntry[];
+  fence: ImportCanonicalFence;
+}
+
+/**
  * How an adapter publishes. Absent means
  * `{ mode: "transactional-apply", outbox: "captured-in-transaction" }`, the
  * version 1 behaviour of the Node SQLite and memory adapters.
@@ -282,7 +299,12 @@ export interface ImportPublicationProfile {
    *   native set-based copy (`INSERT … SELECT`) from that table into the
    *   canonical tables, together with connector state, completion receipts,
    *   the commit receipt and deletion of the staging rows. The copy never
-   *   re-encodes; the engine requires `encodeBatch` for this mode.
+   *   re-encodes; the engine requires `encodeBatch` for this mode. Entries
+   *   encoded against an older canonical state would overwrite later writes,
+   *   so `publish` refuses `canonical_moved` unless the committed value at
+   *   batch 0's `fence.key` still equals its `fence.value` and no other
+   *   canonical transaction committed since batch 0 was staged. The host
+   *   aborts the job and starts it again.
    */
   mode: "transactional-apply" | "native-staged-copy";
   /**
@@ -315,7 +337,7 @@ export interface PdppImportJobCapability {
     receipt: ImportBatchReceipt;
     operations: ImportStagedOperation[];
     /** Present exactly for `native-staged-copy`: store these in the same transaction. */
-    canonical?: { entries: ImportCanonicalEntry[] };
+    canonical?: ImportCanonicalBatch;
   }): Promise<ImportBatchReceipt>;
   readBatchReceipt(
     jobId: string,
@@ -379,6 +401,8 @@ export type ImportJobErrorCode =
   | "job_busy"
   /** A record with `data.blob_ref`; version 1 stages no blobs. */
   | "blob_ref_unsupported"
+  /** A native staged copy whose canonical base moved after batch 0; abort and start again. */
+  | "canonical_moved"
   | "completion_failed";
 
 export class ImportJobError extends Error {

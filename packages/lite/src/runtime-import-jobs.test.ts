@@ -156,6 +156,7 @@ describe("PS Lite import jobs", () => {
             key: op.recordKey,
             value: op.dataJson,
           })),
+          fence: { key: "clock", value: null },
         }),
       },
     });
