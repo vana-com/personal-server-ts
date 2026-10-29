@@ -516,6 +516,85 @@ describe("upload worker against write-once storage", () => {
     expect(r.storage.entries[0]?.version).toBe(2);
   });
 
+  // Desktop 29-10: delete a scope, import it again. The index row carries
+  // after_tombstone_version from ingest; no fence adapter exists for the
+  // deployed gateway, so the re-add used to stay unsynced forever.
+  it("with production wiring, registers an ingest-acknowledged re-add strictly after the tombstone", async () => {
+    await upload(await replica(envelope("original"), 1), production);
+    registry.deleteScope();
+    // The gateway lets a same-version POST rewrite a pending row. The re-add
+    // must still never land on the tombstone's slot.
+    registry.pendingRefresh = true;
+    const content = envelope("re-added");
+    const r = await replica(content, 1);
+    r.storage.entries[0]!.afterTombstoneVersion = 2;
+
+    await upload(r, production);
+
+    expect(registry.versions.get(2n)).toMatchObject({
+      dataHash: TOMBSTONE_DATA_HASH,
+      deletedAt: "2026-10-21T01:00:00Z",
+    });
+    expect(registry.versions.get(3n)?.dataHash).toBe(hashOf(content));
+    expect(r.storage.entries[0]).toMatchObject({
+      version: 3,
+      dataPointId: DATA_POINT_ID,
+    });
+    expect(blobs.blobs.has(blobs.keyFor(2))).toBe(false);
+    const stored = await decryptWithPassword(
+      blobs.blobs.get(blobs.keyFor(3))!,
+      scopeKeyHex,
+    );
+    expect(keccak256(stored)).toBe(hashOf(content));
+  });
+
+  it("with production wiring, refuses a re-add whose acknowledgement is not the observed tombstone", async () => {
+    registry.deleteScope();
+    const r = await replica(envelope("re-added"), 1);
+    // Acknowledges a tombstone version the registry never showed.
+    r.storage.entries[0]!.afterTombstoneVersion = 5;
+
+    await expect(upload(r, production)).rejects.toMatchObject({
+      code: "NEEDS_FENCED_PUBLICATION",
+      reason: "tombstone was not acknowledged by this publication",
+    });
+    expect(blobs.puts).toEqual([]);
+    expect(registry.versions.size).toBe(1);
+    expect(r.storage.entries[0]?.dataPointId).toBeNull();
+  });
+
+  it("with production wiring, drops an unacknowledged entry instead of crossing the tombstone", async () => {
+    registry.deleteScope();
+    const r = await replica(envelope("pre-delete"), 1);
+
+    await expect(upload(r, production)).rejects.toMatchObject({
+      name: "DeletedScopeEntryError",
+    });
+    expect(blobs.puts).toEqual([]);
+    expect(registry.versions.size).toBe(1);
+  });
+
+  it("with production wiring, a second delete that lands during the re-add wins", async () => {
+    registry.deleteScope();
+    const r = await replica(envelope("re-added"), 1);
+    r.storage.entries[0]!.afterTombstoneVersion = 1;
+    let deleted = false;
+    registry.beforeRegister = async () => {
+      if (deleted) return;
+      deleted = true;
+      registry.deleteScope();
+    };
+
+    await expect(upload(r, production)).rejects.toMatchObject({
+      name: "DeletedScopeEntryError",
+    });
+    expect(registry.versions.get(2n)).toMatchObject({
+      dataHash: TOMBSTONE_DATA_HASH,
+      deletedAt: "2026-10-21T01:00:00Z",
+    });
+    expect(registry.versions.size).toBe(2);
+  });
+
   it.each([
     "before upload",
     "after upload",

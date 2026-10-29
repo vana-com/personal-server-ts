@@ -83,6 +83,17 @@ export interface PublishOptions {
   /** Caller applies its own local tombstone/drop semantics on every read. */
   checkHead?(head: PublicationRecord | null): Promise<void>;
   acknowledgedDeletionVersion?: bigint;
+  /**
+   * True only when `acknowledgedDeletionVersion` was recorded durably when the
+   * owner's data was ingested after that tombstone (index
+   * `after_tombstone_version`), never derived from this publication's own
+   * registry reads. Such a deliberate re-add may cross exactly that tombstone
+   * without the fence: it registers a fresh version strictly above it, which
+   * the legacy gateway accepts like any new version and which no exact-key
+   * cleanup of the deletion covers. Any other tombstone, an occupant to
+   * resume, or bytes to heal still need the fence.
+   */
+  deletionAcknowledgedAtIngest?: boolean;
 }
 
 const sameHash = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
@@ -189,7 +200,8 @@ export async function publishPreparedVersion(
   }
   function checkDeletion() {
     if (!head || !isDeleted(head)) return;
-    requireFence("publication crosses a deletion");
+    if (!options.deletionAcknowledgedAtIngest)
+      requireFence("publication crosses a deletion");
     if (options.acknowledgedDeletionVersion !== BigInt(head.expectedVersion))
       throw new NeedsFencedPublicationError(
         scope,
