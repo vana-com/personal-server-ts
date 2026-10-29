@@ -735,6 +735,13 @@ describe("PDPP import job engine (in-memory adapter)", () => {
     expect(await stale.connectorState(INSTANCE)).toBeUndefined();
   });
 
+  it("the memory adapter refuses a page size that is not a positive integer", () => {
+    for (const pageSize of [0, -1, 1.5, Number.NaN])
+      expect(() => createMemoryImportJobCapability({ pageSize })).toThrow(
+        expect.objectContaining({ code: "invalid_request" }),
+      );
+  });
+
   it("refuses an adapter of another contract version", () => {
     const capability = createMemoryImportJobCapability({ contractVersion: 2 });
     expect(() =>

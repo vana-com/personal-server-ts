@@ -93,6 +93,9 @@ export function createMemoryImportJobCapability(
 ) {
   const fault = options.fault ?? (() => {});
   const pageSize = options.pageSize ?? 256;
+  // As the SQLite adapter: a page under one row hangs or skips the index.
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1)
+    throw new ImportJobError("invalid_request", "pageSize must be >= 1");
   const bindings = new Map<string, Binding>();
   const rows = new Map<string, MemoryImportRow>();
   const history: MemoryImportRow[] = [];
