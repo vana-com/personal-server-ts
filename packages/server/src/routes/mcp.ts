@@ -132,6 +132,7 @@ export interface McpRouteDeps {
    * The owner/OAuth connection path is always free regardless of this flag.
    */
   paymentEnabled?: boolean;
+  ownAppAccountUrl?: string;
   /**
    * Lifetime in seconds of grants this server signs itself for MCP
    * connections when there is no live grant expiry to keep. Unset or 0
@@ -1240,6 +1241,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
           serverSigner: deps.serverSigner,
           serverAddress: deps.serverAddress,
           paymentEnabled: true,
+          ownAppAccountUrl: deps.ownAppAccountUrl,
         },
         gateway: deps.gateway,
         gatewayConfig: deps.gatewayConfig,

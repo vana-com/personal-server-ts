@@ -80,6 +80,7 @@ export interface DataRouteDeps {
    * builder-side payment signing.
    */
   paymentEnabled?: boolean;
+  ownAppAccountUrl?: string;
   accessLogWriter: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   syncManager?: SyncManager | null;
@@ -375,6 +376,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         gatewayConfig: deps.gatewayConfig,
         gatewayUrl: deps.gatewayUrl,
         paymentEnabled: deps.paymentEnabled,
+        ownAppAccountUrl: deps.ownAppAccountUrl,
         lineageGateway: deps.lineageGateway,
         onDataWritten: deps.onDataWritten,
         onDataRead: deps.onDataRead,

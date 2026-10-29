@@ -3027,6 +3027,120 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     vi.unstubAllGlobals();
   });
 
+  it("waives only the same-Account app fee without granting the owner view", async () => {
+    const app = createX402App({
+      ownAppAccountUrl: "https://account-dev.vana.org",
+    });
+    const fetch = vi.fn(async () =>
+      Response.json({
+        object: "own_app_read_eligibility",
+        appAddress: builderWallet.address.toLowerCase(),
+        dataOwner: ownerForX402.address.toLowerCase(),
+        network: "moksha",
+        eligibility: "eligible",
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    await ingest(app, "instagram.profile", { username: "own-data" });
+    const response = await getNoPayment(app, "instagram.profile");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Vana-Payment-Exemption")).toBe("own-app");
+    expect(response.headers.get("X-PAYMENT-RESPONSE")).toBeNull();
+    expect(await response.json()).toMatchObject({
+      data: { username: "own-data" },
+    });
+    const storedUri = "/instagram.profile?view=stored";
+    const storedAuth = await buildWeb3SignedHeader({
+      wallet: builderWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/instagram.profile",
+      grantId: GRANT_FOR_X402,
+    });
+    const stored = await app.request(storedUri, {
+      headers: { Authorization: storedAuth },
+    });
+    expect(stored.status).toBe(403);
+    expect(await stored.json()).toMatchObject({
+      error: { errorCode: "FORBIDDEN" },
+    });
+    expect(
+      fetch.mock.calls.every(([url]) =>
+        String(url).startsWith(
+          "https://account-dev.vana.org/api/v1/apps/own-data-read-eligibility?",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["not_eligible", 402],
+    ["unavailable", 503],
+    ["wrong-owner", 503],
+    ["wrong-network", 503],
+    ["redirect", 503],
+  ])(
+    "keeps payment enforcement or fails closed for Account evidence %s",
+    async (evidence, status) => {
+      const app = createX402App({
+        ownAppAccountUrl: "https://account-dev.vana.org",
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          if (evidence === "redirect")
+            return new Response(null, { status: 302 });
+          return Response.json(
+            {
+              object: "own_app_read_eligibility",
+              appAddress: builderWallet.address.toLowerCase(),
+              dataOwner:
+                evidence === "wrong-owner"
+                  ? builderWallet.address.toLowerCase()
+                  : ownerForX402.address.toLowerCase(),
+              network: evidence === "wrong-network" ? "mainnet" : "moksha",
+              eligibility:
+                evidence === "not_eligible"
+                  ? evidence
+                  : evidence === "unavailable"
+                    ? evidence
+                    : "eligible",
+            },
+            { status: evidence === "unavailable" ? 503 : 200 },
+          );
+        }),
+      );
+      await ingest(app, "instagram.profile", { username: "protected" });
+      const response = await getNoPayment(app, "instagram.profile");
+      expect(response.status).toBe(status);
+      expect(response.headers.get("X-Vana-Payment-Exemption")).toBeNull();
+      const body = await response.json();
+      if (status === 402)
+        expect(body.accepts[0].amount).toBe("11000000000000000");
+      else expect(body.error.errorCode).toBe("OWN_APP_ELIGIBILITY_UNAVAILABLE");
+    },
+  );
+
+  it("still refuses a revoked grant before looking up an own-app exemption", async () => {
+    const app = createX402App({
+      ownAppAccountUrl: "https://account-dev.vana.org",
+      gateway: createMockGateway({
+        getGrant: vi.fn().mockResolvedValue({
+          ...paidGrant(),
+          revokedAt: "2026-10-29T00:00:00Z",
+        }),
+      }),
+    });
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const response = await getNoPayment(app, "instagram.profile");
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({
+      error: { errorCode: "GRANT_REVOKED" },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("answers 410 for a deleted scope before issuing any payment challenge", async () => {
     // Deletion is checked ahead of the x402 cycle so a builder is never
     // charged (or even challenged) for data the owner deleted.

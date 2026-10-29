@@ -150,7 +150,7 @@ export interface PsLiteRuntimeOptions {
     server?: { origin?: string };
     gateway?: Partial<DataPortabilityGatewayConfig> & { url?: string };
     /** X402 read enforcement. Off by default in the browser runtime. */
-    payment?: { enabled?: boolean };
+    payment?: { enabled?: boolean; ownAppAccountUrl?: string };
   };
   saveConfig?: (config: unknown) => Promise<void>;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
@@ -1214,6 +1214,7 @@ export function createPsLiteRuntime(
               // config leaves these undefined so reads are served free instead
               // of yielding a malformed challenge.
               paymentEnabled: x402.paymentEnabled,
+              ownAppAccountUrl: options.config?.payment?.ownAppAccountUrl,
               gateway: options.gateway,
               gatewayConfig: x402.gatewayConfig,
               gatewayUrl: x402.gatewayConfig?.url,

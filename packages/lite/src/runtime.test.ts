@@ -1319,6 +1319,75 @@ describe("createPsLiteRuntime", () => {
     );
   });
 
+  it("x402: an operator-configured Account exempts own apps but not other owners", async () => {
+    const { runtime, owner, builder, ORIGIN, GRANT_ID, chainId, contracts } =
+      await setupX402Fixture();
+    const body = JSON.stringify({
+      server: { origin: ORIGIN },
+      gateway: { url: "https://gateway.test", chainId, contracts },
+      payment: {
+        enabled: true,
+        ownAppAccountUrl: "https://account-dev.vana.org",
+      },
+    });
+    const ownerAuth = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: ORIGIN,
+      method: "PUT",
+      uri: "/ui/api/config",
+      body: new TextEncoder().encode(body),
+    });
+    const updated = await runtime.fetch(
+      new Request(`${ORIGIN}/ui/api/config`, {
+        method: "PUT",
+        headers: {
+          Authorization: ownerAuth,
+          "Content-Type": "application/json",
+        },
+        body,
+      }),
+    );
+    expect(updated.status).toBe(200);
+    let eligibility = "eligible";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          object: "own_app_read_eligibility",
+          appAddress: builder.address.toLowerCase(),
+          dataOwner: owner.address.toLowerCase(),
+          network: "moksha",
+          eligibility,
+        }),
+      ),
+    );
+    try {
+      const auth = await buildWeb3SignedHeader({
+        wallet: builder,
+        aud: ORIGIN,
+        method: "GET",
+        uri: "/v1/data/instagram.profile",
+        grantId: GRANT_ID,
+      });
+      const read = () =>
+        runtime.fetch(
+          new Request(`${ORIGIN}/v1/data/instagram.profile`, {
+            headers: { Authorization: auth },
+          }),
+        );
+      const own = await read();
+      expect(own.status).toBe(200);
+      expect(own.headers.get("X-Vana-Payment-Exemption")).toBe("own-app");
+      expect(own.headers.get("X-PAYMENT-RESPONSE")).toBeNull();
+      eligibility = "not_eligible";
+      const other = await read();
+      expect(other.status).toBe(402);
+      expect((await other.json()).accepts[0].amount).toBe("11000000000000000");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("x402: a live gateway change never moves the challenge domain off the signer's domain", async () => {
     const {
       runtime,
