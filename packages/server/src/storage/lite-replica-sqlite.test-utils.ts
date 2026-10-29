@@ -12,16 +12,17 @@
 import Database from "better-sqlite3";
 import { sha256 } from "viem";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
-import type {
-  LiteBlobDescriptor,
-  LiteReplicaPersistence,
-  LiteReplicaSql,
-  LiteReplicaTransaction,
+import {
+  LITE_CANONICAL_MAX_VALUE_BYTES,
+  LITE_REPLICA_SQL_BYTES,
+  type LiteBlobDescriptor,
+  type LiteReplicaPersistence,
+  type LiteReplicaSql,
+  type LiteReplicaTransaction,
 } from "@opendatalabs/personal-server-ts-lite";
 import { nodeReplicaSql } from "./pdpp-replica-sql.js";
 
 const FRAME_BYTES = 128 * 1024;
-const VALUE_BYTES = 256 * 1024;
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS lite_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS lite_blobs (blob_id TEXT PRIMARY KEY, descriptor_json TEXT NOT NULL, bytes BLOB NOT NULL);
@@ -37,6 +38,31 @@ async function collect(chunks: AsyncIterable<Uint8Array>) {
     parts.push(Buffer.from(part));
   }
   return Buffer.concat(parts);
+}
+
+/** Bytes a SQL value takes on the bridge: text as UTF-8, bytes as is. */
+const sqlValueBytes = (value: unknown) =>
+  typeof value === "string"
+    ? Buffer.byteLength(value)
+    : value instanceof Uint8Array
+      ? value.byteLength
+      : 8;
+
+/** The native side refuses a call past its bound with `too-large` (§4.3). */
+function boundedSql(
+  text: string,
+  params: readonly unknown[] = [],
+  rows: Record<string, unknown>[] = [],
+) {
+  let bytes = Buffer.byteLength(text);
+  for (const value of params) bytes += sqlValueBytes(value);
+  for (const row of rows)
+    for (const [key, value] of Object.entries(row))
+      bytes += key.length + sqlValueBytes(value);
+  if (bytes > LITE_REPLICA_SQL_BYTES)
+    throw Object.assign(new Error("replica SQL call exceeds its bound"), {
+      code: "too-large",
+    });
 }
 
 function* frames(bytes: Uint8Array) {
@@ -81,13 +107,28 @@ export function createSqliteLiteReplicaPersistence(
           if (!open) throw new Error("transaction escaped its callback");
           statements++;
         };
+        // As on the phone, each call carries and returns at most
+        // LITE_REPLICA_SQL_BYTES.
         const sql: LiteReplicaSql = {
-          get: async (text, params) =>
-            (live(), sync.get(text, params)) as never,
-          all: async (text, params) =>
-            (live(), sync.all(text, params)) as never,
-          run: async (text, params) =>
-            (live(), sync.run(text, params)) as never,
+          get: async (text, params) => {
+            live();
+            boundedSql(text, params);
+            const row = sync.get(text, params);
+            boundedSql(text, params, row ? [row] : []);
+            return row as never;
+          },
+          all: async (text, params) => {
+            live();
+            boundedSql(text, params);
+            const rows = sync.all(text, params);
+            boundedSql(text, params, rows);
+            return rows as never;
+          },
+          run: async (text, params) => {
+            live();
+            boundedSql(text, params);
+            return sync.run(text, params) as never;
+          },
           exec: async (text) => (live(), sync.exec(text)) as never,
         };
         const attached: string[] = [];
@@ -101,7 +142,7 @@ export function createSqliteLiteReplicaPersistence(
           },
           async put(key, value) {
             live();
-            if (Buffer.byteLength(value) > VALUE_BYTES)
+            if (Buffer.byteLength(value) > LITE_CANONICAL_MAX_VALUE_BYTES)
               throw new Error("native value exceeds 256 KiB");
             db.prepare(
               "INSERT INTO lite_kv (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",

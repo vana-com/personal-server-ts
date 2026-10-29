@@ -10,10 +10,15 @@ import { createDpv2ReplicaTransport } from "@opendatalabs/personal-server-ts-cor
 import type { ReplicaTransportPort } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import type { ReplicaEngine } from "@opendatalabs/personal-server-ts-core/replication/engine";
 import {
+  REPLICA_DEFAULT_FRAGMENT_BYTES,
+  REPLICA_LIMITS_VERSION,
+} from "@opendatalabs/personal-server-ts-core/replication/limits";
+import {
   createLiteCanonicalStore,
   createLiteReplicaEngine,
   createLiteReplicaStorage,
   createLiteReplicationRuntime,
+  LITE_CANONICAL_MAX_OPERATION_BYTES,
   LITE_REPLICATION_LIMITS,
   type LiteReplicaPersistence,
 } from "@opendatalabs/personal-server-ts-lite";
@@ -52,10 +57,18 @@ class SimulatedCrash extends Error {}
 function crashable(inner: LiteReplicaPersistence) {
   let count = 0;
   let crashAt: number | undefined;
-  let crashAtRelease = false;
+  /** The transaction call that marks its transaction to die before commit. */
+  let crashOn:
+    { method: "put" | "releaseBytes"; when(arg: string): boolean } | undefined;
+  let crashInRead = false;
+  let crashInUpload = false;
   let dead = false;
   const alive = () => {
     if (dead) throw new SimulatedCrash("process lost");
+  };
+  const die = (where: string): never => {
+    dead = true;
+    throw new SimulatedCrash(`crash ${where}`);
   };
   const port: LiteReplicaPersistence = {
     ...inner,
@@ -63,32 +76,39 @@ function crashable(inner: LiteReplicaPersistence) {
       const index = ++count;
       return inner.transaction(async (tx) => {
         alive();
-        let released = false;
-        const view = crashAtRelease
+        let marked = false;
+        const trigger = crashOn;
+        const view = trigger
           ? new Proxy(tx, {
               get(target, key) {
-                if (key === "releaseBytes")
-                  return (id: string) => {
-                    released = true;
-                    return target.releaseBytes(id);
-                  };
                 const value = Reflect.get(target, key) as unknown;
-                return typeof value === "function" ? value.bind(target) : value;
+                if (typeof value !== "function") return value;
+                if (key !== trigger.method) return value.bind(target);
+                return (arg: string, ...rest: unknown[]) => {
+                  if (trigger.when(arg)) marked = true;
+                  return (value as (...args: unknown[]) => unknown).call(
+                    target,
+                    arg,
+                    ...rest,
+                  );
+                };
               },
             })
           : tx;
         const result = await run(view);
         alive();
-        if (index === crashAt || released) {
-          dead = true;
-          throw new SimulatedCrash(`crash at transaction ${index}`);
-        }
+        if (index === crashAt || marked) die(`at transaction ${index}`);
         return result;
       });
     },
     async stageBytes(chunks) {
       alive();
       return inner.stageBytes(chunks);
+    },
+    readBytes(id) {
+      alive();
+      if (crashInRead) die("reading attached bytes");
+      return inner.readBytes(id);
     },
   };
   return {
@@ -99,7 +119,22 @@ function crashable(inner: LiteReplicaPersistence) {
     },
     /** Die in the first transaction that releases replica bytes. */
     crashAtRelease() {
-      crashAtRelease = true;
+      crashOn = { method: "releaseBytes", when: () => true };
+    },
+    /** Die in the first transaction that writes a key under `prefix`. */
+    crashAtPut(prefix: string) {
+      crashOn = { method: "put", when: (key) => key.startsWith(prefix) };
+    },
+    /** Die when a download reads the bytes it attached. */
+    crashInRead() {
+      crashInRead = true;
+    },
+    /** Die during the next native upload, after its object reached storage. */
+    crashInUpload() {
+      crashInUpload = true;
+    },
+    uploaded() {
+      if (crashInUpload) die("during the native upload");
     },
     get dead() {
       return dead;
@@ -113,7 +148,10 @@ function crashable(inner: LiteReplicaPersistence) {
  * file, its own server key in the owner's roster, connection `conn` bound
  * to the same source and method as the Node device's.
  */
-async function liteDevice(net: Network, opts: { enabled?: boolean } = {}) {
+async function liteDevice(
+  net: Network,
+  opts: { enabled?: boolean; maxBlobBytes?: number } = {},
+) {
   const path = join(scratchDirectory("lite-engine"), "native.sqlite");
   const context = () => ({
     owner,
@@ -139,11 +177,21 @@ async function liteDevice(net: Network, opts: { enabled?: boolean } = {}) {
       context,
       authenticateReplica,
     });
+    const memory = createMemoryReplicaObjectTransfers(persistence, {
+      objects: net.blobs,
+    }).port;
+    const crash = process;
     const storage = createLiteReplicaStorage({
       persistence,
-      transfers: createMemoryReplicaObjectTransfers(persistence, {
-        objects: net.blobs,
-      }).port,
+      transfers: {
+        ...memory,
+        async upload(request, call) {
+          crash.alive();
+          const result = await memory.upload(request, call);
+          crash.uploaded();
+          return result;
+        },
+      },
       urlForKey: (key) => key,
     });
     const bytes = createDpv2ReplicaTransport({
@@ -194,7 +242,7 @@ async function liteDevice(net: Network, opts: { enabled?: boolean } = {}) {
         authority,
         now: clock.now,
         targetChunkBytes: 4000,
-        maxBlobBytes: 8192,
+        maxBlobBytes: opts.maxBlobBytes ?? 8192,
       },
     });
     return { canonical, engine };
@@ -513,6 +561,8 @@ const written = (prefix: string, text: string, n: number) =>
 
 describe("PS-Lite replication engine: writer changes and bounded storage", () => {
   const N = 6;
+  /** Storage objects as large as a Node writer's default 4 MiB fragment. */
+  const OBJECT_CAP = 8 * 1024 * 1024;
 
   /**
    * Team phones already hold data when replication turns on, and a restore,
@@ -600,44 +650,128 @@ describe("PS-Lite replication engine: writer changes and bounded storage", () =>
   }, 60_000);
 
   /**
-   * A Node batch over the phone's 192 KiB canonical batch bound fails the
-   * same way on every attempt. The phone refuses it once, quarantines its
-   * writer from that batch on, and keeps importing other writers.
+   * Node batches target 32 MiB, so one batch of many small records is far
+   * above the phone's 192 KiB local batch bound and its 1 MiB SQL call
+   * bound. The phone imports the batch whole, in one transaction under one
+   * receipt, and then its successor. Process loss at that import's commit
+   * leaves none of the batch visible; the reopened phone converges.
    */
-  it("quarantines a batch the phone can never import and keeps importing other writers", async () => {
-    const net = network();
-    const poison = transportDevice(net);
+  it("imports a Node batch above 1 MiB and its successor, all or nothing across a crash", async () => {
+    const net = network({ cap: OBJECT_CAP });
+    const node = transportDevice(net, {
+      chunk: REPLICA_DEFAULT_FRAGMENT_BYTES,
+      cap: OBJECT_CAP,
+    });
+    const lite = await liteDevice(net, { maxBlobBytes: OBJECT_CAP });
+    // The phone first imports the Node writer's baseline batch.
+    await run([node, lite], 4);
+    const receipts = () =>
+      (
+        lite
+          .native()
+          .db.prepare(
+            "SELECT count(*) AS n FROM lite_kv WHERE key LIKE 'import/%'",
+          )
+          .get() as { n: number }
+      ).n;
+    const imported = receipts();
+    expect(imported).toBeGreaterThan(0);
+    const M = 1000;
+    for (let i = 0; i < M; i++) node.put(`${i} ${"x".repeat(1000)}`, `b${i}`);
+    await run([node], 4);
+    node.put("successor edit", "b0");
+    node.put("successor", "z");
+    await run([node], 4);
+
+    lite.process.crashAtPut("import/");
+    for (let i = 0; i < 12 && !lite.process.dead; i++) {
+      clock.advance(10_000);
+      await lite.cycle().catch((error: unknown) => {
+        if (!lite.process.dead) throw error;
+      });
+    }
+    expect(lite.process.dead).toBe(true);
+    lite.crashReopen();
+    expect(receipts()).toBe(imported);
+    expect(Object.values(await records(lite, "b", M)).filter(Boolean)).toEqual(
+      [],
+    );
+
+    await run([node, lite]);
+    expect(await records(lite, "b", M)).toEqual(await records(node, "b", M));
+    expect(await lite.get("b0")).toEqual({ id: "b0", text: "successor edit" });
+    expect(await lite.get("z")).toEqual({ id: "z", text: "successor" });
+    // One receipt per batch: the large batch was not split or relabelled.
+    expect(receipts()).toBe(imported + 2);
+  }, 120_000);
+
+  /**
+   * An operation above what the phone keeps as one native value waits as
+   * `resource_unsupported`, with the limits version that refused it, until
+   * a build with a larger bound re-admits it. It is not terminal and not
+   * retried, and other writers keep importing.
+   */
+  it("holds an operation above the phone's value bound as unsupported and keeps importing other writers", async () => {
+    const net = network({ cap: OBJECT_CAP });
+    const big = transportDevice(net, {
+      chunk: REPLICA_DEFAULT_FRAGMENT_BYTES,
+      cap: OBJECT_CAP,
+    });
     const other = transportDevice(net);
-    const lite = await liteDevice(net);
+    const lite = await liteDevice(net, { maxBlobBytes: OBJECT_CAP });
     await lite.cycle();
-    for (let i = 0; i < 4; i++) poison.put("x".repeat(60_000), `p${i}`);
+    big.put("y".repeat(LITE_CANONICAL_MAX_OPERATION_BYTES), "big");
     other.put("from another writer", "q");
-    await run([poison, other, lite]);
+    await run([big, other, lite]);
     expect(await lite.get("q")).toEqual({
       id: "q",
       text: "from another writer",
     });
-    expect(await lite.get("p0")).toBeUndefined();
+    expect(await lite.get("big")).toBeUndefined();
     const db = lite.native().db;
+    const held = () =>
+      db
+        .prepare(
+          `SELECT w.sequence, w.outcome, w.reason, w.attempts, w.next_attempt AS next,
+             m.resource_limits_version AS version
+           FROM pdpp_transport_import_work w
+           JOIN pdpp_transport_manifests_in m ON m.writer=w.writer AND m.batch=w.batch
+           WHERE w.outcome<>'progress'`,
+        )
+        .all();
+    const before = held();
+    expect(before).toEqual([
+      {
+        sequence: 2,
+        outcome: "unsupported",
+        reason: "resource_unsupported",
+        attempts: 0,
+        next: Number.MAX_SAFE_INTEGER,
+        version: REPLICA_LIMITS_VERSION,
+      },
+    ]);
     expect(
       db
         .prepare(
-          "SELECT state, terminal_reason AS reason FROM pdpp_replica_batch_disposition WHERE state='terminal'",
+          "SELECT count(*) AS n FROM pdpp_replica_batch_disposition WHERE state='terminal'",
         )
-        .all(),
-    ).toEqual([{ state: "terminal", reason: "canonical_batch_too_large" }]);
-    expect(
-      db
-        .prepare(
-          "SELECT DISTINCT state, reason FROM pdpp_transport_manifests_in WHERE state='quarantined'",
-        )
-        .all(),
-    ).toEqual([{ state: "quarantined", reason: "finalized_conflict" }]);
-    // Later work of the other writer still flows.
+        .get(),
+    ).toEqual({ n: 0 });
+    // Held, not retried: more steps change nothing, and other work flows.
     other.put("still flowing", "q2");
-    await run([poison, other, lite], 6);
+    await run([big, other, lite], 6);
     expect(await lite.get("q2")).toEqual({ id: "q2", text: "still flowing" });
+    expect(held()).toEqual(before);
   }, 60_000);
+
+  it("pairs the phone's operation bound with the limits version that re-admits held batches", () => {
+    // A build that raises the bound must raise REPLICA_LIMITS_VERSION too, or
+    // batches held under the old bound stay held after the upgrade.
+    expect({
+      bound: LITE_CANONICAL_MAX_OPERATION_BYTES,
+      version: REPLICA_LIMITS_VERSION,
+    }).toEqual({ bound: 256 * 1024 - 8 * 1024, version: 2 });
+  });
 
   /**
    * Process loss after an upload attached its staged bytes and before it
@@ -672,5 +806,75 @@ describe("PS-Lite replication engine: writer changes and bounded storage", () =>
         .db.prepare("SELECT count(*) AS n FROM pdpp_lite_replica_transient")
         .get(),
     ).toEqual({ n: 0 });
+  }, 60_000);
+
+  /** Cycle the phone until its armed crash fires. */
+  async function crashUntilDead(lite: LiteDevice) {
+    for (let i = 0; i < 6 && !lite.process.dead; i++) {
+      clock.advance(10_000);
+      await lite.cycle().catch((error: unknown) => {
+        if (!lite.process.dead) throw error;
+      });
+    }
+    expect(lite.process.dead).toBe(true);
+  }
+  /** Replica bytes the phone holds, and the transient rows that list them. */
+  const inventory = (lite: LiteDevice) =>
+    lite
+      .native()
+      .db.prepare(
+        `SELECT (SELECT count(*) FROM lite_bytes) AS bytes,
+                (SELECT count(*) FROM pdpp_lite_replica_transient) AS transient`,
+      )
+      .get();
+  /**
+   * Reopen after the crash and step on: every step starts by reclaiming
+   * what a dead process left attached, and releases what it attaches, so
+   * no replica bytes remain between steps.
+   */
+  async function recoverBounded(lite: LiteDevice, node: TransportDevice) {
+    expect(inventory(lite)).not.toEqual({ bytes: 0, transient: 0 });
+    lite.crashReopen();
+    for (let i = 0; i < 12; i++) {
+      clock.advance(10_000);
+      await node.cycle();
+      await lite.cycle();
+      expect(inventory(lite)).toEqual({ bytes: 0, transient: 0 });
+    }
+  }
+
+  /**
+   * Process loss during the native PUT, after the attach committed: the
+   * object is in storage and the release never ran. The reopened phone
+   * frees the bytes and publishes the batch.
+   */
+  it("bounds replica bytes after a crash during the native upload, then publishes", async () => {
+    const net = network();
+    const node = transportDevice(net);
+    const lite = await liteDevice(net);
+    await lite.cycle();
+    await lite.put("crash in put", "u");
+    lite.process.crashInUpload();
+    await crashUntilDead(lite);
+    await recoverBounded(lite, node);
+    expect(node.get("u")).toEqual({ id: "u", text: "crash in put" });
+  }, 60_000);
+
+  /**
+   * Process loss during a download, after its bytes were attached and
+   * before they were read and released. The reopened phone frees them and
+   * imports the batch.
+   */
+  it("bounds replica bytes after a crash during a download, then imports", async () => {
+    const net = network();
+    const node = transportDevice(net);
+    const lite = await liteDevice(net);
+    await lite.cycle();
+    node.put("crash in get", "d");
+    await run([node], 4);
+    lite.process.crashInRead();
+    await crashUntilDead(lite);
+    await recoverBounded(lite, node);
+    expect(await lite.get("d")).toEqual({ id: "d", text: "crash in get" });
   }, 60_000);
 });
