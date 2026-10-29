@@ -12,7 +12,6 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import {
   planIngest,
-  type CanonicalMutation,
   type PdppRecordRow,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records/portable";
 import { sha256, toBytes } from "viem";
@@ -81,6 +80,23 @@ interface PendingBatch {
   blobs: LiteBlobDescriptor[];
 }
 const pendingKey = (id: string) => `pending-batches/${keyDigest(id)}`;
+/**
+ * Stored key layout. Layout 1 kept `journal/`, `outbox/` and `mutations/`;
+ * layout 2 keeps one `log/` pointer per local operation. A store opened with
+ * any other layout fails closed instead of reading it.
+ */
+const LAYOUT_VERSION = 2;
+const LAYOUT_KEY = "canonical-layout-version";
+/** One local commit, in sequence order. It points at the retained operation. */
+interface LogEntry {
+  batchId: string;
+  operationKey: string;
+  sequence: number;
+  /** The record row's version after this operation (record operations only). */
+  rowVersion?: number;
+}
+const logKey = (sequence: number) =>
+  `log/${String(sequence).padStart(16, "0")}`;
 /** Bump when a derived pending index changes; older databases need `retry`. */
 const PENDING_INDEX_VERSION = 3;
 const PREVIEW_BLOB_REFS = "preview-blob-refs/";
@@ -212,12 +228,41 @@ async function operations(
   }
   return result;
 }
+/**
+ * Log entries after `after` with their retained operations: one native scan
+ * page, at most 512 KiB of operation bytes. An empty page reports `reported`.
+ */
+async function logPage(
+  tx: LiteCanonicalTransaction,
+  after: number,
+  reported = after,
+) {
+  const page = await tx.scan("log/", logKey(after));
+  const entries: (LogEntry & { operation: ReplicaOperation })[] = [];
+  let bytes = 0;
+  for (const { value } of page.entries) {
+    const entry = JSON.parse(value) as LogEntry;
+    const operation = await tx.get(entry.operationKey);
+    if (!operation) throw new Error("missing immutable outbox operation");
+    bytes += encoder.encode(operation).length;
+    if (bytes > 512 * 1024) break;
+    entries.push({
+      ...entry,
+      operation: replicaOperationSchema.parse(JSON.parse(operation)),
+    });
+  }
+  return {
+    entries,
+    nextAfterSequence: entries.at(-1)?.sequence ?? reported,
+    hasMore: page.after !== undefined || entries.length < page.entries.length,
+  };
+}
 
 /**
  * Experimental canonical persistence port. No runtime/route/publisher wiring.
  * Lifecycle plus one record's retained variants enter the EXISTING merge planner;
  * a scope's record bodies are never loaded together. Native transactions hide all
- * intermediate rows, blob references, journal entries, outbox and import receipts.
+ * intermediate rows, blob references, log entries and import receipts.
  */
 /** Absorbing terminal-batch fact per connection (contract v3.1 A, H). */
 const CONNECTION_QUARANTINE = "connection-quarantine/";
@@ -245,9 +290,19 @@ export function createLiteCanonicalStore(deps: {
       throw new Error("immutable canonical owner binding");
     await put(tx, "owner", context.owner);
     const stored = await get<Clock>(tx, "clock");
-    if (stored) return stored;
+    if (stored) {
+      const layout = (await get<number>(tx, LAYOUT_KEY)) ?? 1;
+      if (layout !== LAYOUT_VERSION)
+        throw new Error(
+          layout > LAYOUT_VERSION
+            ? `canonical layout ${layout} is newer than this build (${LAYOUT_VERSION})`
+            : `canonical layout ${layout} is no longer supported (this build reads ${LAYOUT_VERSION}); clear the canonical store and import again`,
+        );
+      return stored;
+    }
     const initial = { writerId: newId(), counter: 0, sequence: 0 };
     await put(tx, "clock", initial);
+    await put(tx, LAYOUT_KEY, LAYOUT_VERSION);
     await put(tx, "pending-index-version", PENDING_INDEX_VERSION);
     return initial;
   }
@@ -737,7 +792,7 @@ export function createLiteCanonicalStore(deps: {
       const tx = trackViews(base);
       if (local) {
         // One write boundary for every local operation kind. Quarantine is
-        // checked before clocks, staged attachments, receipts, or journals.
+        // checked before clocks, staged attachments, receipts, or the log.
         for (const connectionId of new Set(
           input.operations!.map((op) => op.connectionId),
         )) {
@@ -919,47 +974,20 @@ export function createLiteCanonicalStore(deps: {
             address && !collision ? [address] : undefined,
           );
           current.sequence += 1;
-          await put(
-            tx,
-            `journal/${String(current.sequence).padStart(16, "0")}`,
-            op,
-          );
-          await put(
-            tx,
-            `outbox/${String(current.sequence).padStart(16, "0")}`,
-            {
-              batchId: input.id,
-              operationKey: opKey,
-              sequence: current.sequence,
-            },
-          );
+          const entry: LogEntry = {
+            batchId: input.id,
+            operationKey: opKey,
+            sequence: current.sequence,
+          };
           if (op.kind === "upsert" || op.kind === "delete") {
-            const value = await get<PdppRecordRow>(
+            const row = await get<PdppRecordRow>(
               tx,
               rowKey(op.connectionId, op.declaration.stream, op.recordKey),
             );
-            if (!value) throw new Error("local record was not materialized");
-            const mutation: CanonicalMutation = {
-              sequence: current.sequence,
-              operationId: op.revision.operationId,
-              writerId: op.revision.writerId,
-              sourceId: op.sourceId,
-              connectionId: op.connectionId,
-              method: op.methodId,
-              generation: op.generation,
-              stream: op.declaration.stream,
-              recordKey: op.recordKey,
-              operation: op.kind,
-              value,
-              blobIds:
-                op.kind === "upsert" ? op.blobs.map((b) => b.blobId) : [],
-            };
-            await put(
-              tx,
-              `mutations/${String(current.sequence).padStart(16, "0")}`,
-              mutation,
-            );
+            if (!row) throw new Error("local record was not materialized");
+            entry.rowVersion = row.version;
           }
+          await put(tx, logKey(current.sequence), entry);
         }
       }
       for (const id of dirty)
@@ -1844,15 +1872,21 @@ export function createLiteCanonicalStore(deps: {
         };
       });
     },
-    /** Internal bounded keyset pages; never a public PDPP cursor or grant-relative read. */
-    async readPage(kind: "journal" | "mutations" | "outbox", after?: string) {
+    /**
+     * Internal bounded page of every local commit after a sequence, including
+     * acknowledged ones. Never a public PDPP cursor or grant-relative read.
+     */
+    async readLogPage(afterSequence = 0) {
       enabled();
+      if (!Number.isSafeInteger(afterSequence) || afterSequence < 0)
+        throw new Error("invalid log offset");
       return persistence.transaction(async (base) => {
         const tx = trackViews(base);
         await clock(tx);
-        return tx.scan(`${kind}/`, after);
+        return logPage(tx, afterSequence);
       });
     },
+    /** Local commits after `afterSequence` that are not yet acknowledged. */
     async readOutboxPage(afterSequence = 0) {
       enabled();
       if (!Number.isSafeInteger(afterSequence) || afterSequence < 0)
@@ -1860,40 +1894,24 @@ export function createLiteCanonicalStore(deps: {
       return persistence.transaction(async (base) => {
         const tx = trackViews(base);
         await clock(tx);
-        const page = await tx.scan(
-          "outbox/",
-          `outbox/${String(afterSequence).padStart(16, "0")}`,
+        const acknowledged = (await get<number>(tx, "outbox-ack")) ?? 0;
+        const page = await logPage(
+          tx,
+          Math.max(afterSequence, acknowledged),
+          afterSequence,
         );
-        const entries: {
-          sequence: number;
-          batchId: string;
-          operation: ReplicaOperation;
-        }[] = [];
-        let bytes = 0;
-        for (const entry of page.entries) {
-          const pointer = JSON.parse(entry.value) as {
-            sequence: number;
-            batchId: string;
-            operationKey: string;
-          };
-          const value = await tx.get(pointer.operationKey);
-          if (!value) throw new Error("missing immutable outbox operation");
-          bytes += encoder.encode(value).length;
-          if (bytes > 512 * 1024) break;
-          entries.push({
-            sequence: pointer.sequence,
-            batchId: pointer.batchId,
-            operation: replicaOperationSchema.parse(JSON.parse(value)),
-          });
-        }
         return {
-          entries,
-          nextAfterSequence: entries.at(-1)?.sequence ?? afterSequence,
-          hasMore:
-            page.after !== undefined || entries.length < page.entries.length,
+          entries: page.entries.map(({ sequence, batchId, operation }) => ({
+            sequence,
+            batchId,
+            operation,
+          })),
+          nextAfterSequence: page.nextAfterSequence,
+          hasMore: page.hasMore,
         };
       });
     },
+    /** Moves the outbox past `next`. The log keeps every entry. */
     async acknowledgeOutbox(expected: number, next: number) {
       enabled();
       if (
@@ -1910,10 +1928,6 @@ export function createLiteCanonicalStore(deps: {
         if (actual === next) return;
         if (actual !== expected || next > current.sequence)
           throw new Error("outbox acknowledgment conflict");
-        for await (const entry of scan(tx, "outbox/")) {
-          if (Number(entry.key.slice(7)) > next) break;
-          await tx.delete(entry.key);
-        }
         await put(tx, "outbox-ack", next);
       });
     },
