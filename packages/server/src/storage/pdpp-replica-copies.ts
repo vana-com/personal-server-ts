@@ -113,8 +113,7 @@ export class ReplicaCopyRefused extends Error {
   }
 }
 
-/** Completed non-matching re-downloads before the owner decides (contract F4). */
-export const REPLICA_REFETCH_BUDGET = 5;
+export { REPLICA_REFETCH_BUDGET } from "@opendatalabs/personal-server-ts-core/replication/copy-promotion";
 
 const lowerHex = /^0x[0-9a-f]{64}$/;
 

@@ -125,11 +125,14 @@ export async function runEffectAsync<T, C>(
 
 /** Statement helpers. Every call is one yielded operation. */
 export const sql = {
+  /** A missing row is `undefined` on every host, also when a bridge sends `null`. */
   get<R = ReplicaSqlRow>(text: string, ...params: ReplicaSqlValue[]) {
-    return perform<R | undefined>(
-      (context) =>
-        context.sql.get(text, params) as R | undefined | Promise<R | undefined>,
-    );
+    return perform<R | undefined>((context) => {
+      const row = context.sql.get(text, params);
+      return thenable(row)
+        ? Promise.resolve(row).then((value) => (value ?? undefined) as R)
+        : ((row ?? undefined) as R | undefined);
+    });
   },
   all<R = ReplicaSqlRow>(text: string, ...params: ReplicaSqlValue[]) {
     return perform<R[]>(
