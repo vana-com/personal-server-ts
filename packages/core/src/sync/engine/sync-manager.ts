@@ -13,6 +13,7 @@ import { createDownloadRetryMemory } from "../retry-memory.js";
 import type {
   DeleteDataPort,
   PendingBlobDeletionStore,
+  TombstoneFinalityPort,
 } from "../../ports/index.js";
 
 export interface SyncManagerOptions {
@@ -31,6 +32,11 @@ export interface SyncManagerOptions {
   deleteData?: DeleteDataPort | null;
   /** Durable retry marker for blob deletions that failed after the tombstone. */
   pendingBlobDeletions?: PendingBlobDeletionStore;
+  /**
+   * Holds each storage blob delete until the tombstone that covers the key is
+   * finalized at the gateway (see `DeleteScopeDeps.tombstoneFinality`).
+   */
+  tombstoneFinality?: TombstoneFinalityPort;
   /** Select download-only operation for runtimes that cannot sign uploads. */
   transferMode?: "upload-download" | "download-only";
   /** Exact owner scopes to hydrate before the first full download cycle. */
@@ -254,6 +260,7 @@ export function createSyncManager(
       await retryPendingBlobDeletions({
         deleteData: options?.deleteData,
         pendingBlobDeletions: options?.pendingBlobDeletions,
+        tombstoneFinality: options?.tombstoneFinality,
         dataPointFeed,
         serverOwner: uploadDeps.serverOwner,
         storage: uploadDeps.storage,
@@ -418,6 +425,7 @@ export function createSyncManager(
             serverOwner: uploadDeps.serverOwner,
             deleteData: options?.deleteData,
             pendingBlobDeletions: options?.pendingBlobDeletions,
+            tombstoneFinality: options?.tombstoneFinality,
             scopeDeletions,
             dataPointFeed,
             logger: uploadDeps.logger,
