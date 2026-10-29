@@ -10,6 +10,7 @@ import type {
   PendingBlobDeletionStore,
 } from "../../ports/index.js";
 import { computeDataPointId } from "../data-point-id.js";
+import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 import {
   deletionTimestamp,
   isEntryCoveredByTombstone,
@@ -380,33 +381,20 @@ export async function deleteScope(
     }
 
     // 2. Storage blobs: exact keys, one pass of at most a batch, the rest
-    // queued. A tombstone whose version the gateway did not report cannot be
-    // expanded into registry keys yet; a version-less marker asks the retry
-    // to expand it once the registry answers.
+    // queued. A repeated delete of a scope whose cleanup is still running
+    // resumes from the queue: only work not taken on before is recorded, and
+    // the pass drains the scope's queue head, so no confirmed key is re-sent
+    // and no queued key is dropped. A tombstone whose version the gateway did
+    // not report cannot be expanded into registry keys yet; a version-less
+    // marker asks the retry to expand it once the registry answers.
     // Fence first: the covered entries as they stand before the remote await.
     covered = captureCoveredEntries(storage, scope, tombstoneVersionValue);
     const plan = planBlobDeletions(storage, scope, tombstoneVersionValue);
-    const batch = plan.keys.slice(0, BLOB_DELETE_BATCH_SIZE);
-    const leftovers: PendingBlobDeletion[] = plan.keys
-      .slice(BLOB_DELETE_BATCH_SIZE)
-      .map((version) => ({ scope, version }));
-    if (plan.range) {
-      const taken = takeFromRange(
-        plan.range,
-        BLOB_DELETE_BATCH_SIZE - batch.length,
-      );
-      batch.push(...taken.versions);
-      if (taken.rest)
-        leftovers.push({ scope, version: null, range: taken.rest });
-    }
-    if (tombstoneKnown && tombstoneVersionValue === null) {
-      leftovers.push({ scope, version: null });
-    }
-    const storageStep = await deleteBlobKeys(
+    const storageStep = await deleteScopeBlobs(
       { deleteData, pendingBlobDeletions, logger },
       scope,
-      batch,
-      leftovers,
+      plan,
+      tombstoneKnown && tombstoneVersionValue === null,
     );
     result.steps.storage = storageStep.step;
     result.pendingBlobDeletion = storageStep.pending > 0;
@@ -443,59 +431,236 @@ export async function deleteScope(
 }
 
 /**
- * Delete one pass worth of exact keys and reconcile the retry markers:
- * completed keys (deleted or already absent) leave the store, failed and
- * not-yet-attempted keys enter it.
+ * Where a repeated delete of `scope` resumes: the highest tombstone version
+ * whose covered range was already taken on. The store's watermark says so
+ * directly; a queued range also proves its own upper bound was planned
+ * (which covers marker files written before the watermark existed).
  */
-async function deleteBlobKeys(
-  deps: Pick<DeleteScopeDeps, "deleteData" | "pendingBlobDeletions" | "logger">,
+async function resumePoint(
+  store: PendingBlobDeletionStore,
   scope: string,
-  batch: string[],
-  leftovers: PendingBlobDeletion[],
-): Promise<{ step: DeleteScopeResult["steps"]["storage"]; pending: number }> {
-  const { deleteData, pendingBlobDeletions, logger } = deps;
-  let outcome: Awaited<ReturnType<DeleteDataPort["deleteBlobVersions"]>>;
-  try {
-    outcome =
-      batch.length > 0 && deleteData
-        ? await deleteData.deleteBlobVersions(scope, batch)
-        : { deleted: [], missing: [], failed: [] };
-  } catch (err) {
-    // The port reports per-key failures; a thrown error means none of the
-    // batch can be trusted as done.
-    outcome = {
-      deleted: [],
-      missing: [],
-      failed: batch.map((version) => ({ version, error: errorMessage(err) })),
-    };
+  markers: PendingBlobDeletion[],
+): Promise<bigint | null> {
+  const stored = store.plannedThrough
+    ? await store.plannedThrough(scope)
+    : null;
+  let through = stored === null ? null : BigInt(stored);
+  for (const marker of markers) {
+    if (marker.scope !== scope || marker.version !== null || !marker.range) {
+      continue;
+    }
+    const to = BigInt(marker.range.to);
+    if (through === null || to > through) through = to;
   }
-  const completed = [...outcome.deleted, ...outcome.missing].map(
-    (version): PendingBlobDeletion => ({ scope, version }),
-  );
-  const remaining: PendingBlobDeletion[] = [
-    ...outcome.failed.map(({ version }) => ({ scope, version })),
-    ...leftovers,
-  ];
-  const remainingKeys = countPendingKeys(remaining);
-  let recorded = remainingKeys;
-  if (pendingBlobDeletions) {
+  return through;
+}
+
+/**
+ * The part of `plan` not taken on yet: its exact keys, and the registry range
+ * above `through`. Keys at or below `through` are already deleted or still
+ * queued, so planning them again would only re-send confirmed deletes.
+ */
+function unplannedWork(
+  scope: string,
+  plan: BlobDeletionPlan,
+  through: bigint | null,
+): PendingBlobDeletion[] {
+  const work: PendingBlobDeletion[] = plan.keys.map((version) => ({
+    scope,
+    version,
+  }));
+  if (plan.range) {
+    let from = BigInt(plan.range.from);
+    if (through !== null && through + 1n > from) from = through + 1n;
+    if (from <= BigInt(plan.range.to)) {
+      work.push({
+        scope,
+        version: null,
+        range: { from: from.toString(), to: plan.range.to },
+      });
+    }
+  }
+  return work;
+}
+
+/** Record work and its watermark together when the store supports it. */
+async function recordPlannedWork(
+  store: PendingBlobDeletionStore,
+  scope: string,
+  work: PendingBlobDeletion[],
+  through: string | null,
+): Promise<void> {
+  if (store.enqueue) await store.enqueue(scope, work, through);
+  else await store.add(work);
+}
+
+interface ScopePassOutcome {
+  deleted: string[];
+  missing: string[];
+  failed: Array<{ version: string; error: string }>;
+}
+
+/**
+ * Send one rate-limited batch taken from `markers` (exact keys first, then
+ * range heads, in stored order) and reconcile the store: acknowledged exact
+ * markers (2xx or 404) leave it, a failed key taken from a range becomes an
+ * exact marker, and each consumed range is advanced in place. A key queued
+ * twice (an exact marker inside a range) is sent once.
+ */
+async function drainOnePass(
+  deleteData: DeleteDataPort,
+  store: PendingBlobDeletionStore,
+  markers: PendingBlobDeletion[],
+): Promise<Map<string, ScopePassOutcome>> {
+  let budget = BLOB_DELETE_BATCH_SIZE;
+  const byScope = new Map<string, string[]>();
+  const queued = new Set<string>();
+  const exactOrigin = new Set<string>();
+  const advancedRanges: Array<{
+    old: PendingBlobDeletion;
+    next: PendingBlobDeletion | null;
+  }> = [];
+  const keyOf = (scope: string, version: string) => `${scope}\u0000${version}`;
+  const take = (scope: string, version: string): boolean => {
+    const id = keyOf(scope, version);
+    if (queued.has(id)) return false;
+    queued.add(id);
+    const versions = byScope.get(scope) ?? [];
+    versions.push(version);
+    byScope.set(scope, versions);
+    return true;
+  };
+  for (const marker of markers) {
+    if (budget === 0) break;
+    if (marker.version !== null) {
+      exactOrigin.add(keyOf(marker.scope, marker.version));
+      if (take(marker.scope, marker.version)) budget -= 1;
+    }
+  }
+  for (const marker of markers) {
+    if (budget === 0) break;
+    if (marker.version === null && marker.range) {
+      const taken = takeFromRange(marker.range, budget);
+      for (const version of taken.versions) {
+        if (take(marker.scope, version)) budget -= 1;
+      }
+      advancedRanges.push({
+        old: marker,
+        next: taken.rest
+          ? { scope: marker.scope, version: null, range: taken.rest }
+          : null,
+      });
+    }
+  }
+
+  const outcomes = new Map<string, ScopePassOutcome>();
+  for (const [scope, versions] of byScope) {
+    let outcome: ScopePassOutcome;
     try {
-      if (completed.length > 0) await pendingBlobDeletions.remove(completed);
-      if (remaining.length > 0) await pendingBlobDeletions.add(remaining);
+      outcome = await deleteData.deleteBlobVersions(scope, versions);
+    } catch (err) {
+      // The port reports per-key failures; a thrown error means none of the
+      // batch can be trusted as done.
+      const message = errorMessage(err);
+      outcome = {
+        deleted: [],
+        missing: [],
+        failed: versions.map((version) => ({ version, error: message })),
+      };
+    }
+    outcomes.set(scope, outcome);
+    const completed = [...outcome.deleted, ...outcome.missing]
+      .filter((version) => exactOrigin.has(keyOf(scope, version)))
+      .map((version): PendingBlobDeletion => ({ scope, version }));
+    if (completed.length > 0) await store.remove(completed);
+    // A failed key that came from a range becomes an exact marker; a failed
+    // exact marker simply stays.
+    const failedFromRange = outcome.failed
+      .filter(({ version }) => !exactOrigin.has(keyOf(scope, version)))
+      .map(({ version }): PendingBlobDeletion => ({ scope, version }));
+    if (failedFromRange.length > 0) await store.add(failedFromRange);
+  }
+  // Advance the ranges only now: a crash mid-pass re-sends already-deleted
+  // keys (404, harmless) rather than skipping keys that were never sent. The
+  // successor is persisted before its predecessor is dropped, so a failed or
+  // interrupted write leaves the old range standing, never a gap.
+  for (const { old, next } of advancedRanges) {
+    if (next) await store.add([next]);
+    await store.remove([old]);
+  }
+  return outcomes;
+}
+
+/**
+ * The storage step of one DELETE call: record the work not taken on yet
+ * (with the scope's planned watermark), then send one batch from the head of
+ * the scope's queue and report what is still owed. A first delete and a
+ * repeat of it run the same path, so a repeat resumes where the queue stands.
+ */
+async function deleteScopeBlobs(
+  deps: { deleteData: DeleteDataPort } & Pick<
+    DeleteScopeDeps,
+    "pendingBlobDeletions" | "logger"
+  >,
+  scope: string,
+  plan: BlobDeletionPlan,
+  versionUnknown: boolean,
+): Promise<{ step: DeleteScopeResult["steps"]["storage"]; pending: number }> {
+  const { deleteData, logger } = deps;
+  const withUnknown = (work: PendingBlobDeletion[]) =>
+    versionUnknown ? [...work, { scope, version: null }] : work;
+  let work = withUnknown(unplannedWork(scope, plan, null));
+  let store: PendingBlobDeletionStore | null =
+    deps.pendingBlobDeletions ?? null;
+  if (store) {
+    try {
+      const through = await resumePoint(store, scope, await store.list());
+      work = withUnknown(unplannedWork(scope, plan, through));
+      await recordPlannedWork(store, scope, work, plan.range?.to ?? null);
     } catch (markerErr) {
-      recorded = 0;
       logger.error(
-        { scope, error: errorMessage(markerErr), keys: remainingKeys },
+        { scope, error: errorMessage(markerErr), keys: countPendingKeys(work) },
         "Could not record pending blob deletion markers",
       );
+      store = null;
     }
-  } else if (remaining.length > 0) {
-    recorded = 0;
+  }
+  // Without a durable marker store this pass still sends its batch; what it
+  // cannot send is reported, not recorded.
+  const recorded = store !== null;
+  const passStore = store ?? createMemoryPendingBlobDeletionStore();
+  if (!recorded) await passStore.add(work);
+
+  let outcome: ScopePassOutcome;
+  let remainingKeys: number;
+  try {
+    const queued = (await passStore.list()).filter((m) => m.scope === scope);
+    outcome = (await drainOnePass(deleteData, passStore, queued)).get(
+      scope,
+    ) ?? { deleted: [], missing: [], failed: [] };
+    remainingKeys = countPendingKeys(
+      (await passStore.list()).filter((m) => m.scope === scope),
+    );
+  } catch (markerErr) {
+    // A marker write failed mid-pass. The store never loses owed keys (see
+    // drainOnePass), so the queue still holds this scope's work.
+    const message = errorMessage(markerErr);
+    logger.error(
+      { scope, error: message },
+      "Could not update pending blob deletion markers",
+    );
+    return {
+      step: { status: "failed", error: message },
+      pending: recorded ? 1 : 0,
+    };
+  }
+  if (!recorded && remainingKeys > 0) {
     logger.error(
       { scope, keys: remainingKeys },
       "Blob deletions left unfinished with no marker store to retry them",
     );
   }
+  const pending = recorded ? remainingKeys : 0;
   const counts = {
     blobsDeleted: outcome.deleted.length,
     blobsMissing: outcome.missing.length,
@@ -504,12 +669,7 @@ async function deleteBlobKeys(
   if (outcome.failed.length > 0) {
     const first = outcome.failed[0];
     logger.warn(
-      {
-        scope,
-        failed: outcome.failed.length,
-        pending: recorded,
-        error: first.error,
-      },
+      { scope, failed: outcome.failed.length, pending, error: first.error },
       "Storage blob deletion failed for some keys after gateway tombstone; will retry",
     );
     return {
@@ -518,15 +678,15 @@ async function deleteBlobKeys(
         error: `${outcome.failed.length} blob delete(s) failed: ${first.error}`,
         ...counts,
       },
-      pending: recorded,
+      pending,
     };
   }
-  if (remaining.length > 0) {
+  if (remainingKeys > 0) {
     logger.info(
       { scope, ...counts },
       "Storage blob deletion continues on later sync cycles (rate-limited batch)",
     );
-    return { step: { status: "deferred", ...counts }, pending: recorded };
+    return { step: { status: "deferred", ...counts }, pending };
   }
   return { step: { status: "ok", ...counts }, pending: 0 };
 }
@@ -608,86 +768,38 @@ export async function retryPendingBlobDeletions(
       marker.scope,
       registry.status === "deleted" ? registry.version : null,
     );
-    const expanded: PendingBlobDeletion[] = plan.keys.map((version) => ({
-      scope: marker.scope,
-      version,
-    }));
-    if (plan.range) {
-      expanded.push({ scope: marker.scope, version: null, range: plan.range });
-    }
+    // Only the part not taken on yet: a repeated delete may already have
+    // queued (or finished) the same tombstone's range.
+    const expanded = unplannedWork(
+      marker.scope,
+      plan,
+      await resumePoint(pendingBlobDeletions, marker.scope, markers),
+    );
     // Persist the expansion before dropping the unexpanded marker: a failed or
     // interrupted write leaves the marker to expand again (the same keys), and
     // never drops keys that are still owed.
-    await pendingBlobDeletions.add(expanded);
+    await recordPlannedWork(
+      pendingBlobDeletions,
+      marker.scope,
+      expanded,
+      plan.range?.to ?? null,
+    );
     await pendingBlobDeletions.remove([marker]);
   }
   markers = await pendingBlobDeletions.list();
 
   // One rate-limited batch in stored order: exact keys, then range heads.
-  let budget = BLOB_DELETE_BATCH_SIZE;
-  const byScope = new Map<string, string[]>();
-  const exactOrigin = new Set<string>();
-  const advancedRanges: Array<{
-    old: PendingBlobDeletion;
-    next: PendingBlobDeletion | null;
-  }> = [];
-  const enqueue = (scope: string, version: string) => {
-    const versions = byScope.get(scope) ?? [];
-    versions.push(version);
-    byScope.set(scope, versions);
-  };
-  for (const marker of markers) {
-    if (budget === 0) break;
-    if (marker.version !== null) {
-      enqueue(marker.scope, marker.version);
-      exactOrigin.add(`${marker.scope}\u0000${marker.version}`);
-      budget -= 1;
-    }
-  }
-  for (const marker of markers) {
-    if (budget === 0) break;
-    if (marker.version === null && marker.range) {
-      const taken = takeFromRange(marker.range, budget);
-      for (const version of taken.versions) enqueue(marker.scope, version);
-      budget -= taken.versions.length;
-      advancedRanges.push({
-        old: marker,
-        next: taken.rest
-          ? { scope: marker.scope, version: null, range: taken.rest }
-          : null,
-      });
-    }
-  }
-
-  for (const [scope, versions] of byScope) {
-    let outcome: Awaited<ReturnType<DeleteDataPort["deleteBlobVersions"]>>;
-    try {
-      outcome = await deleteData.deleteBlobVersions(scope, versions);
-    } catch (err) {
-      const message = errorMessage(err);
-      outcome = {
-        deleted: [],
-        missing: [],
-        failed: versions.map((version) => ({ version, error: message })),
-      };
-    }
-    const completed = [...outcome.deleted, ...outcome.missing]
-      .filter((version) => exactOrigin.has(`${scope}\u0000${version}`))
-      .map((version): PendingBlobDeletion => ({ scope, version }));
-    if (completed.length > 0) await pendingBlobDeletions.remove(completed);
+  const outcomes = await drainOnePass(
+    deleteData,
+    pendingBlobDeletions,
+    markers,
+  );
+  for (const [scope, outcome] of outcomes) {
     result.completed.push(
       ...[...outcome.deleted, ...outcome.missing].map(
         (version): PendingBlobDeletion => ({ scope, version }),
       ),
     );
-    // A failed key that came from a range becomes an exact marker; a failed
-    // exact marker simply stays.
-    const failedFromRange = outcome.failed
-      .filter(({ version }) => !exactOrigin.has(`${scope}\u0000${version}`))
-      .map(({ version }): PendingBlobDeletion => ({ scope, version }));
-    if (failedFromRange.length > 0) {
-      await pendingBlobDeletions.add(failedFromRange);
-    }
     for (const failure of outcome.failed) {
       result.failed.push({ scope, ...failure });
     }
@@ -711,14 +823,6 @@ export async function retryPendingBlobDeletions(
         "Pending blob deletion failed again",
       );
     }
-  }
-  // Advance the ranges only now: a crash mid-pass re-sends already-deleted
-  // keys (404, harmless) rather than skipping keys that were never sent. The
-  // successor is persisted before its predecessor is dropped, so a failed or
-  // interrupted write leaves the old range standing, never a gap.
-  for (const { old, next } of advancedRanges) {
-    if (next) await pendingBlobDeletions.add([next]);
-    await pendingBlobDeletions.remove([old]);
   }
   result.remaining = (await pendingBlobDeletions.list()).length;
   return result;
