@@ -489,13 +489,13 @@ function unplannedWork(
   plan: BlobDeletionPlan,
   through: bigint | null,
 ): PendingBlobDeletion[] {
-  // The tombstone that covers the plan; its finality frees the exact keys
-  // too. A range carries its own gate (`range.to`).
-  const gate = plan.range?.to;
+  // A range is gated by its own `range.to`, the tombstone that covers it.
+  // The exact keys lie above that tombstone (or no tombstone exists), so
+  // their slots are still open: each is gated by its own version and waits
+  // for a finalized tombstone at or above it.
   const work: PendingBlobDeletion[] = plan.keys.map((version) => ({
     scope,
     version,
-    ...(gate !== undefined ? { tombstoneVersion: gate } : {}),
   }));
   if (plan.range) {
     let from = BigInt(plan.range.from);

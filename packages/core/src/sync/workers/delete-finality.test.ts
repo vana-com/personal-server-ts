@@ -185,7 +185,10 @@ function setup(
       // As the gateway port does: a head that is already a tombstone answers
       // "already deleted" with its version, else a tombstone is queued.
       const head = gateway.head();
-      if (head?.deletedAt && !options.tombstoneOverTombstone) {
+      if (head === null) {
+        return { status: "not-registered", dataPointId: DATA_POINT_ID };
+      }
+      if (head.deletedAt && !options.tombstoneOverTombstone) {
         return {
           status: "already-deleted",
           dataPointId: DATA_POINT_ID,
@@ -211,8 +214,11 @@ function setup(
       return { deleted, missing, failed: [] };
     }),
   };
+  // Sync cycles are a minute apart; finality rechecks back off per scope.
+  let clock = Date.parse("2026-10-29T12:00:00.000Z");
+  const localStorage = createMemoryDataStorage();
   const deps: DeleteScopeDeps = {
-    storage: createMemoryDataStorage(),
+    storage: localStorage,
     serverOwner: OWNER,
     deleteData,
     pendingBlobDeletions: createMemoryPendingBlobDeletionStore(),
@@ -221,14 +227,33 @@ function setup(
     ...(options.finality === false
       ? {}
       : {
-          tombstoneFinality: createInventoryTombstoneFinality({
-            page: gateway.inventoryPage,
-          }),
+          tombstoneFinality: createInventoryTombstoneFinality(
+            { page: gateway.inventoryPage },
+            { now: () => clock },
+          ),
         }),
   };
-  /** Every sync cycle starts with a retry pass. */
-  const cycle = () => retryPendingBlobDeletions(deps);
-  return { gateway, storage, deps, deleteData, cycle };
+  /**
+   * Every sync cycle starts with a retry pass. By default each call stands
+   * for enough elapsed time that no recheck backoff is pending.
+   */
+  const cycle = (elapsedMs = 60 * 60_000) => {
+    clock += elapsedMs;
+    return retryPendingBlobDeletions(deps);
+  };
+  /** A local entry the deletion covers that never registered (a crashed upload). */
+  const unsyncedLocal = (version: number) =>
+    localStorage.insertEntry({
+      fileId: null,
+      schemaId: null,
+      path: `${SCOPE}/local-${version}.json`,
+      scope: SCOPE,
+      collectedAt: "2026-10-28T00:00:00.000Z",
+      sizeBytes: 10,
+      version,
+      dataPointId: null,
+    });
+  return { gateway, storage, deps, deleteData, cycle, unsyncedLocal };
 }
 
 const bytes = (text: string) => new TextEncoder().encode(text);
@@ -366,6 +391,75 @@ describe("blob cleanup waits for the tombstone to be final", () => {
 
     expect(retried.remaining).toBe(0);
     expect(storage.blobs.size).toBe(0);
+  });
+
+  it("keeps a local key above the tombstone until a tombstone at or above it is final", async () => {
+    const { gateway, storage, deps, cycle, unsyncedLocal } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+    // A crashed upload left a local entry at version 3 and A's bytes at key 3.
+    unsyncedLocal(3);
+    const aBytes = bytes("A: v3");
+    storage.put(3n, aBytes);
+
+    await deleteScope(deps, SCOPE); // tombstone v2
+    gateway.settle(2n, "finalized");
+    await cycle();
+
+    // Tombstone v2 covers keys 1 and 2 only; slot 3 is still open.
+    expect(storage.blobs.has("1")).toBe(false);
+    expect(storage.put(3n, bytes("B: v3"))).toBe("conflict");
+    gateway.register(3n, keccak256(aBytes));
+    expect(storage.hashAt(3n)).toBe(gateway.versions.get(3n)!.dataHash);
+
+    // A later deletion that is final covers key 3 too.
+    gateway.settle(3n, "finalized");
+    await deleteScope(deps, SCOPE); // tombstone v4
+    gateway.settle(4n, "finalized");
+    await cycle();
+    expect(storage.blobs.size).toBe(0);
+  });
+
+  it("a re-delete at a higher slot after a failed tombstone drains the old keys once final", async () => {
+    const { gateway, storage, deps, cycle } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+    await deleteScope(deps, SCOPE); // tombstone v2
+    gateway.settle(2n, "failed");
+    // A writer recovers slot 2 with data, which settles.
+    gateway.register(2n, keccak256(bytes("v2")));
+    storage.put(2n, bytes("v2"));
+    gateway.settle(2n, "finalized");
+    await cycle();
+    expect(storage.blobs.size).toBe(2);
+
+    await deleteScope(deps, SCOPE); // tombstone v3
+    gateway.settle(3n, "finalized");
+    const retried = await cycle();
+
+    expect(retried.remaining).toBe(0);
+    expect(storage.blobs.size).toBe(0);
+  });
+
+  it("holds an unregistered scope's local keys and backs off its finality reads", async () => {
+    const { gateway, storage, deps, cycle, unsyncedLocal } = setup();
+    unsyncedLocal(1);
+    storage.put(1n, bytes("crashed upload"));
+
+    const result = await deleteScope(deps, SCOPE);
+    expect(result.steps.gateway).toMatchObject({
+      status: "skipped",
+      reason: "not-registered",
+    });
+    // No tombstone exists, so slot 1 stays open and its bytes stay.
+    for (let minute = 0; minute < 30; minute++) await cycle(60_000);
+
+    expect(storage.blobs.has("1")).toBe(true);
+    // One read in the delete, then at most one per backoff step over the
+    // 30 minutes (1, 2, 4, 8 and 15 minute rechecks), not one per cycle.
+    expect(gateway.inventoryPage.mock.calls.length).toBeLessThanOrEqual(6);
   });
 
   it("without a finality port the legacy behaviour (delete on acknowledgement) is unchanged", async () => {

@@ -862,6 +862,11 @@ export async function createServer(
             }),
           )
         : undefined;
+    if (deleteData && !tombstoneFinality) {
+      logger.warn(
+        "No version-inventory signer: storage blobs are deleted when a tombstone is queued, before it is final",
+      );
+    }
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
       deleteData,
