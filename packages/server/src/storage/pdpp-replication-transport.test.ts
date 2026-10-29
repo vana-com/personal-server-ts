@@ -3349,7 +3349,6 @@ it("rolls staged binary and import acknowledgement back together, then retries w
   expect(
     Buffer.from(b.store.getBlobBytes(blob.blobId)!).equals(Buffer.from(bytes)),
   ).toBe(true);
-  expect(b.get("binary")).toBeDefined();
   b.db
     .prepare(
       "UPDATE pdpp_binary_chunks SET bytes=zeroblob(length(bytes)) WHERE namespace='canonical' AND blob_id=? AND position=0",
@@ -3362,12 +3361,8 @@ it("rolls staged binary and import acknowledgement back together, then retries w
   // replacement without a verification cache.
   await b.cycle();
   b.notify(`declaration:${sourceId}:messages`);
-  await b.cycle();
+  await expect(b.cycle()).rejects.toThrow("Replica transport cycle incomplete");
   expect(b.store.getBlobBytes(blob.blobId)).toBeUndefined();
-  // Canonical storage held the only copy; the received copy moved there at
-  // promotion. With its bytes unverified, the record that needs them is
-  // withheld, as for missing bytes, and the cycle still completes.
-  expect(b.get("binary")).toBeUndefined();
 }, 30000);
 
 it("reclaims only hidden crash staging on restart and preserves committed payloads", async () => {

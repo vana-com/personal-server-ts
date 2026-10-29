@@ -679,27 +679,33 @@ There is no blob-size cap.
   same for batches finalized by an earlier build.
   `pdpp-replication-blob-storage.test.ts` proves that no outbound phase reads
   the dropped bytes, across later batches and a restart. On the receiver, the
-  import transaction deletes the inbox fragment bodies, and a received blob
-  moves into canonical storage instead of being copied (see Promotion).
+  import transaction deletes the inbox fragment bodies.
 - **No custody of an own batch:** discovery skips every version the device
   published itself, in any state, so a device never downloads or imports its
   own batch. A per-scope floor marks the versions already claimed or
   admitted, so a pass reads only newer versions; releasing a claim lowers
   the floor. The first step of a process deletes inbox rows that an earlier
   build admitted for the device's own published batches.
-- **One local copy per blob:** a blob larger than 1 MiB is stored once, as
-  chunks. A local write stores chunks only, with no whole-row copy. A pin of a
-  chunked canonical blob is a row in `pdpp_replica_blob_pins` that references
-  the canonical chunks. If canonical storage later replaces or drops the blob,
-  a trigger moves the chunks to the pinned namespace first, so the pin keeps
-  its bytes. Copies left by earlier builds (received copies, whole rows of
-  chunked blobs, and pinned copies of chunked canonical blobs) go after the
-  canonical copy verifies. A step verifies at most a quarter of its byte
-  budget, up to 4 MiB, so a large blob takes several steps.
-- **Promotion:** the receiver verifies a received blob larger than 1 MiB and
-  moves its chunks into canonical storage in one transaction. It assembles no
-  whole value and keeps no received copy. When canonical storage already holds
-  the blob, the receiver verifies canonical and deletes the received copy.
+- **One canonical copy per blob:** canonical storage holds a blob larger than
+  1 MiB once, as chunks. A local write stores chunks only, with no whole-row
+  copy. A pin of a chunked canonical blob is a row in `pdpp_replica_blob_pins`
+  that references the canonical chunks. If canonical storage later replaces
+  or drops the blob, a trigger moves the chunks to the pinned namespace
+  first, so the pin keeps its bytes; when the blob returns to canonical
+  storage, the next capture turns that pinned copy into a reference again.
+  Copies left by earlier builds (whole rows of chunked blobs, and pinned
+  copies of chunked canonical blobs) go after the canonical copy verifies. A
+  step verifies at most a quarter of its byte budget, up to 4 MiB, so a large
+  blob takes several steps.
+- **Received custody stays:** the received copy is custody for every
+  retained operation that names the blob, applied or withheld. Canonical
+  collection counts only canonical claims, so a withheld operation would
+  lose its bytes if the received copy went when canonical storage held the
+  blob. A received blob therefore costs two local copies until custody has
+  an owner that canonical collection respects.
+- **Promotion:** the receiver copies a verified blob larger than 1 MiB into
+  canonical storage 64 KiB at a time and stores it once, in the chunk form.
+  It assembles no whole value.
 - **Free pages:** SQLite keeps freed pages in its freelist, so deleted blobs
   do not shrink the database file. Later writes reuse those pages.
 

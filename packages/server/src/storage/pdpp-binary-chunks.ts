@@ -363,52 +363,6 @@ export function copyBinaryToCanonical(
 }
 
 /**
- * Make verified bytes in `from` the canonical copy, and leave none in `from`,
- * in the caller's transaction. Large chunked bytes change namespace in place:
- * no byte is written. The manifest is deleted and inserted, not updated, so
- * the visibility view's manifest triggers see both namespaces change.
- */
-export function moveBinaryToCanonical(
-  db: Database,
-  from: BinaryNamespace,
-  id: string,
-): void {
-  const size = binaryLength(db, from, id);
-  if (size === undefined) throw new Error("missing binary bytes");
-  const chunked =
-    db
-      .prepare(
-        "SELECT 1 FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
-      )
-      .get(from, id) !== undefined;
-  if (size > CANONICAL_INLINE_BYTES && chunked) {
-    db.prepare(`DELETE FROM ${legacy.canonical} WHERE blob_id=?`).run(id);
-    deleteBinary(db, "canonical", id);
-    db.prepare(
-      "DELETE FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
-    ).run(from, id);
-    db.prepare(
-      "UPDATE pdpp_binary_chunks SET namespace='canonical' WHERE namespace=? AND blob_id=?",
-    ).run(from, id);
-    db.prepare(
-      "INSERT INTO pdpp_binary_manifests VALUES ('canonical',?,?)",
-    ).run(id, size);
-  } else copyBinaryToCanonical(db, from, id);
-  deleteBinaryCopy(db, from, id);
-}
-
-/** Delete a namespace's copy in both forms: chunks and the legacy whole row. */
-export function deleteBinaryCopy(
-  db: Database,
-  namespace: BinaryNamespace,
-  id: string,
-): void {
-  deleteBinary(db, namespace, id);
-  const table = legacy[namespace];
-  if (table) db.prepare(`DELETE FROM ${table} WHERE blob_id=?`).run(id);
-}
-
-/**
  * Write main's whole row for each verified canonical blob that has only the
  * chunk form, so a flag-off or plain main build can read it. One blob per
  * transaction; each costs one whole value in memory. Run it only when
@@ -487,7 +441,6 @@ export function readBinary(
  * caller runs each `step` in its own write transaction. A
  * copy goes only when canonical storage holds the blob and it verifies:
  *
- * - a received custody copy (the receiver now moves it at promotion);
  * - main's whole row of a large blob that also has the chunk form;
  * - a capture pin's own copy, which becomes a pin row that references the
  *   canonical chunks (`captureBlob`).
@@ -508,17 +461,6 @@ export function createBinaryCompactor(db: Database) {
   const known = "IN (SELECT blob_id FROM pdpp_blobs)";
   /** Per kind: queries for its candidates after `@after`, first by blob id. */
   const kinds = {
-    received: {
-      arms: [
-        `SELECT blob_id FROM pdpp_binary_manifests
-         WHERE namespace='received' AND blob_id>@after AND blob_id ${known}`,
-        `SELECT blob_id FROM ${legacy.received}
-         WHERE blob_id>@after AND blob_id ${known}`,
-      ],
-      compact(id: string) {
-        deleteBinaryCopy(db, "received", id);
-      },
-    },
     whole: {
       arms: [
         `SELECT c.blob_id FROM ${legacy.canonical} c

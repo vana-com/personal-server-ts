@@ -432,6 +432,81 @@ it("requires verified claimed blob bytes before exposing an imported record", as
   ).toEqual([]);
 });
 
+// Received bytes are custody for the operations that name them. Canonical
+// collection counts only canonical claims, so a verified canonical copy is
+// no reason to drop them: an operation withheld here has no claim yet.
+it.each([
+  ["inline", 2],
+  ["chunked", 2 * 1024 * 1024 + 7],
+])(
+  "keeps a withheld operation's received bytes after the local copy of the same blob is collected (%s)",
+  (_form, size) => {
+    const source = device(),
+      target = device(false);
+    const bytes = new Uint8Array(size).map((_, i) => (i * 7 + 3) & 255);
+    const write = (d: ReturnType<typeof device>, instance: string) =>
+      d.store.storeBlobBytesForInstance({
+        instance,
+        method: "collector",
+        generation: 1,
+        bytes,
+        mimeType: "application/octet-stream",
+      });
+    const blob = write(source, "conn_a");
+    source.store.ingestBatch(
+      [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          emitted_at: at,
+          data: {
+            id: "a",
+            blob_ref: {
+              blob_id: blob.blobId,
+              mime_type: blob.mimeType,
+              size_bytes: size,
+            },
+          },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    target.store.registerConnection({
+      instance: "conn_local",
+      sourceId,
+      method: "collector",
+      label: "L",
+    });
+    expect(write(target, "conn_local").blobId).toBe(blob.blobId);
+    // conn_a has no local mapping on the target, so every operation of it,
+    // the blob claim included, is withheld.
+    expect(
+      target.receiver.import({
+        credential: "replica-secret",
+        envelope: batch(all(source)),
+        blobs: [{ blobId: blob.blobId, bytes }],
+      }).pending.length,
+    ).toBeGreaterThan(0);
+    expect(value(target)).toBeUndefined();
+    target.store.deleteConnection("conn_local");
+    expect(target.store.getBlobBytes(blob.blobId)).toBeUndefined();
+    target.reopen();
+    target.store.registerConnection({
+      instance: "conn_a",
+      sourceId,
+      method: "collector",
+      label: "A",
+    });
+    target.receiver.retry({ credential: "replica-secret" });
+    expect(value(target)?.data.id).toBe("a");
+    expect(target.store.getBlobBytes(blob.blobId)).toEqual(bytes);
+  },
+  30_000,
+);
+
 it("quarantines append-only conflicting content instead of selecting a winner", () => {
   const appendBinding = { ...binding, semantics: "append_only" as const };
   const entries = [
@@ -2113,14 +2188,8 @@ for (const delivery of [
         blobs: [{ blobId: blob.blobId, bytes }],
       });
     receiver.retry({ credential: "replica-secret" });
-    // The bytes that arrived are chunks, not legacy rows. conn_b's upsert is
-    // promoted, so its received chunks move to canonical storage: one copy.
-    const namespace =
-      delivery === "pending carrier"
-        ? "pending"
-        : delivery === "unrelated connection"
-          ? "canonical"
-          : "received";
+    // The bytes that arrived are chunks, not legacy rows.
+    const namespace = delivery === "pending carrier" ? "pending" : "received";
     expect(
       target.db
         .prepare(
@@ -3989,10 +4058,9 @@ it.each([
   },
 );
 
-// A repair write over a namespace whose manifest is malformed. The read side
-// vetoes on the manifest even beside a legacy row, so the write clears it in
-// its own transaction. Canonical repair adds main's row. A received copy of a
-// blob canonical storage holds is redundant, so a re-import drops it.
+// A repair write adds a legacy row in a namespace whose manifest is
+// malformed. The read side vetoes on the manifest even beside a legacy row,
+// so the write clears the malformed manifest in its own transaction.
 it.each([
   ["received", -1],
   ["received", 1.5],
@@ -4052,13 +4120,6 @@ it.each([
           receiver.readStore({ reader }).getBlobBytes(blob.blobId)?.length,
       );
     expect(served()).toEqual([3, 3]);
-    if (namespace === "received") {
-      // Promotion kept no received copy. Model one an earlier build kept.
-      const kept = binaryWriter(target.db, "received", blob.blobId);
-      kept.write(bytes);
-      kept.finish();
-      expect(served()).toEqual([3, 3]);
-    }
     if (namespace === "canonical") {
       // Promotion stores a blob this small inline; store it chunked, as
       // canonical storage holds a blob over 1 MiB.
@@ -4078,7 +4139,8 @@ it.each([
         .run(value, namespace, blob.blobId).changes;
     expect(size(malformed)).toBe(1);
     expect(served()).toEqual([undefined, undefined]);
-    // Supported writes of the same valid bytes clear the malformed manifest.
+    // Supported writes of the same valid bytes add a legacy row and clear the
+    // malformed manifest.
     if (namespace === "received")
       receiver.import({
         credential: "replica-secret",
@@ -4099,7 +4161,7 @@ it.each([
           `SELECT count(*) AS n FROM ${namespace === "received" ? "pdpp_replica_received_bytes" : "pdpp_blob_bytes"} WHERE blob_id=?`,
         )
         .get(blob.blobId),
-    ).toEqual({ n: namespace === "received" ? 0 : 1 });
+    ).toEqual({ n: 1 });
     expect(size(3)).toBe(0);
     expect(served()).toEqual([3, 3]);
   },

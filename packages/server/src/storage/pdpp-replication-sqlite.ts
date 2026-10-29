@@ -4,6 +4,7 @@ import {
   readBinaryChunks,
   verifyBinary,
   copyBinary,
+  deleteBinary,
 } from "./pdpp-binary-chunks.js";
 import type { Database } from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
@@ -326,15 +327,17 @@ export function createReplicationJournal(
       throw new Error("unverified replication blob bytes");
     // A large canonical blob is chunks only; the pin references them, and
     // they become the pinned copy if canonical storage drops the blob
-    // (`pinReferenceKeepsBytes`). Main's whole row has no such hook, so a
-    // small blob keeps its own pinned copy.
-    if (binaryLength(db, "pinned", blobId) === undefined) {
-      if (chunkedCanonical(blobId))
-        db.prepare(
-          "INSERT OR IGNORE INTO pdpp_replica_blob_pins VALUES (?)",
-        ).run(blobId);
-      else copyBinary(db, "canonical", blobId, "pinned");
-    } else if (!verifyBinary(db, "pinned", blobId, blob.sha256, blob.sizeBytes))
+    // (`pinReferenceKeepsBytes`). A pinned copy of such a blob, left when
+    // canonical storage dropped it before, becomes a reference again. Main's
+    // whole row has no such hook, so a small blob keeps its own pinned copy.
+    if (chunkedCanonical(blobId)) {
+      db.prepare("INSERT OR IGNORE INTO pdpp_replica_blob_pins VALUES (?)").run(
+        blobId,
+      );
+      deleteBinary(db, "pinned", blobId);
+    } else if (binaryLength(db, "pinned", blobId) === undefined)
+      copyBinary(db, "canonical", blobId, "pinned");
+    else if (!verifyBinary(db, "pinned", blobId, blob.sha256, blob.sizeBytes))
       throw new Error("corrupt pinned replica bytes");
     // Indexed by pdpp_replica_blob_claim_idx; the predicate must match it.
     const previous = db

@@ -3,9 +3,9 @@
  * a lifetime cap"), measured on what SQLite is handed and keeps, not on the
  * admission ledger:
  *
- * - Promotion: the receiver moves a verified blob into canonical storage in
+ * - Promotion: the receiver copies a verified blob into canonical storage in
  *   chunks. No value as large as the blob crosses into or out of SQLite, and
- *   the blob is stored once, not as a whole row plus a chunked copy.
+ *   canonical storage holds it once, not as a whole row plus a chunked copy.
  * - Reclaim: once a batch's registration is finalized, the sender drops its
  *   payload and fragment ciphertext. No outbound phase reads them afterwards.
  */
@@ -20,6 +20,7 @@ import {
   clock,
   network,
   slotKey,
+  sourceId,
   transportDevice,
   type TransportDevice,
 } from "./pdpp-replica-contract.test-utils.js";
@@ -42,9 +43,14 @@ function pattern(size: number, seed: number) {
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
 
-function writeBlob(device: TransportDevice, bytes: Uint8Array, key: string) {
+function writeBlob(
+  device: TransportDevice,
+  bytes: Uint8Array,
+  key: string,
+  instance = "conn",
+) {
   const blob = device.store.storeBlobBytesForInstance({
-    instance: "conn",
+    instance,
     method: "export",
     generation: 1,
     bytes,
@@ -53,7 +59,7 @@ function writeBlob(device: TransportDevice, bytes: Uint8Array, key: string) {
   device.store.ingestBatch(
     [
       {
-        instance: "conn",
+        instance,
         stream: "messages",
         key,
         data: {
@@ -215,7 +221,7 @@ function published(device: TransportDevice, batch: string) {
   );
 }
 
-it("promotes a large received blob in chunks and stores it once", async () => {
+it("promotes a large received blob in chunks, and canonical storage holds it once", async () => {
   const { from, to } = pair();
   await settle(from, to);
   const source = pattern(BLOB_BYTES, 41);
@@ -427,7 +433,7 @@ it("a device never takes custody of its own published batch", async () => {
   expect(blobStorage(from).namespaces.received ?? 0).toBe(0);
 }, 120_000);
 
-it("keeps one copy of each blob after a two-way exchange, and no custody copy of a canonical blob", async () => {
+it("keeps one canonical copy of each blob after a two-way exchange, and custody only of the received one", async () => {
   const { from, to } = pair();
   await settle(from, to);
   const sourceA = pattern(BLOB_BYTES, 45);
@@ -437,16 +443,17 @@ it("keeps one copy of each blob after a two-way exchange, and no custody copy of
   await exchange(from, to, [a, b]);
   for (const device of [from, to]) {
     const stored = blobStorage(device);
-    // Two blobs, each stored once, in the chunk form; nothing else.
+    // Two canonical blobs in the chunk form, and the received copy that is
+    // custody for the peer's operations; no copy of its own blob.
     expect(stored).toMatchObject({
-      namespaces: { canonical: 2 * BLOB_BYTES },
+      namespaces: { canonical: 2 * BLOB_BYTES, received: BLOB_BYTES },
       whole: 0,
       receivedRows: 0,
       pinnedRows: 0,
       pendingRows: 0,
       inbox: 0,
       outbox: 0,
-      total: 2 * BLOB_BYTES,
+      total: 3 * BLOB_BYTES,
     });
     for (const [id, source] of [
       [a, sourceA],
@@ -462,53 +469,22 @@ it("keeps one copy of each blob after a two-way exchange, and no custody copy of
   }
 }, 120_000);
 
-it("a received blob moves into canonical storage: promotion writes no blob bytes", async () => {
-  const { from, to } = pair();
-  await settle(from, to);
-  const id = writeBlob(from, pattern(BLOB_BYTES, 47), "large");
-  const writes = meter(to.db);
-  for (let i = 0; i < 300 && !arrived(to, id); i++) {
-    clock.advance(10_000);
-    await from.step(BUDGET);
-    await to.step(BUDGET);
-  }
-  writes.stop();
-  expect(arrived(to, id)).toBe(true);
-  // Chunk bytes written per namespace while the blob was received.
-  const written: Record<string, number> = {};
-  for (const { sql, args } of writes.accesses)
-    if (/INSERT[^]*INTO pdpp_binary_chunks/.test(sql) && args[1] === id)
-      written[args[0] as string] =
-        (written[args[0] as string] ?? 0) + sizeOf(args[3]);
-  expect(written.canonical ?? 0).toBe(0);
-  expect(written.received ?? 0).toBeLessThanOrEqual(BLOB_BYTES);
-}, 120_000);
-
-it("a step drops custody bytes and own-slot admissions that an earlier build kept", async () => {
+it("a step drops own-slot admissions that an earlier build kept", async () => {
   const { from, to } = pair();
   await settle(from, to);
   const id = writeBlob(from, pattern(2 * MiB, 48), "large");
   await exchange(from, to, [id]);
-  // Model a database an earlier build left: a received copy of a blob that
-  // canonical storage holds, and an unimported admission of an own slot.
-  to.db.exec(
-    `INSERT OR IGNORE INTO pdpp_binary_chunks SELECT 'received', blob_id, position, bytes FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';
-     INSERT OR IGNORE INTO pdpp_binary_manifests SELECT 'received', blob_id, size_bytes FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id='${id}';`,
-  );
+  // Model a database an earlier build left: an unimported admission of an
+  // own slot.
   const own = ownSlots(from)[0]!;
   from.db
     .prepare(
       "INSERT OR IGNORE INTO pdpp_transport_manifests_in (slot,scope,version,writer) VALUES (?,?,?,?)",
     )
     .run(`${own.scope}:${own.version}`, own.scope, own.version, "own");
-  expect(blobStorage(to).namespaces.received).toBe(2 * MiB);
-  to.crashReopen();
   from.crashReopen();
   clock.advance(10_000);
-  await to.step(BUDGET);
   await from.step(BUDGET);
-  expect(blobStorage(to).namespaces.received ?? 0).toBe(0);
-  expect(sha256(to.store.getBlobBytes(id)!)).toBe(sha256(pattern(2 * MiB, 48)));
   expect(
     from.db
       .prepare(
@@ -560,6 +536,34 @@ it("a pinned blob outlives its canonical record until export no longer needs it"
   expect(reopened).toBe(BLOB_BYTES);
 }, 120_000);
 
+it("a pinned copy becomes a reference again when its blob returns to canonical storage", async () => {
+  const { from } = pair();
+  const source = pattern(BLOB_BYTES, 51);
+  const id = writeBlob(from, source, "large");
+  // Deleting the connection moves the canonical chunks to the pin.
+  from.store.deleteConnection(from.instance);
+  expect(blobStorage(from)).toMatchObject({
+    namespaces: { pinned: BLOB_BYTES },
+    total: BLOB_BYTES,
+  });
+  from.store.registerConnection({
+    instance: "conn2",
+    sourceId,
+    method: "export",
+    label: "D",
+  });
+  expect(writeBlob(from, source, "again", "conn2")).toBe(id);
+  // Capture under conn2 turns the pinned copy into a reference to canonical.
+  expect(blobStorage(from)).toMatchObject({
+    namespaces: { canonical: BLOB_BYTES },
+    total: BLOB_BYTES,
+  });
+  const pinned = createHash("sha256");
+  for (const chunk of from.store.replication.readPinnedBlobChunks(id))
+    pinned.update(chunk);
+  expect(pinned.digest("hex")).toBe(sha256(source));
+}, 120_000);
+
 it("a discover pass over a long own history reads only versions above what it has seen", async () => {
   const { net, from, to } = pair();
   await settle(from, to);
@@ -607,20 +611,25 @@ it("a discover pass over a long own history reads only versions above what it ha
   ).toEqual({ n: 0 });
 }, 120_000);
 
+/** Model an earlier build's own pinned copy of a blob canonical storage holds. */
+function keepPinnedCopy(device: TransportDevice, id: string) {
+  device.db.exec(
+    `INSERT OR IGNORE INTO pdpp_binary_chunks SELECT 'pinned', blob_id, position, bytes FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';
+     INSERT OR IGNORE INTO pdpp_binary_manifests SELECT 'pinned', blob_id, size_bytes FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id='${id}';`,
+  );
+}
+
 it("compaction verifies a leftover copy across steps, within each step's byte budget", async () => {
   const { from, to } = pair();
   await settle(from, to);
   const source = pattern(2 * MiB, 52);
   const id = writeBlob(from, source, "large");
+  // Export first, so the metered steps do only compaction.
   await exchange(from, to, [id]);
-  // An earlier build kept a received copy of a blob canonical storage holds.
-  to.db.exec(
-    `INSERT OR IGNORE INTO pdpp_binary_chunks SELECT 'received', blob_id, position, bytes FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';
-     INSERT OR IGNORE INTO pdpp_binary_manifests SELECT 'received', blob_id, size_bytes FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id='${id}';`,
-  );
-  to.crashReopen();
+  keepPinnedCopy(from, id);
+  from.crashReopen();
   const small = { units: 20, bytes: MiB };
-  const reads = meter(to.db);
+  const reads = meter(from.db);
   const chunkBytes = () =>
     reads.accesses
       .filter((access) => /pdpp_binary_chunks/.test(access.sql))
@@ -628,36 +637,37 @@ it("compaction verifies a leftover copy across steps, within each step's byte bu
   const perStep: number[] = [];
   for (
     let i = 0;
-    i < 40 && (blobStorage(to).namespaces.received ?? 0) > 0;
+    i < 40 && (blobStorage(from).namespaces.pinned ?? 0) > 0;
     i++
   ) {
     const before = chunkBytes();
     clock.advance(10_000);
-    await to.step(small);
+    await from.step(small);
     perStep.push(chunkBytes() - before);
   }
-  expect(blobStorage(to).namespaces.received ?? 0).toBe(0);
+  expect(blobStorage(from).namespaces.pinned ?? 0).toBe(0);
   expect(perStep.length).toBeGreaterThan(1);
   expect(Math.max(...perStep)).toBeLessThanOrEqual(small.bytes);
-  expect(sha256(to.store.getBlobBytes(id)!)).toBe(sha256(source));
+  const pinned = createHash("sha256");
+  for (const chunk of from.store.replication.readPinnedBlobChunks(id))
+    pinned.update(chunk);
+  expect(pinned.digest("hex")).toBe(sha256(source));
 }, 120_000);
 
 it("compaction keeps a leftover copy when canonical storage has a chunk past the blob's end", async () => {
   const { from, to } = pair();
   await settle(from, to);
   const id = writeBlob(from, pattern(2 * MiB, 53), "large");
-  await exchange(from, to, [id]);
-  to.db.exec(
-    `INSERT OR IGNORE INTO pdpp_binary_chunks SELECT 'received', blob_id, position, bytes FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';
-     INSERT OR IGNORE INTO pdpp_binary_manifests SELECT 'received', blob_id, size_bytes FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id='${id}';
-     INSERT INTO pdpp_binary_chunks SELECT 'canonical', blob_id, max(position)+1, x'00' FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';`,
+  keepPinnedCopy(from, id);
+  from.db.exec(
+    `INSERT INTO pdpp_binary_chunks SELECT 'canonical', blob_id, max(position)+1, x'00' FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';`,
   );
-  to.crashReopen();
+  from.crashReopen();
   for (let i = 0; i < 10; i++) {
     clock.advance(10_000);
-    await to.step(BUDGET);
+    await from.step(BUDGET);
   }
-  expect(blobStorage(to).namespaces.received).toBe(2 * MiB);
+  expect(blobStorage(from).namespaces.pinned).toBe(2 * MiB);
 }, 120_000);
 
 it("a step examines a bounded number of compaction candidates", async () => {
@@ -667,13 +677,14 @@ it("a step examines a bounded number of compaction candidates", async () => {
   const ids = Array.from({ length: 60 }, (_, i) =>
     writeBlob(to, pattern(1024, 100 + i), `small-${i}`),
   );
+  // A pinned copy, and a canonical manifest that disagrees with the blob.
   const insert = to.db.prepare(
-    "INSERT INTO pdpp_binary_manifests (namespace, blob_id, size_bytes) VALUES ('received', ?, 1024)",
+    "INSERT OR REPLACE INTO pdpp_binary_manifests (namespace, blob_id, size_bytes) VALUES ('pinned', @id, 1024), ('canonical', @id, 2048)",
   );
   const drop = to.db.prepare("DELETE FROM pdpp_blob_bytes WHERE blob_id=?");
   to.db.transaction(() => {
     for (const id of ids) {
-      insert.run(id);
+      insert.run({ id });
       drop.run(id);
     }
   })();
