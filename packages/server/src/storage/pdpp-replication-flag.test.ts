@@ -43,6 +43,9 @@ const canonicalChunks = (db: Database.Database, blobId: string) =>
       )
       .get(blobId) as { n: number }
   ).n;
+/** Whole-blob equality. `toEqual` walks a 2 MiB array element by element. */
+const sameBytes = (actual: Uint8Array | undefined, expected: Uint8Array) =>
+  actual !== undefined && Buffer.from(actual).equals(Buffer.from(expected));
 
 interface SchemaObject {
   type: string;
@@ -265,9 +268,9 @@ describe("replication flag on", () => {
 
     // An enabled open keeps it chunk-only, and its readers accept that form.
     const onDb = open(path);
-    expect(openRecordStore(onDb, true).getBlobBytes(blob.blobId)).toEqual(
-      bytes,
-    );
+    expect(
+      sameBytes(openRecordStore(onDb, true).getBlobBytes(blob.blobId), bytes),
+    ).toBe(true);
     expect(wholeRow(onDb, blob.blobId)).toBeUndefined();
     onDb.close();
 
@@ -277,12 +280,12 @@ describe("replication flag on", () => {
     expect(wholeRow(offDb, blob.blobId)).toBe(bytes.byteLength);
     expect(canonicalChunks(offDb, blob.blobId)).toBe(0);
     const off = openRecordStore(offDb, false);
-    expect(off.getBlobBytes(blob.blobId)).toEqual(bytes);
+    expect(sameBytes(off.getBlobBytes(blob.blobId), bytes)).toBe(true);
     offDb.close();
 
     const mainDb = open(path);
     const mainStore = createSqliteRecordStore(mainDb);
-    expect(mainStore.getBlobBytes(blob.blobId)).toEqual(bytes);
+    expect(sameBytes(mainStore.getBlobBytes(blob.blobId), bytes)).toBe(true);
     mainDb.close();
   }, 30_000);
 
@@ -333,14 +336,14 @@ describe("replication flag on", () => {
     // The flag-off boot writes main's row before any plain store reads it.
     const offDb = open(path);
     resolveReplication(offDb, false, quiet);
-    expect(openRecordStore(offDb, false).getBlobBytes(blob.blobId)).toEqual(
-      bytes,
-    );
+    expect(
+      sameBytes(openRecordStore(offDb, false).getBlobBytes(blob.blobId), bytes),
+    ).toBe(true);
     offDb.close();
     const plainDb = open(path);
     expect(wholeRow(plainDb, blob.blobId)).toBe(bytes.byteLength);
     const plainStore = createSqliteRecordStore(plainDb);
-    expect(plainStore.getBlobBytes(blob.blobId)).toEqual(bytes);
+    expect(sameBytes(plainStore.getBlobBytes(blob.blobId), bytes)).toBe(true);
     plainDb.close();
   }, 30_000);
 
