@@ -86,8 +86,10 @@ async function written() {
   });
   return d;
 }
-const outbox = async (store: ReturnType<typeof createLiteCanonicalStore>) =>
-  (await store.readOutboxPage()).entries;
+const outbox = async (
+  store: ReturnType<typeof createLiteCanonicalStore>,
+  after = 0,
+) => (await store.readOutboxPage(after)).entries;
 const byText = (entries: { operation: ReplicaOperation }[]) =>
   new Map(
     entries.map(({ operation }) => [
@@ -229,6 +231,93 @@ describe("Lite canonical rebaseline", () => {
       await fresh.store.readRecord(identity.connectionId, binding.stream, "p"),
     ).toMatchObject({ data: { text: "from peer" } });
   });
+
+  it("skips a certified completion whose rewrite outgrows one operation, and re-exports its records", async () => {
+    const d = device();
+    await d.store.provisionConnection(identity.connectionId, {
+      sourceId: identity.sourceId,
+      methodId: identity.methodId,
+    });
+    await d.store.commitLocal("one", [register]);
+    const records = Array.from({ length: 1_700 }, (_, i) => ({
+      ...record(`r${String(i).padStart(4, "0")}`, "r"),
+      revision: {
+        counter: 100 + i,
+        writerId: "device-b",
+        operationId: `r${i}`,
+      },
+    }));
+    await d.store.import({
+      id: "peer-records",
+      credential: "replica",
+      envelope: envelope(records),
+    });
+    const snapshot = sha256(
+      encodeLiveSnapshotDigestInput(
+        {
+          sourceId: identity.sourceId,
+          instance: identity.connectionId,
+          method: identity.methodId,
+          generation: 1,
+          stream: binding.stream,
+        },
+        binding.primaryKey,
+        records.map((op) => ({
+          recordKey: op.recordKey,
+          dataJson: canonicalJson(op.data),
+        })),
+      ),
+    );
+    const complete: ReplicaOperation = {
+      ...identity,
+      kind: "stream-complete",
+      declaration: binding,
+      sourceCollectedAt: "2026-10-20T00:00:00Z",
+      liveCount: records.length,
+      snapshotSha256: `sha256:${snapshot.slice(2)}`,
+      proof: {
+        kind: "producer-asserted",
+        snapshotSha256: null,
+        collectionTimeBasis: null,
+      },
+      dependencies: records.map((op) => ({
+        writerId: "device-b",
+        operationId: op.revision.operationId,
+        digest: operationDigest(op),
+      })),
+      revision: { counter: 9_000, writerId: "device-b", operationId: "peer-c" },
+    };
+    // The peer's completion fits one operation; its rewrite would not.
+    expect(canonicalJson(complete).length).toBeLessThan(
+      LITE_CANONICAL_MAX_OPERATION_BYTES,
+    );
+    await d.store.import({
+      id: "peer-complete",
+      credential: "replica",
+      envelope: envelope([complete]),
+    });
+    expect(
+      [...d.disk.rows.keys()].filter((key) =>
+        key.startsWith("stream-completions/"),
+      ),
+    ).toHaveLength(1);
+
+    expect(await d.store.rebaseline("writer-2")).toEqual({
+      reissued: 1 + records.length,
+      skipped: 1,
+    });
+    const operations: ReplicaOperation[] = [];
+    for (let after = 0; ;) {
+      const page = await outbox(d.store, after);
+      if (!page.length) break;
+      operations.push(...page.map((e) => e.operation));
+      after = page.at(-1)!.sequence;
+    }
+    expect(operations.some((op) => op.kind === "stream-complete")).toBe(false);
+    expect(operations.filter((op) => op.kind === "upsert")).toHaveLength(
+      records.length,
+    );
+  }, 60_000);
 
   it("moves the outbox past published operations and keeps them in the log", async () => {
     const { store, disk } = await written();

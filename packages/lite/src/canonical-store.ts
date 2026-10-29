@@ -260,6 +260,8 @@ const operationPath = (op: ReplicaOperation) => {
 };
 const maxWindowBytes = 4 * 1024 * 1024;
 const encoder = new TextEncoder();
+/** Room for the revision (and its origin) a rebaseline adds to a draft. */
+const REVISION_MARGIN_BYTES = 1024;
 
 async function get<T>(
   tx: LiteCanonicalTransaction,
@@ -1048,22 +1050,31 @@ export function createLiteCanonicalStore(deps: {
         if (certified.kind !== "stream-complete") continue;
         // The certified completion is the one the merge chose.
         const { revision: _, ...draft } = certified;
-        await issue(
-          {
-            ...draft,
-            ...base,
-            generation,
-            dependencies: [
-              ...shared,
-              ...(byStream.get(certified.declaration.stream) ?? []),
-            ].map((op) => ({
-              writerId: op.revision.writerId,
-              operationId: op.revision.operationId,
-              digest: operationDigest(op),
-            })),
-          } as LiteOperationDraft,
-          certified,
-        );
+        const rewritten = {
+          ...draft,
+          ...base,
+          generation,
+          dependencies: [
+            ...shared,
+            ...(byStream.get(certified.declaration.stream) ?? []),
+          ].map((op) => ({
+            writerId: op.revision.writerId,
+            operationId: op.revision.operationId,
+            digest: operationDigest(op),
+          })),
+        } as LiteOperationDraft;
+        // One dependency per live record: a large stream's completion can
+        // outgrow one operation. Its records still re-export; the stream is
+        // then not certified complete from this writer.
+        if (
+          encoder.encode(canonicalJson(rewritten)).length +
+            REVISION_MARGIN_BYTES >
+          LITE_CANONICAL_MAX_OPERATION_BYTES
+        ) {
+          skipped += 1;
+          continue;
+        }
+        await issue(rewritten, certified);
       }
     }
     return { reissued, skipped };
