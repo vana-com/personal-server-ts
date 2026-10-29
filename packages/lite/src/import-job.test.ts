@@ -219,15 +219,14 @@ describe("Lite canonical import encoder", () => {
     expect([...copied].sort()).toEqual([...written.rows].sort());
     expect(base).toEqual(before.rows);
     const keys = encoded.entries.map((entry) => entry.key);
-    for (const prefix of ["rows/", "journal/", "outbox/", "mutations/"])
+    for (const prefix of ["rows/", "log/"])
       expect(keys.some((key) => key.startsWith(prefix))).toBe(true);
-    // Outbox entries point at the retained operation; they carry no record bytes.
-    for (const entry of encoded.entries.filter((e) =>
-      e.key.startsWith("outbox/"),
-    ))
+    // Log entries point at the retained operation; they carry no record bytes.
+    for (const entry of encoded.entries.filter((e) => e.key.startsWith("log/")))
       expect(Object.keys(JSON.parse(entry.value!)).sort()).toEqual([
         "batchId",
         "operationKey",
+        "rowVersion",
         "sequence",
       ]);
   });
