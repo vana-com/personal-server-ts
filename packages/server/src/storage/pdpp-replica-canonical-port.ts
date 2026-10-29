@@ -23,6 +23,7 @@ import {
 import {
   createReplicationJournal,
   REPLICATION_MIGRATION,
+  REPLICA_BINDING_HISTORY_MIGRATION,
   REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
   type ReplicationExport,
 } from "./pdpp-replication-sqlite.js";
@@ -95,6 +96,8 @@ BEGIN SELECT RAISE(ABORT, 'local write log is append-only'); END;
   REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
   // Writer ids derived from the registered server key (host contract §3.2).
   REPLICA_WRITER_IDENTITY_MIGRATION,
+  // Binding generations and declaration history (host contract §4.5).
+  REPLICA_BINDING_HISTORY_MIGRATION,
 ];
 
 /**

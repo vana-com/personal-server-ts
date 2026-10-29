@@ -132,16 +132,20 @@ The derivation uses only the signer's identity and the nonce, not scope names,
 so it carries over unchanged to a per-sync manifest (A12).
 
 A new identity (re-registration, reset, restore or clone) publishes a full
-current-state baseline before its tail: every live record, every tombstone,
-every blob claim and every completion, signed under the new writer ids. So a
+current-state baseline before its tail: every live record, every deleted
+record's tombstone, every blob claim and every completion, signed under the new
+writer ids. So a
 peer that missed old batches, whether refused, never published, or written
 between a gateway change and the next worker step, still converges. Each
 re-issued record and completion orders exactly as the retained operation whose
 effect it copies, own or a peer's: it keeps that operation's counter and names
 its writer and operation id in the signed `revision.origin`, which
 `compareRevisions` reads before the re-issue's own ids. So a re-issue never
-overrides a newer write and never loses a tie the original won. A state no
-retained operation explains takes a new counter, like a local write. The
+overrides a newer write and never loses a tie the original won. A live
+record or completion no retained operation explains takes a new counter, like
+a local write. A tombstone no delete explains is not published: it hides a row
+locally (a withdrawal, a key quarantine, a declaration wait, a reset), and no
+one deleted that row. The
 baseline is published in the usual bounded, fragmented batches and resumes
 from its durable cursor after a crash. A worker step first checks the
 replication door (`replicationAdmitted`): once it is closed, the step does no
@@ -504,6 +508,76 @@ yet the peer, pending and server fields above.
 | Cancellation         | Host         | Aborts the step signal on stop, background, sign-out |
 | Stopping I/O         | Adapter      | Honours the signal                                   |
 | Durable effects      | Phase commit | One transaction per verdict (`coordinator.ts:52-88`) |
+
+### 4.5 Declaration upgrades and new connectors
+
+Every operation names the exact declaration binding it was written under
+(digest, version, stream, semantics, primary key, schema digest). A binding is
+therefore its own version tag, and a rebinding journals nothing.
+
+On each boot the host passes its retained declarations. `beginBaseline`
+compares them with the database's current binding generation
+(`rebinding.ts`):
+
+- The same bindings: nothing changes.
+- An upgraded declaration or an added connector: the database starts the next
+  binding generation, writes new operations under the new bindings, and keeps
+  every earlier binding in `pdpp_replica_declaration_history` with its schema.
+- A changed stream shape (semantics or primary key) of any retained stream:
+  refused. The database keeps its generation and the host reports the reason.
+- Another owner: refused (`replication owner is immutable`).
+
+The host trusts its current bindings plus the history
+(`replicaDeclarationContext(owner, snapshots, history)`), so older operations,
+own or received, still validate against their own schema. Versions of one
+stream with the same shape merge by revision. The transport encodes this
+device's own operations against the retained history too, so an operation
+captured before a rebinding still publishes.
+
+An operation whose binding this device does not retain is resolved by
+`resolveDeclaration` in `merge-plan.ts`:
+
+- Compatible: a retained binding of the same source has the same shape. The
+  operation is another version of a stream this device already trusts, for
+  example a v1 write that a peer made before it upgraded to the v2 this device
+  joined with. Its batch passed the same owner, roster and signature checks as
+  every other batch, so it applies. Its schema is not known here, so it
+  validates by primary key only. Nothing is journaled; the binding stays
+  trusted through the operations that carry it.
+- Missing: no retained binding of that source has that stream (a peer added a
+  connector). The batch imports, its operations stay pending, reconcile
+  reports a `declaration` wait, and the writer's later batches keep importing.
+  When the host supplies the declaration, reconcile applies them.
+- Incompatible: a retained binding of that stream has another shape. The
+  operations stay pending as `incompatible_declaration` and never apply. A
+  rebinding cannot change a retained shape, so reconcile reports an `owner`
+  wait keyed `declaration:<source>:<stream>`. The writer's later batches keep
+  importing.
+
+Nothing is lost or resurrected: a pending operation takes part in the merge
+only once it resolves.
+
+A new writer identity rebaselines current state (`rebaseline`). Each copied
+record or completion keeps the order and binding of the operation the merge
+chose for it: the receiver's reconcile returns the winner each shown row or
+tombstone was written from, and each available completion (`explainState`).
+An operation the merge rejected or keeps pending never explains canonical
+state, even when it has a higher revision and the same data, so its binding is
+never copied. A tombstone is copied only from the delete the merge chose, so
+a row this device hides is never published as a delete. The transport
+publishes this device's own operations under a retained or compatible
+binding. A stream that a rebinding retired keeps its
+rows and tombstones: the rebaseline captures them under their latest retained
+binding.
+
+Known limits:
+
+- A compatible version validates by key only: this device cannot check its
+  data against that version's schema.
+- A database baselined before generations gets generation 1 and a history
+  with an unknown schema. Its operations are compatible with the current
+  binding, so they validate by key only until a host supplies that schema.
+- Lite needs the same history-aware context.
 
 ## 5. Opt-in and the one-way door
 
