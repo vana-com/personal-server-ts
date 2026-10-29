@@ -4473,17 +4473,11 @@ export function createReplicaTransportWorker(deps: {
       }).immediate();
       // Storage earlier builds kept twice shrinks within a share of the
       // step's bytes; a large blob takes several steps.
-      let compactBytes = Math.min(
+      const compactBytes = Math.min(
         COMPACT_BYTES_PER_STEP,
         Math.floor((context.budget.bytes ?? REPLICA_STEP_BYTES) / 4),
       );
-      while (compactBytes > 0) {
-        const read = deps.receiver.atomically(() =>
-          compactor.step(compactBytes),
-        );
-        if (!read) break;
-        compactBytes -= read;
-      }
+      deps.receiver.atomically(() => compactor.step(compactBytes));
       const current = dependencyFingerprint();
       if (current !== fingerprint) {
         fingerprint = current;

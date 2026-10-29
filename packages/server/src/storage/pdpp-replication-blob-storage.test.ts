@@ -641,3 +641,57 @@ it("compaction verifies a leftover copy across steps, within each step's byte bu
   expect(Math.max(...perStep)).toBeLessThanOrEqual(small.bytes);
   expect(sha256(to.store.getBlobBytes(id)!)).toBe(sha256(source));
 }, 120_000);
+
+it("compaction keeps a leftover copy when canonical storage has a chunk past the blob's end", async () => {
+  const { from, to } = pair();
+  await settle(from, to);
+  const id = writeBlob(from, pattern(2 * MiB, 53), "large");
+  await exchange(from, to, [id]);
+  to.db.exec(
+    `INSERT OR IGNORE INTO pdpp_binary_chunks SELECT 'received', blob_id, position, bytes FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';
+     INSERT OR IGNORE INTO pdpp_binary_manifests SELECT 'received', blob_id, size_bytes FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id='${id}';
+     INSERT INTO pdpp_binary_chunks SELECT 'canonical', blob_id, max(position)+1, x'00' FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id='${id}';`,
+  );
+  to.crashReopen();
+  for (let i = 0; i < 10; i++) {
+    clock.advance(10_000);
+    await to.step(BUDGET);
+  }
+  expect(blobStorage(to).namespaces.received).toBe(2 * MiB);
+}, 120_000);
+
+it("a step examines a bounded number of compaction candidates", async () => {
+  const { from, to } = pair();
+  await settle(from, to);
+  // Many leftover copies whose canonical copy is gone: each is skipped.
+  const ids = Array.from({ length: 60 }, (_, i) =>
+    writeBlob(to, pattern(1024, 100 + i), `small-${i}`),
+  );
+  const insert = to.db.prepare(
+    "INSERT INTO pdpp_binary_manifests (namespace, blob_id, size_bytes) VALUES ('received', ?, 1024)",
+  );
+  const drop = to.db.prepare("DELETE FROM pdpp_blob_bytes WHERE blob_id=?");
+  to.db.transaction(() => {
+    for (const id of ids) {
+      insert.run(id);
+      drop.run(id);
+    }
+  })();
+  to.crashReopen();
+  const reads = meter(to.db);
+  const lookups = () =>
+    reads.accesses.filter((access) =>
+      /SELECT size_bytes AS size, sha256 FROM pdpp_blobs/.test(access.sql),
+    ).length;
+  const perStep: number[] = [];
+  for (let i = 0; i < 12; i++) {
+    const before = lookups();
+    clock.advance(10_000);
+    await to.step(BUDGET);
+    perStep.push(lookups() - before);
+  }
+  expect(Math.max(...perStep)).toBeLessThanOrEqual(16);
+  // Every candidate is examined once, then the compactor stops.
+  expect(perStep.reduce((a, b) => a + b, 0)).toBe(ids.length);
+  expect(perStep.at(-1)).toBe(0);
+}, 120_000);
