@@ -141,10 +141,11 @@ export function createSqliteImportJobCapability(
     VALUES (@job_id, @stream, @record_key, @ord, @key_json, @op, @data, @emitted_at, @digest)
     ON CONFLICT (job_id, stream, record_key) DO NOTHING
   `);
-  // Pages are bounded by rows and by the job's batch bytes: the sizes are read
-  // first, then only the rows that fit (at least one) are loaded.
+  // Pages are bounded by rows and by the job's batch bytes, counting every text
+  // column the page loads: the sizes are read first, then only the rows that
+  // fit (at least one) are loaded.
   const stagedSizesStmt = db.prepare(
-    "SELECT ord, length(CAST(key_json AS BLOB)) + coalesce(length(CAST(data AS BLOB)), 0) AS bytes FROM pdpp_import_staged WHERE job_id = ? AND ord > ? ORDER BY ord LIMIT ?",
+    "SELECT ord, length(CAST(stream AS BLOB)) + length(CAST(record_key AS BLOB)) + length(CAST(key_json AS BLOB)) + coalesce(length(CAST(data AS BLOB)), 0) + length(CAST(emitted_at AS BLOB)) AS bytes FROM pdpp_import_staged WHERE job_id = ? AND ord > ? ORDER BY ord LIMIT ?",
   );
   const stagedPageStmt = db.prepare(
     "SELECT stream, record_key, ord, key_json, op, data, emitted_at FROM pdpp_import_staged WHERE job_id = ? AND ord > ? AND ord <= ? ORDER BY ord",
