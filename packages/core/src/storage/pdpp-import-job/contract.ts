@@ -268,7 +268,7 @@ export interface ImportCanonicalEntry {
 }
 
 /**
- * How an adapter publishes (additive after b5f53725). Absent means
+ * How an adapter publishes. Absent means
  * `{ mode: "transactional-apply", outbox: "captured-in-transaction" }`, the
  * version 1 behaviour of the Node SQLite and memory adapters.
  */
@@ -373,11 +373,11 @@ export type ImportJobErrorCode =
   | "spool_offset_mismatch"
   | "batch_count_mismatch"
   | "state_too_large"
-  /** Commit before every spool byte is in a durable batch (added after b5f53725). */
+  /** Commit before every spool byte is in a durable batch. */
   | "spool_incomplete"
-  /** An append beyond `IMPORT_JOB_MAX_IN_FLIGHT`; retry after the pending one (added after b5f53725). */
+  /** An append beyond `IMPORT_JOB_MAX_IN_FLIGHT`; retry after the pending one. */
   | "job_busy"
-  /** A record with `data.blob_ref`; version 1 stages no blobs (added after b5f53725). */
+  /** A record with `data.blob_ref`; version 1 stages no blobs. */
   | "blob_ref_unsupported"
   | "completion_failed";
 
