@@ -20,7 +20,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./additions-worker": "./dist/additions-worker.bundle.js"
+    "./additions-worker": "./dist/additions-worker.bundle.js",
+    "./import-job": {
+      "types": "./dist/import-job.d.ts",
+      "import": "./dist/import-job.js"
+    }
   },
   "publishConfig": {
     "access": "public"
