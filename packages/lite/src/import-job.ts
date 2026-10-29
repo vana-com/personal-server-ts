@@ -75,6 +75,13 @@ export interface LiteCanonicalEncodedBatch {
 
 /** Items per `getMany`/`scanMany` call (the native store's read bound). */
 export const LITE_IMPORT_READ_MANY_MAX = 500;
+/**
+ * The most reads one batch carries to the next as guesses, in string length
+ * (UTF-16 code units of keys and values). A batch's reads grow with the
+ * retained history of the records it touches; past this, the rest is read
+ * again rather than guessed.
+ */
+export const LITE_IMPORT_CARRY_UNITS = 8 * 1024 * 1024;
 /** The native store's page bounds; a page always holds its first entry. */
 const PAGE_ENTRIES = 100;
 const PAGE_BYTES = 512 * 1024;
@@ -215,6 +222,27 @@ interface Reads {
 }
 const noReads = (): Reads => ({ values: new Map(), pages: new Map() });
 
+/** The reads that fit `limit` string units, skipping any that do not. */
+function budgeted(reads: Reads, limit: number) {
+  const kept = noReads();
+  let units = 0;
+  for (const [key, value] of reads.values) {
+    const size = key.length + (value?.length ?? 0);
+    if (units + size > limit) continue;
+    kept.values.set(key, value);
+    units += size;
+  }
+  for (const [id, page] of reads.pages) {
+    let size = id.length;
+    for (const entry of page.entries)
+      size += entry.key.length + entry.value.length;
+    if (units + size > limit) continue;
+    kept.pages.set(id, page);
+    units += size;
+  }
+  return { reads: kept, units };
+}
+
 const samePage = (a: LiteStoragePage, b: LiteStoragePage) =>
   a.after === b.after &&
   a.entries.length === b.entries.length &&
@@ -246,6 +274,8 @@ export interface LiteCanonicalImportEncoderOptions {
   context: () => MergeContext;
   /** Operation ids; the host must persist what it staged, so replay reuses them. */
   newId?: () => string;
+  /** Default `LITE_IMPORT_CARRY_UNITS`. */
+  carryUnits?: number;
 }
 
 export function createLiteCanonicalImportEncoder(
@@ -274,8 +304,9 @@ export function createLiteCanonicalImportEncoder(
       return tape[used++]!;
     },
   });
+  const carryUnits = options.carryUnits ?? LITE_IMPORT_CARRY_UNITS;
   // What the last batch read and wrote: the guesses for the next batch.
-  let carried = { reads: noReads(), overlay: new Overlay() };
+  let carried = { reads: noReads(), units: 0, overlay: new Overlay() };
   let queue = Promise.resolve();
 
   /** Guessed answers: the last batch's reads and writes, else absent. */
@@ -382,7 +413,7 @@ export function createLiteCanonicalImportEncoder(
       // Ids the accepted pass did not use start the next batch's tape.
       tape = tape.slice(used);
       if (!outcome.ok) throw outcome.error;
-      carried = { reads: known, overlay };
+      carried = { ...budgeted(known, carryUnits), overlay };
       return outcome.batch;
     }
   }
@@ -470,5 +501,10 @@ export function createLiteCanonicalImportEncoder(
     return parts;
   }
 
-  return { encode, importBatchParts };
+  return {
+    encode,
+    importBatchParts,
+    /** String units of the reads carried to the next batch (`carryUnits`). */
+    carriedUnits: () => carried.units,
+  };
 }

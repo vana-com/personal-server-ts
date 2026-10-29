@@ -459,6 +459,70 @@ describe("Lite canonical import encoder", () => {
     expect(before.rows.get("clock")).not.toBe(encoded.fence.value);
   });
 
+  it("bounds what it carries between batches when one key changes in every batch", async () => {
+    const before = await registeredDisk();
+    const written = { rows: new Map(before.rows), blobs: new Map() };
+    const store = createLiteCanonicalStore({
+      persistence: createFakeCanonicalPersistence(written).port,
+      enabled: true,
+      context,
+      authenticateReplica: () => undefined,
+      newId: ids("op"),
+    });
+    const limit = 32 * 1024;
+    const bounded = createLiteCanonicalImportEncoder({
+      context,
+      newId: ids("op"),
+      carryUnits: limit,
+    });
+    const unbounded = createLiteCanonicalImportEncoder({
+      context,
+      newId: ids("op"),
+    });
+    const stagedBounded = new Map(before.rows);
+    const stagedUnbounded = new Map(before.rows);
+    const [mutable, ...others] = importOperations();
+    const carried: number[] = [];
+    for (let seq = 0; seq < 40; seq++) {
+      const parts = bounded.importBatchParts({
+        job: importJob,
+        seq,
+        operations: [
+          {
+            ...mutable!,
+            dataJson: JSON.stringify({
+              id: mutable!.recordKey,
+              text: `${seq} ${"·".repeat(2_000)}`,
+            }),
+          },
+          ...others.slice(seq * 5, seq * 5 + 5),
+        ],
+        bindingFor: () => binding,
+      });
+      const receipts = [];
+      for (const part of parts)
+        receipts.push(await store.commitLocal(part.id, part.operations));
+      for (const [encoder, staged] of [
+        [bounded, stagedBounded],
+        [unbounded, stagedUnbounded],
+      ] as const) {
+        const encoded = await encoder.encode(
+          countingView(staged, { batched: true }).view,
+          parts,
+        );
+        expect(encoded.parts.map((part) => part.receipt)).toEqual(receipts);
+        applyEntries(staged, encoded.entries);
+      }
+      expect(bounded.carriedUnits()).toBeLessThanOrEqual(limit);
+      carried.push(unbounded.carriedUnits());
+    }
+    // The key's retained variants make every batch read more; the cap holds.
+    expect(carried.at(-1)!).toBeGreaterThan(2 * limit);
+    expect(carried.at(-1)!).toBeGreaterThan(carried[4]! + 60_000);
+    expect([...stagedBounded].sort()).toEqual([...written.rows].sort());
+    expect([...stagedUnbounded].sort()).toEqual([...written.rows].sort());
+  });
+
   it("puts an operation over 192 KiB alone in its own part", () => {
     const encoder = createLiteCanonicalImportEncoder({ context });
     const [a, b, c] = importOperations();
