@@ -58,6 +58,20 @@ export const LITE_MAX_FRAGMENT_BYTES = 1024 * 1024;
 export const LITE_REPLICA_SQL_BYTES = LITE_MAX_FRAGMENT_BYTES + 64 * 1024;
 
 /**
+ * The fixed bytes an encrypted fragment adds to its plaintext, beyond the
+ * base64 growth of 4/3: envelope framing plus encryption overhead.
+ */
+const FRAGMENT_FRAMING_BYTES = 4100;
+
+/**
+ * The plaintext chunk that encrypts to at most `fragmentBytes`. The native
+ * store keeps a fragment as one value, so the encrypted size is the bound.
+ */
+export function liteTargetChunkBytes(fragmentBytes: number) {
+  return Math.floor(((fragmentBytes - FRAGMENT_FRAMING_BYTES) * 3) / 4);
+}
+
+/**
  * Why a boot configuration cannot run, or `undefined` when it can. PS refuses
  * an invalid value rather than clamping it.
  */
@@ -73,6 +87,8 @@ export function replicationBootConfigProblem(
     !positive(config.chainId) ||
     !positive(fragmentBytes) ||
     fragmentBytes > LITE_MAX_FRAGMENT_BYTES ||
+    // A fragment must fit its framing and at least one plaintext byte.
+    liteTargetChunkBytes(fragmentBytes) < 1 ||
     !positive(step.units) ||
     !positive(step.bytes) ||
     !positive(step.deadlineMs)

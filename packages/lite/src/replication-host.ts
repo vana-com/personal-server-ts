@@ -35,6 +35,7 @@ import {
   type LiteReplicaEngine,
 } from "./replication-engine.js";
 import {
+  liteTargetChunkBytes,
   replicationBootConfigProblem,
   type LiteReplicaObjectTransfers,
   type LiteReplicaPersistence,
@@ -50,19 +51,7 @@ import {
   type LiteTransientBytesInUse,
 } from "./replication-storage.js";
 
-/**
- * The fixed bytes an encrypted fragment adds to its plaintext, beyond the
- * base64 growth of 4/3: envelope framing plus encryption overhead.
- */
-const FRAGMENT_FRAMING_BYTES = 4100;
-
-/**
- * The plaintext chunk that encrypts to at most `fragmentBytes`. The native
- * store keeps a fragment as one value, so the encrypted size is the bound.
- */
-export function liteTargetChunkBytes(fragmentBytes: number) {
-  return Math.floor(((fragmentBytes - FRAGMENT_FRAMING_BYTES) * 3) / 4);
-}
+export { liteTargetChunkBytes };
 
 /**
  * Vana storage addressing and upload authorization for one owner's replica
