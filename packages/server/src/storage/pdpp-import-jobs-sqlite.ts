@@ -102,6 +102,9 @@ export function createSqliteImportJobCapability(
   options: SqliteImportJobCapabilityOptions = {},
 ): PdppImportJobCapability {
   const pageSize = options.pageSize ?? 256;
+  // A page of zero rows would skip the index and still publish the cursor.
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1)
+    throw new ImportJobError("invalid_request", "pageSize must be >= 1");
   const fault = options.fault ?? (() => {});
   db.exec(SCHEMA);
 

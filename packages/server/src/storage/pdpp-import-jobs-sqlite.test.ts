@@ -364,6 +364,16 @@ describe("Node SQLite import job adapter", () => {
     60_000,
   );
 
+  it("refuses a page size that is not a positive integer", () => {
+    const db = new Database(join(dir, "pages.db"));
+    const store = createSqliteRecordStore(db);
+    for (const pageSize of [0, -1, 1.5, Number.NaN])
+      expect(() =>
+        createSqliteImportJobCapability(db, store, { pageSize }),
+      ).toThrow(expect.objectContaining({ code: "invalid_request" }));
+    db.close();
+  });
+
   it("abort leaves nothing visible", async () => {
     const { capability, jobs, begin, db } = await prepare();
     await jobs.begin(begin);
