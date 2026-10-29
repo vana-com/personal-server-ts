@@ -472,7 +472,7 @@ export interface ReplicaEngineExporter<C> {
   /**
    * The gateway confirmed the registration of a tail batch: every local
    * operation up to `next` (a tail cursor) is published. A host with an
-   * outbox drops them; called in order, possibly more than once.
+   * outbox moves past them; called in order, possibly more than once.
    */
   acknowledgePublished(next: number): ReplicaEffect<void, C>;
   readPinnedBlobChunks(

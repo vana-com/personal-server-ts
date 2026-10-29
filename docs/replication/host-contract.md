@@ -487,14 +487,24 @@ Bounded growth on the phone:
 
 - **Outbox.** Once a batch's manifest registration is confirmed on the
   gateway, the engine calls `exporter.acknowledgePublished(next)` in the same
-  transaction, and Lite drops its outbox entries below `next`. Node keeps its
-  journal: rebaseline, completion dependencies and receiver merges read it.
+  transaction, and Lite moves `outbox-ack` to `next`. Neither host deletes
+  published operations yet: the Node journal and the Lite `log/` keep
+  history, because rebaseline, completion dependencies and receiver merges
+  read it. Compaction (keep unpublished operations and the operations the
+  merge chose) is separate work.
+- **Large received batches.** A Node batch targets 32 MiB. Lite keeps a
+  received envelope, its copy and its fetched fragments in parts below the
+  per-call SQL bound (`LITE_REPLICA_SQL_BYTES`) and imports it in one native
+  transaction under one receipt. Only each operation is bounded
+  (`LITE_CANONICAL_MAX_OPERATION_BYTES`), because the store keeps it as one
+  value. A larger operation is held `resource_unsupported` until a build
+  raises the bound and `REPLICA_LIMITS_VERSION` with it.
 - **Orphaned bytes.** `attachBytes` records the id in
   `pdpp_lite_replica_transient`, and `releaseBytes` removes it, in the same
   transaction. A crash between them leaves the id listed, and the next step
   releases every listed id before it stages anything.
 - **Refused batches.** A received batch the canonical store refuses
-  (`LiteCanonicalRefusal`: over the batch or partition bound, wrong owner,
+  (`LiteCanonicalRefusal`: over the header, count or partition bound, wrong owner,
   binding mismatch, reused commit id, blob metadata conflict) cannot import on
   a retry. The engine records it terminal with reason `canonical_<reason>`
   and quarantines that writer from that batch. Other writers keep importing.
