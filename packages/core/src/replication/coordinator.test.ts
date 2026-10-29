@@ -4,7 +4,7 @@ import type {
   ReplicaPhaseHandler,
   ReplicaWorkItem,
 } from "./coordinator.js";
-import { createReplicaCoordinator } from "./coordinator.js";
+import { createReplicaCoordinator, REPLICA_STEP_BYTES } from "./coordinator.js";
 import type {
   ReplicaDependency,
   ReplicaOutcome,
@@ -1440,40 +1440,55 @@ describe("coordinator budgets", () => {
     expect(report.nextWake).toBe(T0);
   });
 
-  it("23 an item larger than the whole byte budget runs alone, then spends the rest", async () => {
+  it("23 under the default budget an item larger than the whole step runs alone, then spends the rest", async () => {
     const world = newWorld();
     addRow(world, "huge", "import", "A", {
-      bytes: 500,
+      bytes: REPLICA_STEP_BYTES + 1,
       state: { nextEligible: 1 },
     });
     addRow(world, "s1", "import", "B", {
       bytes: 30,
       state: { nextEligible: 2 },
     });
-    const first = await stepAt(world, build(world), T0, {
-      units: 10,
-      bytes: 100,
-    });
+    const first = await stepAt(world, build(world), T0, { units: 10 });
     expect(runIds(world)).toEqual(["huge"]);
     expect(first.nextWake).toBe(T0);
-    await stepAt(world, build(world), T0, { units: 10, bytes: 100 });
+    await stepAt(world, build(world), T0, { units: 10 });
     expect(runIds(world)).toEqual(["huge", "s1"]);
   });
 
-  it("23 an item larger than the whole byte budget waits for a step no other item charged", async () => {
+  it("23 under the default budget an oversized item waits for a step no other item charged", async () => {
     const world = newWorld();
     addRow(world, "s1", "import", "B", {
       bytes: 30,
       state: { nextEligible: 1 },
     });
     addRow(world, "huge", "import", "A", {
-      bytes: 500,
+      bytes: REPLICA_STEP_BYTES + 1,
       state: { nextEligible: 2 },
     });
-    await stepAt(world, build(world), T0, { units: 10, bytes: 100 });
+    await stepAt(world, build(world), T0, { units: 10 });
     expect(runIds(world)).toEqual(["s1"]);
-    await stepAt(world, build(world), T0, { units: 10, bytes: 100 });
+    await stepAt(world, build(world), T0, { units: 10 });
     expect(runIds(world)).toEqual(["s1", "huge"]);
+  });
+
+  it("23 under an explicit budget an item larger than the whole budget stays deferred", async () => {
+    const world = newWorld();
+    addRow(world, "huge", "import", "A", {
+      bytes: 500,
+      state: { nextEligible: 1 },
+    });
+    for (let i = 0; i < 2; i++) {
+      const report = await stepAt(world, build(world), T0, {
+        units: 10,
+        bytes: 100,
+      });
+      expect(runIds(world)).toEqual([]);
+      expect(report.nextWake).toBe(T0);
+    }
+    await stepAt(world, build(world), T0, { units: 10, bytes: 500 });
+    expect(runIds(world)).toEqual(["huge"]);
   });
 
   it("23 bytes are charged per run and an exact fit is admitted", async () => {

@@ -256,13 +256,18 @@ it("rejects invalid budgets and clocks before hints, load, selection or effects"
   assert.equal(reads, 0);
 });
 
-it("rejects zero/fractional/nonfinite quanta, polling intervals and timeouts", () => {
+it("rejects zero/fractional/nonfinite polling intervals and timeouts, and invalid quanta", () => {
+  // A zero quantum stays valid, as on main: it leaves its phase idle.
+  assert.doesNotThrow(() =>
+    createReplicaCoordinator({ phases: [], quantum: { publish: 0 } }),
+  );
   for (const value of [0, -1, 0.5, NaN, Infinity]) {
-    assert.throws(
-      () =>
-        createReplicaCoordinator({ phases: [], quantum: { publish: value } }),
-      RangeError,
-    );
+    if (value !== 0)
+      assert.throws(
+        () =>
+          createReplicaCoordinator({ phases: [], quantum: { publish: value } }),
+        RangeError,
+      );
     assert.throws(
       () => createReplicaCoordinator({ phases: [], perWriter: value }),
       RangeError,
@@ -284,15 +289,16 @@ it("rejects zero/fractional/nonfinite quanta, polling intervals and timeouts", (
 
 it("omitted bytes has a finite bound and idle uses undefined, not null", async () => {
   const h = memory();
-  const handler = phase("publish", ["A"], h.receipts);
+  const handler = phase("publish", ["A", "B"], h.receipts);
   const due = handler.due;
   handler.due = (e, limit) =>
     due(e, limit).map((item) => ({ ...item, bytes: REPLICA_STEP_BYTES + 1 }));
+  // Each item is over the default bound: one runs alone, the other waits.
   const report = await createReplicaCoordinator({ phases: [handler] }).step({
     now: 1000,
-    budget: { units: 1 },
+    budget: { units: 2 },
   });
-  assert.deepEqual(report.receipts, []);
+  assert.equal(report.receipts.length, 1);
   assert.equal(report.nextWake, 1000);
   const idle = await createReplicaCoordinator({ phases: [] }).step({
     now: 1000,

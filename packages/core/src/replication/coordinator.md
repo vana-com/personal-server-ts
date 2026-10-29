@@ -18,9 +18,11 @@ Known item byte estimates must be nonnegative safe integers. Bytes limit
 admission estimates, not total allocations or network traffic; omitted item
 estimates are uncharged. A unit is one admitted attempt, not a bound on its
 internal storage/CPU work. Work larger than the remaining byte budget is
-deferred intact and sets `nextWake` to `now`. Work larger than the whole byte
-budget runs when no other item has charged bytes in the step and spends the
-rest of it, so a batch over the budget still makes progress.
+deferred intact and sets `nextWake` to `now`. Under an explicit byte budget,
+work larger than the whole budget stays deferred until a step's budget fits it.
+Under the omitted 64 MiB default, such work runs when no other item has charged
+bytes in the step and spends the rest of it, as the unbounded default ran it
+before.
 
 The result is always a `ProgressReport`. No admitted work or future durable
 deadline means `nextWake: undefined` (not `null`). Pre-aborted steps perform no

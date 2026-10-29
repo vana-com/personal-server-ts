@@ -608,10 +608,13 @@ export function createReplicaCoordinator(input: {
                   (!Number.isSafeInteger(item.bytes) || item.bytes < 0)
                 )
                   throw new RangeError("invalid replica item byte estimate");
-                // An item larger than the whole step budget can never fit. It
-                // runs when no other item has charged bytes in this step, and
-                // spends the rest; otherwise no step would ever serve it.
+                // Under the omitted (default) budget an item larger than the
+                // whole step can never fit. It runs when no other item has
+                // charged bytes in this step, and spends the rest, as the
+                // unbounded default on main ran it. An explicit budget defers
+                // it until the host gives a budget it fits.
                 const alone =
+                  budget.bytes === undefined &&
                   item.bytes !== undefined &&
                   item.bytes > stepBytes &&
                   bytes === stepBytes;
