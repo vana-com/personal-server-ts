@@ -96,10 +96,14 @@ export function normalizePendingBlobDeletions(
         typeof version === "string"
           ? undefined
           : normalizeRange((item as { range?: unknown }).range);
+      const gate = (item as { tombstoneVersion?: unknown }).tombstoneVersion;
       keys.push({
         scope: (item as { scope: string }).scope,
         version: typeof version === "string" ? version : null,
         ...(range ? { range } : {}),
+        ...(typeof gate === "string" && /^\d+$/.test(gate)
+          ? { tombstoneVersion: BigInt(gate).toString() }
+          : {}),
       });
     }
   }
@@ -148,6 +152,9 @@ export function createPendingBlobDeletionStore(
         scope: key.scope,
         version: key.version,
         ...(key.range ? { range: { ...key.range } } : {}),
+        ...(key.tombstoneVersion !== undefined
+          ? { tombstoneVersion: key.tombstoneVersion }
+          : {}),
       });
     }
     return next;

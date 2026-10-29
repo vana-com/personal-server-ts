@@ -73,6 +73,7 @@ import { createSyncCursor } from "./sync-cursor.js";
 import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
+  createInventoryTombstoneFinality,
   createScopeDeletionTracker,
   createSyncManager,
   type PdppImporter,
@@ -849,11 +850,24 @@ export async function createServer(
     const pendingBlobDeletions = createFilePendingBlobDeletionStore(
       pendingBlobDeletionsPath,
     );
+    // Blob deletes wait for the covering tombstone to be finalized, read from
+    // the signed version inventory (owner or registered-server signer).
+    const tombstoneFinality =
+      deleteData && additionsInventorySigner
+        ? createInventoryTombstoneFinality(
+            createVersionInventoryClient({
+              gatewayUrl: config.gateway.url,
+              ownerAddress: serverOwner,
+              ownerSigner: additionsInventorySigner,
+            }),
+          )
+        : undefined;
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
       deleteData,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
+      tombstoneFinality,
       transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {
         try {

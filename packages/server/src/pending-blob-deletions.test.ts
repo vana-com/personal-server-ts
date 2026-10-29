@@ -42,6 +42,23 @@ describe("createFilePendingBlobDeletionStore", () => {
     expect(await createFilePendingBlobDeletionStore(path).list()).toEqual([B7]);
   });
 
+  it("keeps each marker's tombstone finality gate across a fresh store instance", async () => {
+    const path = join(dir, "pending-blob-deletions.json");
+    const gated = { ...A2, tombstoneVersion: "4" };
+    const range = {
+      scope: "instagram.profile",
+      version: null,
+      range: { from: "1", to: "4" },
+      tombstoneVersion: "4",
+    };
+    await createFilePendingBlobDeletionStore(path).add([gated, range]);
+
+    expect(await createFilePendingBlobDeletionStore(path).list()).toEqual([
+      gated,
+      range,
+    ]);
+  });
+
   it("keeps the planned watermark on disk next to the keys, and reads files without one", async () => {
     const path = join(dir, "pending-blob-deletions.json");
     await writeFile(path, JSON.stringify({ version: 2, keys: [B7] }));

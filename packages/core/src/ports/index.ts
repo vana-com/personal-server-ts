@@ -474,6 +474,30 @@ export interface PendingBlobDeletion {
   scope: string;
   version: string | null;
   range?: { from: string; to: string };
+  /**
+   * The tombstone version whose finality frees this key (see
+   * `TombstoneFinalityPort`). A range is gated by its own `range.to`; an
+   * exact key recorded without a gate is gated by its own version.
+   */
+  tombstoneVersion?: string;
+}
+
+/**
+ * When a storage key may be freed. A tombstone the gateway has queued but not
+ * finalized can still fail; the gateway then rolls the head back and lets a
+ * writer recover the failed slot. Freeing a key before that is ruled out lets
+ * another writer put different bytes under a slot that is later registered.
+ */
+export interface TombstoneFinalityPort {
+  /**
+   * The highest registry version at or above `atOrAbove` that holds a
+   * finalized tombstone, or null when none does yet. Keys at or below a
+   * finalized tombstone can never be claimed by a registration again.
+   */
+  finalizedTombstoneAtOrAbove(
+    scope: string,
+    atOrAbove: string,
+  ): Promise<string | null>;
 }
 
 /**
