@@ -8,7 +8,9 @@ import type {
   DeleteDataPort,
   PendingBlobDeletion,
   PendingBlobDeletionStore,
+  TombstoneFence,
   TombstoneFinalityPort,
+  TombstoneFinalityState,
 } from "../../ports/index.js";
 import { computeDataPointId } from "../data-point-id.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
@@ -312,11 +314,11 @@ function countPendingKeys(markers: PendingBlobDeletion[]): number {
  */
 export interface DeleteScopeOptions {
   /**
-   * Automatic re-submission of a rolled-back delete: the tombstone may take a
-   * version at or below `atOrBelow` only (the failed tombstone's slot), so a
+   * Automatic re-submission of a rolled-back delete: the tombstone is queued
+   * only over exactly this head (the one the failed tombstone replaced), so a
    * write that landed after the rollback is never deleted.
    */
-  fence?: { atOrBelow: string };
+  fence?: { head: TombstoneFence };
   /**
    * False records the storage work but sends no batch in this call; the
    * caller's own pass already used this cycle's storage budget.
@@ -355,6 +357,7 @@ export async function deleteScope(
     // local delete that sync silently undoes.
     let tombstoneVersionValue: string | null = null;
     let tombstoneKnown = false;
+    let replacedHead: TombstoneFence | null = null;
     try {
       const tombstone = () =>
         options.fence
@@ -387,6 +390,9 @@ export async function deleteScope(
         result.steps.gateway = { status: "skipped", reason: "not-registered" };
       } else {
         tombstoneKnown = true;
+        if (outcome.status === "tombstoned") {
+          replacedHead = outcome.replaced ?? null;
+        }
         tombstoneVersionValue =
           outcome.version === null
             ? null
@@ -449,6 +455,7 @@ export async function deleteScope(
       plan,
       tombstoneKnown && tombstoneVersionValue === null,
       options.storagePass ?? true,
+      replacedHead,
     );
     result.steps.storage = storageStep.step;
     result.pendingBlobDeletion = storageStep.pending > 0;
@@ -518,6 +525,7 @@ function unplannedWork(
   scope: string,
   plan: BlobDeletionPlan,
   through: bigint | null,
+  replacedHead: TombstoneFence | null = null,
 ): PendingBlobDeletion[] {
   // A range is gated by its own `range.to`, the tombstone that covers it.
   // The exact keys lie above that tombstone (or no tombstone exists), so
@@ -535,6 +543,7 @@ function unplannedWork(
         scope,
         version: null,
         range: { from: from.toString(), to: plan.range.to },
+        ...(replacedHead ? { replacedHead } : {}),
       });
     }
   }
@@ -550,6 +559,14 @@ async function recordPlannedWork(
 ): Promise<void> {
   if (store.enqueue) await store.enqueue(scope, work, through);
   else await store.add(work);
+}
+
+function sameHead(a: TombstoneFence, b: TombstoneFence): boolean {
+  return (
+    a.expectedVersion === b.expectedVersion &&
+    a.dataHash.toLowerCase() === b.dataHash.toLowerCase() &&
+    a.metadataHash.toLowerCase() === b.metadataHash.toLowerCase()
+  );
 }
 
 interface ScopePassOutcome {
@@ -587,8 +604,8 @@ interface ReleasedMarker {
 interface ReleaseDecision {
   /** Markers whose keys may be sent now. */
   released: ReleasedMarker[];
-  /** Scopes whose latest tombstone failed and rolled back, with its version. */
-  rolledBack: Map<string, string>;
+  /** Scopes whose latest tombstone failed and rolled back, with the restored head. */
+  rolledBack: Map<string, NonNullable<TombstoneFinalityState["rolledBack"]>>;
   /**
    * Scopes whose newest tombstone is finalized (nothing settling, no
    * rollback): their delete converged even if keys above it stay held.
@@ -609,7 +626,7 @@ async function releasableMarkers(
   markers: PendingBlobDeletion[],
   logger: Logger,
 ): Promise<ReleaseDecision> {
-  const rolledBack = new Map<string, string>();
+  const rolledBack: ReleaseDecision["rolledBack"] = new Map();
   const converged = new Set<string>();
   if (!finality) {
     return {
@@ -739,6 +756,9 @@ async function drainOnePass(
               ...(marker.tombstoneVersion !== undefined
                 ? { tombstoneVersion: marker.tombstoneVersion }
                 : {}),
+              ...(marker.replacedHead
+                ? { replacedHead: marker.replacedHead }
+                : {}),
             }
           : null,
       });
@@ -805,11 +825,12 @@ async function deleteScopeBlobs(
   plan: BlobDeletionPlan,
   versionUnknown: boolean,
   storagePass: boolean,
+  replacedHead: TombstoneFence | null,
 ): Promise<{ step: DeleteScopeResult["steps"]["storage"]; pending: number }> {
   const { deleteData, logger } = deps;
   const withUnknown = (work: PendingBlobDeletion[]) =>
     versionUnknown ? [...work, { scope, version: null }] : work;
-  let work = withUnknown(unplannedWork(scope, plan, null));
+  let work = withUnknown(unplannedWork(scope, plan, null, replacedHead));
   let store: PendingBlobDeletionStore | null =
     deps.pendingBlobDeletions ?? null;
   // This scope's markers already in the durable store before this call.
@@ -819,7 +840,7 @@ async function deleteScopeBlobs(
       const markers = await store.list();
       queuedBefore = markers.filter((m) => m.scope === scope);
       const through = await resumePoint(store, scope, markers);
-      work = withUnknown(unplannedWork(scope, plan, through));
+      work = withUnknown(unplannedWork(scope, plan, through, replacedHead));
       await recordPlannedWork(store, scope, work, plan.range?.to ?? null);
     } catch (markerErr) {
       logger.error(
@@ -1066,8 +1087,13 @@ export async function retryPendingBlobDeletions(
       );
     }
   }
-  for (const [scope, version] of decision.rolledBack) {
-    await resubmitRolledBackDeletion(deps, scope, version);
+  for (const [scope, rollback] of decision.rolledBack) {
+    await resubmitRolledBackDeletion(
+      deps,
+      scope,
+      rollback,
+      markers.filter((marker) => marker.scope === scope),
+    );
   }
   const left = await pendingBlobDeletions.list();
   // A scope with nothing left to free has converged; forget its attempts.
@@ -1085,13 +1111,17 @@ export async function retryPendingBlobDeletions(
 }
 
 /**
- * The user deleted `scope`, its tombstone at `failedVersion` failed to
- * settle, and the gateway shows the scope live again (the finality port only
- * reports a rollback when no newer version of the scope exists). Re-submit
- * the delete through the ordinary delete path, unless this replica holds
- * data the delete did not cover: any unsynced entry (written after the
- * delete erased the covered ones), or a synced one at or above the failed
- * tombstone. That is a re-add, and a re-add is never deleted again.
+ * The user deleted `scope`, its tombstone failed to settle, and the gateway
+ * shows the scope live again (the finality port only reports a rollback when
+ * no newer version of the scope exists). Re-submit the delete through the
+ * ordinary delete path, but only over exactly the head the user's tombstone
+ * replaced: the queued range marker remembers that head, the inventory read
+ * reports the restored one, and the port refuses any other. A write that
+ * recovered a failed slot below the tombstone, or that lands between the read
+ * and the re-submission, is therefore never deleted. This replica's own
+ * index is checked too: any unsynced entry (written after the delete erased
+ * the covered ones), or a synced one at or above the failed tombstone, is a
+ * re-add, and a re-add is never deleted again.
  *
  * Bounded by the tracker: attempts back off exponentially, and after the
  * last one the scope is logged as an error and reported in the tracker's
@@ -1101,13 +1131,34 @@ export async function retryPendingBlobDeletions(
 async function resubmitRolledBackDeletion(
   deps: RetryPendingBlobDeletionsDeps,
   scope: string,
-  failedVersion: string,
+  rollback: NonNullable<TombstoneFinalityState["rolledBack"]>,
+  scopeMarkers: PendingBlobDeletion[],
 ): Promise<void> {
   const { logger, tombstoneResubmits: tracker } = deps;
+  const failedVersion = rollback.tombstoneVersion;
   if (!deps.resubmitDeletion || !tracker) {
     logger.warn(
       { scope, tombstoneVersion: failedVersion },
       "Scope tombstone failed and the scope is live again; its storage copies stay until the scope is deleted again",
+    );
+    return;
+  }
+  const remembered = scopeMarkers.find(
+    (marker) =>
+      marker.version === null &&
+      marker.range &&
+      BigInt(marker.range.to) === BigInt(failedVersion) &&
+      marker.replacedHead,
+  )?.replacedHead;
+  if (!remembered || !sameHead(remembered, rollback.head)) {
+    logger.info(
+      {
+        scope,
+        tombstoneVersion: failedVersion,
+        head: rollback.head.expectedVersion,
+        remembered: remembered?.expectedVersion ?? null,
+      },
+      "Scope tombstone failed, but the registry head is not the one the delete replaced; not deleting it again",
     );
     return;
   }
@@ -1140,7 +1191,7 @@ async function resubmitRolledBackDeletion(
   );
   try {
     const outcome = await deps.resubmitDeletion(scope, {
-      fence: { atOrBelow: failedVersion },
+      fence: { head: rollback.head },
       storagePass: false,
     });
     if (outcome.steps.gateway.status === "failed") {

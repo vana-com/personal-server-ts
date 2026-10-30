@@ -474,6 +474,11 @@ describe("SyncManager", () => {
   });
 
   describe("durable delete", () => {
+    const LIVE_HEAD = {
+      expectedVersion: "1",
+      dataHash: "0x" + "11".repeat(32),
+      metadataHash: "0x" + "22".repeat(32),
+    };
     function makeDeleteData() {
       return {
         tombstone: vi.fn(async () => ({
@@ -481,6 +486,7 @@ describe("SyncManager", () => {
           dataPointId: "0xdp",
           version: "2",
           deletedAt: "2026-08-25T10:00:00.000Z",
+          replaced: LIVE_HEAD,
         })),
         deleteBlobVersions: vi.fn(
           async (_scope: string, versions: string[]) => ({
@@ -660,7 +666,7 @@ describe("SyncManager", () => {
         tombstoneState: vi.fn(async () => ({
           finalized: null,
           settling: false,
-          rolledBack: "2",
+          rolledBack: { tombstoneVersion: "2", head: LIVE_HEAD },
         })),
         recheckNow: vi.fn(),
       };

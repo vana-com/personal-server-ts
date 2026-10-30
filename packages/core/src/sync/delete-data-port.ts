@@ -4,6 +4,7 @@ import type {
   DeleteBlobVersionsOutcome,
   DeleteDataPort,
   TombstoneOutcome,
+  TombstoneFence,
 } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
 import { computeDataPointId } from "./data-point-id.js";
@@ -99,7 +100,7 @@ export function createGatewayDeleteDataPort(
   return {
     async tombstone(
       scope: string,
-      fence?: { atOrBelow: string },
+      fence?: { head: TombstoneFence },
     ): Promise<TombstoneOutcome> {
       const dataPointId = computeDataPointId(options.serverOwner, scope);
       const current = await options.dataPointFeed.getDataPoint({
@@ -118,17 +119,29 @@ export function createGatewayDeleteDataPort(
         };
       }
 
-      let version = BigInt(current.expectedVersion) + 1n;
-      if (fence && version > BigInt(fence.atOrBelow)) {
+      if (
+        fence &&
+        (current.expectedVersion !== fence.head.expectedVersion ||
+          current.dataHash.toLowerCase() !==
+            fence.head.dataHash.toLowerCase() ||
+          current.metadataHash.toLowerCase() !==
+            fence.head.metadataHash.toLowerCase())
+      ) {
         throw new Error(
-          `Scope has a newer version (${current.expectedVersion}) than the fenced delete allows (≤ ${fence.atOrBelow})`,
+          `Scope head (v${current.expectedVersion}) is not the one the fenced delete saw (v${fence.head.expectedVersion})`,
         );
       }
+      const replaced: TombstoneFence = {
+        expectedVersion: current.expectedVersion,
+        dataHash: current.dataHash,
+        metadataHash: current.metadataHash,
+      };
+      let version = BigInt(current.expectedVersion) + 1n;
       let res = await sendTombstone(scope, dataPointId, version);
       if (res.status === 409 && fence) {
         await res.body?.cancel();
         throw new Error(
-          `Scope has a newer version than the fenced delete allows (≤ ${fence.atOrBelow}): another writer moved the head`,
+          `Scope head is not the one the fenced delete saw (v${fence.head.expectedVersion}): another writer moved it`,
         );
       }
       if (res.status === 409) {
@@ -212,6 +225,7 @@ export function createGatewayDeleteDataPort(
         status: "tombstoned",
         dataPointId: stringField(row, "dataPointId") ?? dataPointId,
         version: stringField(row, "expectedVersion") ?? String(version),
+        replaced,
         deletedAt: stringField(row, "deletedAt"),
       };
     },

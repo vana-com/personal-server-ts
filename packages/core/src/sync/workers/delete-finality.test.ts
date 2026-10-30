@@ -34,6 +34,7 @@ import type { Logger } from "../../logger/index.js";
 import type {
   DataPointFeedPort,
   DeleteDataPort,
+  TombstoneFence,
   TombstoneOutcome,
 } from "../../ports/index.js";
 
@@ -202,7 +203,7 @@ function setup(
     tombstone: vi.fn(
       async (
         _scope: string,
-        fence?: { atOrBelow: string },
+        fence?: { head: TombstoneFence },
       ): Promise<TombstoneOutcome> => {
         // As the gateway port does: a head that is already a tombstone answers
         // "already deleted" with its version, else a tombstone is queued.
@@ -211,9 +212,11 @@ function setup(
           fence &&
           head &&
           !head.deletedAt &&
-          head.version + 1n > BigInt(fence.atOrBelow)
+          (head.version.toString() !== fence.head.expectedVersion ||
+            head.dataHash !== fence.head.dataHash ||
+            head.metadataHash !== fence.head.metadataHash)
         ) {
-          throw new Error("Scope has a newer version than the fenced delete");
+          throw new Error("Scope head is not the one the fenced delete saw");
         }
         if (head === null) {
           return { status: "not-registered", dataPointId: DATA_POINT_ID };
@@ -232,6 +235,11 @@ function setup(
           dataPointId: DATA_POINT_ID,
           version: version.toString(),
           deletedAt: gateway.versions.get(version)!.deletedAt,
+          replaced: {
+            expectedVersion: head.version.toString(),
+            dataHash: head.dataHash,
+            metadataHash: head.metadataHash,
+          },
         };
       },
     ),
@@ -670,8 +678,8 @@ describe("storage cleanup converges on the user's delete", () => {
     expect(deleteData.tombstone).toHaveBeenCalledTimes(1);
   });
 
-  it("drains when the re-submitted tombstone takes a slot below the failed one", async () => {
-    const { gateway, storage, deps, cycle, resubmits } = setup();
+  it("does not re-submit when the head rolled back below the one the delete replaced, and the user's next delete drains the covered keys", async () => {
+    const { gateway, storage, deps, deleteData, cycle, resubmits } = setup();
     gateway.register(1n, keccak256(bytes("v1")));
     storage.put(1n, bytes("v1"));
     gateway.settle(1n, "finalized");
@@ -679,12 +687,21 @@ describe("storage cleanup converges on the user's delete", () => {
     storage.put(2n, bytes("v2"));
 
     await deleteScope(deps, SCOPE); // tombstone v3 over pending data v2
-    // v2's settlement fails, and v3 with it: the head rolls back to v1.
+    // v2's settlement fails, and v3 with it: the head rolls back to v1, which
+    // is not the head the user's tombstone replaced. Whether v1 is the older
+    // data or a re-add cannot be told apart here, so nothing is re-submitted.
     gateway.settle(2n, "failed");
     gateway.settle(3n, "failed");
     expect(gateway.head()?.version).toBe(1n);
+    for (let minute = 0; minute < 10; minute++) await cycle(MINUTE);
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: SCOPE, head: "1", remembered: "2" }),
+      expect.stringContaining("not the one the delete replaced"),
+    );
 
-    await cycle(MINUTE); // re-submitted: the new tombstone recovers slot 2
+    // The user deletes again: the tombstone recovers slot 2.
+    await deleteScope(deps, SCOPE);
     expect(gateway.head()).toMatchObject({
       version: 2n,
       dataHash: TOMBSTONE_DATA_HASH,
@@ -692,14 +709,14 @@ describe("storage cleanup converges on the user's delete", () => {
     });
     const reads = gateway.inventoryPage.mock.calls.length;
     for (let minute = 0; minute < 4; minute++) await cycle(MINUTE);
-    // Still read every cycle while the new tombstone settles.
+    // Read every cycle while the new tombstone settles.
     expect(gateway.inventoryPage.mock.calls.length - reads).toBe(4);
 
     gateway.settle(2n, "finalized");
     await cycle(MINUTE);
 
-    // Keys 1 and 2 are covered by the finalized tombstone v2; slot 3 is open
-    // again and stays held.
+    // Keys 1 and 2 are under the finalized tombstone v2; slot 3 is open
+    // again, so its key would stay held (there is none here).
     expect(storage.blobs.size).toBe(0);
     expect(resubmits.snapshot()).toEqual({ retrying: [], failed: [] });
   });
@@ -726,6 +743,57 @@ describe("storage cleanup converges on the user's delete", () => {
     expect(deleteData.tombstone).toHaveBeenCalledTimes(2);
     expect(gateway.head()).toMatchObject({ version: 2n, deletedAt: null });
     expect(storage.hashAt(2n)).toBe(keccak256(bytes("re-add")));
+  });
+
+  it("does not tombstone a re-add that recovered a failed data slot below the failed tombstone", async () => {
+    const { gateway, storage, deps, deleteData, cycle, syncedLocal } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+    gateway.register(2n, keccak256(bytes("v2")));
+    storage.put(2n, bytes("v2"));
+    syncedLocal(1);
+    syncedLocal(2);
+
+    await deleteScope(deps, SCOPE); // tombstone v3 over pending data v2
+    gateway.settle(2n, "failed");
+    gateway.settle(3n, "failed");
+    expect(gateway.head()?.version).toBe(1n);
+    // Before this replica reads again, the user re-adds elsewhere: the write
+    // recovers slot 2 with new bytes and finalizes; download pulls it back.
+    storage.blobs.delete("2");
+    gateway.register(2n, keccak256(bytes("re-add")));
+    storage.put(2n, bytes("re-add"));
+    gateway.settle(2n, "finalized");
+    syncedLocal(2);
+
+    for (let minute = 0; minute < 10; minute++) await cycle(MINUTE);
+
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(1);
+    expect(gateway.head()).toMatchObject({ version: 2n, deletedAt: null });
+    expect(storage.hashAt(2n)).toBe(keccak256(bytes("re-add")));
+  });
+
+  it("keeps re-submitting when the re-submitted tombstone fails too", async () => {
+    const { gateway, storage, deps, deleteData, cycle } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+    gateway.register(2n, keccak256(bytes("v2")));
+    storage.put(2n, bytes("v2"));
+    gateway.settle(2n, "finalized");
+
+    await deleteScope(deps, SCOPE); // tombstone v3
+    gateway.settle(3n, "failed"); // head back to v2
+    await cycle(MINUTE); // re-submitted at v3
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(2);
+    gateway.settle(3n, "failed");
+    await cycle(2 * MINUTE); // re-submitted again over the same head v2
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(3);
+    gateway.settle(3n, "finalized");
+    await cycle(MINUTE);
+
+    expect(storage.blobs.size).toBe(0);
   });
 
   it("a re-submission sends no storage batch of its own", async () => {
@@ -903,7 +971,14 @@ describe("createInventoryTombstoneFinality", () => {
     await expect(rolledBack.tombstoneState(SCOPE, "2")).resolves.toEqual({
       finalized: null,
       settling: false,
-      rolledBack: "2",
+      rolledBack: {
+        tombstoneVersion: "2",
+        head: {
+          expectedVersion: "1",
+          dataHash: toHex(1, { size: 32 }),
+          metadataHash: toHex(1, { size: 32 }),
+        },
+      },
     });
 
     // A newer write above the failed tombstone, even a failed one.

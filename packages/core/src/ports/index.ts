@@ -404,6 +404,13 @@ export interface DataPointFeedPort {
   }): Promise<DataPointFeedRecord | null>;
 }
 
+/** A registry head as the gateway reported it: version and both commitments. */
+export interface TombstoneFence {
+  expectedVersion: string;
+  dataHash: string;
+  metadataHash: string;
+}
+
 export type TombstoneOutcome =
   | {
       status: "tombstoned";
@@ -411,6 +418,12 @@ export type TombstoneOutcome =
       /** The tombstone's own version (previous current + 1). */
       version: string;
       deletedAt: string | null;
+      /**
+       * The live head the tombstone replaced, when the port read it. If this
+       * tombstone fails and the gateway restores exactly this head, the
+       * deletion may be re-submitted automatically.
+       */
+      replaced?: TombstoneFence | null;
     }
   | {
       status: "already-deleted";
@@ -451,14 +464,15 @@ export interface DeleteBlobVersionsOutcome {
  */
 export interface DeleteDataPort {
   /**
-   * Queue a tombstone at head + 1. With `fence`, the tombstone may take a
-   * version at or below `fence.atOrBelow` only: a head at or above it, or a
-   * 409 (another writer moved the head), throws instead of re-signing, so an
-   * automatic re-submission can never delete a newer write.
+   * Queue a tombstone at head + 1. With `fence`, the tombstone is queued only
+   * over exactly `fence.head` (version and both commitments): any other live
+   * head, or a 409 (another writer moved the head), throws instead of
+   * re-signing, so an automatic re-submission can never delete a write that
+   * landed after the head it saw.
    */
   tombstone(
     scope: string,
-    fence?: { atOrBelow: string },
+    fence?: { head: TombstoneFence },
   ): Promise<TombstoneOutcome>;
   deleteBlobVersions(
     scope: string,
@@ -489,6 +503,12 @@ export interface PendingBlobDeletion {
    * exact key recorded without a gate is gated by its own version.
    */
   tombstoneVersion?: string;
+  /**
+   * On a range marker: the live head its tombstone replaced. A rolled-back
+   * deletion is re-submitted only while the registry shows exactly this head
+   * again, never over a write that landed after it.
+   */
+  replacedHead?: TombstoneFence;
 }
 
 /**
@@ -508,12 +528,13 @@ export interface TombstoneFinalityState {
    */
   settling: boolean;
   /**
-   * The failed tombstone version when the deletion was rolled back: the
-   * highest listed version is a failed tombstone, no tombstone is settling,
-   * and the head is live data below it. Null otherwise, including when any
-   * version above the failed tombstone exists (a newer write).
+   * Set when the deletion was rolled back: the highest listed version is a
+   * failed tombstone, no tombstone is settling, and the head is live data
+   * below it. Carries that head as the gateway reported it. Null otherwise,
+   * including when any version above the failed tombstone exists (a newer
+   * write).
    */
-  rolledBack: string | null;
+  rolledBack: { tombstoneVersion: string; head: TombstoneFence } | null;
 }
 
 /**
