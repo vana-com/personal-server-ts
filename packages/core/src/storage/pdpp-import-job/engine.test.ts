@@ -5,6 +5,7 @@ import { encodeRecordKey } from "../pdpp-records/record-key.js";
 import {
   IMPORT_JOB_MAX_RECORD_BYTES,
   ImportJobError,
+  type ImportBatchReceipt,
   type ImportJobBeginInput,
   type ImportSpoolRecord,
 } from "./contract.js";
@@ -13,7 +14,7 @@ import {
   createMemoryImportJobCapability,
   type MemoryImportFaultPoint,
 } from "./memory.js";
-import { importSpool } from "./spool.js";
+import { importSpool, type ImportSpoolRead } from "./spool.js";
 import {
   IMPORT_VECTOR_INSTANCE as INSTANCE,
   IMPORT_VECTOR_METHOD as METHOD,
@@ -895,6 +896,128 @@ describe("PDPP import job engine (in-memory adapter)", () => {
       jobs.commit({ jobId: "job-1", batches: 1, connectorState: "{}" }),
     ).rejects.toMatchObject({ code: "spool_incomplete" });
     expect(await capability.readConnectorState(INSTANCE)).toBeUndefined();
+  });
+
+  it("stages a spool while the host writes it, with the cuts of the sealed spool", async () => {
+    const big = {
+      stream: "messages",
+      key: "big",
+      data: { id: "big", text: "x".repeat(700) },
+      emitted_at: "2026-10-28T00:00:00.000Z",
+    };
+    const records = [...importVectorRecords(), big, importVectorRecords()[0]];
+    const sealedRun = await setup(records);
+    const sealedJobs = sealedRun.engine();
+    await sealedJobs.begin(sealedRun.begin);
+    const sealedCuts: [number, number, string][] = [];
+    await importSpool(sealedJobs, "job-1", sealedRun.capability.readSpool!, {
+      onBatch: (r) => sealedCuts.push([r.spoolStart, r.spoolEnd, r.sha256]),
+    });
+
+    const { capability, spool, begin, engine } = await setup(records);
+    const { byteLength, sha256 } = spool.handle;
+    const open = { id: spool.handle.id, format: spool.handle.format };
+    let jobs = engine();
+    await jobs.begin({ ...begin, spool: open });
+    let written = 0;
+    const read: ImportSpoolRead = async (handle, offset, maxBytes) => {
+      expect(offset + maxBytes).toBeLessThanOrEqual(written);
+      return capability.readSpool!(handle, offset, maxBytes);
+    };
+    const cuts: [number, number, string][] = [];
+    const onBatch = (r: ImportBatchReceipt) => {
+      cuts.push([r.spoolStart, r.spoolEnd, r.sha256]);
+      // Written bytes follow every batch until the seal.
+      if (r.spoolEnd !== byteLength) expect(r.spoolEnd).toBeLessThan(written);
+    };
+    for (written = 37; written < byteLength; written += 37) {
+      const status = await importSpool(jobs, "job-1", read, {
+        available: written,
+        onBatch,
+      });
+      expect(status.job.spool.byteLength).toBeUndefined();
+      if (written > byteLength / 2) jobs = engine(); // a restart mid-download
+    }
+    expect(cuts.length).toBeGreaterThan(sealedCuts.length / 2);
+    await expect(
+      jobs.commit({ jobId: "job-1", batches: cuts.length }),
+    ).rejects.toMatchObject({ code: "spool_incomplete" });
+    expect(adapterLive(capability)).toEqual({});
+
+    written = byteLength;
+    const status = await importSpool(jobs, "job-1", read, {
+      seal: { byteLength, sha256 },
+      onBatch,
+    });
+    expect(status.job.spool).toEqual(spool.handle);
+    expect(cuts).toEqual(sealedCuts);
+    // The finished spool answers like a sealed one: nothing left to append.
+    expect((await importSpool(jobs, "job-1", read)).job.nextSeq).toBe(
+      cuts.length,
+    );
+    await jobs.commit({ jobId: "job-1", batches: cuts.length });
+    expect(adapterLive(capability)).toEqual(
+      oracleLive(records as ImportSpoolRecord[]),
+    );
+  });
+
+  it("refuses a batch that would end an open spool unsealed or seal it elsewhere", async () => {
+    const { spool, begin, engine } = await setup(importVectorRecords(), {
+      batchBytes: 64 * 1024,
+    });
+    const text = new TextDecoder().decode(spool.bytes);
+    const firstLine = text.slice(0, text.indexOf("\n") + 1);
+    const jobs = engine();
+    const open = { id: spool.handle.id, format: spool.handle.format };
+    await jobs.begin({ ...begin, spool: open });
+    // A changed retry: the open handle is the job's input.
+    await expect(jobs.begin(begin)).rejects.toMatchObject({
+      code: "job_conflict",
+    });
+    const batch = async (text: string) => ({
+      jobId: "job-1",
+      seq: 0,
+      text,
+      sha256: await sha256HexOf(new TextEncoder().encode(text)),
+      spoolStart: 0,
+      spoolEnd: new TextEncoder().encode(text).byteLength,
+    });
+    await expect(
+      jobs.append(await batch(firstLine.slice(0, -1))),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(
+      jobs.append({
+        ...(await batch(firstLine)),
+        seal: {
+          byteLength: spool.handle.byteLength,
+          sha256: spool.handle.sha256,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "spool_offset_mismatch" });
+    await expect(
+      jobs.append({
+        ...(await batch(firstLine)),
+        seal: { byteLength: 0, sha256: spool.handle.sha256 },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(
+      importSpool(jobs, "job-1", async () => new Uint8Array()),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    // Sealed by its last batch, the spool keeps that length and digest.
+    const whole = await batch(text);
+    await jobs.append({
+      ...whole,
+      seal: { byteLength: whole.spoolEnd, sha256: whole.sha256 },
+    });
+    await expect(
+      jobs.append({
+        ...whole,
+        seq: 1,
+        spoolStart: whole.spoolEnd,
+        seal: { byteLength: whole.spoolEnd + 1, sha256: whole.sha256 },
+      }),
+    ).rejects.toMatchObject({ code: "spool_offset_mismatch" });
+    await jobs.commit({ jobId: "job-1", batches: 1 });
   });
 
   it("refuses a batch that names another instance", async () => {
