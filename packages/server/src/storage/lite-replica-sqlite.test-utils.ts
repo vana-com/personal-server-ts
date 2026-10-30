@@ -48,21 +48,120 @@ const sqlValueBytes = (value: unknown) =>
       ? value.byteLength
       : 8;
 
-/** The native side refuses a call past its bound with `too-large` (§4.3). */
-function boundedSql(
+/** The prior observer's raw-field total, retained to prove its false pass. */
+export function previousRawSqlBytes(
   text: string,
-  params: readonly unknown[] = [],
-  rows: Record<string, unknown>[] = [],
+  params: readonly unknown[],
+  rows: Record<string, unknown>[],
 ) {
   let bytes = Buffer.byteLength(text);
   for (const value of params) bytes += sqlValueBytes(value);
   for (const row of rows)
     for (const [key, value] of Object.entries(row))
       bytes += key.length + sqlValueBytes(value);
-  if (bytes > LITE_REPLICA_SQL_BYTES)
-    throw Object.assign(new Error("replica SQL call exceeds its bound"), {
-      code: "too-large",
-    });
+  return bytes;
+}
+
+/**
+ * Observe the SQLite-backed Lite SQL contract: compact UTF-8 JSON framing for
+ * text/scalars plus typed BLOB bytes, with the ps_host success envelope. This
+ * is not a physical-phone wire adapter. The previous raw-field observer is
+ * retained to show its false pass on an escaped-text response.
+ */
+type SqlWireStats = {
+  calls: number;
+  maxRequestBytes: number;
+  maxRequestMethod: string;
+  maxRequestSqlBytes: number;
+  maxRequestParameterBytes: number[];
+  maxReplyBytes: number;
+  rawObserverAcceptedOverflows: number;
+};
+
+/**
+ * Text and scalar SQL values use compact UTF-8 JSON framing. Uint8Array values
+ * use the declared ReplicaSql typed-BLOB contract: count their raw bytes
+ * separately and do not invent a JSON encoding for them. The null placeholder
+ * preserves only the surrounding JSON shape in this contract oracle.
+ */
+function bridgeValue(value: unknown): { json: unknown; binaryBytes: number } {
+  if (value instanceof Uint8Array)
+    return { json: null, binaryBytes: value.byteLength };
+  if (Array.isArray(value)) {
+    const values = value.map(bridgeValue);
+    return {
+      json: values.map((item) => item.json),
+      binaryBytes: values.reduce((sum, item) => sum + item.binaryBytes, 0),
+    };
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value).map(
+      ([key, item]) => [key, bridgeValue(item)] as const,
+    );
+    return {
+      json: Object.fromEntries(entries.map(([key, item]) => [key, item.json])),
+      binaryBytes: entries.reduce((sum, [, item]) => sum + item.binaryBytes, 0),
+    };
+  }
+  return { json: value, binaryBytes: 0 };
+}
+
+function serializedBytes(value: unknown) {
+  const bridged = bridgeValue(value);
+  return Buffer.byteLength(JSON.stringify(bridged.json)) + bridged.binaryBytes;
+}
+
+function checkSqlRequest(
+  method: "get" | "all" | "run" | "exec",
+  text: string,
+  params: readonly unknown[],
+  stats: SqlWireStats,
+) {
+  const request = {
+    operation: `replica.sql.${method}`,
+    sql: text,
+    params,
+  };
+  const requestBytes = serializedBytes(request);
+  stats.calls++;
+  if (requestBytes > stats.maxRequestBytes) {
+    stats.maxRequestBytes = requestBytes;
+    stats.maxRequestMethod = method;
+    stats.maxRequestSqlBytes = Buffer.byteLength(text);
+    stats.maxRequestParameterBytes = params.map(serializedBytes);
+  }
+  if (requestBytes > LITE_REPLICA_SQL_BYTES)
+    throw Object.assign(
+      new Error(
+        `replica SQL request exceeds its bound (${requestBytes} bytes)`,
+      ),
+      { code: "too-large" },
+    );
+  return requestBytes;
+}
+
+function checkSqlReply(
+  text: string,
+  params: readonly unknown[],
+  requestBytes: number,
+  value: unknown,
+  legacyRows: Record<string, unknown>[],
+  stats: SqlWireStats,
+) {
+  const replyBytes = serializedBytes({ ok: true, value });
+  stats.maxReplyBytes = Math.max(stats.maxReplyBytes, replyBytes);
+  const rawBytes = previousRawSqlBytes(text, params, legacyRows);
+  if (
+    rawBytes <= LITE_REPLICA_SQL_BYTES &&
+    (requestBytes > LITE_REPLICA_SQL_BYTES ||
+      replyBytes > LITE_REPLICA_SQL_BYTES)
+  )
+    stats.rawObserverAcceptedOverflows++;
+  if (replyBytes > LITE_REPLICA_SQL_BYTES)
+    throw Object.assign(
+      new Error(`replica SQL reply exceeds its bound (${replyBytes} bytes)`),
+      { code: "too-large" },
+    );
 }
 
 function* frames(bytes: Uint8Array) {
@@ -76,6 +175,16 @@ export interface SqliteLiteReplicaPersistence {
   db: Database.Database;
   /** Statements run inside transactions, for tests that count bridge calls. */
   statements(): number;
+  /** Bytes measured by the SQLite-backed Lite SQL contract oracle. */
+  sqlWireStats(): {
+    calls: number;
+    maxRequestBytes: number;
+    maxRequestMethod: string;
+    maxRequestSqlBytes: number;
+    maxRequestParameterBytes: number[];
+    maxReplyBytes: number;
+    rawObserverAcceptedOverflows: number;
+  };
   /** The next transaction throws after its callback, before it commits. */
   failNextCommit(): void;
   close(): void;
@@ -94,6 +203,15 @@ export function createSqliteLiteReplicaPersistence(
   >();
   const sync = nodeReplicaSql(db);
   let statements = 0;
+  const sqlWire = {
+    calls: 0,
+    maxRequestBytes: 0,
+    maxRequestMethod: "",
+    maxRequestSqlBytes: 0,
+    maxRequestParameterBytes: [] as number[],
+    maxReplyBytes: 0,
+    rawObserverAcceptedOverflows: 0,
+  };
   let queue = Promise.resolve();
   let failBeforeCommit = false;
   let closed = false;
@@ -112,24 +230,39 @@ export function createSqliteLiteReplicaPersistence(
         const sql: LiteReplicaSql = {
           get: async (text, params) => {
             live();
-            boundedSql(text, params);
+            const requestBytes = checkSqlRequest("get", text, params, sqlWire);
             const row = sync.get(text, params);
-            boundedSql(text, params, row ? [row] : []);
+            checkSqlReply(
+              text,
+              params,
+              requestBytes,
+              row ?? null,
+              row ? [row] : [],
+              sqlWire,
+            );
             return row as never;
           },
           all: async (text, params) => {
             live();
-            boundedSql(text, params);
+            const requestBytes = checkSqlRequest("all", text, params, sqlWire);
             const rows = sync.all(text, params);
-            boundedSql(text, params, rows);
+            checkSqlReply(text, params, requestBytes, rows, rows, sqlWire);
             return rows as never;
           },
           run: async (text, params) => {
             live();
-            boundedSql(text, params);
-            return sync.run(text, params) as never;
+            const requestBytes = checkSqlRequest("run", text, params, sqlWire);
+            const result = sync.run(text, params);
+            checkSqlReply(text, params, requestBytes, result, [], sqlWire);
+            return result as never;
           },
-          exec: async (text) => (live(), sync.exec(text)) as never,
+          exec: async (text) => {
+            live();
+            const requestBytes = checkSqlRequest("exec", text, [], sqlWire);
+            sync.exec(text);
+            checkSqlReply(text, [], requestBytes, null, [], sqlWire);
+            return undefined as never;
+          },
         };
         const attached: string[] = [];
         const tx: LiteReplicaTransaction = {
@@ -305,6 +438,7 @@ export function createSqliteLiteReplicaPersistence(
     port,
     db,
     statements: () => statements,
+    sqlWireStats: () => ({ ...sqlWire }),
     failNextCommit() {
       failBeforeCommit = true;
     },

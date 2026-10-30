@@ -156,6 +156,7 @@ import {
   REPLICA_PREPARATION_MIGRATION,
   classifyReplicaPreparationError,
   preparationOperationFailures,
+  ReplicaPreparationIntegrityError,
   snapshotReplicaOperation,
   type ReplicaPreparation,
   type RetainedPreparationOperation,
@@ -1008,6 +1009,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
       "pdpp_transport_preparation",
       "pdpp_transport_preparation_progress",
       "pdpp_transport_operation_parts",
+      "pdpp_transport_operation_retention",
       "pdpp_transport_operation_outcomes",
       "pdpp_transport_upload_attempts",
       "pdpp_transport_registration_recovery",
@@ -1469,81 +1471,363 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
     },
   };
 
+  /** Bound JSON-serialized SQL replies while retaining legacy Node inline rows. */
+  const legacyInlineSliceCharacters = 128 * 1024;
+  const legacyInlineSliceBytes = legacyInlineSliceCharacters * 4;
+
+  function* readLegacyInlineOperation(
+    batch: string,
+    position: number,
+    operationBytes: number,
+    operationCharacters: number,
+  ): Fx<string> {
+    if (
+      !Number.isSafeInteger(operationBytes) ||
+      operationBytes < 1 ||
+      operationBytes > resourceLimits.maxOperationBytes ||
+      !Number.isSafeInteger(operationCharacters) ||
+      operationCharacters < 1
+    )
+      throw new ReplicaPreparationIntegrityError(
+        batch,
+        position,
+        "legacy inline size",
+      );
+
+    const pieces: string[] = [];
+    let bytesRead = 0;
+    for (
+      let offset = 0;
+      offset < operationCharacters;
+      offset += legacyInlineSliceCharacters
+    ) {
+      const characters = Math.min(
+        legacyInlineSliceCharacters,
+        operationCharacters - offset,
+      );
+      const piece = yield* sql.get<{
+        json: string | null;
+        characters: number | null;
+        bytes: number | null;
+      }>(
+        `WITH slice AS (
+          SELECT substr(operation_json,?,?) AS json
+          FROM pdpp_transport_operation_outcomes WHERE batch=? AND position=?
+        )
+        SELECT json,length(json) AS characters,
+               length(CAST(json AS BLOB)) AS bytes FROM slice`,
+        offset + 1,
+        characters,
+        batch,
+        position,
+      );
+      if (
+        !piece ||
+        typeof piece.json !== "string" ||
+        piece.characters !== characters ||
+        !Number.isSafeInteger(piece.bytes) ||
+        piece.bytes! < 1 ||
+        piece.bytes! > legacyInlineSliceBytes
+      )
+        throw new ReplicaPreparationIntegrityError(
+          batch,
+          position,
+          "legacy inline slice",
+        );
+      pieces.push(piece.json);
+      bytesRead += piece.bytes!;
+    }
+    const operation_json = pieces.join("");
+    if (
+      bytesRead !== operationBytes ||
+      new TextEncoder().encode(operation_json).byteLength !== operationBytes
+    )
+      throw new ReplicaPreparationIntegrityError(
+        batch,
+        position,
+        "legacy inline byte length",
+      );
+    return operation_json;
+  }
+
   /**
-   * Large retained JSON is stored in REPLICA_TEXT_PART_BYTES pieces and joined
-   * here, after each SQL result stays within the native call budget.
+   * Read one outcome and one text part per SQL call. Each part is at most
+   * REPLICA_TEXT_PART_BYTES before bridge JSON escaping, which remains below
+   * the declared Lite SQL reply bound even for backslash-heavy canonical JSON.
    */
   function* preparationRows(batch: string): Fx<RetainedPreparationOperation[]> {
-    const pieces = new Map<
-      number,
-      { operation_json: string[]; encoding_failed: number }
-    >();
+    const rows: RetainedPreparationOperation[] = [];
+    const encoder = new TextEncoder();
     let afterPosition = -1;
-    let afterPart = -1;
     for (;;) {
-      const page = yield* sql.all<{
-        position: number;
-        part: number;
-        operation_json: string | null;
+      const next = yield* sql.get<{ position: number }>(
+        `SELECT position FROM (
+          SELECT position FROM pdpp_transport_operation_outcomes
+          WHERE batch=? AND outcome IS NULL AND position>?
+          UNION
+          SELECT r.position FROM pdpp_transport_operation_retention r
+          LEFT JOIN pdpp_transport_operation_outcomes o
+            ON o.batch=r.batch AND o.position=r.position
+          WHERE r.batch=? AND r.position>?
+            AND (o.position IS NULL OR o.outcome IS NULL)
+        ) ORDER BY position LIMIT 1`,
+        batch,
+        afterPosition,
+        batch,
+        afterPosition,
+      );
+      if (!next) break;
+      const position = next.position;
+      afterPosition = position;
+      const outcome = yield* sql.get<{
+        inline_json: string | null;
+        has_inline: number;
+        inline_bytes: number;
+        inline_characters: number;
         encoding_failed: number;
       }>(
-        `WITH pieces AS (
-          SELECT o.position,0 AS part,o.operation_json,o.encoding_failed
-          FROM pdpp_transport_operation_outcomes o
-          WHERE o.batch=? AND o.outcome IS NULL AND o.operation_json IS NOT NULL
-          UNION ALL
-          SELECT o.position,0 AS part,NULL AS operation_json,o.encoding_failed
-          FROM pdpp_transport_operation_outcomes o
-          WHERE o.batch=? AND o.outcome IS NULL AND o.operation_json IS NULL
-            AND o.encoding_failed=1
-          UNION ALL
-          SELECT p.position,p.part,p.json AS operation_json,o.encoding_failed
-          FROM pdpp_transport_operation_parts p
-          JOIN pdpp_transport_operation_outcomes o
-            ON o.batch=p.batch AND o.position=p.position
-          WHERE p.batch=? AND o.outcome IS NULL
-        ), remaining AS (
-          SELECT position,part,operation_json,encoding_failed,
-            sum(length(CAST(coalesce(operation_json,'') AS BLOB))) OVER (
-              ORDER BY position,part ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) - length(CAST(coalesce(operation_json,'') AS BLOB)) AS bytes_before
-          FROM pieces
-          WHERE position>? OR (position=? AND part>?)
-        )
-        SELECT position,part,operation_json,encoding_failed FROM remaining
-        WHERE bytes_before<? ORDER BY position,part`,
-        batch,
-        batch,
-        batch,
-        afterPosition,
-        afterPosition,
-        afterPart,
+        `SELECT CASE WHEN operation_json IS NOT NULL
+                    AND length(CAST(operation_json AS BLOB))<=?
+                THEN operation_json ELSE NULL END AS inline_json,
+                operation_json IS NOT NULL AS has_inline,
+                length(CAST(coalesce(operation_json,'') AS BLOB)) AS inline_bytes,
+                coalesce(length(operation_json),0) AS inline_characters,
+                encoding_failed
+         FROM pdpp_transport_operation_outcomes WHERE batch=? AND position=?`,
         REPLICA_TEXT_PART_BYTES,
+        batch,
+        position,
       );
-      if (!page.length) break;
-      for (const row of page) {
-        let operation = pieces.get(row.position);
-        if (!operation) {
-          operation = {
-            operation_json: [],
-            encoding_failed: row.encoding_failed,
-          };
-          pieces.set(row.position, operation);
+      if (!outcome)
+        throw new ReplicaPreparationIntegrityError(
+          batch,
+          position,
+          "missing outcome",
+        );
+      const metadata = yield* sql.get<{
+        representation: string;
+        part_count: number;
+        operation_bytes: number;
+        operation_sha256: string | null;
+      }>(
+        `SELECT representation,part_count,operation_bytes,operation_sha256
+         FROM pdpp_transport_operation_retention WHERE batch=? AND position=?`,
+        batch,
+        position,
+      );
+      const parts = yield* sql.get<{
+        count: number;
+        min_part: number | null;
+        max_part: number | null;
+      }>(
+        `SELECT count(*) AS count,min(part) AS min_part,max(part) AS max_part
+         FROM pdpp_transport_operation_parts WHERE batch=? AND position=?`,
+        batch,
+        position,
+      );
+      if (!parts)
+        throw new ReplicaPreparationIntegrityError(
+          batch,
+          position,
+          "missing part facts",
+        );
+
+      if (!metadata) {
+        // The ea20eae schema stored only inline operations. Lite capped them
+        // below 248 KiB, while Node could retain larger values. Pushed PR511
+        // multipart rows lack an expected digest, so they remain fail-closed.
+        if (
+          outcome.encoding_failed === 1 &&
+          outcome.has_inline === 0 &&
+          outcome.inline_bytes === 0 &&
+          outcome.inline_characters === 0 &&
+          parts.count === 0
+        ) {
+          rows.push({ position, operation_json: null, encoding_failed: 1 });
+          continue;
         }
-        if (row.operation_json !== null)
-          operation.operation_json.push(row.operation_json);
+        if (
+          outcome.encoding_failed === 0 &&
+          outcome.has_inline === 1 &&
+          outcome.inline_bytes > 0 &&
+          outcome.inline_bytes <= resourceLimits.maxOperationBytes &&
+          outcome.inline_characters > 0 &&
+          parts.count === 0
+        ) {
+          const operation_json =
+            outcome.inline_json ??
+            (yield* readLegacyInlineOperation(
+              batch,
+              position,
+              outcome.inline_bytes,
+              outcome.inline_characters,
+            ));
+          if (
+            new TextEncoder().encode(operation_json).byteLength !==
+            outcome.inline_bytes
+          )
+            throw new ReplicaPreparationIntegrityError(
+              batch,
+              position,
+              "legacy inline byte length",
+            );
+          rows.push({
+            position,
+            operation_json,
+            encoding_failed: 0,
+          });
+          continue;
+        }
+        throw new ReplicaPreparationIntegrityError(
+          batch,
+          position,
+          "unsupported legacy representation",
+        );
       }
-      const last = page.at(-1)!;
-      afterPosition = last.position;
-      afterPart = last.part;
+
+      if (
+        !Number.isSafeInteger(metadata.part_count) ||
+        metadata.part_count < 0 ||
+        !Number.isSafeInteger(metadata.operation_bytes) ||
+        metadata.operation_bytes < 0
+      )
+        throw new ReplicaPreparationIntegrityError(
+          batch,
+          position,
+          "invalid metadata",
+        );
+
+      if (metadata.representation === "invalid") {
+        if (
+          outcome.encoding_failed !== 1 ||
+          outcome.has_inline !== 0 ||
+          outcome.inline_bytes !== 0 ||
+          metadata.part_count !== 0 ||
+          metadata.operation_bytes !== 0 ||
+          metadata.operation_sha256 !== null ||
+          parts.count !== 0
+        )
+          throw new ReplicaPreparationIntegrityError(
+            batch,
+            position,
+            "invalid representation",
+          );
+        rows.push({ position, operation_json: null, encoding_failed: 1 });
+        continue;
+      }
+
+      if (
+        typeof metadata.operation_sha256 !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/.test(metadata.operation_sha256)
+      )
+        throw new ReplicaPreparationIntegrityError(
+          batch,
+          position,
+          "invalid digest",
+        );
+
+      if (metadata.representation === "inline") {
+        if (
+          outcome.encoding_failed !== 0 ||
+          outcome.has_inline !== 1 ||
+          outcome.inline_json === null ||
+          outcome.inline_bytes > REPLICA_TEXT_PART_BYTES ||
+          outcome.inline_bytes !== metadata.operation_bytes ||
+          metadata.part_count !== 0 ||
+          parts.count !== 0
+        )
+          throw new ReplicaPreparationIntegrityError(
+            batch,
+            position,
+            "inline representation",
+          );
+        const bytes = encoder.encode(outcome.inline_json);
+        if (
+          bytes.byteLength !== metadata.operation_bytes ||
+          sha256Digest(bytes) !== metadata.operation_sha256
+        )
+          throw new ReplicaPreparationIntegrityError(
+            batch,
+            position,
+            "inline digest",
+          );
+        rows.push({
+          position,
+          operation_json: outcome.inline_json,
+          encoding_failed: 0,
+        });
+        continue;
+      }
+
+      if (metadata.representation !== "parts")
+        throw new ReplicaPreparationIntegrityError(
+          batch,
+          position,
+          "unknown representation",
+        );
+      const maxPartCount = Math.ceil(
+        metadata.operation_bytes / (REPLICA_TEXT_PART_BYTES - 3),
+      );
+      if (
+        outcome.encoding_failed !== 0 ||
+        outcome.has_inline !== 0 ||
+        outcome.inline_bytes !== 0 ||
+        metadata.part_count < 2 ||
+        metadata.operation_bytes <= REPLICA_TEXT_PART_BYTES ||
+        metadata.operation_bytes > resourceLimits.maxOperationBytes ||
+        metadata.part_count > maxPartCount ||
+        parts.count !== metadata.part_count ||
+        parts.min_part !== 0 ||
+        parts.max_part !== metadata.part_count - 1
+      )
+        throw new ReplicaPreparationIntegrityError(
+          batch,
+          position,
+          "part index or representation",
+        );
+
+      const operationParts: string[] = [];
+      for (let part = 0; part < metadata.part_count; part++) {
+        const storedPart = yield* sql.get<{
+          json: string | null;
+          bytes: number;
+        }>(
+          `SELECT CASE WHEN length(CAST(json AS BLOB))<=? THEN json ELSE NULL END AS json,
+                  length(CAST(json AS BLOB)) AS bytes
+           FROM pdpp_transport_operation_parts
+           WHERE batch=? AND position=? AND part=?`,
+          REPLICA_TEXT_PART_BYTES,
+          batch,
+          position,
+          part,
+        );
+        if (
+          !storedPart ||
+          storedPart.json === null ||
+          storedPart.bytes <= 0 ||
+          storedPart.bytes > REPLICA_TEXT_PART_BYTES
+        )
+          throw new ReplicaPreparationIntegrityError(
+            batch,
+            position,
+            "missing or oversized part",
+          );
+        operationParts.push(storedPart.json);
+      }
+      const operation_json = operationParts.join("");
+      const bytes = encoder.encode(operation_json);
+      if (
+        bytes.byteLength !== metadata.operation_bytes ||
+        sha256Digest(bytes) !== metadata.operation_sha256
+      )
+        throw new ReplicaPreparationIntegrityError(
+          batch,
+          position,
+          "part digest",
+        );
+      rows.push({ position, operation_json, encoding_failed: 0 });
     }
-    return [...pieces].map(([position, operation]) => ({
-      position,
-      operation_json: operation.operation_json.length
-        ? operation.operation_json.join("")
-        : null,
-      encoding_failed: operation.encoding_failed,
-    }));
+    return rows;
   }
   function preparationOf(batch: string) {
     return sql.get<ReplicaPreparation>(
@@ -1640,6 +1924,14 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
         ? replicaTextParts(snapshot.operation_json, REPLICA_TEXT_PART_BYTES)
         : [];
       const inline = parts.length <= 1 ? snapshot.operation_json : null;
+      const bytes = snapshot.operation_json
+        ? new TextEncoder().encode(snapshot.operation_json)
+        : new Uint8Array();
+      const representation = snapshot.encoding_failed
+        ? "invalid"
+        : parts.length > 1
+          ? "parts"
+          : "inline";
       yield* sql.run(
         `INSERT INTO pdpp_transport_operation_outcomes
       (batch,position,operation_json,encoding_failed,writer_id,operation_id) VALUES (?,?,?,?,?,?)`,
@@ -1651,6 +1943,17 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
         typeof op.revision?.operationId === "string"
           ? op.revision.operationId
           : null,
+      );
+      yield* sql.run(
+        `INSERT INTO pdpp_transport_operation_retention
+         (batch,position,representation,part_count,operation_bytes,operation_sha256)
+         VALUES (?,?,?,?,?,?)`,
+        batch,
+        position,
+        representation,
+        parts.length > 1 ? parts.length : 0,
+        bytes.byteLength,
+        snapshot.operation_json ? sha256Digest(bytes) : null,
       );
       if (parts.length > 1)
         for (const [part, json] of parts.entries())
@@ -1734,7 +2037,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
   }
   const preparationWait = (
     batch: string,
-    reason: "unknown" | "upload_started" | "all_ops_unsupported",
+    reason: "unknown" | "integrity" | "upload_started" | "all_ops_unsupported",
   ): Extract<ReplicaPhaseOutcome, { tag: "wait" }> => ({
     tag: "wait",
     dependency: { kind: "preparation", key: batch, reason },
@@ -1839,10 +2142,14 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
     }
   }
   function unknownPreparation(batch: Batch, error: unknown) {
+    const reason =
+      error instanceof ReplicaPreparationIntegrityError
+        ? "integrity"
+        : "unknown";
     return withPlan(retryFromError(error, "prepare_failed"), function* () {
       yield* sql.run(
         "UPDATE pdpp_transport_preparation SET state='prep_failed_unknown',wait_json=? WHERE batch=?",
-        canonicalJson(preparationWait(batch.batch, "unknown")),
+        canonicalJson(preparationWait(batch.batch, reason)),
         batch.batch,
       );
     });

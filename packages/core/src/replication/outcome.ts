@@ -40,7 +40,8 @@ export type ReplicaDependency =
   | {
       kind: "preparation";
       key: string;
-      reason: "unknown" | "upload_started" | "all_ops_unsupported";
+      reason:
+        "unknown" | "integrity" | "upload_started" | "all_ops_unsupported";
     }
   | { kind: "fragments"; key: string }
   | { kind: "mapping"; key: string }

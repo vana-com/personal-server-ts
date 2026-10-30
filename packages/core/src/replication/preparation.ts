@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_operation_outcomes (
 CREATE TABLE IF NOT EXISTS pdpp_transport_operation_parts (
  batch TEXT NOT NULL, position INTEGER NOT NULL, part INTEGER NOT NULL,
  json TEXT NOT NULL, PRIMARY KEY(batch,position,part));
+CREATE TABLE IF NOT EXISTS pdpp_transport_operation_retention (
+ batch TEXT NOT NULL, position INTEGER NOT NULL,
+ representation TEXT NOT NULL CHECK(representation IN ('inline','parts','invalid')),
+ part_count INTEGER NOT NULL, operation_bytes INTEGER NOT NULL,
+ operation_sha256 TEXT,
+ PRIMARY KEY(batch,position));
 CREATE TABLE IF NOT EXISTS pdpp_transport_upload_attempts (
  batch TEXT NOT NULL, kind TEXT NOT NULL, position INTEGER NOT NULL, started_at INTEGER NOT NULL,
  PRIMARY KEY(batch,kind,position));
@@ -48,6 +54,16 @@ export type RetainedPreparationOperation = {
   operation_json: string | null;
   encoding_failed: number;
 };
+
+/** Persisted preparation parts failed their completeness or digest fence. */
+export class ReplicaPreparationIntegrityError extends Error {
+  constructor(batch: string, position: number, reason: string) {
+    super(
+      `replica preparation integrity failed at ${batch}:${position} (${reason})`,
+    );
+    this.name = "ReplicaPreparationIntegrityError";
+  }
+}
 
 /** This error is minted only at the sender's own operation-encoding boundary. */
 export class ReplicaPreparationInputError extends Error {
