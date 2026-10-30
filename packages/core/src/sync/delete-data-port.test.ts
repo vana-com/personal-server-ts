@@ -360,6 +360,57 @@ describe("createGatewayDeleteDataPort.tombstone of a reserved scope", () => {
     expect(signAddData).not.toHaveBeenCalled();
   });
 
+  it("takes the winning tombstone of a 410 from the reserved head, not the feed", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(410, { error: "deleted" }),
+    );
+    const { port, dataPointFeed, reservedHead } = makeReservedPort(
+      { expectedVersion: "23", deletedAt: null },
+      fetchImpl as unknown as typeof fetch,
+    );
+    reservedHead.mockResolvedValueOnce({
+      expectedVersion: "23",
+      deletedAt: null,
+    });
+    reservedHead.mockResolvedValueOnce({
+      expectedVersion: "24",
+      deletedAt: "2026-10-30T12:00:00.000Z",
+    });
+    expect(await port.tombstone(SYSTEM_SCOPE)).toMatchObject({
+      status: "already-deleted",
+      version: "24",
+    });
+    expect(dataPointFeed.getDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("exposes the reserved head on the port only when one is wired", () => {
+    const { port } = makeReservedPort(null, vi.fn() as unknown as typeof fetch);
+    expect(typeof port.head).toBe("function");
+    expect(
+      makePort(null, vi.fn() as unknown as typeof fetch).port.head,
+    ).toBeUndefined();
+  });
+
+  it("matches the gateway's reserved set: vana.system.* only", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { data: {} }));
+    const { port, dataPointFeed, reservedHead } = makeReservedPort(
+      { expectedVersion: "1", deletedAt: null },
+      fetchImpl as unknown as typeof fetch,
+    );
+    (dataPointFeed.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
+      null,
+    );
+    for (const scope of [
+      "vana.system",
+      "vana.profile",
+      "pdpp_replica_v1.batch",
+    ]) {
+      await port.tombstone(scope);
+    }
+    expect(reservedHead).not.toHaveBeenCalled();
+    expect(dataPointFeed.getDataPoint).toHaveBeenCalledTimes(3);
+  });
+
   it("keeps the unsigned feed read for ordinary scopes", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(200, {

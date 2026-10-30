@@ -451,6 +451,14 @@ export interface DeleteBlobVersionsOutcome {
  */
 export interface DeleteDataPort {
   tombstone(scope: string): Promise<TombstoneOutcome>;
+  /**
+   * Head of a gateway-reserved (`vana.system.*`) point through a read the
+   * gateway authorizes for this server. Absent when the host wires none; the
+   * deletion-aware feed is then used, as for every other scope.
+   */
+  head?(
+    scope: string,
+  ): Promise<{ expectedVersion: string; deletedAt: string | null } | null>;
   deleteBlobVersions(
     scope: string,
     versions: string[],

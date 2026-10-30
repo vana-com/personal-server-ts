@@ -225,7 +225,11 @@ function createService(init: AdditionsWorkerInit) {
       activeBudget = options?.budget;
       return inventory.listScopes(options);
     },
-    head: (scope, signal) => inventory.head(scope, signal),
+    head: (scope, signal) => {
+      // An unbudgeted read: do not charge it to an earlier call's budget.
+      activeBudget = undefined;
+      return inventory.head(scope, signal);
+    },
   };
   return createDurableAdditions({
     ...init,

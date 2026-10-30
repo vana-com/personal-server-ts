@@ -6,10 +6,17 @@ import type {
   TombstoneOutcome,
 } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
-import { isSystemScope } from "../policy/reserved-scopes.js";
 import { computeDataPointId } from "./data-point-id.js";
 import { parseGatewayNextVersion } from "./workers/upload.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "./tombstone.js";
+
+/**
+ * Scopes the gateway reserves (data-gateway lib/reserved-scopes.ts): it reads
+ * them for the owner wallet only, so a server must use the signed inventory.
+ */
+export function isGatewayReservedScope(scope: string): boolean {
+  return scope.startsWith("vana.system.");
+}
 
 export interface GatewayDeleteDataPortOptions {
   /** Gateway base URL, e.g. https://dp-rpc.vana.org */
@@ -83,7 +90,7 @@ export function createGatewayDeleteDataPort(
   function currentHead(
     scope: string,
   ): Promise<{ expectedVersion: string; deletedAt: string | null } | null> {
-    if (options.reservedHead && isSystemScope(scope))
+    if (options.reservedHead && isGatewayReservedScope(scope))
       return options.reservedHead(scope);
     return options.dataPointFeed.getDataPoint({
       ownerAddress: options.serverOwner,
@@ -119,6 +126,7 @@ export function createGatewayDeleteDataPort(
   }
 
   return {
+    ...(options.reservedHead ? { head: options.reservedHead } : {}),
     async tombstone(scope: string): Promise<TombstoneOutcome> {
       const dataPointId = computeDataPointId(options.serverOwner, scope);
       const current = await currentHead(scope);
