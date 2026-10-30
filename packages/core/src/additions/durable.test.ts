@@ -285,6 +285,15 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
       async page() {
         throw new Error("Fixture exposes the completed inventory port only");
       },
+      async head(scope) {
+        const current = ((await readRegistry())[scope] ?? { head: null }).head;
+        return current
+          ? {
+              expectedVersion: current.expectedVersion,
+              deletedAt: current.deletedAt,
+            }
+          : null;
+      },
     };
     return createDurableAdditions({
       ownerAddress: OWNER,

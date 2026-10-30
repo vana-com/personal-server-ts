@@ -10,6 +10,7 @@ import type {
   PendingBlobDeletionStore,
 } from "../../ports/index.js";
 import { computeDataPointId } from "../data-point-id.js";
+import { isGatewayReservedScope } from "../delete-data-port.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 import {
   deletionTimestamp,
@@ -764,8 +765,8 @@ export async function retryPendingBlobDeletions(
       logger.warn(
         {
           scope: marker.scope,
-          dataPointId: registry.record.id,
-          version: registry.record.expectedVersion,
+          dataPointId: registry.id,
+          version: registry.expectedVersion,
         },
         "Scope was re-added after its tombstone; dropping the unexpanded blob deletion marker so the live version's ciphertext survives",
       );
@@ -837,7 +838,7 @@ export async function retryPendingBlobDeletions(
 }
 
 type RegistryState =
-  | { status: "live"; record: DataPointFeedRecord }
+  | { status: "live"; id: string; expectedVersion: string }
   | { status: "deleted"; version: string | null }
   | { status: "deleted-or-absent" }
   | { status: "unknown"; error: Error };
@@ -849,9 +850,34 @@ type RegistryState =
  * wired) or the row is gone.
  */
 async function registryState(
-  deps: Pick<DeleteScopeDeps, "dataPointFeed" | "serverOwner">,
+  deps: Pick<DeleteScopeDeps, "dataPointFeed" | "serverOwner" | "deleteData">,
   scope: string,
 ): Promise<RegistryState> {
+  // The gateway refuses an unsigned read of a reserved point; ask the port.
+  if (
+    isGatewayReservedScope(scope) &&
+    deps.deleteData?.head &&
+    deps.serverOwner
+  ) {
+    let head: { expectedVersion: string; deletedAt: string | null } | null;
+    try {
+      head = await deps.deleteData.head(scope);
+    } catch (err) {
+      return {
+        status: "unknown",
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+    if (head === null) return { status: "deleted-or-absent" };
+    if (head.deletedAt === null) {
+      return {
+        status: "live",
+        id: computeDataPointId(deps.serverOwner, scope),
+        expectedVersion: head.expectedVersion,
+      };
+    }
+    return { status: "deleted", version: tombstoneVersion(head) };
+  }
   if (!deps.dataPointFeed || !deps.serverOwner) {
     return { status: "deleted-or-absent" };
   }
@@ -868,7 +894,13 @@ async function registryState(
     };
   }
   if (record === null) return { status: "deleted-or-absent" };
-  if (deletionTimestamp(record) === null) return { status: "live", record };
+  if (deletionTimestamp(record) === null) {
+    return {
+      status: "live",
+      id: record.id,
+      expectedVersion: record.expectedVersion,
+    };
+  }
   return { status: "deleted", version: tombstoneVersion(record) };
 }
 
