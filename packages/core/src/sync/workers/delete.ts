@@ -8,9 +8,17 @@ import type {
   DeleteDataPort,
   PendingBlobDeletion,
   PendingBlobDeletionStore,
+  TombstoneFence,
+  TombstoneFinalityPort,
+  TombstoneFinalityState,
 } from "../../ports/index.js";
 import { computeDataPointId } from "../data-point-id.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
+import {
+  DEFAULT_TOMBSTONE_RESUBMIT_MAX_ATTEMPTS,
+  type TombstoneResubmitState,
+  type TombstoneResubmitTracker,
+} from "../tombstone-resubmits.js";
 import {
   deletionTimestamp,
   isEntryCoveredByTombstone,
@@ -50,6 +58,15 @@ export interface DeleteScopeDeps {
    * expand a marker whose tombstone version was not known.
    */
   dataPointFeed?: DataPointFeedPort;
+  /**
+   * When set, a covered storage key is deleted only once a tombstone at or
+   * above the one that covers it is finalized at the gateway, never on the
+   * tombstone's queue acknowledgement. Until then settlement can fail, the
+   * gateway rolls the head back, and a writer may recover the failed slot: a
+   * key freed earlier could take another writer's bytes under that slot.
+   * Without it keys are deleted as soon as the tombstone is acknowledged.
+   */
+  tombstoneFinality?: TombstoneFinalityPort;
   logger: Logger;
   now?: () => Date;
 }
@@ -227,12 +244,14 @@ async function eraseCoveredEntries(
 function takeFromRange(
   range: { from: string; to: string },
   count: number,
+  cap: bigint | null = null,
 ): { versions: string[]; rest: { from: string; to: string } | null } {
   const from = BigInt(range.from);
   const to = BigInt(range.to);
+  const last = cap !== null && cap < to ? cap : to;
   const versions: string[] = [];
   let cursor = from;
-  while (cursor <= to && versions.length < count) {
+  while (cursor <= last && versions.length < count) {
     versions.push(cursor.toString());
     cursor += 1n;
   }
@@ -278,15 +297,39 @@ function countPendingKeys(markers: PendingBlobDeletion[]): number {
  * markers; step 3 does not wait for them because the tombstone already makes
  * the deletion stick.
  *
+ * With `tombstoneFinality` wired, step 2 queues every covered key and sends
+ * only keys whose covering tombstone the gateway reports as finalized. The
+ * gateway acknowledges a tombstone when it queues it; settlement can still
+ * fail, roll the head back and let a writer recover the failed slot with the
+ * ciphertext it uploaded there. A key freed before finality could take a
+ * second writer's bytes, and the recovered registration would then commit to
+ * bytes that are not stored. Reads refuse the scope from step 1 on, so the
+ * wait only keeps owner-encrypted ciphertext in storage until finality.
+ *
  * Not serialised here: the sync manager runs this under the same lock as its
  * upload/download cycles so a delete cannot interleave with an upload of the
  * same scope on this replica (see engine/sync-manager.ts). Uploads racing on
  * another replica are handled by the upload worker's deletion guard and the
  * download worker's reconcile.
  */
+export interface DeleteScopeOptions {
+  /**
+   * Automatic re-submission of a rolled-back delete: the tombstone is queued
+   * only over exactly this head (the one the failed tombstone replaced), so a
+   * write that landed after the rollback is never deleted.
+   */
+  fence?: { head: TombstoneFence };
+  /**
+   * False records the storage work but sends no batch in this call; the
+   * caller's own pass already used this cycle's storage budget.
+   */
+  storagePass?: boolean;
+}
+
 export async function deleteScope(
   deps: DeleteScopeDeps,
   scope: string,
+  options: DeleteScopeOptions = {},
 ): Promise<DeleteScopeResult> {
   const { storage, deleteData, pendingBlobDeletions, scopeDeletions, logger } =
     deps;
@@ -314,8 +357,13 @@ export async function deleteScope(
     // local delete that sync silently undoes.
     let tombstoneVersionValue: string | null = null;
     let tombstoneKnown = false;
+    let replacedHead: TombstoneFence | null = null;
     try {
-      let outcome = await deleteData.tombstone(scope);
+      const tombstone = () =>
+        options.fence
+          ? deleteData.tombstone(scope, options.fence)
+          : deleteData.tombstone(scope);
+      let outcome = await tombstone();
       if (outcome.status === "not-registered") {
         // "Nothing to tombstone" is only durable if the registry still has
         // no row. A registration racing our lookup would otherwise survive
@@ -324,7 +372,7 @@ export async function deleteScope(
         // registry cannot be asked, refuse rather than delete on a guess.
         let registry = await registryState(deps, scope);
         if (registry.status === "live") {
-          outcome = await deleteData.tombstone(scope);
+          outcome = await tombstone();
           registry = await registryState(deps, scope);
         }
         if (
@@ -342,6 +390,9 @@ export async function deleteScope(
         result.steps.gateway = { status: "skipped", reason: "not-registered" };
       } else {
         tombstoneKnown = true;
+        if (outcome.status === "tombstoned") {
+          replacedHead = outcome.replaced ?? null;
+        }
         tombstoneVersionValue =
           outcome.version === null
             ? null
@@ -366,6 +417,9 @@ export async function deleteScope(
           },
           "local-delete",
         );
+        // A tombstone was just queued (or re-confirmed): read its finality
+        // on the next pass instead of waiting out an earlier backoff.
+        deps.tombstoneFinality?.recheckNow?.(scope);
       }
       result.durable = true;
     } catch (err) {
@@ -391,10 +445,17 @@ export async function deleteScope(
     covered = captureCoveredEntries(storage, scope, tombstoneVersionValue);
     const plan = planBlobDeletions(storage, scope, tombstoneVersionValue);
     const storageStep = await deleteScopeBlobs(
-      { deleteData, pendingBlobDeletions, logger },
+      {
+        deleteData,
+        pendingBlobDeletions,
+        tombstoneFinality: deps.tombstoneFinality,
+        logger,
+      },
       scope,
       plan,
       tombstoneKnown && tombstoneVersionValue === null,
+      options.storagePass ?? true,
+      replacedHead,
     );
     result.steps.storage = storageStep.step;
     result.pendingBlobDeletion = storageStep.pending > 0;
@@ -464,7 +525,12 @@ function unplannedWork(
   scope: string,
   plan: BlobDeletionPlan,
   through: bigint | null,
+  replacedHead: TombstoneFence | null = null,
 ): PendingBlobDeletion[] {
+  // A range is gated by its own `range.to`, the tombstone that covers it.
+  // The exact keys lie above that tombstone (or no tombstone exists), so
+  // their slots are still open: each is gated by its own version and waits
+  // for a finalized tombstone at or above it.
   const work: PendingBlobDeletion[] = plan.keys.map((version) => ({
     scope,
     version,
@@ -477,6 +543,7 @@ function unplannedWork(
         scope,
         version: null,
         range: { from: from.toString(), to: plan.range.to },
+        ...(replacedHead ? { replacedHead } : {}),
       });
     }
   }
@@ -494,10 +561,139 @@ async function recordPlannedWork(
   else await store.add(work);
 }
 
+function sameHead(a: TombstoneFence, b: TombstoneFence): boolean {
+  return (
+    a.expectedVersion === b.expectedVersion &&
+    a.dataHash.toLowerCase() === b.dataHash.toLowerCase() &&
+    a.metadataHash.toLowerCase() === b.metadataHash.toLowerCase()
+  );
+}
+
 interface ScopePassOutcome {
   deleted: string[];
   missing: string[];
   failed: Array<{ version: string; error: string }>;
+}
+
+/**
+ * The tombstone version whose finality frees a marker's keys: its recorded
+ * gate, else a range's upper bound, else an exact key's own version (a key at
+ * or below a finalized tombstone can never be registered again). Null for an
+ * unexpanded marker, which is never sent.
+ */
+function markerGate(marker: PendingBlobDeletion): bigint | null {
+  if (marker.tombstoneVersion !== undefined) {
+    return marker.version !== null || marker.range
+      ? BigInt(marker.tombstoneVersion)
+      : null;
+  }
+  if (marker.version !== null) return BigInt(marker.version);
+  if (marker.range) return BigInt(marker.range.to);
+  return null;
+}
+
+/**
+ * A marker whose keys may be sent now: an exact key, or the part of a range
+ * at or below `through` (the highest finalized tombstone of its scope).
+ */
+interface ReleasedMarker {
+  marker: PendingBlobDeletion;
+  through: bigint | null;
+}
+
+interface ReleaseDecision {
+  /** Markers whose keys may be sent now. */
+  released: ReleasedMarker[];
+  /** Scopes whose latest tombstone failed and rolled back, with the restored head. */
+  rolledBack: Map<string, NonNullable<TombstoneFinalityState["rolledBack"]>>;
+  /**
+   * Scopes whose newest tombstone is finalized (nothing settling, no
+   * rollback): their delete converged even if keys above it stay held.
+   */
+  converged: Set<string>;
+}
+
+/**
+ * The markers whose keys may be sent now. Without a finality port, all of
+ * them (keys go on the tombstone's acknowledgement). With one, only markers
+ * gated at or below the scope's highest finalized tombstone: one inventory
+ * read per scope that has work. A read that fails holds the scope's markers
+ * for a later pass; holding a key only delays its deletion. Scopes whose
+ * deletion the registry rolled back are reported for re-submission.
+ */
+async function releasableMarkers(
+  finality: TombstoneFinalityPort | undefined,
+  markers: PendingBlobDeletion[],
+  logger: Logger,
+): Promise<ReleaseDecision> {
+  const rolledBack: ReleaseDecision["rolledBack"] = new Map();
+  const converged = new Set<string>();
+  if (!finality) {
+    return {
+      released: markers.map((marker) => ({ marker, through: null })),
+      rolledBack,
+      converged,
+    };
+  }
+  const lowestGate = new Map<string, bigint>();
+  for (const marker of markers) {
+    const gate = markerGate(marker);
+    if (gate === null) continue;
+    const lowest = lowestGate.get(marker.scope);
+    if (lowest === undefined || gate < lowest) {
+      lowestGate.set(marker.scope, gate);
+    }
+  }
+  const finalized = new Map<string, bigint | null>();
+  for (const [scope, lowest] of lowestGate) {
+    try {
+      const state = await finality.tombstoneState(scope, lowest.toString());
+      finalized.set(
+        scope,
+        state.finalized === null ? null : BigInt(state.finalized),
+      );
+      if (state.rolledBack !== null) rolledBack.set(scope, state.rolledBack);
+      else if (state.finalized !== null && !state.settling)
+        converged.add(scope);
+    } catch (err) {
+      finalized.set(scope, null);
+      logger.warn(
+        { scope, error: errorMessage(err) },
+        "Could not read tombstone finality; blob deletions wait for a later pass",
+      );
+    }
+  }
+  // A key at or below a finalized tombstone is free (see the safety argument
+  // on `TombstoneFinalityPort`): exact keys by their own version, ranges up
+  // to the finalized version, the rest of the range staying queued.
+  const released: ReleasedMarker[] = [];
+  const held = new Map<string, number>();
+  for (const marker of markers) {
+    const gate = markerGate(marker);
+    if (gate === null) continue;
+    const through = finalized.get(marker.scope) ?? null;
+    const lowestKey =
+      marker.version !== null
+        ? BigInt(marker.version)
+        : BigInt(marker.range!.from);
+    if (through !== null && lowestKey <= through) {
+      released.push({ marker, through: marker.range ? through : null });
+    }
+    const highestKey =
+      marker.version !== null
+        ? BigInt(marker.version)
+        : BigInt(marker.range!.to);
+    if (through === null || highestKey > through) {
+      held.set(marker.scope, (held.get(marker.scope) ?? 0) + 1);
+    }
+  }
+  for (const [scope, count] of held) {
+    logger.info(
+      { scope, markers: count },
+      "Blob deletions wait until the covering tombstone is finalized",
+    );
+  }
+  return { released, rolledBack, converged };
 }
 
 /**
@@ -510,12 +706,14 @@ interface ScopePassOutcome {
 async function drainOnePass(
   deleteData: DeleteDataPort,
   store: PendingBlobDeletionStore,
-  markers: PendingBlobDeletion[],
+  released: ReleasedMarker[],
 ): Promise<Map<string, ScopePassOutcome>> {
   let budget = BLOB_DELETE_BATCH_SIZE;
   const byScope = new Map<string, string[]>();
   const queued = new Set<string>();
   const exactOrigin = new Set<string>();
+  // Gate of each key taken from a range, so a failed key keeps it.
+  const rangeGate = new Map<string, string>();
   const advancedRanges: Array<{
     old: PendingBlobDeletion;
     next: PendingBlobDeletion | null;
@@ -530,24 +728,38 @@ async function drainOnePass(
     byScope.set(scope, versions);
     return true;
   };
-  for (const marker of markers) {
+  for (const { marker } of released) {
     if (budget === 0) break;
     if (marker.version !== null) {
       exactOrigin.add(keyOf(marker.scope, marker.version));
       if (take(marker.scope, marker.version)) budget -= 1;
     }
   }
-  for (const marker of markers) {
+  for (const { marker, through } of released) {
     if (budget === 0) break;
     if (marker.version === null && marker.range) {
-      const taken = takeFromRange(marker.range, budget);
+      const taken = takeFromRange(marker.range, budget, through);
+      const gate = marker.tombstoneVersion ?? marker.range.to;
       for (const version of taken.versions) {
-        if (take(marker.scope, version)) budget -= 1;
+        if (take(marker.scope, version)) {
+          budget -= 1;
+          rangeGate.set(keyOf(marker.scope, version), gate);
+        }
       }
       advancedRanges.push({
         old: marker,
         next: taken.rest
-          ? { scope: marker.scope, version: null, range: taken.rest }
+          ? {
+              scope: marker.scope,
+              version: null,
+              range: taken.rest,
+              ...(marker.tombstoneVersion !== undefined
+                ? { tombstoneVersion: marker.tombstoneVersion }
+                : {}),
+              ...(marker.replacedHead
+                ? { replacedHead: marker.replacedHead }
+                : {}),
+            }
           : null,
       });
     }
@@ -577,7 +789,14 @@ async function drainOnePass(
     // exact marker simply stays.
     const failedFromRange = outcome.failed
       .filter(({ version }) => !exactOrigin.has(keyOf(scope, version)))
-      .map(({ version }): PendingBlobDeletion => ({ scope, version }));
+      .map(({ version }): PendingBlobDeletion => {
+        const gate = rangeGate.get(keyOf(scope, version));
+        return {
+          scope,
+          version,
+          ...(gate !== undefined ? { tombstoneVersion: gate } : {}),
+        };
+      });
     if (failedFromRange.length > 0) await store.add(failedFromRange);
   }
   // Advance the ranges only now: a crash mid-pass re-sends already-deleted
@@ -600,16 +819,18 @@ async function drainOnePass(
 async function deleteScopeBlobs(
   deps: { deleteData: DeleteDataPort } & Pick<
     DeleteScopeDeps,
-    "pendingBlobDeletions" | "logger"
+    "pendingBlobDeletions" | "tombstoneFinality" | "logger"
   >,
   scope: string,
   plan: BlobDeletionPlan,
   versionUnknown: boolean,
+  storagePass: boolean,
+  replacedHead: TombstoneFence | null,
 ): Promise<{ step: DeleteScopeResult["steps"]["storage"]; pending: number }> {
   const { deleteData, logger } = deps;
   const withUnknown = (work: PendingBlobDeletion[]) =>
     versionUnknown ? [...work, { scope, version: null }] : work;
-  let work = withUnknown(unplannedWork(scope, plan, null));
+  let work = withUnknown(unplannedWork(scope, plan, null, replacedHead));
   let store: PendingBlobDeletionStore | null =
     deps.pendingBlobDeletions ?? null;
   // This scope's markers already in the durable store before this call.
@@ -619,7 +840,7 @@ async function deleteScopeBlobs(
       const markers = await store.list();
       queuedBefore = markers.filter((m) => m.scope === scope);
       const through = await resumePoint(store, scope, markers);
-      work = withUnknown(unplannedWork(scope, plan, through));
+      work = withUnknown(unplannedWork(scope, plan, through, replacedHead));
       await recordPlannedWork(store, scope, work, plan.range?.to ?? null);
     } catch (markerErr) {
       logger.error(
@@ -641,7 +862,13 @@ async function deleteScopeBlobs(
   let outcome: ScopePassOutcome;
   let remainingKeys: number;
   try {
-    const queued = (await passStore.list()).filter((m) => m.scope === scope);
+    const { released: queued } = storagePass
+      ? await releasableMarkers(
+          deps.tombstoneFinality,
+          (await passStore.list()).filter((m) => m.scope === scope),
+          logger,
+        )
+      : { released: [] };
     outcome = (await drainOnePass(deleteData, passStore, queued)).get(
       scope,
     ) ?? { deleted: [], missing: [], failed: [] };
@@ -718,20 +945,42 @@ export interface RetryPendingBlobDeletionsResult {
  * are expanded from the registry first; if the registry shows the scope live
  * again the old tombstone's version is unknowable, so the marker is dropped
  * and the pre-tombstone ciphertext stays (owner-decryptable only) until the
- * next delete of that scope.
+ * next delete of that scope. With `tombstoneFinality` wired, a key is sent
+ * only once a tombstone at or above its gate is finalized; a failed
+ * tombstone's keys stay queued (the deletion did not happen) until a later
+ * deletion of the scope is finalized.
  */
+export const TOMBSTONE_RESUBMIT_MAX_ATTEMPTS =
+  DEFAULT_TOMBSTONE_RESUBMIT_MAX_ATTEMPTS;
+
+export type RetryPendingBlobDeletionsDeps = Pick<
+  DeleteScopeDeps,
+  | "deleteData"
+  | "pendingBlobDeletions"
+  | "dataPointFeed"
+  | "serverOwner"
+  | "tombstoneFinality"
+  | "logger"
+> & {
+  /** Local index, for expanding unexpanded markers into exact keys. */
+  storage?: Pick<DataStoragePort, "listVersions">;
+  /**
+   * Re-submits the user's delete of a scope whose tombstone failed, through
+   * the ordinary delete path. The caller runs it inside the same mutation
+   * queue as this pass.
+   */
+  resubmitDeletion?: (
+    scope: string,
+    options: DeleteScopeOptions,
+  ) => Promise<DeleteScopeResult>;
+  /** Bounds the re-submissions; required with `resubmitDeletion`. */
+  tombstoneResubmits?: TombstoneResubmitTracker;
+  /** Called once when a scope's re-submissions are used up. */
+  onDeletionAbandoned?: (state: TombstoneResubmitState) => void;
+};
+
 export async function retryPendingBlobDeletions(
-  deps: Pick<
-    DeleteScopeDeps,
-    | "deleteData"
-    | "pendingBlobDeletions"
-    | "dataPointFeed"
-    | "serverOwner"
-    | "logger"
-  > & {
-    /** Local index, for expanding unexpanded markers into exact keys. */
-    storage?: Pick<DataStoragePort, "listVersions">;
-  },
+  deps: RetryPendingBlobDeletionsDeps,
 ): Promise<RetryPendingBlobDeletionsResult> {
   const { deleteData, pendingBlobDeletions, logger } = deps;
   const result: RetryPendingBlobDeletionsResult = {
@@ -796,11 +1045,17 @@ export async function retryPendingBlobDeletions(
   }
   markers = await pendingBlobDeletions.list();
 
-  // One rate-limited batch in stored order: exact keys, then range heads.
+  // One rate-limited batch in stored order: exact keys, then range heads,
+  // taken only from markers whose covering tombstone is final.
+  const decision = await releasableMarkers(
+    deps.tombstoneFinality,
+    markers,
+    logger,
+  );
   const outcomes = await drainOnePass(
     deleteData,
     pendingBlobDeletions,
-    markers,
+    decision.released,
   );
   for (const [scope, outcome] of outcomes) {
     result.completed.push(
@@ -832,8 +1087,151 @@ export async function retryPendingBlobDeletions(
       );
     }
   }
-  result.remaining = (await pendingBlobDeletions.list()).length;
+  for (const [scope, rollback] of decision.rolledBack) {
+    await resubmitRolledBackDeletion(
+      deps,
+      scope,
+      rollback,
+      markers.filter((marker) => marker.scope === scope),
+    );
+  }
+  const left = await pendingBlobDeletions.list();
+  // A scope with nothing left to free has converged; forget its attempts.
+  if (deps.tombstoneResubmits) {
+    const waiting = new Set(left.map((marker) => marker.scope));
+    const tracked = deps.tombstoneResubmits.snapshot();
+    for (const { scope } of [...tracked.retrying, ...tracked.failed]) {
+      if (!waiting.has(scope) || decision.converged.has(scope)) {
+        deps.tombstoneResubmits.reset(scope);
+      }
+    }
+  }
+  result.remaining = left.length;
   return result;
+}
+
+/**
+ * The user deleted `scope`, its tombstone failed to settle, and the gateway
+ * shows the scope live again (the finality port only reports a rollback when
+ * no newer version of the scope exists). Re-submit the delete through the
+ * ordinary delete path, but only over exactly the head the user's tombstone
+ * replaced: the queued range marker remembers that head, the inventory read
+ * reports the restored one, and the port refuses any other. A different
+ * restored head is reported once as a failed delete instead. A write that
+ * recovered a failed slot below the tombstone, or that lands between the read
+ * and the re-submission, is therefore never deleted. This replica's own
+ * index is checked too: any unsynced entry (written after the delete erased
+ * the covered ones), or a synced one at or above the failed tombstone, is a
+ * re-add, and a re-add is never deleted again.
+ *
+ * Bounded by the tracker: attempts back off exponentially, and after the
+ * last one the scope is logged as an error and reported in the tracker's
+ * `failed` list. Its markers stay queued (nothing is freed while the scope
+ * is live) and drain if a later delete of the scope becomes final.
+ */
+async function resubmitRolledBackDeletion(
+  deps: RetryPendingBlobDeletionsDeps,
+  scope: string,
+  rollback: NonNullable<TombstoneFinalityState["rolledBack"]>,
+  scopeMarkers: PendingBlobDeletion[],
+): Promise<void> {
+  const { logger, tombstoneResubmits: tracker } = deps;
+  const failedVersion = rollback.tombstoneVersion;
+  if (!deps.resubmitDeletion || !tracker) {
+    logger.warn(
+      { scope, tombstoneVersion: failedVersion },
+      "Scope tombstone failed and the scope is live again; its storage copies stay until the scope is deleted again",
+    );
+    return;
+  }
+  const remembered = scopeMarkers.find(
+    (marker) =>
+      marker.version === null &&
+      marker.range &&
+      BigInt(marker.range.to) === BigInt(failedVersion) &&
+      marker.replacedHead,
+  )?.replacedHead;
+  if (readdedLocally(deps.storage, scope, failedVersion)) {
+    logger.info(
+      { scope, tombstoneVersion: failedVersion },
+      "Scope tombstone failed, but the scope was re-added after the delete; not deleting it again",
+    );
+    return;
+  }
+  if (tracker.exhausted(scope)) return;
+  if (!remembered || !sameHead(remembered, rollback.head)) {
+    // The user's delete did not happen and the scope is live again, but the
+    // restored head may be newer data, so it is not deleted automatically.
+    // Report it once, so no surface shows the scope as deleted.
+    const state = tracker.giveUp(scope, failedVersion, "head-changed");
+    logger.error(
+      {
+        scope,
+        tombstoneVersion: failedVersion,
+        head: rollback.head.expectedVersion,
+        remembered: remembered?.expectedVersion ?? null,
+      },
+      "Scope deletion did not complete: the gateway tombstone failed and the restored head is not the one the delete replaced, so it is not deleted again automatically. Delete it again to retry.",
+    );
+    deps.onDeletionAbandoned?.(state);
+    return;
+  }
+  if (tracker.outOfAttempts(scope)) {
+    const state = tracker.giveUp(scope, failedVersion);
+    logger.error(
+      {
+        scope,
+        attempts: state.attempts,
+        tombstoneVersion: failedVersion,
+      },
+      "Scope deletion did not complete: every gateway tombstone failed and the scope is live again. Delete it again to retry.",
+    );
+    deps.onDeletionAbandoned?.(state);
+    return;
+  }
+  if (!tracker.due(scope)) return;
+  const attempt = tracker.recordAttempt(scope, failedVersion);
+  logger.warn(
+    { scope, tombstoneVersion: failedVersion, attempt },
+    "Scope tombstone failed and the scope is live again; re-submitting the user's delete",
+  );
+  try {
+    const outcome = await deps.resubmitDeletion(scope, {
+      fence: { head: rollback.head },
+      storagePass: false,
+    });
+    if (outcome.steps.gateway.status === "failed") {
+      logger.warn(
+        { scope, attempt, error: outcome.steps.gateway.error },
+        "Re-submitted scope delete was refused by the gateway; will retry",
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { scope, attempt, error: errorMessage(err) },
+      "Re-submitted scope delete failed; will retry",
+    );
+  }
+}
+
+/** Whether this replica holds data of `scope` the failed delete did not cover. */
+function readdedLocally(
+  storage: Pick<DataStoragePort, "listVersions"> | undefined,
+  scope: string,
+  failedVersion: string,
+): boolean {
+  // Without a local index nothing proves the scope was not re-added.
+  if (!storage) return true;
+  const failed = BigInt(failedVersion);
+  const PAGE_SIZE = 500;
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const entries = storage.listVersions(scope, { limit: PAGE_SIZE, offset });
+    for (const entry of entries) {
+      if (entry.dataPointId === null) return true;
+      if (BigInt(entry.version) >= failed) return true;
+    }
+    if (entries.length < PAGE_SIZE) return false;
+  }
 }
 
 type RegistryState =

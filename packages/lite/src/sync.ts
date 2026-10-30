@@ -1,4 +1,7 @@
-import { type DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
+import {
+  createVersionInventoryClient,
+  type DurableAdditionsService,
+} from "@opendatalabs/personal-server-ts-core/additions";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
@@ -9,6 +12,7 @@ import {
 import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
+  createInventoryTombstoneFinality,
   createPendingBlobDeletionStore,
   createScopeDeletionTracker,
   normalizePendingBlobDeletionPlanned,
@@ -349,6 +353,22 @@ export async function createPsLiteSyncManager(
   const pendingBlobDeletions = createPsLitePendingBlobDeletionStore(
     options.stateStore,
   );
+  // Blob deletes wait for the covering tombstone to be finalized. The
+  // inventory accepts the owner or a registered server of the owner: the
+  // same account that signs storage requests.
+  const tombstoneFinality = createInventoryTombstoneFinality(
+    createVersionInventoryClient({
+      gatewayUrl: options.config.gateway.url,
+      ownerAddress: serverOwner,
+      ownerSigner: ownerRequestSigner ?? {
+        signRequest: (params) =>
+          buildWeb3SignedHeader({
+            ...params,
+            signMessage: (message: string) => syncAccount.signMessage(message),
+          }),
+      },
+    }),
+  );
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
@@ -382,6 +402,7 @@ export async function createPsLiteSyncManager(
     {
       deleteData,
       pendingBlobDeletions,
+      tombstoneFinality,
       async canSync() {
         if (options.ownerSyncSigner) return { ok: true };
         try {
