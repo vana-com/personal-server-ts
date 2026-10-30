@@ -242,12 +242,14 @@ async function eraseCoveredEntries(
 function takeFromRange(
   range: { from: string; to: string },
   count: number,
+  cap: bigint | null = null,
 ): { versions: string[]; rest: { from: string; to: string } | null } {
   const from = BigInt(range.from);
   const to = BigInt(range.to);
+  const last = cap !== null && cap < to ? cap : to;
   const versions: string[] = [];
   let cursor = from;
-  while (cursor <= to && versions.length < count) {
+  while (cursor <= last && versions.length < count) {
     versions.push(cursor.toString());
     cursor += 1n;
   }
@@ -308,9 +310,24 @@ function countPendingKeys(markers: PendingBlobDeletion[]): number {
  * another replica are handled by the upload worker's deletion guard and the
  * download worker's reconcile.
  */
+export interface DeleteScopeOptions {
+  /**
+   * Automatic re-submission of a rolled-back delete: the tombstone may take a
+   * version at or below `atOrBelow` only (the failed tombstone's slot), so a
+   * write that landed after the rollback is never deleted.
+   */
+  fence?: { atOrBelow: string };
+  /**
+   * False records the storage work but sends no batch in this call; the
+   * caller's own pass already used this cycle's storage budget.
+   */
+  storagePass?: boolean;
+}
+
 export async function deleteScope(
   deps: DeleteScopeDeps,
   scope: string,
+  options: DeleteScopeOptions = {},
 ): Promise<DeleteScopeResult> {
   const { storage, deleteData, pendingBlobDeletions, scopeDeletions, logger } =
     deps;
@@ -339,7 +356,11 @@ export async function deleteScope(
     let tombstoneVersionValue: string | null = null;
     let tombstoneKnown = false;
     try {
-      let outcome = await deleteData.tombstone(scope);
+      const tombstone = () =>
+        options.fence
+          ? deleteData.tombstone(scope, options.fence)
+          : deleteData.tombstone(scope);
+      let outcome = await tombstone();
       if (outcome.status === "not-registered") {
         // "Nothing to tombstone" is only durable if the registry still has
         // no row. A registration racing our lookup would otherwise survive
@@ -348,7 +369,7 @@ export async function deleteScope(
         // registry cannot be asked, refuse rather than delete on a guess.
         let registry = await registryState(deps, scope);
         if (registry.status === "live") {
-          outcome = await deleteData.tombstone(scope);
+          outcome = await tombstone();
           registry = await registryState(deps, scope);
         }
         if (
@@ -427,6 +448,7 @@ export async function deleteScope(
       scope,
       plan,
       tombstoneKnown && tombstoneVersionValue === null,
+      options.storagePass ?? true,
     );
     result.steps.storage = storageStep.step;
     result.pendingBlobDeletion = storageStep.pending > 0;
@@ -553,11 +575,25 @@ function markerGate(marker: PendingBlobDeletion): bigint | null {
   return null;
 }
 
+/**
+ * A marker whose keys may be sent now: an exact key, or the part of a range
+ * at or below `through` (the highest finalized tombstone of its scope).
+ */
+interface ReleasedMarker {
+  marker: PendingBlobDeletion;
+  through: bigint | null;
+}
+
 interface ReleaseDecision {
   /** Markers whose keys may be sent now. */
-  released: PendingBlobDeletion[];
+  released: ReleasedMarker[];
   /** Scopes whose latest tombstone failed and rolled back, with its version. */
   rolledBack: Map<string, string>;
+  /**
+   * Scopes whose newest tombstone is finalized (nothing settling, no
+   * rollback): their delete converged even if keys above it stay held.
+   */
+  converged: Set<string>;
 }
 
 /**
@@ -574,7 +610,14 @@ async function releasableMarkers(
   logger: Logger,
 ): Promise<ReleaseDecision> {
   const rolledBack = new Map<string, string>();
-  if (!finality) return { released: markers, rolledBack };
+  const converged = new Set<string>();
+  if (!finality) {
+    return {
+      released: markers.map((marker) => ({ marker, through: null })),
+      rolledBack,
+      converged,
+    };
+  }
   const lowestGate = new Map<string, bigint>();
   for (const marker of markers) {
     const gate = markerGate(marker);
@@ -593,6 +636,8 @@ async function releasableMarkers(
         state.finalized === null ? null : BigInt(state.finalized),
       );
       if (state.rolledBack !== null) rolledBack.set(scope, state.rolledBack);
+      else if (state.finalized !== null && !state.settling)
+        converged.add(scope);
     } catch (err) {
       finalized.set(scope, null);
       logger.warn(
@@ -601,14 +646,27 @@ async function releasableMarkers(
       );
     }
   }
-  const released: PendingBlobDeletion[] = [];
+  // A key at or below a finalized tombstone is free (see the safety argument
+  // on `TombstoneFinalityPort`): exact keys by their own version, ranges up
+  // to the finalized version, the rest of the range staying queued.
+  const released: ReleasedMarker[] = [];
   const held = new Map<string, number>();
   for (const marker of markers) {
     const gate = markerGate(marker);
+    if (gate === null) continue;
     const through = finalized.get(marker.scope) ?? null;
-    if (gate !== null && through !== null && gate <= through) {
-      released.push(marker);
-    } else if (gate !== null) {
+    const lowestKey =
+      marker.version !== null
+        ? BigInt(marker.version)
+        : BigInt(marker.range!.from);
+    if (through !== null && lowestKey <= through) {
+      released.push({ marker, through: marker.range ? through : null });
+    }
+    const highestKey =
+      marker.version !== null
+        ? BigInt(marker.version)
+        : BigInt(marker.range!.to);
+    if (through === null || highestKey > through) {
       held.set(marker.scope, (held.get(marker.scope) ?? 0) + 1);
     }
   }
@@ -618,7 +676,7 @@ async function releasableMarkers(
       "Blob deletions wait until the covering tombstone is finalized",
     );
   }
-  return { released, rolledBack };
+  return { released, rolledBack, converged };
 }
 
 /**
@@ -631,7 +689,7 @@ async function releasableMarkers(
 async function drainOnePass(
   deleteData: DeleteDataPort,
   store: PendingBlobDeletionStore,
-  markers: PendingBlobDeletion[],
+  released: ReleasedMarker[],
 ): Promise<Map<string, ScopePassOutcome>> {
   let budget = BLOB_DELETE_BATCH_SIZE;
   const byScope = new Map<string, string[]>();
@@ -653,17 +711,17 @@ async function drainOnePass(
     byScope.set(scope, versions);
     return true;
   };
-  for (const marker of markers) {
+  for (const { marker } of released) {
     if (budget === 0) break;
     if (marker.version !== null) {
       exactOrigin.add(keyOf(marker.scope, marker.version));
       if (take(marker.scope, marker.version)) budget -= 1;
     }
   }
-  for (const marker of markers) {
+  for (const { marker, through } of released) {
     if (budget === 0) break;
     if (marker.version === null && marker.range) {
-      const taken = takeFromRange(marker.range, budget);
+      const taken = takeFromRange(marker.range, budget, through);
       const gate = marker.tombstoneVersion ?? marker.range.to;
       for (const version of taken.versions) {
         if (take(marker.scope, version)) {
@@ -746,6 +804,7 @@ async function deleteScopeBlobs(
   scope: string,
   plan: BlobDeletionPlan,
   versionUnknown: boolean,
+  storagePass: boolean,
 ): Promise<{ step: DeleteScopeResult["steps"]["storage"]; pending: number }> {
   const { deleteData, logger } = deps;
   const withUnknown = (work: PendingBlobDeletion[]) =>
@@ -782,11 +841,13 @@ async function deleteScopeBlobs(
   let outcome: ScopePassOutcome;
   let remainingKeys: number;
   try {
-    const { released: queued } = await releasableMarkers(
-      deps.tombstoneFinality,
-      (await passStore.list()).filter((m) => m.scope === scope),
-      logger,
-    );
+    const { released: queued } = storagePass
+      ? await releasableMarkers(
+          deps.tombstoneFinality,
+          (await passStore.list()).filter((m) => m.scope === scope),
+          logger,
+        )
+      : { released: [] };
     outcome = (await drainOnePass(deleteData, passStore, queued)).get(
       scope,
     ) ?? { deleted: [], missing: [], failed: [] };
@@ -887,7 +948,10 @@ export type RetryPendingBlobDeletionsDeps = Pick<
    * the ordinary delete path. The caller runs it inside the same mutation
    * queue as this pass.
    */
-  resubmitDeletion?: (scope: string) => Promise<DeleteScopeResult>;
+  resubmitDeletion?: (
+    scope: string,
+    options: DeleteScopeOptions,
+  ) => Promise<DeleteScopeResult>;
   /** Bounds the re-submissions; required with `resubmitDeletion`. */
   tombstoneResubmits?: TombstoneResubmitTracker;
   /** Called once when a scope's re-submissions are used up. */
@@ -1009,8 +1073,11 @@ export async function retryPendingBlobDeletions(
   // A scope with nothing left to free has converged; forget its attempts.
   if (deps.tombstoneResubmits) {
     const waiting = new Set(left.map((marker) => marker.scope));
-    for (const { scope } of deps.tombstoneResubmits.snapshot().retrying) {
-      if (!waiting.has(scope)) deps.tombstoneResubmits.reset(scope);
+    const tracked = deps.tombstoneResubmits.snapshot();
+    for (const { scope } of [...tracked.retrying, ...tracked.failed]) {
+      if (!waiting.has(scope) || decision.converged.has(scope)) {
+        deps.tombstoneResubmits.reset(scope);
+      }
     }
   }
   result.remaining = left.length;
@@ -1072,7 +1139,10 @@ async function resubmitRolledBackDeletion(
     "Scope tombstone failed and the scope is live again; re-submitting the user's delete",
   );
   try {
-    const outcome = await deps.resubmitDeletion(scope);
+    const outcome = await deps.resubmitDeletion(scope, {
+      fence: { atOrBelow: failedVersion },
+      storagePass: false,
+    });
     if (outcome.steps.gateway.status === "failed") {
       logger.warn(
         { scope, attempt, error: outcome.steps.gateway.error },

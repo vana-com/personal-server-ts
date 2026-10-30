@@ -450,7 +450,16 @@ export interface DeleteBlobVersionsOutcome {
  * 404 on and then wedge.
  */
 export interface DeleteDataPort {
-  tombstone(scope: string): Promise<TombstoneOutcome>;
+  /**
+   * Queue a tombstone at head + 1. With `fence`, the tombstone may take a
+   * version at or below `fence.atOrBelow` only: a head at or above it, or a
+   * 409 (another writer moved the head), throws instead of re-signing, so an
+   * automatic re-submission can never delete a newer write.
+   */
+  tombstone(
+    scope: string,
+    fence?: { atOrBelow: string },
+  ): Promise<TombstoneOutcome>;
   deleteBlobVersions(
     scope: string,
     versions: string[],

@@ -72,6 +72,7 @@ export function createInventoryTombstoneFinality(
       deletedAt: string | null;
       dataHash: string;
       metadataHash: string;
+      status: string;
     } | null = null;
     let complete = false;
     for (let count = 0; count < MAX_PAGES; count++) {
@@ -100,6 +101,18 @@ export function createInventoryTombstoneFinality(
       const next = result.pagination.nextAfter;
       if (next === null) break;
       after = next;
+    }
+    // The head counts as a tombstone row too: a re-submitted delete can take
+    // a slot below the asked version (the gateway rolls back to the latest
+    // non-failed row, which may sit below a failed data row), and its
+    // finality frees the keys at or below it.
+    if (head !== null && (head.deletedAt !== null || isTombstoneRecord(head))) {
+      const value = BigInt(head.expectedVersion);
+      if (head.status === "finalized") {
+        if (finalized === null || value > finalized) finalized = value;
+      } else if (!SETTLED.has(head.status)) {
+        settling = true;
+      }
     }
     // An unfinished traversal can only under-report: keys wait longer, and
     // it never reports a rollback it did not see to the end.
