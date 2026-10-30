@@ -319,7 +319,10 @@ export function createSyncManager(
                 pushError({
                   fileId: null,
                   scope: state.scope,
-                  message: `Deletion of ${state.scope} did not complete: the gateway tombstone failed ${state.attempts + 1} times and the data is live again. Delete it again to retry.`,
+                  message:
+                    state.reason === "head-changed"
+                      ? `Deletion of ${state.scope} did not complete: the gateway tombstone failed and the data is live again. Delete it again to retry.`
+                      : `Deletion of ${state.scope} did not complete: the gateway tombstone failed ${state.attempts + 1} times and the data is live again. Delete it again to retry.`,
                   timestamp: new Date().toISOString(),
                 });
               },

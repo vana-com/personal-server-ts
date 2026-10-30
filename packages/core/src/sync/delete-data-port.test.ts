@@ -193,6 +193,8 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     );
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(outcome).toMatchObject({ status: "tombstoned", version: "8" });
+    // The head it replaced is not the one read before the 409: unknown.
+    expect(outcome).toMatchObject({ replaced: null });
   });
 
   it("with a fence, tombstones only the exact head it names and never re-signs on a 409", async () => {

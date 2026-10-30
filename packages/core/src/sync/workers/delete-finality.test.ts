@@ -695,10 +695,18 @@ describe("storage cleanup converges on the user's delete", () => {
     expect(gateway.head()?.version).toBe(1n);
     for (let minute = 0; minute < 10; minute++) await cycle(MINUTE);
     expect(deleteData.tombstone).toHaveBeenCalledTimes(1);
-    expect(logger.info).toHaveBeenCalledWith(
+    expect(logger.error).toHaveBeenCalledWith(
       expect.objectContaining({ scope: SCOPE, head: "1", remembered: "2" }),
       expect.stringContaining("not the one the delete replaced"),
     );
+    // Not silent: the status reports the delete as failed, once.
+    expect(resubmits.snapshot().failed).toEqual([
+      expect.objectContaining({
+        scope: SCOPE,
+        attempts: 0,
+        reason: "head-changed",
+      }),
+    ]);
 
     // The user deletes again: the tombstone recovers slot 2.
     await deleteScope(deps, SCOPE);

@@ -20,7 +20,15 @@ export interface TombstoneResubmitState {
   tombstoneVersion: string;
   /** ISO time of the last re-submission. */
   lastAttemptAt: string;
+  /**
+   * Why the delete stopped (failed entries only): every attempt failed, or
+   * the gateway restored a head other than the one the delete replaced, so
+   * it is not re-submitted automatically.
+   */
+  reason?: TombstoneResubmitFailure;
 }
+
+export type TombstoneResubmitFailure = "attempts-exhausted" | "head-changed";
 
 export interface TombstoneResubmitSnapshot {
   /** Scopes with a re-submission in progress or due. */
@@ -38,8 +46,12 @@ export interface TombstoneResubmitTracker {
   outOfAttempts(scope: string): boolean;
   /** Count one re-submission; returns the attempt number. */
   recordAttempt(scope: string, tombstoneVersion: string): number;
-  /** Report the scope as failed (after the last attempt also failed). */
-  giveUp(scope: string, tombstoneVersion: string): TombstoneResubmitState;
+  /** Report the scope as failed (the default reason: attempts exhausted). */
+  giveUp(
+    scope: string,
+    tombstoneVersion: string,
+    reason?: TombstoneResubmitFailure,
+  ): TombstoneResubmitState;
   /** Forget the scope: the delete converged, or the user deleted it again. */
   reset(scope: string): void;
   snapshot(): TombstoneResubmitSnapshot;
@@ -67,6 +79,7 @@ export function createTombstoneResubmitTracker(
       tombstoneVersion: string;
       lastAttemptMs: number;
       failedAtMs: number | null;
+      reason?: TombstoneResubmitFailure;
     }
   >();
 
@@ -78,6 +91,7 @@ export function createTombstoneResubmitTracker(
           attempts: state.attempts,
           tombstoneVersion: state.tombstoneVersion,
           lastAttemptAt: new Date(state.lastAttemptMs).toISOString(),
+          ...(state.reason ? { reason: state.reason } : {}),
         }
       : null;
   };
@@ -113,14 +127,19 @@ export function createTombstoneResubmitTracker(
       });
       return attempts;
     },
-    giveUp(scope, tombstoneVersion) {
+    giveUp(scope, tombstoneVersion, reason = "attempts-exhausted") {
       const state = states.get(scope) ?? {
         attempts: 0,
         tombstoneVersion,
         lastAttemptMs: now(),
         failedAtMs: null,
       };
-      states.set(scope, { ...state, tombstoneVersion, failedAtMs: now() });
+      states.set(scope, {
+        ...state,
+        tombstoneVersion,
+        failedAtMs: now(),
+        reason,
+      });
       return view(scope)!;
     },
     reset(scope) {
