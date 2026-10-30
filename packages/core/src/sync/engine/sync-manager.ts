@@ -279,7 +279,10 @@ export function createSyncManager(
   function deleteAdditionsAfter(scope: string): void {
     const additions = uploadDeps.additions;
     if (!additions) return;
-    void Promise.resolve()
+    // Start only once the running cycle has left the mutation queue: the
+    // PS-Lite additions session holds its Web Lock across the ledger delete,
+    // and this cycle's uploads need that lock too.
+    void mutationQueue
       .then(() => additions.deleteScope(scope))
       .catch((err: unknown) => {
         uploadDeps.logger.warn(
@@ -303,8 +306,12 @@ export function createSyncManager(
           ? {
               tombstoneResubmits,
               // Already inside the mutation queue: call the worker directly.
-              async resubmitDeletion(scope: string) {
-                const result = await deleteScope(deleteScopeDeps(), scope);
+              async resubmitDeletion(scope, resubmit) {
+                const result = await deleteScope(
+                  deleteScopeDeps(),
+                  scope,
+                  resubmit,
+                );
                 if (result.durable) deleteAdditionsAfter(scope);
                 return result;
               },

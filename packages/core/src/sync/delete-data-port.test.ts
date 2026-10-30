@@ -190,6 +190,30 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     expect(outcome).toMatchObject({ status: "tombstoned", version: "8" });
   });
 
+  it("with a fence, refuses to tombstone a head at or above it and never re-signs on a 409", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(409, {
+        error: "Stale expectedVersion",
+        nextExpectedVersion: "5",
+      }),
+    );
+    // Head v3: the fenced tombstone may take v4 at most.
+    const { port, signAddData } = makePort(
+      liveRecord(),
+      fetchImpl as unknown as typeof fetch,
+    );
+    await expect(port.tombstone(SCOPE, { atOrBelow: "3" })).rejects.toThrow(
+      /newer version/,
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    await expect(port.tombstone(SCOPE, { atOrBelow: "4" })).rejects.toThrow(
+      /newer version/,
+    );
+    expect(signAddData).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("takes the winning tombstone's version from a 410 body, not the version it attempted", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(410, {
