@@ -483,21 +483,47 @@ export interface PendingBlobDeletion {
 }
 
 /**
+ * What the registry says about a scope's tombstones at or above a version.
+ */
+export interface TombstoneFinalityState {
+  /**
+   * The highest version at or above the asked one that holds a finalized
+   * tombstone, or null when none does yet. Keys at or below a finalized
+   * tombstone can never be claimed by a registration again.
+   */
+  finalized: string | null;
+  /**
+   * True while a tombstone at or above the asked version can still settle
+   * (pending, submitting, confirmed, or a status the reader does not know).
+   * The caller reads again on its next pass.
+   */
+  settling: boolean;
+  /**
+   * The failed tombstone version when the deletion was rolled back: the
+   * highest listed version is a failed tombstone, no tombstone is settling,
+   * and the head is live data below it. Null otherwise, including when any
+   * version above the failed tombstone exists (a newer write).
+   */
+  rolledBack: string | null;
+}
+
+/**
  * When a storage key may be freed. A tombstone the gateway has queued but not
  * finalized can still fail; the gateway then rolls the head back and lets a
  * writer recover the failed slot. Freeing a key before that is ruled out lets
  * another writer put different bytes under a slot that is later registered.
  */
 export interface TombstoneFinalityPort {
-  /**
-   * The highest registry version at or above `atOrAbove` that holds a
-   * finalized tombstone, or null when none does yet. Keys at or below a
-   * finalized tombstone can never be claimed by a registration again.
-   */
-  finalizedTombstoneAtOrAbove(
+  /** The scope's tombstone state at or above `atOrAbove`. */
+  tombstoneState(
     scope: string,
     atOrAbove: string,
-  ): Promise<string | null>;
+  ): Promise<TombstoneFinalityState>;
+  /**
+   * A new tombstone of `scope` was just queued: drop any recheck backoff so
+   * the next pass reads it.
+   */
+  recheckNow?(scope: string): void;
 }
 
 /**

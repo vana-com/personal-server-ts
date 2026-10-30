@@ -10,6 +10,7 @@ import {
   type DeleteScopeResult,
 } from "../workers/delete.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
+import { createTombstoneResubmitTracker } from "../tombstone-resubmits.js";
 import type {
   DeleteDataPort,
   PendingBlobDeletionStore,
@@ -110,6 +111,8 @@ export function createSyncManager(
   // attempted once per session, not once per cycle; transient storage errors
   // back off exponentially instead of re-firing on every cycle.
   const downloadRetryMemory = createDownloadRetryMemory();
+  // Re-submissions of deletes whose tombstone failed (bounded per boot).
+  const tombstoneResubmits = createTombstoneResubmitTracker();
   const dataPointFeed = downloadDeps.dataPointFeed ?? uploadDeps.dataPointFeed;
   const scopeDeletions =
     uploadDeps.scopeDeletions ?? downloadDeps.scopeDeletions;
@@ -255,6 +258,37 @@ export function createSyncManager(
     }
   }
 
+  function deleteScopeDeps() {
+    return {
+      storage: uploadDeps.storage,
+      serverOwner: uploadDeps.serverOwner,
+      deleteData: options?.deleteData,
+      pendingBlobDeletions: options?.pendingBlobDeletions,
+      tombstoneFinality: options?.tombstoneFinality,
+      scopeDeletions,
+      dataPointFeed,
+      logger: uploadDeps.logger,
+    };
+  }
+
+  /**
+   * Durable additions delete their ledger scope through `manager.deleteScope`,
+   * which queues behind the running mutation. Inside a cycle that must not be
+   * awaited, so it is started and left to run after the cycle.
+   */
+  function deleteAdditionsAfter(scope: string): void {
+    const additions = uploadDeps.additions;
+    if (!additions) return;
+    void Promise.resolve()
+      .then(() => additions.deleteScope(scope))
+      .catch((err: unknown) => {
+        uploadDeps.logger.warn(
+          { scope, error: (err as Error).message },
+          "Could not delete the additions ledger of a re-deleted scope",
+        );
+      });
+  }
+
   async function runUploadCycle(): Promise<void> {
     try {
       await retryPendingBlobDeletions({
@@ -265,6 +299,25 @@ export function createSyncManager(
         serverOwner: uploadDeps.serverOwner,
         storage: uploadDeps.storage,
         logger: uploadDeps.logger,
+        ...(options?.tombstoneFinality && options.deleteData
+          ? {
+              tombstoneResubmits,
+              // Already inside the mutation queue: call the worker directly.
+              async resubmitDeletion(scope: string) {
+                const result = await deleteScope(deleteScopeDeps(), scope);
+                if (result.durable) deleteAdditionsAfter(scope);
+                return result;
+              },
+              onDeletionAbandoned(state) {
+                pushError({
+                  fileId: null,
+                  scope: state.scope,
+                  message: `Deletion of ${state.scope} did not complete: the gateway tombstone failed ${state.attempts + 1} times and the data is live again. Delete it again to retry.`,
+                  timestamp: new Date().toISOString(),
+                });
+              },
+            }
+          : {}),
       });
     } catch (err) {
       uploadDeps.logger.warn(
@@ -396,6 +449,7 @@ export function createSyncManager(
         pendingFiles,
         hydratedScopes: [...hydratedScopes],
         errors: [...errors],
+        deletions: tombstoneResubmits.snapshot(),
       };
     },
 
@@ -418,21 +472,11 @@ export function createSyncManager(
     },
 
     async deleteScope(scope: string) {
-      const result = await exclusive(() =>
-        deleteScope(
-          {
-            storage: uploadDeps.storage,
-            serverOwner: uploadDeps.serverOwner,
-            deleteData: options?.deleteData,
-            pendingBlobDeletions: options?.pendingBlobDeletions,
-            tombstoneFinality: options?.tombstoneFinality,
-            scopeDeletions,
-            dataPointFeed,
-            logger: uploadDeps.logger,
-          },
-          scope,
-        ),
-      );
+      const result = await exclusive(() => {
+        // A delete the user asks for starts a fresh set of re-submissions.
+        tombstoneResubmits.reset(scope);
+        return deleteScope(deleteScopeDeps(), scope);
+      });
       if (result.durable && uploadDeps.additions)
         await uploadDeps.additions.deleteScope(scope);
       return result;
