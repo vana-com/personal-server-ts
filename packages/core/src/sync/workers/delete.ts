@@ -1116,7 +1116,8 @@ export async function retryPendingBlobDeletions(
  * no newer version of the scope exists). Re-submit the delete through the
  * ordinary delete path, but only over exactly the head the user's tombstone
  * replaced: the queued range marker remembers that head, the inventory read
- * reports the restored one, and the port refuses any other. A write that
+ * reports the restored one, and the port refuses any other. A different
+ * restored head is reported once as a failed delete instead. A write that
  * recovered a failed slot below the tombstone, or that lands between the read
  * and the re-submission, is therefore never deleted. This replica's own
  * index is checked too: any unsynced entry (written after the delete erased
@@ -1150,18 +1151,6 @@ async function resubmitRolledBackDeletion(
       BigInt(marker.range.to) === BigInt(failedVersion) &&
       marker.replacedHead,
   )?.replacedHead;
-  if (!remembered || !sameHead(remembered, rollback.head)) {
-    logger.info(
-      {
-        scope,
-        tombstoneVersion: failedVersion,
-        head: rollback.head.expectedVersion,
-        remembered: remembered?.expectedVersion ?? null,
-      },
-      "Scope tombstone failed, but the registry head is not the one the delete replaced; not deleting it again",
-    );
-    return;
-  }
   if (readdedLocally(deps.storage, scope, failedVersion)) {
     logger.info(
       { scope, tombstoneVersion: failedVersion },
@@ -1170,6 +1159,23 @@ async function resubmitRolledBackDeletion(
     return;
   }
   if (tracker.exhausted(scope)) return;
+  if (!remembered || !sameHead(remembered, rollback.head)) {
+    // The user's delete did not happen and the scope is live again, but the
+    // restored head may be newer data, so it is not deleted automatically.
+    // Report it once, so no surface shows the scope as deleted.
+    const state = tracker.giveUp(scope, failedVersion, "head-changed");
+    logger.error(
+      {
+        scope,
+        tombstoneVersion: failedVersion,
+        head: rollback.head.expectedVersion,
+        remembered: remembered?.expectedVersion ?? null,
+      },
+      "Scope deletion did not complete: the gateway tombstone failed and the restored head is not the one the delete replaced, so it is not deleted again automatically. Delete it again to retry.",
+    );
+    deps.onDeletionAbandoned?.(state);
+    return;
+  }
   if (tracker.outOfAttempts(scope)) {
     const state = tracker.giveUp(scope, failedVersion);
     logger.error(
