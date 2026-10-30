@@ -343,7 +343,7 @@ function claimedSourceId(document: string): string | null {
 
 /**
  * The connector a source id belongs to — the last path segment of the URI
- * (`https://registry.pdpp.dev/connectors/spotify` → `spotify`). Falls back to
+ * (`https://registry.pdpp.dev/sources/spotify` → `spotify`). Falls back to
  * the whole id for an unparseable value, so an odd source fails the supported
  * check rather than silently matching a connector it is not.
  */

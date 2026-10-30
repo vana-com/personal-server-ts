@@ -30,7 +30,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 
 const snapshot: DeclarationSnapshot = {
-  source_id: "https://registry.pdpp.dev/connectors/spotify",
+  source_id: "https://registry.pdpp.dev/sources/spotify",
   source_kind: "connector",
   version: "2026-08-11",
   digest: "d".repeat(64),

@@ -31,7 +31,7 @@ const logger = pino({ level: "silent" });
 const OWNER = "user_abc123";
 const OTHER_OWNER = "user_other";
 const REDIRECT = "https://app.example.com/callback";
-const SOURCE_ID = "https://registry.pdpp.dev/connectors/spotify";
+const SOURCE_ID = "https://registry.pdpp.dev/sources/spotify";
 const OWNER_INSTANCE = "spotify-account-a";
 /** RFC 7636 §4.1 verifier + its S256 challenge, used by every code flow here. */
 const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -518,7 +518,7 @@ describe("§9 AS item 5 — Source validation failures map to RFC 9396", () => {
     const response = await post(
       "/pdpp/v1/authorize",
       selectionBody({
-        source: { id: "https://registry.pdpp.dev/connectors/nope" },
+        source: { id: "https://registry.pdpp.dev/sources/nope" },
       }),
     );
     expect(response.status).toBe(400);

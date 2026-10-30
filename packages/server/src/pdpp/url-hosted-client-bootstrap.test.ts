@@ -29,7 +29,7 @@ import * as clientDocumentFetch from "./client-document-fetch.js";
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 
-const SOURCE_ID = "https://registry.pdpp.dev/connectors/spotify";
+const SOURCE_ID = "https://registry.pdpp.dev/sources/spotify";
 const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const CHALLENGE = computeS256Challenge(VERIFIER);
 const REDIRECT = "https://client.example.com/callback";

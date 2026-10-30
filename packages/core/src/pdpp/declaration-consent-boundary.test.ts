@@ -26,7 +26,7 @@
 import { describe, expect, it } from "vitest";
 import { parseDeclaration } from "./declaration.js";
 
-const SOURCE_ID = "https://registry.pdpp.dev/connectors/conformance";
+const SOURCE_ID = "https://registry.pdpp.dev/sources/conformance";
 
 function normativeDocument(consentTimeField?: string): string {
   return JSON.stringify({
