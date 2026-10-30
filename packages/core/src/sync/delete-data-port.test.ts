@@ -116,6 +116,11 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
       dataPointId: DATA_POINT_ID,
       version: "4",
       deletedAt: "2026-08-25T10:00:00.000Z",
+      replaced: {
+        expectedVersion: "3",
+        dataHash: "0x" + "11".repeat(32),
+        metadataHash: "0x" + "22".repeat(32),
+      },
     });
   });
 
@@ -190,28 +195,47 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     expect(outcome).toMatchObject({ status: "tombstoned", version: "8" });
   });
 
-  it("with a fence, refuses to tombstone a head at or above it and never re-signs on a 409", async () => {
-    const fetchImpl = vi.fn(async () =>
+  it("with a fence, tombstones only the exact head it names and never re-signs on a 409", async () => {
+    const head = {
+      expectedVersion: "3",
+      dataHash: "0x" + "11".repeat(32),
+      metadataHash: "0x" + "22".repeat(32),
+    };
+    const stale = vi.fn(async () =>
       jsonResponse(409, {
         error: "Stale expectedVersion",
         nextExpectedVersion: "5",
       }),
     );
-    // Head v3: the fenced tombstone may take v4 at most.
     const { port, signAddData } = makePort(
       liveRecord(),
-      fetchImpl as unknown as typeof fetch,
+      stale as unknown as typeof fetch,
     );
-    await expect(port.tombstone(SCOPE, { atOrBelow: "3" })).rejects.toThrow(
-      /newer version/,
-    );
-    expect(fetchImpl).not.toHaveBeenCalled();
+    // Same version, other bytes: a re-add recovered the slot.
+    await expect(
+      port.tombstone(SCOPE, {
+        head: { ...head, dataHash: "0x" + "33".repeat(32) },
+      }),
+    ).rejects.toThrow(/not the one/);
+    await expect(
+      port.tombstone(SCOPE, { head: { ...head, expectedVersion: "2" } }),
+    ).rejects.toThrow(/not the one/);
+    expect(stale).not.toHaveBeenCalled();
 
-    await expect(port.tombstone(SCOPE, { atOrBelow: "4" })).rejects.toThrow(
-      /newer version/,
+    // Exact head, but another writer moved it before the POST: stop.
+    await expect(port.tombstone(SCOPE, { head })).rejects.toThrow(
+      /not the one/,
     );
     expect(signAddData).toHaveBeenCalledTimes(1);
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(stale).toHaveBeenCalledTimes(1);
+
+    const ok = vi.fn(async () =>
+      jsonResponse(200, { data: { expectedVersion: "4", deletedAt: null } }),
+    );
+    const fenced = makePort(liveRecord(), ok as unknown as typeof fetch);
+    await expect(fenced.port.tombstone(SCOPE, { head })).resolves.toMatchObject(
+      { status: "tombstoned", version: "4", replaced: head },
+    );
   });
 
   it("takes the winning tombstone's version from a 410 body, not the version it attempted", async () => {

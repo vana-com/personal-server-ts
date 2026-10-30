@@ -50,6 +50,12 @@ describe("createFilePendingBlobDeletionStore", () => {
       version: null,
       range: { from: "1", to: "4" },
       tombstoneVersion: "4",
+      // The live head the tombstone replaced, for a fenced re-submission.
+      replacedHead: {
+        expectedVersion: "3",
+        dataHash: "0x" + "ab".repeat(32),
+        metadataHash: "0x" + "cd".repeat(32),
+      },
     };
     await createFilePendingBlobDeletionStore(path).add([gated, range]);
 

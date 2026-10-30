@@ -116,14 +116,25 @@ export function createInventoryTombstoneFinality(
     }
     // An unfinished traversal can only under-report: keys wait longer, and
     // it never reports a rollback it did not see to the end.
-    let rolledBack: string | null = null;
+    let rolledBack: TombstoneFinalityState["rolledBack"] = null;
     if (complete && !settling && top?.failedTombstone) {
-      const live =
+      const restored =
         head !== null &&
         head.deletedAt === null &&
         !isTombstoneRecord(head) &&
-        BigInt(head.expectedVersion) < top.version;
-      if (live) rolledBack = top.version.toString();
+        BigInt(head.expectedVersion) < top.version
+          ? head
+          : null;
+      if (restored) {
+        rolledBack = {
+          tombstoneVersion: top.version.toString(),
+          head: {
+            expectedVersion: restored.expectedVersion,
+            dataHash: restored.dataHash,
+            metadataHash: restored.metadataHash,
+          },
+        };
+      }
     }
     return {
       finalized: finalized === null ? null : finalized.toString(),
