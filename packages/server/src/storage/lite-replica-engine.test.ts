@@ -4,6 +4,7 @@
  * both hosts, the Lite side over the Lite ports (SQLite-backed persistence
  * double, in-memory native transfers sharing the network's object store).
  */
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDpv2ReplicaTransport } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
@@ -19,11 +20,15 @@ import {
   createLiteReplicaStorage,
   createLiteReplicationRuntime,
   LITE_CANONICAL_MAX_OPERATION_BYTES,
+  LITE_REPLICA_SQL_BYTES,
   LITE_REPLICATION_LIMITS,
   type LiteReplicaPersistence,
 } from "@opendatalabs/personal-server-ts-lite";
 import { createMemoryReplicaObjectTransfers } from "../../../lite/src/test-support/replication.js";
-import { createSqliteLiteReplicaPersistence } from "./lite-replica-sqlite.test-utils.js";
+import {
+  createSqliteLiteReplicaPersistence,
+  previousRawSqlBytes,
+} from "./lite-replica-sqlite.test-utils.js";
 import {
   at,
   binding,
@@ -150,7 +155,11 @@ function crashable(inner: LiteReplicaPersistence) {
  */
 async function liteDevice(
   net: Network,
-  opts: { enabled?: boolean; maxBlobBytes?: number } = {},
+  opts: {
+    enabled?: boolean;
+    maxBlobBytes?: number;
+    targetChunkBytes?: number;
+  } = {},
 ) {
   const path = join(scratchDirectory("lite-engine"), "native.sqlite");
   const context = () => ({
@@ -241,7 +250,7 @@ async function liteDevice(
         transport,
         authority,
         now: clock.now,
-        targetChunkBytes: 4000,
+        targetChunkBytes: opts.targetChunkBytes ?? 4000,
         maxBlobBytes: opts.maxBlobBytes ?? 8192,
       },
     });
@@ -333,6 +342,200 @@ async function run(devices: Device[], n = 12) {
     clock.advance(10_000);
     for (const device of devices) await device.cycle();
   }
+}
+
+/** Rebuild one due preparation without allowing later publish phases to run. */
+async function rebuildOnePreparation(
+  lite: LiteDevice,
+  batch: string,
+  attempts = 5,
+) {
+  const states: string[] = [];
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const db = lite.native().db;
+    db.prepare(
+      "UPDATE pdpp_transport_coordinator SET rotation_json=? WHERE id=1",
+    ).run(JSON.stringify({ nextPhase: "prepare", writers: {} }));
+    clock.advance(10_000);
+    await lite.engine.step({ budget: { units: 1 } });
+    const preparation = db
+      .prepare(
+        "SELECT state,wait_json FROM pdpp_transport_preparation WHERE batch=?",
+      )
+      .get(batch) as { state: string; wait_json: string | null };
+    states.push(preparation.state);
+    if (preparation.state === "prepared" && preparation.wait_json === null)
+      return;
+    if (
+      !["preparing", "rebuilding"].includes(preparation.state) ||
+      preparation.wait_json
+    )
+      throw new Error(
+        `legacy preparation state: ${JSON.stringify(preparation)}`,
+      );
+  }
+  throw new Error(`legacy preparation did not finish: ${states.join(",")}`);
+}
+
+function payloadSnapshot(
+  db: ReturnType<LiteDevice["native"]>["db"],
+  batch: string,
+) {
+  const rows = db
+    .prepare(
+      "SELECT bytes FROM pdpp_binary_chunks WHERE namespace='payload' AND blob_id=? ORDER BY position",
+    )
+    .all(batch) as { bytes: Buffer }[];
+  const bytes = Buffer.concat(rows.map((row) => row.bytes));
+  const manifest = db
+    .prepare(
+      "SELECT size_bytes FROM pdpp_binary_manifests WHERE namespace='payload' AND blob_id=?",
+    )
+    .get(batch) as { size_bytes: number } | undefined;
+  return {
+    size: manifest?.size_bytes,
+    bytes: bytes.byteLength,
+    digest: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+
+async function preparedMultipartFixture() {
+  const net = network();
+  const lite = await liteDevice(net, {
+    maxBlobBytes: 8 * 1024 * 1024,
+    targetChunkBytes: 512 * 1024,
+  });
+  await lite.cycle();
+  await lite.put("seed", "seed");
+  await run([lite], 8);
+  const restoreNetwork = net.snapshot();
+  lite.offline(true);
+  const boundaryBytes = 512 * 1024;
+  const marker = "漢🙂";
+  const markerBytes = Buffer.byteLength(marker);
+  const text =
+    "x".repeat(boundaryBytes - 64) +
+    marker +
+    "x".repeat(boundaryBytes - markerBytes) +
+    marker +
+    "x".repeat(300_000);
+  await lite.put(text, "integrity-large");
+
+  const db = lite.native().db;
+  const retained = await prepareWithoutPublishing(
+    lite,
+    restoreNetwork,
+    `SELECT r.batch,r.position FROM pdpp_transport_operation_retention r
+     WHERE r.representation='parts' ORDER BY r.batch,r.position LIMIT 1`,
+  );
+  const batch = retained.batch;
+  const position = retained.position;
+  const parts = db
+    .prepare(
+      "SELECT part,json FROM pdpp_transport_operation_parts WHERE batch=? AND position=? ORDER BY part",
+    )
+    .all(batch, position) as { part: number; json: string }[];
+  expect(parts.length).toBeGreaterThanOrEqual(3);
+  expect(
+    db
+      .prepare("SELECT state FROM pdpp_transport_preparation WHERE batch=?")
+      .get(batch),
+  ).toEqual({ state: "prepared" });
+
+  const state = db
+    .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+    .get() as { sequence: number };
+  return {
+    net,
+    lite,
+    batch,
+    position,
+    text,
+    parts,
+    sequence: state.sequence,
+    payload: payloadSnapshot(db, batch),
+    publishedFragmentCalls: net.calls.puts.length,
+    registrationCalls: net.calls.registrations.length,
+  };
+}
+
+async function prepareWithoutPublishing(
+  lite: LiteDevice,
+  restoreNetwork: () => void,
+  lookupSql: string,
+  params: readonly unknown[] = [],
+) {
+  await run([lite], 16);
+  const db = lite.native().db;
+  const retained = db.prepare(lookupSql).get(...params) as
+    { batch: string; position: number } | undefined;
+  if (!retained) throw new Error("batch was not retained");
+  const manifest = db
+    .prepare(
+      "SELECT scope,version FROM pdpp_transport_manifests_out WHERE batch=?",
+    )
+    .get(retained.batch) as { scope: string; version: number } | undefined;
+  const previous = db
+    .prepare("SELECT previous_json FROM pdpp_transport_batches WHERE batch=?")
+    .get(retained.batch) as { previous_json: string | null };
+  const preparation = db
+    .prepare("SELECT version FROM pdpp_transport_preparation WHERE batch=?")
+    .get(retained.batch) as { version: number };
+  const ack = db
+    .prepare("SELECT value FROM lite_kv WHERE key='outbox-ack'")
+    .get() as { value: string } | undefined;
+
+  // The fixture holds the durable local preparation before publication. The
+  // test network is restored to its pre-write snapshot, then local upload and
+  // registration witnesses from the setup run are removed with their bytes.
+  restoreNetwork();
+  db.prepare("DELETE FROM pdpp_transport_upload_attempts WHERE batch=?").run(
+    retained.batch,
+  );
+  db.prepare("DELETE FROM pdpp_transport_fragments_out WHERE batch=?").run(
+    retained.batch,
+  );
+  db.prepare("DELETE FROM pdpp_transport_manifests_out WHERE batch=?").run(
+    retained.batch,
+  );
+  db.prepare(
+    "DELETE FROM pdpp_transport_registration_recovery WHERE batch=?",
+  ).run(retained.batch);
+  db.prepare(
+    "DELETE FROM pdpp_transport_registration_intents WHERE version=?",
+  ).run(manifest?.version ?? preparation.version);
+  db.prepare("UPDATE pdpp_transport_state SET previous_json=? WHERE id=1").run(
+    previous.previous_json,
+  );
+  if (ack)
+    db.prepare("UPDATE lite_kv SET value=? WHERE key='outbox-ack'").run(
+      ack.value,
+    );
+  else db.prepare("DELETE FROM lite_kv WHERE key='outbox-ack'").run();
+  db.prepare(
+    "UPDATE pdpp_transport_preparation SET state='prepared',wait_json=NULL WHERE batch=?",
+  ).run(retained.batch);
+  db.prepare("UPDATE pdpp_transport_batches SET prepared=1 WHERE batch=?").run(
+    retained.batch,
+  );
+  const effects = db
+    .prepare(
+      `SELECT
+         (SELECT count(*) FROM pdpp_transport_upload_attempts WHERE batch=?) AS uploads,
+         (SELECT count(*) FROM pdpp_transport_registration_intents WHERE version=?) AS intents,
+         (SELECT count(*) FROM pdpp_transport_fragments_out WHERE batch=? AND (state<>'ready' OR attempts>0)) AS fragments,
+         (SELECT count(*) FROM pdpp_transport_manifests_out WHERE batch=? AND (state<>'ready' OR attempts>0)) AS manifests`,
+    )
+    .get(retained.batch, preparation.version, retained.batch, retained.batch);
+  if (
+    Object.values(effects as Record<string, number>).some(
+      (count) => count !== 0,
+    )
+  )
+    throw new Error(
+      `fixture still has publish witnesses: ${JSON.stringify(effects)}`,
+    );
+  return retained;
 }
 
 /** Records both writers wrote: their own, the other's and one shared key. */
@@ -708,6 +911,7 @@ describe("PS-Lite replication engine: writer changes and bounded storage", () =>
         if (!lite.process.dead) throw error;
       });
     }
+
     expect(lite.process.dead).toBe(true);
     lite.crashReopen();
     expect(receipts()).toBe(imported);
@@ -782,13 +986,764 @@ describe("PS-Lite replication engine: writer changes and bounded storage", () =>
     expect(held()).toEqual(before);
   }, 60_000);
 
+  it("bounds serialized Lite SQL contract inputs and replies for escaped preparation rows", async () => {
+    const net = network();
+    const lite = await liteDevice(net, {
+      maxBlobBytes: 8 * 1024 * 1024,
+      targetChunkBytes: 512 * 1024,
+    });
+    await lite.cycle();
+    await lite.put("seed", "seed");
+    await run([lite], 8);
+
+    // Each canonical operation is about 300 KiB. Backslashes double in the
+    // SQL reply's JSON string; CJK and emoji exercise UTF-8 boundaries too.
+    const escaped = (id: string) =>
+      `${"\\".repeat(149_000)}${id}漢字🙂${"\\".repeat(1_000)}`;
+    const first = escaped("first");
+    const second = escaped("second");
+    await lite.put(first, "escaped-1");
+    await lite.put(second, "escaped-2");
+    // Force an outgoing SQL parameter near the 512 KiB raw-part cap to be
+    // mostly backslashes, whose compact JSON contract representation is almost 1 MiB.
+    const partEscaped = "\\".repeat(260_000);
+    await lite.put(partEscaped, "escaped-part");
+
+    await run([lite], 20);
+
+    const wire = lite.native().sqlWireStats();
+    expect(wire.rawObserverAcceptedOverflows).toBe(0);
+    expect(wire.maxRequestBytes).toBeLessThanOrEqual(LITE_REPLICA_SQL_BYTES);
+    expect(wire.maxRequestBytes).toBeGreaterThan(1_000_000);
+    expect(Math.max(...wire.maxRequestParameterBytes)).toBeGreaterThan(
+      1_000_000,
+    );
+    expect(wire.maxReplyBytes).toBeLessThanOrEqual(LITE_REPLICA_SQL_BYTES);
+    expect(wire.maxReplyBytes).toBeGreaterThan(1_000_000);
+
+    // Re-run the former page shape over these retained outcomes. Its raw
+    // byte total fits even though the PS host's JSON reply envelope does not.
+    const db = lite.native().db;
+    const batch = (
+      db
+        .prepare(
+          "SELECT batch FROM pdpp_transport_operation_outcomes WHERE operation_json LIKE '%escaped-1%' LIMIT 1",
+        )
+        .get() as { batch: string }
+    ).batch;
+    const previousPageSql = `WITH pieces AS (
+      SELECT o.position,0 AS part,o.operation_json,o.encoding_failed
+      FROM pdpp_transport_operation_outcomes o
+      WHERE o.batch=? AND o.outcome IS NULL AND o.operation_json IS NOT NULL
+      UNION ALL
+      SELECT o.position,0 AS part,NULL AS operation_json,o.encoding_failed
+      FROM pdpp_transport_operation_outcomes o
+      WHERE o.batch=? AND o.outcome IS NULL AND o.operation_json IS NULL
+        AND o.encoding_failed=1
+      UNION ALL
+      SELECT p.position,p.part,p.json AS operation_json,o.encoding_failed
+      FROM pdpp_transport_operation_parts p
+      JOIN pdpp_transport_operation_outcomes o
+        ON o.batch=p.batch AND o.position=p.position
+      WHERE p.batch=? AND o.outcome IS NULL
+    ), remaining AS (
+      SELECT position,part,operation_json,encoding_failed,
+        sum(length(CAST(coalesce(operation_json,'') AS BLOB))) OVER (
+          ORDER BY position,part ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) - length(CAST(coalesce(operation_json,'') AS BLOB)) AS bytes_before
+      FROM pieces
+      WHERE position>? OR (position=? AND part>?)
+    )
+    SELECT position,part,operation_json,encoding_failed FROM remaining
+    WHERE bytes_before<? ORDER BY position,part`;
+    const previousParams = [batch, batch, batch, -1, -1, -1, 512 * 1024];
+    const previousRows = db
+      .prepare(previousPageSql)
+      .all(...previousParams) as Record<string, unknown>[];
+    const previousRawBytes = previousRawSqlBytes(
+      previousPageSql,
+      previousParams,
+      previousRows,
+    );
+    const previousReplyBytes = Buffer.byteLength(
+      JSON.stringify({ ok: true, value: previousRows }),
+    );
+    const previousOperations = previousRows
+      .map(
+        (row) =>
+          JSON.parse(row.operation_json as string) as {
+            data?: { id?: string };
+          },
+      )
+      .map((operation) => operation.data?.id);
+    expect(previousOperations).toContain("escaped-1");
+    expect(previousOperations).toContain("escaped-2");
+    expect(previousRawBytes).toBeLessThanOrEqual(LITE_REPLICA_SQL_BYTES);
+    expect(previousReplyBytes).toBeGreaterThan(LITE_REPLICA_SQL_BYTES);
+    expect(await lite.get("escaped-1")).toEqual({
+      id: "escaped-1",
+      text: first,
+    });
+    expect(await lite.get("escaped-2")).toEqual({
+      id: "escaped-2",
+      text: second,
+    });
+    expect(await lite.get("escaped-part")).toEqual({
+      id: "escaped-part",
+      text: partEscaped,
+    });
+    expect(
+      lite
+        .native()
+        .db.prepare(
+          "SELECT state FROM pdpp_transport_preparation WHERE batch=?",
+        )
+        .get(batch),
+    ).toEqual({ state: "prepared" });
+  }, 120_000);
+
+  it.each([
+    "middle part removed",
+    "all parts removed",
+    "same-length valid edit",
+    "truncated part with matching digest",
+    "extra part index",
+    "negative part index",
+    "skipped part index",
+    "inline and parts both present",
+  ])(
+    "fails closed after restart when retained operation integrity is damaged: %s",
+    async (fault) => {
+      const fixture = await preparedMultipartFixture();
+      const db = fixture.lite.native().db;
+      const currentParts = [...fixture.parts];
+      const joined = currentParts.map((part) => part.json).join("");
+      const original = JSON.parse(joined) as { data: { text: string } };
+      expect(original.data.text).toBe(fixture.text);
+      const partBoundaries: number[] = [];
+      let boundaryOffset = 0;
+      for (const part of currentParts.slice(0, -1)) {
+        boundaryOffset += Buffer.byteLength(part.json);
+        partBoundaries.push(boundaryOffset);
+      }
+      const markerOffsets = [...joined.matchAll(/漢🙂/g)].map((match) =>
+        Buffer.byteLength(joined.slice(0, match.index!)),
+      );
+      expect(markerOffsets).toHaveLength(2);
+      for (const markerOffset of markerOffsets) {
+        expect(
+          Math.min(
+            ...partBoundaries.map((partBoundary) =>
+              Math.abs(partBoundary - markerOffset),
+            ),
+          ),
+        ).toBeLessThanOrEqual(128);
+      }
+
+      if (fault === "middle part removed") {
+        db.prepare(
+          "DELETE FROM pdpp_transport_operation_parts WHERE batch=? AND position=? AND part=1",
+        ).run(fixture.batch, fixture.position);
+        const changed = JSON.parse(
+          currentParts
+            .filter((part) => part.part !== 1)
+            .map((part) => part.json)
+            .join(""),
+        ) as { data: { text: string } };
+        expect(changed.data.text).not.toBe(fixture.text);
+      } else if (fault === "all parts removed") {
+        db.prepare(
+          "DELETE FROM pdpp_transport_operation_parts WHERE batch=? AND position=?",
+        ).run(fixture.batch, fixture.position);
+      } else if (fault === "same-length valid edit") {
+        const changed = currentParts[1]!.json.replace("x", "y");
+        expect(changed).toHaveLength(currentParts[1]!.json.length);
+        db.prepare(
+          "UPDATE pdpp_transport_operation_parts SET json=? WHERE batch=? AND position=? AND part=1",
+        ).run(changed, fixture.batch, fixture.position);
+        const changedOperation = JSON.parse(
+          currentParts
+            .map((part) => (part.part === 1 ? changed : part.json))
+            .join(""),
+        ) as { data: { text: string } };
+        expect(changedOperation.data.text).not.toBe(fixture.text);
+      } else if (fault === "truncated part with matching digest") {
+        const truncated = currentParts[1]!.json.slice(1);
+        db.prepare(
+          "UPDATE pdpp_transport_operation_parts SET json=? WHERE batch=? AND position=? AND part=1",
+        ).run(truncated, fixture.batch, fixture.position);
+        const changed = currentParts
+          .map((part) => (part.part === 1 ? truncated : part.json))
+          .join("");
+        expect(JSON.parse(changed)).toBeDefined();
+        db.prepare(
+          "UPDATE pdpp_transport_operation_retention SET operation_sha256=? WHERE batch=? AND position=?",
+        ).run(
+          `sha256:${createHash("sha256").update(changed).digest("hex")}`,
+          fixture.batch,
+          fixture.position,
+        );
+      } else if (fault === "extra part index") {
+        db.prepare(
+          "INSERT INTO pdpp_transport_operation_parts (batch,position,part,json) VALUES (?,?,?,?)",
+        ).run(
+          fixture.batch,
+          fixture.position,
+          currentParts.length,
+          "ignored-extra-part",
+        );
+      } else if (fault === "negative part index") {
+        db.prepare(
+          "UPDATE pdpp_transport_operation_parts SET part=-1 WHERE batch=? AND position=? AND part=1",
+        ).run(fixture.batch, fixture.position);
+      } else if (fault === "skipped part index") {
+        db.prepare(
+          "UPDATE pdpp_transport_operation_parts SET part=99 WHERE batch=? AND position=? AND part=1",
+        ).run(fixture.batch, fixture.position);
+      } else {
+        db.prepare(
+          "UPDATE pdpp_transport_operation_outcomes SET operation_json=? WHERE batch=? AND position=?",
+        ).run(joined, fixture.batch, fixture.position);
+      }
+
+      const retainedOutcome = db
+        .prepare(
+          "SELECT operation_json,encoding_failed FROM pdpp_transport_operation_outcomes WHERE batch=? AND position=?",
+        )
+        .get(fixture.batch, fixture.position);
+      const retainedMetadata = db
+        .prepare(
+          "SELECT representation,part_count,operation_bytes,operation_sha256 FROM pdpp_transport_operation_retention WHERE batch=? AND position=?",
+        )
+        .get(fixture.batch, fixture.position);
+      const retainedParts = db
+        .prepare(
+          "SELECT part,json FROM pdpp_transport_operation_parts WHERE batch=? AND position=? ORDER BY part",
+        )
+        .all(fixture.batch, fixture.position);
+
+      db.prepare(
+        "UPDATE pdpp_transport_preparation SET state='rebuilding',wait_json=NULL WHERE batch=?",
+      ).run(fixture.batch);
+      db.prepare(
+        "UPDATE pdpp_transport_batches SET prepared=-2 WHERE batch=?",
+      ).run(fixture.batch);
+      fixture.lite.crashReopen();
+      await run([fixture.lite], 8);
+
+      const reopened = fixture.lite.native().db;
+      const preparation = reopened
+        .prepare(
+          "SELECT state,wait_json FROM pdpp_transport_preparation WHERE batch=?",
+        )
+        .get(fixture.batch) as { state: string; wait_json: string | null };
+      expect(preparation.state).toBe("prep_failed_unknown");
+      expect(JSON.parse(preparation.wait_json!).dependency).toMatchObject({
+        kind: "preparation",
+        reason: "integrity",
+      });
+      expect(
+        reopened
+          .prepare(
+            "SELECT operation_json,encoding_failed FROM pdpp_transport_operation_outcomes WHERE batch=? AND position=?",
+          )
+          .get(fixture.batch, fixture.position),
+      ).toEqual(retainedOutcome);
+      expect(
+        reopened
+          .prepare(
+            "SELECT representation,part_count,operation_bytes,operation_sha256 FROM pdpp_transport_operation_retention WHERE batch=? AND position=?",
+          )
+          .get(fixture.batch, fixture.position),
+      ).toEqual(retainedMetadata);
+      expect(
+        reopened
+          .prepare(
+            "SELECT part,json FROM pdpp_transport_operation_parts WHERE batch=? AND position=? ORDER BY part",
+          )
+          .all(fixture.batch, fixture.position),
+      ).toEqual(retainedParts);
+      expect(
+        reopened
+          .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+          .get(),
+      ).toEqual({ sequence: fixture.sequence });
+      expect(
+        reopened
+          .prepare("SELECT prepared FROM pdpp_transport_batches WHERE batch=?")
+          .get(fixture.batch),
+      ).toEqual({ prepared: -2 });
+      expect(payloadSnapshot(reopened, fixture.batch)).toEqual(fixture.payload);
+      expect(fixture.net.calls.puts).toHaveLength(
+        fixture.publishedFragmentCalls,
+      );
+      expect(fixture.net.calls.registrations).toHaveLength(
+        fixture.registrationCalls,
+      );
+      expect(
+        reopened
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_transport_manifests_out WHERE batch=? AND state='published'",
+          )
+          .get(fixture.batch),
+      ).toEqual({ n: 0 });
+    },
+    120_000,
+  );
+
+  it("reopens and replays supported inline preparations from the pre-parts schema", async () => {
+    const net = network();
+    const lite = await liteDevice(net, {
+      maxBlobBytes: 1024 * 1024,
+      targetChunkBytes: 512 * 1024,
+    });
+    await lite.cycle();
+    await lite.put("seed", "seed");
+    await run([lite], 8);
+    const restoreNetwork = net.snapshot();
+    lite.offline(true);
+    const text = "legacy inline text ".repeat(10_000);
+    await lite.put(text, "legacy-small");
+
+    const db = lite.native().db;
+    const retained = await prepareWithoutPublishing(
+      lite,
+      restoreNetwork,
+      "SELECT batch,position FROM pdpp_transport_operation_outcomes WHERE operation_json LIKE '%legacy-small%' LIMIT 1",
+    );
+    const operation = db
+      .prepare(
+        "SELECT operation_json FROM pdpp_transport_operation_outcomes WHERE batch=? AND position=?",
+      )
+      .get(retained.batch, retained.position) as { operation_json: string };
+    expect(Buffer.byteLength(operation.operation_json)).toBeLessThanOrEqual(
+      256 * 1024 - 8 * 1024,
+    );
+    const batch = retained.batch;
+    const payload = payloadSnapshot(db, batch);
+    const sequence = (
+      db
+        .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+        .get() as {
+        sequence: number;
+      }
+    ).sequence;
+
+    // This matches the actual ea20eae pre-change schema: outcomes existed,
+    // but the parts and new retention metadata tables did not.
+    db.exec(
+      "DROP TABLE pdpp_transport_operation_retention; DROP TABLE pdpp_transport_operation_parts;",
+    );
+    expect(
+      db
+        .prepare(
+          "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('pdpp_transport_operation_retention','pdpp_transport_operation_parts')",
+        )
+        .get(),
+    ).toEqual({ n: 0 });
+
+    for (let replay = 0; replay < 2; replay++) {
+      const current = lite.native().db;
+      if (replay > 0) {
+        current
+          .prepare(
+            "UPDATE pdpp_transport_preparation SET state='rebuilding',wait_json=NULL WHERE batch=?",
+          )
+          .run(batch);
+        current
+          .prepare(
+            "UPDATE pdpp_transport_batches SET prepared=-2 WHERE batch=?",
+          )
+          .run(batch);
+      }
+      lite.crashReopen();
+      await rebuildOnePreparation(lite, batch);
+
+      const reopened = lite.native().db;
+      expect(
+        reopened
+          .prepare(
+            "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('pdpp_transport_operation_retention','pdpp_transport_operation_parts')",
+          )
+          .get(),
+      ).toEqual({ n: 2 });
+      const legacyState = reopened
+        .prepare(
+          "SELECT state,wait_json FROM pdpp_transport_preparation WHERE batch=?",
+        )
+        .get(batch) as { state: string; wait_json: string | null };
+      expect(legacyState).toEqual({ state: "prepared", wait_json: null });
+      expect(
+        reopened
+          .prepare(
+            "SELECT operation_json FROM pdpp_transport_operation_outcomes WHERE batch=? AND position=?",
+          )
+          .get(batch, retained.position),
+      ).toEqual({ operation_json: operation.operation_json });
+      expect(
+        reopened
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_transport_operation_retention WHERE batch=?",
+          )
+          .get(batch),
+      ).toEqual({ n: 0 });
+      expect(payloadSnapshot(reopened, batch)).toEqual(payload);
+      expect(
+        reopened
+          .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+          .get(),
+      ).toEqual({ sequence });
+      expect(await lite.get("legacy-small")).toEqual({
+        id: "legacy-small",
+        text,
+      });
+    }
+  }, 120_000);
+
+  it("reopens a near-bound legacy inline preparation without publishing", async () => {
+    const net = network();
+    const lite = await liteDevice(net, {
+      maxBlobBytes: 1024 * 1024,
+      targetChunkBytes: 512 * 1024,
+    });
+    await lite.cycle();
+    await lite.put("seed", "seed");
+    await run([lite], 8);
+    const restoreNetwork = net.snapshot();
+    lite.offline(true);
+    const text = "\\".repeat(250_000);
+    await lite.put(text, "legacy-near-bound");
+
+    const db = lite.native().db;
+    const retained = await prepareWithoutPublishing(
+      lite,
+      restoreNetwork,
+      "SELECT batch,position FROM pdpp_transport_operation_outcomes WHERE operation_json LIKE '%legacy-near-bound%' LIMIT 1",
+    );
+    const operation = db
+      .prepare(
+        "SELECT operation_json FROM pdpp_transport_operation_outcomes WHERE batch=? AND position=?",
+      )
+      .get(retained.batch, retained.position) as { operation_json: string };
+    expect(Buffer.byteLength(operation.operation_json)).toBeGreaterThan(
+      256 * 1024 - 8 * 1024,
+    );
+    expect(Buffer.byteLength(operation.operation_json)).toBeLessThanOrEqual(
+      512 * 1024,
+    );
+    const batch = retained.batch;
+    const payload = payloadSnapshot(db, batch);
+    const sequence = (
+      db
+        .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+        .get() as {
+        sequence: number;
+      }
+    ).sequence;
+    // The pushed PR511 schema already had parts; this upgrade adds retention metadata.
+    expect(
+      db
+        .prepare(
+          "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name='pdpp_transport_operation_parts'",
+        )
+        .get(),
+    ).toEqual({ n: 1 });
+    db.exec("DROP TABLE pdpp_transport_operation_retention;");
+    db.prepare(
+      "UPDATE pdpp_transport_preparation SET state='rebuilding',wait_json=NULL WHERE batch=?",
+    ).run(batch);
+    db.prepare(
+      "UPDATE pdpp_transport_batches SET prepared=-2 WHERE batch=?",
+    ).run(batch);
+    const fragmentCalls = net.calls.puts.length;
+    const registrationCalls = net.calls.registrations.length;
+    lite.crashReopen();
+    await rebuildOnePreparation(lite, batch, 64);
+
+    const reopened = lite.native().db;
+    const preparation = reopened
+      .prepare(
+        "SELECT state,wait_json FROM pdpp_transport_preparation WHERE batch=?",
+      )
+      .get(batch) as { state: string; wait_json: string | null };
+    expect(preparation).toEqual({ state: "prepared", wait_json: null });
+    expect(payloadSnapshot(reopened, batch)).toEqual(payload);
+    expect(
+      reopened
+        .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+        .get(),
+    ).toEqual({ sequence });
+    expect(
+      reopened
+        .prepare("SELECT prepared FROM pdpp_transport_batches WHERE batch=?")
+        .get(batch),
+    ).toEqual({ prepared: 1 });
+    expect(net.calls.puts).toHaveLength(fragmentCalls);
+    expect(net.calls.registrations).toHaveLength(registrationCalls);
+    expect(await lite.get("legacy-near-bound")).toEqual({
+      id: "legacy-near-bound",
+      text,
+    });
+    const wire = lite.native().sqlWireStats();
+    expect(wire.maxRequestBytes).toBeLessThanOrEqual(LITE_REPLICA_SQL_BYTES);
+    expect(wire.maxReplyBytes).toBeLessThanOrEqual(LITE_REPLICA_SQL_BYTES);
+    expect(wire.maxReplyBytes).toBeGreaterThan(1_000_000);
+  }, 120_000);
+
+  it("reads a large pre-parts Node inline preparation in bounded SQL slices", async () => {
+    const net = network();
+    const lite = await liteDevice(net, {
+      maxBlobBytes: 2 * 1024 * 1024,
+      targetChunkBytes: 512 * 1024,
+    });
+    await lite.cycle();
+    await lite.put("seed", "seed");
+    await run([lite], 8);
+    const restoreNetwork = net.snapshot();
+    lite.offline(true);
+    const text = `${"\\".repeat(449_995)}漢🙂${"\\".repeat(5)}`;
+    await lite.put(text, "legacy-node-large");
+
+    const db = lite.native().db;
+    const retained = await prepareWithoutPublishing(
+      lite,
+      restoreNetwork,
+      `SELECT o.batch,o.position FROM pdpp_transport_operation_outcomes o
+       JOIN pdpp_transport_operation_parts p USING(batch,position)
+       WHERE p.json LIKE '%legacy-node-large%' LIMIT 1`,
+    );
+    const operationParts = db
+      .prepare(
+        "SELECT json FROM pdpp_transport_operation_parts WHERE batch=? AND position=? ORDER BY part",
+      )
+      .all(retained.batch, retained.position) as { json: string }[];
+    expect(operationParts.length).toBeGreaterThan(1);
+    const operation = operationParts.map((part) => part.json).join("");
+    expect(Buffer.byteLength(operation)).toBeGreaterThan(512 * 1024);
+    const batch = retained.batch;
+    const payload = payloadSnapshot(db, batch);
+    const sequence = (
+      db
+        .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+        .get() as { sequence: number }
+    ).sequence;
+
+    // Model a supported pre-parts Node row: the old shared engine retained
+    // this admitted operation inline, before Lite introduced its 248 KiB cap.
+    db.prepare(
+      "UPDATE pdpp_transport_operation_outcomes SET operation_json=?,encoding_failed=0 WHERE batch=? AND position=?",
+    ).run(operation, batch, retained.position);
+    db.prepare(
+      "DELETE FROM pdpp_transport_operation_parts WHERE batch=? AND position=?",
+    ).run(batch, retained.position);
+    db.exec(
+      "DROP TABLE pdpp_transport_operation_retention; DROP TABLE pdpp_transport_operation_parts;",
+    );
+    db.prepare(
+      "UPDATE pdpp_transport_preparation SET state='rebuilding',wait_json=NULL WHERE batch=?",
+    ).run(batch);
+    db.prepare(
+      "UPDATE pdpp_transport_batches SET prepared=-2 WHERE batch=?",
+    ).run(batch);
+    const fragmentCalls = net.calls.puts.length;
+    const registrationCalls = net.calls.registrations.length;
+
+    lite.crashReopen();
+    await rebuildOnePreparation(lite, batch, 64);
+
+    const reopened = lite.native().db;
+    expect(
+      reopened
+        .prepare(
+          "SELECT state,wait_json FROM pdpp_transport_preparation WHERE batch=?",
+        )
+        .get(batch),
+    ).toEqual({ state: "prepared", wait_json: null });
+    expect(
+      reopened
+        .prepare(
+          "SELECT operation_json FROM pdpp_transport_operation_outcomes WHERE batch=? AND position=?",
+        )
+        .get(batch, retained.position),
+    ).toEqual({ operation_json: operation });
+    expect(payloadSnapshot(reopened, batch)).toEqual(payload);
+    expect(
+      reopened
+        .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+        .get(),
+    ).toEqual({ sequence });
+    expect(
+      reopened
+        .prepare("SELECT prepared FROM pdpp_transport_batches WHERE batch=?")
+        .get(batch),
+    ).toEqual({ prepared: 1 });
+    expect(net.calls.puts).toHaveLength(fragmentCalls);
+    expect(net.calls.registrations).toHaveLength(registrationCalls);
+    expect(await lite.get("legacy-node-large")).toEqual({
+      id: "legacy-node-large",
+      text,
+    });
+
+    const wire = lite.native().sqlWireStats();
+    expect(wire.maxRequestBytes).toBeLessThanOrEqual(LITE_REPLICA_SQL_BYTES);
+    expect(wire.maxReplyBytes).toBeLessThanOrEqual(LITE_REPLICA_SQL_BYTES);
+    expect(wire.maxReplyBytes).toBeLessThan(600_000);
+  }, 120_000);
+
+  it("holds pre-retention multipart preparations without releasing the payload", async () => {
+    const net = network();
+    const lite = await liteDevice(net, {
+      maxBlobBytes: 2 * 1024 * 1024,
+      targetChunkBytes: 512 * 1024,
+    });
+    await lite.cycle();
+    await lite.put("seed", "seed");
+    await run([lite], 8);
+    const restoreNetwork = net.snapshot();
+    lite.offline(true);
+    const text = "x".repeat(600_000);
+    await lite.put(text, "legacy-parts");
+
+    const db = lite.native().db;
+    const retained = await prepareWithoutPublishing(
+      lite,
+      restoreNetwork,
+      `SELECT o.batch,o.position FROM pdpp_transport_operation_outcomes o
+       JOIN pdpp_transport_operation_parts p USING(batch,position)
+       WHERE p.json LIKE '%legacy-parts%' LIMIT 1`,
+    );
+    const batch = retained.batch;
+    const payload = payloadSnapshot(db, batch);
+    const sequence = (
+      db
+        .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+        .get() as { sequence: number }
+    ).sequence;
+    const partRows = db
+      .prepare(
+        "SELECT part,json FROM pdpp_transport_operation_parts WHERE batch=? AND position=? ORDER BY part",
+      )
+      .all(batch, retained.position);
+    expect(partRows.length).toBeGreaterThan(1);
+    // Pushed PR511 kept parts without expected count/hash; never infer a new
+    // digest from whichever part rows happen to survive.
+    db.exec("DROP TABLE pdpp_transport_operation_retention;");
+    db.prepare(
+      "UPDATE pdpp_transport_preparation SET state='rebuilding',wait_json=NULL WHERE batch=?",
+    ).run(batch);
+    db.prepare(
+      "UPDATE pdpp_transport_batches SET prepared=-2 WHERE batch=?",
+    ).run(batch);
+    const fragmentCalls = net.calls.puts.length;
+    const registrationCalls = net.calls.registrations.length;
+
+    lite.crashReopen();
+    await expect(rebuildOnePreparation(lite, batch, 8)).rejects.toThrow(
+      "legacy preparation state",
+    );
+
+    const reopened = lite.native().db;
+    const preparation = reopened
+      .prepare(
+        "SELECT state,wait_json FROM pdpp_transport_preparation WHERE batch=?",
+      )
+      .get(batch) as { state: string; wait_json: string | null };
+    expect(preparation.state).toBe("prep_failed_unknown");
+    expect(JSON.parse(preparation.wait_json!).dependency).toMatchObject({
+      kind: "preparation",
+      reason: "integrity",
+    });
+    expect(
+      reopened
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_transport_operation_retention WHERE batch=?",
+        )
+        .get(batch),
+    ).toEqual({ n: 0 });
+    expect(
+      reopened
+        .prepare(
+          "SELECT part,json FROM pdpp_transport_operation_parts WHERE batch=? AND position=? ORDER BY part",
+        )
+        .all(batch, retained.position),
+    ).toEqual(partRows);
+    expect(payloadSnapshot(reopened, batch)).toEqual(payload);
+    expect(
+      reopened
+        .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
+        .get(),
+    ).toEqual({ sequence });
+    expect(
+      reopened
+        .prepare("SELECT prepared FROM pdpp_transport_batches WHERE batch=?")
+        .get(batch),
+    ).toEqual({ prepared: -2 });
+    expect(net.calls.puts).toHaveLength(fragmentCalls);
+    expect(net.calls.registrations).toHaveLength(registrationCalls);
+  }, 120_000);
+
+  it("prepares a large local operation through bounded native SQL", async () => {
+    const net = network();
+    const lite = await liteDevice(net, {
+      maxBlobBytes: 8 * 1024 * 1024,
+      targetChunkBytes: 512 * 1024,
+    });
+    await lite.cycle();
+    await lite.put("seed", "seed");
+    await run([lite], 8);
+
+    // This 8.5 MiB operation is over the phone's SQL call bound but within
+    // Lite's canonical value limit. Its retained prepare row must be split.
+    const text = "x".repeat(8_500_000);
+    const receipt = await lite.put(text, "large");
+    expect(receipt.operationCount).toBe(1);
+    expect(await lite.get("large")).toEqual({ id: "large", text });
+
+    await run([lite], 16);
+
+    // The SQLite-backed Lite SQL contract oracle enforces
+    // LITE_REPLICA_SQL_BYTES on each input and result. Reaching prepared proves
+    // the retained operation was read back without one oversized contract call.
+    const prepared = lite
+      .native()
+      .db.prepare(
+        `SELECT p.state,p.wait_json,b.sequence,b.prepared,b.admission_json,
+                b.total_bytes,m.state AS manifest_state,m.outcome AS manifest_outcome
+         FROM pdpp_transport_preparation p
+         JOIN pdpp_transport_batches b ON b.batch=p.batch
+         LEFT JOIN pdpp_transport_manifests_out m ON m.batch=p.batch
+         WHERE b.total_bytes>1000000 ORDER BY b.sequence DESC LIMIT 1`,
+      )
+      .get() as
+      { state: string; prepared: number; total_bytes: number } | undefined;
+    expect(prepared).toMatchObject({ state: "prepared", prepared: 1 });
+    expect(prepared?.total_bytes).toBeGreaterThan(1_000_000);
+    const stored = lite
+      .native()
+      .db.prepare(
+        `SELECT o.operation_json, count(p.part) AS parts,
+                max(length(CAST(p.json AS BLOB))) AS maxPartBytes
+         FROM pdpp_transport_operation_outcomes o
+         LEFT JOIN pdpp_transport_operation_parts p
+           ON p.batch=o.batch AND p.position=o.position
+         WHERE o.operation_json IS NULL AND o.encoding_failed=0
+         GROUP BY o.batch,o.position ORDER BY parts DESC LIMIT 1`,
+      )
+      .get() as
+      { operation_json: null; parts: number; maxPartBytes: number } | undefined;
+    expect(stored?.operation_json).toBeNull();
+    expect(stored?.parts).toBeGreaterThan(1);
+    expect(stored?.maxPartBytes).toBeLessThanOrEqual(512 * 1024);
+    expect(await lite.get("large")).toEqual({ id: "large", text });
+  }, 120_000);
+
   it("pairs the phone's operation bound with the limits version that re-admits held batches", () => {
     // A build that raises the bound must raise REPLICA_LIMITS_VERSION too, or
     // batches held under the old bound stay held after the upgrade.
     expect({
       bound: LITE_CANONICAL_MAX_OPERATION_BYTES,
       version: REPLICA_LIMITS_VERSION,
-    }).toEqual({ bound: 256 * 1024 - 8 * 1024, version: 2 });
+    }).toEqual({ bound: 17 * 1024 * 1024, version: 3 });
   });
 
   /**

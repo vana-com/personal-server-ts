@@ -88,6 +88,10 @@
       "types": "./dist/storage/pdpp-records/index.d.ts",
       "import": "./dist/storage/pdpp-records/index.js"
     },
+    "./storage/pdpp-import-job": {
+      "types": "./dist/storage/pdpp-import-job/index.d.ts",
+      "import": "./dist/storage/pdpp-import-job/index.js"
+    },
     "./storage/blocks": {
       "types": "./dist/storage/blocks/index.d.ts",
       "import": "./dist/storage/blocks/index.js"

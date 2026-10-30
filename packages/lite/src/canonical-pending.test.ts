@@ -7,7 +7,11 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/fixtures";
 import { createLiteCanonicalStore } from "./canonical-store.js";
 import { createFakeCanonicalPersistence } from "./test-support/canonical-persistence.js";
-import { replicaEnvelopeSchema } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import {
+  canonicalJson,
+  replicaEnvelopeSchema,
+} from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import { LITE_CANONICAL_MAX_OPERATION_BYTES } from "./canonical-persistence.js";
 import { REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES } from "@opendatalabs/personal-server-ts-core/replication/limits";
 
 function device() {
@@ -142,13 +146,26 @@ it("E9b stages and promotes a received envelope above 192 KiB within the native 
       ),
     ).toMatchObject({ data: { text: `${index} ${"x".repeat(1000)}` } });
 
+  const oversizedOperation = upsert(
+    "big",
+    2,
+    "y".repeat(LITE_CANONICAL_MAX_OPERATION_BYTES),
+  );
+  const operationBytes = new TextEncoder().encode(
+    canonicalJson(oversizedOperation),
+  ).byteLength;
+  expect(operationBytes).toBeGreaterThan(LITE_CANONICAL_MAX_OPERATION_BYTES);
+  console.info("PENDING_OPERATION_BOUNDARY_BYTES", {
+    operationBytes,
+    limit: LITE_CANONICAL_MAX_OPERATION_BYTES,
+  });
   await expect(
     store.stagePending({
       ...request,
       id: "oversized-operation",
       envelope: {
         ...envelope,
-        operations: [registration, upsert("big", 2, "y".repeat(256 * 1024))],
+        operations: [registration, oversizedOperation],
       },
     }),
   ).rejects.toMatchObject({ reason: "operation_too_large" });

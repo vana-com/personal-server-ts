@@ -259,6 +259,10 @@ const operationPath = (op: ReplicaOperation) => {
   return `${connectionPrefix(op.connectionId)}${suffix}${digest(op)}`;
 };
 const maxWindowBytes = 4 * 1024 * 1024;
+/** A local batch is at most 192 KiB, or one operation alone up to 17 MiB. */
+const localBatchFits = (operations: number, bytes: number) =>
+  bytes <= LITE_CANONICAL_BATCH_BYTES ||
+  (operations === 1 && bytes <= LITE_CANONICAL_MAX_OPERATION_BYTES);
 const encoder = new TextEncoder();
 /** Room for the revision (and its origin) a rebaseline adds to a draft. */
 const REVISION_MARGIN_BYTES = 1024;
@@ -324,7 +328,8 @@ async function logPage(
     const operation = await tx.get(entry.operationKey);
     if (!operation) throw new Error("missing immutable outbox operation");
     bytes += encoder.encode(operation).length;
-    if (bytes > 512 * 1024) break;
+    // A page holds its first operation whatever its size.
+    if (entries.length && bytes > 512 * 1024) break;
     entries.push({
       ...entry,
       operation: replicaOperationSchema.parse(JSON.parse(operation)),
@@ -1113,10 +1118,11 @@ export function createLiteCanonicalStore(deps: {
       throw new LiteCanonicalRefusal("wrong_owner", "wrong replica owner");
     // A local request id also fences the original, unrevised inputs after lost ack.
     const encoded = canonicalJson(local ? input.operations : envelope);
-    if (local && encoder.encode(encoded).length > LITE_CANONICAL_BATCH_BYTES)
+    const bytes = encoder.encode(encoded).length;
+    if (local && !localBatchFits(input.operations!.length, bytes))
       throw new LiteCanonicalRefusal(
         "batch_too_large",
-        "canonical batch exceeds 192 KiB; split before commit",
+        "canonical local batch exceeds 192 KiB (or 17 MiB for one operation); split before commit",
       );
     const fingerprint = `sha256:${sha256(toBytes(encoded)).slice(2)}`;
     return persistence.transaction(async (base) => {

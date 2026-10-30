@@ -117,6 +117,11 @@ import {
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import type { LiteReplicationRuntime } from "./replication-runtime.js";
 import {
+  createPdppImportJobs,
+  type PdppImportJobs,
+  type PdppImportJobsOptions,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-import-job";
+import {
   createDefaultPsLiteAccessLogStore,
   createDefaultPsLiteSaveConfig,
   createDefaultPsLiteTokenStore,
@@ -262,6 +267,17 @@ export interface PsLiteRuntimeOptions {
    * Defaults to a console warning.
    */
   onLegacyProjectionIssue?: (issue: LegacyProjectionIssue) => void;
+  /**
+   * PDPP import jobs (docs/261028-pdpp-import-job.md). When the host's storage
+   * adapter supplies the capability, `runtime.importJobs` runs resumable,
+   * byte-bounded imports against it, bound to `serverOwner`. Absent, the
+   * runtime is unchanged and whole-scope ingest stays the only write path.
+   * A `native-staged-copy` capability needs `encodeBatch`.
+   */
+  importJobs?: Pick<
+    PdppImportJobsOptions,
+    "capability" | "declarations" | "encodeBatch"
+  >;
 }
 
 export interface PsLiteRuntimeStateCapabilities {
@@ -287,6 +303,8 @@ interface PsLiteRuntimeStoreCapabilities {
 export interface PsLiteRuntime extends RuntimeAvailabilityPort {
   readonly kind: "ps-lite";
   readonly storage: PsLiteStorageAdapter | DataStoragePort;
+  /** Present only when the host supplied the import job capability. */
+  readonly importJobs?: PdppImportJobs;
   activate(): void;
   deactivate(): void;
   fetch(request: Request): Promise<Response>;
@@ -1032,9 +1050,19 @@ export function createPsLiteRuntime(
     return undefined;
   }
 
+  // The owner is read on every job operation; while it is missing, all refuse.
+  const importJobs =
+    options.importJobs &&
+    createPdppImportJobs({
+      ...options.importJobs,
+      owner: () => ownerAddress(),
+      now,
+    });
+
   return {
     kind: "ps-lite",
     storage: options.storage,
+    ...(importJobs ? { importJobs } : {}),
     activate() {
       active = true;
       options.syncManager?.start?.();

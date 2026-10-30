@@ -605,7 +605,7 @@ it("A5b resumes a legacy prepared=-2 resource Unsupported from its frozen payloa
     )
     .run(Number.MAX_SAFE_INTEGER);
   d.db.exec(
-    "DROP TABLE pdpp_transport_preparation; DROP TABLE pdpp_transport_operation_outcomes; DROP TABLE pdpp_transport_upload_attempts;",
+    "DROP TABLE pdpp_transport_preparation; DROP TABLE pdpp_transport_operation_outcomes; DROP TABLE pdpp_transport_operation_parts; DROP TABLE pdpp_transport_operation_retention; DROP TABLE pdpp_transport_upload_attempts;",
   );
   quantum.prepare = 50;
   d.reopen();

@@ -20,6 +20,7 @@ export default tseslint.config(
       "packages/core/src/additions/**/*.ts",
       "packages/core/src/replication/**/*.ts",
       "packages/core/src/storage/pdpp-records/completion.ts",
+      "packages/core/src/storage/pdpp-import-job/**/*.ts",
     ],
     ignores: [
       "**/*.test.ts",
@@ -33,6 +34,30 @@ export default tseslint.config(
           patterns: [
             { group: ["node:*"], message: "Keep this module browser-safe." },
           ],
+        },
+      ],
+    },
+  },
+  {
+    // Import jobs read spools in bounded windows (docs/261028-pdpp-import-job.md).
+    files: [
+      "packages/core/src/storage/pdpp-import-job/**/*.ts",
+      "packages/server/src/storage/pdpp-import-jobs-sqlite.ts",
+    ],
+    ignores: ["**/*.test.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector:
+            "CallExpression[callee.property.name=/^(readFile|readFileSync|readEnvelope|text|arrayBuffer|blob|json)$/]",
+          message:
+            "Import jobs never read a whole file; use bounded readSpool windows.",
+        },
+        {
+          selector: "CallExpression[callee.name=/^(readFile|readFileSync)$/]",
+          message:
+            "Import jobs never read a whole file; use bounded readSpool windows.",
         },
       ],
     },

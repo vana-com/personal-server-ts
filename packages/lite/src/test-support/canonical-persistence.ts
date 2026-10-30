@@ -1,11 +1,12 @@
 /** Crash oracle only. This adapter is not exported as durable mobile storage. */
 import { sha256 } from "viem";
 import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
-import type {
-  LiteBlobDescriptor,
-  LiteCanonicalPersistence,
-  LiteCanonicalTransaction,
-  LiteStorageEntry,
+import {
+  LITE_CANONICAL_MAX_VALUE_BYTES,
+  type LiteBlobDescriptor,
+  type LiteCanonicalPersistence,
+  type LiteCanonicalTransaction,
+  type LiteStorageEntry,
 } from "../canonical-persistence.js";
 
 export interface FakeCanonicalDisk {
@@ -32,8 +33,11 @@ export function storagePage(entries: LiteStorageEntry[], after?: string) {
   let size = 0;
   for (const entry of sorted) {
     const bytes = new TextEncoder().encode(entry.value).length;
-    if (bytes > 256 * 1024) throw new Error("native value exceeds 256 KiB");
-    if (page.length === 100 || size + bytes > 512 * 1024) break;
+    if (bytes > LITE_CANONICAL_MAX_VALUE_BYTES)
+      throw new Error("native value exceeds 18 MiB");
+    // A page holds its first entry whatever its size.
+    if (page.length === 100 || (page.length && size + bytes > 512 * 1024))
+      break;
     page.push(entry);
     size += bytes;
   }
@@ -93,8 +97,11 @@ export function createFakeCanonicalPersistence(disk = fakeCanonicalDisk()) {
             return rows.get(key);
           },
           async put(key, value) {
-            if (new TextEncoder().encode(value).length > 256 * 1024)
-              throw new Error("native value exceeds 256 KiB");
+            if (
+              new TextEncoder().encode(value).length >
+              LITE_CANONICAL_MAX_VALUE_BYTES
+            )
+              throw new Error("native value exceeds 18 MiB");
             rows.set(key, value);
             hit(writeCrashPoint(key));
           },

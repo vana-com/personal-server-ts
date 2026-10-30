@@ -729,6 +729,12 @@ export function createSqliteRecordStore(
     label: string;
   }): PdppInstanceBinding;
   deleteConnection(instance: string): PdppInstanceBinding;
+  /**
+   * Erase per-instance data that an extension of this store owns (the import
+   * job tables). Every erase of an instance runs it inside the erasing
+   * transaction: reset, deletion and transition archives.
+   */
+  onEraseInstance(erase: (instance: string) => void): void;
   getInstanceBinding(instance: string): PdppInstanceBinding;
   /**
    * Run synchronous reads against one SQLite read snapshot. A write from any
@@ -1835,6 +1841,7 @@ export function createSqliteRecordStore(
     });
   }
 
+  const instanceErasers: ((instance: string) => void)[] = [];
   function eraseInstanceData(instance: string): void {
     const transition = claudeTransition(instance);
     if (transition) {
@@ -1861,6 +1868,7 @@ export function createSqliteRecordStore(
     db.prepare("DELETE FROM pdpp_record_arrival WHERE instance = ?").run(
       instance,
     );
+    for (const erase of instanceErasers) erase(instance);
     deleteUnclaimedBlobs(db);
   }
 
@@ -2707,6 +2715,9 @@ export function createSqliteRecordStore(
     listConnections,
     registerConnection,
     deleteConnection,
+    onEraseInstance: (erase: (instance: string) => void) => {
+      instanceErasers.push(erase);
+    },
     ingestBatch,
     getInstanceBinding,
     listRetainedRecordData: (instance: string, stream: string) => {
