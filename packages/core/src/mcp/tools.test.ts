@@ -155,8 +155,14 @@ describe("mcp/tools", () => {
 
   it("describes remember as proactive, bounded and grant-gated", () => {
     const { description } = getTool("remember");
+    // Clients that drop server instructions (Hermes) and clients with their
+    // own memory tool (Claude Desktop) see only this text, so it names the
+    // words users actually say and claims the memory role.
+    expect(description).toContain("remember, note, save");
+    expect(description).toContain("instead of built-in memory");
     expect(description).toContain("without being asked");
-    expect(description).toContain("secrets");
+    expect(description).toContain("secrets, passwords or IDs");
+    expect(description).toContain("Tell the user");
     expect(description).toContain("write:<scope>");
     expect(description.length).toBeLessThanOrEqual(260);
   });
