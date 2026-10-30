@@ -13,7 +13,7 @@ import {
 } from "./types.js";
 
 const snapshot: DeclarationSnapshot = {
-  source_id: "https://registry.pdpp.dev/connectors/spotify",
+  source_id: "https://registry.pdpp.dev/sources/spotify",
   source_kind: "connector",
   version: "2026-08-11",
   digest: "d".repeat(64),
@@ -179,7 +179,7 @@ describe("§9 AS item 2 — validate against the retained snapshot", () => {
 
   it("rejects a request whose source.id does not match the snapshot", () => {
     const result = validateSelectionRequest(
-      request({ source: { id: "https://registry.pdpp.dev/connectors/other" } }),
+      request({ source: { id: "https://registry.pdpp.dev/sources/other" } }),
       snapshot,
     );
     expect(result.ok).toBe(false);

@@ -3,7 +3,7 @@ import Database from "better-sqlite3";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { PdppBindingError } from "./pdpp-records-sqlite-store.js";
 
-const SOURCE = "https://registry.pdpp.dev/connectors/spotify";
+const SOURCE = "https://registry.pdpp.dev/sources/spotify";
 const METHOD = "spotify";
 const EMITTED_AT = "2026-09-28T00:00:00.000Z";
 

@@ -9,7 +9,7 @@ const SERVER_OWNER = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
 const OTHER_SUBJECT = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 const DECLARATION: DeclarationSnapshot = {
-  source_id: "https://registry.pdpp.dev/connectors/spotify",
+  source_id: "https://registry.pdpp.dev/sources/spotify",
   source_kind: "connector",
   version: "2026-08-11",
   digest: "sha256:test",

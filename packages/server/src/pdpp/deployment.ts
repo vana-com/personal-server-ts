@@ -133,7 +133,7 @@ export function buildDeclarationRegistry(
  * The connector a declaration belongs to.
  *
  * Source IDs are absolute URIs whose last path segment names the connector
- * (`https://registry.pdpp.dev/connectors/spotify` → `spotify`). Falling back
+ * (`https://registry.pdpp.dev/sources/spotify` → `spotify`). Falling back
  * to the whole ID for an unparseable value means an odd source fails the
  * `supported` check rather than silently matching a connector it is not.
  */

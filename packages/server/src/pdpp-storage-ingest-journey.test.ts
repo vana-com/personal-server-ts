@@ -31,8 +31,8 @@ import { registerTestConnection } from "./pdpp/test-connections.js";
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 
-const CLAUDE = "https://registry.pdpp.dev/connectors/claude";
-const OURA = "https://registry.pdpp.dev/connectors/oura";
+const CLAUDE = "https://registry.pdpp.dev/sources/claude";
+const OURA = "https://registry.pdpp.dev/sources/oura";
 
 // Both sources declare `profile`, with different primary keys. Only oura
 // declares `sleep` (mutable) and `events` (append_only).
@@ -1245,7 +1245,7 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
 
 describe("$pdpp import over POST /v1/data", () => {
   it("writes no canonical row and settles the envelope when no method is configured", async () => {
-    const WHOOP = "https://registry.pdpp.dev/connectors/whoop";
+    const WHOOP = "https://registry.pdpp.dev/sources/whoop";
     const document = JSON.stringify({
       source_id: WHOOP,
       source_kind: "connector",
@@ -2421,7 +2421,7 @@ describe("P7: completion receipt from source_collected_at", () => {
 });
 
 describe("P5: record data is validated against the declared stream schema", () => {
-  const WHOOP = "https://registry.pdpp.dev/connectors/whoop";
+  const WHOOP = "https://registry.pdpp.dev/sources/whoop";
 
   // A normative §5 declaration. `stages` uses 2020-12 `prefixItems` with
   // `items: false`: a tuple of exactly [string, number]. Under draft-07 the
@@ -2736,7 +2736,7 @@ describe("P5: record data is validated against the declared stream schema", () =
       protocol_version: "0.1.0",
       source: {
         kind: "connector",
-        id: `https://registry.pdpp.dev/connectors/${source}`,
+        id: `https://registry.pdpp.dev/sources/${source}`,
       },
       declaration_version: "1",
       publisher: { id: "https://registry.pdpp.dev" },
@@ -2814,11 +2814,11 @@ describe("P5: record data is validated against the declared stream schema", () =
     ]);
     const alphaToken = await ownerToken(
       ctx,
-      "https://registry.pdpp.dev/connectors/alpha",
+      "https://registry.pdpp.dev/sources/alpha",
     );
     const betaToken = await ownerToken(
       ctx,
-      "https://registry.pdpp.dev/connectors/beta",
+      "https://registry.pdpp.dev/sources/beta",
     );
     const at = (source: string, id: string, v: unknown) => ({
       instance: `${source}:${owner}`,
