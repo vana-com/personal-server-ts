@@ -288,7 +288,10 @@ describe("Lite canonical rebaseline", () => {
       revision: { counter: 9_000, writerId: "device-b", operationId: "peer-c" },
     };
     // The peer's completion fits one operation; its rewrite would not.
-    expect(canonicalJson(complete).length).toBeLessThan(
+    const originalCompletionBytes = new TextEncoder().encode(
+      canonicalJson(complete),
+    ).byteLength;
+    expect(originalCompletionBytes).toBeLessThan(
       LITE_CANONICAL_MAX_OPERATION_BYTES,
     );
     await d.store.import({
@@ -302,7 +305,12 @@ describe("Lite canonical rebaseline", () => {
       ),
     ).toHaveLength(1);
 
-    expect(await d.store.rebaseline("writer-2")).toEqual({
+    // Each dependency repeats this valid nonempty writer ID. Keep the record
+    // count fixed while crossing the real operation cap, not a mocked limit.
+    const writerId = "w".repeat(
+      Math.ceil(LITE_CANONICAL_MAX_OPERATION_BYTES / records.length),
+    );
+    expect(await d.store.rebaseline(writerId)).toEqual({
       reissued: 1 + records.length,
       skipped: 1,
     });
@@ -313,6 +321,38 @@ describe("Lite canonical rebaseline", () => {
       operations.push(...page.map((e) => e.operation));
       after = page.at(-1)!.sequence;
     }
+    const { revision: _revision, ...draft } = complete;
+    // The actual emitted lifecycle/record operations are exactly the dependencies
+    // reexport() would put in this completion draft (before its revision margin).
+    const projectedRewrite = {
+      ...draft,
+      dependencies: operations.map((op) => ({
+        writerId: op.revision.writerId,
+        operationId: op.revision.operationId,
+        digest: operationDigest(op),
+      })),
+    };
+    const projectedRewriteBytes = new TextEncoder().encode(
+      canonicalJson(projectedRewrite),
+    ).byteLength;
+    const maxReissuedOperationBytes = Math.max(
+      ...operations.map(
+        (op) => new TextEncoder().encode(canonicalJson(op)).byteLength,
+      ),
+    );
+    expect(projectedRewriteBytes).toBeGreaterThan(
+      LITE_CANONICAL_MAX_OPERATION_BYTES,
+    );
+    expect(maxReissuedOperationBytes).toBeLessThanOrEqual(
+      LITE_CANONICAL_MAX_OPERATION_BYTES,
+    );
+    console.info("REBASELINE_BOUNDARY_BYTES", {
+      originalCompletionBytes,
+      projectedRewriteBytes,
+      maxReissuedOperationBytes,
+      writerIdBytes: new TextEncoder().encode(writerId).byteLength,
+      limit: LITE_CANONICAL_MAX_OPERATION_BYTES,
+    });
     expect(operations.some((op) => op.kind === "stream-complete")).toBe(false);
     expect(operations.filter((op) => op.kind === "upsert")).toHaveLength(
       records.length,
