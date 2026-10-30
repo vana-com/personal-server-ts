@@ -117,12 +117,16 @@ separate from current runtime state/token/MCP keys.
    prefix matching without wildcard interpolation, at most 100 entries and at
    most 512 KiB of values, except that a page always holds its first entry. It
    sees transaction-local writes and deletions. Keys and continuation are opaque
-   strings. Values above 18 MiB throw; pages never truncate a value. Store
-   inputs are bounded to 192 KiB per local operation batch, or one operation
-   alone up to 17 MiB (its operation entry and row are the only values over
-   256 KiB); 7b must enforce that before constructing/parsing a bridge body.
-   Split batches at record boundaries; do not split record identity or alter
-   declared data.
+   strings. Values above `LITE_CANONICAL_MAX_VALUE_BYTES` throw; pages never
+   truncate a value. Local inputs are bounded to 192 KiB per operation batch,
+   or one operation alone up to `LITE_CANONICAL_MAX_OPERATION_BYTES` (its
+   operation entry and row are the only values over 256 KiB); 7b must enforce
+   that before constructing/parsing a bridge body. Split batches at record
+   boundaries; do not split record identity or alter declared data. A received
+   replica envelope has no whole-size bound: the store keeps it in 128 KiB
+   parts, keeps each pending blob descriptor in its own value, and bounds its
+   header, operation count and each operation
+   (`LITE_CANONICAL_MAX_OPERATION_BYTES`) before parsing it.
 3. **Staged, verified blob chunks.** `stageBlob(descriptor, chunks)` sends
    backpressured frames of at most 128 KiB into native staging chunk rows. Hash
    incrementally natively and verify exact length, SHA-256, content-derived id,

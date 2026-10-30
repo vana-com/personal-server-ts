@@ -1,5 +1,5 @@
 /** Protocol limits shared by replication senders, admission, and stream readers. */
-import { MAX_DECLARATION_BYTES } from "../pdpp/declaration.js";
+import { MAX_DECLARATION_BYTES } from "../pdpp/declaration-limits.js";
 
 export const REPLICA_MAX_FRAGMENTS = 100_000;
 /** vana-storage DEFAULT_MAX_BLOB_SIZE. Compare the actual encrypted request. */
@@ -18,7 +18,7 @@ export const REPLICA_DEFAULT_FRAGMENT_BYTES = 4 * 1024 * 1024;
 export const REPLICA_MAX_OPERATIONS = REPLICA_BATCH_OPERATION_LIMIT;
 /** One retained evidence row is created for each manifest fragment. */
 export const REPLICA_MAX_EVIDENCE_ROWS = REPLICA_MAX_FRAGMENTS;
-export const REPLICA_LIMITS_VERSION = 2;
+export const REPLICA_LIMITS_VERSION = 3;
 
 /**
  * Operation metadata can repeat the record key and carries declaration-bound

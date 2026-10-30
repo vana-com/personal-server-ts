@@ -16,7 +16,7 @@ import unittest
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 COMPOSE_DIR = REPO / "deploy" / "dstack"
-MANIFEST = REPO / "deploy" / "dstack" / "fleets" / "preview-prod5.json"
+MANIFEST = REPO / "deploy" / "dstack" / "fleets" / "moksha-prod5.json"
 TEMPLATE = REPO / "deploy" / "dstack" / "fleets" / "mainnet-prod1.json"
 
 SPKI = "MCowBQYDK2VwAyEAPPx3xJ6NkAsPk1gT2v9E3s/huSL9MVG3S9D8e/Eqzjg="
@@ -448,9 +448,9 @@ class ManifestPatching(unittest.TestCase):
 
         self.assertNotEqual(patched, self.text)
         self.assertIn(new_hash, patched)
-        self.assertNotIn(self.nodes["worker-1"]["pinned"]["composeHash"], patched)
         # every other node's pinned hash, and the rest of the file, is untouched
         patched_manifest = json.loads(patched)
+        self.assertEqual(patched_manifest["nodes"]["worker-1"]["pinned"]["composeHash"], new_hash)
         for name in self.nodes:
             if name == "worker-1":
                 continue

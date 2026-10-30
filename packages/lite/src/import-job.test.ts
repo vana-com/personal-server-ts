@@ -628,4 +628,52 @@ describe("Lite canonical import encoder", () => {
       );
     },
   );
+
+  it("encodes an 8.5 MiB record byte-identically to commitLocal and reads it back", async () => {
+    const before = await registeredDisk();
+    const operation = large(importOperations()[0]!, 8_500_000);
+    const encoder = createLiteCanonicalImportEncoder({
+      context,
+      newId: ids("op"),
+    });
+    const parts = encoder.importBatchParts({
+      job: importJob,
+      seq: 0,
+      operations: [operation],
+      bindingFor: () => binding,
+    });
+    expect(parts).toHaveLength(1);
+
+    const written = { rows: new Map(before.rows), blobs: new Map() };
+    const store = createLiteCanonicalStore({
+      persistence: createFakeCanonicalPersistence(written).port,
+      enabled: true,
+      context,
+      authenticateReplica: () => undefined,
+      newId: ids("op"),
+    });
+    const receipts = [];
+    for (const part of parts)
+      receipts.push(await store.commitLocal(part.id, part.operations));
+
+    const base = new Map(before.rows);
+    const encoded = await encoder.encode(viewOf(base), parts);
+    const copied = new Map(base);
+    for (const entry of encoded.entries)
+      if (entry.value === null) copied.delete(entry.key);
+      else copied.set(entry.key, entry.value);
+
+    // Exact key/value equality includes the operation digest path and row.
+    expect(encoded.parts.map((part) => part.receipt)).toEqual(receipts);
+    expect([...copied].sort()).toEqual([...written.rows].sort());
+    expect(
+      (
+        await store.readRecord(
+          identity.connectionId,
+          binding.stream,
+          operation.recordKey,
+        )
+      )?.data,
+    ).toEqual(JSON.parse(operation.dataJson!));
+  });
 });

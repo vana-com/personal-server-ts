@@ -9,7 +9,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
-import { replicaFragmentKey } from "@opendatalabs/personal-server-ts-core/replication/transport";
+import {
+  replicaDigest,
+  replicaFragmentKey,
+} from "@opendatalabs/personal-server-ts-core/replication/transport";
 import {
   authenticatedOwnFork,
   adapterFactories,
@@ -342,8 +345,10 @@ describe("02 Progress to the next phase is atomic", () => {
   it("02 preparation receipt and publish work commit together at every crash point of the prepare transaction", async () => {
     const reference = await prepareRun(undefined);
     const trace = [...reference.crash.trace];
+    // Each fragment commits with the preparation cursor; the manifest and
+    // the prepare receipt commit together after the last one.
     const firstPreparing = trace.findIndex((l) =>
-      l.includes("insert:pdpp_transport_staged_fragments"),
+      l.includes("insert:pdpp_transport_fragments_out"),
     );
     const firstOutbox = trace.findIndex((l) =>
       l.includes("insert:pdpp_transport_manifests_out"),
@@ -358,9 +363,23 @@ describe("02 Progress to the next phase is atomic", () => {
     reference.d.close();
     cleanupHarness();
 
+    // The first fragment's commit, then the last fragment's commit through
+    // the manifest commit. Middle fragments commit the same way as these.
+    const lastFragment = trace.findLastIndex(
+      (l, i) =>
+        i < firstOutbox && l.includes("insert:pdpp_transport_fragments_out"),
+    );
+    const firstCommit = trace.findIndex(
+      (l, i) => i > firstPreparing && l === "commit",
+    );
     const points: number[] = [];
-    for (let i = firstPreparing - 1; i <= commit + 2; i++)
-      if (i >= 0 && i < trace.length) points.push(i);
+    for (let i = firstPreparing - 1; i <= firstCommit + 1; i++) points.push(i);
+    for (let i = lastFragment - 2; i <= commit + 2; i++) points.push(i);
+    const unique = [...new Set(points)].filter(
+      (i) => i >= 0 && i < trace.length,
+    );
+    points.splice(0, points.length, ...unique);
+    expect(lastFragment).toBeGreaterThan(firstCommit);
     expect(points.length).toBeGreaterThan(6);
 
     for (const point of points) {
@@ -385,10 +404,17 @@ describe("02 Progress to the next phase is atomic", () => {
           expect(manifest, where).toHaveLength(1);
           expect(batch.outcome, `${where}: prepare receipt`).toBe("progress");
         } else {
-          expect(mine, where).toHaveLength(0);
+          // Only a committed prefix of fragments, never a manifest.
+          expect(
+            mine.map((o) => o.position).sort((a, b) => a - b),
+            where,
+          ).toEqual([...Array(mine.length).keys()]);
+          expect(mine.length, where).toBeLessThanOrEqual(fragments);
           expect(manifest, where).toHaveLength(0);
           expect(batch.prepared, where).toBe(0);
-          expect(batch.outcome, where).not.toBe("progress");
+          // A committed fragment settles as progress; the batch is not prepared.
+          if (mine.length === 0)
+            expect(batch.outcome, where).not.toBe("progress");
         }
       }
       // Resume twice. Hashes stay stable and nothing duplicates.
@@ -404,10 +430,20 @@ describe("02 Progress to the next phase is atomic", () => {
           (o) => o.batch === before.batch && o.position === before.position,
         );
         expect(now?.digest, where).toEqual(before.digest);
-        expect(
-          Buffer.compare(now?.encrypted as Buffer, before.encrypted as Buffer),
-          where,
-        ).toBe(0);
+        expect(replicaDigest(before.encrypted as Buffer), where).toBe(
+          before.digest,
+        );
+        // A finalized batch drops its fragment bytes; the digest pins them.
+        const held = now?.encrypted as Buffer;
+        if (held.length)
+          expect(Buffer.compare(held, before.encrypted as Buffer), where).toBe(
+            0,
+          );
+        else
+          expect(
+            manifestRows(d).find((m) => m.batch === before.batch)?.state,
+            where,
+          ).toBe("published");
       }
       const finalManifests = manifestRows(d);
       expect(finalManifests, where).toHaveLength(1);
@@ -618,9 +654,16 @@ describe("05 Due to Retry and Retry to Progress", () => {
     expect(puts.parts[1]!.encrypted).toEqual(puts.parts[0]!.encrypted);
     expect(net.blobs.get(puts.parts[0]!.key)).toEqual(puts.parts[0]!.encrypted);
     const done = fragmentRows(d)[0]!;
+    // The stored object is the original ciphertext. The batch is finalized,
+    // so the sender dropped its copy and keeps the digest.
     expect(
-      Buffer.compare(done.encrypted as Buffer, original.encrypted as Buffer),
+      Buffer.compare(
+        Buffer.from(puts.parts[0]!.encrypted),
+        original.encrypted as Buffer,
+      ),
     ).toBe(0);
+    expect(done.digest).toBe(original.digest);
+    expect((done.encrypted as Buffer).length).toBe(0);
     expect(done.state).toBe("stored");
     expect(logical(d, "pdpp_transport_fragments_out")[0]).toMatchObject({
       outcome: "progress",

@@ -36,7 +36,8 @@ export interface LiteCanonicalTransaction {
 export const LITE_CANONICAL_BATCH_BYTES = 192 * 1024;
 /**
  * One operation alone in its local batch: the 16 MiB import record limit plus
- * 1 MiB of operation fields.
+ * 1 MiB of operation fields. Raise core REPLICA_LIMITS_VERSION with this
+ * bound so operations held by older builds are re-admitted.
  */
 export const LITE_CANONICAL_MAX_OPERATION_BYTES = 17 * 1024 * 1024;
 /** One stored value: the operation entry or the row of such an operation. */

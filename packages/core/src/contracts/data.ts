@@ -463,12 +463,18 @@ export async function listDataScopesContract(
       if (!entry) {
         return summary;
       }
+      // Readiness is a hint: a sidecar it cannot read lists as "indexing"
+      // and never fails the inventory.
       const hasBlocks =
         typeof input.storage.hasScopeBlocks === "function"
-          ? await input.storage.hasScopeBlocks(
-              summary.scope,
-              summary.latestCollectedAt,
-            )
+          ? await Promise.resolve()
+              .then(() =>
+                input.storage.hasScopeBlocks!(
+                  summary.scope,
+                  summary.latestCollectedAt,
+                ),
+              )
+              .catch(() => false)
           : false;
       return {
         ...summary,

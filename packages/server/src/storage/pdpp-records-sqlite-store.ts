@@ -1,5 +1,10 @@
 import { assertSupportedSchemaVersions } from "./schema-versions.js";
 import type { ReplicaCanonicalPort } from "./pdpp-replica-canonical-port.js";
+import {
+  binaryLength,
+  readBinary,
+  verifyBinary,
+} from "./pdpp-binary-chunks.js";
 import type { DeclarationBinding } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
   parseTime,
@@ -2550,13 +2555,36 @@ export function createSqliteRecordStore(
     };
   }
 
-  /** Canonical blob bytes remain in main's `pdpp_blob_bytes` format. */
+  /**
+   * Without replication the store writes main's `pdpp_blob_bytes` format. It
+   * also reads a blob over 1 MiB that replication stored only as verified
+   * canonical chunks, so that blob stays readable before a flag-off boot
+   * writes main's row for it.
+   */
+  const chunkStore = () =>
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdpp_binary_manifests'",
+      )
+      .get() !== undefined;
   const blobBytes: CanonicalBlobBytes = replica?.blobBytes ?? {
-    has: (blobId) => getBlobBytesStmt.get(blobId) !== undefined,
+    has: (blobId) =>
+      getBlobBytesStmt.get(blobId) !== undefined ||
+      (chunkStore() && binaryLength(db, "canonical", blobId) !== undefined),
     readVerified(meta) {
       const row = getBlobBytesStmt.get(meta.blobId) as
         { bytes: Buffer } | undefined;
-      if (!row) return undefined;
+      if (!row)
+        return chunkStore() &&
+          verifyBinary(
+            db,
+            "canonical",
+            meta.blobId,
+            `sha256:${meta.sha256}`,
+            meta.sizeBytes,
+          )
+          ? readBinary(db, "canonical", meta.blobId)
+          : undefined;
       const stored = new Uint8Array(row.bytes);
       if (stored.byteLength !== meta.sizeBytes) return undefined;
       return createHash("sha256").update(stored).digest("hex") === meta.sha256

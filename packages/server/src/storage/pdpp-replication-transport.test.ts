@@ -575,10 +575,17 @@ it("resumes uncertain publication with identical durable ciphertext, adopting on
   expect(outbox(a).map((r) => r.encrypted)).toEqual(
     original.map((r) => r.encrypted),
   );
-  expect(fragmentsOut(a).map((r) => r.encrypted)).toEqual(
-    fragments.map((r) => r.encrypted),
+  expect(fragmentsOut(a).map((r) => r.digest)).toEqual(
+    fragments.map((r) => r.digest),
   );
   expect(outbox(a).every((r) => r.state === "published")).toBe(true);
+  // Finalized: the sender dropped its fragment copies, and storage holds the
+  // original ciphertext at each digest.
+  expect(fragmentsOut(a).every((r) => r.encrypted.length === 0)).toBe(true);
+  for (const r of fragments)
+    expect(
+      Buffer.from(net.blobs.get(replicaFragmentKey(a.scope, r.digest))!),
+    ).toEqual(r.encrypted);
   expect(net.registrations.filter((s) => s === original[0]!.slot)).toHaveLength(
     1,
   );
@@ -1132,7 +1139,7 @@ it("fragments large JSON and resumes a partial download in reverse/duplicate lis
   const b = device(net, { chunk: 1800 });
   await cycles([b], 2);
   const retained = fragmentsIn(b).filter(
-    (r) => r.slot === slot && r.fragment_json,
+    (r) => r.slot === slot && r.fragment_json !== null,
   );
   expect(retained).toHaveLength(2);
   b.reopen();
@@ -1286,6 +1293,8 @@ it("failing first 50 fragment uploads cannot starve later runnable fragments", a
     preexisting: "x".repeat(40000),
     chunk: 500,
     cap: 32768,
+    // One prepare unit is one fragment: prepare all of them in the first step.
+    worker: { quantum: { prepare: 100 } },
   });
   let blocked = 0;
   net.beforePut((key) => {
@@ -1346,10 +1355,18 @@ it("keeps unknown declarations pending and refuses wrong owner/declaration bindi
   b.declarations([]);
   await b.cycle();
   expect(b.get()).toBeUndefined();
-  // The unknown declaration is a durable Wait on the batch's import work.
+  // The batch imports; its operations stay pending, and the unknown
+  // declaration is a durable Wait on the reconcile, not on the writer's chain.
   expect(
     importWork(b).some((r) => r.dependency?.startsWith("declaration:")),
-  ).toBe(true);
+  ).toBe(false);
+  expect(
+    b.db
+      .prepare(
+        "SELECT dependency FROM pdpp_transport_phase_state WHERE phase='reconcile'",
+      )
+      .get(),
+  ).toEqual({ dependency: expect.stringMatching(/^declaration:/) });
   b.declarations(expected.declarations);
   await cycles([b], 2);
   expect(b.get()).toEqual(a.get());
@@ -1802,9 +1819,14 @@ it("E8 re-evaluates an older resource_unsupported outcome after the limits versi
   const net = network();
   const a = device(net, { preexisting: "recheck limits" });
   await cycles([a], 12);
+  a.put("tail record", "tail");
+  await cycles([a], 12);
+  // B retains the second batch while its predecessor is unreachable.
+  const [first] = outbox(a);
+  net.failGet.add(first!.slot);
   const b = device(net);
-  b.declarations([]);
   await cycles([b], 12);
+  expect(b.get()).toBeUndefined();
   const retained = b.db
     .prepare(
       `SELECT m.slot,m.writer,m.batch FROM pdpp_transport_manifests_in m
@@ -1828,7 +1850,7 @@ it("E8 re-evaluates an older resource_unsupported outcome after the limits versi
        WHERE writer=? AND batch=?`,
     )
     .run(retained.writer, retained.batch);
-  b.declarations(expected.declarations);
+  net.failGet.clear();
   b.reopen();
 
   expect(
@@ -1840,6 +1862,7 @@ it("E8 re-evaluates an older resource_unsupported outcome after the limits versi
   ).toEqual({ outcome: null, resource_limits_version: null });
   await cycles([b], 12);
   expect(b.get()).toEqual(a.get());
+  expect(b.get("tail")).toEqual(a.get("tail"));
 });
 
 it("is disabled by default and rejects a configured limit above the real storage cap", async () => {
@@ -2056,11 +2079,17 @@ it("H3 prepares, admits and imports one exact maximum honest batch", async () =>
   );
   expect(admission).not.toHaveProperty("kind");
 
-  const encryptedFragments = sender.db
-    .prepare(
-      "SELECT encrypted FROM pdpp_transport_fragments_out WHERE batch=? ORDER BY position",
-    )
-    .all(batch.batch) as { encrypted: Buffer }[];
+  // The batch is finalized, so the sender keeps only each fragment's digest;
+  // the ciphertext is the stored object at that digest.
+  const encryptedFragments = (
+    sender.db
+      .prepare(
+        "SELECT digest FROM pdpp_transport_fragments_out WHERE batch=? ORDER BY position",
+      )
+      .all(batch.batch) as { digest: string }[]
+  ).map((row) => ({
+    encrypted: net.blobs.get(replicaFragmentKey(outgoing.scope, row.digest))!,
+  }));
   const fragments = [];
   for (let index = 0; index < encryptedFragments.length; index++) {
     const plaintext = await net.port.decrypt(
@@ -3339,6 +3368,8 @@ it("rolls staged binary and import acknowledgement back together, then retries w
 it("reclaims only hidden crash staging on restart and preserves committed payloads", async () => {
   const net = network();
   const a = device(net);
+  // Registrations stay unfinalized, so committed payloads are still needed.
+  net.beforePut((key) => net.pending.add(key));
   a.put("retained");
   await a.cycle();
   const { binaryWriter } = await import("./pdpp-binary-chunks.js");
@@ -3461,12 +3492,12 @@ it("does not acknowledge export when persisted payload chunks change before curs
   expect(outbox(a).length).toBeGreaterThan(0);
 });
 
-it("does not promote a prepared batch whose staged fragment set became incomplete", async () => {
+it("does not promote a prepared batch whose committed fragment set became incomplete", async () => {
   const net = network(),
     a = device(net);
   a.put("retained source");
   a.db.exec(
-    "CREATE TRIGGER drop_prepared_stage AFTER INSERT ON pdpp_transport_staged_fragments BEGIN DELETE FROM pdpp_transport_staged_fragments WHERE token=NEW.token AND position=NEW.position; END",
+    "CREATE TRIGGER drop_prepared_stage AFTER INSERT ON pdpp_transport_fragments_out BEGIN DELETE FROM pdpp_transport_fragments_out WHERE batch=NEW.batch AND position=NEW.position; END",
   );
   await a.cycle();
   expect(
@@ -3576,9 +3607,19 @@ it("A3b-1 releases envelope reservations even when staging abort throws and the 
   const budget = new ReplicaByteBudget(8 * 1024);
   let abortThrows = 0;
   let heldAtAbort = 0;
+  // The first import that holds more than the budget fails once after
+  // reading its payload, so staging aborts with every reservation held.
+  let failed = false;
   const receiver = device(net, {
     copyOf: template,
     worker: {
+      expected: () => {
+        if (!failed && budget.reserved > budget.maxBytes) {
+          failed = true;
+          throw new Error("transient import failure");
+        }
+        return expected;
+      },
       resourceBudget: budget,
       resourceLimits: { maxManifestCiphertextBytes: 1024 },
       createStagingStore(
@@ -3599,12 +3640,10 @@ it("A3b-1 releases envelope reservations even when staging abort throws and the 
       },
     },
   });
-  receiver.declarations([]);
   for (let i = 0; i < 24 && abortThrows === 0; i++) await cycles([receiver], 1);
   expect(abortThrows).toBe(1);
   expect(heldAtAbort).toBeGreaterThan(budget.maxBytes);
   expect(budget.reserved).toBe(0);
-  receiver.declarations(expected.declarations);
   await cycles([receiver], 24);
   expect(receiver.get()).toEqual(source.get());
   expect(budget.reserved).toBe(0);
@@ -3751,24 +3790,19 @@ it.each(["framing", "resource"])(
 
 it("A3b-5 uses the exported default fragment size", async () => {
   const net = network(false, 64 * 1024);
-  const inputs: number[] = [];
-  const fragment = replicaStream.fragmentReplicaStream;
-  const spy = vi
-    .spyOn(replicaStream, "fragmentReplicaStream")
-    .mockImplementation((input) => {
-      inputs.push(input.targetChunkBytes!);
-      return fragment(input);
-    });
-  try {
-    const source = device(net, {
-      preexisting: "default chunk",
-      worker: { targetChunkBytes: undefined },
-    });
-    await cycles([source], 1);
-    expect(inputs).toEqual([REPLICA_DEFAULT_FRAGMENT_BYTES]);
-  } finally {
-    spy.mockRestore();
-  }
+  const source = device(net, {
+    preexisting: "default chunk",
+    worker: { targetChunkBytes: undefined },
+  });
+  // The preparation cursor records the chunk size each fragment was cut at.
+  source.db.exec(`CREATE TABLE chunk_sizes (bytes INTEGER);
+    CREATE TRIGGER record_chunk_size AFTER INSERT ON pdpp_transport_preparation_progress
+    BEGIN INSERT INTO chunk_sizes VALUES (NEW.chunk_bytes); END`);
+  await cycles([source], 1);
+  expect(
+    source.db.prepare("SELECT bytes FROM chunk_sizes").pluck().all(),
+  ).toEqual([REPLICA_DEFAULT_FRAGMENT_BYTES]);
+  expect(outbox(source).length).toBeGreaterThan(0);
 });
 
 it("A5b-1 one bad op is Unsupported while the other ops commit at the same version and later batches flow", async () => {

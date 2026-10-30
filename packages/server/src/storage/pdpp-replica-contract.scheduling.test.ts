@@ -10,7 +10,10 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
-import { replicaScope } from "@opendatalabs/personal-server-ts-core/replication/transport";
+import {
+  replicaDigest,
+  replicaScope,
+} from "@opendatalabs/personal-server-ts-core/replication/transport";
 import { ReplicaByteBudget } from "@opendatalabs/personal-server-ts-core/replication/limits";
 import {
   authenticatedOwnFork,
@@ -1223,10 +1226,15 @@ it("25 host cancellation mid-step leaves only committed state; the cancelled run
       "SELECT count(*) AS n FROM pdpp_transport_batches WHERE prepared=-1",
     ),
   ).toBe(0);
+  // A fragment's digest pins its ciphertext; a finalized batch drops the bytes.
+  for (const row of a.db
+    .prepare("SELECT digest,encrypted FROM pdpp_transport_fragments_out")
+    .all() as { digest: string; encrypted: Buffer }[])
+    expect(replicaDigest(row.encrypted)).toBe(row.digest);
   const outbound = () => [
     ...a.db
       .prepare(
-        "SELECT batch,position,encrypted FROM pdpp_transport_fragments_out ORDER BY rowid",
+        "SELECT batch,position,digest FROM pdpp_transport_fragments_out ORDER BY rowid",
       )
       .all(),
     ...a.db

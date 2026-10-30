@@ -9,40 +9,24 @@
  */
 import type { Database } from "better-sqlite3";
 import type { Logger } from "pino";
-import { createPublicClient, http, type Hex } from "viem";
-import { getChainConfig } from "@opendatalabs/vana-sdk/node";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
-import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
-import type { DataPointFeedPort } from "@opendatalabs/personal-server-ts-core/ports";
-import type { BoundedStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type {
   ProgressReport,
   ReplicaBudget,
 } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import { REPLICA_WAIT_FALLBACK_MS } from "@opendatalabs/personal-server-ts-core/replication/schedule";
+import { replicaDeclarationContext } from "@opendatalabs/personal-server-ts-core/replication/host-config";
 import {
-  createDpv2ReplicaTransport,
-  type ReplicaTransportPort,
-} from "@opendatalabs/personal-server-ts-core/replication/dpv2";
-import { createReplicaEvidenceAdapter } from "@opendatalabs/personal-server-ts-core/replication/evidence";
-import { createReplicaFinalityHints } from "@opendatalabs/personal-server-ts-core/replication/finality";
-import {
-  createGatewayReplicaRoster,
-  type ReplicaRosterPort,
-} from "@opendatalabs/personal-server-ts-core/replication/roster";
+  planReplicationHost,
+  type ReplicationNetworkPorts,
+} from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import {
   createReplicationDriver,
   type ReplicationDriver,
   type ReplicationStepper,
   type ReplicationTimers,
 } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
-import {
-  replicaDeclarationContext,
-  replicaEnvironmentForChain,
-  replicaPartitionOwner,
-} from "@opendatalabs/personal-server-ts-core/replication/host-config";
 import type { PdppReplicaReads } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import {
   createReplicaRecordStore,
@@ -61,47 +45,6 @@ import { enableReplicaWriterIdentity } from "./pdpp-replica-writer-identity.js";
 export const NODE_REPLICATION_BUDGET: ReplicaBudget = { units: 50 };
 /** How long shutdown waits for an aborted step before closing storage. */
 export const NODE_REPLICATION_STOP_GRACE_MS = 5_000;
-
-/** The network side of replication: carrier and roster. */
-export interface NodeReplicationPorts {
-  transport: ReplicaTransportPort;
-  roster: ReplicaRosterPort;
-}
-
-/** Production ports: DPv2 on Vana storage and the gateway, finalized RPC evidence. */
-export function createNodeReplicationPorts(input: {
-  config: Pick<ServerConfig, "gateway">;
-  owner: `0x${string}`;
-  masterKey: Uint8Array;
-  storage: BoundedStorageAdapter;
-  gateway: Parameters<typeof createDpv2ReplicaTransport>[0]["gateway"];
-  feed: DataPointFeedPort;
-  signer: Pick<ServerSigner, "signAddData">;
-}): NodeReplicationPorts {
-  const { gateway } = input.config;
-  const chain = getChainConfig(gateway.chainId);
-  if (!chain) throw new Error(`no RPC for chain ${gateway.chainId}`);
-  const rpc = createPublicClient({ chain, transport: http() });
-  return {
-    transport: createDpv2ReplicaTransport({
-      owner: input.owner,
-      masterKey: input.masterKey,
-      storage: input.storage,
-      gateway: input.gateway,
-      feed: input.feed,
-      signer: input.signer,
-      finality: createReplicaFinalityHints({ rpc }),
-      evidence: createReplicaEvidenceAdapter({
-        owner: input.owner,
-        registry: gateway.contracts.dataRegistry as Hex,
-        chainId: gateway.chainId,
-        rpc: rpc as Parameters<typeof createReplicaEvidenceAdapter>[0]["rpc"],
-        gatewayUrl: gateway.url,
-      }),
-    }),
-    roster: createGatewayReplicaRoster({ gatewayUrl: gateway.url }),
-  };
-}
 
 export type NodeReplication =
   | {
@@ -133,38 +76,40 @@ export function createNodeReplication(input: {
   /** The registered server key (`key.json`). Never the owner wallet. */
   serverAccount: Pick<ServerAccount, "address" | "signTypedData">;
   /** Built only once the chain, owner and declarations are known good. */
-  ports: (owner: `0x${string}`) => NodeReplicationPorts;
+  ports: (owner: `0x${string}`) => ReplicationNetworkPorts;
   logger: Pick<Logger, "info" | "warn">;
   budget?: ReplicaBudget;
   timers?: ReplicationTimers;
   /** Worker options for tests (e.g. `now`, chunk sizes). */
   worker?: Partial<Parameters<typeof createReplicaTransportWorker>[0]>;
 }): NodeReplication {
-  const environment = replicaEnvironmentForChain(input.chainId);
-  if (!environment)
-    return { state: "blocked", reason: `unsupported_chain:${input.chainId}` };
-  // The first baseline freezes the binding set. Never freeze an empty one.
-  if (input.declarations.length === 0)
-    return { state: "blocked", reason: "no_retained_declarations" };
-  const owner = replicaPartitionOwner(input.owner) as `0x${string}`;
-  let context: ReturnType<typeof replicaDeclarationContext>;
-  let ports: NodeReplicationPorts;
+  const plan = planReplicationHost(input);
+  if (plan.state === "blocked") return plan;
+  const { owner, environment } = plan;
+  let context = plan.context;
+  let ports: ReplicationNetworkPorts;
   const store = createReplicaRecordStore(input.db);
-  const baseline = () =>
-    store.replication.beginBaseline({
+  // After a baseline or rebinding, trust every binding the database retained
+  // (host contract §4.5): own operations in flight and peers that have not
+  // upgraded yet still name the older ones.
+  const baseline = () => {
+    store.replication.beginBaseline({ owner, declarations: context.current });
+    context = replicaDeclarationContext(
       owner,
-      declarations: [...context.expected.declarations],
-    });
+      input.declarations,
+      store.replication.declarationHistory(),
+    );
+  };
   const baselined = () =>
     input.db
       .prepare("SELECT 1 FROM pdpp_replica_settings WHERE id = 1")
       .get() !== undefined;
   try {
-    context = replicaDeclarationContext(owner, input.declarations);
     ports = input.ports(owner);
-    // An existing baseline must match now: idempotent for the same bindings,
-    // refused for different ones. A first baseline waits for the writer
-    // identity (see `stepper`).
+    // An existing baseline takes this boot's bindings now: idempotent for the
+    // same set, a new binding generation for an upgraded or added
+    // declaration, refused for a changed stream shape. A first baseline waits
+    // for the writer identity (see `stepper`).
     if (baselined()) baseline();
   } catch (error) {
     return {
@@ -265,6 +210,8 @@ export function createNodeReplication(input: {
     onError: (error) =>
       input.logger.warn({ err: error }, "Replication step failed"),
   });
+  // A committed own write schedules a step soon, not at the next wake.
+  store.setReplicaJournalObserver(() => driver.localWrite());
   return {
     state: "started",
     store,
