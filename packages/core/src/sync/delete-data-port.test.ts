@@ -275,6 +275,110 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
   });
 });
 
+describe("createGatewayDeleteDataPort.tombstone of a reserved scope", () => {
+  // The gateway answers an unsigned GET /v1/data/:id of a vana.system.* point
+  // with 401 (owner wallet only), so its head comes from the signed inventory.
+  const SYSTEM_SCOPE = "vana.system.additions";
+  const SYSTEM_ID = computeDataPointId(OWNER, SYSTEM_SCOPE);
+
+  function makeReservedPort(
+    head: { expectedVersion: string; deletedAt: string | null } | null,
+    fetchImpl: typeof fetch,
+  ) {
+    const dataPointFeed: DataPointFeedPort = {
+      getDataPoint: vi.fn(async () => {
+        throw new Error("Gateway error: 401 Unauthorized");
+      }),
+      listDataPointsByOwner: vi.fn(),
+    };
+    const reservedHead = vi.fn(async () => head);
+    const signAddData = vi.fn(async () => "0xaddsig" as `0x${string}`);
+    const port = createGatewayDeleteDataPort({
+      gatewayUrl: GATEWAY,
+      dataPointFeed,
+      reservedHead,
+      serverOwner: OWNER,
+      signer: { signAddData },
+      storage: {
+        endpoint: STORAGE,
+        chainId: CHAIN_ID,
+        signMessage: (message) => serverAccount.signMessage({ message }),
+      },
+      fetch: fetchImpl,
+    });
+    return { port, dataPointFeed, reservedHead, signAddData };
+  }
+
+  it("reads the head through the signed inventory and tombstones at head+1", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, {
+        data: {
+          dataPointId: SYSTEM_ID,
+          expectedVersion: "24",
+          deletedAt: "2026-10-30T12:00:00.000Z",
+        },
+      }),
+    );
+    const { port, dataPointFeed, reservedHead, signAddData } = makeReservedPort(
+      { expectedVersion: "23", deletedAt: null },
+      fetchImpl as unknown as typeof fetch,
+    );
+
+    const outcome = await port.tombstone(SYSTEM_SCOPE);
+
+    expect(reservedHead).toHaveBeenCalledWith(SYSTEM_SCOPE);
+    expect(dataPointFeed.getDataPoint).not.toHaveBeenCalled();
+    expect(signAddData).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: SYSTEM_SCOPE, expectedVersion: 24n }),
+    );
+    expect(outcome).toMatchObject({ status: "tombstoned", version: "24" });
+  });
+
+  it("skips the gateway call when the reserved point was never registered", async () => {
+    const fetchImpl = vi.fn();
+    const { port } = makeReservedPort(
+      null,
+      fetchImpl as unknown as typeof fetch,
+    );
+    expect(await port.tombstone(SYSTEM_SCOPE)).toEqual({
+      status: "not-registered",
+      dataPointId: SYSTEM_ID,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("does not re-sign a reserved point the inventory reports as deleted", async () => {
+    const fetchImpl = vi.fn();
+    const { port, signAddData } = makeReservedPort(
+      { expectedVersion: "24", deletedAt: "2026-10-30T12:00:00.000Z" },
+      fetchImpl as unknown as typeof fetch,
+    );
+    expect(await port.tombstone(SYSTEM_SCOPE)).toMatchObject({
+      status: "already-deleted",
+      version: "24",
+    });
+    expect(signAddData).not.toHaveBeenCalled();
+  });
+
+  it("keeps the unsigned feed read for ordinary scopes", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, {
+        data: { dataPointId: DATA_POINT_ID, expectedVersion: "4" },
+      }),
+    );
+    const { port, dataPointFeed, reservedHead } = makeReservedPort(
+      { expectedVersion: "3", deletedAt: null },
+      fetchImpl as unknown as typeof fetch,
+    );
+    (
+      dataPointFeed.getDataPoint as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce(liveRecord());
+    await port.tombstone(SCOPE);
+    expect(dataPointFeed.getDataPoint).toHaveBeenCalled();
+    expect(reservedHead).not.toHaveBeenCalled();
+  });
+});
+
 describe("createGatewayDeleteDataPort.deleteBlobVersions", () => {
   it.each([undefined, "https://canonical-storage.test"])(
     "sends exact-key DELETEs to the endpoint using audience %s",

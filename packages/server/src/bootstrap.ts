@@ -838,6 +838,17 @@ export async function createServer(
       : createGatewayDeleteDataPort({
           gatewayUrl: config.gateway.url,
           dataPointFeed,
+          // Reserved vana.system.* heads: the gateway refuses an unsigned
+          // read of them (owner wallet only) but admits this registered
+          // server on the signed inventory. Server key, never an owner prompt.
+          reservedHead: requestSigner
+            ? (scope) =>
+                createVersionInventoryClient({
+                  gatewayUrl: config.gateway.url,
+                  ownerAddress: serverOwner,
+                  ownerSigner: requestSigner,
+                }).head(scope)
+            : undefined,
           serverOwner,
           signer: serverSigner,
           storage: {

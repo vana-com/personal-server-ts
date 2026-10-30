@@ -225,6 +225,7 @@ function createService(init: AdditionsWorkerInit) {
       activeBudget = options?.budget;
       return inventory.listScopes(options);
     },
+    head: (scope, signal) => inventory.head(scope, signal),
   };
   return createDurableAdditions({
     ...init,

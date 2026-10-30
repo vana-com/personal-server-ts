@@ -6,6 +6,7 @@ import type {
   TombstoneOutcome,
 } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
+import { isSystemScope } from "../policy/reserved-scopes.js";
 import { computeDataPointId } from "./data-point-id.js";
 import { parseGatewayNextVersion } from "./workers/upload.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "./tombstone.js";
@@ -15,6 +16,15 @@ export interface GatewayDeleteDataPortOptions {
   gatewayUrl: string;
   /** Deletion-aware registry lookup (current version + deleted state). */
   dataPointFeed: DataPointFeedPort;
+  /**
+   * Head of a reserved `vana.system.*` point. The gateway answers an unsigned
+   * GET /v1/data/:id of one with 401 (owner wallet only), so these heads are
+   * read through the signed version inventory, which admits registered
+   * servers. Without it, reserved scopes use `dataPointFeed` like any other.
+   */
+  reservedHead?: (
+    scope: string,
+  ) => Promise<{ expectedVersion: string; deletedAt: string | null } | null>;
   /** Data owner the tombstone is registered on behalf of. */
   serverOwner: `0x${string}`;
   /**
@@ -69,6 +79,18 @@ export function createGatewayDeleteDataPort(
   // exact DELETE keys would not be the ones PUT wrote.
   const owner = options.serverOwner.toLowerCase() as `0x${string}`;
 
+  // Current version and deleted state of the point behind `scope`.
+  function currentHead(
+    scope: string,
+  ): Promise<{ expectedVersion: string; deletedAt: string | null } | null> {
+    if (options.reservedHead && isSystemScope(scope))
+      return options.reservedHead(scope);
+    return options.dataPointFeed.getDataPoint({
+      ownerAddress: options.serverOwner,
+      scope,
+    });
+  }
+
   async function sendTombstone(
     scope: string,
     dataPointId: string,
@@ -99,10 +121,7 @@ export function createGatewayDeleteDataPort(
   return {
     async tombstone(scope: string): Promise<TombstoneOutcome> {
       const dataPointId = computeDataPointId(options.serverOwner, scope);
-      const current = await options.dataPointFeed.getDataPoint({
-        ownerAddress: options.serverOwner,
-        scope,
-      });
+      const current = await currentHead(scope);
       if (current === null) {
         return { status: "not-registered", dataPointId };
       }
@@ -172,9 +191,7 @@ export function createGatewayDeleteDataPort(
         );
         let deletedAt = stringField(echoed, "deletedAt");
         if (winning === null) {
-          const reread = await options.dataPointFeed
-            .getDataPoint({ ownerAddress: options.serverOwner, scope })
-            .catch(() => null);
+          const reread = await currentHead(scope).catch(() => null);
           if (reread && reread.deletedAt !== null) {
             winning = normalizeVersionString(reread.expectedVersion);
             deletedAt = deletedAt ?? reread.deletedAt;

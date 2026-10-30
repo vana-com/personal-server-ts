@@ -322,7 +322,21 @@ export function createVersionInventoryClient(options: {
     }
     throw new Error("Gateway scope page budget exceeded");
   }
-  return { page, list, listScopes };
+  /** Current version and deleted state, or null when never registered. */
+  async function head(
+    scope: string,
+    signal?: AbortSignal,
+  ): Promise<{ expectedVersion: string; deletedAt: string | null } | null> {
+    const current = (await page(scope, { limit: 1, signal })).data.head;
+    return current
+      ? {
+          expectedVersion: current.expectedVersion,
+          deletedAt: current.deletedAt,
+        }
+      : null;
+  }
+
+  return { page, list, listScopes, head };
 }
 export type VersionInventoryClient = ReturnType<
   typeof createVersionInventoryClient
