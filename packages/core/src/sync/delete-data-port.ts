@@ -4,6 +4,7 @@ import type {
   DeleteBlobVersionsOutcome,
   DeleteDataPort,
   TombstoneOutcome,
+  TombstoneFence,
 } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
 import { computeDataPointId } from "./data-point-id.js";
@@ -97,7 +98,10 @@ export function createGatewayDeleteDataPort(
   }
 
   return {
-    async tombstone(scope: string): Promise<TombstoneOutcome> {
+    async tombstone(
+      scope: string,
+      fence?: { head: TombstoneFence },
+    ): Promise<TombstoneOutcome> {
       const dataPointId = computeDataPointId(options.serverOwner, scope);
       const current = await options.dataPointFeed.getDataPoint({
         ownerAddress: options.serverOwner,
@@ -115,8 +119,31 @@ export function createGatewayDeleteDataPort(
         };
       }
 
+      if (
+        fence &&
+        (current.expectedVersion !== fence.head.expectedVersion ||
+          current.dataHash.toLowerCase() !==
+            fence.head.dataHash.toLowerCase() ||
+          current.metadataHash.toLowerCase() !==
+            fence.head.metadataHash.toLowerCase())
+      ) {
+        throw new Error(
+          `Scope head (v${current.expectedVersion}) is not the one the fenced delete saw (v${fence.head.expectedVersion})`,
+        );
+      }
+      let replaced: TombstoneFence | null = {
+        expectedVersion: current.expectedVersion,
+        dataHash: current.dataHash,
+        metadataHash: current.metadataHash,
+      };
       let version = BigInt(current.expectedVersion) + 1n;
       let res = await sendTombstone(scope, dataPointId, version);
+      if (res.status === 409 && fence) {
+        await res.body?.cancel();
+        throw new Error(
+          `Scope head is not the one the fenced delete saw (v${fence.head.expectedVersion}): another writer moved it`,
+        );
+      }
       if (res.status === 409) {
         // Another replica advanced the scope between our read and our
         // write. The 409 body carries `currentExpectedVersion` (and the
@@ -151,6 +178,9 @@ export function createGatewayDeleteDataPort(
           );
         }
         version = next;
+        // The head moved before the POST; which head this tombstone replaces
+        // is not known, so no automatic re-submission may rely on it.
+        replaced = null;
         res = await sendTombstone(scope, dataPointId, version);
       }
       if (res.status === 404) {
@@ -198,6 +228,7 @@ export function createGatewayDeleteDataPort(
         status: "tombstoned",
         dataPointId: stringField(row, "dataPointId") ?? dataPointId,
         version: stringField(row, "expectedVersion") ?? String(version),
+        replaced,
         deletedAt: stringField(row, "deletedAt"),
       };
     },

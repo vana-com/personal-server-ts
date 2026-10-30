@@ -404,6 +404,13 @@ export interface DataPointFeedPort {
   }): Promise<DataPointFeedRecord | null>;
 }
 
+/** A registry head as the gateway reported it: version and both commitments. */
+export interface TombstoneFence {
+  expectedVersion: string;
+  dataHash: string;
+  metadataHash: string;
+}
+
 export type TombstoneOutcome =
   | {
       status: "tombstoned";
@@ -411,6 +418,12 @@ export type TombstoneOutcome =
       /** The tombstone's own version (previous current + 1). */
       version: string;
       deletedAt: string | null;
+      /**
+       * The live head the tombstone replaced, when the port read it. If this
+       * tombstone fails and the gateway restores exactly this head, the
+       * deletion may be re-submitted automatically.
+       */
+      replaced?: TombstoneFence | null;
     }
   | {
       status: "already-deleted";
@@ -450,7 +463,17 @@ export interface DeleteBlobVersionsOutcome {
  * 404 on and then wedge.
  */
 export interface DeleteDataPort {
-  tombstone(scope: string): Promise<TombstoneOutcome>;
+  /**
+   * Queue a tombstone at head + 1. With `fence`, the tombstone is queued only
+   * over exactly `fence.head` (version and both commitments): any other live
+   * head, or a 409 (another writer moved the head), throws instead of
+   * re-signing, so an automatic re-submission can never delete a write that
+   * landed after the head it saw.
+   */
+  tombstone(
+    scope: string,
+    fence?: { head: TombstoneFence },
+  ): Promise<TombstoneOutcome>;
   deleteBlobVersions(
     scope: string,
     versions: string[],
@@ -474,6 +497,63 @@ export interface PendingBlobDeletion {
   scope: string;
   version: string | null;
   range?: { from: string; to: string };
+  /**
+   * The tombstone version whose finality frees this key (see
+   * `TombstoneFinalityPort`). A range is gated by its own `range.to`; an
+   * exact key recorded without a gate is gated by its own version.
+   */
+  tombstoneVersion?: string;
+  /**
+   * On a range marker: the live head its tombstone replaced. A rolled-back
+   * deletion is re-submitted only while the registry shows exactly this head
+   * again, never over a write that landed after it.
+   */
+  replacedHead?: TombstoneFence;
+}
+
+/**
+ * What the registry says about a scope's tombstones at or above a version.
+ */
+export interface TombstoneFinalityState {
+  /**
+   * The highest version at or above the asked one that holds a finalized
+   * tombstone, or null when none does yet. Keys at or below a finalized
+   * tombstone can never be claimed by a registration again.
+   */
+  finalized: string | null;
+  /**
+   * True while a tombstone at or above the asked version can still settle
+   * (pending, submitting, confirmed, or a status the reader does not know).
+   * The caller reads again on its next pass.
+   */
+  settling: boolean;
+  /**
+   * Set when the deletion was rolled back: the highest listed version is a
+   * failed tombstone, no tombstone is settling, and the head is live data
+   * below it. Carries that head as the gateway reported it. Null otherwise,
+   * including when any version above the failed tombstone exists (a newer
+   * write).
+   */
+  rolledBack: { tombstoneVersion: string; head: TombstoneFence } | null;
+}
+
+/**
+ * When a storage key may be freed. A tombstone the gateway has queued but not
+ * finalized can still fail; the gateway then rolls the head back and lets a
+ * writer recover the failed slot. Freeing a key before that is ruled out lets
+ * another writer put different bytes under a slot that is later registered.
+ */
+export interface TombstoneFinalityPort {
+  /** The scope's tombstone state at or above `atOrAbove`. */
+  tombstoneState(
+    scope: string,
+    atOrAbove: string,
+  ): Promise<TombstoneFinalityState>;
+  /**
+   * A new tombstone of `scope` was just queued: drop any recheck backoff so
+   * the next pass reads it.
+   */
+  recheckNow?(scope: string): void;
 }
 
 /**

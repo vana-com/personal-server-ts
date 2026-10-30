@@ -116,6 +116,11 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
       dataPointId: DATA_POINT_ID,
       version: "4",
       deletedAt: "2026-08-25T10:00:00.000Z",
+      replaced: {
+        expectedVersion: "3",
+        dataHash: "0x" + "11".repeat(32),
+        metadataHash: "0x" + "22".repeat(32),
+      },
     });
   });
 
@@ -188,6 +193,51 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     );
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(outcome).toMatchObject({ status: "tombstoned", version: "8" });
+    // The head it replaced is not the one read before the 409: unknown.
+    expect(outcome).toMatchObject({ replaced: null });
+  });
+
+  it("with a fence, tombstones only the exact head it names and never re-signs on a 409", async () => {
+    const head = {
+      expectedVersion: "3",
+      dataHash: "0x" + "11".repeat(32),
+      metadataHash: "0x" + "22".repeat(32),
+    };
+    const stale = vi.fn(async () =>
+      jsonResponse(409, {
+        error: "Stale expectedVersion",
+        nextExpectedVersion: "5",
+      }),
+    );
+    const { port, signAddData } = makePort(
+      liveRecord(),
+      stale as unknown as typeof fetch,
+    );
+    // Same version, other bytes: a re-add recovered the slot.
+    await expect(
+      port.tombstone(SCOPE, {
+        head: { ...head, dataHash: "0x" + "33".repeat(32) },
+      }),
+    ).rejects.toThrow(/not the one/);
+    await expect(
+      port.tombstone(SCOPE, { head: { ...head, expectedVersion: "2" } }),
+    ).rejects.toThrow(/not the one/);
+    expect(stale).not.toHaveBeenCalled();
+
+    // Exact head, but another writer moved it before the POST: stop.
+    await expect(port.tombstone(SCOPE, { head })).rejects.toThrow(
+      /not the one/,
+    );
+    expect(signAddData).toHaveBeenCalledTimes(1);
+    expect(stale).toHaveBeenCalledTimes(1);
+
+    const ok = vi.fn(async () =>
+      jsonResponse(200, { data: { expectedVersion: "4", deletedAt: null } }),
+    );
+    const fenced = makePort(liveRecord(), ok as unknown as typeof fetch);
+    await expect(fenced.port.tombstone(SCOPE, { head })).resolves.toMatchObject(
+      { status: "tombstoned", version: "4", replaced: head },
+    );
   });
 
   it("takes the winning tombstone's version from a 410 body, not the version it attempted", async () => {

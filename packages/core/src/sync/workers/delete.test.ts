@@ -364,9 +364,10 @@ describe("deleteScope orchestration", () => {
     });
     expect(result.pendingBlobDeletion).toBe(true);
     expect(result.steps.local).toEqual({ status: "ok", deletedCount: 2 });
+    // A failed key keeps the gate of the tombstone that covers it.
     expect(await deps.pendingBlobDeletions!.list()).toEqual([
-      { scope: SCOPE, version: "2" },
-      { scope: SCOPE, version: "3" },
+      { scope: SCOPE, version: "2", tombstoneVersion: "4" },
+      { scope: SCOPE, version: "3", tombstoneVersion: "4" },
     ]);
   });
 
@@ -782,7 +783,9 @@ describe("retryPendingBlobDeletions", () => {
     expect(result.failed).toEqual([
       { scope: SCOPE, version: "2", error: "429 Too Many Requests" },
     ]);
-    expect(await pending.list()).toEqual([{ scope: SCOPE, version: "2" }]);
+    expect(await pending.list()).toEqual([
+      { scope: SCOPE, version: "2", tombstoneVersion: "3" },
+    ]);
   });
 
   it("expands a version-less marker into exact keys from the registry before deleting", async () => {
