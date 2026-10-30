@@ -650,6 +650,84 @@ describe("SyncManager", () => {
       ]);
     });
 
+    it("re-submits a rolled-back delete inside the cycle, then reports it in status once the attempts run out", async () => {
+      const uploadDeps = makeMockUploadDeps();
+      uploadDeps.storage.listVersions = vi.fn(() => []);
+      uploadDeps.storage.deleteScope = vi.fn(async () => 0);
+      const deleteData = makeDeleteData();
+      // Every tombstone fails: the registry always reports the rollback.
+      const tombstoneFinality = {
+        tombstoneState: vi.fn(async () => ({
+          finalized: null,
+          settling: false,
+          rolledBack: "2",
+        })),
+        recheckNow: vi.fn(),
+      };
+      // The additions ledger is deleted through the manager's own queue, as
+      // bootstrap wires it; awaiting that inside the cycle would deadlock.
+      const additionsDeleteScope = vi.fn(async (scope: string) => {
+        if (scope.startsWith("vana.system.")) return;
+        await manager.deleteScope(`vana.system.additions.${scope}`);
+      });
+      uploadDeps.additions = {
+        deleteScope: additionsDeleteScope,
+      } as unknown as UploadWorkerDeps["additions"];
+      const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+        deleteData,
+        pendingBlobDeletions: makePending(),
+        tombstoneFinality,
+      });
+
+      await manager.deleteScope("instagram.profile");
+      expect(deleteData.tombstone).toHaveBeenCalledTimes(2); // scope + ledger
+      expect(manager.getStatus().deletions).toEqual({
+        retrying: [],
+        failed: [],
+      });
+
+      await manager.trigger();
+      await vi.advanceTimersByTimeAsync(0);
+      // Both queued scopes were re-submitted inside the cycle, and the source
+      // scope's additions ledger was deleted again after it (no deadlock).
+      expect(deleteData.tombstone).toHaveBeenCalledTimes(5);
+      expect(additionsDeleteScope).toHaveBeenCalledWith("instagram.profile");
+      expect(manager.getStatus().deletions?.retrying).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ scope: "instagram.profile", attempts: 1 }),
+        ]),
+      );
+
+      for (let cycle = 0; cycle < 40; cycle++) {
+        vi.setSystemTime(Date.now() + 10 * 60_000);
+        await manager.trigger();
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      const status = manager.getStatus();
+      expect(status.deletions?.failed).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ scope: "instagram.profile", attempts: 5 }),
+        ]),
+      );
+      expect(status.errors).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            scope: "instagram.profile",
+            message: expect.stringContaining("did not complete"),
+          }),
+        ]),
+      );
+
+      // The user deletes again: a fresh set of attempts.
+      await manager.deleteScope("instagram.profile");
+      expect(
+        manager
+          .getStatus()
+          .deletions?.failed.some((s) => s.scope === "instagram.profile"),
+      ).toBe(false);
+    });
+
     it("does not start a delete while a sync cycle is mid-upload", async () => {
       const uploadDeps = makeMockUploadDeps();
       uploadDeps.storage.deleteScope = vi.fn(async () => 1);
