@@ -131,7 +131,7 @@ export function createGatewayDeleteDataPort(
           `Scope head (v${current.expectedVersion}) is not the one the fenced delete saw (v${fence.head.expectedVersion})`,
         );
       }
-      const replaced: TombstoneFence = {
+      let replaced: TombstoneFence | null = {
         expectedVersion: current.expectedVersion,
         dataHash: current.dataHash,
         metadataHash: current.metadataHash,
@@ -178,6 +178,9 @@ export function createGatewayDeleteDataPort(
           );
         }
         version = next;
+        // The head moved before the POST; which head this tombstone replaces
+        // is not known, so no automatic re-submission may rely on it.
+        replaced = null;
         res = await sendTombstone(scope, dataPointId, version);
       }
       if (res.status === 404) {
