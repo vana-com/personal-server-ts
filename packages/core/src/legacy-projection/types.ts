@@ -12,6 +12,23 @@ export interface PdppRecord {
   stream: string;
 }
 
+/**
+ * What the Personal Server serves for one legacy scope on read: the PDPP
+ * source and streams it joins, the vault scopes those streams are stored
+ * under, and the legacy body version it projects. A client that writes the
+ * raw `{records}` streams under `storedScopes` gets the legacy body back
+ * from a read of `scope`.
+ */
+export interface LegacyScopeProjection {
+  scope: string;
+  pdppSource: string;
+  streams: string[];
+  /** `<source>.<stream>` for each of `streams`, in the same order. */
+  storedScopes: string[];
+  /** `version` of the legacy schema the projected body follows. */
+  legacySchemaVersion: string;
+}
+
 export type LegacyScopeLookupError =
   | { kind: "unknown_scope"; scope: string }
   | { kind: "unsupported_profile"; scope: string; profileKey: string }

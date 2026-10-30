@@ -18,7 +18,9 @@
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   alternateLegacyBindingsForScope,
+  everyItemRowDropped,
   LEGACY_SCOPE_BINDINGS,
+  pdppStreamScope,
   projectPdppRecordsToLegacyPayload,
   type LegacyScopeBinding,
   type PdppRecord,
@@ -200,14 +202,13 @@ export function withLegacyProjection(
     }
 
     const { binding, profileKey } = cached.selected;
-    const source = scope.slice(0, scope.indexOf("."));
     // The latest version joins the latest siblings, whatever order one run
     // wrote its streams in. A historical version joins, of the sibling
     // versions written before the next version of `scope`, the one nearest
     // in time: the one its own run wrote, before or after it.
     const supersededAt = nextVersionTime(raw, scope, collectedAt);
     const inputs = binding.pdppStreams.map((stream) => {
-      const canonicalScope = `${source}.${stream}`;
+      const canonicalScope = pdppStreamScope(scope, stream);
       // For a single-stream alias, prefer the exact requested version when
       // it exists. This keeps alias writes, body classification and cursors
       // tied to the version the caller asked to read.
@@ -349,6 +350,24 @@ export function withLegacyProjection(
     });
     if (!result.ok) {
       failProjection(scope, collectedAt, result.error);
+    }
+    // As the canonical reader does: a view that kept none of the stored item
+    // rows is unavailable, not an empty history.
+    const itemStream = binding.pdppStreams[0]!;
+    if (
+      everyItemRowDropped(
+        itemStream,
+        projectionRecords.filter((record) => record.stream === itemStream)
+          .length,
+        result.diagnostics,
+      )
+    ) {
+      failProjection(scope, collectedAt, {
+        kind: "incomplete_scope",
+        scope,
+        reason: `No stored ${itemStream} row could be projected`,
+        ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
+      });
     }
     if (result.diagnostics?.length) {
       options.onIssue?.({

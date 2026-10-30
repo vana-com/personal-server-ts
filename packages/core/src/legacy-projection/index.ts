@@ -7,6 +7,7 @@ import {
 import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
 import { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
+import { LEGACY_SCHEMA_VERSIONS } from "./legacy-schema-versions.js";
 import { STRAVA_BROWSER_BINDINGS } from "./strava-browser-bindings.js";
 import { classifyAsTestDebris } from "./test-debris.js";
 import {
@@ -14,6 +15,7 @@ import {
   DeclaredTextError,
 } from "./declared-text.js";
 import type {
+  LegacyScopeProjection,
   LegacyScopeBinding,
   LegacyScopeLookupResult,
   PdppRecord,
@@ -35,6 +37,7 @@ export type { LegacyScopeBindingProvenance } from "./provenance.js";
 export { classifyAsTestDebris } from "./test-debris.js";
 export type {
   LegacyProjectionWindow,
+  LegacyScopeProjection,
   LegacyScopeBinding,
   LegacyScopeLookupError,
   LegacyScopeLookupResult,
@@ -122,6 +125,69 @@ export function legacyScopeToPdppSelection(
     ok: true,
     selection: { source: binding.pdppSource, streams: binding.pdppStreams },
   };
+}
+
+/**
+ * Every legacy scope the Personal Server projects from stored PDPP records
+ * on read, sorted. A scope not listed is served as stored.
+ */
+export function legacyScopesProjectedOnRead(): string[] {
+  return [...LEGACY_SCOPE_BINDINGS.keys()].sort();
+}
+
+/**
+ * How the Personal Server serves `scope` on read, or null when it does not
+ * project it (an unbound scope, a PDPP stream such as `chatgpt.messages`,
+ * test debris, or a profile the scope has no reviewed binding for). The
+ * source and streams are `legacyScopeToPdppSelection`'s.
+ */
+export function legacyProjectionFor(
+  scope: string,
+  options: { profileKey?: string } = {},
+): LegacyScopeProjection | null {
+  const lookup = legacyScopeToPdppSelection(scope, options);
+  if (!lookup.ok) return null;
+  const binding = bindingFor(scope, options.profileKey)!;
+  const legacySchemaVersion = LEGACY_SCHEMA_VERSIONS[binding.legacySchemaPath];
+  if (!legacySchemaVersion) {
+    throw new Error(`${scope}: no version for ${binding.legacySchemaPath}`);
+  }
+  const { source, streams } = lookup.selection;
+  return {
+    scope,
+    pdppSource: source,
+    streams: [...streams],
+    storedScopes: streams.map((stream) => pdppStreamScope(scope, stream)),
+    legacySchemaVersion,
+  };
+}
+
+/**
+ * The `records_dropped` diagnostics on `stream` when they account for every
+ * one of its `sourceRows` source rows, else null. A projection that kept
+ * none of a scope's item rows is not an empty result: an empty list would
+ * read as an account with nothing in it. Readers then fail the scope.
+ */
+export function everyItemRowDropped(
+  stream: string,
+  sourceRows: number,
+  diagnostics: readonly ProjectionDiagnostic[] | undefined,
+): { dropped: number; reasons: string[] } | null {
+  const own = (diagnostics ?? []).filter(
+    (d): d is Extract<ProjectionDiagnostic, { kind: "records_dropped" }> =>
+      d.kind === "records_dropped" && d.stream === stream,
+  );
+  const dropped = own.reduce((sum, d) => sum + d.count, 0);
+  if (sourceRows === 0 || dropped < sourceRows) return null;
+  return { dropped, reasons: [...new Set(own.flatMap((d) => d.reasons))] };
+}
+
+/**
+ * The vault scope a PDPP stream of `scope`'s source is stored under:
+ * `<scope's source prefix>.<stream>`, e.g. `chatgpt.messages`.
+ */
+export function pdppStreamScope(scope: string, stream: string): string {
+  return `${scope.slice(0, scope.indexOf("."))}.${stream}`;
 }
 
 /**
