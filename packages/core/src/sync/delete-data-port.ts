@@ -97,7 +97,10 @@ export function createGatewayDeleteDataPort(
   }
 
   return {
-    async tombstone(scope: string): Promise<TombstoneOutcome> {
+    async tombstone(
+      scope: string,
+      fence?: { atOrBelow: string },
+    ): Promise<TombstoneOutcome> {
       const dataPointId = computeDataPointId(options.serverOwner, scope);
       const current = await options.dataPointFeed.getDataPoint({
         ownerAddress: options.serverOwner,
@@ -116,7 +119,18 @@ export function createGatewayDeleteDataPort(
       }
 
       let version = BigInt(current.expectedVersion) + 1n;
+      if (fence && version > BigInt(fence.atOrBelow)) {
+        throw new Error(
+          `Scope has a newer version (${current.expectedVersion}) than the fenced delete allows (≤ ${fence.atOrBelow})`,
+        );
+      }
       let res = await sendTombstone(scope, dataPointId, version);
+      if (res.status === 409 && fence) {
+        await res.body?.cancel();
+        throw new Error(
+          `Scope has a newer version than the fenced delete allows (≤ ${fence.atOrBelow}): another writer moved the head`,
+        );
+      }
       if (res.status === 409) {
         // Another replica advanced the scope between our read and our
         // write. The 409 body carries `currentExpectedVersion` (and the

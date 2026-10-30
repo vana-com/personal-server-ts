@@ -15,8 +15,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { keccak256, toHex } from "viem";
 
-import { deleteScope, retryPendingBlobDeletions } from "./delete.js";
-import type { DeleteScopeDeps } from "./delete.js";
+import {
+  deleteScope,
+  retryPendingBlobDeletions,
+  TOMBSTONE_RESUBMIT_MAX_ATTEMPTS,
+} from "./delete.js";
+import type {
+  DeleteScopeDeps,
+  RetryPendingBlobDeletionsDeps,
+} from "./delete.js";
+import { createTombstoneResubmitTracker } from "../tombstone-resubmits.js";
 import { computeDataPointId } from "../data-point-id.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 import { createInventoryTombstoneFinality } from "../tombstone-finality.js";
@@ -122,8 +130,18 @@ class Gateway {
         .sort(([a], [b]) => (a < b ? -1 : 1));
       const page = rows.slice(0, limit);
       const hasMore = rows.length > limit;
+      const head = this.head();
       return {
         data: {
+          head: head
+            ? {
+                expectedVersion: head.version.toString(),
+                dataHash: head.dataHash,
+                metadataHash: head.metadataHash,
+                status: head.status,
+                deletedAt: head.deletedAt,
+              }
+            : null,
           versions: page.map(([version, row]) => ({
             expectedVersion: version.toString(),
             dataHash: row.dataHash,
@@ -181,29 +199,42 @@ function setup(
   const gateway = new Gateway();
   const storage = new Storage();
   const deleteData: DeleteDataPort = {
-    tombstone: vi.fn(async (): Promise<TombstoneOutcome> => {
-      // As the gateway port does: a head that is already a tombstone answers
-      // "already deleted" with its version, else a tombstone is queued.
-      const head = gateway.head();
-      if (head === null) {
-        return { status: "not-registered", dataPointId: DATA_POINT_ID };
-      }
-      if (head.deletedAt && !options.tombstoneOverTombstone) {
+    tombstone: vi.fn(
+      async (
+        _scope: string,
+        fence?: { atOrBelow: string },
+      ): Promise<TombstoneOutcome> => {
+        // As the gateway port does: a head that is already a tombstone answers
+        // "already deleted" with its version, else a tombstone is queued.
+        const head = gateway.head();
+        if (
+          fence &&
+          head &&
+          !head.deletedAt &&
+          head.version + 1n > BigInt(fence.atOrBelow)
+        ) {
+          throw new Error("Scope has a newer version than the fenced delete");
+        }
+        if (head === null) {
+          return { status: "not-registered", dataPointId: DATA_POINT_ID };
+        }
+        if (head.deletedAt && !options.tombstoneOverTombstone) {
+          return {
+            status: "already-deleted",
+            dataPointId: DATA_POINT_ID,
+            version: head.version.toString(),
+            deletedAt: head.deletedAt,
+          };
+        }
+        const version = gateway.queueTombstone();
         return {
-          status: "already-deleted",
+          status: "tombstoned",
           dataPointId: DATA_POINT_ID,
-          version: head.version.toString(),
-          deletedAt: head.deletedAt,
+          version: version.toString(),
+          deletedAt: gateway.versions.get(version)!.deletedAt,
         };
-      }
-      const version = gateway.queueTombstone();
-      return {
-        status: "tombstoned",
-        dataPointId: DATA_POINT_ID,
-        version: version.toString(),
-        deletedAt: gateway.versions.get(version)!.deletedAt,
-      };
-    }),
+      },
+    ),
     deleteBlobVersions: vi.fn(async (_scope: string, versions: string[]) => {
       const deleted: string[] = [];
       const missing: string[] = [];
@@ -217,7 +248,7 @@ function setup(
   // Sync cycles are a minute apart; finality rechecks back off per scope.
   let clock = Date.parse("2026-10-29T12:00:00.000Z");
   const localStorage = createMemoryDataStorage();
-  const deps: DeleteScopeDeps = {
+  const deps: DeleteScopeDeps & RetryPendingBlobDeletionsDeps = {
     storage: localStorage,
     serverOwner: OWNER,
     deleteData,
@@ -233,6 +264,14 @@ function setup(
           ),
         }),
   };
+  // A failed tombstone is re-submitted through the same delete path the sync
+  // manager wires (one sync-cycle mutation at a time).
+  const resubmits = createTombstoneResubmitTracker({ now: () => clock });
+  if (options.finality !== false) {
+    deps.tombstoneResubmits = resubmits;
+    deps.resubmitDeletion = (scope, resubmit) =>
+      deleteScope(deps, scope, resubmit);
+  }
   /**
    * Every sync cycle starts with a retry pass. By default each call stands
    * for enough elapsed time that no recheck backoff is pending.
@@ -253,7 +292,29 @@ function setup(
       version,
       dataPointId: null,
     });
-  return { gateway, storage, deps, deleteData, cycle, unsyncedLocal };
+  /** A local copy of a registered version, as the download worker writes it. */
+  const syncedLocal = (version: number) =>
+    localStorage.insertEntry({
+      fileId: `file-${version}`,
+      schemaId: null,
+      path: `${SCOPE}/synced-${version}.json`,
+      scope: SCOPE,
+      collectedAt: `2026-10-2${version}T00:00:00.000Z`,
+      sizeBytes: 10,
+      version,
+      dataPointId: DATA_POINT_ID,
+    });
+  return {
+    gateway,
+    storage,
+    deps,
+    deleteData,
+    cycle,
+    unsyncedLocal,
+    syncedLocal,
+    localStorage,
+    resubmits,
+  };
 }
 
 const bytes = (text: string) => new TextEncoder().encode(text);
@@ -377,15 +438,16 @@ describe("blob cleanup waits for the tombstone to be final", () => {
 
     await deleteScope(deps, SCOPE); // tombstone v2
     gateway.settle(2n, "failed");
-    await cycle();
-    // The deletion did not happen: the live v1 head keeps its bytes.
     expect(gateway.head()?.version).toBe(1n);
+    await cycle();
+    // The deletion did not happen: the live v1 head keeps its bytes. The
+    // retry re-submitted it; the new tombstone recovers the failed slot.
     expect(storage.blobs.has("1")).toBe(true);
-
-    // The owner deletes again; the gateway recovers the failed slot with the
-    // new tombstone, and this one becomes final.
-    await deleteScope(deps, SCOPE);
     expect(gateway.head()).toMatchObject({ version: 2n, status: "pending" });
+
+    // The owner deletes again meanwhile (the gateway answers "already
+    // deleted"), and the tombstone becomes final.
+    await deleteScope(deps, SCOPE);
     gateway.settle(2n, "finalized");
     const retried = await cycle();
 
@@ -507,6 +569,250 @@ describe("blob cleanup waits for the tombstone to be final", () => {
   });
 });
 
+describe("storage cleanup converges on the user's delete", () => {
+  const MINUTE = 60_000;
+
+  it("reads finality every sync cycle while the tombstone settles, and cleans up within one cycle of finalization", async () => {
+    const { gateway, storage, deps, cycle } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+
+    await deleteScope(deps, SCOPE); // tombstone v2, pending
+    const readsAtDelete = gateway.inventoryPage.mock.calls.length;
+    gateway.settle(2n, "submitting");
+    for (let minute = 0; minute < 6; minute++) await cycle(MINUTE);
+    // One signed inventory read per cycle while the tombstone settles.
+    expect(gateway.inventoryPage.mock.calls.length - readsAtDelete).toBe(6);
+    expect(storage.blobs.has("1")).toBe(true);
+
+    gateway.settle(2n, "finalized");
+    const retried = await cycle(MINUTE);
+
+    expect(retried.remaining).toBe(0);
+    expect(storage.blobs.size).toBe(0);
+  });
+
+  it("re-submits a tombstone that failed, and the new tombstone's finality drains the queued keys", async () => {
+    const {
+      gateway,
+      storage,
+      deps,
+      deleteData,
+      cycle,
+      syncedLocal,
+      localStorage,
+    } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+    syncedLocal(1);
+
+    await deleteScope(deps, SCOPE); // tombstone v2
+    expect(localStorage.listVersions(SCOPE, { limit: 100 })).toHaveLength(0);
+    gateway.settle(2n, "failed");
+    // Rollback: the gateway shows v1 live again and the download worker
+    // pulls it back into the local index.
+    expect(gateway.head()).toMatchObject({ version: 1n, deletedAt: null });
+    syncedLocal(1);
+
+    await cycle(MINUTE);
+
+    // The user's delete is re-submitted through the delete path: a new
+    // tombstone takes the free slot, and the re-pulled copy is erased again.
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(2);
+    expect(gateway.head()).toMatchObject({
+      version: 2n,
+      status: "pending",
+      dataHash: TOMBSTONE_DATA_HASH,
+    });
+    expect(localStorage.listVersions(SCOPE, { limit: 100 })).toHaveLength(0);
+    expect(storage.blobs.has("1")).toBe(true);
+
+    gateway.settle(2n, "finalized");
+    const retried = await cycle(MINUTE);
+
+    expect(retried.remaining).toBe(0);
+    expect(storage.blobs.size).toBe(0);
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(2);
+  });
+
+  it("never re-deletes a scope the user re-added on this replica after the delete", async () => {
+    const { gateway, storage, deps, deleteData, cycle, unsyncedLocal } =
+      setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+
+    await deleteScope(deps, SCOPE); // tombstone v2
+    // The user adds the data back before the failure is noticed.
+    unsyncedLocal(2);
+    gateway.settle(2n, "failed");
+    for (let minute = 0; minute < 30; minute++) await cycle(MINUTE);
+
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(1);
+    expect(storage.blobs.has("1")).toBe(true);
+  });
+
+  it("never re-deletes a scope another writer re-added at the gateway after the failure", async () => {
+    const { gateway, storage, deps, deleteData, cycle } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+
+    await deleteScope(deps, SCOPE); // tombstone v2
+    gateway.settle(2n, "failed");
+    // Another replica registers new data in the freed slot above the
+    // rolled-back head: the user's newer write wins over the failed delete.
+    gateway.register(2n, keccak256(bytes("re-add")));
+    for (let minute = 0; minute < 30; minute++) await cycle(MINUTE);
+
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(1);
+  });
+
+  it("drains when the re-submitted tombstone takes a slot below the failed one", async () => {
+    const { gateway, storage, deps, cycle, resubmits } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+    gateway.register(2n, keccak256(bytes("v2")));
+    storage.put(2n, bytes("v2"));
+
+    await deleteScope(deps, SCOPE); // tombstone v3 over pending data v2
+    // v2's settlement fails, and v3 with it: the head rolls back to v1.
+    gateway.settle(2n, "failed");
+    gateway.settle(3n, "failed");
+    expect(gateway.head()?.version).toBe(1n);
+
+    await cycle(MINUTE); // re-submitted: the new tombstone recovers slot 2
+    expect(gateway.head()).toMatchObject({
+      version: 2n,
+      dataHash: TOMBSTONE_DATA_HASH,
+      status: "pending",
+    });
+    const reads = gateway.inventoryPage.mock.calls.length;
+    for (let minute = 0; minute < 4; minute++) await cycle(MINUTE);
+    // Still read every cycle while the new tombstone settles.
+    expect(gateway.inventoryPage.mock.calls.length - reads).toBe(4);
+
+    gateway.settle(2n, "finalized");
+    await cycle(MINUTE);
+
+    // Keys 1 and 2 are covered by the finalized tombstone v2; slot 3 is open
+    // again and stays held.
+    expect(storage.blobs.size).toBe(0);
+    expect(resubmits.snapshot()).toEqual({ retrying: [], failed: [] });
+  });
+
+  it("does not tombstone a re-add that lands between the rollback read and the re-submission", async () => {
+    const { gateway, storage, deps, deleteData, cycle } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+    await deleteScope(deps, SCOPE); // tombstone v2
+    gateway.settle(2n, "failed");
+
+    // Another replica re-adds in the free slot while this pass runs.
+    const resubmit = deps.resubmitDeletion!;
+    deps.resubmitDeletion = async (scope, options) => {
+      gateway.register(2n, keccak256(bytes("re-add")));
+      storage.put(2n, bytes("re-add"));
+      return resubmit(scope, options);
+    };
+    await cycle(MINUTE);
+    gateway.settle(2n, "finalized");
+    for (let minute = 0; minute < 5; minute++) await cycle(MINUTE);
+
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(2);
+    expect(gateway.head()).toMatchObject({ version: 2n, deletedAt: null });
+    expect(storage.hashAt(2n)).toBe(keccak256(bytes("re-add")));
+  });
+
+  it("a re-submission sends no storage batch of its own", async () => {
+    const { gateway, storage, deps, deleteData, cycle } = setup();
+    // Scope history: 40 versions under a finalized tombstone v40 that is
+    // still draining, then a re-add at v41 deleted by tombstone v42.
+    for (let v = 1n; v <= 39n; v++) {
+      gateway.register(v, keccak256(bytes(`v${v}`)));
+      storage.put(v, bytes(`v${v}`));
+      gateway.settle(v, "finalized");
+    }
+    await deleteScope(deps, SCOPE); // tombstone v40
+    gateway.settle(40n, "finalized");
+    gateway.register(41n, keccak256(bytes("v41")));
+    storage.put(41n, bytes("v41"));
+    gateway.settle(41n, "finalized");
+    await deleteScope(deps, SCOPE); // tombstone v42
+    gateway.settle(42n, "failed");
+    vi.mocked(deleteData.deleteBlobVersions).mockClear();
+
+    await cycle(MINUTE);
+
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(3);
+    const sent = vi
+      .mocked(deleteData.deleteBlobVersions)
+      .mock.calls.reduce((total, [, versions]) => total + versions.length, 0);
+    expect(sent).toBeLessThanOrEqual(15);
+  });
+
+  it("clears a reported failure once the scope's keys drain", async () => {
+    const { gateway, storage, deps, cycle, resubmits } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+    await deleteScope(deps, SCOPE); // tombstone v2
+    for (let minute = 0; minute < 180; minute++) {
+      if (gateway.versions.get(2n)?.status === "pending")
+        gateway.settle(2n, "failed");
+      await cycle(MINUTE);
+    }
+    expect(resubmits.snapshot().failed).toHaveLength(1);
+
+    // The user deletes on another device; that tombstone becomes final.
+    gateway.queueTombstone();
+    gateway.settle(2n, "finalized");
+    await cycle(60 * MINUTE);
+
+    expect(storage.blobs.size).toBe(0);
+    expect(resubmits.snapshot()).toEqual({ retrying: [], failed: [] });
+  });
+
+  it("gives up after a bounded number of re-submissions and reports the failure", async () => {
+    const { gateway, storage, deps, deleteData, cycle, resubmits } = setup();
+    gateway.register(1n, keccak256(bytes("v1")));
+    storage.put(1n, bytes("v1"));
+    gateway.settle(1n, "finalized");
+
+    await deleteScope(deps, SCOPE); // tombstone v2
+    // Every tombstone of this scope fails to settle.
+    for (let minute = 0; minute < 180; minute++) {
+      const row = gateway.versions.get(2n);
+      if (row?.status === "pending") gateway.settle(2n, "failed");
+      await cycle(MINUTE);
+    }
+
+    expect(deleteData.tombstone).toHaveBeenCalledTimes(
+      1 + TOMBSTONE_RESUBMIT_MAX_ATTEMPTS,
+    );
+    // Nothing was freed: the gateway shows the scope live.
+    expect(storage.blobs.has("1")).toBe(true);
+    expect(resubmits.snapshot()).toEqual({
+      retrying: [],
+      failed: [
+        expect.objectContaining({
+          scope: SCOPE,
+          attempts: TOMBSTONE_RESUBMIT_MAX_ATTEMPTS,
+          tombstoneVersion: "2",
+        }),
+      ],
+    });
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: SCOPE }),
+      expect.stringContaining("Scope deletion did not complete"),
+    );
+  });
+});
+
 describe("createInventoryTombstoneFinality", () => {
   const row = (version: number, status: Status, tombstone = true) => ({
     expectedVersion: String(version),
@@ -544,9 +850,11 @@ describe("createInventoryTombstoneFinality", () => {
     );
     const finality = createInventoryTombstoneFinality({ page });
 
-    await expect(
-      finality.finalizedTombstoneAtOrAbove(SCOPE, "4"),
-    ).resolves.toBe("6");
+    await expect(finality.tombstoneState(SCOPE, "4")).resolves.toEqual({
+      finalized: "6",
+      settling: true,
+      rolledBack: null,
+    });
     expect(page).toHaveBeenNthCalledWith(1, SCOPE, {
       after: "3",
       limit: 1000,
@@ -567,8 +875,102 @@ describe("createInventoryTombstoneFinality", () => {
       ]),
     });
 
-    await expect(
-      finality.finalizedTombstoneAtOrAbove(SCOPE, "2"),
-    ).resolves.toBeNull();
+    await expect(finality.tombstoneState(SCOPE, "2")).resolves.toMatchObject({
+      finalized: null,
+    });
+  });
+
+  const liveHead = (version: number) => ({
+    expectedVersion: String(version),
+    dataHash: toHex(version, { size: 32 }),
+    metadataHash: toHex(version, { size: 32 }),
+    status: "finalized",
+    deletedAt: null,
+  });
+  const onePage = (
+    head: ReturnType<typeof liveHead> | null,
+    versions: Array<ReturnType<typeof row>>,
+  ) =>
+    vi.fn(async () => ({
+      data: { head, versions },
+      pagination: { limit: 1000, hasMore: false, nextAfter: null },
+    }));
+
+  it("reports a rollback only when the newest version is a failed tombstone over a live head", async () => {
+    const rolledBack = createInventoryTombstoneFinality({
+      page: onePage(liveHead(1), [row(2, "failed")]),
+    });
+    await expect(rolledBack.tombstoneState(SCOPE, "2")).resolves.toEqual({
+      finalized: null,
+      settling: false,
+      rolledBack: "2",
+    });
+
+    // A newer write above the failed tombstone, even a failed one.
+    const newerWrite = createInventoryTombstoneFinality({
+      page: onePage(liveHead(1), [row(2, "failed"), row(3, "failed", false)]),
+    });
+    await expect(newerWrite.tombstoneState(SCOPE, "2")).resolves.toMatchObject({
+      rolledBack: null,
+    });
+
+    // The head is an older tombstone: the scope is still deleted.
+    const deletedHead = createInventoryTombstoneFinality({
+      page: onePage(
+        {
+          expectedVersion: "1",
+          dataHash: TOMBSTONE_DATA_HASH,
+          metadataHash: TOMBSTONE_METADATA_HASH,
+          status: "finalized",
+          deletedAt: "2026-10-29T00:00:00.000Z",
+        },
+        [row(2, "failed")],
+      ),
+    });
+    await expect(deletedHead.tombstoneState(SCOPE, "2")).resolves.toMatchObject(
+      { rolledBack: null },
+    );
+
+    // A tombstone still settling.
+    const settling = createInventoryTombstoneFinality({
+      page: onePage(liveHead(1), [row(2, "failed"), row(3, "submitting")]),
+    });
+    await expect(settling.tombstoneState(SCOPE, "2")).resolves.toMatchObject({
+      settling: true,
+      rolledBack: null,
+    });
+  });
+
+  it("treats an unknown status as settling and never backs off while settling", async () => {
+    let clock = 0;
+    const page = onePage(liveHead(1), [row(2, "reorged")]);
+    const finality = createInventoryTombstoneFinality(
+      { page },
+      { now: () => clock },
+    );
+    for (let cycle = 0; cycle < 5; cycle++) {
+      clock += 60_000;
+      await expect(finality.tombstoneState(SCOPE, "2")).resolves.toMatchObject({
+        settling: true,
+      });
+    }
+    expect(page).toHaveBeenCalledTimes(5);
+  });
+
+  it("backs off a scope with nothing settling until recheckNow", async () => {
+    let clock = 0;
+    const page = onePage(liveHead(1), []);
+    const finality = createInventoryTombstoneFinality(
+      { page },
+      { now: () => clock },
+    );
+    await finality.tombstoneState(SCOPE, "2");
+    clock += 30_000;
+    await finality.tombstoneState(SCOPE, "2");
+    expect(page).toHaveBeenCalledTimes(1);
+
+    finality.recheckNow!(SCOPE);
+    await finality.tombstoneState(SCOPE, "2");
+    expect(page).toHaveBeenCalledTimes(2);
   });
 });
