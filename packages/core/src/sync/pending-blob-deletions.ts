@@ -1,6 +1,7 @@
 import type {
   PendingBlobDeletion,
   PendingBlobDeletionStore,
+  TombstoneFence,
 } from "../ports/index.js";
 
 /**
@@ -56,6 +57,29 @@ function markerId(key: PendingBlobDeletion): string {
   return `${key.scope}\u0000${key.version ?? ""}\u0000${range}`;
 }
 
+function normalizeHead(value: unknown): TombstoneFence | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { expectedVersion, dataHash, metadataHash } = value as Record<
+    string,
+    unknown
+  >;
+  if (
+    typeof expectedVersion !== "string" ||
+    !/^\d+$/.test(expectedVersion) ||
+    typeof dataHash !== "string" ||
+    !/^0x[0-9a-fA-F]{64}$/.test(dataHash) ||
+    typeof metadataHash !== "string" ||
+    !/^0x[0-9a-fA-F]{64}$/.test(metadataHash)
+  ) {
+    return undefined;
+  }
+  return {
+    expectedVersion: BigInt(expectedVersion).toString(),
+    dataHash: dataHash.toLowerCase(),
+    metadataHash: metadataHash.toLowerCase(),
+  };
+}
+
 function normalizeRange(
   value: unknown,
 ): { from: string; to: string } | undefined {
@@ -97,6 +121,9 @@ export function normalizePendingBlobDeletions(
           ? undefined
           : normalizeRange((item as { range?: unknown }).range);
       const gate = (item as { tombstoneVersion?: unknown }).tombstoneVersion;
+      const replacedHead = normalizeHead(
+        (item as { replacedHead?: unknown }).replacedHead,
+      );
       keys.push({
         scope: (item as { scope: string }).scope,
         version: typeof version === "string" ? version : null,
@@ -104,6 +131,7 @@ export function normalizePendingBlobDeletions(
         ...(typeof gate === "string" && /^\d+$/.test(gate)
           ? { tombstoneVersion: BigInt(gate).toString() }
           : {}),
+        ...(replacedHead ? { replacedHead } : {}),
       });
     }
   }
@@ -155,6 +183,7 @@ export function createPendingBlobDeletionStore(
         ...(key.tombstoneVersion !== undefined
           ? { tombstoneVersion: key.tombstoneVersion }
           : {}),
+        ...(key.replacedHead ? { replacedHead: { ...key.replacedHead } } : {}),
       });
     }
     return next;
