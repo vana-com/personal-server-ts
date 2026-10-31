@@ -10,6 +10,16 @@
  * `POST /v1/escrow/pay` on the gateway. On 2xx the read proceeds; on
  * 4xx/5xx the server responds with a fresh challenge.
  *
+ * Two offers, one challenge. `accepts` always carries the `grant` offer
+ * (opId = grant id), first, so clients written against it keep working.
+ * Once the grant's registration fee is paid and the read has a signed
+ * accessRecord, `accepts` also carries a `data_access` offer: opId = the
+ * accessRecord's recordId, so the builder's signature commits to this exact
+ * delivery receipt. That is the shape the protocol spec documents and the
+ * one the SDK prefers. `verifyPayment` accepts either. A client that
+ * implements only one of the two shapes therefore never meets a server that
+ * refuses it — see `x402.contract.test.ts`.
+ *
  * This module is wire-format only — it doesn't talk to the gateway or the
  * storage layer. Callers in `api/index.ts` glue it to `gateway.getGrant`
  * (for fee discovery), `IndexEntry.dataPointId/version` (for accessRecord
@@ -95,11 +105,15 @@ export interface X402PaymentMessage {
   paymentNonce: string;
 }
 
+/** Escrow op types a personal server quotes and accepts for a paid read. */
+export const GRANT_OP_TYPE = "grant" as const;
+export const DATA_ACCESS_OP_TYPE = "data_access" as const;
+
 /**
  * One option in the 402 response's `accepts` array.
  */
 export interface X402Accept {
-  // Discriminator for client logic. Currently the only scheme we issue.
+  // Both offers use this scheme; `message.opType` tells them apart.
   scheme: "vana-escrow-grant";
   network: string;
   asset: `0x${string}`;
@@ -120,7 +134,8 @@ export interface X402Accept {
     registrationOwed: boolean;
   };
   // Present when the entry has a registered dataPointId. Omitted on
-  // first-ingest reads before the sync worker has run.
+  // first-ingest reads before the sync worker has run. Always present on a
+  // `data_access` offer: its opId is this record's recordId.
   accessRecord?: X402AccessRecord;
   // Unix seconds. Stateless: the server doesn't track issued challenges;
   // the builder is responsible for retrying within this window.
@@ -133,7 +148,8 @@ export interface X402Accept {
 export interface X402Challenge {
   x402Version: 1;
   error: "PAYMENT_REQUIRED";
-  accepts: [X402Accept];
+  // The `grant` offer first, then the `data_access` offer when one applies.
+  accepts: [X402Accept, ...X402Accept[]];
 }
 
 /**
@@ -169,6 +185,44 @@ const ADDRESS_REGEX = /^0x[0-9a-fA-F]{40}$/;
 const SIGNATURE_REGEX = /^0x[0-9a-fA-F]{130}$/;
 const POSITIVE_DECIMAL_INT_REGEX = /^[1-9]\d*$/;
 const NON_NEGATIVE_DECIMAL_INT_REGEX = /^(0|[1-9]\d*)$/;
+
+// Grant states in which the gateway takes a standalone data_access payment
+// (data-gateway api/v1/escrow/pay.ts, STANDALONE_ACCESS_GRANT_STATES).
+const DATA_ACCESS_GRANT_STATES: readonly string[] = [
+  "pending",
+  "submitting",
+  "confirmed",
+  "finalized",
+];
+
+/**
+ * Whether the gateway would take a standalone data_access payment under this
+ * grant. Mirrors the gateway's own checks so the server never offers (or
+ * forwards) one that is bound to fail, which would strand SDK clients: they
+ * prefer data_access whenever it is offered.
+ *
+ * - registration paid: data_access never carries the registration fee;
+ * - grant live: an accepted chain state, not revoked, not expired;
+ * - the served scope listed in the grant verbatim: the gateway matches the
+ *   receipt's scope exactly, so a wildcard grant (`instagram.*`) that covers
+ *   the read here still pays through the grant offer;
+ * - a non-zero data-access fee: with that fee disabled the gateway prices
+ *   data_access in the zero asset while the grant quotes the registration
+ *   asset, so the two offers would disagree and nothing is left to pay.
+ */
+function dataAccessPayable(
+  grant: GatewayGrantResponse,
+  scope: string,
+): boolean {
+  return (
+    grant.paymentStatus === "paid" &&
+    grant.scopes.includes(scope) &&
+    DATA_ACCESS_GRANT_STATES.includes(grant.status) &&
+    grant.revokedAt === null &&
+    !grant.expired &&
+    POSITIVE_DECIMAL_INT_REGEX.test(grant.fee.dataAccessFee)
+  );
+}
 
 export interface BuildChallengeInput {
   // Recovered Web3Signed signer for the GET — the builder.
@@ -246,39 +300,58 @@ export async function buildChallenge(
     };
   }
 
-  const message: X402PaymentMessage = {
-    payerAddress: input.builder,
-    opType: "grant",
-    opId: input.grantId,
+  const paymentNonce = generateNonce().toString();
+  const breakdown = {
+    registrationFee: registrationOwed ? input.grant.fee.registrationFee : "0",
+    dataAccessFee: input.grant.fee.dataAccessFee,
+    registrationOwed,
+  };
+  const offer = (message: X402PaymentMessage): X402Accept => ({
+    scheme: "vana-escrow-grant",
+    network: input.network,
     asset,
     amount,
-    paymentNonce: generateNonce().toString(),
-  };
+    domain: escrowPaymentDomain(input.gatewayConfig),
+    types: GENERIC_PAYMENT_TYPES,
+    message,
+    breakdown,
+    ...(accessRecord ? { accessRecord } : {}),
+    expiresAt,
+  });
 
-  return {
-    x402Version: 1,
-    error: "PAYMENT_REQUIRED",
-    accepts: [
-      {
-        scheme: "vana-escrow-grant",
-        network: input.network,
+  const accepts: X402Challenge["accepts"] = [
+    offer({
+      payerAddress: input.builder,
+      opType: GRANT_OP_TYPE,
+      opId: input.grantId,
+      asset,
+      amount,
+      paymentNonce,
+    }),
+  ];
+
+  // Offered only where the gateway would take it (see dataAccessPayable),
+  // and only with a receipt to bind to. Both offers share the accessRecord
+  // and nonce; whichever the builder pays consumes the recordId, so the
+  // other cannot be paid as well.
+  if (
+    accessRecord &&
+    input.entry &&
+    dataAccessPayable(input.grant, input.entry.scope)
+  ) {
+    accepts.push(
+      offer({
+        payerAddress: input.builder,
+        opType: DATA_ACCESS_OP_TYPE,
+        opId: accessRecord.recordId.toLowerCase() as `0x${string}`,
         asset,
         amount,
-        domain: escrowPaymentDomain(input.gatewayConfig),
-        types: GENERIC_PAYMENT_TYPES,
-        message,
-        breakdown: {
-          registrationFee: registrationOwed
-            ? input.grant.fee.registrationFee
-            : "0",
-          dataAccessFee: input.grant.fee.dataAccessFee,
-          registrationOwed,
-        },
-        ...(accessRecord ? { accessRecord } : {}),
-        expiresAt,
-      },
-    ],
-  };
+        paymentNonce,
+      }),
+    );
+  }
+
+  return { x402Version: 1, error: "PAYMENT_REQUIRED", accepts };
 }
 
 // Decode base64 to UTF-8. Tolerates standard + url-safe alphabets so clients
@@ -461,12 +534,47 @@ export async function verifyPayment(
     };
   }
 
-  if (msg.opType !== "grant") {
+  if (msg.opType === GRANT_OP_TYPE) {
+    if (msg.opId.toLowerCase() !== input.grantId.toLowerCase()) {
+      return {
+        ok: false,
+        reason: "opId does not match the request's grantId",
+      };
+    }
+  } else if (msg.opType === DATA_ACCESS_OP_TYPE) {
+    // The payment commits to one server-signed receipt: opId is its
+    // recordId. The receipt itself is checked against this server and the
+    // served entry below, like any bundled accessRecord.
+    const ar = payment.payload.accessRecord;
+    if (!ar) {
+      return {
+        ok: false,
+        reason: "accessRecord is required for opType=data_access",
+      };
+    }
+    if (msg.opId.toLowerCase() !== ar.recordId.toLowerCase()) {
+      return {
+        ok: false,
+        reason: "opId must equal accessRecord.recordId for opType=data_access",
+      };
+    }
+    // The gateway prices data_access without the registration fee, so an
+    // unpaid grant must be paid through the grant offer first.
+    if (grant.paymentStatus !== "paid") {
+      return {
+        ok: false,
+        reason: "grant registration is unpaid; pay the grant offer",
+      };
+    }
+    if (!input.entry || !dataAccessPayable(grant, input.entry.scope)) {
+      return {
+        ok: false,
+        reason:
+          "grant does not admit a data_access payment; pay the grant offer",
+      };
+    }
+  } else {
     return { ok: false, reason: `Unsupported opType: ${msg.opType}` };
-  }
-
-  if (msg.opId.toLowerCase() !== input.grantId.toLowerCase()) {
-    return { ok: false, reason: "opId does not match the request's grantId" };
   }
 
   // Amount + asset must match the gateway's canonical values. Re-fetched
