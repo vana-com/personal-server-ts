@@ -107,6 +107,7 @@ import {
 import type { ReplicaWriterRotation } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import { rotateReplicaWriterIdentityAtBoot } from "./storage/pdpp-replica-writer-identity.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
+import { createCanonicalReaddMarkers } from "./storage/canonical-readd-markers.js";
 import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { generateDevToken } from "./dev-token.js";
@@ -1137,7 +1138,12 @@ export async function createServer(
           operatorToken: accessToken,
         }
       : undefined,
-    pdpp: pdppRecords,
+    pdpp: pdppRecords && {
+      ...pdppRecords,
+      // Proven canonical writes over a known tombstone record a re-add marker
+      // in the same database as the rows and the deletion history.
+      canonicalReadd: createCanonicalReaddMarkers(db, scopeDeletions),
+    },
     pdppConnections,
     // The SAME stable delegate the download worker was given above, not a
     // second importer: both arrival routes must resolve to one importer over

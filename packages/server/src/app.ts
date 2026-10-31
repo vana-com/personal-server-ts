@@ -1,3 +1,4 @@
+import type { CanonicalReaddMarkers } from "./storage/canonical-readd-markers.js";
 import { ouraRoutes } from "./routes/oura.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
@@ -266,6 +267,8 @@ export interface AppDeps {
     reads: PdppReplicaReads;
     bindingStore: ReturnType<typeof createSqliteRecordStore>;
     configuredMethods: Map<string, string[]>;
+    /** See `PdppRecordsRouteDeps.canonicalReadd`. */
+    canonicalReadd?: CanonicalReaddMarkers;
     auth: PdppAuthorizationService;
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
@@ -428,6 +431,7 @@ export function createApp(deps: AppDeps): Hono {
         instancesForSource: deps.pdpp.instancesForSource,
         bindingStore: deps.pdpp.bindingStore,
         configuredMethods: deps.pdpp.configuredMethods,
+        canonicalReadd: deps.pdpp.canonicalReadd,
         // An `api_error` on the resource surface is a server fault and must
         // leave a correlatable line behind; the route never reaches the
         // global onError below, because it maps its own errors.
