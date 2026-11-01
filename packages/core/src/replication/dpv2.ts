@@ -191,7 +191,16 @@ export function createDpv2ReplicaTransport(deps: {
   storage: BoundedStorageAdapter;
   gateway: Pick<GatewayClient, "registerDataPoint">;
   feed: DataPointFeedPort;
-  signer: Pick<ServerSigner, "signAddData">;
+  signer: Pick<ServerSigner, "signAddData" | "signMessage" | "address">;
+  registerReplicaDataPoint?: (input: {
+    ownerAddress: string;
+    scope: string;
+    dataHash: string;
+    metadataHash: string;
+    expectedVersion: string;
+    signature: string;
+    replicaAuthorization: Record<string, string>;
+  }) => Promise<unknown>;
   /** Host verifies a slot against a pinned finalized DataRegistryV2 commitment.
    * SDK head-only lookup cannot implement this port. No production fallback is allowed. */
   evidence: (
@@ -200,6 +209,8 @@ export function createDpv2ReplicaTransport(deps: {
   ) => Promise<ReplicaRegistrationEvidence>;
   /** Must fetch and validate the gateway's complete active roster; errors fail closed. */
   compatibilityRoster: () => Promise<ReplicaCompatibilityRoster>;
+  gatewayOrigin?: string;
+  chainId?: bigint;
 }): ReplicaTransportPort {
   if (typeof deps.storage.downloadBounded !== "function")
     throw new TypeError(
@@ -244,7 +255,7 @@ export function createDpv2ReplicaTransport(deps: {
     decrypt: (scope, bytes) => decryptUncompressed(bytes, password(scope)),
     evidence: deps.evidence,
     async putFragment(fragment) {
-      await assertPublicationCompatible();
+      await this.assertPublicationCompatible();
       await deps.storage.upload(
         replicaFragmentKey(fragment.scope, fragment.digest),
         fragment.encrypted,
@@ -265,14 +276,23 @@ export function createDpv2ReplicaTransport(deps: {
       }
     },
     async put(manifest) {
-      await assertPublicationCompatible();
+      await this.assertPublicationCompatible();
       await deps.storage.upload(
         replicaManifestKey(manifest.scope, manifest.version),
         manifest.encrypted,
       );
     },
     async register(manifest) {
-      await assertPublicationCompatible();
+      await this.assertPublicationCompatible();
+      const roster = await deps.compatibilityRoster();
+      const decision = assertReplicaPublicationCompatible(roster);
+      const registration = roster.devices.find(
+        (device) =>
+          device.address.toLowerCase() === deps.signer.address.toLowerCase() &&
+          device.revokedAt === null,
+      );
+      if (!registration || !deps.gatewayOrigin || deps.chainId === undefined)
+        throw new Error("replica_publication_authorization_invalid");
       const msg = {
         ownerAddress: deps.owner,
         scope: manifest.scope,
@@ -280,11 +300,38 @@ export function createDpv2ReplicaTransport(deps: {
         metadataHash: manifest.metadataHash,
         expectedVersion: BigInt(manifest.version),
       };
-      await deps.gateway.registerDataPoint({
+      const bytes = crypto.getRandomValues(new Uint8Array(32));
+      const nonce =
+        `0x${[...bytes].map((value) => value.toString(16).padStart(2, "0")).join("")}` as `0x${string}`;
+      const authorization = {
+        owner: deps.owner,
+        server: deps.signer.address,
+        registrationId: registration.registrationId,
+        expectedEpoch: String(decision.epoch),
+        writeFormat: decision.format,
+        gatewayOrigin: deps.gatewayOrigin,
+        chainId: String(deps.chainId),
+        scope: manifest.scope,
+        expectedVersion: String(manifest.version),
+        dataHash: manifest.dataHash,
+        metadataHash: manifest.metadataHash,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        nonce,
+      };
+      const request = {
         ...msg,
         expectedVersion: String(manifest.version),
         signature: await deps.signer.signAddData(msg),
-      });
+        replicaAuthorization: {
+          ...authorization,
+          signature: await deps.signer.signMessage(
+            `vana.replica-publication-authorization.v1\n${JSON.stringify(authorization)}`,
+          ),
+        },
+      };
+      if (deps.registerReplicaDataPoint)
+        await deps.registerReplicaDataPoint(request);
+      else await deps.gateway.registerDataPoint(request as never);
     },
     get: (scope, version, read) =>
       download(

@@ -91,6 +91,30 @@ export function createNodeReplicationPorts(input: {
       gateway: input.gateway,
       feed: input.feed,
       signer: input.signer,
+      gatewayOrigin: new URL(gateway.url).origin,
+      chainId: BigInt(gateway.chainId),
+      registerReplicaDataPoint: async (registration) => {
+        const response = await fetch(
+          `${gateway.url.replace(/\/$/, "")}/v1/data`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Web3Signed ${registration.signature}`,
+            },
+            body: JSON.stringify(registration),
+          },
+        );
+        if (!response.ok) {
+          const body = (await response.json().catch(() => ({}))) as {
+            error?: unknown;
+          };
+          throw new Error(
+            `Gateway error: ${response.status} ${typeof body.error === "string" ? body.error : response.statusText}`,
+          );
+        }
+        return response.json();
+      },
       compatibilityRoster: createGatewayReplicaCompatibility({
         gatewayUrl: gateway.url,
         chainId: gateway.chainId,

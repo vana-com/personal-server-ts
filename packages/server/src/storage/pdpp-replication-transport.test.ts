@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { retireReplication } from "./pdpp-replication-door.js";
@@ -152,6 +153,7 @@ function network(realCrypto = false, cap = 8192) {
   const puts: { key: string; bytes: Uint8Array }[] = [];
   const gets: string[] = [];
   const registrations: string[] = [];
+  const replicaAuthorizations: unknown[] = [];
   const failPut = new Set<string>();
   const failGet = new Set<string>();
   let loseRegistrationResponse = false;
@@ -189,6 +191,39 @@ function network(realCrypto = false, cap = 8192) {
     expect(msg.expectedVersion).toBeGreaterThan(0n);
     return "0x1234" as const;
   });
+  const gateway: Pick<GatewayClient, "registerDataPoint"> = {
+    async registerDataPoint(input) {
+      const slot = slotKey(input.scope, input.expectedVersion);
+      registrations.push(slot);
+      const max = Math.max(
+        latest(head, input.scope),
+        latest(chain, input.scope),
+      );
+      if (Number(input.expectedVersion) <= max)
+        throw new Error(
+          `Gateway error: 409 Stale expectedVersion; stored value ${max}`,
+        );
+      if (Number(input.expectedVersion) !== max + 1)
+        throw new Error(
+          `Gateway error: 409 Gap in version sequence; next valid version is ${max + 1}`,
+        );
+      const row = {
+        owner: input.ownerAddress,
+        scope: input.scope,
+        version: input.expectedVersion,
+        dataHash: input.dataHash,
+        metadataHash: input.metadataHash,
+        deleted: false,
+      };
+      head.set(slot, row);
+      if (!pending.has(slot)) chain.set(slot, chainRow(slot, row));
+      if (loseRegistrationResponse) {
+        loseRegistrationResponse = false;
+        throw new Error("response lost after commit");
+      }
+      return { dataPointId: slot } as never;
+    },
+  };
   const adapter = createDpv2ReplicaTransport({
     owner,
     masterKey: new Uint8Array(32).fill(5),
@@ -206,40 +241,18 @@ function network(realCrypto = false, cap = 8192) {
         },
       ],
     }),
-    signer: { signAddData },
-    gateway: {
-      async registerDataPoint(input) {
-        const slot = slotKey(input.scope, input.expectedVersion);
-        registrations.push(slot);
-        const max = Math.max(
-          latest(head, input.scope),
-          latest(chain, input.scope),
-        );
-        if (Number(input.expectedVersion) <= max)
-          throw new Error(
-            `Gateway error: 409 Stale expectedVersion; stored value ${max}`,
-          );
-        if (Number(input.expectedVersion) !== max + 1)
-          throw new Error(
-            `Gateway error: 409 Gap in version sequence; next valid version is ${max + 1}`,
-          );
-        const row = {
-          owner: input.ownerAddress,
-          scope: input.scope,
-          version: input.expectedVersion,
-          dataHash: input.dataHash,
-          metadataHash: input.metadataHash,
-          deleted: false,
-        };
-        head.set(slot, row);
-        if (!pending.has(slot)) chain.set(slot, chainRow(slot, row));
-        if (loseRegistrationResponse) {
-          loseRegistrationResponse = false;
-          throw new Error("response lost after commit");
-        }
-        return { dataPointId: slot } as never;
-      },
+    signer: {
+      address: owner as `0x${string}`,
+      signAddData,
+      signMessage: async () => "0x1234" as `0x${string}`,
     },
+    gatewayOrigin: "http://localhost:3000",
+    chainId: 31337n,
+    registerReplicaDataPoint: async (input) => {
+      replicaAuthorizations.push(input.replicaAuthorization);
+      return gateway.registerDataPoint(input as never);
+    },
+    gateway,
     feed: {
       async listDataPointsByOwner(_owner, cursor) {
         const scopes = [
@@ -315,6 +328,7 @@ function network(realCrypto = false, cap = 8192) {
     puts,
     gets,
     registrations,
+    replicaAuthorizations,
     signAddData,
     failPut,
     failGet,
@@ -877,6 +891,49 @@ it("keeps accepted operations pending and names old readers when publication is 
   });
   expect(net.puts).toEqual([]);
   expect(net.registrations).toEqual([]);
+});
+
+it("retries the retained operation after revocation removes the old reader", async () => {
+  const net = network();
+  const a = device(net);
+  let blocked = true;
+  net.port.assertPublicationCompatible = async () => {
+    if (blocked)
+      throw new ReplicaPublicationBlockedError([
+        {
+          address: "0x0000000000000000000000000000000000000002",
+          name: "offline old reader",
+          reason: "reader_format_unsupported",
+        },
+      ]);
+    return { epoch: 8, format: "fragments-v2" };
+  };
+  a.put("accepted locally", "retry-after-revoke");
+  await a.cycle();
+  expect(a.get("retry-after-revoke")).toEqual({
+    id: "retry-after-revoke",
+    text: "accepted locally",
+  });
+  expect(outbox(a)).toHaveLength(1);
+  expect(net.puts).toEqual([]);
+
+  blocked = false;
+  await cycles([a], 100);
+  expect(net.registrations.length).toBeGreaterThan(0);
+  expect(net.replicaAuthorizations.length).toBeGreaterThan(0);
+  expect(net.replicaAuthorizations.at(-1)).toMatchObject({
+    owner,
+    server: owner,
+    registrationId: owner,
+    expectedEpoch: "1",
+    writeFormat: "fragments-v2",
+    scope: a.scope,
+  });
+  expect(outbox(a).length).toBeGreaterThan(0);
+  expect(a.get("retry-after-revoke")).toEqual({
+    id: "retry-after-revoke",
+    text: "accepted locally",
+  });
 });
 
 it("reports a pending predecessor and re-registers that same slot after authoritative absence", async () => {
