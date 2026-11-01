@@ -173,7 +173,9 @@ export function createGatewayReplicaCompatibility(input: {
     await json(accepted);
   }
 
-  return async () => {
+  const check = async (
+    selfRefreshAttempted = false,
+  ): Promise<ReplicaCompatibilityRoster> => {
     if (!advertised) {
       advertised = advertise().catch((error) => {
         advertised = undefined;
@@ -229,6 +231,23 @@ export function createGatewayReplicaCompatibility(input: {
         };
       },
     );
+    const self = devices.find(
+      (device) => device.address.toLowerCase() === serverAddress.toLowerCase(),
+    );
+    const selfDeclarationStale =
+      !self ||
+      self.registrationId.toLowerCase() !== registrationId!.toLowerCase() ||
+      !self.capabilityValid;
+    if (selfDeclarationStale && selfRefreshAttempted) {
+      advertised = undefined;
+      registrationId = undefined;
+      throw new Error("replica_self_registration_changed");
+    }
+    if (selfDeclarationStale) {
+      advertised = undefined;
+      registrationId = undefined;
+      return check(true);
+    }
     const roster: ReplicaCompatibilityRoster = {
       complete: true,
       epoch,
@@ -268,6 +287,13 @@ export function createGatewayReplicaCompatibility(input: {
       unknown
     >;
     if (!activationResponse.ok) {
+      if (
+        activated.error === "Writer registration is not active" ||
+        activated.error === "Invalid publication authorization signature"
+      ) {
+        advertised = undefined;
+        registrationId = undefined;
+      }
       if (
         activated.error === "replica_publication_blocked" &&
         Array.isArray(activated.blockers)
@@ -313,4 +339,5 @@ export function createGatewayReplicaCompatibility(input: {
       minimumReaderFormats: activated.minimumReaderFormats as string[],
     };
   };
+  return () => check();
 }

@@ -26,6 +26,72 @@ const roster = (
 });
 
 describe("replica publication compatibility", () => {
+  it("re-advertises after its own registration changes while the process stays alive", async () => {
+    const account = privateKeyToAccount(`0x${"1".repeat(64)}`);
+    const owner = "0x0000000000000000000000000000000000000009";
+    const first = `0x${"a".repeat(64)}`;
+    const second = `0x${"c".repeat(64)}`;
+    let current = first;
+    let challengeCount = 0;
+    const check = createGatewayReplicaCompatibility({
+      gatewayUrl: "https://gateway.test",
+      chainId: 14800,
+      owner,
+      signer: {
+        address: account.address,
+        signMessage: (message) => account.signMessage({ message }),
+      },
+      bootId: "same-process",
+      now: () => Date.parse("2026-11-01T12:00:00Z"),
+      fetch: async (url, init) => {
+        if (
+          String(url).includes("replica-capabilities") &&
+          init?.method === "POST"
+        )
+          return Response.json({ success: true });
+        if (String(url).includes("replica-capabilities")) {
+          challengeCount++;
+          return Response.json({
+            owner,
+            server: account.address,
+            registrationId: current,
+            revision: "0",
+            challenge: `0x${String(challengeCount).padStart(64, "0")}`,
+            expiresAt: "2026-11-01T12:02:00Z",
+            gatewayOrigin: "https://gateway.test",
+            chainId: "14800",
+          });
+        }
+        if (init?.method === "POST")
+          return Response.json({
+            success: true,
+            epoch: "8",
+            minimumReaderFormats: ["fragments-v2"],
+          });
+        return Response.json({
+          complete: true,
+          owner,
+          epoch: "7",
+          minimumReaderFormats: [],
+          devices: [
+            {
+              address: account.address,
+              name: null,
+              registrationId: current,
+              revokedAt: null,
+              readerFormats: ["fragments-v2"],
+              capabilityValid: true,
+            },
+          ],
+        });
+      },
+    });
+    await check();
+    current = second;
+    await check();
+    expect(challengeCount).toBe(2);
+  });
+
   it("advertises a signed declaration, checks the full roster, then asks the gateway to persist the reader floor", async () => {
     const requests: { url: string; init?: RequestInit }[] = [];
     const account = privateKeyToAccount(`0x${"1".repeat(64)}`);
