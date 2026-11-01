@@ -65,6 +65,7 @@ import { assembleReplicaStream } from "@opendatalabs/personal-server-ts-core/rep
 import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { createReplicaStagingStore } from "./pdpp-replica-staging.js";
 import { ReplicaFramingUnsupported } from "@opendatalabs/personal-server-ts-core/replication/outcome";
+import { ReplicaPublicationBlockedError } from "@opendatalabs/personal-server-ts-core/replication/compatibility";
 import { defaultReplicaBackoff } from "@opendatalabs/personal-server-ts-core/replication/schedule";
 import {
   MAX_BLOB_UPLOAD_BYTES,
@@ -192,6 +193,19 @@ function network(realCrypto = false, cap = 8192) {
     owner,
     masterKey: new Uint8Array(32).fill(5),
     storage,
+    compatibilityRoster: async () => ({
+      complete: true,
+      epoch: 1,
+      devices: [
+        {
+          address: owner,
+          registrationId: owner,
+          revokedAt: null,
+          readerFormats: ["fragments-v2"],
+          capabilityValid: true,
+        },
+      ],
+    }),
     signer: { signAddData },
     gateway: {
       async registerDataPoint(input) {
@@ -483,6 +497,9 @@ function fragmentsOut(d: ReturnType<typeof device>) {
     encrypted: Buffer;
     state: string;
     attempts: number;
+    outcome: string | null;
+    reason: string | null;
+    cause_json: string | null;
   }[];
 }
 function importWork(d: ReturnType<typeof device>) {
@@ -823,6 +840,42 @@ it("S3 keeps an uploaded batch ahead of later operations while a fragment retrie
   expect(net.puts.slice(putsBefore).every(({ key }) => putKeys.has(key))).toBe(
     true,
   );
+  expect(net.registrations).toEqual([]);
+});
+
+it("keeps accepted operations pending and names old readers when publication is blocked", async () => {
+  const net = network();
+  const a = device(net);
+  net.port.assertPublicationCompatible = async () => {
+    throw new ReplicaPublicationBlockedError([
+      {
+        address: "0x0000000000000000000000000000000000000002",
+        name: "offline old reader",
+        reason: "reader_format_unsupported",
+      },
+    ]);
+  };
+  a.put("accepted locally", "pending-record");
+  await a.cycle();
+
+  expect(a.get("pending-record")).toEqual({
+    id: "pending-record",
+    text: "accepted locally",
+  });
+  expect(outbox(a)).toHaveLength(1);
+  expect(outbox(a)[0]!.state).toBe("ready");
+  expect(fragmentsOut(a)).toMatchObject([
+    { state: "ready", outcome: "retry", reason: "publication_blocked" },
+  ]);
+  expect(JSON.parse(String(fragmentsOut(a)[0]!.cause_json))).toMatchObject({
+    blockers: [
+      {
+        address: "0x0000000000000000000000000000000000000002",
+        name: "offline old reader",
+      },
+    ],
+  });
+  expect(net.puts).toEqual([]);
   expect(net.registrations).toEqual([]);
 });
 

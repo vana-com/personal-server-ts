@@ -375,6 +375,19 @@ export function network(
     owner,
     masterKey: new Uint8Array(32).fill(5),
     storage,
+    compatibilityRoster: async () => ({
+      complete: true,
+      epoch: 1,
+      devices: [
+        {
+          address: owner,
+          registrationId: owner,
+          revokedAt: null,
+          readerFormats: ["fragments-v2"],
+          capabilityValid: true,
+        },
+      ],
+    }),
     signer: { signAddData: async () => "0x1234" as const },
     gateway: {
       async registerDataPoint(input) {

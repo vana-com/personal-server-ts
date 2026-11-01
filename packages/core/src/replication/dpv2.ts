@@ -1,5 +1,7 @@
 import type { ReplicaFinalityHints } from "./finality.js";
 export { createReplicaFinalityHints } from "./finality.js";
+import type { ReplicaCompatibilityRoster } from "./compatibility.js";
+import { assertReplicaPublicationCompatible } from "./compatibility.js";
 import {
   deriveScopeKey,
   encryptWithPassword,
@@ -115,6 +117,11 @@ export interface ReplicaTransportPort {
   /** The owner whose keys and signer this port uses. A worker refuses any other binding. */
   owner?: string;
   finality?: ReplicaFinalityHints;
+  /** Fresh, complete gateway roster checked before every new-format object write. */
+  assertPublicationCompatible(): Promise<{
+    epoch: number;
+    format: "fragments-v2";
+  }>;
   encrypt(scope: string, plaintext: Uint8Array): Promise<Uint8Array>;
   /** Exact size for this uncompressed codec, independent of content and randomness.
    * Without this capability, aggregate attribution stays Retry rather than
@@ -191,11 +198,15 @@ export function createDpv2ReplicaTransport(deps: {
     scope: string,
     version: number,
   ) => Promise<ReplicaRegistrationEvidence>;
+  /** Must fetch and validate the gateway's complete active roster; errors fail closed. */
+  compatibilityRoster: () => Promise<ReplicaCompatibilityRoster>;
 }): ReplicaTransportPort {
   if (typeof deps.storage.downloadBounded !== "function")
     throw new TypeError(
       "replication needs a storage adapter with bounded reads",
     );
+  const assertPublicationCompatible = async () =>
+    assertReplicaPublicationCompatible(await deps.compatibilityRoster());
   const password = (scope: string) =>
     bytesToHex(deriveScopeKey(deps.masterKey, scope)).slice(2);
   const fragmentUrl = (scope: string, digest: string) =>
@@ -227,11 +238,13 @@ export function createDpv2ReplicaTransport(deps: {
   return {
     owner: deps.owner,
     finality: deps.finality,
+    assertPublicationCompatible,
     encrypt: (scope, bytes) => encryptWithPassword(bytes, password(scope)),
     encryptedByteLength: replicaOpenPgpCiphertextByteLength,
     decrypt: (scope, bytes) => decryptUncompressed(bytes, password(scope)),
     evidence: deps.evidence,
     async putFragment(fragment) {
+      await assertPublicationCompatible();
       await deps.storage.upload(
         replicaFragmentKey(fragment.scope, fragment.digest),
         fragment.encrypted,
@@ -252,12 +265,14 @@ export function createDpv2ReplicaTransport(deps: {
       }
     },
     async put(manifest) {
+      await assertPublicationCompatible();
       await deps.storage.upload(
         replicaManifestKey(manifest.scope, manifest.version),
         manifest.encrypted,
       );
     },
     async register(manifest) {
+      await assertPublicationCompatible();
       const msg = {
         ownerAddress: deps.owner,
         scope: manifest.scope,

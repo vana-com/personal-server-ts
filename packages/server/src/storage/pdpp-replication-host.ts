@@ -27,6 +27,7 @@ import {
   type ReplicaTransportPort,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import { createReplicaEvidenceAdapter } from "@opendatalabs/personal-server-ts-core/replication/evidence";
+import { createGatewayReplicaCompatibility } from "@opendatalabs/personal-server-ts-core/replication/compatibility";
 import { createReplicaFinalityHints } from "@opendatalabs/personal-server-ts-core/replication/finality";
 import {
   createGatewayReplicaRoster,
@@ -76,7 +77,7 @@ export function createNodeReplicationPorts(input: {
   storage: BoundedStorageAdapter;
   gateway: Parameters<typeof createDpv2ReplicaTransport>[0]["gateway"];
   feed: DataPointFeedPort;
-  signer: Pick<ServerSigner, "signAddData">;
+  signer: Pick<ServerSigner, "address" | "signMessage" | "signAddData">;
 }): NodeReplicationPorts {
   const { gateway } = input.config;
   const chain = getChainConfig(gateway.chainId);
@@ -90,6 +91,12 @@ export function createNodeReplicationPorts(input: {
       gateway: input.gateway,
       feed: input.feed,
       signer: input.signer,
+      compatibilityRoster: createGatewayReplicaCompatibility({
+        gatewayUrl: gateway.url,
+        chainId: gateway.chainId,
+        owner: input.owner,
+        signer: input.signer,
+      }),
       finality: createReplicaFinalityHints({ rpc }),
       evidence: createReplicaEvidenceAdapter({
         owner: input.owner,

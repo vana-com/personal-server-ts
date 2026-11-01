@@ -73,6 +73,24 @@ coverage; receivers must additionally validate merged snapshot and byte integrit
 before claiming availability. The SQLite implementation and fence contract are
 documented in `packages/server/src/storage/pdpp-replication.md`.
 
+## Reader-format publication admission
+
+The DPv2 writer requires a fresh complete owner roster before each fragment,
+manifest, and manifest registration. It signs a boot-scoped reader declaration
+with the registered server key, then asks the gateway to activate the
+`fragments-v2` reader floor. A missing, partial, unknown, or old active reader
+blocks publication. Revoked registrations are not participants. The retry
+record keeps blocker addresses, registration IDs and reasons; the local
+canonical write and its journal remain pending.
+
+This is preflight admission. The gateway checkout has no replica version/head
+registration transaction and the storage adapter returns direct byte URLs.
+Therefore this runtime gate cannot close a membership change between preflight
+and gateway registration, refuse cached object URLs, or make an older binary
+honor a new session contract. Do not treat the local gate as a complete
+mixed-version rollout guarantee or enable it for real owners until those
+external boundaries exist.
+
 `planReplicaMerge` takes the complete retained operation set. Preserve that set
 across calls, including lifecycle evidence, losers, pending evidence, conflicts
 and tombstones. Recompute after dependencies arrive. The result is a plan with

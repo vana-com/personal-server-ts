@@ -62,6 +62,19 @@ function transport(objects: Map<string, Uint8Array>, bounded: boolean) {
     owner,
     masterKey: new Uint8Array(32).fill(5),
     storage,
+    compatibilityRoster: async () => ({
+      complete: true,
+      epoch: 1,
+      devices: [
+        {
+          address: owner,
+          registrationId: owner,
+          revokedAt: null,
+          readerFormats: ["fragments-v2"],
+          capabilityValid: true,
+        },
+      ],
+    }),
     gateway: { registerDataPoint: async () => ({}) as never },
     feed: {
       listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
@@ -75,6 +88,58 @@ function transport(objects: Map<string, Uint8Array>, bounded: boolean) {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it("checks the complete reader roster before the first fragment upload", async () => {
+  let uploads = 0;
+  const port = createDpv2ReplicaTransport({
+    owner,
+    masterKey: new Uint8Array(32).fill(5),
+    storage: {
+      upload: async () => {
+        uploads++;
+        return "unused";
+      },
+      urlForKey: (key: string) => key,
+      download: async () => new Uint8Array(),
+      delete: async () => false,
+      exists: async () => false,
+      downloadBounded: async () => new Uint8Array(),
+    },
+    gateway: { registerDataPoint: async () => ({}) as never },
+    feed: {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+    } as never,
+    signer: { signAddData: async () => "0x12" },
+    evidence: async () => ({ head: null, chain: null, pending: false }),
+    compatibilityRoster: async () => ({
+      complete: true,
+      epoch: 4,
+      devices: [
+        {
+          address: "0x0000000000000000000000000000000000000002",
+          name: "offline old reader",
+          registrationId: `0x${"2".repeat(64)}`,
+          revokedAt: null,
+          readerFormats: [],
+          capabilityValid: true,
+        },
+      ],
+    }),
+  });
+  await expect(
+    port.putFragment({
+      scope,
+      digest: `sha256:${"3".repeat(64)}`,
+      encrypted: new Uint8Array([1]),
+    }),
+  ).rejects.toMatchObject({
+    code: "replica_publication_blocked",
+    blockers: [
+      { name: "offline old reader", reason: "reader_format_unsupported" },
+    ],
+  });
+  expect(uploads).toBe(0);
 });
 
 describe("bounded reads", () => {
@@ -117,6 +182,19 @@ describe("bounded reads", () => {
         owner,
         masterKey: new Uint8Array(32).fill(5),
         storage,
+        compatibilityRoster: async () => ({
+          complete: true,
+          epoch: 1,
+          devices: [
+            {
+              address: owner,
+              registrationId: owner,
+              revokedAt: null,
+              readerFormats: ["fragments-v2"],
+              capabilityValid: true,
+            },
+          ],
+        }),
         gateway: { registerDataPoint: async () => ({}) as never },
         feed: {
           listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
@@ -219,6 +297,19 @@ describe("bounded reads", () => {
         owner,
         masterKey: new Uint8Array(32).fill(5),
         storage,
+        compatibilityRoster: async () => ({
+          complete: true,
+          epoch: 1,
+          devices: [
+            {
+              address: owner,
+              registrationId: owner,
+              revokedAt: null,
+              readerFormats: ["fragments-v2"],
+              capabilityValid: true,
+            },
+          ],
+        }),
         gateway: { registerDataPoint: async () => ({}) as never },
         feed: {
           listDataPointsByOwner: async () => ({
