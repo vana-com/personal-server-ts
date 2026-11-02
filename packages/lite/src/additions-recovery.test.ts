@@ -175,11 +175,22 @@ async function fixture() {
           addedAt: collectedAt,
           isTombstone: false,
         });
-        return Response.json({ expectedVersion: data.expectedVersion });
+        return Response.json({
+          dataPointId: idFor(data.scope),
+          expectedVersion: data.expectedVersion,
+        });
       }
       const scope = url.searchParams.get("scope");
       if (scope !== null) {
         const versions = slots.get(scope) ?? [];
+        const limit = Number(url.searchParams.get("limit"));
+        const remaining = versions.filter(
+          (row) =>
+            BigInt(row.expectedVersion) >
+            BigInt(url.searchParams.get("after") ?? "0"),
+        );
+        const page = remaining.slice(0, limit);
+        const hasMore = remaining.length > page.length;
         return Response.json({
           data: {
             dataPointId: idFor(scope),
@@ -188,16 +199,12 @@ async function fixture() {
             head: versions.length
               ? { ...versions.at(-1), deletedAt: null }
               : null,
-            versions: versions.filter(
-              (row) =>
-                BigInt(row.expectedVersion) >
-                BigInt(url.searchParams.get("after") ?? "0"),
-            ),
+            versions: page,
           },
           pagination: {
-            limit: Number(url.searchParams.get("limit")),
-            hasMore: false,
-            nextAfter: null,
+            limit,
+            hasMore,
+            nextAfter: hasMore ? page.at(-1)!.expectedVersion : null,
           },
         });
       }
