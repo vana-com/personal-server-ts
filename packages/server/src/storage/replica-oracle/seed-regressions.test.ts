@@ -1,7 +1,8 @@
 /**
  * Minimized nightly seeds, originally collected on PR #486 (head 1c5a3b1b).
  * Reset-gap blob reads and cross-connection pending-byte delivery add coverage
- * for the later nightly failures. The latter also withdraws its carrier.
+ * for the later nightly failures. The latter also withdraws its carrier;
+ * another vector supplies a retained Node record from another connection.
  * Replay through every port, including a fresh replay of accepted history.
  */
 import { readFileSync } from "node:fs";

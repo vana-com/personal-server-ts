@@ -2687,5 +2687,100 @@
       "k": "drop",
       "id": "pending-11"
     }
+  ],
+  "3598498473-pending-carrier": [
+    {
+      "k": "stage",
+      "id": "pending-0",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 1,
+            "writerId": "w-c",
+            "operationId": "w-c-0"
+          }
+        }
+      ],
+      "blobs": ["b1"]
+    },
+    {
+      "k": "provision",
+      "connection": "c3"
+    },
+    {
+      "k": "import",
+      "id": "batch-15",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 21,
+            "writerId": "w-d",
+            "operationId": "w-d-29"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:38Z",
+          "data": {
+            "id": "k3",
+            "blob_ref": {
+              "blob_id": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 22,
+            "writerId": "w-c",
+            "operationId": "w-c-30"
+          }
+        }
+      ],
+      "blobs": []
+    }
   ]
 }

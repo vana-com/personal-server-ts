@@ -534,14 +534,14 @@ it("serves pending blob bytes that one batch carries to a record another batch s
     })(),
   ).rejects.toThrow("missing committed blob");
 
-  // Withdrawing the only carrier withdraws the bytes, not the reference.
+  // A record without readable bytes is unavailable (visibility-engine recordRow).
   await store.quarantinePending({
     id: "carrier",
     credential: "replica",
     reason: "later finalized version",
   });
   await expect(owner()).rejects.toThrow("missing committed blob");
-  expect(await read(store, "owner")).toMatchObject({ visibility: "pending" });
+  expect(await read(store, "owner")).toBeUndefined();
 });
 
 it("builds the blob reference index of a version-two database on the write side", async () => {
