@@ -651,8 +651,8 @@ export function createLiteReplicaEngine(
       *declarationHistory() {
         return [];
       },
-      acknowledgePublished: (next) =>
-        store((s) => s.acknowledgePublished(next)),
+      acknowledgePublished: (next, finalized) =>
+        store((s) => s.acknowledgePublished(next, finalized)),
       readPinnedBlobChunks: (blobId) => persistence.readBlob(blobId),
     },
     receiver: {

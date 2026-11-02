@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createDpv2ReplicaTransport } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import type { ReplicaTransportPort } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import type { ReplicaEngine } from "@opendatalabs/personal-server-ts-core/replication/engine";
+import type { ReplicaPendingBudgetLimits } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
+import { ReplicaPendingCapacityError } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
 import { ReplicaPublicationBlockedError } from "@opendatalabs/personal-server-ts-core/replication/compatibility";
 import {
   REPLICA_DEFAULT_FRAGMENT_BYTES,
@@ -151,7 +153,11 @@ function crashable(inner: LiteReplicaPersistence) {
  */
 async function liteDevice(
   net: Network,
-  opts: { enabled?: boolean; maxBlobBytes?: number } = {},
+  opts: {
+    enabled?: boolean;
+    maxBlobBytes?: number;
+    pendingBudget?: ReplicaPendingBudgetLimits;
+  } = {},
 ) {
   const path = join(scratchDirectory("lite-engine"), "native.sqlite");
   const context = () => ({
@@ -265,6 +271,8 @@ async function liteDevice(
     return { canonical, engine };
   };
   let { canonical, engine } = open();
+  if (opts.enabled !== false)
+    await canonical.activatePendingBudget(opts.pendingBudget);
   await canonical.provisionConnection("conn", {
     sourceId,
     methodId: "export",
@@ -373,6 +381,205 @@ async function converged(node: TransportDevice, lite: LiteDevice) {
 }
 
 describe("PS-Lite replication engine with a Node writer", () => {
+  it("holds both hosts at capacity until exact finalized survivors release their debt", async () => {
+    const net = network({ holdFinality: true });
+    const limits = { operations: 3, logicalBytes: 1_000_000 };
+    const node = transportDevice(net, { pendingBudget: limits });
+    const lite = await liteDevice(net, {
+      pendingBudget: { operations: 2, logicalBytes: 1_000_000 },
+    });
+    await run([node, lite], 5);
+
+    const blobBytes = new Uint8Array([3, 1, 4, 1, 5, 9]);
+    const blob = node.store.storeBlobBytesForInstance({
+      instance: "conn",
+      method: "export",
+      generation: 1,
+      bytes: blobBytes,
+      mimeType: "application/octet-stream",
+    });
+    const blobData = {
+      id: "node-blob",
+      blob_ref: { blob_id: blob.blobId, mime_type: blob.mimeType },
+    };
+    expect(
+      node.store.ingestBatch(
+        [
+          {
+            instance: "conn",
+            stream: "messages",
+            key: "node-blob",
+            data: blobData,
+            emitted_at: at,
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+        { method: "export", generation: 1 },
+      ).accepted,
+    ).toBe(1);
+    await lite.put("lite pending", "lite-pending");
+
+    const nodeBefore = node.db
+      .prepare(
+        "SELECT operations,logical_bytes FROM pdpp_replica_pending_budget WHERE id=1",
+      )
+      .get() as { operations: number; logical_bytes: number };
+    const liteBefore = JSON.parse(
+      (
+        lite
+          .native()
+          .db.prepare(
+            "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+          )
+          .get() as { value: string }
+      ).value,
+    ) as { operations: number; logicalBytes: number };
+    expect(nodeBefore.operations).toBe(3);
+    expect(liteBefore.operations).toBe(2);
+    expect(() => node.put("refused at capacity", "node-refused")).toThrow(
+      ReplicaPendingCapacityError,
+    );
+    await expect(
+      lite.put("refused at capacity", "lite-refused"),
+    ).rejects.toBeInstanceOf(ReplicaPendingCapacityError);
+    node.reopen();
+    await lite.crashReopen();
+
+    await run([node, lite], 5);
+    expect(net.pending.size).toBeGreaterThan(0);
+    expect(net.calls.registrations.length).toBeGreaterThan(0);
+    expect(net.head.size).toBeGreaterThan(net.chain.size);
+    expect(
+      node.db
+        .prepare(
+          "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+        )
+        .get(),
+    ).toEqual({ operations: 3 });
+    expect(
+      JSON.parse(
+        (
+          lite
+            .native()
+            .db.prepare(
+              "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+            )
+            .get() as { value: string }
+        ).value,
+      ),
+    ).toMatchObject({ operations: 2 });
+
+    for (let i = 0; i < 64; i++) {
+      net.finalizeAll();
+      clock.advance(10_000);
+      await node.cycle();
+      await lite.cycle();
+      const nodePending = (
+        node.db
+          .prepare(
+            "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+          )
+          .get() as { operations: number }
+      ).operations;
+      const litePending = JSON.parse(
+        (
+          lite
+            .native()
+            .db.prepare(
+              "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+            )
+            .get() as { value: string }
+        ).value,
+      ).operations as number;
+      if (nodePending === 0 && litePending === 0) break;
+    }
+    expect(
+      node.db
+        .prepare(
+          "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+        )
+        .get(),
+    ).toEqual({ operations: 0 });
+    expect(
+      JSON.parse(
+        (
+          lite
+            .native()
+            .db.prepare(
+              "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+            )
+            .get() as { value: string }
+        ).value,
+      ),
+    ).toMatchObject({ operations: 0 });
+
+    expect(() => node.put("node after finality", "node-after")).not.toThrow();
+    await expect(
+      lite.put("lite after finality", "lite-after"),
+    ).resolves.toBeDefined();
+    for (let i = 0; i < 64; i++) {
+      net.finalizeAll();
+      clock.advance(10_000);
+      await node.cycle();
+      await lite.cycle();
+      const nodePending = (
+        node.db
+          .prepare(
+            "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+          )
+          .get() as { operations: number }
+      ).operations;
+      const litePending = JSON.parse(
+        (
+          lite
+            .native()
+            .db.prepare(
+              "SELECT value FROM lite_kv WHERE key='pending-budget/state'",
+            )
+            .get() as { value: string }
+        ).value,
+      ).operations as number;
+      if (nodePending === 0 && litePending === 0) break;
+    }
+    expect(node.get("node-blob")).toEqual(blobData);
+    expect(node.get("lite-pending")).toEqual({
+      id: "lite-pending",
+      text: "lite pending",
+    });
+    expect(node.get("lite-after")).toEqual({
+      id: "lite-after",
+      text: "lite after finality",
+    });
+    expect(await lite.get("node-blob")).toEqual(blobData);
+    expect(await lite.blob(blob.blobId)).toEqual(blobBytes);
+    expect(await lite.get("node-after")).toEqual({
+      id: "node-after",
+      text: "node after finality",
+    });
+    expect(await lite.get("lite-pending")).toEqual({
+      id: "lite-pending",
+      text: "lite pending",
+    });
+    expect(await lite.get("lite-after")).toEqual({
+      id: "lite-after",
+      text: "lite after finality",
+    });
+    expect(
+      node.db
+        .prepare("SELECT count(*) AS n FROM pdpp_replica_operations")
+        .get(),
+    ).not.toEqual({ n: 0 });
+    expect(
+      lite
+        .native()
+        .db.prepare("SELECT count(*) AS n FROM lite_kv WHERE key LIKE 'log/%'")
+        .get(),
+    ).not.toEqual({ n: 0 });
+    node.close();
+    lite.close();
+  });
+
   it("reports missing Lite reader capability and retains work without uploading", async () => {
     const net = network();
     (

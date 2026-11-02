@@ -17,6 +17,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import { REPLICA_WAIT_FALLBACK_MS } from "@opendatalabs/personal-server-ts-core/replication/schedule";
 import { replicaDeclarationContext } from "@opendatalabs/personal-server-ts-core/replication/host-config";
+import type { ReplicaPendingBudgetLimits } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
 import {
   planReplicationHost,
   type ReplicationNetworkPorts,
@@ -79,6 +80,8 @@ export function createNodeReplication(input: {
   ports: (owner: `0x${string}`) => ReplicationNetworkPorts;
   logger: Pick<Logger, "info" | "warn">;
   budget?: ReplicaBudget;
+  /** Owner-local accepted outbound-work limit; activated only with this host. */
+  pendingBudget?: ReplicaPendingBudgetLimits;
   timers?: ReplicationTimers;
   /** Worker options for tests (e.g. `now`, chunk sizes). */
   worker?: Partial<Parameters<typeof createReplicaTransportWorker>[0]>;
@@ -145,6 +148,9 @@ export function createNodeReplication(input: {
     },
     ...input.worker,
   });
+  // Node's canonical journal remains inert until this actual replication host
+  // exists. Existing outstanding engine work is reconstructed once here.
+  store.replication.activatePendingBudget(input.pendingBudget);
   // The first enable: the writer identity must exist before the baseline
   // journals anything, and establishing it needs the roster (network). So the
   // first steps establish it, then baseline, then hand over to the worker.

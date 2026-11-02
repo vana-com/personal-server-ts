@@ -12,6 +12,7 @@ import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import type { ReplicaEngineConfig } from "@opendatalabs/personal-server-ts-core/replication/engine";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
+import type { ReplicaPendingBudgetLimits } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
 import type { ReplicationTimers } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import {
   planReplicationHost,
@@ -116,6 +117,8 @@ export interface LiteReplicationInput {
   onError?: (error: unknown) => void;
   /** Engine options for tests (e.g. `now`). */
   engine?: Partial<ReplicaEngineConfig>;
+  /** Testable logical quota, activated only while this network host is live. */
+  pendingBudget?: ReplicaPendingBudgetLimits;
 }
 
 export type LiteReplication =
@@ -207,6 +210,16 @@ export async function createLiteReplication(
       ...input.engine,
     },
   });
+  const canonical = createLiteCanonicalStore({
+    persistence: input.persistence,
+    enabled: true,
+    ...trusted,
+    pendingBudget: input.pendingBudget,
+    localCommitted: () => runtime.localWrite(),
+  });
+  // Canonical mode may be enabled for imports without a network engine. This
+  // host alone turns on the owner-local outbound budget before rotation.
+  await canonical.activatePendingBudget(input.pendingBudget);
   const rotation = input.rotateWriterIdentity
     ? await rotateAtBoot(engine)
     : "not_requested";
@@ -221,13 +234,7 @@ export async function createLiteReplication(
   return {
     state: "started",
     engine,
-    canonical: createLiteCanonicalStore({
-      persistence: input.persistence,
-      enabled: true,
-      ...trusted,
-      // A committed own write steps soon, not at the next wake (Node: #517).
-      localCommitted: () => runtime.localWrite(),
-    }),
+    canonical,
     rotation,
     runtime,
   };

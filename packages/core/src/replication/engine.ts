@@ -44,6 +44,7 @@ import {
   type Admission,
   type ReplicaResourceLimits,
 } from "./limits.js";
+import type { ReplicaPublishedBatch } from "./pending-budget.js";
 import {
   canonicalJson,
   decodeReplicaEnvelope,
@@ -499,7 +500,10 @@ export interface ReplicaEngineExporter<C> {
    * operation up to `next` (a tail cursor) is published. A host with an
    * outbox moves past them; called in order, possibly more than once.
    */
-  acknowledgePublished(next: number): ReplicaEffect<void, C>;
+  acknowledgePublished(
+    next: number | null,
+    finalized: ReplicaPublishedBatch,
+  ): ReplicaEffect<void, C>;
   readPinnedBlobChunks(
     blobId: string,
   ): Iterable<Uint8Array> | AsyncIterable<Uint8Array>;
@@ -3466,12 +3470,44 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
             );
             // The batch is durable on the gateway: its operations leave the
             // host's outbox in the same transaction.
-            const exported = yield* sql.get<{ export_next: number | null }>(
-              "SELECT export_next FROM pdpp_transport_batches WHERE batch=?",
+            const exported = yield* sql.get<{
+              export_next: number | null;
+              scope: string;
+              version: number;
+              data_hash: `0x${string}`;
+              metadata_hash: `0x${string}`;
+            }>(
+              `SELECT b.export_next,m.scope,m.version,m.data_hash,m.metadata_hash
+               FROM pdpp_transport_batches b
+               JOIN pdpp_transport_manifests_out m ON m.batch=b.batch
+               WHERE b.batch=?`,
               item.row.batch,
             );
-            if (exported?.export_next != null)
-              yield* exporter.acknowledgePublished(exported.export_next);
+            if (!exported) throw new ReplicaProblemError("publish_failed");
+            const survivors = yield* sql.all<{
+              writer_id: string | null;
+              operation_id: string | null;
+            }>(
+              `SELECT writer_id,operation_id FROM pdpp_transport_operation_outcomes
+               WHERE batch=? AND outcome IS NULL AND encoding_failed=0
+                 AND writer_id IS NOT NULL AND operation_id IS NOT NULL
+               ORDER BY position`,
+              item.row.batch,
+            );
+            yield* exporter.acknowledgePublished(exported.export_next, {
+              batch: item.row.batch,
+              slot: `${exported.scope}/${exported.version}`,
+              scope: exported.scope,
+              version: exported.version,
+              commitment: replicaChainCommitment(
+                exported.data_hash,
+                exported.metadata_hash,
+              ).toLowerCase(),
+              operations: survivors.map((row) => ({
+                writerId: row.writer_id!,
+                operationId: row.operation_id!,
+              })),
+            });
             yield* reclaimPublished(item.row.batch);
           }
           if (item.row.kind === "manifest" && outcome.tag === "quarantine")
