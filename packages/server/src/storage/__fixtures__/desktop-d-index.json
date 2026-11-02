@@ -1,0 +1,46 @@
+{
+  "instance": "oura-desktop",
+  "method": "oura-browser",
+  "generation": 2,
+  "head": {
+    "id": 1,
+    "path": "oura/sleep/legacy.json",
+    "version": 7,
+    "casRevision": 9,
+    "collectedAt": "2026-10-20T12:00:00.000Z"
+  },
+  "cursor": "canonical-legacy-view/11:desktop-completed-replacement",
+  "listingCursor": "eyJraW5kIjoibGlzdCIsInN0cmVhbSI6InNsZWVwIiwiZXBvY2giOiJkZXNrdG9wLWQtZml4dHVyZS1lcG9jaCIsImhvcml6b24iOiIxNiIsIm9yZGVyIjoiYXNjIiwic29ydFZhbHVlIjoiMjAyNi0xMC0yMFQxMjowMDowMC4wMDBaIiwicmVjb3JkS2V5Ijoia2VwdC1zbGVlcCIsImluc3RhbmNlIjoib3VyYS1kZXNrdG9wIiwib3JkZXJLZXkiOiJpbnN0YW50In0",
+  "listingNext": {
+    "data": [
+      {
+        "instance": "oura-desktop",
+        "stream": "sleep",
+        "recordKey": "new-sleep",
+        "data": {
+          "id": "new-sleep",
+          "day": "2026-10-20",
+          "score": 88
+        },
+        "version": 1,
+        "emittedAt": "2026-10-21T12:00:00.000Z",
+        "deleted": false
+      }
+    ],
+    "hasMore": false,
+    "horizon": "16"
+  },
+  "changesSince": "eyJraW5kIjoiY2hhbmdlc19zaW5jZSIsInN0cmVhbSI6InNsZWVwIiwiZXBvY2giOiJkZXNrdG9wLWQtZml4dHVyZS1lcG9jaCIsImhvcml6b24iOiIxNyIsInNpbmNlSG9yaXpvbiI6bnVsbCwib2Zmc2V0IjowfQ",
+  "historicalBlob": {
+    "blobId": "sha256:36e8d39b15ce726596b2e44c020a0f0e833b4b1d942150665d91e363a29bf0e1",
+    "mimeType": "text/plain",
+    "sizeBytes": 30,
+    "sha256": "36e8d39b15ce726596b2e44c020a0f0e833b4b1d942150665d91e363a29bf0e1"
+  },
+  "liveBlob": {
+    "blobId": "sha256:c7e4e957dd654dce51cb9e61a975d24773e07ff0575db32231e405d2bdce1563",
+    "mimeType": "text/plain",
+    "sizeBytes": 23,
+    "sha256": "c7e4e957dd654dce51cb9e61a975d24773e07ff0575db32231e405d2bdce1563"
+  }
+}

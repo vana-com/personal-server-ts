@@ -5,12 +5,16 @@ import {
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   createMemoryPsLiteAccessLogStore,
+  createMemoryPsLitePersistence,
+  createMemoryPsLiteStagedFileStore,
   createMemoryPsLiteStateStore,
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
+import { createPersistentPsLiteStorage } from "./storage.js";
 import { createPsLiteRuntime, createWeb3SignedPsLiteAuth } from "./runtime.js";
 import { startPersonalServer } from "./client.js";
 
@@ -46,11 +50,14 @@ function createGateway(overrides: Partial<GatewayClient> = {}): GatewayClient {
   };
 }
 
-function createRuntime(gateway: GatewayClient) {
+function createRuntime(
+  gateway: GatewayClient,
+  storage: DataStoragePort = createMemoryPsLiteStorage(),
+) {
   const accessLogs = createMemoryPsLiteAccessLogStore();
   return createPsLiteRuntime({
     active: true,
-    storage: createMemoryPsLiteStorage(),
+    storage,
     accessLogReader: accessLogs,
     accessLogWriter: accessLogs,
     tokenStore: createMemoryPsLiteTokenStore(),
@@ -199,6 +206,302 @@ describe("startPersonalServer lite handle", () => {
       scope: "instagram.profile",
       status: "stored",
     });
+  });
+
+  it("streams a scope version in batches with owner Web3Signed auth", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway, storage),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+
+    const upload = await ps.openScopeUpload!("notes.entries", {
+      ...auth,
+      data: { source: "test" },
+    });
+    // Over the 1 MiB signed-body limit in one call: the client splits it.
+    const items = Array.from({ length: 6 }, (_, i) => ({
+      id: i,
+      text: "y".repeat(300_000),
+    }));
+    await upload.append(items.slice(0, 1));
+    await upload.append(items.slice(1));
+    await expect(upload.commit({ total: 6 })).resolves.toMatchObject({
+      scope: "notes.entries",
+      records: 6,
+    });
+
+    await expect(ps.readData("notes.entries", { auth })).resolves.toMatchObject(
+      {
+        collectedAt: upload.collectedAt,
+        data: { source: "test", records: items, total: 6 },
+      },
+    );
+  });
+
+  it("serializes each bulk item once, parses none, and reuses bytes after a lost reply", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const runtime = createRuntime(gateway, storage);
+    let attempts = 0;
+    let bulkFetches = 0;
+    const commitments: string[] = [];
+    const ps = await startPersonalServer({
+      runtime: {
+        ...runtime,
+        async fetch(request) {
+          if (request.method === "PUT") bulkFetches += 1;
+          return runtime.fetch(request);
+        },
+        async appendScopeUpload(request, batch) {
+          commitments.push(await request.clone().text());
+          const response = await runtime.appendScopeUpload!(request, batch);
+          attempts += 1;
+          if (attempts === 1)
+            throw new TypeError("reply lost after persistence");
+          return response;
+        },
+      },
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const upload = await ps.openScopeUpload!("notes.entries", {
+      signMessage: ownerWallet.signMessage,
+    });
+    const items = Array.from({ length: 4 }, (_, i) => ({
+      marker: `count-item-${i}`,
+      text: "π😀",
+    }));
+    // Inject observers at the real JSON operations, not at a second model
+    // of the upload. On the old path each marker appears in 3 stringifies
+    // (sizing, HTTP body, persistence) and in the server's batch parse.
+    const stringify = vi.spyOn(JSON, "stringify");
+    const parse = vi.spyOn(JSON, "parse");
+    let serialized = 0;
+    let parsed = 0;
+    try {
+      await upload.append(items);
+      serialized = stringify.mock.results.reduce(
+        (n, result) =>
+          n +
+          (typeof result.value === "string"
+            ? (result.value.match(/count-item-\d/g)?.length ?? 0)
+            : 0),
+        0,
+      );
+      parsed = parse.mock.calls.reduce(
+        (n, [text]) => n + (text.match(/count-item-\d/g)?.length ?? 0),
+        0,
+      );
+    } finally {
+      stringify.mockRestore();
+      parse.mockRestore();
+    }
+    expect(serialized).toBe(items.length);
+    expect(parsed).toBe(0);
+    expect(attempts).toBe(2);
+    expect(bulkFetches).toBe(0);
+    expect(commitments).toHaveLength(2);
+    expect(commitments[0]).toBe(commitments[1]);
+    expect(commitments[0]).not.toContain("count-item-");
+    await expect(upload.commit()).resolves.toMatchObject({
+      records: items.length,
+    });
+    await expect(
+      ps.readData("notes.entries", {
+        auth: { signMessage: ownerWallet.signMessage },
+      }),
+    ).resolves.toMatchObject({ data: { records: items } });
+  });
+
+  it("never serializes more than one batch of a large append at once", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway, storage),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    const items = Array.from({ length: 20 }, (_, i) => ({
+      id: i,
+      text: "z".repeat(200_000),
+    }));
+    const stringify = vi.spyOn(JSON, "stringify");
+    let longest = 0;
+    try {
+      await upload.append(items);
+      for (const result of stringify.mock.results) {
+        if (typeof result.value === "string") {
+          longest = Math.max(longest, result.value.length);
+        }
+      }
+    } finally {
+      stringify.mockRestore();
+    }
+
+    expect(longest).toBeLessThanOrEqual(1024 * 1024);
+    await expect(upload.commit()).resolves.toMatchObject({ records: 20 });
+  });
+
+  it("does not look the server up at the gateway once per batch", async () => {
+    const getServer = vi.fn().mockResolvedValue(null);
+    const gateway = createGateway({ getServer });
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const runtime = createRuntime(gateway, storage);
+    const health = vi.fn();
+    const counted = {
+      ...runtime,
+      fetch(request: Request) {
+        if (new URL(request.url).pathname === "/health") health();
+        return runtime.fetch(request);
+      },
+    } as typeof runtime;
+    const ps = await startPersonalServer({
+      runtime: counted,
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    const before = health.mock.calls.length;
+    // 12 records of 200 kB: at least three batches.
+    await upload.append(
+      Array.from({ length: 12 }, (_, i) => ({
+        id: i,
+        text: "q".repeat(200_000),
+      })),
+    );
+    await upload.append([{ id: 12, text: "last" }]);
+    await expect(upload.commit()).resolves.toMatchObject({ records: 13 });
+    // Appends and the commit address the opened origin; none asks for health.
+    expect(health.mock.calls.length).toBe(before);
+  });
+
+  it("does not resend a batch that landed before a later batch of the same append failed", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const runtime = createRuntime(gateway, storage);
+    // Batch 1 fails, and so does the SDK's immediate resend of it.
+    let failures = 2;
+    const flaky = {
+      ...runtime,
+      // Exercise the supported fallback transport independently of the new
+      // direct append path; its retry contract must not change.
+      appendScopeUpload: undefined,
+      fetch(request: Request) {
+        const isSecondBatch =
+          request.method === "PUT" &&
+          new URL(request.url).pathname.endsWith("/batches/1");
+        if (isSecondBatch && failures > 0) {
+          failures -= 1;
+          return Promise.reject(new TypeError("fetch failed"));
+        }
+        return runtime.fetch(request);
+      },
+    } as typeof runtime;
+    const ps = await startPersonalServer({
+      runtime: flaky,
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    // Each record is over half the batch limit, so [first, second] is two batches.
+    const first = { id: "first", text: "a".repeat(600_000) };
+    const second = { id: "second", text: "b".repeat(600_000) };
+
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    await expect(upload.append([first, second])).rejects.toThrow();
+    // The handle no longer knows where the append stopped, so it refuses
+    // further appends and a commit: it would otherwise resend `first`.
+    await expect(upload.append([first, second])).rejects.toThrow();
+    await expect(upload.commit()).rejects.toThrow();
+    await upload.abort();
+
+    const restart = await ps.openScopeUpload!("notes.entries", auth);
+    await restart.append([first, second]);
+    await expect(restart.commit()).resolves.toMatchObject({ records: 2 });
+    await expect(ps.readData("notes.entries", { auth })).resolves.toMatchObject(
+      { data: { records: [first, second] } },
+    );
+  });
+
+  it("poisons a partially failed direct append until abort", async () => {
+    const gateway = createGateway();
+    const files = createMemoryPsLiteStagedFileStore();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      files,
+    );
+    const runtime = createRuntime(gateway, storage);
+    let failures = 2;
+    const ps = await startPersonalServer({
+      runtime: {
+        ...runtime,
+        appendScopeUpload(request, batch) {
+          if (
+            new URL(request.url).pathname.endsWith("/batches/1") &&
+            failures > 0
+          ) {
+            failures -= 1;
+            return Promise.reject(new TypeError("direct append failed"));
+          }
+          return runtime.appendScopeUpload!(request, batch);
+        },
+      },
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    const items = [
+      { id: 0, text: "a".repeat(600_000) },
+      { id: 1, text: "b".repeat(600_000) },
+    ];
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    await expect(upload.append(items)).rejects.toThrow("direct append failed");
+    await expect(upload.append(items)).rejects.toMatchObject({
+      errorCode: "UPLOAD_FAILED",
+    });
+    await expect(upload.commit()).rejects.toMatchObject({
+      errorCode: "UPLOAD_FAILED",
+    });
+    expect(files.files.size).toBe(0);
+    await upload.abort();
+    const retry = await ps.openScopeUpload!("notes.entries", auth);
+    await retry.append(items);
+    await expect(retry.commit()).resolves.toMatchObject({ records: 2 });
+    expect(files.files.size).toBe(1);
   });
 
   it("exposes typed data and sync helpers through the public handle", async () => {

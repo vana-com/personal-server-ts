@@ -301,3 +301,54 @@ it("rejects foreign-owner discovery and cyclic scope cursors", async () => {
     "did not advance",
   );
 });
+
+describe("version inventory head", () => {
+  function client(head: unknown) {
+    const fetcher = vi.fn().mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            data: {
+              dataPointId: id,
+              ownerAddress: owner,
+              scope: " scope ",
+              head,
+              versions: [],
+            },
+            pagination: { limit: 1, hasMore: false, nextAfter: null },
+          }),
+        ),
+    );
+    const signRequest = vi.fn().mockResolvedValue("Web3Signed server-proof");
+    return {
+      fetcher,
+      signRequest,
+      inventory: createVersionInventoryClient({
+        gatewayUrl: "https://gateway.example",
+        ownerAddress: owner,
+        ownerSigner: { signRequest },
+        fetch: fetcher,
+      }),
+    };
+  }
+
+  it("returns the head's version and deleted state from one signed page", async () => {
+    const { inventory, fetcher, signRequest } = client({
+      expectedVersion: "23",
+      dataHash: hashA,
+      metadataHash: hashB,
+      status: "finalized",
+      deletedAt: null,
+    });
+    expect(await inventory.head(" scope ")).toEqual({
+      expectedVersion: "23",
+      deletedAt: null,
+    });
+    expect(signRequest).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0]![0])).toContain("limit=1");
+  });
+
+  it("returns null for a point the gateway never registered", async () => {
+    expect(await client(null).inventory.head(" scope ")).toBeNull();
+  });
+});

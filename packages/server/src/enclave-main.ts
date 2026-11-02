@@ -373,8 +373,6 @@ export async function createEnclaveAdditionsPorts(
       return publicStorage.download(url);
     },
     async downloadBounded(url, budget) {
-      if (!publicStorage.downloadBounded)
-        throw new Error("Bounded download unavailable");
       return publicStorage.downloadBounded(url, budget);
     },
     async exists(url) {

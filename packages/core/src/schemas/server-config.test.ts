@@ -57,6 +57,93 @@ describe("ServerConfigSchema — sync fields", () => {
   });
 });
 
+describe("pdpp.clients[].grantLifetimeSeconds", () => {
+  it("is unset by default, preserving no-expiry behavior", () => {
+    const config = ServerConfigSchema.parse({
+      pdpp: {
+        clients: [{ clientId: "c1", redirectUris: ["https://app.example/cb"] }],
+      },
+    });
+    expect(config.pdpp.clients[0].grantLifetimeSeconds).toBeUndefined();
+  });
+
+  it("accepts a positive integer", () => {
+    const config = ServerConfigSchema.parse({
+      pdpp: {
+        clients: [
+          {
+            clientId: "c1",
+            redirectUris: ["https://app.example/cb"],
+            grantLifetimeSeconds: 3,
+          },
+        ],
+      },
+    });
+    expect(config.pdpp.clients[0].grantLifetimeSeconds).toBe(3);
+  });
+
+  it("rejects zero, negative, and non-integer durations", () => {
+    for (const grantLifetimeSeconds of [0, -1, 1.5]) {
+      expect(() =>
+        ServerConfigSchema.parse({
+          pdpp: {
+            clients: [
+              {
+                clientId: "c1",
+                redirectUris: ["https://app.example/cb"],
+                grantLifetimeSeconds,
+              },
+            ],
+          },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("rejects a duration that could overflow a computed expiry instant", () => {
+    // Well beyond the 100-year policy ceiling — this is the boundary that
+    // stops an operator config from producing `Date.now() + n * 1000`
+    // overflowing into an invalid or wrapped Date.
+    expect(() =>
+      ServerConfigSchema.parse({
+        pdpp: {
+          clients: [
+            {
+              clientId: "c1",
+              redirectUris: ["https://app.example/cb"],
+              grantLifetimeSeconds: Number.MAX_SAFE_INTEGER,
+            },
+          ],
+        },
+      }),
+    ).toThrow();
+  });
+});
+
+describe("pdpp.connectionMethods", () => {
+  it("parses source and method entries without record declarations", () => {
+    const config = ServerConfigSchema.parse({
+      pdpp: {
+        connectionMethods: [
+          {
+            source_id: "https://registry.pdpp.dev/sources/oura",
+            method_id: "oura",
+          },
+        ],
+      },
+    });
+
+    expect(config.pdpp.declarationPaths).toEqual([]);
+    expect(config.pdpp.methods).toEqual([]);
+    expect(config.pdpp.connectionMethods).toEqual([
+      {
+        source_id: "https://registry.pdpp.dev/sources/oura",
+        method_id: "oura",
+      },
+    ]);
+  });
+});
+
 describe("withCurrentInferenceModel", () => {
   it("moves a superseded default forward", () => {
     const stored = ServerConfigSchema.parse({
@@ -152,5 +239,25 @@ describe("saveConfig", () => {
       expect(parsed.server.port).toBe(8080);
       expect(parsed.sync.enabled).toBe(false);
     });
+  });
+});
+
+describe("pdpp.protocolProfile", () => {
+  it("defaults existing deployments to current behavior", () => {
+    expect(ServerConfigSchema.parse({}).pdpp.protocolProfile).toBe("current");
+    expect(
+      ServerConfigSchema.parse({ pdpp: { enabled: true } }).pdpp
+        .protocolProfile,
+    ).toBe("current");
+  });
+  it("accepts only an explicit known candidate profile", () => {
+    expect(
+      ServerConfigSchema.parse({ pdpp: { protocolProfile: "candidate-0.1.0" } })
+        .pdpp.protocolProfile,
+    ).toBe("candidate-0.1.0");
+    expect(
+      ServerConfigSchema.safeParse({ pdpp: { protocolProfile: "candidate" } })
+        .success,
+    ).toBe(false);
   });
 });

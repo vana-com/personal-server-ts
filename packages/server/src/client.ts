@@ -59,6 +59,7 @@ export interface StartPersonalServerNodeOptions
       | "mcpOAuthApprovalUrl"
       | "mcpScopeRequestApprovalUrl"
       | "mcpGrantTtlSeconds"
+      | "rotateReplicaWriterIdentity"
     >,
     LoadConfigOptions {
   config?: ServerConfig;
@@ -99,6 +100,7 @@ export async function startPersonalServer(
     mcpOAuthApprovalUrl: options.mcpOAuthApprovalUrl,
     mcpScopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
     mcpGrantTtlSeconds: options.mcpGrantTtlSeconds,
+    rotateReplicaWriterIdentity: options.rotateReplicaWriterIdentity,
   });
   const mainServer = await listenHttpServer({
     fetch: context.app.fetch,
@@ -151,6 +153,7 @@ export async function startPersonalServer(
       health: body,
       localUrl: localOrigin,
       publicUrl: context.tunnelUrl ?? null,
+      loopbackUrl: context.getLocalApprovalOrigin() ?? null,
     });
     return lastInfo;
   }
@@ -430,8 +433,13 @@ export async function startPersonalServer(
     await context.cleanup();
   }
 
+  const { replicationStatus, replicaWriterRotation } = context;
   return {
     kind: "node",
+    replication: {
+      status: () => replicationStatus,
+      writerRotation: () => replicaWriterRotation,
+    },
     ready,
     info,
     prepareRegistration,

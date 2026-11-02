@@ -286,7 +286,7 @@ describe("PS-Lite first-seen sidecar", () => {
         collectedAt: AT,
         status: "stored",
       });
-      // The next persist drops the old field; the state keeps its old shape.
+      // The next persist drops the old embedded ledgers; readiness is metadata.
       const state = (await persistence.read()) as Record<string, unknown>;
       expect(Object.keys(state).sort()).toEqual(
         [
@@ -295,6 +295,7 @@ describe("PS-Lite first-seen sidecar", () => {
           "entries",
           "envelopes",
           "nextId",
+          "readyBlockManifests",
           "version",
         ].sort(),
       );

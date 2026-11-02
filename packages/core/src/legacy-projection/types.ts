@@ -15,13 +15,7 @@ export interface PdppRecord {
 export type LegacyScopeLookupError =
   | { kind: "unknown_scope"; scope: string }
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
-  | { kind: "test_debris_scope"; scope: string; reason: string }
-  | {
-      kind: "gap";
-      scope: string;
-      reason: string;
-      provenanceChecked: LegacyScopeBindingProvenance[];
-    };
+  | { kind: "test_debris_scope"; scope: string; reason: string };
 
 export interface LegacyScopeLookupOk {
   ok: true;
@@ -39,19 +33,45 @@ export type ProjectionError =
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
   | { kind: "missing_stream"; scope: string; expectedStream: string }
   | { kind: "invalid_value"; scope: string; reason: string }
-  | { kind: "incomplete_scope"; scope: string; reason: string }
-  | { kind: "gap"; scope: string; reason: string }
+  | {
+      kind:
+        "invalid_encoded_text" | "message_content_omitted" | "unresolved_blob";
+      scope: string;
+      stream: string;
+      field: string;
+    }
+  | {
+      kind: "incomplete_scope";
+      scope: string;
+      reason: string;
+      /**
+       * Rows behind a rejection in which source rows existed but none could
+       * be projected. Absent for other incomplete scopes.
+       */
+      diagnostics?: ProjectionDiagnostic[];
+    }
   | { kind: "empty_singleton"; scope: string };
 
 export interface ProjectionOk {
   diagnostics?: ProjectionDiagnostic[];
+  projectionOmissions?: ProjectionOmission[];
   ok: true;
   payload: Record<string, unknown>;
 }
+/** A field omitted by policy because of the raw canonical value on this entity. */
+export interface ProjectionOmission {
+  entityKey: string | number | boolean;
+  entityPath: string;
+  /** Dot path relative to the entity, e.g. `timestamp` or `contributors.timestamp`. */
+  fieldPath: string;
+  reason: "off_enum_type" | "null_type" | "null_timestamp";
+}
 /**
  * `records_skipped` makes the whole projection `incomplete_scope`.
- * `records_dropped` and `stream_missing` do not: the payload is served
- * without the named rows, and the diagnostic says how many were left out.
+ * `records_dropped`, `records_partial` and `stream_missing` do not: the
+ * payload is served without the named rows (`records_dropped`, `count` is
+ * distinct source rows of `stream`), or with rows the source says are short
+ * of detail (`records_partial`), and the diagnostic says how many.
  */
 export type ProjectionDiagnostic =
   | {
@@ -63,6 +83,13 @@ export type ProjectionDiagnostic =
   | {
       count: number;
       kind: "records_dropped";
+      reasons: string[];
+      scope: string;
+      stream: string;
+    }
+  | {
+      count: number;
+      kind: "records_partial";
       reasons: string[];
       scope: string;
       stream: string;
@@ -83,6 +110,8 @@ export type ProjectionResult = ProjectionOk | ProjectionErr;
  */
 export interface ProjectPdppRecordsOptions {
   fetchedStreams: string[];
+  /** Trusted per-stream declarations governing these rows; absent means no decoding. */
+  streamSchemas?: Readonly<Record<string, Record<string, unknown>>>;
   /** Selected signed connector key. Omitted for the original PAT binding. */
   profileKey?: string;
   /**
@@ -111,11 +140,16 @@ export interface ProjectPdppRecordsOptions {
 }
 
 /**
- * One legacy scope's binding. `project` and `requiredStreams` are absent for
- * a scope this phase declares a gap for (see LEGACY_SCOPE_GAPS) — a gap has
- * no binding entry at all, by design: "no entry, no fabricated mapping."
+ * One legacy scope's binding. An unbound scope has no binding entry, so no
+ * mapping is fabricated.
  */
 export interface LegacyScopeBinding {
+  /**
+   * Streams whose `blob_ref` is only a copy of the raw source envelope: the
+   * declared typed fields already carry the full record, so a reader neither
+   * fetches that blob nor treats it as projected content.
+   */
+  ancillaryBlobStreams?: string[];
   /**
    * Per bound stream, the exact set of declared field names `project()`
    * reads off that stream's records. Checked by the self-check against the
@@ -124,6 +158,8 @@ export interface LegacyScopeBinding {
    * and fail the self-check (S1).
    */
   fieldsRead: Record<string, string[]>;
+  /** Optional passthrough fields supplied by newer profiles, absent at the pinned declaration. */
+  optionalFieldsRead?: Record<string, string[]>;
   /** Legacy JSON Schema path this binding's output must validate against, relative to ./legacy-schemas. */
   legacySchemaPath: string;
   /**
@@ -147,5 +183,50 @@ export interface LegacyScopeBinding {
     options: ProjectPdppRecordsOptions,
   ) => ProjectionResult;
   provenance: LegacyScopeBindingProvenance[];
+  /**
+   * `"arrival"`: the legacy body listed each stream in the order its live
+   * keys last arrived, an unchanged re-delivery moving a key to the end. A
+   * reader then feeds rows to `project()` in that order, and reports when it
+   * cannot prove it. Absent: rows go in primary-key order.
+   */
+  rowOrder?: "arrival";
   scope: string;
+  /**
+   * Present when the projection can be computed a window of parent rows at a
+   * time; see {@link LegacyProjectionWindow}.
+   */
+  window?: LegacyProjectionWindow;
+  /**
+   * Why this binding builds its whole projection in memory and has no
+   * `window`: one line saying why it stays small, or why it cannot be
+   * windowed. Required of every binding with more than one stream that has no
+   * `window` (`window-guard.test.ts`).
+   */
+  memoryBound?: string;
+}
+
+/**
+ * A binding whose output holds one row per `parentStream` row, built from
+ * that row, the `childStream` rows whose `childKey` holds its primary key,
+ * and whole copies of the binding's other streams. Projecting the parents a
+ * window at a time, each with exactly its own children, and joining the
+ * windows' arrays in `parentOrder` gives the whole projection's array, when
+ * the caller passes `orderByPrimaryKey`. Every other payload key is the same
+ * in each window, except `sumKeys`, which add up.
+ *
+ * A child row that is not an object or names no parent is not in any window,
+ * so a caller must refuse such input rather than window it.
+ */
+export interface LegacyProjectionWindow {
+  parentStream: string;
+  childStream: string;
+  childKey: string;
+  /** The payload key of the output array. */
+  arrayKey: string;
+  sumKeys: string[];
+  /** The output array's order, as a total order on parent rows. */
+  parentOrder: (
+    a: Record<string, unknown>,
+    b: Record<string, unknown>,
+  ) => number;
 }

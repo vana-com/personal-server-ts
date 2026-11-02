@@ -1,0 +1,231 @@
+{
+  "scope": "github.history",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; github.history from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic github.history records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{pullRequests:HistoryItem[],issues:HistoryItem[],fetchedAt:string}; HistoryItem required keys: id:string,type:'pr'|'issue',repo:string,comments:number,reactionsTotal:number,isDraft:boolean,labels:string[]; optional keys: number:number,title:string|null,body:string|null,state:string|null,createdAt:string|null,updatedAt:string|null,closedAt:string|null,url:string|null; PR-only optional mergedAt:string|null",
+    "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+    "inputHandling": "Three streams are composed; only authored non-PR issues survive. Dirty body loses its 501st character; mixed labels lose non-string members; invalid title is omitted."
+  },
+  "fetchedStreams": [
+    "user",
+    "issues",
+    "pull_requests"
+  ],
+  "streams": {
+    "user": [
+      {
+        "id": "user-a",
+        "login": "example"
+      }
+    ],
+    "issues": [
+      {
+        "id": "issue-a",
+        "number": 1,
+        "title": "Fix",
+        "body": "Details",
+        "state": "open",
+        "user_login": "example",
+        "labels": [
+          "bug"
+        ],
+        "repository_full_name": "example/sample",
+        "html_url": "https://github.com/example/sample/issues/1",
+        "comments": 2,
+        "reactions_total_count": 3,
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-02T00:00:00Z",
+        "closed_at": null,
+        "is_pull_request": false
+      }
+    ],
+    "pull_requests": [
+      {
+        "id": "pr-a",
+        "number": 2,
+        "title": "Change",
+        "body": "Patch",
+        "state": "open",
+        "labels": [
+          "feature"
+        ],
+        "repository_full_name": "example/sample",
+        "html_url": "https://github.com/example/sample/pull/2",
+        "comments": 1,
+        "reactions_total_count": 0,
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-02T00:00:00Z",
+        "closed_at": null,
+        "merged_at": null,
+        "draft": true
+      }
+    ]
+  },
+  "legacyBody": {
+    "pullRequests": [
+      {
+        "id": "pr-a",
+        "type": "pr",
+        "repo": "example/sample",
+        "comments": 1,
+        "reactionsTotal": 0,
+        "isDraft": true,
+        "number": 2,
+        "title": "Change",
+        "body": "Patch",
+        "state": "open",
+        "createdAt": "2026-09-01T00:00:00Z",
+        "updatedAt": "2026-09-02T00:00:00Z",
+        "closedAt": null,
+        "url": "https://github.com/example/sample/pull/2",
+        "mergedAt": null,
+        "labels": [
+          "feature"
+        ]
+      }
+    ],
+    "issues": [
+      {
+        "id": "issue-a",
+        "type": "issue",
+        "repo": "example/sample",
+        "comments": 2,
+        "reactionsTotal": 3,
+        "isDraft": false,
+        "number": 1,
+        "title": "Fix",
+        "body": "Details",
+        "state": "open",
+        "createdAt": "2026-09-01T00:00:00Z",
+        "updatedAt": "2026-09-02T00:00:00Z",
+        "closedAt": null,
+        "url": "https://github.com/example/sample/issues/1",
+        "labels": [
+          "bug"
+        ]
+      }
+    ],
+    "fetchedAt": "2026-10-01T00:00:00.000Z"
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "github.history",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; github.history from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic github.history records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{pullRequests:HistoryItem[],issues:HistoryItem[],fetchedAt:string}; HistoryItem required keys: id:string,type:'pr'|'issue',repo:string,comments:number,reactionsTotal:number,isDraft:boolean,labels:string[]; optional keys: number:number,title:string|null,body:string|null,state:string|null,createdAt:string|null,updatedAt:string|null,closedAt:string|null,url:string|null; PR-only optional mergedAt:string|null",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Three streams are composed; only authored non-PR issues survive. Dirty body loses its 501st character; mixed labels lose non-string members; invalid title is omitted."
+      },
+      "fetchedStreams": [
+        "user",
+        "issues",
+        "pull_requests"
+      ],
+      "streams": {
+        "user": [],
+        "issues": [],
+        "pull_requests": []
+      },
+      "legacyBody": {
+        "pullRequests": [],
+        "issues": [],
+        "fetchedAt": "2026-10-01T00:00:00.000Z"
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "github.history",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; github.history from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic github.history records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{pullRequests:HistoryItem[],issues:HistoryItem[],fetchedAt:string}; HistoryItem required keys: id:string,type:'pr'|'issue',repo:string,comments:number,reactionsTotal:number,isDraft:boolean,labels:string[]; optional keys: number:number,title:string|null,body:string|null,state:string|null,createdAt:string|null,updatedAt:string|null,closedAt:string|null,url:string|null; PR-only optional mergedAt:string|null",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Three streams are composed; only authored non-PR issues survive. Dirty body loses its 501st character; mixed labels lose non-string members; invalid title is omitted."
+      },
+      "fetchedStreams": [
+        "user",
+        "issues",
+        "pull_requests"
+      ],
+      "streams": {
+        "user": [
+          {
+            "id": "user-a",
+            "login": "example"
+          }
+        ],
+        "issues": [
+          {
+            "id": "issue-dirty",
+            "user_login": "example",
+            "is_pull_request": false,
+            "repository_full_name": "example/sample",
+            "title": 42,
+            "body": null,
+            "state": null,
+            "comments": "2",
+            "reactions_total_count": null,
+            "labels": [
+              "bug",
+              42,
+              null
+            ]
+          }
+        ],
+        "pull_requests": [
+          {
+            "id": "pr-dirty",
+            "repository_full_name": "example/sample",
+            "body": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "draft": true,
+            "state": "closed",
+            "merged_at": null,
+            "labels": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "pullRequests": [
+          {
+            "id": "pr-dirty",
+            "type": "pr",
+            "repo": "example/sample",
+            "comments": 0,
+            "reactionsTotal": 0,
+            "isDraft": false,
+            "body": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "state": "closed",
+            "mergedAt": null,
+            "labels": []
+          }
+        ],
+        "issues": [
+          {
+            "id": "issue-dirty",
+            "type": "issue",
+            "repo": "example/sample",
+            "comments": 0,
+            "reactionsTotal": 0,
+            "isDraft": false,
+            "body": null,
+            "state": null,
+            "labels": [
+              "bug"
+            ]
+          }
+        ],
+        "fetchedAt": "2026-10-01T00:00:00.000Z"
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

@@ -1,0 +1,137 @@
+{
+  "scope": "heb.profile",
+  "case": "normal",
+  "fetchedStreams": [
+    "profile"
+  ],
+  "streams": {
+    "profile": [
+      {
+        "id": "account-a",
+        "name": "Ada Example",
+        "email": "ada@example.test",
+        "phone": "555-0100",
+        "delivery_addresses": [
+          {
+            "address": "1 Main St",
+            "is_primary": true,
+            "label": "Home"
+          }
+        ]
+      }
+    ]
+  },
+  "legacyBody": {
+    "name": "Ada Example",
+    "email": "ada@example.test",
+    "phone": "555-0100",
+    "deliveryAddresses": [
+      {
+        "address": "1 Main St",
+        "isPrimary": true,
+        "label": "Home"
+      }
+    ]
+  },
+  "reviewedDifferences": [
+    {
+      "path": "id",
+      "legacy": "account-a",
+      "projected": "<absent>",
+      "reason": "Source profile.id is used as the stream primary key but omitted from the profile payload."
+    }
+  ],
+  "consumerContractBody": {
+    "name": "Ada Example",
+    "email": "ada@example.test",
+    "phone": "555-0100",
+    "deliveryAddresses": [
+      {
+        "address": "1 Main St",
+        "isPrimary": true,
+        "label": "Home"
+      }
+    ],
+    "id": "account-a"
+  },
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; heb.profile from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic heb.profile records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+    "legacySchemaNote": "Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, apps/desktop/connectors/heb/schemas/heb.profile.json; sha256:0a27981ccdcffad91afd2a78a80407c67227b05ea1cf0c918ddfa5cb6338a3e0.",
+    "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.name\":\"string\",\"$.email\":\"string\",\"$.phone\":\"string\",\"$.deliveryAddresses\":\"array\",\"$.deliveryAddresses[0]\":\"object\",\"$.deliveryAddresses[0].address\":\"string\",\"$.deliveryAddresses[0].isPrimary\":\"boolean\",\"$.deliveryAddresses[0].label\":\"string\"},\"empty\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\"},\"dirty-row\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\",\"$.error.reason\":\"string\"}}",
+    "behaviorNote": "Malformed non-null profile names fail closed; empty fetched profile is empty_singleton. Failure cases have no payload."
+  },
+  "cases": [
+    {
+      "scope": "heb.profile",
+      "case": "empty",
+      "fetchedStreams": [
+        "profile"
+      ],
+      "streams": {
+        "profile": []
+      },
+      "expectedResult": {
+        "ok": false,
+        "error": {
+          "kind": "empty_singleton",
+          "scope": "heb.profile"
+        }
+      },
+      "reviewedDifferences": [],
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; heb.profile from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic heb.profile records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+        "legacySchemaNote": "Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, apps/desktop/connectors/heb/schemas/heb.profile.json; sha256:0a27981ccdcffad91afd2a78a80407c67227b05ea1cf0c918ddfa5cb6338a3e0.",
+        "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.name\":\"string\",\"$.email\":\"string\",\"$.phone\":\"string\",\"$.deliveryAddresses\":\"array\",\"$.deliveryAddresses[0]\":\"object\",\"$.deliveryAddresses[0].address\":\"string\",\"$.deliveryAddresses[0].isPrimary\":\"boolean\",\"$.deliveryAddresses[0].label\":\"string\"},\"empty\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\"},\"dirty-row\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\",\"$.error.reason\":\"string\"}}",
+        "behaviorNote": "Malformed non-null profile names fail closed; empty fetched profile is empty_singleton. Failure cases have no payload."
+      }
+    },
+    {
+      "scope": "heb.profile",
+      "case": "dirty-row",
+      "fetchedStreams": [
+        "profile"
+      ],
+      "streams": {
+        "profile": [
+          {
+            "id": "account-a",
+            "name": 42,
+            "email": "ada@example.test",
+            "phone": "555-0100",
+            "delivery_addresses": [
+              {
+                "address": "1 Main St",
+                "is_primary": true,
+                "label": "Home"
+              }
+            ]
+          }
+        ]
+      },
+      "expectedResult": {
+        "ok": false,
+        "error": {
+          "kind": "incomplete_scope",
+          "scope": "heb.profile",
+          "reason": "profile contains a malformed scalar value"
+        }
+      },
+      "reviewedDifferences": [],
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; heb.profile from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic heb.profile records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+        "legacySchemaNote": "Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, apps/desktop/connectors/heb/schemas/heb.profile.json; sha256:0a27981ccdcffad91afd2a78a80407c67227b05ea1cf0c918ddfa5cb6338a3e0.",
+        "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.name\":\"string\",\"$.email\":\"string\",\"$.phone\":\"string\",\"$.deliveryAddresses\":\"array\",\"$.deliveryAddresses[0]\":\"object\",\"$.deliveryAddresses[0].address\":\"string\",\"$.deliveryAddresses[0].isPrimary\":\"boolean\",\"$.deliveryAddresses[0].label\":\"string\"},\"empty\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\"},\"dirty-row\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\",\"$.error.reason\":\"string\"}}",
+        "behaviorNote": "Malformed non-null profile names fail closed; empty fetched profile is empty_singleton. Failure cases have no payload."
+      }
+    }
+  ]
+}

@@ -116,6 +116,183 @@ async function flushRelayTasks() {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+describe("relay stream lifetime", () => {
+  afterEach(() => vi.useRealTimers());
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+
+  function fakeTls() {
+    let freed = false;
+    const assertLive = () => {
+      if (freed) throw new Error("TLS use after free");
+    };
+    return {
+      processTls: vi.fn((payload: Uint8Array) => {
+        assertLive();
+        return { plaintext: payload, tls: new Uint8Array() };
+      }),
+      writePlaintext: vi.fn((payload: Uint8Array) => {
+        assertLive();
+        return { plaintext: new Uint8Array(), tls: payload };
+      }),
+      close: vi.fn(() => {
+        assertLive();
+        freed = true;
+      }),
+    };
+  }
+
+  function setup(
+    createStream: PsLiteRelayClientOptions["tls"],
+    fetch = vi.fn(async () => new Response("ok")),
+  ) {
+    const sockets: FakeRelayWebSocket[] = [];
+    const statuses: string[] = [];
+    const logs: string[] = [];
+    const client = startPsLiteRelayClient({
+      sessionId: "lifetime",
+      runtime: { fetch } as ReturnType<typeof createTestRuntime>,
+      tls: createStream,
+      logger: (line) => logs.push(line),
+      onStatus: (status) => statuses.push(status),
+      webSocketFactory() {
+        const socket = new FakeRelayWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    return { client, sockets, statuses, logs };
+  }
+
+  it("drops completion of a cancelled pending fetch without touching freed TLS", async () => {
+    const pending = deferred<Response>();
+    const tls = fakeTls();
+    const fetch = vi.fn(() => pending.promise);
+    const { client, sockets, logs } = setup(
+      { createStream: async () => tls },
+      fetch,
+    );
+    const socket = sockets[0];
+    socket.receive(JSON.stringify({ type: "stream.open", streamId: 1 }));
+    await flushRelayTasks();
+    socket.receive(encodeDataFrame(1, httpRequest("GET", "/pending", {})));
+    await flushRelayTasks();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    socket.receive(JSON.stringify({ type: "stream.close", streamId: 1 }));
+    const sent = socket.sent.length;
+    pending.resolve(new Response("late"));
+    await flushRelayTasks();
+    expect(tls.close).toHaveBeenCalledTimes(1);
+    expect(tls.writePlaintext).not.toHaveBeenCalled();
+    expect(socket.sent).toHaveLength(sent);
+    expect(logs).not.toContain("TLS use after free");
+    client.close();
+    client.close();
+    expect(tls.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes an asynchronously created stream cancelled before creation settles", async () => {
+    const pending = deferred<ReturnType<typeof fakeTls>>();
+    const tls = fakeTls();
+    const { client, sockets } = setup({ createStream: () => pending.promise });
+    const socket = sockets[0];
+    socket.receive(JSON.stringify({ type: "stream.open", streamId: 1 }));
+    socket.receive(encodeDataFrame(1, httpRequest("GET", "/pending", {})));
+    socket.receive(JSON.stringify({ type: "stream.close", streamId: 1 }));
+    pending.resolve(tls);
+    await flushRelayTasks();
+    expect(tls.close).toHaveBeenCalledTimes(1);
+    expect(tls.processTls).not.toHaveBeenCalled();
+    expect(socket.sent).toHaveLength(0);
+    client.close();
+    expect(tls.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops old-generation creation and fetch completion without closing a reused stream ID", async () => {
+    vi.useFakeTimers();
+    const creating = deferred<ReturnType<typeof fakeTls>>();
+    const fetching = deferred<Response>();
+    const oldTls = fakeTls();
+    const lateTls = fakeTls();
+    const newTls = fakeTls();
+    const createStream = vi
+      .fn()
+      .mockResolvedValueOnce(oldTls)
+      .mockReturnValueOnce(creating.promise)
+      .mockResolvedValue(newTls);
+    const { client, sockets } = setup(
+      { createStream },
+      vi.fn(() => fetching.promise),
+    );
+    const old = sockets[0];
+    old.receive(JSON.stringify({ type: "stream.open", streamId: 1 }));
+    await vi.advanceTimersByTimeAsync(0);
+    old.receive(encodeDataFrame(1, httpRequest("GET", "/pending", {})));
+    await vi.advanceTimersByTimeAsync(0);
+    old.receive(JSON.stringify({ type: "stream.open", streamId: 2 }));
+    old.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const replacement = sockets[1];
+    replacement.receive(JSON.stringify({ type: "stream.open", streamId: 1 }));
+    await vi.advanceTimersByTimeAsync(0);
+    creating.resolve(lateTls);
+    fetching.resolve(new Response("stale"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(oldTls.writePlaintext).not.toHaveBeenCalled();
+    expect(oldTls.close).toHaveBeenCalledTimes(1);
+    expect(lateTls.close).toHaveBeenCalledTimes(1);
+    expect(newTls.close).not.toHaveBeenCalled();
+    expect(replacement.sent).toHaveLength(0);
+    client.close();
+    expect(newTls.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores callbacks from a replaced socket", async () => {
+    vi.useFakeTimers();
+    const tls = fakeTls();
+    const createStream = vi.fn(async () => tls);
+    const { client, sockets, statuses } = setup({ createStream });
+    const old = sockets[0];
+    old.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const current = sockets[1];
+    current.onopen?.();
+    current.receive(JSON.stringify({ type: "stream.open", streamId: 7 }));
+    await vi.advanceTimersByTimeAsync(0);
+    const statusCount = statuses.length;
+    old.onopen?.();
+    old.onerror?.();
+    old.receive(JSON.stringify({ type: "stream.close", streamId: 7 }));
+    old.receive(JSON.stringify({ type: "stream.open", streamId: 8 }));
+    old.receive(encodeDataFrame(7, httpRequest("GET", "/stale", {})));
+    old.close(1012, "stale takeover");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statuses).toHaveLength(statusCount);
+    expect(createStream).toHaveBeenCalledTimes(1);
+    expect(tls.close).not.toHaveBeenCalled();
+    expect(tls.processTls).not.toHaveBeenCalled();
+    expect(current.sent).toHaveLength(0);
+    client.close();
+  });
+
+  it("detects a silent session and starts reconnect within 15 seconds by default", () => {
+    vi.useFakeTimers();
+    const { client, sockets } = setup(false);
+    sockets[0].onopen?.();
+    vi.advanceTimersByTime(2_000);
+    expect(sockets[0].sent).toContain(JSON.stringify({ type: "ping" }));
+    vi.advanceTimersByTime(13_000);
+    expect(sockets).toHaveLength(2);
+    client.close();
+  });
+});
+
 describe("startPsLiteRelayClient", () => {
   it("adapts PoC relay streams into the browser PS Lite API runtime", async () => {
     const sockets: FakeRelayWebSocket[] = [];

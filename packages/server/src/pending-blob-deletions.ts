@@ -2,8 +2,10 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
   createPendingBlobDeletionStore,
+  normalizePendingBlobDeletionPlanned,
   normalizePendingBlobDeletions,
   type PendingBlobDeletionKv,
+  type PendingBlobDeletionPlanned,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   PendingBlobDeletion,
@@ -13,6 +15,12 @@ import type {
 interface PendingBlobDeletionsFile {
   version: 2;
   keys: PendingBlobDeletion[];
+  /**
+   * Per scope, the highest tombstone version already planned (queued or
+   * done), so a repeated delete resumes instead of restarting at version 1.
+   * Older builds ignore it; losing it only costs a redundant re-sweep.
+   */
+  planned?: PendingBlobDeletionPlanned;
 }
 
 /**
@@ -21,6 +29,7 @@ interface PendingBlobDeletionsFile {
  * each. Lives next to `sync-cursor.json` under the server root; written
  * atomically (tmp + rename) like the cursor. A version-1 file (whole scopes)
  * is read as version-less markers the retry expands into exact keys.
+ * `planned` keeps each scope's planned-through watermark in the same write.
  */
 export function createFilePendingBlobDeletionStore(
   filePath: string,
@@ -33,8 +42,12 @@ export function createFilePendingBlobDeletionStore(
           version?: number;
           keys?: unknown;
           scopes?: unknown;
+          planned?: unknown;
         };
-        return normalizePendingBlobDeletions(parsed.keys ?? parsed.scopes);
+        return {
+          keys: normalizePendingBlobDeletions(parsed.keys ?? parsed.scopes),
+          planned: normalizePendingBlobDeletionPlanned(parsed.planned),
+        };
       } catch (err) {
         if (
           err instanceof Error &&
@@ -46,10 +59,10 @@ export function createFilePendingBlobDeletionStore(
         throw err;
       }
     },
-    async write(keys) {
+    async write(keys, planned) {
       await mkdir(dirname(filePath), { recursive: true });
       const tmpPath = `${filePath}.tmp`;
-      const state: PendingBlobDeletionsFile = { version: 2, keys };
+      const state: PendingBlobDeletionsFile = { version: 2, keys, planned };
       await writeFile(tmpPath, `${JSON.stringify(state, null, 2)}\n`);
       await rename(tmpPath, filePath);
     },

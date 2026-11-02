@@ -1,0 +1,221 @@
+{
+  "scope": "instagram.profile",
+  "profileKey": "meta",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; instagram.profile from packages/core/src/legacy-projection/bindings.ts + meta-040-bindings.ts (profileKey=meta) at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+    "pdppBundle": "synthetic instagram.profile records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+  },
+  "fetchedStreams": [
+    "profile"
+  ],
+  "streams": {
+    "profile": [
+      {
+        "id": "instagram-a",
+        "username": "synthetic_member",
+        "full_name": "Synthetic Member",
+        "bio": "Photos and walks",
+        "profile_pic_url": "https://example.com/avatar.png",
+        "external_url": "https://example.com",
+        "follower_count": 12,
+        "following_count": 3,
+        "is_private": false,
+        "is_verified": true,
+        "is_business": false,
+        "post_count": 2
+      }
+    ]
+  },
+  "legacyBody": {
+    "username": "synthetic_member",
+    "full_name": "Synthetic Member",
+    "bio": "Photos and walks",
+    "profile_pic_url": "https://example.com/avatar.png",
+    "external_url": "https://example.com",
+    "follower_count": 12,
+    "following_count": 3,
+    "media_count": 2,
+    "is_private": false,
+    "is_verified": true,
+    "is_business": false
+  },
+  "consumerContractBody": {
+    "username": "synthetic_member",
+    "full_name": "Synthetic Member",
+    "bio": "Photos and walks",
+    "profile_pic_url": "https://example.com/avatar.png",
+    "external_url": "https://example.com",
+    "follower_count": 12,
+    "following_count": 3,
+    "is_private": false,
+    "is_verified": true,
+    "is_business": false,
+    "id": "instagram-a",
+    "post_count": 2,
+    "media_count": 2
+  },
+  "reviewedDifferences": [
+    {
+      "path": "id",
+      "legacy": "instagram-a",
+      "projected": "<absent>",
+      "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to the legacy media_count. Web Source Detail retains following_count but cannot read post_count from this profile."
+    },
+    {
+      "path": "post_count",
+      "legacy": 2,
+      "projected": "<absent>",
+      "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to the legacy media_count. Web Source Detail retains following_count but cannot read post_count from this profile."
+    }
+  ],
+  "cases": [
+    {
+      "scope": "instagram.profile",
+      "profileKey": "meta",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; instagram.profile from packages/core/src/legacy-projection/bindings.ts + meta-040-bindings.ts (profileKey=meta) at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic instagram.profile records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "profile"
+      ],
+      "streams": {
+        "profile": []
+      },
+      "expectedResult": {
+        "ok": false,
+        "error": {
+          "kind": "empty_singleton",
+          "scope": "instagram.profile"
+        }
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "instagram.profile",
+      "profileKey": "meta",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; instagram.profile from packages/core/src/legacy-projection/bindings.ts + meta-040-bindings.ts (profileKey=meta) at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic instagram.profile records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "profile"
+      ],
+      "streams": {
+        "profile": [
+          {
+            "id": "instagram-dirty",
+            "username": "synthetic_dirty",
+            "full_name": null,
+            "bio": null,
+            "profile_pic_url": 42,
+            "external_url": false,
+            "follower_count": "12",
+            "following_count": null,
+            "post_count": null,
+            "is_private": "false",
+            "is_verified": 0,
+            "is_business": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "username": "synthetic_dirty",
+        "full_name": "",
+        "bio": "",
+        "external_url": ""
+      },
+      "consumerContractBody": {
+        "username": "synthetic_dirty",
+        "full_name": null,
+        "id": "instagram-dirty",
+        "bio": null,
+        "profile_pic_url": 42,
+        "external_url": false,
+        "follower_count": "12",
+        "following_count": null,
+        "post_count": null,
+        "is_private": "false",
+        "is_verified": 0,
+        "is_business": null
+      },
+      "reviewedDifferences": [
+        {
+          "path": "bio",
+          "legacy": null,
+          "projected": "",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "external_url",
+          "legacy": false,
+          "projected": "",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "follower_count",
+          "legacy": "12",
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "following_count",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "full_name",
+          "legacy": null,
+          "projected": "",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "id",
+          "legacy": "instagram-dirty",
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "is_business",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "is_private",
+          "legacy": "false",
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "is_verified",
+          "legacy": 0,
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "post_count",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        },
+        {
+          "path": "profile_pic_url",
+          "legacy": 42,
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name, bio and external_url become ''; other malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+        }
+      ]
+    }
+  ]
+}

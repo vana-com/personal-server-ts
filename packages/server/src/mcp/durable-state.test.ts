@@ -1,9 +1,14 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createCipheriv, randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
+import {
+  approveMcpOAuthAuthorization,
+  createMcpConnection,
+  createMcpOAuthAuthorization,
+  MAX_MCP_OAUTH_CLIENTS,
+} from "@opendatalabs/personal-server-ts-core/mcp";
 import {
   openMcpDurableState,
   McpStateRequiredError,
@@ -83,6 +88,81 @@ afterEach(async () => {
 });
 
 describe("TEE MCP durable state", () => {
+  it("keeps one pending OAuth connection under concurrent registration and preserves approval", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-oauth-replace-"));
+    directories.push(directory);
+    const state = await openMcpDurableState({
+      path: join(directory, "state.sealed"),
+      key: randomBytes(32),
+    });
+    const authorize = () =>
+      createMcpOAuthAuthorization(
+        {
+          clientId: "same-client",
+          redirectUri: "https://claude.ai/api/mcp/auth_callback",
+          codeChallenge: "challenge",
+          codeChallengeMethod: "S256",
+        },
+        {
+          connectionStore: state.connections,
+          authorizationStore: state.authorizations,
+          publicOrigin: "https://mcp.example.test",
+        },
+      );
+
+    const registrations = await Promise.all(
+      Array.from({ length: 100 }, authorize),
+    );
+    const connections = await state.connections.list();
+    expect(
+      connections.filter(
+        (connection) =>
+          connection.clientId === "same-client" &&
+          connection.status === "pending",
+      ),
+    ).toHaveLength(1);
+
+    const pendingConnection = connections.find(
+      (connection) =>
+        connection.clientId === "same-client" &&
+        connection.status === "pending",
+    );
+    const pendingAuthorization = (
+      await Promise.all(
+        registrations.map(({ authorizationId }) =>
+          state.authorizations.getById(authorizationId),
+        ),
+      )
+    ).find(
+      (authorization) =>
+        authorization?.connectionId === pendingConnection?.id &&
+        authorization.status === "pending",
+    );
+    expect(pendingAuthorization).toBeDefined();
+    await approveMcpOAuthAuthorization(
+      {
+        authorizationId: pendingAuthorization!.id,
+        grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+      },
+      {
+        connectionStore: state.connections,
+        authorizationStore: state.authorizations,
+      },
+    );
+
+    await authorize();
+    expect(
+      await state.connections.getById(pendingAuthorization!.connectionId),
+    ).toMatchObject({ status: "approved" });
+    expect(
+      (await state.connections.list()).filter(
+        (connection) =>
+          connection.clientId === "same-client" &&
+          connection.status === "pending",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("restores only the latest sealed owner wakeup envelope after a process restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "mcp-wakeup-"));
     directories.push(directory);
@@ -339,5 +419,103 @@ describe("MCP_STATE_REQUIRED", () => {
     const path = join(directory, "missing.sealed");
     const state = await openMcpDurableState({ path, key: randomBytes(32) });
     expect(await state.getIdentity(userPsId(14800, OWNER))).toBeNull();
+  });
+});
+
+describe("MCP OAuth clients", () => {
+  /** Seals `state` the way a server from before client records wrote it. */
+  async function sealLegacyState(
+    path: string,
+    key: Buffer,
+    state: object,
+  ): Promise<void> {
+    const iv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", key, iv);
+    cipher.setAAD(Buffer.from("vana.mcp.tee-state.v1"));
+    const ciphertext = Buffer.concat([
+      cipher.update(JSON.stringify(state)),
+      cipher.final(),
+    ]);
+    await writeFile(
+      path,
+      JSON.stringify({
+        v: 1,
+        iv: iv.toString("base64"),
+        tag: cipher.getAuthTag().toString("base64"),
+        ciphertext: ciphertext.toString("base64"),
+      }),
+    );
+  }
+
+  const client = {
+    clientId: "mcp-client-1",
+    clientName: "Maple AI",
+    clientUri: "https://trymaple.ai/",
+    createdAt: "2026-10-23T00:00:00.000Z",
+  };
+
+  it("keeps a registered client across a restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-clients-"));
+    directories.push(directory);
+    const path = join(directory, "state.sealed");
+    const key = randomBytes(32);
+
+    await (await openMcpDurableState({ path, key })).clients.create(client);
+    const reopened = await openMcpDurableState({ path, key });
+
+    expect(await reopened.clients.getById(client.clientId)).toEqual(client);
+  });
+
+  it("opens a file sealed before clients were kept, connections intact", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-clients-legacy-"));
+    directories.push(directory);
+    const path = join(directory, "state.sealed");
+    const key = randomBytes(32);
+    const connection = { id: "connection-1", status: "approved" };
+    await sealLegacyState(path, key, {
+      connections: { [connection.id]: connection },
+      authorizations: {},
+      owners: {},
+      identities: {},
+    });
+
+    const state = await openMcpDurableState({ path, key });
+
+    expect(await state.connections.getById(connection.id)).toEqual(connection);
+    expect(await state.clients.getById(client.clientId)).toBeNull();
+    await state.clients.create(client);
+    expect(await state.clients.getById(client.clientId)).toEqual(client);
+  });
+
+  it("persists at most the newest MAX_MCP_OAUTH_CLIENTS clients", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-clients-cap-"));
+    directories.push(directory);
+    const path = join(directory, "state.sealed");
+    const key = randomBytes(32);
+    const base = Date.parse(client.createdAt);
+    const nth = (i: number) => ({
+      clientId: `mcp-client-${i}`,
+      createdAt: new Date(base + i).toISOString(),
+    });
+    // A full store, sealed directly: one encrypted write per client is slow.
+    const full = Array.from({ length: MAX_MCP_OAUTH_CLIENTS }, (_, i) =>
+      nth(i),
+    );
+    await sealLegacyState(path, key, {
+      connections: {},
+      authorizations: {},
+      clients: Object.fromEntries(full.map((c) => [c.clientId, c])),
+      owners: {},
+      identities: {},
+    });
+
+    const state = await openMcpDurableState({ path, key });
+    await state.clients.create(nth(MAX_MCP_OAUTH_CLIENTS));
+    const reopened = await openMcpDurableState({ path, key });
+
+    expect(await reopened.clients.getById(nth(0).clientId)).toBeNull();
+    expect(await reopened.clients.getById(nth(1).clientId)).toEqual(nth(1));
+    const last = nth(MAX_MCP_OAUTH_CLIENTS);
+    expect(await reopened.clients.getById(last.clientId)).toEqual(last);
   });
 });

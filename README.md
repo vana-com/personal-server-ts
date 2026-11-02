@@ -95,21 +95,92 @@ Tests are co-located with source (`foo.ts` → `foo.test.ts`).
 
 All authenticated endpoints use `Authorization: Web3Signed <base64url(json)>.<signature>` — no sessions, no cookies.
 
-| Endpoint                    | Method | Auth            | Purpose                |
-| --------------------------- | ------ | --------------- | ---------------------- |
-| `/health`                   | GET    | None            | Health check           |
-| `/v1/data/{scope}`          | POST   | Owner           | Ingest data            |
-| `/v1/data`                  | GET    | Builder         | List scopes            |
-| `/v1/data/{scope}`          | GET    | Builder + Grant | Read data              |
-| `/v1/data/{scope}/versions` | GET    | Builder         | List versions          |
-| `/v1/data/additions`        | GET    | Owner           | Additions summary      |
-| `/v1/data/{scope}`          | DELETE | Owner           | Delete data (durable)  |
-| `/v1/grants`                | GET    | Owner           | List grants            |
-| `/v1/grants/verify`         | POST   | None            | Verify grant signature |
-| `/v1/access-logs`           | GET    | Owner           | Access history         |
-| `/v1/sync/trigger`          | POST   | Owner           | Force sync             |
-| `/v1/sync/status`           | GET    | Owner           | Sync status            |
-| `/v1/sync/file/{fileId}`    | POST   | Owner           | Sync specific file     |
+| Endpoint                               | Method | Auth            | Purpose                        |
+| -------------------------------------- | ------ | --------------- | ------------------------------ |
+| `/health`                              | GET    | None            | Health check                   |
+| `/v1/data/{scope}`                     | POST   | Owner           | Ingest data                    |
+| `/v1/data/{scope}/imports/{operation}` | PUT    | Owner           | Accept or replay a JSON import |
+| `/v1/data/{scope}/uploads`             | POST   | Owner           | Begin a streamed write (Lite)  |
+| `/v1/data/{scope}/uploads/{id}/...`    | varies | Owner           | Append, commit or abort it     |
+| `/v1/data`                             | GET    | Builder         | List scopes                    |
+| `/v1/data/{scope}`                     | GET    | Builder + Grant | Read data                      |
+| `/v1/data/{scope}/versions`            | GET    | Builder         | List versions                  |
+| `/v1/data/additions`                   | GET    | Owner           | Additions summary              |
+| `/v1/data/{scope}`                     | DELETE | Owner           | Delete data (durable)          |
+| `/v1/grants`                           | GET    | Owner           | List grants                    |
+| `/v1/grants/verify`                    | POST   | None            | Verify grant signature         |
+| `/v1/access-logs`                      | GET    | Owner           | Access history                 |
+| `/v1/sync/trigger`                     | POST   | Owner           | Force sync                     |
+| `/v1/sync/status`                      | GET    | Owner           | Sync status                    |
+| `/v1/sync/file/{fileId}`               | POST   | Owner           | Sync specific file             |
+
+### Claude export-to-live transition
+
+The owner-only `POST /pdpp/instances/:instance/transition-claude-live` accepts
+`{ "expected_generation": N }` for the single registered Claude connection,
+configured as `anthropic` or `anthropic-live`. It is deliberately separate from
+reset: reset still cannot change a registered connection's method.
+
+The transition captures currently readable conversations and projects, archives
+the old canonical rows/history/blob claims, and binds `anthropic-live` at N+1 in
+one SQLite transaction. Snapshot preparation checks the write clock. Stale export
+runs cannot write afterward; replaying N never clears live data. Unreadable,
+nonempty prior data refuses transition. Desktop must verify the signed successor
+before requesting this operation, then activate its declaration at an idle
+restart boundary. A lost response is reconciled by reading the binding.
+
+The previous public bodies remain readable while live collection is incomplete.
+Conversations take over only after covering the saved messages in the same
+organization; a later regression refuses instead of resurrecting the old export.
+Saved projects remain available, but the live connector does not refresh them.
+Deletion/reset removes the corresponding saved baseline and archived data. This
+is a one-way method transition, not an arbitrary method-switching API. Saved
+provider sessions stay at their existing host-owned credential boundary.
+
+### Strava export-to-browser transition
+
+The owner-only `POST /pdpp/instances/:instance/transition-strava-browser`
+accepts `{ "expected_generation": N }` for the single registered Strava
+connection, configured as `strava` or `strava-browser`. It follows the Claude
+transition: it captures the readable `strava.activities` and
+`strava.coverage_diagnostics` bodies, archives the export rows and binds
+`strava-browser` at N+1 in one SQLite transaction. Replays never clear browser
+data. Unreadable, nonempty activities refuse the transition.
+
+Strava browser records carry no athlete id. The saved activities stay
+authoritative until a browser run with a completion receipt holds every saved
+activity id; nothing is deleted before then. A completed run that misses saved
+ids keeps the export. `GET /pdpp/instances/:instance/strava-browser-transition`
+reports `none`, `pending`, `account_mismatch` or `covered`, so a host can tell
+the owner the signed-in account does not match the saved data. After the
+handover, `strava.activities` follows the normal legacy view. The saved
+`strava.coverage_diagnostics` body stays readable and frozen; the browser
+method does not collect diagnostics. Reset or deletion removes the saved bodies
+and archive. The server exports `STRAVA_BROWSER_TRANSITION_CONTRACT`
+(`strava-browser-transition-v1`) for hosts to check before use.
+
+### Owner import acceptance
+
+`PUT /v1/data/{scope}/imports/{operation}` accepts an owner root JSON object up to the data-ingest limit (512 MiB). `operation` is a stable 64-character lowercase hexadecimal identifier for one intended import; derive it from the owner, saved run identity and scope, excluding the body digest and server port. Ordinary `POST` continues to create a distinct write on each request. Binary, lineage and query parameters (including `supersede`) are refused on import PUT.
+
+First acceptance returns `201`; a matching replay returns `200` with the original `{ scope, collectedAt, status, importReceipt: { operation, bodySha256, scope, collectedAt, acceptedAt } }`. `bodySha256` is SHA-256 over the UTF-8 RFC 8785 canonical JSON body: object key ordering and whitespace do not change identity; changed values or array order return `409 IMPORT_CONFLICT`. The receipt identifies local acceptance, not settled remote propagation or a final gateway version. Replaying an accepted import after a later write does not append data or make the old import newest. Replay can wake unfinished sync without another data-written event.
+
+Node storage persists the exact prepared envelope and original causal deletion marker in SQLite before publishing it without replacement, then commits the index and immutable receipt together. Startup and subsequent publication recover prepared imports at their original timestamp. Only import PUTs use this journal. Ordinary JSON, binary and replica writes keep their own staged-file and revision-guarded index commit, and are not journaled. Imports take the same short SQLite writer gate and the same revision-guarded index insert, so an import advances the scope's CAS revision like any other write and is refused (`409 SCOPE_CLOSED_FOR_WRITES`) when the index has closed the scope for writes. An import lands after the scope's current newest version. This gives processes sharing one root a single import authority; independent roots retain independent acceptance. Import identities and receipts do not expire. Deleting a version or scope durably retires its operations before cleanup; matching retries return `410 IMPORT_DELETED` with the original accepted receipt in `error.details.importReceipt`, and an intentional re-add needs a new operation. A cancelled preparation has no accepted receipt. Scope cleanup removes the files and index rows captured at retirement, preserving later writes. Failed deletion keeps cleanup retryable.
+
+Older servers reject the dedicated PUT route before ingestion; unsupported storage returns `501 IMPORT_UNSUPPORTED`. Clients must retain pending delivery and request an upgrade, never fall back to POST. Before upgrading a shared root to a build with the owner-import journal, stop all old writers: the index schema version stamp prevents newly starting old binaries, but cannot evict already-open old connections. Back up `index.db`, its WAL and data files as one root; do not discard receipts or downgrade the schema. Historical POST acceptances cannot acquire trustworthy operation receipts retrospectively.
+
+### Streamed scope writes (PS-Lite)
+
+A JSON write holds the whole document in memory several times while it is parsed, stamped and stored. On a phone a scope of a few hundred MB does not fit. PS-Lite therefore also takes one new version of a scope as a sequence of record batches, and holds one batch at a time:
+
+1. `POST /v1/data/{scope}/uploads` with `{ "data"?: {...}, "arrayKey"?: "records" }` returns `201 { uploadId, scope, collectedAt, maxBatchBytes }`. `data` holds the keys written before the record array.
+2. `PUT /v1/data/{scope}/uploads/{id}/batches/{seq}` with `{ "items": [...] }`, `seq` counting from 0. A batch number sent again with the same body returns `200` and stores nothing; with a different body it returns `409 BATCH_CONFLICT`. A gap returns `409 BATCH_OUT_OF_ORDER`.
+3. `POST /v1/data/{scope}/uploads/{id}/commit` with `{ "data"?: {...} }` (keys written after the array) makes the version visible and returns `201 { scope, collectedAt, status, records, sizeBytes }`.
+4. `DELETE /v1/data/{scope}/uploads/{id}` discards it.
+
+The stored envelope is the one `POST /v1/data/{scope}` stores for `{ ...beginData, [arrayKey]: [...all items], ...commitData }`. Nothing is indexed before commit, so readers and sync see the previous version until then, and an abort, a 2-minute idle timeout or a crash leaves the previous version and no partial one. A commit after another write to the scope returns `409 UPLOAD_SUPERSEDED`. One upload is open at a time; a new begin aborts it. Server-owned keys (`$writtenBy`, `$lineage`, `lineage`, `$binary`) are refused. The commit builds no block sidecar or first-seen ledger entry, because both need the whole envelope in memory; reads and `/additions` rebuild them as for any version without them. Storage without a streaming file writer (the IndexedDB fallback, Node) returns `501 UPLOAD_UNSUPPORTED`. `openScopeUpload` on the Lite client handle sends batches of up to 1 MiB.
+
+Windows skips directory fsync barriers; file fsync and journal recovery remain in place. Directory-entry and power-loss durability are outside the Windows guarantee.
 
 ### Additions summary
 
@@ -133,3 +204,4 @@ This is an unpublished implementation requiring the Gateway contract at `data-ga
 
 - [DPv1 Protocol Spec](docs/260121-data-portability-protocol-spec.md) — canonical protocol behavior
 - [Architecture](docs/260127-personal-server-scaffold.md) — design decisions and repo structure
+- [Replication host contract](docs/replication/host-contract.md) — batch signer, host ports, opt-in and limits for replication testers ([ADR 0001](docs/replication/adr-0001-transport-and-device-identity.md))

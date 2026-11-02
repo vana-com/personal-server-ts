@@ -6,8 +6,9 @@
  * as `chatgpt.conversations` = `{conversations, total}`. `withLegacyProjection`
  * wraps the raw storage port: when the latest stored body of a projected
  * scope is `{records}`, reads return the legacy body projected from that
- * stream and its sibling streams. Every other body is served exactly as
- * stored. Writes, listings and the sync-facing methods pass through.
+ * stream and its sibling streams. Legacy-shaped bodies are served as stored;
+ * raw bodies that cannot be projected fail the served read. Writes, listings
+ * and the sync-facing methods pass through.
  *
  * Give the wrapped ("served") port to every reader of data: the HTTP data
  * route, MCP, derivatives and the job worker. Give the raw port to sync
@@ -16,26 +17,22 @@
 
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
+  alternateLegacyBindingsForScope,
   LEGACY_SCOPE_BINDINGS,
   projectPdppRecordsToLegacyPayload,
+  type LegacyScopeBinding,
   type PdppRecord,
   type ProjectionDiagnostic,
   type ProjectionError,
 } from "../legacy-projection/index.js";
 import type { DataStoragePort } from "../ports/index.js";
+import { ProtocolError } from "../errors/catalog.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import type { IndexEntry } from "./index/types.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
 import type { DataBlockManifest, DataScopeBlock } from "./blocks/types.js";
 import { previewEnvelopeValue } from "./preview.js";
-
-/**
- * Sources whose `{records}` bodies are projected. Other sources either emit
- * legacy wrappers themselves (GitHub, Strava) or have no real-shape parity
- * evidence yet (Oura), so their stored bodies are served as stored.
- */
-const PROJECTED_SOURCES: ReadonlySet<string> = new Set(["chatgpt", "claude"]);
 
 /** Keys the server stamps into `data`; they are not part of the body. */
 const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
@@ -46,13 +43,18 @@ const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
 /**
  * - `legacy`: anything that is not exactly `{records: [...]}`. Served as stored.
  * - `pdpp-projected`: `{records}` of plain rows under a scope with a legacy
- *   binding of a projected source. Served as the projected legacy body.
+ *   binding. Served as the projected legacy body.
  * - `pdpp-unprojected`: `{records}` under any other scope (for example
  *   `chatgpt.messages`, which has no legacy form), or `{records}` holding a
- *   tagged `{stream, data}` row, which is not one stream's rows. Served as
- *   stored.
+ *   tagged `{stream, data}` row, which is not one stream's rows. A bound
+ *   scope rejects this form; an unbound scope is served as stored.
  */
 export type StoredBodyForm = "legacy" | "pdpp-projected" | "pdpp-unprojected";
+
+interface CachedForm {
+  form: StoredBodyForm;
+  selected?: { binding: LegacyScopeBinding; profileKey?: string } | null;
+}
 
 export function classifyStoredBody(
   scope: string,
@@ -80,8 +82,8 @@ export type LegacyProjectionIssue =
 
 export interface LegacyProjectionOptions {
   /**
-   * Called when a projection fails (the stored body is then served as
-   * stored) or succeeds with dropped rows or a missing join stream.
+   * Called when a projection fails or succeeds with dropped rows or a missing
+   * join stream.
    */
   onIssue?: (issue: LegacyProjectionIssue) => void;
 }
@@ -91,6 +93,9 @@ const SERVED = Symbol.for("personal-server-ts.legacy-projection.served");
 const PROJECTED_VIEW = Symbol.for(
   "personal-server-ts.legacy-projection.projected-view",
 );
+
+/** How many stored versions' body forms one served port remembers. */
+const FORM_CACHE_SIZE = 64;
 
 interface Projected {
   /** Identifies the inputs; block cursors carry it so a page from one
@@ -105,9 +110,6 @@ interface Projected {
 
 const textEncoder = new TextEncoder();
 
-/** How many stored versions' body forms one served port remembers. */
-const FORM_CACHE_SIZE = 64;
-
 /**
  * Wrap a raw storage port so reads of projected scopes return legacy bodies.
  * Wrapping an already wrapped port returns it unchanged.
@@ -121,17 +123,33 @@ export function withLegacyProjection(
   // One entry, keyed by the versions of every input. It saves re-projecting
   // on repeated reads of the same data; it is not a persistent cache.
   let memo: { key: string; value: Projected | null } | null = null;
-  // The body form of each stored version read so far, so a version that is
-  // not projected (most often a legacy body) is parsed to classify it once,
-  // not on every read. Bounded; the oldest entry goes first.
-  const forms = new Map<string, StoredBodyForm>();
-  const rememberForm = (version: string, form: StoredBodyForm) => {
-    forms.set(version, form);
+  // Classification is safe to reuse only for the same immutable stored
+  // version. The requested version is classified before the projection cache.
+  const forms = new Map<string, CachedForm>();
+  const rememberForm = (key: string, value: CachedForm) => {
+    forms.set(key, value);
     if (forms.size > FORM_CACHE_SIZE) {
       forms.delete(forms.keys().next().value!);
     }
   };
-
+  function failProjection(
+    scope: string,
+    collectedAt: string,
+    error: ProjectionError,
+  ): never {
+    options.onIssue?.({ kind: "projection_failed", scope, collectedAt, error });
+    throw new ProtocolError(
+      409,
+      "LEGACY_PROJECTION_UNAVAILABLE",
+      `Cannot serve the legacy view for scope "${scope}"`,
+      {
+        scope,
+        collectedAt,
+        reason: "reason" in error ? error.reason : error.kind,
+        projectionError: error.kind,
+      },
+    );
+  }
   /**
    * The projected view of a stored version, or null when it is served as
    * stored. `own` is the stored envelope when it had to be read to decide.
@@ -141,7 +159,47 @@ export function withLegacyProjection(
     collectedAt: string,
   ): Promise<{ view: Projected | null; own?: DataFileEnvelope }> {
     if (!isProjectedScope(scope)) return { view: null };
-    const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
+    const requestedEntry = raw.findEntry({ scope, at: collectedAt });
+    const ownVersion = requestedEntry
+      ? `${requestedEntry.id}@${requestedEntry.collectedAt}`
+      : `unindexed@${collectedAt}`;
+    const formKey = JSON.stringify([scope, ownVersion]);
+    let cached = forms.get(formKey);
+    let own: DataFileEnvelope | undefined;
+    if (!cached) {
+      own = await raw.readEnvelope(scope, collectedAt);
+      const form = classifyStoredBody(scope, own.data);
+      cached = {
+        form,
+        ...(form === "pdpp-projected"
+          ? {
+              selected: selectProjectionBinding(
+                scope,
+                (own.data as { records: Record<string, unknown>[] }).records,
+              ),
+            }
+          : {}),
+      };
+      rememberForm(formKey, cached);
+    }
+    if (cached.form === "legacy") return { view: null, own };
+    if (cached.form === "pdpp-unprojected") {
+      failProjection(scope, collectedAt, {
+        kind: "incomplete_scope",
+        scope,
+        reason: "Stored records are not rows of one stream",
+      });
+    }
+    if (!cached.selected) {
+      failProjection(scope, collectedAt, {
+        kind: "incomplete_scope",
+        scope,
+        reason:
+          "Stored records do not identify one compatible connector profile",
+      });
+    }
+
+    const { binding, profileKey } = cached.selected;
     const source = scope.slice(0, scope.indexOf("."));
     // The latest version joins the latest siblings, whatever order one run
     // wrote its streams in. A historical version joins, of the sibling
@@ -149,13 +207,28 @@ export function withLegacyProjection(
     // in time: the one its own run wrote, before or after it.
     const supersededAt = nextVersionTime(raw, scope, collectedAt);
     const inputs = binding.pdppStreams.map((stream) => {
-      const storedScope = `${source}.${stream}`;
-      const entry =
+      const canonicalScope = `${source}.${stream}`;
+      // For a single-stream alias, prefer the exact requested version when
+      // it exists. This keeps alias writes, body classification and cursors
+      // tied to the version the caller asked to read.
+      let storedScope =
+        binding.pdppStreams.length === 1 && requestedEntry
+          ? scope
+          : canonicalScope;
+      let entry =
         storedScope === scope
-          ? raw.findEntry({ scope, at: collectedAt })
+          ? requestedEntry
           : supersededAt === undefined
             ? raw.findEntry({ scope: storedScope })
             : nearestBefore(raw, storedScope, collectedAt, supersededAt);
+      // Some PDPP streams have a legacy scope alias (for example,
+      // youtube.history -> youtube.watch_history). Lite stores the stream
+      // envelope under that alias, so use it as the single stream input when
+      // no canonical stream-scope entry exists.
+      if (!entry && binding.pdppStreams.length === 1 && storedScope !== scope) {
+        storedScope = scope;
+        entry = requestedEntry;
+      }
       return {
         stream,
         storedScope,
@@ -165,26 +238,25 @@ export function withLegacyProjection(
         version: entry ? `${entry.id}@${entry.collectedAt}` : null,
       };
     });
-    const ownVersion = inputs.find(
-      (input) => input.storedScope === scope,
-    )?.version;
-    if (ownVersion) {
-      const form = forms.get(ownVersion);
-      if (form !== undefined && form !== "pdpp-projected") {
-        return { view: null };
-      }
-    }
-    const key = JSON.stringify([scope, inputs.map((input) => input.version)]);
-    if (memo?.key === key) return { view: memo.value };
+    const key = JSON.stringify([
+      scope,
+      ownVersion,
+      profileKey,
+      inputs.map(({ storedScope, version }) => [storedScope, version]),
+    ]);
+    if (memo?.key === key) return { view: memo.value, own };
 
-    const own = await raw.readEnvelope(scope, collectedAt);
-    const form = classifyStoredBody(scope, own.data);
-    if (ownVersion) rememberForm(ownVersion, form);
-    let value: Projected | null = null;
-    if (form === "pdpp-projected") {
-      value = await project(scope, collectedAt, own, inputs);
-      if (value) value.view = key;
-    }
+    own ??= await raw.readEnvelope(scope, collectedAt);
+
+    const value = await project(
+      scope,
+      collectedAt,
+      own,
+      inputs,
+      binding,
+      profileKey,
+    );
+    if (value) value.view = key;
     memo = { key, value };
     return { view: value, own };
   }
@@ -196,11 +268,30 @@ export function withLegacyProjection(
     return (await resolve(scope, collectedAt)).view;
   }
 
+  async function projectedForSupersede(
+    scope: string,
+    collectedAt: string,
+  ): Promise<Projected | null> {
+    try {
+      return await projected(scope, collectedAt);
+    } catch (error) {
+      if (
+        error instanceof ProtocolError &&
+        error.errorCode === "LEGACY_PROJECTION_UNAVAILABLE"
+      ) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
   async function project(
     scope: string,
     collectedAt: string,
     own: DataFileEnvelope,
     inputs: { stream: string; storedScope: string; collectedAt?: string }[],
+    binding: LegacyScopeBinding,
+    profileKey?: string,
   ): Promise<Projected | null> {
     const records: PdppRecord[] = [];
     const fetchedStreams: string[] = [];
@@ -220,26 +311,44 @@ export function withLegacyProjection(
         .records;
       if (rows.some(isTaggedRecord)) continue;
       fetchedStreams.push(input.stream);
-      if (input.collectedAt > now) now = input.collectedAt;
+      if (Date.parse(input.collectedAt) > Date.parse(now)) {
+        now = input.collectedAt;
+      }
       for (const row of rows) {
         records.push({ stream: input.stream, data: row });
       }
     }
 
-    const result = projectPdppRecordsToLegacyPayload(scope, records, {
+    if (
+      !recordsMatchBindingSource(
+        records,
+        binding,
+        alternateLegacyBindingsForScope(scope).size > 0 &&
+          !(UNTAGGED_ORIGINAL_SCOPES.has(scope) && profileKey === undefined),
+      )
+    ) {
+      failProjection(scope, collectedAt, {
+        kind: "incomplete_scope",
+        scope,
+        reason: "Joined streams have conflicting connector identities",
+      });
+    }
+
+    // Connector identity is storage metadata, not part of an app's legacy row.
+    const projectionRecords = records.map((record) => {
+      const data = { ...record.data };
+      delete data.$pdpp;
+      return { ...record, data };
+    });
+    const result = projectPdppRecordsToLegacyPayload(scope, projectionRecords, {
       fetchedStreams,
       now,
-      orderByPrimaryKey: true,
+      ...(profileKey ? { profileKey } : {}),
+      orderByPrimaryKey: binding.rowOrder !== "arrival",
       allowMissingJoinStreams: true,
     });
     if (!result.ok) {
-      options.onIssue?.({
-        kind: "projection_failed",
-        scope,
-        collectedAt,
-        error: result.error,
-      });
-      return null;
+      failProjection(scope, collectedAt, result.error);
     }
     if (result.diagnostics?.length) {
       options.onIssue?.({
@@ -281,7 +390,7 @@ export function withLegacyProjection(
     [PROJECTED_VIEW]: typeof projected;
   } = {
     [SERVED]: true,
-    [PROJECTED_VIEW]: projected,
+    [PROJECTED_VIEW]: projectedForSupersede,
     async readEnvelope(scope, collectedAt) {
       const { view, own } = await resolve(scope, collectedAt);
       return view?.envelope ?? own ?? raw.readEnvelope(scope, collectedAt);
@@ -340,15 +449,7 @@ export function withLegacyProjection(
         : rawManifest(scope, collectedAt);
     };
   }
-  // A stored sidecar answers "yes" for either form (a projected view can
-  // always be split into blocks), so the stored body is only read when the
-  // raw port has no sidecar yet.
-  if (raw.hasScopeBlocks) {
-    const rawHas = raw.hasScopeBlocks.bind(raw);
-    overrides.hasScopeBlocks = async (scope, collectedAt) =>
-      (await rawHas(scope, collectedAt)) ||
-      (await projected(scope, collectedAt)) !== null;
-  }
+  // Inventory inherits raw metadata readiness. Projection belongs to reads.
   if (raw.canReadScopeBlocks) {
     const rawCan = raw.canReadScopeBlocks.bind(raw);
     overrides.canReadScopeBlocks = async (scope, collectedAt) =>
@@ -396,12 +497,79 @@ export function legacyScopesProjectedFrom(scope: string): string[] {
 }
 
 function isProjectedScope(scope: string): boolean {
-  const dot = scope.indexOf(".");
-  return (
-    dot > 0 &&
-    PROJECTED_SOURCES.has(scope.slice(0, dot)) &&
-    LEGACY_SCOPE_BINDINGS.has(scope)
-  );
+  return LEGACY_SCOPE_BINDINGS.has(scope);
+}
+
+/** Scopes whose untagged stored rows keep the original binding. */
+const UNTAGGED_ORIGINAL_SCOPES: ReadonlySet<string> = new Set([
+  "claude.conversations",
+  "strava.activities",
+]);
+
+function selectProjectionBinding(
+  scope: string,
+  rows: Record<string, unknown>[],
+): { binding: LegacyScopeBinding; profileKey?: string } | null {
+  const original = LEGACY_SCOPE_BINDINGS.get(scope)!;
+  const alternates = alternateLegacyBindingsForScope(scope);
+  const identities = rows.map(recordSourceId);
+  if (identities.includes(null)) return null;
+  // Before live-session admission, stored Claude export rows did not require
+  // identity tags. Keep that persisted contract tied to the original binding,
+  // whose account_profile join is still required. Never infer a live profile.
+  // Strava rows predate strava-browser too; both of its profiles are the
+  // same identity projection, so the original binding serves them unchanged.
+  if (
+    UNTAGGED_ORIGINAL_SCOPES.has(scope) &&
+    identities.every((identity) => identity === undefined)
+  ) {
+    return { binding: original };
+  }
+  if (alternates.size > 0 && identities.includes(undefined)) return null;
+  const sources = new Set(identities.filter((id): id is string => !!id));
+  if (sources.size > 1) return null;
+  if (sources.size === 0) {
+    return alternates.size === 0 ? { binding: original } : null;
+  }
+
+  const sourceId = [...sources][0];
+  const connectorKey = sourceId.slice(sourceId.lastIndexOf("/") + 1);
+  const alternate = alternates.get(connectorKey);
+  if (alternate && sourceIdForBinding(alternate) === sourceId) {
+    return { binding: alternate, profileKey: connectorKey };
+  }
+  return sourceIdForBinding(original) === sourceId
+    ? { binding: original }
+    : null;
+}
+
+function recordSourceId(data: unknown): string | null | undefined {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return null;
+  }
+  if (!("$pdpp" in data)) return undefined;
+  const metadata = data.$pdpp;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return null;
+  }
+  const sourceId = (metadata as { sourceId?: unknown }).sourceId;
+  return typeof sourceId === "string" && sourceId ? sourceId : null;
+}
+
+function sourceIdForBinding(binding: LegacyScopeBinding): string {
+  return binding.pdppSource.replace("/connectors/", "/sources/");
+}
+
+function recordsMatchBindingSource(
+  records: PdppRecord[],
+  binding: LegacyScopeBinding,
+  requireIdentity: boolean,
+): boolean {
+  const expected = sourceIdForBinding(binding);
+  return records.every(({ data }) => {
+    const actual = recordSourceId(data);
+    return actual === expected || (!requireIdentity && actual === undefined);
+  });
 }
 
 const VERSION_PAGE_SIZE = 100;
@@ -507,13 +675,15 @@ export interface SupersedeResult {
 /**
  * After a `{records}` version of a projected scope is committed, delete the
  * scope's older owner-written legacy versions: the new version serves the
- * same legacy view, so they are a second copy.
+ * same legacy view, so they are a second copy. This explicit supersede path
+ * remains available only for the original ChatGPT and Claude sources. Other
+ * bound sources retain legacy versions and replace them only in the read view.
  *
  * It deletes nothing unless `storage` is a served port (see
  * `withLegacyProjection`) whose projection of the new version is complete:
  * no join stream missing and no row left out. It also deletes nothing when
- * the projection holds fewer items than the newest legacy version, or lacks
- * any item id that version holds, so an empty or time-windowed run cannot
+ * the projection holds fewer items than a legacy version, or lacks
+ * any item identity that version holds, so an empty or time-windowed run cannot
  * replace a full history. For Claude scopes it also deletes nothing when an
  * item holds fewer nested messages or documents than the legacy item. A legacy version must carry the scope's legacy
  * collection key (`conversations` for `chatgpt.conversations`); PDPP
@@ -532,6 +702,18 @@ export async function supersedeLegacyVersions(
     superseded: [],
     refused,
   });
+  if (scope.startsWith("youtube.")) {
+    return refuse(
+      "YouTube legacy versions are retained for read-time projection",
+    );
+  }
+  if (
+    isProjectedScope(scope) &&
+    !scope.startsWith("chatgpt.") &&
+    !scope.startsWith("claude.")
+  ) {
+    return refuse("Legacy versions are retained for read-time projection");
+  }
   const readStored = (storage.readStoredEnvelope ?? storage.readEnvelope).bind(
     storage,
   );
@@ -551,6 +733,9 @@ export async function supersedeLegacyVersions(
     return refuse(`the projection is partial (${kinds.join(", ")})`);
   }
   const collection = legacyCollectionKey(scope);
+  if (!collection) {
+    return refuse(`the legacy collection for ${scope} is unsupported`);
+  }
   const projectedItems = (view.envelope.data as Record<string, unknown>)[
     collection
   ] as unknown[];
@@ -573,7 +758,6 @@ export async function supersedeLegacyVersions(
   const legacy: {
     collectedAt: string;
     count: number;
-    ids: string[];
     items: unknown[];
   }[] = [];
   for (const collectedAt of older) {
@@ -585,7 +769,6 @@ export async function supersedeLegacyVersions(
     legacy.push({
       collectedAt,
       count: items.length,
-      ids: items.map(itemId).filter((id) => id !== undefined),
       items,
     });
   }
@@ -596,22 +779,39 @@ export async function supersedeLegacyVersions(
         : best,
     undefined,
   );
-  if (newest && projectedCount < newest.count) {
-    return refuse(
-      `the projection has ${projectedCount} ${collection}; the newest legacy version has ${newest.count}`,
-    );
+  const projectedCounts = new Map<string, number>();
+  for (const item of projectedItems) {
+    const identity = itemIdentity(scope, item);
+    if (!identity) continue;
+    projectedCounts.set(identity, (projectedCounts.get(identity) ?? 0) + 1);
   }
-  if (newest) {
-    const projectedIds = new Set(
-      projectedItems.map(itemId).filter((id) => id !== undefined),
-    );
-    const missing = newest.ids.filter((id) => !projectedIds.has(id));
-    if (missing.length > 0) {
+  for (const version of legacy) {
+    const versionLabel =
+      version === newest ? "the newest legacy version" : "a legacy version";
+    if (projectedCount < version.count) {
       return refuse(
-        `the projection lacks ${missing.length} of the ${collection} in the newest legacy version`,
+        `the projection has ${projectedCount} ${collection}; ${versionLabel} has ${version.count}`,
       );
     }
-    const shortfall = nestedShortfall(scope, newest.items, projectedItems);
+    const requiredCounts = new Map<string, number>();
+    for (const item of version.items) {
+      const identity = itemIdentity(scope, item);
+      if (!identity) {
+        return refuse(`a legacy ${collection} item has no provable identity`);
+      }
+      requiredCounts.set(identity, (requiredCounts.get(identity) ?? 0) + 1);
+    }
+    const missing = [...requiredCounts].reduce(
+      (count, [identity, required]) =>
+        count + Math.max(0, required - (projectedCounts.get(identity) ?? 0)),
+      0,
+    );
+    if (missing > 0) {
+      return refuse(
+        `the projection lacks ${missing} of the ${collection} in ${versionLabel}`,
+      );
+    }
+    const shortfall = nestedShortfall(scope, version.items, projectedItems);
     if (shortfall) return refuse(shortfall);
   }
 
@@ -642,6 +842,10 @@ const NESTED_ITEMS: Record<
 > = {
   "claude.conversations": (item) => ({
     held: arrayLength(field(item, "messages")),
+    selfShort: false,
+  }),
+  "youtube.playlistItems": (item) => ({
+    held: arrayLength(field(item, "items")),
     selfShort: false,
   }),
   "claude.projects": (item) => {
@@ -675,23 +879,51 @@ function nestedShortfall(
 ): string | undefined {
   const nested = NESTED_ITEMS[scope];
   if (!nested) return undefined;
-  const projectedById = new Map(
-    projectedItems.map((item) => [itemId(item), nested(item).held]),
-  );
-  const short = legacyItems.filter(
-    (item) => (projectedById.get(itemId(item)) ?? 0) < nested(item).held,
-  );
+  const heldByIdentity = (items: unknown[]) => {
+    const held = new Map<string, number[]>();
+    for (const item of items) {
+      const identity = itemIdentity(scope, item);
+      if (!identity) continue;
+      const values = held.get(identity) ?? [];
+      values.push(nested(item).held);
+      held.set(identity, values);
+    }
+    for (const values of held.values())
+      values.sort((left, right) => right - left);
+    return held;
+  };
+  const legacyHeld = heldByIdentity(legacyItems);
+  const projectedHeld = heldByIdentity(projectedItems);
+  let short = 0;
+  for (const [identity, required] of legacyHeld) {
+    const available = projectedHeld.get(identity) ?? [];
+    short += required.filter(
+      (count, index) => (available[index] ?? 0) < count,
+    ).length;
+  }
   // A project whose own source lists docs the projection lacks.
   const incomplete = projectedItems.filter((item) => nested(item).selfShort);
-  const count = short.length + incomplete.length;
+  const count = short + incomplete.length;
   return count > 0
-    ? `the projection holds fewer nested rows than the source or the newest legacy version for ${count} of the ${legacyCollectionKey(scope)}`
+    ? `the projection holds fewer nested rows than the source or a legacy version for ${count} of the ${legacyCollectionKey(scope)}`
     : undefined;
 }
 
-/** `chatgpt.conversations` → `conversations`: the array a legacy body holds. */
-function legacyCollectionKey(scope: string): string {
-  return scope.slice(scope.indexOf(".") + 1);
+const LEGACY_COLLECTION_KEYS: Readonly<Record<string, string | null>> = {
+  "youtube.profile": null,
+  "youtube.history": "history",
+  "youtube.subscriptions": "subscriptions",
+  "youtube.playlists": "playlists",
+  "youtube.playlistItems": "playlists",
+  "youtube.likes": "likedVideos",
+  "youtube.watchLater": "watchLater",
+};
+
+/** The array a legacy body holds, or null for singleton/unsupported shapes. */
+function legacyCollectionKey(scope: string): string | null {
+  return scope in LEGACY_COLLECTION_KEYS
+    ? LEGACY_COLLECTION_KEYS[scope]!
+    : scope.slice(scope.indexOf(".") + 1);
 }
 
 /**
@@ -704,8 +936,32 @@ function legacyCollection(scope: string, data: unknown): unknown[] | null {
     return null;
   }
   if (isRecordsBody(data) || "$writtenBy" in data) return null;
-  const items = (data as Record<string, unknown>)[legacyCollectionKey(scope)];
+  const collection = legacyCollectionKey(scope);
+  if (!collection) return null;
+  const items = (data as Record<string, unknown>)[collection];
   return Array.isArray(items) ? items : null;
+}
+
+/** Stable identity fields for scopes whose legacy keys differ from `id`. */
+const IDENTITY_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  "youtube.history": ["videoId", "videoUrl"],
+  "youtube.subscriptions": ["channelId", "channelUrl"],
+  "youtube.playlists": ["playlistId", "url"],
+  "youtube.playlistItems": ["playlistId"],
+  "youtube.likes": ["videoId", "videoUrl"],
+  "youtube.watchLater": ["videoId", "videoUrl"],
+};
+
+/** Stable identity used to prove that a projection covers a legacy item. */
+function itemIdentity(scope: string, item: unknown): string | undefined {
+  for (const key of IDENTITY_FIELDS[scope] ?? []) {
+    const value = field(item, key);
+    if (typeof value === "string" && value.length > 0) {
+      return `${key}:${value}`;
+    }
+  }
+  const id = itemId(item);
+  return id === undefined ? undefined : `id:${id}`;
 }
 
 /** A legacy item's `id` (or `uuid`), when it has a string one. */

@@ -51,7 +51,7 @@ describe("createBodyLimit", () => {
   });
 
   it("constants have correct values", () => {
-    expect(DATA_INGEST_MAX_SIZE).toBe(52428800);
+    expect(DATA_INGEST_MAX_SIZE).toBe(536870912);
     expect(DEFAULT_MAX_SIZE).toBe(1048576);
   });
 });

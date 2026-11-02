@@ -1,0 +1,42 @@
+{
+  "posts": [
+    {
+      "caption": "real post one",
+      "img_url": "https://example.com/real-a.jpg",
+      "num_of_likes": 12,
+      "taken_at": "2026-09-17T10:00:00.000Z"
+    },
+    {
+      "caption": "real post two",
+      "img_url": "https://example.com/real-b.jpg",
+      "num_of_likes": 4
+    }
+  ],
+  "pdpp_snapshot": "current",
+  "$pdpp": {
+    "version": 1,
+    "sourceId": "https://registry.pdpp.dev/connectors/instagram",
+    "declaration": {
+      "source": "instagram",
+      "version": "0.1.0-local",
+      "upstreamCommit": null,
+      "digest": "71535891f772fb65f1d02329c5757ec526df207af44a9f6527d6885550f0333f"
+    },
+    "stream": {
+      "name": "posts",
+      "scope": "instagram.posts",
+      "semantics": "mutable_state",
+      "primaryKey": ["pdpp_snapshot"]
+    },
+    "record": {
+      "key": {
+        "pdpp_snapshot": "current"
+      },
+      "op": "upsert"
+    },
+    "run": {
+      "id": "dp_real_instagram_posts",
+      "source": "instagram"
+    }
+  }
+}

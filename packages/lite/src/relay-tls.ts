@@ -165,14 +165,22 @@ export function psLiteRelayPublicUrl(
 }
 
 function createRustlsStream(tls: RustlsServer): PsLiteRelayTlsStream {
+  let closed = false;
+  const assertOpen = () => {
+    if (closed) throw new Error("TLS stream is closed");
+  };
   return {
     processTls(payload) {
+      assertOpen();
       return normalizeTlsStep(tls.process_tls(payload));
     },
     writePlaintext(payload, endStream) {
+      assertOpen();
       return normalizeTlsStep(tls.write_plaintext(payload, endStream));
     },
     close() {
+      if (closed) return;
+      closed = true;
       tls.free();
     },
   };

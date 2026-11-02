@@ -1,5 +1,10 @@
+import { ouraRoutes } from "./routes/oura.js";
+import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
+import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
+import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -13,7 +18,11 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
-import { requireLoopbackListener } from "./middleware/local-listener.js";
+import {
+  arrivedOnLoopbackListener,
+  isSameOriginLoopbackRequest,
+  requireLoopbackListener,
+} from "./middleware/local-listener.js";
 import { dataRoutes } from "./routes/data.js";
 import { writeSessionRoutes } from "./routes/write-session.js";
 import {
@@ -37,10 +46,12 @@ import { enclaveMcpRoutes } from "./routes/enclave-mcp.js";
 import { enclaveFleetRoutes } from "./routes/enclave-fleet.js";
 import {
   McpActivityRecorder,
+  connectionDataScopes,
   createInMemoryMcpConnectionStore,
   createInMemoryMcpOAuthAuthorizationStore,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
+  type McpOAuthClientStore,
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { uiConfigRoutes } from "./routes/ui-config.js";
@@ -51,7 +62,15 @@ import {
   createDeviceSessionLookup,
 } from "./routes/auth-device.js";
 import { oauthTokenRoutes } from "./routes/oauth-token.js";
+import {
+  pdppAsMetadataHandler,
+  pdppAuthRoutes,
+  type PdppAuthRouteDeps,
+} from "./routes/pdpp-auth.js";
+import { pdppDeclarationRoutes } from "./routes/pdpp-declarations.js";
+import type { MutableDeclarationRegistry } from "./pdpp/declaration-registry.js";
 import type {
+  PdppImporter,
   ScopeDeletionTracker,
   SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -70,6 +89,22 @@ import type { Logger } from "pino";
 import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
 import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
 import type { JobExecuteResponse } from "./jobs/types.js";
+import { pdppRecordsRoutes } from "./routes/pdpp-records.js";
+import { pdppInstanceBindingRoutes } from "./routes/pdpp-instance-bindings.js";
+import {
+  pdppConnectionRoutes,
+  type PdppConnectionRouteDeps,
+} from "./routes/pdpp-connections.js";
+import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
+import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
+import type { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
+import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type { LegacyScopeViewPort } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
+import type {
+  PdppRecordStore,
+  PdppReplicaReads,
+  StreamDeclarationRegistry,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 export interface IdentityInfo {
   address: `0x${string}`;
@@ -118,6 +153,8 @@ export interface AppDeps {
   tokenStore?: TokenStore;
   runtimeAvailability?: RuntimeAvailabilityPort;
   dataStorage?: DataStoragePort;
+  /** Canonical latest bodies for GET /v1/data; absent = file reads only. */
+  legacyScopeView?: LegacyScopeViewPort;
   /**
    * Gateway base URL — wired into the data route so the GET handler can
    * forward validated X-PAYMENTs to POST /v1/escrow/pay via direct fetch.
@@ -144,6 +181,14 @@ export interface AppDeps {
     store: QuestionStore;
     scheduler: RecomputeScheduler;
   } | null;
+  /**
+   * PDPP record importer for locally-ingested envelopes. The bootstrap passes
+   * the same stable delegate it gives the sync download worker, so both
+   * arrival routes — gateway sync and local owner-authenticated POST —
+   * import through one importer into one store. Absent = no PDPP mounted,
+   * and `$pdpp` envelopes are stored and indexed exactly as before.
+   */
+  pdppImporter?: PdppImporter;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
    * Invoked when the /ui/api registration route confirms the server is
@@ -160,7 +205,30 @@ export interface AppDeps {
    */
   mcpConnectionStore?: McpConnectionStore;
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
+  /** DCR client names; defaults to in-memory (lost on restart). */
+  mcpOAuthClientStore?: McpOAuthClientStore;
   mcpOAuthApprovalUrl?: string | (() => string);
+  /**
+   * PDPP Core v0.1 Authorization Server. Absent = the `/pdpp/v1` surface is
+   * not mounted, and existing OAuth/MCP behavior is unchanged. This is a
+   * separate authority from `tokenStore`: PDPP tokens are grant-bound and
+   * live in their own store (spec §8 forbids a second grant authority behind
+   * one enforcement path).
+   */
+  pdppAuth?: PdppAuthRouteDeps;
+  /** Connection registry routes can run with canonical record routes off. */
+  pdppConnections?: PdppConnectionRouteDeps;
+  /**
+   * Operator-authenticated declaration submission. Absent (or with no
+   * operator token) leaves the route unmounted and the declaration set
+   * exactly as config made it — the pre-existing behavior.
+   */
+  pdppDeclarations?: {
+    registry: MutableDeclarationRegistry;
+    supportedConnectors: string[];
+    /** Absent = the route is not mounted at all. */
+    operatorToken?: string;
+  };
   /** See `CreateServerOptions.mcpScopeRequestApprovalUrl`. */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   mcpActivityRecorder?: McpActivityRecorder;
@@ -178,6 +246,52 @@ export interface AppDeps {
   writeProofReplayStore?: WriteProofReplayStore;
   profile?: "standard" | "enclave";
   jobWorker?: (envelope: JobRequestEnvelope) => Promise<JobExecuteResponse>;
+  /**
+   * PDPP §4/§8 record model + Resource Server query surface. Absent = the
+   * PDPP routes are not mounted; existing deployments are unaffected. When
+   * present, all three must be present together (record store, token
+   * resolution, and stream declarations are mutually required).
+   */
+  pdpp?: {
+    store: PdppRecordStore;
+    /**
+     * Required reader capability for every canonical-derived response:
+     * record streams, pages, point reads, change feeds and blobs. The app
+     * selects the reader from the authenticated token class. A host without
+     * a replica receiver passes the canonical store for every reader; one
+     * with a receiver passes `receiver.readStore`. The legacy `/v1/data` view
+     * is composed by the host from the same capability
+     * (`legacyScopeRecords`).
+     */
+    reads: PdppReplicaReads;
+    bindingStore: ReturnType<typeof createSqliteRecordStore>;
+    configuredMethods: Map<string, string[]>;
+    auth: PdppAuthorizationService;
+    declarations: StreamDeclarationRegistry;
+    instancesForSubject?: (subjectId: string) => string[];
+    instancesForSource?: (subjectId: string, sourceId: string) => string[];
+    readBlobBytes?: (
+      blobId: string,
+    ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
+    /** This resource server's own identifier, RFC 9728 `resource` member. */
+    resource: string;
+    authorizationServers?: string[];
+  };
+}
+
+/** MCP endpoint and its OAuth discovery documents, served on both listeners. */
+const MCP_PATH = "/mcp";
+const MCP_WELL_KNOWN_PATHS = new Set([
+  "/.well-known/oauth-protected-resource/mcp",
+  "/.well-known/oauth-authorization-server",
+]);
+
+function isMcpPath(path: string): boolean {
+  return (
+    path === MCP_PATH ||
+    path.startsWith(`${MCP_PATH}/`) ||
+    MCP_WELL_KNOWN_PATHS.has(path)
+  );
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -208,6 +322,23 @@ export function createApp(deps: AppDeps): Hono {
   app.use("/ui", uiLoopbackOnly);
   app.use("/ui/*", uiLoopbackOnly);
 
+  // Local MCP gate. On the loopback listener, MCP answers only a loopback
+  // Host with no foreign browser origin (DNS rebinding, another page probing
+  // the port), and skips the wildcard CORS below: native clients need none.
+  // Tunnel requests on the main listener pass untouched.
+  const listeners = {
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
+  };
+  const isLoopbackMcp = (c: Context) =>
+    isMcpPath(c.req.path) && arrivedOnLoopbackListener(c, listeners);
+  app.use("*", async (c, next) => {
+    if (isLoopbackMcp(c) && !isSameOriginLoopbackRequest(c)) {
+      return c.notFound();
+    }
+    await next();
+  });
+
   // The whole /auth/device subtree stays out of the wildcard CORS: no other
   // origin may read the approval page or the approve/initiate responses
   // (which carry session ids). That includes /auth/device/token (the
@@ -217,10 +348,31 @@ export function createApp(deps: AppDeps): Hono {
   // so a cross-origin preflight for them must fail.
   const cors = corsMiddleware();
   app.use("*", (c, next) =>
-    c.req.path === "/auth/device" || c.req.path.startsWith("/auth/device/")
+    c.req.path === "/auth/device" ||
+    c.req.path.startsWith("/auth/device/") ||
+    isLoopbackMcp(c)
       ? next()
       : cors(c, next),
   );
+
+  const claudeTransition =
+    deps.pdpp && deps.legacyScopeView && deps.dataStorage
+      ? createClaudeMethodTransition(
+          deps.pdpp.bindingStore,
+          deps.legacyScopeView,
+          deps.dataStorage,
+        )
+      : undefined;
+  const claudeView = claudeTransition?.view ?? deps.legacyScopeView;
+  const stravaTransition =
+    deps.pdpp && claudeView && deps.dataStorage
+      ? createStravaMethodTransition(
+          deps.pdpp.bindingStore,
+          claudeView,
+          deps.dataStorage,
+        )
+      : undefined;
+  const legacyScopeView = stravaTransition?.view ?? claudeView;
 
   // Mount health route
   app.route(
@@ -239,6 +391,101 @@ export function createApp(deps: AppDeps): Hono {
     }),
   );
 
+  // PDPP §4 record model + §8 Resource Server query surface. Independent of
+  // the legacy DPP fileId/scope routes above; mounted only when a pdpp deps
+  // bundle is supplied.
+  if (deps.pdppConnections) {
+    app.route("/", pdppConnectionRoutes(deps.pdppConnections));
+  }
+
+  if (deps.pdpp) {
+    // Not a reader surface: `empty` is the binding/reset precondition the
+    // store itself enforces (no canonical row or history), so it reads the
+    // store, never `reads`. A pending or conflict-hidden row does not change it.
+    app.route(
+      "/",
+      pdppInstanceBindingRoutes({
+        store: deps.pdpp.bindingStore,
+        auth: deps.pdpp.auth,
+        ownerSubjectId: deps.serverOwner!,
+        instancesForSubject: deps.pdpp.instancesForSubject!,
+        instancesForSource: deps.pdpp.instancesForSource,
+        configuredMethods: deps.pdpp.configuredMethods,
+        transitionClaude: claudeTransition?.transition,
+        transitionStrava: stravaTransition?.transition,
+        stravaTransitionStatus: stravaTransition?.status,
+      }),
+    );
+    app.route(
+      "/v1",
+      pdppRecordsRoutes({
+        store: deps.pdpp.store,
+        reads: deps.pdpp.reads,
+        auth: deps.pdpp.auth,
+        declarations: deps.pdpp.declarations,
+        ownerSubjectId: deps.serverOwner,
+        instancesForSubject: deps.pdpp.instancesForSubject,
+        instancesForSource: deps.pdpp.instancesForSource,
+        bindingStore: deps.pdpp.bindingStore,
+        configuredMethods: deps.pdpp.configuredMethods,
+        // An `api_error` on the resource surface is a server fault and must
+        // leave a correlatable line behind; the route never reaches the
+        // global onError below, because it maps its own errors.
+        logger: deps.logger,
+        // PDPP reads land in the SAME owner access feed as legacy
+        // `/v1/data/{scope}` reads. Adopting PDPP must not make an owner's
+        // access history less complete than it was before.
+        //
+        // The legacy entry shape is per-scope and per-builder, so the PDPP
+        // fields map on rather than extend it: `grantId` is the PDPP grant,
+        // `builder` is the PDPP client, and `scope` carries the stream. A
+        // denied or failed read is recorded too, which the legacy middleware
+        // cannot do — it only fires on 2xx.
+        accessLog: {
+          record: async (entry) => {
+            await deps.accessLogWriter.write({
+              logId: randomUUID(),
+              grantId: entry.grantId,
+              builder: entry.clientId,
+              action: "read",
+              scope: entry.stream,
+              timestamp: new Date().toISOString(),
+              ipAddress: entry.ipAddress,
+              userAgent: entry.userAgent,
+              ...(entry.outcome !== "completed" && {
+                outcome: entry.outcome,
+              }),
+            } as Parameters<typeof deps.accessLogWriter.write>[0]);
+          },
+        },
+      }),
+    );
+    app.route(
+      "/v1/blobs",
+      pdppBlobsRoutes({
+        store: deps.pdpp.store,
+        reads: deps.pdpp.reads,
+        auth: deps.pdpp.auth,
+        declarations: deps.pdpp.declarations,
+        instancesForSubject: deps.pdpp.instancesForSubject,
+        instancesForSource: deps.pdpp.instancesForSource,
+        isConnectionAvailable: (instance) => {
+          const binding = deps.pdpp!.bindingStore.getInstanceBinding(instance);
+          return binding.sourceId !== null && binding.deletedAt === null;
+        },
+        readBlobBytes: deps.pdpp.readBlobBytes,
+      }),
+    );
+    app.route(
+      "/.well-known",
+      pdppWellKnownRoutes({
+        resource: deps.pdpp.resource,
+        coreQueryBase: "/v1",
+        authorizationServers: deps.pdpp.authorizationServers,
+      }),
+    );
+  }
+
   if (deps.profile === "enclave" && deps.jobWorker && deps.accessToken) {
     app.route(
       "/enclave/v1/jobs",
@@ -248,6 +495,8 @@ export function createApp(deps: AppDeps): Hono {
       }),
     );
   }
+
+  app.route("/v1/import/oura-browser", ouraRoutes(deps));
 
   // Mount data routes (ingest + read + delete)
   app.route(
@@ -269,6 +518,7 @@ export function createApp(deps: AppDeps): Hono {
       scopeDeletions: deps.scopeDeletions,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
+      legacyScopeView,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,
@@ -283,6 +533,15 @@ export function createApp(deps: AppDeps): Hono {
       lineageGateway: deps.lineageGateway,
       writeSessionStore,
       writeProofReplayStore,
+      pdppOwnerBearer: deps.pdpp
+        ? {
+            auth: deps.pdpp.auth,
+            configuredMethods: deps.pdpp.configuredMethods,
+            ownerSubjectId: deps.serverOwner,
+            instancesForSubject: deps.pdpp.instancesForSubject,
+            instancesForSource: deps.pdpp.instancesForSource,
+          }
+        : undefined,
       // A new local version of a scope marks every question that reads it
       // stale; the recompute waits for a reader.
       onDataWritten: deps.derivativeCompute
@@ -295,6 +554,11 @@ export function createApp(deps: AppDeps): Hono {
       onDataRead: deps.derivativeCompute
         ? (event) => deps.derivativeCompute?.scheduler.markDemand(event.scope)
         : undefined,
+      // The same stable importer delegate the sync download worker holds, so
+      // a local owner-authenticated ingest of a `$pdpp` envelope reaches the
+      // record store the resource server reads — see the importer's note in
+      // core's data API. Undefined when the deployment mounted no PDPP.
+      pdppImporter: deps.pdppImporter,
       mountPath: "/v1/data",
     }),
   );
@@ -415,9 +679,19 @@ export function createApp(deps: AppDeps): Hono {
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,
+    oauthClientStore: deps.mcpOAuthClientStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
     scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
     activityRecorder: mcpActivityRecorder,
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
+    // `remember` writes through the mounted POST /v1/data/:scope route under
+    // a write session in the same store that route redeems builder sessions
+    // from, so an MCP write runs the builder write policy end to end.
+    mcpWrites: {
+      sessionStore: writeSessionStore,
+      dispatch: async (request: Request) => app.fetch(request),
+    },
   };
 
   app.route("/", mcpOAuthRoutes(mcpRouteDeps));
@@ -451,9 +725,7 @@ export function createApp(deps: AppDeps): Hono {
         accessToken: deps.accessToken,
         serverOwner: deps.serverOwner,
         execute: async (request, connection) => {
-          await deps.mcpHydrateScopes?.([
-            ...new Set(connection.grants.flatMap((grant) => grant.scopes)),
-          ]);
+          await deps.mcpHydrateScopes?.(connectionDataScopes(connection));
           return executeMcpConnectionRequest(request, connection, mcpRouteDeps);
         },
       }),
@@ -490,6 +762,47 @@ export function createApp(deps: AppDeps): Hono {
         deviceSessions: createDeviceSessionLookup(),
       }),
     );
+  }
+
+  // PDPP Core v0.1 Authorization Server (spec §6–§8). Mounted only when the
+  // deployment supplies a PDPP auth store, so servers that do not speak PDPP
+  // are byte-for-byte unchanged.
+  if (deps.pdppAuth) {
+    app.route("/pdpp/v1", pdppAuthRoutes(deps.pdppAuth));
+
+    // The RFC 8414 §3 discovery URL for the same document: well-known first,
+    // the issuer's `/pdpp/v1` path appended. Mounted here rather than inside
+    // the router above because it lies outside that prefix by construction.
+    //
+    // Without it the AS metadata was reachable only at the path-first
+    // (OIDC-style) URL, which no RFC 8414 client looks at -- so a conformant
+    // client could not discover this authorization server at all. The suffix
+    // keeps it distinct from the bare well-known the MCP AS owns.
+    app.get(
+      "/.well-known/oauth-authorization-server/pdpp/v1",
+      pdppAsMetadataHandler(
+        deps.pdppAuth.issuer,
+        deps.pdppAuth.protocolProfile,
+      ),
+    );
+
+    // Declaration submission (§5 acceptance). Mounted at `/pdpp`, NOT under
+    // `/pdpp/v1`: it is an operator surface rather than part of the versioned
+    // client-facing AS contract, and the separation keeps the "must not be
+    // client-reachable" property visible in the path itself. Only mounted
+    // when an operator credential exists — the route refuses everything
+    // without one, so mounting it would be surface with no capability.
+    if (deps.pdppDeclarations?.operatorToken) {
+      app.route(
+        "/pdpp",
+        pdppDeclarationRoutes({
+          logger: deps.logger,
+          registry: deps.pdppDeclarations.registry,
+          supportedConnectors: deps.pdppDeclarations.supportedConnectors,
+          operatorToken: deps.pdppDeclarations.operatorToken,
+        }),
+      );
+    }
   }
 
   // Mount dev UI routes when dev token is available. The /ui subtree is
@@ -534,7 +847,22 @@ export function createApp(deps: AppDeps): Hono {
       return c.json(err.toJSON(), err.code as 401 | 403 | 413 | 503);
     }
 
-    deps.logger.error({ err }, "Unhandled error");
+    // The last-resort handler. Anything reaching it escaped a route's own
+    // mapping, so carry the same correlation fields the route handlers now
+    // emit — an operator should never have to tell two 500s apart by
+    // timestamp alone. The id goes out on the response too, so a user's bug
+    // report names the line in the log.
+    const requestId = randomUUID();
+    deps.logger.error(
+      {
+        requestId,
+        route: `${c.req.method} ${new URL(c.req.url).pathname}`,
+        errorCode: "INTERNAL_ERROR",
+        err,
+      },
+      "Unhandled error",
+    );
+    c.header("Request-Id", requestId);
     return c.json(
       {
         error: {

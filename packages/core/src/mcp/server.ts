@@ -39,6 +39,8 @@ import {
 export interface HandleMcpRequestOptions {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
+  /** Absent: `remember` answers write_unavailable. */
+  writeClient?: McpToolContext["writeClient"];
   activityRecorder?: McpActivityRecorder;
   requestScopeAccess?: McpToolContext["requestScopeAccess"];
   scopeRequestApprovalUrl?: McpToolContext["scopeRequestApprovalUrl"];
@@ -51,6 +53,20 @@ export interface HandleMcpRequestOptions {
 
 const DEFAULT_SERVER_NAME = "vana-personal-server-mcp";
 const DEFAULT_SERVER_VERSION = "0.0.1";
+
+/**
+ * Server-level guidance sent in the `initialize` result. Tool descriptions
+ * alone did not make clients save memories unprompted: Claude Desktop sent
+ * "remember that ..." to its own built-in memory. Kept here, not in a tool
+ * description, so it costs nothing in the tools/list tunnel budget.
+ */
+export const MCP_SERVER_INSTRUCTIONS =
+  "This is the user's Vana Personal Server. It holds the user's own data and their memory across agents. " +
+  "When the user shares something worth keeping across chats (a preference, a goal, a decision, a fact about themselves), " +
+  "save it with remember without being asked, and tell the user briefly. " +
+  "Prefer Vana remember over any built-in memory for this. " +
+  "Before answering questions about the user, check their memory with search_personal_context or read_scope. " +
+  "Never save secrets, passwords, government IDs or financial account numbers.";
 /** Stateless: no MCP session id is issued and POST answers with JSON, not SSE. */
 const TRANSPORT_OPTIONS = {
   sessionIdGenerator: undefined,
@@ -134,7 +150,10 @@ function buildActivityStartParams(
     tool,
   };
   if (
-    (tool === "read_scope" || tool === "get_scope_file") &&
+    (tool === "read_scope" ||
+      tool === "get_scope_file" ||
+      tool === "remember" ||
+      tool === "forget") &&
     typeof args.scope === "string"
   ) {
     params.scopes = [args.scope];
@@ -410,15 +429,19 @@ export function createMcpServerForConnection(
     >,
   ): void;
 } {
-  const server = new McpServer({
-    name: options.serverName ?? DEFAULT_SERVER_NAME,
-    version: options.serverVersion ?? DEFAULT_SERVER_VERSION,
-  });
+  const server = new McpServer(
+    {
+      name: options.serverName ?? DEFAULT_SERVER_NAME,
+      version: options.serverVersion ?? DEFAULT_SERVER_VERSION,
+    },
+    { instructions: MCP_SERVER_INSTRUCTIONS },
+  );
   const pendingActivityFinishes = new Map<string, PendingActivityFinish>();
 
   const ctx: McpToolContext = {
     connection: options.connection,
     readClient: options.readClient,
+    writeClient: options.writeClient,
     activityRecorder: options.activityRecorder,
     requestScopeAccess: options.requestScopeAccess,
     scopeRequestApprovalUrl: options.scopeRequestApprovalUrl,
@@ -591,10 +614,10 @@ export function isMcpHandshake(body: unknown): boolean {
  * because no handshake method invokes one.
  */
 export async function handleMcpHandshake(request: Request): Promise<Response> {
-  const server = new McpServer({
-    name: DEFAULT_SERVER_NAME,
-    version: DEFAULT_SERVER_VERSION,
-  });
+  const server = new McpServer(
+    { name: DEFAULT_SERVER_NAME, version: DEFAULT_SERVER_VERSION },
+    { instructions: MCP_SERVER_INSTRUCTIONS },
+  );
   const unreachable = () => {
     throw new Error("Handshake server cannot serve data");
   };

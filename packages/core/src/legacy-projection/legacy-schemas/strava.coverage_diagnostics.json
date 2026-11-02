@@ -1,0 +1,25 @@
+{
+  "name": "Strava coverage_diagnostics",
+  "version": "1.0.0",
+  "scope": "strava.coverage_diagnostics",
+  "dialect": "json",
+  "description": "Body the Strava 1.0.8 export projection served for this scope: { coverage_diagnostics: [native record, ...] }. Each native record is passed through unchanged. This schema checks the envelope and the record id only; the signed native ingest validates the native fields, and unknown fields are kept.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "coverage_diagnostics": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string", "minLength": 1 }
+          },
+          "required": ["id"],
+          "additionalProperties": true
+        }
+      }
+    },
+    "required": ["coverage_diagnostics"],
+    "additionalProperties": false
+  }
+}

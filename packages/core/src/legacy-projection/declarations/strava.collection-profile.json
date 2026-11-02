@@ -1,0 +1,308 @@
+{
+	"protocol_version": "0.1.0",
+	"connector_id": "https://registry.pdpp.dev/connectors/strava",
+	"source": {
+		"id": "https://registry.pdpp.dev/sources/strava",
+		"display": {
+			"name": "Strava"
+		}
+	},
+	"connector_key": "strava",
+	"manifest_uri": "https://registry.pdpp.dev/connectors/strava",
+	"version": "1.0.8",
+	"display_name": "Strava",
+	"brand": {
+		"icon": "icon.svg",
+		"background_color": "#FC4C02"
+	},
+	"runtime_requirements": {
+		"bindings": {
+			"network": {
+				"required": false
+			},
+			"filesystem": {
+				"required": true
+			}
+		}
+	},
+	"setup": {
+		"modality": "manual_or_upload",
+		"manual_or_upload": {
+			"label": "Strava account export",
+			"description": "Ask Strava for a copy of your account, wait for their email, then upload the ZIP here. Strava usually takes up to a day, and longer for a large history.",
+			"acquisition_methods": [
+				{
+					"label": "Request your account export from Strava",
+					"platform": "web",
+					"posture": "primary",
+					"detail": "On strava.com go to Settings, My Account, 'Download or Delete Your Account', and choose Request Your Archive under Download Request. Strava emails a download link when the archive is ready — usually within a day, sometimes longer for a large history. Upload the ZIP here, or upload just activities.csv from inside it. Don't unzip it first unless the file is too large to upload.",
+					"help_url": "https://support.strava.com/hc/en-us/articles/216918437-Exporting-your-Data-and-Bulk-Export"
+				}
+			],
+			"accepted_file_extensions": [".zip", ".csv"],
+			"import_dir_env_var": "STRAVA_EXPORT_DIR",
+			"help_url": "https://support.strava.com/hc/en-us/articles/216918437-Exporting-your-Data-and-Bulk-Export",
+			"help_text": "Strava's API cannot serve this. Its API Policy limits Strava Data to a short cache, forbids providing it to any third party other than the Strava user of the application that fetched it — expressly including where the user consents — and requires deletion on request from all systems under the developer's control. A Personal Server that other applications read from can satisfy none of those. An account export is different in kind rather than a way around them: the Policy's restrictions attach to data accessed from the API, and an archive Strava gives you was never accessed from the API. Strava states the export right separately and does not condition what you do with your own archive.",
+			"large_file_fallback": "A Strava archive contains one file per activity as well as the index, so it can be large. If the ZIP exceeds the upload limit, unzip it yourself and upload only activities.csv — that file alone carries everything this profile reads.",
+			"validation": {
+				"kind": "strava_account_export",
+				"file_backed": true,
+				"max_file_bytes": 52428800
+			},
+			"validation_expectations": [
+				"Detected a Strava account export: either the archive ZIP containing activities.csv, or activities.csv on its own",
+				"Confirmed the activities.csv header carries the expected columns, including both occurrences of the repeated Distance and Elapsed Time columns",
+				"Estimated activity record count",
+				"Detected activity date range",
+				"Duplicate, empty, unsupported or too-large files stated rather than silently skipped"
+			]
+		}
+	},
+	"capabilities": {
+		"human_interaction": [],
+		"refresh_policy": {
+			"recommended_mode": "manual",
+			"interaction_posture": "manual_action_likely",
+			"rate_limit_sensitivity": "low",
+			"bot_detection_sensitivity": "low",
+			"background_safe": false,
+			"rationale": "Collection reads an archive the owner requested from Strava; there is no credential, no session and nothing to poll, so an unattended run has nothing to collect. Refreshing means the owner requesting a new archive and uploading it, which Strava fulfils in hours to days."
+		},
+		"public_listing": {
+			"tier": "supported"
+		}
+	},
+	"streams": [
+		{
+			"name": "activities",
+			"required": false,
+			"description": "Workouts recorded on Strava, read from the owner's account export. Location data and free text are excluded at the schema.",
+			"display": {
+				"label": "Your Strava activities",
+				"detail": "Sport, start time, distance, moving and elapsed time, elevation gain, average and maximum heart rate, calories and gear. No route, no GPS coordinates, no activity titles or notes."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string",
+						"description": "Strava's own numeric activity id, stable across exports."
+					},
+					"activity_type": {
+						"type": ["string", "null"],
+						"description": "The export's Activity Type (Ride, Run, Swim, Hike). This is Strava's coarse type, not the API's finer sport_type; the export does not carry the latter.",
+						"x_pdpp_role": "primary-title"
+					},
+					"start_date": {
+						"type": "string",
+						"format": "date",
+						"description": "The calendar day of the activity, YYYY-MM-DD. Carried separately because start_time deliberately does not claim to be an instant: filtering and grouping need a field a server can treat as a date without inventing a timezone to do it. Derived from the same value as start_time, so it INHERITS start_time_basis — under basis 'utc' this is the UTC day, which is the wrong calendar day for any activity between local midnight and the owner's offset. Aggregates over a window (longest, furthest, how many) are safe on any basis; anything anchored to a particular day, including a same-day join against another source, is only safe under basis 'local'."
+					},
+					"start_time": {
+						"type": "string",
+						"description": "Activity start, ISO-8601. Carries a UTC offset only when the archive stated one; Strava's own rendering does not, so a zoneless value is normal. Read start_time_basis before treating this as an instant or making any claim about time of day.",
+						"x_pdpp_role": "event-time"
+					},
+					"start_time_basis": {
+						"type": "string",
+						"enum": ["utc", "local", "unknown"],
+						"description": "Which clock start_time is on. The export carries a single date column and does not state its basis, so this records what was determined rather than what was assumed. On 'unknown' or 'utc', a reader must not make time-of-day claims: an evening ride in one timezone is an afternoon one in another."
+					},
+					"distance_m": {
+						"type": ["number", "null"],
+						"description": "Metres. Taken from the second Distance column, which is canonical; the first is in the athlete's own display units and may be miles."
+					},
+					"moving_time_s": {
+						"type": ["number", "null"],
+						"description": "Seconds."
+					},
+					"elapsed_time_s": {
+						"type": ["number", "null"],
+						"description": "Seconds. Taken from the second Elapsed Time column, which is canonical."
+					},
+					"total_elevation_gain_m": {
+						"type": ["number", "null"],
+						"description": "Metres."
+					},
+					"average_heartrate": {
+						"type": ["number", "null"],
+						"description": "Beats per minute. Null when no monitor was worn, which is the common case — never zero."
+					},
+					"max_heartrate": {
+						"type": ["number", "null"],
+						"description": "Beats per minute. Null when no monitor was worn."
+					},
+					"calories_kcal": {
+						"type": ["number", "null"],
+						"description": "Kilocalories as Strava recorded them. Null is common, particularly for manually entered activities."
+					},
+					"gear": {
+						"type": ["string", "null"],
+						"description": "The owner's own name for the bike or shoes used, from Activity Gear. Null when no gear was assigned."
+					},
+					"freshness": {
+						"type": "string",
+						"enum": ["live", "snapshot"],
+						"description": "How this reading was collected. Always 'snapshot' for an export: the data is as old as the archive. Present in the payload because a reader holds records, not the manifest, and a source collected two ways must be distinguishable per reading."
+					},
+					"exported_at": {
+						"type": ["string", "null"],
+						"format": "date-time",
+						"description": "When Strava generated the archive these records came from. Always present as a key; null only when the archive carried no determinable generation date. Required alongside freshness 'snapshot' so age can be stated rather than inferred."
+					}
+				},
+				"required": [
+					"id",
+					"start_date",
+					"start_time",
+					"start_time_basis",
+					"freshness",
+					"exported_at"
+				]
+			},
+			"primary_key": ["id"],
+			"cursor_field": "start_date",
+			"consent_time_field": "start_time",
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": true,
+			"query": {
+				"range_filters": {
+					"start_date": ["gte", "gt", "lte", "lt"],
+					"exported_at": ["gte", "gt", "lte", "lt"]
+				},
+				"aggregations": {
+					"count": true,
+					"group_by_time": ["start_date"],
+					"group_by": ["activity_type"]
+				}
+			},
+			"coverage_strategy": "snapshot_import_receipt",
+			"freshness_strategy": "manual_as_of"
+		},
+		{
+			"name": "coverage_diagnostics",
+			"required": false,
+			"description": "What this import covered and why it stops where it does. One record per stream per import.",
+			"display": {
+				"label": "What your Strava import covered",
+				"detail": "The window asked for, the window actually read, how many activities arrived, and the reason the covered window ends where it does."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"stream": {
+						"type": ["string", "null"],
+						"description": "The stream this record accounts for."
+					},
+					"status": {
+						"type": "string",
+						"enum": ["complete", "partial", "empty"],
+						"description": "Whether the covered window matches the requested window. 'empty' is an ordinary outcome, not a failure."
+					},
+					"reason": {
+						"type": "string",
+						"enum": [
+							"covered_in_full",
+							"nothing_in_range",
+							"awaiting_upload",
+							"source_unreadable",
+							"source_limit_reached",
+							"collection_interrupted",
+							"records_unreadable",
+							"sign_in_required",
+							"window_unavailable"
+						],
+						"description": "Why the covered window ends where it does. Always present, including on success, so a reader branches on the value and never on the field being absent. Each value implies a different next action for the owner, and each has a reason_display_messages entry.",
+						"x_pdpp_role": "primary-title"
+					},
+					"record_count": {
+						"type": ["integer", "null"],
+						"description": "Records emitted for this stream in this import."
+					},
+					"fields_unavailable": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						},
+						"description": "Fields the schema declares that this particular archive did not carry, so a column of nulls is never mistaken for a column of absent readings. Calories and gear are optional columns in the export and are the two this path exists to deliver."
+					},
+					"window_requested_from": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"window_requested_to": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"window_covered_from": {
+						"type": ["string", "null"],
+						"format": "date-time",
+						"description": "Null when nothing was covered. A reader must render this window rather than the requested one."
+					},
+					"window_covered_to": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"freshness": {
+						"type": "string",
+						"enum": ["live", "snapshot"]
+					},
+					"exported_at": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					}
+				},
+				"required": [
+					"id",
+					"status",
+					"reason",
+					"fields_unavailable",
+					"freshness",
+					"exported_at"
+				]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": false,
+			"query": {
+				"range_filters": {
+					"window_requested_from": ["gte", "gt", "lte", "lt"],
+					"window_requested_to": ["gte", "gt", "lte", "lt"],
+					"window_covered_from": ["gte", "gt", "lte", "lt"],
+					"window_covered_to": ["gte", "gt", "lte", "lt"],
+					"exported_at": ["gte", "gt", "lte", "lt"]
+				},
+				"aggregations": {
+					"count": true
+				}
+			},
+			"coverage_policy": "inventory_only",
+			"coverage_strategy": "snapshot_import_receipt",
+			"freshness_strategy": "manual_as_of"
+		}
+	],
+	"reason_display_messages": {
+		"awaiting_upload": "Nothing to read yet. Ask Strava for a copy of your data, and they'll email you an archive — usually within a day, sometimes longer. Upload it here when it arrives.",
+		"collection_interrupted": "Your export file ended earlier than expected, so some activities are missing. Ask Strava for a fresh copy of your account and upload the new download.",
+		"covered_in_full": "Everything in your export was imported.",
+		"nothing_in_range": "Your export didn't contain any activities in this period. That's not a problem — there was simply nothing to read.",
+		"records_unreadable": "Some entries in your export couldn't be read and were skipped — everything else imported normally. Importing the same file again won't recover them.",
+		"sign_in_required": "Strava needs you to sign in again before this can continue.",
+		"source_limit_reached": "We read up to the limit this import allows, so older activities haven't been collected yet.",
+		"source_unreadable": "That file isn't a Strava export we can read. It should be the .zip Strava emails you — not one you've unzipped, and not a single activity file.",
+		"strava_export_columns_unexpected": "We couldn't read your export because its columns aren't the ones we expect. Strava may have changed the format — please report this rather than retrying.",
+		"strava_export_not_recognised": "That file doesn't look like a Strava account export. Upload the ZIP Strava emailed you, or the activities.csv from inside it.",
+		"window_unavailable": "Your export doesn't reach back as far as the period asked for, so the dates shown are the dates we actually have."
+	}
+}

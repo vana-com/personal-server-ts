@@ -80,6 +80,7 @@ export function createGatewayDataPointFeed(
         : undefined;
       const res = ownerSigner
         ? await fetchImpl(url, {
+            ...(input.signal ? { signal: input.signal } : {}),
             headers: {
               Authorization: await ownerSigner.signRequest({
                 aud: new URL(base).origin,
@@ -88,7 +89,9 @@ export function createGatewayDataPointFeed(
               }),
             },
           })
-        : await fetchImpl(url);
+        : input.signal
+          ? await fetchImpl(url, { signal: input.signal })
+          : await fetchImpl(url);
       if (res.status === 404) return null;
       if (res.status === 410) {
         // Tombstoned. Prefer the row the gateway echoes in the 410 body;

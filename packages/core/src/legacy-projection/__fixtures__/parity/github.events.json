@@ -1,0 +1,63 @@
+{
+  "scope": "github.events",
+  "provenance": {
+    "legacyConnector": "frozen github-playwright 1.5.1; archive sha256:7ee18936162fa33071a9d347b6493790746c0f72b68855dd43a105731bd654c8; script.js sha256:06c61e3a238738778f41fb3b7e71c58f5fd52f7df65b1b51291f06b5c5567848; expected output and PDPP record source: /home/tnunamak/.tmp/pdpp-gateway-fold-1014/packages/app-runtime/src/legacy-scope-adapter/github-browser-parity-fixtures.ts at unity-surfaces commit 01164027ecac1403b867d8b5fef9a930dbcf69eb sha256:148efb9c235372780472899f62b8ca0b87067c3ee4c12a38aced23b286c92cdb",
+    "pdppBundle": "github-browser 0.2.0 snapshots from PDP-Connect/data-connectors commit 7e0f299c469f78c6571ea2e0a8ed43568658bb95; frozen inputs recorded in github-browser-parity-fixtures.ts; provenance source: /home/tnunamak/.tmp/pdpp-gateway-fold-1014/packages/app-runtime/src/legacy-scope-adapter/github-browser-parity-fixtures.ts at unity-surfaces commit 01164027ecac1403b867d8b5fef9a930dbcf69eb sha256:148efb9c235372780472899f62b8ca0b87067c3ee4c12a38aced23b286c92cdb; read-time projection source: personal-server-ts commit 4c601ee77b945146ac7aade68b09e9a98e96f462; fixture source sha256:148efb9c235372780472899f62b8ca0b87067c3ee4c12a38aced23b286c92cdb",
+    "rawSourceAndExpectedFiles": [
+      "/home/tnunamak/.tmp/pdpp-gateway-fold-1014/packages/app-runtime/src/legacy-scope-adapter/github-browser-parity-fixtures.ts at unity-surfaces commit 01164027ecac1403b867d8b5fef9a930dbcf69eb sha256:148efb9c235372780472899f62b8ca0b87067c3ee4c12a38aced23b286c92cdb",
+      "/home/tnunamak/.tmp/pdpp-gateway-fold-1014/packages/app-runtime/src/legacy-scope-adapter/github-browser.test.ts at unity-surfaces commit 01164027ecac1403b867d8b5fef9a930dbcf69eb sha256:f98107c5662212f587e0b7ea40a5708044575a1c1080d5648e2b7855d4c243ca"
+    ],
+    "profileCaveat": "Fixture uses github-browser 0.2.0 (profile bytes pinned from 0.2.1 in GitHub browser parity test); Desktop admits github-browser 0.2.15. No field-level delta was established from the supplied connectors/github source, which is the separate PAT connector.",
+    "emptyOrNullEdge": "Event commits is null."
+  },
+  "fetchedStreams": [
+    "events"
+  ],
+  "streams": {
+    "events": [
+      {
+        "id": "octocat:events",
+        "events": [
+          {
+            "id": "evt-42",
+            "type": "PullRequestEvent",
+            "createdAt": "2026-09-20T12:34:56Z",
+            "repo": "octocat/Hello-World",
+            "repoUrl": "https://github.com/octocat/Hello-World",
+            "action": "opened",
+            "title": "Cross-run parity",
+            "body": "minimal fixture",
+            "url": "https://github.com/octocat/Hello-World/pull/42",
+            "branch": "parity-branch",
+            "commits": null,
+            "isPublic": true
+          }
+        ],
+        "fetchedAt": "2026-09-24T12:00:00.000Z",
+        "windowDescription": "GitHub public events API retention window (up to 300 events)."
+      }
+    ]
+  },
+  "reviewedDifferences": [],
+  "legacyBody": {
+    "events": [
+      {
+        "id": "evt-42",
+        "type": "PullRequestEvent",
+        "createdAt": "2026-09-20T12:34:56Z",
+        "repo": "octocat/Hello-World",
+        "repoUrl": "https://github.com/octocat/Hello-World",
+        "action": "opened",
+        "title": "Cross-run parity",
+        "body": "minimal fixture",
+        "url": "https://github.com/octocat/Hello-World/pull/42",
+        "branch": "parity-branch",
+        "commits": null,
+        "isPublic": true
+      }
+    ],
+    "fetchedAt": "2026-09-24T12:00:00.000Z",
+    "windowDescription": "Up to 300 most recent public events across all repositories (≈90 days, GitHub API limit)"
+  },
+  "profileKey": "github-browser"
+}

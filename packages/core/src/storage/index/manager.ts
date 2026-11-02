@@ -7,6 +7,29 @@ import type {
 
 export interface IndexManager {
   insert(entry: NewIndexEntry): IndexEntry;
+  /** Check a legacy write and allocate its CAS revision in one SQLite transaction. */
+  insertIfCurrent(
+    entry: NewIndexEntry,
+    precondition?: { kind: "none" } | { kind: "match"; version: number },
+  ):
+    | { ok: true; entry: IndexEntry }
+    | {
+        ok: false;
+        currentVersion: number | null;
+        currentProducer: string | null;
+      };
+  /**
+   * Close a recovered scope for CAS writes when deleted history cannot be
+   * proven. Reads remain available; writes fail through the precondition path.
+   */
+  closeScopeForWrites(scope: string): void;
+  /** A durable revision and open-state proof exist for this scope. */
+  hasTrustedRevisionJournal(scope: string): boolean;
+  /**
+   * Internal recovery path for already persisted envelopes. Bypasses the
+   * closed-for-writes guard while preserving CAS allocation and journals.
+   */
+  insertRecovered(entry: NewIndexEntry): IndexEntry;
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
   findLatestByScope(scope: string): IndexEntry | undefined;
@@ -23,6 +46,7 @@ export interface IndexManager {
     limit?: number;
     offset?: number;
   }): { scopes: ScopeSummary[]; total: number };
+  listIndexedScopes(): string[];
   findClosestByScope(scope: string, at: string): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
   /** Find an index entry by its DPv2 data-point id (download dedup). */
@@ -39,8 +63,8 @@ export interface IndexManager {
    */
   updateFileId(path: string, fileId: string): boolean;
   /**
-   * Returns the highest stored `version` for a scope, or 0 if none. Used by
-   * `insert` to derive the next expectedVersion for DPv2 AddData.
+   * Returns the highest DPv2 sync version for a scope, or 0 if none.
+   * This is independent from legacy CAS revision.
    */
   findLatestVersionByScope(scope: string): number;
   /**

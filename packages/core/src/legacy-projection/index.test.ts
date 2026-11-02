@@ -720,6 +720,50 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     });
   });
 
+  it("maps youtube subscriptions' subscriber_count_text and defaults to legacy's null when it is absent", () => {
+    const row = (id: string, extra: Record<string, unknown>) => ({
+      stream: "subscriptions",
+      data: {
+        id,
+        channel_title: `Channel ${id}`,
+        channel_url: `https://youtube.com/@${id}`,
+        subscriber_count: null,
+        is_verified: false,
+        notifications: false,
+        ...extra,
+      },
+    });
+    const result = projectPdppRecordsToLegacyPayload(
+      "youtube.subscriptions",
+      [
+        row("shown", { subscriber_count_text: "1.2M subscribers" }),
+        row("absent", {}),
+        row("null", { subscriber_count_text: null }),
+        row("blank", { subscriber_count_text: "   " }),
+        row("wrong-type", { subscriber_count_text: 12 }),
+      ],
+      { fetchedStreams: ["subscriptions"] },
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const texts = Object.fromEntries(
+      (
+        result.payload.subscriptions as {
+          channelTitle: string;
+          subscriberCountText: string | null;
+        }[]
+      ).map((item) => [item.channelTitle, item.subscriberCountText]),
+    );
+    expect(texts).toEqual({
+      "Channel shown": "1.2M subscribers",
+      "Channel absent": null,
+      "Channel null": null,
+      "Channel blank": null,
+      "Channel wrong-type": null,
+    });
+    validateAgainst(youtubeSubscriptionsSchema, result.payload);
+  });
+
   it("skips YouTube rows that cannot satisfy legacy required fields", () => {
     const cases = [
       [
@@ -1483,7 +1527,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     if (result.ok) validateAgainst(ouraSleepSchema, result.payload);
   });
 
-  it("omits absent optional Oura fields without turning undefined into schema failures", () => {
+  it("keeps nullable Oura scores so every emitted score is integer or null", () => {
     const cases = [
       {
         scope: "oura.activity",
@@ -1511,7 +1555,25 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         { fetchedStreams: [entry.stream] },
       );
       expect(result.ok, `${entry.scope}: ${JSON.stringify(result)}`).toBe(true);
-      if (result.ok) validateAgainst(entry.schema, result.payload);
+      if (result.ok) {
+        const list =
+          entry.scope === "oura.sleep"
+            ? result.payload.dailyScores
+            : result.payload.days;
+        expect(list).toEqual([
+          {
+            id:
+              entry.scope === "oura.sleep"
+                ? "sleep-min"
+                : entry.scope === "oura.readiness"
+                  ? "readiness-min"
+                  : "activity-min",
+            day: "2026-09-01",
+            score: null,
+          },
+        ]);
+        validateAgainst(entry.schema, result.payload);
+      }
     }
   });
 
@@ -1559,8 +1621,12 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             },
           },
           { stream: "folders", data: { id: "folder-1", name: "Ideas" } },
+          {
+            stream: "profile",
+            data: { id: "account-1", user_name: "Test User" },
+          },
         ],
-        { fetchedStreams: ["notes", "folders"] },
+        { fetchedStreams: ["notes", "folders", "profile"] },
       );
 
       expect(result).toEqual({
@@ -1591,10 +1657,40 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             },
           ],
           total: 2,
-          userName: null,
+          userName: "Test User",
         },
       });
       validateAgainst(icloudNotesSchema, result.ok ? result.payload : result);
+    });
+
+    it("projects userName as null only when the profile has no readable name", () => {
+      const project = (profiles: Record<string, unknown>[]) =>
+        projectPdppRecordsToLegacyPayload(
+          "icloud_notes.notes",
+          profiles.map((data) => ({ stream: "profile", data })),
+          { fetchedStreams: ["notes", "folders", "profile"] },
+        );
+      const userName = (profiles: Record<string, unknown>[]) => {
+        const result = project(profiles);
+        expect(result.ok).toBe(true);
+        return result.ok ? result.payload.userName : undefined;
+      };
+      expect(userName([{ id: "account-1", user_name: "Zoë 李" }])).toBe(
+        "Zoë 李",
+      );
+      // The profile row is absent, has no name, or the name is unreadable.
+      expect(userName([])).toBeNull();
+      expect(userName([{ id: "account-1" }])).toBeNull();
+      expect(userName([{ id: "account-1", user_name: null }])).toBeNull();
+      expect(userName([{ id: "account-1", user_name: "  " }])).toBeNull();
+      expect(userName([{ id: "account-1", user_name: 7 }])).toBeNull();
+      // A singleton stream with several rows names no single account.
+      expect(
+        userName([
+          { id: "account-1", user_name: "First" },
+          { id: "account-2", user_name: "Second" },
+        ]),
+      ).toBeNull();
     });
 
     it("rejects records that violate required manifest fields and distinguishes an unfetched stream", () => {
@@ -1602,7 +1698,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         projectPdppRecordsToLegacyPayload(
           "icloud_notes.notes",
           [{ stream: "notes", data: { id: "note-1", is_pinned: false } }],
-          { fetchedStreams: ["notes", "folders"] },
+          { fetchedStreams: ["notes", "folders", "profile"] },
         ),
       ).toMatchObject({
         ok: false,
@@ -1618,6 +1714,18 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           kind: "missing_stream",
           scope: "icloud_notes.notes",
           expectedStream: "folders",
+        },
+      });
+      expect(
+        projectPdppRecordsToLegacyPayload("icloud_notes.notes", [], {
+          fetchedStreams: ["notes", "folders"],
+        }),
+      ).toEqual({
+        ok: false,
+        error: {
+          kind: "missing_stream",
+          scope: "icloud_notes.notes",
+          expectedStream: "profile",
         },
       });
     });
@@ -1823,6 +1931,8 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         payload: {
           username: "example",
           full_name: "",
+          bio: "",
+          external_url: "",
         },
       });
       if (result.ok) validateAgainst(instagramProfileSchema, result.payload);
@@ -1854,7 +1964,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     });
   });
 
-  it("omits nullable optional profile fields and keeps provided values schema-valid", () => {
+  it("defaults legacy profile text and omits other nullable optional fields", () => {
     const result = projectPdppRecordsToLegacyPayload(
       "instagram.profile",
       [
@@ -1883,6 +1993,8 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       payload: {
         username: "example",
         full_name: "Example User",
+        bio: "",
+        external_url: "",
         profile_pic_url: "https://example.test/profile.jpg",
         following_count: 12,
         is_verified: true,
@@ -1890,6 +2002,57 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     });
     if (result.ok) validateAgainst(instagramProfileSchema, result.payload);
   });
+
+  it("maps numeric Instagram profile post_count to legacy media_count", () => {
+    const result = projectPdppRecordsToLegacyPayload(
+      "instagram.profile",
+      [
+        {
+          stream: "profile",
+          data: {
+            id: "profile-1",
+            username: "example",
+            full_name: "Example User",
+            post_count: 42,
+          },
+        },
+      ],
+      { fetchedStreams: ["profile"] },
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      payload: { media_count: 42 },
+    });
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["string", "42"],
+  ])(
+    "omits Instagram media_count when post_count is %s",
+    (_label, postCount) => {
+      const data: Record<string, unknown> = {
+        id: "profile-1",
+        username: "example",
+        full_name: "Example User",
+      };
+      if (postCount !== undefined) data.post_count = postCount;
+
+      const result = projectPdppRecordsToLegacyPayload(
+        "instagram.profile",
+        [{ stream: "profile", data }],
+        { fetchedStreams: ["profile"] },
+      );
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.payload).not.toHaveProperty("media_count");
+        validateAgainst(instagramProfileSchema, result.payload);
+      }
+    },
+  );
 
   for (const prototypeKey of [
     "constructor",
@@ -2035,7 +2198,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       ["empty", instagramProfileEmpty],
       ["large", instagramProfileLarge],
     ] as const) {
-      it(`does NOT reproduce the real "${label}" legacy fixture byte-for-byte — is_private/media_count/is_business/profile_pic_url/external_url have no PDPP source (B1, B2: documented gap, not silently passed)`, () => {
+      it(`does NOT reproduce the real "${label}" legacy fixture byte-for-byte — is_private/is_business/profile_pic_url are not provided by this PDPP row (B1, B2: documented gap, not silently passed)`, () => {
         const pdppRecords: PdppRecord[] = [
           {
             stream: "profile",
@@ -2074,11 +2237,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                 "media_count",
                 "is_business",
                 "profile_pic_url",
-                "external_url",
               ].filter((k) => oldKeys.has(k)),
             ),
           );
-          const sharedKeys = [...oldKeys].filter((k) => newKeys.has(k));
+          // The omitted canonical external_url gets the legacy empty sentinel.
+          expect(result.payload.external_url).toBe("");
+          const sharedKeys = [...oldKeys].filter(
+            (k) => newKeys.has(k) && k !== "external_url",
+          );
           for (const key of sharedKeys) {
             expect(
               (result.payload as Record<string, unknown>)[key],
@@ -2394,6 +2560,263 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           result.payload,
         );
       }
+    });
+
+    describe("message record ids (ChatGPT 0.3.0 names a message <conversation_id>:<node_id>)", () => {
+      const conversation = (id: string, count: number, tip = "n2") => ({
+        stream: "conversations",
+        data: {
+          id,
+          title: id,
+          create_time: "2026-09-22T10:00:00Z",
+          update_time: "2026-09-22T10:05:00Z",
+          current_node: tip,
+          message_count_on_current_branch: count,
+        },
+      });
+      const message = (
+        conversationId: string,
+        node: string,
+        parent: string | null,
+        content: string,
+        { scoped = true, onBranch = true } = {},
+      ): PdppRecord => {
+        const name = (n: string) => (scoped ? `${conversationId}:${n}` : n);
+        return {
+          stream: "messages",
+          data: {
+            id: name(node),
+            conversation_id: conversationId,
+            parent_id: parent === null ? null : name(parent),
+            role: node === "n1" ? "user" : "assistant",
+            content,
+            content_type: "text",
+            model_slug: null,
+            create_time: null,
+            on_current_branch: onBranch,
+          },
+        };
+      };
+      const project = (records: PdppRecord[]) =>
+        projectPdppRecordsToLegacyPayload("chatgpt.conversations", records, {
+          fetchedStreams: ["conversations", "messages"],
+          // Preserve raw record order so permutations exercise duplicate precedence.
+          orderByPrimaryKey: false,
+        });
+      const projected = (result: ReturnType<typeof project>) => {
+        expect(result.ok).toBe(true);
+        if (!result.ok) throw new Error("not ok");
+        return result;
+      };
+
+      it("walks scoped parent links from current_node and gives legacy the node ids", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2),
+            message("c1", "n2", "n1", "second"),
+            message("c1", "n1", null, "first"),
+          ]),
+        );
+        expect(result.diagnostics).toBeUndefined();
+        const payload = result.payload as {
+          conversations: { messages: { id: string; content: string }[] }[];
+        };
+        expect(
+          payload.conversations[0]?.messages.map((m) => [m.id, m.content]),
+        ).toEqual([
+          ["n1", "first"],
+          ["n2", "second"],
+        ]);
+      });
+
+      it.each(["forward", "reverse"])(
+        "isolates shared node ids across conversations in raw %s order",
+        (order) => {
+          const records = [
+            conversation("c1", 2),
+            conversation("c2", 2),
+            message("c1", "n1", null, "first in one"),
+            message("c1", "n2", "n1", "second in one"),
+            message("c2", "n1", null, "first in two"),
+            message("c2", "n2", "n1", "second in two"),
+          ];
+          const result = projected(
+            project(order === "forward" ? records : [...records].reverse()),
+          );
+          expect(result.diagnostics).toBeUndefined();
+          const payload = result.payload as {
+            conversations: {
+              id: string;
+              messages: { id: string; content: string }[];
+            }[];
+          };
+          expect(
+            [...payload.conversations]
+              .sort((a, b) => a.id.localeCompare(b.id))
+              .map((c) => [c.id, c.messages.map((m) => [m.id, m.content])]),
+          ).toEqual([
+            [
+              "c1",
+              [
+                ["n1", "first in one"],
+                ["n2", "second in one"],
+              ],
+            ],
+            [
+              "c2",
+              [
+                ["n1", "first in two"],
+                ["n2", "second in two"],
+              ],
+            ],
+          ]);
+        },
+      );
+
+      it("counts a node stored under both the old and the new key once, and prefers the new row", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2),
+            message("c1", "n1", null, " first ", { scoped: false }),
+            message("c1", "n2", "n1", "second [asset:file-1]", {
+              scoped: false,
+            }),
+            message("c1", "n1", null, " first "),
+            message("c1", "n2", "n1", "second"),
+          ]),
+        );
+        expect(result.diagnostics).toBeUndefined();
+        const payload = result.payload as {
+          conversations: {
+            message_count: number;
+            messages: { id: string; content: string }[];
+          }[];
+        };
+        expect(payload.conversations[0]?.message_count).toBe(2);
+        expect(payload.conversations[0]?.messages).toMatchObject([
+          { id: "n1", content: " first " },
+          { id: "n2", content: "second" },
+        ]);
+      });
+
+      it.each(["old-first", "new-first"])(
+        "takes scoped branch flags over opposing stale flags after a branch change (%s)",
+        (order) => {
+          const oldRows = [
+            message("c1", "n2", "n1", "stale old branch", { scoped: false }),
+            message("c1", "n3", "n1", "stale alternate", {
+              scoped: false,
+              onBranch: false,
+            }),
+          ];
+          const newRows = [
+            message("c1", "n2", "n1", "retired branch", { onBranch: false }),
+            message("c1", "n3", "n1", "fresh branch"),
+          ];
+          const result = projected(
+            project([
+              conversation("c1", 2, "n3"),
+              message("c1", "n1", null, "first"),
+              ...(order === "old-first"
+                ? [...oldRows, ...newRows]
+                : [...newRows, ...oldRows]),
+            ]),
+          );
+          expect(result.diagnostics).toBeUndefined();
+          const payload = result.payload as {
+            conversations: {
+              message_count: number;
+              messages: { id: string; content: string }[];
+            }[];
+            total: number;
+          };
+          expect(payload.total).toBe(1);
+          expect(payload.conversations).toHaveLength(1);
+          expect(payload.conversations[0]?.message_count).toBe(2);
+          expect(
+            payload.conversations[0]?.messages.map((m) => [m.id, m.content]),
+          ).toEqual([
+            ["n1", "first"],
+            ["n3", "fresh branch"],
+          ]);
+        },
+      );
+
+      it("still projects a conversation that holds only old bare-id rows", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2),
+            message("c1", "n1", null, "first", { scoped: false }),
+            message("c1", "n2", "n1", "second", { scoped: false }),
+          ]),
+        );
+        expect(result.diagnostics).toBeUndefined();
+        const payload = result.payload as {
+          conversations: { messages: { id: string }[] }[];
+        };
+        expect(payload.conversations[0]?.messages.map((m) => m.id)).toEqual([
+          "n1",
+          "n2",
+        ]);
+      });
+
+      describe.each(["forward", "reverse"])("raw %s record order", (order) => {
+        it.each([
+          { layout: "scoped", scoped: true },
+          { layout: "mixed", scoped: false },
+        ])(
+          "drops an equal-count disconnected $layout branch with the chain diagnostic",
+          ({ scoped }) => {
+            // Both rows are on-branch: count 2 passes, but n2 cannot reach n1.
+            const records = [
+              conversation("c1", 2),
+              message("c1", "n1", null, "disconnected root", { scoped }),
+              message("c1", "n2", "missing", "orphan tip"),
+            ];
+            const result = projected(
+              project(order === "forward" ? records : [...records].reverse()),
+            );
+            expect(result).toEqual({
+              ok: true,
+              payload: { conversations: [], total: 0 },
+              diagnostics: [
+                {
+                  kind: "records_dropped",
+                  scope: "chatgpt.conversations",
+                  stream: "conversations",
+                  count: 1,
+                  // copy-assertion-ok: identifies the chain guard rather than the earlier count guard.
+                  reasons: ["Current branch message chain is incomplete"],
+                },
+              ],
+            });
+          },
+        );
+
+        it("drops an equal-count branch whose current tip is missing", () => {
+          const records = [
+            conversation("c1", 1),
+            message("c1", "n1", null, "present root"),
+          ];
+          const result = projected(
+            project(order === "forward" ? records : [...records].reverse()),
+          );
+          expect(result).toEqual({
+            ok: true,
+            payload: { conversations: [], total: 0 },
+            diagnostics: [
+              {
+                kind: "records_dropped",
+                scope: "chatgpt.conversations",
+                stream: "conversations",
+                count: 1,
+                // copy-assertion-ok: identifies the chain guard rather than the earlier count guard.
+                reasons: ["Current branch message chain is incomplete"],
+              },
+            ],
+          });
+        });
+      });
     });
 
     it("retains legacy nullable timestamps and generated fetched_at", () => {

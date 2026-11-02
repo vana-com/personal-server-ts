@@ -1,0 +1,2477 @@
+{
+  "352356188": [
+    {
+      "k": "import",
+      "id": "batch-11",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "connection-reset",
+          "previousGeneration": 1,
+          "revision": {
+            "counter": 12,
+            "writerId": "w-d",
+            "operationId": "w-d-18"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-27",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 3,
+          "kind": "connection-reset",
+          "previousGeneration": 2,
+          "revision": {
+            "counter": 35,
+            "writerId": "w-c",
+            "operationId": "w-c-56"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-29",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 4,
+          "kind": "connection-reset",
+          "previousGeneration": 3,
+          "revision": {
+            "counter": 33,
+            "writerId": "w-d",
+            "operationId": "w-d-60"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-35",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 4,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:21Z",
+          "data": {
+            "id": "k0",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 37,
+            "writerId": "w-d",
+            "operationId": "w-d-70"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "stage",
+      "id": "pending-36",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 5,
+          "kind": "connection-reset",
+          "previousGeneration": 4,
+          "revision": {
+            "counter": 39,
+            "writerId": "w-b",
+            "operationId": "w-b-72"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-37",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 5,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:26Z",
+          "data": {
+            "id": "k0",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 39,
+            "writerId": "w-c",
+            "operationId": "w-c-77"
+          }
+        }
+      ],
+      "blobs": []
+    }
+  ],
+  "387276957": [
+    {
+      "k": "provision",
+      "connection": "c3"
+    },
+    {
+      "k": "import",
+      "id": "batch-4",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 7,
+            "writerId": "w-c",
+            "operationId": "w-c-10"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-9",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 12,
+            "writerId": "w-d",
+            "operationId": "w-d-16"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:06Z",
+          "data": {
+            "id": "k0",
+            "blob_ref": {
+              "blob_id": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 11,
+            "writerId": "w-c",
+            "operationId": "w-c-17"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "bytes",
+      "id": "batch-4"
+    }
+  ],
+  "465362048": [
+    {
+      "k": "import",
+      "id": "batch-0",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:24Z",
+          "data": {
+            "id": "k0",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 1,
+            "writerId": "w-b",
+            "operationId": "w-b-0"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-1",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 2,
+            "writerId": "w-d",
+            "operationId": "w-d-5"
+          }
+        }
+      ],
+      "blobs": ["b2", "b1"]
+    },
+    {
+      "k": "import",
+      "id": "batch-2",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:24Z",
+          "data": {
+            "id": "k0",
+            "text": "t1-changed"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 1,
+            "writerId": "w-b",
+            "operationId": "w-b-0"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "stage",
+      "id": "pending-12",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 18,
+            "writerId": "w-b",
+            "operationId": "w-b-31"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:50Z",
+          "data": {
+            "id": "k3",
+            "blob_ref": {
+              "blob_id": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 18,
+            "writerId": "w-d",
+            "operationId": "w-d-32"
+          }
+        }
+      ],
+      "blobs": []
+    }
+  ],
+  "887559774": [
+    {
+      "k": "quarantine",
+      "connection": "c2"
+    },
+    {
+      "k": "stage",
+      "id": "pending-8",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 6,
+            "writerId": "w-d",
+            "operationId": "w-d-14"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:53Z",
+          "data": {
+            "id": "k2",
+            "blob_ref": {
+              "blob_id": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 8,
+            "writerId": "w-c",
+            "operationId": "w-c-15"
+          }
+        }
+      ],
+      "blobs": ["b1"]
+    },
+    {
+      "k": "import",
+      "id": "batch-11",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 8,
+            "writerId": "w-d",
+            "operationId": "w-d-18"
+          }
+        }
+      ],
+      "blobs": []
+    }
+  ],
+  "1035486403": [
+    {
+      "k": "import",
+      "id": "batch-3",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:36Z",
+          "data": {
+            "id": "k0",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 8,
+            "writerId": "w-d",
+            "operationId": "w-d-8"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-4",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "sha256": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 7,
+            "writerId": "w-c",
+            "operationId": "w-c-10"
+          }
+        }
+      ],
+      "blobs": ["b0"]
+    },
+    {
+      "k": "stage",
+      "id": "pending-7",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "sha256": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 11,
+            "writerId": "w-b",
+            "operationId": "w-b-15"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:53Z",
+          "data": {
+            "id": "k3",
+            "blob_ref": {
+              "blob_id": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+              "sha256": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 13,
+            "writerId": "w-b",
+            "operationId": "w-b-16"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-8",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:36Z",
+          "data": {
+            "id": "k0",
+            "text": "t1-changed"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 8,
+            "writerId": "w-d",
+            "operationId": "w-d-8"
+          }
+        }
+      ],
+      "blobs": []
+    }
+  ],
+  "1091989333": [
+    {
+      "k": "import",
+      "id": "batch-12",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 12,
+            "writerId": "w-c",
+            "operationId": "w-c-18"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:37Z",
+          "data": {
+            "id": "k2",
+            "blob_ref": {
+              "blob_id": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 15,
+            "writerId": "w-d",
+            "operationId": "w-d-19"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "stage",
+      "id": "pending-17",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 23,
+            "writerId": "w-c",
+            "operationId": "w-c-30"
+          }
+        }
+      ],
+      "blobs": ["b1"]
+    },
+    {
+      "k": "import",
+      "id": "batch-20",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:40Z",
+          "data": {
+            "id": "k2",
+            "text": "t0"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 5,
+            "writerId": "w-d",
+            "operationId": "w-d-3"
+          }
+        }
+      ],
+      "blobs": []
+    }
+  ],
+  "1274836731": [
+    {
+      "k": "import",
+      "id": "batch-1",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 1,
+            "writerId": "w-c",
+            "operationId": "w-c-4"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:26Z",
+          "data": {
+            "id": "k2",
+            "blob_ref": {
+              "blob_id": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 3,
+            "writerId": "w-c",
+            "operationId": "w-c-5"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-6",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k1",
+          "emittedAt": "2026-10-20T00:00:41Z",
+          "data": {
+            "id": "k1",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 12,
+            "writerId": "w-c",
+            "operationId": "w-c-13"
+          }
+        }
+      ],
+      "blobs": ["b1"]
+    }
+  ],
+  "1422763360": [
+    {
+      "k": "import",
+      "id": "batch-7",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:16Z",
+          "data": {
+            "id": "k0",
+            "blob_ref": {
+              "blob_id": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 14,
+            "writerId": "w-d",
+            "operationId": "w-d-18"
+          }
+        }
+      ],
+      "blobs": ["b2"]
+    },
+    {
+      "k": "import",
+      "id": "batch-12",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "version": "1.0.0",
+            "stream": "events",
+            "semantics": "append_only",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:44Z",
+          "data": {
+            "id": "k3",
+            "text": "t2-changed"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 6,
+            "writerId": "w-c",
+            "operationId": "w-c-7"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-17",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "version": "1.0.0",
+            "stream": "events",
+            "semantics": "append_only",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:44Z",
+          "data": {
+            "id": "k3",
+            "text": "t3"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 6,
+            "writerId": "w-c",
+            "operationId": "w-c-7"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-18",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 23,
+            "writerId": "w-b",
+            "operationId": "w-b-32"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "stage",
+      "id": "pending-20",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 26,
+            "writerId": "w-c",
+            "operationId": "w-c-36"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:47Z",
+          "data": {
+            "id": "k2",
+            "blob_ref": {
+              "blob_id": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 25,
+            "writerId": "w-c",
+            "operationId": "w-c-37"
+          }
+        }
+      ],
+      "blobs": []
+    }
+  ],
+  "1605610758": [
+    {
+      "k": "import",
+      "id": "batch-7",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "version": "2.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:46Z",
+          "data": {
+            "id": "k0",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 8,
+            "writerId": "w-b",
+            "operationId": "w-b-19"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "stage",
+      "id": "pending-16",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "connection-reset",
+          "previousGeneration": 1,
+          "revision": {
+            "counter": 18,
+            "writerId": "w-b",
+            "operationId": "w-b-32"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-18",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:27Z",
+          "data": {
+            "id": "k0",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 21,
+            "writerId": "w-d",
+            "operationId": "w-d-39"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "declare",
+      "binding": "m2"
+    }
+  ],
+  "1844961086": [
+    {
+      "k": "import",
+      "id": "batch-8",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:35Z",
+          "data": {
+            "id": "k2",
+            "text": "t0"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 2,
+            "writerId": "w-c",
+            "operationId": "w-c-1"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "version": "2.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:13Z",
+          "data": {
+            "id": "k2",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 8,
+            "writerId": "w-b",
+            "operationId": "w-b-13"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "declare",
+      "binding": "m2"
+    },
+    {
+      "k": "local",
+      "id": "local-25",
+      "connection": "c1",
+      "binding": "m",
+      "key": "k2",
+      "text": "l3"
+    }
+  ],
+  "1957966946": [
+    {
+      "k": "import",
+      "id": "batch-7",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "version": "2.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:34Z",
+          "data": {
+            "id": "k3",
+            "text": "t2"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 11,
+            "writerId": "w-b",
+            "operationId": "w-b-12"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "declare",
+      "binding": "m2"
+    },
+    {
+      "k": "provision",
+      "connection": "c3"
+    },
+    {
+      "k": "local",
+      "id": "local-27",
+      "connection": "c3",
+      "binding": "m",
+      "key": "k3",
+      "text": "l0"
+    }
+  ],
+  "2014469876": [
+    {
+      "k": "provision",
+      "connection": "c3"
+    },
+    {
+      "k": "declare",
+      "binding": "m2"
+    },
+    {
+      "k": "import",
+      "id": "batch-21",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "version": "2.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:56Z",
+          "data": {
+            "id": "k3",
+            "text": "t0"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 29,
+            "writerId": "w-d",
+            "operationId": "w-d-35"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-22",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:55Z",
+          "data": {
+            "id": "k3",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 28,
+            "writerId": "w-c",
+            "operationId": "w-c-37"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "local",
+      "id": "local-40",
+      "connection": "c3",
+      "binding": "m",
+      "key": "k3",
+      "text": "l1"
+    }
+  ],
+  "2084311414": [
+    {
+      "k": "import",
+      "id": "batch-6",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k1",
+          "emittedAt": "2026-10-20T00:00:16Z",
+          "data": {
+            "id": "k1",
+            "text": "t0"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 11,
+            "writerId": "w-c",
+            "operationId": "w-c-10"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-14",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "version": "2.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "recordKey": "k1",
+          "emittedAt": "2026-10-20T00:00:29Z",
+          "data": {
+            "id": "k1",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 21,
+            "writerId": "w-d",
+            "operationId": "w-d-22"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "declare",
+      "binding": "m2"
+    },
+    {
+      "k": "local",
+      "id": "local-35",
+      "connection": "c1",
+      "binding": "m",
+      "key": "k1",
+      "text": "l1"
+    }
+  ],
+  "2288740973": [
+    {
+      "k": "import",
+      "id": "batch-3",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "version": "1.0.0",
+            "stream": "events",
+            "semantics": "append_only",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:26Z",
+          "data": {
+            "id": "k0",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 9,
+            "writerId": "w-b",
+            "operationId": "w-b-7"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-8",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "version": "1.0.0",
+            "stream": "events",
+            "semantics": "append_only",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:56Z",
+          "data": {
+            "id": "k0",
+            "text": "t0"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 13,
+            "writerId": "w-b",
+            "operationId": "w-b-19"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "local",
+      "id": "local-25",
+      "connection": "c1",
+      "binding": "a",
+      "key": "k0",
+      "text": "l0"
+    }
+  ],
+  "2458249763": [
+    {
+      "k": "import",
+      "id": "batch-4",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 7,
+            "writerId": "w-b",
+            "operationId": "w-b-11"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-6",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "connection-reset",
+          "previousGeneration": 1,
+          "revision": {
+            "counter": 9,
+            "writerId": "w-b",
+            "operationId": "w-b-17"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-7",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 10,
+            "writerId": "w-b",
+            "operationId": "w-b-18"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:27Z",
+          "data": {
+            "id": "k2",
+            "blob_ref": {
+              "blob_id": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 12,
+            "writerId": "w-c",
+            "operationId": "w-c-19"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "bytes",
+      "id": "batch-4"
+    }
+  ],
+  "2493170532": [
+    {
+      "k": "import",
+      "id": "batch-17",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "version": "2.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:45Z",
+          "data": {
+            "id": "k3",
+            "text": "t3"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 22,
+            "writerId": "w-d",
+            "operationId": "w-d-35"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-25",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:53Z",
+          "data": {
+            "id": "k3",
+            "text": "t2"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 29,
+            "writerId": "w-d",
+            "operationId": "w-d-50"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "provision",
+      "connection": "c3"
+    },
+    {
+      "k": "declare",
+      "binding": "m2"
+    },
+    {
+      "k": "local",
+      "id": "local-57",
+      "connection": "c3",
+      "binding": "m",
+      "key": "k3",
+      "text": "l3"
+    }
+  ],
+  "2710938699": [
+    {
+      "k": "provision",
+      "connection": "c3"
+    },
+    {
+      "k": "import",
+      "id": "batch-17",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 19,
+            "writerId": "w-c",
+            "operationId": "w-c-35"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k1",
+          "emittedAt": "2026-10-20T00:00:22Z",
+          "data": {
+            "id": "k1",
+            "blob_ref": {
+              "blob_id": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "sha256": "sha256:b84b6a52ef376ee15292b0a7dd1b74512e17026806832ef9a89c872aebe84d08",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 19,
+            "writerId": "w-d",
+            "operationId": "w-d-36"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-24",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:40Z",
+          "data": {
+            "id": "k2",
+            "text": "t0"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 28,
+            "writerId": "w-d",
+            "operationId": "w-d-47"
+          }
+        }
+      ],
+      "blobs": ["b2"]
+    }
+  ],
+  "2732520860": [
+    {
+      "k": "import",
+      "id": "batch-0",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:21Z",
+          "data": {
+            "id": "k3",
+            "text": "t2"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 1,
+            "writerId": "w-d",
+            "operationId": "w-d-1"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "stage",
+      "id": "pending-2",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "sha256": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 1,
+            "writerId": "w-d",
+            "operationId": "w-d-2"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:28Z",
+          "data": {
+            "id": "k2",
+            "blob_ref": {
+              "blob_id": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+              "sha256": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 1,
+            "writerId": "w-c",
+            "operationId": "w-c-3"
+          }
+        }
+      ],
+      "blobs": ["b0"]
+    },
+    {
+      "k": "import",
+      "id": "batch-1",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:21Z",
+          "data": {
+            "id": "k3",
+            "text": "t2-changed"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 1,
+            "writerId": "w-d",
+            "operationId": "w-d-1"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-4",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "sha256": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 6,
+            "writerId": "w-d",
+            "operationId": "w-d-7"
+          }
+        }
+      ],
+      "blobs": []
+    }
+  ],
+  "2858865328": [
+    {
+      "k": "import",
+      "id": "batch-25",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:30Z",
+          "data": {
+            "id": "k3",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 18,
+            "writerId": "w-b",
+            "operationId": "w-b-39"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "stage",
+      "id": "pending-31",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "connection-reset",
+          "previousGeneration": 1,
+          "revision": {
+            "counter": 23,
+            "writerId": "w-b",
+            "operationId": "w-b-50"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-42",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 2,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:10Z",
+          "data": {
+            "id": "k3",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 31,
+            "writerId": "w-b",
+            "operationId": "w-b-67"
+          }
+        }
+      ],
+      "blobs": []
+    }
+  ],
+  "3302645215": [
+    {
+      "k": "import",
+      "id": "batch-11",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "blob-claim",
+          "blob": {
+            "blobId": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "sha256": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+            "mimeType": "application/octet-stream",
+            "sizeBytes": 14
+          },
+          "revision": {
+            "counter": 12,
+            "writerId": "w-d",
+            "operationId": "w-d-22"
+          }
+        },
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c1",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:19Z",
+          "data": {
+            "id": "k0",
+            "blob_ref": {
+              "blob_id": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+              "sha256": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 15,
+            "writerId": "w-d",
+            "operationId": "w-d-23"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "import",
+      "id": "batch-17",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 3,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:48Z",
+          "data": {
+            "id": "k0",
+            "blob_ref": {
+              "blob_id": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+              "sha256": "sha256:f85f4ef194b819011b35414727a334292340413a632f6f0b20c91c89f75445b1",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 20,
+            "writerId": "w-d",
+            "operationId": "w-d-40"
+          }
+        }
+      ],
+      "blobs": ["b0"]
+    }
+  ],
+  "3472154005": [
+    {
+      "k": "declare",
+      "binding": "m2"
+    },
+    {
+      "k": "import",
+      "id": "batch-7",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "version": "2.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "recordKey": "k0",
+          "emittedAt": "2026-10-20T00:00:09Z",
+          "data": {
+            "id": "k0",
+            "text": "t3"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 13,
+            "writerId": "w-b",
+            "operationId": "w-b-14"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "provision",
+      "connection": "c3"
+    },
+    {
+      "k": "local",
+      "id": "local-48",
+      "connection": "c3",
+      "binding": "m",
+      "key": "k0",
+      "text": "l3"
+    }
+  ],
+  "3598498473": [
+    {
+      "k": "declare",
+      "binding": "m2"
+    },
+    {
+      "k": "import",
+      "id": "batch-2",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "version": "2.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:01Z",
+          "data": {
+            "id": "k3",
+            "text": "t1"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 11,
+            "writerId": "w-d",
+            "operationId": "w-d-8"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "provision",
+      "connection": "c3"
+    },
+    {
+      "k": "import",
+      "id": "batch-15",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c3",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k3",
+          "emittedAt": "2026-10-20T00:00:38Z",
+          "data": {
+            "id": "k3",
+            "blob_ref": {
+              "blob_id": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913"
+            }
+          },
+          "blobs": [
+            {
+              "blobId": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "sha256": "sha256:142ef096363450793398ab71bbb14b6e807705f330ac1ee3521c1f1a53fd3913",
+              "mimeType": "application/octet-stream",
+              "sizeBytes": 14
+            }
+          ],
+          "revision": {
+            "counter": 22,
+            "writerId": "w-c",
+            "operationId": "w-c-30"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "local",
+      "id": "local-31",
+      "connection": "c3",
+      "binding": "m",
+      "key": "k3",
+      "text": "l1"
+    }
+  ],
+  "3964193269": [
+    {
+      "k": "import",
+      "id": "batch-2",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:32Z",
+          "data": {
+            "id": "k2",
+            "text": "t3"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 7,
+            "writerId": "w-d",
+            "operationId": "w-d-7"
+          }
+        }
+      ],
+      "blobs": []
+    },
+    {
+      "k": "stage",
+      "id": "pending-4",
+      "ops": [
+        {
+          "owner": "owner-a",
+          "sourceId": "https://example.test/source",
+          "connectionId": "c2",
+          "methodId": "export",
+          "generation": 1,
+          "kind": "upsert",
+          "declaration": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "version": "1.0.0",
+            "stream": "messages",
+            "semantics": "mutable_state",
+            "primaryKey": ["id"],
+            "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "recordKey": "k2",
+          "emittedAt": "2026-10-20T00:00:29Z",
+          "data": {
+            "id": "k2",
+            "text": "t3"
+          },
+          "blobs": [],
+          "revision": {
+            "counter": 10,
+            "writerId": "w-c",
+            "operationId": "w-c-12"
+          }
+        }
+      ],
+      "blobs": []
+    }
+  ]
+}

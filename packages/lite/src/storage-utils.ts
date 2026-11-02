@@ -11,9 +11,19 @@ import type {
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 export { previewEnvelopeValue } from "@opendatalabs/personal-server-ts-core/storage/preview";
 
+function compareCollectedAt(a: string, b: string): number {
+  const aTime = Date.parse(a);
+  const bTime = Date.parse(b);
+  return Number.isFinite(aTime) && Number.isFinite(bTime)
+    ? aTime - bTime
+    : a.localeCompare(b);
+}
+
 export function sortEntries(entries: IndexEntry[]): IndexEntry[] {
-  return [...entries].sort((a, b) =>
-    b.collectedAt.localeCompare(a.collectedAt),
+  return [...entries].sort(
+    (a, b) =>
+      compareCollectedAt(b.collectedAt, a.collectedAt) ||
+      (b.casRevision ?? b.version) - (a.casRevision ?? a.version),
   );
 }
 
@@ -104,7 +114,7 @@ function summarizeScopes(
       scope: entry.scope,
       latestCollectedAt:
         existing &&
-        existing.latestCollectedAt.localeCompare(entry.collectedAt) > 0
+        compareCollectedAt(existing.latestCollectedAt, entry.collectedAt) > 0
           ? existing.latestCollectedAt
           : entry.collectedAt,
       versionCount: (existing?.versionCount ?? 0) + 1,

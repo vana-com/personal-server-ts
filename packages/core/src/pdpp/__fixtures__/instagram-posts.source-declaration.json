@@ -1,0 +1,135 @@
+{
+  "protocol_version": "0.1.0",
+  "source": {
+    "kind": "connector",
+    "id": "https://registry.pdpp.dev/connectors/instagram"
+  },
+  "declaration_version": "0.1.0-local",
+  "publisher": {
+    "id": "https://vana.org/unity-surfaces"
+  },
+  "display": {
+    "name": "Instagram"
+  },
+  "streams": [
+    {
+      "name": "profile",
+      "description": "Instagram profile snapshot",
+      "display": {
+        "label": "Instagram profile",
+        "detail": "Instagram account id, username, profile text, and profile counters. No posts or direct messages."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "full_name": {
+            "type": "string"
+          },
+          "bio": {
+            "type": "string"
+          },
+          "external_url": {
+            "type": "string"
+          },
+          "follower_count": {
+            "type": "number"
+          },
+          "following_count": {
+            "type": "number"
+          },
+          "media_count": {
+            "type": "number"
+          },
+          "is_business": {
+            "type": "boolean"
+          },
+          "is_private": {
+            "type": "boolean"
+          },
+          "is_verified": {
+            "type": "boolean"
+          },
+          "profile_pic_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "username",
+          "full_name"
+        ]
+      },
+      "primary_key": [
+        "id"
+      ],
+      "selection": {
+        "fields": true,
+        "resources": false
+      }
+    },
+    {
+      "name": "posts",
+      "description": "Instagram posts, retained as one current snapshot (not per-post history)",
+      "display": {
+        "label": "Instagram posts",
+        "detail": "The most recently collected set of Instagram posts, replaced in full on each sync. No per-post identity and no historical coverage — this is the current retained snapshot only, same as the underlying instagram.posts scope."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "posts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "caption": {
+                  "type": "string"
+                },
+                "img_url": {
+                  "type": "string"
+                },
+                "num_of_likes": {
+                  "type": "number"
+                },
+                "taken_at": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "caption",
+                "img_url",
+                "num_of_likes"
+              ]
+            }
+          },
+          "pdpp_snapshot": {
+            "type": "string",
+            "const": "current"
+          }
+        },
+        "required": [
+          "posts",
+          "pdpp_snapshot"
+        ]
+      },
+      "primary_key": [
+        "pdpp_snapshot"
+      ],
+      "selection": {
+        "fields": true,
+        "resources": false
+      }
+    }
+  ],
+  "extensions": {}
+}

@@ -511,10 +511,37 @@ describe("SyncManager", () => {
       };
     }
 
+    /** Covered local rows, one per version, as the index lists them. */
+    function localRows(versions: number[]) {
+      return versions.map((version) => ({
+        path: `instagram.profile/v${version}.json`,
+        scope: "instagram.profile",
+        collectedAt: `2026-08-0${version}T00:00:00.000Z`,
+        version,
+        dataPointId: "0xdp",
+        afterTombstoneVersion: null,
+      }));
+    }
+
+    /** Per-version local storage: listing reads the live rows, each erase removes its own row. */
+    function perVersionStorage(
+      storage: Record<string, unknown>,
+      rows: ReturnType<typeof localRows>,
+    ) {
+      storage.listVersions = vi.fn(() => rows);
+      storage.deleteVersion = vi.fn(
+        async (_scope: string, collectedAt: string) => {
+          const at = rows.findIndex((row) => row.collectedAt === collectedAt);
+          if (at < 0) return false;
+          rows.splice(at, 1);
+          return true;
+        },
+      );
+    }
+
     it("deleteScope() runs tombstone -> blobs -> local through the wired ports", async () => {
       const uploadDeps = makeMockUploadDeps();
-      uploadDeps.storage.deleteScope = vi.fn(async () => 2);
-      uploadDeps.storage.listVersions = vi.fn(() => []);
+      perVersionStorage(uploadDeps.storage, localRows([1, 2]));
       const deleteData = makeDeleteData();
       const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
         deleteData,
@@ -528,8 +555,16 @@ describe("SyncManager", () => {
         "instagram.profile",
         ["1", "2"],
       );
-      expect(uploadDeps.storage.deleteScope).toHaveBeenCalledWith(
+      expect(uploadDeps.storage.deleteVersion).toHaveBeenCalledTimes(2);
+      expect(uploadDeps.storage.deleteVersion).toHaveBeenCalledWith(
         "instagram.profile",
+        "2026-08-01T00:00:00.000Z",
+        expect.objectContaining({ path: "instagram.profile/v1.json" }),
+      );
+      expect(uploadDeps.storage.deleteVersion).toHaveBeenCalledWith(
+        "instagram.profile",
+        "2026-08-02T00:00:00.000Z",
+        expect.objectContaining({ path: "instagram.profile/v2.json" }),
       );
       expect(result.durable).toBe(true);
       expect(result.steps.local).toEqual({ status: "ok", deletedCount: 2 });
@@ -652,8 +687,7 @@ describe("SyncManager", () => {
 
     it("does not start a sync cycle while a delete is in flight", async () => {
       const uploadDeps = makeMockUploadDeps();
-      uploadDeps.storage.deleteScope = vi.fn(async () => 1);
-      uploadDeps.storage.listVersions = vi.fn(() => []);
+      perVersionStorage(uploadDeps.storage, localRows([1]));
       let releaseTombstone!: () => void;
       const deleteData = makeDeleteData();
       const tombstoneStarted = new Promise<void>((started) => {
@@ -687,7 +721,7 @@ describe("SyncManager", () => {
       expect(uploadAll).toHaveBeenCalledTimes(1);
       // The local delete finished before the cycle's upload began.
       const deleteOrder = (
-        uploadDeps.storage.deleteScope as ReturnType<typeof vi.fn>
+        uploadDeps.storage.deleteVersion as ReturnType<typeof vi.fn>
       ).mock.invocationCallOrder[0];
       const uploadOrder = (uploadAll as ReturnType<typeof vi.fn>).mock
         .invocationCallOrder[0];
@@ -696,10 +730,10 @@ describe("SyncManager", () => {
 
     it("a failed delete does not block the next cycle", async () => {
       const uploadDeps = makeMockUploadDeps();
-      uploadDeps.storage.deleteScope = vi.fn(async () => {
+      perVersionStorage(uploadDeps.storage, localRows([1]));
+      uploadDeps.storage.deleteVersion = vi.fn(async () => {
         throw new Error("index locked");
       });
-      uploadDeps.storage.listVersions = vi.fn(() => []);
       const deleteData = makeDeleteData();
       const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
         deleteData,

@@ -803,10 +803,18 @@ export function createMcpDataReadClient(
         fileId: selectedEntry.fileId ?? undefined,
         metadataOnly: true,
       });
-      const manifest = await storage.readBlockManifest(
-        scope,
-        selectedEntry.collectedAt,
-      );
+      let manifest;
+      try {
+        manifest = await storage.readBlockManifest(
+          scope,
+          selectedEntry.collectedAt,
+        );
+      } catch (err) {
+        if (err instanceof ProtocolError) {
+          throw new McpDataReadError(err.code, err.toJSON());
+        }
+        throw err;
+      }
       // Logged like any other grant-gated read, but never reported as a read
       // fulfillment: a table of contents carries no block values.
       await writeReadAccessLog(request, { scope, grantId, authResult });

@@ -227,6 +227,11 @@ export const MEMORY_RECORD_RULES: Readonly<
   "github.organizations": [untracked("organizations")],
   "instagram.post_likes": [untracked("post_likes")],
   "spotify.playlist_items": [untracked("playlist_items")],
+  "icloud_notes.profile": [untracked("profile")],
+  // The legacy body passes the native records through under the scope's own
+  // name; no fixture proves an id equal in both forms.
+  "strava.activities": [untracked("activities")],
+  "strava.coverage_diagnostics": [untracked("coverage_diagnostics")],
 };
 
 /** The rules for a scope, or null when the scope has no entry (generic default applies). */

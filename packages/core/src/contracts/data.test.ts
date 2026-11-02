@@ -250,6 +250,63 @@ describe("data contract helpers", () => {
     });
   });
 
+  it("lists extra canonical scopes only where the caller's grants cover them, and never re-adds a stored scope", async () => {
+    const storage = createMemoryStorage();
+    for (const scope of ["instagram.profile", "twitter.posts"]) {
+      await ingestDataContract({
+        storage,
+        scopeParam: scope,
+        body: { username: "test_user" },
+        collectedAt: "2026-05-08T00:00:00.000Z",
+        status: "stored",
+      });
+    }
+    const canonical = (scope: string) => ({
+      scope,
+      latestCollectedAt: "2026-05-09T00:00:00.000Z",
+      versionCount: 0,
+    });
+
+    const result = await listDataScopesContract({
+      storage,
+      limit: 20,
+      offset: 0,
+      // The grants cover instagram.profile and the two canonical scopes
+      // named chatgpt.* and claude.*, but not twitter.posts or github.*.
+      isListable: (scope) =>
+        scope === "instagram.profile" ||
+        scope.startsWith("chatgpt.") ||
+        scope.startsWith("claude."),
+      extraScopes: async (_prefix, stored) => {
+        // Storage holds both stored scopes, listable or not.
+        expect([...stored].sort()).toEqual([
+          "instagram.profile",
+          "twitter.posts",
+        ]);
+        return [
+          canonical("instagram.profile"),
+          canonical("twitter.posts"),
+          canonical("github.repositories"),
+          canonical("claude.projects"),
+          canonical("chatgpt.conversations"),
+        ];
+      },
+    });
+
+    expect(result.response.scopes.map((entry) => entry.scope)).toEqual([
+      "chatgpt.conversations",
+      "claude.projects",
+      "instagram.profile",
+    ]);
+    expect(result.response.total).toBe(3);
+    // The stored scope keeps its stored summary, not the canonical row.
+    expect(
+      result.response.scopes.find(
+        (entry) => entry.scope === "instagram.profile",
+      )?.versionCount,
+    ).toBe(1);
+  });
+
   it("returns compatibility-shaped validation errors", async () => {
     const storage = createMemoryStorage();
 

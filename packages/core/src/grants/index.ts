@@ -24,3 +24,25 @@ export type {
   GatewayGrantFee,
   GrantListItem,
 } from "@opendatalabs/vana-sdk/browser";
+
+// §6 — the PDPP↔chain grant binding. Keyed by existing chain permission
+// identity; adds no field to any signed struct.
+export {
+  createPdppGrantBinding,
+  grantVersionStillAuthorizes,
+  isValidGrantVersion,
+  samePermission,
+  verifyPdppGrantBinding,
+  type ChainPermissionRef,
+  type CreateBindingInput,
+  type PdppGrantBinding,
+  type ResolvedBuilder,
+  type VerifyBindingInput,
+} from "./pdpp-binding.js";
+export {
+  assertWritableGrantVersion,
+  bindingsAgree,
+  createInMemoryPdppGrantBindingStore,
+  permissionKey,
+  type PdppGrantBindingStore,
+} from "./pdpp-binding-store.js";

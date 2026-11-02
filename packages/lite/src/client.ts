@@ -8,6 +8,7 @@ import {
   dataVersionsPath,
   grantRevokePath,
   parsePersonalServerJsonResponse,
+  PersonalServerClientError,
   requestPath,
   submitPersonalServerRegistration,
   type PersonalServerAuthRequestOptions,
@@ -22,6 +23,7 @@ import {
   type PersonalServerListGrantsResult,
   type PersonalServerListVersionsOptions,
   type PersonalServerListVersionsResult,
+  type PersonalServerOpenScopeUploadOptions,
   type PersonalServerOwnerAuth,
   type PersonalServerPostDataOptions,
   type PersonalServerPrepareRegistrationOptions,
@@ -29,11 +31,17 @@ import {
   type PersonalServerReadyOptions,
   type PersonalServerRevokeGrantResult,
   type PersonalServerRegistrationRequest,
+  type PersonalServerScopeUpload,
+  type PersonalServerScopeUploadResult,
   type PersonalServerStatus,
   type PersonalServerSubmitRegistrationOptions,
   type PersonalServerSyncTriggerResult,
 } from "@opendatalabs/personal-server-ts-core/client";
 import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  prepareScopeUploadBatches,
+  type PreparedScopeUploadBatch,
+} from "@opendatalabs/personal-server-ts-core/api";
 import {
   createGatewayClient,
   type DataFileEnvelope,
@@ -64,6 +72,8 @@ import {
 
 const DEFAULT_LITE_ORIGIN = "https://ps-lite.local";
 
+/** Target body size of one scope-upload batch. */
+const SCOPE_UPLOAD_BATCH_BYTES = 1024 * 1024;
 export interface StartPersonalServerLiteRelayOptions extends Omit<
   PsLiteRelayClientOptions,
   "runtime" | "onStatus" | "sessionId"
@@ -286,6 +296,177 @@ export async function startPersonalServer(
     );
   }
 
+  async function openScopeUpload(
+    scope: string,
+    uploadOptions: PersonalServerOpenScopeUploadOptions,
+  ): Promise<PersonalServerScopeUpload> {
+    const origin = requiredApiOrigin(await info());
+    const base = `/v1/data/${encodeURIComponent(scope)}/uploads`;
+    // Every request below is already addressed to `origin`, so each goes
+    // straight to the runtime. `callFetch` would ask `info()` for the origin
+    // again, and that is a `/health` request that looks the server up at the
+    // gateway: once per batch of a large upload.
+    const fetchOpened = (request: Request) => runtime.fetch(request);
+    const send = async (
+      method: string,
+      path: string,
+      body: unknown,
+      what: string,
+    ) => {
+      const request = await createOwnerRequest({
+        origin,
+        path,
+        method,
+        body,
+        authOptions: uploadOptions,
+        headers: {
+          "Content-Type": "application/json",
+          ...uploadOptions.headers,
+        },
+      });
+      return parsePersonalServerJsonResponse(await fetchOpened(request), what);
+    };
+    const begun = (await send(
+      "POST",
+      base,
+      { data: uploadOptions.data, arrayKey: uploadOptions.arrayKey },
+      "scope upload begin",
+    )) as { uploadId: string; collectedAt: string; maxBatchBytes: number };
+    const path = `${base}/${encodeURIComponent(begun.uploadId)}`;
+    // Batches stay at the size Web3Signed owner auth accepts as a body; only
+    // a single larger record goes up alone, up to the server's limit.
+    const batchBytes = Math.min(begun.maxBatchBytes, SCOPE_UPLOAD_BATCH_BYTES);
+    let seq = 0;
+    // Set when an append fails: the server may hold some of its batches, and
+    // the handle does not know which, so it takes no more appends or commits.
+    let failed = false;
+    const failedUpload = () =>
+      new PersonalServerClientError({
+        message:
+          "An earlier append to this upload failed, so the server may hold part of it. Abort the upload and start over.",
+        status: 409,
+        errorCode: "UPLOAD_FAILED",
+      });
+
+    async function sendBatch(items: unknown[]): Promise<void> {
+      const body = { items };
+      const batchPath = `${path}/batches/${seq}`;
+      try {
+        await send("PUT", batchPath, body, "scope upload batch");
+      } catch (err) {
+        // A transport failure may hide a stored batch: resend it under the
+        // same number, which the server answers as a replay if it was.
+        if (err instanceof PersonalServerClientError) throw err;
+        await send("PUT", batchPath, body, "scope upload batch");
+      }
+      seq += 1;
+    }
+
+    async function sendPreparedBatch(
+      batch: PreparedScopeUploadBatch,
+    ): Promise<void> {
+      const batchPath = `${path}/batches/${seq}`;
+      const sendPrepared = async () => {
+        const request = await createOwnerRequest({
+          origin,
+          path: batchPath,
+          method: "PUT",
+          body: { bodySha256: batch.bodySha256 },
+          authOptions: uploadOptions,
+          headers: {
+            "Content-Type": "application/json",
+            ...uploadOptions.headers,
+          },
+        });
+        return parsePersonalServerJsonResponse(
+          await runtime.appendScopeUpload!(request, batch),
+          "scope upload batch",
+        );
+      };
+      try {
+        await sendPrepared();
+      } catch (err) {
+        if (err instanceof PersonalServerClientError) throw err;
+        // Retain the immutable batch, not the source objects: a lost reply
+        // must replay the very same bytes without serializing them again.
+        await sendPrepared();
+      }
+      seq += 1;
+    }
+
+    /** Group items into batches by their own encoded size, one at a time. */
+    async function appendItems(items: unknown[]): Promise<void> {
+      if (runtime.appendScopeUpload) {
+        for await (const batch of prepareScopeUploadBatches(
+          items,
+          batchBytes,
+        )) {
+          await sendPreparedBatch(batch);
+        }
+        return;
+      }
+      const encoder = new TextEncoder();
+      const frameBytes = encoder.encode('{"items":[]}').byteLength;
+      let batch: unknown[] = [];
+      let bytes = frameBytes;
+      for (const item of items) {
+        const itemBytes =
+          encoder.encode(JSON.stringify(item) ?? "null").byteLength + 1;
+        if (batch.length > 0 && bytes + itemBytes > batchBytes) {
+          await sendBatch(batch);
+          batch = [];
+          bytes = frameBytes;
+        }
+        batch.push(item);
+        bytes += itemBytes;
+      }
+      if (batch.length > 0) await sendBatch(batch);
+    }
+
+    return {
+      uploadId: begun.uploadId,
+      collectedAt: begun.collectedAt,
+      maxBatchBytes: begun.maxBatchBytes,
+      async append(items) {
+        if (failed) throw failedUpload();
+        try {
+          await appendItems(items);
+        } catch (err) {
+          failed = true;
+          throw err;
+        }
+      },
+      async commit(data) {
+        // A partial append must not become a version: it would publish a
+        // prefix of the records as if it were the whole scope.
+        if (failed) throw failedUpload();
+        return (await send(
+          "POST",
+          `${path}/commit`,
+          { data },
+          "scope upload commit",
+        )) as PersonalServerScopeUploadResult;
+      },
+      async abort() {
+        const request = await createOwnerRequest({
+          origin,
+          path,
+          method: "DELETE",
+          authOptions: uploadOptions,
+          headers: uploadOptions.headers,
+        });
+        const response = await fetchOpened(request);
+        if (
+          !response.ok &&
+          response.status !== 404 &&
+          response.status !== 410
+        ) {
+          await parsePersonalServerJsonResponse(response, "scope upload abort");
+        }
+      },
+    };
+  }
+
   async function listData(
     listOptions: PersonalServerListDataOptions = {},
   ): Promise<PersonalServerListDataResult> {
@@ -505,14 +686,21 @@ export async function startPersonalServer(
     setStatus("stopped");
   }
 
+  // Only a runtime this function built has passed the door. A supplied
+  // runtime's storage is the caller's, so its handle reports no status.
+  const replicationStatus = runtimeBundle?.replication;
   return {
     kind: "lite",
+    ...(replicationStatus && {
+      replication: { status: () => replicationStatus },
+    }),
     ready: (_options?: PersonalServerReadyOptions) => info(),
     info,
     prepareRegistration,
     submitRegistration,
     fetch: callFetch,
     postData,
+    openScopeUpload,
     listData,
     listAccessLogs,
     listVersions,

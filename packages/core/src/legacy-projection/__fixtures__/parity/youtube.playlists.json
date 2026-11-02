@@ -1,0 +1,113 @@
+{
+  "scope": "youtube.playlists",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; youtube.playlists from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic youtube.playlists records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{playlists:Array<{playlistId:string, url:string, title:string|null, owner:string|null, ownerUrl:string|null, privacy:'Public'|'Private'|'Unlisted'|null, videoCount:number|null, views:number|null}>}.",
+    "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. Unknown visibility becomes null; missing URL rejects the public projection as incomplete_scope."
+  },
+  "fetchedStreams": [
+    "playlists"
+  ],
+  "streams": {
+    "playlists": [
+      {
+        "id": "PL-a",
+        "url": "https://www.youtube.com/playlist?list=PL-a",
+        "title": "Playlist A",
+        "owner": "Owner",
+        "owner_url": "https://www.youtube.com/@owner",
+        "visibility": "Unlisted",
+        "video_count": 3,
+        "view_count": 20
+      }
+    ]
+  },
+  "legacyBody": {
+    "playlists": [
+      {
+        "playlistId": "PL-a",
+        "url": "https://www.youtube.com/playlist?list=PL-a",
+        "title": "Playlist A",
+        "owner": "Owner",
+        "ownerUrl": "https://www.youtube.com/@owner",
+        "privacy": "Unlisted",
+        "videoCount": 3,
+        "views": 20
+      }
+    ]
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "youtube.playlists",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; youtube.playlists from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic youtube.playlists records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{playlists:Array<{playlistId:string, url:string, title:string|null, owner:string|null, ownerUrl:string|null, privacy:'Public'|'Private'|'Unlisted'|null, videoCount:number|null, views:number|null}>}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. Unknown visibility becomes null; missing URL rejects the public projection as incomplete_scope."
+      },
+      "fetchedStreams": [
+        "playlists"
+      ],
+      "streams": {
+        "playlists": []
+      },
+      "legacyBody": {
+        "playlists": []
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "youtube.playlists",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; youtube.playlists from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic youtube.playlists records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{playlists:Array<{playlistId:string, url:string, title:string|null, owner:string|null, ownerUrl:string|null, privacy:'Public'|'Private'|'Unlisted'|null, videoCount:number|null, views:number|null}>}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. Unknown visibility becomes null; missing URL rejects the public projection as incomplete_scope."
+      },
+      "fetchedStreams": [
+        "playlists"
+      ],
+      "streams": {
+        "playlists": [
+          {
+            "id": "PL-a",
+            "url": "https://www.youtube.com/playlist?list=PL-a",
+            "title": "Playlist A",
+            "owner": "Owner",
+            "owner_url": "https://www.youtube.com/@owner",
+            "visibility": "Unlisted",
+            "video_count": 3,
+            "view_count": 20
+          },
+          {
+            "id": "PL-b",
+            "url": null,
+            "title": "Playlist A",
+            "owner": "Owner",
+            "owner_url": "https://www.youtube.com/@owner",
+            "visibility": "Unlisted",
+            "video_count": 3,
+            "view_count": 20
+          }
+        ]
+      },
+      "expectedResult": {
+        "ok": false,
+        "error": {
+          "kind": "incomplete_scope",
+          "scope": "youtube.playlists",
+          "reason": "1 source records missing playlists.id, playlists.url"
+        }
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

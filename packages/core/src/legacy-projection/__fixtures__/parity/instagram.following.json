@@ -1,0 +1,110 @@
+{
+  "scope": "instagram.following",
+  "case": "normal",
+  "profileKey": "meta",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; instagram.following from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic instagram.following records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{accounts:Array<{username:string,full_name:string,is_private:boolean,is_verified:boolean,profile_pic_url:string|null,pk?:string}>,total:number}",
+    "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+    "inputHandling": "Only source-declared mappings and observed normalization are represented; no hypothetical consumer fields are added."
+  },
+  "fetchedStreams": [
+    "following"
+  ],
+  "streams": {
+    "following": [
+      {
+        "id": "account-a",
+        "username": "example",
+        "full_name": "Example Person",
+        "is_private": true,
+        "is_verified": true,
+        "profile_pic_url": "https://example.com/avatar.jpg"
+      }
+    ]
+  },
+  "legacyBody": {
+    "accounts": [
+      {
+        "username": "example",
+        "full_name": "Example Person",
+        "is_private": true,
+        "is_verified": true,
+        "profile_pic_url": "https://example.com/avatar.jpg",
+        "pk": "account-a"
+      }
+    ],
+    "total": 1
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "instagram.following",
+      "case": "empty",
+      "profileKey": "meta",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; instagram.following from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic instagram.following records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{accounts:Array<{username:string,full_name:string,is_private:boolean,is_verified:boolean,profile_pic_url:string|null,pk?:string}>,total:number}",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Only source-declared mappings and observed normalization are represented; no hypothetical consumer fields are added."
+      },
+      "fetchedStreams": [
+        "following"
+      ],
+      "streams": {
+        "following": []
+      },
+      "legacyBody": {
+        "accounts": [],
+        "total": 0
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "instagram.following",
+      "case": "dirty-row",
+      "profileKey": "meta",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; instagram.following from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic instagram.following records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{accounts:Array<{username:string,full_name:string,is_private:boolean,is_verified:boolean,profile_pic_url:string|null,pk?:string}>,total:number}",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Only source-declared mappings and observed normalization are represented; no hypothetical consumer fields are added."
+      },
+      "fetchedStreams": [
+        "following"
+      ],
+      "streams": {
+        "following": [
+          {
+            "id": "account-dirty",
+            "username": "dirty",
+            "full_name": null,
+            "is_private": "true",
+            "is_verified": null,
+            "profile_pic_url": ""
+          }
+        ]
+      },
+      "legacyBody": {
+        "accounts": [
+          {
+            "username": "dirty",
+            "full_name": "",
+            "is_private": false,
+            "is_verified": false,
+            "profile_pic_url": null,
+            "pk": "account-dirty"
+          }
+        ],
+        "total": 1
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

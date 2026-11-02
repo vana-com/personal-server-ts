@@ -1,0 +1,252 @@
+{
+  "scope": "instagram.posts",
+  "profileKey": "meta",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; instagram.posts from packages/core/src/legacy-projection/bindings.ts + meta-040-bindings.ts (profileKey=meta) at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+    "pdppBundle": "synthetic instagram.posts records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+  },
+  "fetchedStreams": [
+    "posts",
+    "post_likes"
+  ],
+  "streams": {
+    "posts": [
+      {
+        "id": "post-a",
+        "caption": "A walk",
+        "media_type": "IMAGE",
+        "media_url": "https://example.com/photo.jpg",
+        "like_count": 7,
+        "comment_count": 2,
+        "location_name": "Example Park",
+        "taken_at": "2026-09-01T12:00:00.000Z"
+      }
+    ],
+    "post_likes": [
+      {
+        "post_id": "post-a",
+        "liker_ordinal": 0,
+        "user_id": "user-a",
+        "username": "synthetic_liker",
+        "profile_pic_url": "https://example.com/liker.jpg",
+        "pk": "pk-a",
+        "id": "liker-a"
+      }
+    ]
+  },
+  "legacyBody": {
+    "posts": [
+      {
+        "img_url": "https://example.com/photo.jpg",
+        "caption": "A walk",
+        "num_of_likes": 7,
+        "who_liked": [
+          {
+            "profile_pic_url": "https://example.com/liker.jpg",
+            "pk": "pk-a",
+            "username": "synthetic_liker",
+            "id": "liker-a"
+          }
+        ],
+        "taken_at": "2026-09-01T12:00:00.000Z"
+      }
+    ]
+  },
+  "consumerContractBody": {
+    "posts": [
+      {
+        "img_url": "https://example.com/photo.jpg",
+        "caption": "A walk",
+        "num_of_likes": 7,
+        "who_liked": [
+          {
+            "profile_pic_url": "https://example.com/liker.jpg",
+            "pk": "pk-a",
+            "username": "synthetic_liker",
+            "id": "liker-a"
+          }
+        ],
+        "taken_at": "2026-09-01T12:00:00.000Z",
+        "id": "post-a",
+        "media_type": "IMAGE",
+        "media_url": "https://example.com/photo.jpg",
+        "like_count": 7,
+        "comment_count": 2,
+        "location_name": "Example Park"
+      }
+    ]
+  },
+  "reviewedDifferences": [
+    {
+      "path": "posts[0].comment_count",
+      "legacy": 2,
+      "projected": "<absent>",
+      "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array."
+    },
+    {
+      "path": "posts[0].id",
+      "legacy": "post-a",
+      "projected": "<absent>",
+      "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array."
+    },
+    {
+      "path": "posts[0].like_count",
+      "legacy": 7,
+      "projected": "<absent>",
+      "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array."
+    },
+    {
+      "path": "posts[0].location_name",
+      "legacy": "Example Park",
+      "projected": "<absent>",
+      "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array."
+    },
+    {
+      "path": "posts[0].media_type",
+      "legacy": "IMAGE",
+      "projected": "<absent>",
+      "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array."
+    },
+    {
+      "path": "posts[0].media_url",
+      "legacy": "https://example.com/photo.jpg",
+      "projected": "<absent>",
+      "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array."
+    }
+  ],
+  "cases": [
+    {
+      "scope": "instagram.posts",
+      "profileKey": "meta",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; instagram.posts from packages/core/src/legacy-projection/bindings.ts + meta-040-bindings.ts (profileKey=meta) at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic instagram.posts records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "posts",
+        "post_likes"
+      ],
+      "streams": {
+        "posts": [],
+        "post_likes": []
+      },
+      "legacyBody": {
+        "posts": []
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "instagram.posts",
+      "profileKey": "meta",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; instagram.posts from packages/core/src/legacy-projection/bindings.ts + meta-040-bindings.ts (profileKey=meta) at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic instagram.posts records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "posts",
+        "post_likes"
+      ],
+      "streams": {
+        "posts": [
+          {
+            "id": "post-dirty",
+            "caption": null,
+            "media_type": "VIDEO",
+            "media_url": null,
+            "like_count": "7",
+            "comment_count": null,
+            "location_name": 42,
+            "taken_at": null
+          }
+        ],
+        "post_likes": []
+      },
+      "legacyBody": {
+        "posts": [
+          {
+            "img_url": "",
+            "caption": "",
+            "num_of_likes": 0,
+            "who_liked": []
+          }
+        ]
+      },
+      "consumerContractBody": {
+        "posts": [
+          {
+            "img_url": "",
+            "caption": null,
+            "num_of_likes": 0,
+            "who_liked": [],
+            "id": "post-dirty",
+            "media_type": "VIDEO",
+            "media_url": null,
+            "like_count": "7",
+            "comment_count": null,
+            "location_name": 42,
+            "taken_at": null
+          }
+        ]
+      },
+      "reviewedDifferences": [
+        {
+          "path": "posts[0].caption",
+          "legacy": null,
+          "projected": "",
+          "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array. The dirty post is retained: null media_url/caption become empty strings, nonnumeric like_count becomes zero, and null taken_at is omitted."
+        },
+        {
+          "path": "posts[0].comment_count",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array. The dirty post is retained: null media_url/caption become empty strings, nonnumeric like_count becomes zero, and null taken_at is omitted."
+        },
+        {
+          "path": "posts[0].id",
+          "legacy": "post-dirty",
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array. The dirty post is retained: null media_url/caption become empty strings, nonnumeric like_count becomes zero, and null taken_at is omitted."
+        },
+        {
+          "path": "posts[0].like_count",
+          "legacy": "7",
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array. The dirty post is retained: null media_url/caption become empty strings, nonnumeric like_count becomes zero, and null taken_at is omitted."
+        },
+        {
+          "path": "posts[0].location_name",
+          "legacy": 42,
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array. The dirty post is retained: null media_url/caption become empty strings, nonnumeric like_count becomes zero, and null taken_at is omitted."
+        },
+        {
+          "path": "posts[0].media_type",
+          "legacy": "VIDEO",
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array. The dirty post is retained: null media_url/caption become empty strings, nonnumeric like_count becomes zero, and null taken_at is omitted."
+        },
+        {
+          "path": "posts[0].media_url",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array. The dirty post is retained: null media_url/caption become empty strings, nonnumeric like_count becomes zero, and null taken_at is omitted."
+        },
+        {
+          "path": "posts[0].taken_at",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Hoe-kemon consumes the whole posts payload: id, media_type, comment_count and location_name are omitted; media_url/like_count are renamed img_url/num_of_likes. Meta profile preserves liker profile_pic_url, pk and id, unlike the default binding. Source-parser loss of video media and later carousel images cannot be recovered or certified by these synthetic fixtures. Web Source Detail can still count the retained posts array. The dirty post is retained: null media_url/caption become empty strings, nonnumeric like_count becomes zero, and null taken_at is omitted."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,124 @@
+{
+  "scope": "youtube.subscriptions",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; youtube.subscriptions from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic youtube.subscriptions records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{subscriptions:Array<{channelTitle:string, channelUrl:string, handle:string|null, channelId:string|null, avatarUrl:string|null, subscriberCountText:string|null, subscriberCount:number|null, description:string|null, isVerified:boolean, isBellNotification:boolean}>}.",
+    "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. subscriber_count_text maps to subscriberCountText; a missing or blank value gives null, legacy's own default. id is used for ordering but not emitted. Dirty missing title rejects the public projection as incomplete_scope."
+  },
+  "fetchedStreams": [
+    "subscriptions"
+  ],
+  "streams": {
+    "subscriptions": [
+      {
+        "id": "sub-a",
+        "channel_id": "UC-a",
+        "channel_title": "Channel A",
+        "channel_url": "https://www.youtube.com/channel/UC-a",
+        "handle": "@channel-a",
+        "avatar_url": "https://example.com/a.png",
+        "subscriber_count": 1200,
+        "subscriber_count_text": "1.2K subscribers",
+        "description": "Channel A description",
+        "is_verified": true,
+        "notifications": false
+      }
+    ]
+  },
+  "legacyBody": {
+    "subscriptions": [
+      {
+        "channelTitle": "Channel A",
+        "channelUrl": "https://www.youtube.com/channel/UC-a",
+        "handle": "@channel-a",
+        "channelId": "UC-a",
+        "avatarUrl": "https://example.com/a.png",
+        "subscriberCountText": "1.2K subscribers",
+        "subscriberCount": 1200,
+        "description": "Channel A description",
+        "isVerified": true,
+        "isBellNotification": false
+      }
+    ]
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "youtube.subscriptions",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; youtube.subscriptions from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic youtube.subscriptions records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{subscriptions:Array<{channelTitle:string, channelUrl:string, handle:string|null, channelId:string|null, avatarUrl:string|null, subscriberCountText:string|null, subscriberCount:number|null, description:string|null, isVerified:boolean, isBellNotification:boolean}>}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. subscriber_count_text maps to subscriberCountText; a missing or blank value gives null, legacy's own default. id is used for ordering but not emitted. Dirty missing title rejects the public projection as incomplete_scope."
+      },
+      "fetchedStreams": [
+        "subscriptions"
+      ],
+      "streams": {
+        "subscriptions": []
+      },
+      "legacyBody": {
+        "subscriptions": []
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "youtube.subscriptions",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; youtube.subscriptions from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic youtube.subscriptions records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{subscriptions:Array<{channelTitle:string, channelUrl:string, handle:string|null, channelId:string|null, avatarUrl:string|null, subscriberCountText:string|null, subscriberCount:number|null, description:string|null, isVerified:boolean, isBellNotification:boolean}>}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. subscriber_count_text maps to subscriberCountText; a missing or blank value gives null, legacy's own default. id is used for ordering but not emitted. Dirty missing title rejects the public projection as incomplete_scope."
+      },
+      "fetchedStreams": [
+        "subscriptions"
+      ],
+      "streams": {
+        "subscriptions": [
+          {
+            "id": "sub-a",
+            "channel_id": "UC-a",
+            "channel_title": "Channel A",
+            "channel_url": "https://www.youtube.com/channel/UC-a",
+            "handle": "@channel-a",
+            "avatar_url": "https://example.com/a.png",
+            "subscriber_count": 1200,
+            "subscriber_count_text": "1.2K subscribers",
+            "description": "Channel A description",
+            "is_verified": true,
+            "notifications": false
+          },
+          {
+            "id": "sub-b",
+            "channel_id": "UC-a",
+            "channel_title": " ",
+            "channel_url": "https://www.youtube.com/channel/UC-a",
+            "handle": "@channel-a",
+            "avatar_url": "https://example.com/a.png",
+            "subscriber_count": 1200,
+            "subscriber_count_text": "1.2K subscribers",
+            "description": "Channel A description",
+            "is_verified": true,
+            "notifications": false
+          }
+        ]
+      },
+      "expectedResult": {
+        "ok": false,
+        "error": {
+          "kind": "incomplete_scope",
+          "scope": "youtube.subscriptions",
+          "reason": "1 source records missing subscriptions.channel_title"
+        }
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

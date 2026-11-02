@@ -769,3 +769,63 @@ describe("startPersonalServer relay persistence wiring", () => {
     }
   });
 });
+
+describe("PS Lite persistence bundle — replication door", () => {
+  /** Boot over `bundle` with the flag as a host persists it, then stop. */
+  async function bootStatus(bundle: PsLitePersistenceBundle, enabled: boolean) {
+    const stored = await bundle.state.get<Record<string, unknown>>("config-v1");
+    if (stored)
+      await bundle.state.set("config-v1", {
+        ...stored,
+        replication: { enabled },
+      });
+    const server = await startServerOverBundle(bundle, {
+      configDefaults: {
+        server: { origin: "https://ps.local" },
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+        replication: { enabled },
+      },
+    });
+    const status = server.replication?.status();
+    expect((await server.info()).status).toBe("ready");
+    await server.stop();
+    return status;
+  }
+
+  it("reports never with the flag off, so a host can offer the opt-in", async () => {
+    const bundle = memoryBundle();
+    expect(await bootStatus(bundle, false)).toEqual({ state: "never" });
+    expect(await bundle.state.get("replication-door-v1")).toBeNull();
+  });
+
+  it("keeps off permanent: on, off, then on is refused and the server still starts", async () => {
+    const bundle = memoryBundle();
+    expect(await bootStatus(bundle, true)).toEqual({ state: "on" });
+    expect(await bootStatus(bundle, true)).toEqual({ state: "on" });
+    expect(await bootStatus(bundle, false)).toEqual({ state: "off" });
+    expect(await bootStatus(bundle, true)).toEqual({
+      state: "refused",
+      refusal: "reenable_refused",
+    });
+    expect(await bootStatus(bundle, false)).toEqual({ state: "off" });
+  });
+
+  it("treats an unreadable door entry as closed", async () => {
+    const bundle = memoryBundle();
+    await bundle.state.set("replication-door-v1", { off: "maybe" });
+    expect(await bootStatus(bundle, true)).toEqual({
+      state: "refused",
+      refusal: "reenable_refused",
+    });
+  });
+
+  it("reports no status for a caller-supplied runtime, whose storage never passed the door", async () => {
+    const server = await startPersonalServer({
+      runtime: await registrationRuntimeOverBundle(memoryBundle()),
+      relay: false,
+    });
+    expect(server.replication).toBeUndefined();
+    await server.stop();
+  });
+});

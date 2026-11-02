@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { diffBodies } from "../legacy-projection/__fixtures__/parity/diff.js";
+import { LEGACY_SCOPE_BINDINGS } from "../legacy-projection/index.js";
 import {
   ingestBinaryDataContract,
   ingestDataContract,
@@ -72,8 +73,8 @@ describe("classifyStoredBody", () => {
     ["chatgpt.conversations", { records: [] }, "pdpp-projected"],
     ["claude.projects", { records: [{ id: "p" }] }, "pdpp-projected"],
     ["chatgpt.messages", { records: [] }, "pdpp-unprojected"],
-    ["oura.sleep", { records: [] }, "pdpp-unprojected"],
-    ["github.repositories", { records: [] }, "pdpp-unprojected"],
+    ["oura.sleep", { records: [] }, "pdpp-projected"],
+    ["github.repositories", { records: [] }, "pdpp-projected"],
     ["chatgpt.conversations", { conversations: [], total: 0 }, "legacy"],
     ["chatgpt.conversations", { records: [], total: 0 }, "legacy"],
     ["chatgpt.conversations", { records: {} }, "legacy"],
@@ -96,6 +97,15 @@ describe("classifyStoredBody", () => {
   ])("%s %j is %s", (scope, data, form) => {
     expect(classifyStoredBody(scope, data)).toBe(form);
   });
+
+  it("classifies every bound legacy scope for projection", () => {
+    for (const scope of LEGACY_SCOPE_BINDINGS.keys()) {
+      expect(classifyStoredBody(scope, { records: [] })).toBe("pdpp-projected");
+    }
+    expect(classifyStoredBody("spotify.saved_tracks", { records: [] })).toBe(
+      "pdpp-unprojected",
+    );
+  });
 });
 
 describe("legacyScopesProjectedFrom", () => {
@@ -104,6 +114,7 @@ describe("legacyScopesProjectedFrom", () => {
     ["chatgpt.conversations", []],
     ["claude.account_profile", ["claude.conversations", "claude.projects"]],
     ["claude.project_documents", ["claude.projects"]],
+    ["spotify.playlist_items", ["spotify.playlists"]],
     ["oura.sleep", []],
     ["notes", []],
   ])("%s → %j", (scope, expected) => {
@@ -112,6 +123,27 @@ describe("legacyScopesProjectedFrom", () => {
 });
 
 describe("withLegacyProjection", () => {
+  it.each([
+    ["2026-10-01T00:00:00Z", "2026-10-01T00:00:00.500Z"],
+    ["2026-10-01T00:00:00.500Z", "2026-10-01T00:00:00Z"],
+  ])(
+    "uses the newest input instant for mixed formats (%s, %s)",
+    async (own, sibling) => {
+      const raw = createMemoryDataStorage();
+      await store(raw, "chatgpt.conversations", own, {
+        records: [conversation],
+      });
+      await store(raw, "chatgpt.messages", sibling, { records: messages });
+      const envelope = await withLegacyProjection(raw).readEnvelope(
+        "chatgpt.conversations",
+        own,
+      );
+      expect(envelope.data).toMatchObject({
+        conversations: [{ fetched_at: "2026-10-01T00:00:00.500Z" }],
+      });
+    },
+  );
+
   it("serves chatgpt.conversations projected from the stored conversations and messages streams", async () => {
     const raw = createMemoryDataStorage();
     await store(raw, "chatgpt.messages", "2026-10-01T00:00:02.000Z", {
@@ -203,7 +235,6 @@ describe("withLegacyProjection", () => {
   it.each([
     ["a legacy body", "chatgpt.conversations", { conversations: [], total: 0 }],
     ["an unbound records stream", "chatgpt.messages", { records: messages }],
-    ["records of an unprojected source", "oura.sleep", { records: [{}] }],
     ["an unrelated scope", "notes.entries", { text: "hello" }],
   ])("passes %s through unchanged", async (_label, scope, body) => {
     const raw = createMemoryDataStorage();
@@ -276,7 +307,7 @@ describe("withLegacyProjection", () => {
     });
   });
 
-  it("serves the stored body and reports the error when projection fails", async () => {
+  it("rejects the served read and reports the error when projection fails", async () => {
     const raw = createMemoryDataStorage();
     const onIssue = vi.fn();
     // A claude scope with no account_profile stream cannot be projected.
@@ -285,12 +316,20 @@ describe("withLegacyProjection", () => {
     });
     const served = withLegacyProjection(raw, { onIssue });
 
-    const envelope = await served.readEnvelope(
-      "claude.projects",
-      "2026-10-01T00:00:01.000Z",
-    );
-
-    expect(envelope.data).toEqual({
+    await expect(
+      served.readEnvelope("claude.projects", "2026-10-01T00:00:01.000Z"),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+    });
+    expect(
+      (
+        await served.readStoredEnvelope!(
+          "claude.projects",
+          "2026-10-01T00:00:01.000Z",
+        )
+      ).data,
+    ).toEqual({
       records: [{ id: "p1", name: "Research" }],
     });
     expect(onIssue).toHaveBeenCalledWith(
@@ -299,6 +338,50 @@ describe("withLegacyProjection", () => {
         scope: "claude.projects",
         error: expect.objectContaining({ kind: "missing_stream" }),
       }),
+    );
+  });
+
+  it("rejects every served read path for unidentified multi-profile rows while preserving stored and legacy bodies", async () => {
+    const raw = createMemoryDataStorage();
+    const scope = "oura.sleep";
+    const rawAt = "2026-10-01T00:00:01.000Z";
+    const legacyAt = "2026-10-02T00:00:01.000Z";
+    const rawBody = { records: [{ id: "sleep-1" }] };
+    const legacyBody = { sleepPeriods: [], total: 0 };
+    await store(raw, scope, rawAt, rawBody);
+    await store(raw, scope, legacyAt, legacyBody);
+
+    const rawFallback = vi.fn(async () => {
+      throw new Error("The served read used the raw fallback");
+    });
+    raw.readEnvelopeBytes = rawFallback;
+    raw.readEnvelopeStream = rawFallback;
+    raw.readEnvelopePreview = rawFallback;
+    raw.readScopeBlocks = rawFallback;
+    raw.readBlockManifest = rawFallback;
+    const served = withLegacyProjection(raw);
+
+    const reads: Array<() => Promise<unknown>> = [
+      () => served.readEnvelope(scope, rawAt),
+      () => served.readEnvelopeBytes!(scope, rawAt),
+      () => served.readEnvelopeStream!(scope, rawAt),
+      () => served.readEnvelopePreview!(scope, rawAt, { maxBytes: 1024 }),
+      () => served.readScopeBlocks!(scope, rawAt, { maxBytes: 1024 }),
+      () => served.readBlockManifest!(scope, rawAt),
+    ];
+    for (const read of reads) {
+      await expect(read()).rejects.toMatchObject({
+        code: 409,
+        errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+      });
+    }
+
+    expect(rawFallback).not.toHaveBeenCalled();
+    expect((await served.readStoredEnvelope!(scope, rawAt)).data).toEqual(
+      rawBody,
+    );
+    expect(await served.readEnvelope(scope, legacyAt)).toEqual(
+      await raw.readEnvelope(scope, legacyAt),
     );
   });
 
@@ -453,7 +536,7 @@ describe("withLegacyProjection", () => {
     expect(readEnvelope).toHaveBeenCalledOnce();
   });
 
-  it("serves a body of tagged {stream, data} rows as stored", async () => {
+  it("rejects tagged {stream, data} rows in a bound legacy scope", async () => {
     const raw = createMemoryDataStorage();
     await store(raw, "chatgpt.messages", "2026-10-01T00:00:00.000Z", {
       records: messages,
@@ -463,12 +546,73 @@ describe("withLegacyProjection", () => {
     };
     await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", body);
 
-    const { data } = await withLegacyProjection(raw).readEnvelope(
-      "chatgpt.conversations",
-      "2026-10-01T00:00:01.000Z",
+    const served = withLegacyProjection(raw);
+    await expect(
+      served.readEnvelope("chatgpt.conversations", "2026-10-01T00:00:01.000Z"),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+    });
+    expect(
+      (
+        await served.readStoredEnvelope!(
+          "chatgpt.conversations",
+          "2026-10-01T00:00:01.000Z",
+        )
+      ).data,
+    ).toEqual(body);
+  });
+
+  // Strava gained a browser profile; both profiles are the same identity, so
+  // stored rows written before identity tags keep projecting.
+  it.each([
+    ["unmarked", {}],
+    [
+      "strava-browser",
+      {
+        $pdpp: { sourceId: "https://registry.pdpp.dev/sources/strava-browser" },
+      },
+    ],
+    [
+      "strava",
+      { $pdpp: { sourceId: "https://registry.pdpp.dev/sources/strava" } },
+    ],
+  ])("serves %s stored Strava activities", async (_name, mark) => {
+    const raw = createMemoryDataStorage();
+    const at = "2026-10-01T00:00:01.000Z";
+    await store(raw, "strava.activities", at, {
+      records: [{ id: "ride-1", activity_type: "Ride", ...mark }],
+    });
+
+    const served = await withLegacyProjection(raw).readEnvelope(
+      "strava.activities",
+      at,
     );
 
-    expect(data).toEqual(body);
+    expect(served.data).toEqual({
+      activities: [{ id: "ride-1", activity_type: "Ride" }],
+    });
+  });
+
+  it("refuses stored Strava activities from two producers", async () => {
+    const raw = createMemoryDataStorage();
+    const at = "2026-10-01T00:00:01.000Z";
+    const from = (key: string) => ({
+      $pdpp: { sourceId: `https://registry.pdpp.dev/sources/${key}` },
+    });
+    await store(raw, "strava.activities", at, {
+      records: [
+        { id: "ride-1", ...from("strava") },
+        { id: "ride-2", ...from("strava-browser") },
+      ],
+    });
+
+    await expect(
+      withLegacyProjection(raw).readEnvelope("strava.activities", at),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+    });
   });
 
   it.each([
@@ -530,6 +674,43 @@ describe("withLegacyProjection parity goldens", () => {
   // Same clock the legacy connector ran under (see the goldens' provenance),
   // so the projection time equals legacy's stamped fetched_at.
   const COLLECTED_AT = "2026-10-01T00:00:00.000Z";
+
+  it("does not join identified live messages into historical untagged Claude export rows", async () => {
+    const golden = JSON.parse(
+      readFileSync(
+        new URL(
+          "../legacy-projection/__fixtures__/parity/claude.conversations.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as { streams: Record<string, Record<string, unknown>[]> };
+    const raw = createMemoryDataStorage();
+    for (const [stream, rows] of Object.entries(golden.streams)) {
+      await store(raw, `claude.${stream}`, COLLECTED_AT, {
+        records:
+          stream === "messages"
+            ? rows.map((row) => ({
+                ...row,
+                $pdpp: {
+                  sourceId: "https://registry.pdpp.dev/sources/anthropic-live",
+                },
+              }))
+            : rows,
+      });
+    }
+    await expect(
+      withLegacyProjection(raw).readEnvelope(
+        "claude.conversations",
+        COLLECTED_AT,
+      ),
+    ).rejects.toMatchObject({
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+      details: {
+        reason: "Joined streams have conflicting connector identities",
+      },
+    });
+  });
 
   it.each([
     "chatgpt.conversations",
@@ -672,6 +853,43 @@ describe("supersedeLegacyVersions", () => {
     expect(raw.entries).toHaveLength(2);
   });
 
+  it("keeps the legacy claude.conversations when no conversation count proves the messages complete", async () => {
+    const scope = "claude.conversations";
+    const golden = JSON.parse(
+      readFileSync(
+        new URL(
+          `../legacy-projection/__fixtures__/parity/${scope}.json`,
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as {
+      streams: Record<string, Record<string, unknown>[]>;
+      legacyBody: Record<string, unknown>;
+    };
+    const raw = createMemoryDataStorage();
+    await store(raw, scope, "2026-09-01T00:00:00.000Z", golden.legacyBody);
+    for (const [stream, rows] of Object.entries(golden.streams)) {
+      await store(raw, `claude.${stream}`, "2026-10-01T00:00:00.000Z", {
+        records: rows.map(({ message_count: _count, ...row }) => row),
+      });
+    }
+
+    const result = await supersedeLegacyVersions(
+      withLegacyProjection(raw),
+      scope,
+      "2026-10-01T00:00:00.000Z",
+    );
+
+    expect(result).toEqual({
+      superseded: [],
+      refused: "the projection is partial (records_partial)",
+    });
+    expect(raw.entries.filter((entry) => entry.scope === scope)).toHaveLength(
+      2,
+    );
+  });
+
   it.each([
     ["claude.conversations", "messages", "conversation_id"],
     ["claude.projects", "project_documents", "project_id"],
@@ -692,15 +910,24 @@ describe("supersedeLegacyVersions", () => {
       };
       const raw = createMemoryDataStorage();
       await store(raw, scope, "2026-09-01T00:00:00.000Z", golden.legacyBody);
+      const nested = golden.streams[nestedStream]!;
+      const keptNested = nested.slice(0, nested.length - 1);
       for (const [stream, rows] of Object.entries(golden.streams)) {
+        // The source agrees with itself (its count matches the rows it
+        // kept), but holds fewer nested items than the legacy file.
         const kept =
           stream === nestedStream
-            ? rows.slice(0, rows.length - 1)
-            : rows.map((row) => {
-                // No source count to check the nested rows against.
-                const { message_count: _count, ...rest } = row;
-                return rest;
-              });
+            ? keptNested
+            : rows.map((row) =>
+                "message_count" in row
+                  ? {
+                      ...row,
+                      message_count: keptNested.filter(
+                        (message) => message.conversation_id === row.id,
+                      ).length,
+                    }
+                  : row,
+              );
         await store(raw, `claude.${stream}`, "2026-10-01T00:00:00.000Z", {
           records: kept,
         });

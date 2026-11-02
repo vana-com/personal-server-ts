@@ -13,30 +13,58 @@ const project = (scope: string, records: PdppRecord[]) =>
   });
 
 describe("production DCR semantic parity fixtures", () => {
-  it("fails H-E-B order projection when a declaration-valid nullable product id cannot be represented", () => {
-    expect(
-      project("heb.orders", hebInput.records as PdppRecord[]),
-    ).toMatchObject({
-      ok: false,
-      error: {
-        kind: "incomplete_scope",
-        scope: "heb.orders",
-        reason: expect.stringContaining("order_items.product_id"),
+  it("reports an H-E-B order line whose nullable product id cannot be represented instead of delivering it", () => {
+    expect(project("heb.orders", hebInput.records as PdppRecord[])).toEqual({
+      ok: true,
+      payload: {
+        orders: [
+          expect.objectContaining({
+            orderId: "HEB12345",
+            items: [expect.objectContaining({ productId: "12345678" })],
+          }),
+        ],
+        totalOrders: 1,
+        totalItems: 1,
       },
+      diagnostics: [
+        {
+          kind: "records_dropped",
+          scope: "heb.orders",
+          stream: "order_items",
+          count: 1,
+          reasons: ["projection_order_item_missing_product_id"],
+        },
+      ],
     });
   });
 
-  it("fails Whole Foods orders instead of silently dropping a nullable product id", () => {
-    expect(
-      project("wholefoods.orders", cases["wholefoods.orders"] as PdppRecord[]),
-    ).toMatchObject({
+  it("rejects the Whole Foods scope, keeping both omission counts, when the only line lacks a product id", () => {
+    const result = project(
+      "wholefoods.orders",
+      cases["wholefoods.orders"] as PdppRecord[],
+    );
+    expect(result).toMatchObject({
       ok: false,
-      error: {
-        kind: "incomplete_scope",
-        scope: "wholefoods.orders",
-        reason: expect.stringContaining("order_items.product_id"),
-      },
+      error: { kind: "incomplete_scope", scope: "wholefoods.orders" },
     });
+    expect(
+      !result.ok &&
+        result.error.kind === "incomplete_scope" &&
+        result.error.diagnostics,
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stream: "order_items",
+          reasons: ["projection_order_item_missing_product_id"],
+          count: 1,
+        }),
+        expect.objectContaining({
+          stream: "orders",
+          reasons: ["projection_order_items_gap"],
+          count: 1,
+        }),
+      ]),
+    );
   });
 
   it("retains Instagram posts with the old collector's null sentinels", () => {

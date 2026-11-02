@@ -1,0 +1,207 @@
+{
+  "scope": "heb.nutrition",
+  "case": "normal",
+  "fetchedStreams": [
+    "nutrition",
+    "orders",
+    "order_items"
+  ],
+  "streams": {
+    "nutrition": [
+      {
+        "id": "nutrition-a",
+        "product_id": "12345678",
+        "name": "Oats",
+        "product_url": "https://example.test/oats",
+        "source": "heb_product_page",
+        "confidence": "high",
+        "calories": 150,
+        "protein_g": 5,
+        "serving_size": "40 g",
+        "servings_per_container": "10"
+      }
+    ],
+    "orders": [],
+    "order_items": [
+      {
+        "id": "line-a",
+        "product_id": "12345678",
+        "name": "Oats",
+        "product_url": "https://example.test/oats",
+        "image_url": "https://example.test/oats.jpg"
+      }
+    ]
+  },
+  "legacyBody": {
+    "items": {
+      "12345678": {
+        "name": "Oats",
+        "productUrl": "https://example.test/oats",
+        "source": "heb_product_page",
+        "confidence": "high",
+        "calories": 150,
+        "protein_g": 5,
+        "servingSize": "40 g",
+        "servingsPerContainer": "10",
+        "images": {
+          "thumbnail": "https://images.heb.com/is/image/HEBGrocery/prd-small/012345678.jpg",
+          "full": "https://images.heb.com/is/image/HEBGrocery/12345678-1"
+        }
+      }
+    },
+    "coverage": {
+      "total": 1,
+      "found": 1,
+      "foundUSDA": 0,
+      "blocked": 0,
+      "percentCovered": 100
+    }
+  },
+  "reviewedDifferences": [],
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; heb.nutrition from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic heb.nutrition records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+    "legacySchemaNote": "Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, apps/desktop/connectors/heb/schemas/heb.nutrition.json; sha256:2dbc47a40391b7ee11c8601a2b2cd5bf327aaa552898f0d8c957dc111d92807c.",
+    "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.12345678\":\"object\",\"$.items.12345678.name\":\"string\",\"$.items.12345678.productUrl\":\"string\",\"$.items.12345678.source\":\"string\",\"$.items.12345678.confidence\":\"string\",\"$.items.12345678.calories\":\"number\",\"$.items.12345678.protein_g\":\"number\",\"$.items.12345678.servingSize\":\"string\",\"$.items.12345678.servingsPerContainer\":\"string\",\"$.items.12345678.images\":\"object\",\"$.items.12345678.images.thumbnail\":\"string\",\"$.items.12345678.images.full\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"empty\":{\"$\":\"object\",\"$.items\":\"object\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"dirty-row\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.12345678\":\"object\",\"$.items.12345678.name\":\"string\",\"$.items.12345678.productUrl\":\"string\",\"$.items.12345678.source\":\"string\",\"$.items.12345678.confidence\":\"string\",\"$.items.12345678.protein_g\":\"null\",\"$.items.12345678.servingSize\":\"string\",\"$.items.12345678.servingsPerContainer\":\"string\",\"$.items.12345678.images\":\"object\",\"$.items.12345678.images.thumbnail\":\"string\",\"$.items.12345678.images.full\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"}}",
+    "behaviorNote": "Provider product_id keys the map; images use deterministic H-E-B URLs. Dirty string calories is omitted while explicit null protein_g is preserved."
+  },
+  "cases": [
+    {
+      "scope": "heb.nutrition",
+      "case": "empty",
+      "fetchedStreams": [
+        "nutrition",
+        "orders",
+        "order_items"
+      ],
+      "streams": {
+        "nutrition": [],
+        "orders": [],
+        "order_items": []
+      },
+      "legacyBody": {
+        "items": {},
+        "coverage": {
+          "total": 0,
+          "found": 0,
+          "foundUSDA": 0,
+          "blocked": 0,
+          "percentCovered": 0
+        }
+      },
+      "reviewedDifferences": [],
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; heb.nutrition from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic heb.nutrition records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+        "legacySchemaNote": "Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, apps/desktop/connectors/heb/schemas/heb.nutrition.json; sha256:2dbc47a40391b7ee11c8601a2b2cd5bf327aaa552898f0d8c957dc111d92807c.",
+        "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.12345678\":\"object\",\"$.items.12345678.name\":\"string\",\"$.items.12345678.productUrl\":\"string\",\"$.items.12345678.source\":\"string\",\"$.items.12345678.confidence\":\"string\",\"$.items.12345678.calories\":\"number\",\"$.items.12345678.protein_g\":\"number\",\"$.items.12345678.servingSize\":\"string\",\"$.items.12345678.servingsPerContainer\":\"string\",\"$.items.12345678.images\":\"object\",\"$.items.12345678.images.thumbnail\":\"string\",\"$.items.12345678.images.full\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"empty\":{\"$\":\"object\",\"$.items\":\"object\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"dirty-row\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.12345678\":\"object\",\"$.items.12345678.name\":\"string\",\"$.items.12345678.productUrl\":\"string\",\"$.items.12345678.source\":\"string\",\"$.items.12345678.confidence\":\"string\",\"$.items.12345678.protein_g\":\"null\",\"$.items.12345678.servingSize\":\"string\",\"$.items.12345678.servingsPerContainer\":\"string\",\"$.items.12345678.images\":\"object\",\"$.items.12345678.images.thumbnail\":\"string\",\"$.items.12345678.images.full\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"}}",
+        "behaviorNote": "Provider product_id keys the map; images use deterministic H-E-B URLs. Dirty string calories is omitted while explicit null protein_g is preserved."
+      }
+    },
+    {
+      "scope": "heb.nutrition",
+      "case": "dirty-row",
+      "fetchedStreams": [
+        "nutrition",
+        "orders",
+        "order_items"
+      ],
+      "streams": {
+        "nutrition": [
+          {
+            "id": "nutrition-a",
+            "product_id": "12345678",
+            "name": "Oats",
+            "product_url": "https://example.test/oats",
+            "source": "heb_product_page",
+            "confidence": "high",
+            "calories": "unknown",
+            "protein_g": null,
+            "serving_size": "40 g",
+            "servings_per_container": "10"
+          }
+        ],
+        "orders": [],
+        "order_items": [
+          {
+            "id": "line-a",
+            "product_id": "12345678",
+            "name": "Oats",
+            "product_url": "https://example.test/oats",
+            "image_url": "https://example.test/oats.jpg"
+          }
+        ]
+      },
+      "legacyBody": {
+        "items": {
+          "12345678": {
+            "name": "Oats",
+            "productUrl": "https://example.test/oats",
+            "source": "heb_product_page",
+            "confidence": "high",
+            "protein_g": null,
+            "servingSize": "40 g",
+            "servingsPerContainer": "10",
+            "images": {
+              "thumbnail": "https://images.heb.com/is/image/HEBGrocery/prd-small/012345678.jpg",
+              "full": "https://images.heb.com/is/image/HEBGrocery/12345678-1"
+            }
+          }
+        },
+        "coverage": {
+          "total": 1,
+          "found": 1,
+          "foundUSDA": 0,
+          "blocked": 0,
+          "percentCovered": 100
+        }
+      },
+      "reviewedDifferences": [
+        {
+          "path": "items.12345678.calories",
+          "legacy": "unknown",
+          "projected": "<absent>",
+          "reason": "Source nutrition.calories is present as a malformed string; the binding emits only number or null nutrient values and omits this field."
+        }
+      ],
+      "consumerContractBody": {
+        "items": {
+          "12345678": {
+            "name": "Oats",
+            "productUrl": "https://example.test/oats",
+            "source": "heb_product_page",
+            "confidence": "high",
+            "protein_g": null,
+            "servingSize": "40 g",
+            "servingsPerContainer": "10",
+            "images": {
+              "thumbnail": "https://images.heb.com/is/image/HEBGrocery/prd-small/012345678.jpg",
+              "full": "https://images.heb.com/is/image/HEBGrocery/12345678-1"
+            },
+            "calories": "unknown"
+          }
+        },
+        "coverage": {
+          "total": 1,
+          "found": 1,
+          "foundUSDA": 0,
+          "blocked": 0,
+          "percentCovered": 100
+        }
+      },
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; heb.nutrition from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic heb.nutrition records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+        "legacySchemaNote": "Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, apps/desktop/connectors/heb/schemas/heb.nutrition.json; sha256:2dbc47a40391b7ee11c8601a2b2cd5bf327aaa552898f0d8c957dc111d92807c.",
+        "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.12345678\":\"object\",\"$.items.12345678.name\":\"string\",\"$.items.12345678.productUrl\":\"string\",\"$.items.12345678.source\":\"string\",\"$.items.12345678.confidence\":\"string\",\"$.items.12345678.calories\":\"number\",\"$.items.12345678.protein_g\":\"number\",\"$.items.12345678.servingSize\":\"string\",\"$.items.12345678.servingsPerContainer\":\"string\",\"$.items.12345678.images\":\"object\",\"$.items.12345678.images.thumbnail\":\"string\",\"$.items.12345678.images.full\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"empty\":{\"$\":\"object\",\"$.items\":\"object\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"dirty-row\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.12345678\":\"object\",\"$.items.12345678.name\":\"string\",\"$.items.12345678.productUrl\":\"string\",\"$.items.12345678.source\":\"string\",\"$.items.12345678.confidence\":\"string\",\"$.items.12345678.protein_g\":\"null\",\"$.items.12345678.servingSize\":\"string\",\"$.items.12345678.servingsPerContainer\":\"string\",\"$.items.12345678.images\":\"object\",\"$.items.12345678.images.thumbnail\":\"string\",\"$.items.12345678.images.full\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"}}",
+        "behaviorNote": "Provider product_id keys the map; images use deterministic H-E-B URLs. Dirty string calories is omitted while explicit null protein_g is preserved."
+      }
+    }
+  ]
+}

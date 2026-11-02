@@ -1,3 +1,4 @@
+import { importOuraBrowserRecords } from "./oura-import.js";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   withLegacyProjection,
@@ -29,13 +30,18 @@ import {
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
+  handlePersonalServerScopeUploadAppend,
+  createScopeUploadRegistry,
+  handleOuraCollectionRequirementsRequest,
   handlePersonalServerGrantsRequest,
   handlePersonalServerOauthTokenRequest,
   handlePersonalServerSyncRequest,
   type PersonalServerApiAuthPort,
+  type PersonalServerApiLogger,
   type PersonalServerReadAuthInput,
   type PersonalServerReadAuthResult,
   type PersonalServerReadFulfillmentReporter,
+  type PreparedScopeUploadBatch,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   handlePersonalServerDerivativesRequest,
@@ -109,6 +115,7 @@ import {
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
+import type { LiteReplicationRuntime } from "./replication-runtime.js";
 import {
   createDefaultPsLiteAccessLogStore,
   createDefaultPsLiteSaveConfig,
@@ -127,7 +134,14 @@ export type PsLiteReadAuthInput = PersonalServerReadAuthInput;
 
 export type PsLiteReadAuthResult = PersonalServerReadAuthResult;
 
-export type PsLiteAuthAdapter = PersonalServerApiAuthPort;
+export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
+  /**
+   * Opt in only when owner authorization does not interpret application body
+   * fields. Direct uploads authenticate a digest commitment instead of items.
+   * Existing/custom adapters without this flag retain their HTTP body contract.
+   */
+  supportsScopeUploadCommitments?: true;
+}
 
 export interface PsLiteRuntimeOptions {
   storage: PsLiteStorageAdapter | DataStoragePort;
@@ -165,6 +179,8 @@ export interface PsLiteRuntimeOptions {
    * alongside the sync manager, which keeps it current.
    */
   scopeDeletions?: ScopeDeletionTracker;
+  /** Receives the cause of every 500 the runtime answers. */
+  logger?: PersonalServerApiLogger;
   additions?: DurableAdditionsService;
   accessLogReader?: AccessLogReader;
   accessLogWriter?: AccessLogWriter;
@@ -235,6 +251,12 @@ export interface PsLiteRuntimeOptions {
    */
   diagnostics?: DiagnosticsRecorder;
   /**
+   * Record replication (host contract §4.4). `activate` resumes it and
+   * `deactivate` pauses it; owner-only `GET /v1/replication/status` and
+   * `POST /v1/replication/sync` expose it. Absent means off.
+   */
+  replication?: LiteReplicationRuntime;
+  /**
    * Called when a legacy scope cannot be projected from stored PDPP records
    * (the stored body is then served) or is projected with rows left out.
    * Defaults to a console warning.
@@ -268,6 +290,11 @@ export interface PsLiteRuntime extends RuntimeAvailabilityPort {
   activate(): void;
   deactivate(): void;
   fetch(request: Request): Promise<Response>;
+  /** Optional direct bulk transport; older/custom runtimes keep HTTP. */
+  appendScopeUpload?(
+    request: Request,
+    batch: PreparedScopeUploadBatch,
+  ): Promise<Response>;
 }
 
 /**
@@ -540,6 +567,7 @@ export function createBearerTokenPsLiteAuth(
     assertBearerToken(request, options.ownerToken, true);
   };
   return {
+    supportsScopeUploadCommitments: true,
     authorizeOwner,
     ...(options.writeSessions
       ? writeSessionAuthMethods(options.writeSessions, authorizeOwner)
@@ -618,6 +646,7 @@ export function createWeb3SignedPsLiteAuth(
     }
   };
   return {
+    supportsScopeUploadCommitments: true,
     authorizeOwner,
     ...(options.writeSessions
       ? writeSessionAuthMethods(
@@ -761,7 +790,7 @@ function resolveX402Settings(
 function warnLegacyProjectionIssue(issue: LegacyProjectionIssue): void {
   console.warn(
     issue.kind === "projection_failed"
-      ? "[legacy-projection] projection failed; serving stored body"
+      ? "[legacy-projection] served read refused"
       : "[legacy-projection] projection left rows out",
     issue,
   );
@@ -778,6 +807,11 @@ export function createPsLiteRuntime(
   const dataStorage = withLegacyProjection(toDataStoragePort(options.storage), {
     onIssue: options.onLegacyProjectionIssue ?? warnLegacyProjectionIssue,
   });
+  // Streamed scope writes need a file store that can append to an unindexed
+  // file; without one the upload routes answer 501.
+  const scopeUploads = dataStorage.openVersionWriter
+    ? createScopeUploadRegistry()
+    : undefined;
   // Wire diagnostics by default so GET /v1/diagnostics is always available.
   const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
   options = { ...options, diagnostics };
@@ -836,6 +870,16 @@ export function createPsLiteRuntime(
       if (err instanceof ProtocolError) {
         return protocolErrorResponse(err);
       }
+      options.logger?.error?.(
+        {
+          errorCode: "INTERNAL_ERROR",
+          err:
+            err instanceof Error
+              ? { name: err.name, message: err.message, stack: err.stack }
+              : { message: String(err) },
+        },
+        "Unhandled error in PS Lite runtime",
+      );
       return errorResponse(500, "INTERNAL_ERROR", "Internal server error");
     }
   }
@@ -995,15 +1039,32 @@ export function createPsLiteRuntime(
       active = true;
       options.syncManager?.start?.();
       options.derivatives?.scheduler.start();
+      options.replication?.resume();
     },
     deactivate() {
       active = false;
       void options.syncManager?.stop?.();
       options.derivatives?.scheduler.stop();
+      void options.replication?.pause();
     },
     isAvailable() {
       return active;
     },
+    ...(auth.supportsScopeUploadCommitments
+      ? {
+          async appendScopeUpload(
+            request: Request,
+            batch: PreparedScopeUploadBatch,
+          ) {
+            if (!active) return unavailableResponse();
+            return handlePersonalServerScopeUploadAppend(
+              request,
+              { storage: dataStorage, auth, accessLogWriter, scopeUploads },
+              batch,
+            );
+          },
+        }
+      : {}),
     async fetch(request: Request) {
       return withProtocolErrors(async () => {
         const url = new URL(request.url);
@@ -1107,8 +1168,88 @@ export function createPsLiteRuntime(
           return jsonResponse(snapshot);
         }
 
+        if (url.pathname === "/v1/replication/status") {
+          if (request.method !== "GET")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          await auth.authorizeOwner(request);
+          return jsonResponse(
+            options.replication?.status() ?? { state: "off" },
+          );
+        }
+
         if (!active) {
           return unavailableResponse();
+        }
+
+        if (url.pathname === "/v1/replication/sync") {
+          if (request.method !== "POST")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          await auth.authorizeOwner(request);
+          const status = options.replication?.status() ?? { state: "off" };
+          if (status.state !== "on")
+            return jsonResponse(
+              {
+                error: {
+                  code: 409,
+                  errorCode: "REPLICATION_NOT_RUNNING",
+                  message: "Replication is not running",
+                },
+                status,
+              },
+              { status: 409 },
+            );
+          // "Sync now" starts a step and answers at once; the step may run
+          // up to its deadline. Its outcome shows in the status.
+          void options.replication!.trigger("sync_now");
+          return jsonResponse({ accepted: true, status }, { status: 202 });
+        }
+
+        if (url.pathname === "/v1/import/oura-browser/requirements") {
+          return handleOuraCollectionRequirementsRequest(request, {
+            auth,
+            storage: toDataStoragePort(options.storage),
+          });
+        }
+
+        if (url.pathname === "/v1/import/oura-browser") {
+          await auth.authorizeOwner(request);
+          if (request.method !== "POST")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          let body;
+          try {
+            body = await request.json();
+          } catch {
+            return errorResponse(400, "INVALID_BODY", "Body must be JSON");
+          }
+          const result = await importOuraBrowserRecords(
+            toDataStoragePort(options.storage),
+            body,
+            {
+              additions: options.additions,
+              scopeDeletions: options.scopeDeletions,
+              syncManager: options.syncManager ?? null,
+              onDataWritten: options.derivatives
+                ? (event) =>
+                    options.derivatives?.scheduler.markSourceChanged(
+                      event.scope,
+                      { lineageSources: event.lineageSources },
+                    )
+                : undefined,
+            },
+          );
+          return jsonResponse(result, { status: result.ok ? 200 : 409 });
         }
 
         const dataPrefix = "/v1/data";
@@ -1122,11 +1263,13 @@ export function createPsLiteRuntime(
             {
               storage: dataStorage,
               auth,
+              logger: options.logger,
               accessLogWriter,
               readFulfillmentReporter: options.readFulfillmentReporter,
               additions: options.additions,
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
+              scopeUploads,
               now,
               createLogId,
               // x402 payment enforcement for builder reads. Only engages with a

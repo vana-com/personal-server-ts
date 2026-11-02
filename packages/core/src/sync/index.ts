@@ -20,6 +20,24 @@ export type {
   DownloadDiagnosticsHook,
   DownloadWorkerDeps,
 } from "./workers/download.js";
+// The single-data-point download path, exported so an integration test can
+// drive the REAL decrypt-and-index worker end to end rather than restate it.
+export { downloadOne, type DownloadResult } from "./workers/download.js";
+export {
+  createPdppImporter,
+  isPermanentRejection,
+  normalizeDigest,
+  PDPP_METADATA_KEY,
+  SUPPORTED_PDPP_METADATA_VERSION,
+  type ImportableEnvelope,
+  type ImportStreamShape,
+  type PdppImporter,
+  type PdppImporterDeps,
+  type PdppImportOutcome,
+  type PdppImportRejection,
+  type PdppImportRejectionCode,
+  type RetainedDeclaration,
+} from "./pdpp-import.js";
 export {
   BLOB_DELETE_BATCH_SIZE,
   deleteScope,
@@ -43,8 +61,11 @@ export {
 export {
   createMemoryPendingBlobDeletionStore,
   createPendingBlobDeletionStore,
+  normalizePendingBlobDeletionPlanned,
   normalizePendingBlobDeletions,
   type PendingBlobDeletionKv,
+  type PendingBlobDeletionPlanned,
+  type PendingBlobDeletionState,
 } from "./pending-blob-deletions.js";
 export { computeDataPointId } from "./data-point-id.js";
 export {
@@ -57,6 +78,7 @@ export {
   type ScopeDeletionResolveOptions,
   type ScopeDeletionSource,
   type ScopeDeletionTracker,
+  type ScopeDeletionHistory,
   type ScopeDeletionTrackerOptions,
   type ScopeDeletionVerdict,
   type ScopeTombstone,
@@ -66,3 +88,10 @@ export {
   TOMBSTONE_METADATA_HASH,
   isTombstoneRecord,
 } from "./tombstone.js";
+
+export {
+  NeedsFencedPublicationError,
+  type FencedPublicationPort,
+  type PublicationFence,
+  type PublicationRecord,
+} from "../publication/publish.js";

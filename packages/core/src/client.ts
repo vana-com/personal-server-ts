@@ -1,3 +1,5 @@
+import type { ReplicationDoorStatus } from "./replication/door.js";
+import type { ReplicaWriterRotation } from "./replication/writer-identity.js";
 import {
   buildWeb3SignedHeader,
   type DataFileEnvelope,
@@ -33,6 +35,12 @@ export interface PersonalServerUrls {
   public: string | null;
   apiOrigin: string | null;
   registration: string | null;
+  /**
+   * Loopback auth listener origin, e.g. `http://127.0.0.1:34127`: local MCP
+   * clients connect to `${loopback}/mcp`. Null when no loopback listener is
+   * bound (Lite, cloud mode, `localApproval: false`, or the bind failed).
+   */
+  loopback: string | null;
 }
 
 export type PersonalServerRegistrationCandidate = Omit<
@@ -82,6 +90,53 @@ export type PersonalServerOwnerAuth =
 export type PersonalServerPostDataOptions = PersonalServerOwnerAuth & {
   headers?: Record<string, string>;
 };
+
+export type PersonalServerOpenScopeUploadOptions =
+  PersonalServerPostDataOptions & {
+    /** Keys written before the record array. */
+    data?: Record<string, unknown>;
+    /** Name of the record array in `data`. Default `"records"`. */
+    arrayKey?: string;
+  };
+
+export interface PersonalServerScopeUploadResult {
+  scope: string;
+  collectedAt: string;
+  status: string;
+  records: number;
+  sizeBytes: number;
+}
+
+/**
+ * One scope version being written in batches; see `openScopeUpload`. Calls
+ * must not overlap.
+ */
+export interface PersonalServerScopeUpload {
+  readonly uploadId: string;
+  readonly collectedAt: string;
+  /** Largest batch body the server accepts, in bytes. */
+  readonly maxBatchBytes: number;
+  /**
+   * Append records. A list over 1 MiB serialized is sent as several batches;
+   * one record over that goes alone (Web3Signed auth refuses it).
+   *
+   * Retry contract: if `append` throws, the server may already hold some of
+   * its batches, and the handle does not record which. The handle then refuses
+   * every later `append` and `commit` with `UPLOAD_FAILED`, so a retry cannot
+   * resend a batch that landed. Call `abort()`, then start a new upload with
+   * the full list. `abort()` is the only call that still works.
+   */
+  append(items: unknown[]): Promise<void>;
+  /**
+   * Write `data` after the record array and make the version visible. Throws
+   * `UPLOAD_FAILED` if an earlier `append` failed; see `append`.
+   */
+  commit(
+    data?: Record<string, unknown>,
+  ): Promise<PersonalServerScopeUploadResult>;
+  /** Discard the upload. The scope keeps its previous version. */
+  abort(): Promise<void>;
+}
 
 export interface PersonalServerListDataOptions {
   scopePrefix?: string;
@@ -181,6 +236,19 @@ export interface PersonalServerRevokeGrantResult {
 
 export interface PersonalServerHandle {
   readonly kind: PersonalServerKind;
+  /**
+   * The replication door this boot passed, fixed before the handle is
+   * returned. Present only on a server whose storage enforces the door, so
+   * its presence means the door is enforced, whatever the state. A host shows
+   * the opt-in from `never`, and the reason from `refused`.
+   * `writerRotation` is what this boot did with the host's request to
+   * rotate the writer identity (host contract §3.2); absent on a runtime
+   * that cannot rotate at boot.
+   */
+  readonly replication?: {
+    status(): ReplicationDoorStatus;
+    writerRotation?(): ReplicaWriterRotation;
+  };
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
   info(): Promise<PersonalServerInfo>;
   prepareRegistration(
@@ -195,6 +263,16 @@ export interface PersonalServerHandle {
     body: unknown,
     options: PersonalServerPostDataOptions,
   ): Promise<{ scope: string; collectedAt: string; status: string }>;
+  /**
+   * Write one new version of a scope as record batches, so neither side holds
+   * the whole scope in memory. The stored envelope equals a `postData` of
+   * `{...options.data, [arrayKey]: [...every appended item], ...commitData}`.
+   * Absent on servers without streamed writes.
+   */
+  openScopeUpload?(
+    scope: string,
+    options: PersonalServerOpenScopeUploadOptions,
+  ): Promise<PersonalServerScopeUpload>;
   listData(
     options?: PersonalServerListDataOptions,
   ): Promise<PersonalServerListDataResult>;
@@ -322,6 +400,7 @@ export function createPersonalServerInfoFromHealth(params: {
   health: unknown;
   localUrl?: string | null;
   publicUrl?: string | null;
+  loopbackUrl?: string | null;
 }): PersonalServerInfo {
   const health = toHealthBody(params.health);
   const publicUrl =
@@ -358,6 +437,7 @@ export function createPersonalServerInfoFromHealth(params: {
       public: publicUrl,
       apiOrigin,
       registration: publicUrl ?? health.registration?.serverUrl ?? null,
+      loopback: params.loopbackUrl ?? null,
     },
     registration: {
       registered: Boolean(health.registration?.registered),

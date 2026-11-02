@@ -1,3 +1,4 @@
+export { canonicalJsonBytes } from "../derivatives/e2ee/jcs.js";
 export {
   deleteDataScopeContract,
   IngestPersistedError,
@@ -7,6 +8,7 @@ export {
   listDataVersionsContract,
   parseDataScopeContract,
   readDataContract,
+  VersionSupersededError,
 } from "./data.js";
 export {
   BINARY_MARKER,
@@ -66,6 +68,9 @@ export type {
   DataContractError,
   DataContractErrorBody,
   DataContractErrorCode,
+  LegacyPrecondition,
+  LegacyProducer,
+  LegacyProducerProvenance,
   DeleteDataScopeContractInput,
   DeleteDataScopeContractResult,
   IngestDataContractInput,
@@ -99,3 +104,9 @@ export type {
   OAuthTokenResult,
   OAuthTokenStorePort,
 } from "./oauth.js";
+
+export {
+  deriveOuraCollectionRequirements,
+  OURA_LEGACY_TAKEOVER_CONTRACT,
+  type OuraCollectionRequirements,
+} from "./oura-collection-requirements.js";

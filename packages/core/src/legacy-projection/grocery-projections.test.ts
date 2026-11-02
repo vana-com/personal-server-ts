@@ -615,7 +615,7 @@ describe("grocery legacy scope projections", () => {
     }
   });
 
-  it("fails closed for incomplete Whole Foods order snapshots", () => {
+  it("reports incomplete Whole Foods order snapshots as partial, and rejects an order with no usable line", () => {
     const binding = LEGACY_SCOPE_BINDINGS.get("wholefoods.orders");
     const order = { stream: "orders", data: { id: "order-1", item_count: 2 } };
     const item = {
@@ -627,16 +627,28 @@ describe("grocery legacy scope projections", () => {
         product_id: "B000000001",
       },
     };
-    for (const incomplete of [
+    const project = (records: (typeof order)[]) =>
+      binding?.project(records, { fetchedStreams: ["orders", "order_items"] });
+    // Short of, or without, a known line count: delivered, never complete.
+    for (const shortOrUnknown of [
       [order, item],
-      [order, { ...item, data: { ...item.data, product_id: null } }],
       [{ ...order, data: { id: "order-1" } }, item],
     ]) {
-      expect(
-        binding?.project(incomplete, {
-          fetchedStreams: ["orders", "order_items"],
-        }),
-      ).toMatchObject({ ok: false, error: { kind: "incomplete_scope" } });
+      expect(project(shortOrUnknown)).toMatchObject({
+        ok: true,
+        payload: { orders: [{ orderId: "order-1" }] },
+        diagnostics: [
+          {
+            kind: "records_partial",
+            stream: "orders",
+            count: 1,
+            reasons: ["projection_order_item_count_mismatch"],
+          },
+        ],
+      });
     }
+    expect(
+      project([order, { ...item, data: { ...item.data, product_id: null } }]),
+    ).toMatchObject({ ok: false, error: { kind: "incomplete_scope" } });
   });
 });

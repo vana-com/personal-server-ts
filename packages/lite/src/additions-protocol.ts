@@ -30,6 +30,7 @@ export type WorkerMessage =
       error?: string;
       spent: number;
       budgetExceeded?: boolean;
+      publicationBlocked?: { scope: string; reason: string };
     };
 export type HostMessage =
   | {

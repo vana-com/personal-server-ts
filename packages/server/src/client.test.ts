@@ -9,7 +9,17 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
+import Database from "better-sqlite3";
 import { startPersonalServer } from "./client.js";
+import {
+  enableReplicaTestIdentity,
+  replicaTestAuthority,
+} from "./storage/pdpp-replica-writer-identity.test-utils.js";
+import {
+  currentReplicaWriterIdentity,
+  enableReplicaWriterIdentity,
+} from "./storage/pdpp-replica-writer-identity.js";
 
 const ownerWallet = createTestWallet(8);
 let cleanupFns: Array<() => Promise<void>> = [];
@@ -138,6 +148,7 @@ describe("startPersonalServer node handle", () => {
         local: `http://127.0.0.1:${port}`,
         apiOrigin: `http://localhost:${port}`,
         registration: `http://localhost:${port}`,
+        loopback: null,
       },
     });
     expect(info.server?.address).toMatch(/^0x[0-9a-fA-F]{40}$/);
@@ -379,6 +390,141 @@ describe("startPersonalServer node handle", () => {
       scope: "instagram.profile",
     });
   });
+
+  it("reports the replication door at ready, and a refused boot is still ready", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
+    cleanupFns.push(() => rm(rootPath, { recursive: true, force: true }));
+    const boot = async (enabled: boolean) => {
+      const port = await getFreePort();
+      const ps = await startPersonalServer({
+        rootPath,
+        config: ServerConfigSchema.parse({
+          server: { port, origin: `http://localhost:${port}` },
+          logging: { level: "fatal", pretty: false },
+          devUi: { enabled: false },
+          sync: { enabled: false, lastProcessedTimestamp: null },
+          tunnel: { enabled: false },
+          replication: { enabled },
+        }),
+        ownerSignature: await createOwnerSignature(),
+        gatewayClient: createGateway(),
+        localApproval: false,
+        startBackgroundServices: false,
+      });
+      try {
+        await expect(ps.ready()).resolves.toMatchObject({ status: "ready" });
+        expect((await fetch(`http://127.0.0.1:${port}/health`)).status).toBe(
+          200,
+        );
+        return ps.replication?.status();
+      } finally {
+        await ps.stop();
+      }
+    };
+
+    expect(await boot(false)).toEqual({ state: "never" });
+    expect(await boot(true)).toEqual({ state: "on" });
+    expect(await boot(true)).toEqual({ state: "on" });
+    expect(await boot(false)).toEqual({ state: "off" });
+    expect(await boot(true)).toEqual({
+      state: "refused",
+      refusal: "reenable_refused",
+    });
+  }, 30_000);
+
+  it("rotates the writer identity at boot only when the host asks and replication runs", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
+    cleanupFns.push(() => rm(rootPath, { recursive: true, force: true }));
+    const boot = async (enabled: boolean, rotate?: boolean) => {
+      const port = await getFreePort();
+      const ps = await startPersonalServer({
+        rootPath,
+        config: ServerConfigSchema.parse({
+          server: { port, origin: `http://localhost:${port}` },
+          logging: { level: "fatal", pretty: false },
+          devUi: { enabled: false },
+          sync: { enabled: false, lastProcessedTimestamp: null },
+          tunnel: { enabled: false },
+          replication: { enabled },
+        }),
+        ownerSignature: await createOwnerSignature(),
+        gatewayClient: createGateway(),
+        localApproval: false,
+        startBackgroundServices: false,
+        ...(rotate !== undefined && { rotateReplicaWriterIdentity: rotate }),
+      });
+      try {
+        return ps.replication?.writerRotation?.();
+      } finally {
+        await ps.stop();
+      }
+    };
+    const identities = () => {
+      const db = new Database(join(rootPath, "index.db"));
+      try {
+        const rows = db
+          .prepare("SELECT COUNT(*) AS n FROM pdpp_replica_writer_identity")
+          .get() as { n: number };
+        return { rows: rows.n, current: currentReplicaWriterIdentity(db) };
+      } finally {
+        db.close();
+      }
+    };
+
+    // First enable: no identity yet, so a rotation request has nothing to do.
+    expect(await boot(true, true)).toBe("no_identity");
+    expect(identities().rows).toBe(0);
+
+    // The worker's first enable establishes the identity.
+    const db = new Database(join(rootPath, "index.db"));
+    const original = enableReplicaTestIdentity(db, {
+      owner: ownerWallet.address.toLowerCase(),
+      roster: createTestReplicaRoster(),
+      authority: replicaTestAuthority(createTestReplicaRoster()),
+    });
+    db.close();
+
+    // A normal restart keeps it.
+    expect(await boot(true)).toBe("not_requested");
+    expect(await boot(true, false)).toBe("not_requested");
+    expect(identities().current).toEqual(original);
+
+    // A host that suspects a copy: same registration, new nonce.
+    expect(await boot(true, true)).toBe("rotated");
+    const rotated = identities().current!;
+    expect(rotated.incarnation).toBe(original.incarnation + 1);
+    expect(rotated.seed).toEqual({
+      ...original.seed,
+      writerNonce: rotated.seed.writerNonce,
+    });
+    expect(rotated.seed.writerNonce).not.toBe(original.seed.writerNonce);
+    expect(rotated.transportWriter).not.toBe(original.transportWriter);
+    expect(rotated.operationWriter).not.toBe(original.operationWriter);
+
+    // The runtime's first step after that boot reads the same registration
+    // from the roster and keeps the rotated identity.
+    const stepDb = new Database(join(rootPath, "index.db"));
+    try {
+      const { owner, server, serverId } = original.seed;
+      await expect(
+        enableReplicaWriterIdentity({
+          db: stepDb,
+          owner,
+          server,
+          roster: {
+            server: async () => ({ owner, id: serverId, revokedAt: null }),
+          },
+        }),
+      ).resolves.toEqual({ tag: "ready", identity: rotated });
+    } finally {
+      stepDb.close();
+    }
+
+    // Flag off, then a refused re-enable: nothing to rotate, nothing written.
+    expect(await boot(false, true)).toBe("replication_off");
+    expect(await boot(true, true)).toBe("replication_off");
+    expect(identities()).toEqual({ rows: 2, current: rotated });
+  }, 30_000);
 
   it("stops idempotently", async () => {
     const { ps } = await startTestServer();

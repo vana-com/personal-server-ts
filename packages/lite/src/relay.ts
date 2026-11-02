@@ -31,11 +31,11 @@ export interface PsLiteRelayClientOptions {
     status: PsLiteRelayStatus,
     detail?: PsLiteRelayStatusDetail,
   ) => void;
-  /** Heartbeat ping cadence (ms). Default 20_000. */
+  /** Heartbeat ping cadence (ms). Default 2_000. */
   heartbeatIntervalMs?: number;
   /**
    * Force-reconnect when a ping the client actually sent goes unanswered by
-   * ANY relay frame for this long, measured by wall clock (ms). Default 45_000.
+   * ANY relay frame for this long, measured by wall clock (ms). Default 10_000.
    */
   heartbeatTimeoutMs?: number;
   /** First reconnect backoff delay (ms); doubles up to the max. Default 1_000. */
@@ -159,6 +159,10 @@ export interface PsLiteRelayTlsStep {
 interface StreamState {
   streamId: number;
   plaintext: string;
+  socket: PsLiteRelayWebSocket;
+  closed: boolean;
+  ready: boolean;
+  handling: boolean;
   tls?: PsLiteRelayTlsStream;
 }
 
@@ -235,17 +239,16 @@ export function startPsLiteRelayClient(
   const streams = new Map<number, StreamState>();
   const pendingStreamData = new Map<number, Uint8Array[]>();
   const origin = options.origin ?? DEFAULT_ORIGIN;
-  // Resilience knobs. Defaults chosen so a backgrounded mobile tab whose socket
-  // went half-open (no `onclose` ever fires) is detected within ~1 missed
-  // heartbeat and reconnected with capped exponential backoff.
-  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? 20_000;
-  const heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 45_000;
+  // On-schedule timers detect a half-open socket within 14s and start the
+  // first reconnect within 15s, below the consumer's 20s request budget.
+  // Throttled timers retain the evidence-based grace window below.
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? 2_000;
+  const heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 10_000;
   const reconnectInitialDelayMs = options.reconnectInitialDelayMs ?? 1_000;
   const reconnectMaxDelayMs = options.reconnectMaxDelayMs ?? 30_000;
   let issueToken: string | undefined;
   let closed = false;
-  // `socket` is reassigned on every (re)connect; all the closures below read it
-  // lazily at call time, so they always act on the current socket.
+  // Every stream and callback belongs to one socket, never its replacement.
   let socket: PsLiteRelayWebSocket;
   let reconnectAttempts = 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -264,53 +267,81 @@ export function startPsLiteRelayClient(
 
   const log = (line: string) => options.logger?.(line);
 
-  const sendText = (message: unknown) => {
-    if (socket.readyState === socket.OPEN) {
-      socket.send(JSON.stringify(message));
+  const isLive = (stream: StreamState) =>
+    !closed &&
+    !stream.closed &&
+    stream.socket === socket &&
+    socket.readyState === socket.OPEN &&
+    streams.get(stream.streamId) === stream;
+
+  const sendText = (message: unknown, target = socket) => {
+    if (!closed && target === socket && target.readyState === target.OPEN) {
+      target.send(JSON.stringify(message));
     }
   };
 
-  const sendData = (streamId: number, payload: Uint8Array) => {
-    if (socket.readyState === socket.OPEN) {
-      socket.send(encodeDataFrame(streamId, payload));
+  const sendData = (stream: StreamState, payload: Uint8Array) => {
+    if (isLive(stream)) {
+      stream.socket.send(encodeDataFrame(stream.streamId, payload));
     }
   };
 
-  const closeStream = (streamId: number, reason: string) => {
-    const stream = streams.get(streamId);
-    stream?.tls?.close?.();
-    streams.delete(streamId);
-    pendingStreamData.delete(streamId);
-    sendText({ type: "stream.close", streamId, reason });
+  const disposeStream = (stream: StreamState) => {
+    if (stream.closed) return;
+    stream.closed = true;
+    if (streams.get(stream.streamId) === stream) {
+      streams.delete(stream.streamId);
+      pendingStreamData.delete(stream.streamId);
+    }
+    // Invalidate before calling external code that may re-enter the client.
+    const connection = stream.tls;
+    stream.tls = undefined;
+    connection?.close?.();
+  };
+
+  const closeStream = (stream: StreamState, reason: string) => {
+    if (!isLive(stream)) return;
+    disposeStream(stream);
+    sendText(
+      { type: "stream.close", streamId: stream.streamId, reason },
+      stream.socket,
+    );
+  };
+
+  const disposeStreams = () => {
+    for (const stream of [...streams.values()]) disposeStream(stream);
+    pendingStreamData.clear();
   };
 
   const writePlaintextResponse = (
     stream: StreamState,
     responseBytes: Uint8Array,
   ) => {
+    if (!isLive(stream)) return;
     if (!stream.tls) {
       for (const chunk of chunks(responseBytes, RESPONSE_CHUNK_BYTES)) {
-        sendData(stream.streamId, chunk);
+        sendData(stream, chunk);
       }
       return;
     }
 
     const responseChunks = chunks(responseBytes, RESPONSE_CHUNK_BYTES);
     for (let index = 0; index < responseChunks.length; index += 1) {
+      if (!isLive(stream)) return;
       const step = stream.tls.writePlaintext(
         responseChunks[index],
         index === responseChunks.length - 1,
       );
       for (const chunk of chunks(step.tls, RESPONSE_CHUNK_BYTES)) {
         if (chunk.length > 0) {
-          sendData(stream.streamId, chunk);
+          sendData(stream, chunk);
         }
       }
     }
   };
 
   const drainHttpRequests = async (stream: StreamState) => {
-    while (true) {
+    while (isLive(stream)) {
       const parsed = parseHttpRequest(stream.plaintext);
       if (!parsed) {
         return;
@@ -322,6 +353,7 @@ export function startPsLiteRelayClient(
         parsed.request,
         origin,
       );
+      if (!isLive(stream)) return;
       // `response` is a binary (latin1) string: buildHttpResponse appends the
       // body via bytesToBinary, so each char code 0x00–0xFF is one body byte.
       // It must be turned back into bytes the same way (binaryToBytes), NOT
@@ -330,23 +362,27 @@ export function startPsLiteRelayClient(
       // files fail downstream with "not a valid OpenPGP message"). ASCII/JSON
       // bodies survive UTF-8, which is why only encrypted binary downloads broke.
       writePlaintextResponse(stream, binaryToBytes(response));
-      closeStream(stream.streamId, "http_response_sent");
+      closeStream(stream, "http_response_sent");
       return;
     }
   };
 
   const handlePlaintext = (stream: StreamState, plaintext: Uint8Array) => {
-    if (plaintext.length === 0) {
+    if (!isLive(stream) || stream.handling || plaintext.length === 0) {
       return;
     }
     stream.plaintext += bytesToBinary(plaintext);
+    if (!parseHttpRequest(stream.plaintext)) return;
+    stream.handling = true;
     void drainHttpRequests(stream).catch((error: unknown) => {
+      if (!isLive(stream)) return;
       log(error instanceof Error ? error.message : String(error));
-      closeStream(stream.streamId, "handler_error");
+      closeStream(stream, "handler_error");
     });
   };
 
   const processPayload = (stream: StreamState, payload: Uint8Array) => {
+    if (!isLive(stream) || !stream.ready) return;
     if (!stream.tls) {
       handlePlaintext(stream, payload);
       return;
@@ -355,34 +391,50 @@ export function startPsLiteRelayClient(
     try {
       const step = stream.tls.processTls(payload);
       if (step.tls.length > 0) {
-        sendData(stream.streamId, step.tls);
+        sendData(stream, step.tls);
       }
       handlePlaintext(stream, step.plaintext);
     } catch (error) {
       log(error instanceof Error ? error.message : String(error));
-      closeStream(stream.streamId, "tls_error");
+      closeStream(stream, "tls_error");
     }
   };
 
   const openStream = async (streamId: number) => {
+    const previous = streams.get(streamId);
+    if (previous) disposeStream(previous);
     const stream: StreamState = {
       streamId,
       plaintext: "",
+      socket,
+      closed: false,
+      ready: !tls,
+      handling: false,
     };
-
-    if (tls) {
-      stream.tls = await tls.createStream({
-        sessionId: options.sessionId,
-        streamId,
-        issueToken,
-      });
-    }
-
+    // Register before awaiting creation so cancellation can invalidate it.
     streams.set(streamId, stream);
-    const buffered = pendingStreamData.get(streamId) ?? [];
-    pendingStreamData.delete(streamId);
-    for (const payload of buffered) {
-      processPayload(stream, payload);
+    try {
+      if (tls) {
+        const connection = await tls.createStream({
+          sessionId: options.sessionId,
+          streamId,
+          issueToken,
+        });
+        if (!isLive(stream)) {
+          connection.close?.();
+          return;
+        }
+        stream.tls = connection;
+        stream.ready = true;
+      }
+      if (!isLive(stream)) return;
+      const buffered = pendingStreamData.get(streamId) ?? [];
+      pendingStreamData.delete(streamId);
+      for (const payload of buffered) processPayload(stream, payload);
+    } catch (error) {
+      if (!isLive(stream)) return;
+      log(error instanceof Error ? error.message : String(error));
+      closeStream(stream, "stream_open_error");
     }
   };
 
@@ -413,12 +465,7 @@ export function startPsLiteRelayClient(
       message.type === "stream.open" &&
       typeof message.streamId === "number"
     ) {
-      void openStream(message.streamId).catch((error: unknown) => {
-        log(error instanceof Error ? error.message : String(error));
-        if (typeof message.streamId === "number") {
-          closeStream(message.streamId, "stream_open_error");
-        }
-      });
+      void openStream(message.streamId);
       return;
     }
 
@@ -426,8 +473,8 @@ export function startPsLiteRelayClient(
       message.type === "stream.close" &&
       typeof message.streamId === "number"
     ) {
-      streams.get(message.streamId)?.tls?.close?.();
-      streams.delete(message.streamId);
+      const stream = streams.get(message.streamId);
+      if (stream) disposeStream(stream);
       pendingStreamData.delete(message.streamId);
     }
   };
@@ -439,7 +486,7 @@ export function startPsLiteRelayClient(
     }
 
     const stream = streams.get(frame.streamId);
-    if (!stream) {
+    if (!stream || !stream.ready) {
       const buffered = pendingStreamData.get(frame.streamId) ?? [];
       buffered.push(frame.payload);
       pendingStreamData.set(frame.streamId, buffered);
@@ -540,15 +587,21 @@ export function startPsLiteRelayClient(
     }
     issueToken = undefined;
     socket = createSocket(options.webSocketFactory, controlUrl);
+    const currentSocket = socket;
+    const isCurrent = () => !closed && socket === currentSocket;
+    const acceptsFrames = () =>
+      isCurrent() && currentSocket.readyState === currentSocket.OPEN;
     socket.binaryType = "arraybuffer";
     options.onStatus?.("connecting");
 
     socket.onopen = () => {
+      if (!acceptsFrames()) return;
       reconnectAttempts = 0;
       startHeartbeat();
       options.onStatus?.("connected");
     };
     socket.onmessage = (event) => {
+      if (!acceptsFrames()) return;
       lastFrameReceivedAt = Date.now();
       if (typeof event.data === "string") {
         handleControl(JSON.parse(event.data) as ControlMessage);
@@ -557,10 +610,9 @@ export function startPsLiteRelayClient(
       handleDataFrame(event.data);
     };
     socket.onclose = (event) => {
+      if (socket !== currentSocket) return;
       stopHeartbeat();
-      streams.forEach((stream) => stream.tls?.close?.());
-      streams.clear();
-      pendingStreamData.clear();
+      disposeStreams();
       issueToken = undefined;
       const detail = { code: event?.code, reason: event?.reason };
       if (closed) {
@@ -586,7 +638,7 @@ export function startPsLiteRelayClient(
       scheduleReconnect();
     };
     socket.onerror = () => {
-      if (closed) {
+      if (!isCurrent() || currentSocket.readyState > currentSocket.OPEN) {
         return;
       }
       options.onStatus?.("error");
@@ -618,15 +670,14 @@ export function startPsLiteRelayClient(
       }
     },
     close(reason = "closed") {
+      if (closed) return;
       closed = true;
       stopHeartbeat();
       if (reconnectTimer !== undefined) {
         clearTimeout(reconnectTimer);
         reconnectTimer = undefined;
       }
-      streams.forEach((stream) => stream.tls?.close?.());
-      streams.clear();
-      pendingStreamData.clear();
+      disposeStreams();
       socket.close(1000, reason);
     },
   };

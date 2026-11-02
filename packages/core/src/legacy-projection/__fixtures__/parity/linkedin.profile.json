@@ -1,0 +1,232 @@
+{
+  "scope": "linkedin.profile",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.profile from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+    "pdppBundle": "synthetic linkedin.profile records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+  },
+  "fetchedStreams": [
+    "profile",
+    "experience",
+    "education"
+  ],
+  "streams": {
+    "profile": [
+      {
+        "id": "member-a",
+        "public_url": "https://example.com/profile",
+        "full_name": "Synthetic Member",
+        "headline": "Engineer",
+        "location": "Remote",
+        "connection_count": 12,
+        "profile_picture_url": "https://example.com/avatar.png",
+        "summary": "Builds useful tools"
+      }
+    ],
+    "experience": [
+      {
+        "id": "role-a",
+        "title": "Engineer",
+        "company": "Example Studio",
+        "employment_type": "Full-time",
+        "start_date": "2022-03",
+        "end_date": null,
+        "location": "Remote",
+        "description": "Built tools"
+      }
+    ],
+    "education": [
+      {
+        "id": "school-a",
+        "school": "Example University",
+        "degree": "BSc",
+        "field_of_study": "Computing",
+        "start_date": "2017",
+        "end_date": "2021-06",
+        "grade": "Honors",
+        "logo_url": "https://example.com/school.png"
+      }
+    ]
+  },
+  "legacyBody": {
+    "profileUrl": "https://example.com/profile",
+    "fullName": "Synthetic Member",
+    "headline": "Engineer",
+    "location": "Remote",
+    "connections": "12",
+    "profilePictureUrl": "https://example.com/avatar.png",
+    "about": "Builds useful tools"
+  },
+  "consumerContractBody": {
+    "profileUrl": "https://example.com/profile",
+    "fullName": "Synthetic Member",
+    "headline": "Engineer",
+    "location": "Remote",
+    "connections": "12",
+    "profilePictureUrl": "https://example.com/avatar.png",
+    "about": "Builds useful tools",
+    "name": "Synthetic Member",
+    "experience": [
+      {
+        "id": "role-a",
+        "title": "Engineer",
+        "company": "Example Studio",
+        "employment_type": "Full-time",
+        "start_date": "2022-03",
+        "end_date": null,
+        "location": "Remote",
+        "description": "Built tools"
+      }
+    ],
+    "education": [
+      {
+        "id": "school-a",
+        "school": "Example University",
+        "degree": "BSc",
+        "field_of_study": "Computing",
+        "start_date": "2017",
+        "end_date": "2021-06",
+        "grade": "Honors",
+        "logo_url": "https://example.com/school.png"
+      }
+    ]
+  },
+  "reviewedDifferences": [
+    {
+      "path": "education",
+      "legacy": [
+        {
+          "id": "school-a",
+          "school": "Example University",
+          "degree": "BSc",
+          "field_of_study": "Computing",
+          "start_date": "2017",
+          "end_date": "2021-06",
+          "grade": "Honors",
+          "logo_url": "https://example.com/school.png"
+        }
+      ],
+      "projected": "<absent>",
+      "reason": "Career Quest reads name and embedded experience/education: full_name becomes fullName (no name alias), and the profile binding reads only profile and never embeds either collection even if their rows are supplied. headline, location and summary -> about are preserved."
+    },
+    {
+      "path": "experience",
+      "legacy": [
+        {
+          "id": "role-a",
+          "title": "Engineer",
+          "company": "Example Studio",
+          "employment_type": "Full-time",
+          "start_date": "2022-03",
+          "end_date": null,
+          "location": "Remote",
+          "description": "Built tools"
+        }
+      ],
+      "projected": "<absent>",
+      "reason": "Career Quest reads name and embedded experience/education: full_name becomes fullName (no name alias), and the profile binding reads only profile and never embeds either collection even if their rows are supplied. headline, location and summary -> about are preserved."
+    },
+    {
+      "path": "name",
+      "legacy": "Synthetic Member",
+      "projected": "<absent>",
+      "reason": "Career Quest reads name and embedded experience/education: full_name becomes fullName (no name alias), and the profile binding reads only profile and never embeds either collection even if their rows are supplied. headline, location and summary -> about are preserved."
+    }
+  ],
+  "cases": [
+    {
+      "scope": "linkedin.profile",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.profile from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic linkedin.profile records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "profile"
+      ],
+      "streams": {
+        "profile": []
+      },
+      "expectedResult": {
+        "ok": false,
+        "error": {
+          "kind": "empty_singleton",
+          "scope": "linkedin.profile"
+        }
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "linkedin.profile",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.profile from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic linkedin.profile records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "profile"
+      ],
+      "streams": {
+        "profile": [
+          {
+            "id": "member-dirty",
+            "public_url": null,
+            "full_name": null,
+            "headline": 42,
+            "location": null,
+            "connection_count": "12",
+            "profile_picture_url": false,
+            "summary": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "profileUrl": "",
+        "fullName": "",
+        "headline": "",
+        "location": "",
+        "connections": "0",
+        "profilePictureUrl": "",
+        "about": ""
+      },
+      "consumerContractBody": {
+        "profileUrl": "",
+        "fullName": "",
+        "headline": "",
+        "location": "",
+        "connections": "0",
+        "profilePictureUrl": "",
+        "about": "",
+        "name": null,
+        "experience": [],
+        "education": []
+      },
+      "reviewedDifferences": [
+        {
+          "path": "education",
+          "legacy": [],
+          "projected": "<absent>",
+          "reason": "Career Quest reads name and embedded experience/education: full_name becomes fullName (no name alias), and the profile binding reads only profile and never embeds either collection even if their rows are supplied. headline, location and summary -> about are preserved. Null or non-string profile text defaults to empty strings; nonnumeric connection_count becomes '0'."
+        },
+        {
+          "path": "experience",
+          "legacy": [],
+          "projected": "<absent>",
+          "reason": "Career Quest reads name and embedded experience/education: full_name becomes fullName (no name alias), and the profile binding reads only profile and never embeds either collection even if their rows are supplied. headline, location and summary -> about are preserved. Null or non-string profile text defaults to empty strings; nonnumeric connection_count becomes '0'."
+        },
+        {
+          "path": "name",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Career Quest reads name and embedded experience/education: full_name becomes fullName (no name alias), and the profile binding reads only profile and never embeds either collection even if their rows are supplied. headline, location and summary -> about are preserved. Null or non-string profile text defaults to empty strings; nonnumeric connection_count becomes '0'."
+        }
+      ]
+    }
+  ]
+}

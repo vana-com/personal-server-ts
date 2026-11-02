@@ -1,9 +1,18 @@
 // biome-ignore lint/performance/noBarrelFile: re-exported through @vana-unity/app-runtime/sources
-import { LEGACY_SCOPE_BINDINGS, LEGACY_SCOPE_GAPS } from "./bindings.js";
+import {
+  ANTHROPIC_LIVE_BINDINGS,
+  GROCERY_INVALID_ORDER,
+  LEGACY_SCOPE_BINDINGS,
+} from "./bindings.js";
 import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
 import { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
+import { STRAVA_BROWSER_BINDINGS } from "./strava-browser-bindings.js";
 import { classifyAsTestDebris } from "./test-debris.js";
+import {
+  decodeDeclaredRecordsForProjection,
+  DeclaredTextError,
+} from "./declared-text.js";
 import type {
   LegacyScopeBinding,
   LegacyScopeLookupResult,
@@ -13,20 +22,26 @@ import type {
   ProjectionResult,
 } from "./types.js";
 
+export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
-export { LEGACY_SCOPE_GAPS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 export { META_040_BINDINGS } from "./meta-040-bindings.js";
-export { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
+export {
+  OURA_BROWSER_BINDINGS,
+  OURA_BROWSER_DECLARATION_DIGEST,
+} from "./oura-browser-bindings.js";
+export { STRAVA_BROWSER_BINDINGS } from "./strava-browser-bindings.js";
 export type { LegacyScopeBindingProvenance } from "./provenance.js";
 export { classifyAsTestDebris } from "./test-debris.js";
 export type {
+  LegacyProjectionWindow,
   LegacyScopeBinding,
   LegacyScopeLookupError,
   LegacyScopeLookupResult,
   PdppRecord,
   PdppSelection,
   ProjectionDiagnostic,
+  ProjectionOmission,
   ProjectionError,
   ProjectionResult,
   ProjectPdppRecordsOptions,
@@ -36,13 +51,26 @@ const ALTERNATE_PROFILE_BINDINGS: ReadonlyMap<
   string,
   ReadonlyMap<string, LegacyScopeBinding>
 > = new Map([
+  ["anthropic-live", ANTHROPIC_LIVE_BINDINGS],
   ["github-browser", GITHUB_BROWSER_BINDINGS],
   ["meta", META_040_BINDINGS],
   ["oura-browser", OURA_BROWSER_BINDINGS],
+  ["strava-browser", STRAVA_BROWSER_BINDINGS],
 ]);
 
 export function hasAlternateLegacyProfile(profileKey: string): boolean {
   return ALTERNATE_PROFILE_BINDINGS.has(profileKey);
+}
+
+/** Alternate bindings available for one retained legacy scope. */
+export function alternateLegacyBindingsForScope(
+  scope: string,
+): ReadonlyMap<string, LegacyScopeBinding> {
+  return new Map(
+    [...ALTERNATE_PROFILE_BINDINGS]
+      .filter(([, bindings]) => bindings.has(scope))
+      .map(([profileKey, bindings]) => [profileKey, bindings.get(scope)!]),
+  );
 }
 
 /** Only declaration-reviewed profile keys may project into retained scopes. */
@@ -60,8 +88,8 @@ export function legacyBindingsForProfile(
 
 /**
  * Translate an exact legacy scope string to the PDPP selection an already
- * deployed app should now be served from. Exact string match only — a known
- * gap is distinct from an unknown scope, and neither is guessed.
+ * deployed app should now be served from. Exact string match only; unbound
+ * scopes are not guessed.
  */
 export function legacyScopeToPdppSelection(
   scope: string,
@@ -84,18 +112,6 @@ export function legacyScopeToPdppSelection(
           kind: "unsupported_profile",
           scope,
           profileKey: options.profileKey,
-        },
-      };
-    }
-    const gap = LEGACY_SCOPE_GAPS.get(scope);
-    if (gap) {
-      return {
-        ok: false,
-        error: {
-          kind: "gap",
-          scope,
-          reason: gap.reason,
-          provenanceChecked: gap.provenanceChecked,
         },
       };
     }
@@ -136,11 +152,20 @@ export function projectPdppRecordsToLegacyPayload(
         },
       };
     }
-    const gap = LEGACY_SCOPE_GAPS.get(scope);
-    if (gap) {
-      return { ok: false, error: { kind: "gap", scope, reason: gap.reason } };
-    }
     return { ok: false, error: { kind: "unknown_scope", scope } };
+  }
+  let decodeDiagnostics: ProjectionDiagnostic[] = [];
+  try {
+    const decoded = decodeDeclaredRecordsForProjection(
+      records,
+      options.streamSchemas,
+      scope,
+    );
+    records = decoded.records;
+    decodeDiagnostics = decoded.diagnostics;
+  } catch (error) {
+    if (!(error instanceof DeclaredTextError)) throw error;
+    return { ok: false, error: error.projectionError(scope) };
   }
   const result = binding.project(
     options.orderByPrimaryKey
@@ -149,11 +174,28 @@ export function projectPdppRecordsToLegacyPayload(
     options,
   );
   if (!result.ok) return result;
+  if (decodeDiagnostics.length > 0) {
+    result.diagnostics = [...decodeDiagnostics, ...(result.diagnostics ?? [])];
+  }
+  if (scope.startsWith("oura.")) {
+    assertOuraLegacyScoresAreIntegers(scope, result.payload);
+  }
 
   // These bindings drop and count malformed rows themselves (see their
   // records_dropped diagnostics) instead of failing the whole scope.
   if (DROP_AND_COUNT_SCOPES.has(scope)) return result;
 
+  // An order dropped and counted for its unusable id may pass the key check;
+  // every other malformed key stays fatal.
+  let reportedInvalidOrders = (result.diagnostics ?? []).reduce(
+    (total, diagnostic) =>
+      diagnostic.kind === "records_dropped" &&
+      diagnostic.stream === "orders" &&
+      diagnostic.reasons.includes(GROCERY_INVALID_ORDER)
+        ? total + diagnostic.count
+        : total,
+    0,
+  );
   for (const record of records) {
     if (!binding.pdppStreams.includes(record.stream)) continue;
     if (
@@ -177,6 +219,10 @@ export function projectPdppRecordsToLegacyPayload(
         value === undefined ||
         (typeof value === "string" && !value.trim())
       ) {
+        if (record.stream === "orders" && reportedInvalidOrders > 0) {
+          reportedInvalidOrders -= 1;
+          break;
+        }
         return {
           ok: false,
           error: {
@@ -216,6 +262,31 @@ export function projectPdppRecordsToLegacyPayload(
 const DROP_AND_COUNT_SCOPES: ReadonlySet<string> = new Set([
   "chatgpt.conversations",
 ]);
+
+/** Keep OpenPet's Go `*int` score decoding safe for every Oura projection. */
+export function assertOuraLegacyScoresAreIntegers(
+  scope: string,
+  payload: Record<string, unknown>,
+): void {
+  for (const collection of ["days", "dailyScores"] as const) {
+    const rows = payload[collection];
+    if (!Array.isArray(rows)) continue;
+    for (const [index, row] of rows.entries()) {
+      if (row === null || typeof row !== "object") continue;
+      // `score` is required on every daily score row: absent and undefined
+      // (dropped by JSON serialization) are both rejected.
+      const score = (row as Record<string, unknown>).score;
+      if (
+        score === null ||
+        (typeof score === "number" && Number.isInteger(score))
+      )
+        continue;
+      throw new Error(
+        `${scope}.${collection}[${index}].score must be an integer or null`,
+      );
+    }
+  }
+}
 
 type RecordsSkipped = Extract<
   ProjectionDiagnostic,

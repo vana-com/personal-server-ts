@@ -83,6 +83,79 @@ export interface DataStorageEnvelopePreview {
   truncated: boolean;
 }
 
+export interface ImportReceipt {
+  readonly operation: string;
+  readonly bodySha256: string;
+  readonly scope: string;
+  readonly collectedAt: string;
+  readonly acceptedAt: string;
+}
+
+export interface ImportIntent {
+  operation: string;
+  bodySha256: string;
+  owner: string;
+  authority: string;
+}
+
+export type VersionCommit =
+  | {
+      kind: "append";
+      envelope: DataFileEnvelope;
+      metadata: { sizeBytes?: number; afterTombstoneVersion?: number | null };
+      import?: ImportIntent;
+    }
+  | {
+      kind: "replica";
+      envelope: DataFileEnvelope;
+      metadata: {
+        schemaId: string | null;
+        dataPointId: string;
+        version: number;
+        producer?: "pdpp-projector" | "pdpp-import-projection";
+        producerProvenance?: string;
+      };
+    };
+
+export type VersionCommitResult =
+  | {
+      kind: "stored";
+      envelope: DataFileEnvelope;
+      entry: IndexEntry;
+      writeResult: WriteResult;
+      receipt?: ImportReceipt;
+    }
+  | { kind: "replay"; receipt: ImportReceipt };
+
+/**
+ * The row a conditional erase was decided for. `id` is the local row id, which
+ * storage never reuses for another row; `path` is its data file. A replacement
+ * that takes the same collection stamp has a different id.
+ */
+export interface VersionFence {
+  id: number;
+  path: string;
+}
+
+/** One version being written by `DataStoragePort.openVersionWriter`. */
+export interface DataVersionWriter {
+  /** Append serialized envelope text. Calls must not overlap. */
+  write(text: string): Promise<void>;
+  /**
+   * Finish the file, then index it as the scope's newest version. With
+   * `onlyIfNewest`, the index publishes it only if no version of the scope
+   * with a later `collectedAt` is already there; the check and the
+   * publication are one step. Otherwise nothing is published and the call
+   * throws `VersionSupersededError`.
+   */
+  commit(
+    entry: Omit<NewIndexEntry, "path" | "sizeBytes" | "scope" | "collectedAt">,
+    options?: { onlyIfNewest?: boolean },
+  ): Promise<WriteResult>;
+  /** Discard everything written. Idempotent; a no-op after `commit`. */
+  abort(): Promise<void>;
+}
+
 export interface DataStoragePort extends RuntimeStoragePort {
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
@@ -143,6 +216,8 @@ export interface DataStoragePort extends RuntimeStoragePort {
     scope: string,
     collectedAt: string,
   ): Promise<DataBlockManifest | null>;
+  /** Metadata-only readiness hint. Must not read bodies or build/project blocks.
+   * Return false when readiness cannot be established cheaply. */
   hasScopeBlocks?(
     scope: string,
     collectedAt: string,
@@ -152,6 +227,36 @@ export interface DataStoragePort extends RuntimeStoragePort {
     collectedAt: string,
   ): boolean | Promise<boolean>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
+  /**
+   * Write one version's envelope as a stream of serialized JSON text, so a
+   * large version never has to exist in memory as one value. Nothing written
+   * is visible until `commit`: until then the version has no index row and
+   * readers keep seeing the previous one. `commit` finishes the file and
+   * indexes it; `abort` (or a crash before `commit`) leaves no version.
+   * Optional: a storage that cannot stream does not offer it.
+   */
+  openVersionWriter?(
+    scope: string,
+    collectedAt: string,
+  ): Promise<DataVersionWriter>;
+  /** Atomic local legacy write, including a version compare when requested. */
+  commitEnvelope?(
+    envelope: DataFileEnvelope,
+    entry: Omit<NewIndexEntry, "path" | "sizeBytes"> & { sizeBytes?: number },
+    precondition?: { kind: "none" } | { kind: "match"; version: number },
+  ): Promise<
+    | { ok: true; writeResult: WriteResult }
+    | {
+        ok: false;
+        currentVersion: number | null;
+        currentProducer: string | null;
+      }
+  >;
+  /**
+   * Durable owner-import commit (operation journal, receipt, replay); owner
+   * imports require this capability. Ordinary writes use `commitEnvelope`.
+   */
+  commitVersion?(command: VersionCommit): Promise<VersionCommitResult>;
   writeBlockManifest?(
     scope: string,
     collectedAt: string,
@@ -169,6 +274,17 @@ export interface DataStoragePort extends RuntimeStoragePort {
   writeFirstSeenLedger?(scope: string, ledger: unknown): Promise<void>;
   /** Idempotent. `deleteScope` also removes the scope's ledger. */
   deleteFirstSeenLedger?(scope: string): Promise<void>;
+  /**
+   * Write one version's envelope and index its row as one step, so no erase
+   * or replacement of that path runs between the blob and the row. Throws
+   * `IngestPersistedError` when the blob is written but the row is not. Optional:
+   * a storage without it gets `writeEnvelope` then `insertEntry`, which can
+   * leave a row with no blob between the two calls.
+   */
+  writeEnvelopeAndIndex?(
+    envelope: DataFileEnvelope,
+    entry: Omit<NewIndexEntry, "path" | "sizeBytes"> & { sizeBytes?: number },
+  ): Promise<IndexEntry>;
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   /** Highest stored DPv2 `version` for a scope; 0 if none. */
@@ -202,7 +318,31 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * deletion reconciliation to drop the exact versions a gateway tombstone
    * covers while leaving a newer local re-ingest in place.
    */
-  deleteVersion(scope: string, collectedAt: string): Promise<boolean>;
+  /**
+   * Erases one version (index row + local blob). With `fence`, erases only
+   * while the row is still the one the caller decided on: same local `id` and
+   * `path`. A row erased or replaced since then is left alone (false). Without
+   * `fence` the erase is by (scope, collectedAt) alone.
+   */
+  deleteVersion(
+    scope: string,
+    collectedAt: string,
+    fence?: VersionFence,
+  ): Promise<boolean>;
+  /**
+   * Erases one version (index row + local blob) only while its envelope is
+   * absent and its row is still the one the caller decided on (same local `id`
+   * and `path`). The absence check, the row check and the erase are one step
+   * under the same gate that publishes a version, so a write that restores the
+   * envelope cannot land between them. Resolves false when the envelope is
+   * present or the row was erased or replaced. Rejects when absence cannot be
+   * established (a read fault is not absence), leaving the row in place.
+   */
+  deleteVersionIfEnvelopeMissing?(
+    scope: string,
+    collectedAt: string,
+    fence: VersionFence,
+  ): Promise<boolean>;
   /**
    * Drop a single unsynced index entry by path, WITHOUT touching any blob.
    * Used by the upload worker to evict an orphaned row whose local payload
@@ -259,6 +399,8 @@ export interface DataPointFeedPort {
   getDataPoint(input: {
     ownerAddress: string;
     scope: string;
+    /** Cancel a deadline-bound discovery lookup when supported by the adapter. */
+    signal?: AbortSignal;
   }): Promise<DataPointFeedRecord | null>;
 }
 
@@ -309,6 +451,14 @@ export interface DeleteBlobVersionsOutcome {
  */
 export interface DeleteDataPort {
   tombstone(scope: string): Promise<TombstoneOutcome>;
+  /**
+   * Head of a gateway-reserved (`vana.system.*`) point through a read the
+   * gateway authorizes for this server. Absent when the host wires none; the
+   * deletion-aware feed is then used, as for every other scope.
+   */
+  head?(
+    scope: string,
+  ): Promise<{ expectedVersion: string; deletedAt: string | null } | null>;
   deleteBlobVersions(
     scope: string,
     versions: string[],
@@ -345,6 +495,24 @@ export interface PendingBlobDeletionStore {
   list(): Promise<PendingBlobDeletion[]>;
   add(keys: PendingBlobDeletion[]): Promise<void>;
   remove(keys: PendingBlobDeletion[]): Promise<void>;
+  /**
+   * Highest tombstone version whose covered registry range (versions 1..v)
+   * this store has already taken on for `scope`: every key in it is either
+   * confirmed deleted or still queued here. A repeated delete of the scope
+   * plans only above it, so it resumes instead of starting over at version 1.
+   * Null when nothing was planned (or the store predates the watermark).
+   */
+  plannedThrough?(scope: string): Promise<string | null>;
+  /**
+   * Add `keys` and raise the scope's planned watermark to `through` in one
+   * atomic write, so a crash can never record the watermark without the work
+   * it stands for.
+   */
+  enqueue?(
+    scope: string,
+    keys: PendingBlobDeletion[],
+    through: string | null,
+  ): Promise<void>;
 }
 
 // FeeVerifier was the pre-X402 hook that gated reads on grant.paymentStatus

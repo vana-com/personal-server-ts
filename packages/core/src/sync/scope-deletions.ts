@@ -42,6 +42,8 @@ export interface ScopeDeletionResolveOptions {
    * same to the local index and a fresh feed pass cannot tell them apart.
    */
   consultGateway?: "if-stale" | "always";
+  /** Maximum wait for gateway state. Zero uses cached state only. */
+  gatewayTimeoutMs?: number;
 }
 
 /**
@@ -75,6 +77,8 @@ export interface ScopeDeletionResolveOptions {
  *     does.
  */
 export interface ScopeDeletionTracker {
+  /** Durable or pending observations, independent of the registry's current file state. */
+  readonly deletionHistory?: ScopeDeletionHistory;
   /**
    * Record a gateway tombstone for `scope`. `source` names who learned it
    * (default "feed"; the delete worker passes "local-delete").
@@ -95,6 +99,8 @@ export interface ScopeDeletionTracker {
    * tombstones re-validated as of `at`. An incremental pass (`since` the
    * cursor) proves nothing about tombstones it did not list, so those keep
    * ageing and are re-checked at the gateway after `maxStalenessMs`.
+   * Retries pending history writes before recording completion. A storage
+   * error propagates and leaves the unsuccessful observations pending.
    */
   noteFeedSynced(at?: Date, options?: { full?: boolean }): void;
   /** Synchronous view: a known tombstone, or null when none is known. */
@@ -115,7 +121,14 @@ export interface ScopeTombstone {
   version: string | null;
 }
 
+/** Owner-partitioned metadata supplied by the runtime, never projected data. */
+export interface ScopeDeletionHistory {
+  remember(scope: string, tombstone: ScopeTombstone): void;
+  get(scope: string): ScopeTombstone | null;
+}
+
 export interface ScopeDeletionTrackerOptions {
+  deletionHistory?: ScopeDeletionHistory;
   /** Deletion-aware registry lookup for on-demand checks. Optional: without it the tracker only knows what it is told. */
   feed?: DataPointFeedPort;
   /** Data owner used for on-demand lookups. Optional for the same reason. */
@@ -147,6 +160,33 @@ interface KnownTombstone extends ScopeTombstone {
   verifiedAtMs: number;
 }
 
+class DeletionLookupTimeout extends Error {}
+
+/** A timed-out response is never applied to the tracker cache. */
+async function beforeDeadline<T>(
+  request: Promise<T>,
+  timeoutMs?: number,
+  onTimeout?: () => void,
+): Promise<T> {
+  if (timeoutMs === undefined) return request;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      request,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new DeletionLookupTimeout("Deletion lookup deadline exceeded"),
+          );
+          onTimeout?.();
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export function createScopeDeletionTracker(
   options: ScopeDeletionTrackerOptions = {},
 ): ScopeDeletionTracker {
@@ -168,6 +208,31 @@ export function createScopeDeletionTracker(
   let lastGatewayFailureMs: number | null = null;
   // Coalesce concurrent lookups of the same scope into one request.
   const inflight = new Map<string, Promise<ScopeDeletionVerdict | null>>();
+  // A live file may clear `deleted`, but cannot clear an observed canonical
+  // refusal whose history write failed. Remove it only after persistence.
+  const pendingHistory = new Map<string, ScopeTombstone>();
+  const history = options.deletionHistory;
+
+  function persistPendingHistory(scope: string): void {
+    const tombstone = pendingHistory.get(scope);
+    if (!history || !tombstone) return;
+    history.remember(scope, tombstone);
+    pendingHistory.delete(scope);
+  }
+
+  const deletionHistory: ScopeDeletionHistory | undefined = history
+    ? {
+        remember(scope, tombstone) {
+          pendingHistory.set(scope, tombstone);
+          persistPendingHistory(scope);
+        },
+        get(scope) {
+          // Preserve durable-read errors and the existing durable fact when
+          // an update failed. Either fact is sufficient to refuse canonical.
+          return history.get(scope) ?? pendingHistory.get(scope) ?? null;
+        },
+      }
+    : undefined;
 
   function rememberLive(scope: string, at: number): void {
     deleted.delete(scope);
@@ -186,13 +251,17 @@ export function createScopeDeletionTracker(
     tombstone: ScopeTombstone,
     source: KnownTombstone["source"],
   ): void {
-    deleted.set(scope, {
+    const normalized = {
       deletedAt: tombstone.deletedAt,
       version: normalizeVersion(tombstone.version),
+    };
+    deleted.set(scope, {
+      ...normalized,
       source,
       verifiedAtMs: nowMs(),
     });
     live.delete(scope);
+    deletionHistory?.remember(scope, normalized);
   }
 
   function isFresh(at: number | null): boolean {
@@ -224,10 +293,14 @@ export function createScopeDeletionTracker(
    * owner wired, inside the failure back-off, or the request failed): the
    * caller falls back to its last known state.
    */
-  async function lookup(scope: string): Promise<ScopeDeletionVerdict | null> {
+  async function lookup(
+    scope: string,
+    timeoutMs?: number,
+  ): Promise<ScopeDeletionVerdict | null> {
     const feed = options.feed;
     const owner = options.serverOwner;
-    if (!feed || !owner) return null;
+    if (!feed || !owner || (timeoutMs !== undefined && timeoutMs <= 0))
+      return null;
     if (
       lastGatewayFailureMs !== null &&
       nowMs() - lastGatewayFailureMs < gatewayRetryMs
@@ -235,15 +308,30 @@ export function createScopeDeletionTracker(
       return null;
     }
     const pending = inflight.get(scope);
-    if (pending) return pending;
+    if (pending) {
+      // A read may already own an unbounded lookup. Inventory still has its
+      // own deadline and must not wait for that request.
+      return beforeDeadline(pending, timeoutMs).catch((error) => {
+        if (error instanceof DeletionLookupTimeout) return null;
+        throw error;
+      });
+    }
+    const deletionAtStart = deleted.get(scope);
     const request = (async () => {
+      let record: DataPointFeedRecord | null;
+      const controller =
+        timeoutMs === undefined ? undefined : new AbortController();
       try {
-        const record = await feed.getDataPoint({
-          ownerAddress: owner,
-          scope,
-        });
+        record = await beforeDeadline(
+          feed.getDataPoint({
+            ownerAddress: owner,
+            scope,
+            ...(controller ? { signal: controller.signal } : {}),
+          }),
+          timeoutMs,
+          () => controller?.abort(),
+        );
         lastGatewayFailureMs = null;
-        return verdictFromRecord(scope, record);
       } catch (err) {
         lastGatewayFailureMs = nowMs();
         options.logger?.warn?.(
@@ -255,16 +343,36 @@ export function createScopeDeletionTracker(
           "Could not check gateway deletion state; serving last known state",
         );
         return null;
-      } finally {
-        inflight.delete(scope);
       }
-    })();
+      // Every deletion observation replaces this object. A response started
+      // before a newer tombstone (or its re-add) cannot overwrite that state.
+      if (deleted.get(scope) !== deletionAtStart)
+        return lastKnownVerdict(scope);
+      // Persistence failures must propagate. Treating them as a network
+      // outage could answer assumed-live before the deletion is recorded.
+      return verdictFromRecord(scope, record);
+    })().finally(() => inflight.delete(scope));
     inflight.set(scope, request);
     return request;
   }
 
+  function lastKnownVerdict(scope: string): ScopeDeletionVerdict {
+    // Sync or a local delete can teach us a tombstone during the lookup.
+    const known = deleted.get(scope);
+    return known
+      ? {
+          deleted: true,
+          deletedAt: known.deletedAt,
+          version: known.version,
+          source: known.source,
+          verified: false,
+        }
+      : { deleted: false, source: "assumed-live", verified: false };
+  }
+
   return {
     maxStalenessMs,
+    deletionHistory,
 
     markDeleted(scope, tombstone, source = "feed") {
       rememberDeleted(scope, tombstone, source);
@@ -275,6 +383,9 @@ export function createScopeDeletionTracker(
     },
 
     noteFeedSynced(at, options) {
+      // One attempt per pending scope per completed feed pass, including
+      // live/empty passes after the gateway has stopped listing a deletion.
+      for (const scope of pendingHistory.keys()) persistPendingHistory(scope);
       lastFeedSyncMs = (at ?? now()).getTime();
       if (!options?.full) return;
       // A full listing would have shown any re-add as a live row (and marked
@@ -314,15 +425,9 @@ export function createScopeDeletionTracker(
         // Stale tombstone: the scope may have been re-added elsewhere. Ask;
         // if the registry cannot be reached, keep refusing (never resurrect
         // on a guess) and say the verdict is unverified.
-        const rechecked = await lookup(scope);
+        const rechecked = await lookup(scope, resolveOptions?.gatewayTimeoutMs);
         if (rechecked !== null) return rechecked;
-        return {
-          deleted: true,
-          deletedAt: known.deletedAt,
-          version: known.version,
-          source: known.source,
-          verified: false,
-        };
+        return lastKnownVerdict(scope);
       }
       if (isFresh(live.get(scope) ?? null)) {
         return { deleted: false, source: "gateway", verified: true };
@@ -332,11 +437,8 @@ export function createScopeDeletionTracker(
         return { deleted: false, source: "feed", verified: true };
       }
       return (
-        (await lookup(scope)) ?? {
-          deleted: false,
-          source: "assumed-live",
-          verified: false,
-        }
+        (await lookup(scope, resolveOptions?.gatewayTimeoutMs)) ??
+        lastKnownVerdict(scope)
       );
     },
   };

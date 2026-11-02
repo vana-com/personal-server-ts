@@ -1,10 +1,22 @@
-import { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
+import {
+  LEGACY_SCOPE_BINDINGS,
+  OURA_SLEEP_CONTRIBUTOR_INTEGERS,
+  ouraInteger,
+  ouraSleepPeriod,
+  ouraSleepPeriodOmissions,
+  withOuraContributors,
+  partitionOuraRows,
+} from "./bindings.js";
 import type { LegacyScopeBinding, ProjectionResult } from "./types.js";
 
 // Map signed Oura Browser 0.1.2 records into the retained legacy scopes.
 const source = "https://registry.pdpp.dev/connectors/oura-browser";
 const digest =
   "sha256:ddc901015996e4ae67030bcd9ec809aa368b1b69d94b8ed5515d1be0a886975d";
+
+/** Digest of the frozen projection collection profile, distinct from its OCI image. */
+export const OURA_BROWSER_DECLARATION_DIGEST =
+  "sha256:0b149898fceb3aa16e6e97b170273a7660d23ed567a905d465ddd8274bc58ed7";
 
 export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
   new Map(
@@ -83,8 +95,6 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                 if (
                   typeof data.id !== "string" ||
                   !data.id.trim() ||
-                  typeof data.day !== "string" ||
-                  !/^\d{4}-\d{2}-\d{2}$/.test(data.day) ||
                   (stream === "sleep" &&
                     data.record_type !== "sleep_session" &&
                     data.record_type !== "daily_score")
@@ -99,70 +109,72 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                   };
                 }
               }
+              // Day and score rules are the base profile's: an impossible day
+              // or a missing/malformed score drops and counts the row.
               if (stream !== "sleep") return original.project(records, options);
 
-              const sessions = streamRecords.filter(
-                ({ data }) => data.record_type === "sleep_session",
+              // A session row produces no daily score here, so only its day
+              // is checked; each daily_score row must carry the legacy score.
+              const { rows, diagnostics } = partitionOuraRows(
+                scope,
+                stream,
+                streamRecords.map(({ data }) => data),
+                (row) =>
+                  row.record_type === "daily_score" ? "sleep_score" : undefined,
               );
-              const scores = streamRecords.filter(
-                ({ data }) => data.record_type === "daily_score",
+              const sessions = rows.filter(
+                (row) => row.record_type === "sleep_session",
               );
-              const sessionRecords = records.filter(
-                (record) =>
-                  record.stream !== "sleep" ||
-                  record.data.record_type === "sleep_session",
+              const scores = rows.filter(
+                (row) => row.record_type === "daily_score",
               );
-              const projected = original.project(sessionRecords, options);
-              if (!projected.ok) return projected;
-
-              const sessionById = new Map(
-                sessions.map(({ data }) => [data.id, data]),
-              );
-              const sleepPeriods = Array.isArray(projected.payload.sleepPeriods)
-                ? projected.payload.sleepPeriods.map((period) => {
-                    if (
-                      !period ||
-                      typeof period !== "object" ||
-                      Array.isArray(period)
-                    )
-                      return period;
-                    const sourceSession = sessionById.get(
-                      (period as Record<string, unknown>).id,
-                    );
-                    if (
-                      !sourceSession ||
-                      !(
-                        typeof sourceSession.awake_time === "number" ||
-                        sourceSession.awake_time === null
-                      )
-                    )
-                      return period;
-                    return {
-                      ...(period as Record<string, unknown>),
-                      awakeTime: sourceSession.awake_time,
-                    };
-                  })
-                : projected.payload.sleepPeriods;
-              const dailyScores = scores.map(({ data }) => ({
+              const sleepPeriods = sessions.map((session) => ({
+                ...ouraSleepPeriod(session),
+                ...(typeof session.awake_time === "number" ||
+                session.awake_time === null
+                  ? { awakeTime: ouraInteger(session.awake_time) }
+                  : {}),
+              }));
+              const dailyScores = scores.map((data) => ({
                 id:
                   typeof data.daily_sleep_id === "string"
                     ? data.daily_sleep_id
                     : data.id,
                 day: data.day,
-                ...(typeof data.sleep_score === "number" ||
-                data.sleep_score === null
-                  ? { score: data.sleep_score }
-                  : {}),
-                ...(typeof data.daily_sleep_timestamp === "string"
-                  ? { timestamp: data.daily_sleep_timestamp }
-                  : {}),
-                ...(data.contributors && typeof data.contributors === "object"
-                  ? { contributors: data.contributors }
-                  : {}),
+                score: ouraInteger(data.sleep_score),
+                ...(data.daily_sleep_timestamp === null
+                  ? {}
+                  : typeof data.daily_sleep_timestamp === "string"
+                    ? { timestamp: data.daily_sleep_timestamp }
+                    : {}),
+                ...withOuraContributors(
+                  data.contributors,
+                  OURA_SLEEP_CONTRIBUTOR_INTEGERS,
+                ),
               }));
+              const projectionOmissions = sessions.flatMap(
+                ouraSleepPeriodOmissions,
+              );
+              for (const data of scores) {
+                if (data.daily_sleep_timestamp !== null) continue;
+                const entityKey =
+                  typeof data.daily_sleep_id === "string"
+                    ? data.daily_sleep_id
+                    : data.id;
+                projectionOmissions.push({
+                  entityPath: "$.dailyScores[]",
+                  entityKey: String(entityKey),
+                  fieldPath: "timestamp",
+                  reason: "null_timestamp",
+                });
+              }
               return {
-                ...projected,
-                payload: { ...projected.payload, dailyScores, sleepPeriods },
+                ok: true,
+                ...(projectionOmissions.length > 0
+                  ? { projectionOmissions }
+                  : {}),
+                payload: { dailyScores, sleepPeriods },
+                ...(diagnostics.length > 0 ? { diagnostics } : {}),
               };
             },
           },

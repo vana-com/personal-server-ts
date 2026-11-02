@@ -1,4 +1,5 @@
-export type { StorageAdapter } from "./interface.js";
+export type { BoundedStorageAdapter, StorageAdapter } from "./interface.js";
+export { StoredBlobConflictError } from "./interface.js";
 export {
   createSdkStorageAdapter,
   type SdkStorageProvider,
@@ -8,3 +9,4 @@ export {
   createVanaSyncStorageAdapter,
   resolveVanaStorageEndpoint,
 } from "./vana.js";
+export { vanaBlobRequests } from "./vana-audience.js";

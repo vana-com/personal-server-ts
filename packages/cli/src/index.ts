@@ -1,3 +1,4 @@
+export { OURA_LEGACY_TAKEOVER_CONTRACT } from "@opendatalabs/personal-server-ts-core/contracts";
 export {
   createOwnerSignedPersonalServerRequest,
   createPersonalServerInfoFromHealth,

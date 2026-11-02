@@ -500,7 +500,7 @@ describe("createPsLiteRuntime", () => {
     expect(write.status).toBe(201);
     await expect(write.json()).resolves.toEqual({
       scope: "instagram.profile",
-      collectedAt: "2026-05-08T00:00:00Z",
+      collectedAt: "2026-05-08T00:00:00.000Z",
       status: "stored",
     });
 
@@ -517,7 +517,7 @@ describe("createPsLiteRuntime", () => {
     await expect(read.json()).resolves.toMatchObject({
       version: "1.0",
       scope: "instagram.profile",
-      collectedAt: "2026-05-08T00:00:00Z",
+      collectedAt: "2026-05-08T00:00:00.000Z",
       data: { username: "test_user" },
     });
   });
@@ -586,7 +586,7 @@ describe("createPsLiteRuntime", () => {
       scopes: [
         {
           scope: "instagram.profile",
-          latestCollectedAt: "2026-05-08T00:00:00Z",
+          latestCollectedAt: "2026-05-08T00:00:00.000Z",
           versionCount: 1,
         },
       ],
@@ -601,9 +601,59 @@ describe("createPsLiteRuntime", () => {
     expect(versions.status).toBe(200);
     await expect(versions.json()).resolves.toMatchObject({
       scope: "instagram.profile",
-      versions: [{ collectedAt: "2026-05-08T00:00:00Z" }],
+      versions: [{ collectedAt: "2026-05-08T00:00:00.000Z" }],
       total: 1,
     });
+  });
+
+  it("reads a same-second write after a legacy second-precision row", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const old = createDataFileEnvelope(
+      "instagram.profile",
+      "2026-05-08T00:00:00Z",
+      { username: "old" },
+    );
+    const written = await storage.writeEnvelope(old);
+    await storage.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: old.scope,
+      collectedAt: old.collectedAt,
+      sizeBytes: written.sizeBytes,
+    });
+    const runtime = createTestRuntime({
+      storage,
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      now: () => new Date("2026-05-08T00:00:00.000Z"),
+    });
+    const write = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "new" }),
+      }),
+    );
+    expect(write.status).toBe(201);
+    expect(await write.json()).toMatchObject({
+      collectedAt: "2026-05-08T00:00:00.001Z",
+    });
+    const read = await runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
+    expect(read.status).toBe(200);
+    expect((await read.json()).data).toEqual({ username: "new" });
+    expect(storage.listScopes({}).scopes[0]?.latestCollectedAt).toBe(
+      "2026-05-08T00:00:00.001Z",
+    );
   });
 
   it("deletes a scope with owner auth", async () => {

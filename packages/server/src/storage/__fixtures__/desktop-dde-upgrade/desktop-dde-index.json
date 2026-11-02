@@ -1,0 +1,82 @@
+{
+  "provenance": {
+    "historicalCommit": "dde4ed94b710e074e93896b1c7d6dacc71883f23",
+    "indexSchemaVersion": 15,
+    "pdppSchemaVersion": 15,
+    "generatedBy": "historical DDE initializeDatabase + createSqliteRecordStore + transitionStravaToBrowser",
+    "sourceFiles": {
+      "index-schema.ts": "c0e7a3b559fe24f4db33d618a44e19553723876546a0a8a0921d990d267b464e",
+      "pdpp-records-sqlite-store.ts": "6d9cce280c7c24000f7a644d3a607a742c0c99107227013b816971f99802b6a5",
+      "pdpp-stream-completion.ts": "6bd5ad80dc5585deaec46769dfa36cf7c67ee970679cc3e2c917c9a779154f30",
+      "legacy-scope-authority.ts": "0ad22a7a7813ba36b8f1c310af242745b7f1a144ce8a24d1ac0174b6462b3742",
+      "strava-method-transition.ts": "fefc052fd98cb50a3087d8311d8e13d0f27a0a27e030754e1ea5c6bee94f69e5"
+    },
+    "sqlSha256": "ad166cd39d1d38d40107117190bd82b43255fe2eb53481c5c40e44b296039e6e",
+    "syntheticOnly": true,
+    "seed": {
+      "instance": "strava:fixture-owner",
+      "method": "strava",
+      "generationBefore": 1,
+      "transitionGeneration": 2,
+      "archiveInstance": "retired-strava:0634f6db-e43f-4225-88ba-4716585dc293",
+      "activityIds": ["a", "b"],
+      "activityHistory": "activity a was replaced once before the completed export was archived",
+      "blob": {
+        "blobId": "sha256:75cd7d2113b42277cc57addfe9ebd694631be611db52d8706655245f727cb614",
+        "sha256": "75cd7d2113b42277cc57addfe9ebd694631be611db52d8706655245f727cb614",
+        "bytes": "synthetic DDE Strava retained image bytes"
+      },
+      "stravaScopes": ["strava.activities", "strava.coverage_diagnostics"],
+      "rawSqlLegacyFileSeeds": [
+        {
+          "path": "data/strava.activities.fixture.json",
+          "scope": "strava.activities"
+        },
+        {
+          "path": "data/strava.coverage_diagnostics.fixture.json",
+          "scope": "strava.coverage_diagnostics"
+        }
+      ]
+    }
+  },
+  "instance": "strava:fixture-owner",
+  "sourceId": "https://registry.pdpp.dev/sources/strava",
+  "method": "strava-browser",
+  "generation": 2,
+  "archiveInstance": "retired-strava:0634f6db-e43f-4225-88ba-4716585dc293",
+  "collectedAt": "2026-10-20T00:00:00.000Z",
+  "blobId": "sha256:75cd7d2113b42277cc57addfe9ebd694631be611db52d8706655245f727cb614",
+  "blobSha256": "75cd7d2113b42277cc57addfe9ebd694631be611db52d8706655245f727cb614",
+  "archiveBytesSha256": "75cd7d2113b42277cc57addfe9ebd694631be611db52d8706655245f727cb614",
+  "snapshots": {
+    "strava.activities": {
+      "scope": "strava.activities",
+      "collectedAt": "2026-10-20T00:00:00.000Z",
+      "data": {
+        "activities": [
+          {
+            "id": "a",
+            "activity_type": "Ride",
+            "freshness": "snapshot",
+            "blob_ref": {
+              "blob_id": "sha256:75cd7d2113b42277cc57addfe9ebd694631be611db52d8706655245f727cb614"
+            }
+          },
+          {
+            "id": "b",
+            "activity_type": "Run",
+            "freshness": "snapshot"
+          }
+        ]
+      }
+    },
+    "strava.coverage_diagnostics": {
+      "scope": "strava.coverage_diagnostics",
+      "collectedAt": "2026-10-20T00:00:00.000Z",
+      "data": {
+        "scanned": 2,
+        "warnings": []
+      }
+    }
+  }
+}

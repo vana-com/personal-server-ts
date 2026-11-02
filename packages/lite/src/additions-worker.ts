@@ -10,6 +10,7 @@ import {
   deriveScopeKey,
   encryptWithPassword,
 } from "@opendatalabs/vana-sdk/browser";
+import { NeedsFencedPublicationError } from "@opendatalabs/personal-server-ts-core/publication";
 import { keccak256, stringToHex } from "viem";
 import { decryptBoundedAdditions } from "./additions-crypto.js";
 import { additionsTransfers } from "./additions-protocol.js";
@@ -108,11 +109,12 @@ function createService(init: AdditionsWorkerInit) {
   const reconciledScopes = new Set<string>();
   async function reconcilePending(scope: string, budget: ByteBudget) {
     if (reconciledScopes.has(scope)) return null;
-    const prior = await transport("readPending", [scope], budget);
-    if (!prior) {
+    const pending = await transport("readPending", [scope], budget);
+    if (!pending) {
       reconciledScopes.add(scope);
       return null;
     }
+    let prior = pending;
     let snapshot = await inventory.list(scope, {
       budget,
       signal: budget.signal,
@@ -128,9 +130,9 @@ function createService(init: AdditionsWorkerInit) {
     if (slot && replaced && !["confirmed", "finalized"].includes(slot.status))
       throw new Error("Pending checkpoint replacement is not settled");
     if (!slot) {
-      // The exact encrypted candidate is retried; never bump the version
-      // on an ambiguous PUT or registration receipt.
-      await transport("publish", [prior], budget);
+      // The owner retries the exact bytes and resolves the current registry head.
+      const published = await transport("publish", [prior], budget);
+      prior = { ...prior, expectedVersion: published.expectedVersion };
       snapshot = await inventory.list(scope, {
         budget,
         signal: budget.signal,
@@ -223,6 +225,11 @@ function createService(init: AdditionsWorkerInit) {
       activeBudget = options?.budget;
       return inventory.listScopes(options);
     },
+    head: (scope, signal) => {
+      // An unbudgeted read: do not charge it to an earlier call's budget.
+      activeBudget = undefined;
+      return inventory.head(scope, signal);
+    },
   };
   const reported = new Set<string>();
   return createDurableAdditions({
@@ -306,8 +313,7 @@ function createService(init: AdditionsWorkerInit) {
             ),
           ),
         };
-        await transport("publish", [prepared], budget);
-        return prepared;
+        return transport("publish", [prepared], budget);
       },
     },
   });
@@ -324,7 +330,13 @@ worker.onmessage = (event) => {
         request?.reject(
           message.budgetExceeded
             ? new AdditionsBudgetExceeded(message.error)
-            : new Error(message.error),
+            : message.publicationBlocked
+              ? new NeedsFencedPublicationError(
+                  message.publicationBlocked.scope,
+                  message.publicationBlocked.reason,
+                  false,
+                )
+              : new Error(message.error),
         );
       else request?.resolve(message.result);
     } catch (error) {
