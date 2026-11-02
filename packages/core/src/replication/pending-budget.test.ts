@@ -77,4 +77,19 @@ describe("replica pending budget", () => {
       limit: "logicalBytes",
     });
   });
+
+  it.each([-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid persisted usage %s even when the requested delta is valid",
+    (value) => {
+      for (const field of ["operations", "logicalBytes"] as const) {
+        expect(() =>
+          assertReplicaPendingCapacity({
+            limits: { operations: 10, logicalBytes: 10 },
+            used: { operations: 0, logicalBytes: 0, [field]: value },
+            requested: { operations: 1, logicalBytes: 1 },
+          }),
+        ).toThrow(RangeError);
+      }
+    },
+  );
 });

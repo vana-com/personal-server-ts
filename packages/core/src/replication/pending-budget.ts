@@ -47,12 +47,10 @@ export function assertReplicaPendingCapacity(input: {
   used: { operations: number; logicalBytes: number };
   requested: { operations: number; logicalBytes: number };
 }): void {
-  for (const [name, value] of Object.entries({
-    ...input.used,
-    ...input.requested,
-  }))
-    if (!Number.isSafeInteger(value) || value < 0)
-      throw new RangeError(`invalid replica pending ${name}`);
+  for (const counters of [input.used, input.requested])
+    for (const [name, value] of Object.entries(counters))
+      if (!Number.isSafeInteger(value) || value < 0)
+        throw new RangeError(`invalid replica pending ${name}`);
   const operations = input.used.operations + input.requested.operations;
   const logicalBytes = input.used.logicalBytes + input.requested.logicalBytes;
   if (!Number.isSafeInteger(operations) || !Number.isSafeInteger(logicalBytes))
