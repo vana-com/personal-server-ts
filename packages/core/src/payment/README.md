@@ -14,4 +14,6 @@ This waives read-time data access payment, not unrelated transaction gas, storag
 
 ## Local runtime candidate
 
-The implementation is forward-adopted from official `dev` revision `d87e6727d8160b1ec3a0593acf124b2357ae6f92` onto Desktop's selected `5f17ebd64ed21bbd7d302c8b614d0c04a4700437` baseline. Desktop derives `payment.ownAppAccountUrl` from its selected Account configuration. This local commit exists only to identify manifest-checked staging inputs. It is not published or deployed, and production consumers retain their stable pins until separately authorized.
+The original local candidate forward-adopted official `dev` revision `d87e6727d8160b1ec3a0593acf124b2357ae6f92` onto Desktop's then-selected `5f17ebd64ed21bbd7d302c8b614d0c04a4700437` baseline. The 3 November 2026 coordinated release review carries that implementation onto main `c32f9b6ef7fa25e964c92e1e7a7845825ed17db9`, at local runtime commit `392a3af3cd22609e8b066102a4c6b5610373b727`. Native bundle and synthetic SDK-read receipts identify that exact runtime commit; this documentation update changes no runtime code.
+
+Desktop derives `payment.ownAppAccountUrl` from its selected Account configuration. These local commits identify manifest-checked staging inputs. Before Desktop delivery, replace its local candidate pin with the accepted upstream merge commit. Nothing here is published or deployed, and production consumers retain their stable pins until separately authorized.
