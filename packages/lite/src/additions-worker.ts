@@ -2,6 +2,7 @@ import {
   AdditionsBudgetExceeded,
   createDurableAdditions,
   createVersionInventoryClient,
+  findCheckpointRegistration,
   type ByteBudget,
 } from "@opendatalabs/personal-server-ts-core/additions";
 import {
@@ -144,8 +145,7 @@ function createService(init: AdditionsWorkerInit) {
     if (
       !slot ||
       (!replaced &&
-        (slot.dataHash !== prior.dataHash ||
-          slot.metadataHash !== prior.metadataHash))
+        !findCheckpointRegistration(snapshot, prior.expectedVersion, prior))
     )
       throw new Error("Interrupted checkpoint registration remains ambiguous");
     const proof = replaced ? slot : prior;
@@ -184,26 +184,30 @@ function createService(init: AdditionsWorkerInit) {
         throw new Error("Interrupted checkpoint commitment mismatch");
       data = envelope.data;
     }
-    if (replaced) {
-      // Other devices do not share our Web Lock. Authenticate their settled
-      // winning bytes and recheck the slot before retiring this local intent.
-      const latest = await inventory.list(scope, {
-        budget,
-        signal: budget.signal,
-      });
-      if (
-        !latest.versions.some(
+    // Other devices do not share our Web Lock. Recheck registration visibility
+    // after authenticating bytes, including an unchanged but now failed intent.
+    const latest = await inventory.list(scope, {
+      budget,
+      signal: budget.signal,
+    });
+    const visible = slot.isTombstone
+      ? latest.head &&
+        BigInt(proof.expectedVersion) <= BigInt(latest.head.expectedVersion) &&
+        latest.versions.find(
           (row) =>
             row.expectedVersion === proof.expectedVersion &&
             row.dataHash === proof.dataHash &&
             row.metadataHash === proof.metadataHash &&
-            ["confirmed", "finalized"].includes(row.status),
+            row.isTombstone,
         )
-      )
-        throw new Error(
-          "Pending checkpoint replacement changed during verification",
-        );
-    }
+      : findCheckpointRegistration(latest, proof.expectedVersion, proof);
+    if (
+      !visible ||
+      (replaced && !["confirmed", "finalized"].includes(visible.status))
+    )
+      throw new Error(
+        "Interrupted checkpoint registration changed during verification",
+      );
     await transport("clearPending", [scope], budget);
     reconciledScopes.add(scope);
     return replaced ? null : { proof: prior, data };

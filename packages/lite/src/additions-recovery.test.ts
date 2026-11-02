@@ -99,6 +99,9 @@ async function fixture() {
   const slots = new Map<string, Slot[]>();
   const blobs = new Map<string, Uint8Array>();
   const stall = new Set<string>();
+  const failedRegistrations = new Set<string>();
+  const interruptRegistration = new Set<string>();
+  const failRegistrationOnDownload = new Set<string>();
   const collectedAt = "2026-10-20T00:00:00.000Z";
   function register(scope: string, slot: Slot) {
     slots.set(scope, [...(slots.get(scope) ?? []), slot]);
@@ -163,6 +166,15 @@ async function fixture() {
           );
         }
         const bytes = blobs.get(key);
+        if (failRegistrationOnDownload.delete(key)) {
+          const [scope, version] = key.split("/");
+          const registration = slots
+            .get(scope)
+            ?.find((slot) => slot.expectedVersion === version);
+          if (!registration)
+            throw new Error("Missing registration to transition");
+          registration.status = "failed";
+        }
         return bytes
           ? new Response(new Uint8Array(bytes))
           : new Response(null, { status: 404 });
@@ -171,10 +183,12 @@ async function fixture() {
         const data = JSON.parse(await new Response(init.body).text());
         register(data.scope, {
           ...data,
-          status: "finalized",
+          status: failedRegistrations.has(data.scope) ? "failed" : "finalized",
           addedAt: collectedAt,
           isTombstone: false,
         });
+        if (interruptRegistration.delete(data.scope))
+          throw new Error("Connection interrupted after registration");
         return Response.json({
           dataPointId: idFor(data.scope),
           expectedVersion: data.expectedVersion,
@@ -269,7 +283,18 @@ async function fixture() {
       ),
     ).data;
   }
-  return { source, session, document, slots, blobs, stall, query };
+  return {
+    source,
+    session,
+    document,
+    slots,
+    blobs,
+    stall,
+    query,
+    failedRegistrations,
+    interruptRegistration,
+    failRegistrationOnDownload,
+  };
 }
 
 it("recovers a large source after warm checkpoints while upload hints retain their smaller allowance", async () => {
@@ -413,3 +438,31 @@ it("reports a source-unit timeout as a budget limit rather than corrupt data", a
     }),
   );
 }, 10000);
+
+it.each(["before restart", "after checkpoint download"])(
+  "retains an interrupted checkpoint intent when registration fails %s",
+  async (phase) => {
+    const f = await fixture();
+    const scope = "vana.system.additions.github.profile";
+    await f.source("github.profile", "1", { name: "a" });
+    if (phase === "before restart") f.failedRegistrations.add(scope);
+    f.interruptRegistration.add(scope);
+    await (await f.session(256 * 1024 * 1024)).summarize(f.query);
+    expect(f.slots.get(scope)).toHaveLength(1);
+    expect(f.slots.get(scope)![0].status).toBe(
+      phase === "before restart" ? "failed" : "finalized",
+    );
+    if (phase === "after checkpoint download")
+      f.failRegistrationOnDownload.add(`${scope}/1`);
+    const checkpoint = f.blobs.get(`${scope}/1`);
+    f.blobs.delete("github.profile/1");
+    const result = await (
+      await f.session(256 * 1024 * 1024)
+    ).summarize(f.query);
+    expect(result.coverage).not.toBe("complete");
+    expect(f.slots.get(scope)).toHaveLength(1);
+    expect(f.blobs.get(`${scope}/1`)).toEqual(checkpoint);
+    expect(f.blobs.has(`${scope}/2`)).toBe(false);
+  },
+  60_000,
+);

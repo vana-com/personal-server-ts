@@ -22,6 +22,12 @@ This Lite composition uses existing owner-wallet authority. Every inventory requ
 
 Cross-device correctness does not depend on process-local locks or CAS registration. A later reader repairs lost or lower-prefix checkpoints. If source blobs are missing during required replay, history remains partial. An inaccessible checkpoint is never overwritten with a failed rebuild. Full runtime has no 200-version/256-MiB backfill cap. Inventory pages are still accumulated, with a configurable page limit, so full-runtime memory includes the version inventory and one scope ledger.
 
+Checkpoint selection uses only settled ledger tombstones at or below the authoritative head. A retained checkpoint must also match an eligible prefix of the current source inventory; failed or unknown registrations cannot keep contributing merely because their hashes match. If source replay stalls after pruning or a stale writer published a shorter checkpoint, recovery can select an older compatible checkpoint with strictly more verified source progress.
+
+Each summarize/upload invocation admits at most 256 retained-checkpoint download/decryption attempts during discovery across all scopes, including fallback searches. Child work shares this allowance. Rejected registration identities are memoized only for that invocation and source-inventory fingerprint, with at most 256 charged metadata entries and no decrypted-document cache. Valid evidence is still revalidated when needed. Search exhaustion reports `checkpoint_search_exhausted` and returns behind without publishing an empty replacement; fallback retains the best verified prefix and its publication reserve. This bounds discovery rather than guaranteeing recovery from arbitrarily deep retained checkpoint history. Full-runtime source-version replay remains separate from this checkpoint-search limit.
+
+Publication continues through the shared write-once policy in [Write-once publication](design/write-once-publication.md). Recovery does not bypass its deletion/generation fences to adopt another writer's orphan. A Lite publication intent is cleared only after its verified registration remains visible and eligible on a second inventory observation; failed registrations keep the intent.
+
 ## Summary contract
 
 The version-1 payload retains local route fields and adds coverage, through markers, recent `buckets`, `fineSince`, and older `daily` UTC counts, globally and per source. Ten complete UTC days plus today retain quarter-hours. This covers the current seven-local-day chart at UTC-12 through UTC+14, DST transitions and current fractional-hour zones. Counts older than `fineSince` compact into UTC days without deleting permanent ledger evidence.
@@ -94,3 +100,8 @@ operations. Interrupted cleanup is retried from authoritative source tombstones.
 This option clears pending publication journals after registry deletion; it does
 not drain physical ciphertext deletion. The ordinary deletion pipeline retains
 its existing blob deletion batches and retry ownership.
+
+The full Core host rejects `durableOnly` when only its ordinary cleanup callback
+is available, and checks cancellation before deletion effects. Lite's bounded
+registry/journal deletion remains at its existing transport owner; Core never
+silently turns a bounded-only request into physical cleanup.
