@@ -27,7 +27,7 @@ import type {
   ReplicaOperation,
   ReplicaEnvelope,
 } from "../packages/core/src/replication/envelope.js";
-import { createNodeReplicationPorts } from "../packages/server/src/storage/pdpp-replication-host.js";
+import { createReplicationNetworkPorts } from "../packages/core/src/replication/host-ports.js";
 import {
   replicaFragmentKey,
   replicaManifestKey,
@@ -346,7 +346,7 @@ export async function openReplicaRuntime(init: Init) {
     serverOwner: init.owner,
     serverAccount: account,
   });
-  const { transport } = createNodeReplicationPorts({
+  const { transport } = createReplicationNetworkPorts({
     config,
     owner: init.owner,
     masterKey: new Uint8Array(init.master),
@@ -354,6 +354,7 @@ export async function openReplicaRuntime(init: Init) {
     gateway: createGatewayClient(gatewayUrl),
     signer: createServerSigner(account, config.gateway),
     feed: createGatewayDataPointFeed({ gatewayUrl, fetch: boundedFetch }),
+    compatibilityFetch: boundedFetch,
   });
   db.exec(
     "CREATE TABLE IF NOT EXISTS harness_evidence (slot TEXT PRIMARY KEY, json TEXT NOT NULL)",

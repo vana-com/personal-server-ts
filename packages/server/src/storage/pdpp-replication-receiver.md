@@ -2,7 +2,7 @@
 
 `createReplicaReceiver` is an internal SQLite port. With `replication.enabled`, the server bootstrap constructs it through `createNodeReplication` (`pdpp-replication-host.ts`); a flag-off boot does not. The host supplies the database's owner, a replica-specific credential verifier, and retained declaration bindings with validators for their exact schemas. The verifier must establish the owner independently of the envelope and must refuse collector credentials. This slice supplies no credential issuance or network transport.
 
-Call `store.replication.beginBaseline` before importing. Its immutable owner binding must match the receiver. The receiver combines original local baseline/tail operations with durably retained imports, then calls the core `planReplicaMerge`. Imported operations retain their original writer, operation ID, counter and payload. They never enter either outbound journal. The local Lamport clock advances beyond observed imports before a later local mutation.
+Call `store.replication.beginBaseline` before importing. Its immutable owner must match the receiver. The receiver combines original local baseline/tail operations with durably retained imports, then calls the core `planReplicaMerge`. Imported operations retain their original writer, operation ID, counter and payload. They never enter either outbound journal. The local Lamport clock advances beyond observed imports before a later local mutation.
 
 ## Local authority
 
@@ -13,7 +13,7 @@ same.
 
 The export profile uses the canonical instance ID as the logical connection ID. Import requires a locally registered connection with the same source and acquisition method. Imported registration evidence cannot create that mapping or change its method. An absent mapping or declaration remains pending. After the host provisions a mapping, call `retry` with replica credentials. After trusted declaration documents or validators change, call `reconcileDeclarations` instead (see below). A source or method mismatch rejects the transaction. A complete reset chain can advance the registered connection's generation; older record operations remain suppressed. Connection deletion dominates record operations.
 
-The declaration resolver is trusted host configuration, not connector metadata. It must bind source, declaration digest, version, stream, primary key, semantics and schema digest to the retained document and exact validator. The receiver does not fetch declarations or accept schemas from incoming operations.
+The declaration resolver is trusted host configuration, not connector metadata. It must bind source, declaration digest, version, stream, primary key, semantics and schema digest to the retained document and exact validator. The receiver does not fetch declarations or accept schemas from incoming operations. An incoming binding that is another version of a retained stream's shape applies and validates by key only; another shape of a retained stream stays pending as `incompatible_declaration` (`resolveDeclaration`, host contract §4.5).
 
 ## Commit and retry
 

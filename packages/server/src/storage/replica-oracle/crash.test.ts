@@ -208,8 +208,7 @@ function withoutViewRevisions(dump: Record<string, unknown>) {
 const LITE_POINTS: CanonicalCrashPoint[] = [
   "record",
   "blob",
-  "journal",
-  "outbox",
+  "log",
   "import",
   "before-commit",
   "after-commit",

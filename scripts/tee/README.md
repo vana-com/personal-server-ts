@@ -232,24 +232,24 @@ item named on the command line and read per invocation, never from a file.
 | `scripts/tee/sign-fleet.cjs`    | signs each draft with the operator key, writes receipts; `--apply` settles the CVM, then `phala envs update` with the 409 retry      |
 | `scripts/tee/gateway-nodes.cjs` | `register`/`wait`/`admit`/`drain`/`remove`/`resume`, and `rotate` for the whole roll sequence                                        |
 
-Rolling the prod5 preview fleet to a new head:
+Rolling the Moksha prod5 fleet to a new head:
 
 ```sh
 # 1. Render, stage every compose (controller first), pin the read-back hashes.
 python3 scripts/tee/render-fleet.py \
-  --manifest deploy/dstack/fleets/preview-prod5.json \
+  --manifest deploy/dstack/fleets/moksha-prod5.json \
   --images-env <ci-docker-dir>/images.env \
   --out rendered/ --stage --settle --write-manifest
 
 # 2. Sign each draft and push it as the sealed environment.
 node scripts/tee/sign-fleet.cjs \
-  --manifest deploy/dstack/fleets/preview-prod5.json \
+  --manifest deploy/dstack/fleets/moksha-prod5.json \
   --drafts rendered/ --key-item <signing-key item> --apply
 
 # 3. Rotate each worker's Gateway row onto the new hash.
 for node in worker-1 worker-2 worker-3 worker-4; do
   node scripts/tee/gateway-nodes.cjs rotate \
-    --manifest deploy/dstack/fleets/preview-prod5.json \
+    --manifest deploy/dstack/fleets/moksha-prod5.json \
     --node "$node" --receipts receipts/
 done
 ```

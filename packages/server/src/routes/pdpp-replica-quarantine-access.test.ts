@@ -42,8 +42,13 @@ const binding = {
   primaryKey: ["id"],
   schemaDigest: `sha256:${"b".repeat(64)}`,
 };
+/**
+ * Another shape of the same stream. A binding that differs only by version
+ * or schema is an upgrade and merges by revision; a shape change conflicts.
+ */
 const alternateBinding = {
   ...binding,
+  semantics: "append_only" as const,
   schemaDigest: `sha256:${"c".repeat(64)}`,
 };
 const secret = "QUARANTINED-PRIOR-PAYLOAD-8b-5";

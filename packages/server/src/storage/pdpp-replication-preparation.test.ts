@@ -139,9 +139,15 @@ it("A5b-R2 a new local write for the same record during rebuild stays in a later
       "SELECT b.batch FROM pdpp_transport_batches b JOIN pdpp_transport_manifests_out m ON m.batch=b.batch WHERE m.version=3",
     )
     .get() as { batch: string };
-  const laterPayload = new TextDecoder().decode(
-    readBinary(d.db, "payload", later.batch),
-  );
+  // v3 is finalized, so its payload is reclaimed; its exact operations stay.
+  expect(readBinary(d.db, "payload", later.batch)).toBeUndefined();
+  const laterPayload = (
+    d.db
+      .prepare(
+        "SELECT group_concat(operation_json) AS ops FROM pdpp_transport_operation_outcomes WHERE batch=?",
+      )
+      .get(later.batch) as { ops: string }
+  ).ops;
   expect(laterPayload).toContain("new local value");
   expect(laterPayload).not.toContain("old retained value");
   await run(d, 3);

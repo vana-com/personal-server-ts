@@ -88,6 +88,9 @@ const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
  * Never arrival order, size, counter, deadline or hint. The predecessor check
  * is the caller's precondition, not part of this decision.
  */
+/** Completed non-matching re-downloads before the owner decides (contract F4). */
+export const REPLICA_REFETCH_BUDGET = 5;
+
 export function decideCopyPromotion(input: CopyDecisionInput): CopyDecision {
   const byKey = new Map<string, RetainedCopy>();
   for (const copy of input.copies)

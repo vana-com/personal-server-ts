@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
 import {
   canonicalJson,
+  declarationShape,
   replicaOperationSchema,
   type ReplicaOperation,
 } from "./envelope.js";
@@ -74,7 +75,8 @@ export function selectStreamCompletion(
       operation.connectionId,
       operation.methodId,
       operation.generation,
-      operation.declaration,
+      // Versions of one declared stream are one stream (a rebinding).
+      declarationShape(operation.declaration),
     ]);
     if (identity !== undefined && identity !== key)
       throw new Error("mixed completion identities");

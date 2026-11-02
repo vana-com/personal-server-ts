@@ -29,12 +29,15 @@ import {
 } from "./completion.js";
 import {
   canonicalJson,
+  declarationShape,
   exactJson,
   type RecordOperation,
   type ReplicaOperation,
 } from "./envelope.js";
 import {
+  declarationWait,
   planReplicaMerge,
+  resolveDeclaration,
   type MergeContext,
   type MergedRecord,
   type ReplicaMergePlan,
@@ -651,7 +654,8 @@ export interface CompletionFacts {
 /**
  * The available completion, or null. Available means: the connection is
  * active on the events' generation, no key of the stream is quarantined, the
- * events under declarations the host trusts name exactly one declaration,
+ * events under declarations the host trusts name exactly one declaration
+ * shape (`declarationShape`),
  * the newest of those events is a completion, every dependency has exactly one retained variant with the
  * pinned digest, nothing touching the stream is unresolved, and the live rows
  * match the declared count and snapshot digest.
@@ -659,12 +663,14 @@ export interface CompletionFacts {
 export function completionAvailability(
   facts: CompletionFacts,
 ): CompletionProjection | null {
-  const trusted = (op: CompletionEvent) =>
-    facts.declarations.find(
-      (entry) =>
-        entry.sourceId === op.sourceId &&
-        canonicalJson(entry.binding) === canonicalJson(op.declaration),
+  const trusted = (op: CompletionEvent) => {
+    const { status } = resolveDeclaration(
+      facts.declarations,
+      op.sourceId,
+      op.declaration,
     );
+    return status === "retained" || status === "compatible";
+  };
   // An event under a declaration the host does not trust waits for it, as
   // an undeclared record operation does; it neither certifies nor withdraws.
   const events = facts.events.filter(trusted);
@@ -677,9 +683,10 @@ export function completionAvailability(
     facts.unresolved
   )
     return null;
-  if (new Set(events.map((op) => canonicalJson(op.declaration))).size > 1)
+  // Versions of one declared stream (a rebinding) certify one stream; a
+  // changed shape does not.
+  if (new Set(events.map((op) => declarationShape(op.declaration))).size > 1)
     return null;
-  const declaration = trusted(first)!;
   const completion = selectStreamCompletion(events);
   if (!completion) return null;
   if (!completionDependenciesCovered(completion, facts.variantDigests))
@@ -697,7 +704,7 @@ export function completionAvailability(
             generation: first.generation,
             stream: first.declaration.stream,
           },
-          declaration.binding.primaryKey,
+          first.declaration.primaryKey,
           facts.liveRows,
         ),
       ),
@@ -777,8 +784,7 @@ function projectCompletions(
         ) ||
         issues.some(
           (issue) =>
-            issue.reason !== "missing_declaration" &&
-            issue.operations.some(inStream),
+            !declarationWait(issue.reason) && issue.operations.some(inStream),
         ),
       variantDigests,
       liveRows,

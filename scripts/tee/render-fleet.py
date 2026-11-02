@@ -6,7 +6,7 @@ pins and non-secret env only. Secrets are never rendered: a draft names its
 keychain items in `secretRefs`, and sign-fleet.cjs fills them in at signing
 time.
 
-  render-fleet.py --manifest deploy/dstack/fleets/preview-prod5.json \
+  render-fleet.py --manifest deploy/dstack/fleets/moksha-prod5.json \
       --images-env ci-docker-<head7>/images.env --out rendered/ [--stage]
 
 `--stage` applies each rendered compose to its CVM with a fail-closed dummy

@@ -503,7 +503,7 @@ class ReplicaOperationLimitScanner {
               this.limits.maxOperations,
             );
           this.inOperation = true;
-          this.depth = 1;
+          this.depth = 0;
           this.operationBytes = 0;
           this.inString = false;
           this.escaped = false;

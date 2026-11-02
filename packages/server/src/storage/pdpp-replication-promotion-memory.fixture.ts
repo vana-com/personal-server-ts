@@ -30,7 +30,7 @@ const report = (before: number, after: number) =>
 if (mode === "promote") {
   // Replicated canonical promotion alone, from chunks already staged as
   // `received`. Staging streams 64 KiB pieces, so no whole blob exists before
-  // the marker. Promotion makes the whole value that main's row format needs.
+  // the marker. Promotion copies them to canonical chunks the same way.
   const db = new Database(join(directory, "destination.sqlite"));
   const store = createReplicaRecordStore(db);
   const id = "promote-blob";

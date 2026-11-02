@@ -24,6 +24,13 @@ Under the omitted 64 MiB default, such work runs when no other item has charged
 bytes in the step and spends the rest of it, as the unbounded default ran it
 before.
 
+An item with a `part` is admitted once per part in a step: after a run, the
+same item may run again in that step only under a different part (its next
+resumable unit, e.g. the next fragment), and it never overlaps itself. An
+item without `part` runs at most once per step. A handler whose work can
+exceed a step's budget advertises the bytes of one part, so the step makes
+progress on it instead of deferring it.
+
 The result is always a `ProgressReport`. No admitted work or future durable
 deadline means `nextWake: undefined` (not `null`). Pre-aborted steps perform no
 hint read, run or checkpoint; they may read durable scheduling state to retain
@@ -95,9 +102,12 @@ rewrite old data or require a non-forward schema conversion. Older code that
 ignores it does not acquire restart-fairness guarantees.
 
 Omitting `state` from core is an in-memory-only fixture seam, not a durable host
-configuration. Lite must provide its own transactional ownership adapter and
-pass `replicaCoordinatorStateContract` on real native storage before runtime
-enablement. Node's PID-based recovery is not a portable native lifecycle model.
+configuration. Lite's ownership adapter is `createLiteReplicaCoordinatorState`
+(`packages/lite/src/replication-coordinator-state.ts`), an asynchronous port
+over the native transaction. It passes `replicaCoordinatorStateContract` over
+a SQLite-backed test double; it must pass again on real native storage
+before runtime enablement. Node's PID-based recovery is not a portable native
+lifecycle model.
 
 ## Proofs and remaining gates
 

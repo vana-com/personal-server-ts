@@ -564,6 +564,55 @@ describe("deleteScope orchestration", () => {
   });
 });
 
+describe("deleteScope of a gateway-reserved scope", () => {
+  // The gateway answers an unsigned read of a vana.system.* point with 401, so
+  // the not-registered re-check must ask the port's signed head, not the feed.
+  const RESERVED = "vana.system.additions";
+
+  it("re-checks a not-registered reserved point through the port head, never the feed", async () => {
+    const dataPointFeed = feedAnswering(async () => {
+      throw new Error("Gateway error: 401 Unauthorized");
+    });
+    const deps = makeDeps({ dataPointFeed });
+    const head = vi.fn(async () => null);
+    deps.deleteData!.head = head;
+    (
+      deps.deleteData!.tombstone as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce({
+      status: "not-registered",
+      dataPointId: computeDataPointId(OWNER, RESERVED),
+    });
+
+    const result = await deleteScope(deps, RESERVED);
+
+    expect(head).toHaveBeenCalledWith(RESERVED);
+    expect(dataPointFeed.getDataPoint).not.toHaveBeenCalled();
+    expect(result.durable).toBe(true);
+    expect(result.steps.gateway).toEqual({
+      status: "skipped",
+      reason: "not-registered",
+    });
+  });
+
+  it("refuses when the reserved head cannot be read, keeping the local copy", async () => {
+    const deps = makeDeps({ dataPointFeed: feedAnswering(async () => null) });
+    deps.deleteData!.head = vi.fn(async () => {
+      throw new Error("Gateway inventory request failed (503)");
+    });
+    (
+      deps.deleteData!.tombstone as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce({
+      status: "not-registered",
+      dataPointId: computeDataPointId(OWNER, RESERVED),
+    });
+
+    const result = await deleteScope(deps, RESERVED);
+
+    expect(result.durable).toBe(false);
+    expect(result.steps.local.status).not.toBe("ok");
+  });
+});
+
 describe("deleteScope vs a registration racing a not-registered answer", () => {
   it("tombstones the row that a registration raced in", async () => {
     let lookups = 0;

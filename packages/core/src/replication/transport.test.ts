@@ -47,8 +47,8 @@ it("runs the pinned published receive boundary against authenticated v1 and v2 m
     "writer-identity.ts": "0958dff0e274970e81150e552a76c027a00207c4",
     "namespace.ts": "ff2c2adeb775783e8dcfd2ed32c43bc4e89e5de0",
     "roster.ts": "bf76f3da60baa8aeb5f7fc20e70657ca4ce5e050",
-    "../../coordinator.ts": "3364140d2f314f678fcdbcfd435dfcae9f50172b",
-    "../../../pdpp/declaration.ts": "52b81afabd5d6ccef124066bda381980f4ea7826",
+    "coordinator.ts": "ba8bbe6ebca6cec1a49ec9dc4dde768c1df61b46",
+    "../pdpp/declaration.ts": "bbac95e8ecc04f5c1b90d819aa93057c00a07c80",
   };
   for (const [path, expected] of Object.entries(sourceBlobs))
     expect(

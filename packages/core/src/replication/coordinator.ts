@@ -17,6 +17,35 @@ import {
   type ReplicaWorkState,
 } from "./schedule.js";
 
+type MaybePromise<T> = T | Promise<T>;
+
+const isPromiseLike = (value: unknown): value is PromiseLike<unknown> =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as { then?: unknown }).then === "function";
+
+/** Continue with `next` now when `value` is plain, after it when a promise. */
+function then<T, R>(
+  value: MaybePromise<T>,
+  next: (value: T) => MaybePromise<R>,
+): MaybePromise<R> {
+  return isPromiseLike(value) ? (value as Promise<T>).then(next) : next(value);
+}
+
+/** `try`/`catch` over a computation that may or may not be asynchronous. */
+function recover<T>(
+  run: () => MaybePromise<T>,
+  handle: (error: unknown) => MaybePromise<T>,
+): MaybePromise<T> {
+  let value: MaybePromise<T>;
+  try {
+    value = run();
+  } catch (error) {
+    return handle(error);
+  }
+  return isPromiseLike(value) ? (value as Promise<T>).catch(handle) : value;
+}
+
 export interface ReplicaWorkItem {
   id: string;
   phase: ReplicaPhase;
@@ -24,6 +53,13 @@ export interface ReplicaWorkItem {
   state: ReplicaWorkState;
   /** Admission estimate for byte budgets. */
   bytes?: number;
+  /**
+   * The resumable unit this attempt covers, e.g. the next fragment of a
+   * batch. A step admits an item once per part, so an item that commits one
+   * unit per attempt can take further units in the same step, each charged
+   * on its own. Runs of one item never overlap, whatever their part.
+   */
+  part?: string;
 }
 
 /**
@@ -32,9 +68,10 @@ export interface ReplicaWorkItem {
  * attempt, so a discarded attempt (deadline, abort) leaves no trace. A plan
  * may refine the verdict from what it committed.
  */
-export interface ReplicaAttempt {
+export interface ReplicaAttempt<P = () => ReplicaPhaseOutcome | void> {
   outcome: ReplicaPhaseOutcome;
-  plan?: () => ReplicaPhaseOutcome | void;
+  /** Node plans are callbacks; shared-engine plans are storage effects. */
+  plan?: P;
   /** Release short-lived resources after this attempt is committed or discarded. */
   release?: () => void;
 }
@@ -87,6 +124,53 @@ export interface ReplicaPhaseHandler<
   earliest(eligibility: ReplicaEligibility): number | undefined;
   /** Make waits on this dependency key due now. Idempotent. */
   wake?(key: string, now: number): number;
+}
+
+/**
+ * A phase handler whose storage may answer asynchronously (PS-Lite's native
+ * transaction). A handler that returns plain values runs exactly as a
+ * synchronous one: the coordinator awaits only what is a promise.
+ */
+export interface AsyncReplicaPhaseHandler<
+  I extends ReplicaWorkItem = ReplicaWorkItem,
+  C = unknown,
+  P = unknown,
+> {
+  phase: ReplicaPhase;
+  /**
+   * Eligible items (see replicaEligibleAt): at most perWriter per writer,
+   * every writer's first item before any writer's second, and writers in
+   * cyclic order starting after `after` (the writer this phase served last).
+   * Oldest first within a writer.
+   */
+  due(
+    eligibility: ReplicaEligibility,
+    limit: { total: number; perWriter: number; after?: string },
+  ): MaybePromise<I[]>;
+  /** Must honour `signal`: after abort it performs no further effect. */
+  run(item: I, signal: AbortSignal): Promise<ReplicaAttempt<P>>;
+  /**
+   * In ONE transaction: run `attempt.plan` (if any), settle the verdict with
+   * `settle`, persist outcome and state. Return the persisted outcome. A throw
+   * persists nothing. `context` is the durable state port's transaction,
+   * so the attempt and the rotation commit together.
+   */
+  commit(
+    item: I,
+    attempt: ReplicaAttempt<P>,
+    settle: ReplicaSettle,
+    context: C,
+  ): MaybePromise<ReplicaOutcome>;
+  /** Problem recorded when a plan's transaction fails. */
+  commitProblem?: ReplicaProblem;
+  /**
+   * Earliest eligibility of this phase's durable deadlines (retries, waits),
+   * by the same policy as `due`; undefined when none. Polling sources and
+   * sweeps that run on the host's cadence report only their deadlines.
+   */
+  earliest(eligibility: ReplicaEligibility): MaybePromise<number | undefined>;
+  /** Make waits on this dependency key due now. Idempotent. */
+  wake?(key: string, now: number): MaybePromise<number>;
 }
 
 /** A finalized-head hint source. Optional: it can only park finality waits. */
@@ -188,7 +272,7 @@ export class ReplicaCoordinatorConflict extends Error {
  * Check current ownership and revision before calling checkpoint, and again
  * before commit. On any throw, neither the checkpoint nor cursor may persist.
  * The callback is synchronous and must not escape or run after commit returns.
- * Lite may supply this port only after passing the shared adapter contract.
+ * Every adapter must pass `replicaCoordinatorStateContract`.
  */
 export interface ReplicaCoordinatorStatePort {
   load(): ReplicaCoordinatorState;
@@ -197,6 +281,30 @@ export interface ReplicaCoordinatorStatePort {
     next: ReplicaRotation,
     checkpoint: () => T,
   ): { state: ReplicaCoordinatorState; result: T };
+}
+
+/**
+ * The same port over an asynchronous transaction (PS-Lite's native one).
+ * `checkpoint` receives that transaction and the port awaits it before the
+ * rotation is written; the same ownership, revision and rollback rules
+ * apply. The callback must not escape or run after commit settles.
+ */
+export interface AsyncReplicaCoordinatorStatePort<C> {
+  readonly async: true;
+  load(): Promise<ReplicaCoordinatorState>;
+  commit<T>(
+    expected: ReplicaCoordinatorState,
+    next: ReplicaRotation,
+    checkpoint: (context: C) => Promise<T>,
+  ): Promise<{ state: ReplicaCoordinatorState; result: T }>;
+}
+
+/** Thrown when a synchronous port is handed an asynchronous checkpoint. */
+export class ReplicaAsyncCheckpointError extends Error {
+  constructor() {
+    super("asynchronous replica checkpoint under a synchronous state port");
+    this.name = "ReplicaAsyncCheckpointError";
+  }
 }
 
 export interface ProgressReport {
@@ -234,14 +342,8 @@ const DEFAULT_QUANTUM = 50;
 /** Bound on one hint read when no per-run deadline is configured. */
 const HINT_TIMEOUT_MS = 2_000;
 
-/**
- * Selects due work fairly and turns phase verdicts into durable transitions.
- * The host schedules step(); it never runs another semantic retry loop.
- */
-export function createReplicaCoordinator(input: {
-  phases: ReplicaPhaseHandler[];
-  /** Required for restart fairness; omission is an in-memory-only test seam. */
-  state?: ReplicaCoordinatorStatePort;
+/** Options shared by both coordinator factories. */
+export interface ReplicaCoordinatorOptions {
   quantum?: Partial<Record<ReplicaPhase, number>>;
   /** Items per writer in one selection round. Defaults to one. */
   perWriter?: number;
@@ -259,7 +361,51 @@ export function createReplicaCoordinator(input: {
    * only after every other phase, so a sweep cannot crowd out progress.
    */
   background?: readonly ReplicaPhase[];
-}) {
+}
+
+/**
+ * Selects due work fairly and turns phase verdicts into durable transitions.
+ * The host schedules step(); it never runs another semantic retry loop.
+ */
+export function createReplicaCoordinator(
+  input: ReplicaCoordinatorOptions & {
+    phases: ReplicaPhaseHandler[];
+    /** Required for restart fairness; omission is an in-memory-only test seam. */
+    state?: ReplicaCoordinatorStatePort;
+  },
+) {
+  const coordinator = createAsyncReplicaCoordinator<undefined>(
+    input as ReplicaCoordinatorOptions & {
+      phases: AsyncReplicaPhaseHandler<ReplicaWorkItem, undefined>[];
+      state?: ReplicaCoordinatorStatePort;
+    },
+  );
+  return {
+    step: coordinator.step,
+    onDependencyChanged(key: string, now: number): number {
+      const woken = coordinator.onDependencyChanged(key, now);
+      if (isPromiseLike(woken)) throw new ReplicaAsyncCheckpointError();
+      return woken;
+    },
+  };
+}
+
+/**
+ * The coordinator over handlers and a state port that may answer
+ * asynchronously. Plain values keep the synchronous path, so a synchronous
+ * host (Node) behaves exactly as under `createReplicaCoordinator`. With a
+ * synchronous port, an asynchronous checkpoint is refused inside its
+ * transaction, never committed half-done.
+ */
+export function createAsyncReplicaCoordinator<C>(
+  input: ReplicaCoordinatorOptions & {
+    // Each handler names its own work item and plan types.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    phases: AsyncReplicaPhaseHandler<any, C, any>[];
+    /** Required for restart fairness; omission is an in-memory-only test seam. */
+    state?: ReplicaCoordinatorStatePort | AsyncReplicaCoordinatorStatePort<C>;
+  },
+) {
   for (const value of [
     input.perWriter ?? 1,
     input.deadlineMs ?? REPLICA_ATTEMPT_TIMEOUT_MS,
@@ -279,6 +425,7 @@ export function createReplicaCoordinator(input: {
     input.phases.length
   )
     throw new RangeError("duplicate replica phase");
+  type Handler = (typeof input.phases)[number];
   const quantum = (phase: ReplicaPhase) =>
     input.quantum?.[phase] ?? DEFAULT_QUANTUM;
   /** Items whose run has not settled. A timed-out run blocks redispatch until it ends. */
@@ -358,17 +505,17 @@ export function createReplicaCoordinator(input: {
 
   /** `undefined`: the host aborted the step before this run settled. */
   async function execute(
-    handler: ReplicaPhaseHandler,
+    handler: Handler,
     item: ReplicaWorkItem,
     signal: AbortSignal | undefined,
-  ): Promise<ReplicaAttempt | undefined> {
+  ): Promise<ReplicaAttempt<unknown> | undefined> {
     const key = `${handler.phase}\0${item.id}`;
     inflight.add(key);
-    let running: Promise<ReplicaAttempt> | undefined;
+    let running: Promise<ReplicaAttempt<unknown>> | undefined;
     const result = await bounded((inner) => {
       running = handler
         .run(item, inner)
-        .catch((error: unknown): ReplicaAttempt => ({
+        .catch((error: unknown): ReplicaAttempt<unknown> => ({
           outcome: retryFromError(error, "unknown"),
         }))
         .finally(() => inflight.delete(key));
@@ -428,59 +575,84 @@ export function createReplicaCoordinator(input: {
    * the report never states an outcome the repository does not hold.
    */
   function commit(
-    handler: ReplicaPhaseHandler,
+    handler: Handler,
     item: ReplicaWorkItem,
-    attempt: ReplicaAttempt,
+    attempt: ReplicaAttempt<unknown>,
     signal: AbortSignal | undefined,
-  ): ReplicaOutcome {
+  ): MaybePromise<ReplicaOutcome> {
     const settle: ReplicaSettle = (verdict) =>
       settleReplicaWork(item.state, verdict, input.clock?.() ?? stepNow, {
         backoff: input.backoff,
         hints: input.hint !== undefined,
       });
-    const advance = (value: ReplicaAttempt): ReplicaOutcome => {
+    const advance = (
+      value: ReplicaAttempt<unknown>,
+    ): MaybePromise<ReplicaOutcome> => {
       const position = input.phases.indexOf(handler);
       const next: ReplicaRotation = {
         nextPhase: input.phases[(position + 1) % input.phases.length]?.phase,
         writers: { ...state.writers, [handler.phase]: item.writer },
       };
-      const checkpoint = () => {
+      const checkpoint = (context: C) => {
         const assertNotAborted = () => {
           if (signal?.aborted)
             throw signal.reason ?? new DOMException("aborted", "AbortError");
         };
         assertNotAborted();
-        const result = handler.commit(item, value, settle);
-        // Still inside the durable state port's outer transaction. A plan
-        // may synchronously close the host lifetime; roll back its effects.
-        assertNotAborted();
-        return result;
+        return then(handler.commit(item, value, settle, context), (result) => {
+          // Still inside the durable state port's outer transaction. A plan
+          // may close the host lifetime; roll back its effects.
+          assertNotAborted();
+          return result;
+        });
       };
-      if (input.state) {
-        const committed = input.state.commit(state, next, checkpoint);
+      const port = input.state;
+      if (port && "async" in port && port.async)
+        return port
+          .commit(state, next, async (context) => checkpoint(context))
+          .then((committed) => {
+            state = committed.state;
+            return committed.result;
+          });
+      if (port) {
+        const committed = (port as ReplicaCoordinatorStatePort).commit(
+          state,
+          next,
+          () => {
+            const result = checkpoint(undefined as C);
+            if (isPromiseLike(result)) {
+              // Never leave the refused checkpoint's rejection unobserved.
+              (result as Promise<unknown>).catch(() => undefined);
+              throw new ReplicaAsyncCheckpointError();
+            }
+            return result;
+          },
+        );
         state = committed.state;
         return committed.result;
       }
-      const result = checkpoint();
-      state = { ...state, ...next, version: state.version + 1 };
-      return result;
-    };
-    try {
-      return advance(attempt);
-    } catch (error) {
-      if (
-        signal?.aborted ||
-        !attempt.plan ||
-        error instanceof ReplicaCoordinatorConflict
-      )
-        throw error;
-      return advance({
-        outcome: retryFromError(
-          error,
-          handler.commitProblem ?? "storage_failed",
-        ),
+      return then(checkpoint(undefined as C), (result) => {
+        state = { ...state, ...next, version: state.version + 1 };
+        return result;
       });
-    }
+    };
+    return recover(
+      () => advance(attempt),
+      (error) => {
+        if (
+          signal?.aborted ||
+          !attempt.plan ||
+          error instanceof ReplicaCoordinatorConflict
+        )
+          throw error;
+        return advance({
+          outcome: retryFromError(
+            error,
+            handler.commitProblem ?? "storage_failed",
+          ),
+        });
+      },
+    );
   }
   let stepNow = 0;
 
@@ -532,7 +704,10 @@ export function createReplicaCoordinator(input: {
       try {
         const { now, signal, budget } = context;
         // No in-memory cursor from a prior instance is authoritative.
-        if (input.state) state = input.state.load();
+        if (input.state) {
+          const loaded = input.state.load();
+          state = isPromiseLike(loaded) ? await loaded : loaded;
+        }
         const report: ProgressReport = {
           receipts: [],
           waits: [],
@@ -582,27 +757,36 @@ export function createReplicaCoordinator(input: {
               units,
             );
             let count = 0;
+            // Items deferred for bytes in this phase. Each one widens the next
+            // due() page by one, so an item that does not fit cannot hide the
+            // items behind it (another writer's work that fits). Bounded by the
+            // phase quantum, so a backlog of oversized items stays a bounded scan.
+            let skipped = 0;
             // Refilled rounds: each due() call admits at most perWriter items per
             // writer, so one writer's backlog cannot fill a phase's quantum.
             while (count < cap && units > 0 && !aborted()) {
+              const selected = handler.due(selection(), {
+                total: cap - count + skipped,
+                perWriter: input.perWriter ?? 1,
+                after: state.writers[handler.phase],
+              });
               const items = interleave(
                 handler.phase,
-                handler
-                  .due(selection(), {
-                    total: cap - count,
-                    perWriter: input.perWriter ?? 1,
-                    after: state.writers[handler.phase],
-                  })
-                  .filter((item) => {
+                (isPromiseLike(selected) ? await selected : selected).filter(
+                  (item: ReplicaWorkItem) => {
                     const key = `${handler.phase}\0${item.id}`;
-                    return !inflight.has(key) && !ran.has(key);
-                  }),
+                    return (
+                      !inflight.has(key) &&
+                      !ran.has(`${key}\0${item.part ?? ""}`)
+                    );
+                  },
+                ),
               );
               let admitted = 0;
+              let deferredHere = 0;
               for (const item of items) {
                 if (count >= cap || units <= 0 || aborted()) break;
-                const key = `${handler.phase}\0${item.id}`;
-                ran.add(key);
+                ran.add(`${handler.phase}\0${item.id}\0${item.part ?? ""}`);
                 if (
                   item.bytes !== undefined &&
                   (!Number.isSafeInteger(item.bytes) || item.bytes < 0)
@@ -620,6 +804,7 @@ export function createReplicaCoordinator(input: {
                   bytes === stepBytes;
                 if (item.bytes !== undefined && item.bytes > bytes && !alone) {
                   deferred = true;
+                  deferredHere++;
                   continue;
                 }
                 admitted++;
@@ -633,17 +818,21 @@ export function createReplicaCoordinator(input: {
                   // Abort can arrive between the winning run promise and this
                   // continuation. Discard/release before entering a checkpoint.
                   if (aborted()) break;
+                  const outcome = commit(handler, item, attempt, signal);
                   record(
                     report,
                     handler.phase,
                     item.id,
-                    commit(handler, item, attempt, signal),
+                    isPromiseLike(outcome) ? await outcome : outcome,
                   );
                 } finally {
                   attempt.release?.();
                 }
               }
-              if (!admitted) break;
+              skipped += deferredHere;
+              if (admitted) continue;
+              // Nothing fit: look past the deferred items, within the bound.
+              if (!deferredHere || skipped > quantum(handler.phase)) break;
             }
             spent.set(handler.phase, used + count);
           }
@@ -652,7 +841,8 @@ export function createReplicaCoordinator(input: {
         const after = eligibility(input.clock?.() ?? now);
         let wake: number | undefined;
         for (const handler of input.phases) {
-          const next = handler.earliest(after);
+          const earliest = handler.earliest(after);
+          const next = isPromiseLike(earliest) ? await earliest : earliest;
           if (next !== undefined && (wake === undefined || next < wake))
             wake = next;
         }
@@ -667,11 +857,13 @@ export function createReplicaCoordinator(input: {
         stepping = false;
       }
     },
-    onDependencyChanged(key: string, now: number): number {
-      let woken = 0;
-      for (const handler of input.phases)
-        woken += handler.wake?.(key, now) ?? 0;
-      return woken;
+    onDependencyChanged(key: string, now: number): MaybePromise<number> {
+      const counts = input.phases.map((handler) => handler.wake?.(key, now));
+      const sum = (values: (number | undefined)[]) =>
+        values.reduce<number>((total, value) => total + (value ?? 0), 0);
+      return counts.some(isPromiseLike)
+        ? Promise.all(counts).then(sum)
+        : sum(counts as (number | undefined)[]);
     },
   };
 }

@@ -255,8 +255,10 @@ export function retryFromError(
     problem:
       error instanceof ReplicaProblemError
         ? error.problem
-        : (error as { code?: unknown } | null)?.code ===
-            "replica_publication_blocked"
+        : [
+              "replica_publication_blocked",
+              "replica_publication_capability_unavailable",
+            ].includes((error as { code?: unknown } | null)?.code as string)
           ? "publication_blocked"
           : fallback,
     cause: replicaCause(error),

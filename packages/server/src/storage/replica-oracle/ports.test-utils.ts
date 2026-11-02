@@ -755,14 +755,13 @@ export async function liteDriver(options: LiteDriverOptions) {
     },
     async localOperations() {
       const ops: ReplicaOperation[] = [];
-      let after: string | undefined;
-      do {
-        const page = await store.readPage("journal", after);
-        for (const entry of page.entries)
-          ops.push(replicaOperationSchema.parse(JSON.parse(entry.value)));
-        after = page.after;
-      } while (after !== undefined);
-      return ops;
+      let after = 0;
+      for (;;) {
+        const page = await store.readLogPage(after);
+        ops.push(...page.entries.map((entry) => entry.operation));
+        after = page.nextAfterSequence;
+        if (!page.hasMore) return ops;
+      }
     },
     async snapshot(universe) {
       const stored: Record<string, StoredRow> = {};

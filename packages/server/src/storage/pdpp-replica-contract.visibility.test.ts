@@ -1821,13 +1821,15 @@ describe("64 [Node SQLite] fence dominance", () => {
   });
   /**
    * The baseline retains declaration A; an imported record for key k names a
-   * different valid declaration B. A local write under A then completes a
-   * declaration conflict, and reconciliation must have the last word.
+   * valid declaration B of another shape (semantics). A local write under A
+   * then completes a declaration conflict, and reconciliation must have the
+   * last word. Another version of the same shape would merge by revision.
    */
   const conflictedByLocalWrite = () => {
     const declB: DeclarationBinding = {
       ...binding,
       digest: `sha256:${"c".repeat(64)}`,
+      semantics: "append_only",
     };
     const d = nodeLocal({ declarations: decls(binding) });
     createReplicaReceiver({

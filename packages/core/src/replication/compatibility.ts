@@ -32,6 +32,15 @@ export interface ReplicaPublicationBlocker {
   reason: "capability_unknown" | "reader_format_unsupported";
 }
 
+export class ReplicaPublicationCapabilityUnavailableError extends Error {
+  readonly code = "replica_publication_capability_unavailable";
+
+  constructor() {
+    super("replica_publication_capability_unavailable");
+    this.name = "ReplicaPublicationCapabilityUnavailableError";
+  }
+}
+
 export class ReplicaPublicationBlockedError extends Error {
   readonly code = "replica_publication_blocked";
 

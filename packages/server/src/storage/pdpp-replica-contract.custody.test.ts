@@ -132,7 +132,9 @@ function outboxSnapshot(db: Database.Database): Record<string, OutboxRow> {
   )?.writer;
   const fragments = db
     .prepare(
-      "SELECT batch,digest,hex(encrypted) AS e,state FROM pdpp_transport_fragments_out ORDER BY batch,position",
+      `SELECT f.batch,f.digest,hex(f.encrypted) AS e,f.state,
+        (length(f.encrypted)=0 AND EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m WHERE m.batch=f.batch AND m.state='published')) AS reclaimed
+       FROM pdpp_transport_fragments_out f ORDER BY f.batch,f.position`,
     )
     .all() as Record<string, string>[];
   const manifests = db
@@ -146,7 +148,8 @@ function outboxSnapshot(db: Database.Database): Record<string, OutboxRow> {
       {
         kind: "fragment" as const,
         batch: r.batch!,
-        encrypted: r.e!.toLowerCase(),
+        // A finalized batch's fragments drop their bytes; the key keeps the digest.
+        encrypted: Number(r.reclaimed) ? RECLAIMED : r.e!.toLowerCase(),
         plaintext: "",
         dataHash: r.digest!,
         metadataHash: "",
@@ -169,6 +172,28 @@ function outboxSnapshot(db: Database.Database): Record<string, OutboxRow> {
   ]);
 }
 /** A fragment is done once stored; a manifest once its registration is final. */
+/** The `encrypted` of a fragment whose batch is finalized and reclaimed. */
+const RECLAIMED = "reclaimed";
+const hexDigest = (hex: string) =>
+  `sha256:${createHash("sha256").update(Buffer.from(hex, "hex")).digest("hex")}`;
+/**
+ * The bytes `hex` are this row's ciphertext. A reclaimed fragment is checked
+ * against its digest, which is also its storage key.
+ */
+const isCiphertextOf = (hex: string, row: OutboxRow) =>
+  row.encrypted === RECLAIMED
+    ? row.kind === "fragment" && hexDigest(hex) === row.dataHash
+    : hex === row.encrypted;
+/**
+ * A fragment's custody identity is its digest when the held bytes match it,
+ * so dropping a finalized fragment's bytes is not a change. A manifest keeps
+ * its bytes.
+ */
+const custodyBytes = (r: OutboxRow) =>
+  r.kind === "fragment" &&
+  (r.encrypted === RECLAIMED || hexDigest(r.encrypted) === r.dataHash)
+    ? `digest ${r.dataHash}`
+    : r.encrypted;
 const outboundDone = (r: OutboxRow) =>
   r.state === (r.kind === "manifest" ? "published" : "stored");
 /** Received manifests and fragments the device holds, by work id and storage key. */
@@ -200,7 +225,7 @@ const stableOutbox = (rows: Record<string, OutboxRow>) =>
   Object.fromEntries(
     Object.entries(rows).map(([scope, r]) => [
       scope,
-      { ...r, state: undefined },
+      { ...r, state: undefined, encrypted: custodyBytes(r) },
     ]),
   );
 function batchSnapshot(db: Database.Database) {
@@ -660,8 +685,10 @@ async function sourceWorld(options: SourceOptions): Promise<World> {
         for (const [scope, bytes] of net.blobs)
           if (
             capturedOutbox[scope] &&
-            Buffer.from(bytes).toString("hex") !==
-              capturedOutbox[scope].encrypted
+            !isCiphertextOf(
+              Buffer.from(bytes).toString("hex"),
+              capturedOutbox[scope],
+            )
           )
             out.push(
               `[custody] stored bytes of ${scope} differ from the outbox ciphertext`,
@@ -687,7 +714,10 @@ async function sourceWorld(options: SourceOptions): Promise<World> {
         const outbox = outboxSnapshot(a.db);
         // No ciphertext that existed before the crash is ever replaced.
         for (const [scope, row] of Object.entries(capturedOutbox))
-          if (outbox[scope]?.encrypted !== row.encrypted)
+          if (
+            outbox[scope]?.encrypted !== row.encrypted &&
+            !(row.kind === "fragment" && outbox[scope]?.encrypted === RECLAIMED)
+          )
             out.push(`[custody] ciphertext of ${scope} changed after resume`);
         if (prelude) {
           if (
@@ -739,8 +769,10 @@ async function sourceWorld(options: SourceOptions): Promise<World> {
             );
           if (
             net.blobs.has(scope) &&
-            Buffer.from(net.blobs.get(scope)!).toString("hex") !==
-              outbox[scope]!.encrypted
+            !isCiphertextOf(
+              Buffer.from(net.blobs.get(scope)!).toString("hex"),
+              outbox[scope]!,
+            )
           )
             out.push(
               `[custody] remote bytes of ${scope} differ from the persisted ciphertext`,
@@ -1023,12 +1055,16 @@ async function destinationWorld(options: DestinationOptions): Promise<World> {
             { scan_cursor: string | null } | undefined
         )?.scan_cursor;
         if (cursor) {
+          // Discovery admits every version of a listed scope, except the
+          // device's own slots, which it never imports.
           const admitted = count(
             b.db,
-            "SELECT count(*) AS n FROM pdpp_transport_manifests_in WHERE scope<=?",
+            `SELECT (SELECT count(*) FROM pdpp_transport_manifests_in WHERE scope<=?)
+              + (SELECT count(*) FROM pdpp_transport_manifests_out o WHERE o.scope<=?
+                 AND NOT EXISTS (SELECT 1 FROM pdpp_transport_manifests_in i WHERE i.scope=o.scope AND i.version=o.version)) AS n`,
+            cursor,
             cursor,
           );
-          // Discovery admits every version of a listed scope.
           const listed = [...net.head.keys()].filter(
             (k) => k.slice(0, k.lastIndexOf("/")) <= cursor,
           ).length;

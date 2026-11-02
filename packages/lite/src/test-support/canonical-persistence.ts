@@ -17,17 +17,10 @@ export const fakeCanonicalDisk = (): FakeCanonicalDisk => ({
   blobs: new Map(),
 });
 export type CanonicalCrashPoint =
-  | "record"
-  | "blob"
-  | "journal"
-  | "outbox"
-  | "import"
-  | "before-commit"
-  | "after-commit";
+  "record" | "blob" | "log" | "import" | "before-commit" | "after-commit";
 export function writeCrashPoint(key: string): CanonicalCrashPoint | undefined {
   if (key.startsWith("rows/")) return "record";
-  if (key.startsWith("journal/")) return "journal";
-  if (key.startsWith("outbox/")) return "outbox";
+  if (key.startsWith("log/")) return "log";
   if (key.startsWith("import/")) return "import";
   return undefined;
 }

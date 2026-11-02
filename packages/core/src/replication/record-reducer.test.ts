@@ -518,7 +518,11 @@ const DESTINATIONS: Record<string, { live: object; statuses: object }> = {
     statuses: { "c-a": "active:3", "c-b": "deleted:1" },
   },
   "missing declarations": {
-    live: { [rowId("c-a", "messages", "k1")]: "v1" },
+    // k2 holds versions of one declared stream: they merge by revision.
+    live: {
+      [rowId("c-a", "messages", "k1")]: "v1",
+      [rowId("c-a", "messages", "k2")]: "v1",
+    },
     statuses: { "c-a": "active:1", "c-b": "withdrawn:local_mapping_conflict" },
   },
   "completion dependencies": {

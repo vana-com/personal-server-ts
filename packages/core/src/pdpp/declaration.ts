@@ -22,8 +22,9 @@ import type {
   DeclaredDisplay,
   SourceKind,
 } from "./types.js";
+import { MAX_DECLARATION_BYTES } from "./declaration-limits.js";
 
-export const MAX_DECLARATION_BYTES = 256 * 1024;
+export { MAX_DECLARATION_BYTES };
 export const MAX_REDIRECTS = 3;
 export const DECLARATION_FETCH_TIMEOUT_MS = 5_000;
 

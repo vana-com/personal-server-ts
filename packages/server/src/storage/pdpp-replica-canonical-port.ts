@@ -23,6 +23,7 @@ import {
 import {
   createReplicationJournal,
   REPLICATION_MIGRATION,
+  REPLICA_BINDING_HISTORY_MIGRATION,
   REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
   type ReplicationExport,
 } from "./pdpp-replication-sqlite.js";
@@ -95,6 +96,11 @@ BEGIN SELECT RAISE(ABORT, 'local write log is append-only'); END;
   REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
   // Writer ids derived from the registered server key (host contract §3.2).
   REPLICA_WRITER_IDENTITY_MIGRATION,
+  // Binding generations and declaration history (host contract §4.5).
+  REPLICA_BINDING_HISTORY_MIGRATION,
+  // Capture pins that reference canonical chunks instead of copying them.
+  // See `pinReferenceKeepsBytes`.
+  `CREATE TABLE IF NOT EXISTS pdpp_replica_blob_pins (blob_id TEXT PRIMARY KEY);`,
 ];
 
 /**
@@ -132,7 +138,13 @@ export function ensureReplicaSchema(db: Database): void {
     // connection that enabled replication, so remove it.
     db.exec("DROP TRIGGER IF EXISTS pdpp_canonical_chunks_delete");
     // A plain open can delete a blob without clearing its replica chunks.
-    // Clear what such deletes left, on every enabled open.
+    // Clear what such deletes left, on every enabled open; a pin keeps them.
+    const orphans = `SELECT blob_id FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs)`;
+    const keep = pinReferenceKeepsBytes("@id").map((sql) => db.prepare(sql));
+    for (const { blob_id } of db.prepare(orphans).all() as {
+      blob_id: string;
+    }[])
+      for (const statement of keep) statement.run({ id: blob_id });
     db.exec(`
       DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs);
       DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs);
@@ -141,12 +153,27 @@ export function ensureReplicaSchema(db: Database): void {
 }
 
 /**
+ * A capture pin of a large blob references its canonical chunks; it holds no
+ * copy (`captureBlob`). Before canonical storage drops such a blob, its
+ * chunks change namespace to `pinned`, so export can still read them. No byte
+ * is copied, and the pin row goes: the pinned copy now holds the bytes.
+ */
+function pinReferenceKeepsBytes(id: string): string[] {
+  const pinOnly = `EXISTS (SELECT 1 FROM pdpp_replica_blob_pins WHERE blob_id=${id}) AND NOT EXISTS (SELECT 1 FROM pdpp_binary_manifests WHERE namespace='pinned' AND blob_id=${id})`;
+  return [
+    `UPDATE pdpp_binary_chunks SET namespace='pinned' WHERE namespace='canonical' AND blob_id=${id} AND ${pinOnly};`,
+    `INSERT INTO pdpp_binary_manifests SELECT 'pinned',blob_id,size_bytes FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=${id} AND ${pinOnly};`,
+    `DELETE FROM pdpp_replica_blob_pins WHERE blob_id=${id} AND EXISTS (SELECT 1 FROM pdpp_binary_manifests WHERE namespace='pinned' AND blob_id=${id});`,
+  ];
+}
+
+/**
  * Deleting a canonical blob deletes its replica chunks. TEMP, so it lives on
  * the connection that enabled replication and never fires for a plain open's
  * writes; a plain open leaves the chunks, and the next enabled open clears
  * them (see `ensureReplicaSchema`).
  */
-const CANONICAL_CHUNKS_TRIGGER = `CREATE TEMP TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END`;
+const CANONICAL_CHUNKS_TRIGGER = `CREATE TEMP TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN ${pinReferenceKeepsBytes("OLD.blob_id").join(" ")} DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END`;
 
 function assertReplicaSchema(db: Database): void {
   const row = db
@@ -277,34 +304,6 @@ export function createReplicaCanonicalPort(db: Database) {
     admitReplication(db);
     ensureReplicaSchema(db);
     db.exec(CANONICAL_CHUNKS_TRIGGER);
-    // Older replication builds stored large canonical blobs only in the
-    // replica chunk tables. Materialize those bytes in main's canonical table
-    // before a flag-off or main build can be used to read the database.
-    db.transaction(() => {
-      const missing = db
-        .prepare(
-          `SELECT m.blob_id, b.size_bytes, b.sha256
-           FROM pdpp_binary_manifests m
-           JOIN pdpp_blobs b ON b.blob_id = m.blob_id
-           LEFT JOIN pdpp_blob_bytes c ON c.blob_id = m.blob_id
-           WHERE m.namespace = 'canonical' AND c.blob_id IS NULL`,
-        )
-        .all() as { blob_id: string; size_bytes: number; sha256: string }[];
-      for (const blob of missing) {
-        if (
-          !verifyBinary(
-            db,
-            "canonical",
-            blob.blob_id,
-            `sha256:${blob.sha256}`,
-            blob.size_bytes,
-          )
-        )
-          continue;
-        const bytes = readBinary(db, "canonical", blob.blob_id);
-        if (bytes) writeCanonicalBinary(db, blob.blob_id, bytes);
-      }
-    }).immediate();
   }
   const writerId = (
     db
@@ -314,9 +313,11 @@ export function createReplicaCanonicalPort(db: Database) {
   // Captured operations name the derived operation writer. Before the first
   // enable they name the installation writer and stay local: no receiver
   // accepts them, and enabling refuses a journal that has them.
+  let journalObserver: (() => void) | undefined;
   const journal = createReplicationJournal(
     db,
     () => currentReplicaWriterIdentity(db)?.operationWriter ?? writerId,
+    () => journalObserver?.(),
   );
   const insertLocalWrite = db.prepare(`
     INSERT INTO pdpp_replica_own_writes
@@ -595,6 +596,15 @@ export function createReplicaCanonicalPort(db: Database) {
       writeBoundary = write;
       readBoundary = read;
     },
+    /**
+     * Called for each operation appended to the local journal (a record,
+     * blob, completion or lifecycle write; never an import), inside the
+     * write's transaction. The observer must defer its effect past the
+     * transaction: a rolled-back write may still have called it.
+     */
+    setReplicaJournalObserver(observer: () => void) {
+      journalObserver = observer;
+    },
     /** Called for each locally written key when the store settles, inside the write's transaction. */
     setReplicaLocalWriteObserver(
       observer: (instance: string, stream: string, recordKey: string) => void,
@@ -665,6 +675,7 @@ export function createReplicaRecordStore(
     setReplicaVisibilityObserver: r.setReplicaVisibilityObserver,
     setReplicaWriteBoundary: r.setReplicaWriteBoundary,
     setReplicaLocalWriteObserver: r.setReplicaLocalWriteObserver,
+    setReplicaJournalObserver: r.setReplicaJournalObserver,
     replicaIntegrityEpoch: r.replicaIntegrityEpoch,
     replicaVisibilityEpoch: r.replicaVisibilityEpoch,
     fenceReplicaConnection: r.fenceReplicaConnection,

@@ -13,6 +13,7 @@
  * open only probes `sqlite_master` for the table.
  */
 import type { Database, Statement } from "better-sqlite3";
+import { materializeCanonicalBinaries } from "./pdpp-binary-chunks.js";
 import {
   ReplicationRefusedError,
   type ReplicationDoorStatus,
@@ -211,13 +212,17 @@ export function admitReplication(db: Database): void {
 /**
  * The flag-off open's door step: once replication was enabled, an open with
  * it off closes the door for good and drops the fence, so a closed door costs
- * flag-off writes nothing. On a database that never enabled it, this is one
- * read of `sqlite_master` and writes nothing.
+ * flag-off writes nothing. It also writes main's whole row for canonical
+ * blobs that replication stored only as chunks. On a database that never
+ * enabled it, this is one read of `sqlite_master` and writes nothing.
  */
 export function retireReplication(db: Database): ReplicationDoorStatus {
   if (!hasDoor(db)) return { state: "never" };
   db.transaction(() => db.exec(CLOSE_DOOR)).immediate();
   abortRunningSteps(db, new ReplicationRefusedError("reenable_refused"));
+  // Replication keeps large canonical blobs chunk-only. Give each one main's
+  // whole row before any flag-off store or plain main build reads it.
+  materializeCanonicalBinaries(db);
   return { state: "off" };
 }
 

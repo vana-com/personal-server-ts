@@ -1,11 +1,14 @@
 import type { Database, Statement } from "better-sqlite3";
 import {
   canonicalJson,
+  declarationShape,
   type ReplicaOperation,
   type RecordOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
+  declarationWait,
   planReplicaMerge,
+  resolveDeclaration,
   type MergeContext,
   type MergeIssue,
   type ReplicaMergePlan,
@@ -750,7 +753,7 @@ export function createReplicaReconciler(deps: {
       ...keyPlan.pending,
       ...keyPlan.conflicts,
       ...keyPlan.rejected,
-    ].some((issue) => issue.reason !== "missing_declaration");
+    ].some((issue) => !declarationWait(issue.reason));
     const local = effects.binding(instance)!;
     for (const record of keyPlan.records) {
       const { generation } = record.identity;
@@ -785,13 +788,14 @@ export function createReplicaReconciler(deps: {
       }
       if (shown?.kind === "upsert") effects.persistBlobs(shown);
       effects.write(instance, stream, recordKey, shown);
+      if (shown) run.explaining.push(shown);
     }
     const materialized = new Set(
       keyPlan.records.map((record) => canonicalJson(record.identity)),
     );
     for (const issue of [...keyPlan.pending, ...keyPlan.rejected]) {
       if (
-        issue.reason !== "missing_declaration" &&
+        !declarationWait(issue.reason) &&
         issue.reason !== "invalid_record_data"
       )
         continue;
@@ -852,12 +856,9 @@ export function createReplicaReconciler(deps: {
     if (!local?.source_id) return;
     const mapping = { sourceId: local.source_id, methodId: local.method ?? "" };
     const { context, plan } = run;
-    const trusted = (op: CompletionEvent) =>
-      context.declarations.some(
-        (d) =>
-          d.sourceId === op.sourceId &&
-          canonicalJson(d.binding) === canonicalJson(op.declaration),
-      );
+    const resolution = (op: CompletionEvent) =>
+      resolveDeclaration(context.declarations, op.sourceId, op.declaration)
+        .status;
     const all = retained<CompletionEvent>(
       `${X.kind} IN ${COMPLETIONS} AND ${X.instance} = ? AND ${X.stream} = ?`,
       [instance, stream],
@@ -871,9 +872,14 @@ export function createReplicaReconciler(deps: {
           sql(
             "INSERT OR IGNORE INTO pdpp_replica_reconcile_dependencies VALUES (?, ?, ?, ?)",
           ).run(dependency.writerId, dependency.operationId, instance, stream);
-    for (const op of all)
-      if (!trusted(op))
-        plan.pending.push({ reason: "missing_declaration", operations: [op] });
+    for (const op of all) {
+      const status = resolution(op);
+      if (status === "missing" || status === "incompatible")
+        plan.pending.push({
+          reason: `${status}_declaration`,
+          operations: [op],
+        });
+    }
     if (!all.length) return;
     const connection = connectionFromFacts(
       context,
@@ -930,13 +936,14 @@ export function createReplicaReconciler(deps: {
         native ? completion.snapshotSha256.slice(7) : null,
         native ? "host_run_finished" : null,
       );
+      run.explaining.push(completion);
       return;
     }
     sql(
       "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
     ).run(instance, stream);
     // Diagnostics only: the engine already decided.
-    if (new Set(events.map((op) => canonicalJson(op.declaration))).size > 1)
+    if (new Set(events.map((op) => declarationShape(op.declaration))).size > 1)
       plan.conflicts.push({
         reason: "incompatible_completion_declaration",
         operations: events,
@@ -957,6 +964,11 @@ export function createReplicaReconciler(deps: {
     plan: ReplicaMergePlan;
     /** Connections whose connection-level issues this run already reported. */
     reported: Set<string>;
+    /**
+     * The operations this run wrote canonical state from: each shown row's or
+     * tombstone's winner and each persisted completion, in run order.
+     */
+    explaining: ReplicaOperation[];
   }
   /**
    * Reconcile queued work. `background: false` leaves a paged pass's entries
@@ -967,6 +979,7 @@ export function createReplicaReconciler(deps: {
   function drain(input: { background: boolean; page?: ReplicaReconcilePage }): {
     plan: ReplicaMergePlan;
     complete: boolean;
+    explaining: ReplicaOperation[];
   } {
     ingest();
     const run: Run = {
@@ -979,6 +992,7 @@ export function createReplicaReconciler(deps: {
         suppressed: [],
       },
       reported: new Set(),
+      explaining: [],
     };
     meter = { operations: 0, bytes: 0 };
     // Retained evidence does not change during a drain: ingest ran above.
@@ -1021,7 +1035,11 @@ export function createReplicaReconciler(deps: {
         );
       else reconcileCompletion(entry.instance, entry.stream, background, run);
     }
-    return { plan: normalize(run.plan), complete: !queued() };
+    return {
+      plan: normalize(run.plan),
+      complete: !queued(),
+      explaining: run.explaining,
+    };
   }
   function queued(): boolean {
     return !!sql("SELECT 1 FROM pdpp_replica_reconcile_queue LIMIT 1").get();

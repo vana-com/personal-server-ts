@@ -95,11 +95,26 @@ function compareRevision(a: ReplicaOperation, b: ReplicaOperation): number {
 const isRecord = (op: ReplicaOperation): op is RecordOperation =>
   op.kind === "upsert" || op.kind === "delete";
 
-function declared(world: RefWorld, op: RecordOperation) {
+/**
+ * The exact binding is retained, or another version of the same stream is:
+ * same source, stream, semantics and primary key. A peer carries the older
+ * version in its operations; it validates by key here (as `validData` does).
+ */
+function retained(world: RefWorld, op: RecordOperation) {
   return world.declarations.some(
     (d) =>
       d.sourceId === op.sourceId &&
       canonicalJson(d.binding) === canonicalJson(op.declaration),
+  );
+}
+function declared(world: RefWorld, op: RecordOperation) {
+  return world.declarations.some(
+    (d) =>
+      d.sourceId === op.sourceId &&
+      d.binding.stream === op.declaration.stream &&
+      d.binding.semantics === op.declaration.semantics &&
+      canonicalJson(d.binding.primaryKey) ===
+        canonicalJson(op.declaration.primaryKey),
   );
 }
 function validData(op: RecordOperation): boolean {
@@ -230,12 +245,15 @@ function keyedCandidates(
 }
 
 /**
- * A key's candidates conflict when they name two declarations, or when an
- * append-only key carries two contents. A conflict hides the key for good.
+ * A key's candidates conflict when they name two declaration shapes (stream,
+ * semantics, primary key), or when an append-only key carries two contents.
+ * Two versions of one shape are one record. A conflict hides the key for good.
  */
 function keyConflicted(candidates: readonly RecordOperation[]) {
   const bindings = new Set(
-    candidates.map((op) => canonicalJson(op.declaration)),
+    candidates.map(({ declaration: d }) =>
+      canonicalJson([d.stream, d.semantics, d.primaryKey]),
+    ),
   );
   const contents = new Set(
     candidates.map((op) =>
@@ -356,7 +374,7 @@ export function refLocalWritable(
   return (
     status === "active" &&
     op.generation === generation &&
-    declared(world, op) &&
+    retained(world, op) &&
     validData(op)
   );
 }

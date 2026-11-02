@@ -210,17 +210,20 @@ describe("completion availability", () => {
     ],
     ["it has no dependencies", { events: [completion([], [a.data, b.data])] }],
     [
-      "the events name two trusted declarations",
+      "the events name two trusted declaration shapes",
       {
         declarations: [
           ...world.declarations,
-          { ...world.declarations[0], binding: { ...binding, version: "2" } },
+          {
+            ...world.declarations[0],
+            binding: { ...binding, version: "2", primaryKey: ["text"] },
+          },
         ],
         events: [
           done,
           {
             ...completion([a], [a.data], 4),
-            declaration: { ...binding, version: "2" },
+            declaration: { ...binding, version: "2", primaryKey: ["text"] },
           },
         ],
       },
@@ -246,8 +249,48 @@ describe("completion availability", () => {
       expect(completionAvailability({ ...facts, ...change })).toBeNull();
     });
 
+  it("takes the newest completion across versions of one declared stream", () => {
+    // A rebinding: a newer completion under the upgraded version replaces
+    // the older version's completion, as a newer completion of one version
+    // does.
+    const upgraded = { ...binding, version: "2" };
+    const newer = {
+      ...completion([registration, a, b], [a.data, b.data], 12),
+      declaration: upgraded,
+    };
+    const versions = {
+      ...facts,
+      declarations: [
+        ...world.declarations,
+        { ...world.declarations[0], binding: upgraded },
+      ],
+    };
+    expect(
+      completionAvailability({ ...versions, events: [done, newer] }),
+    ).toEqual({ operation: newer });
+    expect(
+      completionAvailability({ ...versions, events: [newer, done] }),
+    ).toEqual({ operation: newer });
+  });
+
+  it("takes a completion under another version of the retained stream", () => {
+    const carried = { ...binding, version: "2" };
+    const newer = {
+      ...completion([registration, a, b], [a.data, b.data], 12),
+      declaration: carried,
+    };
+    expect(completionAvailability({ ...facts, events: [done, newer] })).toEqual(
+      { operation: newer },
+    );
+  });
+
   it("ignores events under a declaration the host does not trust", () => {
-    const untrusted = { ...binding, version: "2" };
+    // Another shape of the retained stream: incompatible, never trusted.
+    const untrusted = {
+      ...binding,
+      version: "2",
+      semantics: "append_only" as const,
+    };
     expect(
       completionAvailability({
         ...facts,

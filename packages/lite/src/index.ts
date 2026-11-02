@@ -188,20 +188,26 @@ export {
 
 export {
   createLiteCanonicalStore,
+  LiteCanonicalRefusal,
+  litePendingFingerprint,
   type LiteCommitReceipt,
   type LiteReplicaReadOptions,
   type LiteVisibleRecord,
   type LiteOperationDraft,
 } from "./canonical-store.js";
-export type {
-  LiteCanonicalPersistence,
-  LiteCanonicalTransaction,
-  LiteBlobDescriptor,
-  LiteStorageEntry,
-  LiteStoragePage,
+export {
+  LITE_CANONICAL_BATCH_BYTES,
+  LITE_CANONICAL_MAX_OPERATION_BYTES,
+  LITE_CANONICAL_MAX_VALUE_BYTES,
+  type LiteCanonicalPersistence,
+  type LiteCanonicalTransaction,
+  type LiteBlobDescriptor,
+  type LiteStorageEntry,
+  type LiteStoragePage,
 } from "./canonical-persistence.js";
 export {
   LITE_MAX_FRAGMENT_BYTES,
+  LITE_REPLICA_SQL_BYTES,
   LITE_REPLICATION_LIMITS,
   LiteReplicaTransferError,
   replicationBootConfigProblem,
@@ -212,12 +218,35 @@ export {
   type LiteReplicaTransferCall,
   type LiteReplicaTransferFailure,
   type LiteReplicaPersistence,
+  type LiteReplicaSql,
   type LiteReplicaTransaction,
   type LiteReplicationEngine,
   type LiteReplicationTrigger,
   type ReplicationBootConfig,
   type ReplicationLimits,
 } from "./replication-ports.js";
+export {
+  acquireLiteReplicaOwner,
+  createLiteReplicaCoordinatorState,
+} from "./replication-coordinator-state.js";
+export {
+  createLiteReplicaEngine,
+  type LiteReplicaEngine,
+  type LiteReplicaEngineInput,
+} from "./replication-engine.js";
+export {
+  LITE_REPLICA_TRANSFER_DEADLINE_MS,
+  createLiteReplicaStorage,
+  type LiteReplicaUploadHeaders,
+  type LiteTransientBytesInUse,
+} from "./replication-storage.js";
+export {
+  createLiteReplication,
+  liteTargetChunkBytes,
+  liteVanaReplicaObjects,
+  type LiteReplication,
+  type LiteReplicationInput,
+} from "./replication-host.js";
 export {
   LITE_REPLICATION_PAUSE_GRACE_MS,
   createLiteReplicationRuntime,

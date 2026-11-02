@@ -37,6 +37,7 @@ import {
   handlePersonalServerOauthTokenRequest,
   handlePersonalServerSyncRequest,
   type PersonalServerApiAuthPort,
+  type PersonalServerApiLogger,
   type PersonalServerReadAuthInput,
   type PersonalServerReadAuthResult,
   type PersonalServerReadFulfillmentReporter,
@@ -178,6 +179,8 @@ export interface PsLiteRuntimeOptions {
    * alongside the sync manager, which keeps it current.
    */
   scopeDeletions?: ScopeDeletionTracker;
+  /** Receives the cause of every 500 the runtime answers. */
+  logger?: PersonalServerApiLogger;
   additions?: DurableAdditionsService;
   accessLogReader?: AccessLogReader;
   accessLogWriter?: AccessLogWriter;
@@ -867,6 +870,16 @@ export function createPsLiteRuntime(
       if (err instanceof ProtocolError) {
         return protocolErrorResponse(err);
       }
+      options.logger?.error?.(
+        {
+          errorCode: "INTERNAL_ERROR",
+          err:
+            err instanceof Error
+              ? { name: err.name, message: err.message, stack: err.stack }
+              : { message: String(err) },
+        },
+        "Unhandled error in PS Lite runtime",
+      );
       return errorResponse(500, "INTERNAL_ERROR", "Internal server error");
     }
   }
@@ -1250,6 +1263,7 @@ export function createPsLiteRuntime(
             {
               storage: dataStorage,
               auth,
+              logger: options.logger,
               accessLogWriter,
               readFulfillmentReporter: options.readFulfillmentReporter,
               additions: options.additions,

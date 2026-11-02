@@ -8,6 +8,7 @@ import {
 import { createLiteCanonicalStore } from "./canonical-store.js";
 import { createFakeCanonicalPersistence } from "./test-support/canonical-persistence.js";
 import { replicaEnvelopeSchema } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import { REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES } from "@opendatalabs/personal-server-ts-core/replication/limits";
 
 function device() {
   const adapter = createFakeCanonicalPersistence();
@@ -101,12 +102,56 @@ it("E9 rejects an oversized raw envelope before schema parsing", async () => {
       ...request,
       envelope: {
         ...request.envelope,
-        padding: "x".repeat(192 * 1024),
+        padding: "x".repeat(REPLICA_MAX_PAYLOAD_ENVELOPE_BYTES),
       },
     }),
-  ).rejects.toThrow("192 KiB");
+  ).rejects.toMatchObject({ reason: "batch_too_large" });
   expect(parse).not.toHaveBeenCalled();
   parse.mockRestore();
+});
+
+it("E9b stages and promotes a received envelope above 192 KiB within the native value bound", async () => {
+  const { make } = device();
+  const store = make();
+  await provision(store);
+  const operations = Array.from({ length: 300 }, (_, index) => ({
+    ...upsert(`large-${index}`, 100 + index, `${index} ${"x".repeat(1000)}`),
+    recordKey: `key-${index}`,
+    data: { id: `key-${index}`, text: `${index} ${"x".repeat(1000)}` },
+  }));
+  const request = pending();
+  const envelope = {
+    ...request.envelope,
+    operations: [registration, ...operations],
+  };
+  expect(JSON.stringify(envelope).length).toBeGreaterThan(256 * 1024);
+
+  const staged = await store.stagePending({ ...request, envelope });
+  await store.promotePending({
+    id: request.id,
+    credential: "replica",
+    fingerprint: staged.fingerprint,
+  });
+  for (const index of [0, 299])
+    expect(
+      await make().readRecord(
+        identity.connectionId,
+        binding.stream,
+        `key-${index}`,
+        { reader: "grant" },
+      ),
+    ).toMatchObject({ data: { text: `${index} ${"x".repeat(1000)}` } });
+
+  await expect(
+    store.stagePending({
+      ...request,
+      id: "oversized-operation",
+      envelope: {
+        ...envelope,
+        operations: [registration, upsert("big", 2, "y".repeat(256 * 1024))],
+      },
+    }),
+  ).rejects.toMatchObject({ reason: "operation_too_large" });
 });
 
 it("E10 caps a stageBlob stream at the declared byte length", async () => {
@@ -2039,3 +2084,71 @@ it("does not serve confirmed blob bytes claimed only under a binding conflict", 
       })(),
     ).rejects.toThrow("missing committed blob");
 });
+
+it("E9c stages and promotes a batch of 1,800 small blob claims within the native value bound", async () => {
+  const { sha256 } = await import("viem");
+  const { make } = device();
+  const store = make();
+  await provision(store);
+  const blobs = [];
+  const claims = [];
+  for (let index = 0; index < 1_800; index++) {
+    const bytes = new TextEncoder().encode(`blob ${index}`);
+    const hash = `sha256:${sha256(bytes).slice(2)}`;
+    const descriptor = {
+      blobId: hash,
+      sha256: hash,
+      mimeType: "text/plain",
+      sizeBytes: bytes.length,
+    };
+    const stagingId = await store.stageBlob(
+      descriptor,
+      (async function* () {
+        yield bytes;
+      })(),
+    );
+    blobs.push({ stagingId, descriptor, bytes });
+    claims.push({
+      ...identity,
+      kind: "blob-claim" as const,
+      revision: {
+        counter: 2 + index,
+        writerId: "device-a",
+        operationId: `claim-${index}`,
+      },
+      blob: descriptor,
+    });
+  }
+  // The descriptors alone are above one native value.
+  expect(
+    new TextEncoder().encode(JSON.stringify(blobs.map((b) => b.descriptor)))
+      .length,
+  ).toBeGreaterThan(256 * 1024);
+  const last = blobs.at(-1)!;
+  const record = upsert("blob", 2 + blobs.length);
+  record.blobs = [last.descriptor];
+  record.data.blob_ref = { blob_id: last.descriptor.blobId };
+  const request = pending();
+  request.envelope.operations = [registration, ...claims, record];
+  const staged = await store.stagePending({
+    ...request,
+    blobs: blobs.map(({ stagingId, descriptor }) => ({
+      stagingId,
+      descriptor,
+    })),
+  });
+  await store.promotePending({
+    id: request.id,
+    credential: "replica",
+    fingerprint: staged.fingerprint,
+  });
+  const parts: Uint8Array[] = [];
+  for await (const part of make().readBlob(last.descriptor.blobId, {
+    reader: "grant",
+  }))
+    parts.push(part);
+  expect(parts).toEqual([last.bytes]);
+  expect(await read(make())).toMatchObject({
+    data: { blob_ref: { blob_id: last.descriptor.blobId } },
+  });
+}, 60_000);

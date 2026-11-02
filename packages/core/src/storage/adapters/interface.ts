@@ -14,9 +14,10 @@ export interface StorageAdapter {
    * {@link StoredBlobConflictError} with the stored bytes left unchanged.
    * @param key - unique storage key / path
    * @param data - encrypted binary data
+   * @param signal - cancels the transfer; the call settles once it stops
    * @returns URL where the blob is accessible
    */
-  upload(key: string, data: Uint8Array): Promise<string>;
+  upload(key: string, data: Uint8Array, signal?: AbortSignal): Promise<string>;
 
   /**
    * Resolve the canonical URL for a storage key WITHOUT uploading.

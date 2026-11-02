@@ -77,6 +77,17 @@ describe("createLiteReplicationRuntime", () => {
         },
         { state: "blocked", reason: "invalid_limits" },
       ],
+      // Below the framing overhead: no plaintext byte fits a fragment.
+      [
+        {
+          door: on,
+          config: {
+            ...config,
+            limits: { ...config.limits, fragmentBytes: 4096 },
+          },
+        },
+        { state: "blocked", reason: "invalid_limits" },
+      ],
     ] as const;
     for (const [input, status] of cases) {
       const runtime = createLiteReplicationRuntime({ ...input, engine });

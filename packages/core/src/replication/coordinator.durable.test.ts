@@ -49,6 +49,8 @@ function phase(
   name: ReplicaPhase,
   writers: string[],
   receipts: string[],
+  /** Byte estimate per writer's item; 1 when absent. */
+  bytes: Record<string, number> = {},
 ): ReplicaPhaseHandler {
   return {
     phase: name,
@@ -65,7 +67,7 @@ function phase(
           phase: name,
           writer,
           state: { ...initialReplicaWorkState },
-          bytes: 1,
+          bytes: bytes[writer] ?? 1,
         }));
     },
     run: async (item) => ({
@@ -116,6 +118,61 @@ it("restart before every one-unit turn preserves phase and writer service", asyn
   );
   assert.equal(trace[3].cursor.writers.retain, "B");
   assert.equal(trace[5].cursor.writers.import, "Z");
+});
+
+it("an item larger than the explicit byte budget does not block another writer's item that fits", async () => {
+  // Review of #513 (P2): A needs 2 bytes, B needs 1, the budget is 1 byte.
+  // A due() bounded by total=1 returns A only; B must still be served.
+  const h = memory();
+  const runs: string[] = [];
+  for (let turn = 0; turn < 4; turn++) {
+    // A new coordinator each turn: a process restart between steps.
+    const handler = phase("publish", ["A", "B"], h.receipts, { A: 2, B: 1 });
+    const run = handler.run;
+    handler.run = (item, signal) => {
+      runs.push(item.writer);
+      return run(item, signal);
+    };
+    const co = createReplicaCoordinator({ state: h.port, phases: [handler] });
+    const now = 1000 + turn;
+    const report = await co.step({ now, budget: { units: 1, bytes: 1 } });
+    assert.deepEqual(
+      report.receipts.map((r) => r.key),
+      ["B"],
+      `turn ${turn}`,
+    );
+    // A is deferred intact: never run, never settled, due again now.
+    assert.equal(report.nextWake, now);
+    assert.equal(h.port.load().writers.publish, "B");
+  }
+  assert.deepEqual(runs, ["B", "B", "B", "B"]);
+  assert.deepEqual(h.receipts, Array(4).fill("publish:B:progress"));
+});
+
+it("items deferred for bytes stay bounded: a backlog of oversized items is not scanned whole", async () => {
+  const h = memory();
+  const writers = Array.from(
+    { length: 500 },
+    (_, i) => `W${String(i).padStart(3, "0")}`,
+  );
+  const sizes = Object.fromEntries(writers.map((w) => [w, 2]));
+  const handler = phase("publish", [...writers, "Z"], h.receipts, sizes);
+  const pages: number[] = [];
+  const due = handler.due;
+  handler.due = (eligibility, limit) => {
+    pages.push(limit.total);
+    return due(eligibility, limit);
+  };
+  const co = createReplicaCoordinator({
+    state: h.port,
+    phases: [handler],
+    quantum: { publish: 4 },
+  });
+  const report = await co.step({ now: 1000, budget: { units: 1, bytes: 1 } });
+  // Z sits behind 500 oversized items: not reached within the bound this step.
+  assert.deepEqual(report.receipts, []);
+  assert.equal(report.nextWake, 1000);
+  assert.ok(Math.max(...pages) <= 1 + 4 + 1, `pages ${pages.join(",")}`);
 });
 
 it("cyclic-after selection wraps after a writer which is absent from the page", async () => {

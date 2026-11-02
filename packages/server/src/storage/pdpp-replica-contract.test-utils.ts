@@ -30,6 +30,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import {
   canonicalJson,
+  type DeclarationBinding,
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
@@ -375,20 +376,26 @@ export function network(
     owner,
     masterKey: new Uint8Array(32).fill(5),
     storage,
+    gatewayOrigin: "https://gateway.invalid",
+    chainId: 14800n,
     compatibilityRoster: async () => ({
       complete: true,
       epoch: 1,
       devices: [
         {
-          address: owner,
-          registrationId: owner,
+          address: `0x${"22".repeat(20)}`,
+          registrationId: `0x${"33".repeat(32)}`,
           revokedAt: null,
           readerFormats: ["fragments-v2"],
           capabilityValid: true,
         },
       ],
     }),
-    signer: { signAddData: async () => "0x1234" as const },
+    signer: {
+      signAddData: async () => "0x1234" as const,
+      signMessage: async () => `0x${"11".repeat(65)}` as `0x${string}`,
+      address: `0x${"22".repeat(20)}` as `0x${string}`,
+    },
     gateway: {
       async registerDataPoint(input) {
         const slot = slotKey(input.scope, input.expectedVersion);
@@ -660,6 +667,13 @@ export function transportDevice(
     preexisting?: string;
     crash?: CrashController;
     instance?: string;
+    /** The bindings this device baselines with and trusts (default `expected`). */
+    declarations?: (typeof expected)["declarations"];
+    /** The receiver's data check per binding (default: a string `id`). */
+    validateData?: (
+      binding: DeclarationBinding,
+      data: Record<string, unknown>,
+    ) => boolean;
     /** Extra worker deps, passed through (e.g. coordinator quanta). */
     worker?: Record<string, unknown>;
   } = {},
@@ -704,8 +718,8 @@ export function transportDevice(
     nonce: `0x${randomBytes(16).toString("hex")}`,
   });
   if (opts.preexisting) put(opts.preexisting);
-  store.replication.beginBaseline(expected);
-  let declarations = expected.declarations;
+  let declarations = opts.declarations ?? expected.declarations;
+  store.replication.beginBaseline({ owner, declarations });
   let receiver: Receiver;
   const make = () => {
     receiver = createReplicaReceiver({
@@ -717,7 +731,9 @@ export function transportDevice(
         declarations.map((d) => ({
           ...d,
           validateData: (data: Record<string, unknown>) =>
-            typeof data.id === "string",
+            opts.validateData
+              ? opts.validateData(d.binding, data)
+              : typeof data.id === "string",
         })),
     });
     return createReplicaTransportWorker({
@@ -1040,6 +1056,22 @@ export function transportInvariantViolations(d: TransportDevice): string[] {
         `slot imported without receipt: ${orphanImported.map((r) => r.slot).join(",")}`,
       );
   }
+  if (has("pdpp_transport_discover_floor")) {
+    // Discovery reads only versions above a scope's floor, so every version
+    // at or below it must be claimed here or admitted.
+    const gaps = db
+      .prepare(
+        `SELECT f.scope FROM pdpp_transport_discover_floor f WHERE f.version <> (
+          SELECT count(*) FROM (
+            SELECT version FROM pdpp_transport_manifests_out WHERE scope=f.scope AND version BETWEEN 1 AND f.version
+            UNION SELECT version FROM pdpp_transport_manifests_in WHERE scope=f.scope AND version BETWEEN 1 AND f.version))`,
+      )
+      .all() as { scope: string }[];
+    if (gaps.length)
+      violations.push(
+        `discover floor above an unadmitted version: ${gaps.map((r) => r.scope).join(",")}`,
+      );
+  }
   if (has("pdpp_transport_batches")) {
     const prepared = db
       .prepare(
@@ -1052,10 +1084,20 @@ export function transportInvariantViolations(d: TransportDevice): string[] {
       violations.push(
         `prepared batch without manifest or fragments: ${prepared.map((r) => r.batch).join(",")}`,
       );
+    // An unprepared batch has no manifest. Its fragments are exactly the
+    // ones its preparation cursor has committed (positions 0..next-1); the
+    // OUTBOUND view hides them from publish until the batch is prepared.
+    const progress = has("pdpp_transport_preparation_progress")
+      ? "(SELECT next_index FROM pdpp_transport_preparation_progress p WHERE p.batch=b.batch)"
+      : "NULL";
     const unprepared = db
       .prepare(
-        `SELECT DISTINCT o.batch FROM (SELECT batch FROM pdpp_transport_manifests_out UNION ALL SELECT batch FROM pdpp_transport_fragments_out) o
-          JOIN pdpp_transport_batches b ON b.batch=o.batch WHERE b.prepared<>1`,
+        `SELECT b.batch FROM pdpp_transport_batches b WHERE b.prepared<>1 AND (
+          EXISTS (SELECT 1 FROM pdpp_transport_manifests_out m WHERE m.batch=b.batch)
+          OR (SELECT count(*) FROM pdpp_transport_fragments_out f WHERE f.batch=b.batch)
+            <> coalesce(${progress}, 0)
+          OR EXISTS (SELECT 1 FROM pdpp_transport_fragments_out f WHERE f.batch=b.batch
+            AND (f.position < 0 OR f.position >= coalesce(${progress}, 0))))`,
       )
       .all() as { batch: string }[];
     if (unprepared.length)

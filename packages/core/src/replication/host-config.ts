@@ -45,18 +45,33 @@ export function replicaPartitionOwner(address: string): string {
 const sha256Text = (text: string) =>
   `sha256:${sha256(stringToBytes(text)).slice(2)}`;
 
+/** A stream's JSON Schema; `null` when the stream declares none. */
+export type ReplicaStreamSchema = Record<string, unknown> | null;
+
+/** One bound stream, with the schema its operations validate against. */
+export interface RetainedReplicaDeclaration {
+  sourceId: string;
+  binding: DeclarationBinding;
+  schema: ReplicaStreamSchema;
+}
+
+/** The `schemaDigest` a binding carries for a stream schema. */
+export function replicaSchemaDigest(schema: ReplicaStreamSchema): string {
+  return sha256Text(canonicalJson(schema));
+}
+
 /**
  * One binding per declared stream of each retained declaration: the exact
  * document digest and version, the stream's semantics and primary key, and a
  * digest of its JSON Schema (`null` when it declares none). Throws when a
  * stream cannot be bound; the host then does not start replication.
  *
- * The binding set is frozen by the first baseline (`beginBaseline`). A later
- * declaration upgrade changes it, and that database refuses it.
+ * A changed set is a rebinding (`rebinding.ts`): `beginBaseline` records a
+ * new binding generation and keeps trusting the older bindings.
  */
 export function replicaDeclarationBindings(
   snapshots: readonly DeclarationSnapshot[],
-): { sourceId: string; binding: DeclarationBinding }[] {
+): RetainedReplicaDeclaration[] {
   return [...snapshots]
     .sort((a, b) => (a.source_id < b.source_id ? -1 : 1))
     .flatMap((snapshot) =>
@@ -68,46 +83,75 @@ export function replicaDeclarationBindings(
           stream: stream.name,
           semantics: stream.semantics ?? "mutable_state",
           primaryKey: stream.primary_key,
-          schemaDigest: sha256Text(canonicalJson(stream.schema ?? null)),
+          schemaDigest: replicaSchemaDigest(stream.schema ?? null),
         }),
+        schema: stream.schema ?? null,
       })),
     );
 }
 
-/** The envelope expectation and receiver declarations for one owner. */
+/**
+ * The bindings this boot writes under (`current`, for `beginBaseline`) and
+ * the trusted set every replication check uses: `current` plus every binding
+ * the database retained in an earlier generation (`history`, from
+ * `declarationHistory()`). Own operations still in flight and peers that have
+ * not upgraded yet write under those older bindings; trusting only `current`
+ * would refuse them. A history entry without a schema, or whose schema does
+ * not match its digest, is not trusted, so its operations wait.
+ */
 export function replicaDeclarationContext(
   owner: string,
   snapshots: readonly DeclarationSnapshot[],
+  history: readonly (Omit<RetainedReplicaDeclaration, "schema"> & {
+    schema?: ReplicaStreamSchema;
+  })[] = [],
 ): {
+  current: RetainedReplicaDeclaration[];
   expected: EnvelopeExpectation;
   declarations: MergeContext["declarations"];
 } {
-  const bindings = replicaDeclarationBindings(snapshots);
-  const schemas = new Map(
-    snapshots.flatMap((snapshot) =>
-      snapshot.streams.map(
-        (stream) =>
-          [
-            canonicalJson([snapshot.source_id, stream.name]),
-            stream.schema,
-          ] as const,
-      ),
-    ),
-  );
-  return {
-    expected: { owner, declarations: bindings },
-    // The same rule as the resource server: a stream without a schema states
-    // no shape to check.
-    declarations: bindings.map((entry) => {
-      const schema = schemas.get(
-        canonicalJson([entry.sourceId, entry.binding.stream]),
-      );
-      const validate = schema ? compileRecordSchema(schema) : undefined;
-      return {
+  const current = replicaDeclarationBindings(snapshots);
+  const trusted = new Map<string, RetainedReplicaDeclaration>();
+  for (const { schema, ...entry } of [...current, ...history])
+    if (
+      schema !== undefined &&
+      replicaSchemaDigest(schema) === entry.binding.schemaDigest
+    )
+      trusted.set(canonicalJson([entry.sourceId, entry.binding]), {
         ...entry,
-        validateData: (data: Record<string, unknown>) =>
-          validate ? validate(data) === true : true,
-      };
-    }),
+        schema,
+      });
+  const entries = [...trusted.values()];
+  const validators = new Map<
+    string,
+    (data: Record<string, unknown>) => boolean
+  >();
+  // The same rule as the resource server: a stream without a schema states
+  // no shape to check.
+  const validatorFor = (entry: RetainedReplicaDeclaration) => {
+    let validate = validators.get(entry.binding.schemaDigest);
+    if (!validate) {
+      const compiled = entry.schema
+        ? compileRecordSchema(entry.schema)
+        : undefined;
+      validate = (data) => (compiled ? compiled(data) === true : true);
+      validators.set(entry.binding.schemaDigest, validate);
+    }
+    return validate;
+  };
+  return {
+    current,
+    expected: {
+      owner,
+      declarations: entries.map(({ sourceId, binding }) => ({
+        sourceId,
+        binding,
+      })),
+    },
+    declarations: entries.map((entry) => ({
+      sourceId: entry.sourceId,
+      binding: entry.binding,
+      validateData: validatorFor(entry),
+    })),
   };
 }

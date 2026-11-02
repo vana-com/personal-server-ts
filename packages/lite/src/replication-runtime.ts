@@ -53,6 +53,8 @@ export interface LiteReplicationRuntime {
   trigger(reason: LiteReplicationTrigger): Promise<ProgressReport | undefined>;
   /** A host-observed dependency change, e.g. `mapping:<connection>`. */
   wake(dependency: string): void;
+  /** A local write committed: step within the driver's debounce window. */
+  localWrite(): void;
   /** Foreground: start stepping (steps once now). Idempotent. */
   resume(): void;
   /** Background: abort the running step and stop scheduling. */
@@ -78,6 +80,7 @@ export function createLiteReplicationRuntime(input: {
     status: () => status,
     trigger: async () => undefined,
     wake: () => {},
+    localWrite: () => {},
     resume: () => {},
     pause: async () => {},
     stop: async () => true,
@@ -111,6 +114,7 @@ export function createLiteReplicationRuntime(input: {
     },
     trigger: () => driver.trigger(),
     wake: (dependency) => driver.wake(dependency),
+    localWrite: () => driver.localWrite(),
     resume() {
       const mine = ++lifecycle;
       // A resume during a pause waits for it, so the old step settles first.
