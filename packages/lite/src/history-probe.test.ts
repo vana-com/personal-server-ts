@@ -153,6 +153,16 @@ it("checks retained originals through the real read-only worker without exposing
         ],
       }),
     ).toEqual([{ kind: "refused", code: "invalid_input_or_owner" }]);
+    await worker?.terminate();
+    for (const scope of [".", ".."]) {
+      expect(
+        await invoke({
+          ...input,
+          candidates: [{ ...input.candidates[0]!, scope }],
+        }),
+      ).toEqual([{ kind: "refused", code: "invalid_input_or_owner" }]);
+      await worker?.terminate();
+    }
     expect(methods).toHaveLength(6);
   } finally {
     await worker?.terminate();

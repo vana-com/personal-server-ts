@@ -20,7 +20,10 @@ const inputSchema = z.object({
   candidates: z
     .array(
       z.object({
-        scope: z.string().regex(/^[a-zA-Z0-9._-]{1,256}$/),
+        scope: z
+          .string()
+          .regex(/^[a-zA-Z0-9._-]{1,256}$/)
+          .refine((scope) => scope !== "." && scope !== ".."),
         expectedVersion: z.string().regex(/^[1-9][0-9]{0,63}$/),
         storageVersion: z
           .string()
