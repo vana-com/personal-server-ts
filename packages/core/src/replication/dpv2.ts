@@ -33,6 +33,7 @@ import type { DataPointFeedPort } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
 import {
   replicaFragmentKey,
+  replicaLegacyFragmentKey,
   replicaManifestKey,
   type PreparedFragment,
   type PreparedManifest,
@@ -220,8 +221,6 @@ export function createDpv2ReplicaTransport(deps: {
     assertReplicaPublicationCompatible(await deps.compatibilityRoster());
   const password = (scope: string) =>
     bytesToHex(deriveScopeKey(deps.masterKey, scope)).slice(2);
-  const fragmentUrl = (scope: string, digest: string) =>
-    deps.storage.urlForKey(replicaFragmentKey(scope, digest));
   async function download(url: string, read: ReplicaRead) {
     const timeout = AbortSignal.timeout(REPLICA_RECEIVE_TIMEOUT_MS);
     const signal = read.signal
@@ -246,6 +245,32 @@ export function createDpv2ReplicaTransport(deps: {
       throw new ReplicaObjectRefused("oversize");
     return bytes;
   }
+  async function downloadFragment(
+    scope: string,
+    digest: string,
+    read: ReplicaRead,
+  ) {
+    // Both addresses share one deadline and caller cancellation. Only a
+    // definitive absence permits the single historical-address read.
+    const timeout = AbortSignal.timeout(REPLICA_RECEIVE_TIMEOUT_MS);
+    const signal = read.signal
+      ? AbortSignal.any([read.signal, timeout])
+      : timeout;
+    const bounded = { ...read, signal };
+    try {
+      return await download(
+        deps.storage.urlForKey(replicaFragmentKey(scope, digest)),
+        bounded,
+      );
+    } catch (error) {
+      signal.throwIfAborted();
+      if (!isDefinitiveNotFound(error)) throw error;
+      return download(
+        deps.storage.urlForKey(replicaLegacyFragmentKey(scope, digest)),
+        bounded,
+      );
+    }
+  }
   return {
     owner: deps.owner,
     finality: deps.finality,
@@ -261,13 +286,12 @@ export function createDpv2ReplicaTransport(deps: {
         fragment.encrypted,
       );
     },
-    getFragment: (scope, digest, read) =>
-      download(fragmentUrl(scope, digest), read),
+    getFragment: (scope, digest, read) => downloadFragment(scope, digest, read),
     async hasFragment(scope, digest, signal) {
       try {
         // A zero-byte bounded probe proves presence as soon as bytes arrive.
         // StorageAdapter.exists may hide a full SDK download; never call it.
-        await download(fragmentUrl(scope, digest), { maxBytes: 0, signal });
+        await downloadFragment(scope, digest, { maxBytes: 0, signal });
         return true;
       } catch (error) {
         if (error instanceof ReplicaObjectRefused) return true;

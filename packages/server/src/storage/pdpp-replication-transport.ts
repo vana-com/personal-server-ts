@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_manifests_in (
  slot TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL, writer TEXT NOT NULL,
  manifest_json TEXT, data_hash TEXT, metadata_hash TEXT, batch TEXT, sequence INTEGER,
  state TEXT NOT NULL DEFAULT 'ready', evidence_checked INTEGER NOT NULL DEFAULT 0, ${WORK},
+ readmission_capability TEXT, quarantine_history TEXT,
  UNIQUE(scope,version));
 CREATE TABLE IF NOT EXISTS pdpp_transport_fragments_in (
  slot TEXT NOT NULL, position INTEGER NOT NULL, digest TEXT NOT NULL, bytes INTEGER NOT NULL,
@@ -532,6 +533,14 @@ export function createReplicaTransportWorker(deps: {
     if (!columns.some((column) => column.name === "resource_limits_version"))
       db.exec(
         "ALTER TABLE pdpp_transport_manifests_in ADD COLUMN resource_limits_version INTEGER",
+      );
+    if (!columns.some((column) => column.name === "readmission_capability"))
+      db.exec(
+        "ALTER TABLE pdpp_transport_manifests_in ADD COLUMN readmission_capability TEXT",
+      );
+    if (!columns.some((column) => column.name === "quarantine_history"))
+      db.exec(
+        "ALTER TABLE pdpp_transport_manifests_in ADD COLUMN quarantine_history TEXT",
       );
     db.prepare(
       "INSERT OR IGNORE INTO pdpp_transport_repository (id,repository_id) VALUES (1,?)",
@@ -4035,6 +4044,33 @@ export function createReplicaTransportWorker(deps: {
     unsupported: [],
     nextWake: undefined,
   });
+  /** Reopen a bounded page once for this reader capability, under the worker fence. */
+  function readmitManifestFormat(): void {
+    db.transaction(() => {
+      const slots = db
+        .prepare(
+          `SELECT slot FROM pdpp_transport_manifests_in
+           WHERE state='quarantined' AND reason='manifest_invalid'
+             AND manifest_json IS NULL
+             AND coalesce(readmission_capability,'')<>'manifest-v2'
+           ORDER BY rowid LIMIT 32`,
+        )
+        .all() as { slot: string }[];
+      for (const { slot } of slots) {
+        db.prepare(
+          `UPDATE pdpp_transport_manifests_in
+           SET quarantine_history=CASE WHEN quarantine_history IS NULL
+             THEN '["manifest_invalid"]' ELSE quarantine_history END,
+             readmission_capability='manifest-v2',state='ready',
+             outcome=NULL,cause_json=NULL,dependency=NULL,error=NULL,
+             attempts=0,next_attempt=0,wait_since=NULL,checked_block=NULL
+           WHERE slot=? AND state='quarantined' AND reason='manifest_invalid'
+             AND manifest_json IS NULL
+             AND coalesce(readmission_capability,'')<>'manifest-v2'`,
+        ).run(slot);
+      }
+    }).immediate();
+  }
 
   /**
    * Node wrapper for core step({now,budget,signal}). The optional clock and
@@ -4103,6 +4139,7 @@ export function createReplicaTransportWorker(deps: {
       activeStepSignal = lifetime.signal;
       // Under the writer lock: a new identity resets its chain transactionally.
       if (!authority(own.identity)) return idle();
+      readmitManifestFormat();
       const stagedObjects = stagingStore(false);
       stagedObjects.cleanup();
       stagedObjects.cleanupAttachedTemporaryBytes();
@@ -4139,6 +4176,33 @@ export function createReplicaTransportWorker(deps: {
         ...context,
         signal: lifetime.signal,
       });
+      // Quarantines are durable unresolved work. Re-report them after quiet
+      // cycles and restarts so an empty latest step cannot imply catch-up.
+      const unresolved = db
+        .prepare(
+          `SELECT slot,reason FROM pdpp_transport_manifests_in
+           WHERE state='quarantined' ORDER BY rowid LIMIT ?`,
+        )
+        .all(REPLICA_REPORT_LIMIT + 1) as { slot: string; reason: string }[];
+      for (const { slot, reason } of unresolved) {
+        if (report.quarantines.some((entry) => entry.id === slot)) continue;
+        if (
+          report.receipts.length +
+            report.waits.length +
+            report.problems.length +
+            report.quarantines.length +
+            report.unsupported.length >=
+          REPLICA_REPORT_LIMIT
+        ) {
+          report.diagnosticsTruncated = true;
+          break;
+        }
+        report.quarantines.push({
+          id: slot,
+          phase: "download",
+          proof: { reason, key: slot } as ReplicaQuarantineProof,
+        });
+      }
       const diagnosticRoom = () =>
         REPLICA_REPORT_LIMIT -
         report.receipts.length -

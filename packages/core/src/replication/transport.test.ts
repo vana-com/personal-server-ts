@@ -7,6 +7,7 @@ import {
   prepareReplicaManifest,
   replicaDigest,
   replicaFragmentKey,
+  replicaLegacyFragmentKey,
   replicaManifestKey,
   replicaScope,
   replicaWriterOf,
@@ -17,6 +18,15 @@ import {
 import { canonicalJson } from "./envelope.js";
 import { unsignedReplicaBatch } from "./writer-identity.test-utils.js";
 import { assembleReplicaStream } from "./stream.js";
+
+it("models the pinned published reader's strict version gate", () => {
+  // Source-derived from 08d612f4061b7fed592b688993d8ec44381f4d1f:
+  // replicaManifestSchema used z.literal(1), so decode refuses v2 before
+  // the caller can schedule fragment reads. This is not a full old-runtime test.
+  const acceptsPublishedManifestVersion = (version: unknown) => version === 1;
+  expect(acceptsPublishedManifestVersion(1)).toBe(true);
+  expect(acceptsPublishedManifestVersion(2)).toBe(false);
+});
 
 it("fragments a large export without changing bytes or exceeding encrypted cap", async () => {
   const bytes = new TextEncoder().encode("😺large JSON record".repeat(2000));
@@ -89,11 +99,26 @@ it("binds a manifest to its owner, writer scope and version, and its fragments t
   expect(manifest).toMatchObject({ scope, version: 2 });
   expect(replicaManifestKey(scope, 2)).toBe(`${scope}/2`);
   expect(replicaFragmentKey(scope, parts[0]!.digest)).toBe(
+    `${scope}/fragments-${parts[0]!.digest.slice(7)}`,
+  );
+  expect(replicaLegacyFragmentKey(scope, parts[0]!.digest)).toBe(
     `${scope}/fragments/${parts[0]!.digest.slice(7)}`,
   );
   expect(replicaWriterOf(scope)).toBe(writer);
   expect(replicaWriterOf(`${scope}.0`)).toBeUndefined();
   const decoded = decodeReplicaManifest(manifest.plaintext, scope, "owner");
+  expect(decoded.version).toBe(2);
+  const legacyEnvelope = JSON.parse(
+    new TextDecoder().decode(manifest.plaintext),
+  );
+  legacyEnvelope.data.manifest.version = 1;
+  expect(
+    decodeReplicaManifest(
+      new TextEncoder().encode(canonicalJson(legacyEnvelope)),
+      scope,
+      "owner",
+    ).version,
+  ).toBe(1);
   expect(decoded.fragments).toHaveLength(parts.length);
   // The statement is signed over this manifest at its version.
   expect(decoded.authority).toEqual(

@@ -18,9 +18,11 @@ one registration.
   reader of only the latest version would see only the last batch, so the
   receiver discovers and reads every version.
 - **Fragments.** A batch payload is cut into fragments (default target 4 MiB).
-  Each encrypted fragment is stored **unregistered** at its content address,
-  `<scope>/fragments/<sha256 of the encrypted bytes>`. A fragment is never
-  registered and is never trusted on its own.
+  Each encrypted fragment is stored **unregistered** at its content address.
+  Manifest version 1 can name either the historical slash address
+  `<scope>/fragments/<sha256>` or the already-published dash address
+  `<scope>/fragments-<sha256>`; version 2 names the dash address. A fragment
+  is never registered and is never trusted on its own.
 - **Manifest.** The batch has one manifest. It names the owner, writer,
   batch, sequence, predecessor batch and digest, collection time, payload
   digest and length, and lists every fragment, in index order, by digest and
@@ -54,8 +56,15 @@ Every object uses the existing per-scope key derivation, OpenPGP encryption,
 plaintext keccak commitment, metadata commitment and AddData signature. The
 worker never calls the legacy uploader or its file-head recovery/rebase path.
 
-Manifest and fragment plaintexts are standard version-1.0 data-file envelopes,
-with the replica object under `data.manifest` or `data.fragment`. Exact legacy
+Manifest and fragment plaintexts are standard version-1.0 data-file envelopes.
+The inner manifest uses version 2 for new dash-address publications and readers
+accept explicit versions 1 and 2. An old reader rejects version 2 before it
+fetches fragments; after upgrading, a reader retries previously refused slots
+once for the manifest-v2 capability. This refusal prevents silent omission of
+new-format data, but an old runtime may continue to expose a historical read
+and later report an empty latest step. Do not interpret that old status as
+proof that it read the new slot. Each envelope carries the replica object under
+`data.manifest` or `data.fragment`. Exact legacy
 scope lookups do not select them. This compatibility promise means old app
 reads remain stale or absent. It does not mean an unmodified old runtime skips
 downloading internal objects, or that its wildcard grants gain the upgraded

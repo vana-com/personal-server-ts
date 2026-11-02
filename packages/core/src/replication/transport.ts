@@ -79,7 +79,8 @@ export type ManifestEntry = z.infer<typeof manifestEntrySchema>;
  */
 export const replicaManifestSchema = z.strictObject({
   format: z.literal("vana-pdpp-replica-manifest"),
-  version: z.literal(1),
+  /** Version 1 covers historical slash and already-published dash layouts. */
+  version: z.union([z.literal(1), z.literal(2)]),
   owner: z.string().min(1),
   writer: token,
   batch: token,
@@ -128,6 +129,14 @@ export function replicaWriterOf(scope: string): string | undefined {
 }
 /** Storage key of a content-addressed fragment. Never registered. */
 export function replicaFragmentKey(scope: string, fragmentDigest: string) {
+  digest.parse(fragmentDigest);
+  return `${scope}/fragments-${fragmentDigest.slice("sha256:".length)}`;
+}
+/** Historical address read only after a definitive absence at the dash key. */
+export function replicaLegacyFragmentKey(
+  scope: string,
+  fragmentDigest: string,
+) {
   digest.parse(fragmentDigest);
   return `${scope}/fragments/${fragmentDigest.slice("sha256:".length)}`;
 }
@@ -406,7 +415,7 @@ export async function prepareReplicaManifest(input: {
   const scope = replicaScope(input.writer);
   const unsigned = replicaManifestSchema.omit({ authority: true }).parse({
     format: "vana-pdpp-replica-manifest",
-    version: 1,
+    version: 2,
     owner: input.owner,
     writer: input.writer,
     batch: input.batch,
