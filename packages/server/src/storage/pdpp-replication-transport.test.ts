@@ -625,13 +625,14 @@ it("does not resubmit a registration while accepted evidence is temporarily hidd
   let hidden: Parameters<ReplicaTransportPort["register"]>[0] | undefined;
   net.port.register = async (manifest) => {
     calls.push(slotKey(manifest.scope, manifest.version));
-    await originalRegister(manifest);
+    await originalRegister.call(net.port, manifest);
     hidden = manifest;
     const slot = slotKey(manifest.scope, manifest.version);
     net.head.delete(slot);
     net.chain.delete(slot);
   };
 
+  a.put("accepted registration with temporarily hidden evidence", "first");
   await a.cycle();
   const slot = outbox(a)[0]!.slot;
   expect(calls).toEqual([slot]);
@@ -948,7 +949,7 @@ it("reports a pending predecessor and re-registers that same slot after authorit
   const calls: string[] = [];
   net.port.register = async (manifest) => {
     calls.push(slotKey(manifest.scope, manifest.version));
-    await originalRegister(manifest);
+    await originalRegister.call(net.port, manifest);
   };
 
   net.beforePut((key) => net.pending.add(key));
@@ -1152,12 +1153,13 @@ it("aborts later outbound writes when the door closes after a fragment upload", 
   const a = device(net);
   const originalPutFragment = net.port.putFragment;
   net.port.putFragment = async (fragment) => {
-    await originalPutFragment(fragment);
+    await originalPutFragment.call(net.port, fragment);
     retireReplication(a.db);
   };
   const manifestPut = vi.spyOn(net.port, "put");
   const register = vi.spyOn(net.port, "register");
 
+  a.put("close after an accepted fragment upload", "first");
   await a.cycle();
 
   expect(net.puts.some(({ key }) => isFragmentKey(key))).toBe(true);
@@ -1171,7 +1173,7 @@ it("does not let a stale outbound receipt overwrite a newer quarantine", async (
   const a = device(net);
   const originalPutFragment = net.port.putFragment;
   net.port.putFragment = async (fragment) => {
-    await originalPutFragment(fragment);
+    await originalPutFragment.call(net.port, fragment);
     a.db
       .prepare(
         "UPDATE pdpp_transport_fragments_out SET state='quarantined',outcome='quarantine',reason='fragment_mismatch' WHERE digest=?",
@@ -1179,6 +1181,7 @@ it("does not let a stale outbound receipt overwrite a newer quarantine", async (
       .run(fragment.digest);
   };
 
+  a.put("fragment upload races a newer quarantine", "first");
   await a.cycle();
 
   expect(fragmentsOut(a)[0]).toMatchObject({
