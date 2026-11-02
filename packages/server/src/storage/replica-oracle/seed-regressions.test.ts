@@ -1,7 +1,8 @@
 /**
- * The 22 minimized seeds from the nightly oracle run on PR #486 (head
- * 1c5a3b1b). Each failed before the fixes in this branch and replays clean
- * now, through every port with a fresh replay of the accepted history.
+ * Minimized nightly seeds, originally collected on PR #486 (head 1c5a3b1b).
+ * Reset-gap blob reads and cross-connection pending-byte delivery add coverage
+ * for the later nightly failures. The latter also withdraws its carrier.
+ * Replay through every port, including a fresh replay of accepted history.
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
