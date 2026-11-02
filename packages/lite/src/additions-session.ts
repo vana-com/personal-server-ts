@@ -1,6 +1,7 @@
 import {
   AdditionsBudget,
   AdditionsBudgetExceeded,
+  createAdditionsDeletionBudget,
   additionsLedgerScope,
   ADDITIONS_SUMMARY_SCOPE,
   summarizeAdditions,
@@ -15,6 +16,7 @@ import type {
 } from "./additions-protocol.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 import type { PsLiteAdditionsTransport } from "./additions-transport.js";
+import { CreateOnlyUnavailableError } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 
 export interface AdditionsWorkerPort {
   postMessage(message: WorkerMessage, transfer?: Transferable[]): void;
@@ -167,6 +169,7 @@ export function createPsLiteAdditionsSession(
                   result = await transport.publish(
                     args[0] as Parameters<typeof transport.publish>[0],
                     hostBudget,
+                    args[1] === true,
                   );
                   break;
                 case "readPending":
@@ -198,6 +201,10 @@ export function createPsLiteAdditionsSession(
                   kind: "response",
                   id: message.id,
                   error: error instanceof Error ? error.message : String(error),
+                  recoveryCode:
+                    error instanceof CreateOnlyUnavailableError
+                      ? "immutable_storage_unavailable"
+                      : undefined,
                   budgetExceeded:
                     error instanceof AdditionsBudgetExceeded ||
                     budget.signal?.aborted,
@@ -259,11 +266,7 @@ export function createPsLiteAdditionsSession(
       // Explicit durable deletion belongs to the ordinary sync pipeline and
       // has no bounded-recovery deadline or noncancelable worker RPC.
       const budget = deletion?.durableOnly
-        ? new AdditionsBudget(
-            Math.min(8 * 1024 * 1024, options.init.byteBudget),
-            options.init.timeBudgetMs,
-            deletion.signal,
-          )
+        ? createAdditionsDeletionBudget(options.init, deletion.signal)
         : undefined;
       await navigator.locks.request(
         JSON.stringify([

@@ -12,7 +12,11 @@ import {
   type ByteBudget,
 } from "@opendatalabs/personal-server-ts-core/additions";
 import { createGatewayDeleteDataPort } from "@opendatalabs/personal-server-ts-core/sync";
-import { resolveVanaStorageEndpoint } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import {
+  resolveVanaStorageEndpoint,
+  supportsWriteOnce,
+  CreateOnlyUnavailableError,
+} from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { RequestSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
@@ -137,6 +141,7 @@ export function createPsLiteAdditionsTransport(options: {
   // authenticated fingerprints, since returning candidate buffers transfers ownership.
   function openSession() {
     const fingerprints = new Map<string, string | null>();
+    let writeOnce = false;
     function fingerprint(prepared: PsLitePreparedPublication) {
       return JSON.stringify([
         prepared.scope,
@@ -268,17 +273,36 @@ export function createPsLiteAdditionsTransport(options: {
     async function publish(
       prepared: PsLitePreparedPublication,
       budget: ByteBudget,
+      replacePending = false,
     ) {
       budget.charge(prepared.encrypted.byteLength * 32);
       if (!fingerprints.has(prepared.scope))
         await readPending(prepared.scope, budget);
       const pending = fingerprints.get(prepared.scope);
       const candidate = fingerprint(prepared);
-      if (pending && pending !== candidate)
+      if (pending && pending !== candidate && !replacePending)
         throw new Error(
           "Interrupted checkpoint must be reconciled before replacement",
         );
-      if (!pending) {
+      if (!writeOnce) {
+        const capabilities = await fetchBounded(
+          { url: `${storage}/v1/capabilities` },
+          budget,
+        );
+        budget.charge(capabilities.body.byteLength * 3);
+        let advertisement: unknown;
+        try {
+          advertisement = JSON.parse(
+            new TextDecoder().decode(capabilities.body),
+          );
+        } catch {
+          throw new CreateOnlyUnavailableError();
+        }
+        if (capabilities.status !== 200 || !supportsWriteOnce(advertisement))
+          throw new CreateOnlyUnavailableError();
+        writeOnce = true;
+      }
+      if (!pending || (replacePending && pending !== candidate)) {
         await persistPending(prepared, budget);
         fingerprints.set(prepared.scope, candidate);
       }
@@ -304,6 +328,7 @@ export function createPsLiteAdditionsTransport(options: {
         },
         budget,
       );
+      if (uploaded.status === 409) return { conflict: true as const };
       if (uploaded.status < 200 || uploaded.status >= 300)
         throw new Error(`Checkpoint upload failed (${uploaded.status})`);
       budget.charge();
@@ -344,6 +369,7 @@ export function createPsLiteAdditionsTransport(options: {
           `Checkpoint registration failed (${registered.status})`,
         );
       // Keep the journal until the worker verifies inventory AND decrypted blob commitments.
+      return { conflict: false as const };
     }
     return {
       fetch: fetchBounded,

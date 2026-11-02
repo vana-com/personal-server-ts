@@ -1,8 +1,26 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { createSdkStorageAdapter, type SdkStorageProvider } from "./sdk.js";
+import { StoredBlobConflictError } from "./interface.js";
 
 describe("createSdkStorageAdapter", () => {
+  it.each([
+    { status: 409 },
+    { statusCode: 409 },
+    new Error("vana-storage upload failed: 409 Conflict - BLOB_EXISTS"),
+  ])(
+    "maps a real SDK write conflict without changing the stored object (%j)",
+    async (error) => {
+      const adapter = createSdkStorageAdapter({
+        upload: vi.fn().mockRejectedValue(error),
+        download: vi.fn(),
+        delete: vi.fn(),
+      });
+      await expect(
+        adapter.upload("scope/1", new Uint8Array([1])),
+      ).rejects.toBeInstanceOf(StoredBlobConflictError);
+    },
+  );
   it("delegates upload and download through the SDK storage provider", async () => {
     const provider: SdkStorageProvider = {
       upload: vi.fn().mockResolvedValue({

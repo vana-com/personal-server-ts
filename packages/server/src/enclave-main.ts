@@ -3,7 +3,11 @@ import {
   recoverServerOwner,
   createGatewayClient,
 } from "@opendatalabs/vana-sdk/node";
-import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import {
+  createVanaSyncStorageAdapter,
+  withCreateOnlyUploads,
+  StoredBlobConflictError,
+} from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { CreateServerOptions } from "./bootstrap.js";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createPublicOnlyAccount } from "@opendatalabs/personal-server-ts-core/keys";
@@ -365,6 +369,7 @@ export async function createEnclaveAdditionsPorts(
         signal: AbortSignal.timeout(15_000),
       });
       await response.body?.cancel();
+      if (response.status === 409) throw new StoredBlobConflictError(key);
       if (!response.ok)
         throw new Error(`Checkpoint upload failed (${response.status})`);
       return url;
@@ -387,7 +392,7 @@ export async function createEnclaveAdditionsPorts(
   return {
     additionsInventorySigner,
     additionsWriter: {
-      storageAdapter,
+      storageAdapter: withCreateOnlyUploads(storageAdapter, storageEndpoint),
       gateway: createGatewayClient(config.gateway.url),
       signer: {
         async signAddData(message) {

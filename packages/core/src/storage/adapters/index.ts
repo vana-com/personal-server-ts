@@ -8,3 +8,9 @@ export {
   createVanaSyncStorageAdapter,
   resolveVanaStorageEndpoint,
 } from "./vana.js";
+
+export {
+  StoredBlobConflictError,
+  CreateOnlyUnavailableError,
+} from "./interface.js";
+export { supportsWriteOnce, withCreateOnlyUploads } from "./write-once.js";

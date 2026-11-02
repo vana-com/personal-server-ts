@@ -13,6 +13,12 @@ export interface StorageAdapter {
    */
   upload(key: string, data: Uint8Array): Promise<string>;
 
+  /** Atomic create-only upload. Existing different bytes must remain unchanged.
+   * Absence means the backend cannot guarantee immutable checkpoint publication.
+   * Identical retries may succeed; conflicting bytes throw StoredBlobConflictError.
+   */
+  uploadCreateOnly?(key: string, data: Uint8Array): Promise<string>;
+
   /**
    * Resolve the canonical URL for a storage key WITHOUT uploading.
    *
@@ -63,4 +69,23 @@ export interface StorageAdapter {
    * @returns count of blobs deleted
    */
   deleteAll?(): Promise<number>;
+}
+
+/**
+ * The upload key already holds different bytes, which the backend kept.
+ * Callers decide whether those bytes are theirs (same plaintext, different
+ * ciphertext) or another writer's.
+ */
+export class StoredBlobConflictError extends Error {
+  constructor(readonly key: string) {
+    super(`Storage key ${key} already holds different bytes`);
+    this.name = "StoredBlobConflictError";
+  }
+}
+
+export class CreateOnlyUnavailableError extends Error {
+  constructor() {
+    super("Atomic create-only storage is unavailable");
+    this.name = "CreateOnlyUnavailableError";
+  }
 }

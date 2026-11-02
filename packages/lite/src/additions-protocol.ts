@@ -28,6 +28,7 @@ export type WorkerMessage =
       id: number;
       result?: unknown;
       error?: string;
+      recoveryCode?: "immutable_storage_unavailable";
       spent: number;
       budgetExceeded?: boolean;
     };

@@ -2,7 +2,11 @@ import { privateKeyToAccount } from "viem/accounts";
 import { MASTER_KEY_MESSAGE } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readEnclaveEnv, runEnclaveMain } from "./enclave-main.js";
+import {
+  readEnclaveEnv,
+  runEnclaveMain,
+  createEnclaveAdditionsPorts,
+} from "./enclave-main.js";
 
 const serviceMocks = vi.hoisted(() => ({
   createPublicOnlyAccount: vi.fn().mockReturnValue({}),
@@ -26,6 +30,55 @@ const MASTER_SIGNATURE = await privateKeyToAccount(
 const SERVER_ADDRESS = "0x2222222222222222222222222222222222222222";
 const SERVER_PUBLIC_KEY = `0x04${"33".repeat(64)}`;
 const AGENT_URL = "http://agent:8787";
+
+it("exposes enclave create-only checkpoint publication only after the backend guarantee", async () => {
+  const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+    if (String(input).endsWith("/v1/capabilities"))
+      return Response.json({ blobs: { writeOnce: true } });
+    if (init?.method === "PUT") return new Response(null, { status: 201 });
+    return Response.json({ authorization: "test-owner-authorization" });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  try {
+    const config = ServerConfigSchema.parse({
+      storage: { config: { vana: { apiUrl: "https://storage.example" } } },
+    });
+    const env = {
+      ownerSignature: MASTER_SIGNATURE,
+      accessToken: "test-token",
+      serverAddress: SERVER_ADDRESS,
+      serverPublicKey: SERVER_PUBLIC_KEY as `0x${string}`,
+      agentUrl: AGENT_URL,
+    };
+    const { additionsWriter } = await createEnclaveAdditionsPorts(config, env);
+    expect(additionsWriter?.storageAdapter.uploadCreateOnly).toBeTypeOf(
+      "function",
+    );
+    await additionsWriter!.storageAdapter.uploadCreateOnly!(
+      "vana.system.additions.instagram.posts/1",
+      new Uint8Array([1]),
+    );
+    expect(String(fetcher.mock.calls[0][0])).toBe(
+      "https://storage.example/v1/capabilities",
+    );
+    expect(
+      fetcher.mock.calls.filter((call) => call[1]?.method === "PUT"),
+    ).toHaveLength(1);
+    fetcher
+      .mockClear()
+      .mockImplementation(async () => new Response(null, { status: 404 }));
+    const unavailable = await createEnclaveAdditionsPorts(config, env);
+    await expect(
+      unavailable.additionsWriter!.storageAdapter.uploadCreateOnly!(
+        "vana.system.additions.instagram.posts/1",
+        new Uint8Array([2]),
+      ),
+    ).rejects.toThrow();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
 
 function prepareEnclaveRun() {
   const config = ServerConfigSchema.parse({});
