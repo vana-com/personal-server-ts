@@ -56,7 +56,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 10;
+const VIEW_SCHEMA = 11;
 /** How often a transaction may find another connection committed first. */
 const SYNC_ATTEMPTS = 16;
 /**
@@ -168,10 +168,17 @@ export function createReplicaVisibilityView(deps: {
   const localIdentitySql = (alias: string) =>
     `EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=${alias}.instance AND b.deleted_at IS NULL AND b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.source_id=${alias}.source_id AND b.method=${alias}.method AND b.generation=${alias}.generation)`;
   const localProjection = `SELECT j.connection_id,j.stream,j.record_key,json_extract(j.value_json,'$.emittedAt'),j.value_json,json_extract(j.value_json,'$.data.blob_ref.blob_id'),0,json_extract(j.value_json,'$.deleted'),NULL,j.sequence,j.generation,j.source_id,j.method FROM pdpp_replica_own_writes j JOIN pdpp_instance_binding b ON b.instance=j.connection_id AND b.generation=j.generation AND b.source_id=j.source_id AND b.method=j.method WHERE b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL AND j.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND NOT EXISTS (SELECT 1 FROM pdpp_replica_own_writes newer WHERE newer.connection_id=j.connection_id AND newer.generation=j.generation AND newer.stream=j.stream AND newer.record_key=j.record_key AND newer.source_id=j.source_id AND newer.method=j.method AND newer.writer_id=j.writer_id AND newer.sequence>j.sequence)`;
+  // Pending custody can supply a retained record on another connection.
+  const pendingBlobReference = (
+    instance: string,
+    stream: string,
+    key: string,
+  ) =>
+    `EXISTS (SELECT 1 FROM pdpp_replica_view_operations bo JOIN pdpp_replica_view_pending bp ON bp.blob_id=bo.blob_id AND bp.kind='blob-claim' WHERE bo.instance=${instance} AND bo.stream=${stream} AND bo.record_key=${key} AND bo.kind='upsert')`;
   // Whether a key can have an overlay row at all. Canonical writes and retained
   // record operations outside this predicate cannot change the owner preview.
   const touches = (instance: string, stream: string, key: string) =>
-    `(EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${instance} AND v.stream=${stream} AND v.record_key=${key}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_pending p WHERE p.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_conflicts c WHERE c.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=${instance} AND b.deleted_at IS NOT NULL))`;
+    `(EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${instance} AND v.stream=${stream} AND v.record_key=${key}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_pending p WHERE p.instance=${instance}) OR ${pendingBlobReference(instance, stream, key)} OR EXISTS (SELECT 1 FROM pdpp_replica_view_conflicts c WHERE c.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=${instance} AND b.deleted_at IS NOT NULL))`;
   // Trigger bodies use NOT EXISTS, never a conflict clause (OR IGNORE, OR
   // REPLACE, ...): an outer statement's conflict clause, including an upsert's,
   // overrides one inside a trigger. A receiver test checks every trigger body.
@@ -776,12 +783,7 @@ export function createReplicaVisibilityView(deps: {
             other.methodId === op.methodId,
         ),
     );
-    const claims = !!db
-      .prepare(
-        "SELECT 1 FROM pdpp_replica_view_pending WHERE instance=? AND kind='blob-claim'",
-      )
-      .get(instance);
-    return { all: conflicts || lifecycle, claims };
+    return { all: conflicts || lifecycle };
   }
   function flush(): void {
     if (!db.inTransaction) return db.transaction(flush).immediate();
@@ -826,11 +828,7 @@ export function createReplicaVisibilityView(deps: {
         dirtyKey(op.connectionId, op.declaration.stream, op.recordKey);
       else if (op.kind === "blob-claim") {
         for (const dependent of ops(
-          evidence(
-            "blob_id=? AND instance=? AND kind='upsert'",
-            op.blob.blobId,
-            op.connectionId,
-          ),
+          evidence("blob_id=? AND kind='upsert'", op.blob.blobId),
         ))
           if (dependent.kind === "upsert")
             dirtyKey(
@@ -968,14 +966,9 @@ export function createReplicaVisibilityView(deps: {
         .get(instance, stream, key)
     )
       return true;
-    return (
-      connection.claims &&
-      !!db
-        .prepare(
-          "SELECT 1 FROM pdpp_replica_view_operations o WHERE o.instance=? AND o.stream=? AND o.record_key=? AND o.blob_id IN (SELECT blob_id FROM pdpp_replica_view_pending WHERE instance=? AND kind='blob-claim')",
-        )
-        .get(instance, stream, key, instance)
-    );
+    return !!db
+      .prepare(`SELECT 1 WHERE ${pendingBlobReference("?", "?", "?")}`)
+      .get(instance, stream, key);
   }
   function reconcileKey(
     instance: string,
