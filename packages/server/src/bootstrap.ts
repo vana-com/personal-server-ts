@@ -1161,6 +1161,7 @@ export async function createServer(
     gateway: gatewayClient,
     gatewayConfig: config.gateway,
     paymentEnabled: config.payment.enabled,
+    ownAppAccountUrl: config.payment.ownAppAccountUrl,
     gatewayUrl: config.gateway.url,
     lineageGateway,
     derivativeCompute,
