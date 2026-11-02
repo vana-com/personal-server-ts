@@ -20,7 +20,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./additions-worker": "./dist/additions-worker.bundle.js"
+    "./additions-worker": "./dist/additions-worker.bundle.js",
+    "./history-probe-worker": {
+      "types": "./dist/history-probe.worker.d.ts",
+      "import": "./dist/history-probe-worker.bundle.js"
+    }
   },
   "publishConfig": {
     "access": "public"
@@ -31,7 +35,7 @@
   "scripts": {
     "copy-tls": "mkdir -p dist/browser-tls-rustls && cp src/browser-tls-rustls/* dist/browser-tls-rustls/",
     "build": "tsc --build && npm run copy-tls && npm run build-worker",
-    "build-worker": "esbuild src/additions-worker.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=dist/additions-worker.bundle.js"
+    "build-worker": "esbuild src/additions-worker.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=dist/additions-worker.bundle.js && esbuild src/history-probe.worker.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=dist/history-probe-worker.bundle.js"
   },
   "dependencies": {
     "@opendatalabs/personal-server-ts-core": "*",

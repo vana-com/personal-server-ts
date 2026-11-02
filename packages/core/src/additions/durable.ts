@@ -63,7 +63,11 @@ const documentSchema = z.object({
 });
 type LedgerDocument = Omit<z.infer<typeof documentSchema>, "ledger"> & {
   ledger: ScopeFirstSeenLedger | null;
-  repairHead?: true;
+};
+type RetainedCheckpoint = {
+  document: LedgerDocument;
+  publicationVersion: string;
+  repairHead: boolean;
 };
 
 /** The separate hash namespace cannot collide with a literal source suffix. */
@@ -74,7 +78,36 @@ export function additionsLedgerScope(scope: string): string {
     : `vana.system.additions-hash.${keccak256(stringToHex(scope)).slice(2)}`;
 }
 
+export type AdditionsRecoveryCode =
+  | "compressed_packet"
+  | "decrypt_failed"
+  | "data_hash_mismatch"
+  | "metadata_hash_mismatch"
+  | "invalid_envelope"
+  | "unsupported_source_data"
+  | "replay_failed"
+  | "checkpoint_search_exhausted"
+  | "budget_exceeded"
+  | "cancelled";
+export interface AdditionsRecoveryDiagnostic {
+  scope: string;
+  version: string;
+  code: AdditionsRecoveryCode;
+}
+/** Fixed operator codes only: never retain payloads or raw exception text. */
+export class AdditionsRecoveryError extends Error {
+  constructor(
+    readonly code: AdditionsRecoveryCode,
+    message: string = code,
+  ) {
+    super(message);
+    this.name = "AdditionsRecoveryError";
+  }
+}
+
 export interface DurableAdditionsOptions {
+  /** Transient operator observation; never persisted in ledgers or summaries. */
+  onRecoveryDiagnostic?: (event: AdditionsRecoveryDiagnostic) => void;
   ownerAddress: string;
   /** Include chain and Gateway origin. A service instance belongs to one owner/network. */
   network: string;
@@ -86,7 +119,8 @@ export interface DurableAdditionsOptions {
   fencedPublication?: FencedPublicationPort;
   /** Summaries remain behind; hosts can expose the retryable recovery reason. */
   onPublicationBlocked?: (error: NeedsFencedPublicationError) => void;
-  /** Full PS defaults remain unlimited. Bounded hosts must also supply boundedWork. */
+  /** Full PS source replay defaults remain unlimited; checkpoint discovery is capped.
+   * Bounded hosts must also supply boundedWork. */
   byteBudget?: number;
   /** Host operations must cancel and settle all work before returning on abort.
    * Crypto must enforce a plaintext limit before decompression/allocation.
@@ -136,9 +170,16 @@ export interface DurableAdditionsService {
 }
 
 class InaccessibleLedger extends Error {}
+class CheckpointSearchExceeded extends BudgetExceeded {}
+const CHECKPOINT_READ_LIMIT = 256;
+type CheckpointSearch = {
+  reads: number;
+  rejected: Map<string, "inaccessible" | "invalid">;
+};
 class BoundedWorkUnavailable extends Error {}
 class ReadBudget extends AdditionsBudget {
   readonly limited: boolean;
+  readonly checkpoints: CheckpointSearch;
   constructor(
     options: Pick<
       DurableAdditionsOptions,
@@ -147,6 +188,7 @@ class ReadBudget extends AdditionsBudget {
     parent?: ReadBudget,
   ) {
     super(options.byteBudget, options.timeBudgetMs, options.signal, parent);
+    this.checkpoints = parent?.checkpoints ?? { reads: 0, rejected: new Map() };
     this.limited =
       options.byteBudget !== undefined || options.timeBudgetMs !== undefined;
   }
@@ -197,6 +239,45 @@ function sameInventory(a: VersionInventory, b: VersionInventory): boolean {
 function settled(slot: { status: string }): boolean {
   return slot.status === "confirmed" || slot.status === "finalized";
 }
+function eligible(slot: { status: string; isTombstone: boolean }): boolean {
+  return (
+    !slot.isTombstone &&
+    ["confirmed", "finalized", "pending", "submitting"].includes(slot.status)
+  );
+}
+function sourceWindow(snapshot: VersionInventory) {
+  const end = BigInt(snapshot.head?.expectedVersion ?? "0");
+  const rows = snapshot.versions.filter(
+    (slot) => BigInt(slot.expectedVersion) <= end,
+  );
+  const after = BigInt(
+    rows.filter((slot) => slot.isTombstone && settled(slot)).at(-1)
+      ?.expectedVersion ?? "0",
+  );
+  return {
+    end,
+    after,
+    relevant: rows.filter((slot) => BigInt(slot.expectedVersion) > after),
+  };
+}
+
+/** Reuse only a commitment still visible after the current registry deletion boundary. */
+export function findCheckpointRegistration(
+  snapshot: VersionInventory,
+  version: string,
+  commitment: { dataHash: string; metadataHash: string },
+) {
+  if (!snapshot.head || snapshot.head.deletedAt !== null) return undefined;
+  const { end, after } = sourceWindow(snapshot);
+  if (BigInt(version) > end || BigInt(version) <= after) return undefined;
+  return snapshot.versions.find(
+    (row) =>
+      row.expectedVersion === version &&
+      eligible(row) &&
+      row.dataHash.toLowerCase() === commitment.dataHash.toLowerCase() &&
+      row.metadataHash.toLowerCase() === commitment.metadataHash.toLowerCase(),
+  );
+}
 function sourceData(data: unknown): Record<string, unknown> | null {
   if (data === null || typeof data !== "object" || Array.isArray(data))
     return null;
@@ -233,17 +314,36 @@ export function createDurableAdditions(
         : await storageAdapter.download(url);
     if (!budget.limited) budget.check(encrypted.byteLength);
     const password = hex(deriveScopeKey(options.masterKey, scope));
-    const plaintext =
-      budget.limited && options.boundedWork
-        ? await options.boundedWork.decrypt(encrypted, password, budget)
-        : await decryptWithPassword(encrypted, password);
+    let plaintext: Uint8Array;
+    try {
+      plaintext =
+        budget.limited && options.boundedWork
+          ? await options.boundedWork.decrypt(encrypted, password, budget)
+          : await decryptWithPassword(encrypted, password);
+    } catch (error) {
+      if (
+        error instanceof AdditionsRecoveryError ||
+        error instanceof BudgetExceeded ||
+        budget.signal?.aborted
+      )
+        throw error;
+      throw new AdditionsRecoveryError("decrypt_failed");
+    }
     budget.check(plaintext.byteLength);
     if (keccak256(plaintext).toLowerCase() !== slot.dataHash.toLowerCase())
-      throw new Error("Additions content commitment mismatch");
+      throw new AdditionsRecoveryError(
+        "data_hash_mismatch",
+        "Additions content commitment mismatch",
+      );
     budget.check(plaintext.byteLength * 3);
-    const envelope = DataFileEnvelopeSchema.parse(
-      JSON.parse(new TextDecoder().decode(plaintext)),
-    );
+    let envelope: ReturnType<typeof DataFileEnvelopeSchema.parse>;
+    try {
+      envelope = DataFileEnvelopeSchema.parse(
+        JSON.parse(new TextDecoder().decode(plaintext)),
+      );
+    } catch {
+      throw new AdditionsRecoveryError("invalid_envelope");
+    }
     const metadataHash = keccak256(
       stringToHex(
         JSON.stringify({
@@ -258,7 +358,10 @@ export function createDurableAdditions(
       !Number.isFinite(Date.parse(envelope.collectedAt)) ||
       metadataHash.toLowerCase() !== slot.metadataHash.toLowerCase()
     )
-      throw new Error("Additions metadata commitment mismatch");
+      throw new AdditionsRecoveryError(
+        "metadata_hash_mismatch",
+        "Additions metadata commitment mismatch",
+      );
     budget.check();
     return envelope;
   }
@@ -269,12 +372,10 @@ export function createDurableAdditions(
     budget.check();
     const head = snapshot.head;
     if (!head || head.deletedAt !== null) return null;
-    const slot = snapshot.versions.find(
-      (row) =>
-        row.expectedVersion === head.expectedVersion &&
-        !row.isTombstone &&
-        row.dataHash === head.dataHash &&
-        row.metadataHash === head.metadataHash,
+    const slot = findCheckpointRegistration(
+      snapshot,
+      head.expectedVersion,
+      head,
     );
     if (!slot) throw new Error("Additions head missing from inventory");
     return { snapshot, envelope: await readEnvelope(scope, slot, budget) };
@@ -283,21 +384,64 @@ export function createDurableAdditions(
   async function readDocument(
     scope: string,
     budget: ReadBudget,
-  ): Promise<LedgerDocument | null> {
+    source: VersionInventory,
+    search?: { before: string; longerThan: number },
+  ): Promise<RetainedCheckpoint | null> {
+    const { relevant, after } = sourceWindow(source);
     const systemScope = additionsLedgerScope(scope);
     const snapshot = await inventory.list(systemScope, budget.readOptions);
     if (!snapshot.head || snapshot.head.deletedAt !== null) return null;
+    // Same visibility as source recovery: only settled tombstones at or below the head delete history.
     const boundary =
-      snapshot.versions.filter((row) => row.isTombstone).at(-1)
-        ?.expectedVersion ?? "0";
+      snapshot.versions
+        .filter(
+          (row) =>
+            row.isTombstone &&
+            settled(row) &&
+            BigInt(row.expectedVersion) <=
+              BigInt(snapshot.head!.expectedVersion),
+        )
+        .at(-1)?.expectedVersion ?? "0";
     let inaccessible = false;
-    for (const slot of [...snapshot.versions].reverse()) {
+    const sourceFingerprint = fingerprintVersionInventory(source);
+    for (let index = snapshot.versions.length - 1; index >= 0; index--) {
+      budget.check();
+      const slot = snapshot.versions[index]!;
       if (
         BigInt(slot.expectedVersion) <= BigInt(boundary) ||
         BigInt(slot.expectedVersion) > BigInt(snapshot.head.expectedVersion) ||
-        slot.isTombstone
+        (search && BigInt(slot.expectedVersion) >= BigInt(search.before)) ||
+        !eligible(slot)
       )
         continue;
+      const identity = JSON.stringify([
+        systemScope,
+        slot.expectedVersion,
+        slot.dataHash.toLowerCase(),
+        slot.metadataHash.toLowerCase(),
+        sourceFingerprint,
+      ]);
+      const rejected = budget.checkpoints.rejected.get(identity);
+      if (rejected !== undefined) {
+        inaccessible ||= rejected === "inaccessible";
+        continue;
+      }
+      if (budget.checkpoints.reads >= CHECKPOINT_READ_LIMIT) {
+        try {
+          options.onRecoveryDiagnostic?.({
+            scope,
+            version: slot.expectedVersion,
+            code: "checkpoint_search_exhausted",
+          });
+        } catch {
+          /* Observation cannot alter recovery. */
+        }
+        throw new CheckpointSearchExceeded(
+          "Retained checkpoint search exhausted",
+        );
+      }
+      budget.check(identity.length * 2 + 64);
+      budget.checkpoints.reads++;
       let envelope;
       try {
         envelope = await readEnvelope(systemScope, slot, budget);
@@ -305,6 +449,7 @@ export function createDurableAdditions(
         if (error instanceof BudgetExceeded || budget.signal?.aborted)
           throw error;
         inaccessible = true;
+        budget.checkpoints.rejected.set(identity, "inaccessible");
         continue;
       }
       const parsed = documentSchema.safeParse(envelope.data);
@@ -313,20 +458,36 @@ export function createDurableAdditions(
         parsed.data.owner !== owner ||
         parsed.data.network !== options.network ||
         parsed.data.scope !== scope
-      )
+      ) {
+        budget.checkpoints.rejected.set(identity, "invalid");
         continue;
+      }
       const ledger =
         parsed.data.ledger === null
           ? null
           : readScopeFirstSeenLedger(parsed.data.ledger);
-      if (parsed.data.ledger !== null && (!ledger || ledger.scope !== scope))
+      if (parsed.data.ledger !== null && (!ledger || ledger.scope !== scope)) {
+        budget.checkpoints.rejected.set(identity, "invalid");
         continue;
+      }
+      const candidate = { ...parsed.data, ledger };
+      if (
+        candidate.slots.length > relevant.length ||
+        !candidate.slots.every(
+          (row, i) =>
+            eligible(relevant[i]!) && sameCommitment(row, relevant[i]!),
+        ) ||
+        candidate.through !==
+          (candidate.slots.at(-1)?.expectedVersion ?? String(after))
+      ) {
+        budget.checkpoints.rejected.set(identity, "invalid");
+        continue;
+      }
+      if (search && candidate.slots.length <= search.longerThan) continue;
       return {
-        ...parsed.data,
-        ledger,
-        ...(slot.expectedVersion !== snapshot.head.expectedVersion
-          ? { repairHead: true as const }
-          : {}),
+        document: candidate,
+        publicationVersion: slot.expectedVersion,
+        repairHead: slot.expectedVersion !== snapshot.head.expectedVersion,
       };
     }
     if (inaccessible)
@@ -350,11 +511,10 @@ export function createDurableAdditions(
       const proof = await options.boundedWork.publish(scope, data, budget);
       budget.check();
       const check = await inventory.list(scope, budget.readOptions);
-      const slot = check.versions.find(
-        (row) =>
-          row.expectedVersion === proof.expectedVersion &&
-          row.dataHash === proof.dataHash &&
-          row.metadataHash === proof.metadataHash,
+      const slot = findCheckpointRegistration(
+        check,
+        proof.expectedVersion,
+        proof,
       );
       if (!slot)
         throw new Error("Bounded checkpoint registration was replaced");
@@ -396,12 +556,10 @@ export function createDurableAdditions(
       throw error;
     });
     const check = await inventory.list(scope, budget.readOptions);
-    const registered = check.versions.find(
-      (slot) =>
-        slot.expectedVersion === String(proof.version) &&
-        slot.dataHash === proof.dataHash &&
-        slot.metadataHash === proof.metadataHash &&
-        !slot.isTombstone,
+    const registered = findCheckpointRegistration(
+      check,
+      String(proof.version),
+      proof,
     );
     if (!registered)
       throw new Error(
@@ -456,32 +614,18 @@ export function createDurableAdditions(
               : "complete",
       };
     }
-    const end = BigInt(head.expectedVersion);
-    const rows = snapshot.versions.filter(
-      (slot) => BigInt(slot.expectedVersion) <= end,
-    );
-    const boundary = rows
-      .filter((slot) => slot.isTombstone && settled(slot))
-      .at(-1);
-    const after = BigInt(boundary?.expectedVersion ?? "0");
-    const relevant = rows.filter(
-      (slot) => BigInt(slot.expectedVersion) > after,
-    );
-    let existing: LedgerDocument | null = null;
+    const { end, after, relevant } = sourceWindow(snapshot);
+    let checkpoint: RetainedCheckpoint | null = null;
     let inaccessibleExisting = false;
     try {
-      existing = await readDocument(scope, budget);
+      checkpoint = await readDocument(scope, budget, snapshot);
     } catch (error) {
       if (error instanceof BudgetExceeded || budget.signal?.aborted)
         throw error;
       inaccessibleExisting = true;
     }
-    const prefixValid =
-      existing !== null &&
-      existing.slots.length <= relevant.length &&
-      existing.slots.every((slot, i) => sameCommitment(slot, relevant[i]!)) &&
-      existing.through ===
-        (existing.slots.at(-1)?.expectedVersion ?? String(after));
+    let existing = checkpoint?.document ?? null;
+    const prefixValid = existing !== null;
     let ledger = prefixValid ? existing!.ledger : null;
     const folded = prefixValid ? relevant.slice(0, existing!.slots.length) : [];
     let currentTotal = prefixValid ? existing!.currentTotal : 0;
@@ -500,6 +644,7 @@ export function createDurableAdditions(
         coverage = "partial";
       expected = BigInt(slot.expectedVersion) + 1n;
     }
+    const sourceCoverage = coverage;
     const checkpointBytes = (
       candidate: ScopeFirstSeenLedger | null,
       count: number,
@@ -517,27 +662,20 @@ export function createDurableAdditions(
             currentTotal,
           }),
         ).byteLength;
-    for (const slot of relevant.slice(folded.length)) {
+    while (folded.length < relevant.length) {
+      const slot = relevant[folded.length]!;
+      let unitBudget = budget;
       try {
         // Keep publication capacity in the same owner-wide allowance. Exhaustion
         // of the child leaves the already-folded prefix publishable.
-        const unitBudget = budget.limited
+        unitBudget = budget.limited
           ? budget.excluding(checkpointBytes(ledger, folded.length))
           : budget;
         unitBudget.check();
         if (BigInt(slot.expectedVersion) !== BigInt(through) + 1n)
           coverage = "partial";
         // Mutable slots are provisional; failed/unknown slots cannot advance the prefix.
-        if (
-          slot.status === "failed" ||
-          !["confirmed", "finalized", "pending", "submitting"].includes(
-            slot.status,
-          )
-        ) {
-          coverage = "partial";
-          break;
-        }
-        if (slot.isTombstone) {
+        if (!eligible(slot)) {
           coverage = "partial";
           break;
         }
@@ -569,12 +707,14 @@ export function createDurableAdditions(
           metadata === slot.metadataHash
         ) {
           const data = sourceData(inMemory.data.data);
-          if (!data) throw new Error("Unsupported source envelope");
+          if (!data)
+            throw new AdditionsRecoveryError("unsupported_source_data");
           version = { scope, collectedAt: inMemory.data.collectedAt, data };
         } else {
           const envelope = await readEnvelope(scope, slot, unitBudget);
           const data = sourceData(envelope.data);
-          if (!data) throw new Error("Unsupported source envelope");
+          if (!data)
+            throw new AdditionsRecoveryError("unsupported_source_data");
           version = { scope, collectedAt: envelope.collectedAt, data };
         }
         const hadBaseline = ledger !== null && ledger.baseline !== null;
@@ -599,8 +739,65 @@ export function createDurableAdditions(
         folded.push(slot);
         through = slot.expectedVersion;
       } catch (error) {
+        // Normal advancement needs one checkpoint, not the complete publication
+        // history. Search older evidence only when replay cannot advance, keeping
+        // the bytes reserved for publishing our best verified source prefix.
+        if (checkpoint && !budget.signal?.aborted) {
+          const searchBudget = budget.limited
+            ? budget.excluding(checkpointBytes(ledger, folded.length))
+            : budget;
+          try {
+            const fallback = await readDocument(scope, searchBudget, snapshot, {
+              before: checkpoint.publicationVersion,
+              longerThan: folded.length,
+            });
+            if (fallback) {
+              checkpoint = fallback;
+              existing = fallback.document;
+              ledger = existing.ledger;
+              currentTotal = existing.currentTotal;
+              through = existing.through;
+              folded.splice(
+                0,
+                folded.length,
+                ...relevant.slice(0, existing.slots.length),
+              );
+              coverage = sourceCoverage;
+              continue;
+            }
+          } catch (failure) {
+            // Keep the verified prefix and its publication reserve, but expose
+            // a bounded search that could not finish as retryable coverage.
+            if (failure instanceof BudgetExceeded) error = failure;
+            else if (searchBudget.signal?.aborted)
+              error = new BudgetExceeded(
+                "Checkpoint fallback allowance exhausted",
+              );
+          }
+        }
+        try {
+          options.onRecoveryDiagnostic?.({
+            scope,
+            version: slot.expectedVersion,
+            code:
+              error instanceof BudgetExceeded ||
+              (unitBudget.signal?.aborted &&
+                unitBudget.signal.reason instanceof DOMException &&
+                unitBudget.signal.reason.name === "TimeoutError")
+                ? "budget_exceeded"
+                : budget.signal?.aborted
+                  ? "cancelled"
+                  : error instanceof AdditionsRecoveryError
+                    ? error.code
+                    : "replay_failed",
+          });
+        } catch {
+          /* Observation cannot alter recovery. */
+        }
         coverage =
-          error instanceof BudgetExceeded || budget.signal?.aborted
+          error instanceof BudgetExceeded ||
+          budget.signal?.aborted ||
+          unitBudget.signal?.aborted
             ? "behind"
             : "partial";
         break;
@@ -636,7 +833,8 @@ export function createDurableAdditions(
       ((!existing && !inaccessibleExisting) ||
         prefixValid ||
         coverage === "complete") &&
-      JSON.stringify(document) !== JSON.stringify(existing)
+      (checkpoint?.repairHead ||
+        JSON.stringify(document) !== JSON.stringify(existing))
     ) {
       // A write failure affects durability, never hides the verified in-memory result.
       try {
@@ -784,13 +982,10 @@ export function createDurableAdditions(
           ) !== head.dataHash
         )
           return;
-        const previous = await readDocument(version.scope, budget);
-        const boundary =
-          snapshot.versions
-            .filter((slot) => slot.isTombstone && settled(slot))
-            .at(-1)?.expectedVersion ?? "0";
-        const startsFresh =
-          BigInt(head.expectedVersion) === BigInt(boundary) + 1n;
+        const previous = (await readDocument(version.scope, budget, snapshot))
+          ?.document;
+        const { after } = sourceWindow(snapshot);
+        const startsFresh = BigInt(head.expectedVersion) === after + 1n;
         if (
           !startsFresh &&
           (!previous ||
@@ -806,8 +1001,14 @@ export function createDurableAdditions(
         /* Next reader retries. */
       }
     },
-    async deleteScope(scope) {
+    async deleteScope(scope, deletion) {
+      deletion?.signal?.throwIfAborted();
+      options.signal?.throwIfAborted();
       if (isSystemScope(scope)) return;
+      // Lite owns a separate bounded registry/journal deleter. This core host
+      // only has ordinary cleanup and must not silently use it for durableOnly.
+      if (deletion?.durableOnly)
+        throw new Error("Bounded additions deletion is unavailable");
       if (!options.deleteSystemScope)
         throw new Error("Durable additions deletion is unavailable");
       await options.deleteSystemScope(additionsLedgerScope(scope));

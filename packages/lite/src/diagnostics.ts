@@ -171,7 +171,7 @@ export class DiagnosticsRecorder {
   private readonly scopeMap = new Map<string, ScopeDiagnostics>();
   private readonly repairCounts: Record<string, number> = {};
 
-  push(options: RecordEventOptions): void {
+  private appendEvent(options: RecordEventOptions): DiagnosticsEvent {
     const event: DiagnosticsEvent = {
       at: new Date().toISOString(),
       phase: options.phase,
@@ -184,6 +184,16 @@ export class DiagnosticsRecorder {
     if (this.events.length > MAX_EVENTS) {
       this.events.splice(0, this.events.length - MAX_EVENTS);
     }
+    return event;
+  }
+
+  /** A transient observation cannot change source readiness or active work. */
+  observe(options: RecordEventOptions): void {
+    this.appendEvent(options);
+  }
+
+  push(options: RecordEventOptions): void {
+    const event = this.appendEvent(options);
     this.currentPhase = options.phase;
 
     if (options.scope) {

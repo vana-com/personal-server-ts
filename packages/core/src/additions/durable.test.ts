@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, writeFile, rename, rm } from "node:fs/promises";
+import {
+  mkdtemp,
+  readFile,
+  writeFile,
+  rename,
+  rm,
+  readdir,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { keccak256, stringToHex } from "viem";
@@ -19,9 +26,11 @@ import type {
   PublicationFence,
 } from "../publication/publish.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
+import type { ByteBudget } from "./budget.js";
 import type { VersionInventoryClient } from "./version-inventory.js";
 import {
   additionsLedgerScope,
+  ADDITIONS_SUMMARY_SCOPE,
   createDurableAdditions,
   type DurableAdditionsOptions,
 } from "./durable.js";
@@ -265,7 +274,7 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
       ).data;
   }
   function actor(
-    budgets: Pick<DurableAdditionsOptions, "byteBudget" | "timeBudgetMs"> = {},
+    budgets: Partial<DurableAdditionsOptions> = {},
     beforeInventoryRead?: (scope: string) => Promise<void>,
     beforeRegistration?: () => void,
     fencedPublication?: FencedPublicationPort,
@@ -326,6 +335,69 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
       ...budgets,
     });
   }
+  function boundedActor(
+    input: {
+      beforeDownload?: (key: string, budget: ByteBudget) => Promise<void>;
+      proof?: (proof: {
+        expectedVersion: string;
+        dataHash: string;
+        metadataHash: string;
+      }) => { expectedVersion: string; dataHash: string; metadataHash: string };
+      options?: Partial<DurableAdditionsOptions>;
+    } = {},
+  ) {
+    const events: string[] = [];
+    const adapter = storage();
+    const service = actor({
+      byteBudget: 2 * 1024 * 1024,
+      storageAdapter: {
+        ...adapter,
+        async downloadBounded(key, budget) {
+          budget.charge();
+          events.push(`download:${key}`);
+          await input.beforeDownload?.(key, budget);
+          budget.charge();
+          const bytes = new Uint8Array(
+            await readFile(key, { signal: budget.signal }),
+          );
+          budget.charge(bytes.byteLength * 2);
+          return bytes;
+        },
+      },
+      boundedWork: {
+        async decrypt(bytes, key, budget) {
+          budget.charge(bytes.byteLength * 8);
+          const plaintext = await decryptWithPassword(bytes, key);
+          budget.charge(plaintext.byteLength);
+          return plaintext;
+        },
+        async publish(scope, data, budget) {
+          budget.charge();
+          events.push(`publish:${scope}`);
+          const previous =
+            (await readRegistry())[scope]?.versions.at(-1)?.expectedVersion ??
+            "0";
+          const expectedVersion = String(BigInt(previous) + 1n);
+          budget.charge(JSON.stringify(data).length * 16);
+          await put(scope, expectedVersion, T4, data);
+          budget.charge();
+          const slot = (await readRegistry())[scope].versions.at(-1)!;
+          const proof = {
+            expectedVersion,
+            dataHash: slot.dataHash,
+            metadataHash: slot.metadataHash,
+          };
+          return input.proof?.(proof) ?? proof;
+        },
+        async confirmed(scope, budget) {
+          budget.charge();
+          events.push(`confirmed:${scope}`);
+        },
+      },
+      ...input.options,
+    });
+    return { service, events };
+  }
   return {
     root,
     actor,
@@ -337,6 +409,7 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
     blobPath,
     setSlot,
     fenced,
+    boundedActor,
     onDownload: (hook: typeof afterDownload) => {
       afterDownload = hook;
     },
@@ -398,6 +471,8 @@ describe("durable owner additions recovery", () => {
       .parse(await f.document(additionsLedgerScope(SOURCE)));
     await f.source("2", T2, ["a", "b"]);
     expect((await tee.summarize(QUERY)).through).toEqual({ [SOURCE]: "2" });
+    await rm(f.blobPath(`${SOURCE}/1`));
+    await rm(f.blobPath(`${SOURCE}/2`));
     // Simulate a delayed registration of the older whole-document writer.
     await f.put(additionsLedgerScope(SOURCE), "3", T3, oldDocument);
     const repaired = await desktop.summarize(QUERY);
@@ -947,4 +1022,396 @@ it("keeps Unicode byte-edge names and literal hash-looking sources collision-sep
     hashed,
   );
   expect(additionsLedgerScope(long + " ")).not.toBe(hashed);
+});
+
+it.each(["confirmed", "pending"])(
+  "keeps the readable checkpoint when a %s tombstone is retained above the authoritative head and sources are pruned",
+  async (status) => {
+    const f = await fixture();
+    await f.source("1", T1, ["a"]);
+    const first = await f.actor().summarize(QUERY);
+    expect(first).toMatchObject({ coverage: "complete", total: 1 });
+    const ledgerScope = additionsLedgerScope(SOURCE);
+    const head = (await f.readRegistry())[ledgerScope]?.versions.at(-1);
+    if (!head) throw new Error("Fixture missing checkpoint");
+    const before = await f.document(ledgerScope);
+    // A rollback leaves the higher tombstone in the inventory but moves the head back.
+    await f.setSlot(
+      ledgerScope,
+      {
+        expectedVersion: String(BigInt(head.expectedVersion) + 1n),
+        dataHash:
+          "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+        metadataHash:
+          "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90",
+        status,
+        addedAt: T2,
+        isTombstone: true,
+      },
+      T2,
+    );
+    await f.setSlot(ledgerScope, head);
+    await rm(f.blobPath(`${SOURCE}/1`));
+    const next = await f.actor().summarize(QUERY);
+    expect(next).toMatchObject({
+      coverage: "complete",
+      total: 1,
+      through: { [SOURCE]: "1" },
+    });
+    expect(next.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
+    expect(await f.document(ledgerScope)).toEqual(before);
+  },
+);
+
+it("selects an older compatible checkpoint when the source head rolls back after pruning", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.actor().summarize(QUERY);
+  const first = (await f.readRegistry())[SOURCE].versions[0];
+  await f.source("2", T2, ["a", "b"]);
+  await f.actor().summarize(QUERY);
+  await rm(f.blobPath(`${SOURCE}/1`));
+  await rm(f.blobPath(`${SOURCE}/2`));
+  await f.setSlot(SOURCE, first);
+  expect(await f.actor().summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 1,
+    through: { [SOURCE]: "1" },
+  });
+});
+
+it.each(["failed", "unknown"])(
+  "discards a checkpoint contribution when its pending registration becomes %s",
+  async (status) => {
+    const f = await fixture();
+    await f.source("1", T1, ["a"]);
+    await f.actor().summarize(QUERY);
+    await f.source("2", T2, ["a", "b"]);
+    const slot = (await f.readRegistry())[SOURCE].versions[1];
+    await f.setSlot(SOURCE, { ...slot, status: "pending" });
+    expect(await f.actor().summarize(QUERY)).toMatchObject({
+      total: 2,
+      through: { [SOURCE]: "2" },
+    });
+    await rm(f.blobPath(`${SOURCE}/1`));
+    await f.setSlot(SOURCE, { ...slot, status });
+    for (let read = 0; read < 2; read++) {
+      const summary = await f.actor().summarize(QUERY);
+      expect(summary).toMatchObject({
+        coverage: "partial",
+        total: 1,
+        through: { [SOURCE]: "1" },
+      });
+      expect(summary.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
+    }
+  },
+);
+
+it("bounds retained-checkpoint search without publishing an empty rebuild over deeper history", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.actor().summarize(QUERY);
+  const scope = additionsLedgerScope(SOURCE);
+  const original = z
+    .record(z.string(), z.unknown())
+    .parse(await f.document(scope));
+  for (let version = 2; version <= 258; version++) {
+    await f.put(scope, String(version), T2, {
+      ...original,
+      owner: "0x2222222222222222222222222222222222222222",
+    });
+  }
+  await rm(f.blobPath(`${SOURCE}/1`));
+  const before = await f.readRegistry();
+  const files = (await readdir(f.root)).sort();
+  let reads = 0;
+  f.onDownload(async (url) => {
+    if (url.includes(`${encodeURIComponent(scope)}%2F`)) reads++;
+  });
+  const codes: string[] = [];
+  const result = await f
+    .actor({
+      onRecoveryDiagnostic: (event) => codes.push(event.code),
+    })
+    .summarize(QUERY);
+  expect(result.coverage).toBe("behind");
+  expect(reads).toBe(256);
+  expect(codes).toContain("checkpoint_search_exhausted");
+  expect(await f.readRegistry()).toEqual(before);
+  expect((await readdir(f.root)).sort()).toEqual(files);
+}, 20_000);
+
+it("does not download a rejected checkpoint twice during one upload recovery", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.actor().summarize(QUERY);
+  const scope = additionsLedgerScope(SOURCE);
+  const original = z
+    .record(z.string(), z.unknown())
+    .parse(await f.document(scope));
+  await f.put(scope, "2", T2, {
+    ...original,
+    owner: "0x2222222222222222222222222222222222222222",
+  });
+  await f.source("2", T2, ["a", "b"]);
+  const rejected = f.blobPath(`${scope}/2`);
+  let reads = 0;
+  f.onDownload(async (url) => {
+    if (url === rejected) reads++;
+  });
+  await f.actor().recordUpload({ scope: SOURCE });
+  expect(await f.document(scope)).toMatchObject({
+    through: "2",
+    currentTotal: 2,
+  });
+  expect(reads).toBe(1);
+});
+
+it("persists a bounded prefix when the next source unit exhausts its allowance and resumes after pruning", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.source("2", T2, ["a", "b"]);
+  const first = f.boundedActor({
+    beforeDownload: async (key, budget) => {
+      if (key === f.blobPath(`${SOURCE}/2`))
+        budget.charge(budget.remaining + 1);
+    },
+  });
+  expect(await first.service.summarize(QUERY)).toMatchObject({
+    coverage: "behind",
+    total: 1,
+    through: { [SOURCE]: "1" },
+  });
+  expect(first.events).toContain(`confirmed:${additionsLedgerScope(SOURCE)}`);
+  expect(await f.document(additionsLedgerScope(SOURCE))).toMatchObject({
+    through: "1",
+    currentTotal: 1,
+  });
+  await rm(f.blobPath(`${SOURCE}/1`));
+  expect(await f.boundedActor().service.summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 2,
+    through: { [SOURCE]: "2" },
+  });
+});
+
+it("advances bounded recovery without rereading all older checkpoints", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.actor().summarize(QUERY);
+  const scope = additionsLedgerScope(SOURCE);
+  const document = z
+    .record(z.string(), z.unknown())
+    .parse(await f.document(scope));
+  for (let version = 2; version <= 20; version++)
+    await f.put(scope, String(version), T4, document);
+  await f.source("2", T2, ["a", "b"]);
+  const actor = f.boundedActor({
+    beforeDownload: async (key, budget) => {
+      if (
+        key.startsWith(f.blobPath(`${scope}/`).slice(0, -".encrypted".length))
+      )
+        budget.charge(150_000);
+    },
+  });
+  expect(await actor.service.summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 2,
+    through: { [SOURCE]: "2" },
+  });
+});
+
+it("preserves publication capacity on bounded fallback overflow and resumes only from longer evidence", async () => {
+  const f = await fixture();
+  const scope = additionsLedgerScope(SOURCE);
+  await f.source("1", T1, ["a"]);
+  await f.actor().summarize(QUERY);
+  const stale = z
+    .record(z.string(), z.unknown())
+    .parse(await f.document(scope));
+  await f.source("2", T2, ["a", "b"]);
+  await f.source("3", T3, ["a", "b", "c"]);
+  await f.actor().summarize(QUERY);
+  await f.source("4", T4, ["a", "b", "c", "d"]);
+  await f.put(scope, "3", T4, stale);
+  await rm(f.blobPath(`${SOURCE}/1`));
+  await rm(f.blobPath(`${SOURCE}/3`));
+  const limited = f.boundedActor({
+    beforeDownload: async (key, budget) => {
+      if (key === f.blobPath(`${scope}/2`)) {
+        budget.charge(budget.remaining);
+        budget.charge(1);
+      }
+    },
+  });
+  expect(await limited.service.summarize(QUERY)).toMatchObject({
+    coverage: "behind",
+    total: 2,
+    through: { [SOURCE]: "2" },
+  });
+  expect(limited.events).toContain(`confirmed:${scope}`);
+  expect(await f.document(scope)).toMatchObject({
+    through: "2",
+    currentTotal: 2,
+  });
+  await rm(f.blobPath(`${SOURCE}/2`));
+  const downloaded: string[] = [];
+  const restarted = f.boundedActor({
+    beforeDownload: async (key) => {
+      downloaded.push(key);
+    },
+  });
+  expect(await restarted.service.summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 4,
+    through: { [SOURCE]: "4" },
+  });
+  expect(downloaded).not.toContain(f.blobPath(`${SOURCE}/2`));
+  expect(
+    downloaded.filter((key) => key === f.blobPath(`${SOURCE}/3`)),
+  ).toHaveLength(1);
+});
+
+it.each(["proof", "content"])(
+  "does not confirm bounded publication with mismatched %s",
+  async (failure) => {
+    const f = await fixture();
+    await f.source("1", T1, ["a"]);
+    const actor = f.boundedActor({
+      proof:
+        failure === "proof"
+          ? (proof) => ({ ...proof, dataHash: `0x${"ff".repeat(32)}` })
+          : undefined,
+      beforeDownload: async (key) => {
+        if (
+          failure === "content" &&
+          key === f.blobPath(`${additionsLedgerScope(SOURCE)}/1`)
+        )
+          await f.put(additionsLedgerScope(SOURCE), "1", T3, { forged: true });
+      },
+    });
+    expect(await actor.service.summarize(QUERY)).toMatchObject({
+      coverage: "behind",
+      total: 1,
+    });
+    expect(
+      actor.events.filter((event) => event.startsWith("confirmed:")),
+    ).toEqual([]);
+  },
+);
+
+it("settles an aborted bounded source unit before returning and starts no later effects", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  const controller = new AbortController();
+  let started!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const settling = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const actor = f.boundedActor({
+    options: { signal: controller.signal },
+    beforeDownload: async () => {
+      controller.abort(new Error("cancel recovery"));
+      started();
+      await settling;
+      controller.signal.throwIfAborted();
+    },
+  });
+  let returned = false;
+  const summary = actor.service.summarize(QUERY).then((result) => {
+    returned = true;
+    return result;
+  });
+  await entered;
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(returned).toBe(false);
+  } finally {
+    release();
+  }
+  expect(await summary).toMatchObject({
+    coverage: "behind",
+    total: 0,
+  });
+  const completedEvents = [...actor.events];
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(actor.events).toEqual(completedEvents);
+  expect(
+    actor.events.filter((event) => /^(publish|confirmed):/.test(event)),
+  ).toEqual([]);
+  expect(await f.readRegistry()).not.toHaveProperty(
+    additionsLedgerScope(SOURCE),
+  );
+});
+
+it("converges after two independent actors summarize concurrently and a third restarts", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.source("2", T2, ["a", "b"]);
+  const desktop = f.actor();
+  const tee = f.actor();
+  const results = await Promise.all([
+    desktop.summarize(QUERY),
+    tee.summarize(QUERY),
+  ]);
+  for (const result of results) {
+    expect(result.total).toBe(2);
+    expect(result.through).toEqual({ [SOURCE]: "2" });
+    expect(result.days.map((day) => day.added)).toEqual([1, 1, 0, 0]);
+  }
+  const restarted = await f.actor().summarize(QUERY);
+  expect(restarted).toMatchObject({
+    coverage: "complete",
+    total: 2,
+    through: { [SOURCE]: "2" },
+  });
+  expect(restarted.days.map((day) => day.added)).toEqual([1, 1, 0, 0]);
+  expect(await f.document(additionsLedgerScope(SOURCE))).toMatchObject({
+    through: "2",
+  });
+});
+
+it("replaces a failed portable-summary registration instead of treating its bytes as published", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.actor().summarize(QUERY);
+  const slot = (await f.readRegistry())[ADDITIONS_SUMMARY_SCOPE].versions[0];
+  await f.setSlot(ADDITIONS_SUMMARY_SCOPE, { ...slot, status: "failed" });
+  expect(await f.actor().summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 1,
+  });
+  expect((await f.readRegistry())[ADDITIONS_SUMMARY_SCOPE].head).toMatchObject({
+    expectedVersion: "2",
+    status: "confirmed",
+  });
+});
+
+it("refuses unsupported durable-only cleanup and honors cancellation before ordinary deletion", async () => {
+  const f = await fixture();
+  const deleted: string[] = [];
+  const service = f.actor({
+    deleteSystemScope: async (scope) => {
+      deleted.push(scope);
+    },
+  });
+  await expect(
+    service.deleteScope(SOURCE, {
+      durableOnly: true,
+      signal: AbortSignal.abort(new Error("cancel cleanup")),
+    }),
+  ).rejects.toThrow("cancel cleanup");
+  await expect(
+    service.deleteScope(SOURCE, { durableOnly: true }),
+  ).rejects.toThrow("Bounded additions deletion is unavailable");
+  expect(deleted).toEqual([]);
+  await service.deleteScope(SOURCE);
+  expect(deleted).toEqual([
+    additionsLedgerScope(SOURCE),
+    ADDITIONS_SUMMARY_SCOPE,
+  ]);
 });
