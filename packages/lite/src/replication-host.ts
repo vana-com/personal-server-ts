@@ -31,6 +31,7 @@ import {
   type BoundedStorageAdapter,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createLiteCanonicalStore } from "./canonical-store.js";
+import type { LiteCanonicalPersistence } from "./canonical-persistence.js";
 import {
   createLiteReplicaEngine,
   type LiteReplicaEngine,
@@ -210,8 +211,27 @@ export async function createLiteReplication(
       ...input.engine,
     },
   });
+  const canonicalPersistence: LiteCanonicalPersistence = {
+    transaction: (work) =>
+      input.persistence.transaction((tx) =>
+        work({
+          get: (key) => tx.get(key),
+          put: (key, value) => tx.put(key, value),
+          delete: (key) => tx.delete(key),
+          scan: (prefix, after) => tx.scan(prefix, after),
+          attachBlob: (id, expected) => tx.attachBlob(id, expected),
+          blob: (id) => tx.blob(id),
+          replicaEvidence: {
+            all: (statement, params) => tx.sql.all(statement, params),
+          },
+        }),
+      ),
+    stageBlob: (descriptor, chunks) =>
+      input.persistence.stageBlob(descriptor, chunks),
+    readBlob: (blobId) => input.persistence.readBlob(blobId),
+  };
   const canonical = createLiteCanonicalStore({
-    persistence: input.persistence,
+    persistence: canonicalPersistence,
     enabled: true,
     ...trusted,
     pendingBudget: input.pendingBudget,

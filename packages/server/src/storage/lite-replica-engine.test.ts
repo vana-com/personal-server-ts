@@ -7,6 +7,7 @@
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDpv2ReplicaTransport } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
+import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { ReplicaTransportPort } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import type { ReplicaEngine } from "@opendatalabs/personal-server-ts-core/replication/engine";
 import type { ReplicaPendingBudgetLimits } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
@@ -23,6 +24,7 @@ import {
   createLiteReplicationRuntime,
   LITE_CANONICAL_MAX_OPERATION_BYTES,
   LITE_REPLICATION_LIMITS,
+  type LiteCanonicalPersistence,
   type LiteReplicaPersistence,
 } from "@opendatalabs/personal-server-ts-lite";
 import { createMemoryReplicaObjectTransfers } from "../../../lite/src/test-support/replication.js";
@@ -178,8 +180,27 @@ async function liteDevice(
   let offline = false;
   const open = () => {
     const persistence = process.port;
+    const canonicalPersistence: LiteCanonicalPersistence = {
+      transaction: (work) =>
+        persistence.transaction((tx) =>
+          work({
+            get: (key) => tx.get(key),
+            put: (key, value) => tx.put(key, value),
+            delete: (key) => tx.delete(key),
+            scan: (prefix, after) => tx.scan(prefix, after),
+            attachBlob: (id, expected) => tx.attachBlob(id, expected),
+            blob: (id) => tx.blob(id),
+            replicaEvidence: {
+              all: (statement, params) => tx.sql.all(statement, params),
+            },
+          }),
+        ),
+      stageBlob: (descriptor, chunks) =>
+        persistence.stageBlob(descriptor, chunks),
+      readBlob: (blobId) => persistence.readBlob(blobId),
+    };
     const canonical = createLiteCanonicalStore({
-      persistence,
+      persistence: canonicalPersistence,
       enabled: true,
       context,
       authenticateReplica,
@@ -324,6 +345,20 @@ async function liteDevice(
           blobs: [],
         },
       ]),
+    activateBudget: (limits?: ReplicaPendingBudgetLimits) =>
+      canonical.activatePendingBudget(limits),
+    outboxEntries: () => canonical.readOutboxPage(0),
+    acknowledgeBudget: (
+      operations: { writerId: string; operationId: string }[],
+    ) =>
+      canonical.acknowledgePublished(null, {
+        batch: "upgrade-drain",
+        slot: "scope/2",
+        scope: "scope",
+        version: 2,
+        commitment: `0x${"3".repeat(64)}`,
+        operations,
+      }),
     async get(id = "a") {
       return (await canonical.readRecord("conn", "messages", id))?.data;
     },
@@ -381,6 +416,94 @@ async function converged(node: TransportDevice, lite: LiteDevice) {
 }
 
 describe("PS-Lite replication engine with a Node writer", () => {
+  it("rebuilds old published SQL history, an unpublished tail and unsupported debt", async () => {
+    const net = network();
+    const lite = await liteDevice(net, { enabled: false });
+    await lite.put("published history", "history");
+    await lite.put("unpublished tail", "tail");
+    const entries = (await lite.outboxEntries()).entries;
+    const published = entries.slice(0, 2).map(({ operation }) => operation);
+    const unsupported = structuredClone(entries[2]!.operation);
+    unsupported.revision.operationId = "unsupported-retained-operation";
+    const db = lite.native().db;
+    db.exec(`CREATE TABLE pdpp_transport_manifests_out (
+      batch TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL,
+      data_hash TEXT NOT NULL, metadata_hash TEXT NOT NULL, state TEXT NOT NULL
+    );
+    CREATE TABLE pdpp_transport_operation_outcomes (
+      batch TEXT NOT NULL, position INTEGER NOT NULL, operation_json TEXT,
+      writer_id TEXT, operation_id TEXT, outcome TEXT, encoding_failed INTEGER NOT NULL DEFAULT 0
+    );`);
+    db.prepare(
+      "INSERT INTO pdpp_transport_manifests_out VALUES (?,?,?,?,?,'published')",
+    ).run(
+      "old-published",
+      "scope",
+      1,
+      `0x${"1".repeat(64)}`,
+      `0x${"2".repeat(64)}`,
+    );
+    const publishedOutcome = db.prepare(
+      "INSERT INTO pdpp_transport_operation_outcomes (batch,position,operation_json,writer_id,operation_id,outcome,encoding_failed) VALUES (?,?,?,?,?,NULL,0)",
+    );
+    published.forEach((operation, position) =>
+      publishedOutcome.run(
+        "old-published",
+        position,
+        canonicalJson(operation),
+        operation.revision.writerId,
+        operation.revision.operationId,
+      ),
+    );
+    db.prepare(
+      "INSERT INTO pdpp_transport_operation_outcomes (batch,position,operation_json,writer_id,operation_id,outcome,encoding_failed) VALUES ('old-unsupported',0,?,?,?,'unsupported',0)",
+    ).run(
+      canonicalJson(unsupported),
+      unsupported.revision.writerId,
+      unsupported.revision.operationId,
+    );
+    db.prepare("DELETE FROM lite_kv WHERE key LIKE 'pending-budget/%'").run();
+
+    await lite.activateBudget({ operations: 2, logicalBytes: 1_000_000 });
+    const state = JSON.parse(
+      db
+        .prepare("SELECT value FROM lite_kv WHERE key='pending-budget/state'")
+        .get()!.value as string,
+    ) as { operations: number };
+    expect(
+      state.operations,
+      JSON.stringify({
+        entries: entries.map(({ operation }) => operation.revision),
+        released: db
+          .prepare(
+            "SELECT key,value FROM lite_kv WHERE key LIKE 'pending-budget/released/%'",
+          )
+          .all(),
+        sql: db
+          .prepare(
+            "SELECT batch,position,writer_id,operation_id,outcome FROM pdpp_transport_operation_outcomes",
+          )
+          .all(),
+      }),
+    ).toBe(2);
+    expect(await lite.get("history")).toEqual({
+      id: "history",
+      text: "published history",
+    });
+    await lite.activateBudget({ operations: 2, logicalBytes: 1_000_000 });
+    await expect(lite.put("blocked", "blocked")).rejects.toBeInstanceOf(
+      ReplicaPendingCapacityError,
+    );
+
+    const debt = [entries[2]!.operation, unsupported].map((operation) => ({
+      writerId: operation.revision.writerId,
+      operationId: operation.revision.operationId,
+    }));
+    await lite.acknowledgeBudget(debt);
+    await expect(lite.put("after drain", "after-drain")).resolves.toBeDefined();
+    lite.close();
+  });
+
   it("holds both hosts at capacity until exact finalized survivors release their debt", async () => {
     const net = network({ holdFinality: true });
     const limits = { operations: 3, logicalBytes: 1_000_000 };

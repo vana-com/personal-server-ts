@@ -220,6 +220,33 @@ it("builds nothing with the door closed or the boot config off", async () => {
   a.native.close();
 });
 
+it("boots a fresh Lite host before the lazy transport tables exist", async () => {
+  const net = network();
+  const a = phone(net, "phone-fresh-schema");
+  expect(
+    a.native.db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'pdpp_transport_%'",
+      )
+      .all(),
+  ).toEqual([]);
+  const replication = await createLiteReplication(a.input());
+  expect(replication.state).toBe("started");
+  expect(
+    a.native.db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'pdpp_transport_%'",
+      )
+      .all(),
+  ).toEqual([]);
+  expect(
+    a.native.db
+      .prepare("SELECT value FROM lite_kv WHERE key='pending-budget/state'")
+      .get(),
+  ).toBeDefined();
+  a.native.close();
+});
+
 it("blocks with a reason when the partition cannot be derived", async () => {
   const net = network();
   const a = phone(net, "phone-blocked");

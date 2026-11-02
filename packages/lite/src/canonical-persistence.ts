@@ -17,8 +17,18 @@ export interface LiteStoragePage {
   after?: string;
 }
 
+/** Read-only transport evidence bound to the current native transaction. */
+export interface LiteReplicaEvidence {
+  all(
+    statement: string,
+    params: readonly (string | number)[],
+  ): Promise<Record<string, unknown>[]>;
+}
+
 /** One serializable, owner-partitioned SQLite transaction. No await escapes its lifetime. */
 export interface LiteCanonicalTransaction {
+  /** Present only when this transaction is backed by the native replica engine. */
+  readonly replicaEvidence?: LiteReplicaEvidence;
   get(key: string): Promise<string | undefined>;
   put(key: string, value: string): Promise<void>;
   delete(key: string): Promise<void>;

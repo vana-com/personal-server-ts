@@ -224,6 +224,7 @@ function trackViews(base: LiteCanonicalTransaction): LiteCanonicalTransaction {
     scan: (prefix, after) => base.scan(prefix, after),
     attachBlob: (stagingId, expected) => base.attachBlob(stagingId, expected),
     blob: (blobId) => base.blob(blobId),
+    ...(base.replicaEvidence ? { replicaEvidence: base.replicaEvidence } : {}),
   };
   viewWrites.set(tx, { base, first });
   return tx;
@@ -557,79 +558,91 @@ export function createLiteCanonicalStore(deps: {
     // Reconstruct facts the old engine still retained. Only a published
     // manifest plus its null-outcome survivors proves finality; the legacy
     // outbox cursor alone does not prove that every operation survived.
-    const sql = (
-      tx as LiteCanonicalTransaction & {
-        sql?: {
-          all(
-            statement: string,
-            params: readonly (string | number)[],
-          ): Promise<Record<string, unknown>[]>;
-        };
-      }
-    ).sql;
-    if (sql) {
-      let after = "";
-      for (;;) {
-        const manifests = await sql.all(
-          `SELECT batch,scope,version,data_hash,metadata_hash FROM pdpp_transport_manifests_out
+    const evidence = tx.replicaEvidence;
+    if (evidence) {
+      const schema = await evidence.all(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name IN
+         ('pdpp_transport_operation_outcomes','pdpp_transport_manifests_out')`,
+        [],
+      );
+      const tables = new Set(schema.map((row) => row.name as string));
+      const hasOutcomes = tables.has("pdpp_transport_operation_outcomes");
+      const hasManifests = tables.has("pdpp_transport_manifests_out");
+      if (hasOutcomes && hasManifests) {
+        let after = "";
+        for (;;) {
+          const manifests = await evidence.all(
+            `SELECT batch,scope,version,data_hash,metadata_hash FROM pdpp_transport_manifests_out
            WHERE state='published' AND batch>? ORDER BY batch LIMIT 100`,
-          [after],
-        );
-        if (!manifests.length) break;
-        for (const row of manifests) {
-          const batch = row.batch as string;
-          const operations = await sql.all(
-            `SELECT writer_id,operation_id FROM pdpp_transport_operation_outcomes
+            [after],
+          );
+          if (!manifests.length) break;
+          for (const row of manifests) {
+            const batch = row.batch as string;
+            const operations = await evidence.all(
+              `SELECT writer_id,operation_id FROM pdpp_transport_operation_outcomes
              WHERE batch=? AND outcome IS NULL AND encoding_failed=0
                AND writer_id IS NOT NULL AND operation_id IS NOT NULL ORDER BY position`,
-            [batch],
-          );
-          const witness: ReplicaPublishedBatch = {
-            batch,
-            slot: `${row.scope as string}/${row.version as number}`,
-            scope: row.scope as string,
-            version: row.version as number,
-            commitment: replicaChainCommitment(
-              row.data_hash as `0x${string}`,
-              row.metadata_hash as `0x${string}`,
-            ).toLowerCase(),
-            operations: operations.map((operation) => ({
-              writerId: operation.writer_id as string,
-              operationId: operation.operation_id as string,
-            })),
-          };
-          await put(tx, pendingBudgetPublicationKey(batch), witness);
-          for (const identity of witness.operations)
-            await put(
-              tx,
-              pendingBudgetReleasedKey(identity.writerId, identity.operationId),
-              witness,
+              [batch],
             );
+            const witness: ReplicaPublishedBatch = {
+              batch,
+              slot: `${row.scope as string}/${row.version as number}`,
+              scope: row.scope as string,
+              version: row.version as number,
+              commitment: replicaChainCommitment(
+                row.data_hash as `0x${string}`,
+                row.metadata_hash as `0x${string}`,
+              ).toLowerCase(),
+              operations: operations.map((operation) => ({
+                writerId: operation.writer_id as string,
+                operationId: operation.operation_id as string,
+              })),
+            };
+            await put(tx, pendingBudgetPublicationKey(batch), witness);
+            for (const identity of witness.operations)
+              await put(
+                tx,
+                pendingBudgetReleasedKey(
+                  identity.writerId,
+                  identity.operationId,
+                ),
+                witness,
+              );
+          }
+          after = manifests.at(-1)!.batch as string;
         }
-        after = manifests.at(-1)!.batch as string;
       }
-      let batch = "";
-      let position = -1;
-      for (;;) {
-        const rows = await sql.all(
-          `SELECT o.batch,o.position,o.operation_json,o.writer_id,o.operation_id
-           FROM pdpp_transport_operation_outcomes o
-           LEFT JOIN pdpp_transport_manifests_out m ON m.batch=o.batch
-           WHERE (o.batch>? OR (o.batch=? AND o.position>?))
-             AND o.operation_json IS NOT NULL
-             AND (o.outcome='unsupported' OR coalesce(m.state,'ready')<>'published')
-           ORDER BY o.batch,o.position LIMIT 100`,
-          [batch, batch, position],
-        );
-        if (!rows.length) break;
-        for (const row of rows) {
-          const op = replicaOperationSchema.parse(
-            JSON.parse(row.operation_json as string),
+      if (hasOutcomes) {
+        let batch = "";
+        let position = -1;
+        for (;;) {
+          const rows = await evidence.all(
+            hasManifests
+              ? `SELECT o.batch,o.position,o.operation_json,o.writer_id,o.operation_id
+                 FROM pdpp_transport_operation_outcomes o
+                 LEFT JOIN pdpp_transport_manifests_out m ON m.batch=o.batch
+                 WHERE (o.batch>? OR (o.batch=? AND o.position>?))
+                   AND o.operation_json IS NOT NULL
+                   AND (o.outcome='unsupported' OR coalesce(m.state,'ready')<>'published')
+                 ORDER BY o.batch,o.position LIMIT 100`
+              : `SELECT batch,position,operation_json,writer_id,operation_id
+                 FROM pdpp_transport_operation_outcomes
+                 WHERE (batch>? OR (batch=? AND position>?))
+                   AND operation_json IS NOT NULL
+                 ORDER BY batch,position LIMIT 100`,
+            [batch, batch, position],
           );
-          await reservePendingOperation(tx, op, true);
+          if (!rows.length) break;
+          for (const row of rows) {
+            const op = replicaOperationSchema.parse(
+              JSON.parse(row.operation_json as string),
+            );
+            await reservePendingOperation(tx, op, true);
+          }
+          batch = rows.at(-1)!.batch as string;
+          position = rows.at(-1)!.position as number;
         }
-        batch = rows.at(-1)!.batch as string;
-        position = rows.at(-1)!.position as number;
       }
     }
     for await (const entry of scan(tx, "log/")) {

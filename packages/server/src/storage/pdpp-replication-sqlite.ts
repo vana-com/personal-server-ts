@@ -320,62 +320,101 @@ export function createReplicationJournal(
           "INSERT INTO pdpp_replica_pending_budget VALUES (1,1,?,0,0)",
         ).run(canonicalJson(limits));
         const candidates = new Map<string, ReplicaOperation>();
-        if (
-          tableExists("pdpp_transport_operation_outcomes") &&
-          tableExists("pdpp_transport_manifests_out")
-        ) {
+        const hasOutcomes = tableExists("pdpp_transport_operation_outcomes");
+        const hasManifests = tableExists("pdpp_transport_manifests_out");
+        const finalized = new Set<string>();
+        if (hasOutcomes) {
+          if (hasManifests) {
+            const survivors = db
+              .prepare(
+                `SELECT o.writer_id,o.operation_id
+                 FROM pdpp_transport_operation_outcomes o
+                 JOIN pdpp_transport_manifests_out m ON m.batch=o.batch
+                 WHERE m.state='published' AND o.outcome IS NULL
+                   AND o.encoding_failed=0 AND o.writer_id IS NOT NULL
+                   AND o.operation_id IS NOT NULL`,
+              )
+              .all() as { writer_id: string; operation_id: string }[];
+            for (const survivor of survivors)
+              finalized.add(
+                `${survivor.writer_id}\u0000${survivor.operation_id}`,
+              );
+          }
           const rows = db
             .prepare(
-              `SELECT o.operation_json FROM pdpp_transport_operation_outcomes o
-            LEFT JOIN pdpp_transport_manifests_out m ON m.batch=o.batch
-            WHERE o.operation_json IS NOT NULL AND (o.outcome='unsupported' OR (o.outcome IS NULL AND coalesce(m.state,'ready')<>'published'))`,
+              hasManifests
+                ? `SELECT o.operation_json FROM pdpp_transport_operation_outcomes o
+                   LEFT JOIN pdpp_transport_manifests_out m ON m.batch=o.batch
+                   WHERE o.operation_json IS NOT NULL AND (o.outcome='unsupported' OR (o.outcome IS NULL AND coalesce(m.state,'ready')<>'published'))`
+                : `SELECT operation_json FROM pdpp_transport_operation_outcomes
+                   WHERE operation_json IS NOT NULL`,
             )
             .all() as { operation_json: string }[];
           for (const row of rows) {
             const operation = replicaOperationSchema.parse(
               JSON.parse(row.operation_json),
             );
-            candidates.set(
-              `${operation.revision.writerId}\u0000${operation.revision.operationId}`,
-              operation,
-            );
+            const identity = `${operation.revision.writerId}\u0000${operation.revision.operationId}`;
+            if (finalized.has(identity)) continue;
+            candidates.set(identity, operation);
           }
         }
-        if (tableExists("pdpp_transport_state")) {
-          const state = db
-            .prepare(
-              "SELECT baseline_cursor,baseline_done,tail_cursor FROM pdpp_transport_state WHERE id=1",
-            )
-            .get() as
-            | {
-                baseline_cursor: number;
-                baseline_done: number;
-                tail_cursor: number | null;
-              }
-            | undefined;
-          if (state) {
-            const rows = state.baseline_done
-              ? state.tail_cursor == null
-                ? []
-                : (db
-                    .prepare(
-                      "SELECT o.operation_json FROM pdpp_replica_operations o WHERE o.sequence>? ",
-                    )
-                    .all(state.tail_cursor) as { operation_json: string }[])
-              : (db
-                  .prepare(
-                    "SELECT o.operation_json FROM pdpp_replica_operations o JOIN pdpp_replica_baseline b ON b.sequence=o.sequence WHERE b.sequence>? ",
-                  )
-                  .all(state.baseline_cursor) as { operation_json: string }[]);
-            for (const row of rows) {
-              const operation = replicaOperationSchema.parse(
-                JSON.parse(row.operation_json),
-              );
-              candidates.set(
-                `${operation.revision.writerId}\u0000${operation.revision.operationId}`,
-                operation,
-              );
-            }
+        const hasState = tableExists("pdpp_transport_state");
+        const hasSettings = tableExists("pdpp_replica_settings");
+        const settings = hasSettings
+          ? (db
+              .prepare(
+                "SELECT watermark,checkpoint FROM pdpp_replica_settings WHERE id=1",
+              )
+              .get() as { watermark: number; checkpoint: number } | undefined)
+          : undefined;
+        const hasJournal = tableExists("pdpp_replica_operations");
+        const hasBaseline = tableExists("pdpp_replica_baseline");
+        if (hasJournal) {
+          const state = hasState
+            ? (db
+                .prepare(
+                  "SELECT baseline_cursor,baseline_done,tail_cursor FROM pdpp_transport_state WHERE id=1",
+                )
+                .get() as
+                | {
+                    baseline_cursor: number;
+                    baseline_done: number;
+                    tail_cursor: number | null;
+                  }
+                | undefined)
+            : undefined;
+          // Without both retained outcome evidence and an engine cursor, no
+          // journal row is known to be settled. Charging the journal is the
+          // only safe upgrade when the engine schema is still lazy.
+          const conservativeAll =
+            !hasOutcomes || !state || !settings || !hasBaseline;
+          const baselineAfter = conservativeAll
+            ? 0
+            : (state?.baseline_cursor ?? settings?.checkpoint ?? 0);
+          const watermark = settings?.watermark ?? 0;
+          const tailAfter = conservativeAll
+            ? watermark
+            : (state?.tail_cursor ?? watermark);
+          const rows = conservativeAll
+            ? (db
+                .prepare("SELECT operation_json FROM pdpp_replica_operations")
+                .all() as { operation_json: string }[])
+            : (db
+                .prepare(
+                  `SELECT o.operation_json FROM pdpp_replica_operations o
+                   WHERE (o.sequence>? AND o.sequence IN (SELECT sequence FROM pdpp_replica_baseline))
+                     OR (o.sequence>? AND o.sequence>?)`,
+                )
+                .all(baselineAfter, tailAfter, watermark) as {
+                operation_json: string;
+              }[]);
+          for (const row of rows) {
+            const operation = replicaOperationSchema.parse(
+              JSON.parse(row.operation_json),
+            );
+            const identity = `${operation.revision.writerId}\u0000${operation.revision.operationId}`;
+            if (!finalized.has(identity)) candidates.set(identity, operation);
           }
         }
         for (const operation of candidates.values()) chargeExisting(operation);
