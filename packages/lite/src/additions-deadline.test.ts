@@ -110,7 +110,7 @@ it.each([
     field: "additionsTimeBudgetMs",
     value,
   })),
-  ...[0, -1, 1.5, 32 * 1024 * 1024 + 1, Infinity, NaN].map((value) => ({
+  ...[0, -1, 1.5, 256 * 1024 * 1024 + 1, Infinity, NaN].map((value) => ({
     field: "additionsByteBudget",
     value,
   })),

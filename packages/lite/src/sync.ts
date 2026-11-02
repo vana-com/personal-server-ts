@@ -91,7 +91,7 @@ export interface PsLiteSyncOptions {
   /** Background recovery deadline, including lock wait. Defaults to 10 seconds;
    * hosted owner signing may use up to two minutes. */
   additionsTimeBudgetMs?: number;
-  /** Summary recovery work allowance, default 8 MiB, maximum 32 MiB.
+  /** Summary recovery work allowance, default 8 MiB, maximum 256 MiB.
    * Upload hints and bounded deletion retain their 8 MiB allowance. */
   additionsByteBudget?: number;
   /** Metrics-only hosts can use the bounded coordinator without starting sync. */
@@ -256,10 +256,10 @@ export async function createPsLiteSyncManager(
   if (
     !Number.isSafeInteger(additionsByteBudget) ||
     additionsByteBudget < 1 ||
-    additionsByteBudget > 32 * 1024 * 1024
+    additionsByteBudget > 256 * 1024 * 1024
   ) {
     throw new RangeError(
-      "Additions recovery allowance must be 1..33554432 bytes",
+      "Additions recovery allowance must be 1..268435456 bytes",
     );
   }
   if (

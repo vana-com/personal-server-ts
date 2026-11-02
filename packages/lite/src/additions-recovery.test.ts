@@ -317,6 +317,36 @@ it("recovers a large source after warm checkpoints while upload hints retain the
   });
 }, 60_000);
 
+it("checkpoints a multi-megabyte source that cannot advance under the 32 MiB allowance", async () => {
+  const { source, session, document, blobs, query } = await fixture();
+  const posts = Array.from({ length: 600 }, (_, taken_at) => ({
+    taken_at,
+    caption: "x".repeat(8000),
+  }));
+  const size = await source("instagram.posts", "1", { posts });
+  expect(size).toBeGreaterThan(4_700_000);
+  expect(size).toBeLessThan(5_000_000);
+  const limited = await (await session(32 * 1024 * 1024)).summarize(query);
+  expect(limited.coverage).toBe("behind");
+  expect(await document("vana.system.additions.instagram.posts")).toMatchObject(
+    { through: "0" },
+  );
+  const recovered = await (await session(256 * 1024 * 1024)).summarize(query);
+  expect(recovered).toMatchObject({ coverage: "complete", total: 600 });
+  expect(await document("vana.system.additions")).toMatchObject({
+    coverage: "complete",
+    total: 600,
+    through: { "instagram.posts": "1" },
+  });
+  blobs.delete("instagram.posts/1");
+  expect(
+    await (await session(256 * 1024 * 1024)).summarize(query),
+  ).toMatchObject({
+    coverage: "complete",
+    total: 600,
+  });
+}, 60_000);
+
 it.each(["metadata_hash_mismatch", "compressed_packet"] as const)(
   "reports %s through the existing diagnostics recorder while rejecting the source",
   async (code) => {
