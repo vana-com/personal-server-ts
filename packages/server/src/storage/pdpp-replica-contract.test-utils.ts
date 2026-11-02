@@ -378,25 +378,26 @@ export function network(
     delete: async () => false,
     exists: async (key: string) => blobs.has(key),
   };
+  const compatibilityRoster = async () => ({
+    complete: true,
+    epoch: 1,
+    devices: [
+      {
+        address: `0x${"22".repeat(20)}`,
+        registrationId: `0x${"33".repeat(32)}`,
+        revokedAt: null,
+        readerFormats: ["fragments-v2"],
+        capabilityValid: true,
+      },
+    ],
+  });
   const adapter = createDpv2ReplicaTransport({
     owner,
     masterKey: new Uint8Array(32).fill(5),
     storage,
     gatewayOrigin: "https://gateway.invalid",
     chainId: 14800n,
-    compatibilityRoster: async () => ({
-      complete: true,
-      epoch: 1,
-      devices: [
-        {
-          address: `0x${"22".repeat(20)}`,
-          registrationId: `0x${"33".repeat(32)}`,
-          revokedAt: null,
-          readerFormats: ["fragments-v2"],
-          capabilityValid: true,
-        },
-      ],
-    }),
+    compatibilityRoster,
     signer: {
       signAddData: async () => "0x1234" as const,
       signMessage: async () => `0x${"11".repeat(65)}` as `0x${string}`,
@@ -520,6 +521,7 @@ export function network(
   };
   return {
     port,
+    compatibilityRoster,
     /** The owner's gateway server roster. */
     roster: createTestReplicaRoster(),
     blobs,
