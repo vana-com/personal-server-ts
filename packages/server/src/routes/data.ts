@@ -148,6 +148,11 @@ export interface DataRouteDeps {
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
   const app = new Hono();
+  // These owner-scoped reads change after import and deletion; 410 is cacheable by default.
+  app.use("*", async (c, next) => {
+    await next();
+    c.header("Cache-Control", "no-store");
+  });
 
   const dataStorage =
     deps.dataStorage ??
