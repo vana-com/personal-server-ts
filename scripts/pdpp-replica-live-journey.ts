@@ -45,6 +45,15 @@ import { createGatewayDataPointFeed } from "../packages/core/src/sync/data-point
 import { createReplicaRecordStore } from "../packages/server/src/storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../packages/server/src/storage/pdpp-replication-transport.js";
+import { createSqliteLiteReplicaPersistence } from "../packages/server/src/storage/lite-replica-sqlite.test-utils.js";
+import {
+  createLiteCanonicalStore,
+  createLiteReplicaEngine,
+  liteTargetChunkBytes,
+} from "@opendatalabs/personal-server-ts-lite";
+import { createSourceStreamDeclarationRegistry } from "../packages/core/src/storage/pdpp-records/stream-declaration.js";
+import { createRecordDataValidator } from "../packages/core/src/storage/pdpp-records/schema.js";
+import { canonicalJson } from "../packages/core/src/replication/envelope.js";
 import { enableReplicaWriterIdentity } from "../packages/server/src/storage/pdpp-replica-writer-identity.js";
 import { createGatewayReplicaRoster } from "../packages/core/src/replication/roster.js";
 import {
@@ -80,6 +89,39 @@ export const binding = {
 };
 export const digest = (bytes: Uint8Array | string) =>
   createHash("sha256").update(bytes).digest("hex");
+export interface UploadObservation {
+  key: string;
+  sha256?: string;
+  acknowledged?: boolean;
+  lostReplyId?: string;
+}
+export function assertLostUploadRetried(
+  objects: readonly UploadObservation[],
+  faultId: string,
+) {
+  const losses = objects
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => entry.lostReplyId === faultId);
+  assert.equal(
+    losses.length,
+    1,
+    "expected exactly one injected upload reply loss",
+  );
+  const { entry: lost, index } = losses[0];
+  assert.equal(lost.acknowledged, false);
+  assert(lost.sha256, "injected loss must identify the uploaded bytes");
+  const retried = objects
+    .slice(index + 1)
+    .some(
+      (entry) =>
+        entry.acknowledged === true &&
+        entry.lostReplyId === undefined &&
+        entry.key === lost.key &&
+        entry.sha256 === lost.sha256,
+    );
+  assert(retried, "injected upload reply loss has no later acknowledged retry");
+  return lost;
+}
 export const pause = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const nativeFetch = globalThis.fetch;
@@ -934,14 +976,852 @@ export class Device {
   }
 }
 
+/** Fresh typed SQLite peers using the same Lite policy and phase engine as the host. */
+async function typedLiteJourney(
+  inits: Init[],
+  report: Record<string, unknown>,
+  save: () => void,
+) {
+  const profile = JSON.parse(
+    readFileSync(
+      new URL(
+        "../packages/core/src/legacy-projection/declarations/chatgpt.collection-profile.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const names = [
+    "conversations",
+    "messages",
+    "memories",
+    "custom_instructions",
+  ];
+  const streams = names.map((name) => {
+    const stream = profile.streams.find(
+      (s: { name: string }) => s.name === name,
+    );
+    assert(stream?.schema);
+    return stream;
+  });
+  const connectionId = "synthetic-connection";
+  const methodId = "synthetic-export";
+  const declarations = createSourceStreamDeclarationRegistry([
+    {
+      sourceId,
+      instance: connectionId,
+      streams: streams.map((s) => ({
+        name: s.name,
+        semantics: s.semantics,
+        primaryKey: s.primary_key,
+        cursorField: "emitted_at",
+        requiredFields: s.schema.required,
+        schema: s.schema,
+      })),
+    },
+  ]);
+  const validate = createRecordDataValidator(declarations);
+  const bindings = streams.map((s) => ({
+    sourceId,
+    binding: {
+      digest: `sha256:${digest(canonicalJson(profile))}`,
+      version: profile.version,
+      stream: s.name,
+      semantics: s.semantics,
+      primaryKey: s.primary_key,
+      schemaDigest: `sha256:${digest(canonicalJson(s.schema))}`,
+    },
+    validateData: (data: Record<string, unknown>) =>
+      validate(s.name, connectionId, data) === null,
+  }));
+  const owner = inits[0].owner;
+  const expected = {
+    owner,
+    declarations: bindings.map(({ sourceId, binding }) => ({
+      sourceId,
+      binding,
+    })),
+  };
+  const ctx = () => ({ owner, declarations: bindings });
+  const objects: (UploadObservation & { bytes: number; at: string })[] =
+    Array.isArray(report.objects) ? report.objects : [];
+  const evidence: unknown[] = Array.isArray(report.evidence)
+    ? report.evidence
+    : [];
+  const times = (report.times as
+    | {
+        localCommitMs: number;
+        encryptionMs: number;
+        uploadMs: number;
+        peerApplyMs: number;
+      }
+    | undefined) ?? {
+    localCommitMs: 0,
+    encryptionMs: 0,
+    uploadMs: 0,
+    peerApplyMs: 0,
+  };
+  Object.assign(report, {
+    mode: "typed-lite",
+    streams: names,
+    objects,
+    evidence,
+    times,
+    cases: report.cases ?? [],
+  });
+  const devices = inits.map((init) => {
+    mkdirSync(init.root, { recursive: true, mode: 0o700 });
+    const account = serverAccount(init.serverKey);
+    const native = createSqliteLiteReplicaPersistence(
+      join(init.root, "typed.sqlite"),
+      true,
+    );
+    const roster = createGatewayReplicaRoster({
+      gatewayUrl,
+      fetch: boundedFetch,
+    });
+    const storage = createVanaSyncStorageAdapter({
+      config,
+      serverOwner: owner,
+      serverAccount: account,
+    });
+    const upload = storage.upload.bind(storage);
+    let loseUploadReply: string | undefined;
+    storage.upload = async (key, bytes, signal) => {
+      const started = performance.now();
+      const result = await upload(key, bytes, signal);
+      times.uploadMs += performance.now() - started;
+      const lostReplyId = loseUploadReply;
+      loseUploadReply = undefined;
+      objects.push({
+        key,
+        bytes: bytes.length,
+        sha256: digest(bytes),
+        acknowledged: lostReplyId === undefined,
+        ...(lostReplyId ? { lostReplyId } : {}),
+        at: new Date().toISOString(),
+      });
+      save();
+      if (lostReplyId) {
+        throw new Error("synthetic lost upload reply");
+      }
+      return result;
+    };
+    const rpc = createPublicClient({
+      transport: http(rpcUrl, { timeout: 25_000, retryCount: 0 }),
+    });
+    const check = createReplicaEvidenceAdapter({
+      owner,
+      gatewayUrl,
+      chainId: 14800,
+      registry,
+      fetch: boundedFetch,
+      rpc,
+    });
+    const transport = createDpv2ReplicaTransport({
+      owner,
+      masterKey: new Uint8Array(init.master),
+      storage,
+      gateway: createGatewayClient(gatewayUrl),
+      signer: createServerSigner(account, config.gateway),
+      feed: createGatewayDataPointFeed({ gatewayUrl, fetch: boundedFetch }),
+      finality: createReplicaFinalityHints({ rpc }),
+      evidence: async (scope, version) => {
+        const result = await check(scope, version);
+        evidence.push(
+          JSON.parse(
+            JSON.stringify(
+              { scope, version, result, at: new Date().toISOString() },
+              (_key, value) =>
+                typeof value === "bigint" ? value.toString() : value,
+            ),
+          ),
+        );
+        save();
+        return result;
+      },
+    });
+    const blockedFragments = new Set<string>();
+    const getFragment = transport.getFragment;
+    transport.getFragment = (scope, fragmentDigest, read) => {
+      if (blockedFragments.has(fragmentDigest))
+        throw Object.assign(new Error("synthetic missing fragment"), {
+          status: 404,
+        });
+      return getFragment(scope, fragmentDigest, read);
+    };
+    const encrypt = transport.encrypt;
+    transport.encrypt = async (...args) => {
+      const start = performance.now();
+      try {
+        return await encrypt(...args);
+      } finally {
+        times.encryptionMs += performance.now() - start;
+      }
+    };
+    const authenticateReplica = (c: unknown) =>
+      c === "isolated-harness" ? owner : undefined;
+    const canonical = createLiteCanonicalStore({
+      persistence: native.port,
+      enabled: true,
+      context: ctx,
+      authenticateReplica,
+    });
+    const engine = createLiteReplicaEngine({
+      persistence: native.port,
+      canonical: { context: ctx, authenticateReplica },
+      engine: {
+        enabled: true,
+        expected: () => expected,
+        credential: "isolated-harness",
+        transport,
+        authority: {
+          signer: account,
+          roster,
+          chainId: 14800,
+          environment: "dev",
+        },
+        targetChunkBytes: liteTargetChunkBytes(1024 * 1024),
+        maxBlobBytes: 4 * 1024 * 1024,
+      },
+    });
+    return {
+      native,
+      canonical,
+      engine,
+      transport,
+      armLostUpload() {
+        assert.equal(
+          loseUploadReply,
+          undefined,
+          "upload reply loss already armed",
+        );
+        loseUploadReply = randomUUID();
+        return loseUploadReply;
+      },
+      blockedFragments,
+    };
+  });
+  const [a, b] = devices;
+  const base = {
+    owner,
+    sourceId,
+    connectionId,
+    methodId,
+    generation: 1 as const,
+  };
+  const snapshot = (d: typeof a) => ({
+    state: d.native.db.prepare("SELECT * FROM pdpp_transport_state").all(),
+    out: d.native.db
+      .prepare(
+        "SELECT batch,scope,version,state,outcome,reason,error,checked_block FROM pdpp_transport_manifests_out",
+      )
+      .all(),
+    incoming: d.native.db
+      .prepare(
+        "SELECT slot,scope,version,state,outcome,reason,error,checked_block FROM pdpp_transport_manifests_in",
+      )
+      .all(),
+    imports: d.native.db.prepare("SELECT * FROM pdpp_transport_imported").all(),
+    rows: d.native.db
+      .prepare("SELECT namespace,count(*) n FROM lite_rows GROUP BY namespace")
+      .all(),
+  });
+  try {
+    for (const d of devices) {
+      await d.canonical.provisionConnection(connectionId, {
+        sourceId,
+        methodId,
+      });
+      try {
+        await d.engine.cycle();
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          error.message !== "Replica transport cycle incomplete"
+        )
+          throw error;
+      }
+      await d.canonical.commitLocal("register", [
+        { ...base, kind: "connection-register" },
+      ]);
+    }
+    const wait = async (
+      label: string,
+      condition: () => Promise<boolean>,
+      active = devices,
+    ) => {
+      const start = Date.now();
+      while (Date.now() - start < 12 * 60_000) {
+        for (const d of active) {
+          try {
+            await d.engine.cycle();
+          } catch (error) {
+            if (
+              !(error instanceof Error) ||
+              error.message !== "Replica transport cycle incomplete"
+            )
+              throw error;
+            report.incompleteCycles = Number(report.incompleteCycles ?? 0) + 1;
+          }
+        }
+        report.lastSnapshots = devices.map(snapshot);
+        report.wait = { label, elapsedMs: Date.now() - start };
+        save();
+        if (await condition()) return Date.now() - start;
+        await pause(5000);
+      }
+      try {
+        const rpc = createPublicClient({
+          transport: http(rpcUrl, { timeout: 25_000, retryCount: 0 }),
+        });
+        const [head, block] = await Promise.all([
+          rpc.getBlockNumber(),
+          rpc.getBlock({ blockTag: "finalized" }),
+        ]);
+        report.chainAtTimeout = {
+          head: head.toString(),
+          finalized: block.number?.toString(),
+          hash: block.hash,
+        };
+      } catch (error) {
+        report.chainAtTimeout = {
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+      save();
+      throw new Error(
+        `Timed out waiting for ${label}; see retained snapshots and chain evidence`,
+      );
+    };
+    const finalized = async (d: typeof a) => {
+      const row = d.native.db
+        .prepare(
+          "SELECT scope,version FROM pdpp_transport_manifests_out WHERE state='published' ORDER BY version DESC LIMIT 1",
+        )
+        .get() as { scope: string; version: number } | undefined;
+      if (!row) return false;
+      const e = await d.transport.evidence(row.scope, row.version);
+      return (
+        e.chain?.status === "Active" &&
+        BigInt(e.chain.currentVersion) >= BigInt(row.version)
+      );
+    };
+    const baselineWait = await wait(
+      "both baseline finality",
+      async () => (await finalized(a)) && (await finalized(b)),
+    );
+    report.baselineFinalityMs ??= baselineWait;
+    const started = performance.now();
+    const values: {
+      stream: string;
+      id: string;
+      data: Record<string, string>;
+    }[] = [];
+    for (let i = 0; i < 1000; i++) {
+      const stream = names[i % names.length],
+        id = `synthetic-${i}`;
+      const data: Record<string, string> =
+        stream === "messages"
+          ? {
+              id,
+              conversation_id: `conversation-${i % 250}`,
+              content: `message ${i}`,
+            }
+          : stream === "memories"
+            ? { id, content: `memory ${i}` }
+            : stream === "conversations"
+              ? { id, title: `conversation ${i}` }
+              : { id, about_user: `account ${i}` };
+      assert.equal(validate(stream, connectionId, data), null);
+      values.push({ stream, id, data });
+    }
+    let first: unknown = (
+      report.receipts as { lostReplyRetry?: unknown } | undefined
+    )?.lostReplyRetry;
+    for (let offset = 0; offset < values.length; offset += 25) {
+      if (report.recordCount === 1000 && offset !== 0) continue;
+      const operations = values
+        .slice(offset, offset + 25)
+        .map(({ stream, id, data }) => ({
+          ...base,
+          kind: "upsert" as const,
+          declaration: bindings.find((v) => v.binding.stream === stream)!
+            .binding,
+          recordKey: id,
+          emittedAt: "2026-10-31T00:00:00.000Z",
+          data,
+          blobs: [],
+        }));
+      const receipt = await a.canonical.commitLocal(
+        `batch-${offset}`,
+        operations,
+      );
+      if (offset === 0 && report.recordCount === 1000) {
+        assert.deepEqual(receipt, first);
+      } else if (offset === 0) {
+        first = receipt;
+        assert.deepEqual(
+          await a.canonical.commitLocal("batch-0", operations),
+          first,
+        );
+      }
+    }
+    const priorBlob = report.blob as
+      { size: number; sha256: string } | undefined;
+    const retainedParts: Uint8Array[] = [];
+    if (priorBlob)
+      for await (const part of a.canonical.readBlob(priorBlob.sha256))
+        retainedParts.push(part);
+    const blobBytes = priorBlob
+      ? Buffer.concat(retainedParts)
+      : randomBytes(2 * 1024 * 1024);
+    const hash = `sha256:${digest(blobBytes)}`;
+    if (priorBlob) assert.equal(hash, priorBlob.sha256);
+    const descriptor = {
+      blobId: hash,
+      sha256: hash,
+      sizeBytes: blobBytes.length,
+      mimeType: "application/octet-stream",
+    };
+    let blobReceipt = (report.receipts as { blob?: unknown } | undefined)?.blob;
+    if (!priorBlob) {
+      const stagingId = await a.canonical.stageBlob(
+        descriptor,
+        (async function* () {
+          for (let i = 0; i < blobBytes.length; i += 128 * 1024)
+            yield blobBytes.subarray(i, i + 128 * 1024);
+        })(),
+      );
+      const blobData = {
+        id: "synthetic-blob",
+        title: "synthetic attachment",
+        blob_ref: { blob_id: hash },
+      };
+      assert.equal(validate("conversations", connectionId, blobData), null);
+      blobReceipt = await a.canonical.commitLocal(
+        "blob",
+        [
+          { ...base, kind: "blob-claim", blob: descriptor },
+          {
+            ...base,
+            kind: "upsert",
+            declaration: bindings.find(
+              (v) => v.binding.stream === "conversations",
+            )!.binding,
+            recordKey: "synthetic-blob",
+            emittedAt: "2026-10-31T00:00:00.000Z",
+            data: blobData,
+            blobs: [descriptor],
+          },
+        ],
+        [{ stagingId, descriptor }],
+      );
+      times.localCommitMs = performance.now() - started;
+    }
+    report.recordCount = values.length;
+    report.receipts = { batches: 40, lostReplyRetry: first, blob: blobReceipt };
+    report.blob = { size: blobBytes.length, sha256: hash };
+    save();
+    const applyStarted = performance.now();
+    const deliveryWait = await wait("record delivery", async () => {
+      const row = await b.canonical.readRecord(
+        connectionId,
+        "conversations",
+        "synthetic-blob",
+      );
+      return !!row;
+    });
+    report.deliveryMs ??= deliveryWait;
+    const verifyStarted = performance.now();
+    for (const value of values) {
+      const row = await b.canonical.readRecord(
+        connectionId,
+        value.stream,
+        value.id,
+      );
+      assert(row && !row.deleted);
+      assert.deepEqual(row.data, value.data);
+    }
+    const receivedBlob: Uint8Array[] = [];
+    for await (const part of b.canonical.readBlob(hash))
+      receivedBlob.push(part);
+    assert.deepEqual(Buffer.concat(receivedBlob), blobBytes);
+    times.peerApplyMs = performance.now() - verifyStarted;
+    report.peerWaitAndVerifyMs = performance.now() - applyStarted;
+    const conversation = bindings.find(
+      (v) => v.binding.stream === "conversations",
+    )!.binding;
+    const preview = await b.canonical.stagePending({
+      id: "synthetic-preview",
+      credential: "isolated-harness",
+      envelope: {
+        format: "vana-pdpp-replica",
+        version: 1,
+        owner,
+        batchId: "synthetic-preview",
+        operations: [
+          {
+            ...base,
+            kind: "upsert",
+            declaration: conversation,
+            recordKey: "synthetic-0",
+            emittedAt: "2026-11-01T00:00:00.000Z",
+            data: { id: "synthetic-0", title: "pending edit" },
+            blobs: [],
+            revision: {
+              counter: 999999,
+              writerId: "preview-writer",
+              operationId: "preview-operation",
+            },
+          },
+        ],
+      },
+    });
+    const visible = await b.canonical.readRecord(
+      connectionId,
+      "conversations",
+      "synthetic-0",
+      { reader: "owner" },
+    );
+    const confirmedOnly = await b.canonical.readRecord(
+      connectionId,
+      "conversations",
+      "synthetic-0",
+      { reader: "grant" },
+    );
+    assert(
+      visible && !visible.deleted && confirmedOnly && !confirmedOnly.deleted,
+    );
+    assert.equal(visible.data.title, "pending edit");
+    assert.equal(confirmedOnly.data.title, "conversation 0");
+    await b.canonical.quarantinePending({
+      id: "synthetic-preview",
+      credential: "isolated-harness",
+      reason: "synthetic withdrawal",
+    });
+    const restored = await b.canonical.readRecord(
+      connectionId,
+      "conversations",
+      "synthetic-0",
+      { reader: "owner" },
+    );
+    assert(restored && !restored.deleted);
+    assert.equal(restored.data.title, "conversation 0");
+    (report.cases as unknown[]).push({
+      case: "preview-quarantine",
+      fingerprint: preview.fingerprint,
+      ownerPreview: true,
+      grantStayedConfirmed: true,
+      restored: true,
+    });
+    save();
+    const operation = (id: string, title: string) => ({
+      ...base,
+      kind: "upsert" as const,
+      declaration: conversation,
+      recordKey: id,
+      emittedAt: "2026-11-02T00:00:00.000Z",
+      data: { id, title },
+      blobs: [],
+    });
+    const lostReplyId = a.armLostUpload();
+    const [raceA, raceB] = await Promise.all([
+      a.canonical.commitLocal("concurrent-a", [operation("race", "from A")]),
+      b.canonical.commitLocal("concurrent-b", [operation("race", "from B")]),
+    ]);
+    const aScope = (
+      a.native.db
+        .prepare(
+          "SELECT scope FROM pdpp_transport_manifests_out WHERE version=1",
+        )
+        .get() as { scope: string }
+    ).scope;
+    const bScope = (
+      b.native.db
+        .prepare(
+          "SELECT scope FROM pdpp_transport_manifests_out WHERE version=1",
+        )
+        .get() as { scope: string }
+    ).scope;
+    const imported = (d: typeof a, scope: string, version: number) =>
+      !!d.native.db
+        .prepare(
+          "SELECT 1 FROM pdpp_transport_manifests_in WHERE scope=? AND version>=? AND state='imported'",
+        )
+        .get(scope, version);
+    const concurrentMs = await wait(
+      "concurrent writers and lost upload reply",
+      async () => {
+        if (!imported(a, bScope, 2) || !imported(b, aScope, 3)) return false;
+        const left = await a.canonical.readRecord(
+          connectionId,
+          "conversations",
+          "race",
+        );
+        const right = await b.canonical.readRecord(
+          connectionId,
+          "conversations",
+          "race",
+        );
+        return (
+          !!left &&
+          !!right &&
+          !left.deleted &&
+          !right.deleted &&
+          canonicalJson(left.data) === canonicalJson(right.data)
+        );
+      },
+    );
+    const repeated = assertLostUploadRetried(objects, lostReplyId);
+    (report.cases as unknown[]).push({
+      case: "concurrent-writers-lost-upload-reply",
+      concurrentMs,
+      raceA,
+      raceB,
+      lostReplyId,
+      retriedKey: repeated.key,
+      sha256: repeated.sha256,
+    });
+    save();
+    const offlineReceipt = await a.canonical.commitLocal("offline", [
+      operation("offline", "arrived while peer offline"),
+    ]);
+    const offlinePublishMs = await wait(
+      "offline peer publication",
+      async () => {
+        const row = a.native.db
+          .prepare(
+            "SELECT scope,version FROM pdpp_transport_manifests_out WHERE scope=? AND version>=4 AND state='published' ORDER BY version DESC LIMIT 1",
+          )
+          .get(aScope) as { scope: string; version: number } | undefined;
+        if (!row) return false;
+        const e = await a.transport.evidence(row.scope, row.version);
+        return (
+          e.chain?.status === "Active" &&
+          BigInt(e.chain.currentVersion) >= BigInt(row.version)
+        );
+      },
+      [a],
+    );
+    assert.equal(
+      await b.canonical.readRecord(connectionId, "conversations", "offline"),
+      undefined,
+    );
+    const offlineCatchupMs = await wait(
+      "offline peer catch-up",
+      async () =>
+        !!(await b.canonical.readRecord(
+          connectionId,
+          "conversations",
+          "offline",
+        )),
+    );
+    (report.cases as unknown[]).push({
+      case: "offline-catch-up",
+      offlineReceipt,
+      offlinePublishMs,
+      offlineCatchupMs,
+    });
+    save();
+    const firstGapReceipt = await a.canonical.commitLocal("gap-first", [
+      operation("gap-first", "earlier batch"),
+    ]);
+    const publishVersion = (version: number) =>
+      wait(
+        `publish gap version ${version}`,
+        async () => {
+          const row = a.native.db
+            .prepare(
+              "SELECT scope,version FROM pdpp_transport_manifests_out WHERE scope=? AND version=? AND state='published'",
+            )
+            .get(aScope, version) as
+            { scope: string; version: number } | undefined;
+          if (!row) return false;
+          const e = await a.transport.evidence(row.scope, row.version);
+          return (
+            e.chain?.status === "Active" &&
+            BigInt(e.chain.currentVersion) >= BigInt(version)
+          );
+        },
+        [a],
+      );
+    const firstGapMs = await publishVersion(5);
+    const secondGapReceipt = await a.canonical.commitLocal("gap-second", [
+      operation("gap-second", "later batch"),
+    ]);
+    const secondGapMs = await publishVersion(6);
+    const fragments = a.native.db
+      .prepare(
+        "SELECT f.digest FROM pdpp_transport_fragments_out f JOIN pdpp_transport_manifests_out m ON m.batch=f.batch WHERE m.scope=? AND m.version=5",
+      )
+      .all(aScope) as { digest: string }[];
+    assert(fragments.length > 0);
+    for (const fragment of fragments) b.blockedFragments.add(fragment.digest);
+    const gapObservedMs = await wait(
+      "missing earlier fragment while later slot is discovered",
+      async () => {
+        const later = b.native.db
+          .prepare(
+            "SELECT state FROM pdpp_transport_manifests_in WHERE scope=? AND version=6",
+          )
+          .get(aScope);
+        if (!later) return false;
+        assert.equal(imported(b, aScope, 5), false);
+        assert.equal(imported(b, aScope, 6), false);
+        assert.equal(
+          await b.canonical.readRecord(
+            connectionId,
+            "conversations",
+            "gap-second",
+          ),
+          undefined,
+        );
+        return true;
+      },
+    );
+    b.blockedFragments.clear();
+    const gapCatchupMs = await wait(
+      "missing batch recovery",
+      async () =>
+        imported(b, aScope, 6) &&
+        !!(await b.canonical.readRecord(
+          connectionId,
+          "conversations",
+          "gap-second",
+        )),
+    );
+    (report.cases as unknown[]).push({
+      case: "missing-earlier-batch",
+      firstGapReceipt,
+      secondGapReceipt,
+      firstGapMs,
+      secondGapMs,
+      gapObservedMs,
+      gapCatchupMs,
+      blockedDigests: fragments.map((f) => f.digest),
+    });
+    save();
+    report.status = "partial";
+    report.limitations = [
+      "host SQLite double, not native phone writers",
+      "peer read uses canonical API, not grant route",
+      "legacy scope/blob coexistence and account isolation not yet exercised in this live scenario",
+    ];
+  } finally {
+    report.lastSnapshots = devices.map((d) => {
+      try {
+        return snapshot(d);
+      } catch {
+        return null;
+      }
+    });
+    save();
+    for (const d of devices) d.native.close();
+  }
+}
+
 async function main() {
   installHarnessSafety();
+  const resumeAt = process.argv.indexOf("--resume-evidence");
+  if (resumeAt !== -1) {
+    const root = process.argv[resumeAt + 1];
+    assert(
+      root?.startsWith(join(homedir(), ".tmp", "replica-live-")),
+      "invalid retained fixture",
+    );
+    const receipt = JSON.parse(
+      readFileSync(join(root, ".fleet-owner.json"), "utf8"),
+    );
+    assert.equal(receipt.thread_id, process.env.FLEET_THREAD_ID);
+    const keys = JSON.parse(readFileSync(join(root, "keys.json"), "utf8")) as {
+      devices: Init[];
+    };
+    const reportPath = join(root, "result.json");
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    report.previousFailure = report.error;
+    report.error = undefined;
+    report.status = "running";
+    report.resumedAt = new Date().toISOString();
+    report.resumedScriptSha256 = digest(
+      readFileSync(fileURLToPath(import.meta.url)),
+    );
+    report.resumedDiffSha256 = digest(
+      execFileSync(
+        "git",
+        [
+          "diff",
+          "HEAD",
+          "--",
+          "packages",
+          "scripts/pdpp-replica-live-journey.ts",
+        ],
+        { encoding: "utf8" },
+      ),
+    );
+    const save = () => {
+      writeFileSync(reportPath, JSON.stringify(report, null, 2) + "\n", {
+        mode: 0o600,
+      });
+      writeFileSync(
+        join(root, "cleanup.json"),
+        JSON.stringify(
+          {
+            fixture: root,
+            retained: true,
+            servers: report.registeredServers,
+            objects: report.objects ?? [],
+          },
+          null,
+          2,
+        ),
+        { mode: 0o600 },
+      );
+    };
+    try {
+      await typedLiteJourney(keys.devices, report, save);
+    } catch (error) {
+      report.status = "failed";
+      report.error = error instanceof Error ? error.message : String(error);
+      process.exitCode = 1;
+    } finally {
+      report.finishedAt = new Date().toISOString();
+      save();
+      console.log(
+        JSON.stringify({
+          status: report.status,
+          error: report.error,
+          reportPath,
+        }),
+      );
+    }
+    return;
+  }
   const parent = join(homedir(), ".tmp");
   mkdirSync(parent, { recursive: true });
+  const retain = process.argv.includes("--retain-evidence");
+  const threadId = process.env.FLEET_THREAD_ID;
+  if (retain && !threadId)
+    throw new Error("FLEET_THREAD_ID is required for retained evidence");
   const root = mkdtempSync(join(parent, "replica-live-"));
-  const reportPath =
-    process.argv[2] ?? join(parent, `replica-live-${Date.now()}.json`);
-  const ownerAccount = privateKeyToAccount(generatePrivateKey());
+  if (retain)
+    writeFileSync(
+      join(root, ".fleet-owner.json"),
+      JSON.stringify({
+        thread_id: threadId,
+        disposable: true,
+        tim_driven: true,
+      }),
+      { mode: 0o600 },
+    );
+  const reportPath = retain
+    ? join(root, "result.json")
+    : (process.argv[2] ?? join(parent, `replica-live-${Date.now()}.json`));
+  const ownerKey = generatePrivateKey();
+  const ownerAccount = privateKeyToAccount(ownerKey);
   const owner = ownerAccount.address;
   const master = [
     ...deriveMasterKey(
@@ -959,14 +1839,28 @@ async function main() {
       }),
   );
   const [a, b] = devices;
+  if (retain)
+    writeFileSync(
+      join(root, "keys.json"),
+      JSON.stringify({
+        ownerKey,
+        master,
+        devices: devices.map((device) => device.init),
+      }),
+      { mode: 0o600 },
+    );
   const report: Record<string, unknown> = {
     run: randomUUID(),
+    fixture: retain ? root : undefined,
+    registeredServers: [] as unknown[],
     owner,
     gatewayUrl,
     storageUrl,
     rpcUrl,
     chainId: 14800,
-    base: "723c4854ee5ee83d8e83baa20cc2b0d30b99fea3",
+    base: execFileSync("git", ["rev-parse", "origin/main"], {
+      encoding: "utf8",
+    }).trim(),
     head: execFileSync("git", ["rev-parse", "HEAD"], {
       encoding: "utf8",
     }).trim(),
@@ -1004,10 +1898,26 @@ async function main() {
     startedAt: new Date().toISOString(),
   };
   const cases = report.cases as unknown[];
-  const save = () =>
+  const save = () => {
     writeFileSync(reportPath, JSON.stringify(report, null, 2) + "\n", {
       mode: 0o600,
     });
+    if (retain)
+      writeFileSync(
+        join(root, "cleanup.json"),
+        JSON.stringify(
+          {
+            fixture: root,
+            retained: true,
+            servers: report.registeredServers,
+            objects: report.objects ?? [],
+          },
+          null,
+          2,
+        ),
+        { mode: 0o600 },
+      );
+  };
   async function settle(
     label: string,
     predicate: (x: Snapshot, y: Snapshot) => boolean,
@@ -1105,6 +2015,8 @@ async function main() {
         throw new Error(
           `Dev server ${i} registration failed: HTTP ${r.status}: ${body.slice(0, 800)}`,
         );
+      (report.registeredServers as unknown[]).push({ message, response: body });
+      save();
       console.log(
         JSON.stringify({
           stage: "registered",
@@ -1113,6 +2025,15 @@ async function main() {
           status: r.status,
         }),
       );
+    }
+    if (process.argv.includes("--typed-lite")) {
+      if (!retain) throw new Error("--typed-lite requires --retain-evidence");
+      await typedLiteJourney(
+        devices.map((device) => device.init),
+        report,
+        save,
+      );
+      return;
     }
     await a.start();
     await b.start();
@@ -1673,11 +2594,20 @@ async function main() {
       B: b.peakRssKiB,
     };
     report.storageCleanup = [];
+    const retainedObjects: unknown[] = Array.isArray(report.objects)
+      ? [...report.objects]
+      : [];
     for (const device of devices) {
       try {
-        (report.storageCleanup as unknown[]).push(
-          await device.call("cleanupStorage"),
-        );
+        if (retain) {
+          const snapshot = await device.call("snapshot");
+          retainedObjects.push(...snapshot.wire);
+          (report.storageCleanup as unknown[]).push({ retained: true });
+        } else {
+          (report.storageCleanup as unknown[]).push(
+            await device.call("cleanupStorage"),
+          );
+        }
       } catch {
         (report.storageCleanup as unknown[]).push({
           failed: "host unavailable",
@@ -1686,7 +2616,22 @@ async function main() {
       await device.kill();
     }
     save();
-    rmSync(root, { recursive: true, force: true });
+    if (retain)
+      writeFileSync(
+        join(root, "cleanup.json"),
+        JSON.stringify(
+          {
+            fixture: root,
+            retained: true,
+            servers: report.registeredServers,
+            objects: retainedObjects,
+          },
+          null,
+          2,
+        ),
+        { mode: 0o600 },
+      );
+    else rmSync(root, { recursive: true, force: true });
     console.log(
       JSON.stringify({
         status: report.status,

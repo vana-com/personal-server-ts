@@ -165,7 +165,7 @@ async function liteDevice(
     c === credential ? owner : undefined;
   const authority = replicaTestAuthority(net.roster, "lite-phone");
   net.roster.register(authority.signer.address, owner);
-  let native = createSqliteLiteReplicaPersistence(path);
+  let native = createSqliteLiteReplicaPersistence(path, true);
   let process = crashable(native.port);
   // Registrations fail while offline: retained batches stay unpublished.
   let offline = false;
@@ -311,7 +311,7 @@ async function liteDevice(
     /** Process loss: drop every component, reopen the file without injection. */
     crashReopen() {
       native.close();
-      native = createSqliteLiteReplicaPersistence(path);
+      native = createSqliteLiteReplicaPersistence(path, true);
       process = crashable(native.port);
       ({ canonical, engine } = open());
     },

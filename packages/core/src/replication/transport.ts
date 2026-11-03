@@ -129,6 +129,14 @@ export function replicaWriterOf(scope: string): string | undefined {
 /** Storage key of a content-addressed fragment. Never registered. */
 export function replicaFragmentKey(scope: string, fragmentDigest: string) {
   digest.parse(fragmentDigest);
+  return `${scope}/fragments-${fragmentDigest.slice("sha256:".length)}`;
+}
+/** Historical read-only key; new writes use the two-segment key. */
+export function replicaLegacyFragmentKey(
+  scope: string,
+  fragmentDigest: string,
+) {
+  digest.parse(fragmentDigest);
   return `${scope}/fragments/${fragmentDigest.slice("sha256:".length)}`;
 }
 /** Storage key of a manifest: the ordinary DPv2 `<scope>/<version>` key. */

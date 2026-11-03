@@ -62,7 +62,7 @@ afterEach(() => {
 });
 
 /** Real disk SQLite implementation of the port. No Dart/native-file claims. */
-function sqlitePort() {
+function sqlitePort(typed = false) {
   const directory = mkdtempSync(join(tmpdir(), "lite-canonical-"));
   const path = join(directory, "native.sqlite");
   let db: Database.Database;
@@ -81,6 +81,10 @@ function sqlitePort() {
     db.exec(
       "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, descriptor TEXT NOT NULL, bytes BLOB NOT NULL); CREATE TABLE IF NOT EXISTS staging (id TEXT PRIMARY KEY, descriptor TEXT NOT NULL, bytes BLOB NOT NULL)",
     );
+    if (typed)
+      db.exec(
+        "CREATE TABLE IF NOT EXISTS typed_rows (key TEXT PRIMARY KEY, namespace TEXT NOT NULL, blob_id TEXT, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS typed_blob ON typed_rows(namespace,blob_id,key)",
+      );
   };
   open();
   const port: LiteCanonicalPersistence = {
@@ -94,25 +98,46 @@ function sqlitePort() {
           const tx: LiteCanonicalTransaction = {
             async get(key) {
               return (
-                db.prepare("SELECT value FROM kv WHERE key=?").get(key) as
-                  { value: string } | undefined
+                db
+                  .prepare(
+                    `SELECT value FROM ${typed && /^(preview\/)?rows\//.test(key) ? "typed_rows" : "kv"} WHERE key=?`,
+                  )
+                  .get(key) as { value: string } | undefined
               )?.value;
             },
             async put(key, value) {
               if (Buffer.byteLength(value) > 256 * 1024)
                 throw new Error("native value exceeds 256 KiB");
-              db.prepare(
-                "INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-              ).run(key, value);
+              if (typed && /^(preview\/)?rows\//.test(key)) {
+                const row = JSON.parse(value);
+                const blobId =
+                  !row.deleted &&
+                  typeof row.data?.blob_ref?.blob_id === "string"
+                    ? row.data.blob_ref.blob_id
+                    : null;
+                db.prepare(
+                  "INSERT INTO typed_rows VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET namespace=excluded.namespace,blob_id=excluded.blob_id,value=excluded.value",
+                ).run(
+                  key,
+                  key.startsWith("preview/") ? "preview" : "canonical",
+                  blobId,
+                  value,
+                );
+              } else
+                db.prepare(
+                  "INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ).run(key, value);
               hit(writeCrashPoint(key));
             },
             async delete(key) {
-              db.prepare("DELETE FROM kv WHERE key=?").run(key);
+              db.prepare(
+                `DELETE FROM ${typed && /^(preview\/)?rows\//.test(key) ? "typed_rows" : "kv"} WHERE key=?`,
+              ).run(key);
             },
             async scan(prefix, after) {
               const entries = db
                 .prepare(
-                  "SELECT key,value FROM kv WHERE substr(key,1,length(?))=? AND key>? ORDER BY key LIMIT 101",
+                  `SELECT key,value FROM (${typed ? "SELECT key,value FROM kv UNION ALL SELECT key,value FROM typed_rows" : "SELECT key,value FROM kv"}) WHERE substr(key,1,length(?))=? AND key>? ORDER BY key LIMIT 101`,
                 )
                 .all(prefix, prefix, after ?? "") as {
                 key: string;
@@ -123,6 +148,29 @@ function sqlitePort() {
                 page.after = page.entries.at(-1)!.key;
               return page;
             },
+            ...(typed
+              ? {
+                  async blobRows(
+                    namespace: "canonical" | "preview",
+                    blobId: string,
+                    prefix: string,
+                    after?: string,
+                  ) {
+                    const entries = db
+                      .prepare(
+                        "SELECT key,value FROM typed_rows WHERE namespace=? AND blob_id=? AND substr(key,1,length(?))=? AND key>? ORDER BY key LIMIT 101",
+                      )
+                      .all(namespace, blobId, prefix, prefix, after ?? "") as {
+                      key: string;
+                      value: string;
+                    }[];
+                    const page = storagePage(entries, after);
+                    if (entries.length === 101 && !page.after)
+                      page.after = page.entries.at(-1)!.key;
+                    return page;
+                  },
+                }
+              : {}),
             async attachBlob(id, expected) {
               const staged = db
                 .prepare("SELECT * FROM staging WHERE id=?")
@@ -189,6 +237,9 @@ function sqlitePort() {
   });
   return {
     port,
+    get db() {
+      return db;
+    },
     crashAt(point: CanonicalCrashPoint) {
       failure = point;
     },
@@ -198,6 +249,209 @@ function sqlitePort() {
     },
   };
 }
+
+it("keeps preview blob references in authoritative SQLite rows", async () => {
+  const adapter = sqlitePort(true);
+  const store = createLiteCanonicalStore({
+    persistence: adapter.port,
+    enabled: true,
+    context: () => context,
+    authenticateReplica: (credential) =>
+      credential === "replica" ? identity.owner : undefined,
+  });
+  await store.provisionConnection(identity.connectionId, {
+    sourceId: identity.sourceId,
+    methodId: identity.methodId,
+  });
+  const bytes = new Uint8Array([1, 2, 3]);
+  const hash = `sha256:${sha256(bytes).slice(2)}`;
+  const blob = {
+    blobId: hash,
+    sha256: hash,
+    sizeBytes: bytes.length,
+    mimeType: "application/octet-stream",
+  };
+  const stagingId = await store.stageBlob(
+    blob,
+    (async function* () {
+      yield bytes;
+    })(),
+  );
+  const record = {
+    ...upsert("preview", 3),
+    data: { id: "same-key", blob_ref: { blob_id: hash } },
+    blobs: [blob],
+  };
+  await store.stagePending({
+    id: "preview",
+    credential: "replica",
+    envelope: envelope([
+      registration,
+      {
+        ...identity,
+        kind: "blob-claim",
+        revision: { counter: 2, writerId: "device-a", operationId: "claim" },
+        blob,
+      },
+      record,
+    ]),
+    blobs: [{ stagingId, descriptor: blob }],
+  });
+  expect(
+    Buffer.concat(
+      await Array.fromAsync(store.readBlob(hash, { reader: "owner" })),
+    ),
+  ).toEqual(Buffer.from(bytes));
+  expect(
+    adapter.db
+      .prepare("SELECT count(*) n FROM kv WHERE key LIKE 'preview-blob-refs/%'")
+      .get(),
+  ).toEqual({ n: 0 });
+  expect(
+    adapter.db
+      .prepare(
+        "SELECT count(*) n FROM typed_rows WHERE namespace='preview' AND blob_id=?",
+      )
+      .get(hash),
+  ).toEqual({ n: 1 });
+  adapter.reopen();
+  expect(
+    Buffer.concat(
+      await Array.fromAsync(store.readBlob(hash, { reader: "owner" })),
+    ),
+  ).toEqual(Buffer.from(bytes));
+  await store.quarantinePending({
+    id: "preview",
+    credential: "replica",
+    reason: "withdraw",
+  });
+  await expect(
+    Array.fromAsync(store.readBlob(hash, { reader: "owner" })),
+  ).rejects.toThrow("missing committed blob");
+  expect(
+    adapter.db
+      .prepare(
+        "SELECT count(*) n FROM typed_rows WHERE namespace='preview' AND blob_id=?",
+      )
+      .get(hash),
+  ).toEqual({ n: 0 });
+});
+it.each([false, true])(
+  "ignores overinclusive preview candidates after withdrawal=%s",
+  async (withdraw) => {
+    const adapter = sqlitePort(true);
+    const indexFault: { candidate?: { key: string; value: string } } = {};
+    const persistence: LiteCanonicalPersistence = {
+      ...adapter.port,
+      transaction: (run) =>
+        adapter.port.transaction((tx) =>
+          run({
+            ...tx,
+            blobRows: async (namespace, blobId, prefix, after) =>
+              namespace === "preview" && indexFault.candidate
+                ? after === undefined
+                  ? {
+                      entries: [{ key: "preview/rows/", value: "{}" }],
+                      after: "preview/rows/",
+                    }
+                  : { entries: [indexFault.candidate] }
+                : tx.blobRows!(namespace, blobId, prefix, after),
+          }),
+        ),
+    };
+    const store = createLiteCanonicalStore({
+      persistence,
+      enabled: true,
+      context: () => context,
+      authenticateReplica: (credential) =>
+        credential === "replica" ? identity.owner : undefined,
+    });
+    await store.provisionConnection(identity.connectionId, {
+      sourceId: identity.sourceId,
+      methodId: identity.methodId,
+    });
+    const blobs = [];
+    for (const bytes of [new Uint8Array([1]), new Uint8Array([2])]) {
+      const hash = `sha256:${sha256(bytes).slice(2)}`;
+      const descriptor = {
+        blobId: hash,
+        sha256: hash,
+        sizeBytes: bytes.length,
+        mimeType: "application/octet-stream",
+      };
+      const stagingId = await store.stageBlob(
+        descriptor,
+        (async function* () {
+          yield bytes;
+        })(),
+      );
+      blobs.push({ stagingId, descriptor });
+    }
+    const claim = (blob: (typeof blobs)[number]) => ({
+      ...identity,
+      kind: "blob-claim" as const,
+      revision: {
+        counter: 2,
+        writerId: "device-a",
+        operationId: blob.descriptor.blobId,
+      },
+      blob: blob.descriptor,
+    });
+    await store.import({
+      id: "unreferenced-bytes",
+      credential: "replica",
+      envelope: envelope([registration, claim(blobs[1])]),
+      blobs: [blobs[1]],
+    });
+    await store.stagePending({
+      id: "visible-preview",
+      credential: "replica",
+      envelope: envelope([
+        registration,
+        claim(blobs[0]),
+        {
+          ...upsert("preview", 3),
+          data: {
+            id: "same-key",
+            blob_ref: { blob_id: blobs[0].descriptor.blobId },
+          },
+          blobs: [blobs[0].descriptor],
+        },
+      ]),
+      blobs: [blobs[0]],
+    });
+    expect(
+      Buffer.concat(
+        await Array.fromAsync(
+          store.readBlob(blobs[0].descriptor.blobId, { reader: "owner" }),
+        ),
+      ),
+    ).toEqual(Buffer.from([1]));
+    indexFault.candidate = await adapter.port.transaction(
+      async (tx) => (await tx.scan("preview/rows/")).entries[0],
+    );
+    expect(indexFault.candidate).toBeDefined();
+    expect(
+      Buffer.concat(
+        await Array.fromAsync(
+          store.readBlob(blobs[0].descriptor.blobId, { reader: "owner" }),
+        ),
+      ),
+    ).toEqual(Buffer.from([1]));
+    if (withdraw)
+      await store.quarantinePending({
+        id: "visible-preview",
+        credential: "replica",
+        reason: "withdraw",
+      });
+    await expect(
+      Array.fromAsync(
+        store.readBlob(blobs[1].descriptor.blobId, { reader: "owner" }),
+      ),
+    ).rejects.toThrow("missing committed blob");
+  },
+);
+
 function memoryPort() {
   const disk = fakeCanonicalDisk();
   let current = createFakeCanonicalPersistence(disk);
@@ -387,6 +641,8 @@ const factories = {
   "Lite fake": (entries = context) => liteDevice(memoryPort, true, entries),
   "Lite SQLite port": (entries = context) =>
     liteDevice(sqlitePort, true, entries),
+  "Lite typed SQLite port": (entries = context) =>
+    liteDevice(() => sqlitePort(true), true, entries),
 };
 for (const [name, factory] of Object.entries(factories))
   describe(name, () => {

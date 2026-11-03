@@ -214,6 +214,12 @@ function trackViews(base: LiteCanonicalTransaction): LiteCanonicalTransaction {
       await base.delete(key);
     },
     scan: (prefix, after) => base.scan(prefix, after),
+    ...(base.blobRows
+      ? {
+          blobRows: (namespace, blobId, prefix, after) =>
+            base.blobRows!(namespace, blobId, prefix, after),
+        }
+      : {}),
     attachBlob: (stagingId, expected) => base.attachBlob(stagingId, expected),
     blob: (blobId) => base.blob(blobId),
   };
@@ -1499,14 +1505,14 @@ export function createLiteCanonicalStore(deps: {
       },
       put: async (key, value) => {
         if (!key.startsWith("rows/")) return;
-        const before = await tx.get(`preview/${key}`);
+        const before = tx.blobRows ? undefined : await tx.get(`preview/${key}`);
         await tx.put(`preview/${key}`, value);
-        await indexPreviewBlobRef(tx, key, before, value);
+        if (!tx.blobRows) await indexPreviewBlobRef(tx, key, before, value);
       },
       delete: async (key) => {
-        const before = await tx.get(`preview/${key}`);
+        const before = tx.blobRows ? undefined : await tx.get(`preview/${key}`);
         await tx.delete(`preview/${key}`);
-        await indexPreviewBlobRef(tx, key, before, undefined);
+        if (!tx.blobRows) await indexPreviewBlobRef(tx, key, before, undefined);
       },
       scan: (prefix, after) => mergedPage(tx, "pending-index/", prefix, after),
     };
@@ -1732,13 +1738,14 @@ export function createLiteCanonicalStore(deps: {
     // One-time upgrade belongs to an authenticated writer, never a record read.
     if (version === 2) {
       // Version 3 adds the visible blob-reference index over existing rows.
-      for await (const entry of scan(tx, "preview/rows/"))
-        await indexPreviewBlobRef(
-          tx,
-          entry.key.slice("preview/".length),
-          undefined,
-          entry.value,
-        );
+      if (!tx.blobRows)
+        for await (const entry of scan(tx, "preview/rows/"))
+          await indexPreviewBlobRef(
+            tx,
+            entry.key.slice("preview/".length),
+            undefined,
+            entry.value,
+          );
       await put(tx, "pending-index-version", PENDING_INDEX_VERSION);
       return;
     }
@@ -1786,7 +1793,11 @@ export function createLiteCanonicalStore(deps: {
       // Their confirmed bytes must remain readable with those rows.
       if (connection.status !== "active" && connection.status !== "held")
         continue;
-      for await (const rowEntry of scan(tx, `rows/${digest}/`)) {
+      const prefix = `rows/${digest}/`;
+      const candidates = tx.blobRows
+        ? blobCandidates(tx, "canonical", blobId, prefix)
+        : scan(tx, prefix);
+      for await (const rowEntry of candidates) {
         const row = JSON.parse(rowEntry.value) as PdppRecordRow;
         if (row.deleted) continue;
         const generation = await get<number>(
@@ -1799,6 +1810,45 @@ export function createLiteCanonicalStore(deps: {
         )?.blob_id;
         if (reference === blobId) return true;
       }
+    }
+    return false;
+  }
+  async function* blobCandidates(
+    tx: LiteCanonicalTransaction,
+    namespace: "canonical" | "preview",
+    blobId: string,
+    prefix: string,
+  ) {
+    let after: string | undefined;
+    do {
+      const page = await tx.blobRows!(namespace, blobId, prefix, after);
+      for (const candidate of page.entries) {
+        if (!candidate.key.startsWith(prefix)) continue;
+        const value = await tx.get(candidate.key);
+        if (value !== undefined) yield { key: candidate.key, value };
+      }
+      after = page.after;
+    } while (after !== undefined);
+  }
+  async function hasPreviewReference(
+    tx: LiteCanonicalTransaction,
+    blobId: string,
+  ) {
+    if (!tx.blobRows)
+      return any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`);
+    for await (const entry of blobCandidates(
+      tx,
+      "preview",
+      blobId,
+      "preview/rows/",
+    )) {
+      const row = JSON.parse(entry.value) as PdppRecordRow;
+      if (
+        !row.deleted &&
+        (row.data.blob_ref as { blob_id?: unknown } | undefined)?.blob_id ===
+          blobId
+      )
+        return true;
     }
     return false;
   }
@@ -1819,7 +1869,7 @@ export function createLiteCanonicalStore(deps: {
       visible = await hasCurrentConfirmedReference(tx, blobId, deps.context());
       if (previewReader) {
         await readView(tx, options);
-        visible ||= await any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`);
+        visible ||= await hasPreviewReference(tx, blobId);
       }
     } else if (pendingBytes && previewReader) {
       // Pending bytes need a live reference this reader sees, and an active
@@ -1827,7 +1877,7 @@ export function createLiteCanonicalStore(deps: {
       // the bytes; either can later be withdrawn independently.
       await readView(tx, options);
       visible =
-        (await any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`)) &&
+        (await hasPreviewReference(tx, blobId)) &&
         (await any(tx, `pending-blob-active/${keyDigest(blobId)}/`));
     }
     return {

@@ -89,7 +89,7 @@ it("binds a manifest to its owner, writer scope and version, and its fragments t
   expect(manifest).toMatchObject({ scope, version: 2 });
   expect(replicaManifestKey(scope, 2)).toBe(`${scope}/2`);
   expect(replicaFragmentKey(scope, parts[0]!.digest)).toBe(
-    `${scope}/fragments/${parts[0]!.digest.slice(7)}`,
+    `${scope}/fragments-${parts[0]!.digest.slice(7)}`,
   );
   expect(replicaWriterOf(scope)).toBe(writer);
   expect(replicaWriterOf(`${scope}.0`)).toBeUndefined();

@@ -24,6 +24,19 @@ export interface LiteCanonicalTransaction {
   delete(key: string): Promise<void>;
   /** Exclusive bytewise key cursor; snapshot stable for this transaction. */
   scan(prefix: string, after?: string): Promise<LiteStoragePage>;
+  /**
+   * Complete indexed candidates for current canonical/preview row keys in this
+   * transaction. Use the scan ordering, exclusive cursor and page byte bounds;
+   * an oversized entry throws. Results may be overinclusive. The consumer reads
+   * each key again and checks its current row before granting visibility.
+   * This query never grants access, and must not omit a matching row.
+   */
+  blobRows?(
+    namespace: "canonical" | "preview",
+    blobId: string,
+    prefix: string,
+    after?: string,
+  ): Promise<LiteStoragePage>;
   /** Verify staged length/hash/MIME and publish its immutable reference in THIS transaction. */
   attachBlob(
     stagingId: LiteStagingId,

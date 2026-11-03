@@ -83,10 +83,16 @@ export interface SqliteLiteReplicaPersistence {
 
 export function createSqliteLiteReplicaPersistence(
   path = ":memory:",
+  typed = false,
 ): SqliteLiteReplicaPersistence {
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
   db.exec(SCHEMA);
+  if (typed)
+    db.exec(
+      "CREATE TABLE IF NOT EXISTS lite_rows (key TEXT PRIMARY KEY, namespace TEXT NOT NULL, blob_id TEXT, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS lite_rows_blob ON lite_rows(namespace,blob_id,key)",
+    );
+  const rowKey = (key: string) => typed && /^(preview\/)?rows\//.test(key);
   const staged = new Map<string, Buffer>();
   const stagedBlobs = new Map<
     string,
@@ -113,14 +119,14 @@ export function createSqliteLiteReplicaPersistence(
           get: async (text, params) => {
             live();
             boundedSql(text, params);
-            const row = sync.get(text, params);
+            const row = await sync.get(text, params);
             boundedSql(text, params, row ? [row] : []);
             return row as never;
           },
           all: async (text, params) => {
             live();
             boundedSql(text, params);
-            const rows = sync.all(text, params);
+            const rows = await sync.all(text, params);
             boundedSql(text, params, rows);
             return rows as never;
           },
@@ -136,7 +142,9 @@ export function createSqliteLiteReplicaPersistence(
           async get(key) {
             live();
             const row = db
-              .prepare("SELECT value FROM lite_kv WHERE key=?")
+              .prepare(
+                `SELECT value FROM ${rowKey(key) ? "lite_rows" : "lite_kv"} WHERE key=?`,
+              )
               .get(key) as { value: string } | undefined;
             return row?.value;
           },
@@ -144,19 +152,36 @@ export function createSqliteLiteReplicaPersistence(
             live();
             if (Buffer.byteLength(value) > LITE_CANONICAL_MAX_VALUE_BYTES)
               throw new Error("native value exceeds 256 KiB");
-            db.prepare(
-              "INSERT INTO lite_kv (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            ).run(key, value);
+            if (rowKey(key)) {
+              const row = JSON.parse(value);
+              const blobId =
+                !row.deleted && typeof row.data?.blob_ref?.blob_id === "string"
+                  ? row.data.blob_ref.blob_id
+                  : null;
+              db.prepare(
+                "INSERT INTO lite_rows VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET namespace=excluded.namespace,blob_id=excluded.blob_id,value=excluded.value",
+              ).run(
+                key,
+                key.startsWith("preview/") ? "preview" : "canonical",
+                blobId,
+                value,
+              );
+            } else
+              db.prepare(
+                "INSERT INTO lite_kv (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+              ).run(key, value);
           },
           async delete(key) {
             live();
-            db.prepare("DELETE FROM lite_kv WHERE key=?").run(key);
+            db.prepare(
+              `DELETE FROM ${rowKey(key) ? "lite_rows" : "lite_kv"} WHERE key=?`,
+            ).run(key);
           },
           async scan(prefix, after) {
             live();
             const rows = db
               .prepare(
-                "SELECT key,value FROM lite_kv WHERE substr(key,1,?)=? AND key>? ORDER BY key LIMIT 101",
+                `SELECT key,value FROM (${typed ? "SELECT key,value FROM lite_kv UNION ALL SELECT key,value FROM lite_rows" : "SELECT key,value FROM lite_kv"}) WHERE substr(key,1,?)=? AND key>? ORDER BY key LIMIT 101`,
               )
               .all(prefix.length, prefix, after ?? "") as {
               key: string;
@@ -177,6 +202,44 @@ export function createSqliteLiteReplicaPersistence(
                 : {}),
             };
           },
+          ...(typed
+            ? {
+                async blobRows(
+                  namespace: "canonical" | "preview",
+                  blobId: string,
+                  prefix: string,
+                  after?: string,
+                ) {
+                  live();
+                  const rows = db
+                    .prepare(
+                      "SELECT key,value FROM lite_rows WHERE namespace=? AND blob_id=? AND substr(key,1,?)=? AND key>? ORDER BY key LIMIT 101",
+                    )
+                    .all(
+                      namespace,
+                      blobId,
+                      prefix.length,
+                      prefix,
+                      after ?? "",
+                    ) as { key: string; value: string }[];
+                  const entries: { key: string; value: string }[] = [];
+                  let size = 0;
+                  for (const row of rows) {
+                    const bytes = Buffer.byteLength(row.value);
+                    if (entries.length === 100 || size + bytes > 512 * 1024)
+                      break;
+                    entries.push(row);
+                    size += bytes;
+                  }
+                  return {
+                    entries,
+                    ...(entries.length < rows.length
+                      ? { after: entries.at(-1)!.key }
+                      : {}),
+                  };
+                },
+              }
+            : {}),
           async attachBlob(id, expected) {
             live();
             const value = stagedBlobs.get(id);

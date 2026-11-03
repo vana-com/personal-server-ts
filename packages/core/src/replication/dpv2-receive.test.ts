@@ -4,6 +4,7 @@ import { bytesToHex } from "viem";
 import { deriveScopeKey } from "@opendatalabs/vana-sdk/browser";
 import { readBoundedResponse, type ByteBudget } from "../additions/budget.js";
 import type { StorageAdapter } from "../storage/adapters/interface.js";
+import { createSdkStorageAdapter } from "../storage/adapters/sdk.js";
 import { createVanaSyncStorageAdapter } from "../storage/adapters/vana.js";
 import { ServerConfigSchema } from "../schemas/server-config.js";
 import { createDpv2ReplicaTransport, ReplicaObjectRefused } from "./dpv2.js";
@@ -12,6 +13,8 @@ import {
   fromBase64,
   REPLICA_FRAGMENT_OVERHEAD_BYTES,
   replicaFragmentKey,
+  replicaLegacyFragmentKey,
+  replicaDigest,
   replicaFramedBytesBound,
   replicaManifestKey,
   replicaScope,
@@ -414,4 +417,269 @@ describe("framed bytes bound", () => {
         );
       }
     }, 60000);
+});
+
+describe("SDK-compatible fragment addresses", () => {
+  function fixture() {
+    const objects = new Map<string, Uint8Array>();
+    const reads: string[] = [],
+      writes: string[] = [];
+    const failures = new Map<string, number | Error>();
+    const vana = createVanaSyncStorageAdapter({
+      config: ServerConfigSchema.parse({
+        storage: {
+          config: { vana: { apiUrl: "https://storage.test.invalid" } },
+        },
+        gateway: { chainId: 14800 },
+      }),
+      serverOwner: owner,
+      serverAccount: {
+        address: owner,
+        signMessage: async () => "0x12" as const,
+      },
+      reads: "public",
+    });
+    // Exercise the real SDK adapter's unchanged filename forwarding.
+    // This provider enforces the supplied SDK filename contract, not a
+    // claim that the installed SDK or a live service was exercised.
+    const sdk = createSdkStorageAdapter(
+      {
+        async upload(blob, filename) {
+          const parts = filename?.split("/") ?? [];
+          if (
+            parts.length !== 2 ||
+            parts.some((p) => !p || p === "." || p === "..")
+          )
+            throw new Error("INVALID_FILENAME");
+          writes.push(filename!);
+          const url = vana.urlForKey(filename!);
+          objects.set(url, new Uint8Array(await blob.arrayBuffer()));
+          return { url };
+        },
+        async download() {
+          throw new Error("unbounded SDK download forbidden");
+        },
+        async delete() {
+          return false;
+        },
+      },
+      { urlForKey: (key) => vana.urlForKey(key) },
+    );
+    vi.stubGlobal("fetch", async (input: string | URL | Request) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      reads.push(url);
+      const failure = failures.get(url);
+      if (failure instanceof Error) throw failure;
+      if (failure) return new Response(null, { status: failure });
+      const bytes = objects.get(url);
+      return bytes
+        ? new Response(new Blob([Uint8Array.from(bytes).buffer]))
+        : new Response(null, { status: 404 });
+    });
+    const port = createDpv2ReplicaTransport({
+      owner,
+      masterKey: new Uint8Array(32).fill(5),
+      storage: { ...sdk, downloadBounded: vana.downloadBounded.bind(vana) },
+      gateway: { registerDataPoint: async () => ({}) as never },
+      feed: {
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      } as never,
+      signer: { signAddData: async () => "0x12" },
+      evidence: async () => ({ head: null, chain: null, pending: false }),
+    });
+    return {
+      port,
+      objects,
+      reads,
+      writes,
+      failures,
+      url: (key: string) => vana.urlForKey(key),
+    };
+  }
+
+  it("uploads, gets and probes the same two-segment SDK address", async () => {
+    const f = fixture(),
+      bytes = new Uint8Array([1, 2, 3]);
+    const digest = replicaDigest(bytes),
+      key = replicaFragmentKey(scope, digest);
+    await f.port.putFragment({ scope, digest, encrypted: bytes });
+    expect(f.writes).toEqual([key]);
+    expect(key.split("/")).toEqual([scope, "fragments-" + digest.slice(7)]);
+    expect(key).not.toBe(replicaManifestKey(scope, 1));
+    await expect(
+      f.port.getFragment(scope, digest, { maxBytes: 3 }),
+    ).resolves.toEqual(bytes);
+    await expect(f.port.hasFragment(scope, digest)).resolves.toBe(true);
+    expect(f.reads).toEqual([f.url(key), f.url(key)]);
+  });
+
+  it("passes the fragment address through the installed Vana SDK upload validator", async () => {
+    let signCalls = 0;
+    const requests: {
+      method: string;
+      pathname: string;
+      authorization: boolean;
+    }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          input instanceof Request
+            ? input.url
+            : input instanceof URL
+              ? input.href
+              : input;
+        requests.push({
+          method: init?.method ?? "GET",
+          pathname: new URL(url).pathname,
+          authorization: new Headers(init?.headers).has("authorization"),
+        });
+        return new Response(
+          JSON.stringify({ url: "https://storage.test.invalid/uploaded" }),
+          { status: 201, headers: { "content-type": "application/json" } },
+        );
+      },
+    );
+    const storage = createVanaSyncStorageAdapter({
+      config: ServerConfigSchema.parse({
+        storage: {
+          config: { vana: { apiUrl: "https://storage.test.invalid" } },
+        },
+        gateway: { chainId: 14800 },
+      }),
+      serverOwner: owner,
+      serverAccount: {
+        address: owner,
+        signMessage: async () => {
+          signCalls++;
+          return `0x${"ab".repeat(65)}` as const;
+        },
+      },
+    });
+    const digest = `sha256:${"b".repeat(64)}`;
+    const key = replicaFragmentKey(scope, digest);
+
+    await expect(storage.upload(key, new Uint8Array([1, 2, 3]))).resolves.toBe(
+      "https://storage.test.invalid/uploaded",
+    );
+    expect(signCalls).toBe(1);
+    expect(requests).toEqual([
+      {
+        method: "PUT",
+        pathname: `/v1/chains/14800/blobs/${owner}/${key}`,
+        authorization: true,
+      },
+    ]);
+  });
+
+  for (const status of [404, 410])
+    it(`reads and probes historical bytes only after new-address ${status}`, async () => {
+      const f = fixture(),
+        plain = new Uint8Array([7, 8, 9]);
+      const bytes = await f.port.encrypt(scope, plain),
+        digest = replicaDigest(bytes);
+      const current = f.url(replicaFragmentKey(scope, digest));
+      const legacy = f.url(replicaLegacyFragmentKey(scope, digest));
+      f.failures.set(current, status);
+      f.objects.set(legacy, bytes);
+      const got = await f.port.getFragment(scope, digest, {
+        maxBytes: bytes.length,
+      });
+      expect(replicaDigest(got)).toBe(digest);
+      await expect(f.port.decrypt(scope, got)).resolves.toEqual(plain);
+      await expect(f.port.hasFragment(scope, digest)).resolves.toBe(true);
+      expect(f.reads).toEqual([current, legacy, current, legacy]);
+      expect(f.writes).toEqual([]);
+    });
+
+  it("returns absent only after both addresses are definitively absent", async () => {
+    const f = fixture(),
+      digest = "sha256:" + "0".repeat(64);
+    await expect(f.port.hasFragment(scope, digest)).resolves.toBe(false);
+    expect(f.reads).toEqual([
+      f.url(replicaFragmentKey(scope, digest)),
+      f.url(replicaLegacyFragmentKey(scope, digest)),
+    ]);
+  });
+
+  for (const failure of [401, 403, 500, new Error("connection reset")])
+    it(`does not fall back on current-address ${String(failure)}`, async () => {
+      const f = fixture(),
+        bytes = new Uint8Array([1]),
+        digest = replicaDigest(bytes);
+      const current = f.url(replicaFragmentKey(scope, digest));
+      f.objects.set(f.url(replicaLegacyFragmentKey(scope, digest)), bytes);
+      f.failures.set(current, failure);
+      await expect(
+        f.port.getFragment(scope, digest, { maxBytes: 1 }),
+      ).rejects.toBeDefined();
+      await expect(f.port.hasFragment(scope, digest)).rejects.toBeDefined();
+      expect(f.reads).toEqual([current, current]);
+    });
+
+  it("never replaces corrupt or oversized current bytes with valid legacy bytes", async () => {
+    const f = fixture(),
+      plain = new Uint8Array([4, 5]);
+    const good = await f.port.encrypt(scope, plain),
+      digest = replicaDigest(good);
+    const current = f.url(replicaFragmentKey(scope, digest));
+    f.objects.set(current, new Uint8Array([0, 1, 2]));
+    f.objects.set(f.url(replicaLegacyFragmentKey(scope, digest)), good);
+    const got = await f.port.getFragment(scope, digest, {
+      maxBytes: good.length,
+    });
+    // Digest verification remains the receiver's responsibility; the carrier
+    // must not try a different address after bad bytes have been returned.
+    expect(replicaDigest(got)).not.toBe(digest);
+    await expect(f.port.decrypt(scope, got)).rejects.toBeDefined();
+    await expect(
+      f.port.getFragment(scope, digest, { maxBytes: 2 }),
+    ).rejects.toEqual(new ReplicaObjectRefused("oversize"));
+    await expect(f.port.hasFragment(scope, digest)).resolves.toBe(true);
+    expect(f.reads).toEqual([current, current, current]);
+  });
+
+  it("honors cancellation between new-address absence and legacy fallback", async () => {
+    const f = fixture(),
+      digest = "sha256:" + "0".repeat(64);
+    const current = f.url(replicaFragmentKey(scope, digest));
+    const controller = new AbortController(),
+      reads: string[] = [];
+    vi.stubGlobal("fetch", async (input: string | URL | Request) => {
+      reads.push(
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+      );
+      controller.abort(new Error("cancelled before legacy"));
+      return new Response(null, { status: 404 });
+    });
+    await expect(
+      f.port.getFragment(scope, digest, {
+        maxBytes: 1,
+        signal: controller.signal,
+      }),
+    ).rejects.toBeDefined();
+    expect(reads).toEqual([current]);
+  });
+
+  it("does not retry legacy reads or hide a legacy authentication failure", async () => {
+    const f = fixture(),
+      digest = "sha256:" + "0".repeat(64);
+    const current = f.url(replicaFragmentKey(scope, digest));
+    const legacy = f.url(replicaLegacyFragmentKey(scope, digest));
+    f.failures.set(legacy, 403);
+    await expect(
+      f.port.getFragment(scope, digest, { maxBytes: 1 }),
+    ).rejects.toBeDefined();
+    await expect(f.port.hasFragment(scope, digest)).rejects.toBeDefined();
+    expect(f.reads).toEqual([current, legacy, current, legacy]);
+  });
 });
