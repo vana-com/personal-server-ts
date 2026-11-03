@@ -3217,6 +3217,13 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           cycle: false,
         },
         {
+          cause: "current_node_not_stored",
+          tip: "missing",
+          parent: null,
+          count: 0,
+          cycle: false,
+        },
+        {
           cause: "parent_not_stored",
           tip: "n2",
           parent: "missing",
@@ -3235,13 +3242,17 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         ({ cause, tip, parent, count, cycle }) => {
           const records: PdppRecord[] = [
             conversation("c1", count, tip),
-            message("c1", "n1", cycle ? "n2" : null, "first"),
-            message("c1", "n2", parent, "second"),
+            ...(count === 0
+              ? []
+              : [
+                  message("c1", "n1", cycle ? "n2" : null, "first"),
+                  message("c1", "n2", parent, "second"),
+                ]),
           ];
           const result = projected(project(records));
-          if (cycle) {
+          if (cycle || count === 0) {
             expect(result.payload).toMatchObject({
-              conversations: [{ message_count: 2 }],
+              conversations: [{ message_count: count }],
             });
           } else {
             expect(result.payload).toMatchObject({
