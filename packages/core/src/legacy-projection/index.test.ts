@@ -2563,7 +2563,11 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     });
 
     describe("message record ids (ChatGPT 0.3.0 names a message <conversation_id>:<node_id>)", () => {
-      const conversation = (id: string, count: number, tip = "n2") => ({
+      const conversation = (
+        id: string,
+        count: number,
+        tip: string | null = "n2",
+      ) => ({
         stream: "conversations",
         data: {
           id,
@@ -2705,18 +2709,18 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         });
 
         it.each([undefined, null, "false", true])(
-          "requires strictly false rather than %s for retained evidence",
+          "uses the walked branch rather than the stored %s flag for retained evidence",
           (flag) => {
             const row = retained("c1", "other", { on_current_branch: flag });
             // A true row is represented on the current chain, not retained.
             const parents =
               flag === true
                 ? [conversation("c1", 1, "other")]
-                : [conversation("c1", 0, "")];
+                : [conversation("c1", 0, null)];
             const result = projected(project([...parents, retained(), row]));
             expect(
               result.retainedChatgptMessages?.map((r) => r.message.id),
-            ).toEqual(["retired"]);
+            ).toEqual(flag === true ? ["retired"] : ["retired", "other"]);
             if (flag === true) {
               expect(result.payload).toMatchObject({
                 conversations: [
@@ -2822,7 +2826,11 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                   retained("c1", "retired", overrides),
                 ),
               ]).map((r) => r.message.id),
-            ).toEqual(["control"]);
+            ).toEqual(
+              Object.hasOwn(overrides, "on_current_branch")
+                ? ["control", "retired"]
+                : ["control"],
+            );
           });
         });
 
@@ -3202,28 +3210,31 @@ describe("projectPdppRecordsToLegacyPayload", () => {
 
       it.each([
         {
-          cause: "missing_current_node",
+          cause: "current_node_not_stored",
           tip: "missing",
           parent: null,
+          count: 2,
           cycle: false,
         },
         {
-          cause: "missing_parent",
+          cause: "parent_not_stored",
           tip: "n2",
           parent: "missing",
+          count: 3,
           cycle: false,
         },
         {
           cause: "cycle",
           tip: "n2",
           parent: "n1",
+          count: 2,
           cycle: true,
         },
       ])(
         "falls back to stored flags and diagnoses $cause",
-        ({ cause, tip, parent, cycle }) => {
+        ({ cause, tip, parent, count, cycle }) => {
           const records: PdppRecord[] = [
-            conversation("c1", 2, tip),
+            conversation("c1", count, tip),
             message("c1", "n1", cycle ? "n2" : null, "first"),
             message("c1", "n2", parent, "second"),
           ];
@@ -3267,6 +3278,39 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         });
       });
 
+      it("accepts the omitted original parent when the expected count closes at that boundary", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n2"),
+            message("c1", "n1", "filtered-root", "retained root"),
+            message("c1", "n2", "n1", "tip"),
+          ]),
+        );
+        expect(result.diagnostics).toBeUndefined();
+        expect(result.payload).toMatchObject({
+          conversations: [
+            { message_count: 2, messages: [{ id: "n1" }, { id: "n2" }] },
+          ],
+        });
+      });
+
+      it("falls back when count is reached while another parent remains stored", () => {
+        const result = projected(
+          project([
+            conversation("c1", 1, "n2"),
+            message("c1", "n1", null, "root"),
+            message("c1", "n2", "n1", "tip"),
+          ]),
+        );
+        expect(result.diagnostics).toContainEqual({
+          kind: "branch_walk_fallback",
+          scope: "chatgpt.conversations",
+          stream: "conversations",
+          count: 1,
+          reasons: ["count_reached_parent_stored"],
+        });
+      });
+
       it("still projects a conversation that holds only old bare-id rows", () => {
         const result = projected(
           project([
@@ -3306,6 +3350,13 @@ describe("projectPdppRecordsToLegacyPayload", () => {
               payload: { conversations: [], total: 0 },
               diagnostics: [
                 {
+                  kind: "branch_walk_fallback",
+                  scope: "chatgpt.conversations",
+                  stream: "conversations",
+                  count: 1,
+                  reasons: ["parent_not_stored"],
+                },
+                {
                   kind: "records_dropped",
                   scope: "chatgpt.conversations",
                   stream: "conversations",
@@ -3330,6 +3381,13 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             ok: true,
             payload: { conversations: [], total: 0 },
             diagnostics: [
+              {
+                kind: "branch_walk_fallback",
+                scope: "chatgpt.conversations",
+                stream: "conversations",
+                count: 1,
+                reasons: ["current_node_not_stored"],
+              },
               {
                 kind: "records_dropped",
                 scope: "chatgpt.conversations",
@@ -3600,6 +3658,13 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         payload: { conversations: [], total: 0 },
         diagnostics: [
           {
+            kind: "branch_walk_fallback",
+            scope: "chatgpt.conversations",
+            stream: "conversations",
+            count: 1,
+            reasons: ["current_node_not_stored"],
+          },
+          {
             kind: "records_dropped",
             stream: "conversations",
             count: 1,
@@ -3659,6 +3724,13 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         payload: { conversations: [], total: 0 },
         diagnostics: [
           {
+            kind: "branch_walk_fallback",
+            scope: "chatgpt.conversations",
+            stream: "conversations",
+            count: 1,
+            reasons: ["parent_not_stored"],
+          },
+          {
             kind: "records_dropped",
             stream: "conversations",
             count: 1,
@@ -3708,6 +3780,13 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       expect(conversations[0].messages).toHaveLength(3);
       expect(result.payload.total).toBe(1);
       expect(result.diagnostics).toEqual([
+        {
+          kind: "branch_walk_fallback",
+          scope: "chatgpt.conversations",
+          stream: "conversations",
+          count: 1,
+          reasons: ["current_node_not_stored"],
+        },
         {
           kind: "records_dropped",
           scope: "chatgpt.conversations",
