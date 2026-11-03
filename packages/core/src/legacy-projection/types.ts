@@ -86,7 +86,9 @@ export interface ProjectionOmission {
  * `records_dropped`, `records_partial` and `stream_missing` do not: the
  * payload is served without the named rows (`records_dropped`, `count` is
  * distinct source rows of `stream`), or with rows the source says are short
- * of detail (`records_partial`), and the diagnostic says how many.
+ * of detail (`records_partial`). `branch_walk_fallback` reports conversations
+ * whose stored flags were used after an invalid parent walk; it does not mean
+ * that a row was dropped or make the scope incomplete.
  */
 export type ProjectionDiagnostic =
   | {
@@ -108,6 +110,13 @@ export type ProjectionDiagnostic =
       reasons: string[];
       scope: string;
       stream: string;
+    }
+  | {
+      count: number;
+      kind: "branch_walk_fallback";
+      reasons: string[];
+      scope: string;
+      stream: "conversations";
     }
   | { kind: "stream_missing"; scope: string; stream: string };
 export interface ProjectionErr {
