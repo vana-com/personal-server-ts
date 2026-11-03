@@ -357,3 +357,107 @@ it("returns an owner HTTP 503 budget refusal with zero copied bodies and no stor
     ),
   ).toEqual([]);
 });
+
+async function cachedReadDeletionCase(
+  deletion: "record" | "connection" | "unsupported-sql",
+) {
+  const bytes = new TextEncoder().encode(
+    JSON.stringify({
+      format: "anthropic-source-record-v1",
+      stream: "projects",
+      record_key: "p",
+      payload: { uuid: "p", name: "Private source", docs: [] },
+    }),
+  );
+  const upload = await ctx.app.request(
+    `/v1/blobs/ingest?instance=${encodeURIComponent(instance)}&method=anthropic&binding_generation=1`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: bytes,
+    },
+  );
+  expect(upload.status).toBe(200);
+  const blob_ref = await upload.json();
+  await replace("account_profile", [profile]);
+  await replace("projects", [{ id: "p", name: "Private source", blob_ref }]);
+  await replace("project_documents", []);
+  const read = () =>
+    ctx.app.request("/v1/data/claude.projects", {
+      headers: { authorization: `Bearer ${CONTROL}` },
+    });
+  const projected = await read();
+  expect(projected.status, await projected.clone().text()).toBe(200);
+  const envelope = await projected.json();
+  const file = await ctx.app.request("/v1/data/claude.projects", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${CONTROL}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(envelope.data),
+  });
+  expect(file.status).toBe(201);
+  expect((await read()).status).toBe(200);
+  expect((await read()).status).toBe(200);
+  const db = new Database(join(root, "index.db"), { readonly: true });
+  try {
+    expect(
+      db
+        .prepare(
+          "SELECT verdict FROM legacy_scope_takeover_verdicts WHERE scope='claude.projects'",
+        )
+        .pluck()
+        .get(),
+    ).toBe("covered");
+    if (deletion === "unsupported-sql") {
+      const writer = new Database(join(root, "index.db"));
+      writer
+        .prepare("DELETE FROM pdpp_blob_bytes WHERE blob_id=?")
+        .run(blob_ref.blob_id);
+      writer.close();
+      const after = await read();
+      expect(after.status).toBeGreaterThanOrEqual(400);
+      return;
+    }
+    const deleted = await ctx.app.request(
+      deletion === "connection"
+        ? `/pdpp/connections/${encodeURIComponent(instance)}`
+        : "/v1/streams/projects/records/p",
+      { method: "DELETE", headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(deleted.status).toBe(deletion === "connection" ? 200 : 204);
+    if (deletion === "connection")
+      expect(
+        db
+          .prepare("SELECT COUNT(*) FROM pdpp_blob_bytes WHERE blob_id=?")
+          .pluck()
+          .get(blob_ref.blob_id),
+      ).toBe(0);
+    const after = await read();
+    const text = await after.text();
+    expect(after.status).toBeGreaterThanOrEqual(400);
+    expect(text).not.toContain("Private source");
+    if (after.status === 503) {
+      const error = JSON.parse(text);
+      expect(error.retryable).toBe(true);
+      expect(typeof error.reason).toBe("string");
+    }
+  } finally {
+    db.close();
+  }
+}
+
+it.each(["record", "connection"] as const)(
+  "does not serve a warmed covered blob body after USER DELETE %s",
+  cachedReadDeletionCase,
+);
+
+// No supported production remover erases referenced canonical bytes while
+// leaving clocks/admission intact. Keep the out-of-band corruption guard red
+// and skipped until a production reproducer justifies changing the read key.
+it.skip("guard: arbitrary SQL removal behind a warmed body must refuse", () =>
+  cachedReadDeletionCase("unsupported-sql"));

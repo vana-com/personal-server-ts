@@ -560,7 +560,7 @@ export function createPdppSyncImporter(options: {
  * store backends actually sort by; naming a declared field the store does not
  * order by would produce cursors that resume at the wrong place.
  */
-function toStreamDeclarations(
+export function toStreamDeclarations(
   snapshot: DeclarationSnapshot,
 ): StreamDeclaration[] {
   return snapshot.streams.map((stream) => ({
