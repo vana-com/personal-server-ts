@@ -1280,6 +1280,30 @@ describe("receipted ChatGPT conversation exclusions", () => {
       expect(verdict.excludedConversations).toBeUndefined();
     }
   });
+
+  it("does not let a gap receipt hide a canonical conversation mismatch", () => {
+    const verdict = compareLegacyCoverage(
+      { conversations: [{ id: "excluded", title: "legacy" }] },
+      { conversations: [{ id: "excluded", title: "canonical" }] },
+      {
+        scope: "chatgpt.conversations",
+        entityKeys: { "$.conversations": ["id"] },
+        chatgptCoverageGaps: [
+          {
+            conversationIdHash:
+              "cfa5ad96f5be4fc290f591b8afd957551315abbb0a68cdf7660849d8829d644f",
+            reason: "parent_not_stored/fallback_chain_incomplete",
+            declaredCount: 2,
+            walkedCount: 1,
+          },
+        ],
+      },
+    );
+
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("field_mismatch");
+    expect(verdict.excludedConversations).toBeUndefined();
+  });
 });
 
 describe("growth boundaries and independent coverage failures", () => {
