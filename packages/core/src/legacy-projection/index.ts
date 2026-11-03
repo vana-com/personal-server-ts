@@ -43,6 +43,8 @@ export type {
   ProjectionDiagnostic,
   ProjectionOmission,
   RetainedChatgptMessage,
+  ChatgptConversationCoverageGap,
+  ChatgptBranchWalkDiagnostic,
   ProjectionError,
   ProjectionResult,
   ProjectPdppRecordsOptions,

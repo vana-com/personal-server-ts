@@ -66,7 +66,38 @@ export interface RetainedChatgptMessage {
   };
 }
 
+/** Receipted exclusion of one conversation whose fallback branch was unusable. */
+export interface ChatgptConversationCoverageGap {
+  /** Full SHA-256 binds the receipt; reports display only the first 12 hex. */
+  conversationIdHash: string;
+  reason: string;
+  declaredCount: number;
+  walkedCount: number;
+}
+
+/** Takeover diagnostics show only the first 12 hex of a full internal receipt hash. */
+export type ChatgptConversationCoverageGapSummary = Omit<
+  ChatgptConversationCoverageGap,
+  "conversationIdHash"
+> & { conversationIdHash: string };
+
+/** Hash-only count disagreement when a complete parent walk is authoritative. */
+export interface ChatgptBranchWalkDiagnostic {
+  conversationIdHash: string;
+  reason: "declared_count_below_walked";
+  declaredCount: number;
+  walkedCount: number;
+}
+
+/** Public branch diagnostics show only the first 12 hex of the full receipt hash. */
+export type ChatgptBranchWalkDiagnosticSummary = Omit<
+  ChatgptBranchWalkDiagnostic,
+  "conversationIdHash"
+> & { conversationIdHash: string };
+
 export interface ProjectionOk {
+  chatgptCoverageGaps?: readonly ChatgptConversationCoverageGap[];
+  chatgptBranchDiagnostics?: readonly ChatgptBranchWalkDiagnostic[];
   retainedChatgptMessages?: readonly RetainedChatgptMessage[];
   diagnostics?: ProjectionDiagnostic[];
   projectionOmissions?: ProjectionOmission[];
