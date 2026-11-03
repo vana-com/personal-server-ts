@@ -305,7 +305,9 @@ async function fixture() {
     failRegistrationOnDownload,
     tombstone: (scope: string) =>
       register(scope, {
-        expectedVersion: "1",
+        expectedVersion: String(
+          BigInt(slots.get(scope)?.at(-1)?.expectedVersion ?? "0") + 1n,
+        ),
         dataHash:
           "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
         metadataHash:
@@ -507,3 +509,26 @@ it("reconstructs cold multi-scope history through the actual worker under invent
   expect(recovered).toMatchObject({ coverage: "complete", total: 30 });
   expect(recovered.days.map((day) => day.added)).toEqual([30, 0]);
 }, 30_000);
+
+it("returns verified cold history when portable publication is fenced without replacing its tombstone", async () => {
+  const f = await fixture();
+  await f.source("github.events", "1", { events: [{ id: "a" }] });
+  expect(await (await f.session()).summarize(f.query)).toMatchObject({
+    coverage: "complete",
+    total: 1,
+  });
+  f.tombstone("vana.system.additions");
+  f.blobs.delete("github.events/1");
+  const diagnostics = new DiagnosticsRecorder();
+  expect(
+    await (await f.session(undefined, diagnostics)).summarize(f.query),
+  ).toMatchObject({ coverage: "complete", total: 1 });
+  expect(f.slots.get("vana.system.additions")).toHaveLength(2);
+  expect(f.slots.get("vana.system.additions")?.at(-1)).toMatchObject({
+    expectedVersion: "2",
+    isTombstone: true,
+  });
+  expect(diagnostics.snapshot().recentEvents).toContainEqual(
+    expect.objectContaining({ detail: "additions:publication_blocked" }),
+  );
+});

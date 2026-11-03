@@ -87,6 +87,7 @@ export type AdditionsRecoveryCode =
   | "unsupported_source_data"
   | "replay_failed"
   | "checkpoint_search_exhausted"
+  | "publication_blocked"
   | "budget_exceeded"
   | "cancelled";
 export interface AdditionsRecoveryDiagnostic {
@@ -172,6 +173,7 @@ export interface DurableAdditionsService {
 class InaccessibleLedger extends Error {}
 class CheckpointSearchExceeded extends BudgetExceeded {}
 const CHECKPOINT_READ_LIMIT = 256;
+const INVENTORY_CONCURRENCY = 8;
 type CheckpointSearch = {
   reads: number;
   rejected: Map<string, "inaccessible" | "invalid">;
@@ -922,27 +924,33 @@ export function createDurableAdditions(
             checkpoint?: PromiseSettledResult<VersionInventory>;
           }
         >();
-        for (let offset = 0; offset < scopes.length; offset += 4) {
+        for (
+          let offset = 0;
+          offset < scopes.length;
+          offset += INVENTORY_CONCURRENCY
+        ) {
           const batch = await Promise.allSettled(
-            scopes.slice(offset, offset + 4).map(async (scope) => {
-              const source = await inventory.list(scope, budget.readOptions);
-              const checkpoint =
-                source.head && source.head.deletedAt === null
-                  ? await inventory
-                      .list(additionsLedgerScope(scope), budget.readOptions)
-                      .then(
-                        (value): PromiseSettledResult<VersionInventory> => ({
-                          status: "fulfilled",
-                          value,
-                        }),
-                        (reason): PromiseSettledResult<VersionInventory> => ({
-                          status: "rejected",
-                          reason,
-                        }),
-                      )
-                  : undefined;
-              return { scope, source, checkpoint };
-            }),
+            scopes
+              .slice(offset, offset + INVENTORY_CONCURRENCY)
+              .map(async (scope) => {
+                const source = await inventory.list(scope, budget.readOptions);
+                const checkpoint =
+                  source.head && source.head.deletedAt === null
+                    ? await inventory
+                        .list(additionsLedgerScope(scope), budget.readOptions)
+                        .then(
+                          (value): PromiseSettledResult<VersionInventory> => ({
+                            status: "fulfilled",
+                            value,
+                          }),
+                          (reason): PromiseSettledResult<VersionInventory> => ({
+                            status: "rejected",
+                            reason,
+                          }),
+                        )
+                    : undefined;
+                return { scope, source, checkpoint };
+              }),
           );
           // Settle every admitted request before propagating cancellation/failure.
           for (const item of batch) {
@@ -973,12 +981,18 @@ export function createDurableAdditions(
             coverage = result.coverage;
         }
         const pending = [...deferred];
-        for (let offset = 0; offset < pending.length; offset += 4) {
+        for (
+          let offset = 0;
+          offset < pending.length;
+          offset += INVENTORY_CONCURRENCY
+        ) {
           const batch = await Promise.allSettled(
-            pending.slice(offset, offset + 4).map(async ([scope, snapshot]) => {
-              const check = await inventory.list(scope, budget.readOptions);
-              if (!sameInventory(snapshot, check)) coverage = "behind";
-            }),
+            pending
+              .slice(offset, offset + INVENTORY_CONCURRENCY)
+              .map(async ([scope, snapshot]) => {
+                const check = await inventory.list(scope, budget.readOptions);
+                if (!sameInventory(snapshot, check)) coverage = "behind";
+              }),
           );
           for (const item of batch)
             if (item.status === "rejected") throw item.reason;
@@ -1040,8 +1054,23 @@ export function createDurableAdditions(
             );
             await publish(ADDITIONS_SUMMARY_SCOPE, { ...portable }, budget);
           }
-        } catch {
-          result.coverage = "behind";
+        } catch (error) {
+          if (
+            error instanceof NeedsFencedPublicationError &&
+            error.scope === ADDITIONS_SUMMARY_SCOPE
+          ) {
+            // The current source/checkpoint observations still prove this read.
+            // Do not cross the deletion fence merely to persist a derived cache.
+            try {
+              options.onRecoveryDiagnostic?.({
+                scope: ADDITIONS_SUMMARY_SCOPE,
+                version: "0",
+                code: "publication_blocked",
+              });
+            } catch {
+              /* Observation cannot alter recovery. */
+            }
+          } else result.coverage = "behind";
         }
       }
       try {

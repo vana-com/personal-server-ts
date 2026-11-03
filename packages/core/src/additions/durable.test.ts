@@ -1509,3 +1509,23 @@ it.each(["live", "deleted"] as const)(
     expect(await f.document(ADDITIONS_SUMMARY_SCOPE)).toEqual(portable);
   },
 );
+
+it("returns freshly verified history without crossing a deleted portable-summary publication", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  expect(await f.actor().summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 1,
+  });
+  await f.tombstone("2", ADDITIONS_SUMMARY_SCOPE);
+  const before = (await f.readRegistry())[ADDITIONS_SUMMARY_SCOPE];
+  await rm(f.blobPath(`${SOURCE}/1`));
+  const cold = await f.actor().summarize(QUERY);
+  expect(cold).toMatchObject({
+    coverage: "complete",
+    total: 1,
+    through: { [SOURCE]: "1" },
+  });
+  expect(cold.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
+  expect((await f.readRegistry())[ADDITIONS_SUMMARY_SCOPE]).toEqual(before);
+});
