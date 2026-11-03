@@ -1,4 +1,5 @@
 import {
+  AdditionsBudget,
   AdditionsBudgetExceeded,
   createDurableAdditions,
   createVersionInventoryClient,
@@ -34,29 +35,67 @@ const pending = new Map<
     resolve(value: unknown): void;
     reject(error: Error): void;
     budget?: ByteBudget;
+    reservation?: ReturnType<AdditionsBudget["reserve"]>;
   }
 >();
+let hostWork = Promise.resolve();
 function rpc(
   method: HostMethod,
   args: unknown[],
   budget?: ByteBudget,
 ): Promise<unknown> {
-  budget?.charge();
-  return new Promise((resolve, reject) => {
-    const id = ++sequence;
-    pending.set(id, { resolve, reject, budget });
-    worker.postMessage(
-      {
-        kind: "request",
-        id,
-        method,
-        args,
-        remaining: budget?.remaining ?? 0,
-        remainingMilliseconds: budget?.remainingMilliseconds,
-      },
-      additionsTransfers(args),
-    );
-  });
+  // Small inventory bodies can overlap only after their full host allowances
+  // are held in the shared budget. Other host work stays serial and sees the
+  // reduced allowance, never bytes already promised to an in-flight response.
+  const exchange = (
+    reservation?: ReturnType<AdditionsBudget["reserve"]>,
+    allowance?: number,
+  ) => {
+    try {
+      budget?.charge();
+    } catch (error) {
+      reservation?.settle(0);
+      return Promise.reject(error);
+    }
+    return new Promise((resolve, reject) => {
+      const id = ++sequence;
+      pending.set(id, { resolve, reject, budget, reservation });
+      try {
+        worker.postMessage(
+          {
+            kind: "request",
+            id,
+            method,
+            args,
+            remaining: allowance ?? budget?.remaining ?? 0,
+            remainingMilliseconds: budget?.remainingMilliseconds,
+          },
+          additionsTransfers(args),
+        );
+      } catch (error) {
+        pending.delete(id);
+        reservation?.settle(0);
+        reject(error);
+      }
+    });
+  };
+  if (method === "signRequest") return exchange();
+  if (method === "fetch" && budget instanceof AdditionsBudget) {
+    // Version pages contain at most 100 rows in this lane. Keep per-response
+    // work finite as well as aggregate work; leave room for JSON validation.
+    const allowance = Math.min(1024 * 1024, Math.floor(budget.remaining / 4));
+    if (allowance < 1)
+      return Promise.reject(
+        new AdditionsBudgetExceeded("No inventory allowance"),
+      );
+    return exchange(budget.reserve(allowance), allowance);
+  }
+  const result = hostWork.then(() => exchange());
+  hostWork = result.then(
+    () => {},
+    () => {},
+  );
+  return result;
 }
 function hex(bytes: Uint8Array) {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
@@ -74,39 +113,39 @@ function createService(init: AdditionsWorkerInit) {
     (await rpc(method, args, budget)) as Awaited<
       ReturnType<PsLiteAdditionsTransport[K]>
     >;
-  let activeBudget: ByteBudget | undefined;
-  const inventory = createVersionInventoryClient({
-    gatewayUrl: init.gatewayUrl,
-    ownerAddress: init.ownerAddress,
-    ownerSigner: {
-      signRequest: (params) => transport("signRequest", [params], activeBudget),
-    },
-    boundedOwnerSigner: (params) =>
-      transport("signRequest", [params], activeBudget),
-    fetch: async (input, request) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input.url;
-      const response = await transport(
-        "fetch",
-        [
-          {
-            url,
-            method: request?.method,
-            headers: [...new Headers(request?.headers)],
-          },
-        ],
-        activeBudget,
-      );
-      return new Response(new Uint8Array(response.body), {
-        status: response.status,
-        headers: response.headers,
-      });
-    },
-  });
+  const inventoryFor = (budget?: ByteBudget) =>
+    createVersionInventoryClient({
+      gatewayUrl: init.gatewayUrl,
+      ownerAddress: init.ownerAddress,
+      ownerSigner: {
+        signRequest: (params) => transport("signRequest", [params], budget),
+      },
+      boundedOwnerSigner: (params) =>
+        transport("signRequest", [params], budget),
+      fetch: async (input, request) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        const response = await transport(
+          "fetch",
+          [
+            {
+              url,
+              method: request?.method,
+              headers: [...new Headers(request?.headers)],
+            },
+          ],
+          budget,
+        );
+        return new Response(new Uint8Array(response.body), {
+          status: response.status,
+          headers: response.headers,
+        });
+      },
+    });
   const reconciledScopes = new Set<string>();
   async function reconcilePending(scope: string, budget: ByteBudget) {
     if (reconciledScopes.has(scope)) return null;
@@ -116,7 +155,7 @@ function createService(init: AdditionsWorkerInit) {
       return null;
     }
     let prior = pending;
-    let snapshot = await inventory.list(scope, {
+    let snapshot = await inventoryFor(budget).list(scope, {
       budget,
       signal: budget.signal,
     });
@@ -134,7 +173,7 @@ function createService(init: AdditionsWorkerInit) {
       // The owner retries the exact bytes and resolves the current registry head.
       const published = await transport("publish", [prior], budget);
       prior = { ...prior, expectedVersion: published.expectedVersion };
-      snapshot = await inventory.list(scope, {
+      snapshot = await inventoryFor(budget).list(scope, {
         budget,
         signal: budget.signal,
       });
@@ -186,7 +225,7 @@ function createService(init: AdditionsWorkerInit) {
     }
     // Other devices do not share our Web Lock. Recheck registration visibility
     // after authenticating bytes, including an unchanged but now failed intent.
-    const latest = await inventory.list(scope, {
+    const latest = await inventoryFor(budget).list(scope, {
       budget,
       signal: budget.signal,
     });
@@ -214,25 +253,20 @@ function createService(init: AdditionsWorkerInit) {
   }
   // Budget objects never cross structured clone; each RPC receives the current
   // remaining allowance and the host's session-wide cancellation signal.
-  const boundedInventory: typeof inventory = {
+  const boundedInventory: ReturnType<typeof createVersionInventoryClient> = {
     page: async (scope, options) => {
-      activeBudget = options?.budget;
-      return inventory.page(scope, options);
+      return inventoryFor(options?.budget).page(scope, options);
     },
     list: async (scope, options) => {
-      activeBudget = options?.budget;
       if (scope.startsWith("vana.system.") && options?.budget)
         await reconcilePending(scope, options.budget);
-      return inventory.list(scope, options);
+      return inventoryFor(options?.budget).list(scope, options);
     },
     listScopes: async (options) => {
-      activeBudget = options?.budget;
-      return inventory.listScopes(options);
+      return inventoryFor(options?.budget).listScopes(options);
     },
     head: (scope, signal) => {
-      // An unbudgeted read: do not charge it to an earlier call's budget.
-      activeBudget = undefined;
-      return inventory.head(scope, signal);
+      return inventoryFor().head(scope, signal);
     },
   };
   const reported = new Set<string>();
@@ -279,11 +313,10 @@ function createService(init: AdditionsWorkerInit) {
       },
       decrypt: decryptBoundedAdditions,
       async publish(scope, data, budget) {
-        activeBudget = budget;
         const prior = await reconcilePending(scope, budget);
         if (prior && JSON.stringify(prior.data) === JSON.stringify(data))
           return prior.proof;
-        const snapshot = await inventory.list(scope, {
+        const snapshot = await inventoryFor(budget).list(scope, {
           budget,
           signal: budget.signal,
         });
@@ -328,7 +361,8 @@ worker.onmessage = (event) => {
     const request = pending.get(message.id);
     pending.delete(message.id);
     try {
-      request?.budget?.recordSpent(message.spent);
+      if (request?.reservation) request.reservation.settle(message.spent);
+      else request?.budget?.recordSpent(message.spent);
       request?.budget?.charge();
       if (message.error)
         request?.reject(

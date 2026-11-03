@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createMessage, encrypt, enums } from "openpgp";
 import { DiagnosticsRecorder } from "./diagnostics.js";
 import { Worker } from "node:worker_threads";
+import { setTimeout as delay } from "node:timers/promises";
 import { build } from "esbuild";
 import { IDBFactory } from "fake-indexeddb";
 import { encodeAbiParameters, keccak256, stringToHex } from "viem";
@@ -96,6 +97,7 @@ async function fixture() {
     addedAt: string;
     isTombstone: boolean;
   };
+  let inventoryDelayMs = 0;
   const slots = new Map<string, Slot[]>();
   const blobs = new Map<string, Uint8Array>();
   const stall = new Set<string>();
@@ -196,6 +198,10 @@ async function fixture() {
       }
       const scope = url.searchParams.get("scope");
       if (scope !== null) {
+        if (inventoryDelayMs)
+          await delay(inventoryDelayMs, undefined, {
+            signal: init?.signal ?? undefined,
+          });
         const versions = slots.get(scope) ?? [];
         const limit = Number(url.searchParams.get("limit"));
         const remaining = versions.filter(
@@ -211,7 +217,10 @@ async function fixture() {
             ownerAddress: owner.address,
             scope,
             head: versions.length
-              ? { ...versions.at(-1), deletedAt: null }
+              ? {
+                  ...versions.at(-1),
+                  deletedAt: versions.at(-1)!.isTombstone ? collectedAt : null,
+                }
               : null,
             versions: page,
           },
@@ -294,6 +303,22 @@ async function fixture() {
     failedRegistrations,
     interruptRegistration,
     failRegistrationOnDownload,
+    tombstone: (scope: string) =>
+      register(scope, {
+        expectedVersion: String(
+          BigInt(slots.get(scope)?.at(-1)?.expectedVersion ?? "0") + 1n,
+        ),
+        dataHash:
+          "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+        metadataHash:
+          "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90",
+        status: "finalized",
+        addedAt: collectedAt,
+        isTombstone: true,
+      }),
+    delayInventory: (milliseconds: number) => {
+      inventoryDelayMs = milliseconds;
+    },
   };
 }
 
@@ -466,3 +491,44 @@ it.each(["before restart", "after checkpoint download"])(
   },
   60_000,
 );
+
+it("reconstructs cold multi-scope history through the actual worker under inventory latency", async () => {
+  const f = await fixture();
+  const scopes = Array.from({ length: 30 }, (_, i) => `notes.${i}`);
+  for (const scope of scopes)
+    await f.source(scope, "1", { records: [{ id: scope }] });
+  for (let i = 0; i < 44; i++) f.tombstone(`removed.${i}`);
+  expect(
+    await (await f.session(256 * 1024 * 1024)).summarize(f.query),
+  ).toMatchObject({ coverage: "complete", total: 30 });
+  for (const scope of scopes) f.blobs.delete(`${scope}/1`);
+  f.delayInventory(200);
+  const recovered = await (
+    await f.session(256 * 1024 * 1024, undefined, 13_000)
+  ).summarize(f.query);
+  expect(recovered).toMatchObject({ coverage: "complete", total: 30 });
+  expect(recovered.days.map((day) => day.added)).toEqual([30, 0]);
+}, 30_000);
+
+it("returns verified cold history when portable publication is fenced without replacing its tombstone", async () => {
+  const f = await fixture();
+  await f.source("github.events", "1", { events: [{ id: "a" }] });
+  expect(await (await f.session()).summarize(f.query)).toMatchObject({
+    coverage: "complete",
+    total: 1,
+  });
+  f.tombstone("vana.system.additions");
+  f.blobs.delete("github.events/1");
+  const diagnostics = new DiagnosticsRecorder();
+  expect(
+    await (await f.session(undefined, diagnostics)).summarize(f.query),
+  ).toMatchObject({ coverage: "complete", total: 1 });
+  expect(f.slots.get("vana.system.additions")).toHaveLength(2);
+  expect(f.slots.get("vana.system.additions")?.at(-1)).toMatchObject({
+    expectedVersion: "2",
+    isTombstone: true,
+  });
+  expect(diagnostics.snapshot().recentEvents).toContainEqual(
+    expect.objectContaining({ detail: "additions:publication_blocked" }),
+  );
+});
