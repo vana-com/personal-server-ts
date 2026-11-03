@@ -243,9 +243,9 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
       conversations: ids.map((id) => ({ id })),
     });
   }
-  async function tombstone(version: string) {
+  async function tombstone(version: string, scope = SOURCE) {
     await setSlot(
-      SOURCE,
+      scope,
       {
         expectedVersion: version,
         dataHash:
@@ -1417,85 +1417,95 @@ it("refuses unsupported durable-only cleanup and honors cancellation before ordi
   ]);
 });
 
-it("recovers retained history across 29 scopes inside one owner deadline", async () => {
-  const f = await fixture();
-  const scopes = Array.from(
-    { length: 29 },
-    (_, index) => `notes.${String(index).padStart(2, "0")}`,
-  );
-  for (const scope of scopes)
-    await f.put(scope, "1", T1, { records: [{ id: scope }] });
-  expect(await f.actor().summarize(QUERY)).toMatchObject({
-    coverage: "complete",
-    total: 29,
-  });
-  // A genuinely cold reader has no original bodies, local sidecars or cached ledgers.
-  for (const scope of scopes) await rm(f.blobPath(`${scope}/1`));
-  let elapsed = 0;
-  vi.spyOn(performance, "now").mockImplementation(() => elapsed);
-  async function network(milliseconds: number) {
-    const end = elapsed + milliseconds;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    elapsed = Math.max(elapsed, end);
-  }
-  let registry = await f.readRegistry();
-  const inventory: VersionInventoryClient = {
-    async list(scope) {
-      const snapshot = structuredClone(
-        registry[scope] ?? { head: null, versions: [] },
-      );
-      await network(1600);
-      return snapshot;
-    },
-    async listScopes() {
-      return Object.keys(registry).filter(
-        (scope) => !scope.startsWith("vana.system."),
-      );
-    },
-    async page() {
-      throw new Error("Completed inventory port only");
-    },
-    async head() {
-      throw new Error("Completed inventory port only");
-    },
-  };
-  let replaceDuringRead = false;
-  let replaced = false;
-  const actor = f.boundedActor({
-    beforeDownload: async (key) => {
-      await network(1900);
+it.each(["live", "deleted"] as const)(
+  "recovers live and retained deleted scopes and rejects a %s replacement",
+  async (replacement) => {
+    const f = await fixture();
+    const scopes = Array.from(
+      { length: 30 },
+      (_, index) => `notes.${String(index).padStart(2, "0")}`,
+    );
+    for (const scope of scopes)
+      await f.put(scope, "1", T1, { records: [{ id: scope }] });
+    const deleted = Array.from({ length: 44 }, (_, i) => `removed.${i}`);
+    for (const scope of deleted) await f.tombstone("1", scope);
+    expect(await f.actor().summarize(QUERY)).toMatchObject({
+      coverage: "complete",
+      total: 30,
+    });
+    // A genuinely cold reader has no original bodies, local sidecars or cached ledgers.
+    for (const scope of scopes) await rm(f.blobPath(`${scope}/1`));
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    async function network(milliseconds: number) {
+      const end = elapsed + milliseconds;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      elapsed = Math.max(elapsed, end);
+    }
+    let registry = await f.readRegistry();
+    const inventory: VersionInventoryClient = {
+      async list(scope) {
+        const snapshot = structuredClone(
+          registry[scope] ?? { head: null, versions: [] },
+        );
+        await network(1600);
+        return snapshot;
+      },
+      async listScopes() {
+        return Object.keys(registry).filter(
+          (scope) => !scope.startsWith("vana.system."),
+        );
+      },
+      async page() {
+        throw new Error("Completed inventory port only");
+      },
+      async head() {
+        throw new Error("Completed inventory port only");
+      },
+    };
+    let replaceDuringRead = false;
+    let replaced = false;
+    const actor = f.boundedActor({
+      beforeDownload: async (key) => {
+        await network(900);
 
-      if (
-        replaceDuringRead &&
-        !replaced &&
-        key === f.blobPath(`${additionsLedgerScope(scopes.at(-1)!)}/1`)
-      ) {
-        replaced = true;
-        await f.put(scopes[0]!, "1", T2, { records: [{ id: "replacement" }] });
-        registry = await f.readRegistry();
-      }
-    },
-    options: {
-      byteBudget: 256 * 1024 * 1024,
-      timeBudgetMs: 120_000,
-      inventory,
-    },
-  });
-  const result = await actor.service.summarize(QUERY);
-  expect(result).toMatchObject({ coverage: "complete", total: 29 });
-  expect(result.days.map((day) => day.added)).toEqual([29, 0, 0, 0]);
-  expect(result.through).toEqual(
-    Object.fromEntries(scopes.map((scope) => [scope, "1"])),
-  );
-  expect(elapsed).toBeLessThan(120_000);
-  const portable = await f.document(ADDITIONS_SUMMARY_SCOPE);
-  // A different device replaces an early source after its checkpoint was read.
-  // Batched final observations must still reject the obsolete evidence.
-  replaceDuringRead = true;
-  elapsed = 0;
-  expect(await actor.service.summarize(QUERY)).toMatchObject({
-    coverage: "behind",
-  });
-  expect(replaced).toBe(true);
-  expect(await f.document(ADDITIONS_SUMMARY_SCOPE)).toEqual(portable);
-});
+        if (
+          replaceDuringRead &&
+          !replaced &&
+          key === f.blobPath(`${additionsLedgerScope(scopes.at(-1)!)}/1`)
+        ) {
+          replaced = true;
+          await f.put(
+            replacement === "live" ? scopes[0]! : deleted[0]!,
+            replacement === "live" ? "1" : "2",
+            T2,
+            { records: [{ id: "replacement" }] },
+          );
+          registry = await f.readRegistry();
+        }
+      },
+      options: {
+        byteBudget: 256 * 1024 * 1024,
+        timeBudgetMs: 120_000,
+        inventory,
+      },
+    });
+    const result = await actor.service.summarize(QUERY);
+    expect(result).toMatchObject({ coverage: "complete", total: 30 });
+    expect(result.days.map((day) => day.added)).toEqual([30, 0, 0, 0]);
+    expect(result.through).toEqual(
+      Object.fromEntries([...scopes, ...deleted].map((scope) => [scope, "1"])),
+    );
+    expect(elapsed).toBeLessThan(120_000);
+    const portable = await f.document(ADDITIONS_SUMMARY_SCOPE);
+    // A different device replaces an early source after its checkpoint was read.
+    // Batched final observations must still reject the obsolete evidence.
+    replaceDuringRead = true;
+    elapsed = 0;
+    expect(await actor.service.summarize(QUERY)).toMatchObject({
+      coverage: "behind",
+    });
+    expect(replaced).toBe(true);
+    expect(await f.document(ADDITIONS_SUMMARY_SCOPE)).toEqual(portable);
+  },
+);

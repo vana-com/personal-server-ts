@@ -581,7 +581,7 @@ export function createDurableAdditions(
       source: VersionInventory;
       checkpoint?: PromiseSettledResult<VersionInventory>;
     },
-    deferUnchanged?: (snapshot: VersionInventory) => void,
+    deferVerification?: (snapshot: VersionInventory) => void,
   ): Promise<{
     ledger: ScopeFirstSeenLedger | null;
     through: string;
@@ -605,7 +605,10 @@ export function createDurableAdditions(
               settled(slot),
           )
         : null;
-      const check = await inventory.list(scope, budget.readOptions);
+      const check = deferVerification
+        ? snapshot
+        : await inventory.list(scope, budget.readOptions);
+      deferVerification?.(snapshot);
       return {
         ledger: null,
         inventory: fingerprintVersionInventory(snapshot),
@@ -839,11 +842,11 @@ export function createDurableAdditions(
     // together after all content reads. Never defer a changed prefix: it must
     // spend its reserved publication capacity before the next source unit.
     if (
-      deferUnchanged &&
+      deferVerification &&
       !checkpoint?.repairHead &&
       JSON.stringify(document) === JSON.stringify(existing)
     ) {
-      deferUnchanged(snapshot);
+      deferVerification(snapshot);
       return {
         ledger,
         through,
@@ -947,14 +950,14 @@ export function createDurableAdditions(
             snapshots.set(item.value.scope, item.value);
           }
         }
-        const unchanged = new Map<string, VersionInventory>();
+        const deferred = new Map<string, VersionInventory>();
         for (const scope of scopes) {
           const result = await recover(
             scope,
             budget,
             undefined,
             snapshots.get(scope),
-            (snapshot) => unchanged.set(scope, snapshot),
+            (snapshot) => deferred.set(scope, snapshot),
           );
           if (result.ledger)
             ledgers.push({
@@ -969,7 +972,7 @@ export function createDurableAdditions(
           )
             coverage = result.coverage;
         }
-        const pending = [...unchanged];
+        const pending = [...deferred];
         for (let offset = 0; offset < pending.length; offset += 4) {
           const batch = await Promise.allSettled(
             pending.slice(offset, offset + 4).map(async ([scope, snapshot]) => {

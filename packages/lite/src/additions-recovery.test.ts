@@ -217,7 +217,10 @@ async function fixture() {
             ownerAddress: owner.address,
             scope,
             head: versions.length
-              ? { ...versions.at(-1), deletedAt: null }
+              ? {
+                  ...versions.at(-1),
+                  deletedAt: versions.at(-1)!.isTombstone ? collectedAt : null,
+                }
               : null,
             versions: page,
           },
@@ -300,6 +303,17 @@ async function fixture() {
     failedRegistrations,
     interruptRegistration,
     failRegistrationOnDownload,
+    tombstone: (scope: string) =>
+      register(scope, {
+        expectedVersion: "1",
+        dataHash:
+          "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+        metadataHash:
+          "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90",
+        status: "finalized",
+        addedAt: collectedAt,
+        isTombstone: true,
+      }),
     delayInventory: (milliseconds: number) => {
       inventoryDelayMs = milliseconds;
     },
@@ -478,17 +492,18 @@ it.each(["before restart", "after checkpoint download"])(
 
 it("reconstructs cold multi-scope history through the actual worker under inventory latency", async () => {
   const f = await fixture();
-  const scopes = Array.from({ length: 29 }, (_, i) => `notes.${i}`);
+  const scopes = Array.from({ length: 30 }, (_, i) => `notes.${i}`);
   for (const scope of scopes)
     await f.source(scope, "1", { records: [{ id: scope }] });
+  for (let i = 0; i < 44; i++) f.tombstone(`removed.${i}`);
   expect(
     await (await f.session(256 * 1024 * 1024)).summarize(f.query),
-  ).toMatchObject({ coverage: "complete", total: 29 });
+  ).toMatchObject({ coverage: "complete", total: 30 });
   for (const scope of scopes) f.blobs.delete(`${scope}/1`);
   f.delayInventory(200);
   const recovered = await (
-    await f.session(256 * 1024 * 1024, undefined, 9000)
+    await f.session(256 * 1024 * 1024, undefined, 13_000)
   ).summarize(f.query);
-  expect(recovered).toMatchObject({ coverage: "complete", total: 29 });
-  expect(recovered.days.map((day) => day.added)).toEqual([29, 0]);
+  expect(recovered).toMatchObject({ coverage: "complete", total: 30 });
+  expect(recovered.days.map((day) => day.added)).toEqual([30, 0]);
 }, 30_000);
