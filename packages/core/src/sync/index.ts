@@ -58,6 +58,7 @@ export {
   createGatewayDeleteDataPort,
   type GatewayDeleteDataPortOptions,
 } from "./delete-data-port.js";
+export { createInventoryTombstoneFinality } from "./tombstone-finality.js";
 export {
   createMemoryPendingBlobDeletionStore,
   createPendingBlobDeletionStore,
