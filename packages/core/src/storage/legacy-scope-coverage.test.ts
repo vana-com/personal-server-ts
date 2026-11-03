@@ -1161,6 +1161,62 @@ describe("retained ChatGPT message evidence", () => {
   });
 });
 
+describe("receipted ChatGPT conversation exclusions", () => {
+  it("covers only the exactly hashed excluded legacy conversation and reports the receipt", () => {
+    const legacy = {
+      conversations: [
+        { id: "excluded", messages: [] },
+        { id: "not-excluded", messages: [] },
+      ],
+    };
+    const canonical = { conversations: [{ id: "not-excluded", messages: [] }] };
+    const verdict = compareLegacyCoverage(legacy, canonical, {
+      scope: "chatgpt.conversations",
+      entityKeys: { "$.conversations": ["id"] },
+      chatgptCoverageGaps: [
+        {
+          conversationIdHash: "cfa5ad96f5be",
+          reason: "parent_not_stored/fallback_chain_incomplete",
+          declaredCount: 2,
+          walkedCount: 1,
+        },
+      ],
+    });
+    expect(verdict.covered).toBe(true);
+    expect(verdict.reasonCounts.missing_entity).toBe(1);
+    expect(verdict.excludedConversations).toEqual([
+      {
+        conversationIdHash: "cfa5ad96f5be",
+        reason: "parent_not_stored/fallback_chain_incomplete",
+        declaredCount: 2,
+        walkedCount: 1,
+      },
+    ]);
+    expect(JSON.stringify(verdict)).not.toContain("excluded");
+  });
+
+  it("does not waive an unreceipted missing conversation", () => {
+    const verdict = compareLegacyCoverage(
+      { conversations: [{ id: "other", messages: [] }] },
+      { conversations: [] },
+      {
+        scope: "chatgpt.conversations",
+        entityKeys: { "$.conversations": ["id"] },
+        chatgptCoverageGaps: [
+          {
+            conversationIdHash: "cfa5ad96f5be",
+            reason: "parent_not_stored/fallback_chain_incomplete",
+            declaredCount: 2,
+            walkedCount: 1,
+          },
+        ],
+      },
+    );
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("missing_entity");
+  });
+});
+
 describe("growth boundaries and independent coverage failures", () => {
   it("does not reject equality at either growth threshold", () => {
     const legacy = { value: "same" };
