@@ -1,3 +1,4 @@
+import { isLegacyEvaluationWorker } from "./storage/legacy-scope-evaluation.js";
 import { createRequire } from "node:module";
 import { loadConfig } from "./config/index.js";
 import { createServer } from "./bootstrap.js";
@@ -121,7 +122,8 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-main().catch((err) => {
-  console.error("Failed to start server:", err);
-  process.exit(1);
-});
+if (!isLegacyEvaluationWorker)
+  main().catch((err) => {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+  });

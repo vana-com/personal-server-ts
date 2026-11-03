@@ -1,3 +1,9 @@
+import { trackLegacyScopeMutations } from "./storage/legacy-scope-revalidation-state.js";
+import {
+  createLegacyScopeRevalidator,
+  legacyCoverageCandidates,
+} from "./storage/legacy-scope-revalidator.js";
+import { createLegacyEvaluationWorker } from "./storage/legacy-scope-evaluation.js";
 import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   createDurableAdditions,
@@ -390,7 +396,21 @@ export async function createServer(
     }
   };
 
-  const db = initializeDatabase(indexPath);
+  const sweepMs = Number(process.env.PDPP_LEGACY_COVERAGE_SWEEP_MS ?? 900_000);
+  if (!Number.isFinite(sweepMs) || sweepMs < 100 || sweepMs > 900_000)
+    throw Error("Coverage sweep interval must be 100..900000 ms");
+  const ceilingMs = Number(
+    process.env.PDPP_LEGACY_COVERAGE_CEILING_MS ?? 2 * sweepMs,
+  );
+  if (!Number.isFinite(ceilingMs) || ceilingMs < 100 || ceilingMs > 2 * sweepMs)
+    throw Error(
+      "Coverage ceiling must be 100 ms through twice the sweep interval",
+    );
+  const rawDb = initializeDatabase(indexPath);
+  const revalidationState = config.pdpp.enabled
+    ? trackLegacyScopeMutations(rawDb, { ceilingMs })
+    : undefined;
+  const db = revalidationState?.db ?? rawDb;
   await migrateLocalState({
     storageRoot,
     dataDir,
@@ -1121,6 +1141,94 @@ export async function createServer(
         })
       : undefined;
 
+  const legacyScopeView = createLegacyScopeView({
+    logger,
+    authority: createLegacyScopeAuthority(db),
+    records: pdppRecords && legacyScopeRecords(pdppRecords),
+    // Reuse the source-scoped declarations selected by the record server.
+    // Declaration schema identity participates in projection revisions and
+    // takeover cache keys; staging an upgrade takes effect on the next boot.
+    declarations: pdppRecords?.declarations,
+    configuredMethods: (sourceId) =>
+      pdppRecords?.configuredMethods.get(sourceId) ?? [],
+    optInMethods: new Set(config.pdpp.optInMethods),
+    readLegacyHead: async (head) => {
+      if (
+        head.path.startsWith("/") ||
+        head.path.split(/[\\/]/).includes("..")
+      ) {
+        throw new Error("Unsafe indexed legacy path");
+      }
+      return DataFileEnvelopeSchema.passthrough().parse(
+        JSON.parse(await readFile(join(dataDir, head.path), "utf8")),
+      );
+    },
+    coverageThresholds: {
+      maxPayloadRatio: takeoverLimit("PDPP_TAKEOVER_MAX_PAYLOAD_RATIO", 1.5),
+      maxExtraBytes: takeoverLimit("PDPP_TAKEOVER_MAX_EXTRA_BYTES", 256 * 1024),
+    },
+  });
+
+  const evaluationWorker = createLegacyEvaluationWorker();
+  const evaluationConfig = () => ({
+    database: db.name,
+    ceilingMs,
+    dataDir,
+    owner: serverOwner ?? "",
+    replication: !!replicaHost,
+    declarations: pdppAuth?.retainedDeclarations ?? [],
+    configuredMethods: [
+      ...(pdppRecords?.configuredMethods ?? new Map<string, string[]>()),
+    ],
+    optInMethods: [...config.pdpp.optInMethods],
+    coverageThresholds: {
+      maxPayloadRatio: takeoverLimit("PDPP_TAKEOVER_MAX_PAYLOAD_RATIO", 1.5),
+      maxExtraBytes: takeoverLimit("PDPP_TAKEOVER_MAX_EXTRA_BYTES", 256 * 1024),
+    },
+  });
+  let policyFingerprint = JSON.stringify(evaluationConfig());
+  let lastPolicyCheck = Date.now();
+  const revalidator = createLegacyScopeRevalidator({
+    candidates: () => legacyCoverageCandidates(db),
+    onChange: () => evaluationWorker.invalidate(),
+    onSweep: () => {
+      revalidationState?.ensureDirty();
+      const overdue = revalidationState?.diagnostics();
+      if (overdue?.length)
+        logger.warn(
+          { scopes: overdue },
+          "Legacy coverage re-evaluation is overdue",
+        );
+    },
+    onFailure: (instance, scopes) => revalidationState?.fail(instance, scopes),
+    fingerprint: () => {
+      const currentPolicy = JSON.stringify(evaluationConfig());
+      if (currentPolicy !== policyFingerprint) {
+        revalidationState?.markDirty(lastPolicyCheck);
+        policyFingerprint = currentPolicy;
+      }
+      lastPolicyCheck = Date.now();
+      revalidationState?.diagnostics();
+      return JSON.stringify([revalidationState?.fingerprint(), currentPolicy]);
+    },
+    intervalMs: sweepMs,
+    logger,
+    async evaluate(instance, scopes) {
+      const result = await evaluationWorker.evaluate({
+        ...evaluationConfig(),
+        instance,
+        scopes,
+      });
+      if (result.refused.length)
+        logger.warn(
+          { scopes: result.refused },
+          "Legacy coverage re-evaluation refused scopes",
+        );
+    },
+  });
+  // Startup recovery does not delay the listener or force-open a disabled store.
+  if (pdppRecords && serverOwner) revalidator.start();
+
   const app = createApp({
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
@@ -1175,36 +1283,7 @@ export async function createServer(
     // configured methods the RS enforces. Composed with or without the RS,
     // so a scope whose data moved there is refused, not read from its stale
     // file, on a boot that does not mount the RS.
-    legacyScopeView: createLegacyScopeView({
-      logger,
-      authority: createLegacyScopeAuthority(db),
-      records: pdppRecords && legacyScopeRecords(pdppRecords),
-      // Reuse the source-scoped declarations selected by the record server.
-      // Declaration schema identity participates in projection revisions and
-      // takeover cache keys; staging an upgrade takes effect on the next boot.
-      declarations: pdppRecords?.declarations,
-      configuredMethods: (sourceId) =>
-        pdppRecords?.configuredMethods.get(sourceId) ?? [],
-      optInMethods: new Set(config.pdpp.optInMethods),
-      readLegacyHead: async (head) => {
-        if (
-          head.path.startsWith("/") ||
-          head.path.split(/[\\/]/).includes("..")
-        ) {
-          throw new Error("Unsafe indexed legacy path");
-        }
-        return DataFileEnvelopeSchema.passthrough().parse(
-          JSON.parse(await readFile(join(dataDir, head.path), "utf8")),
-        );
-      },
-      coverageThresholds: {
-        maxPayloadRatio: takeoverLimit("PDPP_TAKEOVER_MAX_PAYLOAD_RATIO", 1.5),
-        maxExtraBytes: takeoverLimit(
-          "PDPP_TAKEOVER_MAX_EXTRA_BYTES",
-          256 * 1024,
-        ),
-      },
-    }),
+    legacyScopeView,
     scopeDeletions,
     cloudMode,
     devToken,
@@ -1229,6 +1308,9 @@ export async function createServer(
 
   const cleanup = async () => {
     backgroundClosed = true;
+    const stopRevalidation = revalidator.stop();
+    await evaluationWorker.stop();
+    await stopRevalidation;
     clearRegistrationPoll();
     // Before the database closes: abort the running step and let it settle.
     if (

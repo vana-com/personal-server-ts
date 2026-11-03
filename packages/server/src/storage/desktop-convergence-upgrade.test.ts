@@ -290,11 +290,30 @@ describe("B-written Desktop profile convergence", () => {
               await readFile(join(dir!, "data", head.path), "utf8"),
             ) as DataFileEnvelope,
         });
-        if (restart === 0)
+        if (restart === 0) {
+          // These B fixtures have a current-head replacement witness. SWR keeps
+          // it listed until the fresh read below confirms or retracts it.
+          const retainedAt: Record<string, string> = {
+            fewer: "2026-10-21T12:00:00.000Z",
+            disjoint: "2026-10-21T12:00:00.000Z",
+            empty: "2026-10-21T12:00:00.000Z",
+            parity: "2026-10-01T12:00:00.000Z",
+            "stale-nonhead": "2026-10-20T12:00:00.000Z",
+            "unreceipted-loss": "2026-10-20T12:00:00.000Z",
+          };
           for (const scope of scopes)
-            expect(view.listingFor(scope)).toEqual(
-              scenario.listingBefore[scope],
+            expect(view.listingFor(scope), `${scenario.name}:${scope}`).toEqual(
+              retainedAt[scenario.name] &&
+                !(
+                  scenario.name === "stale-nonhead" && scope === "oura.activity"
+                ) &&
+                !(
+                  scenario.name === "unreceipted-loss" && scope === "oura.sleep"
+                )
+                ? { kind: "canonical", collectedAt: retainedAt[scenario.name] }
+                : scenario.listingBefore[scope],
             );
+        }
         for (const scope of scopes) {
           const read = await view.readLatest(scope);
           expect(read.kind).toBe(scenario.expected[scope]!.kind);

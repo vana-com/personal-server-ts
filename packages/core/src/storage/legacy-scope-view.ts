@@ -189,6 +189,12 @@ export interface LegacyScopeAuthority {
     method: string,
     canonicalCursor: string,
   ): boolean;
+  hasListingWitness(
+    scope: string,
+    head: LegacyScopeHead,
+    instance: string,
+    generation: number,
+  ): boolean;
   isReset(scope: string): boolean;
   cachedVerdict(
     scope: string,
@@ -630,6 +636,27 @@ export function createLegacyScopeView(
     const hasLegacyHead = legacyHead !== null;
     if (hasLegacyHead && !hasTakeover && !initialOuraRunComplete(decision)) {
       return { kind: "file" };
+    }
+    // Inventory retains the last proved body while a background read refreshes it.
+    // Admission and the complete eligible-head identity remain live.
+    if (legacyHead !== null && hasTakeover) {
+      if (
+        !authority.hasListingWitness(
+          scope,
+          legacyHead,
+          decision.selection.instance,
+          decision.generation,
+        )
+      )
+        return { kind: "refused" };
+      const collectedAt = listedCollectedAt(
+        decision.records,
+        decision.selection.instance,
+        decision.streams,
+      );
+      return collectedAt === null
+        ? { kind: "refused" }
+        : { kind: "canonical", collectedAt };
     }
     const completedReplacement =
       legacyHead !== null &&

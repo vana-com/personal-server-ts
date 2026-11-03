@@ -361,6 +361,7 @@ function viewFixture(
     hasTakeover: () => covered,
     hasMethodTakeover: () => covered,
     hasCoveredHead: () => covered,
+    hasListingWitness: () => covered,
     isReset: () => false,
     cachedVerdict: (_scope, _instance, _generation, _head, cursor) =>
       cache.get(cursor) ?? null,

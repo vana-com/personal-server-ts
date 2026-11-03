@@ -214,6 +214,48 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       );
     },
 
+    hasListingWitness(scope, head, instance, generation) {
+      if (hasTable("legacy_scope_revalidation_scopes")) {
+        const state = db
+          .prepare(
+            "SELECT dirty_since,ceiling_ms FROM legacy_scope_revalidation_scopes WHERE instance=? AND scope=?",
+          )
+          .get(instance, scope) as
+          { dirty_since: number | null; ceiling_ms: number } | undefined;
+        if (
+          state?.dirty_since !== null &&
+          state?.dirty_since !== undefined &&
+          Date.now() >= state.dirty_since + state.ceiling_ms
+        )
+          return false;
+      }
+      if (!hasTable("legacy_scope_takeovers")) return false;
+      const ledger = db
+        .prepare(
+          `SELECT replacement_cursor FROM legacy_scope_takeovers WHERE scope=? AND instance=? AND generation=? AND superseded_path=? AND superseded_version=? AND superseded_cas_revision=? AND superseded_collected_at=?`,
+        )
+        .all(
+          scope,
+          instance,
+          generation,
+          head.path,
+          head.version,
+          head.casRevision,
+          head.collectedAt,
+        ) as { replacement_cursor: string | null }[];
+      if (!ledger.length) return false;
+      const verdict = db
+        .prepare(
+          "SELECT verdict FROM legacy_scope_takeover_verdicts WHERE scope=? AND instance=? AND generation=? AND legacy_version_id=?",
+        )
+        .get(scope, instance, generation, head.id) as
+        { verdict: string } | undefined;
+      if (verdict) return verdict.verdict === "covered";
+      return ledger.some((row) =>
+        row.replacement_cursor?.startsWith(`${head.id}:`),
+      );
+    },
+
     isReset(scope) {
       return isReset(scope);
     },
@@ -425,6 +467,13 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             `${expectedHead.id}:${verdict.canonicalCursor}`,
             scope,
           );
+          // A newly confirmed complete replacement supersedes a prior parity
+          // refusal for this head. Inventory must follow the latest proof.
+          if (hasTable("legacy_scope_takeover_verdicts"))
+            db.prepare(
+              "DELETE FROM legacy_scope_takeover_verdicts WHERE scope=? AND instance=? AND generation=? AND legacy_version_id=? AND verdict='not_covered'",
+            ).run(scope, verdict.instance, verdict.generation, expectedHead.id);
+          clearRevalidation(scope, verdict.instance);
           return true;
         }
 
@@ -472,6 +521,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             coverage.canonicalBytes,
             coverage.byteDelta,
           );
+          clearRevalidation(scope, verdict.instance);
           if (!coverage.covered) return true;
           db.prepare(
             `INSERT INTO legacy_scope_takeovers
@@ -534,6 +584,13 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       }
     },
   };
+
+  function clearRevalidation(scope: string, instance: string): void {
+    if (hasTable("legacy_scope_revalidation_scopes"))
+      db.prepare(
+        "UPDATE legacy_scope_revalidation_scopes SET dirty_since=NULL,error_count=0,reason=NULL WHERE instance=? AND scope=? AND dirty_since IS NOT NULL",
+      ).run(instance, scope);
+  }
 
   function readEligibleLegacyHead(scope: string): LegacyScopeHead | null {
     if (!hasTable("data_files")) return null;

@@ -41,7 +41,12 @@ afterEach(() => {
 function host({
   epoch,
   conflictFacts = true,
-}: { epoch?: () => number; conflictFacts?: boolean } = {}) {
+  coverageHead = false,
+}: {
+  epoch?: () => number;
+  conflictFacts?: boolean;
+  coverageHead?: boolean;
+} = {}) {
   const db = initializeDatabase(":memory:");
   const store = createReplicaRecordStore(db);
   store.registerConnection({ instance, sourceId, method, label: "A" });
@@ -117,6 +122,23 @@ function host({
     reads: (reader: "owner" | "grant") => receiver.readStore({ reader }),
   };
   const indexManager = createIndexManager(db);
+  let savedEnvelope:
+    | Awaited<
+        ReturnType<ReturnType<typeof createLegacyScopeView>["readLatest"]>
+      >
+    | undefined;
+  const legacyScopeView = createLegacyScopeView({
+    authority: createLegacyScopeAuthority(db),
+    records: legacyScopeRecords(pdpp),
+    configuredMethods: () => [method],
+    readLegacyHead: coverageHead
+      ? async () => {
+          if (savedEnvelope?.kind !== "canonical")
+            throw Error("missing fixture");
+          return savedEnvelope.envelope;
+        }
+      : undefined,
+  });
   const app = createApp({
     logger: pino({ level: "silent" }),
     version: "test",
@@ -133,11 +155,7 @@ function host({
     },
     pdpp,
     // Composed exactly as bootstrap composes it.
-    legacyScopeView: createLegacyScopeView({
-      authority: createLegacyScopeAuthority(db),
-      records: legacyScopeRecords(pdpp),
-      configuredMethods: () => [method],
-    }),
+    legacyScopeView,
   } as AppDeps);
   closers.push(() => store.close());
   const get = async (token: string, path: string, method = "GET") => {
@@ -202,6 +220,28 @@ function host({
     bytes,
     blobId,
     registration: { ...registration, ...ids },
+    async warmCoveredHead() {
+      savedEnvelope = await legacyScopeView.readLatest("oura.activity");
+      if (savedEnvelope.kind !== "canonical")
+        throw Error("fixture projection unavailable");
+      db.prepare(
+        "INSERT INTO data_files(path,scope,collected_at,size_bytes) VALUES ('old','oura.activity','2026-11-01',1)",
+      ).run();
+      expect((await get("legacy-owner", "/v1/data/oura.activity")).status).toBe(
+        200,
+      );
+      expect((await get("legacy-owner", "/v1/data/oura.activity")).status).toBe(
+        200,
+      );
+      expect(
+        db
+          .prepare(
+            "SELECT verdict FROM legacy_scope_takeover_verdicts WHERE scope='oura.activity'",
+          )
+          .pluck()
+          .get(),
+      ).toBe("covered");
+    },
   };
 }
 
@@ -341,6 +381,57 @@ describe("createApp with an enabled replica receiver", () => {
     expect(after).toMatchObject({
       status: 503,
       body: { status: "unavailable", reason: "no_synced_data" },
+    });
+  });
+
+  it("remote record deletion invalidates a warmed covered legacy body", async () => {
+    const h = host({ coverageHead: true });
+    const row = (key: string, n: number) => ({
+      ...h.row(`seed-${key}`, n, key),
+      blobs: [],
+      data: { id: key, day: "2026-08-01", score: 80 },
+    });
+    h.receiver.import({
+      credential: "x",
+      envelope: h.envelope("seed", [
+        h.registration,
+        row("a1", 2),
+        row("a2", 3),
+      ]),
+    });
+    await h.warmCoveredHead();
+    const before = h.db
+      .prepare("SELECT value FROM pdpp_write_clock")
+      .pluck()
+      .get() as number;
+    h.receiver.import({
+      credential: "x",
+      envelope: h.envelope("remote-delete", [
+        {
+          ...ids,
+          kind: "delete",
+          declaration,
+          recordKey: "a1",
+          emittedAt: "2026-10-21T00:00:00Z",
+          deletedAt: "2026-10-21T00:00:00Z",
+          revision: {
+            counter: 100,
+            writerId: "device-b",
+            operationId: "remote-delete",
+          },
+        },
+      ]),
+    });
+    expect(
+      h.db.prepare("SELECT value FROM pdpp_write_clock").pluck().get(),
+    ).toBeGreaterThan(before);
+    const after = await h.get("legacy-owner", "/v1/data/oura.activity");
+    expect(JSON.stringify(after.body)).not.toContain('"id":"a1"');
+    expect(after.status).toBe(503);
+    expect(after.body).toMatchObject({
+      error: "CANONICAL_VIEW_UNAVAILABLE",
+      retryable: true,
+      reason: expect.any(String),
     });
   });
 

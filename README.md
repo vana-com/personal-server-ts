@@ -182,6 +182,16 @@ The stored envelope is the one `POST /v1/data/{scope}` stores for `{ ...beginDat
 
 Windows skips directory fsync barriers; file fsync and journal recovery remain in place. Directory-entry and power-loss durability are outside the Windows guarantee.
 
+### Scope inventory freshness
+
+`GET /v1/data` (`listScopes`) is an inventory hint, not a delivery guarantee. A taken-over scope keeps its last covered verdict for the current eligible legacy head while background re-evaluation runs. A confirmed negative verdict hides it. Head identity, connection selection, reset and deletion checks remain live.
+
+Inventory remains stale while re-evaluation is pending, running or retrying, but for at most two sweep intervals after the first mutation. The default sweep interval is 15 minutes (`PDPP_LEGACY_COVERAGE_SWEEP_MS`, 100 through 900000 milliseconds), with a 30-minute hard ceiling. `PDPP_LEGACY_COVERAGE_CEILING_MS` can set a shorter ceiling, up to twice the sweep interval. The first dirty timestamp survives restart; later mutations and failures cannot postpone it. Past the ceiling, the scope is hidden until evaluation succeeds. Persisted diagnostics distinguish `evaluation_overdue` and `evaluation_failing` and include the error count.
+
+Startup and periodic sweeps recover lost notifications. A coarse transaction marker covers stream, blob, replica, receipt and visibility changes once per commit; the source mutation and dirty marker commit or roll back together. Polling also detects declaration and threshold changes. All candidate instances are conservatively dirtied, including owners of shared blobs. Instances share one background worker and one coalesced follow-up per instance. Projection work runs on a separate event loop and SQLite connection. Errors retain the previous verdict and retry on a later sweep, subject to the inventory ceiling.
+
+Latest-body reads retain the full current coverage cursor and both confirmation fences. They re-check coverage and stay fail-closed rather than trusting inventory. A retryable canonical refusal retains `CANONICAL_VIEW_UNAVAILABLE`, includes its machine-readable `reason`, and sets `retryable: true` for HTTP 503. Callers must handle this list/read disagreement and retry the read.
+
 ### Additions summary
 
 `GET /v1/data/additions?tz=<IANA zone>&days=<1..31>` remains owner-only and keeps `timezone`, `total`, `days`, `trackedSince`, `partial` and `scopes`. The version-1 response adds `coverage`, numeric-string `through` markers, recent UTC quarter-hour `buckets`, `fineSince`, older daily UTC `daily` counts, and corresponding per-scope counts. A day's additions mean records that arrived then, including records absent from later snapshots. Current `total` can therefore be smaller than historical additions.
