@@ -2610,6 +2610,36 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       };
 
       describe("retained off-branch canonical messages", () => {
+        it.each(["text", "multimodal_text"])(
+          "serves explicit current-empty %s without rescuing older alias text",
+          (content_type) => {
+            for (const reverse of [false, true]) {
+              const bare = message("c1", "n1", null, "old alias", {
+                scoped: false,
+              });
+              const current = message("c1", "n1", null, "");
+              current.data.content_type = content_type;
+              const rows = reverse ? [current, bare] : [bare, current];
+              const result = projected(
+                project([conversation("c1", 1, "n1"), ...rows]),
+              );
+              expect(result.payload).toMatchObject({
+                conversations: [
+                  {
+                    message_count: 1,
+                    messages: [{ id: "n1", content: "", content_type }],
+                  },
+                ],
+              });
+              expect(result.retainedChatgptMessages).toBeUndefined();
+              validateAgainst(
+                { schema: chatgptConversationsSchema.schema },
+                result.payload,
+              );
+            }
+          },
+        );
+
         const retained = (
           conversationId = "c1",
           node = "retired",
