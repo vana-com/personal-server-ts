@@ -265,7 +265,7 @@ it("wires trusted declarations into the production legacy view", () => {
     "utf8",
   );
   expect(bootstrap).toMatch(
-    /legacyScopeView: createLegacyScopeView\(\{[\s\S]*?declarations: pdppRecords\?\.declarations,/,
+    /const legacyScopeView = createLegacyScopeView\(\{[\s\S]*?declarations: pdppRecords\?\.declarations,/,
   );
 });
 

@@ -1424,6 +1424,29 @@ describe("legacy scope view over the real SQLite record store", () => {
     });
     expect(parity.verdictFor("oura.activity")[0]!.verdict).toBe("not_covered");
     expect(parity.listingFor("oura.activity").kind).toBe("refused");
+    db.exec(
+      "UPDATE legacy_scope_takeover_verdicts SET canonical_cursor='old:proof'",
+    );
+    const retry = vi.spyOn(parity, "readLatest").mockResolvedValue({
+      kind: "refused",
+      refusal: {
+        status: "unavailable",
+        reason: "store_inconsistent_read",
+        detail: "concurrent write",
+      },
+    });
+    await parity.upgradeCoverageWitnesses();
+    expect(retry).toHaveBeenCalledTimes(2);
+    retry.mockClear().mockResolvedValue({
+      kind: "refused",
+      refusal: {
+        status: "unavailable",
+        reason: "store_inconsistent_read",
+        detail: "indexed legacy head could not be read",
+      },
+    });
+    await parity.upgradeCoverageWitnesses();
+    expect(retry).toHaveBeenCalledTimes(1);
   });
 
   it("reuses the covered projection without reading source rows again", async () => {

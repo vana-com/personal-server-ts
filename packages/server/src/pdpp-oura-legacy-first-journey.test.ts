@@ -1306,10 +1306,23 @@ describe("Oura default admission cutover", () => {
           )!.replacement_cursor;
           expect(replacement.startsWith(`${head.id}:`)).toBe(true);
           const currentCursor = replacement.slice(String(head.id).length + 1);
-          const oldCursor = currentCursor.replace(
-            /:[0-9]+:1\.5:262144$/,
-            ":8:1.5:262144",
-          );
+          const tuple = JSON.parse(
+            currentCursor.slice("legacy-coverage-v2:".length),
+          ) as unknown[];
+          const oldCursor = [
+            db.prepare("SELECT value FROM pdpp_write_clock").pluck().get(),
+            db
+              .prepare("SELECT value FROM pdpp_record_arrival_clock")
+              .pluck()
+              .get(),
+            tuple[6],
+            tuple[4],
+            tuple[8],
+            tuple[9],
+            8,
+            1.5,
+            262144,
+          ].join(":");
           expect(oldCursor).not.toBe(currentCursor);
           db.prepare(
             `INSERT INTO legacy_scope_takeover_verdicts

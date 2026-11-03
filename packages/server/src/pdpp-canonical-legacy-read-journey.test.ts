@@ -1667,6 +1667,57 @@ describe("GET /v1/data listing", () => {
       total: 1,
     });
   });
+
+  it("revalidates a taken-over scope after an unrelated stream write", async () => {
+    await legacyWrite("oura.activity", COVERED_A1);
+    const token = await ownerPdppToken();
+    await upsert(token, day("a1", "2026-09-01"));
+    expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+      "canonical",
+    );
+    await replace(
+      token,
+      "readiness",
+      [{ id: "r1", day: "2026-09-01", score: 70 }],
+      "2026-09-10T06:00:00Z",
+    );
+    const listing = JSON.parse((await ownerGet("/v1/data")).text) as {
+      scopes: { scope: string }[];
+    };
+    expect(listing.scopes.map((row) => row.scope)).toContain("oura.activity");
+    await ctx!.cleanup();
+    ctx = undefined;
+    const persisted = new Database(join(tempDir, "index.db"));
+    const count = persisted
+      .prepare("SELECT COUNT(*) FROM legacy_scope_takeovers")
+      .pluck()
+      .get();
+    persisted.exec(
+      "UPDATE legacy_scope_takeover_verdicts SET canonical_cursor='old:global:clock'; UPDATE legacy_scope_takeovers SET replacement_cursor='old:replacement' WHERE replacement_cursor IS NOT NULL",
+    );
+    persisted.close();
+    ctx = await boot();
+    const upgraded = JSON.parse((await ownerGet("/v1/data")).text) as {
+      scopes: { scope: string }[];
+    };
+    expect(upgraded.scopes.map((row) => row.scope)).toContain("oura.activity");
+    const checked = new Database(join(tempDir, "index.db"));
+    expect(
+      checked
+        .prepare(
+          "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope='oura.activity'",
+        )
+        .pluck()
+        .get(),
+    ).toMatch(/^legacy-coverage-v2:/);
+    expect(
+      checked
+        .prepare("SELECT COUNT(*) FROM legacy_scope_takeovers")
+        .pluck()
+        .get(),
+    ).toBe(count);
+    checked.close();
+  });
 });
 
 describe("scopes the canonical view does not convert", () => {

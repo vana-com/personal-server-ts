@@ -1372,13 +1372,21 @@ export function createLegacyScopeView(
         const stale = authority.readSnapshot(() => {
           const decision = decide(scope);
           const head = authority.eligibleLegacyHead(scope);
-          if (
-            !head ||
-            !authority.hasTakeover(scope) ||
-            decision.kind !== "canonical"
-          )
+          if (!head || !authority.hasTakeover(scope)) return false;
+          if (decision.kind !== "canonical") {
+            if (decision.kind === "refused")
+              input.logger?.info(
+                { scope, reason: decision.refusal.reason },
+                "Legacy coverage upgrade unresolved",
+              );
             return false;
+          }
           const cursor = coverageCursor(scope, decision);
+          if (cursor === null)
+            input.logger?.info(
+              { scope, reason: "coverage_dependencies_unavailable" },
+              "Legacy coverage upgrade unresolved",
+            );
           return (
             cursor !== null &&
             !authority.cachedVerdict(
@@ -1404,6 +1412,7 @@ export function createLegacyScopeView(
           if (result.kind !== "refused") break;
           if (
             result.refusal.reason === "store_inconsistent_read" &&
+            result.refusal.detail !== "indexed legacy head could not be read" &&
             attempt === 0
           )
             continue;

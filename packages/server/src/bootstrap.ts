@@ -1121,6 +1121,35 @@ export async function createServer(
         })
       : undefined;
 
+  const legacyScopeView = createLegacyScopeView({
+    logger,
+    authority: createLegacyScopeAuthority(db),
+    records: pdppRecords && legacyScopeRecords(pdppRecords),
+    // Reuse the source-scoped declarations selected by the record server.
+    // Declaration schema identity participates in projection revisions and
+    // takeover cache keys; staging an upgrade takes effect on the next boot.
+    declarations: pdppRecords?.declarations,
+    configuredMethods: (sourceId) =>
+      pdppRecords?.configuredMethods.get(sourceId) ?? [],
+    optInMethods: new Set(config.pdpp.optInMethods),
+    readLegacyHead: async (head) => {
+      if (
+        head.path.startsWith("/") ||
+        head.path.split(/[\\/]/).includes("..")
+      ) {
+        throw new Error("Unsafe indexed legacy path");
+      }
+      return DataFileEnvelopeSchema.passthrough().parse(
+        JSON.parse(await readFile(join(dataDir, head.path), "utf8")),
+      );
+    },
+    coverageThresholds: {
+      maxPayloadRatio: takeoverLimit("PDPP_TAKEOVER_MAX_PAYLOAD_RATIO", 1.5),
+      maxExtraBytes: takeoverLimit("PDPP_TAKEOVER_MAX_EXTRA_BYTES", 256 * 1024),
+    },
+  });
+  await legacyScopeView.upgradeCoverageWitnesses();
+
   const app = createApp({
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
@@ -1175,36 +1204,7 @@ export async function createServer(
     // configured methods the RS enforces. Composed with or without the RS,
     // so a scope whose data moved there is refused, not read from its stale
     // file, on a boot that does not mount the RS.
-    legacyScopeView: createLegacyScopeView({
-      logger,
-      authority: createLegacyScopeAuthority(db),
-      records: pdppRecords && legacyScopeRecords(pdppRecords),
-      // Reuse the source-scoped declarations selected by the record server.
-      // Declaration schema identity participates in projection revisions and
-      // takeover cache keys; staging an upgrade takes effect on the next boot.
-      declarations: pdppRecords?.declarations,
-      configuredMethods: (sourceId) =>
-        pdppRecords?.configuredMethods.get(sourceId) ?? [],
-      optInMethods: new Set(config.pdpp.optInMethods),
-      readLegacyHead: async (head) => {
-        if (
-          head.path.startsWith("/") ||
-          head.path.split(/[\\/]/).includes("..")
-        ) {
-          throw new Error("Unsafe indexed legacy path");
-        }
-        return DataFileEnvelopeSchema.passthrough().parse(
-          JSON.parse(await readFile(join(dataDir, head.path), "utf8")),
-        );
-      },
-      coverageThresholds: {
-        maxPayloadRatio: takeoverLimit("PDPP_TAKEOVER_MAX_PAYLOAD_RATIO", 1.5),
-        maxExtraBytes: takeoverLimit(
-          "PDPP_TAKEOVER_MAX_EXTRA_BYTES",
-          256 * 1024,
-        ),
-      },
-    }),
+    legacyScopeView,
     scopeDeletions,
     cloudMode,
     devToken,
