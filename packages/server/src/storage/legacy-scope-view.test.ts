@@ -1,3 +1,5 @@
+import { trackLegacyScopeMutations } from "./legacy-scope-revalidation-state.js";
+import { freshCoverageAuthority } from "./legacy-scope-evaluation.js";
 import Database from "better-sqlite3";
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1106,7 +1108,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     db.prepare(
       "UPDATE pdpp_stream_completion SET source_collected_at = ? WHERE instance = ? AND stream = ?",
     ).run("2026-10-03T00:00:00.000Z", "conn_a", "activity");
-    expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
       "canonical",
     );
@@ -1126,7 +1128,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         .all(),
     ).toEqual([{ instance: "conn_a" }, { instance: "conn_b" }]);
     ingest(store, "conn_b", "a1", "2026-09-10T08:00:00.000Z", 91);
-    expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
     expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
     expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
     expect(parityView.verdictFor("oura.activity")).toMatchObject([
@@ -1194,7 +1196,9 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(fresh.envelope.data).toMatchObject({
       days: [{ id: "a1", score: 91 }],
     });
-    expect(parityView.verdictFor("oura.activity")).toEqual(staleVerdicts);
+    // A confirmed complete replacement supersedes the old parity refusal.
+    expect(parityView.verdictFor("oura.activity")).toEqual([]);
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
     expect(
       db
         .prepare(
@@ -1252,7 +1256,9 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(fresh.envelope.data).toMatchObject({
       days: [{ id: "a1", score: 91 }],
     });
-    expect(parityView.verdictFor("oura.activity")).toEqual(staleVerdicts);
+    // A confirmed complete replacement supersedes the old parity refusal.
+    expect(parityView.verdictFor("oura.activity")).toEqual([]);
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
     expect(
       db
         .prepare(
@@ -3431,6 +3437,137 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     expect((await view.readLatest(scope)).kind).toBe("canonical");
     return { view, original, config };
   }
+
+  it("never publishes an older background positive over a newer negative", async () => {
+    const { view, original, config } = await fixture();
+    const beforeVerdict = view.verdictFor(scope)[0]!;
+    const coverage = config.authority.cachedVerdict(
+      scope,
+      "chat",
+      1,
+      beforeVerdict.legacyVersionId,
+      beforeVerdict.canonicalCursor,
+    )!;
+    let publication = 0;
+    const captured = publication;
+    const racing = createLegacyScopeView({
+      ...config,
+      authority: freshCoverageAuthority(
+        config.authority,
+        () => publication === captured,
+      ),
+      readLegacyHead: async () => {
+        config.authority.confirmRead(
+          scope,
+          config.authority.eligibleLegacyHead(scope),
+          () => true,
+          "chatgpt",
+          {
+            instance: "chat",
+            generation: 1,
+            writeClock: config.authority.writeClock(),
+            arrivalRevision: config.authority.arrivalRevision(),
+            canonicalCursor: beforeVerdict.canonicalCursor,
+            coverage: {
+              ...coverage,
+              covered: false,
+              reason: "missing_entity",
+              missingEntityCount: 1,
+            },
+            cached: false,
+          },
+        );
+        publication++;
+        return original.envelope;
+      },
+    });
+    expect(await racing.readLatest(scope)).toMatchObject({
+      kind: "refused",
+      refusal: { reason: "store_inconsistent_read" },
+    });
+    expect(view.verdictFor(scope)[0]?.verdict).toBe("not_covered");
+    expect(view.listingFor(scope).kind).toBe("refused");
+  });
+
+  it("stays listed while a slow successful evaluation is pending inside the ceiling", async () => {
+    const { view, original, config } = await fixture();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1000);
+    const state = trackLegacyScopeMutations(db, { ceilingMs: 2000 });
+    state.markDirty();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow = createLegacyScopeView({
+      ...config,
+      authority: freshCoverageAuthority(config.authority, () => true),
+      readLegacyHead: async () => {
+        await gate;
+        return original.envelope;
+      },
+    });
+    try {
+      const evaluating = slow.readLatest(scope);
+      await Promise.resolve();
+      expect(view.listingFor(scope).kind).toBe("canonical");
+      vi.setSystemTime(2999);
+      expect(view.listingFor(scope).kind).toBe("canonical");
+      release();
+      expect((await evaluating).kind).toBe("canonical");
+      // The background publisher clears dirty state after confirming the proof,
+      // including an identical proof whose persisted verdict needed no rewrite.
+      expect(state.complete("chat", scope, state.revision("chat"))).toBe(true);
+      expect(state.status("chat", scope)?.dirty_since).toBeNull();
+      vi.setSystemTime(4000);
+      expect(view.listingFor(scope).kind).toBe("canonical");
+    } finally {
+      release();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a covered ChatGPT scope listed after an unrelated connector write", async () => {
+    const { view } = await fixture();
+    connect(store, "other", "oura", OURA);
+    store.ingestBatch(
+      [
+        {
+          instance: "other",
+          stream: "activity",
+          key: "a",
+          data: { id: "a", day: "2026-09-11", score: 80 },
+          emitted_at: after,
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "oura", generation: 1 },
+    );
+    expect(view.listingFor(scope).kind).toBe("canonical");
+    expect((await view.readLatest(scope)).kind).toBe("canonical");
+    expect(view.verdictFor(scope)[0]?.verdict).toBe("covered");
+    expect(view.listingFor(scope).kind).toBe("canonical");
+  });
+
+  it("keeps ChatGPT listed through conversations and messages sync, then unlists a fresh negative", async () => {
+    const { view, original, config } = await fixture();
+    const background = createLegacyScopeView({
+      ...config,
+      authority: freshCoverageAuthority(config.authority, () => true),
+      readLegacyHead: async () => original.envelope,
+    });
+    put("messages", message("old", true));
+    expect(view.listingFor(scope).kind).toBe("canonical");
+    put("conversations", conversation("old"));
+    expect(view.listingFor(scope).kind).toBe("canonical");
+    expect((await background.readLatest(scope)).kind).toBe("canonical");
+    put("messages", { ...message("old", true), content: null });
+    expect(view.listingFor(scope).kind).toBe("canonical");
+    expect((await background.readLatest(scope)).kind).toBe("refused");
+    expect(view.verdictFor(scope)[0]?.verdict).toBe("not_covered");
+    expect(view.listingFor(scope).kind).toBe("refused");
+  });
 
   it.each(["old", "conversation:old"])(
     "covers retained %s after a branch switch without changing the served branch",

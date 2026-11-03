@@ -1362,6 +1362,7 @@ function legacyViewRefusalResponse(
   return jsonResponse(
     {
       error: "CANONICAL_VIEW_UNAVAILABLE",
+      retryable: status === 503,
       message: `The latest data for scope "${scope}" cannot be served from the owner's connector records (${refusal.reason}).`,
       status: refusal.status,
       reason: refusal.reason,

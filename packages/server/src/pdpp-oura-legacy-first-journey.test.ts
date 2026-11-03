@@ -1345,6 +1345,11 @@ describe("Oura default admission cutover", () => {
         db.close();
       }
       await restartWithMethods(["oura-browser"], []);
+      // SWR may retain the historical positive until fresh evaluation finishes.
+      // The foreground read must revalidate immediately and publish the negative.
+      expect(await readAll()).toEqual(
+        ALL(withTakeover ? "503 canonical_view_incomplete" : FILE),
+      );
       const listing = await ctx!.app.request("/v1/data", {
         headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
       });
@@ -1354,9 +1359,6 @@ describe("Oura default admission cutover", () => {
           (SCOPES as readonly string[]).includes(entry.scope),
         ),
       ).toBe(!withTakeover);
-      expect(await readAll()).toEqual(
-        ALL(withTakeover ? "503 canonical_view_incomplete" : FILE),
-      );
       const verified = new Database(join(tempDir, "index.db"));
       try {
         expect(
