@@ -67,7 +67,7 @@ const BINDING_PROFILES = [
   STRAVA_BROWSER_BINDINGS,
 ];
 
-// Invalidate witnesses predating retained-branch evidence and newer growth rules.
+// Invalidate witnesses predating exact conversation gaps and empty retained text.
 const COVERAGE_RULE_VERSION = 13;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 

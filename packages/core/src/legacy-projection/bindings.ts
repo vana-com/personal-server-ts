@@ -1839,7 +1839,7 @@ const chatgptConversations: LegacyScopeBinding = {
     "fetched_at is the projection time (options.now, else the wall clock), matching legacy's per-run toConversationRecord timestamp.",
     "Invalid conversation ids, timestamps or declared counts remain records_dropped omissions. If a broken parent walk cannot be recovered from stored flags, only that conversation is excluded and a same-read hash-only coverage receipt records the gap; messages without a stored conversation remain records_dropped.",
     "Current branch membership comes from immutable parent_id links starting at current_node. A complete walk is followed to its terminal parent even when it exceeds a stale declared count; stored on_current_branch flags are used only after a broken walk and emit branch_walk_fallback diagnostics.",
-    "Current user/assistant text or multimodal_text messages preserve explicit empty strings; null or non-string content is omitted. Off-branch coverage evidence still requires nonempty text; message_count counts displayed messages.",
+    "Current and retained off-branch user/assistant text or multimodal_text messages preserve explicit empty strings; null or non-string content is omitted. message_count counts displayed messages.",
     "A missing title becomes 'Untitled', matching the legacy connector's toConversationRecord fallback; model_slug is renamed to model.",
     "Legacy message ids are source node ids. ChatGPT 0.3.0 stores a message under '<conversation_id>:<node_id>' (and links parent_id the same way); the projection strips that prefix, reads a bare pre-0.3.0 id as it is, and counts a node stored under both forms once, preferring the 0.3.0 row.",
   ],
@@ -2047,8 +2047,7 @@ const chatgptConversations: LegacyScopeBinding = {
           (branchWalk.ok
             ? !activeNodes.has(nodeId)
             : message.on_current_branch === false) &&
-          isChatgptTextMessage(message) &&
-          message.content.length > 0
+          isChatgptTextMessage(message)
         ) {
           retainedChatgptMessages.push({
             scope,
