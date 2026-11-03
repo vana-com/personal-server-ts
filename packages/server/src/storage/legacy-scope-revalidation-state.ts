@@ -81,9 +81,9 @@ function makeState(
     if (!bindingsReady) bindingsReady = bindingTable.get() !== undefined;
     return bindingsReady ? legacyCoverageCandidates(raw) : [];
   }
-  function mark(bumpRevision: boolean, since = now()) {
+  function mark(since = now()) {
     for (const candidate of candidates()) {
-      if (bumpRevision) bump.run(candidate.instance);
+      bump.run(candidate.instance);
       for (const scope of candidate.scopes)
         dirty.run(candidate.instance, scope, since, options.ceilingMs);
     }
@@ -99,7 +99,7 @@ function makeState(
         .transaction(() => {
           const result = run();
           if (outer && dirtyAt !== null) {
-            mark(true, dirtyAt);
+            mark(dirtyAt);
             dirtyAt = null;
           }
           return result;
@@ -214,10 +214,24 @@ function makeState(
       ),
     candidates,
     markDirty(since = now()) {
-      raw.transaction(() => mark(true, since)).immediate();
+      raw.transaction(() => mark(since)).immediate();
     },
     ensureDirty() {
-      raw.transaction(() => mark(false)).immediate();
+      // Recovery seeds unknown witnesses, but a sweep is not a mutation.
+      // A previously refreshed, clean proof must not acquire an expiry merely
+      // because a later periodic evaluation fails.
+      const seed =
+        raw.prepare(`INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms) VALUES (?,?,?,?)
+        ON CONFLICT(instance,scope) DO UPDATE SET ceiling_ms=excluded.ceiling_ms
+        WHERE ceiling_ms<>excluded.ceiling_ms`);
+      raw
+        .transaction(() => {
+          const since = now();
+          for (const candidate of candidates())
+            for (const scope of candidate.scopes)
+              seed.run(candidate.instance, scope, since, options.ceilingMs);
+        })
+        .immediate();
     },
     complete(instance: string, scope: string, revision: number) {
       if (Number(readRevision.get(instance) ?? 0) !== revision) return false;

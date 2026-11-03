@@ -225,6 +225,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
         if (
           state?.dirty_since !== null &&
           state?.dirty_since !== undefined &&
+          // A wall-clock rollback can extend the stale window; this is accepted.
           Date.now() >= state.dirty_since + state.ceiling_ms
         )
           return false;
@@ -588,7 +589,11 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
   function clearRevalidation(scope: string, instance: string): void {
     if (hasTable("legacy_scope_revalidation_scopes"))
       db.prepare(
-        "UPDATE legacy_scope_revalidation_scopes SET dirty_since=NULL,error_count=0,reason=NULL WHERE instance=? AND scope=? AND dirty_since IS NOT NULL",
+        // A clean new witness has no active ceiling; the next mutation stamps
+        // the configured ceiling. Seed it now so a sweep won't call it unknown.
+        `INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms) VALUES (?,?,NULL,1800000)
+         ON CONFLICT(instance,scope) DO UPDATE SET dirty_since=NULL,error_count=0,reason=NULL
+         WHERE dirty_since IS NOT NULL OR error_count<>0 OR reason IS NOT NULL`,
       ).run(instance, scope);
   }
 

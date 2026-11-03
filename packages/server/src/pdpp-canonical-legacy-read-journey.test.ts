@@ -595,6 +595,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       const historicalVerdicts = JSON.parse(
         (await ownerGet("/v1/data/oura.activity/takeover")).text,
       ).verdicts;
+      expect(historicalVerdicts).toMatchObject([{ verdict: "not_covered" }]);
       await replace(
         token,
         "activity",
@@ -607,7 +608,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       expect(
         JSON.parse((await ownerGet("/v1/data/oura.activity/takeover")).text)
           .verdicts,
-      ).toEqual(historicalVerdicts);
+      ).toEqual([]);
       expectCompletedReplacement("oura.activity");
     } finally {
       vi.useRealTimers();
