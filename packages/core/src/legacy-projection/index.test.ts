@@ -3313,13 +3313,42 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             message("c1", "n2", "n1", "tip"),
           ]),
         );
-        expect(result.diagnostics).toContainEqual({
-          kind: "branch_walk_fallback",
-          scope: "chatgpt.conversations",
-          stream: "conversations",
-          count: 1,
-          reasons: ["count_reached_parent_stored"],
+        expect(result.payload).toMatchObject({
+          conversations: [
+            { message_count: 2, messages: [{ id: "n1" }, { id: "n2" }] },
+          ],
         });
+        expect(result.branchWalkDiagnostics).toContainEqual({
+          conversationIdHash: "d0f631ca1ddb",
+          reason: "declared_count_below_walked",
+          declaredCount: 1,
+          walkedCount: 2,
+        });
+      });
+
+      it("excludes a conversation with an unavailable old-flag fallback and hashes its id", () => {
+        const result = projected(
+          project([
+            conversation("broken", 2, "n2"),
+            conversation("healthy", 1, "h1"),
+            message("broken", "n1", null, "broken root"),
+            message("broken", "n2", "missing", "broken tip"),
+            message("healthy", "h1", null, "healthy"),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [{ id: "healthy", message_count: 1 }],
+          total: 1,
+        });
+        expect(result.chatgptCoverageGaps).toEqual([
+          {
+            conversationIdHash: "f526795c9539",
+            reason: "parent_not_stored/fallback_chain_incomplete",
+            declaredCount: 2,
+            walkedCount: 1,
+          },
+        ]);
       });
 
       it("still projects a conversation that holds only old bare-id rows", () => {
