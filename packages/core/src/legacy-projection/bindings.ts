@@ -5,6 +5,7 @@ import type {
   ProjectionDiagnostic,
   ProjectionErr,
   ProjectionOmission,
+  RetainedChatgptMessage,
   ProjectionResult,
 } from "./types.js";
 import type { LegacyScopeBindingProvenance } from "./provenance.js";
@@ -1893,6 +1894,7 @@ const chatgptConversations: LegacyScopeBinding = {
     }
 
     const conversations: Record<string, unknown>[] = [];
+    const retainedChatgptMessages: RetainedChatgptMessage[] = [];
     for (const conversation of sourceConversations) {
       const {
         id,
@@ -1968,22 +1970,24 @@ const chatgptConversations: LegacyScopeBinding = {
       }
       ordered.reverse();
       const messages = ordered
-        .filter(
-          (m) =>
-            (m.role === "user" || m.role === "assistant") &&
-            (m.content_type === "text" ||
-              m.content_type === "multimodal_text") &&
-            typeof m.content === "string" &&
-            m.content.length > 0,
-        )
-        .map((m) => ({
-          id: chatgptNodeId(id, m.id as string),
-          role: m.role,
-          content: m.content,
-          content_type: m.content_type,
-          create_time: typeof m.create_time === "string" ? m.create_time : null,
-          model: typeof m.model_slug === "string" ? m.model_slug : null,
-        }));
+        .filter(isChatgptTextMessage)
+        .map((m) => projectChatgptMessage(id, m));
+      // Only validated, represented parents contribute same-read evidence.
+      // Deduplication precedes eligibility: an ineligible scoped row must
+      // never be rescued by an older bare-id row.
+      for (const [nodeId, message] of byNode) {
+        if (
+          nodeId.trim().length > 0 &&
+          message.on_current_branch === false &&
+          isChatgptTextMessage(message)
+        ) {
+          retainedChatgptMessages.push({
+            scope,
+            conversationId: id,
+            message: projectChatgptMessage(id, message),
+          });
+        }
+      }
       conversations.push({
         id,
         title,
@@ -2029,6 +2033,9 @@ const chatgptConversations: LegacyScopeBinding = {
     return {
       ok: true,
       payload: { conversations, total: conversations.length },
+      ...(retainedChatgptMessages.length > 0
+        ? { retainedChatgptMessages }
+        : {}),
       ...(diagnostics.length > 0 ? { diagnostics } : {}),
     };
   },
@@ -2044,6 +2051,41 @@ const chatgptConversations: LegacyScopeBinding = {
 function chatgptNodeId(conversationId: string, recordId: string): string {
   const prefix = `${conversationId}:`;
   return recordId.startsWith(prefix) ? recordId.slice(prefix.length) : recordId;
+}
+
+function isChatgptTextMessage(
+  message: Record<string, unknown>,
+): message is Record<string, unknown> & {
+  role: "user" | "assistant";
+  content_type: "text" | "multimodal_text";
+  content: string;
+} {
+  return (
+    (message.role === "user" || message.role === "assistant") &&
+    (message.content_type === "text" ||
+      message.content_type === "multimodal_text") &&
+    typeof message.content === "string" &&
+    message.content.length > 0
+  );
+}
+
+function projectChatgptMessage(
+  conversationId: string,
+  message: Record<string, unknown> & {
+    role: "user" | "assistant";
+    content_type: "text" | "multimodal_text";
+    content: string;
+  },
+): RetainedChatgptMessage["message"] {
+  return {
+    id: chatgptNodeId(conversationId, message.id as string),
+    role: message.role,
+    content: message.content,
+    content_type: message.content_type,
+    create_time:
+      typeof message.create_time === "string" ? message.create_time : null,
+    model: typeof message.model_slug === "string" ? message.model_slug : null,
+  };
 }
 
 /**
