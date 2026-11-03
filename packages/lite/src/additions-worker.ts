@@ -1,4 +1,5 @@
 import {
+  AdditionsBudget,
   AdditionsBudgetExceeded,
   createDurableAdditions,
   createVersionInventoryClient,
@@ -34,6 +35,7 @@ const pending = new Map<
     resolve(value: unknown): void;
     reject(error: Error): void;
     budget?: ByteBudget;
+    reservation?: ReturnType<AdditionsBudget["reserve"]>;
   }
 >();
 let hostWork = Promise.resolve();
@@ -42,29 +44,53 @@ function rpc(
   args: unknown[],
   budget?: ByteBudget,
 ): Promise<unknown> {
-  // Signing has no byte receipt. Byte-consuming host calls are dispatched one
-  // at a time, after booking the preceding receipt, so concurrent inventory
-  // requests cannot each spend the same remaining owner-wide allowance.
-  const exchange = () => {
-    budget?.charge();
+  // Small inventory bodies can overlap only after their full host allowances
+  // are held in the shared budget. Other host work stays serial and sees the
+  // reduced allowance, never bytes already promised to an in-flight response.
+  const exchange = (
+    reservation?: ReturnType<AdditionsBudget["reserve"]>,
+    allowance?: number,
+  ) => {
+    try {
+      budget?.charge();
+    } catch (error) {
+      reservation?.settle(0);
+      return Promise.reject(error);
+    }
     return new Promise((resolve, reject) => {
       const id = ++sequence;
-      pending.set(id, { resolve, reject, budget });
-      worker.postMessage(
-        {
-          kind: "request",
-          id,
-          method,
-          args,
-          remaining: budget?.remaining ?? 0,
-          remainingMilliseconds: budget?.remainingMilliseconds,
-        },
-        additionsTransfers(args),
-      );
+      pending.set(id, { resolve, reject, budget, reservation });
+      try {
+        worker.postMessage(
+          {
+            kind: "request",
+            id,
+            method,
+            args,
+            remaining: allowance ?? budget?.remaining ?? 0,
+            remainingMilliseconds: budget?.remainingMilliseconds,
+          },
+          additionsTransfers(args),
+        );
+      } catch (error) {
+        pending.delete(id);
+        reservation?.settle(0);
+        reject(error);
+      }
     });
   };
   if (method === "signRequest") return exchange();
-  const result = hostWork.then(exchange);
+  if (method === "fetch" && budget instanceof AdditionsBudget) {
+    // Version pages contain at most 100 rows in this lane. Keep per-response
+    // work finite as well as aggregate work; leave room for JSON validation.
+    const allowance = Math.min(1024 * 1024, Math.floor(budget.remaining / 4));
+    if (allowance < 1)
+      return Promise.reject(
+        new AdditionsBudgetExceeded("No inventory allowance"),
+      );
+    return exchange(budget.reserve(allowance), allowance);
+  }
+  const result = hostWork.then(() => exchange());
   hostWork = result.then(
     () => {},
     () => {},
@@ -335,7 +361,8 @@ worker.onmessage = (event) => {
     const request = pending.get(message.id);
     pending.delete(message.id);
     try {
-      request?.budget?.recordSpent(message.spent);
+      if (request?.reservation) request.reservation.settle(message.spent);
+      else request?.budget?.recordSpent(message.spent);
       request?.budget?.charge();
       if (message.error)
         request?.reject(

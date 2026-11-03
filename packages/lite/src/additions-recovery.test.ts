@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createMessage, encrypt, enums } from "openpgp";
 import { DiagnosticsRecorder } from "./diagnostics.js";
 import { Worker } from "node:worker_threads";
+import { setTimeout as delay } from "node:timers/promises";
 import { build } from "esbuild";
 import { IDBFactory } from "fake-indexeddb";
 import { encodeAbiParameters, keccak256, stringToHex } from "viem";
@@ -96,6 +97,7 @@ async function fixture() {
     addedAt: string;
     isTombstone: boolean;
   };
+  let inventoryDelayMs = 0;
   const slots = new Map<string, Slot[]>();
   const blobs = new Map<string, Uint8Array>();
   const stall = new Set<string>();
@@ -196,6 +198,10 @@ async function fixture() {
       }
       const scope = url.searchParams.get("scope");
       if (scope !== null) {
+        if (inventoryDelayMs)
+          await delay(inventoryDelayMs, undefined, {
+            signal: init?.signal ?? undefined,
+          });
         const versions = slots.get(scope) ?? [];
         const limit = Number(url.searchParams.get("limit"));
         const remaining = versions.filter(
@@ -294,6 +300,9 @@ async function fixture() {
     failedRegistrations,
     interruptRegistration,
     failRegistrationOnDownload,
+    delayInventory: (milliseconds: number) => {
+      inventoryDelayMs = milliseconds;
+    },
   };
 }
 
@@ -466,3 +475,20 @@ it.each(["before restart", "after checkpoint download"])(
   },
   60_000,
 );
+
+it("reconstructs cold multi-scope history through the actual worker under inventory latency", async () => {
+  const f = await fixture();
+  const scopes = Array.from({ length: 29 }, (_, i) => `notes.${i}`);
+  for (const scope of scopes)
+    await f.source(scope, "1", { records: [{ id: scope }] });
+  expect(
+    await (await f.session(256 * 1024 * 1024)).summarize(f.query),
+  ).toMatchObject({ coverage: "complete", total: 29 });
+  for (const scope of scopes) f.blobs.delete(`${scope}/1`);
+  f.delayInventory(200);
+  const recovered = await (
+    await f.session(256 * 1024 * 1024, undefined, 9000)
+  ).summarize(f.query);
+  expect(recovered).toMatchObject({ coverage: "complete", total: 29 });
+  expect(recovered.days.map((day) => day.added)).toEqual([29, 0]);
+}, 30_000);

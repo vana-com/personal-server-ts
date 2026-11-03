@@ -109,3 +109,25 @@ it("settles late host receipts after child cancellation without spending the che
   owner.charge(256 * 1024);
   expect(owner.remaining).toBe(256 * 1024);
 });
+
+it("holds concurrent host allowances and settles actual bytes after cancellation", () => {
+  const owner = new AdditionsBudget(1000);
+  const controller = new AbortController();
+  const child = new AdditionsBudget(800, undefined, controller.signal, owner);
+  const first = child.reserve(300);
+  const second = child.reserve(400);
+  expect(child.remaining).toBe(100);
+  expect(owner.remaining).toBe(300);
+  // Other owner work cannot spend bytes promised to either in-flight response.
+  owner.charge(200);
+  controller.abort(new Error("cancelled"));
+  second.settle(150);
+  first.settle(200);
+  expect(child.remaining).toBe(450);
+  expect(owner.remaining).toBe(450);
+  expect(() => child.charge()).toThrow("cancelled");
+  expect(() => first.settle(0)).toThrow();
+  expect(owner.remaining).toBe(450);
+  owner.charge(450);
+  expect(owner.remaining).toBe(0);
+});

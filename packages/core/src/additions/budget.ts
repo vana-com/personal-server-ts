@@ -54,6 +54,30 @@ export class AdditionsBudget implements ByteBudget {
     this.used += bytes;
     this.parent?.charge(bytes);
   }
+  /** Hold an in-flight host allowance before another request can spend it.
+   * Settle once with the actual receipt, even after cancellation. */
+  reserve(bytes: number) {
+    this.charge(bytes);
+    let settled = false;
+    return {
+      settle: (spent: number) => {
+        if (settled) throw new Error("Additions reservation already settled");
+        if (!Number.isSafeInteger(spent) || spent < 0)
+          throw new AdditionsBudgetExceeded("Invalid reserved-byte receipt");
+        settled = true;
+        this.refund(bytes);
+        this.recordSpent(spent);
+        if (spent > bytes) {
+          this.exhausted = true;
+          throw new AdditionsBudgetExceeded("Reserved host allowance exceeded");
+        }
+      },
+    };
+  }
+  private refund(bytes: number) {
+    this.used -= bytes;
+    this.parent?.refund(bytes);
+  }
   recordSpent(bytes: number) {
     if (!Number.isSafeInteger(bytes) || bytes < 0) {
       this.exhausted = true;

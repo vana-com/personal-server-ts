@@ -44,7 +44,7 @@ Source deletion uses the existing durable deletion pipeline for its checkpoint a
 
 ## Budgeted hosts
 
-Lite inventory calls bind their budget in a per-call closure. Owner signatures may overlap; byte-consuming worker RPCs are queued until the preceding receipt is booked, then dispatch with the current remaining allowance. This avoids overspending the same allowance through concurrent metadata requests. The queue checks cancellation before starting any later effect.
+Lite inventory calls bind their budget in a per-call closure. Owner signatures and small inventory bodies may overlap. Each inventory response reserves at most 1 MiB of accounted host work (and at most one quarter of the current remainder) before dispatch; the exact receipt releases unused capacity, including after cancellation. JSON validation still charges the same owner-wide budget. Other worker RPCs remain serial and see only the unreserved remainder. This avoids overspending the same allowance through concurrent metadata requests. The queue checks cancellation before starting any later effect.
 
 One `AdditionsBudget` covers inventory bodies, ciphertext, contiguous copies, decoded plaintext, parse input work, checkpoint verification and derived summary work across scopes. Exhaustion is sticky. Monotonic deadline checks catch CPU work that runs past an undelivered timer callback. Real fetch/stream cancellation is awaited; no timeout race abandons an SDK operation.
 
