@@ -1401,7 +1401,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
       )
       .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/9");
+    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/11");
     const callsAfterFirstRead = listRecords.mock.calls.length;
     expect(callsAfterFirstRead).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
@@ -3407,9 +3407,52 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     on_current_branch,
   });
 
-  async function fixture() {
+  async function fixture({ healthy = false, unrelated = false } = {}) {
     put("conversations", conversation("old"), before);
     put("messages", message("old", true), before);
+    if (healthy) {
+      put(
+        "conversations",
+        {
+          id: "healthy",
+          title: "Healthy peer",
+          create_time: before,
+          update_time: before,
+          current_node: "healthy:tip",
+          message_count_on_current_branch: 1,
+        },
+        before,
+      );
+      put(
+        "messages",
+        {
+          id: "healthy:tip",
+          conversation_id: "healthy",
+          parent_id: null,
+          role: "assistant",
+          content_type: "text",
+          content: "healthy peer",
+          create_time: before,
+          model_slug: "synthetic",
+          on_current_branch: true,
+        },
+        before,
+      );
+    }
+    if (unrelated) {
+      put(
+        "conversations",
+        {
+          id: "unrelated",
+          title: "Unrelated empty conversation",
+          create_time: before,
+          update_time: before,
+          current_node: null,
+          message_count_on_current_branch: 0,
+        },
+        before,
+      );
+    }
     const authority = createLegacyScopeAuthority(db);
     const config = {
       authority,
@@ -3431,6 +3474,169 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     expect((await view.readLatest(scope)).kind).toBe("canonical");
     return { view, original, config };
   }
+
+  function breakCurrentBranch() {
+    put("messages", {
+      ...message("conversation:tip", true),
+      parent_id: "missing-parent",
+    });
+    put("conversations", {
+      ...conversation("conversation:tip"),
+      message_count_on_current_branch: 2,
+    });
+  }
+
+  function replaceChatStream(
+    stream: "conversations" | "messages",
+    data: Record<string, unknown>[],
+  ) {
+    store.replaceStream({
+      instance: "chat",
+      stream,
+      method: "chatgpt",
+      generation: 1,
+      primaryKey: ["id"],
+      emittedAt: after,
+      sourceCollectedAt: after,
+      envelopes: data.map((row) => ({
+        instance: "chat",
+        stream,
+        key: String(row.id),
+        data: row,
+        emitted_at: after,
+      })),
+    });
+  }
+
+  it("serves an empty payload when the only conversation has a receipted gap", async () => {
+    const { view } = await fixture();
+    breakCurrentBranch();
+
+    const read = await view.readLatest(scope);
+    expect(read.kind).toBe("canonical");
+    if (read.kind !== "canonical") throw new Error("Expected canonical read");
+    expect(read.envelope.data).toMatchObject({ conversations: [], total: 0 });
+    expect(read.chatgptCoverageGaps).toHaveLength(1);
+  });
+
+  it("serves a healthy peer with an explicit, durable per-conversation gap", async () => {
+    const { view, original, config } = await fixture({ healthy: true });
+    breakCurrentBranch();
+
+    const read = await view.readLatest(scope);
+    expect(read.kind).toBe("canonical");
+    if (read.kind !== "canonical") throw new Error("Expected canonical read");
+    expect(read.envelope.data).toMatchObject({
+      conversations: [{ id: "healthy" }],
+      total: 1,
+    });
+    expect(read.chatgptCoverageGaps).toEqual([
+      {
+        conversationIdHash:
+          "8b34dbc2c05eb4d7e25d48efeace82456b16cee760bcae80c157f52a3c2e787b",
+        reason: "parent_not_stored/fallback_chain_incomplete",
+        declaredCount: 2,
+        walkedCount: 1,
+      },
+    ]);
+    expect(view.verdictFor(scope)[0]).toMatchObject({
+      verdict: "covered",
+      excludedConversations: read.chatgptCoverageGaps,
+    });
+
+    const restarted = createLegacyScopeView({
+      ...config,
+      readLegacyHead: async () => original.envelope,
+    });
+    expect(await restarted.readLatest(scope)).toMatchObject({
+      kind: "canonical",
+      chatgptCoverageGaps: read.chatgptCoverageGaps,
+    });
+    expect(restarted.verdictFor(scope)[0]).toMatchObject({
+      verdict: "covered",
+      excludedConversations: read.chatgptCoverageGaps,
+    });
+  });
+
+  it("keeps a message tombstone refusal global when a conversation gap is present", async () => {
+    const { view } = await fixture({ healthy: true });
+    breakCurrentBranch();
+    replaceChatStream("messages", [
+      {
+        ...message("conversation:tip", true),
+        parent_id: "missing-parent",
+      },
+      {
+        id: "healthy:tip",
+        conversation_id: "healthy",
+        parent_id: null,
+        role: "assistant",
+        content_type: "text",
+        content: "healthy peer",
+        create_time: before,
+        model_slug: "synthetic",
+        on_current_branch: true,
+      },
+    ]);
+
+    expect(await view.readLatest(scope)).toMatchObject({
+      kind: "refused",
+      refusal: {
+        status: "incomplete",
+        reason: "canonical_view_incomplete",
+      },
+    });
+  });
+
+  it("does not let a gapped whole replacement prove deletion of another conversation", async () => {
+    const { view } = await fixture({ healthy: true, unrelated: true });
+    breakCurrentBranch();
+    replaceChatStream("conversations", [
+      {
+        ...conversation("conversation:tip"),
+        message_count_on_current_branch: 2,
+      },
+      {
+        id: "healthy",
+        title: "Healthy peer",
+        create_time: before,
+        update_time: before,
+        current_node: "healthy:tip",
+        message_count_on_current_branch: 1,
+      },
+    ]);
+    replaceChatStream("messages", [
+      message("old", true),
+      {
+        ...message("conversation:tip", true),
+        parent_id: "missing-parent",
+      },
+      {
+        id: "healthy:tip",
+        conversation_id: "healthy",
+        parent_id: null,
+        role: "assistant",
+        content_type: "text",
+        content: "healthy peer",
+        create_time: before,
+        model_slug: "synthetic",
+        on_current_branch: true,
+      },
+    ]);
+
+    expect(store.listStreamCompletions("chat")).toHaveLength(2);
+    expect(await view.readLatest(scope)).toMatchObject({
+      kind: "refused",
+      refusal: {
+        status: "incomplete",
+        reason: "canonical_view_incomplete",
+      },
+    });
+    expect(view.verdictFor(scope)[0]).toMatchObject({
+      verdict: "not_covered",
+      reason: { reason: "missing_entity" },
+    });
+  });
 
   it.each(["old", "conversation:old"])(
     "covers retained %s after a branch switch without changing the served branch",
@@ -3940,7 +4146,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     },
   );
 
-  it("recomputes a rule-11 refused witness under rule 12", async () => {
+  it("recomputes a rule-12 refused witness under rule 13", async () => {
     const { view, original, config } = await fixture();
     const prior = view.verdictFor(scope)[0]!;
     const authority = config.authority;
@@ -3963,7 +4169,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
         ...authority,
         cachedVerdict(scope, instance, generation, version, cursor) {
           seen.push(cursor);
-          const rule11 = cursor.replace(/:12:1\.5:262144$/, ":11:1.5:262144");
+          const rule12 = cursor.replace(/:13:1\.5:262144$/, ":12:1.5:262144");
           expect(
             authority.confirmRead(
               scope,
@@ -3975,7 +4181,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
                 generation,
                 writeClock: authority.writeClock(),
                 arrivalRevision: authority.arrivalRevision(),
-                canonicalCursor: rule11,
+                canonicalCursor: rule12,
                 coverage: {
                   ...covered,
                   covered: false,
@@ -3994,7 +4200,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     });
     expect((await restarted.readLatest(scope)).kind).toBe("canonical");
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatch(/:12:1\.5:262144$/);
+    expect(seen[0]).toMatch(/:13:1\.5:262144$/);
     expect(restarted.verdictFor(scope)[0]).toMatchObject({
       verdict: "covered",
     });
