@@ -61,8 +61,8 @@ const BINDING_PROFILES = [
   STRAVA_BROWSER_BINDINGS,
 ];
 
-// Invalidate witnesses predating retained-branch evidence and newer growth rules.
-const COVERAGE_RULE_VERSION = 12;
+// Invalidate witnesses that excluded explicit empty retained-message text.
+const COVERAGE_RULE_VERSION = 13;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the
