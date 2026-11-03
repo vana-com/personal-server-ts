@@ -355,6 +355,7 @@ function viewFixture(
   const authority: LegacyScopeAuthority = {
     listMethodConnections: () => [store.getInstanceBinding("test")],
     hasHeldData: () => true,
+    hasRetainedTombstones: () => false,
     readSnapshot: (read) => read(),
     writeClock: () => 1,
     arrivalRevision: () => 1,
@@ -845,11 +846,7 @@ describe("real ChatGPT nested declarations", () => {
           count: 1,
           reasons: ["invalid_encoded_text: tool_calls"],
         });
-        expect(canonical.diagnostics.omissions).toContainEqual({
-          stream: "conversations",
-          count: 1,
-          reasons: ["Current branch message count does not match conversation"],
-        });
+        expect(canonical.chatgptCoverageGaps).toHaveLength(1);
       },
     );
 

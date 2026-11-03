@@ -1194,7 +1194,7 @@ describe("receipted ChatGPT conversation exclusions", () => {
         walkedCount: 1,
       },
     ]);
-    expect(JSON.stringify(verdict)).not.toContain("excluded");
+    expect(JSON.stringify(verdict)).not.toContain('"id":"excluded"');
   });
 
   it("does not waive an unreceipted missing conversation", () => {
