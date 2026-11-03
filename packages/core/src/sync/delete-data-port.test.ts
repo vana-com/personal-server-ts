@@ -341,7 +341,13 @@ describe("createGatewayDeleteDataPort.tombstone of a reserved scope", () => {
       }),
       listDataPointsByOwner: vi.fn(),
     };
-    const reservedHead = vi.fn(async () => head);
+    const hashes = {
+      dataHash: "0x" + "11".repeat(32),
+      metadataHash: "0x" + "22".repeat(32),
+    };
+    const reservedHead = vi.fn(async () =>
+      head ? { ...hashes, ...head } : null,
+    );
     const signAddData = vi.fn(async () => "0xaddsig" as `0x${string}`);
     const port = createGatewayDeleteDataPort({
       gatewayUrl: GATEWAY,
@@ -384,6 +390,38 @@ describe("createGatewayDeleteDataPort.tombstone of a reserved scope", () => {
     expect(outcome).toMatchObject({ status: "tombstoned", version: "24" });
   });
 
+  it("checks both reserved head hashes before submitting a fenced tombstone", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, { data: { expectedVersion: "24" } }),
+    );
+    const { port, signAddData, dataPointFeed } = makeReservedPort(
+      { expectedVersion: "23", deletedAt: null },
+      fetchImpl as unknown as typeof fetch,
+    );
+    const head = {
+      expectedVersion: "23",
+      dataHash: "0x" + "11".repeat(32),
+      metadataHash: "0x" + "22".repeat(32),
+    };
+    await expect(
+      port.tombstone(SYSTEM_SCOPE, {
+        head: { ...head, dataHash: "0x" + "33".repeat(32) },
+      }),
+    ).rejects.toThrow(/not the one/);
+    await expect(
+      port.tombstone(SYSTEM_SCOPE, {
+        head: { ...head, metadataHash: "0x" + "33".repeat(32) },
+      }),
+    ).rejects.toThrow(/not the one/);
+    expect(signAddData).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(port.tombstone(SYSTEM_SCOPE, { head })).resolves.toMatchObject(
+      { status: "tombstoned", version: "24" },
+    );
+    expect(dataPointFeed.getDataPoint).not.toHaveBeenCalled();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("skips the gateway call when the reserved point was never registered", async () => {
     const fetchImpl = vi.fn();
     const { port } = makeReservedPort(
@@ -419,10 +457,14 @@ describe("createGatewayDeleteDataPort.tombstone of a reserved scope", () => {
       fetchImpl as unknown as typeof fetch,
     );
     reservedHead.mockResolvedValueOnce({
+      dataHash: "0x" + "11".repeat(32),
+      metadataHash: "0x" + "22".repeat(32),
       expectedVersion: "23",
       deletedAt: null,
     });
     reservedHead.mockResolvedValueOnce({
+      dataHash: "0x" + "11".repeat(32),
+      metadataHash: "0x" + "22".repeat(32),
       expectedVersion: "24",
       deletedAt: "2026-10-30T12:00:00.000Z",
     });

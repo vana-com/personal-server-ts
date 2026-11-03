@@ -30,9 +30,12 @@ export interface GatewayDeleteDataPortOptions {
    * read through the signed version inventory, which admits registered
    * servers. Without it, reserved scopes use `dataPointFeed` like any other.
    */
-  reservedHead?: (
-    scope: string,
-  ) => Promise<{ expectedVersion: string; deletedAt: string | null } | null>;
+  reservedHead?: (scope: string) => Promise<{
+    expectedVersion: string;
+    dataHash: string;
+    metadataHash: string;
+    deletedAt: string | null;
+  } | null>;
   /** Data owner the tombstone is registered on behalf of. */
   serverOwner: `0x${string}`;
   /**
@@ -88,9 +91,12 @@ export function createGatewayDeleteDataPort(
   const owner = options.serverOwner.toLowerCase() as `0x${string}`;
 
   // Current version and deleted state of the point behind `scope`.
-  function currentHead(
-    scope: string,
-  ): Promise<{ expectedVersion: string; deletedAt: string | null } | null> {
+  function currentHead(scope: string): Promise<{
+    expectedVersion: string;
+    dataHash: string;
+    metadataHash: string;
+    deletedAt: string | null;
+  } | null> {
     if (options.reservedHead && isGatewayReservedScope(scope))
       return options.reservedHead(scope);
     return options.dataPointFeed.getDataPoint({

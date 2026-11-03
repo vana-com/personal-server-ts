@@ -479,9 +479,12 @@ export interface DeleteDataPort {
    * gateway authorizes for this server. Absent when the host wires none; the
    * deletion-aware feed is then used, as for every other scope.
    */
-  head?(
-    scope: string,
-  ): Promise<{ expectedVersion: string; deletedAt: string | null } | null>;
+  head?(scope: string): Promise<{
+    expectedVersion: string;
+    dataHash: string;
+    metadataHash: string;
+    deletedAt: string | null;
+  } | null>;
   deleteBlobVersions(
     scope: string,
     versions: string[],
