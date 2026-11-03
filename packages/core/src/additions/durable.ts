@@ -386,10 +386,12 @@ export function createDurableAdditions(
     budget: ReadBudget,
     source: VersionInventory,
     search?: { before: string; longerThan: number },
+    prefetched?: VersionInventory,
   ): Promise<RetainedCheckpoint | null> {
     const { relevant, after } = sourceWindow(source);
     const systemScope = additionsLedgerScope(scope);
-    const snapshot = await inventory.list(systemScope, budget.readOptions);
+    const snapshot =
+      prefetched ?? (await inventory.list(systemScope, budget.readOptions));
     if (!snapshot.head || snapshot.head.deletedAt !== null) return null;
     // Same visibility as source recovery: only settled tombstones at or below the head delete history.
     const boundary =
@@ -575,6 +577,11 @@ export function createDurableAdditions(
       version: VersionToFold;
       proof?: { envelope: unknown; encryptedSize: number };
     },
+    initial?: {
+      source: VersionInventory;
+      checkpoint?: PromiseSettledResult<VersionInventory>;
+    },
+    deferUnchanged?: (snapshot: VersionInventory) => void,
   ): Promise<{
     ledger: ScopeFirstSeenLedger | null;
     through: string;
@@ -583,7 +590,8 @@ export function createDurableAdditions(
     coverage: AdditionsCoverage;
   }> {
     budget.check();
-    const snapshot = await inventory.list(scope, budget.readOptions);
+    const snapshot =
+      initial?.source ?? (await inventory.list(scope, budget.readOptions));
     budget.check();
     const head = snapshot.head;
     if (!head || head.deletedAt !== null) {
@@ -618,7 +626,17 @@ export function createDurableAdditions(
     let checkpoint: RetainedCheckpoint | null = null;
     let inaccessibleExisting = false;
     try {
-      checkpoint = await readDocument(scope, budget, snapshot);
+      if (initial?.checkpoint?.status === "rejected")
+        throw initial.checkpoint.reason;
+      checkpoint = await readDocument(
+        scope,
+        budget,
+        snapshot,
+        undefined,
+        initial?.checkpoint?.status === "fulfilled"
+          ? initial.checkpoint.value
+          : undefined,
+      );
     } catch (error) {
       if (error instanceof BudgetExceeded || budget.signal?.aborted)
         throw error;
@@ -806,6 +824,34 @@ export function createDurableAdditions(
     if (BigInt(through) !== end && coverage === "complete")
       coverage = "partial";
     if (ledger?.incomplete || ledger?.skipped) coverage = "partial";
+    const document: LedgerDocument = {
+      version: 1,
+      owner,
+      network: options.network,
+      scope,
+      through,
+      currentTotal,
+      slots: folded,
+      ledger,
+    };
+    // A matching retained document needs no publication. Delay only its final
+    // observation so summaries can authenticate those independent inventories
+    // together after all content reads. Never defer a changed prefix: it must
+    // spend its reserved publication capacity before the next source unit.
+    if (
+      deferUnchanged &&
+      !checkpoint?.repairHead &&
+      JSON.stringify(document) === JSON.stringify(existing)
+    ) {
+      deferUnchanged(snapshot);
+      return {
+        ledger,
+        through,
+        currentTotal,
+        coverage,
+        inventory: fingerprintVersionInventory(snapshot),
+      };
+    }
     // The pages above are separate snapshots. Never certify against an old view.
     if (!budget.signal?.aborted) {
       const check = await inventory.list(scope, budget.readOptions);
@@ -818,16 +864,6 @@ export function createDurableAdditions(
           coverage: "behind",
         };
     }
-    const document: LedgerDocument = {
-      version: 1,
-      owner,
-      network: options.network,
-      scope,
-      through,
-      currentTotal,
-      slots: folded,
-      ledger,
-    };
     // Never replace durable permanent evidence with a failed invalidation replay.
     if (
       ((!existing && !inaccessibleExisting) ||
@@ -873,8 +909,53 @@ export function createDurableAdditions(
         scopes = (await inventory.listScopes(budget.readOptions))
           .filter((scope) => !isSystemScope(scope))
           .sort();
+        // Overlap owner signing and small registry reads, not source replay or
+        // checkpoint writes. Snapshots live only in this invocation and recovery
+        // still observes each source again after reading its committed evidence.
+        const snapshots = new Map<
+          string,
+          {
+            source: VersionInventory;
+            checkpoint?: PromiseSettledResult<VersionInventory>;
+          }
+        >();
+        for (let offset = 0; offset < scopes.length; offset += 4) {
+          const batch = await Promise.allSettled(
+            scopes.slice(offset, offset + 4).map(async (scope) => {
+              const source = await inventory.list(scope, budget.readOptions);
+              const checkpoint =
+                source.head && source.head.deletedAt === null
+                  ? await inventory
+                      .list(additionsLedgerScope(scope), budget.readOptions)
+                      .then(
+                        (value): PromiseSettledResult<VersionInventory> => ({
+                          status: "fulfilled",
+                          value,
+                        }),
+                        (reason): PromiseSettledResult<VersionInventory> => ({
+                          status: "rejected",
+                          reason,
+                        }),
+                      )
+                  : undefined;
+              return { scope, source, checkpoint };
+            }),
+          );
+          // Settle every admitted request before propagating cancellation/failure.
+          for (const item of batch) {
+            if (item.status === "rejected") throw item.reason;
+            snapshots.set(item.value.scope, item.value);
+          }
+        }
+        const unchanged = new Map<string, VersionInventory>();
         for (const scope of scopes) {
-          const result = await recover(scope, budget);
+          const result = await recover(
+            scope,
+            budget,
+            undefined,
+            snapshots.get(scope),
+            (snapshot) => unchanged.set(scope, snapshot),
+          );
           if (result.ledger)
             ledgers.push({
               ...result.ledger,
@@ -887,6 +968,17 @@ export function createDurableAdditions(
             (result.coverage === "partial" && coverage === "complete")
           )
             coverage = result.coverage;
+        }
+        const pending = [...unchanged];
+        for (let offset = 0; offset < pending.length; offset += 4) {
+          const batch = await Promise.allSettled(
+            pending.slice(offset, offset + 4).map(async ([scope, snapshot]) => {
+              const check = await inventory.list(scope, budget.readOptions);
+              if (!sameInventory(snapshot, check)) coverage = "behind";
+            }),
+          );
+          for (const item of batch)
+            if (item.status === "rejected") throw item.reason;
         }
         const check = (await inventory.listScopes(budget.readOptions))
           .filter((scope) => !isSystemScope(scope))

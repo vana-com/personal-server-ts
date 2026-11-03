@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   mkdtemp,
   readFile,
@@ -60,6 +60,7 @@ const registrySchema = z.record(
 );
 const roots: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -338,6 +339,7 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
   function boundedActor(
     input: {
       beforeDownload?: (key: string, budget: ByteBudget) => Promise<void>;
+      beforeInventoryRead?: (scope: string) => Promise<void>;
       proof?: (proof: {
         expectedVersion: string;
         dataHash: string;
@@ -348,54 +350,57 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
   ) {
     const events: string[] = [];
     const adapter = storage();
-    const service = actor({
-      byteBudget: 2 * 1024 * 1024,
-      storageAdapter: {
-        ...adapter,
-        async downloadBounded(key, budget) {
-          budget.charge();
-          events.push(`download:${key}`);
-          await input.beforeDownload?.(key, budget);
-          budget.charge();
-          const bytes = new Uint8Array(
-            await readFile(key, { signal: budget.signal }),
-          );
-          budget.charge(bytes.byteLength * 2);
-          return bytes;
+    const service = actor(
+      {
+        byteBudget: 2 * 1024 * 1024,
+        storageAdapter: {
+          ...adapter,
+          async downloadBounded(key, budget) {
+            budget.charge();
+            events.push(`download:${key}`);
+            await input.beforeDownload?.(key, budget);
+            budget.charge();
+            const bytes = new Uint8Array(
+              await readFile(key, { signal: budget.signal }),
+            );
+            budget.charge(bytes.byteLength * 2);
+            return bytes;
+          },
         },
+        boundedWork: {
+          async decrypt(bytes, key, budget) {
+            budget.charge(bytes.byteLength * 8);
+            const plaintext = await decryptWithPassword(bytes, key);
+            budget.charge(plaintext.byteLength);
+            return plaintext;
+          },
+          async publish(scope, data, budget) {
+            budget.charge();
+            events.push(`publish:${scope}`);
+            const previous =
+              (await readRegistry())[scope]?.versions.at(-1)?.expectedVersion ??
+              "0";
+            const expectedVersion = String(BigInt(previous) + 1n);
+            budget.charge(JSON.stringify(data).length * 16);
+            await put(scope, expectedVersion, T4, data);
+            budget.charge();
+            const slot = (await readRegistry())[scope].versions.at(-1)!;
+            const proof = {
+              expectedVersion,
+              dataHash: slot.dataHash,
+              metadataHash: slot.metadataHash,
+            };
+            return input.proof?.(proof) ?? proof;
+          },
+          async confirmed(scope, budget) {
+            budget.charge();
+            events.push(`confirmed:${scope}`);
+          },
+        },
+        ...input.options,
       },
-      boundedWork: {
-        async decrypt(bytes, key, budget) {
-          budget.charge(bytes.byteLength * 8);
-          const plaintext = await decryptWithPassword(bytes, key);
-          budget.charge(plaintext.byteLength);
-          return plaintext;
-        },
-        async publish(scope, data, budget) {
-          budget.charge();
-          events.push(`publish:${scope}`);
-          const previous =
-            (await readRegistry())[scope]?.versions.at(-1)?.expectedVersion ??
-            "0";
-          const expectedVersion = String(BigInt(previous) + 1n);
-          budget.charge(JSON.stringify(data).length * 16);
-          await put(scope, expectedVersion, T4, data);
-          budget.charge();
-          const slot = (await readRegistry())[scope].versions.at(-1)!;
-          const proof = {
-            expectedVersion,
-            dataHash: slot.dataHash,
-            metadataHash: slot.metadataHash,
-          };
-          return input.proof?.(proof) ?? proof;
-        },
-        async confirmed(scope, budget) {
-          budget.charge();
-          events.push(`confirmed:${scope}`);
-        },
-      },
-      ...input.options,
-    });
+      input.beforeInventoryRead,
+    );
     return { service, events };
   }
   return {
@@ -1414,4 +1419,58 @@ it("refuses unsupported durable-only cleanup and honors cancellation before ordi
     additionsLedgerScope(SOURCE),
     ADDITIONS_SUMMARY_SCOPE,
   ]);
+});
+
+it("recovers retained history across 29 scopes inside one owner deadline", async () => {
+  const f = await fixture();
+  const scopes = Array.from(
+    { length: 29 },
+    (_, index) => `notes.${String(index).padStart(2, "0")}`,
+  );
+  for (const scope of scopes)
+    await f.put(scope, "1", T1, { records: [{ id: scope }] });
+  expect(await f.actor().summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 29,
+  });
+  // A genuinely cold reader has no original bodies, local sidecars or cached ledgers.
+  for (const scope of scopes) await rm(f.blobPath(`${scope}/1`));
+  let elapsed = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+  async function network(milliseconds: number) {
+    const end = elapsed + milliseconds;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    elapsed = Math.max(elapsed, end);
+  }
+  const actor = f.boundedActor({
+    beforeInventoryRead: () => network(1600),
+    beforeDownload: () => network(1900),
+    options: { byteBudget: 256 * 1024 * 1024, timeBudgetMs: 120_000 },
+  });
+  const result = await actor.service.summarize(QUERY);
+  expect(result).toMatchObject({ coverage: "complete", total: 29 });
+  expect(result.days.map((day) => day.added)).toEqual([29, 0, 0, 0]);
+  expect(result.through).toEqual(
+    Object.fromEntries(scopes.map((scope) => [scope, "1"])),
+  );
+  expect(elapsed).toBeLessThan(120_000);
+  const portable = await f.document(ADDITIONS_SUMMARY_SCOPE);
+  // A different device replaces an early source after its checkpoint was read.
+  // Batched final observations must still reject the obsolete evidence.
+  let replaced = false;
+  f.onDownload(async (key) => {
+    if (
+      !replaced &&
+      key === f.blobPath(`${additionsLedgerScope(scopes.at(-1)!)}/1`)
+    ) {
+      replaced = true;
+      await f.put(scopes[0]!, "1", T2, { records: [{ id: "replacement" }] });
+    }
+  });
+  elapsed = 0;
+  expect(await actor.service.summarize(QUERY)).toMatchObject({
+    coverage: "behind",
+  });
+  expect(replaced).toBe(true);
+  expect(await f.document(ADDITIONS_SUMMARY_SCOPE)).toEqual(portable);
 });

@@ -36,27 +36,40 @@ const pending = new Map<
     budget?: ByteBudget;
   }
 >();
+let hostWork = Promise.resolve();
 function rpc(
   method: HostMethod,
   args: unknown[],
   budget?: ByteBudget,
 ): Promise<unknown> {
-  budget?.charge();
-  return new Promise((resolve, reject) => {
-    const id = ++sequence;
-    pending.set(id, { resolve, reject, budget });
-    worker.postMessage(
-      {
-        kind: "request",
-        id,
-        method,
-        args,
-        remaining: budget?.remaining ?? 0,
-        remainingMilliseconds: budget?.remainingMilliseconds,
-      },
-      additionsTransfers(args),
-    );
-  });
+  // Signing has no byte receipt. Byte-consuming host calls are dispatched one
+  // at a time, after booking the preceding receipt, so concurrent inventory
+  // requests cannot each spend the same remaining owner-wide allowance.
+  const exchange = () => {
+    budget?.charge();
+    return new Promise((resolve, reject) => {
+      const id = ++sequence;
+      pending.set(id, { resolve, reject, budget });
+      worker.postMessage(
+        {
+          kind: "request",
+          id,
+          method,
+          args,
+          remaining: budget?.remaining ?? 0,
+          remainingMilliseconds: budget?.remainingMilliseconds,
+        },
+        additionsTransfers(args),
+      );
+    });
+  };
+  if (method === "signRequest") return exchange();
+  const result = hostWork.then(exchange);
+  hostWork = result.then(
+    () => {},
+    () => {},
+  );
+  return result;
 }
 function hex(bytes: Uint8Array) {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
@@ -74,39 +87,39 @@ function createService(init: AdditionsWorkerInit) {
     (await rpc(method, args, budget)) as Awaited<
       ReturnType<PsLiteAdditionsTransport[K]>
     >;
-  let activeBudget: ByteBudget | undefined;
-  const inventory = createVersionInventoryClient({
-    gatewayUrl: init.gatewayUrl,
-    ownerAddress: init.ownerAddress,
-    ownerSigner: {
-      signRequest: (params) => transport("signRequest", [params], activeBudget),
-    },
-    boundedOwnerSigner: (params) =>
-      transport("signRequest", [params], activeBudget),
-    fetch: async (input, request) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input.url;
-      const response = await transport(
-        "fetch",
-        [
-          {
-            url,
-            method: request?.method,
-            headers: [...new Headers(request?.headers)],
-          },
-        ],
-        activeBudget,
-      );
-      return new Response(new Uint8Array(response.body), {
-        status: response.status,
-        headers: response.headers,
-      });
-    },
-  });
+  const inventoryFor = (budget?: ByteBudget) =>
+    createVersionInventoryClient({
+      gatewayUrl: init.gatewayUrl,
+      ownerAddress: init.ownerAddress,
+      ownerSigner: {
+        signRequest: (params) => transport("signRequest", [params], budget),
+      },
+      boundedOwnerSigner: (params) =>
+        transport("signRequest", [params], budget),
+      fetch: async (input, request) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        const response = await transport(
+          "fetch",
+          [
+            {
+              url,
+              method: request?.method,
+              headers: [...new Headers(request?.headers)],
+            },
+          ],
+          budget,
+        );
+        return new Response(new Uint8Array(response.body), {
+          status: response.status,
+          headers: response.headers,
+        });
+      },
+    });
   const reconciledScopes = new Set<string>();
   async function reconcilePending(scope: string, budget: ByteBudget) {
     if (reconciledScopes.has(scope)) return null;
@@ -116,7 +129,7 @@ function createService(init: AdditionsWorkerInit) {
       return null;
     }
     let prior = pending;
-    let snapshot = await inventory.list(scope, {
+    let snapshot = await inventoryFor(budget).list(scope, {
       budget,
       signal: budget.signal,
     });
@@ -134,7 +147,7 @@ function createService(init: AdditionsWorkerInit) {
       // The owner retries the exact bytes and resolves the current registry head.
       const published = await transport("publish", [prior], budget);
       prior = { ...prior, expectedVersion: published.expectedVersion };
-      snapshot = await inventory.list(scope, {
+      snapshot = await inventoryFor(budget).list(scope, {
         budget,
         signal: budget.signal,
       });
@@ -186,7 +199,7 @@ function createService(init: AdditionsWorkerInit) {
     }
     // Other devices do not share our Web Lock. Recheck registration visibility
     // after authenticating bytes, including an unchanged but now failed intent.
-    const latest = await inventory.list(scope, {
+    const latest = await inventoryFor(budget).list(scope, {
       budget,
       signal: budget.signal,
     });
@@ -214,25 +227,20 @@ function createService(init: AdditionsWorkerInit) {
   }
   // Budget objects never cross structured clone; each RPC receives the current
   // remaining allowance and the host's session-wide cancellation signal.
-  const boundedInventory: typeof inventory = {
+  const boundedInventory: ReturnType<typeof createVersionInventoryClient> = {
     page: async (scope, options) => {
-      activeBudget = options?.budget;
-      return inventory.page(scope, options);
+      return inventoryFor(options?.budget).page(scope, options);
     },
     list: async (scope, options) => {
-      activeBudget = options?.budget;
       if (scope.startsWith("vana.system.") && options?.budget)
         await reconcilePending(scope, options.budget);
-      return inventory.list(scope, options);
+      return inventoryFor(options?.budget).list(scope, options);
     },
     listScopes: async (options) => {
-      activeBudget = options?.budget;
-      return inventory.listScopes(options);
+      return inventoryFor(options?.budget).listScopes(options);
     },
     head: (scope, signal) => {
-      // An unbudgeted read: do not charge it to an earlier call's budget.
-      activeBudget = undefined;
-      return inventory.head(scope, signal);
+      return inventoryFor().head(scope, signal);
     },
   };
   const reported = new Set<string>();
@@ -279,11 +287,10 @@ function createService(init: AdditionsWorkerInit) {
       },
       decrypt: decryptBoundedAdditions,
       async publish(scope, data, budget) {
-        activeBudget = budget;
         const prior = await reconcilePending(scope, budget);
         if (prior && JSON.stringify(prior.data) === JSON.stringify(data))
           return prior.proof;
-        const snapshot = await inventory.list(scope, {
+        const snapshot = await inventoryFor(budget).list(scope, {
           budget,
           signal: budget.signal,
         });

@@ -17,7 +17,7 @@ This Lite composition uses existing owner-wallet authority. Every inventory requ
 3. Start after the last settled tombstone. Reimport baseline identities have unknown arrival dates and are not new arrivals.
 4. Validate the entire stored checkpoint prefix against current commitments. Same-version replacement invalidates the prefix.
 5. Fold readable envelopes in numeric order using only `collectedAt`. Retain exact permanent identity/timestamp evidence. Missing evidence, failed/unknown slots and tentative pending slots prevent complete coverage.
-6. Re-read the inventory and source listing before certifying. Pages are separate snapshots, not owner-wide atomic finality.
+6. Re-read the inventory and source listing before certifying. Pages are separate snapshots, not owner-wide atomic finality. Initial source/checkpoint inventories are read in batches of at most four, using one owner-wide budget. Replay and checkpoint publication remain serial. Unchanged retained checkpoints defer their second source observation to a final batch of at most four; a mismatch makes the whole result behind and prevents summary publication. Changed prefixes are verified and published immediately, before the next source spends their reserved capacity. No inventory or plaintext cache survives the invocation.
 7. Publish encrypted checkpoints and a changed portable summary. Re-read registration and blob commitments after publication. System writes never recursively fold.
 
 Cross-device correctness does not depend on process-local locks or CAS registration. A later reader repairs lost or lower-prefix checkpoints. If source blobs are missing during required replay, history remains partial. An inaccessible checkpoint is never overwritten with a failed rebuild. Full runtime has no 200-version/256-MiB backfill cap. Inventory pages are still accumulated, with a configurable page limit, so full-runtime memory includes the version inventory and one scope ledger.
@@ -43,6 +43,8 @@ Full-runtime requested local days are rebuilt directly from exact ledger timesta
 Source deletion uses the existing durable deletion pipeline for its checkpoint and summary invalidation. Subsequent recovery reads current source tombstones. Captured prior ciphertext remains owner-decryptable, as with ordinary source data deletion.
 
 ## Budgeted hosts
+
+Lite inventory calls bind their budget in a per-call closure. Owner signatures may overlap; byte-consuming worker RPCs are queued until the preceding receipt is booked, then dispatch with the current remaining allowance. This avoids overspending the same allowance through concurrent metadata requests. The queue checks cancellation before starting any later effect.
 
 One `AdditionsBudget` covers inventory bodies, ciphertext, contiguous copies, decoded plaintext, parse input work, checkpoint verification and derived summary work across scopes. Exhaustion is sticky. Monotonic deadline checks catch CPU work that runs past an undelivered timer callback. Real fetch/stream cancellation is awaited; no timeout race abandons an SDK operation.
 
