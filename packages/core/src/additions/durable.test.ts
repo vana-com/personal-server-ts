@@ -339,7 +339,6 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
   function boundedActor(
     input: {
       beforeDownload?: (key: string, budget: ByteBudget) => Promise<void>;
-      beforeInventoryRead?: (scope: string) => Promise<void>;
       proof?: (proof: {
         expectedVersion: string;
         dataHash: string;
@@ -350,57 +349,54 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
   ) {
     const events: string[] = [];
     const adapter = storage();
-    const service = actor(
-      {
-        byteBudget: 2 * 1024 * 1024,
-        storageAdapter: {
-          ...adapter,
-          async downloadBounded(key, budget) {
-            budget.charge();
-            events.push(`download:${key}`);
-            await input.beforeDownload?.(key, budget);
-            budget.charge();
-            const bytes = new Uint8Array(
-              await readFile(key, { signal: budget.signal }),
-            );
-            budget.charge(bytes.byteLength * 2);
-            return bytes;
-          },
+    const service = actor({
+      byteBudget: 2 * 1024 * 1024,
+      storageAdapter: {
+        ...adapter,
+        async downloadBounded(key, budget) {
+          budget.charge();
+          events.push(`download:${key}`);
+          await input.beforeDownload?.(key, budget);
+          budget.charge();
+          const bytes = new Uint8Array(
+            await readFile(key, { signal: budget.signal }),
+          );
+          budget.charge(bytes.byteLength * 2);
+          return bytes;
         },
-        boundedWork: {
-          async decrypt(bytes, key, budget) {
-            budget.charge(bytes.byteLength * 8);
-            const plaintext = await decryptWithPassword(bytes, key);
-            budget.charge(plaintext.byteLength);
-            return plaintext;
-          },
-          async publish(scope, data, budget) {
-            budget.charge();
-            events.push(`publish:${scope}`);
-            const previous =
-              (await readRegistry())[scope]?.versions.at(-1)?.expectedVersion ??
-              "0";
-            const expectedVersion = String(BigInt(previous) + 1n);
-            budget.charge(JSON.stringify(data).length * 16);
-            await put(scope, expectedVersion, T4, data);
-            budget.charge();
-            const slot = (await readRegistry())[scope].versions.at(-1)!;
-            const proof = {
-              expectedVersion,
-              dataHash: slot.dataHash,
-              metadataHash: slot.metadataHash,
-            };
-            return input.proof?.(proof) ?? proof;
-          },
-          async confirmed(scope, budget) {
-            budget.charge();
-            events.push(`confirmed:${scope}`);
-          },
-        },
-        ...input.options,
       },
-      input.beforeInventoryRead,
-    );
+      boundedWork: {
+        async decrypt(bytes, key, budget) {
+          budget.charge(bytes.byteLength * 8);
+          const plaintext = await decryptWithPassword(bytes, key);
+          budget.charge(plaintext.byteLength);
+          return plaintext;
+        },
+        async publish(scope, data, budget) {
+          budget.charge();
+          events.push(`publish:${scope}`);
+          const previous =
+            (await readRegistry())[scope]?.versions.at(-1)?.expectedVersion ??
+            "0";
+          const expectedVersion = String(BigInt(previous) + 1n);
+          budget.charge(JSON.stringify(data).length * 16);
+          await put(scope, expectedVersion, T4, data);
+          budget.charge();
+          const slot = (await readRegistry())[scope].versions.at(-1)!;
+          const proof = {
+            expectedVersion,
+            dataHash: slot.dataHash,
+            metadataHash: slot.metadataHash,
+          };
+          return input.proof?.(proof) ?? proof;
+        },
+        async confirmed(scope, budget) {
+          budget.charge();
+          events.push(`confirmed:${scope}`);
+        },
+      },
+      ...input.options,
+    });
     return { service, events };
   }
   return {
@@ -1442,10 +1438,48 @@ it("recovers retained history across 29 scopes inside one owner deadline", async
     await new Promise<void>((resolve) => setImmediate(resolve));
     elapsed = Math.max(elapsed, end);
   }
+  let registry = await f.readRegistry();
+  const inventory: VersionInventoryClient = {
+    async list(scope) {
+      const snapshot = structuredClone(
+        registry[scope] ?? { head: null, versions: [] },
+      );
+      await network(1600);
+      return snapshot;
+    },
+    async listScopes() {
+      return Object.keys(registry).filter(
+        (scope) => !scope.startsWith("vana.system."),
+      );
+    },
+    async page() {
+      throw new Error("Completed inventory port only");
+    },
+    async head() {
+      throw new Error("Completed inventory port only");
+    },
+  };
+  let replaceDuringRead = false;
+  let replaced = false;
   const actor = f.boundedActor({
-    beforeInventoryRead: () => network(1600),
-    beforeDownload: () => network(1900),
-    options: { byteBudget: 256 * 1024 * 1024, timeBudgetMs: 120_000 },
+    beforeDownload: async (key) => {
+      await network(1900);
+
+      if (
+        replaceDuringRead &&
+        !replaced &&
+        key === f.blobPath(`${additionsLedgerScope(scopes.at(-1)!)}/1`)
+      ) {
+        replaced = true;
+        await f.put(scopes[0]!, "1", T2, { records: [{ id: "replacement" }] });
+        registry = await f.readRegistry();
+      }
+    },
+    options: {
+      byteBudget: 256 * 1024 * 1024,
+      timeBudgetMs: 120_000,
+      inventory,
+    },
   });
   const result = await actor.service.summarize(QUERY);
   expect(result).toMatchObject({ coverage: "complete", total: 29 });
@@ -1457,16 +1491,7 @@ it("recovers retained history across 29 scopes inside one owner deadline", async
   const portable = await f.document(ADDITIONS_SUMMARY_SCOPE);
   // A different device replaces an early source after its checkpoint was read.
   // Batched final observations must still reject the obsolete evidence.
-  let replaced = false;
-  f.onDownload(async (key) => {
-    if (
-      !replaced &&
-      key === f.blobPath(`${additionsLedgerScope(scopes.at(-1)!)}/1`)
-    ) {
-      replaced = true;
-      await f.put(scopes[0]!, "1", T2, { records: [{ id: "replacement" }] });
-    }
-  });
+  replaceDuringRead = true;
   elapsed = 0;
   expect(await actor.service.summarize(QUERY)).toMatchObject({
     coverage: "behind",
