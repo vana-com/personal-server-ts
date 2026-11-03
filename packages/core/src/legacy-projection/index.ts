@@ -42,6 +42,7 @@ export type {
   PdppSelection,
   ProjectionDiagnostic,
   ProjectionOmission,
+  RetainedChatgptMessage,
   ProjectionError,
   ProjectionResult,
   ProjectPdppRecordsOptions,
