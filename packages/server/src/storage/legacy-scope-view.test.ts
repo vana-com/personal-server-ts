@@ -3852,8 +3852,16 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
         envelopes: [],
       });
     }
-    expect((await view.readLatest(scope)).kind).toBe("refused");
-    expect((await view.readLatest(scope)).kind).toBe("refused");
+    const expectedKind =
+      variant === "unfetched detail" || variant === "wrong parent"
+        ? "canonical"
+        : "refused";
+    const firstRead = await view.readLatest(scope);
+    expect(firstRead.kind).toBe(expectedKind);
+    if (expectedKind === "canonical") {
+      expect(firstRead.chatgptCoverageGaps).toHaveLength(1);
+    }
+    expect((await view.readLatest(scope)).kind).toBe(expectedKind);
   });
 
   it.each([

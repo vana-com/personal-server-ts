@@ -2965,34 +2965,46 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             parent: { message_count_on_current_branch: 2 },
             rows: [message("c1", "n2", null, "disconnected")],
           },
-        ])("never rescues a $label parent", ({ parent, rows }) => {
-          const base = conversation("c1", 1, "n1");
-          const result = projected(
-            project([
-              ...(parent === null
-                ? []
-                : [
-                    {
-                      ...base,
-                      data: { ...base.data, ...parent },
-                    },
-                  ]),
-              message("c1", "n1", null, "visible"),
-              ...rows,
-              retained(),
-              conversation("control", 0, ""),
-              retained("control"),
-            ]),
-          );
-          expect(result.payload).toMatchObject({
-            total: 1,
-            conversations: [{ id: "control", messages: [] }],
-          });
-          expect(
-            result.retainedChatgptMessages?.map((r) => r.conversationId),
-          ).toEqual(["control"]);
-          expect(result.chatgptCoverageGaps).toHaveLength(1);
-        });
+        ])(
+          "keeps $label data out of retained evidence",
+          ({ label, parent, rows }) => {
+            const base = conversation("c1", 1, "n1");
+            const result = projected(
+              project([
+                ...(parent === null
+                  ? []
+                  : [
+                      {
+                        ...base,
+                        data: { ...base.data, ...parent },
+                      },
+                    ]),
+                message("c1", "n1", null, "visible"),
+                ...rows,
+                retained(),
+                conversation("control", 0, ""),
+                retained("control"),
+              ]),
+            );
+            expect(result.payload).toMatchObject({
+              total: 1,
+              conversations: [{ id: "control", messages: [] }],
+            });
+            expect(
+              result.retainedChatgptMessages?.map((r) => r.conversationId),
+            ).toEqual(["control"]);
+            if (["incomplete count", "disconnected chain"].includes(label)) {
+              expect(result.chatgptCoverageGaps).toHaveLength(1);
+            } else {
+              expect(result.chatgptCoverageGaps).toBeUndefined();
+              expect(result.diagnostics).toEqual(
+                expect.arrayContaining([
+                  expect.objectContaining({ kind: "records_dropped" }),
+                ]),
+              );
+            }
+          },
+        );
 
         it("does not emit evidence when the messages stream was not fetched", () => {
           const result = projected(
