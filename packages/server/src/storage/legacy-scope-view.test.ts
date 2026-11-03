@@ -3539,10 +3539,34 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
         walkedCount: 1,
       },
     ]);
-    expect(view.verdictFor(scope)[0]).toMatchObject({
+    const displayVerdict = view.verdictFor(scope)[0]!;
+    const displayedGap = read.chatgptCoverageGaps![0]!;
+    expect(displayVerdict).toMatchObject({
       verdict: "covered",
-      excludedConversations: read.chatgptCoverageGaps,
+      excludedConversations: [
+        {
+          ...displayedGap,
+          conversationIdHash: displayedGap.conversationIdHash.slice(0, 12),
+        },
+      ],
+      reason: {
+        excludedConversations: [
+          {
+            ...displayedGap,
+            conversationIdHash: displayedGap.conversationIdHash.slice(0, 12),
+          },
+        ],
+      },
     });
+    expect(
+      config.authority.cachedVerdict(
+        scope,
+        "chat",
+        1,
+        displayVerdict.legacyVersionId,
+        displayVerdict.canonicalCursor,
+      )?.excludedConversations?.[0]?.conversationIdHash,
+    ).toBe(displayedGap.conversationIdHash);
 
     const restarted = createLegacyScopeView({
       ...config,
@@ -3554,7 +3578,12 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     });
     expect(restarted.verdictFor(scope)[0]).toMatchObject({
       verdict: "covered",
-      excludedConversations: read.chatgptCoverageGaps,
+      excludedConversations: [
+        {
+          ...displayedGap,
+          conversationIdHash: displayedGap.conversationIdHash.slice(0, 12),
+        },
+      ],
     });
   });
 
