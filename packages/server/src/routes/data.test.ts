@@ -2424,6 +2424,7 @@ describe("DELETE /v1/data/:scope", () => {
     });
 
     expect(getRes.status).toBe(410);
+    expect(getRes.headers.get("cache-control")).toBe("no-store");
     const json = await getRes.json();
     expect(json.error.errorCode).toBe("DATA_DELETED");
     expect(json.error.details).toMatchObject({
@@ -2633,6 +2634,7 @@ describe("DELETE /v1/data/:scope", () => {
         headers: { Authorization: versionsHeader },
       });
       expect(versions.status).toBe(410);
+      expect(versions.headers.get("cache-control")).toBe("no-store");
       expect((await versions.json()).error.errorCode).toBe("DATA_DELETED");
     });
 
