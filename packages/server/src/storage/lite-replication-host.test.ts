@@ -88,12 +88,17 @@ function dpv2(net: Network) {
       owner: partition,
       masterKey: new Uint8Array(32).fill(5),
       storage,
+      compatibilityRoster: net.compatibilityRoster,
       gateway: { registerDataPoint: () => Promise.reject(new Error("unused")) },
       feed: {
         listDataPointsByOwner: () => Promise.reject(new Error("unused")),
         getDataPoint: () => Promise.reject(new Error("unused")),
       },
-      signer: { signAddData: () => Promise.reject(new Error("unused")) },
+      signer: {
+        address: partition,
+        signMessage: () => Promise.reject(new Error("unused")),
+        signAddData: () => Promise.reject(new Error("unused")),
+      },
       evidence: () => Promise.reject(new Error("unused")),
     });
     return {
@@ -220,6 +225,33 @@ it("builds nothing with the door closed or the boot config off", async () => {
   a.native.close();
 });
 
+it("boots a fresh Lite host before the lazy transport tables exist", async () => {
+  const net = network();
+  const a = phone(net, "phone-fresh-schema");
+  expect(
+    a.native.db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'pdpp_transport_%'",
+      )
+      .all(),
+  ).toEqual([]);
+  const replication = await createLiteReplication(a.input());
+  expect(replication.state).toBe("started");
+  expect(
+    a.native.db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'pdpp_transport_%'",
+      )
+      .all(),
+  ).toEqual([]);
+  expect(
+    a.native.db
+      .prepare("SELECT value FROM lite_kv WHERE key='pending-budget/state'")
+      .get(),
+  ).toBeDefined();
+  a.native.close();
+});
+
 it("blocks with a reason when the partition cannot be derived", async () => {
   const net = network();
   const a = phone(net, "phone-blocked");
@@ -254,6 +286,46 @@ it("blocks with a reason when the partition cannot be derived", async () => {
   ).toBe("no RPC for chain 14800");
   expect(a.persistence.transactions()).toBe(0);
   a.native.close();
+});
+
+it("retains factory writes while compatibility is unavailable and delivers after recovery", async () => {
+  const net = network();
+  const compatible = net.compatibilityRoster;
+  const gate = vi
+    .spyOn(net, "compatibilityRoster")
+    .mockRejectedValue(new Error("test roster unavailable"));
+  const pa = phone(net, "phone-offline-a");
+  const pb = phone(net, "phone-offline-b");
+  const a = await device(await createLiteReplication(pa.input()));
+  const b = await device(await createLiteReplication(pb.input()));
+  await a.cycle();
+  await b.cycle();
+  await a.put("accepted offline", "offline");
+  for (let i = 0; i < 3; i++) {
+    clock.advance(10_000);
+    await a.cycle();
+    await b.cycle();
+  }
+  expect(gate).toHaveBeenCalled();
+  expect(pa.uploads).toEqual([]);
+  expect(pb.uploads).toEqual([]);
+  expect(await a.get("offline")).toEqual({
+    id: "offline",
+    text: "accepted offline",
+  });
+  expect(await b.get("offline")).toBeUndefined();
+  gate.mockImplementation(compatible);
+  for (let i = 0; i < 12; i++) {
+    clock.advance(10_000);
+    await a.cycle();
+    await b.cycle();
+  }
+  expect(await b.get("offline")).toEqual({
+    id: "offline",
+    text: "accepted offline",
+  });
+  pa.native.close();
+  pb.native.close();
 });
 
 it("two phones built by the factory converge over DPv2 and native transfers", async () => {

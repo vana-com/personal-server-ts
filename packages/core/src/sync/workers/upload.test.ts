@@ -5,6 +5,7 @@ import { keccak256 } from "viem";
 import type { UploadWorkerDeps } from "./upload.js";
 import { uploadOne, uploadAll, computeDataPointId } from "./upload.js";
 import type { IndexEntry } from "../../storage/index/types.js";
+import { StoredBlobConflictError } from "../../storage/adapters/interface.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type {
   DataFileEnvelope,
@@ -16,12 +17,18 @@ import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
 
-vi.mock("@opendatalabs/vana-sdk/browser", () => ({
-  deriveScopeKey: vi.fn(),
-  encryptWithPassword: vi.fn(),
-}));
+vi.mock("@opendatalabs/vana-sdk/browser", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    deriveScopeKey: vi.fn(),
+    encryptWithPassword: vi.fn(),
+    decryptWithPassword: vi.fn(),
+  };
+});
 
 import {
+  decryptWithPassword,
   deriveScopeKey,
   encryptWithPassword,
 } from "@opendatalabs/vana-sdk/browser";
@@ -142,6 +149,9 @@ describe("upload worker", () => {
     (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
     (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
       ENCRYPTED_BYTES,
+    );
+    (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new TextEncoder().encode(JSON.stringify(makeEnvelope())),
     );
   });
 
@@ -318,6 +328,73 @@ describe("upload worker", () => {
           signature: "0xadddatasignature",
         }),
       );
+    });
+
+    it("keeps the renderer event loop responsive while committing a large upload", async () => {
+      const deps = makeMockDeps();
+      const envelope: DataFileEnvelope = {
+        ...makeEnvelope(),
+        data: { payload: "x".repeat(8 * 1024 * 1024) },
+      };
+      deps.storage.readEnvelope = vi.fn().mockResolvedValue(envelope);
+      let uploadCompleted = false;
+      let heartbeatRanDuringUpload = false;
+      const heartbeat = new Promise<void>((resolve) => {
+        setTimeout(() => {
+          heartbeatRanDuringUpload = !uploadCompleted;
+          resolve();
+        }, 0);
+      });
+
+      const upload = uploadOne(deps, makeEntry());
+      await upload;
+      uploadCompleted = true;
+      await heartbeat;
+
+      const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
+      expect(heartbeatRanDuringUpload).toBe(true);
+      expect(deps.signer.signAddData).toHaveBeenCalledWith(
+        expect.objectContaining({ dataHash: keccak256(plaintext) }),
+      );
+    });
+
+    it("yields while hashing retained bytes before refusing a foreign reservation", async () => {
+      const deps = makeMockDeps();
+      const retainedEnvelope: DataFileEnvelope = {
+        ...makeEnvelope(),
+        data: { payload: "y".repeat(8 * 1024 * 1024) },
+      };
+      const retainedPlaintext = new TextEncoder().encode(
+        JSON.stringify(retainedEnvelope),
+      );
+      (
+        deps.storageAdapter.upload as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(new StoredBlobConflictError(`${SCOPE}/1`));
+      deps.storageAdapter.download = vi.fn().mockResolvedValue(ENCRYPTED_BYTES);
+      (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+        retainedPlaintext,
+      );
+      let uploadSettled = false;
+      let heartbeatRanDuringUpload = false;
+      const heartbeat = new Promise<void>((resolve) => {
+        setTimeout(() => {
+          heartbeatRanDuringUpload = !uploadSettled;
+          resolve();
+        }, 0);
+      });
+
+      let failure: unknown;
+      await uploadOne(deps, makeEntry()).catch((error: unknown) => {
+        uploadSettled = true;
+        failure = error;
+      });
+      uploadSettled = true;
+      await heartbeat;
+
+      expect(failure).toMatchObject({ code: "NEEDS_FENCED_PUBLICATION" });
+      expect(heartbeatRanDuringUpload).toBe(true);
+      expect(decryptWithPassword).toHaveBeenCalledOnce();
+      expect(deps.signer.signAddData).not.toHaveBeenCalled();
     });
 
     it("skips data-point registration when entry already has a dataPointId", async () => {

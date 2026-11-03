@@ -9,6 +9,7 @@ import {
 import { keccak256, stringToHex } from "viem";
 import { isTombstoneRecord } from "../sync/tombstone.js";
 import { readStoredLineage } from "../lineage/lineage.js";
+import { keccak256Cooperatively } from "./keccak.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import type { ServerSigner } from "../signing/signer.js";
 import {
@@ -125,7 +126,11 @@ export async function publishVersion(
       return {
         encrypted,
         wanted: {
-          ...candidate(envelope, encrypted, keccak256(plaintext)),
+          ...candidate(
+            envelope,
+            encrypted,
+            await keccak256Cooperatively(plaintext),
+          ),
           lineage,
         },
         async verifyStored(bytes) {
@@ -138,7 +143,7 @@ export async function publishVersion(
             !Number.isFinite(Date.parse(env.collectedAt))
           )
             throw new Error("Publication envelope scope/timestamp mismatch");
-          return candidate(env, bytes, keccak256(clear));
+          return candidate(env, bytes, await keccak256Cooperatively(clear));
         },
       };
     },

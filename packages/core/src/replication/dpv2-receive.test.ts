@@ -11,8 +11,10 @@ import {
   fragmentReplicaPayload,
   fromBase64,
   REPLICA_FRAGMENT_OVERHEAD_BYTES,
+  replicaDigest,
   replicaFragmentKey,
   replicaFramedBytesBound,
+  replicaLegacyFragmentKey,
   replicaManifestKey,
   replicaScope,
 } from "./transport.js";
@@ -24,6 +26,8 @@ const scope = replicaScope(writer);
 /** A DPv2 transport over in-memory storage, with or without bounded reads. */
 function transport(objects: Map<string, Uint8Array>, bounded: boolean) {
   const reads: number[] = [];
+  const requests: string[] = [];
+  const failures = new Map<string, Error>();
   const storage: StorageAdapter = {
     upload: async (key, data) => {
       objects.set(key, data);
@@ -40,7 +44,11 @@ function transport(objects: Map<string, Uint8Array>, bounded: boolean) {
     exists: async (key) => objects.has(key),
     ...(bounded && {
       async downloadBounded(key: string, budget: ByteBudget) {
-        const bytes = objects.get(key)!;
+        requests.push(key);
+        const failure = failures.get(key);
+        if (failure) throw failure;
+        const bytes = objects.get(key);
+        if (!bytes) throw new Error("download failed: 404");
         // Serve in 1 KiB chunks, so a refusal stops part-way.
         let offset = 0;
         const body = new ReadableStream<Uint8Array>({
@@ -62,6 +70,19 @@ function transport(objects: Map<string, Uint8Array>, bounded: boolean) {
     owner,
     masterKey: new Uint8Array(32).fill(5),
     storage,
+    compatibilityRoster: async () => ({
+      complete: true,
+      epoch: 1,
+      devices: [
+        {
+          address: owner,
+          registrationId: owner,
+          revokedAt: null,
+          readerFormats: ["fragments-v2"],
+          capabilityValid: true,
+        },
+      ],
+    }),
     gateway: { registerDataPoint: async () => ({}) as never },
     feed: {
       listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
@@ -69,12 +90,64 @@ function transport(objects: Map<string, Uint8Array>, bounded: boolean) {
     signer: { signAddData: async () => "0x12" },
     evidence: async () => ({ head: null, chain: null, pending: false }),
   });
-  return { port, reads };
+  return { port, reads, requests, failures };
 }
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it("checks the complete reader roster before the first fragment upload", async () => {
+  let uploads = 0;
+  const port = createDpv2ReplicaTransport({
+    owner,
+    masterKey: new Uint8Array(32).fill(5),
+    storage: {
+      upload: async () => {
+        uploads++;
+        return "unused";
+      },
+      urlForKey: (key: string) => key,
+      download: async () => new Uint8Array(),
+      delete: async () => false,
+      exists: async () => false,
+      downloadBounded: async () => new Uint8Array(),
+    },
+    gateway: { registerDataPoint: async () => ({}) as never },
+    feed: {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+    } as never,
+    signer: { signAddData: async () => "0x12" },
+    evidence: async () => ({ head: null, chain: null, pending: false }),
+    compatibilityRoster: async () => ({
+      complete: true,
+      epoch: 4,
+      devices: [
+        {
+          address: "0x0000000000000000000000000000000000000002",
+          name: "offline old reader",
+          registrationId: `0x${"2".repeat(64)}`,
+          revokedAt: null,
+          readerFormats: [],
+          capabilityValid: true,
+        },
+      ],
+    }),
+  });
+  await expect(
+    port.putFragment({
+      scope,
+      digest: `sha256:${"3".repeat(64)}`,
+      encrypted: new Uint8Array([1]),
+    }),
+  ).rejects.toMatchObject({
+    code: "replica_publication_blocked",
+    blockers: [
+      { name: "offline old reader", reason: "reader_format_unsupported" },
+    ],
+  });
+  expect(uploads).toBe(0);
 });
 
 describe("bounded reads", () => {
@@ -117,6 +190,19 @@ describe("bounded reads", () => {
         owner,
         masterKey: new Uint8Array(32).fill(5),
         storage,
+        compatibilityRoster: async () => ({
+          complete: true,
+          epoch: 1,
+          devices: [
+            {
+              address: owner,
+              registrationId: owner,
+              revokedAt: null,
+              readerFormats: ["fragments-v2"],
+              capabilityValid: true,
+            },
+          ],
+        }),
         gateway: { registerDataPoint: async () => ({}) as never },
         feed: {
           listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
@@ -219,6 +305,19 @@ describe("bounded reads", () => {
         owner,
         masterKey: new Uint8Array(32).fill(5),
         storage,
+        compatibilityRoster: async () => ({
+          complete: true,
+          epoch: 1,
+          devices: [
+            {
+              address: owner,
+              registrationId: owner,
+              revokedAt: null,
+              readerFormats: ["fragments-v2"],
+              capabilityValid: true,
+            },
+          ],
+        }),
         gateway: { registerDataPoint: async () => ({}) as never },
         feed: {
           listDataPointsByOwner: async () => ({
@@ -253,6 +352,49 @@ describe("bounded reads", () => {
     // the stream may have pulled one chunk ahead.
     expect(reads).toHaveLength(1);
     expect(reads[0]).toBeLessThanOrEqual(2 * 4096 + 2 * 1024);
+  });
+});
+
+describe("versioned fragment addresses", () => {
+  it("writes dash keys and reads both historical slash and recent dash keys", async () => {
+    const objects = new Map<string, Uint8Array>();
+    const { port, requests } = transport(objects, true);
+    const bytes = new Uint8Array([7, 8, 9]);
+    const digest = replicaDigest(bytes);
+    const current = replicaFragmentKey(scope, digest);
+    const legacy = replicaLegacyFragmentKey(scope, digest);
+
+    await port.putFragment({ scope, digest, encrypted: bytes });
+    expect(objects.has(current)).toBe(true);
+    expect(current).toBe(`${scope}/fragments-${digest.slice(7)}`);
+
+    objects.delete(current);
+    objects.set(legacy, bytes);
+    await expect(
+      port.getFragment(scope, digest, { maxBytes: bytes.length }),
+    ).resolves.toEqual(bytes);
+    expect(requests.slice(-2)).toEqual([current, legacy]);
+
+    objects.set(current, bytes);
+    await expect(
+      port.getFragment(scope, digest, { maxBytes: bytes.length }),
+    ).resolves.toEqual(bytes);
+    expect(requests.at(-1)).toBe(current);
+  });
+
+  it("does not try the slash key after a transient dash-key failure", async () => {
+    const objects = new Map<string, Uint8Array>();
+    const { port, requests, failures } = transport(objects, true);
+    const bytes = new Uint8Array([1]);
+    const digest = replicaDigest(bytes);
+    const current = replicaFragmentKey(scope, digest);
+    objects.set(replicaLegacyFragmentKey(scope, digest), bytes);
+    failures.set(current, new Error("network unavailable"));
+
+    await expect(
+      port.getFragment(scope, digest, { maxBytes: bytes.length }),
+    ).rejects.toThrow("network unavailable");
+    expect(requests).toEqual([current]);
   });
 });
 

@@ -44,6 +44,7 @@ import {
   type Admission,
   type ReplicaResourceLimits,
 } from "./limits.js";
+import type { ReplicaPublishedBatch } from "./pending-budget.js";
 import {
   canonicalJson,
   decodeReplicaEnvelope,
@@ -128,6 +129,7 @@ import {
   type ReplicaWorkState,
 } from "./schedule.js";
 import { createCachedReplicaRoster, type ReplicaRosterPort } from "./roster.js";
+import { ReplicaPublicationCapabilityUnavailableError } from "./compatibility.js";
 import {
   authorizeReplicaBatch,
   replicaOperationWriterRefusal,
@@ -254,6 +256,7 @@ CREATE TABLE IF NOT EXISTS pdpp_transport_manifests_in (
  slot TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL, writer TEXT NOT NULL,
  manifest_json TEXT, data_hash TEXT, metadata_hash TEXT, batch TEXT, sequence INTEGER,
  state TEXT NOT NULL DEFAULT 'ready', evidence_checked INTEGER NOT NULL DEFAULT 0, ${WORK},
+ readmission_capability TEXT, quarantine_history TEXT,
  UNIQUE(scope,version));
 CREATE TABLE IF NOT EXISTS pdpp_transport_fragments_in (
  slot TEXT NOT NULL, position INTEGER NOT NULL, digest TEXT NOT NULL, bytes INTEGER NOT NULL,
@@ -388,7 +391,11 @@ const WORK_SET =
   "outcome=?,reason=?,cause_json=?,dependency=?,error=?,attempts=?,next_attempt=?,wait_since=?,checked_block=?";
 /** A durable quarantine with its closed reason, for a slot or fragment row. */
 const QUARANTINE_SET = (reason: ReplicaQuarantineProof["reason"]) =>
-  `state='quarantined',outcome='quarantine',reason='${reason}',error='${reason}'`;
+  `state='quarantined',outcome='quarantine',reason='${reason}',error='${reason}',
+   quarantine_history=CASE
+     WHEN quarantine_history IS NULL THEN json_array('${reason}')
+     WHEN json_extract(quarantine_history,'$[' || (json_array_length(quarantine_history)-1) || ']')='${reason}' THEN quarantine_history
+     ELSE json_insert(quarantine_history,'$[#]','${reason}') END`;
 /** Column reset that makes a receiver row fresh work again. */
 export const REPLICA_RESET_WORK =
   "outcome=NULL,reason=NULL,cause_json=NULL,dependency=NULL,error=NULL,attempts=0,wait_since=NULL,checked_block=NULL";
@@ -493,7 +500,10 @@ export interface ReplicaEngineExporter<C> {
    * operation up to `next` (a tail cursor) is published. A host with an
    * outbox moves past them; called in order, possibly more than once.
    */
-  acknowledgePublished(next: number): ReplicaEffect<void, C>;
+  acknowledgePublished(
+    next: number | null,
+    finalized: ReplicaPublishedBatch,
+  ): ReplicaEffect<void, C>;
   readPinnedBlobChunks(
     blobId: string,
   ): Iterable<Uint8Array> | AsyncIterable<Uint8Array>;
@@ -835,6 +845,14 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
     const columns = yield* sql.all<{ name: string }>(
       "PRAGMA table_info(pdpp_transport_manifests_in)",
     );
+    if (!columns.some((column) => column.name === "readmission_capability"))
+      yield* sql.exec(
+        "ALTER TABLE pdpp_transport_manifests_in ADD COLUMN readmission_capability TEXT",
+      );
+    if (!columns.some((column) => column.name === "quarantine_history"))
+      yield* sql.exec(
+        "ALTER TABLE pdpp_transport_manifests_in ADD COLUMN quarantine_history TEXT",
+      );
     if (!columns.some((column) => column.name === "resource_limits_version"))
       yield* sql.exec(
         "ALTER TABLE pdpp_transport_manifests_in ADD COLUMN resource_limits_version INTEGER",
@@ -934,6 +952,34 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
       });
     },
   );
+
+  function* readmitManifestFormat(): Fx<void> {
+    const slots = yield* sql.all<{ slot: string }>(
+      `SELECT slot FROM pdpp_transport_manifests_in
+       WHERE state='quarantined' AND reason='manifest_invalid'
+         AND manifest_json IS NULL
+         AND coalesce(readmission_capability,'')<>'manifest-v2'
+       ORDER BY rowid LIMIT 32`,
+    );
+    for (const { slot } of slots)
+      yield* sql.run(
+        `UPDATE pdpp_transport_manifests_in
+         SET quarantine_history=CASE WHEN quarantine_history IS NULL
+           THEN json_array('manifest_invalid') ELSE quarantine_history END,
+           readmission_capability='manifest-v2',state='ready',${RESET_WORK},
+           next_attempt=0,checked_block=NULL
+         WHERE slot=? AND state='quarantined' AND reason='manifest_invalid'
+           AND manifest_json IS NULL
+           AND coalesce(readmission_capability,'')<>'manifest-v2'`,
+        slot,
+      );
+  }
+
+  function assertPublicationCompatible() {
+    if (typeof transport.assertPublicationCompatible !== "function")
+      throw new ReplicaPublicationCapabilityUnavailableError();
+    return transport.assertPublicationCompatible();
+  }
 
   // Owner and writer of the running step, read under the writer lock. The
   // owner binding never changes, and only authority() changes the writer.
@@ -3214,6 +3260,9 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
           metadataHash: row.metadata_hash,
         };
         await recordUploadAttempt(batch, "manifest", -1, signal);
+        // New-format manifests may be referenced by every active reader. The
+        // complete signed roster is required before the first carrier PUT.
+        await call(signal, assertPublicationCompatible);
         await call(signal, () => transport.put(manifest, signal));
         await recordRegistrationAttempt(expected, row.encrypted, signal);
         try {
@@ -3369,6 +3418,9 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
         // Unregistered and content-addressed: a PUT is safe to repeat, and
         // nothing references it until the manifest is finalized.
         await recordUploadAttempt(row.batch, "fragment", row.position, signal);
+        // Keep this gate in the shared phase engine so Node and Lite cannot
+        // accidentally upload through a host adapter without the capability.
+        await call(signal, assertPublicationCompatible);
         await call(signal, () =>
           transport.putFragment(
             {
@@ -3418,12 +3470,44 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
             );
             // The batch is durable on the gateway: its operations leave the
             // host's outbox in the same transaction.
-            const exported = yield* sql.get<{ export_next: number | null }>(
-              "SELECT export_next FROM pdpp_transport_batches WHERE batch=?",
+            const exported = yield* sql.get<{
+              export_next: number | null;
+              scope: string;
+              version: number;
+              data_hash: `0x${string}`;
+              metadata_hash: `0x${string}`;
+            }>(
+              `SELECT b.export_next,m.scope,m.version,m.data_hash,m.metadata_hash
+               FROM pdpp_transport_batches b
+               JOIN pdpp_transport_manifests_out m ON m.batch=b.batch
+               WHERE b.batch=?`,
               item.row.batch,
             );
-            if (exported?.export_next != null)
-              yield* exporter.acknowledgePublished(exported.export_next);
+            if (!exported) throw new ReplicaProblemError("publish_failed");
+            const survivors = yield* sql.all<{
+              writer_id: string | null;
+              operation_id: string | null;
+            }>(
+              `SELECT writer_id,operation_id FROM pdpp_transport_operation_outcomes
+               WHERE batch=? AND outcome IS NULL AND encoding_failed=0
+                 AND writer_id IS NOT NULL AND operation_id IS NOT NULL
+               ORDER BY position`,
+              item.row.batch,
+            );
+            yield* exporter.acknowledgePublished(exported.export_next, {
+              batch: item.row.batch,
+              slot: `${exported.scope}/${exported.version}`,
+              scope: exported.scope,
+              version: exported.version,
+              commitment: replicaChainCommitment(
+                exported.data_hash,
+                exported.metadata_hash,
+              ).toLowerCase(),
+              operations: survivors.map((row) => ({
+                writerId: row.writer_id!,
+                operationId: row.operation_id!,
+              })),
+            });
             yield* reclaimPublished(item.row.batch);
           }
           if (item.row.kind === "manifest" && outcome.tag === "quarantine")
@@ -5037,6 +5121,7 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
       const authorized = await authority(own.identity);
       if (!authorized) return idle();
       bound = authorized;
+      await atomic(readmitManifestFormat());
       const stagedObjects = await stagingStore(false);
       await stagedObjects.cleanup();
       await stagedObjects.cleanupAttachedTemporaryBytes();
@@ -5139,6 +5224,25 @@ export function createReplicaEngine<C extends ReplicaEffectContext>(
               reason: row.state,
             },
           });
+      }
+      const unresolved = await query(
+        sql.all<{ slot: string; reason: string }>(
+          `SELECT slot,reason FROM pdpp_transport_manifests_in
+           WHERE state='quarantined' ORDER BY rowid LIMIT ?`,
+          REPLICA_REPORT_LIMIT + 1,
+        ),
+      );
+      for (const { slot, reason } of unresolved) {
+        if (report.quarantines.some((entry) => entry.id === slot)) continue;
+        if (diagnosticRoom() <= 0) {
+          report.diagnosticsTruncated = true;
+          break;
+        }
+        report.quarantines.push({
+          id: slot,
+          phase: "download",
+          proof: { reason, key: slot } as ReplicaQuarantineProof,
+        });
       }
       return report;
     } finally {
