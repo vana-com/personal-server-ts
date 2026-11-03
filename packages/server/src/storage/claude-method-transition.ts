@@ -139,9 +139,13 @@ export function createClaudeMethodTransition(
         ? { kind: "canonical", collectedAt: previous.envelope.collectedAt }
         : base.listingFor(scope);
     },
-    listCanonicalScopes(prefix) {
+    listCanonicalScopes(prefix, observe) {
       const listed = new Map(
-        base.listCanonicalScopes(prefix).map((item) => [item.scope, item]),
+        base
+          .listCanonicalScopes(prefix, (scope) =>
+            observe?.(scope, view.listingFor(scope)),
+          )
+          .map((item) => [item.scope, item]),
       );
       for (const scope of scopes) {
         const previous = snapshot(scope);

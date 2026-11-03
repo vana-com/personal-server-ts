@@ -1,3 +1,4 @@
+import type { LegacyScopeListing } from "../storage/legacy-scope-view.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
@@ -1246,6 +1247,7 @@ function listingVisibility(
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
   deadlineAtMs: number,
+  decisions: Map<string, LegacyScopeListing>,
 ): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
   const deletion = deps.scopeDeletions
     ? async (scope: string, entry: ReadDeletionEntry) =>
@@ -1260,7 +1262,8 @@ function listingVisibility(
   const view = deps.legacyScopeView;
   if (!view) return deletion;
   return async (scope, entry) => {
-    const listing = view.listingFor(scope);
+    const listing = decisions.get(scope) ?? view.listingFor(scope);
+    decisions.set(scope, listing);
     if (listing.kind === "refused") return false;
     const canonicalOwned = deletionHistoryOf(listing) === "canonical";
     // A file's re-add marker cannot revive the canonical body this row
@@ -1288,6 +1291,7 @@ function canonicalOnlyScopes(
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
   deadlineAtMs: number,
+  decisions: Map<string, LegacyScopeListing>,
 ):
   | ((
       scopePrefix: string | undefined,
@@ -1298,9 +1302,10 @@ function canonicalOnlyScopes(
   if (!view) return undefined;
   return async (scopePrefix, stored) => {
     const listed: ScopeSummary[] = [];
-    for (const { scope, collectedAt } of view.listCanonicalScopes(
-      scopePrefix,
-    )) {
+    for (const [scope, listing] of decisions) {
+      if (scopePrefix !== undefined && !scope.startsWith(scopePrefix)) continue;
+      if (listing.kind !== "canonical") continue;
+      const collectedAt = listing.collectedAt;
       if (stored.has(scope)) continue;
       if (
         (await resolveReadDeletion(
@@ -1326,10 +1331,10 @@ function canonicalOnlyScopes(
  * does not serve, so they are dropped.
  */
 function withCanonicalListing(
-  deps: Pick<PersonalServerDataApiDeps, "legacyScopeView">,
+  decisions: Map<string, LegacyScopeListing>,
   summary: ScopeSummary,
 ): ScopeSummary {
-  const listing = deps.legacyScopeView?.listingFor(summary.scope);
+  const listing = decisions.get(summary.scope);
   if (listing?.kind !== "canonical") return summary;
   return {
     scope: summary.scope,
@@ -1926,21 +1931,46 @@ export async function handlePersonalServerDataRequest(
       });
       // One budget for every stored and canonical-only scope, not per row.
       const deletionDeadlineAtMs = Date.now() + 250;
+      const decisions = new Map<string, LegacyScopeListing>();
+      deps.legacyScopeView?.listCanonicalScopes(
+        url.searchParams.get("scopePrefix") ?? undefined,
+        (scope, listing) => {
+          if (
+            !isSystemScope(scope) &&
+            (!listAuth || listAuthCovers(listAuth, scope))
+          )
+            decisions.set(scope, listing);
+        },
+      );
       const result = await listDataScopesContract({
         storage: deps.storage,
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
-        isVisible: listingVisibility(deps, deletionDeadlineAtMs),
+        isVisible: listingVisibility(deps, deletionDeadlineAtMs, decisions),
         isListable: (scope) =>
           !isSystemScope(scope) &&
           (!listAuth || listAuthCovers(listAuth, scope)),
-        extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs),
+        extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs, decisions),
       });
+      if (
+        deps.legacyScopeView &&
+        !deps.legacyScopeView.listingsAreCurrent(
+          [...decisions].map(([scope, listing]) => ({ scope, listing })),
+        )
+      ) {
+        return jsonResponse(
+          {
+            error: "STORE_INCONSISTENT_READ",
+            message: "Scope inventory changed during listing.",
+          },
+          { status: 503, headers: { "Retry-After": "1" } },
+        );
+      }
       return jsonResponse({
         ...result.response,
         scopes: result.response.scopes.map((summary) =>
-          withCanonicalListing(deps, summary),
+          withCanonicalListing(decisions, summary),
         ),
       });
     }
