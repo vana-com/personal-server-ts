@@ -2740,7 +2740,6 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           { role: null },
           { content_type: "code" },
           { content_type: null },
-          { content: "" },
           { content: null },
           { content: 7 },
         ])("excludes ineligible off-branch fields %j", (overrides) => {
@@ -2751,6 +2750,21 @@ describe("projectPdppRecordsToLegacyPayload", () => {
               retained("c1", "ineligible", overrides),
             ]).map((r) => r.message.id),
           ).toEqual(["retired"]);
+        });
+
+        it("retains explicit empty off-branch text", () => {
+          expect(
+            evidence([
+              ...validParent(),
+              retained("c1", "retired", { content: "" }),
+            ]),
+          ).toMatchObject([{ message: { id: "retired", content: "" } }]);
+        });
+
+        it("does not invent missing off-branch content", () => {
+          const absent = retained("c1", "unknown");
+          delete absent.data.content;
+          expect(evidence([...validParent(), absent])).toEqual([]);
         });
 
         it("keeps whitespace and maps non-string optional fields to null", () => {
@@ -2783,32 +2797,34 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           const orderedRows = (bare: PdppRecord, composite: PdppRecord) =>
             order === "bare-first" ? [bare, composite] : [composite, bare];
 
-          it("selects composite fields before retaining a normalized node", () => {
-            expect(
-              evidence([
-                ...validParent(),
-                ...orderedRows(
-                  retained("c1", "retired", {
-                    id: "retired",
-                    content: "stale",
-                  }),
-                  retained("c1", "retired", { content: "preferred" }),
-                ),
-              ]).map((r) => r.message),
-            ).toEqual([
-              {
-                id: "retired",
-                role: "assistant",
-                content: "preferred",
-                content_type: "text",
-                create_time: null,
-                model: null,
-              },
-            ]);
-          });
+          it.each(["preferred", ""])(
+            "selects composite %j text before retaining a normalized node",
+            (content) => {
+              expect(
+                evidence([
+                  ...validParent(),
+                  ...orderedRows(
+                    retained("c1", "retired", {
+                      id: "retired",
+                      content: "stale",
+                    }),
+                    retained("c1", "retired", { content }),
+                  ),
+                ]).map((r) => r.message),
+              ).toEqual([
+                {
+                  id: "retired",
+                  role: "assistant",
+                  content,
+                  content_type: "text",
+                  create_time: null,
+                  model: null,
+                },
+              ]);
+            },
+          );
 
           it.each([
-            { content: "" },
             { content: null },
             { role: "tool" },
             { content_type: "code" },
