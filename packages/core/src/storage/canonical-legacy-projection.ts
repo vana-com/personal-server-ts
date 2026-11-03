@@ -16,6 +16,7 @@ import {
 import type {
   ProjectionDiagnostic,
   ProjectionOmission,
+  RetainedChatgptMessage,
 } from "../legacy-projection/types.js";
 import {
   declaredBlobField,
@@ -159,6 +160,8 @@ export interface CanonicalLegacyReadOk {
   ok: true;
   envelope: DataFileEnvelope;
   projectionOmissions?: ProjectionOmission[];
+  /** Stored off-branch fields from the same selected snapshot as the envelope. */
+  retainedChatgptMessages?: readonly RetainedChatgptMessage[];
   /** Conservative collection horizon for each input stream in this snapshot. */
   streamCollectionTimes?: Record<string, string | null>;
   /** Current accepted P7 completion time for each input stream, if any. */
@@ -909,6 +912,9 @@ async function projectSnapshot(
     ok: true,
     ...(projected.projectionOmissions
       ? { projectionOmissions: projected.projectionOmissions }
+      : {}),
+    ...(projected.retainedChatgptMessages
+      ? { retainedChatgptMessages: projected.retainedChatgptMessages }
       : {}),
     envelope: {
       version: "1.0",

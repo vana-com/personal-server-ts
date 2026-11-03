@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { compareLegacyCoverage } from "./legacy-scope-coverage.js";
+import { coversClaudeTransition } from "./legacy-scope-view.js";
 import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
 
 const keys = { "$.items": ["id"], "$.items[].children": ["id"] };
@@ -996,4 +997,251 @@ describe("Oura frozen integer schema defect", () => {
       }).covered,
     ).toBe(false);
   });
+});
+
+describe("canonical-newer payload growth", () => {
+  it.each([true, false, undefined])(
+    "keeps 300 KiB same-identity growth gated by chronology: %s",
+    (canonicalNewer) => {
+      const legacy = { items: [{ id: "same", content: "old" }] };
+      const canonical = {
+        items: [{ id: "same", content: "old", extra: "x".repeat(300 * 1024) }],
+      };
+      const verdict = compareLegacyCoverage(legacy, canonical, {
+        entityKeys: keys,
+        canonicalNewer,
+      });
+      expect(verdict.covered).toBe(canonicalNewer === true);
+      expect(verdict.reasonCounts.payload_growth).toBe(
+        canonicalNewer === true ? 0 : 1,
+      );
+      expect(verdict.missingEntityCount).toBe(0);
+      expect(verdict.byteDelta).toBeGreaterThan(300 * 1024);
+      expect(verdict.canonicalBytes).toBe(
+        new TextEncoder().encode(JSON.stringify(canonical)).length,
+      );
+    },
+  );
+});
+
+describe("retained ChatGPT message evidence", () => {
+  const message = {
+    id: "old",
+    role: "assistant" as const,
+    content: "retained",
+    content_type: "text" as const,
+    create_time: "2026-01-01T00:00:00Z",
+    model: "synthetic",
+  };
+  const body = (messages: object[], id = "conversation") => ({
+    conversations: [{ id, messages }],
+  });
+  const options = {
+    scope: "chatgpt.conversations",
+    entityKeys: {
+      "$.conversations": ["id"],
+      "$.conversations[].messages": ["id"],
+    },
+    retainedChatgptMessages: [
+      {
+        scope: "chatgpt.conversations" as const,
+        conversationId: "conversation",
+        message,
+      },
+    ],
+  };
+
+  it.each([false, true])(
+    "compares retained fields without adding displayed bytes (newer=%s)",
+    (canonicalNewer) => {
+      const legacy = body([message]);
+      const canonical = body([]);
+      const verdict = compareLegacyCoverage(legacy, canonical, {
+        ...options,
+        canonicalNewer,
+      });
+      expect(verdict.covered).toBe(canonicalNewer);
+      expect(verdict.reasonCounts.array_order).toBe(canonicalNewer ? 0 : 1);
+      expect(verdict.missingEntityCount).toBe(0);
+      expect(verdict.canonicalBytes).toBe(
+        new TextEncoder().encode(JSON.stringify(canonical)).length,
+      );
+      expect(
+        compareLegacyCoverage(
+          body([{ ...message, create_time: "2025-01-01T00:00:00Z" }]),
+          canonical,
+          { ...options, canonicalNewer },
+        ).reason,
+      ).toBe("creation_mismatch");
+      expect(
+        compareLegacyCoverage(body([{ ...message, model: null }]), canonical, {
+          ...options,
+          canonicalNewer,
+        }).reason,
+      ).toBe("type_mismatch");
+      expect(
+        compareLegacyCoverage(
+          body([{ ...message, extra: "missing" }]),
+          canonical,
+          { ...options, canonicalNewer },
+        ).reason,
+      ).toBe("missing_field");
+      expect(
+        compareLegacyCoverage(
+          body([{ ...message, content: "changed" }]),
+          canonical,
+          { ...options, canonicalNewer },
+        ).covered,
+      ).toBe(canonicalNewer);
+    },
+  );
+
+  it("does not cover a missing conversation or reuse another conversation's node", () => {
+    for (const [legacy, canonical] of [
+      [body([message]), { conversations: [] }],
+      [body([message], "other"), body([], "other")],
+    ]) {
+      const verdict = compareLegacyCoverage(legacy, canonical, options);
+      expect(verdict.covered).toBe(false);
+      expect(verdict.missingEntityCount).toBe(1);
+    }
+  });
+
+  it("uses displayed rows before retained evidence and keeps scope identity", () => {
+    const visible = body([{ ...message, content: "visible" }]);
+    const verdict = compareLegacyCoverage(visible, visible, options);
+    expect(verdict.covered).toBe(true);
+    expect(verdict.reasonCounts.field_mismatch).toBe(0);
+    expect(verdict.reasonCounts.array_order).toBe(0);
+    expect(
+      compareLegacyCoverage(body([message]), body([]), {
+        ...options,
+        scope: "other.conversations",
+        canonicalNewer: true,
+      }).reason,
+    ).toBe("missing_entity");
+  });
+
+  it("refuses ambiguous retained evidence without overriding a displayed node", () => {
+    const ambiguous = {
+      ...options,
+      canonicalNewer: true,
+      retainedChatgptMessages: [
+        ...options.retainedChatgptMessages,
+        {
+          scope: "chatgpt.conversations" as const,
+          conversationId: "conversation",
+          message: { ...message, content: "other" },
+        },
+      ],
+    };
+    expect(
+      compareLegacyCoverage(body([message]), body([]), ambiguous),
+    ).toMatchObject({
+      covered: false,
+      missingEntityCount: 1,
+      reason: "missing_entity",
+    });
+    expect(
+      compareLegacyCoverage(body([message]), body([message]), ambiguous)
+        .covered,
+    ).toBe(true);
+  });
+
+  it("keeps displayed-node ordering and stable-key checks with retained peers", () => {
+    const a = { ...message, id: "a" };
+    const b = { ...message, id: "b" };
+    expect(
+      compareLegacyCoverage(body([a, message, b]), body([b, a]), options)
+        .reason,
+    ).toBe("array_order");
+    expect(
+      compareLegacyCoverage(body([message, message]), body([]), options).reason,
+    ).toBe("no_stable_key");
+  });
+});
+
+describe("growth boundaries and independent coverage failures", () => {
+  it("does not reject equality at either growth threshold", () => {
+    const legacy = { value: "same" };
+    const canonical = { value: "same", extra: "x".repeat(300 * 1024) };
+    const measured = compareLegacyCoverage(legacy, canonical);
+    expect(measured.reason).toBe("payload_growth");
+    expect(
+      compareLegacyCoverage(legacy, canonical, {
+        maxPayloadRatio: measured.canonicalBytes / measured.legacyBytes,
+        maxExtraBytes: 0,
+      }).reasonCounts.payload_growth,
+    ).toBe(0);
+    expect(
+      compareLegacyCoverage(legacy, canonical, {
+        maxPayloadRatio: 1,
+        maxExtraBytes: measured.byteDelta,
+      }).reasonCounts.payload_growth,
+    ).toBe(0);
+    expect(
+      compareLegacyCoverage(legacy, canonical, {
+        maxPayloadRatio: 1,
+        maxExtraBytes: measured.byteDelta - 1,
+      }).reasonCounts.payload_growth,
+    ).toBe(1);
+  });
+
+  it.each([
+    ["missing_entity", { id: "owner", items: [] }],
+    [
+      "identity_mismatch",
+      {
+        id: "other",
+        items: [{ id: "same", createdAt: "2026-01-01", value: 1 }],
+      },
+    ],
+    [
+      "type_mismatch",
+      {
+        id: "owner",
+        items: [{ id: "same", createdAt: "2026-01-01", value: "1" }],
+      },
+    ],
+    [
+      "creation_mismatch",
+      {
+        id: "owner",
+        items: [{ id: "same", createdAt: "2026-01-02", value: 1 }],
+      },
+    ],
+  ] as const)("newer growth does not waive %s", (reason, current) => {
+    const verdict = compareLegacyCoverage(
+      {
+        id: "owner",
+        items: [{ id: "same", createdAt: "2026-01-01", value: 1 }],
+      },
+      { ...current, extra: "x".repeat(300 * 1024) },
+      { entityKeys: keys, canonicalNewer: true },
+    );
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe(reason);
+    expect(verdict.reasonCounts.payload_growth).toBe(0);
+  });
+
+  it.each([false, true])(
+    "applies the same growth rule to Claude transition: newer=%s",
+    async (newer) => {
+      const previous = {
+        version: "1.0" as const,
+        scope: "claude.conversations",
+        collectedAt: "2026-01-01T00:00:00Z",
+        data: { organizationId: "organization" },
+      };
+      const current = {
+        envelope: {
+          ...previous,
+          collectedAt: newer ? "2026-01-02T00:00:00Z" : previous.collectedAt,
+          data: { ...previous.data, extra: "x".repeat(300 * 1024) },
+        },
+        revision: "synthetic",
+      };
+      expect(await coversClaudeTransition(current, previous)).toBe(newer);
+    },
+  );
 });

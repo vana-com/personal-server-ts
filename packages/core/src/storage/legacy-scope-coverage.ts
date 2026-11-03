@@ -4,7 +4,10 @@
  * newer canonical state may reorder or, with proof, delete entities.
  * Diagnostics contain paths and counts, never entity keys or field values.
  */
-import type { ProjectionOmission } from "../legacy-projection/types.js";
+import type {
+  ProjectionOmission,
+  RetainedChatgptMessage,
+} from "../legacy-projection/types.js";
 import {
   LEGACY_COVERAGE_EXCEPTIONS,
   LEGACY_INTEGER_ROUNDING_EXCEPTIONS,
@@ -22,6 +25,8 @@ export interface LegacyCoverageOptions {
   scope?: string;
   /** Raw-value-backed omissions emitted by this exact canonical projection. */
   projectionOmissions?: readonly ProjectionOmission[];
+  /** Internal stored-row evidence from this exact canonical projection. */
+  retainedChatgptMessages?: readonly RetainedChatgptMessage[];
   /** JSON paths to entity arrays; [] marks each array element, e.g. $.posts[].comments. */
   entityKeys?: Readonly<Record<string, readonly string[]>>;
   /** Legacy payload schema. An `id` or `uuid` item field supplies a key. */
@@ -215,6 +220,25 @@ export function compareLegacyCoverage(
     projection_unavailable: 0,
   };
   let missingEntityCount = 0;
+  const retainedMessages = new Map<
+    string,
+    Map<string, RetainedChatgptMessage["message"] | undefined>
+  >();
+  if (options.scope === "chatgpt.conversations") {
+    for (const entry of options.retainedChatgptMessages ?? []) {
+      if (entry.scope !== "chatgpt.conversations") continue;
+      let messages = retainedMessages.get(entry.conversationId);
+      if (!messages) {
+        messages = new Map();
+        retainedMessages.set(entry.conversationId, messages);
+      }
+      // Conflicting or repeated evidence must not pick a convenient version.
+      messages.set(
+        entry.message.id,
+        messages.has(entry.message.id) ? undefined : entry.message,
+      );
+    }
+  }
 
   function mark(
     reason: LegacyCoverageReason,
@@ -285,17 +309,35 @@ export function compareLegacyCoverage(
             const key = stableKey(item, fields);
             // Every legacy key was checked above.
             const position = canonicalPositions.get(key!);
-            if (position === undefined) {
+            const retained =
+              position === undefined &&
+              options.scope === "chatgpt.conversations" &&
+              arrayPath === "$.conversations[].messages" &&
+              entityPath === "$.conversations[]" &&
+              typeof entityKey === "string" &&
+              fields.length === 1 &&
+              fields[0] === "id" &&
+              object(item) &&
+              typeof item.id === "string"
+                ? retainedMessages.get(entityKey)?.get(item.id)
+                : undefined;
+            if (position === undefined && retained === undefined) {
               missingEntityCount += 1;
               mark("missing_entity", undefined, !deletionAllowed);
               continue;
             }
-            if (!options.canonicalNewer && position < lastPosition)
+            // Presence cannot establish same-time order in the displayed branch.
+            // Never invent a position from the legacy array.
+            if (position === undefined && !options.canonicalNewer)
               mark("array_order", path);
-            lastPosition = position;
+            if (position !== undefined) {
+              if (!options.canonicalNewer && position < lastPosition)
+                mark("array_order", path);
+              lastPosition = position;
+            }
             compare(
               item,
-              canonical[position],
+              position === undefined ? retained : canonical[position],
               `${path}[${index}]`,
               `${arrayPath}[]`,
               schema?.items,
@@ -551,6 +593,7 @@ export function compareLegacyCoverage(
   const schema = options.schema?.schema ?? options.schema;
   compare(legacyPayload, canonicalPayload, "$", "$", schema);
   if (
+    options.canonicalNewer !== true &&
     canonicalBytes > legacyBytes * (options.maxPayloadRatio ?? 1.5) &&
     byteDelta > (options.maxExtraBytes ?? 256 * 1024)
   ) {
