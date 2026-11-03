@@ -1,4 +1,6 @@
 import type {
+  ChatgptBranchWalkDiagnostic,
+  ChatgptConversationCoverageGap,
   LegacyScopeBinding,
   PdppRecord,
   ProjectPdppRecordsOptions,
@@ -8,6 +10,7 @@ import type {
   RetainedChatgptMessage,
   ProjectionResult,
 } from "./types.js";
+import { chatgptConversationIdHash } from "./chatgpt-conversation-hash.js";
 import type { LegacyScopeBindingProvenance } from "./provenance.js";
 
 /**
@@ -1834,8 +1837,8 @@ const chatgptConversations: LegacyScopeBinding = {
   lossy: [
     "Conversation create/update times pass through as null when the source lacks them, matching legacy's listed?.create_time ?? fetched.create_time ?? null fallback.",
     "fetched_at is the projection time (options.now, else the wall clock), matching legacy's per-run toConversationRecord timestamp.",
-    "A conversation without complete current-branch message evidence, a valid id, or valid timestamps is dropped and counted in a records_dropped diagnostic; nested full threads are not invented. Messages whose conversation is absent are dropped and counted the same way.",
-    "Current branch membership is derived by walking parent_id from current_node through stored messages; on_current_branch is used only when that walk is broken, which emits branch_walk_fallback diagnostics.",
+    "Invalid conversation ids, timestamps or declared counts remain records_dropped omissions. If a broken parent walk cannot be recovered from stored flags, only that conversation is excluded and a same-read hash-only coverage receipt records the gap; messages without a stored conversation remain records_dropped.",
+    "Current branch membership comes from immutable parent_id links starting at current_node. A complete walk is followed to its terminal parent even when it exceeds a stale declared count; stored on_current_branch flags are used only after a broken walk and emit branch_walk_fallback diagnostics.",
     "Current user/assistant text or multimodal_text messages preserve explicit empty strings; null or non-string content is omitted. Off-branch coverage evidence still requires nonempty text; message_count counts displayed messages.",
     "A missing title becomes 'Untitled', matching the legacy connector's toConversationRecord fallback; model_slug is renamed to model.",
     "Legacy message ids are source node ids. ChatGPT 0.3.0 stores a message under '<conversation_id>:<node_id>' (and links parent_id the same way); the projection strips that prefix, reads a bare pre-0.3.0 id as it is, and counts a node stored under both forms once, preferring the 0.3.0 row.",
@@ -1896,6 +1899,8 @@ const chatgptConversations: LegacyScopeBinding = {
 
     const conversations: Record<string, unknown>[] = [];
     const retainedChatgptMessages: RetainedChatgptMessage[] = [];
+    const chatgptCoverageGaps: ChatgptConversationCoverageGap[] = [];
+    const chatgptBranchDiagnostics: ChatgptBranchWalkDiagnostic[] = [];
     const branchWalkFallbacks = new Map<string, number>();
     for (const conversation of sourceConversations) {
       const {
@@ -1952,27 +1957,56 @@ const chatgptConversations: LegacyScopeBinding = {
         message_count_on_current_branch,
         byNode,
       );
-      if (!walked.ok) {
+      const branchWalk =
+        walked.ok && walked.messages.length < message_count_on_current_branch
+          ? {
+              ok: false as const,
+              reason: walked.terminatedAtMissingParent
+                ? "parent_not_stored"
+                : "walked_count_below_declared",
+              walkedCount: walked.messages.length,
+            }
+          : walked;
+      if (
+        branchWalk.ok &&
+        branchWalk.messages.length > message_count_on_current_branch
+      ) {
+        chatgptBranchDiagnostics.push({
+          conversationIdHash: chatgptConversationIdHash(id),
+          reason: "declared_count_below_walked",
+          declaredCount: message_count_on_current_branch,
+          walkedCount: branchWalk.messages.length,
+        });
+      }
+      if (!branchWalk.ok) {
         branchWalkFallbacks.set(
-          walked.reason,
-          (branchWalkFallbacks.get(walked.reason) ?? 0) + 1,
+          branchWalk.reason,
+          (branchWalkFallbacks.get(branchWalk.reason) ?? 0) + 1,
         );
       }
-      const branch = walked.ok
-        ? walked.messages
+      const branch = branchWalk.ok
+        ? branchWalk.messages
         : [...byNode.values(), ...unkeyed].filter(
             (m) => m.on_current_branch === true,
           );
-      if (branch.length !== message_count_on_current_branch) {
-        drop("Current branch message count does not match conversation");
+      if (!branchWalk.ok && branch.length !== message_count_on_current_branch) {
+        chatgptCoverageGaps.push({
+          conversationIdHash: chatgptConversationIdHash(id),
+          reason: `${branchWalk.reason}/fallback_count_mismatch`,
+          declaredCount: message_count_on_current_branch,
+          walkedCount: branchWalk.walkedCount,
+        });
         continue;
       }
       const ordered: Record<string, unknown>[] = [];
       const seen = new Set<string>();
-      if (walked.ok) {
-        ordered.push(...walked.messages);
+      if (branchWalk.ok) {
+        ordered.push(...branchWalk.messages);
       } else {
-        let node = typeof current_node === "string" ? current_node : null;
+        let node =
+          typeof current_node === "string"
+            ? chatgptNodeId(id, current_node)
+            : null;
         while (node && !seen.has(node)) {
           const message = byNode.get(node);
           if (!message || message.on_current_branch !== true) break;
@@ -1984,8 +2018,13 @@ const chatgptConversations: LegacyScopeBinding = {
               : null;
         }
       }
-      if (!walked.ok && ordered.length !== branch.length) {
-        drop("Current branch message chain is incomplete");
+      if (!branchWalk.ok && ordered.length !== branch.length) {
+        chatgptCoverageGaps.push({
+          conversationIdHash: chatgptConversationIdHash(id),
+          reason: `${branchWalk.reason}/fallback_chain_incomplete`,
+          declaredCount: message_count_on_current_branch,
+          walkedCount: branchWalk.walkedCount,
+        });
         continue;
       }
       ordered.reverse();
@@ -1996,8 +2035,8 @@ const chatgptConversations: LegacyScopeBinding = {
       // Deduplication precedes eligibility: an ineligible scoped row must
       // never be rescued by an older bare-id row.
       const activeNodes = new Set(
-        walked.ok
-          ? walked.messages.map((message) =>
+        branchWalk.ok
+          ? branchWalk.messages.map((message) =>
               chatgptNodeId(id, message.id as string),
             )
           : [],
@@ -2005,7 +2044,7 @@ const chatgptConversations: LegacyScopeBinding = {
       for (const [nodeId, message] of byNode) {
         if (
           nodeId.trim().length > 0 &&
-          (walked.ok
+          (branchWalk.ok
             ? !activeNodes.has(nodeId)
             : message.on_current_branch === false) &&
           isChatgptTextMessage(message) &&
@@ -2074,6 +2113,10 @@ const chatgptConversations: LegacyScopeBinding = {
     return {
       ok: true,
       payload: { conversations, total: conversations.length },
+      ...(chatgptCoverageGaps.length > 0 ? { chatgptCoverageGaps } : {}),
+      ...(chatgptBranchDiagnostics.length > 0
+        ? { chatgptBranchDiagnostics }
+        : {}),
       ...(retainedChatgptMessages.length > 0
         ? { retainedChatgptMessages }
         : {}),
@@ -2095,14 +2138,19 @@ function chatgptNodeId(conversationId: string, recordId: string): string {
 }
 
 type ChatgptBranchWalk =
-  | { ok: true; messages: Record<string, unknown>[] }
+  | {
+      ok: true;
+      messages: Record<string, unknown>[];
+      terminatedAtMissingParent: boolean;
+    }
   | {
       ok: false;
       reason:
         | "current_node_not_stored"
         | "parent_not_stored"
-        | "count_reached_parent_stored"
+        | "walked_count_below_declared"
         | "cycle";
+      walkedCount: number;
     };
 
 /** Walk the selected message's immutable parent links to recover its branch. */
@@ -2113,28 +2161,29 @@ function walkChatgptCurrentBranch(
   byNode: Map<string, Record<string, unknown>>,
 ): ChatgptBranchWalk {
   if (currentNode === null) {
-    return { ok: true, messages: [] };
+    return expectedCount === 0
+      ? { ok: true, messages: [], terminatedAtMissingParent: false }
+      : { ok: false, reason: "current_node_not_stored", walkedCount: 0 };
   }
   if (typeof currentNode !== "string" || currentNode.length === 0) {
-    return { ok: false, reason: "current_node_not_stored" };
+    return { ok: false, reason: "current_node_not_stored", walkedCount: 0 };
   }
 
   const messages: Record<string, unknown>[] = [];
   const seen = new Set<string>();
   let node: string | null = chatgptNodeId(conversationId, currentNode);
   while (node !== null) {
-    if (seen.has(node)) return { ok: false, reason: "cycle" };
+    if (seen.has(node))
+      return { ok: false, reason: "cycle", walkedCount: messages.length };
     const message = byNode.get(node);
     if (!message) {
-      if (messages.length > 0 && messages.length === expectedCount) {
-        return { ok: true, messages };
+      if (messages.length > 0) {
+        return { ok: true, messages, terminatedAtMissingParent: true };
       }
       return {
         ok: false,
-        reason:
-          messages.length === 0
-            ? "current_node_not_stored"
-            : "parent_not_stored",
+        reason: "current_node_not_stored",
+        walkedCount: 0,
       };
     }
     seen.add(node);
@@ -2144,13 +2193,10 @@ function walkChatgptCurrentBranch(
         ? chatgptNodeId(conversationId, message.parent_id)
         : null;
     if (node !== null && seen.has(node)) {
-      return { ok: false, reason: "cycle" };
-    }
-    if (messages.length >= expectedCount && node !== null && byNode.has(node)) {
-      return { ok: false, reason: "count_reached_parent_stored" };
+      return { ok: false, reason: "cycle", walkedCount: messages.length };
     }
   }
-  return { ok: true, messages };
+  return { ok: true, messages, terminatedAtMissingParent: false };
 }
 
 function isChatgptTextMessage(

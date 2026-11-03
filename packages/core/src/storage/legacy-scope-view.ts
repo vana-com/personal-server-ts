@@ -6,6 +6,12 @@ import {
 export type { LegacyCoverageVerdict } from "./legacy-scope-coverage.js";
 import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
 import { OURA_BROWSER_HISTORY_POLICY } from "../oura/history-policy.js";
+import type {
+  ChatgptBranchWalkDiagnostic,
+  ChatgptBranchWalkDiagnosticSummary,
+  ChatgptConversationCoverageGap,
+  ChatgptConversationCoverageGapSummary,
+} from "../legacy-projection/types.js";
 import {
   ANTHROPIC_LIVE_BINDINGS,
   GITHUB_BROWSER_BINDINGS,
@@ -62,7 +68,7 @@ const BINDING_PROFILES = [
 ];
 
 // Invalidate witnesses predating retained-branch evidence and newer growth rules.
-const COVERAGE_RULE_VERSION = 12;
+const COVERAGE_RULE_VERSION = 13;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the
@@ -236,10 +242,14 @@ export interface LegacyScopeVerdictRecord {
   comparisonCase: "same_time" | "canonical_newer";
   reasonCounts: Record<string, number>;
   appliedExceptions: LegacyCoverageVerdict["appliedExceptions"];
+  excludedConversations?: readonly ChatgptConversationCoverageGapSummary[];
+  chatgptBranchDiagnostics?: readonly ChatgptBranchWalkDiagnosticSummary[];
   reason: {
     reason: string;
     missingEntityCount: number;
     mismatchedFieldPaths: string[];
+    excludedConversations?: readonly ChatgptConversationCoverageGapSummary[];
+    chatgptBranchDiagnostics?: readonly ChatgptBranchWalkDiagnosticSummary[];
   } | null;
   legacyBytes: number;
   canonicalBytes: number;
@@ -295,6 +305,8 @@ export type LegacyScopeLatest =
       envelope: DataFileEnvelope;
       /** Opaque, stable while the rows and receipts do not change. */
       revision: string;
+      chatgptCoverageGaps?: readonly ChatgptConversationCoverageGap[];
+      chatgptBranchDiagnostics?: readonly ChatgptBranchWalkDiagnostic[];
     }
   | { kind: "refused"; refusal: LegacyScopeRefusal };
 
@@ -387,8 +399,36 @@ export function createLegacyScopeView(
   const { authority, records } = input;
   const coveredProjection = new Map<
     string,
-    { key: string; envelope: DataFileEnvelope; revision: string }
+    {
+      key: string;
+      envelope: DataFileEnvelope;
+      revision: string;
+      chatgptCoverageGaps?: readonly ChatgptConversationCoverageGap[];
+      chatgptBranchDiagnostics?: readonly ChatgptBranchWalkDiagnostic[];
+    }
   >();
+
+  function canonicalBody(
+    read: Pick<
+      CanonicalLegacyReadOk,
+      | "envelope"
+      | "revision"
+      | "chatgptCoverageGaps"
+      | "chatgptBranchDiagnostics"
+    >,
+  ): Extract<LegacyScopeLatest, { kind: "canonical" }> {
+    return {
+      kind: "canonical",
+      envelope: read.envelope,
+      revision: read.revision,
+      ...(read.chatgptCoverageGaps
+        ? { chatgptCoverageGaps: read.chatgptCoverageGaps }
+        : {}),
+      ...(read.chatgptBranchDiagnostics
+        ? { chatgptBranchDiagnostics: read.chatgptBranchDiagnostics }
+        : {}),
+    };
+  }
 
   /**
    * The scope's methods, minus each opt-in method (`input.optInMethods`)
@@ -756,6 +796,12 @@ export function createLegacyScopeView(
         decision,
         retainedEntityLoss:
           decision.kind === "canonical" && ouraHasRetainedEntityLoss(decision),
+        chatgptMessageTombstones:
+          decision.kind === "canonical" &&
+          scope === "chatgpt.conversations" &&
+          authority.hasRetainedTombstones(decision.selection.instance, [
+            "messages",
+          ]),
         legacyHead: authority.eligibleLegacyHead(scope),
         hasTakeover: authority.hasTakeover(
           scope,
@@ -881,6 +927,15 @@ export function createLegacyScopeView(
         kind: "canonical",
         envelope: cachedProjection.envelope,
         revision: cachedProjection.revision,
+        ...(cachedProjection.chatgptCoverageGaps
+          ? { chatgptCoverageGaps: cachedProjection.chatgptCoverageGaps }
+          : {}),
+        ...(cachedProjection.chatgptBranchDiagnostics
+          ? {
+              chatgptBranchDiagnostics:
+                cachedProjection.chatgptBranchDiagnostics,
+            }
+          : {}),
       };
     }
     if (cachedCoverage && !cachedCoverage.covered && legacyHead) {
@@ -1072,12 +1127,35 @@ export function createLegacyScopeView(
         },
       };
     }
+    if (
+      initial.chatgptMessageTombstones &&
+      (read.chatgptCoverageGaps?.length ?? 0) > 0
+    ) {
+      return hasTakeover || legacyHead === null
+        ? {
+            kind: "refused",
+            refusal: {
+              status: "incomplete",
+              reason: "canonical_view_incomplete",
+              diagnostics: [
+                {
+                  stream: "messages",
+                  kind: "omitted",
+                  detail:
+                    "conversation branch exclusions cannot bypass retained message tombstones",
+                },
+              ],
+            },
+          }
+        : { kind: "file" };
+    }
     // Whole-dataset replacement needs a fresh completion for every input.
     // Equal/older horizons retain the existing parity path, not deletion authority.
     if (
       legacyHead !== null &&
       replacementEligible &&
       read.complete &&
+      (read.chatgptCoverageGaps?.length ?? 0) === 0 &&
       allStreamsProvenAfter(read, decision.streams, legacyHead.collectedAt)
     ) {
       const confirmed = authority.confirmRead(
@@ -1118,11 +1196,7 @@ export function createLegacyScopeView(
           },
         };
       }
-      return {
-        kind: "canonical",
-        envelope: read.envelope,
-        revision: read.revision,
-      };
+      return canonicalBody(read);
     }
     // Without the old body, only a newer complete import can prove replacement.
     // Do not fall through to confirmation that records an unscoped takeover.
@@ -1189,6 +1263,10 @@ export function createLegacyScopeView(
           entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
           projectionOmissions: read.projectionOmissions,
           retainedChatgptMessages: read.retainedChatgptMessages,
+          chatgptCoverageGaps: initial.chatgptMessageTombstones
+            ? []
+            : read.chatgptCoverageGaps,
+          chatgptBranchDiagnostics: read.chatgptBranchDiagnostics,
           canonicalNewer: allStreamsNewerThan(
             read,
             decision.streams,
@@ -1202,6 +1280,7 @@ export function createLegacyScopeView(
               ? OURA_BROWSER_HISTORY_POLICY.allowProvenDeletion
               : true) &&
             read.diagnostics.omissions.length === 0 &&
+            (read.chatgptCoverageGaps?.length ?? 0) === 0 &&
             (read.diagnostics.unproven?.length ?? 0) === 0 &&
             allStreamsProvenAfter(
               read,
@@ -1259,12 +1338,10 @@ export function createLegacyScopeView(
         key: projectionKey,
         envelope: read.envelope,
         revision: read.revision,
+        chatgptCoverageGaps: read.chatgptCoverageGaps,
+        chatgptBranchDiagnostics: read.chatgptBranchDiagnostics,
       });
-      return {
-        kind: "canonical",
-        envelope: read.envelope,
-        revision: read.revision,
-      };
+      return canonicalBody(read);
     }
     if (!read.complete) {
       if (legacyHead !== null && !hasTakeover) {
@@ -1309,11 +1386,7 @@ export function createLegacyScopeView(
         },
       };
     }
-    return {
-      kind: "canonical",
-      envelope: read.envelope,
-      revision: read.revision,
-    };
+    return canonicalBody(read);
   }
 
   return {
