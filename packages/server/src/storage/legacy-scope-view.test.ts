@@ -1367,6 +1367,65 @@ describe("legacy scope view over the real SQLite record store", () => {
     );
   });
 
+  it("keeps covered inventory across unrelated writes and upgrades old witnesses only by evaluation", async () => {
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1", "a2"]);
+    const projected = await view.readLatest("oura.activity");
+    if (projected.kind !== "canonical")
+      throw Error("missing fixture projection");
+    db.exec(
+      "INSERT INTO data_files(path,scope,collected_at,size_bytes) VALUES ('old.json','oura.activity','2026-10-01',1); DELETE FROM pdpp_stream_completion",
+    );
+    const readLegacyHead = vi.fn(async () => projected.envelope);
+    const parity = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (source) => CONFIGURED[source] ?? [],
+      readLegacyHead,
+    });
+    expect((await parity.readLatest("oura.activity")).kind).toBe("canonical");
+    const witness = parity.verdictFor("oura.activity")[0]!.canonicalCursor;
+    expect(witness.startsWith("legacy-coverage-v2:")).toBe(true);
+    const listRecords = vi.spyOn(store, "listRecords");
+    listRecords.mockClear();
+    readLegacyHead.mockClear();
+    ingest(store, "conn_a", "other", "2026-09-10", 80, { stream: "unbound" });
+    connect(store, "other", "github-browser", GITHUB);
+    ingest(store, "other", "other", "2026-09-10", 80, {
+      stream: "unbound",
+      method: "github-browser",
+    });
+    db.exec(
+      "INSERT INTO pdpp_record_arrival VALUES ('conn_a','unbound','arrival',1,999); INSERT INTO pdpp_stream_completion(instance,stream,method,generation,source_collected_at,write_seq,live_count) VALUES ('conn_a','unbound','oura',1,'2026-09-10',1,1)",
+    );
+    expect(parity.listingFor("oura.activity").kind).toBe("canonical");
+    expect(parity.verdictFor("oura.activity")[0]!.canonicalCursor).toBe(
+      witness,
+    );
+    expect(listRecords).not.toHaveBeenCalled();
+    expect(readLegacyHead).not.toHaveBeenCalled();
+    await parity.upgradeCoverageWitnesses();
+    expect(listRecords).not.toHaveBeenCalled();
+    db.exec(
+      "UPDATE legacy_scope_takeover_verdicts SET canonical_cursor='old:clock:proof'",
+    );
+    expect(parity.listingFor("oura.activity").kind).toBe("refused");
+    await parity.upgradeCoverageWitnesses();
+    expect(parity.listingFor("oura.activity").kind).toBe("canonical");
+    expect(readLegacyHead).toHaveBeenCalledTimes(1);
+    expect(parity.verdictFor("oura.activity")[0]!.canonicalCursor).toBe(
+      witness,
+    );
+    replace(store, "conn_a", "activity", ["a2"]);
+    expect(parity.listingFor("oura.activity").kind).toBe("refused");
+    expect(await parity.readLatest("oura.activity")).toMatchObject({
+      kind: "refused",
+      refusal: { reason: "canonical_view_incomplete" },
+    });
+    expect(parity.verdictFor("oura.activity")[0]!.verdict).toBe("not_covered");
+    expect(parity.listingFor("oura.activity").kind).toBe("refused");
+  });
+
   it("reuses the covered projection without reading source rows again", async () => {
     connect(store, "conn_a", "oura");
     replace(store, "conn_a", "activity", ["a1"]);
@@ -1952,7 +2011,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     const headB = authority.eligibleLegacyHead(scope);
     if (!headB) throw new Error("Missing newer head");
     expect(headB.path).toBe("oura/activity/b.json");
-    expect(proved(headB)).toBe(true);
+    expect(proved(headB)).toBe(false);
     expect(current.listingFor(scope).kind).toBe("canonical");
     expect(db.prepare("SELECT * FROM data_files ORDER BY id").all()).toEqual(
       indexedBeforeBRead,
@@ -1975,7 +2034,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     }).toEqual({ validProof: false, canonicalListing: false });
     expect(current.verdictFor(scope)).toEqual([]);
     expect((await current.readLatest(scope)).kind).toBe("canonical");
-    expect(proved(changedA)).toBe(true);
+    expect(proved(changedA)).toBe(false);
     expect(current.listingFor(scope).kind).toBe("canonical");
     expect(db.prepare("SELECT * FROM data_files ORDER BY id").all()).toEqual(
       beforeReearning,
@@ -3171,7 +3230,11 @@ describe("Oura completed wholesale snapshots with retained tombstones", () => {
         if (takenOver || removedHead) {
           expect(read).toMatchObject({
             kind: "refused",
-            refusal: { reason: "canonical_view_incomplete" },
+            refusal: {
+              reason: removedHead
+                ? "store_inconsistent_read"
+                : "canonical_view_incomplete",
+            },
           });
         } else {
           expect(read).toMatchObject({ kind: "file" });
@@ -3963,7 +4026,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
         ...authority,
         cachedVerdict(scope, instance, generation, version, cursor) {
           seen.push(cursor);
-          const rule11 = cursor.replace(/:12:1\.5:262144$/, ":11:1.5:262144");
+          const rule11 = cursor.replace(/,12,1\.5,262144,/, ",11,1.5,262144,");
           expect(
             authority.confirmRead(
               scope,
@@ -3994,7 +4057,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     });
     expect((await restarted.readLatest(scope)).kind).toBe("canonical");
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatch(/:12:1\.5:262144$/);
+    expect(seen[0]).toMatch(/,12,1\.5,262144,/);
     expect(restarted.verdictFor(scope)[0]).toMatchObject({
       verdict: "covered",
     });

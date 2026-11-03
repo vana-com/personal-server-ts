@@ -168,6 +168,10 @@ export interface LegacyScopeAuthority {
   writeClock(): number;
   /** Monotonic arrival revision, independent of record content writes. */
   arrivalRevision(): number;
+  coverageDependencies(
+    instance: string,
+    streams: readonly string[],
+  ): string | null;
   /** Whether a complete canonical read has already superseded the legacy head. */
   hasTakeover(scope: string, instance?: string, generation?: number): boolean;
   /**
@@ -326,9 +330,14 @@ export interface LegacyScopeViewPort {
    * this lists (for example a projection rejection).
    */
   listingFor(scope: string): LegacyScopeListing;
+  listingsAreCurrent(
+    expected: readonly { scope: string; listing: LegacyScopeListing }[],
+  ): boolean;
+  upgradeCoverageWitnesses(): Promise<void>;
   /** Bound scopes under `scopePrefix` that `listingFor` lists as canonical. */
   listCanonicalScopes(
     scopePrefix: string | undefined,
+    observe?: (scope: string, listing: LegacyScopeListing) => void,
   ): { scope: string; collectedAt: string }[];
   /**
    * True when connection rows make a legacy-only deletion unsafe: deleting
@@ -631,6 +640,8 @@ export function createLegacyScopeView(
     if (hasLegacyHead && !hasTakeover && !initialOuraRunComplete(decision)) {
       return { kind: "file" };
     }
+    const cursor = coverageCursor(scope, decision);
+    if (cursor === null) return { kind: "refused" };
     const completedReplacement =
       legacyHead !== null &&
       authority.hasCompletedReplacement?.(
@@ -639,13 +650,7 @@ export function createLegacyScopeView(
         decision.selection.instance,
         decision.generation,
         decision.selection.method,
-        coverageCursor(
-          scope,
-          decision,
-          authority.writeClock(),
-          authority.arrivalRevision(),
-          receiptCursor(decision, input.declarations),
-        ),
+        cursor,
       ) === true;
     if (hasLegacyHead && input.readLegacyHead && !completedReplacement) {
       const verdict = authority
@@ -660,16 +665,7 @@ export function createLegacyScopeView(
       if (verdict?.verdict !== "covered") {
         return { kind: coveredHead ? "refused" : "file" };
       }
-      if (
-        verdict.canonicalCursor !==
-        coverageCursor(
-          scope,
-          decision,
-          authority.writeClock(),
-          authority.arrivalRevision(),
-          receiptCursor(decision, input.declarations),
-        )
-      ) {
+      if (verdict.canonicalCursor !== cursor) {
         return { kind: "refused" };
       }
     } else if (hasLegacyHead && !hasTakeover) return { kind: "file" };
@@ -730,21 +726,38 @@ export function createLegacyScopeView(
   function coverageCursor(
     scope: string,
     decision: Extract<Decision, { kind: "canonical" }>,
-    writeClock: number,
-    arrivalRevision: number,
-    receipts: string,
-  ): string {
-    return [
-      writeClock,
-      arrivalRevision,
-      receipts,
-      decision.generation,
-      CANONICAL_LEGACY_VIEW_CONTRACT,
-      scopeDeclarationCursor(scope),
-      COVERAGE_RULE_VERSION,
-      input.coverageThresholds?.maxPayloadRatio ?? 1.5,
-      input.coverageThresholds?.maxExtraBytes ?? 256 * 1024,
-    ].join(":");
+  ): string | null {
+    const dependencies = authority.coverageDependencies(
+      decision.selection.instance,
+      coverageDependencyStreams(decision),
+    );
+    if (dependencies === null) return null;
+    return (
+      "legacy-coverage-v2:" +
+      JSON.stringify([
+        dependencies,
+        decision.selection.instance,
+        decision.selection.sourceId,
+        decision.selection.method,
+        decision.generation,
+        authority.eligibleLegacyHead(scope),
+        receiptCursor(decision, input.declarations),
+        decision.selection.method === "oura-browser"
+          ? OURA_RUN_STREAMS.map((stream) =>
+              authority.eligibleLegacyHead(`oura.${stream}`),
+            )
+          : null,
+        CANONICAL_LEGACY_VIEW_CONTRACT,
+        scopeDeclarationCursor(scope),
+        COVERAGE_RULE_VERSION,
+        input.coverageThresholds?.maxPayloadRatio ?? 1.5,
+        input.coverageThresholds?.maxExtraBytes ?? 256 * 1024,
+        decision.selection.method === "oura-browser"
+          ? OURA_BROWSER_HISTORY_POLICY
+          : null,
+        [...(input.optInMethods ?? [])].sort(),
+      ])
+    );
   }
 
   /** One snapshot: the decision and the evidence the read is judged by. */
@@ -770,6 +783,10 @@ export function createLegacyScopeView(
           missingCompletionReceipts(decision).length === 0,
         initialOuraRunComplete:
           decision.kind !== "canonical" || initialOuraRunComplete(decision),
+        canonicalCursor:
+          decision.kind === "canonical"
+            ? coverageCursor(scope, decision)
+            : null,
         writeClock: authority.writeClock(),
         arrivalRevision: authority.arrivalRevision(),
         receiptCursor:
@@ -818,15 +835,16 @@ export function createLegacyScopeView(
     const replacementEligible =
       initial.hasCompletion &&
       typeof authority.hasCompletedReplacement === "function";
-    const canonicalCursor = legacyHead
-      ? coverageCursor(
-          scope,
-          decision,
-          initial.writeClock,
-          initial.arrivalRevision,
-          initial.receiptCursor,
-        )
-      : "";
+    const canonicalCursor = initial.canonicalCursor;
+    if (canonicalCursor === null)
+      return {
+        kind: "refused",
+        refusal: {
+          status: "unavailable",
+          reason: "store_inconsistent_read",
+          detail: "coverage dependencies unavailable",
+        },
+      };
     const projectionKey = legacyHead
       ? JSON.stringify([
           decision.selection.instance,
@@ -853,7 +871,7 @@ export function createLegacyScopeView(
         legacyHead,
         () =>
           sameSelection(decide(scope), decision) &&
-          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+          coverageCursor(scope, decision) === canonicalCursor,
         decision.selection.method,
         {
           instance: decision.selection.instance,
@@ -915,7 +933,7 @@ export function createLegacyScopeView(
         legacyHead,
         () =>
           sameSelection(decide(scope), decision) &&
-          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+          coverageCursor(scope, decision) === canonicalCursor,
         decision.selection.method,
         {
           instance: decision.selection.instance,
@@ -969,7 +987,9 @@ export function createLegacyScopeView(
       // The rows must come from a state in which this is still the one
       // connection: a second account appearing between the decision and
       // the rows refuses instead of serving a body chosen while ambiguous.
-      confirmSelection: () => sameSelection(decide(scope), decision),
+      confirmSelection: () =>
+        sameSelection(decide(scope), decision) &&
+        coverageCursor(scope, decision) === canonicalCursor,
     });
     if (!read.ok) {
       if (
@@ -1004,15 +1024,14 @@ export function createLegacyScopeView(
           legacyHead,
           () =>
             sameSelection(decide(scope), decision) &&
-            receiptCursor(decision, input.declarations) ===
-              initial.receiptCursor,
+            coverageCursor(scope, decision) === canonicalCursor,
           decision.selection.method,
           {
             instance: decision.selection.instance,
             generation: decision.generation,
             writeClock: initial.writeClock,
             arrivalRevision: initial.arrivalRevision,
-            canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
+            canonicalCursor: `legacy-coverage-v2:unavailable:${canonicalCursor}:${read.reason}`,
             coverage,
             cached: false,
           },
@@ -1085,7 +1104,7 @@ export function createLegacyScopeView(
         legacyHead,
         () =>
           sameSelection(decide(scope), decision) &&
-          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+          coverageCursor(scope, decision) === canonicalCursor,
         decision.selection.method,
         {
           instance: decision.selection.instance,
@@ -1217,7 +1236,7 @@ export function createLegacyScopeView(
         legacyHead,
         () =>
           sameSelection(decide(scope), decision) &&
-          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+          coverageCursor(scope, decision) === canonicalCursor,
         decision.selection.method,
         {
           instance: decision.selection.instance,
@@ -1285,7 +1304,9 @@ export function createLegacyScopeView(
     const confirmed = authority.confirmRead(
       scope,
       legacyHead,
-      () => sameSelection(decide(scope), decision),
+      () =>
+        sameSelection(decide(scope), decision) &&
+        coverageCursor(scope, decision) === canonicalCursor,
       decision.selection.method,
     );
     if (!confirmed) {
@@ -1327,13 +1348,82 @@ export function createLegacyScopeView(
 
     listingFor,
 
-    listCanonicalScopes(scopePrefix) {
+    listingsAreCurrent(expected) {
+      return authority.readSnapshot(() =>
+        expected.every(({ scope, listing }) => {
+          // Use the composed receiver: transition overlays share this snapshot.
+          const current = this.listingFor(scope);
+          return (
+            current.kind === listing.kind &&
+            (current.kind !== "canonical" ||
+              listing.kind !== "canonical" ||
+              current.collectedAt === listing.collectedAt) &&
+            (current.kind !== "file" ||
+              listing.kind !== "file" ||
+              current.deletion === listing.deletion)
+          );
+        }),
+      );
+    },
+
+    async upgradeCoverageWitnesses() {
+      if (!input.records) return;
+      for (const scope of boundScopes()) {
+        const stale = authority.readSnapshot(() => {
+          const decision = decide(scope);
+          const head = authority.eligibleLegacyHead(scope);
+          if (
+            !head ||
+            !authority.hasTakeover(scope) ||
+            decision.kind !== "canonical"
+          )
+            return false;
+          const cursor = coverageCursor(scope, decision);
+          return (
+            cursor !== null &&
+            !authority.cachedVerdict(
+              scope,
+              decision.selection.instance,
+              decision.generation,
+              head.id,
+              cursor,
+            ) &&
+            !authority.hasCompletedReplacement?.(
+              scope,
+              head,
+              decision.selection.instance,
+              decision.generation,
+              decision.selection.method,
+              cursor,
+            )
+          );
+        });
+        if (!stale) continue;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const result = await this.readLatest(scope);
+          if (result.kind !== "refused") break;
+          if (
+            result.refusal.reason === "store_inconsistent_read" &&
+            attempt === 0
+          )
+            continue;
+          input.logger?.info(
+            { scope, reason: result.refusal.reason },
+            "Legacy coverage upgrade unresolved",
+          );
+          break;
+        }
+      }
+    },
+
+    listCanonicalScopes(scopePrefix, observe) {
       const listed: { scope: string; collectedAt: string }[] = [];
       for (const scope of boundScopes()) {
         if (scopePrefix !== undefined && !scope.startsWith(scopePrefix)) {
           continue;
         }
         const listing = listingFor(scope);
+        observe?.(scope, listing);
         if (listing.kind === "canonical") {
           listed.push({ scope, collectedAt: listing.collectedAt });
         }
@@ -1417,6 +1507,17 @@ function isProjectionDataFailure(reason: string): boolean {
   ].includes(reason);
 }
 
+function coverageDependencyStreams(
+  decision: Extract<Decision, { kind: "canonical" }>,
+): string[] {
+  return [
+    ...new Set([
+      ...decision.streams,
+      ...(decision.selection.method === "oura-browser" ? OURA_RUN_STREAMS : []),
+    ]),
+  ].sort();
+}
+
 function receiptCursor(
   decision: Extract<Decision, { kind: "canonical" }>,
   declarations?: ReadCanonicalLegacyScopeInput["declarations"],
@@ -1443,7 +1544,7 @@ function receiptCursor(
   if (!declarations) return JSON.stringify(receipts);
   return JSON.stringify({
     receipts,
-    schemas: decision.streams.map((stream) => [
+    schemas: coverageDependencyStreams(decision).map((stream) => [
       stream,
       declarations.forInstance(decision.selection.instance, stream)?.schema ??
         null,

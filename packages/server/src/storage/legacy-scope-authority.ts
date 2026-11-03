@@ -1,3 +1,4 @@
+import { readLegacyScopeDependencies } from "./legacy-scope-dependencies.js";
 import type { Database } from "better-sqlite3";
 import type {
   LegacyScopeAuthority,
@@ -151,6 +152,8 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       );
     },
 
+    coverageDependencies: (instance, streams) =>
+      readLegacyScopeDependencies(db, instance, streams),
     arrivalRevision() {
       if (!hasTable("pdpp_record_arrival_clock")) return 0;
       return (

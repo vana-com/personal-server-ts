@@ -358,6 +358,7 @@ function viewFixture(
     readSnapshot: (read) => read(),
     writeClock: () => 1,
     arrivalRevision: () => 1,
+    coverageDependencies: () => "synthetic-dependencies",
     hasTakeover: () => covered,
     hasMethodTakeover: () => covered,
     hasCoveredHead: () => covered,
