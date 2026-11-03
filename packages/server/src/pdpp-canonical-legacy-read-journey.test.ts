@@ -360,6 +360,197 @@ function expectCompletedReplacement(scope: string): void {
 }
 
 describe("GET /v1/data/:scope for a bound connector scope", () => {
+  it("serves newer explicit empty ChatGPT text and retains exact legacy history after reopen", async () => {
+    const scope = "chatgpt.conversations";
+    const source = "https://registry.pdpp.dev/sources/chatgpt";
+    const before = "2026-09-10T07:00:00.000Z";
+    const after = "2026-09-11T07:00:00.000Z";
+    const oldText = "Exact synthetic history.\n  Preserve spacing and 🐟.";
+    const conversation = {
+      id: "conversation",
+      title: "Synthetic empty transition",
+      create_time: before,
+      update_time: before,
+      current_node: "node",
+      message_count_on_current_branch: 1,
+    };
+    const message = {
+      id: "conversation:node",
+      conversation_id: "conversation",
+      parent_id: null,
+      role: "assistant",
+      content_type: "text",
+      content: oldText,
+      create_time: before,
+      model_slug: "synthetic",
+      on_current_branch: true,
+    };
+    const declaration = JSON.stringify({
+      source_id: source,
+      source_kind: "connector",
+      version: "1",
+      streams: Object.entries({
+        conversations: conversation,
+        messages: message,
+      }).map(([name, row]) => ({
+        name,
+        fields: Object.keys(row),
+        required_fields: ["id"],
+        primary_key: ["id"],
+        ...(name === "messages"
+          ? {
+              schema: {
+                type: "object",
+                required: ["id", "content"],
+                properties: {
+                  id: { type: "string" },
+                  content: {
+                    type: ["string", "null"],
+                    x_pdpp_text_encoding: "pdpp-safe-escape-v1",
+                  },
+                  blob_ref: {
+                    x_pdpp_blob_projects_field: "content",
+                    x_pdpp_blob_codec: "json-string-v1",
+                  },
+                },
+              },
+            }
+          : {}),
+      })),
+    });
+    await ctx!.cleanup();
+    ctx = await boot("chatgpt", { declaration });
+    const legacyBody = {
+      conversations: [
+        {
+          id: conversation.id,
+          title: conversation.title,
+          create_time: before,
+          update_time: before,
+          message_count: 1,
+          messages: [
+            {
+              id: "node",
+              role: "assistant",
+              content: oldText,
+              content_type: "text",
+              create_time: before,
+              model: "synthetic",
+            },
+          ],
+        },
+      ],
+      total: 1,
+    };
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(before));
+      await legacyWrite(scope, legacyBody);
+    } finally {
+      vi.useRealTimers();
+    }
+    const token = await registerTestConnection(
+      ctx.app,
+      ctx.devToken!,
+      owner,
+      source,
+      "chatgpt",
+    );
+    const ingestRow = async (
+      stream: string,
+      data: Record<string, unknown>,
+      emittedAt: string,
+      rejection?: string,
+    ) => {
+      const response = await ctx!.app.request(
+        `/v1/streams/${stream}/records/ingest?method=chatgpt&binding_generation=1`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            instance: `chatgpt:${owner}`,
+            key: String(data.id),
+            data,
+            emitted_at: emittedAt,
+          }),
+        },
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject(
+        rejection
+          ? { accepted: 0, rejected: [{ index: 0, reason: rejection }] }
+          : { accepted: 1, rejected: [] },
+      );
+    };
+    await ingestRow("conversations", conversation, before);
+    await ingestRow("messages", message, before);
+    const original = await ownerGet(`/v1/data/${scope}`);
+    expect(original.status).toBe(200);
+    expect(original.dataSource).toBe("canonical");
+    // No completion receipts: this must use ordinary field coverage.
+    await ingestRow("messages", { ...message, content: "" }, after);
+    await ingestRow(
+      "conversations",
+      { ...conversation, update_time: after },
+      after,
+    );
+    const verify = async () => {
+      const current = await ownerGet(`/v1/data/${scope}`);
+      expect(current.status, current.text).toBe(200);
+      expect(current.dataSource).toBe("canonical");
+      expect(JSON.parse(current.text).data.conversations[0]).toMatchObject({
+        message_count: 1,
+        messages: [{ id: "node", content: "" }],
+      });
+      expect(current.text).not.toContain(oldText);
+      for (const query of [`at=${encodeURIComponent(before)}`, "view=stored"]) {
+        const historical = await ownerGet(`/v1/data/${scope}?${query}`);
+        expect(historical.status, historical.text).toBe(200);
+        expect(JSON.parse(historical.text).data).toEqual(legacyBody);
+        expect(
+          JSON.parse(historical.text).data.conversations[0].messages[0].content,
+        ).toBe(oldText);
+      }
+    };
+    await verify();
+    await verify();
+    await ctx.cleanup();
+    ctx = await boot("chatgpt", { declaration });
+    await verify();
+    // Unknown extraction invalidates warm coverage. An unclaimed blob row is
+    // rejected at ingest and cannot turn that unknown state into explicit empty.
+    // The owner can still read the old exact file when current reads refuse.
+    for (const content of [null, ""]) {
+      await ingestRow(
+        "messages",
+        {
+          ...message,
+          content,
+          ...(content === ""
+            ? {
+                blob_ref: {
+                  blob_id: `sha256:${"0".repeat(64)}`,
+                  sha256: "0".repeat(64),
+                  size_bytes: 2,
+                  mime_type: "application/json",
+                },
+              }
+            : {}),
+        },
+        after,
+        content === "" ? "blob_unclaimed" : undefined,
+      );
+      const refused = await ownerGet(`/v1/data/${scope}`);
+      expect(refused.status, refused.text).toBe(503);
+      const historical = await ownerGet(`/v1/data/${scope}?view=stored`);
+      expect(historical.status).toBe(200);
+      expect(JSON.parse(historical.text).data).toEqual(legacyBody);
+    }
+  });
+
   it("accepts mutable value drift from a newer canonical collection", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
