@@ -11,6 +11,7 @@ import {
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { initializeDatabase } from "./index-schema.js";
+import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 const OURA = "https://registry.pdpp.dev/sources/oura";
 const GITHUB = "https://registry.pdpp.dev/sources/github";
@@ -3476,6 +3477,178 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
       expect(await restarted.readLatest(scope)).toEqual(read);
     },
   );
+
+  it.each(["text", "multimodal_text"])(
+    "covers newer current-empty %s through ordinary field rules",
+    async (content_type) => {
+      const { view, original, config } = await fixture();
+      put("messages", { ...message("old", true), content: "", content_type });
+      put("conversations", { ...conversation("old"), update_time: after });
+      const read = await view.readLatest(scope);
+      expect(read.kind).toBe("canonical");
+      if (read.kind !== "canonical")
+        throw new Error("Expected explicit empty state");
+      expect(read.envelope.data).toMatchObject({
+        conversations: [
+          {
+            message_count: 1,
+            messages: [{ id: "old", content: "", content_type }],
+          },
+        ],
+      });
+      expect(view.verdictFor(scope)[0]).toMatchObject({
+        verdict: "covered",
+        reasonCounts: { missing_entity: 0 },
+      });
+      expect(store.listStreamCompletions("chat")).toEqual([]);
+      expect(await view.readLatest(scope)).toEqual(read);
+      const restarted = createLegacyScopeView({
+        ...config,
+        readLegacyHead: async () => original.envelope,
+      });
+      expect(await restarted.readLatest(scope)).toEqual(read);
+      // The current-empty witness cannot survive a later unknown source value.
+      put("messages", { ...message("old", true), content: null });
+      expect((await restarted.readLatest(scope)).kind).toBe("refused");
+    },
+  );
+
+  it("rechecks the current-empty snapshot before confirming coverage", async () => {
+    const { original, config } = await fixture();
+    put("messages", { ...message("old", true), content: "" });
+    put("conversations", { ...conversation("old"), update_time: after });
+    const view = createLegacyScopeView({
+      ...config,
+      readLegacyHead: async () => {
+        put("messages", { ...message("old", true), content: null });
+        return original.envelope;
+      },
+    });
+    expect(await view.readLatest(scope)).toMatchObject({
+      kind: "refused",
+      refusal: { reason: "store_inconsistent_read" },
+    });
+  });
+
+  it("refuses a current-empty row whose declared blob is unavailable", async () => {
+    const { original, config } = await fixture();
+    const meta = store.storeBlobBytesForInstance({
+      instance: "chat",
+      method: "chatgpt",
+      generation: 1,
+      bytes: new TextEncoder().encode(JSON.stringify("source blob text")),
+      mimeType: "application/json",
+    });
+    put("messages", {
+      ...message("old", true),
+      content: "",
+      blob_ref: {
+        blob_id: meta.blobId,
+        sha256: meta.sha256,
+        size_bytes: meta.sizeBytes,
+        mime_type: meta.mimeType,
+      },
+    });
+    put("conversations", { ...conversation("old"), update_time: after });
+    const view = createLegacyScopeView({
+      ...config,
+      records: { ...store, getBlobBytes: () => undefined },
+      declarations: createStreamDeclarationRegistry([
+        {
+          name: "messages",
+          semantics: "mutable_state",
+          primaryKey: ["id"],
+          cursorField: "create_time",
+          requiredFields: ["id"],
+          schema: {
+            properties: {
+              content: { type: ["string", "null"] },
+              blob_ref: {
+                x_pdpp_blob_projects_field: "content",
+                x_pdpp_blob_codec: "json-string-v1",
+              },
+            },
+          },
+        },
+      ]),
+      readLegacyHead: async () => original.envelope,
+    });
+    expect(await view.readLatest(scope)).toMatchObject({
+      kind: "refused",
+      refusal: { reason: "blob_backed_record_invalid" },
+    });
+  });
+
+  it.each([
+    "null",
+    "missing content",
+    "unsupported parts",
+    "unsupported type",
+    "unfetched detail",
+    "absent parent",
+    "equal messages",
+    "older messages",
+    "equal conversations",
+    "older conversations",
+    "changed creation",
+    "changed role",
+    "wrong parent",
+    "preferred null",
+  ])("refuses current-empty transition with %s", async (variant) => {
+    const { view } = await fixture();
+    const current: Record<string, unknown> = {
+      ...message("old", true),
+      content: "",
+    };
+    if (variant === "null") current.content = null;
+    if (variant === "missing content" || variant === "unsupported parts") {
+      delete current.content;
+      if (variant === "unsupported parts") current.parts = [""];
+    }
+    if (variant === "unsupported type") current.content_type = "code";
+    if (variant === "changed creation") current.create_time = after;
+    if (variant === "changed role") current.role = "tool";
+    if (variant === "wrong parent") current.conversation_id = "other";
+    if (variant !== "unfetched detail") {
+      put(
+        "messages",
+        current,
+        variant === "equal messages"
+          ? before
+          : variant === "older messages"
+            ? "2026-09-09T07:00:00.000Z"
+            : after,
+      );
+    }
+    put(
+      "conversations",
+      {
+        ...conversation(variant === "unfetched detail" ? "unfetched" : "old"),
+        update_time: after,
+      },
+      variant === "equal conversations"
+        ? before
+        : variant === "older conversations"
+          ? "2026-09-09T07:00:00.000Z"
+          : after,
+    );
+    if (variant === "preferred null") {
+      put("messages", { ...current, id: "conversation:old", content: null });
+    }
+    if (variant === "absent parent") {
+      store.replaceStream({
+        instance: "chat",
+        stream: "conversations",
+        method: "chatgpt",
+        generation: 1,
+        primaryKey: ["id"],
+        emittedAt: after,
+        envelopes: [],
+      });
+    }
+    expect((await view.readLatest(scope)).kind).toBe("refused");
+    expect((await view.readLatest(scope)).kind).toBe("refused");
+  });
 
   it.each([
     "absent",

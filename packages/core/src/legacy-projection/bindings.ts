@@ -1835,7 +1835,7 @@ const chatgptConversations: LegacyScopeBinding = {
     "Conversation create/update times pass through as null when the source lacks them, matching legacy's listed?.create_time ?? fetched.create_time ?? null fallback.",
     "fetched_at is the projection time (options.now, else the wall clock), matching legacy's per-run toConversationRecord timestamp.",
     "A conversation without complete current-branch message evidence, a valid id, or valid timestamps is dropped and counted in a records_dropped diagnostic; nested full threads are not invented. Messages whose conversation is absent are dropped and counted the same way.",
-    "Only user/assistant text or multimodal_text messages with nonempty string content are retained, matching the legacy connector's walkMessages filter; message_count is the retained count.",
+    "Current user/assistant text or multimodal_text messages preserve explicit empty strings; null or non-string content is omitted. Off-branch coverage evidence still requires nonempty text; message_count counts displayed messages.",
     "A missing title becomes 'Untitled', matching the legacy connector's toConversationRecord fallback; model_slug is renamed to model.",
     "Legacy message ids are source node ids. ChatGPT 0.3.0 stores a message under '<conversation_id>:<node_id>' (and links parent_id the same way); the projection strips that prefix, reads a bare pre-0.3.0 id as it is, and counts a node stored under both forms once, preferring the 0.3.0 row.",
   ],
@@ -1979,7 +1979,8 @@ const chatgptConversations: LegacyScopeBinding = {
         if (
           nodeId.trim().length > 0 &&
           message.on_current_branch === false &&
-          isChatgptTextMessage(message)
+          isChatgptTextMessage(message) &&
+          message.content.length > 0
         ) {
           retainedChatgptMessages.push({
             scope,
@@ -2064,8 +2065,8 @@ function isChatgptTextMessage(
     (message.role === "user" || message.role === "assistant") &&
     (message.content_type === "text" ||
       message.content_type === "multimodal_text") &&
-    typeof message.content === "string" &&
-    message.content.length > 0
+    // An explicit empty string is current source state. NULL remains unknown.
+    typeof message.content === "string"
   );
 }
 
