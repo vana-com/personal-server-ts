@@ -3173,6 +3173,33 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         });
       });
 
+      it("uses the walked branch for the conversation and off-branch coverage evidence", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n3"),
+            message("c1", "n1", null, "shared"),
+            message("c1", "n2", "n1", "old sibling", {
+              onBranch: true,
+            }),
+            message("c1", "n3", "n1", "current sibling", {
+              onBranch: false,
+            }),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 2,
+              messages: [{ id: "n1" }, { id: "n3" }],
+            },
+          ],
+        });
+        expect(
+          result.retainedChatgptMessages?.map((entry) => entry.message.id),
+        ).toEqual(["n2"]);
+      });
+
       it.each([
         {
           cause: "missing_current_node",
