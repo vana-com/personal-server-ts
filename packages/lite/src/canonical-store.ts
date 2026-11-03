@@ -520,8 +520,9 @@ export function createLiteCanonicalStore(deps: {
         claims.push(replicaOperationSchema.parse(JSON.parse(entry.value)));
       if (
         (await tx.blob(blob.blobId)) &&
-        (pendingBytes ||
-          (await get(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`)))
+        ((await get(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`)) ||
+          (pendingBytes &&
+            (await any(tx, `pending-blob-active/${keyDigest(blob.blobId)}/`))))
       )
         verified.add(blob.blobId);
     }
@@ -1680,6 +1681,17 @@ export function createLiteCanonicalStore(deps: {
         changed.set(op.connectionId, keys);
       } else full.add(op.connectionId);
     }
+    // A carrier can provide bytes for a record retained on another connection.
+    // Update availability before materializing every connection that claims it.
+    for await (const blob of pendingBlobsOf(tx, batch)) {
+      const path = `pending-blob-active/${keyDigest(blob.blobId)}/${keyDigest(batch.id)}`;
+      if (active) await put(tx, path, true);
+      else await tx.delete(path);
+      for (const id of await claimants(pendingMaterializer(tx), blob.blobId)) {
+        dirty.add(id);
+        full.add(id);
+      }
+    }
     for (const id of dirty)
       await refreshPreview(
         tx,
@@ -1708,11 +1720,6 @@ export function createLiteCanonicalStore(deps: {
           await tx.delete(
             `pending-index/retained-connections/${keyDigest(id)}`,
           );
-    }
-    for await (const blob of pendingBlobsOf(tx, batch)) {
-      const path = `pending-blob-active/${keyDigest(blob.blobId)}/${keyDigest(batch.id)}`;
-      if (active) await put(tx, path, true);
-      else await tx.delete(path);
     }
     await advanceChanged(tx, dirty);
   }
@@ -1774,8 +1781,11 @@ export function createLiteCanonicalStore(deps: {
         !(await any(tx, `${connectionPrefix(id)}claims/${keyDigest(blobId)}/`))
       )
         continue;
-      const { connection, blocked } = await connectionState(tx, id, context);
-      if (blocked || connection.status !== "active") continue;
+      const { connection } = await connectionState(tx, id, context);
+      // Missing lifecycle evidence keeps the applied generation's rows live.
+      // Their confirmed bytes must remain readable with those rows.
+      if (connection.status !== "active" && connection.status !== "held")
+        continue;
       for await (const rowEntry of scan(tx, `rows/${digest}/`)) {
         const row = JSON.parse(rowEntry.value) as PdppRecordRow;
         if (row.deleted) continue;

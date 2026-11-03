@@ -98,6 +98,14 @@ Tests are co-located with source files. Use the existing test utilities in `pack
 
 Both are enforced via pre-commit hooks (husky + lint-staged).
 
+## Release Pipeline
+
+A merge to `main` starts the [Release workflow](https://github.com/vana-com/personal-server-ts/actions/workflows/release.yml). It builds and tests the repository, then semantic-release publishes Core, Lite, Server and the CLI facade to npm when the accumulated commits require a release. Their stable versions share the same release number and `latest` tag.
+
+The same push starts [Docker publishing](https://github.com/vana-com/personal-server-ts/actions/workflows/docker.yml). It publishes `vanaorg/personal-server`, `vanaorg/personal-server-enclave` and `vanaorg/personal-server-sandbox-runtime` with the commit SHA and `latest` tags.
+
+Verify delivery against the actual outputs: all four npm packages at the expected version, all three image digests tied to the source commit, and a working published artifact. An enabled workflow or a successful run that skipped publishing does not establish delivery. When restoring a paused publisher, finish this verification before closing its restoration task.
+
 ## Security
 
 If you discover a security vulnerability, **do not open a public issue**. See [SECURITY.md](SECURITY.md) for responsible disclosure instructions.
