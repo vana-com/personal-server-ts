@@ -939,6 +939,88 @@ describe("deleteScope erases only the fence captured before the remote await", (
       afterTombstoneVersion,
     });
 
+  it("a fresh owner delete erases captured unsynced re-adds without extending the old remote blob fence", async () => {
+    const storage = createMemoryDataStorage();
+    indexed(storage, "p/readd.json", "2026-08-02T00:00:00.000Z", 4);
+    storage.updateEntryVersion("p/readd.json", 99);
+    const deleteData = makeDeleteData({
+      tombstone: vi.fn(async () => {
+        indexed(
+          storage,
+          "p/during-tombstone.json",
+          "2026-08-03T00:00:00.000Z",
+          4,
+        );
+        return {
+          status: "already-deleted",
+          dataPointId: DATA_POINT_ID,
+          version: "4",
+          deletedAt: DELETED_AT,
+        };
+      }),
+      deleteBlobVersions: vi.fn(async (_scope, versions) => {
+        indexed(storage, "p/during-blobs.json", "2026-08-04T00:00:00.000Z", 4);
+        return { deleted: versions, missing: [], failed: [] };
+      }),
+    });
+    const result = await deleteScope(
+      { storage, serverOwner: OWNER, deleteData, logger: makeLogger() },
+      SCOPE,
+    );
+    expect(result.steps.gateway).toMatchObject({
+      status: "ok",
+      version: "4",
+      reason: "already-deleted",
+    });
+    expect(result.steps.local).toEqual({ status: "ok", deletedCount: 1 });
+    expect(
+      storage
+        .listVersions(SCOPE, { limit: 50 })
+        .map((entry) => entry.path)
+        .sort(),
+    ).toEqual(["p/during-blobs.json", "p/during-tombstone.json"]);
+    const targets = vi
+      .mocked(deleteData.deleteBlobVersions)
+      .mock.calls.flatMap(([scope, versions]) =>
+        versions.map((version) => [scope, version]),
+      );
+    expect(targets.sort()).toEqual(
+      ["1", "2", "3", "4"].map((version) => [SCOPE, version]),
+    );
+  });
+
+  it("keeps replacement rows and published or newer-marker rows outside a fresh owner fence", async () => {
+    const storage = createMemoryDataStorage();
+    indexed(storage, "p/replace.json", "2026-08-02T00:00:00.000Z", 4);
+    const published = indexed(
+      storage,
+      "p/published.json",
+      "2026-08-03T00:00:00.000Z",
+      null,
+    );
+    storage.updateDataPointId(published.path, DATA_POINT_ID);
+    storage.updateEntryVersion(published.path, 5);
+    indexed(storage, "p/newer.json", "2026-08-04T00:00:00.000Z", 5);
+    const deleteData = makeDeleteData({
+      deleteBlobVersions: vi.fn(async (_scope, versions) => {
+        await storage.deleteVersion(SCOPE, "2026-08-02T00:00:00.000Z");
+        indexed(storage, "p/replacement.json", "2026-08-02T00:00:00.000Z", 4);
+        return { deleted: versions, missing: [], failed: [] };
+      }),
+    });
+    const result = await deleteScope(
+      { storage, serverOwner: OWNER, deleteData, logger: makeLogger() },
+      SCOPE,
+    );
+    expect(result.steps.local).toEqual({ status: "ok", deletedCount: 0 });
+    expect(
+      storage
+        .listVersions(SCOPE, { limit: 50 })
+        .map((entry) => entry.path)
+        .sort(),
+    ).toEqual(["p/newer.json", "p/published.json", "p/replacement.json"]);
+  });
+
   it("keeps every entry that arrives during the remote delete and erases only the captured covered versions", async () => {
     const storage = createMemoryDataStorage();
     indexed(storage, "p/a.json", "2026-08-01T00:00:00.000Z", null);

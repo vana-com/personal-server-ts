@@ -155,32 +155,33 @@ export function planBlobDeletions(
 }
 
 /**
- * A local entry the tombstone covered, as it stood when the tombstone landed:
- * its immutable row identity (`id`, `path`) and its collection stamp.
+ * Exact local row identity and its re-add acknowledgement at capture time.
  */
-type CoveredEntry = Pick<IndexEntry, "id" | "path" | "collectedAt">;
+type CoveredEntry = Pick<
+  IndexEntry,
+  "id" | "path" | "collectedAt" | "afterTombstoneVersion"
+>;
 
 /**
- * The entries `tombstoneVersionValue` covers, read once when the tombstone
- * lands and before any remote await. This fence is the only thing step 3 may
- * erase: an entry that arrives later is outside it, whatever its marker.
+ * Snapshot matching rows synchronously. Owner-intent capture precedes remote
+ * work; tombstone capture precedes blob cleanup. Later rows stay outside each fence.
  */
-function captureCoveredEntries(
+function captureEntries(
   storage: Pick<DataStoragePort, "listVersions">,
   scope: string,
-  tombstoneVersionValue: string | null,
+  includes: (entry: IndexEntry) => boolean,
 ): CoveredEntry[] {
-  const tombstone = { version: tombstoneVersionValue };
   const covered: CoveredEntry[] = [];
   const PAGE_SIZE = 500;
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const entries = storage.listVersions(scope, { limit: PAGE_SIZE, offset });
     for (const entry of entries) {
-      if (isEntryCoveredByTombstone(entry, tombstone)) {
+      if (includes(entry)) {
         covered.push({
           id: entry.id,
           path: entry.path,
           collectedAt: entry.collectedAt,
+          afterTombstoneVersion: entry.afterTombstoneVersion,
         });
       }
     }
@@ -306,6 +307,18 @@ export async function deleteScope(
     },
     pendingBlobDeletion: false,
   };
+  // A new owner request also covers already-acknowledged local re-adds. Capture
+  // them before remote work; background retries never get this owner-intent fence.
+  const requestedReadds = deleteData
+    ? captureEntries(
+        storage,
+        scope,
+        (entry) =>
+          entry.dataPointId === null &&
+          Number.isSafeInteger(entry.afterTombstoneVersion) &&
+          Number(entry.afterTombstoneVersion) > 0,
+      )
+    : [];
   // Set only once a gateway tombstone has landed (see step 2).
   let covered: CoveredEntry[] | null = null;
 
@@ -389,7 +402,21 @@ export async function deleteScope(
     // not report cannot be expanded into registry keys yet; a version-less
     // marker asks the retry to expand it once the registry answers.
     // Fence first: the covered entries as they stand before the remote await.
-    covered = captureCoveredEntries(storage, scope, tombstoneVersionValue);
+    covered = captureEntries(storage, scope, (entry) =>
+      isEntryCoveredByTombstone(entry, { version: tombstoneVersionValue }),
+    );
+    if (tombstoneVersionValue !== null) {
+      const anchor = BigInt(tombstoneVersionValue);
+      const coveredIds = new Set(covered.map((entry) => entry.id));
+      for (const entry of requestedReadds) {
+        if (
+          typeof entry.afterTombstoneVersion === "number" &&
+          BigInt(entry.afterTombstoneVersion) <= anchor &&
+          !coveredIds.has(entry.id)
+        )
+          covered.push(entry);
+      }
+    }
     const plan = planBlobDeletions(storage, scope, tombstoneVersionValue);
     const storageStep = await deleteScopeBlobs(
       { deleteData, pendingBlobDeletions, logger },
@@ -403,8 +430,8 @@ export async function deleteScope(
 
   // 3. Local copy. Safe now: the registry row is a tombstone (or the point
   // was never registered / sync is off), so nothing can re-pull it. Only the
-  // versions fenced in step 2 are erased: a row that arrived while the remote
-  // deletes were in flight is outside the fence and stays. With no gateway
+  // versions fenced by the tombstone or this owner request are erased: a
+  // later re-add stays outside the owner fence. With no gateway
   // there is no fence and the whole local copy goes.
   try {
     const deletedCount = covered
