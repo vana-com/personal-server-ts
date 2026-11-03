@@ -190,7 +190,7 @@ Inventory remains stale while re-evaluation is pending, running or retrying, but
 
 Startup and periodic sweeps recover lost notifications. A coarse transaction marker covers stream, blob, replica, receipt and visibility changes once per commit; the source mutation and dirty marker commit or roll back together. Polling also detects declaration and threshold changes. All candidate instances are conservatively dirtied, including owners of shared blobs. Instances share one background worker and one coalesced follow-up per instance. Projection work runs on a separate event loop and SQLite connection. Errors retain the previous verdict and retry on a later sweep, subject to the inventory ceiling.
 
-Latest-body reads retain the full current coverage cursor and both confirmation fences. They re-check coverage and stay fail-closed rather than trusting inventory. A retryable canonical refusal retains `CANONICAL_VIEW_UNAVAILABLE`, includes its machine-readable `reason`, and sets `retryable: true` for HTTP 503. Callers must handle this list/read disagreement and retry the read.
+Latest-body reads retain the full current coverage cursor and both confirmation fences. They re-check coverage and stay fail-closed rather than trusting inventory. A retryable canonical refusal retains `CANONICAL_VIEW_UNAVAILABLE`, includes its machine-readable `reason`, and sets `retryable: true` for transient HTTP 503 coverage refusals. Unsupported paid access remains non-retryable. Callers must handle this list/read disagreement and retry only retryable reads.
 
 ### Additions summary
 

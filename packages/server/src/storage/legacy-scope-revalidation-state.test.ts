@@ -116,6 +116,8 @@ it("expires failing evidence at the ceiling and keeps a slow successful evaluati
     state.complete("i", "oura.activity", state.revision("i"));
     now = 8000;
     vi.setSystemTime(now);
+    state.ensureDirty();
+    expect(state.status("i", "oura.activity")?.dirty_since).toBeNull();
     expect(view.listingFor("oura.activity").kind).toBe("canonical");
     expect(state.overdue("i", "oura.activity")).toBe(false);
   } finally {
