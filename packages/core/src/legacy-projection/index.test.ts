@@ -3146,6 +3146,100 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         },
       );
 
+      it("derives the active branch from current_node when stored flags are stale after regeneration", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n3"),
+            message("c1", "n1", null, "shared", { onBranch: true }),
+            message("c1", "n2", "n1", "regenerated answer", {
+              onBranch: false,
+            }),
+            message("c1", "n3", "n1", "current answer", {
+              onBranch: false,
+            }),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 2,
+              messages: [
+                { id: "n1", content: "shared" },
+                { id: "n3", content: "current answer" },
+              ],
+            },
+          ],
+        });
+      });
+
+      it.each([
+        {
+          cause: "missing_current_node",
+          tip: "missing",
+          parent: null,
+          cycle: false,
+        },
+        {
+          cause: "missing_parent",
+          tip: "n2",
+          parent: "missing",
+          cycle: false,
+        },
+        {
+          cause: "cycle",
+          tip: "n2",
+          parent: "n1",
+          cycle: true,
+        },
+      ])(
+        "falls back to stored flags and diagnoses $cause",
+        ({ cause, tip, parent, cycle }) => {
+          const records: PdppRecord[] = [
+            conversation("c1", 2, tip),
+            message("c1", "n1", cycle ? "n2" : null, "first"),
+            message("c1", "n2", parent, "second"),
+          ];
+          const result = projected(project(records));
+          if (cycle) {
+            expect(result.payload).toMatchObject({
+              conversations: [{ message_count: 2 }],
+            });
+          } else {
+            expect(result.payload).toMatchObject({
+              conversations: [],
+              total: 0,
+            });
+          }
+          expect(result.diagnostics).toContainEqual({
+            kind: "branch_walk_fallback",
+            scope: "chatgpt.conversations",
+            stream: "conversations",
+            count: 1,
+            reasons: [cause],
+          });
+        },
+      );
+
+      it("walks a relinked retained ancestor without falling back", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n3"),
+            message("c1", "n1", null, "retained ancestor"),
+            message("c1", "n3", "n1", "tip"),
+          ]),
+        );
+        expect(result.diagnostics).toBeUndefined();
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 2,
+              messages: [{ id: "n1" }, { id: "n3" }],
+            },
+          ],
+        });
+      });
+
       it("still projects a conversation that holds only old bare-id rows", () => {
         const result = projected(
           project([
