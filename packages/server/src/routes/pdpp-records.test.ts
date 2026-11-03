@@ -1224,6 +1224,161 @@ describe("pdpp records routes: record ingest ownership", () => {
     emitted_at: "2026-04-01T00:00:00.000Z",
   };
 
+  it.each(["memory", "sqlite"] as const)(
+    "fills only absent keys atomically and queries missing keys read-only on %s",
+    async (backend) => {
+      const db = backend === "sqlite" ? new Database(":memory:") : undefined;
+      const sqlite = db && createSqliteRecordStore(db);
+      const store = sqlite || createMemoryRecordStore();
+      sqlite?.registerConnection({
+        instance: "inst_1",
+        sourceId: "https://test.invalid/source",
+        method: "m1",
+        label: "Test",
+      });
+      const { app } = buildApp(
+        {
+          owner: {
+            active: true,
+            tokenKind: "owner",
+            subjectId: "sub_1",
+            instanceIds: ["inst_1"],
+          },
+          client: {
+            active: true,
+            tokenKind: "client",
+            subjectId: "sub_1",
+            grant: clientGrant(),
+          },
+        },
+        {
+          store,
+          ...(sqlite && {
+            bindingStore: sqlite,
+            configuredMethods: new Map([["inst_1", ["m1"]]]),
+          }),
+        },
+      );
+      const headers = {
+        Authorization: "Bearer owner",
+        "Content-Type": "application/json",
+      };
+      const write = (body: unknown) =>
+        app.request(
+          "/streams/playlists/records/ingest?method=m1&binding_generation=1&write_mode=fill_missing",
+          { method: "POST", headers, body: JSON.stringify(body) },
+        );
+      const missing = (keys: unknown[], generation = 1, token = "owner") =>
+        app.request(
+          `/streams/playlists/records/missing?binding_generation=${generation}`,
+          {
+            method: "POST",
+            headers: { ...headers, Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ instance: "inst_1", keys }),
+          },
+        );
+      const row = (key: string, name = "first") => ({
+        ...envelope,
+        key,
+        data: { id: key, name },
+        op: "upsert",
+      });
+      try {
+        // Same-key entries within the batch see the earlier insert.
+        expect(
+          await (await write([row("a"), row("a", "changed"), row("b")])).json(),
+        ).toEqual({
+          write_mode: "fill_missing",
+          inserted: 2,
+          present: 1,
+          deleted: 0,
+          results: [
+            { index: 0, outcome: "inserted" },
+            { index: 1, outcome: "present" },
+            { index: 2, outcome: "inserted" },
+          ],
+        });
+        const original = store.getRecord("inst_1", "playlists", "a");
+        expect(original?.data.name).toBe("first");
+        expect(
+          await (await write([row("a", "changed"), row("b")])).json(),
+        ).toMatchObject({ inserted: 0, present: 2, deleted: 0 });
+        expect(store.getRecord("inst_1", "playlists", "a")).toEqual(original);
+        store.deleteRecord(
+          "inst_1",
+          "playlists",
+          "b",
+          "2026-04-02T00:00:00Z",
+          "mutable_state",
+        );
+        expect(
+          await (await write([row("a"), row("b"), row("c")])).json(),
+        ).toEqual({
+          write_mode: "fill_missing",
+          inserted: 1,
+          present: 1,
+          deleted: 1,
+          results: [
+            { index: 0, outcome: "present" },
+            { index: 1, outcome: "deleted" },
+            { index: 2, outcome: "inserted" },
+          ],
+        });
+        expect(store.getRecord("inst_1", "playlists", "b")).toBeUndefined();
+        // Invalid input after a staged insert must roll back rows AND history.
+        const beforeRollback = db?.serialize();
+        expect(
+          (await write([row("rollback"), { ...row("bad"), data: null }]))
+            .status,
+        ).toBe(400);
+        expect(
+          store.recordStates("inst_1", "playlists", ["rollback", "bad"]),
+        ).toEqual(["missing", "missing"]);
+        if (db) expect(db.serialize()).toEqual(beforeRollback);
+        for (const op of ["delete", "other", null]) {
+          expect(
+            (await write([row("nonupsert"), { ...row("bad"), op }])).status,
+          ).toBe(400);
+          expect(
+            store.getRecord("inst_1", "playlists", "nonupsert"),
+          ).toBeUndefined();
+        }
+        const beforeRead = db?.serialize();
+        const beforeListing = store.listStreams(["inst_1"]);
+        expect(await (await missing(["a", "b", "absent"])).json()).toEqual({
+          missing: ["absent"],
+          deleted: ["b"],
+        });
+        expect(await (await missing([])).json()).toEqual({
+          missing: [],
+          deleted: [],
+        });
+        expect(
+          (await missing(Array.from({ length: 1000 }, (_, i) => `k${i}`)))
+            .status,
+        ).toBe(200);
+        expect(
+          (await missing(Array.from({ length: 1001 }, (_, i) => `k${i}`)))
+            .status,
+        ).toBe(400);
+        expect((await missing([null])).status).toBe(400);
+        expect((await missing(["a"], 1, "client")).status).toBe(401);
+        if (sqlite) {
+          expect((await missing(["a"], 2)).status).toBe(409);
+          expect(sqlite.listStreamCompletions("inst_1")).toEqual([]);
+          expect(sqlite.listArrivalOrder("inst_1", "playlists")).toEqual([
+            "a",
+            "c",
+          ]);
+        }
+        expect(store.listStreams(["inst_1"])).toEqual(beforeListing);
+        if (db) expect(db.serialize()).toEqual(beforeRead);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
   it("accepts an envelope for the token subject's owned instance", async () => {
     const { app, store } = buildApp({
       "owner-tok": {

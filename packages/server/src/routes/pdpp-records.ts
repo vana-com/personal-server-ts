@@ -29,6 +29,8 @@ import {
   recordWithinGrantTimeConstraint,
   resolveReadScope,
   summarizeIngest,
+  encodeRecordKey,
+  FillMissingIngestError,
   type IngestOutcome,
   type PdppRecordEnvelopeInput,
   type PdppRecordRow,
@@ -216,6 +218,7 @@ export interface PdppRecordsRouteDeps {
     getInstanceBinding(instance: string): {
       sourceId: string | null;
       deletedAt: string | null;
+      generation: number;
     };
     storeBlobBytesForInstance(input: {
       instance: string;
@@ -355,6 +358,8 @@ function requestId(): string {
 /** Maps a thrown store-layer error to the PdppError the spec's Errors table requires. */
 function toPdppError(err: unknown): PdppError {
   if (err instanceof PdppError) return err;
+  if (err instanceof FillMissingIngestError)
+    return new PdppError("invalid_request", err.message);
   if (err instanceof CursorExpiredError) {
     return new PdppError("cursor_expired", "changes_since cursor has expired");
   }
@@ -1271,6 +1276,102 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   // this lane's own write path so there is data to serve. Body is a single
   // RECORD envelope or an array of envelopes; the whole call is one
   // ingestBatch invocation (one SQLite transaction on the desktop backend).
+  app.post("/streams/:stream/records/missing", async (c) => {
+    const reqId = requestId();
+    const { context, error } = await authenticate(c, reqId);
+    if (error) return error;
+    try {
+      if (
+        context!.tokenKind !== "owner" ||
+        !context!.subjectId ||
+        !deps.ownerSubjectId ||
+        context!.subjectId.toLowerCase() !== deps.ownerSubjectId.toLowerCase()
+      )
+        throw new PdppError(
+          "authentication_error",
+          "Missing keys requires an owner token",
+        );
+      const stream = c.req.param("stream");
+      if (!deps.declarations.declares(stream))
+        throw new PdppError("not_found", "Stream not found");
+      const body = parseIngestBody(
+        await readBoundedBody(c.req.raw, MAX_INGEST_BODY_BYTES, "Ingest"),
+      ) as Record<string, unknown>;
+      if (Array.isArray(body))
+        throw new PdppError(
+          "invalid_request",
+          "Missing keys body must be an object",
+        );
+      if (
+        typeof body.instance !== "string" ||
+        !ownerInstances(context!).includes(body.instance)
+      )
+        throw new PdppError(
+          "authentication_error",
+          "Missing keys requires an owned instance",
+        );
+      if (!deps.declarations.forInstance(body.instance, stream))
+        throw new PdppError("not_found", "Stream not found");
+      const generation = Number(c.req.query("binding_generation"));
+      if (
+        !Number.isSafeInteger(generation) ||
+        generation < 1 ||
+        !Array.isArray(body.keys) ||
+        body.keys.length > 1000
+      )
+        throw new PdppError("invalid_request", "Invalid generation or keys");
+      if (deps.bindingStore) {
+        const binding = deps.bindingStore.getInstanceBinding(body.instance);
+        if (
+          binding.sourceId === null ||
+          binding.deletedAt !== null ||
+          binding.generation !== generation
+        )
+          throw new PdppBindingError("binding_generation_mismatch");
+      }
+      let encoded: string[];
+      try {
+        encoded = body.keys.map((key: unknown) => {
+          if (
+            typeof key !== "string" &&
+            !(
+              Array.isArray(key) &&
+              key.length > 0 &&
+              key.every((part) => typeof part === "string")
+            )
+          )
+            throw new Error("invalid key");
+          return encodeRecordKey(key);
+        });
+      } catch {
+        throw new PdppError("invalid_request", "Invalid key");
+      }
+      const states = deps.store.recordStates(body.instance, stream, encoded);
+      return c.json(
+        {
+          missing: body.keys.filter((_, i) => states[i] === "missing"),
+          deleted: body.keys.filter((_, i) => states[i] === "deleted"),
+        },
+        200,
+        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+      );
+    } catch (err) {
+      if (err instanceof PdppBindingError)
+        return c.json(
+          {
+            error: { code: err.reason, message: err.reason },
+            request_id: reqId,
+          },
+          409,
+        );
+      return sendError(
+        c,
+        mapAndLog(deps, "POST /v1/streams/:stream/records/missing", reqId, err),
+        reqId,
+      );
+    }
+  });
+
   app.post("/streams/:stream/records/ingest", async (c) => {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
@@ -1310,6 +1411,22 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
       const entries = Array.isArray(body) ? body : [body];
+      const fillMissing = c.req.query("write_mode") === "fill_missing";
+      if (
+        fillMissing &&
+        entries.some(
+          (entry) =>
+            !entry ||
+            typeof entry !== "object" ||
+            Array.isArray(entry) ||
+            (entry as Record<string, unknown>).op !== "upsert",
+        )
+      ) {
+        throw new PdppError(
+          "invalid_request",
+          "fill_missing requires upsert operations",
+        );
+      }
 
       // Each entry gets exactly one outcome, by input index. Entries that
       // cannot reach the store are decided here; the rest go to the store in
@@ -1351,6 +1468,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           }
         }
         if (!deps.declarations.forInstance(e.instance, stream)) {
+          if (fillMissing)
+            throw new PdppError(
+              "invalid_request",
+              "Instance does not declare stream",
+            );
           results[index] = {
             index,
             outcome: "rejected",
@@ -1373,13 +1495,33 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
       const declarationFor = (instance: string) =>
         deps.declarations.forInstance(instance, stream)!;
+      const fillOutcomes: ("inserted" | "present" | "deleted")[] = [];
       const stored = deps.store.ingestBatch(
         admitted.map((a) => a.envelope),
         (_stream, instance) => declarationFor(instance).semantics,
         (_stream, instance) => declarationFor(instance).primaryKey,
         deps.bindingStore && method ? { method, generation } : undefined,
         validateData,
+        undefined,
+        fillMissing ? fillOutcomes : undefined,
       );
+      if (fillMissing) {
+        const outcomes = fillOutcomes.map((outcome, index) => ({
+          index: admitted[index].index,
+          outcome,
+        }));
+        return c.json(
+          {
+            write_mode: "fill_missing",
+            inserted: fillOutcomes.filter((x) => x === "inserted").length,
+            present: fillOutcomes.filter((x) => x === "present").length,
+            deleted: fillOutcomes.filter((x) => x === "deleted").length,
+            results: outcomes,
+          },
+          200,
+          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        );
+      }
       stored.results.forEach((result, position) => {
         const index = admitted[position].index;
         results[index] = { ...result, index };

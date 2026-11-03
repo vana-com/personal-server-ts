@@ -25,6 +25,7 @@ import { randomUUID } from "node:crypto";
 import {
   encodeRecordKey,
   planIngest,
+  FillMissingIngestError,
   RecordKeyError,
   summarizeIngest,
   decodeCursor,
@@ -952,6 +953,7 @@ export function createSqliteRecordStore(
       stream: string,
       instance: string,
     ) => DeclarationBinding | undefined,
+    fillMissing?: ("inserted" | "present" | "deleted")[],
   ): IngestResult {
     const results: IngestOutcome[] = [];
 
@@ -983,6 +985,22 @@ export function createSqliteRecordStore(
       envelopes.forEach((envelope, index) => {
         const semantics = streamSemantics(envelope.stream, envelope.instance);
         const primaryKey = primaryKeyFields(envelope.stream, envelope.instance);
+        if (fillMissing) {
+          if (envelope.op !== "upsert")
+            throw new FillMissingIngestError(
+              "fill_missing requires upsert operations",
+            );
+          const row = getCurrentStmt.get(
+            envelope.instance,
+            envelope.stream,
+            encodeRecordKey(envelope.key),
+          ) as RecordRowDb | undefined;
+          if (row) {
+            fillMissing.push(row.deleted ? "deleted" : "present");
+            results.push({ index, outcome: "unchanged" });
+            return;
+          }
+        }
         const plan = planIngest(
           index,
           envelope,
@@ -1004,6 +1022,8 @@ export function createSqliteRecordStore(
           validateData,
         );
         results.push(plan.outcome);
+        if (fillMissing && !plan.write)
+          throw new FillMissingIngestError("Invalid fill_missing envelope");
         if (!plan.write) {
           // An equal re-delivery is still an arrival. A delete of a missing
           // key and an append_only conflict are not.
@@ -1029,6 +1049,7 @@ export function createSqliteRecordStore(
           blobId &&
           !blobClaimedByCurrentGeneration(blobId, envelope.instance)
         ) {
+          if (fillMissing) throw new FillMissingIngestError("blob_unclaimed");
           results[results.length - 1] = {
             index,
             outcome: "rejected",
@@ -1036,6 +1057,7 @@ export function createSqliteRecordStore(
           };
           return;
         }
+        fillMissing?.push("inserted");
         writeVersion(
           envelope.instance,
           envelope.stream,
@@ -2708,6 +2730,14 @@ export function createSqliteRecordStore(
     registerConnection,
     deleteConnection,
     ingestBatch,
+    recordStates: (instance, stream, keys) =>
+      inReadSnapshot(() =>
+        keys.map((key) => {
+          const row = getCurrentStmt.get(instance, stream, key) as
+            RecordRowDb | undefined;
+          return !row ? "missing" : row.deleted ? "deleted" : "present";
+        }),
+      ),
     getInstanceBinding,
     listRetainedRecordData: (instance: string, stream: string) => {
       const prior = db.prepare(`SELECT data FROM pdpp_record_changes

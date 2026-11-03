@@ -10,6 +10,9 @@ import type {
   StreamSemantics,
 } from "./types.js";
 
+/** Invalid input aborts an entire insert-only batch. */
+export class FillMissingIngestError extends Error {}
+
 /** The stored state of a key that decides an envelope's outcome. */
 export interface CurrentContent {
   deleted: boolean;

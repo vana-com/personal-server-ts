@@ -54,7 +54,21 @@ export interface PdppRecordStore {
       stream: string,
       instance: string,
     ) => DeclarationBinding | undefined,
+    /**
+     * Supplying this output array selects insert-only ingest. Existing live
+     * rows and tombstones are untouched; new rows use ordinary ingest effects.
+     * Invalid input throws and rolls back the batch. Outcomes are usable only
+     * after a successful return. This operation never marks completion.
+     */
+    fillMissing?: ("inserted" | "present" | "deleted")[],
   ): IngestResult;
+
+  /** Read a snapshot of encoded keys, including tombstones, without mutation. */
+  recordStates(
+    instance: string,
+    stream: string,
+    keys: string[],
+  ): ("missing" | "present" | "deleted")[];
 
   getRecord(
     instance: string,

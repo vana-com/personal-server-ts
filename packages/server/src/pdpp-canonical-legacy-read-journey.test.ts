@@ -1493,6 +1493,41 @@ describe("paths the canonical view leaves to existing storage", () => {
 });
 
 describe("GET /v1/data listing", () => {
+  it("lists fill_missing rows exactly like normally ingested new keys", async () => {
+    const ingestAndList = async (mode: string) => {
+      const token = await ownerPdppToken();
+      const response = await ctx!.app.request(
+        `/v1/streams/activity/records/ingest?method=oura&binding_generation=1${mode}`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            instance: accountOne,
+            key: "a1",
+            data: day("a1", "2026-09-01"),
+            emitted_at: "2026-09-10T07:00:00Z",
+            op: "upsert",
+          }),
+        },
+      );
+      expect(response.status).toBe(200);
+      return JSON.parse((await ownerGet("/v1/data")).text);
+    };
+    const filled = await ingestAndList("&write_mode=fill_missing");
+    expect(filled.scopes).toEqual([
+      expect.objectContaining({ scope: "oura.activity" }),
+    ]);
+    await ctx!.cleanup();
+    ctx = undefined;
+    await rm(tempDir, { recursive: true, force: true });
+    await mkdir(tempDir, { recursive: true });
+    ctx = await boot();
+    expect(await ingestAndList("")).toEqual(filled);
+  });
+
   it("lists a bound scope with canonical freshness, never the legacy head's", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
     await legacyWrite("notes.manual", { text: "kept" });

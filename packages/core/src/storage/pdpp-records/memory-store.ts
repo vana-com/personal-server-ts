@@ -1,3 +1,4 @@
+import { encodeRecordKey } from "./record-key.js";
 import { selectSyncChange } from "./sync-selection.js";
 import {
   compareListRows,
@@ -12,6 +13,7 @@ import { timeSortKey } from "../../pdpp/time.js";
 import type { PdppRecordStore } from "./interface.js";
 import {
   planIngest,
+  FillMissingIngestError,
   summarizeIngest,
   type RecordDataValidator,
 } from "./ingest-plan.js";
@@ -114,6 +116,8 @@ export function createMemoryRecordStore(): PdppRecordStore {
     primaryKeyFields: (stream: string, instance: string) => string[],
     _binding?: { method: string; generation: number },
     validateData?: RecordDataValidator,
+    _declarationFor?: unknown,
+    fillMissing?: ("inserted" | "present" | "deleted")[],
   ): IngestResult {
     const results: IngestOutcome[] = [];
     // Stage writes and commit them together, so a thrown error leaves no
@@ -125,6 +129,24 @@ export function createMemoryRecordStore(): PdppRecordStore {
     const read = (key: RowKey) => staged.get(key) ?? current.get(key);
 
     envelopes.forEach((envelope, index) => {
+      if (fillMissing) {
+        if (envelope.op !== "upsert")
+          throw new FillMissingIngestError(
+            "fill_missing requires upsert operations",
+          );
+        const existing = read(
+          rowKey(
+            envelope.instance,
+            envelope.stream,
+            encodeRecordKey(envelope.key),
+          ),
+        );
+        if (existing) {
+          fillMissing.push(existing.deleted ? "deleted" : "present");
+          results.push({ index, outcome: "unchanged" });
+          return;
+        }
+      }
       const plan = planIngest(
         index,
         envelope,
@@ -142,7 +164,10 @@ export function createMemoryRecordStore(): PdppRecordStore {
         validateData,
       );
       results.push(plan.outcome);
+      if (fillMissing && !plan.write)
+        throw new FillMissingIngestError("Invalid fill_missing envelope");
       if (!plan.write) return;
+      fillMissing?.push("inserted");
 
       const { recordKey, data } = plan.write;
       const key = rowKey(envelope.instance, envelope.stream, recordKey);
@@ -576,6 +601,11 @@ export function createMemoryRecordStore(): PdppRecordStore {
 
   return {
     ingestBatch,
+    recordStates: (instance, stream, keys) =>
+      keys.map((key) => {
+        const row = current.get(rowKey(instance, stream, key));
+        return !row ? "missing" : row.deleted ? "deleted" : "present";
+      }),
     getRecord,
     listRecords,
     deleteRecord,
