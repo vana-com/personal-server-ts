@@ -2991,11 +2991,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           expect(
             result.retainedChatgptMessages?.map((r) => r.conversationId),
           ).toEqual(["control"]);
-          expect(result.diagnostics).toEqual(
-            expect.arrayContaining([
-              expect.objectContaining({ kind: "records_dropped" }),
-            ]),
-          );
+          expect(result.chatgptCoverageGaps).toHaveLength(1);
         });
 
         it("does not emit evidence when the messages stream was not fetched", () => {
