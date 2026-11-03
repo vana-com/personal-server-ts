@@ -135,7 +135,7 @@ describe("pdpp_record_changes blob reference index (v15)", () => {
     try {
       expect(
         reopened.prepare("SELECT version FROM pdpp_schema_version").get(),
-      ).toEqual({ version: 16 });
+      ).toEqual({ version: 17 });
       expect(
         reopened
           .prepare(
@@ -166,7 +166,7 @@ describe("pdpp_record_changes blob reference index (v15)", () => {
     try {
       expect(
         reopened.prepare("SELECT version FROM pdpp_schema_version").get(),
-      ).toEqual({ version: 16 });
+      ).toEqual({ version: 17 });
       expectIndexedHistoryCheck(reopened, CANDIDATES);
       expectIndexedHistoryCheck(reopened, DELETE_BLOBS);
       // Startup collection deletes nothing, including the unreferenced orphan.

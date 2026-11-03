@@ -1,3 +1,4 @@
+import { installLegacyScopeDependencies } from "./legacy-scope-dependencies.js";
 import type { Database, Statement } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import {
@@ -434,6 +435,16 @@ export function createReplicaVisibilityView(deps: {
         VIEW_SCHEMA,
       );
     }
+    installLegacyScopeDependencies(db);
+    if (
+      !initialized &&
+      db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE name='legacy_scope_stream_revisions'",
+        )
+        .get()
+    )
+      db.exec("UPDATE legacy_scope_stream_revisions SET revision=revision+1");
     markSynced();
     seen = dataVersion();
   }).immediate();

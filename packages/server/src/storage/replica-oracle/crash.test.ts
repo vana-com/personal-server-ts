@@ -242,11 +242,16 @@ const litePort = (sqlite: boolean): Port<LiteDriver> => ({
  * the comparisons of a state from before a reopen with one after it use it.
  */
 function withoutNodeRevisions(dump: Record<string, string[]>) {
-  const streams = dump.pdpp_replica_view_streams;
-  if (!streams) return dump;
-  return {
-    ...dump,
-    pdpp_replica_view_streams: streams
+  const normalized = { ...dump };
+  // Dependency revisions also advance on conservative no-op SQL updates.
+  // Compare their identities here; rollback/monotonicity has its own tests.
+  for (const table of [
+    "pdpp_replica_view_streams",
+    "legacy_scope_stream_revisions",
+    "legacy_scope_instance_revisions",
+  ]) {
+    if (!dump[table]) continue;
+    normalized[table] = dump[table]
       .map((row) => {
         const { revision: _revision, ...rest } = JSON.parse(row) as Record<
           string,
@@ -254,9 +259,11 @@ function withoutNodeRevisions(dump: Record<string, string[]>) {
         >;
         return JSON.stringify(rest);
       })
-      .sort(),
-  };
+      .sort();
+  }
+  return normalized;
 }
+
 const nodePort: Port<NodeDriver> = {
   open: async () =>
     nodeDriver({
@@ -275,7 +282,7 @@ const nodePort: Port<NodeDriver> = {
       pdpp_record_arrival_clock: _clock,
       ...rest
     } = sqliteDump(driver.db);
-    return rest;
+    return withoutNodeRevisions(rest);
   },
   // Node local writes carry no request id and a repeated promotion returns
   // no receipt; both must still change nothing.

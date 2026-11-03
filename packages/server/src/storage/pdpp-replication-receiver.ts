@@ -1,3 +1,4 @@
+import { installLegacyScopeDependencies } from "./legacy-scope-dependencies.js";
 import { createReplicaVisibilityView } from "./pdpp-replica-visibility-view.js";
 import {
   binaryLength,
@@ -148,6 +149,7 @@ export function createReplicaReceiver(deps: {
   ); CREATE TABLE IF NOT EXISTS pdpp_replica_pending_bytes (
     batch_id TEXT NOT NULL, blob_id TEXT NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(batch_id,blob_id)
   )`);
+  installLegacyScopeDependencies(db);
   type PendingBatch = {
     id: string;
     envelope_json: string;

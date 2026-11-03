@@ -75,7 +75,12 @@ describe("Desktop D index.db upgrade", () => {
         .prepare("SELECT name FROM sqlite_master WHERE name = ?")
         .get("idx_pdpp_record_changes_blob_ref"),
     ).toBeUndefined();
-    const original = { ...storedRows(db), pdpp_strava_transition: [] };
+    const original = {
+      ...storedRows(db),
+      pdpp_strava_transition: [],
+      legacy_scope_stream_revisions: [],
+      legacy_scope_instance_revisions: [],
+    };
     const receipts = db.prepare("SELECT * FROM pdpp_stream_completion").all();
     expect(receipts).toHaveLength(3);
     db.close();
@@ -85,7 +90,7 @@ describe("Desktop D index.db upgrade", () => {
     expect(db.pragma("user_version", { simple: true })).toBe(17);
     expect(db.prepare("SELECT version FROM pdpp_schema_version").get()).toEqual(
       {
-        version: 16,
+        version: 17,
       },
     );
     expect(

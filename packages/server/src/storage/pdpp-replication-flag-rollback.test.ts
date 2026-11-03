@@ -114,12 +114,13 @@ const triggersOnDisk = (db: Database.Database) =>
       "SELECT name, tbl_name AS tableName FROM sqlite_master WHERE type='trigger' ORDER BY name",
     )
     .all() as { name: string; tableName: string }[];
-/** Replica triggers on canonical tables, apart from the door's fence. */
+/** Replica reducer triggers, excluding persistent door and coverage facts. */
 const replicaTriggersOnCanonicalTables = (db: Database.Database) =>
   triggersOnDisk(db).filter(
     ({ name, tableName }) =>
       !/^pdpp_replica_|^pdpp_binary_|^pdpp_transport_/.test(tableName) &&
-      !name.startsWith("pdpp_replica_door_"),
+      !name.startsWith("pdpp_replica_door_") &&
+      !name.startsWith("legacy_scope_dep_"),
   );
 const door = (db: Database.Database) =>
   db.prepare("SELECT capturing, uncaptured, off FROM pdpp_replica_door").get();

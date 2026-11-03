@@ -1,3 +1,4 @@
+import { installLegacyScopeDependencies } from "./legacy-scope-dependencies.js";
 import type { Database } from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import type { DeclarationBinding } from "@opendatalabs/personal-server-ts-core/replication/envelope";
@@ -133,6 +134,7 @@ export function ensureReplicaSchema(db: Database): void {
     db.prepare(
       "UPDATE pdpp_replica_schema_version SET version = ? WHERE id = 1",
     ).run(REPLICA_MIGRATIONS.length);
+    installLegacyScopeDependencies(db);
     // A database a canary build opened has the chunk trigger as a persistent
     // object. Replica triggers on canonical tables must exist only on a
     // connection that enabled replication, so remove it.

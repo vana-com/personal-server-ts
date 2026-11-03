@@ -1,6 +1,6 @@
 {
-  "source": "createSqliteRecordStore(new Database(':memory:')) on personal-server-ts main 50f529f2 (#475), before replication landed. Regenerate only for a deliberate change to main's record-store schema.",
-  "schemaVersion": 16,
+  "source": "Plain record-store schema after the additive v17 legacy scope dependency migration. No replica tables are created.",
+  "schemaVersion": 17,
   "objects": [
     {
       "type": "index",
@@ -61,6 +61,18 @@
       "name": "idx_pdpp_records_stream",
       "tableName": "pdpp_records",
       "sql": "CREATE INDEX idx_pdpp_records_stream\n  ON pdpp_records (stream, instance, emitted_at)"
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_legacy_scope_instance_revisions_1",
+      "tableName": "legacy_scope_instance_revisions",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_legacy_scope_stream_revisions_1",
+      "tableName": "legacy_scope_stream_revisions",
+      "sql": null
     },
     {
       "type": "index",
@@ -127,6 +139,18 @@
       "name": "sqlite_autoindex_pdpp_stream_completion_1",
       "tableName": "pdpp_stream_completion",
       "sql": null
+    },
+    {
+      "type": "table",
+      "name": "legacy_scope_instance_revisions",
+      "tableName": "legacy_scope_instance_revisions",
+      "sql": "CREATE TABLE legacy_scope_instance_revisions (\n instance TEXT NOT NULL PRIMARY KEY,\n revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0 AND revision<=9007199254740991))"
+    },
+    {
+      "type": "table",
+      "name": "legacy_scope_stream_revisions",
+      "tableName": "legacy_scope_stream_revisions",
+      "sql": "CREATE TABLE legacy_scope_stream_revisions (\n instance TEXT NOT NULL, stream TEXT NOT NULL,\n revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0 AND revision<=9007199254740991),\n PRIMARY KEY(instance,stream))"
     },
     {
       "type": "table",
@@ -217,6 +241,114 @@
       "name": "sqlite_sequence",
       "tableName": "sqlite_sequence",
       "sql": "CREATE TABLE sqlite_sequence(name,seq)"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_blob_bytes_delete",
+      "tableName": "pdpp_blob_bytes",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_blob_bytes_delete BEFORE DELETE ON pdpp_blob_bytes BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id))) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id));\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id)) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_blob_bytes_insert",
+      "tableName": "pdpp_blob_bytes",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_blob_bytes_insert AFTER INSERT ON pdpp_blob_bytes BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id))) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id));\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id)) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_blob_bytes_update",
+      "tableName": "pdpp_blob_bytes",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_blob_bytes_update BEFORE UPDATE ON pdpp_blob_bytes BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id))) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id));\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id)) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream);SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id))) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id));\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id)) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_blobs_delete",
+      "tableName": "pdpp_blobs",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_blobs_delete BEFORE DELETE ON pdpp_blobs BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id))) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id));\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id)) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_blobs_insert",
+      "tableName": "pdpp_blobs",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_blobs_insert AFTER INSERT ON pdpp_blobs BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id))) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id));\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id)) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_blobs_update",
+      "tableName": "pdpp_blobs",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_blobs_update BEFORE UPDATE ON pdpp_blobs BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id))) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id));\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT OLD.blob_id)) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream);SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id))) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id));\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT DISTINCT instance,stream FROM pdpp_records INDEXED BY idx_pdpp_records_blob_id WHERE blob_id IN (SELECT NEW.blob_id)) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_instance_binding_delete",
+      "tableName": "pdpp_instance_binding",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_instance_binding_delete BEFORE DELETE ON pdpp_instance_binding BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_instance_revisions WHERE instance=OLD.instance AND revision>=9007199254740991) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n            UPDATE legacy_scope_instance_revisions SET revision=revision+1 WHERE instance=OLD.instance;\n            INSERT INTO legacy_scope_instance_revisions(instance,revision) SELECT OLD.instance,1 WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_instance_revisions WHERE instance=OLD.instance); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_instance_binding_insert",
+      "tableName": "pdpp_instance_binding",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_instance_binding_insert AFTER INSERT ON pdpp_instance_binding BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_instance_revisions WHERE instance=NEW.instance AND revision>=9007199254740991) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n            UPDATE legacy_scope_instance_revisions SET revision=revision+1 WHERE instance=NEW.instance;\n            INSERT INTO legacy_scope_instance_revisions(instance,revision) SELECT NEW.instance,1 WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_instance_revisions WHERE instance=NEW.instance); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_instance_binding_update",
+      "tableName": "pdpp_instance_binding",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_instance_binding_update BEFORE UPDATE ON pdpp_instance_binding BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_instance_revisions WHERE instance=OLD.instance AND revision>=9007199254740991) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n            UPDATE legacy_scope_instance_revisions SET revision=revision+1 WHERE instance=OLD.instance;\n            INSERT INTO legacy_scope_instance_revisions(instance,revision) SELECT OLD.instance,1 WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_instance_revisions WHERE instance=OLD.instance);SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_instance_revisions WHERE instance=NEW.instance AND revision>=9007199254740991) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n            UPDATE legacy_scope_instance_revisions SET revision=revision+1 WHERE instance=NEW.instance;\n            INSERT INTO legacy_scope_instance_revisions(instance,revision) SELECT NEW.instance,1 WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_instance_revisions WHERE instance=NEW.instance); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_record_arrival_delete",
+      "tableName": "pdpp_record_arrival",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_record_arrival_delete BEFORE DELETE ON pdpp_record_arrival BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT OLD.instance AS instance,OLD.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_record_arrival_insert",
+      "tableName": "pdpp_record_arrival",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_record_arrival_insert AFTER INSERT ON pdpp_record_arrival BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT NEW.instance AS instance,NEW.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_record_arrival_update",
+      "tableName": "pdpp_record_arrival",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_record_arrival_update BEFORE UPDATE ON pdpp_record_arrival BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT OLD.instance AS instance,OLD.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream);SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT NEW.instance AS instance,NEW.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_records_delete",
+      "tableName": "pdpp_records",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_records_delete BEFORE DELETE ON pdpp_records BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT OLD.instance AS instance,OLD.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_records_insert",
+      "tableName": "pdpp_records",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_records_insert AFTER INSERT ON pdpp_records BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT NEW.instance AS instance,NEW.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_records_update",
+      "tableName": "pdpp_records",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_records_update BEFORE UPDATE ON pdpp_records BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT OLD.instance AS instance,OLD.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream);SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT NEW.instance AS instance,NEW.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_stream_completion_delete",
+      "tableName": "pdpp_stream_completion",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_stream_completion_delete BEFORE DELETE ON pdpp_stream_completion BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT OLD.instance AS instance,OLD.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_stream_completion_insert",
+      "tableName": "pdpp_stream_completion",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_stream_completion_insert AFTER INSERT ON pdpp_stream_completion BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT NEW.instance AS instance,NEW.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
+    },
+    {
+      "type": "trigger",
+      "name": "legacy_scope_dep_pdpp_stream_completion_update",
+      "tableName": "pdpp_stream_completion",
+      "sql": "CREATE TRIGGER legacy_scope_dep_pdpp_stream_completion_update BEFORE UPDATE ON pdpp_stream_completion BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT OLD.instance AS instance,OLD.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT OLD.instance AS instance,OLD.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream);SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_scope_stream_revisions WHERE revision>=9007199254740991 AND (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream)) THEN RAISE(ABORT, 'legacy scope dependency overflow') END;\n    UPDATE legacy_scope_stream_revisions SET revision=revision+1\n    WHERE (instance,stream) IN (SELECT NEW.instance AS instance,NEW.stream AS stream);\n    INSERT INTO legacy_scope_stream_revisions(instance,stream,revision)\n    SELECT s.instance,s.stream,1 FROM (SELECT NEW.instance AS instance,NEW.stream AS stream) s\n    WHERE NOT EXISTS(SELECT 1 FROM legacy_scope_stream_revisions r WHERE r.instance=s.instance AND r.stream=s.stream); END"
     }
   ]
 }

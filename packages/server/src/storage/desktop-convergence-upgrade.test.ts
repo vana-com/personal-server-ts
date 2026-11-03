@@ -246,6 +246,8 @@ describe("B-written Desktop profile convergence", () => {
           expect(rows(openDb)).toEqual({
             ...original,
             pdpp_strava_transition: [],
+            legacy_scope_stream_revisions: [],
+            legacy_scope_instance_revisions: [],
           });
         if (restart === 0 && scenario.name === "stale-nonhead") {
           openDb.exec("SAVEPOINT sequence_probe");
@@ -263,12 +265,14 @@ describe("B-written Desktop profile convergence", () => {
           expect(rows(openDb)).toEqual({
             ...original,
             pdpp_strava_transition: [],
+            legacy_scope_stream_revisions: [],
+            legacy_scope_instance_revisions: [],
           });
         }
         expect(openDb.pragma("user_version", { simple: true })).toBe(17);
         expect(
           openDb.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 16 });
+        ).toEqual({ version: 17 });
         const index = openDb
           .prepare(
             "SELECT sql FROM sqlite_master WHERE name='idx_pdpp_record_changes_blob_ref'",
@@ -474,10 +478,15 @@ describe("B-written Desktop profile convergence", () => {
     expect(rows(openDb)).toEqual(original);
     openDb.exec("DROP TRIGGER fail_pdpp_upgrade");
     const store = createSqliteRecordStore(openDb);
-    expect(rows(openDb)).toEqual({ ...original, pdpp_strava_transition: [] });
+    expect(rows(openDb)).toEqual({
+      ...original,
+      pdpp_strava_transition: [],
+      legacy_scope_stream_revisions: [],
+      legacy_scope_instance_revisions: [],
+    });
     expect(
       openDb.prepare("SELECT version FROM pdpp_schema_version").get(),
-    ).toEqual({ version: 16 });
+    ).toEqual({ version: 17 });
     store.close();
   });
 });

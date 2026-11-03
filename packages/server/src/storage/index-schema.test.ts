@@ -71,7 +71,7 @@ describe("initializeDatabase", () => {
       const path = join(dir, "index.db");
       const future = new Database(path);
       future.exec(
-        "CREATE TABLE pdpp_schema_version (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO pdpp_schema_version VALUES (1, 17)",
+        "CREATE TABLE pdpp_schema_version (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO pdpp_schema_version VALUES (1, 18)",
       );
       future.pragma("user_version = 15");
       future.pragma("journal_mode = DELETE");
@@ -80,7 +80,7 @@ describe("initializeDatabase", () => {
         const opened = initializeDatabase(path);
         opened.close();
       }).toThrow(
-        "Unsupported index.db PDPP schema version 17; runtime supports 16",
+        "Unsupported index.db PDPP schema version 18; runtime supports 17",
       );
       const unchanged = new Database(path, { readonly: true });
       try {
@@ -90,7 +90,7 @@ describe("initializeDatabase", () => {
         );
         expect(
           unchanged.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 17 });
+        ).toEqual({ version: 18 });
         expect(
           unchanged
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")

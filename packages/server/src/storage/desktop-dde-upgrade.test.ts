@@ -89,7 +89,9 @@ function expectedUpgradedRows(original: ReturnType<typeof storedRows>) {
   const expected = structuredClone(original) as ReturnType<typeof storedRows>;
   (
     expected.pdpp_schema_version as { id: number; version: number }[]
-  )[0]!.version = 16;
+  )[0]!.version = 17;
+  expected.legacy_scope_stream_revisions = [];
+  expected.legacy_scope_instance_revisions = [];
   return expected;
 }
 
@@ -166,7 +168,7 @@ describe("Desktop DDE index.db upgrade", () => {
     expect(db.pragma("user_version", { simple: true })).toBe(17);
     expect(db.prepare("SELECT version FROM pdpp_schema_version").get()).toEqual(
       {
-        version: 16,
+        version: 17,
       },
     );
     expect(

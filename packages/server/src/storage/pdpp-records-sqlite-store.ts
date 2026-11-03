@@ -1,3 +1,7 @@
+import {
+  installLegacyScopeDependencies,
+  LEGACY_SCOPE_DEPENDENCY_SCHEMA,
+} from "./legacy-scope-dependencies.js";
 import { assertSupportedSchemaVersions } from "./schema-versions.js";
 import type { ReplicaCanonicalPort } from "./pdpp-replica-canonical-port.js";
 import {
@@ -377,6 +381,8 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
   ON pdpp_record_changes (CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT));
 `,
+  // v17: durable scope coverage dependencies.
+  LEGACY_SCOPE_DEPENDENCY_SCHEMA,
 ];
 
 /** The records namespace in the shared index.db; preflight before bootstrap effects. */
@@ -465,6 +471,7 @@ function migrate(db: Database): void {
         ).run(randomUUID());
       }
       if (v === 12) migrateToV13(db);
+      if (v === 16) installLegacyScopeDependencies(db);
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -806,6 +813,7 @@ export function createSqliteRecordStore(
   } else {
     db.pragma("journal_mode = WAL");
     migrate(db);
+    installLegacyScopeDependencies(db);
     sweepStaleBlobClaims(db);
   }
   const replica = options.replica?.(db);
