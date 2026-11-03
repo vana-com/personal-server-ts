@@ -12,8 +12,8 @@ This local Desktop candidate wires the setting through Node's config/bootstrap a
 
 This waives read-time data access payment, not unrelated transaction gas, storage, inference or registration costs incurred elsewhere. It creates no grant, funding allocation, credit or cross-network data transfer. Moksha test-credit funding (BUI-945) keeps normal fee metering and is independent of this exemption.
 
-## Local runtime candidate
+## Release-review candidate
 
-The original local candidate forward-adopted official `dev` revision `d87e6727d8160b1ec3a0593acf124b2357ae6f92` onto Desktop's then-selected `5f17ebd64ed21bbd7d302c8b614d0c04a4700437` baseline. The 3 November 2026 coordinated release review carries that implementation onto main `c32f9b6ef7fa25e964c92e1e7a7845825ed17db9`, at local runtime commit `392a3af3cd22609e8b066102a4c6b5610373b727`. Native bundle and synthetic SDK-read receipts identify that exact runtime commit; this documentation update changes no runtime code.
+The implementation is forward-adopted from official dev revision `d87e6727d8160b1ec3a0593acf124b2357ae6f92` onto current upstream main `2df2ae99e4f0960c2337adf2f2c8984a8f3c6c68`. It retains the upstream storage, replica and recovery fixes, including #535 and #537. Desktop derives `payment.ownAppAccountUrl` from its selected Account configuration.
 
-Desktop derives `payment.ownAppAccountUrl` from its selected Account configuration. These local commits identify manifest-checked staging inputs. Before Desktop delivery, replace its local candidate pin with the accepted upstream merge commit. Nothing here is published or deployed, and production consumers retain their stable pins until separately authorized.
+The rebased candidate passes its build and 198 focused data/MCP/schema tests locally. The earlier native Desktop and same-grant synthetic consumer proof belongs to implementation `392a3af` and Unity `4bc4ac6b3`; it is not relabelled as native proof of this newer base. Accept this change upstream, adopt the accepted merge SHA in Desktop's runtime lock, and verify the resulting distributed bundle through normal delivery. This source preparation creates no release or deployment.
