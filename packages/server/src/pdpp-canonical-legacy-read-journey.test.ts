@@ -360,7 +360,7 @@ function expectCompletedReplacement(scope: string): void {
 }
 
 describe("GET /v1/data/:scope for a bound connector scope", () => {
-  it("serves newer explicit empty ChatGPT text and retains exact legacy history after reopen", async () => {
+  const verifyEmptyChatgptTransition = async (retention: string) => {
     const scope = "chatgpt.conversations";
     const source = "https://registry.pdpp.dev/sources/chatgpt";
     const before = "2026-09-10T07:00:00.000Z";
@@ -497,13 +497,13 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       { ...conversation, update_time: after },
       after,
     );
-    const verify = async () => {
+    const verify = async (node = "node", content = "") => {
       const current = await ownerGet(`/v1/data/${scope}`);
       expect(current.status, current.text).toBe(200);
       expect(current.dataSource).toBe("canonical");
       expect(JSON.parse(current.text).data.conversations[0]).toMatchObject({
         message_count: 1,
-        messages: [{ id: "node", content: "" }],
+        messages: [{ id: node, content }],
       });
       expect(current.text).not.toContain(oldText);
       for (const query of [`at=${encodeURIComponent(before)}`, "view=stored"]) {
@@ -520,6 +520,48 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     await ctx.cleanup();
     ctx = await boot("chatgpt", { declaration });
     await verify();
+    if (retention === "off-branch") {
+      // Known-empty text remains retention evidence after the selected branch moves.
+      const branchChangedAt = "2026-09-12T07:00:00.000Z";
+      const nextText = "New current answer";
+      await ingestRow(
+        "messages",
+        { ...message, content: "", on_current_branch: false },
+        branchChangedAt,
+      );
+      await ingestRow(
+        "messages",
+        { ...message, id: "conversation:next", content: nextText },
+        branchChangedAt,
+      );
+      await ingestRow(
+        "conversations",
+        {
+          ...conversation,
+          current_node: "next",
+          update_time: branchChangedAt,
+        },
+        branchChangedAt,
+      );
+      await verify("next", nextText);
+      await verify("next", nextText);
+      await ingestRow(
+        "messages",
+        { ...message, content: null, on_current_branch: false },
+        "2026-09-13T07:00:00.000Z",
+      );
+      expect((await ownerGet(`/v1/data/${scope}`)).status).toBe(503);
+      await ingestRow(
+        "messages",
+        { ...message, content: "", on_current_branch: false },
+        "2026-09-14T07:00:00.000Z",
+      );
+      await verify("next", nextText);
+      await ctx.cleanup();
+      ctx = await boot("chatgpt", { declaration });
+      await verify("next", nextText);
+      return;
+    }
     // Unknown extraction invalidates warm coverage. An unclaimed blob row is
     // rejected at ingest and cannot turn that unknown state into explicit empty.
     // The owner can still read the old exact file when current reads refuse.
@@ -549,7 +591,12 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       expect(historical.status).toBe(200);
       expect(JSON.parse(historical.text).data).toEqual(legacyBody);
     }
-  });
+  };
+
+  it.each(["current", "off-branch"])(
+    "serves newer explicit empty ChatGPT text and retains exact legacy history after reopen (%s)",
+    verifyEmptyChatgptTransition,
+  );
 
   it("accepts mutable value drift from a newer canonical collection", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
