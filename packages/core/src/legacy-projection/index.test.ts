@@ -3305,11 +3305,11 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         });
       });
 
-      it("falls back when count is reached while another parent remains stored", () => {
+      it("trusts a complete walk that passes an undercount and reaches an absent parent", () => {
         const result = projected(
           project([
             conversation("c1", 1, "n2"),
-            message("c1", "n1", null, "root"),
+            message("c1", "n1", "filtered-root", "root"),
             message("c1", "n2", "n1", "tip"),
           ]),
         );
@@ -3318,11 +3318,39 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             { message_count: 2, messages: [{ id: "n1" }, { id: "n2" }] },
           ],
         });
-        expect(result.branchWalkDiagnostics).toContainEqual({
-          conversationIdHash: "d0f631ca1ddb",
+        expect(result.chatgptBranchDiagnostics).toContainEqual({
+          conversationIdHash:
+            "d0f631ca1ddba8db3bcfcb9e057cdc98d0379f1bee00e75a545147a27dadd982",
           reason: "declared_count_below_walked",
           declaredCount: 1,
           walkedCount: 2,
+        });
+      });
+
+      it("keeps the first-version parent chain when it exceeds the declared count", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n3"),
+            message("c1", "n1", "filtered-root", "root"),
+            message("c1", "n2", "n1", "middle", { onBranch: false }),
+            message("c1", "n3", "n2", "tip", { onBranch: false }),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 3,
+              messages: [{ id: "n1" }, { id: "n2" }, { id: "n3" }],
+            },
+          ],
+        });
+        expect(result.chatgptBranchDiagnostics).toContainEqual({
+          conversationIdHash:
+            "d0f631ca1ddba8db3bcfcb9e057cdc98d0379f1bee00e75a545147a27dadd982",
+          reason: "declared_count_below_walked",
+          declaredCount: 2,
+          walkedCount: 3,
         });
       });
 
@@ -3343,7 +3371,8 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         });
         expect(result.chatgptCoverageGaps).toEqual([
           {
-            conversationIdHash: "f526795c9539",
+            conversationIdHash:
+              "f526795c95399cea27c055c842c3d6ab018ed0fa4f66f701c28ab22dec28237b",
             reason: "parent_not_stored/fallback_chain_incomplete",
             declaredCount: 2,
             walkedCount: 1,
@@ -3374,7 +3403,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           { layout: "scoped", scoped: true },
           { layout: "mixed", scoped: false },
         ])(
-          "drops an equal-count disconnected $layout branch with the chain diagnostic",
+          "receipts an equal-count disconnected $layout branch with the chain diagnostic",
           ({ scoped }) => {
             // Both rows are on-branch: count 2 passes, but n2 cannot reach n1.
             const records = [
@@ -3396,20 +3425,21 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                   count: 1,
                   reasons: ["parent_not_stored"],
                 },
+              ],
+              chatgptCoverageGaps: [
                 {
-                  kind: "records_dropped",
-                  scope: "chatgpt.conversations",
-                  stream: "conversations",
-                  count: 1,
-                  // copy-assertion-ok: identifies the chain guard rather than the earlier count guard.
-                  reasons: ["Current branch message chain is incomplete"],
+                  conversationIdHash:
+                    "d0f631ca1ddba8db3bcfcb9e057cdc98d0379f1bee00e75a545147a27dadd982",
+                  reason: "parent_not_stored/fallback_chain_incomplete",
+                  declaredCount: 2,
+                  walkedCount: 1,
                 },
               ],
             });
           },
         );
 
-        it("drops an equal-count branch whose current tip is missing", () => {
+        it("receipts an equal-count branch whose current tip is missing", () => {
           const records = [
             conversation("c1", 1),
             message("c1", "n1", null, "present root"),
@@ -3428,13 +3458,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                 count: 1,
                 reasons: ["current_node_not_stored"],
               },
+            ],
+            chatgptCoverageGaps: [
               {
-                kind: "records_dropped",
-                scope: "chatgpt.conversations",
-                stream: "conversations",
-                count: 1,
-                // copy-assertion-ok: identifies the chain guard rather than the earlier count guard.
-                reasons: ["Current branch message chain is incomplete"],
+                conversationIdHash:
+                  "d0f631ca1ddba8db3bcfcb9e057cdc98d0379f1bee00e75a545147a27dadd982",
+                reason: "current_node_not_stored/fallback_chain_incomplete",
+                declaredCount: 1,
+                walkedCount: 0,
               },
             ],
           });
@@ -3674,7 +3705,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       });
     });
 
-    it("drops and counts the conversation when the current-branch message set is incomplete", () => {
+    it("receipts a conversation when the current tip is missing and flags cannot recover it", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -3704,19 +3735,20 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             count: 1,
             reasons: ["current_node_not_stored"],
           },
+        ],
+        chatgptCoverageGaps: [
           {
-            kind: "records_dropped",
-            stream: "conversations",
-            count: 1,
-            reasons: [
-              "Current branch message count does not match conversation",
-            ],
+            conversationIdHash:
+              "f8886d8016bf30b1dc77cc6c499fc1b47ee25d7ec2973dc6821b100bc6311b26",
+            reason: "current_node_not_stored/fallback_count_mismatch",
+            declaredCount: 1,
+            walkedCount: 0,
           },
         ],
       });
     });
 
-    it("drops and counts the conversation when a current-branch message is orphaned from the current_node chain", () => {
+    it("receipts a conversation when a current-branch message is orphaned from the current_node chain", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -3770,11 +3802,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             count: 1,
             reasons: ["parent_not_stored"],
           },
+        ],
+        chatgptCoverageGaps: [
           {
-            kind: "records_dropped",
-            stream: "conversations",
-            count: 1,
-            reasons: ["Current branch message chain is incomplete"],
+            conversationIdHash:
+              "6f1aaf37cce99a9ab19aaebd8891d6374608e9d4f5b34c03d1b745299a1e0b41",
+            reason: "parent_not_stored/fallback_chain_incomplete",
+            declaredCount: 2,
+            walkedCount: 1,
           },
         ],
       });
@@ -3830,16 +3865,18 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         {
           kind: "records_dropped",
           scope: "chatgpt.conversations",
-          stream: "conversations",
-          count: 1,
-          reasons: ["Current branch message count does not match conversation"],
-        },
-        {
-          kind: "records_dropped",
-          scope: "chatgpt.conversations",
           stream: "messages",
           count: 1,
           reasons: ["Messages have no matching conversation"],
+        },
+      ]);
+      expect(result.chatgptCoverageGaps).toEqual([
+        {
+          conversationIdHash:
+            "5dc6fcec043ca1fe7b05065b20cb3d77c428c36f27b793ca1f2a4dcec68565ed",
+          reason: "current_node_not_stored/fallback_count_mismatch",
+          declaredCount: 2,
+          walkedCount: 0,
         },
       ]);
       validateAgainst(

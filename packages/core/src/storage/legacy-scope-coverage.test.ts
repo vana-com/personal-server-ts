@@ -1175,7 +1175,8 @@ describe("receipted ChatGPT conversation exclusions", () => {
       entityKeys: { "$.conversations": ["id"] },
       chatgptCoverageGaps: [
         {
-          conversationIdHash: "cfa5ad96f5be",
+          conversationIdHash:
+            "cfa5ad96f5be4fc290f591b8afd957551315abbb0a68cdf7660849d8829d644f",
           reason: "parent_not_stored/fallback_chain_incomplete",
           declaredCount: 2,
           walkedCount: 1,
@@ -1186,7 +1187,8 @@ describe("receipted ChatGPT conversation exclusions", () => {
     expect(verdict.reasonCounts.missing_entity).toBe(1);
     expect(verdict.excludedConversations).toEqual([
       {
-        conversationIdHash: "cfa5ad96f5be",
+        conversationIdHash:
+          "cfa5ad96f5be4fc290f591b8afd957551315abbb0a68cdf7660849d8829d644f",
         reason: "parent_not_stored/fallback_chain_incomplete",
         declaredCount: 2,
         walkedCount: 1,
@@ -1204,7 +1206,8 @@ describe("receipted ChatGPT conversation exclusions", () => {
         entityKeys: { "$.conversations": ["id"] },
         chatgptCoverageGaps: [
           {
-            conversationIdHash: "cfa5ad96f5be",
+            conversationIdHash:
+              "cfa5ad96f5be4fc290f591b8afd957551315abbb0a68cdf7660849d8829d644f",
             reason: "parent_not_stored/fallback_chain_incomplete",
             declaredCount: 2,
             walkedCount: 1,
@@ -1214,6 +1217,68 @@ describe("receipted ChatGPT conversation exclusions", () => {
     );
     expect(verdict.covered).toBe(false);
     expect(verdict.reason).toBe("missing_entity");
+  });
+
+  it("matches the receipted total independent of top-level key order", () => {
+    const gap = {
+      conversationIdHash:
+        "cfa5ad96f5be4fc290f591b8afd957551315abbb0a68cdf7660849d8829d644f",
+      reason: "parent_not_stored/fallback_chain_incomplete",
+      declaredCount: 2,
+      walkedCount: 1,
+    };
+    const verdict = compareLegacyCoverage(
+      {
+        total: 2,
+        conversations: [
+          { id: "excluded", messages: [] },
+          { id: "healthy", messages: [] },
+        ],
+      },
+      { total: 1, conversations: [{ id: "healthy", messages: [] }] },
+      {
+        scope: "chatgpt.conversations",
+        entityKeys: { "$.conversations": ["id"] },
+        chatgptCoverageGaps: [gap],
+      },
+    );
+
+    expect(verdict.covered).toBe(true);
+    expect(verdict.reasonCounts.missing_entity).toBe(1);
+    expect(verdict.excludedConversations).toEqual([gap]);
+  });
+
+  it("does not use an unmatched or duplicate receipt to waive counts", () => {
+    const gap = {
+      conversationIdHash:
+        "cfa5ad96f5be4fc290f591b8afd957551315abbb0a68cdf7660849d8829d644f",
+      reason: "parent_not_stored/fallback_chain_incomplete",
+      declaredCount: 2,
+      walkedCount: 1,
+    };
+    for (const { missingId, gaps } of [
+      { missingId: "unreceipted", gaps: [gap] },
+      { missingId: "excluded", gaps: [gap, gap] },
+    ]) {
+      const verdict = compareLegacyCoverage(
+        {
+          total: 2,
+          conversations: [
+            { id: missingId, messages: [] },
+            { id: "healthy", messages: [] },
+          ],
+        },
+        { total: 1, conversations: [{ id: "healthy", messages: [] }] },
+        {
+          scope: "chatgpt.conversations",
+          entityKeys: { "$.conversations": ["id"] },
+          chatgptCoverageGaps: gaps,
+        },
+      );
+      expect(verdict.covered).toBe(false);
+      expect(verdict.reason).toBe("missing_entity");
+      expect(verdict.excludedConversations).toBeUndefined();
+    }
   });
 });
 
