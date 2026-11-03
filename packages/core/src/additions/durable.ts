@@ -173,7 +173,7 @@ export interface DurableAdditionsService {
 class InaccessibleLedger extends Error {}
 class CheckpointSearchExceeded extends BudgetExceeded {}
 const CHECKPOINT_READ_LIMIT = 256;
-const INVENTORY_CONCURRENCY = 8;
+const INVENTORY_CONCURRENCY = 16;
 type CheckpointSearch = {
   reads: number;
   rejected: Map<string, "inaccessible" | "invalid">;

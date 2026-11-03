@@ -1448,7 +1448,7 @@ it.each(["live", "deleted"] as const)(
         const snapshot = structuredClone(
           registry[scope] ?? { head: null, versions: [] },
         );
-        await network(1600);
+        await network(4000);
         return snapshot;
       },
       async listScopes() {
