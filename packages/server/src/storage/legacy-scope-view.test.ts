@@ -1882,6 +1882,69 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(view.listCanonicalScopes("github.")).toEqual([]);
   });
 
+  it("re-proves an old canonical-contract replacement with unchanged source state", async () => {
+    const scope = "oura.activity";
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    db.prepare(
+      "INSERT INTO data_files (scope, path, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(scope, "oura/activity/old.json", "2026-01-01T00:00:00.000Z", 1);
+    const authority = createLegacyScopeAuthority(db);
+    const readLegacyHead = vi.fn(async () => {
+      throw new Error("A complete replacement should not read the old body");
+    });
+    const config = {
+      authority,
+      records: store,
+      configuredMethods: (sourceId: string) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead,
+    };
+    const initial = createLegacyScopeView(config);
+    expect((await initial.readLatest(scope)).kind).toBe("canonical");
+    expect(initial.listingFor(scope).kind).toBe("canonical");
+    const snapshot = () => ({
+      records: db
+        .prepare("SELECT * FROM pdpp_records ORDER BY stream, record_key")
+        .all(),
+      receipts: db
+        .prepare("SELECT * FROM pdpp_stream_completion ORDER BY stream")
+        .all(),
+      clock: authority.writeClock(),
+      arrivals: authority.arrivalRevision(),
+      head: authority.eligibleLegacyHead(scope),
+    });
+    const unchanged = snapshot();
+    const row = db
+      .prepare(
+        "SELECT replacement_cursor FROM legacy_scope_takeovers WHERE scope = ?",
+      )
+      .get(scope) as { replacement_cursor: string };
+    expect(row.replacement_cursor).toContain("canonical-legacy-view/14");
+    const oldCursor = row.replacement_cursor.replace(
+      "canonical-legacy-view/14",
+      "canonical-legacy-view/13",
+    );
+    expect(oldCursor).not.toBe(row.replacement_cursor);
+    db.prepare(
+      "UPDATE legacy_scope_takeovers SET replacement_cursor = ? WHERE scope = ?",
+    ).run(oldCursor, scope);
+    const restarted = createLegacyScopeView(config);
+    expect(restarted.listingFor(scope).kind).not.toBe("canonical");
+    const listRecords = vi.spyOn(store, "listRecords");
+    expect((await restarted.readLatest(scope)).kind).toBe("canonical");
+    expect(listRecords).toHaveBeenCalled();
+    expect(readLegacyHead).not.toHaveBeenCalled();
+    expect(
+      db
+        .prepare(
+          "SELECT replacement_cursor FROM legacy_scope_takeovers WHERE scope = ?",
+        )
+        .get(scope),
+    ).toEqual(row);
+    expect(restarted.listingFor(scope).kind).toBe("canonical");
+    expect(snapshot()).toEqual(unchanged);
+  });
+
   it("does not rebind a non-head replacement cursor when legacy metadata changes", async () => {
     const scope = "oura.activity";
     const authority = createLegacyScopeAuthority(db);
@@ -4200,6 +4263,88 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
           ),
         ).toBeNull();
       }
+    },
+  );
+
+  it.each(["covered", "not_covered"] as const)(
+    "recomputes an old canonical-contract %s witness with unchanged source state",
+    async (priorState) => {
+      const { view, original, config } = await fixture();
+      const baseline = await view.readLatest(scope);
+      expect(baseline.kind).toBe("canonical");
+      if (baseline.kind !== "canonical") throw new Error("Missing baseline");
+      const authority = config.authority;
+      const head = authority.eligibleLegacyHead(scope);
+      if (!head) throw new Error("Missing legacy head");
+      const prior = view.verdictFor(scope)[0]!;
+      const coverage = authority.cachedVerdict(
+        scope,
+        "chat",
+        1,
+        prior.legacyVersionId,
+        prior.canonicalCursor,
+      )!;
+      expect(coverage.covered).toBe(true);
+      const snapshot = () => ({
+        records: db
+          .prepare("SELECT * FROM pdpp_records ORDER BY stream, record_key")
+          .all(),
+        receipts: db
+          .prepare("SELECT * FROM pdpp_stream_completion ORDER BY stream")
+          .all(),
+        clock: authority.writeClock(),
+        arrivals: authority.arrivalRevision(),
+        head: authority.eligibleLegacyHead(scope),
+      });
+      const unchanged = snapshot();
+      // Derive the old identity from a real generated cursor; keep the current
+      // coverage-rule suffix and every source/head input unchanged.
+      expect(prior.canonicalCursor).toContain("canonical-legacy-view/14");
+      const oldCursor = prior.canonicalCursor.replace(
+        "canonical-legacy-view/14",
+        "canonical-legacy-view/13",
+      );
+      expect(oldCursor).not.toBe(prior.canonicalCursor);
+      expect(
+        authority.confirmRead(scope, head, () => true, "chatgpt", {
+          instance: "chat",
+          generation: 1,
+          writeClock: authority.writeClock(),
+          arrivalRevision: authority.arrivalRevision(),
+          canonicalCursor: oldCursor,
+          coverage:
+            priorState === "covered"
+              ? coverage
+              : {
+                  ...coverage,
+                  covered: false,
+                  reason: "missing_entity",
+                  missingEntityCount: 1,
+                  reasonCounts: { ...coverage.reasonCounts, missing_entity: 1 },
+                },
+          cached: false,
+        }),
+      ).toBe(true);
+      expect(view.verdictFor(scope)[0]).toMatchObject({
+        verdict: priorState,
+        canonicalCursor: oldCursor,
+      });
+      expect(snapshot()).toEqual(unchanged);
+      const listRecords = vi.spyOn(store, "listRecords");
+      const readLegacyHead = vi.fn(async () => original.envelope);
+      const restarted = createLegacyScopeView({ ...config, readLegacyHead });
+      const read = await restarted.readLatest(scope);
+      expect(read.kind).toBe("canonical");
+      if (read.kind !== "canonical")
+        throw new Error("Old contract witness was reused");
+      expect(read.envelope.data).toEqual(baseline.envelope.data);
+      expect(listRecords).toHaveBeenCalled();
+      expect(readLegacyHead).toHaveBeenCalledOnce();
+      expect(restarted.verdictFor(scope)[0]).toMatchObject({
+        verdict: "covered",
+        canonicalCursor: prior.canonicalCursor,
+      });
+      expect(snapshot()).toEqual(unchanged);
     },
   );
 

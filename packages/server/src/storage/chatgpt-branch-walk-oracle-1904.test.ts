@@ -1636,3 +1636,33 @@ describe("Round 2 rooted-walk regressions", () => {
     assertGaps(read.chatgptCoverageGaps, []);
   });
 });
+
+describe("Round 3 successful recovery diagnostics", () => {
+  it.each(["missing-tip", "cycle"] as const)(
+    "does not diagnose a recovered flag branch as a trusted current walk: %s",
+    async (kind) => {
+      const cs = [C("A", kind === "cycle" ? "cycle" : "absent-tip", 2)];
+      const ms = [
+        ...(kind === "cycle" ? [M("A", "cycle", "cycle", false)] : []),
+        M("A", "a0", "synthetic-root", true),
+        M("A", "a1", "a0", true),
+      ];
+      const p = project(records(cs, ms));
+      expect(p.payload).toEqual(A2);
+      expect(p.chatgptCoverageGaps ?? []).toEqual([]);
+      assertDiagnostics(p.chatgptBranchDiagnostics, []);
+      expect(p.diagnostics).toContainEqual({
+        kind: "branch_walk_fallback",
+        scope: SCOPE,
+        stream: "conversations",
+        count: 1,
+        reasons: [kind === "cycle" ? "cycle" : "current_node_not_stored"],
+      });
+      const f = createReadFixture(cs, ms);
+      const read = await readCanonical(f);
+      expect(read.envelope.data).toEqual(A2);
+      assertGaps(read.chatgptCoverageGaps, []);
+      assertDiagnostics(read.chatgptBranchDiagnostics, []);
+    },
+  );
+});
