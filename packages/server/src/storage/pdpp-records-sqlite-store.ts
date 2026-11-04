@@ -1531,7 +1531,10 @@ export function createSqliteRecordStore(
     );
   }
 
-  function clearClaudeTransitionScope(scope: string): void {
+  function clearClaudeTransitionScope(
+    scope: string,
+    preserveShared = false,
+  ): void {
     if (scope !== "claude.conversations" && scope !== "claude.projects") return;
     connectionMutation(
       () => listClaudeTransitions().map((transition) => transition.instance),
@@ -1545,7 +1548,7 @@ export function createSqliteRecordStore(
             scope === "claude.conversations"
               ? ["conversations", "messages"]
               : ["projects", "project_documents"];
-          if (Object.keys(transition.snapshots).length === 0)
+          if (Object.keys(transition.snapshots).length === 0 && !preserveShared)
             streams.push("account_profile");
           for (const table of [
             "pdpp_records",
@@ -1862,19 +1865,23 @@ export function createSqliteRecordStore(
       () => {
         if (!writeHistory()) return;
         const transitionInstances = new Set([
-          ...listClaudeTransitions()
-            .filter((transition) => scope in transition.snapshots)
-            .map((transition) => transition.instance),
-          ...listStravaTransitions()
-            .filter((transition) => scope in transition.snapshots)
-            .map((transition) => transition.instance),
+          ...(scope === "claude.conversations" || scope === "claude.projects"
+            ? listClaudeTransitions().map((transition) => transition.instance)
+            : []),
+          ...(scope === "strava.activities" ||
+          scope === "strava.coverage_diagnostics"
+            ? listStravaTransitions().map((transition) => transition.instance)
+            : []),
         ]);
-        clearClaudeTransitionScope(scope);
+        clearClaudeTransitionScope(scope, true);
         clearStravaTransitionScope(scope);
         for (const { instance, method, deleted_at } of listBindings()) {
           const streams = byMethod.get(method) ?? [];
-          if (streams.length === 0) continue;
-          const marks = streams.map(() => "?").join(",");
+          if (streams.length === 0 && !transitionInstances.has(instance))
+            continue;
+          const marks = streams.length
+            ? streams.map(() => "?").join(",")
+            : "NULL";
           const held = [
             "pdpp_records",
             "pdpp_record_changes",

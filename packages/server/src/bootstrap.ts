@@ -108,7 +108,10 @@ import {
 import type { ReplicaWriterRotation } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import { rotateReplicaWriterIdentityAtBoot } from "./storage/pdpp-replica-writer-identity.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
-import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
+import {
+  createScopeDeletionHistory,
+  migrateScopeDeletionHistory,
+} from "./storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
@@ -1140,6 +1143,11 @@ export async function createServer(
     (hasRecordRegistry
       ? (replicaHost?.store ?? openRecordStore(db, replication.enabled))
       : undefined);
+  if (serverOwner) {
+    migrateScopeDeletionHistory(db, serverOwner, deletionRecordStore, logger, {
+      dryRun: process.env.PS_SCOPE_DELETION_MIGRATION_DRY_RUN === "true",
+    });
+  }
   if (syncManager) {
     syncManager.start();
     logger.info("Sync engine started");

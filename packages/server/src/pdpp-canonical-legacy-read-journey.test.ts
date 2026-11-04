@@ -13,6 +13,9 @@
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
 import type {
@@ -687,6 +690,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
   it.each(["1", "0", "9007199254740992"])(
     "does not let a file-only re-add resurrect deleted canonical data or discovery (tombstone %s)",
     async (tombstoneVersion) => {
+      vi.stubEnv("PS_SCOPE_DELETION_MIGRATION_DRY_RUN", "true");
       let deleted = false;
       let registeredFile = false;
       let offline = false;
@@ -1753,6 +1757,220 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
       "notes.manual",
       "oura.readiness",
     ]);
+  });
+
+  it.each(["between entries", "inside transaction"])(
+    "keeps an unmarked scope hidden after a process kill %s and resumes on restart",
+    async (mode) => {
+      const token = await collectActivity();
+      await replace(
+        token,
+        "readiness",
+        [day("sibling", "2026-09-02")],
+        "2026-09-10T06:00:00Z",
+      );
+      await ctx!.cleanup();
+      ctx = undefined;
+      const dbPath = join(tempDir, "index.db");
+      const fixtureDb = new Database(dbPath);
+      try {
+        const insert = fixtureDb.prepare(
+          "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)",
+        );
+        insert.run(owner, "oura.activity", "2026-09-11T00:00:00Z", "2");
+        insert.run(owner, "oura.readiness", "2026-09-11T00:00:00Z", "2");
+        if (mode === "inside transaction")
+          fixtureDb.exec(
+            "CREATE TRIGGER interrupt_scope_erase BEFORE UPDATE OF generation ON pdpp_instance_binding WHEN OLD.generation = 2 BEGIN SELECT pause_test(); END",
+          );
+      } finally {
+        fixtureDb.close();
+      }
+      const base = join(process.cwd(), "packages/server/src/storage");
+      const storeUrl = pathToFileURL(
+        join(base, "pdpp-records-sqlite-store.ts"),
+      ).href;
+      const historyUrl = pathToFileURL(
+        join(base, "scope-deletion-history.ts"),
+      ).href;
+      const script = `
+        import Database from 'better-sqlite3';
+        import { writeSync } from 'node:fs';
+        import { createSqliteRecordStore } from ${JSON.stringify(storeUrl)};
+        import { migrateScopeDeletionHistory } from ${JSON.stringify(historyUrl)};
+        const db = new Database(${JSON.stringify(dbPath)});
+        const pause = () => { writeSync(1, 'READY\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); return 0; };
+        db.function('pause_test', pause);
+        const store = createSqliteRecordStore(db);
+        migrateScopeDeletionHistory(db, ${JSON.stringify(owner)}, store, {info(fields) { if (${JSON.stringify(mode)} === 'between entries' && fields.scope === 'oura.readiness') pause(); }, error() {}});
+      `;
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "--eval", script],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let errors = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (data: string) => {
+        errors += data;
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error(`migration child did not pause: ${errors}`)),
+            15_000,
+          );
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (data: string) => {
+            if (data.includes("READY")) {
+              clearTimeout(timer);
+              resolve();
+            }
+          });
+          child.once("error", (error) => {
+            clearTimeout(timer);
+            reject(error);
+          });
+          child.once("exit", () => {
+            clearTimeout(timer);
+            reject(new Error(`migration child exited: ${errors}`));
+          });
+        });
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) {
+          const closed = once(child, "close");
+          child.kill("SIGKILL");
+          await closed;
+        }
+      }
+      vi.stubEnv("PS_SCOPE_DELETION_MIGRATION_DRY_RUN", "true");
+      ctx = await boot();
+      expect((await ownerGet("/v1/data/oura.readiness")).status).toBe(410);
+      await ctx.cleanup();
+      ctx = undefined;
+      const checkDb = new Database(dbPath);
+      try {
+        expect(
+          checkDb
+            .prepare(
+              "SELECT scope, erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? ORDER BY scope",
+            )
+            .all(owner),
+        ).toEqual([
+          { scope: "oura.activity", erase_applied: 1 },
+          { scope: "oura.readiness", erase_applied: 0 },
+        ]);
+        expect(
+          checkDb
+            .prepare(
+              "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'readiness'",
+            )
+            .get(accountOne),
+        ).toEqual({ n: 1 });
+        if (mode === "inside transaction")
+          checkDb.exec("DROP TRIGGER interrupt_scope_erase");
+      } finally {
+        checkDb.close();
+      }
+      vi.stubEnv("PS_SCOPE_DELETION_MIGRATION_DRY_RUN", "false");
+      ctx = await boot();
+      const resumedDb = new Database(dbPath, { readonly: true });
+      try {
+        expect(
+          resumedDb
+            .prepare(
+              "SELECT erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
+            )
+            .get(owner, "oura.readiness"),
+        ).toEqual({ erase_applied: 1 });
+        expect(
+          resumedDb
+            .prepare(
+              "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'readiness'",
+            )
+            .get(accountOne),
+        ).toEqual({ n: 0 });
+      } finally {
+        resumedDb.close();
+      }
+    },
+    30_000,
+  );
+
+  it("keeps an interrupted migration hidden and resumes it after restart", async () => {
+    const token = await collectActivity();
+    await replace(
+      token,
+      "readiness",
+      [day("sibling", "2026-09-02")],
+      "2026-09-10T06:00:00Z",
+    );
+    const fixtureDb = new Database(join(tempDir, "index.db"));
+    try {
+      fixtureDb
+        .prepare(
+          "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)",
+        )
+        .run(owner, "oura.activity", "2026-09-11T00:00:00Z", "2");
+      fixtureDb.exec(
+        "CREATE TRIGGER interrupt_scope_erase BEFORE UPDATE OF generation ON pdpp_instance_binding BEGIN SELECT RAISE(ABORT, 'interrupted migration'); END",
+      );
+    } finally {
+      fixtureDb.close();
+    }
+    await ctx!.cleanup();
+    ctx = await boot();
+    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
+    const afterFailure = new Database(join(tempDir, "index.db"));
+    try {
+      expect(
+        afterFailure
+          .prepare(
+            "SELECT erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
+          )
+          .get(owner, "oura.activity"),
+      ).toEqual({ erase_applied: 0 });
+      expect(
+        afterFailure
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'activity'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 1 });
+      afterFailure.exec("DROP TRIGGER interrupt_scope_erase");
+    } finally {
+      afterFailure.close();
+    }
+    await ctx.cleanup();
+    ctx = await boot();
+    const afterRestart = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+    });
+    try {
+      expect(
+        afterRestart
+          .prepare(
+            "SELECT erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
+          )
+          .get(owner, "oura.activity"),
+      ).toEqual({ erase_applied: 1 });
+      expect(
+        afterRestart
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'activity'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 0 });
+      expect(
+        afterRestart
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'readiness'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 1 });
+    } finally {
+      afterRestart.close();
+    }
   });
 
   it("keeps pre-upgrade unmarked deletion history hidden", async () => {
