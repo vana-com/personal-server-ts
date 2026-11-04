@@ -502,9 +502,23 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       expect(current.status, current.text).toBe(200);
       expect(current.dataSource).toBe("canonical");
       expect(JSON.parse(current.text).data.conversations[0]).toMatchObject({
-        message_count: 1,
-        messages: [{ id: node, content }],
+        message_count: content.length === 0 ? 0 : 1,
+        messages: content.length === 0 ? [] : [{ id: node, content }],
       });
+      const db = new Database(join(tempDir, "index.db"), { readonly: true });
+      try {
+        const rows = db
+          .prepare(
+            "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+          )
+          .all(`chatgpt:${owner}`, "messages") as { data: string }[];
+        const stored = rows
+          .map((row) => JSON.parse(row.data) as Record<string, unknown>)
+          .find((row) => row.id === "conversation:node");
+        expect(stored).toMatchObject({ content: "" });
+      } finally {
+        db.close();
+      }
       expect(current.text).not.toContain(oldText);
       for (const query of [`at=${encodeURIComponent(before)}`, "view=stored"]) {
         const historical = await ownerGet(`/v1/data/${scope}?${query}`);
@@ -594,7 +608,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
   };
 
   it.each(["current", "off-branch"])(
-    "serves newer explicit empty ChatGPT text and retains exact legacy history after reopen (%s)",
+    "omits newer explicit empty ChatGPT text and retains exact legacy history after reopen (%s)",
     verifyEmptyChatgptTransition,
   );
 
