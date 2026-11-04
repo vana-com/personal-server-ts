@@ -9,8 +9,8 @@ that existing apps read (for example `chatgpt.conversations` →
 - `legacyScopeToPdppSelection(scope)` — the PDPP source and streams a legacy
   scope is built from.
 
-This module has no dependencies and no Node built-ins, so it runs in browsers
-and WebViews (eslint rejects `node:` imports here). It is not a published
+This module uses browser-safe hashing and no Node built-ins, so it runs in
+browsers and WebViews (eslint rejects `node:` imports here). It is not a published
 package: it ships inside core, and apps read legacy scopes through the
 Personal Server, which projects. The source was lifted from `unity-surfaces`
 `packages/app-runtime/src/legacy-scope-adapter` at `origin/dev` b227e8ce1;
@@ -41,8 +41,9 @@ inline values are supported. Missing/unreadable bytes return `missing_raw_blob`;
 an absent optional target and absent reference stay absent. An explicitly
 required absent target returns `message_content_omitted`. Decode omissions
 make canonical reads incomplete, and an entirely rejected item stream never
-returns a successful empty history. Takeover records gaps as not covered.
-Schema and projection-contract changes invalidate both
+returns a successful empty history. These decode gaps block takeover. The
+ChatGPT branch-integrity exception below applies only to its exact
+conversation receipts. Schema and projection-contract changes invalidate both
 view revisions and takeover caches.
 
 Integration requirement: server composition must supply the registry governing
@@ -51,3 +52,20 @@ core storage was changed in this scoped patch. Do not annotate old vendored
 declarations as a substitute: doing so would reinterpret old literal escapes.
 The caller must keep declaration upgrades consistent with the records they
 govern; this patch does not infer a historical per-record declaration version.
+
+## ChatGPT branch evidence
+
+ChatGPT conversation reads follow the selected node's stored first-version
+parent links within that conversation. A clean path longer than the declared
+count is served with `declared_count_below_walked`; a count never truncates a
+stored path. A short or unavailable path uses flags only when they identify
+one coherent chain of the declared size. Cycles cannot become valid through
+flag cardinality. An unrecoverable conversation yields a hashed coverage gap;
+healthy conversations remain available. Exact receipts can preserve scope
+coverage, but grant neither deletion permission nor replacement authority.
+
+Canonical storage keeps explicit empty message text. Legacy reads omit it,
+matching the old ChatGPT connector's nonempty-text filter. Same-read empty
+text remains retention evidence for coverage; null, absent and non-string
+content do not. Retained tombstones and the existing deletion, identity and
+snapshot safeguards still protect the whole scope.
