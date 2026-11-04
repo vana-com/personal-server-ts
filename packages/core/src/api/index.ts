@@ -2853,12 +2853,18 @@ export async function handlePersonalServerDataRequest(
         throw new LineageCascadeUnavailableError({ scope: parsed.scope });
       }
 
-      // A canonical-owned scope's latest body is its connection's rows. No
-      // store seam deletes one legacy scope's rows (streams can be shared,
-      // and the account and its generation are the unit of erasure), so a
-      // 200 here would leave the data readable. Refuse before any gateway or
-      // file change; the connection's own delete erases its rows.
-      if (deps.legacyScopeView?.blocksScopeDeletion(parsed.scope)) {
+      // Shared streams stay available to sibling scopes. Their deletion needs
+      // a durable tombstone and history so this scope remains hidden.
+      const sharedScopeAllowed = Boolean(
+        deps.syncManager?.deleteScope && deps.scopeDeletions?.deletionHistory,
+      );
+      const normallyBlocked =
+        deps.legacyScopeView?.blocksScopeDeletion(parsed.scope) ?? false;
+      const sharedScopeDelete =
+        normallyBlocked &&
+        sharedScopeAllowed &&
+        !deps.legacyScopeView!.blocksScopeDeletion(parsed.scope, true);
+      if (normallyBlocked && !sharedScopeDelete) {
         return jsonResponse(
           {
             error: "CANONICAL_DELETE_UNSUPPORTED",
@@ -2893,6 +2899,31 @@ export async function handlePersonalServerDataRequest(
           scope: parsed.scope,
           result,
         });
+      }
+
+      // Shared rows are hidden by durable history. Do not report success if
+      // no gateway tombstone was recorded for this scope.
+      const sharedHistory = sharedScopeDelete
+        ? deps.scopeDeletions?.deletionHistory?.get(parsed.scope)
+        : undefined;
+      if (
+        sharedScopeDelete &&
+        (!result.durable ||
+          result.steps.gateway.status !== "ok" ||
+          !result.steps.gateway.version ||
+          deps.legacyScopeView?.hasExclusiveRecords(parsed.scope) ||
+          !sharedHistory?.eraseApplied ||
+          sharedHistory.version !== result.steps.gateway.version)
+      ) {
+        return jsonResponse(
+          {
+            error: "CANONICAL_DELETE_NOT_DURABLE",
+            message:
+              "The shared scope deletion could not be confirmed; file cleanup may already have occurred.",
+            scope: parsed.scope,
+          },
+          { status: 503 },
+        );
       }
 
       // Audit entry, best-effort: the deletion above is irreversible and

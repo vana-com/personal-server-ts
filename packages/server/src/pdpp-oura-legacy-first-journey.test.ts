@@ -2201,6 +2201,112 @@ describe("Oura collection requirements", () => {
     ).toBe(401);
   });
 
+  it.each([T_PDPP, "2026-10-17T00:00:00Z"])(
+    "refuses a non-native batch without proof of fresh collection after deletion (%s)",
+    async (collectedAt) => {
+      await freshBoot(["oura-browser"], []);
+      const db = new Database(join(tempDir, "index.db"));
+      try {
+        db.prepare(
+          "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version, erase_applied) VALUES (?, ?, ?, ?, 1)",
+        ).run(owner, "oura.activity", T_LEGACY_NEWER, "2");
+      } finally {
+        db.close();
+      }
+      const body = {
+        collectedAt,
+        records: SCOPES.flatMap((scope) =>
+          pdppRows(scope, DAYS).map((data) => ({
+            stream: STREAM_OF[scope],
+            data,
+          })),
+        ),
+        selection: { streams: SCOPES.map((name) => ({ name })) },
+        completion: {
+          streams: SCOPES.map((scope) => ({
+            stream: STREAM_OF[scope],
+            status: "complete",
+            recordCount: pdppRows(scope, DAYS).length,
+          })),
+        },
+      };
+      const response = await ctx!.app.request("/v1/import/oura-browser", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(409);
+      const check = new Database(join(tempDir, "index.db"), { readonly: true });
+      try {
+        expect(
+          check.prepare("SELECT count(*) AS n FROM pdpp_records").get(),
+        ).toEqual({ n: 0 });
+        expect(
+          check.prepare("SELECT count(*) AS n FROM data_files").get(),
+        ).toEqual({ n: 0 });
+      } finally {
+        check.close();
+      }
+    },
+  );
+
+  it("refuses a non-native batch when deletion history appears during preflight", async () => {
+    await freshBoot(["oura-browser"], []);
+    barrier.afterReadLatest = async () => {
+      const db = new Database(join(tempDir, "index.db"));
+      try {
+        db.prepare(
+          "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version, erase_applied) VALUES (?, ?, ?, ?, 1)",
+        ).run(owner, "oura.activity", T_LEGACY_NEWER, "2");
+      } finally {
+        db.close();
+      }
+    };
+    const body = {
+      collectedAt: T_PDPP,
+      records: SCOPES.flatMap((scope) =>
+        pdppRows(scope, DAYS).map((data) => ({
+          stream: STREAM_OF[scope],
+          data,
+        })),
+      ),
+      selection: { streams: SCOPES.map((name) => ({ name })) },
+      completion: {
+        streams: SCOPES.map((scope) => ({
+          stream: STREAM_OF[scope],
+          status: "complete",
+          recordCount: pdppRows(scope, DAYS).length,
+        })),
+      },
+    };
+    const response = await ctx!.app.request("/v1/import/oura-browser", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      reason: "fresh_collection_proof_required",
+    });
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      expect(
+        db.prepare("SELECT count(*) AS n FROM pdpp_records").get(),
+      ).toEqual({ n: 0 });
+      expect(db.prepare("SELECT count(*) AS n FROM data_files").get()).toEqual({
+        n: 0,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
   it("keeps opt-in and incomplete phone batches on legacy, then admits one complete batch through canonical reads", async () => {
     await writeLegacy(DAYS, T_LEGACY);
     const body = {

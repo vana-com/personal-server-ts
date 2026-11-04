@@ -339,7 +339,9 @@ export interface LegacyScopeViewPort {
    */
   ownsScope(scope: string): boolean;
   /** Whether deleting only the scope file could expose retained records. */
-  blocksScopeDeletion(scope: string): boolean;
+  blocksScopeDeletion(scope: string, allowSharedScope?: boolean): boolean;
+  /** True if exclusive records or receipts may remain after a deletion. */
+  hasExclusiveRecords(scope: string): boolean;
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
   resetTakeover(scope: string): void;
   isReset(scope: string): boolean;
@@ -446,13 +448,22 @@ export function createLegacyScopeView(
   }
 
   /** Refuse a file-only deletion when canonical data may remain. */
-  function blocksScopeDeletion(scope: string): boolean {
+  function blocksScopeDeletion(
+    scope: string,
+    allowSharedScope = false,
+  ): boolean {
     const connections = authority.listMethodConnections([
       ...scopeMethods(scope).keys(),
     ]);
     if (connections.length > 0 && (!records || !authority.heldDataAvailable()))
       return true;
     const ungated = decide(scope, false);
+    if (allowSharedScope && ungated.kind === "canonical") {
+      const method = ungated.selection.method;
+      const streams = scopeMethods(scope).get(method) ?? [];
+      const exclusive = exclusiveScopeStreams(scope).get(method) ?? [];
+      if (streams.length > exclusive.length) return false;
+    }
     if (ungated.kind === "file") return false;
     if (
       ungated.kind === "refused" &&
@@ -1366,8 +1377,24 @@ export function createLegacyScopeView(
     ownsScope(scope) {
       return authority.readSnapshot(() => ownsScope(scope));
     },
-    blocksScopeDeletion(scope) {
-      return authority.readSnapshot(() => blocksScopeDeletion(scope));
+    blocksScopeDeletion(scope, allowSharedScope) {
+      return authority.readSnapshot(() =>
+        blocksScopeDeletion(scope, allowSharedScope),
+      );
+    },
+    hasExclusiveRecords(scope) {
+      return authority.readSnapshot(() => {
+        if (!records || !authority.heldDataAvailable()) return true;
+        const methods = exclusiveScopeStreams(scope);
+        return authority
+          .listMethodConnections([...methods.keys()])
+          .some((connection) =>
+            authority.hasHeldData(
+              connection.instance,
+              methods.get(connection.method ?? "") ?? [],
+            ),
+          );
+      });
     },
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),

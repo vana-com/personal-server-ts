@@ -8,6 +8,10 @@ import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "../storage/legacy-scope-authority.js";
+import {
+  createScopeDeletionHistory,
+  migrateScopeDeletionHistory,
+} from "../storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import Database from "better-sqlite3";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -3227,5 +3231,216 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     expect(res.status).toBe(402);
     const body = await res.json();
     expect(body.x402Version).toBe(1);
+  });
+});
+
+describe("shared canonical streams on scope deletion", () => {
+  const source = "https://registry.pdpp.dev/sources/icloud-notes";
+  const scopeX = "icloud_notes.notes";
+  const scopeY = "icloud_notes.folders";
+  const token = "owner-session-shared-test";
+  let db: ReturnType<typeof initializeDatabase>;
+  let store: ReturnType<typeof createSqliteRecordStore>;
+  let history: ReturnType<typeof createScopeDeletionHistory>;
+  let app: ReturnType<typeof dataRoutes>;
+  let routeDeps: DataRouteDeps;
+  let dir: string;
+  let recordTombstone: boolean;
+  const mark = { version: "2", deletedAt: "2026-09-11T00:00:00Z" };
+  function replace(
+    stream: string,
+    data: Record<string, unknown>,
+    generation = 1,
+  ) {
+    const at = "2026-09-10T00:00:00Z";
+    return store.replaceStream({
+      instance: "conn",
+      stream,
+      method: "icloud-notes",
+      generation,
+      primaryKey: ["id"],
+      emittedAt: at,
+      sourceCollectedAt: at,
+      envelopes: [
+        {
+          instance: "conn",
+          stream,
+          key: String(data.id),
+          data,
+          emitted_at: at,
+        },
+      ],
+    });
+  }
+  function req(path: string, method = "GET") {
+    return app.request(path, {
+      method,
+      headers: { authorization: `Bearer ${token}` },
+    });
+  }
+  async function assertHiddenOnlyX() {
+    const y = await req(`/${scopeY}`);
+    expect(y.status, await y.clone().text()).toBe(200);
+    expect(JSON.stringify(await y.json())).toContain("Work");
+    expect((await req(`/${scopeX}`)).status).toBe(410);
+    const list = await req("/");
+    expect(list.status).toBe(200);
+    const names = (
+      (await list.json()) as { scopes: { scope: string }[] }
+    ).scopes.map((item) => item.scope);
+    expect(names).toContain(scopeY);
+    expect(names).not.toContain(scopeX);
+  }
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "shared-scope-test-"));
+    db = initializeDatabase(":memory:");
+    const indexManager = createIndexManager(db);
+    store = createSqliteRecordStore(db);
+    store.registerConnection({
+      instance: "conn",
+      sourceId: source,
+      method: "icloud-notes",
+      label: "",
+    });
+    replace("folders", { id: "f1", name: "Work" });
+    replace("profile", { id: "p1", user_name: "reader" });
+    replace("notes", {
+      id: "n1",
+      title: "note",
+      folder_id: "f1",
+      is_pinned: false,
+      has_attachments: false,
+    });
+    const view = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: () => ["icloud-notes"],
+    });
+    history = createScopeDeletionHistory(db, ownerWallet.address, store);
+    const tracker = createScopeDeletionTracker({ deletionHistory: history });
+    recordTombstone = true;
+    routeDeps = {
+      indexManager,
+      hierarchyOptions: { dataDir: dir },
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessToken: token,
+      legacyScopeView: view,
+      scopeDeletions: tracker,
+      syncManager: {
+        deleteScope: async (scope: string) => {
+          if (recordTombstone) tracker.markDeleted(scope, mark, "local-delete");
+          return {
+            scope,
+            dataPointId: "0x00",
+            durable: true,
+            steps: {
+              gateway: recordTombstone
+                ? { status: "ok", version: "2" }
+                : { status: "skipped", reason: "not-registered" },
+              storage: { status: "ok" },
+              local: { status: "ok", deletedCount: 0 },
+            },
+            pendingBlobDeletion: false,
+          };
+        },
+      } as unknown as SyncManager,
+    };
+    app = dataRoutes(routeDeps);
+  });
+  afterEach(async () => {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  it("deletes only the requested scope while its shared stream remains readable through the sibling", async () => {
+    const result = await req(`/${scopeX}`, "DELETE");
+    expect(result.status, await result.clone().text()).toBe(200);
+    await assertHiddenOnlyX();
+    expect(store.getRecord("conn", "notes", "n1")).toBeUndefined();
+    expect(store.getRecord("conn", "folders", "f1")).toBeDefined();
+  });
+  it("refuses shared-scope deletion without a durable delete worker", async () => {
+    const localApp = dataRoutes({ ...routeDeps, syncManager: null });
+    const response = await localApp.request(`/${scopeX}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(409);
+    expect(store.getRecord("conn", "notes", "n1")).toBeDefined();
+  });
+  it("does not claim success when no gateway tombstone was recorded", async () => {
+    recordTombstone = false;
+    const response = await req(`/${scopeX}`, "DELETE");
+    expect(response.status).toBe(503);
+    expect((await response.json()).error).toBe("CANONICAL_DELETE_NOT_DURABLE");
+    expect(store.getRecord("conn", "notes", "n1")).toBeDefined();
+  });
+
+  it("does not claim success while matching old history remains unapplied", async () => {
+    db.prepare(
+      "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)",
+    ).run(
+      ownerWallet.address.toLowerCase(),
+      scopeX,
+      mark.deletedAt,
+      mark.version,
+    );
+    const response = await req(`/${scopeX}`, "DELETE");
+    expect(response.status).toBe(503);
+    expect(store.getRecord("conn", "notes", "n1")).toBeDefined();
+  });
+
+  it("does not report a repeated tombstone as erasing newly collected exclusive rows", async () => {
+    history.remember(scopeX, mark);
+    replace(
+      "notes",
+      {
+        id: "fresh",
+        title: "new",
+        folder_id: "f1",
+        is_pinned: false,
+        has_attachments: false,
+      },
+      2,
+    );
+    const response = await req(`/${scopeX}`, "DELETE");
+    expect(response.status).toBe(503);
+    expect(store.getRecord("conn", "notes", "fresh")).toBeDefined();
+  });
+
+  it("migrates old unmarked history without hiding the sibling scope", async () => {
+    db.prepare(
+      "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)",
+    ).run(
+      ownerWallet.address.toLowerCase(),
+      scopeX,
+      mark.deletedAt,
+      mark.version,
+    );
+    migrateScopeDeletionHistory(db, ownerWallet.address, store, logger);
+    expect(store.getRecord("conn", "notes", "n1")).toBeUndefined();
+    expect(store.getRecord("conn", "folders", "f1")).toBeDefined();
+    await assertHiddenOnlyX();
+  });
+  it("known gap: a fresh write to a shared stream does not yet unhide the deleted scope", async () => {
+    history.remember(scopeX, mark);
+    replace("folders", { id: "f1", name: "Fresh" }, 2);
+    replace("profile", { id: "p1", user_name: "reader" }, 2);
+    replace(
+      "notes",
+      {
+        id: "n1",
+        title: "new",
+        folder_id: "f1",
+        is_pinned: false,
+        has_attachments: false,
+      },
+      2,
+    );
+    // Closing this gap needs per-scope causal evidence that the shared write followed the tombstone.
+    expect((await req(`/${scopeX}`)).status).toBe(410);
   });
 });
