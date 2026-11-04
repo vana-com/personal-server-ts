@@ -17,6 +17,7 @@ export interface LegacyRevalidationState {
   fingerprint(): string;
   candidates(): ReturnType<typeof legacyCoverageCandidates>;
   markDirty(since?: number): void;
+  observePolicy(fingerprint: string, since: number): void;
   ensureDirty(): void;
   complete(instance: string, scope: string, revision: number): boolean;
   fail(instance: string, scopes: readonly string[]): void;
@@ -54,7 +55,9 @@ function makeState(
     CREATE TABLE IF NOT EXISTS legacy_scope_revalidation_scopes (
     instance TEXT NOT NULL,scope TEXT NOT NULL,dirty_since INTEGER,
     ceiling_ms INTEGER NOT NULL,error_count INTEGER NOT NULL DEFAULT 0,reason TEXT,
-    PRIMARY KEY(instance,scope));`);
+    PRIMARY KEY(instance,scope));
+    CREATE TABLE IF NOT EXISTS legacy_scope_revalidation_policy (
+    id INTEGER PRIMARY KEY CHECK(id=1),fingerprint TEXT NOT NULL);`);
   const bump =
     raw.prepare(`INSERT INTO legacy_scope_revalidation_instances(instance,revision) VALUES (?,1)
     ON CONFLICT(instance) DO UPDATE SET revision=revision+1`);
@@ -217,6 +220,25 @@ function makeState(
     candidates,
     markDirty(since = now()) {
       raw.transaction(() => mark(since)).immediate();
+    },
+    observePolicy(fingerprint: string, since: number) {
+      raw
+        .transaction(() => {
+          const previous = raw
+            .prepare(
+              "SELECT fingerprint FROM legacy_scope_revalidation_policy WHERE id=1",
+            )
+            .pluck()
+            .get();
+          if (previous === fingerprint) return;
+          mark(since);
+          raw
+            .prepare(
+              "INSERT INTO legacy_scope_revalidation_policy VALUES (1,?) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint",
+            )
+            .run(fingerprint);
+        })
+        .immediate();
     },
     ensureDirty() {
       // Recovery seeds unknown witnesses, but a sweep is not a mutation.

@@ -170,3 +170,40 @@ it("blob and replica mutations coarsely dirty every candidate, including shared-
     raw.close();
   }
 });
+
+it("persists policy identity so a changed policy on restart dirties clean proofs", () => {
+  const parent = join(homedir(), ".tmp");
+  mkdirSync(parent, { recursive: true });
+  const dir = mkdtempSync(join(parent, "swr-policy-"));
+  const path = join(dir, "index.db");
+  let now = 1000;
+  let raw = seed(path);
+  let state = trackLegacyScopeMutations(raw, {
+    ceilingMs: 2000,
+    now: () => now,
+  });
+  try {
+    state.observePolicy("schema-v1:threshold-1.5", now);
+    state.complete("i", "oura.activity", state.revision("i"));
+    raw.close();
+    now = 1500;
+    raw = initializeDatabase(path);
+    state = trackLegacyScopeMutations(raw, { ceilingMs: 2000, now: () => now });
+    state.observePolicy("schema-v1:threshold-1.5", now);
+    expect(state.status("i", "oura.activity")?.dirty_since).toBeNull();
+    now = 2000;
+    state.observePolicy("schema-v2:threshold-1.0", now);
+    expect(state.status("i", "oura.activity")?.dirty_since).toBe(2000);
+    raw.close();
+    now = 3500;
+    raw = initializeDatabase(path);
+    state = trackLegacyScopeMutations(raw, { ceilingMs: 2000, now: () => now });
+    state.observePolicy("schema-v2:threshold-1.0", now);
+    expect(state.status("i", "oura.activity")?.dirty_since).toBe(2000);
+    now = 4000;
+    expect(state.overdue("i", "oura.activity")).toBe(true);
+  } finally {
+    raw.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
