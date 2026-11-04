@@ -45,6 +45,8 @@ import {
 } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 
+import * as deletedScopePolicy from "@opendatalabs/personal-server-ts-core/sync/deleted-scope-policy";
+
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 const CONTROL_PLANE_TOKEN = "canonical-read-journey-control-plane";
@@ -892,6 +894,111 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
         (row: { scope: string }) => row.scope,
       ),
     ).toEqual(["notes.manual", "oura.activity", "oura.readiness"]);
+  });
+
+  it("requires a gateway re-add under erase-and-stop policy for reads and listing, even after reset", async () => {
+    const actualPolicy = deletedScopePolicy.deletedScopeNeedsGatewayReadd;
+    const override = vi
+      .spyOn(deletedScopePolicy, "deletedScopeNeedsGatewayReadd")
+      .mockImplementation(() => actualPolicy("erase-and-stop"));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let state: "deleted" | "missing" | "live" = "deleted";
+    let gatewayVersion = "1";
+    const scope = "oura.activity";
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope: requested }) =>
+        requested !== scope || state === "missing"
+          ? null
+          : {
+              id: "policy-point",
+              ownerAddress,
+              scope,
+              dataHash: `0x${(state === "deleted" ? "00" : "11").repeat(32)}`,
+              metadataHash: `0x${(state === "deleted" ? "00" : "11").repeat(32)}`,
+              expectedVersion: gatewayVersion,
+              addedAt: "2026-09-01T00:00:00Z",
+              deletedAt: state === "deleted" ? "2026-09-11T00:00:00Z" : null,
+            },
+    };
+    try {
+      await ctx!.cleanup();
+      ctx = await boot("oura", { dataPointFeed });
+      const token = await ownerPdppToken();
+      expect((await ownerGet(`/v1/data/${scope}`)).status).toBe(410);
+      const bindingDb = new Database(join(tempDir, "index.db"), {
+        readonly: true,
+      });
+      const { generation } = bindingDb
+        .prepare(
+          "SELECT generation FROM pdpp_instance_binding WHERE instance = ?",
+        )
+        .get(accountOne) as { generation: number };
+      bindingDb.close();
+      await replace(
+        token,
+        "activity",
+        [day("recollected", "2026-09-15")],
+        "2026-09-15T06:00:00Z",
+        accountOne,
+        generation,
+      );
+      const assertHidden = async () => {
+        expect((await ownerGet(`/v1/data/${scope}`)).status).toBe(410);
+        expect((await builderGet(scope)).status).toBe(410);
+        const listing = await ownerGet("/v1/data");
+        expect(listing.status).toBe(200);
+        expect(
+          JSON.parse(listing.text).scopes.map(
+            (row: { scope: string }) => row.scope,
+          ),
+        ).not.toContain(scope);
+      };
+      await assertHidden();
+      const reset = await ctx!.app.request(
+        `/pdpp/instances/${encodeURIComponent(accountOne)}/reset`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            expected_method: "oura",
+            expected_generation: generation,
+            next_method: "oura",
+          }),
+        },
+      );
+      expect(reset.status).toBe(200);
+      await replace(
+        token,
+        "activity",
+        [day("after-reset", "2026-09-15")],
+        "2026-09-15T06:00:00Z",
+        accountOne,
+        generation + 1,
+      );
+      await assertHidden();
+      state = "missing";
+      vi.setSystemTime(Date.now() + 120_001);
+      await assertHidden();
+      state = "live";
+      vi.setSystemTime(Date.now() + 120_001);
+      await assertHidden(); // A live response at the deleted version is not a re-add.
+      gatewayVersion = "2";
+      vi.setSystemTime(Date.now() + 120_001);
+      expect((await ownerGet(`/v1/data/${scope}`)).status).toBe(200);
+      expect((await builderGet(scope)).status).toBe(200);
+      const listed = JSON.parse((await ownerGet("/v1/data")).text).scopes.map(
+        (row: { scope: string }) => row.scope,
+      );
+      expect(listed).toContain(scope);
+      expect(override).toHaveBeenCalled();
+    } finally {
+      override.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("serves canonical rows to a legacy grant and the owner after coverage", async () => {

@@ -1,3 +1,4 @@
+import { deletedScopeNeedsGatewayReadd } from "../sync/deleted-scope-policy.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
@@ -1187,7 +1188,7 @@ export async function resolveReadDeletion(
     ...(gatewayTimeoutMs === undefined ? {} : { gatewayTimeoutMs }),
   });
   const history = deps.scopeDeletions.deletionHistory?.get(scope);
-  const tombstone =
+  let tombstone =
     body === "canonical" || body === "canonical-empty"
       ? body === "canonical" &&
         history?.eraseApplied &&
@@ -1197,8 +1198,21 @@ export async function resolveReadDeletion(
       : verdict.deleted
         ? verdict
         : null;
+  const observedDeletion = history ?? (verdict.deleted ? verdict : null);
+  const liveVersion = deps.scopeDeletions.knownLiveVersion?.(scope) ?? null;
+  // Under the stop policy, a full reset proof cannot replace a gateway re-add.
+  const policyRefuses =
+    deletedScopeNeedsGatewayReadd() &&
+    observedDeletion !== null &&
+    (verdict.deleted ||
+      !verdict.verified ||
+      liveVersion === null ||
+      (observedDeletion.version !== null &&
+        BigInt(liveVersion) <= BigInt(observedDeletion.version)));
+  if (policyRefuses) tombstone = observedDeletion;
   if (!tombstone) return null;
   if (
+    !policyRefuses &&
     body === "file" &&
     entry &&
     !isEntryCoveredByTombstone(entry, tombstone)
