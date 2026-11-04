@@ -2977,18 +2977,22 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             rows: [],
           },
           {
-            label: "incomplete count",
+            label: "missing parent below declared count",
             parent: { message_count_on_current_branch: 2 },
+            rootParent: "missing-parent",
             rows: [],
           },
           {
-            label: "disconnected chain",
+            label: "disconnected fallback flags",
             parent: { message_count_on_current_branch: 2 },
+            rootParent: "missing-parent",
             rows: [message("c1", "n2", null, "disconnected")],
           },
         ])(
           "keeps $label data out of retained evidence",
-          ({ label, parent, rows }) => {
+          ({ parent, rows, rootParent }) => {
+            // ruled by lead 11-03: a rooted count mismatch is trusted; these
+            // negative controls need a genuinely unavailable current parent.
             const base = conversation("c1", 1, "n1");
             const result = projected(
               project([
@@ -3000,7 +3004,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                         data: { ...base.data, ...parent },
                       },
                     ]),
-                message("c1", "n1", null, "visible"),
+                message("c1", "n1", rootParent ?? null, "visible"),
                 ...rows,
                 retained(),
                 conversation("control", 0, null),
@@ -3014,7 +3018,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             expect(
               result.retainedChatgptMessages?.map((r) => r.conversationId),
             ).toEqual(["control"]);
-            if (["incomplete count", "disconnected chain"].includes(label)) {
+            if (rootParent !== undefined) {
               expect(result.chatgptCoverageGaps).toHaveLength(1);
             } else {
               expect(result.chatgptCoverageGaps).toBeUndefined();

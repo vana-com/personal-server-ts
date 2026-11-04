@@ -1401,7 +1401,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
       )
       .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/13");
+    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/14");
     const callsAfterFirstRead = listRecords.mock.calls.length;
     expect(callsAfterFirstRead).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
