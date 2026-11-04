@@ -1,3 +1,4 @@
+import { assertScopeStreamsBound } from "./scope-deletion-bindings.js";
 import { exclusiveScopeStreams } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { assertSupportedSchemaVersions } from "./schema-versions.js";
 import type { ReplicaCanonicalPort } from "./pdpp-replica-canonical-port.js";
@@ -1864,6 +1865,7 @@ export function createSqliteRecordStore(
       () => listBindings().map((binding) => binding.instance),
       () => {
         if (!writeHistory()) return;
+        assertScopeStreamsBound(db, scope);
         const transitionInstances = new Set([
           ...(scope === "claude.conversations" || scope === "claude.projects"
             ? listClaudeTransitions().map((transition) => transition.instance)
@@ -1927,8 +1929,12 @@ export function createSqliteRecordStore(
             ).run(instance, blob_id);
           }
           db.prepare(
-            "UPDATE pdpp_instance_binding SET generation = generation + 1 WHERE instance = ?",
-          ).run(instance);
+            "UPDATE pdpp_instance_binding SET generation = generation + 1, reset_clock = CASE WHEN ? THEN ? ELSE reset_clock END WHERE instance = ?",
+          ).run(
+            held || transitionInstances.has(instance) ? 1 : 0,
+            (nextWriteSeq.get() as { value: number }).value,
+            instance,
+          );
           for (const table of [
             "pdpp_stream_completion",
             "pdpp_record_arrival",

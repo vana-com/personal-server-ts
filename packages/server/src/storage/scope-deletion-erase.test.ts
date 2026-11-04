@@ -80,8 +80,11 @@ describe("scope deletion observations", () => {
     expect(store.getRecord("connection", "readiness", "sibling")).toBeDefined();
     expect(store.getInstanceBinding("connection")).toMatchObject({
       generation: 2,
-      resetClock,
+      resetClock: expect.any(Number),
     });
+    expect(store.getInstanceBinding("connection").resetClock).toBeGreaterThan(
+      resetClock,
+    );
     expect(store.listStreamCompletions("connection")).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ stream: "readiness", generation: 2 }),
@@ -98,6 +101,31 @@ describe("scope deletion observations", () => {
     expect(store.getInstanceBinding("connection").generation).toBe(3);
   });
 
+  it("refuses to mark a live deletion while an unbound orphan holds exclusive rows", () => {
+    db.prepare(
+      "INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted) VALUES ('orphan', 'activity', 'old', '{}', 1, '2026-09-10', 0)",
+    ).run();
+    const tracker = createScopeDeletionTracker({ deletionHistory: history });
+    expect(() => tracker.markDeleted(SCOPE, deleted)).toThrow(
+      "Cannot establish",
+    );
+    expect(tracker.deletionHistory?.get(SCOPE)?.eraseApplied).not.toBe(true);
+    expect(store.getRecord("connection", "activity", "old")).toBeDefined();
+  });
+  it("expires a continuation token when a scope erase removes rows", () => {
+    const page = store.changesSince("activity", {
+      instanceIds: ["connection"],
+      limit: 100,
+    });
+    history.remember(SCOPE, deleted);
+    expect(() =>
+      store.changesSince("activity", {
+        instanceIds: ["connection"],
+        changesSince: page.nextChangesSince,
+        limit: 100,
+      }),
+    ).toThrow();
+  });
   it("fences a bound collector even when the stream is still empty", () => {
     store.registerConnection({
       instance: "empty",

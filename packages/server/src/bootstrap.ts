@@ -661,6 +661,7 @@ export async function createServer(
     deletionHistory: serverOwner
       ? createScopeDeletionHistory(db, serverOwner, () => deletionRecordStore, {
           replicationEnabled: config.replication.enabled,
+          logger,
         })
       : undefined,
   });

@@ -656,41 +656,48 @@ describe("createPsLiteRuntime", () => {
     );
   });
 
-  it("refuses scope deletion when record replication is enabled", async () => {
-    const storage = createMemoryPsLiteStorage();
-    const runtime = createTestRuntime({
-      storage,
-      config: { replication: { enabled: true } },
-      auth: createBearerTokenPsLiteAuth({ ownerToken: "owner-token" }),
-      active: true,
-    });
-    await runtime.fetch(
-      new Request("https://ps.local/v1/data/instagram.profile", {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer owner-token",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ username: "kept" }),
-      }),
-    );
-    const response = await runtime.fetch(
-      new Request("https://ps.local/v1/data/instagram.profile", {
-        method: "DELETE",
-        headers: { Authorization: "Bearer owner-token" },
-      }),
-    );
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({
-      error: "SCOPE_ERASE_REPLICATION_ENABLED",
-    });
-    const read = await runtime.fetch(
-      new Request("https://ps.local/v1/data/instagram.profile", {
-        headers: { Authorization: "Bearer owner-token" },
-      }),
-    );
-    expect(read.status).toBe(200);
-  });
+  it.each([
+    ["example.profile", 200, 404],
+    ["oura.activity", 409, 200],
+  ])(
+    "deletes only file scopes under replication (%s)",
+    async (scope, status, readStatus) => {
+      const storage = createMemoryPsLiteStorage();
+      const runtime = createTestRuntime({
+        storage,
+        config: { replication: { enabled: true } },
+        auth: createBearerTokenPsLiteAuth({ ownerToken: "owner-token" }),
+        active: true,
+      });
+      await runtime.fetch(
+        new Request(`https://ps.local/v1/data/${scope}`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer owner-token",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ username: "kept" }),
+        }),
+      );
+      const response = await runtime.fetch(
+        new Request(`https://ps.local/v1/data/${scope}`, {
+          method: "DELETE",
+          headers: { Authorization: "Bearer owner-token" },
+        }),
+      );
+      expect(response.status).toBe(status);
+      if (status === 409)
+        expect(await response.json()).toMatchObject({
+          error: "SCOPE_ERASE_REPLICATION_ENABLED",
+        });
+      const read = await runtime.fetch(
+        new Request(`https://ps.local/v1/data/${scope}`, {
+          headers: { Authorization: "Bearer owner-token" },
+        }),
+      );
+      expect(read.status).toBe(readStatus);
+    },
+  );
   it("deletes a scope with owner auth", async () => {
     const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),

@@ -98,6 +98,7 @@ import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
   deletionHistoryOf,
   scopeHasSharedStreams,
+  exclusiveScopeStreams,
   type LegacyScopeRefusal,
   type LegacyScopeViewPort,
 } from "../storage/legacy-scope-view.js";
@@ -2845,7 +2846,11 @@ export async function handlePersonalServerDataRequest(
       // wasted remote call.
       const parsed = parseDataScopeContract(scopeParam);
       if (!parsed.ok) return contractErrorResponse(parsed);
-      if (deps.replicationEnabled) {
+      if (
+        deps.replicationEnabled &&
+        (exclusiveScopeStreams(parsed.scope).size > 0 ||
+          deps.legacyScopeView?.blocksScopeDeletion(parsed.scope))
+      ) {
         return jsonResponse(
           {
             error: "SCOPE_ERASE_REPLICATION_ENABLED",

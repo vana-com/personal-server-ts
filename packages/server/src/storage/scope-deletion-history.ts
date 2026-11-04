@@ -1,3 +1,4 @@
+import { assertScopeStreamsBound } from "./scope-deletion-bindings.js";
 import { exclusiveScopeStreams } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type { Database } from "better-sqlite3";
 import type {
@@ -29,7 +30,10 @@ export function createScopeDeletionHistory(
             ): void;
           }
         | undefined),
-  options: { replicationEnabled?: boolean } = {},
+  options: {
+    replicationEnabled?: boolean;
+    logger?: { error(fields: Record<string, unknown>, message: string): void };
+  } = {},
 ): ScopeDeletionHistory {
   db.exec(`
     CREATE TABLE IF NOT EXISTS vana_scope_deletion_history (
@@ -104,22 +108,39 @@ export function createScopeDeletionHistory(
           "UPDATE vana_scope_deletion_history SET erase_applied = 1 WHERE owner_address = ? AND scope = ?",
         ).run(owner, scope);
       };
-      if (options.replicationEnabled) db.transaction(write).immediate();
-      else if (store) store.recordScopeDeletion(scope, write, markApplied);
-      else if (records) {
-        db.transaction(() => {
-          const registry = db
-            .prepare(
-              "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN ('pdpp_instance_binding', 'pdpp_records', 'pdpp_record_changes', 'pdpp_stream_completion', 'pdpp_record_arrival') LIMIT 1",
-            )
-            .get();
-          if (registry)
-            throw new Error(
-              "Canonical record store unavailable for deletion observation",
-            );
-          if (write()) markApplied();
-        }).immediate();
-      } else write();
+      try {
+        if (options.replicationEnabled) db.transaction(write).immediate();
+        else if (store) store.recordScopeDeletion(scope, write, markApplied);
+        else if (records) {
+          db.transaction(() => {
+            const registry = db
+              .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN ('pdpp_instance_binding', 'pdpp_records', 'pdpp_record_changes', 'pdpp_stream_completion', 'pdpp_record_arrival') LIMIT 1",
+              )
+              .get();
+            if (registry)
+              throw new Error(
+                "Canonical record store unavailable for deletion observation",
+              );
+            if (write()) markApplied();
+          }).immediate();
+        } else write();
+      } catch (error) {
+        options.logger?.error(
+          {
+            scope,
+            error: error instanceof Error ? error.message : String(error),
+            ...(error instanceof Error
+              ? {
+                  instance: (error as Error & { instance?: string }).instance,
+                  stream: (error as Error & { stream?: string }).stream,
+                }
+              : {}),
+          },
+          "Scope deletion observation failed; deletion remains hidden",
+        );
+        throw error;
+      }
     },
     get(scope): ScopeTombstone | null {
       const row = get.get(owner, scope) as
@@ -204,6 +225,7 @@ export function migrateScopeDeletionHistory(
           throw new Error(
             "Canonical record store unavailable for deletion migration",
           );
+        if (records) assertScopeStreamsBound(db, scope);
         const methods = exclusiveScopeStreams(scope);
         type Count = { erase: number; keep: number };
         type StreamCounts = {
@@ -239,7 +261,6 @@ export function migrateScopeDeletionHistory(
           for (const stream of exclusive) add(stream, "pdpp_records", true, 0);
         }
         if (records && methods.size > 0) {
-          const exclusive = [...new Set([...methods.values()].flat())];
           const names = [...methods.keys()];
           const archive =
             scope === "claude.conversations"
@@ -266,16 +287,6 @@ export function migrateScopeDeletionHistory(
             "pdpp_stream_completion",
             "pdpp_record_arrival",
           ]) {
-            if (exclusive.length > 0) {
-              const marks = exclusive.map(() => "?").join(",");
-              const unknown = db
-                .prepare(
-                  `SELECT 1 FROM ${table} r LEFT JOIN pdpp_instance_binding b ON b.instance = r.instance WHERE (b.instance IS NULL OR b.method IS NULL) AND NOT EXISTS (SELECT 1 FROM pdpp_claude_transition c WHERE c.archive_instance = r.instance) AND NOT EXISTS (SELECT 1 FROM pdpp_strava_transition t WHERE t.archive_instance = r.instance) AND r.stream IN (${marks}) LIMIT 1`,
-                )
-                .get(...exclusive);
-              if (unknown)
-                throw new Error("Cannot establish the owner of a stream");
-            }
             const rows = db
               .prepare(
                 `SELECT b.method, r.stream, COUNT(*) AS count FROM ${table} r JOIN pdpp_instance_binding b ON b.instance = r.instance WHERE b.method IN (${names.map(() => "?").join(",")}) GROUP BY b.method, r.stream`,
@@ -330,9 +341,18 @@ export function migrateScopeDeletionHistory(
         db.transaction(() => {
           if (preview()) mark.run(owner, scope);
         }).immediate();
-    } catch {
+    } catch (error) {
       logger.error(
-        { scope },
+        {
+          scope,
+          error: error instanceof Error ? error.message : String(error),
+          ...(error instanceof Error
+            ? {
+                instance: (error as Error & { instance?: string }).instance,
+                stream: (error as Error & { stream?: string }).stream,
+              }
+            : {}),
+        },
         "Scope deletion migration failed; deletion remains hidden",
       );
     }
