@@ -1,4 +1,7 @@
-import { trackLegacyScopeMutations } from "./legacy-scope-revalidation-state.js";
+import {
+  trackLegacyScopeMutations,
+  type LegacyRevalidationState,
+} from "./legacy-scope-revalidation-state.js";
 import { readlinkSync } from "node:fs";
 import { setPriority } from "node:os";
 import { isDeepStrictEqual } from "node:util";
@@ -51,11 +54,12 @@ export const isLegacyEvaluationWorker =
 
 /** Separate event loop and SQLite handle: projection CPU never runs in ingest. */
 export function createLegacyEvaluationWorker(
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; state?: LegacyRevalidationState } = {},
 ) {
   const epoch = new Int32Array(new SharedArrayBuffer(4));
   let worker: Worker | undefined;
   let closed = false;
+  let running = false;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   type Result = { wallMs: number; peakRssKiB: number; refused: string[] };
   let active:
@@ -72,53 +76,88 @@ export function createLegacyEvaluationWorker(
       interrupted?.reject(error);
     });
   }
+  function dispatch(
+    input: Omit<LegacyEvaluationJob, "epoch">,
+  ): Promise<Result> {
+    if (!worker) {
+      const url = import.meta.url.endsWith(".ts")
+        ? new URL(
+            "../../dist/storage/legacy-scope-evaluation.js",
+            import.meta.url,
+          )
+        : new URL(import.meta.url);
+      const current = new Worker(url, {
+        workerData: { legacyScopeEvaluation: true, epoch: epoch.buffer },
+        resourceLimits: { maxOldGenerationSizeMb: 1024 },
+      });
+      worker = current;
+      current.on("message", (message) => {
+        if (worker !== current) return;
+        clearTimeout(timeout);
+        if (message.error) active?.reject(Error(message.error));
+        else active?.resolve(message);
+        active = undefined;
+      });
+      current.on("error", (error) =>
+        fail(
+          current,
+          error instanceof Error ? error : Error("Legacy evaluator failed"),
+        ),
+      );
+      current.on("exit", () =>
+        fail(current, Error("Legacy evaluator stopped")),
+      );
+    }
+    const current = worker;
+    return new Promise<Result>((resolve, reject) => {
+      active = { resolve, reject };
+      timeout = setTimeout(
+        () => fail(current, Error("Legacy evaluator exceeded its time budget")),
+        options.timeoutMs ?? 60_000,
+      );
+      timeout.unref();
+      current.postMessage({ ...input, epoch: Atomics.load(epoch, 0) });
+    });
+  }
   return {
     invalidate() {
       Atomics.add(epoch, 0, 1);
     },
     evaluate(input: Omit<LegacyEvaluationJob, "epoch">) {
       if (closed) throw Error("Legacy evaluator is closed");
-      if (active) throw Error("Legacy evaluator is already running");
-      if (!worker) {
-        const url = import.meta.url.endsWith(".ts")
-          ? new URL(
-              "../../dist/storage/legacy-scope-evaluation.js",
-              import.meta.url,
-            )
-          : new URL(import.meta.url);
-        const current = new Worker(url, {
-          workerData: { legacyScopeEvaluation: true, epoch: epoch.buffer },
-          resourceLimits: { maxOldGenerationSizeMb: 1024 },
-        });
-        worker = current;
-        current.on("message", (message) => {
-          if (worker !== current) return;
-          clearTimeout(timeout);
-          if (message.error) active?.reject(Error(message.error));
-          else active?.resolve(message);
-          active = undefined;
-        });
-        current.on("error", (error) =>
-          fail(
-            current,
-            error instanceof Error ? error : Error("Legacy evaluator failed"),
-          ),
-        );
-        current.on("exit", () =>
-          fail(current, Error("Legacy evaluator stopped")),
-        );
-      }
-      const current = worker;
-      return new Promise<Result>((resolve, reject) => {
-        active = { resolve, reject };
-        timeout = setTimeout(
-          () =>
-            fail(current, Error("Legacy evaluator exceeded its time budget")),
-          options.timeoutMs ?? 60_000,
-        );
-        timeout.unref();
-        current.postMessage({ ...input, epoch: Atomics.load(epoch, 0) });
-      });
+      if (running) throw Error("Legacy evaluator is already running");
+      running = true;
+      return (async () => {
+        const result: Result = { wallMs: 0, peakRssKiB: 0, refused: [] };
+        let failure: unknown;
+        try {
+          // Each scope gets the full budget; one slow scope cannot consume the
+          // tail's budget. Keep a single Worker to bound projection memory.
+          for (const scope of input.scopes) {
+            if (closed) throw Error("Legacy evaluator stopped");
+            const revision = options.state?.revision(input.instance);
+            try {
+              const next = await dispatch({ ...input, scopes: [scope] });
+              result.wallMs += next.wallMs;
+              result.peakRssKiB = Math.max(result.peakRssKiB, next.peakRssKiB);
+              result.refused.push(...next.refused);
+            } catch (error) {
+              if (closed) throw error;
+              failure ??= error;
+            }
+            if (revision !== undefined)
+              options.state!.acknowledgeAttempt(
+                input.instance,
+                scope,
+                revision,
+              );
+          }
+          if (failure) throw failure;
+          return result;
+        } finally {
+          running = false;
+        }
+      })();
     },
     async stop() {
       closed = true;

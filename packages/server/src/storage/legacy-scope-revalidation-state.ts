@@ -22,6 +22,7 @@ export interface LegacyRevalidationState {
   observePolicy(fingerprint: string, since: number): void;
   ensureDirty(): void;
   complete(instance: string, scope: string, revision: number): boolean;
+  acknowledgeAttempt(instance: string, scope: string, revision: number): void;
   fail(instance: string, scopes: readonly string[]): void;
   status(instance: string, scope: string): LegacyRevalidationStatus | undefined;
   overdue(instance: string, scope: string): boolean;
@@ -63,22 +64,20 @@ function makeState(
     CREATE TABLE IF NOT EXISTS legacy_scope_revalidation_scopes (
     instance TEXT NOT NULL,scope TEXT NOT NULL,dirty_since INTEGER,
     ceiling_ms INTEGER NOT NULL,error_count INTEGER NOT NULL DEFAULT 0,reason TEXT,
-    confirmed_revision INTEGER,
+    confirmed_revision INTEGER,attempted_revision INTEGER,
     PRIMARY KEY(instance,scope));
     CREATE TABLE IF NOT EXISTS legacy_scope_revalidation_policy (
     id INTEGER PRIMARY KEY CHECK(id=1),fingerprint TEXT NOT NULL);`);
   // Older bridge versions did not retain the revision confirmed by a clean
   // marker. Unknown revisions need recovery, not an assumed current proof.
-  if (
-    !(
-      raw.pragma("table_info(legacy_scope_revalidation_scopes)") as {
-        name: string;
-      }[]
-    ).some((column) => column.name === "confirmed_revision")
-  )
-    raw.exec(
-      "ALTER TABLE legacy_scope_revalidation_scopes ADD COLUMN confirmed_revision INTEGER",
-    );
+  const columns = raw.pragma(
+    "table_info(legacy_scope_revalidation_scopes)",
+  ) as { name: string }[];
+  for (const column of ["confirmed_revision", "attempted_revision"])
+    if (!columns.some((existing) => existing.name === column))
+      raw.exec(
+        `ALTER TABLE legacy_scope_revalidation_scopes ADD COLUMN ${column} INTEGER`,
+      );
   const bump =
     raw.prepare(`INSERT INTO legacy_scope_revalidation_instances(instance,revision) VALUES (?,1)
     ON CONFLICT(instance) DO UPDATE SET revision=revision+1`);
@@ -118,10 +117,11 @@ function makeState(
     if (!bindingsReady) bindingsReady = bindingTable.get() !== undefined;
     if (!bindingsReady) return [];
     candidateQuery ??=
-      raw.prepare(`SELECT DISTINCT b.instance,t.scope FROM legacy_scope_takeovers t
+      raw.prepare(`SELECT DISTINCT b.instance,t.scope,COALESCE(s.attempted_revision,-1) AS attempted_revision FROM legacy_scope_takeovers t
       JOIN pdpp_instance_binding b ON (t.instance=b.instance AND t.generation=b.generation) OR t.instance=''
+      LEFT JOIN legacy_scope_revalidation_scopes s ON s.instance=b.instance AND s.scope=t.scope
       WHERE b.deleted_at IS NULL AND EXISTS(SELECT 1 FROM data_files f WHERE f.scope=t.scope)
-      ORDER BY b.instance,t.scope`);
+      ORDER BY b.instance,attempted_revision,t.scope`);
     const rows = candidateQuery.all() as { instance: string; scope: string }[];
     const result = new Map<string, { instance: string; scopes: string[] }>();
     for (const { instance, scope } of rows) {
@@ -358,12 +358,26 @@ function makeState(
       if (Number(readRevision.get(instance) ?? 0) !== revision) return false;
       raw
         .prepare(
-          `INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms,confirmed_revision) VALUES (?,?,NULL,?,?)
-         ON CONFLICT(instance,scope) DO UPDATE SET dirty_since=NULL,error_count=0,reason=NULL,confirmed_revision=excluded.confirmed_revision
-         WHERE dirty_since IS NOT NULL OR error_count<>0 OR reason IS NOT NULL OR confirmed_revision IS NOT excluded.confirmed_revision`,
+          `INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms,confirmed_revision,attempted_revision) VALUES (?,?,NULL,?,?,?)
+         ON CONFLICT(instance,scope) DO UPDATE SET dirty_since=NULL,error_count=0,reason=NULL,confirmed_revision=excluded.confirmed_revision,attempted_revision=excluded.attempted_revision
+         WHERE dirty_since IS NOT NULL OR error_count<>0 OR reason IS NOT NULL OR confirmed_revision IS NOT excluded.confirmed_revision OR attempted_revision IS NOT excluded.attempted_revision`,
         )
-        .run(instance, scope, options.ceilingMs, revision);
+        .run(instance, scope, options.ceilingMs, revision, revision);
       return true;
+    },
+    acknowledgeAttempt(instance: string, scope: string, revision: number) {
+      // An attempt is scheduling progress, never a positive coverage proof.
+      // Keep it across boot invalidation so restarts resume the unfinished tail.
+      raw
+        .transaction(() => {
+          if (Number(readRevision.get(instance) ?? 0) !== revision) return;
+          raw
+            .prepare(
+              "UPDATE legacy_scope_revalidation_scopes SET attempted_revision=? WHERE instance=? AND scope=?",
+            )
+            .run(revision, instance, scope);
+        })
+        .immediate();
     },
     fail(instance: string, scopes: readonly string[]) {
       const statement = raw.prepare(

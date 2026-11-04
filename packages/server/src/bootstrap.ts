@@ -1185,7 +1185,9 @@ export async function createServer(
     },
   });
 
-  const evaluationWorker = createLegacyEvaluationWorker();
+  const evaluationWorker = createLegacyEvaluationWorker({
+    state: revalidationState,
+  });
   const evaluationConfig = () => ({
     database: db.name,
     ceilingMs,
