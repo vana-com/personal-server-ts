@@ -289,7 +289,7 @@ async function replaceStream(
   expect(response.status, response.text).toBe(200);
 }
 
-async function setupCoveredLegacyScope() {
+async function setupCoveredLegacyScope(establishTakeover = true) {
   const legacyData = {
     conversations: [
       {
@@ -362,14 +362,16 @@ async function setupCoveredLegacyScope() {
     T0,
   );
 
-  const takeover = await ownerGet(`/v1/data/${SCOPE}`);
-  expect(takeover.status).toBe(200);
-  expect(takeover.dataSource).toBe("canonical");
-  const takeoverEvidence = messageEvidence(
-    JSON.parse(takeover.text) as unknown,
-  );
-  expect(takeoverEvidence.ids).toContain(LEGACY_DELETED_MESSAGE_ID);
-  expect(takeoverEvidence.contentHashes).toContain(DELETED_CONTENT_SHA256);
+  if (establishTakeover) {
+    const takeover = await ownerGet(`/v1/data/${SCOPE}`);
+    expect(takeover.status).toBe(200);
+    expect(takeover.dataSource).toBe("canonical");
+    const takeoverEvidence = messageEvidence(
+      JSON.parse(takeover.text) as unknown,
+    );
+    expect(takeoverEvidence.ids).toContain(LEGACY_DELETED_MESSAGE_ID);
+    expect(takeoverEvidence.contentHashes).toContain(DELETED_CONTENT_SHA256);
+  }
 
   const legacyEntry = ctx!.indexManager.findLatestByScope(SCOPE);
   expect(legacyEntry).toBeDefined();
@@ -393,6 +395,23 @@ function expectRetainedMessageTombstone() {
       data: null,
       deleted: 1,
     });
+  } finally {
+    db.close();
+  }
+}
+
+function expectNoLegacyTakeover() {
+  const db = new Database(join(tempDir, "index.db"), {
+    readonly: true,
+    fileMustExist: true,
+  });
+  try {
+    const row = db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM legacy_scope_takeovers WHERE scope = ?",
+      )
+      .get(SCOPE) as { count: number };
+    expect(row.count).toBe(0);
   } finally {
     db.close();
   }
@@ -586,5 +605,87 @@ describe("ChatGPT retained-message deletion through the real server", () => {
     expectDeletedBodyAbsent(postReopenLatest);
     expect(exposuresOf(preReopenReads)).toEqual([]);
     expect(exposuresOf(postReopenReads)).toEqual([]);
+  });
+
+  it("refuses deleted history through every legacy read before canonical takeover", async () => {
+    const { legacyEntry } = await setupCoveredLegacyScope(false);
+    expectNoLegacyTakeover();
+
+    const at = encodeURIComponent(legacyEntry.collectedAt);
+    const fileId = encodeURIComponent(legacyEntry.fileId!);
+    const preDeleteHistory = [
+      {
+        path: "stored",
+        response: await ownerGet(`/v1/data/${SCOPE}?view=stored`),
+      },
+      {
+        path: "history-at",
+        response: await ownerGet(`/v1/data/${SCOPE}?at=${at}`),
+      },
+      {
+        path: "stored-at",
+        response: await ownerGet(`/v1/data/${SCOPE}?view=stored&at=${at}`),
+      },
+      {
+        path: "history-file-id",
+        response: await ownerGet(`/v1/data/${SCOPE}?fileId=${fileId}`),
+      },
+      {
+        path: "stored-file-id",
+        response: await ownerGet(
+          `/v1/data/${SCOPE}?view=stored&fileId=${fileId}`,
+        ),
+      },
+    ];
+    expect(preDeleteHistory.map(({ response }) => response.status)).toEqual([
+      200, 200, 200, 200, 200,
+    ]);
+    expectNoLegacyTakeover();
+    expect(
+      exposuresOf(preDeleteHistory)
+        .map(({ path }) => path)
+        .sort(),
+    ).toEqual([
+      "history-at",
+      "history-file-id",
+      "stored",
+      "stored-at",
+      "stored-file-id",
+    ]);
+
+    await damageConversationWithDeletedParent();
+    const afterDelete = await readLegacyAndRecordSurfaces(legacyEntry);
+    const latest = afterDelete.find(({ path }) => path === "latest")!.response;
+    expectCanonicalRefusal(latest);
+    expectDeletedBodyAbsent(latest);
+
+    const listing = afterDelete.find(
+      ({ path }) => path === "scope-list",
+    )!.response;
+    expect(listing.status).toBe(200);
+    expectDeletedBodyAbsent(listing);
+
+    const messageList = afterDelete.find(
+      ({ path }) => path === "record-list",
+    )!.response;
+    expect(messageList.status).toBe(200);
+    const liveMessageRows = (
+      JSON.parse(messageList.text) as {
+        data: { id: string; data?: { content?: string } }[];
+      }
+    ).data;
+    expect(liveMessageRows.map((row) => row.id)).not.toContain(
+      DELETED_MESSAGE_ID,
+    );
+    expect(liveMessageRows).toContainEqual(
+      expect.objectContaining({
+        id: "H:h0",
+        data: expect.objectContaining({ content: "healthy synthetic H body" }),
+      }),
+    );
+
+    expect(exposuresOf(afterDelete)).toEqual([]);
+    expectNoLegacyTakeover();
+    expectRetainedMessageTombstone();
   });
 });
