@@ -269,34 +269,39 @@ function ensureSchemaVersion(db: Database.Database): void {
   db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
 }
 
+/** Shared main/Worker connection policy; check versions before changing storage. */
+export function configureDatabaseConnection(db: Database.Database): void {
+  db.pragma("busy_timeout = 5000");
+  // `user_version` belongs to the legacy index schema. PDPP records use
+  // their own `pdpp_schema_version`; neither counter may stand in for the
+  // other. Check before changing journal mode or creating any schema so a
+  // rollback runtime fails closed without touching a newer database.
+  assertSupportedSchemaVersions(db, PDPP_RECORD_SCHEMA_VERSION);
+  const deadline = performance.now() + 5000;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    try {
+      if (db.pragma("journal_mode", { simple: true }) !== "wal") {
+        db.pragma("journal_mode = WAL");
+      }
+      break;
+    } catch (err) {
+      if (
+        (err as { code?: string }).code !== "SQLITE_BUSY" ||
+        performance.now() >= deadline
+      )
+        throw err;
+      Atomics.wait(pause, 0, 0, Math.min(50, deadline - performance.now()));
+    }
+  }
+  db.pragma("synchronous = FULL");
+}
+
 /** Open/create SQLite database, run CREATE TABLE IF NOT EXISTS, set WAL mode */
 export function initializeDatabase(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   try {
-    db.pragma("busy_timeout = 5000");
-    // `user_version` belongs to the legacy index schema. PDPP records use
-    // their own `pdpp_schema_version`; neither counter may stand in for the
-    // other. Check before changing journal mode or creating any schema so a
-    // rollback runtime fails closed without touching a newer database.
-    assertSupportedSchemaVersions(db, PDPP_RECORD_SCHEMA_VERSION);
-    const deadline = performance.now() + 5000;
-    const pause = new Int32Array(new SharedArrayBuffer(4));
-    for (;;) {
-      try {
-        if (db.pragma("journal_mode", { simple: true }) !== "wal") {
-          db.pragma("journal_mode = WAL");
-        }
-        break;
-      } catch (err) {
-        if (
-          (err as { code?: string }).code !== "SQLITE_BUSY" ||
-          performance.now() >= deadline
-        )
-          throw err;
-        Atomics.wait(pause, 0, 0, Math.min(50, deadline - performance.now()));
-      }
-    }
-    db.pragma("synchronous = FULL");
+    configureDatabaseConnection(db);
 
     db.exec(CREATE_TABLE_SQL);
     db.exec(CREATE_SCOPE_REVISIONS_SQL);

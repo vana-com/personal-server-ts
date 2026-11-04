@@ -20,6 +20,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { createServer, type ServerContext } from "../bootstrap.js";
 import { initializeDatabase } from "./index-schema.js";
+import { trackLegacyScopeMutations } from "./legacy-scope-revalidation-state.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 
@@ -281,8 +282,12 @@ describe("B-written Desktop profile convergence", () => {
           expect(Buffer.from(store.getBlobBytes(blob.blobId)!)).toEqual(
             Buffer.from(blob.text),
           );
+        const state = trackLegacyScopeMutations(openDb, {
+          ceilingMs: 1_800_000,
+        });
+        state.observePolicy("desktop upgrade fixture", Date.now());
         const view = createLegacyScopeView({
-          authority: createLegacyScopeAuthority(openDb),
+          authority: createLegacyScopeAuthority(openDb, state),
           records: store,
           configuredMethods: (id) => (id === source ? [scenario.method] : []),
           readLegacyHead: async (head) =>
@@ -290,11 +295,30 @@ describe("B-written Desktop profile convergence", () => {
               await readFile(join(dir!, "data", head.path), "utf8"),
             ) as DataFileEnvelope,
         });
-        if (restart === 0)
+        if (restart === 0) {
+          // These B fixtures have a current-head replacement witness. SWR keeps
+          // it listed until the fresh read below confirms or retracts it.
+          const retainedAt: Record<string, string> = {
+            fewer: "2026-10-21T12:00:00.000Z",
+            disjoint: "2026-10-21T12:00:00.000Z",
+            empty: "2026-10-21T12:00:00.000Z",
+            parity: "2026-10-01T12:00:00.000Z",
+            "stale-nonhead": "2026-10-20T12:00:00.000Z",
+            "unreceipted-loss": "2026-10-20T12:00:00.000Z",
+          };
           for (const scope of scopes)
-            expect(view.listingFor(scope)).toEqual(
-              scenario.listingBefore[scope],
+            expect(view.listingFor(scope), `${scenario.name}:${scope}`).toEqual(
+              retainedAt[scenario.name] &&
+                !(
+                  scenario.name === "stale-nonhead" && scope === "oura.activity"
+                ) &&
+                !(
+                  scenario.name === "unreceipted-loss" && scope === "oura.sleep"
+                )
+                ? { kind: "canonical", collectedAt: retainedAt[scenario.name] }
+                : scenario.listingBefore[scope],
             );
+        }
         for (const scope of scopes) {
           const read = await view.readLatest(scope);
           expect(read.kind).toBe(scenario.expected[scope]!.kind);

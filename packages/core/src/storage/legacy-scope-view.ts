@@ -152,6 +152,31 @@ function scopeDeclarationCursor(scope: string): string {
   );
 }
 
+/** Shared identity for persisted witnesses and their cursor representation. */
+export const LEGACY_SCOPE_WITNESS_IDENTITY = {
+  cursorVersion: "legacy-scope-cursor/1",
+  coverageRule: COVERAGE_RULE_VERSION,
+  projectionContract: CANONICAL_LEGACY_VIEW_CONTRACT,
+  bindingDeclarations: [
+    ...new Set(BINDING_PROFILES.flatMap((profile) => [...profile.keys()])),
+  ]
+    .sort()
+    .map(scopeDeclarationCursor),
+} as const;
+
+/** Compare semantic identity alone; source clocks intentionally do not participate. */
+export function legacyScopeCursorIsCurrent(
+  scope: string,
+  cursor: string,
+): boolean {
+  return (
+    cursor.startsWith(`${LEGACY_SCOPE_WITNESS_IDENTITY.cursorVersion}:`) &&
+    cursor.includes(
+      `:${CANONICAL_LEGACY_VIEW_CONTRACT}:${scopeDeclarationCursor(scope)}:${COVERAGE_RULE_VERSION}:`,
+    )
+  );
+}
+
 /**
  * Registry facts and takeover diagnostics from the same SQLite database as
  * the rows. Facts must work when the record server is not mounted (its tables
@@ -174,6 +199,18 @@ export interface LegacyScopeAuthority {
   writeClock(): number;
   /** Monotonic arrival revision, independent of record content writes. */
   arrivalRevision(): number;
+  /** Full dependency revision, including blob, replica and quarantine changes. */
+  dependencyRevision?(instance: string): number;
+  /** One snapshot of mutation identity and cached-body admission. */
+  witnessState?(
+    scope: string,
+    instance: string,
+  ): {
+    dependencyRevision: number;
+    dirtySince: number | null;
+    deadline: number | null;
+    reusable: boolean;
+  };
   /** Whether a complete canonical read has already superseded the legacy head. */
   hasTakeover(scope: string, instance?: string, generation?: number): boolean;
   /**
@@ -194,6 +231,12 @@ export interface LegacyScopeAuthority {
     generation: number,
     method: string,
     canonicalCursor: string,
+  ): boolean;
+  hasListingWitness(
+    scope: string,
+    head: LegacyScopeHead,
+    instance: string,
+    generation: number,
   ): boolean;
   isReset(scope: string): boolean;
   cachedVerdict(
@@ -224,6 +267,7 @@ export interface LegacyScopeAuthority {
       generation: number;
       writeClock: number;
       arrivalRevision: number;
+      dependencyRevision: number;
       canonicalCursor: string;
     } & (
       | { coverage: LegacyCoverageVerdict; cached: boolean; completion?: false }
@@ -281,6 +325,8 @@ export type LegacyScopeRefusal =
   | {
       status: "incomplete";
       reason: "canonical_view_incomplete";
+      /** Missing proof may recover; observed data loss is a final refusal. */
+      confirmation: "confirmed" | "unconfirmed";
       diagnostics: {
         stream: string;
         kind: "omitted" | "partial" | "unproven";
@@ -673,6 +719,27 @@ export function createLegacyScopeView(
     if (hasLegacyHead && !hasTakeover && !initialOuraRunComplete(decision)) {
       return { kind: "file" };
     }
+    // Inventory retains the last proved body while a background read refreshes it.
+    // Admission and the complete eligible-head identity remain live.
+    if (legacyHead !== null && hasTakeover) {
+      if (
+        !authority.hasListingWitness(
+          scope,
+          legacyHead,
+          decision.selection.instance,
+          decision.generation,
+        )
+      )
+        return { kind: "refused" };
+      const collectedAt = listedCollectedAt(
+        decision.records,
+        decision.selection.instance,
+        decision.streams,
+      );
+      return collectedAt === null
+        ? { kind: "refused" }
+        : { kind: "canonical", collectedAt };
+    }
     const completedReplacement =
       legacyHead !== null &&
       authority.hasCompletedReplacement?.(
@@ -687,6 +754,7 @@ export function createLegacyScopeView(
           authority.writeClock(),
           authority.arrivalRevision(),
           receiptCursor(decision, input.declarations),
+          authority.dependencyRevision?.(decision.selection.instance) ?? 0,
         ),
       ) === true;
     if (hasLegacyHead && input.readLegacyHead && !completedReplacement) {
@@ -710,6 +778,7 @@ export function createLegacyScopeView(
           authority.writeClock(),
           authority.arrivalRevision(),
           receiptCursor(decision, input.declarations),
+          authority.dependencyRevision?.(decision.selection.instance) ?? 0,
         )
       ) {
         return { kind: "refused" };
@@ -775,10 +844,13 @@ export function createLegacyScopeView(
     writeClock: number,
     arrivalRevision: number,
     receipts: string,
+    dependencyRevision: number,
   ): string {
     return [
+      LEGACY_SCOPE_WITNESS_IDENTITY.cursorVersion,
       writeClock,
       arrivalRevision,
+      dependencyRevision,
       receipts,
       decision.generation,
       CANONICAL_LEGACY_VIEW_CONTRACT,
@@ -793,7 +865,12 @@ export function createLegacyScopeView(
   function readDecision(scope: string) {
     return authority.readSnapshot(() => {
       const decision = decide(scope);
+      const witness =
+        decision.kind === "canonical"
+          ? authority.witnessState?.(scope, decision.selection.instance)
+          : undefined;
       return {
+        witness,
         reset: authority.isReset(scope),
         decision,
         retainedEntityLoss:
@@ -820,6 +897,12 @@ export function createLegacyScopeView(
           decision.kind !== "canonical" || initialOuraRunComplete(decision),
         writeClock: authority.writeClock(),
         arrivalRevision: authority.arrivalRevision(),
+        dependencyRevision:
+          decision.kind === "canonical"
+            ? (witness?.dependencyRevision ??
+              authority.dependencyRevision?.(decision.selection.instance) ??
+              0)
+            : 0,
         receiptCursor:
           decision.kind === "canonical"
             ? receiptCursor(decision, input.declarations)
@@ -844,16 +927,82 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return decision;
+    const confirmIncomplete = async (
+      refusal: LegacyScopeRefusal,
+    ): Promise<ChosenBody> => {
+      if (legacyHead === null || !input.readLegacyHead)
+        return { kind: "refused", refusal };
+      let legacy: DataFileEnvelope;
+      try {
+        legacy = await input.readLegacyHead(legacyHead);
+      } catch {
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail: "indexed legacy head could not be read",
+          },
+        };
+      }
+      if (legacy.scope !== scope)
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail: "indexed legacy head has another scope",
+          },
+        };
+      // Inventory and reads consume this same saved verdict. A confirmed
+      // incomplete projection must replace the previous covered witness.
+      const confirmed = authority.confirmRead(
+        scope,
+        legacyHead,
+        () =>
+          sameSelection(decide(scope), decision) &&
+          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
+        {
+          instance: decision.selection.instance,
+          generation: decision.generation,
+          writeClock: initial.writeClock,
+          arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
+          canonicalCursor: coverageCursor(
+            scope,
+            decision,
+            initial.writeClock,
+            initial.arrivalRevision,
+            initial.receiptCursor,
+            initial.dependencyRevision,
+          ),
+          coverage: projectionUnavailableCoverage(legacy.data),
+          cached: false,
+        },
+      );
+      if (!confirmed) {
+        if (authority.isReset(scope)) return { kind: "file" };
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail:
+              "legacy head or canonical cursor changed during incomplete projection",
+          },
+        };
+      }
+      return { kind: "refused", refusal };
+    };
     if (initial.retainedEntityLoss && !ouraCompletedReplacement(decision)) {
       return hasTakeover || legacyHead === null
-        ? {
-            kind: "refused",
-            refusal: {
-              status: "incomplete",
-              reason: "canonical_view_incomplete",
-              diagnostics: [],
-            },
-          }
+        ? confirmIncomplete({
+            status: "incomplete",
+            reason: "canonical_view_incomplete",
+            confirmation: "confirmed",
+            diagnostics: [],
+          })
         : { kind: "file" };
     }
     if (
@@ -873,16 +1022,18 @@ export function createLegacyScopeView(
           initial.writeClock,
           initial.arrivalRevision,
           initial.receiptCursor,
+          initial.dependencyRevision,
         )
       : "";
-    const projectionKey = legacyHead
-      ? JSON.stringify([
-          decision.selection.instance,
-          decision.generation,
-          legacyHead.id,
-          canonicalCursor,
-        ])
-      : "";
+    const keyFor = (witness = initial.witness) =>
+      JSON.stringify([
+        decision.selection.instance,
+        decision.generation,
+        legacyHead?.id,
+        canonicalCursor,
+        witness,
+      ]);
+    const projectionKey = legacyHead ? keyFor() : "";
     const projectionOwner = scope;
     const cachedCoverage =
       legacyHead !== null && input.readLegacyHead
@@ -895,7 +1046,11 @@ export function createLegacyScopeView(
           )
         : null;
     const cachedProjection = coveredProjection.get(projectionOwner);
-    if (cachedCoverage?.covered && cachedProjection?.key === projectionKey) {
+    if (
+      cachedCoverage?.covered &&
+      (initial.witness?.reusable ?? true) &&
+      cachedProjection?.key === projectionKey
+    ) {
       const confirmed = authority.confirmRead(
         scope,
         legacyHead,
@@ -908,6 +1063,7 @@ export function createLegacyScopeView(
           generation: decision.generation,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
           canonicalCursor,
           coverage: cachedCoverage,
           cached: true,
@@ -979,6 +1135,7 @@ export function createLegacyScopeView(
           generation: decision.generation,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
           canonicalCursor,
           coverage: cachedCoverage,
           cached: true,
@@ -1002,6 +1159,7 @@ export function createLegacyScopeView(
             refusal: {
               status: "incomplete",
               reason: "canonical_view_incomplete",
+              confirmation: "confirmed",
               diagnostics: [],
             },
           }
@@ -1069,7 +1227,8 @@ export function createLegacyScopeView(
             generation: decision.generation,
             writeClock: initial.writeClock,
             arrivalRevision: initial.arrivalRevision,
-            canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
+            dependencyRevision: initial.dependencyRevision,
+            canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.dependencyRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
             coverage,
             cached: false,
           },
@@ -1120,34 +1279,28 @@ export function createLegacyScopeView(
         );
         if (stillLegacyOwned) return { kind: "file" };
       }
-      return {
-        kind: "refused",
-        refusal: {
-          status: "incomplete",
-          reason: "canonical_view_incomplete",
-          diagnostics: incompleteness(read),
-        },
-      };
+      return confirmIncomplete({
+        ...incompleteView(read),
+        confirmation: "confirmed",
+      });
     }
     if (
       initial.chatgptMessageTombstones &&
       (read.chatgptCoverageGaps?.length ?? 0) > 0
     ) {
-      return {
-        kind: "refused",
-        refusal: {
-          status: "incomplete",
-          reason: "canonical_view_incomplete",
-          diagnostics: [
-            {
-              stream: "messages",
-              kind: "omitted",
-              detail:
-                "conversation branch exclusions cannot bypass retained message tombstones",
-            },
-          ],
-        },
-      };
+      return confirmIncomplete({
+        status: "incomplete",
+        reason: "canonical_view_incomplete",
+        confirmation: "confirmed",
+        diagnostics: [
+          {
+            stream: "messages",
+            kind: "omitted",
+            detail:
+              "conversation branch exclusions cannot bypass retained message tombstones",
+          },
+        ],
+      });
     }
     // Whole-dataset replacement needs a fresh completion for every input.
     // Equal/older horizons retain the existing parity path, not deletion authority.
@@ -1170,6 +1323,7 @@ export function createLegacyScopeView(
           generation: decision.generation,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
           canonicalCursor,
           completion: true,
         },
@@ -1207,11 +1361,7 @@ export function createLegacyScopeView(
       if (stillLegacyOwned) return { kind: "file" };
       return {
         kind: "refused",
-        refusal: {
-          status: "incomplete",
-          reason: "canonical_view_incomplete",
-          diagnostics: incompleteness(read),
-        },
+        refusal: incompleteView(read),
       };
     }
     if (legacyHead !== null && input.readLegacyHead) {
@@ -1303,6 +1453,7 @@ export function createLegacyScopeView(
           generation: decision.generation,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
           canonicalCursor,
           coverage,
           cached,
@@ -1329,13 +1480,23 @@ export function createLegacyScopeView(
               refusal: {
                 status: "incomplete",
                 reason: "canonical_view_incomplete",
+                confirmation: "confirmed",
                 diagnostics: [],
               },
             }
           : { kind: "file" };
       }
       coveredProjection.set(projectionOwner, {
-        key: projectionKey,
+        // Confirmation cleared this captured revision's dirty marker. Never
+        // read a newer revision here and attach an older body to its key.
+        key: initial.witness
+          ? keyFor({
+              ...initial.witness,
+              dirtySince: null,
+              deadline: null,
+              reusable: true,
+            })
+          : projectionKey,
         envelope: read.envelope,
         revision: read.revision,
         chatgptCoverageGaps: read.chatgptCoverageGaps,
@@ -1352,17 +1513,16 @@ export function createLegacyScopeView(
       }
       return {
         kind: "refused",
-        refusal: {
-          status: "incomplete",
-          reason: "canonical_view_incomplete",
-          diagnostics: incompleteness(read),
-        },
+        refusal: incompleteView(read),
       };
     }
     const confirmed = authority.confirmRead(
       scope,
       legacyHead,
-      () => sameSelection(decide(scope), decision),
+      () =>
+        sameSelection(decide(scope), decision) &&
+        (authority.dependencyRevision?.(decision.selection.instance) ?? 0) ===
+          initial.dependencyRevision,
       decision.selection.method,
     );
     if (!confirmed) {
@@ -1416,6 +1576,7 @@ export function createLegacyScopeView(
         return {
           status: "incomplete",
           reason: "canonical_view_incomplete",
+          confirmation: "confirmed",
           diagnostics: [
             {
               stream: "messages",
@@ -1693,29 +1854,34 @@ function listedCollectedAt(
   return Number.isFinite(newest) ? new Date(newest).toISOString() : null;
 }
 
-function incompleteness(
+function incompleteView(
   read: CanonicalLegacyReadOk,
-): Extract<
-  LegacyScopeRefusal,
-  { reason: "canonical_view_incomplete" }
->["diagnostics"] {
+): Extract<LegacyScopeRefusal, { reason: "canonical_view_incomplete" }> {
   const { omissions, partialRows, unproven } = read.diagnostics;
-  return [
-    ...omissions.map((entry) => ({
-      stream: entry.stream,
-      kind: "omitted" as const,
-      detail: `${entry.count} rows: ${entry.reasons.join("; ")}`,
-    })),
-    ...partialRows.map((entry) => ({
-      stream: entry.stream,
-      kind: "partial" as const,
-      detail: `${entry.count} rows: ${entry.reasons.join("; ")}`,
-    })),
-    // Optional on the canonical-legacy-view/4 contract: omitted when empty.
-    ...(unproven ?? []).map((entry) => ({
-      stream: entry.stream,
-      kind: "unproven" as const,
-      detail: `${entry.aspect}: ${entry.reason}`,
-    })),
-  ];
+  return {
+    status: "incomplete",
+    reason: "canonical_view_incomplete",
+    confirmation:
+      omissions.length > 0 || partialRows.length > 0
+        ? "confirmed"
+        : "unconfirmed",
+    diagnostics: [
+      ...omissions.map((entry) => ({
+        stream: entry.stream,
+        kind: "omitted" as const,
+        detail: `${entry.count} rows: ${entry.reasons.join("; ")}`,
+      })),
+      ...partialRows.map((entry) => ({
+        stream: entry.stream,
+        kind: "partial" as const,
+        detail: `${entry.count} rows: ${entry.reasons.join("; ")}`,
+      })),
+      // Optional on the canonical-legacy-view/4 contract: omitted when empty.
+      ...(unproven ?? []).map((entry) => ({
+        stream: entry.stream,
+        kind: "unproven" as const,
+        detail: `${entry.aspect}: ${entry.reason}`,
+      })),
+    ],
+  };
 }

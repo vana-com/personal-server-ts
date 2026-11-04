@@ -1,4 +1,6 @@
+import { legacyScopeCursorIsCurrent } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type { Database } from "better-sqlite3";
+import type { LegacyRevalidationState } from "./legacy-scope-revalidation-state.js";
 import type {
   LegacyScopeAuthority,
   LegacyScopeHead,
@@ -81,7 +83,10 @@ function coverageFromRow(row: VerdictRow): LegacyCoverageVerdict {
  * `readSnapshot` see that same snapshot. Takeover writes only the separate
  * diagnostic ledger; it never changes the legacy index or its files.
  */
-export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
+export function createLegacyScopeAuthority(
+  db: Database,
+  revalidation?: LegacyRevalidationState,
+): LegacyScopeAuthority {
   const hasTable = (name: string) =>
     db
       .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
@@ -92,7 +97,37 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       .prepare("SELECT 1 FROM legacy_scope_takeover_resets WHERE scope = ?")
       .get(scope) !== undefined;
 
+  // Listing may use a dirty witness before its ceiling. Bodies additionally
+  // fence their captured revision; only fresh evaluation may pass the ceiling.
+  function witnessIsCurrent(
+    scope: string,
+    instance: string,
+    revision?: number,
+    fresh = false,
+  ): boolean {
+    if (!revalidation) return !hasTable("legacy_scope_revalidation_scopes");
+    return (
+      (revision === undefined ||
+        revalidation.revision(instance) === revision) &&
+      (fresh ||
+        (!revalidation.overdue(instance, scope) &&
+          (revision === undefined ||
+            revalidation.status(instance, scope)?.dirty_since == null)))
+    );
+  }
+
   return {
+    dependencyRevision: (instance) => revalidation?.revision(instance) ?? 0,
+    witnessState(scope, instance) {
+      const row = revalidation?.status(instance, scope);
+      const dependencyRevision = revalidation?.revision(instance) ?? 0;
+      return {
+        dependencyRevision,
+        dirtySince: row?.dirty_since ?? null,
+        deadline: row?.deadline ?? null,
+        reusable: witnessIsCurrent(scope, instance, dependencyRevision),
+      };
+    },
     listMethodConnections(methods) {
       if (methods.length === 0 || !hasTable("pdpp_instance_binding")) {
         return [];
@@ -231,6 +266,50 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       );
     },
 
+    hasListingWitness(scope, head, instance, generation) {
+      if (!witnessIsCurrent(scope, instance)) return false;
+      if (!hasTable("legacy_scope_takeovers")) return false;
+      const ledger = db
+        .prepare(
+          `SELECT replacement_cursor FROM legacy_scope_takeovers WHERE scope=? AND instance=? AND generation=? AND superseded_path=? AND superseded_version=? AND superseded_cas_revision=? AND superseded_collected_at=?`,
+        )
+        .all(
+          scope,
+          instance,
+          generation,
+          head.path,
+          head.version,
+          head.casRevision,
+          head.collectedAt,
+        ) as { replacement_cursor: string | null }[];
+      if (!ledger.length) return false;
+      const verdict = db
+        .prepare(
+          "SELECT verdict,canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope=? AND instance=? AND generation=? AND legacy_version_id=?",
+        )
+        .get(scope, instance, generation, head.id) as
+        { verdict: string; canonical_cursor: string } | undefined;
+      // Tracked runtimes get the SWR deadline from observePolicy. An untracked
+      // adapter has no grace timer, so it must reject obsolete semantics now.
+      const tracked = hasTable("legacy_scope_revalidation_scopes");
+      if (verdict)
+        return (
+          verdict.verdict === "covered" &&
+          (tracked ||
+            legacyScopeCursorIsCurrent(scope, verdict.canonical_cursor))
+        );
+      const prefix = `${head.id}:`;
+      return ledger.some(
+        (row) =>
+          row.replacement_cursor?.startsWith(prefix) &&
+          (tracked ||
+            legacyScopeCursorIsCurrent(
+              scope,
+              row.replacement_cursor.slice(prefix.length),
+            )),
+      );
+    },
+
     isReset(scope) {
       return isReset(scope);
     },
@@ -242,6 +321,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       legacyVersionId,
       canonicalCursor,
     ) {
+      if (!witnessIsCurrent(scope, instance)) return null;
       if (!hasTable("legacy_scope_takeover_verdicts")) return null;
       const row = db
         .prepare(
@@ -410,6 +490,16 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             ).value
         )
           return false;
+        if (
+          verdict &&
+          !witnessIsCurrent(
+            scope,
+            verdict.instance,
+            verdict.dependencyRevision,
+            !verdict.cached,
+          )
+        )
+          return false;
         if (expectedHead === null) return true;
         if (verdict?.cached) {
           // The same proof as when the takeover was recorded: it also names
@@ -461,6 +551,17 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             expectedHead.id,
             `${expectedHead.id}:${verdict.canonicalCursor}`,
             scope,
+          );
+          // A newly confirmed complete replacement supersedes a prior parity
+          // refusal for this head. Inventory must follow the latest proof.
+          if (hasTable("legacy_scope_takeover_verdicts"))
+            db.prepare(
+              "DELETE FROM legacy_scope_takeover_verdicts WHERE scope=? AND instance=? AND generation=? AND legacy_version_id=? AND verdict='not_covered'",
+            ).run(scope, verdict.instance, verdict.generation, expectedHead.id);
+          revalidation?.complete(
+            verdict.instance,
+            scope,
+            verdict.dependencyRevision,
           );
           return true;
         }
@@ -524,6 +625,11 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             coverage.legacyBytes,
             coverage.canonicalBytes,
             coverage.byteDelta,
+          );
+          revalidation?.complete(
+            verdict.instance,
+            scope,
+            verdict.dependencyRevision,
           );
           if (!coverage.covered) return true;
           db.prepare(

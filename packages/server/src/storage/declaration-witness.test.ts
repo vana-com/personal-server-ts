@@ -21,6 +21,7 @@ import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/sto
 import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { initializeDatabase } from "./index-schema.js";
+import { trackLegacyScopeMutations } from "./legacy-scope-revalidation-state.js";
 
 // These server-level checks run with server-witness and use real SQLite rows
 // and persisted takeover verdicts, not the portable in-memory store.
@@ -33,6 +34,7 @@ describe("current declarations at the server legacy-read boundary", () => {
   const decoded = "title\u0000";
   let db: InstanceType<typeof Database>;
   let store: ReturnType<typeof createSqliteRecordStore>;
+  let state: ReturnType<typeof trackLegacyScopeMutations>;
   let current: ReturnType<typeof createStreamDeclarationRegistry> | undefined;
 
   function registry(annotated: boolean) {
@@ -72,7 +74,7 @@ describe("current declarations at the server legacy-read boundary", () => {
     >[0]["readLegacyHead"],
   ) =>
     createLegacyScopeView({
-      authority: createLegacyScopeAuthority(db),
+      authority: createLegacyScopeAuthority(db, state),
       records: store,
       declarations,
       configuredMethods: (id) => (id === source ? ["chatgpt"] : []),
@@ -82,7 +84,10 @@ describe("current declarations at the server legacy-read boundary", () => {
   beforeEach(() => {
     faults.open = "";
     faults.read = "";
-    db = initializeDatabase(":memory:");
+    state = trackLegacyScopeMutations(initializeDatabase(":memory:"), {
+      ceilingMs: 1_800_000,
+    });
+    db = state.db;
     store = createSqliteRecordStore(db);
     current = undefined;
     store.registerConnection({
@@ -180,13 +185,14 @@ describe("current declarations at the server legacy-read boundary", () => {
     expect(readHead).toHaveBeenCalledTimes(1);
 
     current = registry(true);
-    expect(view.listingFor(scope)).toEqual({ kind: "refused" });
+    expect(view.listingFor(scope).kind).toBe("canonical");
     // The old file contains encoded text. A decoded body no longer covers it:
     // recompute parity and refuse rather than return the stale cached body.
     expect((await view.readLatest(scope)).kind).toBe("refused");
     expect(readHead).toHaveBeenCalledTimes(2);
     expect(view.verdictFor(scope)[0]!.canonicalCursor).not.toBe(cursor);
     expect(view.verdictFor(scope)[0]!.verdict).toBe("not_covered");
+    expect(view.listingFor(scope).kind).toBe("refused");
   });
 
   it("invalidates a fresh whole-replacement cursor when declarations change", async () => {
@@ -225,11 +231,11 @@ describe("current declarations at the server legacy-read boundary", () => {
     db.prepare(
       "UPDATE legacy_scope_takeovers SET replacement_cursor = ? WHERE scope = ?",
     ).run(oldRuleCursor, scope);
-    expect(view.listingFor(scope)).toEqual({ kind: "refused" });
+    expect(view.listingFor(scope).kind).toBe("canonical");
     expect((await view.readLatest(scope)).kind).toBe("canonical");
     expect(replacementCursor()).not.toBe(oldRuleCursor);
     current = registry(true);
-    expect(view.listingFor(scope)).toEqual({ kind: "refused" });
+    expect(view.listingFor(scope).kind).toBe("canonical");
     // The new declaration must be projected and confirmed anew, not served
     // from the old replacement witness. Fresh completion still permits it.
     const after = await view.readLatest(scope);
@@ -265,7 +271,7 @@ it("wires trusted declarations into the production legacy view", () => {
     "utf8",
   );
   expect(bootstrap).toMatch(
-    /legacyScopeView: createLegacyScopeView\(\{[\s\S]*?declarations: pdppRecords\?\.declarations,/,
+    /const legacyScopeView = createLegacyScopeView\(\{[\s\S]*?declarations: pdppRecords\?\.declarations,/,
   );
 });
 
