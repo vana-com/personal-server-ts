@@ -128,7 +128,7 @@ describe("canonical ChatGPT declared text over SQLite", () => {
           });
           expect(result.chatgptCoverageGaps).toContainEqual(
             expect.objectContaining({
-              reason: "current_node_not_stored/fallback_count_mismatch",
+              reason: "current_node_not_stored/flag_fallback_count_mismatch",
               declaredCount: 1,
               walkedCount: 0,
             }),

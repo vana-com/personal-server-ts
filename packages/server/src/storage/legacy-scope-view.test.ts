@@ -1401,7 +1401,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
       )
       .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/12");
+    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/13");
     const callsAfterFirstRead = listRecords.mock.calls.length;
     expect(callsAfterFirstRead).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
@@ -3407,9 +3407,17 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     on_current_branch,
   });
 
-  async function fixture({ healthy = false, unrelated = false } = {}) {
+  async function fixture({
+    healthy = false,
+    unrelated = false,
+    contentType = "text",
+  }: { healthy?: boolean; unrelated?: boolean; contentType?: string } = {}) {
     put("conversations", conversation("old"), before);
-    put("messages", message("old", true), before);
+    put(
+      "messages",
+      { ...message("old", true), content_type: contentType },
+      before,
+    );
     if (healthy) {
       put(
         "conversations",
@@ -3534,7 +3542,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
       {
         conversationIdHash:
           "8b34dbc2c05eb4d7e25d48efeace82456b16cee760bcae80c157f52a3c2e787b",
-        reason: "parent_not_stored/fallback_chain_incomplete",
+        reason: "parent_not_stored/flag_fallback_ambiguous",
         declaredCount: 2,
         walkedCount: 1,
       },
@@ -3714,9 +3722,11 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
   );
 
   it.each(["text", "multimodal_text"])(
-    "covers newer current-empty %s through ordinary field rules",
+    "covers newer current-empty %s while omitting it from legacy display",
     async (content_type) => {
-      const { view, original, config } = await fixture();
+      const { view, original, config } = await fixture({
+        contentType: content_type,
+      });
       put("messages", { ...message("old", true), content: "", content_type });
       put("conversations", { ...conversation("old"), update_time: after });
       const read = await view.readLatest(scope);
@@ -3726,11 +3736,12 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
       expect(read.envelope.data).toMatchObject({
         conversations: [
           {
-            message_count: 1,
-            messages: [{ id: "old", content: "", content_type }],
+            message_count: 0,
+            messages: [],
           },
         ],
       });
+      expect(store.getRecord("chat", "messages", "old")?.data.content).toBe("");
       expect(view.verdictFor(scope)[0]).toMatchObject({
         verdict: "covered",
         reasonCounts: { missing_entity: 0 },
@@ -3881,10 +3892,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
         envelopes: [],
       });
     }
-    const expectedKind =
-      variant === "unfetched detail" || variant === "wrong parent"
-        ? "canonical"
-        : "refused";
+    const expectedKind = variant === "wrong parent" ? "canonical" : "refused";
     const firstRead = await view.readLatest(scope);
     expect(firstRead.kind).toBe(expectedKind);
     if (expectedKind === "canonical") {
@@ -4195,7 +4203,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     },
   );
 
-  it("recomputes a rule-12 refused witness under rule 13", async () => {
+  it("recomputes a rule-13 refused witness under rule 14", async () => {
     const { view, original, config } = await fixture();
     const prior = view.verdictFor(scope)[0]!;
     const authority = config.authority;
@@ -4218,7 +4226,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
         ...authority,
         cachedVerdict(scope, instance, generation, version, cursor) {
           seen.push(cursor);
-          const rule12 = cursor.replace(/:13:1\.5:262144$/, ":12:1.5:262144");
+          const rule13 = cursor.replace(/:14:1\.5:262144$/, ":13:1.5:262144");
           expect(
             authority.confirmRead(
               scope,
@@ -4230,7 +4238,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
                 generation,
                 writeClock: authority.writeClock(),
                 arrivalRevision: authority.arrivalRevision(),
-                canonicalCursor: rule12,
+                canonicalCursor: rule13,
                 coverage: {
                   ...covered,
                   covered: false,
@@ -4249,7 +4257,7 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
     });
     expect((await restarted.readLatest(scope)).kind).toBe("canonical");
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatch(/:13:1\.5:262144$/);
+    expect(seen[0]).toMatch(/:14:1\.5:262144$/);
     expect(restarted.verdictFor(scope)[0]).toMatchObject({
       verdict: "covered",
     });
