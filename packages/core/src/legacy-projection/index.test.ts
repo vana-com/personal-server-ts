@@ -3300,9 +3300,17 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           }
           if (cycle) {
             expect(result.chatgptCoverageGaps).toContainEqual(
-              expect.objectContaining({ reason: "cycle" }),
+              expect.objectContaining({
+                reason: expect.stringContaining("cycle"),
+              }),
             );
-            expect(result.diagnostics).toBeUndefined();
+            expect(result.diagnostics).toContainEqual({
+              kind: "branch_walk_fallback",
+              scope: "chatgpt.conversations",
+              stream: "conversations",
+              count: 1,
+              reasons: ["cycle"],
+            });
           } else {
             expect(result.diagnostics).toContainEqual({
               kind: "branch_walk_fallback",
