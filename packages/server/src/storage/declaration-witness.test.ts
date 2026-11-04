@@ -21,6 +21,7 @@ import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/sto
 import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { initializeDatabase } from "./index-schema.js";
+import { trackLegacyScopeMutations } from "./legacy-scope-revalidation-state.js";
 
 // These server-level checks run with server-witness and use real SQLite rows
 // and persisted takeover verdicts, not the portable in-memory store.
@@ -33,6 +34,7 @@ describe("current declarations at the server legacy-read boundary", () => {
   const decoded = "title\u0000";
   let db: InstanceType<typeof Database>;
   let store: ReturnType<typeof createSqliteRecordStore>;
+  let state: ReturnType<typeof trackLegacyScopeMutations>;
   let current: ReturnType<typeof createStreamDeclarationRegistry> | undefined;
 
   function registry(annotated: boolean) {
@@ -72,7 +74,7 @@ describe("current declarations at the server legacy-read boundary", () => {
     >[0]["readLegacyHead"],
   ) =>
     createLegacyScopeView({
-      authority: createLegacyScopeAuthority(db),
+      authority: createLegacyScopeAuthority(db, state),
       records: store,
       declarations,
       configuredMethods: (id) => (id === source ? ["chatgpt"] : []),
@@ -82,7 +84,10 @@ describe("current declarations at the server legacy-read boundary", () => {
   beforeEach(() => {
     faults.open = "";
     faults.read = "";
-    db = initializeDatabase(":memory:");
+    state = trackLegacyScopeMutations(initializeDatabase(":memory:"), {
+      ceilingMs: 1_800_000,
+    });
+    db = state.db;
     store = createSqliteRecordStore(db);
     current = undefined;
     store.registerConnection({

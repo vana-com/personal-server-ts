@@ -235,7 +235,7 @@ if (isLegacyEvaluationWorker) {
           streams: toStreamDeclarations(snapshot),
         })),
       );
-      const baseAuthority = createLegacyScopeAuthority(db);
+      const baseAuthority = createLegacyScopeAuthority(db, state);
       const authority = {
         ...baseAuthority,
         confirmRead(...args: Parameters<typeof baseAuthority.confirmRead>) {

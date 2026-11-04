@@ -730,6 +730,20 @@ const writers: Writer[] = [
     },
   },
   {
+    name: "replica: bounded declaration reconciliation",
+    prepare: (h) => {
+      h.receiver!.import({ credential, envelope: h.envelope([h.operation()]) });
+      h.declare([]);
+    },
+    write: (h) => {
+      h.receiver!.reconcileStep({
+        credential,
+        restart: true,
+        page: { operations: 1000, bytes: 1024 * 1024 },
+      });
+    },
+  },
+  {
     name: "replica: retirement materializes and closes the door",
     prepare: (h) => {
       h.activate();

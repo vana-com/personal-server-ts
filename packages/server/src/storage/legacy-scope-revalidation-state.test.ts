@@ -99,7 +99,7 @@ it("expires failing evidence at the ceiling and keeps a slow successful evaluati
     now: () => now,
   });
   const view = createLegacyScopeView({
-    authority: createLegacyScopeAuthority(raw),
+    authority: createLegacyScopeAuthority(raw, state),
     records: createSqliteRecordStore(raw),
     configuredMethods: () => ["oura"],
   });
@@ -246,8 +246,8 @@ it.each([
       state.complete("i", "oura.activity", state.revision("i"));
       expect(state.status("i", "oura.activity")?.dirty_since).toBeNull();
       const clocks = [
-        createLegacyScopeAuthority(raw).writeClock(),
-        createLegacyScopeAuthority(raw).arrivalRevision(),
+        createLegacyScopeAuthority(raw, state).writeClock(),
+        createLegacyScopeAuthority(raw, state).arrivalRevision(),
       ];
       Object.assign(semantics, {
         [component]: typeof old === "number" ? old + 1 : old + "/new",
@@ -256,7 +256,7 @@ it.each([
       vi.setSystemTime(now);
       state.observePolicy("unchanged configuration", now);
       const view = createLegacyScopeView({
-        authority: createLegacyScopeAuthority(raw),
+        authority: createLegacyScopeAuthority(raw, state),
         records: createSqliteRecordStore(raw),
         configuredMethods: () => ["oura"],
         readLegacyHead: async () => {
@@ -271,12 +271,14 @@ it.each([
       });
       expect(view.verdictFor("oura.activity")[0]?.verdict).toBe("covered");
       expect([
-        createLegacyScopeAuthority(raw).writeClock(),
-        createLegacyScopeAuthority(raw).arrivalRevision(),
+        createLegacyScopeAuthority(raw, state).writeClock(),
+        createLegacyScopeAuthority(raw, state).arrivalRevision(),
       ]).toEqual(clocks);
-      vi.setSystemTime(3499);
+      now = 3499;
+      vi.setSystemTime(now);
       expect(view.listingFor("oura.activity").kind).toBe("canonical");
-      vi.setSystemTime(3500);
+      now = 3500;
+      vi.setSystemTime(now);
       expect(view.listingFor("oura.activity").kind).toBe("refused");
     } finally {
       Object.assign(semantics, { [component]: old });

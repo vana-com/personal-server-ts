@@ -3796,10 +3796,16 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
   });
 
   it("stays listed while a slow successful evaluation is pending inside the ceiling", async () => {
-    const { view, original, config } = await fixture();
+    const { original, config } = await fixture();
+    let view = createLegacyScopeView(config);
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(1000);
     const state = trackLegacyScopeMutations(db, { ceilingMs: 2000 });
+    config.authority = createLegacyScopeAuthority(db, state);
+    view = createLegacyScopeView({
+      ...config,
+      readLegacyHead: async () => original.envelope,
+    });
     state.markDirty();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {

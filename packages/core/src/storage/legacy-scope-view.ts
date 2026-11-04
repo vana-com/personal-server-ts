@@ -199,6 +199,18 @@ export interface LegacyScopeAuthority {
   writeClock(): number;
   /** Monotonic arrival revision, independent of record content writes. */
   arrivalRevision(): number;
+  /** Full dependency revision, including blob, replica and quarantine changes. */
+  dependencyRevision?(instance: string): number;
+  /** One snapshot of mutation identity and cached-body admission. */
+  witnessState?(
+    scope: string,
+    instance: string,
+  ): {
+    dependencyRevision: number;
+    dirtySince: number | null;
+    deadline: number | null;
+    reusable: boolean;
+  };
   /** Whether a complete canonical read has already superseded the legacy head. */
   hasTakeover(scope: string, instance?: string, generation?: number): boolean;
   /**
@@ -255,6 +267,7 @@ export interface LegacyScopeAuthority {
       generation: number;
       writeClock: number;
       arrivalRevision: number;
+      dependencyRevision: number;
       canonicalCursor: string;
     } & (
       | { coverage: LegacyCoverageVerdict; cached: boolean; completion?: false }
@@ -739,6 +752,7 @@ export function createLegacyScopeView(
           authority.writeClock(),
           authority.arrivalRevision(),
           receiptCursor(decision, input.declarations),
+          authority.dependencyRevision?.(decision.selection.instance) ?? 0,
         ),
       ) === true;
     if (hasLegacyHead && input.readLegacyHead && !completedReplacement) {
@@ -762,6 +776,7 @@ export function createLegacyScopeView(
           authority.writeClock(),
           authority.arrivalRevision(),
           receiptCursor(decision, input.declarations),
+          authority.dependencyRevision?.(decision.selection.instance) ?? 0,
         )
       ) {
         return { kind: "refused" };
@@ -827,11 +842,13 @@ export function createLegacyScopeView(
     writeClock: number,
     arrivalRevision: number,
     receipts: string,
+    dependencyRevision: number,
   ): string {
     return [
       LEGACY_SCOPE_WITNESS_IDENTITY.cursorVersion,
       writeClock,
       arrivalRevision,
+      dependencyRevision,
       receipts,
       decision.generation,
       CANONICAL_LEGACY_VIEW_CONTRACT,
@@ -846,7 +863,12 @@ export function createLegacyScopeView(
   function readDecision(scope: string) {
     return authority.readSnapshot(() => {
       const decision = decide(scope);
+      const witness =
+        decision.kind === "canonical"
+          ? authority.witnessState?.(scope, decision.selection.instance)
+          : undefined;
       return {
+        witness,
         reset: authority.isReset(scope),
         decision,
         retainedEntityLoss:
@@ -873,6 +895,12 @@ export function createLegacyScopeView(
           decision.kind !== "canonical" || initialOuraRunComplete(decision),
         writeClock: authority.writeClock(),
         arrivalRevision: authority.arrivalRevision(),
+        dependencyRevision:
+          decision.kind === "canonical"
+            ? (witness?.dependencyRevision ??
+              authority.dependencyRevision?.(decision.selection.instance) ??
+              0)
+            : 0,
         receiptCursor:
           decision.kind === "canonical"
             ? receiptCursor(decision, input.declarations)
@@ -926,16 +954,18 @@ export function createLegacyScopeView(
           initial.writeClock,
           initial.arrivalRevision,
           initial.receiptCursor,
+          initial.dependencyRevision,
         )
       : "";
-    const projectionKey = legacyHead
-      ? JSON.stringify([
-          decision.selection.instance,
-          decision.generation,
-          legacyHead.id,
-          canonicalCursor,
-        ])
-      : "";
+    const keyFor = (witness = initial.witness) =>
+      JSON.stringify([
+        decision.selection.instance,
+        decision.generation,
+        legacyHead?.id,
+        canonicalCursor,
+        witness,
+      ]);
+    const projectionKey = legacyHead ? keyFor() : "";
     const projectionOwner = scope;
     const cachedCoverage =
       legacyHead !== null && input.readLegacyHead
@@ -948,7 +978,11 @@ export function createLegacyScopeView(
           )
         : null;
     const cachedProjection = coveredProjection.get(projectionOwner);
-    if (cachedCoverage?.covered && cachedProjection?.key === projectionKey) {
+    if (
+      cachedCoverage?.covered &&
+      (initial.witness?.reusable ?? true) &&
+      cachedProjection?.key === projectionKey
+    ) {
       const confirmed = authority.confirmRead(
         scope,
         legacyHead,
@@ -961,6 +995,7 @@ export function createLegacyScopeView(
           generation: decision.generation,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
           canonicalCursor,
           coverage: cachedCoverage,
           cached: true,
@@ -1032,6 +1067,7 @@ export function createLegacyScopeView(
           generation: decision.generation,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
           canonicalCursor,
           coverage: cachedCoverage,
           cached: true,
@@ -1122,7 +1158,8 @@ export function createLegacyScopeView(
             generation: decision.generation,
             writeClock: initial.writeClock,
             arrivalRevision: initial.arrivalRevision,
-            canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
+            dependencyRevision: initial.dependencyRevision,
+            canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.dependencyRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
             coverage,
             cached: false,
           },
@@ -1223,6 +1260,7 @@ export function createLegacyScopeView(
           generation: decision.generation,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
           canonicalCursor,
           completion: true,
         },
@@ -1356,6 +1394,7 @@ export function createLegacyScopeView(
           generation: decision.generation,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
           canonicalCursor,
           coverage,
           cached,
@@ -1388,7 +1427,16 @@ export function createLegacyScopeView(
           : { kind: "file" };
       }
       coveredProjection.set(projectionOwner, {
-        key: projectionKey,
+        // Confirmation cleared this captured revision's dirty marker. Never
+        // read a newer revision here and attach an older body to its key.
+        key: initial.witness
+          ? keyFor({
+              ...initial.witness,
+              dirtySince: null,
+              deadline: null,
+              reusable: true,
+            })
+          : projectionKey,
         envelope: read.envelope,
         revision: read.revision,
         chatgptCoverageGaps: read.chatgptCoverageGaps,
@@ -1415,7 +1463,10 @@ export function createLegacyScopeView(
     const confirmed = authority.confirmRead(
       scope,
       legacyHead,
-      () => sameSelection(decide(scope), decision),
+      () =>
+        sameSelection(decide(scope), decision) &&
+        (authority.dependencyRevision?.(decision.selection.instance) ?? 0) ===
+          initial.dependencyRevision,
       decision.selection.method,
     );
     if (!confirmed) {

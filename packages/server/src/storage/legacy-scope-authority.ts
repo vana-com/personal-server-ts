@@ -1,5 +1,6 @@
 import { legacyScopeCursorIsCurrent } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type { Database } from "better-sqlite3";
+import type { LegacyRevalidationState } from "./legacy-scope-revalidation-state.js";
 import type {
   LegacyScopeAuthority,
   LegacyScopeHead,
@@ -82,7 +83,10 @@ function coverageFromRow(row: VerdictRow): LegacyCoverageVerdict {
  * `readSnapshot` see that same snapshot. Takeover writes only the separate
  * diagnostic ledger; it never changes the legacy index or its files.
  */
-export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
+export function createLegacyScopeAuthority(
+  db: Database,
+  revalidation?: LegacyRevalidationState,
+): LegacyScopeAuthority {
   const hasTable = (name: string) =>
     db
       .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
@@ -93,7 +97,37 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       .prepare("SELECT 1 FROM legacy_scope_takeover_resets WHERE scope = ?")
       .get(scope) !== undefined;
 
+  // Listing may use a dirty witness before its ceiling. Bodies additionally
+  // fence their captured revision; only fresh evaluation may pass the ceiling.
+  function witnessIsCurrent(
+    scope: string,
+    instance: string,
+    revision?: number,
+    fresh = false,
+  ): boolean {
+    if (!revalidation) return !hasTable("legacy_scope_revalidation_scopes");
+    return (
+      (revision === undefined ||
+        revalidation.revision(instance) === revision) &&
+      (fresh ||
+        (!revalidation.overdue(instance, scope) &&
+          (revision === undefined ||
+            revalidation.status(instance, scope)?.dirty_since == null)))
+    );
+  }
+
   return {
+    dependencyRevision: (instance) => revalidation?.revision(instance) ?? 0,
+    witnessState(scope, instance) {
+      const row = revalidation?.status(instance, scope);
+      const dependencyRevision = revalidation?.revision(instance) ?? 0;
+      return {
+        dependencyRevision,
+        dirtySince: row?.dirty_since ?? null,
+        deadline: row?.deadline ?? null,
+        reusable: witnessIsCurrent(scope, instance, dependencyRevision),
+      };
+    },
     listMethodConnections(methods) {
       if (methods.length === 0 || !hasTable("pdpp_instance_binding")) {
         return [];
@@ -233,21 +267,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
     },
 
     hasListingWitness(scope, head, instance, generation) {
-      if (hasTable("legacy_scope_revalidation_scopes")) {
-        const state = db
-          .prepare(
-            "SELECT dirty_since,ceiling_ms FROM legacy_scope_revalidation_scopes WHERE instance=? AND scope=?",
-          )
-          .get(instance, scope) as
-          { dirty_since: number | null; ceiling_ms: number } | undefined;
-        if (
-          state?.dirty_since !== null &&
-          state?.dirty_since !== undefined &&
-          // A wall-clock rollback can extend the stale window; this is accepted.
-          Date.now() >= state.dirty_since + state.ceiling_ms
-        )
-          return false;
-      }
+      if (!witnessIsCurrent(scope, instance)) return false;
       if (!hasTable("legacy_scope_takeovers")) return false;
       const ledger = db
         .prepare(
@@ -301,6 +321,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       legacyVersionId,
       canonicalCursor,
     ) {
+      if (!witnessIsCurrent(scope, instance)) return null;
       if (!hasTable("legacy_scope_takeover_verdicts")) return null;
       const row = db
         .prepare(
@@ -469,6 +490,16 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             ).value
         )
           return false;
+        if (
+          verdict &&
+          !witnessIsCurrent(
+            scope,
+            verdict.instance,
+            verdict.dependencyRevision,
+            !verdict.cached,
+          )
+        )
+          return false;
         if (expectedHead === null) return true;
         if (verdict?.cached) {
           // The same proof as when the takeover was recorded: it also names
@@ -527,7 +558,11 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             db.prepare(
               "DELETE FROM legacy_scope_takeover_verdicts WHERE scope=? AND instance=? AND generation=? AND legacy_version_id=? AND verdict='not_covered'",
             ).run(scope, verdict.instance, verdict.generation, expectedHead.id);
-          clearRevalidation(scope, verdict.instance);
+          revalidation?.complete(
+            verdict.instance,
+            scope,
+            verdict.dependencyRevision,
+          );
           return true;
         }
 
@@ -591,7 +626,11 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             coverage.canonicalBytes,
             coverage.byteDelta,
           );
-          clearRevalidation(scope, verdict.instance);
+          revalidation?.complete(
+            verdict.instance,
+            scope,
+            verdict.dependencyRevision,
+          );
           if (!coverage.covered) return true;
           db.prepare(
             `INSERT INTO legacy_scope_takeovers
@@ -654,17 +693,6 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       }
     },
   };
-
-  function clearRevalidation(scope: string, instance: string): void {
-    if (hasTable("legacy_scope_revalidation_scopes"))
-      db.prepare(
-        // A clean new witness has no active ceiling; the next mutation stamps
-        // the configured ceiling. Seed it now so a sweep won't call it unknown.
-        `INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms) VALUES (?,?,NULL,1800000)
-         ON CONFLICT(instance,scope) DO UPDATE SET dirty_since=NULL,error_count=0,reason=NULL
-         WHERE dirty_since IS NOT NULL OR error_count<>0 OR reason IS NOT NULL`,
-      ).run(instance, scope);
-  }
 
   function readEligibleLegacyHead(scope: string): LegacyScopeHead | null {
     if (!hasTable("data_files")) return null;

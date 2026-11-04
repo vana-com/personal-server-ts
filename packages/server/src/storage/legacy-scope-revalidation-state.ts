@@ -8,6 +8,7 @@ const dependencyTable =
 export interface LegacyRevalidationStatus {
   dirty_since: number | null;
   ceiling_ms: number;
+  deadline: number | null;
   error_count: number;
   reason: string | null;
 }
@@ -73,7 +74,7 @@ function makeState(
     )
     .pluck();
   const readStatus = raw.prepare(
-    "SELECT dirty_since,ceiling_ms,error_count,reason FROM legacy_scope_revalidation_scopes WHERE instance=? AND scope=?",
+    "SELECT dirty_since,ceiling_ms,dirty_since+ceiling_ms AS deadline,error_count,reason FROM legacy_scope_revalidation_scopes WHERE instance=? AND scope=?",
   );
   let dirtyAt: number | null = null;
   let forceDirty = false;
@@ -101,11 +102,22 @@ function makeState(
     }
     return [...result.values()];
   }
-  function mark(since = now()) {
+  function mark(since = now(), previous: ReturnType<typeof candidates> = []) {
+    const affected = new Map(
+      previous.map((candidate) => [
+        candidate.instance,
+        new Set(candidate.scopes),
+      ]),
+    );
     for (const candidate of candidates()) {
-      bump.run(candidate.instance);
-      for (const scope of candidate.scopes)
-        dirty.run(candidate.instance, scope, since, options.ceilingMs);
+      const scopes = affected.get(candidate.instance) ?? new Set<string>();
+      for (const scope of candidate.scopes) scopes.add(scope);
+      affected.set(candidate.instance, scopes);
+    }
+    for (const [instance, scopes] of affected) {
+      bump.run(instance);
+      for (const scope of scopes)
+        dirty.run(instance, scope, since, options.ceilingMs);
     }
   }
   function atomic<T>(
@@ -119,6 +131,7 @@ function makeState(
       return raw
         .transaction(() => {
           const before = outer ? Number(totalChanges.get()) : 0;
+          const previous = outer ? candidates() : [];
           transactionDepth++;
           try {
             const result = run();
@@ -127,7 +140,7 @@ function makeState(
                 dirtyAt !== null &&
                 (forceDirty || Number(totalChanges.get()) > before)
               )
-                mark(dirtyAt);
+                mark(dirtyAt, previous);
               dirtyAt = null;
               forceDirty = false;
             }
@@ -215,6 +228,7 @@ function makeState(
       | {
           dirty_since: number | null;
           ceiling_ms: number;
+          deadline: number | null;
           error_count: number;
           reason: string | null;
         }
@@ -279,9 +293,11 @@ function makeState(
       if (Number(readRevision.get(instance) ?? 0) !== revision) return false;
       raw
         .prepare(
-          "UPDATE legacy_scope_revalidation_scopes SET dirty_since=NULL,error_count=0,reason=NULL WHERE instance=? AND scope=?",
+          `INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms) VALUES (?,?,NULL,?)
+         ON CONFLICT(instance,scope) DO UPDATE SET dirty_since=NULL,error_count=0,reason=NULL
+         WHERE dirty_since IS NOT NULL OR error_count<>0 OR reason IS NOT NULL`,
         )
-        .run(instance, scope);
+        .run(instance, scope, options.ceilingMs);
       return true;
     },
     fail(instance: string, scopes: readonly string[]) {
@@ -298,7 +314,8 @@ function makeState(
       return (
         row?.dirty_since !== null &&
         row?.dirty_since !== undefined &&
-        now() >= row.dirty_since + row.ceiling_ms
+        // A wall-clock rollback can extend the stale window; this is accepted.
+        now() >= row.deadline!
       );
     },
     diagnostics() {

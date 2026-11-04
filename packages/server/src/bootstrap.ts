@@ -1159,7 +1159,7 @@ export async function createServer(
 
   const legacyScopeView = createLegacyScopeView({
     logger,
-    authority: createLegacyScopeAuthority(db),
+    authority: createLegacyScopeAuthority(db, revalidationState),
     records: pdppRecords && legacyScopeRecords(pdppRecords),
     // Reuse the source-scoped declarations selected by the record server.
     // Declaration schema identity participates in projection revisions and

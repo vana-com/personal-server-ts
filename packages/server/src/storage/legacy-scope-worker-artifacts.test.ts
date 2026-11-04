@@ -75,7 +75,7 @@ describe("real coverage Worker in shipped artifacts", () => {
         ).toEqual([]);
       }
       put(80);
-      const authority = createLegacyScopeAuthority(state.db);
+      const authority = createLegacyScopeAuthority(state.db, state);
       const config = {
         authority,
         records: store,

@@ -20,6 +20,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { createServer, type ServerContext } from "../bootstrap.js";
 import { initializeDatabase } from "./index-schema.js";
+import { trackLegacyScopeMutations } from "./legacy-scope-revalidation-state.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 
@@ -281,8 +282,12 @@ describe("B-written Desktop profile convergence", () => {
           expect(Buffer.from(store.getBlobBytes(blob.blobId)!)).toEqual(
             Buffer.from(blob.text),
           );
+        const state = trackLegacyScopeMutations(openDb, {
+          ceilingMs: 1_800_000,
+        });
+        state.observePolicy("desktop upgrade fixture", Date.now());
         const view = createLegacyScopeView({
-          authority: createLegacyScopeAuthority(openDb),
+          authority: createLegacyScopeAuthority(openDb, state),
           records: store,
           configuredMethods: (id) => (id === source ? [scenario.method] : []),
           readLegacyHead: async (head) =>

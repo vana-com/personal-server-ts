@@ -53,7 +53,7 @@ it("runs a fresh comparison off-thread and publishes a negative after same-strea
       { method: "oura", generation: 1 },
     );
   put(80);
-  const authority = createLegacyScopeAuthority(state.db);
+  const authority = createLegacyScopeAuthority(state.db, state);
   const config = {
     authority,
     records: store,

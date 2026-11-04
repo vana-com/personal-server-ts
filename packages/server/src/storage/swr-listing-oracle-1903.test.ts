@@ -128,7 +128,7 @@ async function fixture() {
       schema: { type: "object", $id: `oracle/${stream}/${declarationVersion}` },
     }),
   };
-  let authority = createLegacyScopeAuthority(state.db);
+  let authority = createLegacyScopeAuthority(state.db, state);
   let view = createLegacyScopeView({
     authority,
     declarations,
@@ -268,6 +268,7 @@ async function fixture() {
         generation: G,
         writeClock: authority.writeClock(),
         arrivalRevision: authority.arrivalRevision(),
+        dependencyRevision: state.revision(I),
         canonicalCursor: verdict.canonicalCursor,
         coverage: {
           ...coverage,
@@ -327,7 +328,7 @@ async function fixture() {
     db = initializeDatabase(path);
     state = trackLegacyScopeMutations(db, { ceilingMs: CEILING });
     store = createSqliteRecordStore(state.db);
-    authority = createLegacyScopeAuthority(state.db);
+    authority = createLegacyScopeAuthority(state.db, state);
     view = createLegacyScopeView({
       authority,
       records: store,
