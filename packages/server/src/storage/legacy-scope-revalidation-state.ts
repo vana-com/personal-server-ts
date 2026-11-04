@@ -73,6 +73,9 @@ function makeState(
     "SELECT dirty_since,ceiling_ms,error_count,reason FROM legacy_scope_revalidation_scopes WHERE instance=? AND scope=?",
   );
   let dirtyAt: number | null = null;
+  let forceDirty = false;
+  let transactionDepth = 0;
+  const totalChanges = raw.prepare("SELECT total_changes()").pluck();
   const bindingTable = raw.prepare(
     "SELECT 1 FROM sqlite_master WHERE name='pdpp_instance_binding'",
   );
@@ -92,43 +95,42 @@ function makeState(
     run: () => T,
     mode: "deferred" | "immediate" | "exclusive" = "immediate",
   ): T {
-    const outer = !raw.inTransaction;
+    const outer = transactionDepth === 0 && !raw.inTransaction;
     const checkpoint = dirtyAt;
+    const forceCheckpoint = forceDirty;
     try {
       return raw
         .transaction(() => {
-          const result = run();
-          if (outer && dirtyAt !== null) {
-            mark(dirtyAt);
-            dirtyAt = null;
+          const before = outer ? Number(totalChanges.get()) : 0;
+          transactionDepth++;
+          try {
+            const result = run();
+            if (outer) {
+              if (
+                dirtyAt !== null &&
+                (forceDirty || Number(totalChanges.get()) > before)
+              )
+                mark(dirtyAt);
+              dirtyAt = null;
+              forceDirty = false;
+            }
+            return result;
+          } finally {
+            transactionDepth--;
           }
-          return result;
         })
         [mode]();
     } catch (error) {
       dirtyAt = checkpoint;
+      forceDirty = forceCheckpoint;
       throw error;
     }
   }
-  function mutate<T>(run: () => T, exec = false, force = false): T {
+  function mutate<T>(run: () => T, force = false): T {
     const write = () => {
-      const started = dirtyAt ?? now();
-      const before = exec
-        ? (raw.prepare("SELECT total_changes()").pluck().get() as number)
-        : 0;
-      const result = run();
-      const changed = exec
-        ? (raw.prepare("SELECT total_changes()").pluck().get() as number) >
-          before
-        : !(
-            typeof result === "object" &&
-            result !== null &&
-            "changes" in result &&
-            result.changes === 0
-          ) && result !== undefined;
-      if (changed || force)
-        dirtyAt = dirtyAt === null ? started : Math.min(dirtyAt, started);
-      return result;
+      dirtyAt ??= now();
+      forceDirty ||= force;
+      return run();
     };
     return raw.inTransaction ? write() : atomic(write);
   }
@@ -156,7 +158,6 @@ function makeState(
           if (dependencyTable.test(sql))
             mutate(
               () => target.exec(sql),
-              true,
               /\b(?:DROP|ALTER)\s+TABLE/i.test(sql),
             );
           else target.exec(sql);
@@ -167,25 +168,26 @@ function makeState(
           const statement = target.prepare(sql);
           if (statement.readonly || !dependencyTable.test(sql))
             return statement;
-          const methods = new Map<PropertyKey, unknown>();
-          const proxy = new Proxy(statement, {
-            get(stmt, key) {
-              if (methods.has(key)) return methods.get(key);
-              const value = Reflect.get(stmt, key, stmt);
-              if (typeof value !== "function") return value;
-              const method =
-                key === "run" || key === "get" || key === "all"
-                  ? (...args: unknown[]) =>
-                      mutate(() => value.apply(stmt, args))
-                  : (...args: unknown[]) => {
-                      const result = value.apply(stmt, args);
-                      return result === stmt ? proxy : result;
-                    };
-              methods.set(key, method);
-              return method;
-            },
-          });
-          return proxy;
+          for (const key of ["run", "get", "all"] as const) {
+            const native = statement[key].bind(statement) as (
+              ...args: unknown[]
+            ) => unknown;
+            const autocommit = (...args: unknown[]) =>
+              mutate(() => native(...args));
+            Object.defineProperty(statement, key, {
+              configurable: true,
+              get() {
+                if (transactionDepth > 0 || raw.inTransaction) {
+                  // Compare total_changes at the outer boundary. Native calls
+                  // need no per-record arrays, closures or proxy dispatch.
+                  dirtyAt ??= now();
+                  return native;
+                }
+                return autocommit;
+              },
+            });
+          }
+          return statement;
         };
       const value = Reflect.get(target, property, target);
       return typeof value === "function" ? value.bind(target) : value;
