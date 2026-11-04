@@ -16,17 +16,17 @@ Actors: **Web** (apps/web enclave client), **Account** (apps/account intents, Pr
 5. **Registration signature (owner, EIP-712, V2 today).** Web calls Account intent `personal_server.server_registration.v1` (`unity-surfaces/apps/account/src/lib/signing/personal-server-intent-service.ts:164-325`) with `serverAddress=evidence.address`, `serverPublicKey=evidence.publicKey`, `serverUrl=IdentityResponse.serverUrl`. Privy signs silently (`:275-283`); external wallets go through the signing exchange (`:201-212`). Typed data = SDK `buildPersonalServerRegistrationTypedData` (`vana-sdk/packages/vana-sdk/src/protocol/personal-server-registration.ts:174-191`, types `eip712.ts:139-146`).
 6. Web submits `POST /v1/identity/{userPsId}/register` with `Authorization: Web3Signed <sig>` (bare EIP-712 sig, same as `POST /v1/servers`, `data-gateway/lib/auth.ts:11-28`). GW checks the body equals the identity row (address, publicKey, serverUrl) and runs the existing registration path (extracted from `api/v1/servers.ts:245-620`): row in `servers` with `status='pending'` (`db/schema.ts:192`), `identity_records.state='registered'`. **`confirming` (decision 19) = `servers.status IN ('pending','submitting')`**; no new enum on `servers`.
 7. **Master signature (owner, EIP-191 `vana-master-key-v1`).** Web calls new Account intent `personal_server.enclave_delivery.v1` with the evidence. Account verifies evidence, signs `vana-master-key-v1` via Privy (existing `signOwnerBindingWithPrivy`, `constrained-silent-signing.ts:191`), builds `MasterSignatureDelivery`, ECIES-encrypts it to `evidence.publicKey` (SDK `NodeECIESProvider`, `crypto/ecies/node.ts:50`), returns ciphertext only. Web posts `POST /v1/identity/{userPsId}/secret`.
-8. GW relays ciphertext blind to Agent `POST /agent/v1/secrets/seal`. Agent decrypts with the wallet key, checks `recoverServerOwner(masterSignature) == ownerAddress` (SDK `crypto/keys/derive.ts:59-66`) and `enclaveAddress == derived`, seals (`sealing/envelope.ts:49-66`, AAD = userPsId), returns the envelope. GW stores `sealed_secrets`; `identity_records.state='sealed'`. Product state _on_ = registered AND sealed.
+8. GW relays ciphertext blind to Agent `POST /agent/v1/secrets/seal`. Agent decrypts with the wallet key, checks `recoverServerOwner(masterSignature) == ownerAddress` (SDK `crypto/keys/derive.ts:59-66`) and `enclaveAddress == derived`, seals (`sealing/envelope.ts:49-66`, AAD = `${userPsId}/${epoch}`), returns the envelope. GW stores `sealed_secrets`; `identity_records.state='sealed'`. Product state _on_ = registered AND sealed.
 9. `/v1/cron/settle` settles `registerServerWithSignature` as today (`data-gateway/lib/settle.ts:1817`); `servers.status` -> `confirmed|finalized|failed`. `failed` rolls the identity back to `prepared` (decision 19).
 10. Revoke = existing `DELETE /v1/servers/:address` (`api/v1/servers/[address].ts:159-412`); the same transaction retires the identity and hard-deletes `sealed_secrets` (section 3). Re-enable derives epoch+1 (new path suffix, new address, decision 12).
 
-**V3 forward compatibility.** `IdentityRegistrationRequest.version` discriminates `'v2' | 'v3'`; `identity_records.registration_version` stores it; V3 adds `nonce, deadline` to the same `ServerRegistration` primaryType (contract change, step 3). Bridge for replay (decision 11): GW refuses a registration whose `serverAddress` belongs to a retired `identity_records` row (`409 IDENTITY_RETIRED`); Agent refuses to derive/seal for `epoch < current` (retired epoch).
+**V3 forward compatibility.** `IdentityRegistrationRequest.version` discriminates `'v2' | 'v3'`; `identity_records.registration_version` stores it; V3 adds `nonce, deadline` to the same `ServerRegistration` primaryType (contract change, step 3). Bridge for replay (decision 11): GW refuses a registration whose `serverAddress` belongs to a retired `identity_records` row (`409 IDENTITY_RETIRED`); Agent refuses to seal below the Gateway-supplied `minEpoch` floor (no agent-side epoch store in v1; the jobs path relies on Gateway deletion of the sealed secret).
 
 **Agent HTTP surface (minimum, `personal-server-ts/packages/enclave/src/agent/http.ts`, reachable only from GW with `Authorization: Bearer <ENCLAVE_AGENT_SECRET>`):**
 
 - `GET /agent/v1/health` -> `{appId, composeHash, instanceId, osVersion}` (from `DstackInfo`, `dstack/client.ts:17-26`).
 - `POST /agent/v1/identity` `{ownerAddress, chainId, epoch}` -> `EnclaveIdentityEvidence`.
-- `POST /agent/v1/secrets/seal` `{ownerAddress, chainId, epoch, enclaveAddress, ciphertext}` -> `{envelope, secretHash}` | `422 OWNER_MISMATCH | 409 EPOCH_RETIRED`.
+- `POST /agent/v1/secrets/seal` `{ownerAddress, chainId, epoch, minEpoch, enclaveAddress, ciphertext}` -> `{envelope, secretHash}` | `422 OWNER_MISMATCH | 409 EPOCH_RETIRED`.
 
 ## 2. vana-sdk `protocol/identity`
 
@@ -128,15 +128,28 @@ export interface EnclaveTrustAnchors {
   kmsRootPubkey: Hex;
   appIds: Hex[];
 } // per chainId constants exported here
+export interface ExpectedIdentity {
+  ownerAddress: Address;
+  chainId: number;
+  epoch: number;
+}
+export const MASTER_SIGNATURE_DELIVERY_MAX_AGE_SECONDS = 600;
+// Throws. Checks pubkey -> address, both chain links (compressed-key preimages,
+// raw app_id), anchors.kmsRootPubkey in COMPRESSED form (as kmsInfo().k256Pubkey
+// reports it), appId allowlist, purpose, and that userPsId/owner/chainId/epoch
+// equal `expected` (userPsId recomputed). Fails closed on empty anchors.
 export function verifyEnclaveIdentityEvidence(
   e: EnclaveIdentityEvidence,
   anchors: EnclaveTrustAnchors,
-): Promise<void>; // throws
+  expected: ExpectedIdentity,
+): Promise<void>;
+// Rejects unless masterSignature recovers to e.ownerAddress over MASTER_KEY_MESSAGE.
 export function buildMasterSignatureDelivery(
   e: EnclaveIdentityEvidence,
   masterSignature: Hex,
   now?: number,
-): MasterSignatureDelivery;
+): Promise<MasterSignatureDelivery>;
+// Rejects unless publicKeyToAddress(publicKey) == d.enclaveAddress.
 export function encryptMasterSignatureDelivery(
   d: MasterSignatureDelivery,
   publicKey: Hex,
@@ -177,7 +190,7 @@ Text over jsonb matches existing conventions (`schema.ts:2-16` imports no `jsonb
 
 **Delete-on-revoke hook.** `api/v1/servers/[address].ts:389-400` does a single `update servers set revoked_at ...`. Wrap it in `db.transaction` (pattern `api/v1/servers.ts:533`) and add: `update identity_records set state='retired', retired_at=now() where enclave_address=$serverAddress and state!='retired'`; `delete from sealed_secrets where (user_ps_id, epoch) in (...)`. Hard delete, not soft. Neon PITR backups expire with the window (operational, no code). `POST /v1/identity` after retire derives `epoch+1`.
 
-**Attestation verification v1 (`lib/tee/kms-chain.ts`, decision 26; DCAP deferred to step 4).** Checked, in order, before any row is written: (1) `publicKeyToAddress(publicKey) == address` (`viem/accounts`, as `servers.ts:328`); (2) recover app-root pubkey from `signatureChain[0]` over `keccak256(purpose || ":" || hex(publicKey))`; (3) recover KMS root from `signatureChain[1]` over `keccak256("dstack-kms-issued" || ":" || appId || sec1_compressed(appRootPub))` and compare to `ENCLAVE_KMS_ROOT_PUBKEY` env (from `phala kms phala` / `DstackKms.kmsInfo().k256Pubkey`, spike doc Q4); (4) `appId ∈ ENCLAVE_APP_ID_ALLOWLIST` (csv env; the SDK ships the same values per chainId for the browser, GW env is authoritative, mismatch fails closed); (5) `composeHash` recorded, not enforced in step 2 (Spike 1 showed env updates rotate it; enforcement joins the `tee_nodes` measurement policy in step 1/4). Quote is stored opaque. UNVERIFIED: exact preimage encoding of link 0 (`hex(pubkey)` compressed vs uncompressed, `0x` or not) and of the `app_id` bytes in link 1; pin against `dstack` `kms/src/crypto.rs` and a captured vector from a real CVM (Spike 1 recorded link values at spike doc line 104 but not the pubkey, so a fresh capture is needed for the test fixture).
+**Attestation verification v1 (`lib/tee/kms-chain.ts`, decision 26; DCAP deferred to step 4).** Checked, in order, before any row is written: (1) `publicKeyToAddress(publicKey) == address` (`viem/accounts`, as `servers.ts:328`); (2) recover app-root pubkey from `signatureChain[0]` over `keccak256(utf8(purpose || ":" || lowercase_hex(sec1_compressed(publicKey))))`; (3) recover KMS root from `signatureChain[1]` over `keccak256("dstack-kms-issued" || ":" || app_id_raw_20_bytes || sec1_compressed(appRootPub))` and compare to `ENCLAVE_KMS_ROOT_PUBKEY` env in compressed form (from `phala kms phala` / `DstackKms.kmsInfo().k256Pubkey`, spike doc Q4; encodings verified against dstack source and a live CVM vector, spike results doc "Chain vector"); (4) `appId ∈ ENCLAVE_APP_ID_ALLOWLIST` (csv env; the SDK ships the same values per chainId for the browser, GW env is authoritative, mismatch fails closed); (5) `composeHash` recorded, not enforced in step 2 (Spike 1 showed env updates rotate it; enforcement joins the `tee_nodes` measurement policy in step 1/4). Quote is stored opaque. Preimage encodings verified 2026-09-02; the live vector is pinned as a test in all three repos.
 
 Tests: `tests/identity-handlers.test.ts` mocking `../db/index.js` and the agent client (pattern `tests/builders-post-handler.test.ts:24-37`); `tests/kms-chain.test.ts` with a generated chain (`@noble/curves`) plus the captured vector; Postgres-gated `tests/identity-postgres.test.ts` (`vitest.config.ts:6` include).
 
@@ -192,13 +205,13 @@ Tests: `tests/identity-handlers.test.ts` mocking `../db/index.js` and the agent 
 ## 5. PR plan
 
 1. **vana-sdk** `feat(protocol): enclave identity types and evidence verifier` — `src/protocol/identity.ts` (+`identity.test.ts`), exports in `index.node.ts`/`index.browser.ts`; optional `SERVER_REGISTRATION_V3_TYPES` stub in `eip712.ts` left for step 3. Publish a PR prerelease (`3.23.0-pr.<n>.<sha>`; precedent: account pins `3.13.4-pr.186.276dad0`, `apps/account/package.json:21`). SDK is at `3.22.0` (`package.json:3`).
-2. **personal-server-ts** `feat(enclave): merge spike package + node agent identity endpoints` — merge `spike/enclave` `packages/enclave` (`ed161d3`); `identity/paths.ts` gains `epoch` (`walletPath(id, epoch)`, `sealingPath(id, epoch)`); `agent/http.ts` (3 endpoints, bearer secret); `agent/evidence.ts` builds `EnclaveIdentityEvidence` from `deriveEnclaveIdentity` + `info()` + `quote()`; `agent/seal.ts` (decrypt, recover, seal); tests on `dstack/fake.ts`. Depends on SDK pr-tag (bump from `3.14.0`, `packages/core/package.json:145`). Parallel to 3.
+2. **personal-server-ts** `feat(enclave): merge spike package + node agent identity endpoints` — merge `spike/enclave` `packages/enclave` (`ed161d3`); `identity/paths.ts` gains `epoch` (`walletPath(id, epoch)`, `sealingPath(id, epoch)`); `agent/http.ts` (4 endpoints (plus `/agent/v1/drain`, jobs contract 4a), bearer secret); `agent/evidence.ts` builds `EnclaveIdentityEvidence` from `deriveEnclaveIdentity` + `info()` + `quote()`; `agent/seal.ts` (decrypt, recover, seal); tests on `dstack/fake.ts`. Depends on SDK pr-tag (bump from `3.14.0`, `packages/core/package.json:145`). Parallel to 3.
 3. **data-gateway A** `feat(identity): schema, kms chain verifier, agent client` — `db/schema.ts`, `db/migrations/0053_identity.sql`, `lib/identity.ts`, `lib/tee/kms-chain.ts`, `lib/enclave-agent.ts`, `lib/servers.ts` (`registerServer` extraction), tests. **SDK consumption:** data-gateway has no SDK dependency (`package.json:36-41`) and mirrors EIP-712 types locally (`lib/eip712.ts:160-185`). Keep that: mirror the DTOs in `lib/identity-types.ts` with a header naming the SDK version, and add the SDK as a **devDependency only** for a shape-equality test. Local integration: `"@opendatalabs/vana-sdk": "file:../vana-sdk/packages/vana-sdk"` after `npm run build` in the SDK (resolves `dist/protocol/identity.js` through the `./*` export). Before merge: replace with the published pr-tag, refresh `package-lock.json`, and CI must fail on any `file:` spec.
 4. **data-gateway B** `feat(identity): /v1/identity routes and delete-on-revoke` — three handlers, `vercel.json`, `api/v1/servers/[address].ts` transaction hook, env docs (`ENCLAVE_AGENT_URL/SECRET`, `ENCLAVE_KMS_ROOT_PUBKEY`, `ENCLAVE_APP_ID_ALLOWLIST`). Fake agent in tests; real agent on a Phala CVM for the preview run.
 5. **unity-surfaces A** `feat(account): enclave delivery intent` — files in section 4; SDK bump to pr-tag; route tests mirroring `intents/personal-server-owner-binding/sign/__tests__/route.test.ts`.
 6. **unity-surfaces B** `feat(web): enclave consent and Personal Server screen` — enclave client, consent UI, two user states.
 
-## 6. Resolved 2026-09-02
+## 6. Resolved 2026-09-02, confirmed 2026-09-03 (Kahtaf)
 
 1. **Auth on `POST /v1/identity` and `/secret`: unauthenticated in v1.** Web has no silent generic request signer; the Agent's owner-recovery check authenticates the secret; per-owner and per-IP limits land with `lib/rate-limit` (step 4).
 2. **Trust anchors for the browser**: constants in `protocol/identity.ts` keyed by chainId (1480, 14800); Gateway env is authoritative; mismatch fails closed.
@@ -206,6 +219,14 @@ Tests: `tests/identity-handlers.test.ts` mocking `../db/index.js` and the agent 
 4. **Register before seal.** _On_ requires both; a sealed-but-unregistered row is harmless and retried.
 5. **`composeHash` recorded, not enforced** in step 2; enforcement joins the `tee_nodes` measurement policy.
 6. **Gateway stays SDK-free at runtime**: identity DTOs mirrored in `lib/identity-types.ts`; the SDK is a devDependency for a shape-equality test (local `file:` during development, published pr-tag before merge).
+7. **`kmsRootFingerprint = keccak256(uncompressed KMS root)`** everywhere; the SDK compares anchors in compressed form and accepts either encoding; Gateway env accepts both.
+8. **DCAP quote verification stays at step 4.** Until then the owner/chain/epoch binding lives only in `report_data`; the bearer-authenticated Gateway-to-agent channel is the backstop.
+9. **Fleet replicas share one `app_id`** (a different `app_id` cannot decrypt the fleet's jobs); each replica gets its own `NODE_ID`/`NODE_SECRET` via `phala cvms replicate -e <env-file>`.
+10. **Account builds against throwaway vana-sdk #208** (main + escrow #186 + #207, dist-tag `pr-208`) until #186 merges; close #208 then.
+11. **Web consent panel** ships behind `NEXT_PUBLIC_PS_ENCLAVE_ENABLED` (default off), copy marked draft in `enclave-copy.ts`, revoke disabled until the SDK has a deregistration builder.
+12. **Web external-wallet owners are refused in v1 (2026-09-03, unity-surfaces #990 review).** The browser fallback that signed `vana-master-key-v1` and ECIES-encrypted client-side is removed (raw signature never in web JS, section 4). Account's signing exchange (`POST /api/v1/signing-exchanges`) accepts Desktop clients only, so Web shows a non-retryable "not supported yet" state. Decision 5 (external wallets in scope) still needs an Account change: open the exchange to Web sessions, or an Account-origin signing route that returns ciphertext only.
+13. **Test-fleet anchors (2026-09-03).** The SDK anchor map stays empty until fleet provisioning. Web reads `NEXT_PUBLIC_PS_ENCLAVE_ANCHOR_OVERRIDE` (JSON `{kmsRootPubkey, appIds}`) in non-production builds only, ignored in production; it replaces the SDK anchor for the chain; Account reads the same shape from `ACCOUNT_PS_ENCLAVE_ANCHOR_OVERRIDE` (its delivery intent verifies evidence too, found in the first Level C run). Level C = the consent flow with a real Privy owner (prepare, browser verify, registration, sealed delivery, _on_); the builder job stays at level B because no owner-signed grant path exists without the owner's key.
+14. **Level C passed (2026-09-03).** Real Privy owner (Google login through the hosted Hydra, Account and Web run locally in real mode against the `spike-b3` Gateway preview and one Phala node): prepare, browser verification with the override anchor, registration signed silently by Privy through the Account intent, sealed delivery through the Account intent with the Account override, identity `sealed` on the Gateway; the enclave server became the owner's newest active server next to their existing PS Lite registration. First attempt failed only on the missing Account anchor override (item 13). The product state stays _turning on_ until `/v1/cron/settle` runs, which a preview never does; job admission needs `sealed` only.
 
 ### Critical files
 
