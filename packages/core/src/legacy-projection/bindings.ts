@@ -1971,14 +1971,6 @@ const chatgptConversations: LegacyScopeBinding = {
         walked.messages.length >= message_count_on_current_branch
       ) {
         branch = walked.messages;
-      } else if (!walked.ok && walked.reason === "cycle") {
-        chatgptCoverageGaps.push({
-          conversationIdHash: chatgptConversationIdHash(id),
-          reason: "cycle",
-          declaredCount: message_count_on_current_branch,
-          walkedCount,
-        });
-        continue;
       } else {
         branchWalkFallbacks.set(
           walkFailureReason,
