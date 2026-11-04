@@ -1573,6 +1573,36 @@ function scopeMethods(scope: string): Map<string, readonly string[]> {
   return methods;
 }
 
+/** Streams used by this scope and no other scope for each method. */
+export function exclusiveScopeStreams(
+  scope: string,
+): Map<string, readonly string[]> {
+  const methods = scopeMethods(scope);
+  const result = new Map<string, readonly string[]>();
+  for (const [method, streams] of methods) {
+    const shared = new Set<string>();
+    for (const other of boundScopes()) {
+      if (other === scope) continue;
+      for (const stream of scopeMethods(other).get(method) ?? [])
+        shared.add(stream);
+    }
+    result.set(
+      method,
+      streams.filter((stream) => !shared.has(stream)),
+    );
+  }
+  return result;
+}
+
+/** True when a method maps this scope to a stream also used by another scope. */
+export function scopeHasSharedStreams(scope: string): boolean {
+  const exclusive = exclusiveScopeStreams(scope);
+  return [...scopeMethods(scope)].some(
+    ([method, streams]) =>
+      streams.length !== (exclusive.get(method)?.length ?? 0),
+  );
+}
+
 function boundScopes(): string[] {
   const scopes = new Set<string>();
   for (const profile of BINDING_PROFILES) {

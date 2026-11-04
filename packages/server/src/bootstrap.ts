@@ -630,6 +630,8 @@ export async function createServer(
    * did before this existed.
    */
   let pdppImporterImpl: PdppImporter | null = null;
+  let deletionRecordStore: ReturnType<typeof openRecordStore> | undefined =
+    undefined;
   const pdppImporter: PdppImporter = {
     importEnvelope: (envelope) =>
       pdppImporterImpl?.importEnvelope(envelope) ?? { status: "skipped" },
@@ -654,7 +656,7 @@ export async function createServer(
     serverOwner,
     logger,
     deletionHistory: serverOwner
-      ? createScopeDeletionHistory(db, serverOwner)
+      ? createScopeDeletionHistory(db, serverOwner, () => deletionRecordStore)
       : undefined,
   });
 
@@ -907,8 +909,6 @@ export async function createServer(
         }
       },
     });
-    syncManager.start();
-    logger.info("Sync engine started");
   } else if (config.sync.enabled) {
     logger.warn(
       "Sync enabled in config but VANA_MASTER_KEY_SIGNATURE not set — sync disabled",
@@ -1128,6 +1128,22 @@ export async function createServer(
       serverOwner,
       logger,
     }) ?? null;
+
+  const hasRecordRegistry =
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdpp_instance_binding'",
+      )
+      .get() !== undefined;
+  deletionRecordStore =
+    pdppRecords?.bindingStore ??
+    (hasRecordRegistry
+      ? (replicaHost?.store ?? openRecordStore(db, replication.enabled))
+      : undefined);
+  if (syncManager) {
+    syncManager.start();
+    logger.info("Sync engine started");
+  }
 
   // Standard mode keeps MCP clients (e.g. a claude.ai connector) signed in
   // across restarts. Enclaves use the TEE ingress's own sealed state.

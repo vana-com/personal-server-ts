@@ -116,6 +116,8 @@ export interface ScopeDeletionTracker {
 }
 
 export interface ScopeTombstone {
+  /** True only when this exact deletion was atomically applied to canonical rows. */
+  eraseApplied?: boolean;
   deletedAt: string;
   /** Registry version of the tombstone; null when unknown (covers everything). */
   version: string | null;
@@ -229,7 +231,7 @@ export function createScopeDeletionTracker(
         get(scope) {
           // Preserve durable-read errors and the existing durable fact when
           // an update failed. Either fact is sufficient to refuse canonical.
-          return history.get(scope) ?? pendingHistory.get(scope) ?? null;
+          return pendingHistory.get(scope) ?? history.get(scope) ?? null;
         },
       }
     : undefined;

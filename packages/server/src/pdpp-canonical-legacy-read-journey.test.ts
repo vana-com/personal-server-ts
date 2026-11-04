@@ -135,6 +135,7 @@ interface BootOptions {
   payment?: boolean;
   dataPointFeed?: CreateServerOptions["dataPointFeed"];
   pdppEnabled?: boolean;
+  syncEnabled?: boolean;
 }
 
 async function boot(
@@ -144,6 +145,7 @@ async function boot(
     payment = false,
     dataPointFeed,
     pdppEnabled = true,
+    syncEnabled = false,
   }: BootOptions = {},
 ) {
   const dir = join(tempDir, "declarations");
@@ -160,10 +162,12 @@ async function boot(
       addedAt: "2026-01-21T10:00:00.000Z",
     } satisfies Builder),
     getGrant: vi.fn().mockResolvedValue(grant()),
+    getServer: vi.fn().mockResolvedValue(null),
   } as unknown as GatewayClient;
   return createServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
+      sync: { enabled: syncEnabled },
       payment: { enabled: payment },
       pdpp: {
         enabled: pdppEnabled,
@@ -222,9 +226,10 @@ async function replace(
   rows: Record<string, unknown>[],
   sourceCollectedAt: string | undefined,
   instance = accountOne,
+  generation = 1,
 ) {
   const response = await ctx!.app.request(
-    `/v1/streams/${stream}/records/replace?method=oura&binding_generation=1`,
+    `/v1/streams/${stream}/records/replace?method=oura&binding_generation=${generation}`,
     {
       method: "POST",
       headers: {
@@ -245,7 +250,7 @@ async function replace(
       }),
     },
   );
-  expect(response.status).toBe(200);
+  expect(response.status, await response.clone().text()).toBe(200);
 }
 
 async function upsert(token: string, data: Record<string, unknown>) {
@@ -727,6 +732,22 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
         return response.json();
       };
       const before = await nativeRows();
+      // Simulate a deletion history entry written before erase markers existed.
+      const historyDb = new Database(join(tempDir, "index.db"));
+      try {
+        historyDb
+          .prepare(
+            `INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)`,
+          )
+          .run(
+            owner,
+            "oura.activity",
+            "2026-09-11T00:00:00Z",
+            tombstoneVersion,
+          );
+      } finally {
+        historyDb.close();
+      }
       deleted = true;
       expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
 
@@ -837,21 +858,32 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect((await ownerGet("/v1/data/oura.activity")).status).toBe(200);
     await legacyWrite("oura.readiness", { readiness: [] });
     const token = await ownerPdppToken();
+    const bindingDb = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+    });
+    const binding = bindingDb
+      .prepare(
+        "SELECT generation FROM pdpp_instance_binding WHERE instance = ?",
+      )
+      .get(accountOne) as { generation: number };
+    bindingDb.close();
     await replace(
       token,
       "activity",
-      [day("canonical-without-readd", "2026-09-10")],
+      [day("fresh-collection", "2026-09-10")],
       "2026-09-10T06:00:00Z",
+      accountOne,
+      binding.generation,
     );
-    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
-    expect((await builderGet("oura.activity")).status).toBe(410);
+    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(200);
+    expect((await builderGet("oura.activity")).status).toBe(200);
     expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
     expect((await ownerGet("/v1/data/oura.readiness")).status).toBe(200);
     expect(
       JSON.parse((await ownerGet("/v1/data")).text).scopes.map(
         (row: { scope: string }) => row.scope,
       ),
-    ).toEqual(["notes.manual", "oura.readiness"]);
+    ).toEqual(["notes.manual", "oura.activity", "oura.readiness"]);
   });
 
   it("serves canonical rows to a legacy grant and the owner after coverage", async () => {
@@ -1721,6 +1753,204 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
       "notes.manual",
       "oura.readiness",
     ]);
+  });
+
+  it("keeps pre-upgrade unmarked deletion history hidden", async () => {
+    await collectActivity();
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      db.prepare(
+        `INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)`,
+      ).run(owner, "oura.activity", "2026-09-11T00:00:00Z", "2");
+    } finally {
+      db.close();
+    }
+    const read = await ownerGet("/v1/data/oura.activity");
+    expect(read.status).toBe(410);
+    const listing = await ownerGet("/v1/data");
+    const body = JSON.parse(listing.text) as { scopes: { scope: string }[] };
+    expect(body.scopes.some((scope) => scope.scope === "oura.activity")).toBe(
+      false,
+    );
+  });
+
+  it("erases a newly observed deletion and keeps sibling records", async () => {
+    let deleted = false;
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope }) =>
+        !deleted || scope !== "oura.activity"
+          ? null
+          : {
+              id: "point",
+              ownerAddress,
+              scope,
+              dataHash: `0x${"11".repeat(32)}`,
+              metadataHash: `0x${"22".repeat(32)}`,
+              expectedVersion: "2",
+              addedAt: "2026-09-01T00:00:00Z",
+              deletedAt: "2026-09-11T00:00:00Z",
+            },
+    };
+    await ctx!.cleanup();
+    ctx = await boot("oura", { dataPointFeed });
+    const token = await collectActivity();
+    await replace(
+      token,
+      "readiness",
+      [day("sibling", "2026-09-02")],
+      "2026-09-10T06:00:00Z",
+    );
+    deleted = true;
+    const listing = await ownerGet("/v1/data");
+    expect(JSON.parse(listing.text).scopes).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ scope: "oura.activity" }),
+      ]),
+    );
+    const read = await ownerGet("/v1/data/oura.activity");
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      expect(
+        db
+          .prepare(
+            "SELECT erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
+          )
+          .get(owner, "oura.activity"),
+      ).toEqual({ erase_applied: 1 });
+      expect(
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'activity'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 0 });
+      expect(
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = 'readiness'",
+          )
+          .get(accountOne),
+      ).toEqual({ n: 1 });
+    } finally {
+      db.close();
+    }
+    expect(read.status, read.text).toBe(410);
+  });
+
+  it("serves new canonical records after durable scope deletion", async () => {
+    let deleted = false;
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope }) => ({
+        id: "point",
+        ownerAddress,
+        scope,
+        dataHash: `0x${"11".repeat(32)}`,
+        metadataHash: `0x${"22".repeat(32)}`,
+        expectedVersion: deleted ? "2" : "1",
+        addedAt: "2026-09-01T00:00:00Z",
+        deletedAt: deleted ? "2026-09-11T00:00:00Z" : null,
+      }),
+    };
+    await ctx!.cleanup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (init?.method === "GET") {
+          const request = new URL(url);
+          return new Response(
+            JSON.stringify({
+              data: {
+                dataPointId: request.pathname.split("/")[3],
+                ownerAddress: owner,
+                scope: request.searchParams.get("scope"),
+                head: null,
+                versions: [],
+              },
+              pagination: {
+                limit: Number(request.searchParams.get("limit")),
+                hasMore: false,
+                nextAfter: null,
+              },
+            }),
+          );
+        }
+        deleted = true;
+        return new Response(
+          JSON.stringify({
+            expectedVersion: "2",
+            deletedAt: "2026-09-11T00:00:00Z",
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+    try {
+      ctx = await boot("oura", { dataPointFeed, syncEnabled: true });
+      expect(ctx.syncManager).not.toBeNull();
+      await legacyWrite("oura.activity", COVERED_A1);
+      const token = await collectActivity();
+      const reset = await ctx.app.request(
+        `/pdpp/instances/${encodeURIComponent(accountOne)}/reset`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            expected_method: "oura",
+            expected_generation: 1,
+            next_method: "oura",
+          }),
+        },
+      );
+      expect(reset.status).toBe(200);
+      const deletion = await ctx.app.request("/v1/data/oura.activity", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      expect(deletion.status).toBe(200);
+      expect(await deletion.json()).toMatchObject({
+        durable: true,
+        steps: { gateway: { status: "ok" } },
+      });
+      const write = await ctx.app.request(
+        "/v1/streams/activity/records/replace?method=oura&binding_generation=3",
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            instance: accountOne,
+            emitted_at: "2026-09-12T12:00:00Z",
+            source_collected_at: "2026-09-12T06:00:00Z",
+            records: [
+              {
+                key: "fresh",
+                data: day("fresh", "2026-09-12"),
+                emitted_at: "2026-09-12T07:00:00Z",
+              },
+            ],
+          }),
+        },
+      );
+      expect(write.status).toBe(200);
+      const read = await ownerGet("/v1/data/oura.activity");
+      expect(read.status).toBe(200);
+      expect(ids(read.text)).toEqual(["fresh"]);
+      const listing = await ownerGet("/v1/data");
+      expect(JSON.parse(listing.text).scopes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ scope: "oura.activity" }),
+        ]),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it.each(["reset", "delete"])(

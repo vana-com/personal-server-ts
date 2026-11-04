@@ -97,6 +97,7 @@ import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
   deletionHistoryOf,
+  scopeHasSharedStreams,
   type LegacyScopeRefusal,
   type LegacyScopeViewPort,
 } from "../storage/legacy-scope-view.js";
@@ -1170,7 +1171,7 @@ export async function resolveReadDeletion(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
-  body: "file" | "canonical" = "file",
+  body: "file" | "canonical" | "canonical-empty" = "file",
   gatewayTimeoutMs?: number,
 ): Promise<{
   scope: string;
@@ -1182,12 +1183,14 @@ export async function resolveReadDeletion(
     consultGateway: entry ? "if-stale" : "always",
     ...(gatewayTimeoutMs === undefined ? {} : { gatewayTimeoutMs }),
   });
-  // A live DPv2 file cannot establish that a different canonical body was
-  // re-added. Keep this refusal until a genuine canonical re-add seam exists.
+  const history = deps.scopeDeletions.deletionHistory?.get(scope);
   const tombstone =
-    body === "canonical"
-      ? (deps.scopeDeletions.deletionHistory?.get(scope) ??
-        (verdict.deleted ? verdict : null))
+    body === "canonical" || body === "canonical-empty"
+      ? body === "canonical" &&
+        history?.eraseApplied &&
+        !scopeHasSharedStreams(scope)
+        ? null
+        : (history ?? (verdict.deleted ? verdict : null))
       : verdict.deleted
         ? verdict
         : null;
@@ -1217,7 +1220,7 @@ export async function assertScopeNotDeleted(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
-  body: "file" | "canonical" = "file",
+  body: "file" | "canonical" | "canonical-empty" = "file",
 ): Promise<void> {
   const deletion = await resolveReadDeletion(deps, scope, entry, body);
   if (deletion) throw new DataDeletedError(deletion);
@@ -1263,17 +1266,31 @@ function listingVisibility(
     const listing = view.listingFor(scope);
     if (listing.kind === "refused") return false;
     const canonicalOwned = deletionHistoryOf(listing) === "canonical";
-    // A file's re-add marker cannot revive the canonical body this row
-    // describes. Canonical re-adds have no registered version yet.
-    return (
+    // A file's re-add marker cannot authorize a canonical body.
+    const visible =
       (await resolveReadDeletion(
         deps,
         scope,
         canonicalOwned ? undefined : entry,
         canonicalOwned ? "canonical" : "file",
         Math.max(0, deadlineAtMs - Date.now()),
-      )) === null
-    );
+      )) === null;
+    if (!visible) return false;
+    // A lookup can apply a tombstone and erase rows after the first decision.
+    const after = view.listingFor(scope);
+    if (after.kind === "refused") return false;
+    if (canonicalOwned && deletionHistoryOf(after) !== "canonical") {
+      return (
+        (await resolveReadDeletion(
+          deps,
+          scope,
+          entry,
+          "file",
+          Math.max(0, deadlineAtMs - Date.now()),
+        )) === null
+      );
+    }
+    return true;
   };
 }
 
@@ -1298,9 +1315,7 @@ function canonicalOnlyScopes(
   if (!view) return undefined;
   return async (scopePrefix, stored) => {
     const listed: ScopeSummary[] = [];
-    for (const { scope, collectedAt } of view.listCanonicalScopes(
-      scopePrefix,
-    )) {
+    for (const { scope } of view.listCanonicalScopes(scopePrefix)) {
       if (stored.has(scope)) continue;
       if (
         (await resolveReadDeletion(
@@ -1313,8 +1328,14 @@ function canonicalOnlyScopes(
       ) {
         continue;
       }
-      // No legacy version exists to count or to ask `/versions` for.
-      listed.push({ scope, latestCollectedAt: collectedAt, versionCount: 0 });
+      // The deletion lookup may have erased the candidate during this listing.
+      const current = view.listingFor(scope);
+      if (current.kind !== "canonical") continue;
+      listed.push({
+        scope,
+        latestCollectedAt: current.collectedAt,
+        versionCount: 0,
+      });
     }
     return listed;
   };
@@ -2237,6 +2258,17 @@ export async function handlePersonalServerDataRequest(
       // version and re-add marker authorize that file, not canonical rows.
       // `?view=stored` asks for the stored file's body, so it never reads the
       // canonical view either.
+      // Observe and apply any tombstone before selecting canonical rows.
+      if (
+        deps.legacyScopeView &&
+        fileIdParam === undefined &&
+        atParam === undefined &&
+        view === null
+      ) {
+        await deps.scopeDeletions?.resolve(scopeResult.scope, {
+          consultGateway: selectedEntry ? "if-stale" : "always",
+        });
+      }
       const latest =
         fileIdParam === undefined && atParam === undefined && view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
@@ -2253,7 +2285,17 @@ export async function handlePersonalServerDataRequest(
         deps,
         scopeResult.scope,
         canonicalOwned ? undefined : selectedEntry,
-        canonicalOwned ? "canonical" : "file",
+        canonicalOwned
+          ? latest?.kind === "refused" &&
+            latest.refusal.status === "unavailable" &&
+            [
+              "no_connection",
+              "no_synced_data",
+              "stream_completion_unknown",
+            ].includes(latest.refusal.reason)
+            ? "canonical-empty"
+            : "canonical"
+          : "file",
       );
 
       if (view === "stored" && !isOwnerView(authResult)) {
