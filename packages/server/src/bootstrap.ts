@@ -1207,6 +1207,7 @@ export async function createServer(
   });
   let policyFingerprint = JSON.stringify(evaluationConfig());
   let lastPolicyCheck = Date.now();
+  revalidationState?.observePolicy(policyFingerprint, lastPolicyCheck);
   const revalidator = createLegacyScopeRevalidator({
     candidates: () => legacyCoverageCandidates(db),
     onChange: () => evaluationWorker.invalidate(),
@@ -1223,7 +1224,7 @@ export async function createServer(
     fingerprint: () => {
       const currentPolicy = JSON.stringify(evaluationConfig());
       if (currentPolicy !== policyFingerprint) {
-        revalidationState?.markDirty(lastPolicyCheck);
+        revalidationState?.observePolicy(currentPolicy, lastPolicyCheck);
         policyFingerprint = currentPolicy;
       }
       lastPolicyCheck = Date.now();
