@@ -430,7 +430,7 @@ describe("createApp with an enabled replica receiver", () => {
     expect(after.status).toBe(503);
     expect(after.body).toMatchObject({
       error: "CANONICAL_VIEW_UNAVAILABLE",
-      // ruled by lead 2026-11-04: confirmed loss and inconsistent reads are final.
+      // Confirmed loss and inconsistent reads are final.
       retryable: false,
       reason: expect.any(String),
     });

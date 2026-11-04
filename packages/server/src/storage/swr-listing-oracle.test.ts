@@ -1,6 +1,6 @@
-// Independent oracle: oracles/swr-listing-oracle-tests-1903.md, main 2df2ae99.
-// Case IDs retain the independent design's numbering. Only explicit Lead rulings
-// change that design; each such change is marked beside its assertions.
+// Independent oracle for the SWR listing bridge, written before the implementation.
+// Case numbers follow that design; where an assertion departs from it, the reason
+// is stated beside it.
 import type * as WorkerThreads from "node:worker_threads";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -107,7 +107,7 @@ afterEach(async () => {
 async function fixture() {
   const parent = join(homedir(), ".tmp");
   await mkdir(parent, { recursive: true });
-  const root = await mkdtemp(join(parent, "swr-oracle-1903-"));
+  const root = await mkdtemp(join(parent, "swr-oracle-"));
   const path = join(root, "index.db");
   let db = initializeDatabase(path);
   let state = trackLegacyScopeMutations(db, { ceilingMs: CEILING });
@@ -383,7 +383,7 @@ async function fixture() {
 }
 
 // Every test below corresponds to an oracle case, not a local implementation test.
-describe("independent SWR listing oracle 1903", () => {
+describe("independent SWR listing oracle", () => {
   it("01 unrelated_write_keeps_taken_over_scope", async () => {
     const h = await fixture(),
       before = h.origin(),
@@ -522,8 +522,8 @@ describe("independent SWR listing oracle 1903", () => {
     expect(published).toEqual([false, true]);
   });
   it("05 timed_out_instance_preserves_verdict_and_cannot_defeat_ceiling", async () => {
-    // ruled by lead 11-03: retain serialization; require deadline, no fabricated
-    // promotion on timeout, and listing expiry independent of worker completion.
+    // Instances are evaluated serially. A timeout must not promote a verdict,
+    // and the ceiling expires independently of worker completion.
     const h = await fixture(),
       original = h.authority.verdictFor(S);
     h.state.markDirty();
@@ -579,7 +579,7 @@ describe("independent SWR listing oracle 1903", () => {
     expect(finished).toEqual(["I2"]);
   });
   it("06 restart_preserves_stale_since_and_deadline", async () => {
-    // ruled by lead 11-03: deadline is first stale mutation + 30 min, not proof age.
+    // The deadline is 30 minutes after the first stale mutation.
     const h = await fixture(),
       proof = h.origin();
     vi.setSystemTime(T0 + 5 * 60_000);
@@ -606,7 +606,7 @@ describe("independent SWR listing oracle 1903", () => {
     await q.idle();
   });
   it("07 no_mutation_does_not_expire_a_clean_proof", async () => {
-    // ruled by lead 11-03: no mutation means no stale window and no age expiry.
+    // A clean proof with no mutation has no stale window or age expiry.
     const h = await fixture(),
       original = h.authority.verdictFor(S);
     for (const delta of [CEILING - 1, CEILING, CEILING + 1]) {
@@ -617,7 +617,7 @@ describe("independent SWR listing oracle 1903", () => {
     expect(h.state.status(I, S)?.dirty_since).toBeNull();
   });
   it("08 repeated_dirty_events_do_not_slide_deadline", async () => {
-    // ruled by lead 11-03: first stale mutation at +1 min anchors expiry at +31 min.
+    // The first stale mutation at +1 minute anchors expiry at +31 minutes.
     const h = await fixture(),
       proof = h.origin();
     for (const minute of [1, 10, 20, 29]) {
@@ -632,8 +632,8 @@ describe("independent SWR listing oracle 1903", () => {
     expect(h.view.listingFor(S).kind).toBe("refused");
   });
   it("09 successful_revalidation_clears_staleness_until_the_next_mutation", async () => {
-    // ruled by lead 11-03: success clears stale-since; the next mutation, not
-    // successful-proof age, starts a new 30-minute budget.
+    // Success clears the first-stale timestamp. The next mutation starts
+    // a new 30-minute window.
     const h = await fixture();
     vi.setSystemTime(T0 + 60_000);
     h.put("messages", h.message("A"));
@@ -650,7 +650,7 @@ describe("independent SWR listing oracle 1903", () => {
     expect(h.view.listingFor(S).kind).toBe("refused");
   });
   it("10 failed_or_cancelled_recheck_does_not_renew", async () => {
-    // ruled by lead 11-03: failure budget ends 30 min after first stale mutation.
+    // Failed or cancelled evaluations do not renew the first-stale deadline.
     const h = await fixture(),
       proof = h.origin(),
       first = barrier(),
@@ -881,7 +881,9 @@ describe("independent SWR listing oracle 1903", () => {
     expect(b.view.listingFor(S).kind).not.toBe("canonical");
   });
   it("18 retryable_only_for_unconfirmed_incomplete_view", async () => {
-    // ruled by lead 2026-11-04: retryable only for unconfirmed
+    // Only canonical_view_incomplete without a confirmed proof is retryable.
+    // Every other refusal reason, including confirmed incompleteness and
+    // store_inconsistent_read, is final (retryable: false).
     // The bridge still requires only retryable + reason, without the fuller
     // retryAfterMs/action/scope/Retry-After client contract.
     const h = await fixture();
@@ -1148,7 +1150,7 @@ describe("independent SWR listing oracle 1903", () => {
     expect(sourceBytes).toHaveBeenCalled();
     expect(await response.json()).toMatchObject({
       error: "CANONICAL_VIEW_UNAVAILABLE",
-      // ruled by lead 2026-11-04: source-byte failures are not retryable.
+      // Source-byte failures are not retryable.
       retryable: false,
       reason: expect.any(String),
     });
@@ -1202,6 +1204,6 @@ describe("independent SWR listing oracle 1903", () => {
     for (const page of pages)
       expect(page.latestCollectedAt).toBe("2026-09-01T00:00:00.000Z");
   });
-  // Case 23 is deliberately not implemented.
-  // ruled by lead 11-03: drop case 23; accept wall-clock rollback extending the window.
+  // A wall-clock rollback can extend the stale window; this suite does not
+  // assert a monotonic-clock bound.
 });

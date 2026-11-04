@@ -204,7 +204,8 @@ it("invalidates clean proofs on restart while preserving policy and first-stale 
     raw = initializeDatabase(path);
     state = trackLegacyScopeMutations(raw, { ceilingMs: 2000, now: () => now });
     state.observePolicy("schema-v1:threshold-1.5", now);
-    // ruled by lead 11-04: a clean marker crossing a process boundary is stale.
+    // A clean marker that survives a process boundary is not trusted, because
+    // writes from an older server or a PDPP-off boot are not tracked.
     expect(state.status("i", "oura.activity")?.dirty_since).toBe(1500);
     now = 2000;
     state.observePolicy("schema-v2:threshold-1.0", now);

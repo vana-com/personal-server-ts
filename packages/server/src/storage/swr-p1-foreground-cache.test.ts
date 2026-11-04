@@ -30,7 +30,8 @@ function barrier() {
 }
 
 beforeEach(() => {
-  // Same clock convention as oracle-1903; no real sleeps or worker processes.
+  // Use a fixed wall clock and controlled interval timers; no real sleeps
+  // or worker processes.
   vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
   vi.setSystemTime(T0);
 });
@@ -256,11 +257,11 @@ describe("P1 foreground proof must observe tracked dependency mutations", () => 
   });
 
   it.each(["covered", "not_covered"] as const)(
-    "1924 minimal trace: dependency_change(%s) -> advance_to_ceiling -> direct_read",
+    "minimal dependency trace: dependency_change(%s) -> advance_to_ceiling -> direct_read",
     async (outcome) => {
       const h = await fixture();
-      // Exact three-event script from the two subsequence-minimal violations
-      // in dot 1924. No intervening read, evaluation, timeout or restart.
+      // Minimal state-model traces: a dependency-only mutation, ceiling expiry,
+      // then a direct read. No evaluation, timeout or restart intervenes.
       if (outcome === "covered") h.addCoveredDependency();
       else h.loseRequiredBytes();
       const dirtySince = h.state.status(I, S)!.dirty_since!;
@@ -275,7 +276,7 @@ describe("P1 foreground proof must observe tracked dependency mutations", () => 
         expect.soft(response.status).toBe(503);
         expect.soft(await response.json()).toMatchObject({
           error: "CANONICAL_VIEW_UNAVAILABLE",
-          // ruled by lead 2026-11-04: confirmed loss and inconsistent reads are final.
+          // Confirmed loss and inconsistent reads are final.
           retryable: false,
           reason: expect.any(String),
         });
@@ -319,11 +320,12 @@ describe("P1 foreground proof must observe tracked dependency mutations", () => 
       expect.soft(response.status, boundary).toBe(503);
       expect.soft(await response.json(), boundary).toMatchObject({
         error: "CANONICAL_VIEW_UNAVAILABLE",
-        // ruled by lead 2026-11-04: confirmed loss and inconsistent reads are final.
+        // Confirmed loss and inconsistent reads are final.
         retryable: false,
         reason: expect.any(String),
       });
-      // ruled by lead 11-04: a confirmed negative from a same-evaluation byte check is a valid outcome
+      // An evaluation that checks source bytes can confirm a negative verdict
+      // and clear its dirty marker.
       const verdict = h.authority.verdictFor(S)[0]!;
       if (
         verdict.verdict === "not_covered" &&
@@ -386,7 +388,7 @@ describe("P1 foreground proof must observe tracked dependency mutations", () => 
     const response = await h.get();
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({
-      // ruled by lead 2026-11-04: confirmed loss and inconsistent reads are final.
+      // Confirmed loss and inconsistent reads are final.
       retryable: false,
       reason: expect.any(String),
     });

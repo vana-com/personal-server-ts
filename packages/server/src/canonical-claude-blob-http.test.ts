@@ -443,7 +443,7 @@ async function cachedReadDeletionCase(
     expect(text).not.toContain("Private source");
     if (after.status === 503) {
       const error = JSON.parse(text);
-      // ruled by lead 2026-11-04: deletion and inconsistent reads are final.
+      // Deletion and inconsistent reads are final.
       expect(error.retryable).toBe(false);
       expect(typeof error.reason).toBe("string");
     }
