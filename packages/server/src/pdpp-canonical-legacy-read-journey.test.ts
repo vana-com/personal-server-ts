@@ -360,7 +360,10 @@ function expectCompletedReplacement(scope: string): void {
 }
 
 describe("GET /v1/data/:scope for a bound connector scope", () => {
-  const verifyEmptyChatgptTransition = async (retention: string) => {
+  const verifyEmptyChatgptTransition = async (
+    retention: string,
+    appendOnly = false,
+  ) => {
     const scope = "chatgpt.conversations";
     const source = "https://registry.pdpp.dev/sources/chatgpt";
     const before = "2026-09-10T07:00:00.000Z";
@@ -397,6 +400,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
         fields: Object.keys(row),
         required_fields: ["id"],
         primary_key: ["id"],
+        ...(name === "messages" && appendOnly
+          ? { semantics: "append_only" }
+          : {}),
         ...(name === "messages"
           ? {
               schema: {
@@ -486,10 +492,15 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       );
     };
     await ingestRow("conversations", conversation, before);
-    await ingestRow("messages", message, before);
-    const original = await ownerGet(`/v1/data/${scope}`);
-    expect(original.status).toBe(200);
-    expect(original.dataSource).toBe("canonical");
+    if (appendOnly) {
+      // The unknown state is stored first; the explicit empty fill follows below.
+      await ingestRow("messages", { ...message, content: null }, before);
+    } else {
+      await ingestRow("messages", message, before);
+      const original = await ownerGet(`/v1/data/${scope}`);
+      expect(original.status).toBe(200);
+      expect(original.dataSource).toBe("canonical");
+    }
     // No completion receipts: this must use ordinary field coverage.
     await ingestRow("messages", { ...message, content: "" }, after);
     await ingestRow(
@@ -534,6 +545,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     await ctx.cleanup();
     ctx = await boot("chatgpt", { declaration });
     await verify();
+    // The unknown-extraction tail below refuses null over a stored empty,
+    // which is the correct append_only outcome but not this case's subject.
+    if (appendOnly) return;
     if (retention === "off-branch") {
       // Known-empty text remains retention evidence after the selected branch moves.
       const branchChangedAt = "2026-09-12T07:00:00.000Z";
@@ -611,6 +625,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     "omits newer explicit empty ChatGPT text and retains exact legacy history after reopen (%s)",
     verifyEmptyChatgptTransition,
   );
+
+  it("accepts an append_only null text re-emitted as explicit empty and serves it as covered", () =>
+    verifyEmptyChatgptTransition("current", true));
 
   it("accepts mutable value drift from a newer canonical collection", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });

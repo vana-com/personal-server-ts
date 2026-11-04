@@ -116,12 +116,42 @@ export function planIngest(
     // Core: append_only records are immutable and duplicate keys are
     // idempotent, so the first write stands. The flag lets the producer
     // count a source that changed a record it declared immutable.
-    if (semantics === "append_only") return unchanged("append_only_conflict");
+    if (
+      semantics === "append_only" &&
+      !isNullToEmptyFill(existing.data, data)
+    ) {
+      return unchanged("append_only_conflict");
+    }
   }
   return {
     outcome: { index, outcome: "accepted" },
     write: { recordKey, data },
   };
+}
+
+/**
+ * True when `incoming` differs from `existing` only by top-level fields that
+ * went from `null` to `""`. `null` means the source did not know the value,
+ * and `""` is an explicit empty observation: filling unknown with empty adds
+ * no content, so it cannot hide an edit.
+ */
+function isNullToEmptyFill(
+  existing: Record<string, unknown> | null,
+  incoming: Record<string, unknown>,
+): boolean {
+  if (existing === null) return false;
+  const keys = Object.keys(incoming);
+  if (Object.keys(existing).length !== keys.length) return false;
+  let filled = false;
+  for (const key of keys) {
+    if (!Object.hasOwn(existing, key)) return false;
+    const before = existing[key];
+    const after = incoming[key];
+    if (canonicalJson(before) === canonicalJson(after)) continue;
+    if (before !== null || after !== "") return false;
+    filled = true;
+  }
+  return filled;
 }
 
 /** JSON with object keys sorted at every depth. */
