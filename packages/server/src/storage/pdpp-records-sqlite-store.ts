@@ -712,6 +712,7 @@ export function createSqliteRecordStore(
   db: Database,
   options: SqliteRecordStoreOptions = {},
 ): PdppRecordStore & {
+  readonly database: Database;
   transitionClaudeToLive(input: ClaudeTransitionInput): PdppInstanceBinding;
   claudeTransition(instance: string): ClaudeTransition | null;
   listClaudeTransitions(): ClaudeTransition[];
@@ -2812,6 +2813,7 @@ export function createSqliteRecordStore(
   }
 
   return {
+    database: db,
     transitionClaudeToLive,
     claudeTransition,
     listClaudeTransitions,

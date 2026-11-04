@@ -2272,10 +2272,18 @@ export async function handlePersonalServerDataRequest(
           consultGateway: selectedEntry ? "if-stale" : "always",
         });
       }
-      const latest =
-        fileIdParam === undefined && atParam === undefined && view === null
-          ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
-          : undefined;
+      const historyStamp = () =>
+        JSON.stringify(
+          deps.scopeDeletions?.deletionHistory?.get(scopeResult.scope) ?? null,
+        );
+      let latest;
+      if (fileIdParam === undefined && atParam === undefined && view === null) {
+        let before;
+        do {
+          before = historyStamp();
+          latest = await deps.legacyScopeView?.readLatest(scopeResult.scope);
+        } while (before !== historyStamp());
+      }
       // The deletion history comes with the body the view chose, never from
       // a later ownership query a concurrent write could change.
       const canonicalOwned =

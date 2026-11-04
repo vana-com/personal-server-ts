@@ -3355,6 +3355,45 @@ describe("shared canonical streams on scope deletion", () => {
     store.close();
     await rm(dir, { recursive: true, force: true });
   });
+  it("rereads canonical rows if deletion history changes while readLatest awaits", async () => {
+    let reads = 0;
+    const scope = "oura.activity";
+    const raced = dataRoutes({
+      ...routeDeps,
+      legacyScopeView: {
+        ...routeDeps.legacyScopeView!,
+        async readLatest() {
+          reads++;
+          if (reads === 1) {
+            history.remember(scope, mark);
+            return {
+              kind: "canonical",
+              envelope: {
+                version: "1.0",
+                scope,
+                collectedAt: mark.deletedAt,
+                data: { secret: "old" },
+              },
+              revision: "old",
+            };
+          }
+          return {
+            kind: "refused",
+            refusal: {
+              status: "unavailable",
+              reason: "no_connection",
+              candidates: 0,
+            },
+          };
+        },
+      },
+    });
+    const response = await raced.request(`/${scope}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(410);
+    expect(reads).toBe(2);
+  });
   it("refuses scope deletion with replication enabled before changing rows or history", async () => {
     const localApp = dataRoutes({
       ...routeDeps,

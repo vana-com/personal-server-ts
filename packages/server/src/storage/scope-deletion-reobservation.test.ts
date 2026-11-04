@@ -153,4 +153,21 @@ describe("scope deletion re-observation", () => {
       deleteScope({ ...deps, now: () => new Date("2026-09-12") }, scope),
     ).resolves.toMatchObject({ durable: true });
   });
+  it("rejects a history/store database mismatch", () => {
+    const other = initializeDatabase(":memory:");
+    try {
+      expect(() => createScopeDeletionHistory(other, owner, store)).toThrow(
+        "same SQLite connection",
+      );
+    } finally {
+      other.close();
+    }
+  });
+  it("does not trust an erase marker left behind by an older upsert", () => {
+    history.remember(scope, { version: "3", deletedAt: at });
+    db.prepare(
+      "UPDATE vana_scope_deletion_history SET tombstone_version = '4' WHERE scope = ?",
+    ).run(scope);
+    expect(history.get(scope)?.eraseApplied).not.toBe(true);
+  });
 });

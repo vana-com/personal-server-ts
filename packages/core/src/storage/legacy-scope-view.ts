@@ -1588,7 +1588,7 @@ function sameSelection(
  * reads. A method id is a binding's connector key; its binding is the one
  * the reader will use for that method.
  */
-function scopeMethods(scope: string): Map<string, readonly string[]> {
+export function scopeMethods(scope: string): Map<string, readonly string[]> {
   const methods = new Map<string, readonly string[]>();
   for (const profile of BINDING_PROFILES) {
     const bound = profile.get(scope);
@@ -1621,13 +1621,19 @@ export function exclusiveScopeStreams(
   return result;
 }
 
+const sharedScopeCache = new Map<string, boolean>();
+
 /** True when a method maps this scope to a stream also used by another scope. */
 export function scopeHasSharedStreams(scope: string): boolean {
+  const cached = sharedScopeCache.get(scope);
+  if (cached !== undefined) return cached;
   const exclusive = exclusiveScopeStreams(scope);
-  return [...scopeMethods(scope)].some(
+  const shared = [...scopeMethods(scope)].some(
     ([method, streams]) =>
       streams.length !== (exclusive.get(method)?.length ?? 0),
   );
+  sharedScopeCache.set(scope, shared);
+  return shared;
 }
 
 function boundScopes(): string[] {

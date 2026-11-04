@@ -654,13 +654,20 @@ export async function createServer(
     });
   // Read-side memory of tombstones, shared by the sync workers (which feed
   // it) and the data route (which consults it on every read).
+  // The replication door, once per boot and before any record store opens.
+  // A refused re-enable keeps the server ready, with the flag off.
+  const replication = resolveReplication(
+    db,
+    config.replication.enabled,
+    logger,
+  );
   const scopeDeletions = createScopeDeletionTracker({
     feed: dataPointFeed,
     serverOwner,
     logger,
     deletionHistory: serverOwner
       ? createScopeDeletionHistory(db, serverOwner, () => deletionRecordStore, {
-          replicationEnabled: config.replication.enabled,
+          replicationEnabled: replication.enabled,
           logger,
         })
       : undefined,
@@ -1003,13 +1010,6 @@ export async function createServer(
     tokenStore,
   });
 
-  // The replication door, once per boot and before any record store opens.
-  // A refused re-enable keeps the server ready, with the flag off.
-  const replication = resolveReplication(
-    db,
-    config.replication.enabled,
-    logger,
-  );
   // A copied database must not continue its original's writer sequences.
   // Before any store of this boot captures a write.
   const replicaWriterRotation = rotateReplicaWriterIdentityAtBoot(db, {
@@ -1141,6 +1141,8 @@ export async function createServer(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdpp_instance_binding'",
       )
       .get() !== undefined;
+  // Even a PDPP-disabled boot must apply deletion history to a retained registry.
+  // Opening the store runs its schema migration and stale-claim sweep before erasure.
   deletionRecordStore =
     pdppRecords?.bindingStore ??
     (hasRecordRegistry
@@ -1149,7 +1151,7 @@ export async function createServer(
   if (serverOwner) {
     migrateScopeDeletionHistory(db, serverOwner, deletionRecordStore, logger, {
       dryRun: process.env.PS_SCOPE_DELETION_MIGRATION_DRY_RUN === "true",
-      replicationEnabled: config.replication.enabled,
+      replicationEnabled: replication.enabled,
     });
   }
   if (syncManager) {
@@ -1169,7 +1171,7 @@ export async function createServer(
       : undefined;
 
   const app = createApp({
-    replicationEnabled: config.replication.enabled,
+    replicationEnabled: replication.enabled,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
     // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).

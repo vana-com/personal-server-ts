@@ -15,6 +15,7 @@ export function createScopeDeletionHistory(
   ownerAddress: string,
   records?:
     | {
+        readonly database: Database;
         recordScopeDeletion(
           scope: string,
           writeHistory: () => boolean,
@@ -23,6 +24,7 @@ export function createScopeDeletionHistory(
       }
     | (() =>
         | {
+            readonly database: Database;
             recordScopeDeletion(
               scope: string,
               writeHistory: () => boolean,
@@ -35,6 +37,10 @@ export function createScopeDeletionHistory(
     logger?: { error(fields: Record<string, unknown>, message: string): void };
   } = {},
 ): ScopeDeletionHistory {
+  if (records && typeof records !== "function" && records.database !== db)
+    throw new Error(
+      "History and record store must share the same SQLite connection",
+    );
   db.exec(`
     CREATE TABLE IF NOT EXISTS vana_scope_deletion_history (
       owner_address TEXT NOT NULL,
@@ -52,6 +58,11 @@ export function createScopeDeletionHistory(
       "ALTER TABLE vana_scope_deletion_history ADD COLUMN erase_applied INTEGER NOT NULL DEFAULT 0",
     );
   }
+  if (!columns.some((column) => column.name === "erase_applied_version")) {
+    db.exec(
+      "ALTER TABLE vana_scope_deletion_history ADD COLUMN erase_applied_version TEXT",
+    );
+  }
   const owner = ownerAddress.toLowerCase();
   // A previously applied local erase does not prove replicated copies are gone.
   // Re-enable the read gate before replication can import or serve records.
@@ -67,10 +78,10 @@ export function createScopeDeletionHistory(
     ON CONFLICT (owner_address, scope) DO UPDATE SET
       deleted_at = excluded.deleted_at,
       tombstone_version = excluded.tombstone_version,
-      erase_applied = 0
+      erase_applied = 0, erase_applied_version = NULL
   `);
   const get = db.prepare(`
-    SELECT deleted_at, tombstone_version, erase_applied FROM vana_scope_deletion_history
+    SELECT deleted_at, tombstone_version, erase_applied, erase_applied_version FROM vana_scope_deletion_history
     WHERE owner_address = ? AND scope = ?
   `);
   return {
@@ -81,6 +92,7 @@ export function createScopeDeletionHistory(
               deleted_at: string;
               tombstone_version: string | null;
               erase_applied: number;
+              erase_applied_version: string | null;
             }
           | undefined;
         if (previous) {
@@ -94,7 +106,10 @@ export function createScopeDeletionHistory(
             if (BigInt(tombstone.version) < BigInt(priorVersion)) return false;
             if (BigInt(tombstone.version) === BigInt(priorVersion)) {
               return (
-                previous.erase_applied !== 1 && !options.replicationEnabled
+                (previous.erase_applied !== 1 ||
+                  previous.erase_applied_version !==
+                    previous.tombstone_version) &&
+                !options.replicationEnabled
               );
             }
           }
@@ -103,9 +118,13 @@ export function createScopeDeletionHistory(
         return true;
       };
       const store = typeof records === "function" ? records() : records;
+      if (store && store.database !== db)
+        throw new Error(
+          "History and record store must share the same SQLite connection",
+        );
       const markApplied = () => {
         db.prepare(
-          "UPDATE vana_scope_deletion_history SET erase_applied = 1 WHERE owner_address = ? AND scope = ?",
+          "UPDATE vana_scope_deletion_history SET erase_applied = 1, erase_applied_version = tombstone_version WHERE owner_address = ? AND scope = ?",
         ).run(owner, scope);
       };
       try {
@@ -148,13 +167,17 @@ export function createScopeDeletionHistory(
             deleted_at: string;
             tombstone_version: string | null;
             erase_applied: number;
+            erase_applied_version: string | null;
           }
         | undefined;
       return row
         ? {
             deletedAt: row.deleted_at,
             version: row.tombstone_version,
-            ...(row.erase_applied === 1 ? { eraseApplied: true } : {}),
+            ...(row.erase_applied === 1 &&
+            row.erase_applied_version === row.tombstone_version
+              ? { eraseApplied: true }
+              : {}),
           }
         : null;
     },
@@ -167,6 +190,7 @@ export function migrateScopeDeletionHistory(
   ownerAddress: string,
   records:
     | {
+        readonly database: Database;
         recordScopeDeletion(
           scope: string,
           writeHistory: () => boolean,
@@ -181,16 +205,36 @@ export function migrateScopeDeletionHistory(
   options: { dryRun?: boolean; replicationEnabled?: boolean } = {},
 ): void {
   const owner = ownerAddress.toLowerCase();
-  const scopes = db
+  let scopes = db
     .prepare(
-      "SELECT scope FROM vana_scope_deletion_history WHERE owner_address = ? AND erase_applied = 0 ORDER BY scope",
+      "SELECT scope FROM vana_scope_deletion_history WHERE owner_address = ? AND (erase_applied = 0 OR erase_applied_version IS NOT tombstone_version) ORDER BY scope",
     )
     .all(owner) as { scope: string }[];
+  if (records && records.database !== db)
+    throw new Error(
+      "History and record store must share the same SQLite connection",
+    );
+  if (!options.dryRun && !options.replicationEnabled) {
+    const unmapped = scopes
+      .filter(({ scope }) => exclusiveScopeStreams(scope).size === 0)
+      .map(({ scope }) => scope);
+    if (unmapped.length) {
+      db.prepare(
+        "UPDATE vana_scope_deletion_history SET erase_applied = 1, erase_applied_version = tombstone_version WHERE owner_address = ? AND scope IN (SELECT value FROM json_each(?))",
+      ).run(owner, JSON.stringify(unmapped));
+      logger.info(
+        { rule: "unmapped", count: unmapped.length },
+        "Scope deletion migration",
+      );
+      const applied = new Set(unmapped);
+      scopes = scopes.filter(({ scope }) => !applied.has(scope));
+    }
+  }
   const current = db.prepare(
-    "SELECT erase_applied FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
+    "SELECT erase_applied, erase_applied_version, tombstone_version FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
   );
   const mark = db.prepare(
-    "UPDATE vana_scope_deletion_history SET erase_applied = 1 WHERE owner_address = ? AND scope = ? AND erase_applied = 0",
+    "UPDATE vana_scope_deletion_history SET erase_applied = 1, erase_applied_version = tombstone_version WHERE owner_address = ? AND scope = ? AND (erase_applied = 0 OR erase_applied_version IS NOT tombstone_version)",
   );
   const hasRegistry = () =>
     db
@@ -219,8 +263,18 @@ export function migrateScopeDeletionHistory(
       }
       const preview = () => {
         const row = current.get(owner, scope) as
-          { erase_applied: number } | undefined;
-        if (!row || row.erase_applied !== 0) return false;
+          | {
+              erase_applied: number;
+              erase_applied_version: string | null;
+              tombstone_version: string | null;
+            }
+          | undefined;
+        if (
+          !row ||
+          (row.erase_applied === 1 &&
+            row.erase_applied_version === row.tombstone_version)
+        )
+          return false;
         if (!records && hasRegistry())
           throw new Error(
             "Canonical record store unavailable for deletion migration",
@@ -328,7 +382,9 @@ export function migrateScopeDeletionHistory(
               a.stream.localeCompare(b.stream),
             ),
           },
-          "Scope deletion migration preview",
+          options.dryRun
+            ? "Scope deletion migration preview"
+            : "Scope deletion migration",
         );
         return true;
       };
