@@ -3315,6 +3315,43 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         },
       );
 
+      it("recovers a coherent flagged chain after a current-branch cycle", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n2"),
+            message("c1", "n1", "n2", "stale cycle", {
+              onBranch: false,
+            }),
+            message("c1", "n2", "n1", "cycle tip", {
+              onBranch: false,
+            }),
+            message("c1", "n3", null, "flagged root"),
+            message("c1", "n4", "n3", "flagged tip"),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 2,
+              messages: [
+                { id: "n3", content: "flagged root" },
+                { id: "n4", content: "flagged tip" },
+              ],
+            },
+          ],
+          total: 1,
+        });
+        expect(result.diagnostics).toContainEqual({
+          kind: "branch_walk_fallback",
+          scope: "chatgpt.conversations",
+          stream: "conversations",
+          count: 1,
+          reasons: ["cycle"],
+        });
+        expect(result.chatgptCoverageGaps).toBeUndefined();
+      });
+
       it("walks a relinked retained ancestor without falling back", () => {
         const result = projected(
           project([
