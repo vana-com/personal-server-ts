@@ -340,6 +340,8 @@ export interface PersonalServerDataApiDeps {
    * "deleted" from "never had it". Without it reads are local-only.
    */
   scopeDeletions?: ScopeDeletionTracker;
+  /** Refuse scope erasure while replication can retain or restore rows. */
+  replicationEnabled?: boolean;
   /**
    * Required when payment is on. Powers two things on GET /v1/data/:scope:
    *   - the X402 challenge generation (fee lookup, accessRecord binding)
@@ -2843,6 +2845,17 @@ export async function handlePersonalServerDataRequest(
       // wasted remote call.
       const parsed = parseDataScopeContract(scopeParam);
       if (!parsed.ok) return contractErrorResponse(parsed);
+      if (deps.replicationEnabled) {
+        return jsonResponse(
+          {
+            error: "SCOPE_ERASE_REPLICATION_ENABLED",
+            message:
+              "Scope deletion is unavailable while replication is enabled. Full reset of the connection is required to erase its records. Nothing was deleted.",
+            scope: parsed.scope,
+          },
+          { status: 409 },
+        );
+      }
       if (cascade === "lineage") {
         // Specified (docs/derivative-data-api.md, "Delete") but not
         // implemented here. The durable per-scope delete below is what a

@@ -29,6 +29,7 @@ export function createScopeDeletionHistory(
             ): void;
           }
         | undefined),
+  options: { replicationEnabled?: boolean } = {},
 ): ScopeDeletionHistory {
   db.exec(`
     CREATE TABLE IF NOT EXISTS vana_scope_deletion_history (
@@ -48,6 +49,13 @@ export function createScopeDeletionHistory(
     );
   }
   const owner = ownerAddress.toLowerCase();
+  // A previously applied local erase does not prove replicated copies are gone.
+  // Re-enable the read gate before replication can import or serve records.
+  if (options.replicationEnabled) {
+    db.prepare(
+      "UPDATE vana_scope_deletion_history SET erase_applied = 0 WHERE owner_address = ? AND erase_applied = 1",
+    ).run(owner);
+  }
   const remember = db.prepare(`
     INSERT INTO vana_scope_deletion_history
       (owner_address, scope, deleted_at, tombstone_version)
@@ -90,7 +98,8 @@ export function createScopeDeletionHistory(
           "UPDATE vana_scope_deletion_history SET erase_applied = 1 WHERE owner_address = ? AND scope = ?",
         ).run(owner, scope);
       };
-      if (store) store.recordScopeDeletion(scope, write, markApplied);
+      if (options.replicationEnabled) db.transaction(write).immediate();
+      else if (store) store.recordScopeDeletion(scope, write, markApplied);
       else if (records) {
         db.transaction(() => {
           const registry = db
@@ -142,7 +151,7 @@ export function migrateScopeDeletionHistory(
     info(fields: Record<string, unknown>, message: string): void;
     error(fields: Record<string, unknown>, message: string): void;
   },
-  options: { dryRun?: boolean } = {},
+  options: { dryRun?: boolean; replicationEnabled?: boolean } = {},
 ): void {
   const owner = ownerAddress.toLowerCase();
   const scopes = db
@@ -162,8 +171,25 @@ export function migrateScopeDeletionHistory(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN ('pdpp_instance_binding', 'pdpp_records', 'pdpp_record_changes', 'pdpp_stream_completion', 'pdpp_record_arrival') LIMIT 1",
       )
       .get() !== undefined;
+  if (options.replicationEnabled) {
+    logger.info(
+      {
+        skipped: "replication",
+        count: scopes.length,
+        dryRun: options.dryRun === true,
+      },
+      "Scope deletion migration skip count",
+    );
+  }
   for (const { scope } of scopes) {
     try {
+      if (options.replicationEnabled) {
+        logger.info(
+          { scope, skipped: "replication", dryRun: options.dryRun === true },
+          "Scope deletion migration skipped",
+        );
+        continue;
+      }
       const preview = () => {
         const row = current.get(owner, scope) as
           { erase_applied: number } | undefined;

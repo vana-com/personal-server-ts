@@ -659,7 +659,9 @@ export async function createServer(
     serverOwner,
     logger,
     deletionHistory: serverOwner
-      ? createScopeDeletionHistory(db, serverOwner, () => deletionRecordStore)
+      ? createScopeDeletionHistory(db, serverOwner, () => deletionRecordStore, {
+          replicationEnabled: config.replication.enabled,
+        })
       : undefined,
   });
 
@@ -1146,6 +1148,7 @@ export async function createServer(
   if (serverOwner) {
     migrateScopeDeletionHistory(db, serverOwner, deletionRecordStore, logger, {
       dryRun: process.env.PS_SCOPE_DELETION_MIGRATION_DRY_RUN === "true",
+      replicationEnabled: config.replication.enabled,
     });
   }
   if (syncManager) {
@@ -1165,6 +1168,7 @@ export async function createServer(
       : undefined;
 
   const app = createApp({
+    replicationEnabled: config.replication.enabled,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
     // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).

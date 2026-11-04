@@ -68,6 +68,36 @@ describe("startup scope deletion migration", () => {
     vi.clearAllMocks();
   });
   afterEach(() => store.close());
+  it("skips and counts unmarked entries when replication is enabled", () => {
+    migrateScopeDeletionHistory(db, OWNER, store, logger, {
+      dryRun: true,
+      replicationEnabled: true,
+    });
+    migrateScopeDeletionHistory(db, OWNER, store, logger, {
+      replicationEnabled: true,
+    });
+    expect(
+      store.getRecord("connection", "activity", "newer-client-time"),
+    ).toBeDefined();
+    expect(
+      createScopeDeletionHistory(db, OWNER).get("oura.activity")?.eraseApplied,
+    ).not.toBe(true);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        skipped: "replication",
+        count: 1,
+        dryRun: true,
+      }),
+      expect.any(String),
+    );
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "oura.activity",
+        skipped: "replication",
+      }),
+      expect.any(String),
+    );
+  });
   it("erases all exclusive rows regardless of supplied time and preserves sibling rows", () => {
     migrateScopeDeletionHistory(db, OWNER, store, logger);
     expect(

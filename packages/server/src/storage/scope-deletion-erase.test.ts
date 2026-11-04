@@ -51,6 +51,27 @@ describe("scope deletion observations", () => {
   });
   afterEach(() => store.close());
 
+  it("records an observed tombstone unmarked without erasing when replication is enabled", () => {
+    const replicated = createScopeDeletionHistory(db, OWNER, store, {
+      replicationEnabled: true,
+    });
+    replicated.remember(SCOPE, deleted);
+    expect(replicated.get(SCOPE)).toMatchObject({ version: "3" });
+    expect(replicated.get(SCOPE)?.eraseApplied).not.toBe(true);
+    expect(store.getRecord("connection", "activity", "old")).toBeDefined();
+    expect(store.getInstanceBinding("connection").generation).toBe(1);
+  });
+  it("gates an earlier applied tombstone when replication is enabled after restart", () => {
+    history.remember(SCOPE, deleted);
+    replace("activity", "recollected", 2);
+    const replicated = createScopeDeletionHistory(db, OWNER, store, {
+      replicationEnabled: true,
+    });
+    expect(replicated.get(SCOPE)?.eraseApplied).not.toBe(true);
+    expect(
+      store.getRecord("connection", "activity", "recollected"),
+    ).toBeDefined();
+  });
   it("erases only the scope stream and fences old-generation writers", () => {
     const resetClock = store.getInstanceBinding("connection").resetClock;
     history.remember(SCOPE, deleted);

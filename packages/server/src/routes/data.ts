@@ -85,6 +85,7 @@ export interface DataRouteDeps {
   syncManager?: SyncManager | null;
   /** Read-side tombstone memory; reads of a deleted scope answer 410. */
   scopeDeletions?: ScopeDeletionTracker;
+  replicationEnabled?: boolean;
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
@@ -372,6 +373,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         readFulfillmentReporter: deps.readFulfillmentReporter,
         syncManager: deps.syncManager ?? null,
         scopeDeletions: deps.scopeDeletions,
+        replicationEnabled: deps.replicationEnabled,
         runtimeAvailability: deps.runtimeAvailability,
         serverSigner: deps.serverSigner,
         serverOwner: deps.serverOwner,

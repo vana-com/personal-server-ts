@@ -153,6 +153,7 @@ export interface PsLiteRuntimeOptions {
     gateway?: Partial<DataPortabilityGatewayConfig> & { url?: string };
     /** X402 read enforcement. Off by default in the browser runtime. */
     payment?: { enabled?: boolean };
+    replication?: { enabled?: boolean };
   };
   saveConfig?: (config: unknown) => Promise<void>;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
@@ -835,6 +836,9 @@ export function createPsLiteRuntime(
   // omitted gateway block silently becomes the schema default) would issue
   // x402 challenges, and query a gateway, for a domain the accessRecord
   // signature was never made against. Gateway changes take effect on restart.
+  const replicationAtBoot = Boolean(
+    options.config?.replication?.enabled || options.replication,
+  );
   const boundGatewayConfig = snapshotGatewayConfig(options.config);
   // Validate initial x402 readiness. The same derivation runs for every read
   // and before every config write so payment policy cannot drift from the live
@@ -1269,6 +1273,9 @@ export function createPsLiteRuntime(
               additions: options.additions,
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
+              replicationEnabled:
+                replicationAtBoot ||
+                options.config?.replication?.enabled === true,
               scopeUploads,
               now,
               createLogId,

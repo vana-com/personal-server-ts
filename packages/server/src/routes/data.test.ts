@@ -3355,6 +3355,24 @@ describe("shared canonical streams on scope deletion", () => {
     store.close();
     await rm(dir, { recursive: true, force: true });
   });
+  it("refuses scope deletion with replication enabled before changing rows or history", async () => {
+    const localApp = dataRoutes({
+      ...routeDeps,
+      replicationEnabled: true,
+    });
+    const response = await localApp.request(`/${scopeX}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: "SCOPE_ERASE_REPLICATION_ENABLED",
+      message: expect.stringContaining("reset"),
+    });
+    expect(store.getRecord("conn", "notes", "n1")).toBeDefined();
+    expect(store.getRecord("conn", "folders", "f1")).toBeDefined();
+    expect(history.get(scopeX)?.eraseApplied).not.toBe(true);
+  });
   it("deletes only the requested scope while its shared stream remains readable through the sibling", async () => {
     const result = await req(`/${scopeX}`, "DELETE");
     expect(result.status, await result.clone().text()).toBe(200);
@@ -3441,6 +3459,26 @@ describe("shared canonical streams on scope deletion", () => {
       2,
     );
     // Closing this gap needs per-scope causal evidence that the shared write followed the tombstone.
+    expect((await req(`/${scopeX}`)).status).toBe(410);
+    store.resetInstanceBinding({
+      instance: "conn",
+      expectedMethod: "icloud-notes",
+      expectedGeneration: 2,
+      nextMethod: "icloud-notes",
+    });
+    replace("folders", { id: "f1", name: "After reset" }, 3);
+    replace("profile", { id: "p1", user_name: "reader" }, 3);
+    replace(
+      "notes",
+      {
+        id: "n1",
+        title: "after reset",
+        folder_id: "f1",
+        is_pinned: false,
+        has_attachments: false,
+      },
+      3,
+    );
     expect((await req(`/${scopeX}`)).status).toBe(410);
   });
 });
