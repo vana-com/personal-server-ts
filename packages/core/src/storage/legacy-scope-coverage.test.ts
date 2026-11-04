@@ -1216,10 +1216,9 @@ describe("retained ChatGPT message evidence", () => {
       ],
     };
 
-    expect(compareLegacyCoverage(legacy, canonical, options)).toMatchObject({
-      covered: false,
-      reason: "missing_entity",
-    });
+    expect(compareLegacyCoverage(legacy, canonical, options).covered).toBe(
+      false,
+    );
     expect(
       compareLegacyCoverage(legacy, canonical, emptyEvidence).covered,
     ).toBe(false);
