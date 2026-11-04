@@ -22,7 +22,7 @@ import {
   PublishedDataFileError,
   snapshotScopeFiles,
 } from "./hierarchy.js";
-import { relative } from "node:path";
+import { relative, resolve } from "node:path";
 import type { VersionFence } from "@opendatalabs/personal-server-ts-core/ports";
 
 interface OperationRow {
@@ -84,69 +84,80 @@ export function createImportOperations(
     }
   }
 
-  function recover(): void {
+  function recover(own?: ReturnType<typeof key>): void {
     const rows = db
       .prepare(
         "SELECT * FROM owner_import_operations WHERE state = 'prepared' OR (state IN ('deleted', 'cancelled') AND metadata_json IS NOT NULL) ORDER BY rowid",
       )
       .all() as OperationRow[];
     for (const row of rows) {
-      if (row.state !== "prepared") {
-        deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
-        index.deleteByPath(row.path);
-        db.prepare(
-          `UPDATE owner_import_operations SET envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
-        ).run(row);
-        continue;
-      }
-      const bytes = row.envelope_bytes!;
-      const envelope = JSON.parse(bytes.toString("utf8")) as DataFileEnvelope;
-      const metadata = JSON.parse(
-        row.metadata_json!,
-      ) as VersionCommit["metadata"] & {
-        sizeBytes?: number;
-        afterTombstoneVersion?: number | null;
-      };
-      const written = publishDataFile(options, envelope, bytes, row.operation);
-      let entry = index.findByPath(row.path);
-      if (!entry) {
-        const inserted = index.insertIfCurrent({
-          fileId: null,
-          schemaId: null,
-          path: row.path,
-          scope: row.scope,
-          collectedAt: row.collected_at,
-          sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
-          afterTombstoneVersion: metadata.afterTombstoneVersion ?? null,
-        });
-        if (!inserted.ok) {
-          // The index closed this scope for writes (history unknown). Fail
-          // closed like an ordinary write: drop the unacknowledged operation
-          // so the caller can retry once the scope is repaired.
-          deleteDataFileSync(
-            options,
-            row.scope,
-            row.collected_at,
-            row.operation,
-          );
-          db.prepare(
-            `DELETE FROM owner_import_operations WHERE ${keyWhere}`,
-          ).run(row);
-          continue;
+      try {
+        recoverRow(row);
+      } catch (error) {
+        if (
+          own &&
+          row.scope === own.scope &&
+          row.authority === own.authority &&
+          row.owner === own.owner &&
+          row.operation === own.operation
+        ) {
+          throw error;
         }
-        entry = inserted.entry;
       }
-      const receipt: ImportReceipt = {
-        operation: row.operation,
-        bodySha256: row.body_sha256,
-        scope: row.scope,
-        collectedAt: entry.collectedAt,
-        acceptedAt: new Date().toISOString(),
-      };
-      db.prepare(
-        `UPDATE owner_import_operations SET state = 'accepted', receipt_json = @receipt, envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
-      ).run({ ...row, receipt: JSON.stringify(receipt) });
     }
+  }
+
+  function recoverRow(row: OperationRow): void {
+    if (row.state !== "prepared") {
+      deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
+      index.deleteByPath(row.path);
+      db.prepare(
+        `UPDATE owner_import_operations SET envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
+      ).run(row);
+      return;
+    }
+    const bytes = row.envelope_bytes!;
+    const envelope = JSON.parse(bytes.toString("utf8")) as DataFileEnvelope;
+    const metadata = JSON.parse(
+      row.metadata_json!,
+    ) as VersionCommit["metadata"] & {
+      sizeBytes?: number;
+      afterTombstoneVersion?: number | null;
+    };
+    const written = publishDataFile(options, envelope, bytes, row.operation);
+    let entry = index.findByPath(row.path);
+    if (!entry) {
+      const inserted = index.insertIfCurrent({
+        fileId: null,
+        schemaId: null,
+        path: row.path,
+        scope: row.scope,
+        collectedAt: row.collected_at,
+        sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
+        afterTombstoneVersion: metadata.afterTombstoneVersion ?? null,
+      });
+      if (!inserted.ok) {
+        // The index closed this scope for writes (history unknown). Fail
+        // closed like an ordinary write: drop the unacknowledged operation
+        // so the caller can retry once the scope is repaired.
+        deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
+        db.prepare(`DELETE FROM owner_import_operations WHERE ${keyWhere}`).run(
+          row,
+        );
+        return;
+      }
+      entry = inserted.entry;
+    }
+    const receipt: ImportReceipt = {
+      operation: row.operation,
+      bodySha256: row.body_sha256,
+      scope: row.scope,
+      collectedAt: entry.collectedAt,
+      acceptedAt: new Date().toISOString(),
+    };
+    db.prepare(
+      `UPDATE owner_import_operations SET state = 'accepted', receipt_json = @receipt, envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
+    ).run({ ...row, receipt: JSON.stringify(receipt) });
   }
 
   function reserve(envelope: DataFileEnvelope): DataFileEnvelope {
@@ -193,7 +204,7 @@ export function createImportOperations(
       const admitted = immediate(() => {
         const prior = find(command.envelope.scope, intent);
         check(prior, intent);
-        recover();
+        recover(key(command.envelope.scope, intent));
         if (prior) return false;
         const envelope = reserve(command.envelope);
         const path = relative(
@@ -218,7 +229,7 @@ export function createImportOperations(
         return true;
       });
       const published = immediate((): VersionCommitResult | undefined => {
-        recover();
+        recover(key(command.envelope.scope, intent));
         const row = find(command.envelope.scope, intent);
         // recover() dropped the operation: the scope is closed for writes.
         // Report it after the drop commits; a throw here would roll it back.
@@ -328,7 +339,21 @@ export function createImportOperations(
       });
       return immediate(() => {
         recover();
-        deleteScopeFilesSync(snapshot.files);
+        // A replica can reuse a captured path between these transactions.
+        const captured = new Set(snapshot.entries.map(({ id }) => id));
+        const later = new Set(
+          (
+            db
+              .prepare("SELECT id, path FROM data_files WHERE scope = ?")
+              .all(scope) as { id: number; path: string }[]
+          )
+            .filter(({ id }) => !captured.has(id))
+            .map(({ path }) => resolve(options.dataDir, path)),
+        );
+        deleteScopeFilesSync({
+          ...snapshot.files,
+          files: snapshot.files.files.filter((file) => !later.has(file)),
+        });
         const remove = db.prepare(
           "DELETE FROM data_files WHERE id = @id AND path = @path",
         );
