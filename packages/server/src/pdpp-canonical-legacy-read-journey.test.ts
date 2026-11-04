@@ -1723,6 +1723,128 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     ]);
   });
 
+  it.each(["reset", "delete"])(
+    "deletes the scope file after connection %s erases its rows",
+    async (action) => {
+      await legacyWrite("oura.activity", COVERED_A1);
+      const file = ctx!.indexManager.findLatestByScope("oura.activity")!;
+      const token = await collectActivity();
+      const erasure =
+        action === "reset"
+          ? await ctx!.app.request(
+              `/pdpp/instances/${encodeURIComponent(accountOne)}/reset`,
+              {
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  "content-type": "application/json",
+                },
+                body: JSON.stringify({
+                  expected_method: "oura",
+                  expected_generation: 1,
+                  next_method: "oura",
+                }),
+              },
+            )
+          : await ctx!.app.request(
+              `/pdpp/connections/${encodeURIComponent(accountOne)}`,
+              {
+                method: "DELETE",
+                headers: { authorization: `Bearer ${token}` },
+              },
+            );
+      expect(erasure.status).toBe(200);
+      const deletion = await ctx!.app.request("/v1/data/oura.activity", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      expect(deletion.status).toBe(200);
+      expect(
+        ctx!.indexManager.findLatestByScope("oura.activity"),
+      ).toBeUndefined();
+      await expect(
+        readFile(join(tempDir, "data", file.path)),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      const versions = await ownerGet("/v1/data/oura.activity/versions");
+      expect([200, 410]).toContain(versions.status);
+      if (versions.status === 200)
+        expect(JSON.parse(versions.text).versions).toEqual([]);
+
+      if (action === "reset") {
+        const write = await ctx!.app.request(
+          "/v1/streams/activity/records/replace?method=oura&binding_generation=2",
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              instance: accountOne,
+              emitted_at: "2026-09-11T12:00:00Z",
+              source_collected_at: "2026-09-11T06:00:00Z",
+              records: [
+                {
+                  key: "a2",
+                  data: day("a2", "2026-09-02"),
+                  emitted_at: "2026-09-11T07:00:00Z",
+                },
+              ],
+            }),
+          },
+        );
+        expect(write.status).toBe(200);
+        const read = await ownerGet("/v1/data/oura.activity");
+        expect(read.status).toBe(200);
+        expect(ids(read.text)).toEqual(["a2"]);
+        expect(
+          (
+            await ctx!.app.request("/v1/data/oura.activity", {
+              method: "DELETE",
+              headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+            })
+          ).status,
+        ).toBe(409);
+      }
+    },
+  );
+
+  it("keeps the scope file when another connection still holds rows", async () => {
+    await legacyWrite("oura.activity", COVERED_A1);
+    const token = await collectActivity();
+    await registerSecondAccount(token);
+    const secondToken = await ownerPdppToken(SECOND_ACCOUNT);
+    await replace(
+      secondToken,
+      "activity",
+      [day("b1", "2026-09-02")],
+      "2026-09-10T06:00:00Z",
+      SECOND_ACCOUNT,
+    );
+    const reset = await ctx!.app.request(
+      `/pdpp/instances/${encodeURIComponent(accountOne)}/reset`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          expected_method: "oura",
+          expected_generation: 1,
+          next_method: "oura",
+        }),
+      },
+    );
+    expect(reset.status).toBe(200);
+    const deletion = await ctx!.app.request("/v1/data/oura.activity", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(deletion.status).toBe(409);
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeDefined();
+  });
+
   it("refuses a local DELETE of a canonical scope and changes nothing", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
     await legacyWrite("notes.manual", { text: "kept" });
@@ -1738,6 +1860,8 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     expect(await deletion.json()).toMatchObject({
       error: "CANONICAL_DELETE_UNSUPPORTED",
       scope: "oura.activity",
+      message:
+        'Scope "oura.activity" has connector records that this route cannot delete. Nothing was deleted. Reset or delete the connection to erase its records, then delete the scope.',
     });
     // Nothing was deleted, and nothing claims it was: the legacy history
     // and the canonical latest body are both as before.

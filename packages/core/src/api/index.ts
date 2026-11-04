@@ -2820,7 +2820,7 @@ export async function handlePersonalServerDataRequest(
         return jsonResponse(
           {
             error: "CANONICAL_DELETE_UNSUPPORTED",
-            message: `Scope "${parsed.scope}" has connector records that this route cannot delete. Nothing was deleted; delete the connection to erase its records.`,
+            message: `Scope "${parsed.scope}" has connector records that this route cannot delete. Nothing was deleted. Reset or delete the connection to erase its records, then delete the scope.`,
             scope: parsed.scope,
           },
           { status: 409 },

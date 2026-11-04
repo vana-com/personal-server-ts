@@ -161,6 +161,8 @@ export interface LegacyScopeAuthority {
    * `streams`, or holds a completion receipt for one. Null `streams`: any.
    */
   hasHeldData(instance: string, streams: readonly string[] | null): boolean;
+  /** Whether all tables needed to establish absence of held data exist. */
+  heldDataAvailable(): boolean;
   /** Current-generation record tombstones, including IDs acquired after takeover. */
   hasRetainedTombstones(instance: string, streams: readonly string[]): boolean;
   /** See `CanonicalLegacyReadStore.readSnapshot`. Same database connection. */
@@ -431,20 +433,36 @@ export function createLegacyScopeView(
   /**
    * Deletion safety asks the ungated question: do connection rows exist that
    * a legacy-only deletion would let appear? Where the gate keeps the file
-   * over an opted-out method, only live rows of that method count: a deleted,
-   * reset or replaced connection erased its rows, and a connection that never
-   * held data has none.
+   * over an opted-out method, check every connection for retained rows, even
+   * if it was deleted. Missing record tables or an unmounted store cannot
+   * establish that the rows are absent.
    */
   function ownsScope(scope: string): boolean {
-    if (decide(scope, false).kind === "file") return false;
+    const connections = authority.listMethodConnections([
+      ...scopeMethods(scope).keys(),
+    ]);
+    if (
+      connections.length > 0 &&
+      (!records || !authority.heldDataAvailable())
+    ) {
+      return true;
+    }
+    const ungated = decide(scope, false);
+    if (ungated.kind === "file") return false;
+    if (
+      ungated.kind === "refused" &&
+      ungated.refusal.status === "unavailable" &&
+      ungated.refusal.reason === "no_connection"
+    ) {
+      if (!records || !authority.heldDataAvailable()) return true;
+      return connections.some((connection) =>
+        authority.hasHeldData(connection.instance, null),
+      );
+    }
     if (decide(scope).kind !== "file") return true;
     return authority
       .listMethodConnections([...optedOutMethods(scope)])
-      .some(
-        (connection) =>
-          connection.deletedAt === null &&
-          authority.hasHeldData(connection.instance, null),
-      );
+      .some((connection) => authority.hasHeldData(connection.instance, null));
   }
 
   /** Decided with the body: connection rows serve the scope, or they do not. */

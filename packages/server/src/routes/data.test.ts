@@ -2167,6 +2167,45 @@ describe("DELETE /v1/data/:scope", () => {
     await rm(dataDir, { recursive: true, force: true });
   });
 
+  it.each(["missing table", "unmounted store"])(
+    "keeps a scope file with a configured connection and %s",
+    async (state) => {
+      const db = initializeDatabase(":memory:");
+      const store = createSqliteRecordStore(db);
+      store.registerConnection({
+        instance: "conn_a",
+        sourceId: "https://registry.pdpp.dev/sources/oura",
+        method: "oura",
+        label: "",
+      });
+      store.resetInstanceBinding({
+        instance: "conn_a",
+        expectedMethod: "oura",
+        expectedGeneration: 1,
+        nextMethod: "oura",
+      });
+      if (state === "missing table") db.exec("DROP TABLE pdpp_records");
+      const legacyScopeView = createLegacyScopeView({
+        authority: createLegacyScopeAuthority(db),
+        records: state === "missing table" ? store : undefined,
+        configuredMethods: () => ["oura"],
+      });
+      const app = createApp({ legacyScopeView });
+      try {
+        await ingestData("oura.activity", { days: [] }, app);
+        const head = indexManager.findLatestByScope("oura.activity")!;
+        const filePath = join(dataDir, head.path);
+        const before = await readFile(filePath);
+        const response = await deleteWithAuth(app, "oura.activity");
+        expect(response.status).toBe(409);
+        expect(indexManager.countByScope("oura.activity")).toBe(1);
+        expect(await readFile(filePath)).toEqual(before);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
   it("returns 200 with a per-step result and removes files + index for existing scope", async () => {
     const app = createApp();
 
