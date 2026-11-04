@@ -1,8 +1,5 @@
 import { trackLegacyScopeMutations } from "./storage/legacy-scope-revalidation-state.js";
-import {
-  createLegacyScopeRevalidator,
-  legacyCoverageCandidates,
-} from "./storage/legacy-scope-revalidator.js";
+import { createLegacyScopeRevalidator } from "./storage/legacy-scope-revalidator.js";
 import { createLegacyEvaluationWorker } from "./storage/legacy-scope-evaluation.js";
 import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
@@ -1209,7 +1206,7 @@ export async function createServer(
   let lastPolicyCheck = Date.now();
   revalidationState?.observePolicy(policyFingerprint, lastPolicyCheck);
   const revalidator = createLegacyScopeRevalidator({
-    candidates: () => legacyCoverageCandidates(db),
+    candidates: () => revalidationState?.candidates() ?? [],
     onChange: () => evaluationWorker.invalidate(),
     onSweep: () => {
       revalidationState?.ensureDirty();
@@ -1228,7 +1225,6 @@ export async function createServer(
         policyFingerprint = currentPolicy;
       }
       lastPolicyCheck = Date.now();
-      revalidationState?.diagnostics();
       return JSON.stringify([revalidationState?.fingerprint(), currentPolicy]);
     },
     intervalMs: sweepMs,

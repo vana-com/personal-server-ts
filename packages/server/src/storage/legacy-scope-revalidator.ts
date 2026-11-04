@@ -1,12 +1,9 @@
-import type { Database, Statement } from "better-sqlite3";
-
 /** One global evaluator bounds memory; each instance has one coalesced follow-up. */
 export function createLegacyScopeRevalidator(input: {
   evaluate(instance: string, scopes: readonly string[]): Promise<void>;
   candidates(): readonly {
     instance: string;
     scopes: readonly string[];
-    stale: boolean;
   }[];
   fingerprint(): string;
   intervalMs?: number;
@@ -63,12 +60,11 @@ export function createLegacyScopeRevalidator(input: {
       }
     }
   }
-  function scan(force: boolean) {
+  function scan() {
     if (closed) return;
     try {
       for (const candidate of input.candidates())
-        if (force || candidate.stale)
-          enqueue(candidate.instance, candidate.scopes);
+        enqueue(candidate.instance, candidate.scopes);
     } catch {
       input.logger.warn(
         { reason: "scan_failed" },
@@ -79,7 +75,7 @@ export function createLegacyScopeRevalidator(input: {
   function sweep() {
     try {
       input.onSweep?.();
-      scan(true);
+      scan();
     } catch {
       input.logger.warn(
         { reason: "sweep_failed" },
@@ -98,7 +94,7 @@ export function createLegacyScopeRevalidator(input: {
             if (next !== fingerprint) {
               fingerprint = next;
               input.onChange?.();
-              scan(true);
+              scan();
             }
           } catch {
             input.logger.warn(
@@ -125,35 +121,4 @@ export function createLegacyScopeRevalidator(input: {
       if (running) await running;
     },
   };
-}
-
-const candidateQueries = new WeakMap<Database, Statement<[]>>();
-
-/** Durable candidate identities only; the worker reuses the full live decision. */
-export function legacyCoverageCandidates(db: Database) {
-  let query = candidateQueries.get(db);
-  if (!query) {
-    query = db.prepare(
-      `SELECT DISTINCT b.instance,t.scope FROM legacy_scope_takeovers t
-    JOIN pdpp_instance_binding b ON (t.instance=b.instance AND t.generation=b.generation) OR t.instance=''
-    WHERE b.deleted_at IS NULL AND EXISTS(SELECT 1 FROM data_files f WHERE f.scope=t.scope)
-    ORDER BY b.instance,t.scope`,
-    );
-    candidateQueries.set(db, query);
-  }
-  const rows = query.all() as { instance: string; scope: string }[];
-  const candidates = new Map<
-    string,
-    { instance: string; scopes: string[]; stale: boolean }
-  >();
-  for (const { instance, scope } of rows) {
-    const candidate = candidates.get(instance) ?? {
-      instance,
-      scopes: [],
-      stale: true,
-    };
-    candidate.scopes.push(scope);
-    candidates.set(instance, candidate);
-  }
-  return [...candidates.values()];
 }

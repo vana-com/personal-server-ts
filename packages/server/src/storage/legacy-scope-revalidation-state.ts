@@ -1,5 +1,4 @@
-import type { Database } from "better-sqlite3";
-import { legacyCoverageCandidates } from "./legacy-scope-revalidator.js";
+import type { Database, Statement } from "better-sqlite3";
 
 /** Conservatively cover all PDPP state, including claims, custody and visibility.
  * The bridge owns only legacy_* marker tables, so marking cannot enqueue itself. */
@@ -15,7 +14,7 @@ export interface LegacyRevalidationState {
   db: Database;
   revision(instance: string): number;
   fingerprint(): string;
-  candidates(): ReturnType<typeof legacyCoverageCandidates>;
+  candidates(): { instance: string; scopes: string[] }[];
   markDirty(since?: number): void;
   observePolicy(fingerprint: string, since: number): void;
   ensureDirty(): void;
@@ -83,9 +82,23 @@ function makeState(
     "SELECT 1 FROM sqlite_master WHERE name='pdpp_instance_binding'",
   );
   let bindingsReady = false;
+  let candidateQuery: Statement<[]> | undefined;
   function candidates() {
     if (!bindingsReady) bindingsReady = bindingTable.get() !== undefined;
-    return bindingsReady ? legacyCoverageCandidates(raw) : [];
+    if (!bindingsReady) return [];
+    candidateQuery ??=
+      raw.prepare(`SELECT DISTINCT b.instance,t.scope FROM legacy_scope_takeovers t
+      JOIN pdpp_instance_binding b ON (t.instance=b.instance AND t.generation=b.generation) OR t.instance=''
+      WHERE b.deleted_at IS NULL AND EXISTS(SELECT 1 FROM data_files f WHERE f.scope=t.scope)
+      ORDER BY b.instance,t.scope`);
+    const rows = candidateQuery.all() as { instance: string; scope: string }[];
+    const result = new Map<string, { instance: string; scopes: string[] }>();
+    for (const { instance, scope } of rows) {
+      const candidate = result.get(instance) ?? { instance, scopes: [] };
+      candidate.scopes.push(scope);
+      result.set(instance, candidate);
+    }
+    return [...result.values()];
   }
   function mark(since = now()) {
     for (const candidate of candidates()) {
@@ -284,16 +297,14 @@ function makeState(
       );
     },
     diagnostics() {
-      raw
-        .prepare(
-          `UPDATE legacy_scope_revalidation_scopes SET reason=CASE WHEN error_count>0 THEN 'evaluation_failing' ELSE 'evaluation_overdue' END WHERE dirty_since IS NOT NULL AND dirty_since+ceiling_ms<=? AND (reason IS NULL OR reason<>CASE WHEN error_count>0 THEN 'evaluation_failing' ELSE 'evaluation_overdue' END)`,
-        )
-        .run(now());
       return raw
         .prepare(
-          "SELECT instance,scope,dirty_since,error_count,reason FROM legacy_scope_revalidation_scopes WHERE reason IS NOT NULL",
+          `SELECT instance,scope,dirty_since,error_count,
+        CASE WHEN error_count>0 THEN 'evaluation_failing' ELSE 'evaluation_overdue' END AS reason
+        FROM legacy_scope_revalidation_scopes
+        WHERE dirty_since IS NOT NULL AND dirty_since+ceiling_ms<=?`,
         )
-        .all() as ReturnType<LegacyRevalidationState["diagnostics"]>;
+        .all(now()) as ReturnType<LegacyRevalidationState["diagnostics"]>;
     },
   };
 }

@@ -1,7 +1,4 @@
-import {
-  createLegacyScopeRevalidator,
-  legacyCoverageCandidates,
-} from "./legacy-scope-revalidator.js";
+import { createLegacyScopeRevalidator } from "./legacy-scope-revalidator.js";
 import { homedir } from "node:os";
 import { performance } from "node:perf_hooks";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -9,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { trackLegacyScopeMutations } from "./legacy-scope-revalidation-state.js";
 import { initializeDatabase } from "./index-schema.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { createLegacyEvaluationWorker } from "./legacy-scope-evaluation.js";
@@ -24,7 +22,8 @@ it("runs a fresh comparison off-thread and publishes a negative after same-strea
   const dataDir = join(root, "data");
   await mkdir(dataDir);
   const db = initializeDatabase(join(root, "index.db"));
-  const store = createSqliteRecordStore(db);
+  const state = trackLegacyScopeMutations(db, { ceilingMs: 1_800_000 });
+  const store = createSqliteRecordStore(state.db);
   const worker = createLegacyEvaluationWorker();
   cleanup = async () => {
     await worker.stop();
@@ -54,7 +53,7 @@ it("runs a fresh comparison off-thread and publishes a negative after same-strea
       { method: "oura", generation: 1 },
     );
   put(80);
-  const authority = createLegacyScopeAuthority(db);
+  const authority = createLegacyScopeAuthority(state.db);
   const config = {
     authority,
     records: store,
@@ -88,7 +87,7 @@ it("runs a fresh comparison off-thread and publishes a negative after same-strea
     scopes: ["oura.activity"],
   };
   const recovery = createLegacyScopeRevalidator({
-    candidates: () => legacyCoverageCandidates(db),
+    candidates: () => state.candidates(),
     fingerprint: () => "deliberately dropped notification",
     intervalMs: 1000,
     logger: { warn: () => {} },
