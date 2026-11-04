@@ -66,12 +66,17 @@ export function createScopeDeletionHistory(
       "ALTER TABLE vana_scope_deletion_history ADD COLUMN erase_applied_version TEXT",
     );
   }
+  if (!columns.some((column) => column.name === "shared_fresh")) {
+    db.exec(
+      "ALTER TABLE vana_scope_deletion_history ADD COLUMN shared_fresh INTEGER NOT NULL DEFAULT 0",
+    );
+  }
   const owner = ownerAddress.toLowerCase();
   // A previously applied local erase does not prove replicated copies are gone.
   // Re-enable the read gate before replication can import or serve records.
   if (options.replicationEnabled) {
     db.prepare(
-      "UPDATE vana_scope_deletion_history SET erase_applied = 0 WHERE owner_address = ? AND erase_applied = 1",
+      "UPDATE vana_scope_deletion_history SET erase_applied = 0, shared_fresh = 0 WHERE owner_address = ? AND erase_applied = 1",
     ).run(owner);
   }
   const remember = db.prepare(`
@@ -81,10 +86,10 @@ export function createScopeDeletionHistory(
     ON CONFLICT (owner_address, scope) DO UPDATE SET
       deleted_at = excluded.deleted_at,
       tombstone_version = excluded.tombstone_version,
-      erase_applied = 0, erase_applied_version = NULL
+      erase_applied = 0, erase_applied_version = NULL, shared_fresh = 0
   `);
   const get = db.prepare(`
-    SELECT deleted_at, tombstone_version, erase_applied, erase_applied_version FROM vana_scope_deletion_history
+    SELECT deleted_at, tombstone_version, erase_applied, erase_applied_version, shared_fresh FROM vana_scope_deletion_history
     WHERE owner_address = ? AND scope = ?
   `);
   return {
@@ -94,6 +99,7 @@ export function createScopeDeletionHistory(
           | {
               deleted_at: string;
               tombstone_version: string | null;
+              shared_fresh: number;
               erase_applied: number;
               erase_applied_version: string | null;
             }
@@ -127,7 +133,7 @@ export function createScopeDeletionHistory(
         );
       const markApplied = () => {
         db.prepare(
-          "UPDATE vana_scope_deletion_history SET erase_applied = 1, erase_applied_version = tombstone_version WHERE owner_address = ? AND scope = ?",
+          "UPDATE vana_scope_deletion_history SET erase_applied = 1, erase_applied_version = tombstone_version, shared_fresh = 0 WHERE owner_address = ? AND scope = ?",
         ).run(owner, scope);
       };
       try {
@@ -176,12 +182,18 @@ export function createScopeDeletionHistory(
         | {
             deleted_at: string;
             tombstone_version: string | null;
+            shared_fresh: number;
             erase_applied: number;
             erase_applied_version: string | null;
           }
         | undefined;
       return row
         ? {
+            ...(row.shared_fresh === 1 &&
+            row.erase_applied === 1 &&
+            row.erase_applied_version === row.tombstone_version
+              ? { sharedFresh: true }
+              : {}),
             deletedAt: row.deleted_at,
             version: row.tombstone_version,
             ...(row.erase_applied === 1 &&
@@ -230,7 +242,7 @@ export function migrateScopeDeletionHistory(
       .map(({ scope }) => scope);
     if (unmapped.length) {
       db.prepare(
-        "UPDATE vana_scope_deletion_history SET erase_applied = 1, erase_applied_version = tombstone_version WHERE owner_address = ? AND scope IN (SELECT value FROM json_each(?))",
+        "UPDATE vana_scope_deletion_history SET erase_applied = 1, erase_applied_version = tombstone_version, shared_fresh = 0 WHERE owner_address = ? AND scope IN (SELECT value FROM json_each(?))",
       ).run(owner, JSON.stringify(unmapped));
       logger.info(
         { rule: "unmapped", count: unmapped.length },
@@ -244,7 +256,7 @@ export function migrateScopeDeletionHistory(
     "SELECT erase_applied, erase_applied_version, tombstone_version FROM vana_scope_deletion_history WHERE owner_address = ? AND scope = ?",
   );
   const mark = db.prepare(
-    "UPDATE vana_scope_deletion_history SET erase_applied = 1, erase_applied_version = tombstone_version WHERE owner_address = ? AND scope = ? AND (erase_applied = 0 OR erase_applied_version IS NOT tombstone_version)",
+    "UPDATE vana_scope_deletion_history SET erase_applied = 1, erase_applied_version = tombstone_version, shared_fresh = 0 WHERE owner_address = ? AND scope = ? AND (erase_applied = 0 OR erase_applied_version IS NOT tombstone_version)",
   );
   const hasRegistry = () =>
     db
@@ -274,6 +286,7 @@ export function migrateScopeDeletionHistory(
       const preview = () => {
         const row = current.get(owner, scope) as
           | {
+              shared_fresh: number;
               erase_applied: number;
               erase_applied_version: string | null;
               tombstone_version: string | null;

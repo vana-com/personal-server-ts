@@ -1192,7 +1192,7 @@ export async function resolveReadDeletion(
     body === "canonical" || body === "canonical-empty"
       ? body === "canonical" &&
         history?.eraseApplied &&
-        !scopeHasSharedStreams(scope)
+        (!scopeHasSharedStreams(scope) || history.sharedFresh)
         ? null
         : (history ?? (verdict.deleted ? verdict : null))
       : verdict.deleted

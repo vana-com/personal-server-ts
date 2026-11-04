@@ -1,4 +1,7 @@
-import { assertScopeStreamsBound } from "./scope-deletion-bindings.js";
+import {
+  assertScopeStreamsBound,
+  markEmptySharedScopes,
+} from "./scope-deletion-bindings.js";
 import { exclusiveScopeStreams } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { assertSupportedSchemaVersions } from "./schema-versions.js";
 import type { ReplicaCanonicalPort } from "./pdpp-replica-canonical-port.js";
@@ -1471,6 +1474,7 @@ export function createSqliteRecordStore(
         resetClock,
         input.instance,
       );
+      markEmptySharedScopes(db, replica !== undefined);
       replica?.captureLifecycle(input.instance, "connection-reset");
       replica?.notifyVisibility();
       return {
@@ -1840,6 +1844,7 @@ export function createSqliteRecordStore(
       db.prepare(
         "UPDATE pdpp_instance_binding SET deleted_at = ?, generation = generation + 1, reset_clock = ? WHERE instance = ?",
       ).run(deletedAt, resetClock, instance);
+      markEmptySharedScopes(db, replica !== undefined);
       replica?.captureLifecycle(instance, "connection-delete");
       replica?.notifyVisibility();
       return getInstanceBinding(instance);
@@ -1880,7 +1885,9 @@ export function createSqliteRecordStore(
         clearStravaTransitionScope(scope);
         for (const { instance, method, deleted_at } of listBindings()) {
           const streams = byMethod.get(method) ?? [];
-          if (streams.length === 0 && !transitionInstances.has(instance))
+          // Even a fully shared scope must fence pre-deletion collectors.
+          // Otherwise an empty peer could write old rows after a full-reset proof.
+          if (!byMethod.has(method) && !transitionInstances.has(instance))
             continue;
           const marks = streams.length
             ? streams.map(() => "?").join(",")

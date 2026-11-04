@@ -120,6 +120,8 @@ export interface ScopeDeletionTracker {
 export interface ScopeTombstone {
   /** True only when this exact deletion was atomically applied to canonical rows. */
   eraseApplied?: boolean;
+  /** Full reset proved every stream of this scope empty after its erase. */
+  sharedFresh?: boolean;
   deletedAt: string;
   /** Registry version of the tombstone; null when unknown (covers everything). */
   version: string | null;

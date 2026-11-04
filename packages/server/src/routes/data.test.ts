@@ -3482,7 +3482,7 @@ describe("shared canonical streams on scope deletion", () => {
     expect(store.getRecord("conn", "folders", "f1")).toBeDefined();
     await assertHiddenOnlyX();
   });
-  it("known gap: a fresh write to a shared stream does not yet unhide the deleted scope", async () => {
+  it("requires a full reset before a fresh shared collection becomes visible", async () => {
     history.remember(scopeX, mark);
     replace("folders", { id: "f1", name: "Fresh" }, 2);
     replace("profile", { id: "p1", user_name: "reader" }, 2);
@@ -3518,6 +3518,6 @@ describe("shared canonical streams on scope deletion", () => {
       },
       3,
     );
-    expect((await req(`/${scopeX}`)).status).toBe(410);
+    expect((await req(`/${scopeX}`)).status).toBe(200);
   });
 });
