@@ -815,7 +815,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       on_current_branch: true,
     };
     const badConversation = {
-      id: "bad",
+      id: "",
       current_node: null,
       message_count_on_current_branch: 1,
     };
@@ -1247,7 +1247,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       );
     });
 
-    it("turns a partial first read into the complete view once the source is repaired", async () => {
+    it("receipts a broken branch, then serves it after the missing row arrives", async () => {
       const a = connect("conn_a", "chatgpt");
       const conv = (id: string) => ({
         id,
@@ -1276,7 +1276,8 @@ describe("canonical legacy projection over the real SQLite record store", () => 
         scope: "chatgpt.conversations",
         selection: a,
       });
-      expect(partial.ok && partial.complete).toBe(false);
+      expect(partial.ok && partial.complete).toBe(true);
+      expect(partial.ok && partial.chatgptCoverageGaps).toHaveLength(1);
       expect(
         partial.ok && (partial.envelope.data.conversations as unknown[]).length,
       ).toBe(1);
@@ -1292,6 +1293,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
         complete.ok &&
           (complete.envelope.data.conversations as unknown[]).length,
       ).toBe(2);
+      expect(complete.ok && complete.chatgptCoverageGaps).toBeUndefined();
       expect(complete.ok && partial.ok && complete.revision).not.toBe(
         partial.ok && partial.revision,
       );

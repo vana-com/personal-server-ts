@@ -1401,7 +1401,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
       )
       .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/11");
+    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/12");
     const callsAfterFirstRead = listRecords.mock.calls.length;
     expect(callsAfterFirstRead).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
@@ -3970,7 +3970,19 @@ describe("ChatGPT retained off-branch coverage over stored rows", () => {
       });
       put("conversations", { ...conversation("new"), id: "other" });
     }
-    expect((await view.readLatest(scope)).kind).toBe("refused");
+    const read = await view.readLatest(scope);
+    if (variant === "empty") {
+      expect(read.kind).toBe("canonical");
+      expect(
+        view
+          .verdictFor(scope)
+          .find(
+            (row) => row.instance === "chat" && row.generation === generation,
+          ),
+      ).toMatchObject({ verdict: "covered" });
+      return;
+    }
+    expect(read.kind).toBe("refused");
     const activeGeneration = view
       .verdictFor(scope)
       .find((row) => row.instance === "chat" && row.generation === generation);

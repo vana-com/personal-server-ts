@@ -2615,7 +2615,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
 
       describe("retained off-branch canonical messages", () => {
         it.each(["text", "multimodal_text"])(
-          "serves explicit current-empty %s without rescuing older alias text",
+          "omits explicit current-empty %s and retains it without rescuing older alias text",
           (content_type) => {
             for (const reverse of [false, true]) {
               const bare = message("c1", "n1", null, "old alias", {
@@ -2630,12 +2630,17 @@ describe("projectPdppRecordsToLegacyPayload", () => {
               expect(result.payload).toMatchObject({
                 conversations: [
                   {
-                    message_count: 1,
-                    messages: [{ id: "n1", content: "", content_type }],
+                    message_count: 0,
+                    messages: [],
                   },
                 ],
               });
-              expect(result.retainedChatgptMessages).toBeUndefined();
+              expect(result.retainedChatgptMessages).toMatchObject([
+                {
+                  conversationId: "c1",
+                  message: { id: "n1", content: "", content_type },
+                },
+              ]);
               validateAgainst(
                 { schema: chatgptConversationsSchema.schema },
                 result.payload,
@@ -2855,7 +2860,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           (reverse) => {
             const records = [
               ...validParent(),
-              conversation("c2", 0, ""),
+              conversation("c2", 0, null),
               retained("c1", "shared", { content: "first parent" }),
               retained("c2", "shared", { content: "second parent" }),
             ];
@@ -2998,7 +3003,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                 message("c1", "n1", null, "visible"),
                 ...rows,
                 retained(),
-                conversation("control", 0, ""),
+                conversation("control", 0, null),
                 retained("control"),
               ]),
             );
@@ -3236,9 +3241,10 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         {
           cause: "current_node_not_stored",
           tip: "missing",
-          parent: null,
+          parent: "n1",
           count: 2,
           cycle: false,
+          recovered: true,
         },
         {
           cause: "current_node_not_stored",
@@ -3246,6 +3252,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           parent: null,
           count: 0,
           cycle: false,
+          recovered: false,
         },
         {
           cause: "parent_not_stored",
@@ -3253,6 +3260,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           parent: "missing",
           count: 3,
           cycle: false,
+          recovered: false,
         },
         {
           cause: "cycle",
@@ -3260,10 +3268,11 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           parent: "n1",
           count: 2,
           cycle: true,
+          recovered: false,
         },
       ])(
         "falls back to stored flags and diagnoses $cause",
-        ({ cause, tip, parent, count, cycle }) => {
+        ({ cause, tip, parent, count, cycle, recovered }) => {
           const records: PdppRecord[] = [
             conversation("c1", count, tip),
             ...(count === 0
@@ -3274,9 +3283,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                 ]),
           ];
           const result = projected(project(records));
-          if (cycle || count === 0) {
+          if (recovered) {
             expect(result.payload).toMatchObject({
-              conversations: [{ message_count: count }],
+              conversations: [
+                {
+                  message_count: count,
+                  messages: [{ id: "n1" }, { id: "n2" }],
+                },
+              ],
             });
           } else {
             expect(result.payload).toMatchObject({
@@ -3284,13 +3298,20 @@ describe("projectPdppRecordsToLegacyPayload", () => {
               total: 0,
             });
           }
-          expect(result.diagnostics).toContainEqual({
-            kind: "branch_walk_fallback",
-            scope: "chatgpt.conversations",
-            stream: "conversations",
-            count: 1,
-            reasons: [cause],
-          });
+          if (cycle) {
+            expect(result.chatgptCoverageGaps).toContainEqual(
+              expect.objectContaining({ reason: "cycle" }),
+            );
+            expect(result.diagnostics).toBeUndefined();
+          } else {
+            expect(result.diagnostics).toContainEqual({
+              kind: "branch_walk_fallback",
+              scope: "chatgpt.conversations",
+              stream: "conversations",
+              count: 1,
+              reasons: [cause],
+            });
+          }
         },
       );
 
@@ -3397,7 +3418,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           {
             conversationIdHash:
               "f526795c95399cea27c055c842c3d6ab018ed0fa4f66f701c28ab22dec28237b",
-            reason: "parent_not_stored/fallback_chain_incomplete",
+            reason: "parent_not_stored/flag_fallback_ambiguous",
             declaredCount: 2,
             walkedCount: 1,
           },
@@ -3454,7 +3475,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                 {
                   conversationIdHash:
                     "d0f631ca1ddba8db3bcfcb9e057cdc98d0379f1bee00e75a545147a27dadd982",
-                  reason: "parent_not_stored/fallback_chain_incomplete",
+                  reason: "parent_not_stored/flag_fallback_ambiguous",
                   declaredCount: 2,
                   walkedCount: 1,
                 },
@@ -3463,7 +3484,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           },
         );
 
-        it("receipts an equal-count branch whose current tip is missing", () => {
+        it("recovers a current branch whose tip is missing from a complete flag chain", () => {
           const records = [
             conversation("c1", 1),
             message("c1", "n1", null, "present root"),
@@ -3471,9 +3492,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           const result = projected(
             project(order === "forward" ? records : [...records].reverse()),
           );
-          expect(result).toEqual({
+          expect(result).toMatchObject({
             ok: true,
-            payload: { conversations: [], total: 0 },
+            payload: {
+              conversations: [
+                { id: "c1", message_count: 1, messages: [{ id: "n1" }] },
+              ],
+              total: 1,
+            },
             diagnostics: [
               {
                 kind: "branch_walk_fallback",
@@ -3483,16 +3509,8 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                 reasons: ["current_node_not_stored"],
               },
             ],
-            chatgptCoverageGaps: [
-              {
-                conversationIdHash:
-                  "d0f631ca1ddba8db3bcfcb9e057cdc98d0379f1bee00e75a545147a27dadd982",
-                reason: "current_node_not_stored/fallback_chain_incomplete",
-                declaredCount: 1,
-                walkedCount: 0,
-              },
-            ],
           });
+          expect(result.chatgptCoverageGaps).toBeUndefined();
         });
       });
     });
@@ -3764,7 +3782,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           {
             conversationIdHash:
               "f8886d8016bf30b1dc77cc6c499fc1b47ee25d7ec2973dc6821b100bc6311b26",
-            reason: "current_node_not_stored/fallback_count_mismatch",
+            reason: "current_node_not_stored/flag_fallback_count_mismatch",
             declaredCount: 1,
             walkedCount: 0,
           },
@@ -3831,7 +3849,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           {
             conversationIdHash:
               "6f1aaf37cce99a9ab19aaebd8891d6374608e9d4f5b34c03d1b745299a1e0b41",
-            reason: "parent_not_stored/fallback_chain_incomplete",
+            reason: "parent_not_stored/flag_fallback_ambiguous",
             declaredCount: 2,
             walkedCount: 1,
           },
@@ -3898,7 +3916,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         {
           conversationIdHash:
             "5dc6fcec043ca1fe7b05065b20cb3d77c428c36f27b793ca1f2a4dcec68565ed",
-          reason: "current_node_not_stored/fallback_count_mismatch",
+          reason: "current_node_not_stored/flag_fallback_count_mismatch",
           declaredCount: 2,
           walkedCount: 0,
         },

@@ -1096,6 +1096,84 @@ describe("retained ChatGPT message evidence", () => {
     },
   );
 
+  it("covers a same-time explicit empty message omitted from display", () => {
+    const emptyMessage = { ...message, content: "" };
+    const legacy = {
+      conversations: [
+        { id: "conversation", message_count: 1, messages: [emptyMessage] },
+      ],
+    };
+    const canonical = {
+      conversations: [{ id: "conversation", message_count: 0, messages: [] }],
+    };
+    const verdict = compareLegacyCoverage(legacy, canonical, {
+      ...options,
+      retainedChatgptMessages: [
+        {
+          scope: "chatgpt.conversations",
+          conversationId: "conversation",
+          message: emptyMessage,
+        },
+      ],
+    });
+
+    expect(verdict).toMatchObject({
+      covered: true,
+      reason: null,
+      reasonCounts: { array_order: 0, field_mismatch: 1 },
+      missingEntityCount: 0,
+    });
+  });
+
+  it("keeps unknown and same-time changed content blocking", () => {
+    const emptyMessage = { ...message, content: "" };
+    const legacy = {
+      conversations: [
+        { id: "conversation", message_count: 1, messages: [message] },
+      ],
+    };
+    const canonical = {
+      conversations: [{ id: "conversation", message_count: 0, messages: [] }],
+    };
+    const emptyEvidence = {
+      ...options,
+      retainedChatgptMessages: [
+        {
+          scope: "chatgpt.conversations" as const,
+          conversationId: "conversation",
+          message: emptyMessage,
+        },
+      ],
+    };
+
+    expect(compareLegacyCoverage(legacy, canonical, options)).toMatchObject({
+      covered: false,
+      reason: "missing_entity",
+    });
+    expect(
+      compareLegacyCoverage(legacy, canonical, emptyEvidence).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(legacy, canonical, {
+        ...emptyEvidence,
+        canonicalNewer: true,
+      }),
+    ).toMatchObject({ covered: true, reason: null });
+    expect(
+      compareLegacyCoverage(legacy, canonical, {
+        ...emptyEvidence,
+        canonicalNewer: true,
+        retainedChatgptMessages: [
+          {
+            scope: "chatgpt.conversations",
+            conversationId: "conversation",
+            message: { ...emptyMessage, create_time: "2025-01-01T00:00:00Z" },
+          },
+        ],
+      }).covered,
+    ).toBe(false);
+  });
+
   it("does not cover a missing conversation or reuse another conversation's node", () => {
     for (const [legacy, canonical] of [
       [body([message]), { conversations: [] }],
