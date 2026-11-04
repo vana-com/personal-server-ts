@@ -1838,7 +1838,7 @@ const chatgptConversations: LegacyScopeBinding = {
     "Conversation create/update times pass through as null when the source lacks them, matching legacy's listed?.create_time ?? fetched.create_time ?? null fallback.",
     "fetched_at is the projection time (options.now, else the wall clock), matching legacy's per-run toConversationRecord timestamp.",
     "Invalid conversation ids, timestamps or declared counts remain records_dropped omissions. If a broken parent walk cannot be recovered from stored flags, only that conversation is excluded and a same-read hash-only coverage receipt records the gap; messages without a stored conversation remain records_dropped.",
-    "Current branch membership comes from stored first-version parent_id links starting at current_node. A complete walk is followed to its terminal parent even when it exceeds a stale declared count; after a broken walk, flags recover only one unambiguous chain of the declared size and emit branch_walk_fallback diagnostics.",
+    "Current branch membership comes from stored first-version parent_id links starting at current_node. An explicit-null-rooted complete walk is authoritative at every declared count, with count disagreements recorded as diagnostics. The count-validated omitted-parent boundary remains valid; after a broken walk, flags recover only one unambiguous chain of the declared size and emit branch_walk_fallback diagnostics.",
     "Only nonempty user/assistant text or multimodal_text messages appear in the legacy payload. Same-read stored text omitted from display, including explicit empty strings, remains coverage evidence; null or non-string content is unknown. message_count counts displayed messages.",
     "A missing title becomes 'Untitled', matching the legacy connector's toConversationRecord fallback; model_slug is renamed to model.",
     "Legacy message ids are source node ids. ChatGPT 0.3.0 stores a message under '<conversation_id>:<node_id>' (and links parent_id the same way); the projection strips that prefix, reads a bare pre-0.3.0 id as it is, and counts a node stored under both forms once, preferring the 0.3.0 row.",
@@ -1965,11 +1965,17 @@ const chatgptConversations: LegacyScopeBinding = {
           ? "parent_not_stored"
           : "walked_count_below_declared"
         : walked.reason;
-      let branch: Record<string, unknown>[];
-      if (
+      // A rooted, complete current walk never falls back because of a count.
+      // Only parent_id === null proves that root; the walk also terminates at
+      // malformed non-string parents. Missing tips/parents and cycles remain
+      // structurally broken and may use coherent flags. Keep the established
+      // count-validated boundary for an omitted synthetic parent as well.
+      const useCurrentWalk =
         walked.ok &&
-        walked.messages.length >= message_count_on_current_branch
-      ) {
+        (walked.messages.at(-1)?.parent_id === null ||
+          walked.messages.length >= message_count_on_current_branch);
+      let branch: Record<string, unknown>[];
+      if (useCurrentWalk) {
         branch = walked.messages;
       } else {
         branchWalkFallbacks.set(
@@ -1992,13 +1998,22 @@ const chatgptConversations: LegacyScopeBinding = {
         }
         branch = fallback.messages;
       }
+      // Connector counts describe its selected role-bearing emitted mapping
+      // (data-connectors f29ef8da, parsers.ts:1037 and index.ts:3086; Muse count
+      // review 37a8). This walk counts distinct stored nodes before display filtering
+      // (PS count review 1931), so display filtering does not lower walkedCount.
+      // Cross-run topology or metadata may differ: either count direction is
+      // diagnostic only once the stored current path is authoritative.
       if (
-        walked.ok &&
-        walked.messages.length > message_count_on_current_branch
+        useCurrentWalk &&
+        walked.messages.length !== message_count_on_current_branch
       ) {
         chatgptBranchDiagnostics.push({
           conversationIdHash: chatgptConversationIdHash(id),
-          reason: "declared_count_below_walked",
+          reason:
+            walked.messages.length > message_count_on_current_branch
+              ? "declared_count_below_walked"
+              : "declared_count_above_walked",
           declaredCount: message_count_on_current_branch,
           walkedCount: walked.messages.length,
         });

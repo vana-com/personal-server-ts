@@ -56,11 +56,16 @@ govern; this patch does not infer a historical per-record declaration version.
 ## ChatGPT branch evidence
 
 ChatGPT conversation reads follow the selected node's stored first-version
-parent links within that conversation. A clean path longer than the declared
-count is served with `declared_count_below_walked`; a count never truncates a
-stored path. A short or unavailable path uses flags only when they identify
-one coherent chain of the declared size. Cycles cannot become valid through
-flag cardinality. An unrecoverable conversation yields a hashed coverage gap;
+parent links within that conversation. A complete path ending at an explicit
+null parent is authoritative regardless of the declared count. Count differences
+produce `declared_count_below_walked` or `declared_count_above_walked`, never
+select another branch. The count-validated omitted-parent boundary remains
+valid. A broken path (missing tip, missing parent or cycle) uses flags only
+when they identify one coherent chain of the declared size; malformed parents
+do not prove a null root. A cyclic current walk remains broken; only a separate
+coherent flagged chain may recover the branch. Counting cyclic flagged nodes
+never makes a valid fallback. An unrecoverable conversation yields a hashed
+coverage gap;
 healthy conversations remain available. Exact receipts can preserve scope
 coverage, but grant neither deletion permission nor replacement authority.
 

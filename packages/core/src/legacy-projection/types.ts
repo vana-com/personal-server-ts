@@ -84,7 +84,7 @@ export type ChatgptConversationCoverageGapSummary = Omit<
 /** Hash-only count disagreement when a complete parent walk is authoritative. */
 export interface ChatgptBranchWalkDiagnostic {
   conversationIdHash: string;
-  reason: "declared_count_below_walked";
+  reason: "declared_count_below_walked" | "declared_count_above_walked";
   declaredCount: number;
   walkedCount: number;
 }
