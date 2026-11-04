@@ -927,17 +927,82 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return decision;
+    const confirmIncomplete = async (
+      refusal: LegacyScopeRefusal,
+    ): Promise<ChosenBody> => {
+      if (legacyHead === null || !input.readLegacyHead)
+        return { kind: "refused", refusal };
+      let legacy: DataFileEnvelope;
+      try {
+        legacy = await input.readLegacyHead(legacyHead);
+      } catch {
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail: "indexed legacy head could not be read",
+          },
+        };
+      }
+      if (legacy.scope !== scope)
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail: "indexed legacy head has another scope",
+          },
+        };
+      // Inventory and reads consume this same saved verdict. A confirmed
+      // incomplete projection must replace the previous covered witness.
+      const confirmed = authority.confirmRead(
+        scope,
+        legacyHead,
+        () =>
+          sameSelection(decide(scope), decision) &&
+          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
+        {
+          instance: decision.selection.instance,
+          generation: decision.generation,
+          writeClock: initial.writeClock,
+          arrivalRevision: initial.arrivalRevision,
+          dependencyRevision: initial.dependencyRevision,
+          canonicalCursor: coverageCursor(
+            scope,
+            decision,
+            initial.writeClock,
+            initial.arrivalRevision,
+            initial.receiptCursor,
+            initial.dependencyRevision,
+          ),
+          coverage: projectionUnavailableCoverage(legacy.data),
+          cached: false,
+        },
+      );
+      if (!confirmed) {
+        if (authority.isReset(scope)) return { kind: "file" };
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail:
+              "legacy head or canonical cursor changed during incomplete projection",
+          },
+        };
+      }
+      return { kind: "refused", refusal };
+    };
     if (initial.retainedEntityLoss && !ouraCompletedReplacement(decision)) {
       return hasTakeover || legacyHead === null
-        ? {
-            kind: "refused",
-            refusal: {
-              status: "incomplete",
-              reason: "canonical_view_incomplete",
-              confirmation: "confirmed",
-              diagnostics: [],
-            },
-          }
+        ? confirmIncomplete({
+            status: "incomplete",
+            reason: "canonical_view_incomplete",
+            confirmation: "confirmed",
+            diagnostics: [],
+          })
         : { kind: "file" };
     }
     if (
@@ -1214,31 +1279,28 @@ export function createLegacyScopeView(
         );
         if (stillLegacyOwned) return { kind: "file" };
       }
-      return {
-        kind: "refused",
-        refusal: { ...incompleteView(read), confirmation: "confirmed" },
-      };
+      return confirmIncomplete({
+        ...incompleteView(read),
+        confirmation: "confirmed",
+      });
     }
     if (
       initial.chatgptMessageTombstones &&
       (read.chatgptCoverageGaps?.length ?? 0) > 0
     ) {
-      return {
-        kind: "refused",
-        refusal: {
-          status: "incomplete",
-          reason: "canonical_view_incomplete",
-          confirmation: "confirmed",
-          diagnostics: [
-            {
-              stream: "messages",
-              kind: "omitted",
-              detail:
-                "conversation branch exclusions cannot bypass retained message tombstones",
-            },
-          ],
-        },
-      };
+      return confirmIncomplete({
+        status: "incomplete",
+        reason: "canonical_view_incomplete",
+        confirmation: "confirmed",
+        diagnostics: [
+          {
+            stream: "messages",
+            kind: "omitted",
+            detail:
+              "conversation branch exclusions cannot bypass retained message tombstones",
+          },
+        ],
+      });
     }
     // Whole-dataset replacement needs a fresh completion for every input.
     // Equal/older horizons retain the existing parity path, not deletion authority.
