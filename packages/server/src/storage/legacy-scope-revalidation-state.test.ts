@@ -1,3 +1,4 @@
+import type * as LegacyScopeViewModule from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -7,6 +8,19 @@ import { afterEach, expect, it, vi } from "vitest";
 import { initializeDatabase } from "./index-schema.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { trackLegacyScopeMutations } from "./legacy-scope-revalidation-state.js";
+const semantics = vi.hoisted(() => ({
+  coverageRule: 13,
+  projectionContract: "projection/old",
+  cursorVersion: 1,
+  bindingDeclarations: "old-bindings",
+}));
+vi.mock(
+  "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view",
+  async (original) => ({
+    ...(await original<typeof LegacyScopeViewModule>()),
+    LEGACY_SCOPE_WITNESS_IDENTITY: semantics,
+  }),
+);
 afterEach(() => vi.useRealTimers());
 function seed(path = ":memory:") {
   const raw = initializeDatabase(path);
@@ -207,3 +221,66 @@ it("persists policy identity so a changed policy on restart dirties clean proofs
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Semantic policy upgrades are code changes, not record writes. Each input
+// must start a deadline even when the new evaluator cannot replace the proof.
+it.each([
+  "coverageRule",
+  "projectionContract",
+  "cursorVersion",
+  "bindingDeclarations",
+] as const)(
+  "starts the dirty ceiling over a clean witness after a %s upgrade and refused evaluation",
+  async (component) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let now = 1000;
+    vi.setSystemTime(now);
+    const raw = seed();
+    const state = trackLegacyScopeMutations(raw, {
+      ceilingMs: 2000,
+      now: () => now,
+    });
+    const old = semantics[component];
+    try {
+      state.observePolicy("unchanged configuration", now);
+      state.complete("i", "oura.activity", state.revision("i"));
+      expect(state.status("i", "oura.activity")?.dirty_since).toBeNull();
+      const clocks = [
+        createLegacyScopeAuthority(raw).writeClock(),
+        createLegacyScopeAuthority(raw).arrivalRevision(),
+      ];
+      Object.assign(semantics, {
+        [component]: typeof old === "number" ? old + 1 : old + "/new",
+      });
+      now = 1500;
+      vi.setSystemTime(now);
+      state.observePolicy("unchanged configuration", now);
+      const view = createLegacyScopeView({
+        authority: createLegacyScopeAuthority(raw),
+        records: createSqliteRecordStore(raw),
+        configuredMethods: () => ["oura"],
+        readLegacyHead: async () => {
+          throw Error("synthetic new evaluator refuses");
+        },
+      });
+      expect((await view.readLatest("oura.activity")).kind).toBe("refused");
+      state.fail("i", ["oura.activity"]);
+      expect(state.status("i", "oura.activity")).toMatchObject({
+        dirty_since: 1500,
+        error_count: 1,
+      });
+      expect(view.verdictFor("oura.activity")[0]?.verdict).toBe("covered");
+      expect([
+        createLegacyScopeAuthority(raw).writeClock(),
+        createLegacyScopeAuthority(raw).arrivalRevision(),
+      ]).toEqual(clocks);
+      vi.setSystemTime(3499);
+      expect(view.listingFor("oura.activity").kind).toBe("canonical");
+      vi.setSystemTime(3500);
+      expect(view.listingFor("oura.activity").kind).toBe("refused");
+    } finally {
+      Object.assign(semantics, { [component]: old });
+      raw.close();
+    }
+  },
+);

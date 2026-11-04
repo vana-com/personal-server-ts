@@ -152,6 +152,31 @@ function scopeDeclarationCursor(scope: string): string {
   );
 }
 
+/** Shared identity for persisted witnesses and their cursor representation. */
+export const LEGACY_SCOPE_WITNESS_IDENTITY = {
+  cursorVersion: "legacy-scope-cursor/1",
+  coverageRule: COVERAGE_RULE_VERSION,
+  projectionContract: CANONICAL_LEGACY_VIEW_CONTRACT,
+  bindingDeclarations: [
+    ...new Set(BINDING_PROFILES.flatMap((profile) => [...profile.keys()])),
+  ]
+    .sort()
+    .map(scopeDeclarationCursor),
+} as const;
+
+/** Compare semantic identity alone; source clocks intentionally do not participate. */
+export function legacyScopeCursorIsCurrent(
+  scope: string,
+  cursor: string,
+): boolean {
+  return (
+    cursor.startsWith(`${LEGACY_SCOPE_WITNESS_IDENTITY.cursorVersion}:`) &&
+    cursor.includes(
+      `:${CANONICAL_LEGACY_VIEW_CONTRACT}:${scopeDeclarationCursor(scope)}:${COVERAGE_RULE_VERSION}:`,
+    )
+  );
+}
+
 /**
  * Registry facts and takeover diagnostics from the same SQLite database as
  * the rows. Facts must work when the record server is not mounted (its tables
@@ -804,6 +829,7 @@ export function createLegacyScopeView(
     receipts: string,
   ): string {
     return [
+      LEGACY_SCOPE_WITNESS_IDENTITY.cursorVersion,
       writeClock,
       arrivalRevision,
       receipts,

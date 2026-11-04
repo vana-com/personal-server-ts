@@ -1,3 +1,4 @@
+import { LEGACY_SCOPE_WITNESS_IDENTITY } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type { Database, Statement } from "better-sqlite3";
 
 /** Conservatively cover all PDPP state, including claims, custody and visibility.
@@ -235,6 +236,10 @@ function makeState(
       raw.transaction(() => mark(since)).immediate();
     },
     observePolicy(fingerprint: string, since: number) {
+      fingerprint = JSON.stringify([
+        LEGACY_SCOPE_WITNESS_IDENTITY,
+        fingerprint,
+      ]);
       raw
         .transaction(() => {
           const previous = raw

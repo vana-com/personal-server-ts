@@ -1,3 +1,4 @@
+import { legacyScopeCursorIsCurrent } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type { Database } from "better-sqlite3";
 import type {
   LegacyScopeAuthority,
@@ -264,13 +265,28 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       if (!ledger.length) return false;
       const verdict = db
         .prepare(
-          "SELECT verdict FROM legacy_scope_takeover_verdicts WHERE scope=? AND instance=? AND generation=? AND legacy_version_id=?",
+          "SELECT verdict,canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope=? AND instance=? AND generation=? AND legacy_version_id=?",
         )
         .get(scope, instance, generation, head.id) as
-        { verdict: string } | undefined;
-      if (verdict) return verdict.verdict === "covered";
-      return ledger.some((row) =>
-        row.replacement_cursor?.startsWith(`${head.id}:`),
+        { verdict: string; canonical_cursor: string } | undefined;
+      // Tracked runtimes get the SWR deadline from observePolicy. An untracked
+      // adapter has no grace timer, so it must reject obsolete semantics now.
+      const tracked = hasTable("legacy_scope_revalidation_scopes");
+      if (verdict)
+        return (
+          verdict.verdict === "covered" &&
+          (tracked ||
+            legacyScopeCursorIsCurrent(scope, verdict.canonical_cursor))
+        );
+      const prefix = `${head.id}:`;
+      return ledger.some(
+        (row) =>
+          row.replacement_cursor?.startsWith(prefix) &&
+          (tracked ||
+            legacyScopeCursorIsCurrent(
+              scope,
+              row.replacement_cursor.slice(prefix.length),
+            )),
       );
     },
 
