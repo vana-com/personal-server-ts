@@ -1,3 +1,4 @@
+import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
@@ -386,6 +387,8 @@ export interface PersonalServerDataApiDeps {
    * serve. When false (default), reads bypass payment entirely.
    */
   paymentEnabled?: boolean;
+  /** Operator-selected Account authority. Never taken from a read request. */
+  ownAppAccountUrl?: string;
   /**
    * Test seam for the gateway forwarding fetch. Defaults to the global
    * `fetch`; tests inject a mock that returns specific gateway statuses.
@@ -2295,9 +2298,40 @@ export async function handlePersonalServerDataRequest(
       const builder = authResult?.builder;
       const resolvedGrantId =
         !isOwnerSignal && authResult?.grantId ? authResult.grantId : undefined;
+      let ownAppRead = false;
+      if (
+        deps.paymentEnabled &&
+        !isOwnerSignal &&
+        resolvedGrantId &&
+        builder &&
+        deps.ownAppAccountUrl
+      ) {
+        if (!deps.serverOwner || !deps.gatewayConfig) {
+          return errorResponse(
+            503,
+            "OWN_APP_ELIGIBILITY_UNAVAILABLE",
+            "Own-app fee eligibility could not be verified",
+          );
+        }
+        try {
+          ownAppRead = await isOwnAppRead({
+            accountUrl: deps.ownAppAccountUrl,
+            appAddress: builder,
+            dataOwner: deps.serverOwner,
+            chainId: deps.gatewayConfig.chainId,
+          });
+        } catch {
+          return errorResponse(
+            503,
+            "OWN_APP_ELIGIBILITY_UNAVAILABLE",
+            "Own-app fee eligibility could not be verified",
+          );
+        }
+      }
       const willCharge = Boolean(
         deps.paymentEnabled &&
         !isOwnerSignal &&
+        !ownAppRead &&
         typeof builder === "string" &&
         builder.startsWith("0x") &&
         resolvedGrantId &&
@@ -2352,6 +2386,7 @@ export async function handlePersonalServerDataRequest(
       if (
         deps.paymentEnabled &&
         !isOwnerSignal &&
+        !ownAppRead &&
         typeof builder === "string" &&
         builder.startsWith("0x") &&
         resolvedGrantId &&
@@ -2389,6 +2424,7 @@ export async function handlePersonalServerDataRequest(
       }
 
       const headers: Record<string, string> = {};
+      if (ownAppRead) headers["X-Vana-Payment-Exemption"] = "own-app";
       headers["X-Vana-Data-Source"] =
         latest?.kind === "canonical" ? "canonical" : "legacy";
       let envelope: DataFileEnvelope;
