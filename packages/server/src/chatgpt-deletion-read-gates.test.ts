@@ -336,7 +336,7 @@ async function setupCoveredLegacyScope(establishTakeover = true) {
     ctx!.indexManager.updateFileId(unlinkedLegacyEntry!.path, LEGACY_FILE_ID),
   ).toBe(true);
 
-  // ruled by lead 11-03: oracle precondition used an Oura-only flag
+  // Before a canonical connection is admitted, the legacy body remains the read source.
   const beforeTakeover = await ownerGet(`/v1/data/${SCOPE}`);
   expect(beforeTakeover.status).toBe(200);
   expect(beforeTakeover.dataSource).toBe("legacy");
@@ -519,7 +519,7 @@ function expectDeletedBodyAbsent(response: { status: number; text: string }) {
 
 beforeEach(async () => {
   await mkdir(SCRATCH_ROOT, { recursive: true });
-  tempDir = await mkdtemp(join(SCRATCH_ROOT, "oracle-1904-http-"));
+  tempDir = await mkdtemp(join(SCRATCH_ROOT, "chatgpt-deletion-http-"));
   vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", KNOWN_SIG);
   vi.stubEnv("PS_ACCESS_TOKEN", OWNER_TOKEN);
   owner = (await recoverServerOwner(KNOWN_SIG)).toLowerCase();

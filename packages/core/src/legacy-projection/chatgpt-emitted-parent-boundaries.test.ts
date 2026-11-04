@@ -51,7 +51,7 @@ function project(records: PdppRecord[]) {
   return result;
 }
 
-describe("Muse 1885 emitted-parent boundaries (separate from oracle 1904)", () => {
+describe("ChatGPT emitted-parent boundary cases", () => {
   it("M02 follows a nearest retained ancestor without requiring a hidden system node", () => {
     const result = project([
       conversation("A", "a1", 2),

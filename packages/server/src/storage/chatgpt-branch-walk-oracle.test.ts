@@ -547,7 +547,7 @@ const AEMPTYFILTERED = {
   total: 1,
 };
 
-describe("independent ChatGPT branch-walk oracle 1904", () => {
+describe("independent ChatGPT branch-walk oracle", () => {
   it("O01 — equal count, missing synthetic root is clean", async () => {
     const cs = [C("A", "a1", 2)];
     const ms = [M("A", "a0", "synthetic-root", true), M("A", "a1", "a0", true)];
@@ -936,7 +936,8 @@ describe("independent ChatGPT branch-walk oracle 1904", () => {
     const f = createReadFixture(cs, ms);
     const v = await readCanonical(f);
     expect(v.envelope.data).toEqual(AEMPTYFILTERED);
-    // ruled by lead 11-03: canonical keeps explicit empty current; projection follows legacy shape (omits, chatgpt-playwright.js:505-507)
+    // Stored canonical content preserves an explicit empty value. The legacy
+    // projection omits it to match the legacy envelope shape.
     const storedEmpty = f.db
       .prepare(
         "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
@@ -1343,8 +1344,8 @@ describe("independent ChatGPT branch-walk oracle 1904", () => {
   });
 
   it("O22 — a retained ChatGPT tombstone keeps branch-gap refusal whole-scope", async () => {
-    // ruled by lead 11-03: oracle precondition used an Oura-only flag
-    // Source: legacy-scope-view.ts:734 (Oura-only predicate), :798 (initial decision).
+    // A retained ChatGPT tombstone must block whole-scope fallback when
+    // another conversation cannot be reconstructed.
     const initialConversations = [C("A", "a0", 1), C("H", "h0", 1)];
     const deletedContent = "deleted branch content";
     const deletedContentHash = createHash("sha256")
@@ -1529,8 +1530,8 @@ describe("independent ChatGPT branch-walk oracle 1904", () => {
   });
 });
 
-describe("Round 2 rooted-walk regressions", () => {
-  // ruled by lead 11-03: a rooted complete current walk wins at every declared count.
+describe("rooted current-walk regressions", () => {
+  // A complete rooted current walk proves branch membership even when the count differs.
   it.each([
     { caseId: "R2a", withFlags: true },
     { caseId: "R2b", withFlags: false },
@@ -1579,7 +1580,8 @@ describe("Round 2 rooted-walk regressions", () => {
     },
   );
 
-  // ruled by lead 11-03: only parent_id === null proves the root; malformed parents do not.
+  // Only an explicit null parent identifies the root; other non-string parents
+  // provide no root evidence.
   it.each([undefined, 0, false, {}])(
     "R2d — a non-string parent is not an explicit null root (%j)",
     (parent) => {
@@ -1612,7 +1614,8 @@ describe("Round 2 rooted-walk regressions", () => {
     },
   );
 
-  // ruled by lead 11-03: a cyclic walk is not rooted and complete; coherent flag recovery may apply.
+  // A cycle cannot prove a complete rooted walk. A coherent flagged chain
+  // can provide recovery evidence.
   it("R2c — recovers a coherent flagged chain when current-node history cycles", async () => {
     const cs = [C("A", "cycle", 2)];
     const ms = [

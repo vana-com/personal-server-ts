@@ -2991,8 +2991,8 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         ])(
           "keeps $label data out of retained evidence",
           ({ parent, rows, rootParent }) => {
-            // ruled by lead 11-03: a rooted count mismatch is trusted; these
-            // negative controls need a genuinely unavailable current parent.
+            // A rooted count mismatch remains usable. These negative controls need
+            // an unavailable current parent to exercise missing evidence.
             const base = conversation("c1", 1, "n1");
             const result = projected(
               project([
