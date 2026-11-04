@@ -73,21 +73,27 @@ export function createScopeDeletionHistory(
     remember(scope, tombstone) {
       const write = () => {
         const previous = get.get(owner, scope) as
-          { deleted_at: string; tombstone_version: string | null } | undefined;
+          | {
+              deleted_at: string;
+              tombstone_version: string | null;
+              erase_applied: number;
+            }
+          | undefined;
         if (previous) {
           const priorVersion =
             previous.tombstone_version === "0"
               ? null
               : previous.tombstone_version;
-          if (priorVersion === null || tombstone.version === null) {
-            if (
-              priorVersion === tombstone.version &&
-              previous.deleted_at === tombstone.deletedAt
-            )
-              return false;
-            throw new Error("Cannot order tombstones without versions");
+          if (tombstone.version === null || tombstone.version === "0")
+            return false;
+          if (priorVersion !== null) {
+            if (BigInt(tombstone.version) < BigInt(priorVersion)) return false;
+            if (BigInt(tombstone.version) === BigInt(priorVersion)) {
+              return (
+                previous.erase_applied !== 1 && !options.replicationEnabled
+              );
+            }
           }
-          if (BigInt(tombstone.version) <= BigInt(priorVersion)) return false;
         }
         remember.run(owner, scope, tombstone.deletedAt, tombstone.version);
         return true;

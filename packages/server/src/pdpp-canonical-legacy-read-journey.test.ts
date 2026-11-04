@@ -736,7 +736,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
         return response.json();
       };
       const before = await nativeRows();
-      // Simulate a deletion history entry written before erase markers existed.
+      // Simulate pre-upgrade history newer than this stale gateway observation.
+      // An equal known version now intentionally retries erasure (covered separately).
+      // This journey retains its old-history and file-only re-add assertions.
       const historyDb = new Database(join(tempDir, "index.db"));
       try {
         historyDb
@@ -747,7 +749,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
             owner,
             "oura.activity",
             "2026-09-11T00:00:00Z",
-            tombstoneVersion,
+            tombstoneVersion === "0"
+              ? "0"
+              : String(BigInt(tombstoneVersion) + 1n),
           );
       } finally {
         historyDb.close();

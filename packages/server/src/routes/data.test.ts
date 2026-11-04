@@ -3397,7 +3397,7 @@ describe("shared canonical streams on scope deletion", () => {
     expect(store.getRecord("conn", "notes", "n1")).toBeDefined();
   });
 
-  it("does not claim success while matching old history remains unapplied", async () => {
+  it("retries and applies matching old history during deletion", async () => {
     db.prepare(
       "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)",
     ).run(
@@ -3407,8 +3407,8 @@ describe("shared canonical streams on scope deletion", () => {
       mark.version,
     );
     const response = await req(`/${scopeX}`, "DELETE");
-    expect(response.status).toBe(503);
-    expect(store.getRecord("conn", "notes", "n1")).toBeDefined();
+    expect(response.status).toBe(200);
+    expect(store.getRecord("conn", "notes", "n1")).toBeUndefined();
   });
 
   it("does not report a repeated tombstone as erasing newly collected exclusive rows", async () => {

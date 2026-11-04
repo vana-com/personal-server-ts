@@ -127,14 +127,14 @@ describe("scope deletion observations", () => {
     expect(store.getRecord("connection", "activity", "old")).toBeDefined();
   });
 
-  it("leaves pre-upgrade history unmarked", () => {
+  it("retries pre-upgrade history when the same version is observed", () => {
     db.prepare(
       "INSERT INTO vana_scope_deletion_history (owner_address, scope, deleted_at, tombstone_version) VALUES (?, ?, ?, ?)",
     ).run(OWNER, SCOPE, deleted.deletedAt, deleted.version);
     expect(history.get(SCOPE)?.eraseApplied).not.toBe(true);
     history.remember(SCOPE, deleted);
-    expect(history.get(SCOPE)?.eraseApplied).not.toBe(true);
-    expect(store.getRecord("connection", "activity", "old")).toBeDefined();
+    expect(history.get(SCOPE)?.eraseApplied).toBe(true);
+    expect(store.getRecord("connection", "activity", "old")).toBeUndefined();
   });
 
   it("keeps a failed newer observation unmarked even when older history was applied", () => {
