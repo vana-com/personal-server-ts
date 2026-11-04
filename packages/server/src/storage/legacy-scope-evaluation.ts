@@ -245,8 +245,8 @@ if (isLegacyEvaluationWorker) {
             .transaction(() => {
               if (state!.revision(job.instance) !== revision) return false;
               const confirmed = baseAuthority.confirmRead(...args);
-              if (confirmed && args[4])
-                state!.complete(job.instance, args[0], revision);
+              // A successful headless read is confirmed under the same revision fence.
+              if (confirmed) state!.complete(job.instance, args[0], revision);
               return confirmed;
             })
             .immediate();

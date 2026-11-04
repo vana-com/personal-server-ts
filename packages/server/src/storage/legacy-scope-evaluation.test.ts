@@ -121,3 +121,92 @@ it("runs a fresh comparison off-thread and publishes a negative after same-strea
   expect(view.verdictFor("oura.activity")[0]?.verdict).toBe("not_covered");
   expect(view.listingFor("oura.activity").kind).toBe("refused");
 });
+
+it.each(["pdpp-projector", "pdpp-import-projection"] as const)(
+  "completes a fenced headless candidate after a %s head replaces its legacy head",
+  async (producer) => {
+    const root = await mkdtemp(join(homedir(), ".tmp", "swr-headless-"));
+    const dataDir = join(root, "data");
+    await mkdir(dataDir);
+    const raw = initializeDatabase(join(root, "index.db"));
+    let now = 1000;
+    const state = trackLegacyScopeMutations(raw, {
+      ceilingMs: 2000,
+      now: () => now,
+    });
+    const store = createSqliteRecordStore(state.db);
+    const worker = createLegacyEvaluationWorker();
+    cleanup = async () => {
+      await worker.stop();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    };
+    const scope = "oura.activity";
+    const source = "https://registry.pdpp.dev/sources/oura";
+    store.registerConnection({
+      instance: "i",
+      sourceId: source,
+      method: "oura",
+      label: "Synthetic",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "i",
+          stream: "activity",
+          key: "a",
+          data: { id: "a", day: "2026-09-01", score: 80 },
+          emitted_at: "2026-09-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "oura", generation: 1 },
+    );
+    const authority = createLegacyScopeAuthority(state.db, state);
+    const config = {
+      authority,
+      records: store,
+      configuredMethods: () => ["oura"],
+    };
+    const original = await createLegacyScopeView(config).readLatest(scope);
+    if (original.kind !== "canonical") throw Error("synthetic fixture");
+    state.db
+      .prepare(
+        "INSERT INTO data_files(path,scope,collected_at,size_bytes) VALUES ('legacy.json',?,'2026-09-01T00:00:00.000Z',1)",
+      )
+      .run(scope);
+    const view = createLegacyScopeView({
+      ...config,
+      readLegacyHead: async () => original.envelope,
+    });
+    expect((await view.readLatest(scope)).kind).toBe("canonical");
+    expect(state.status("i", scope)?.dirty_since).toBeNull();
+    state.db
+      .prepare(
+        "INSERT INTO data_files(path,scope,collected_at,size_bytes,producer) VALUES ('projector.json',?,'2026-11-04T00:00:00.000Z',1,?)",
+      )
+      .run(scope, producer);
+    expect(authority.eligibleLegacyHead(scope)).toBeNull();
+    expect(state.status("i", scope)?.dirty_since).toBe(1000);
+    const result = await worker.evaluate({
+      database: raw.name,
+      dataDir,
+      owner: "synthetic-owner",
+      replication: false,
+      declarations: [],
+      configuredMethods: [[source, ["oura"]]],
+      optInMethods: [],
+      coverageThresholds: undefined,
+      ceilingMs: 2000,
+      instance: "i",
+      scopes: [scope],
+    });
+    expect(result.refused).toEqual([]);
+    // Only the production Worker confirmation may complete this marker.
+    expect.soft(state.status("i", scope)?.dirty_since).toBeNull();
+    now = 4000;
+    expect(state.diagnostics()).toEqual([]);
+    expect((await view.readLatest(scope)).kind).toBe("canonical");
+  },
+);
