@@ -332,6 +332,8 @@ type ChosenBody =
 export interface LegacyScopeViewPort {
   /** The latest body of a scope. Never used for an explicit version. */
   readLatest(scope: string): Promise<LegacyScopeLatest>;
+  /** Refuse a legacy file body that could resurrect a retained row tombstone. */
+  legacyFileReadRefusal(scope: string): LegacyScopeRefusal | null;
   /**
    * Listing metadata from counts and receipts only, without reading rows.
    * A refusal here is also a refusal on read; a read can still refuse what
@@ -1131,23 +1133,21 @@ export function createLegacyScopeView(
       initial.chatgptMessageTombstones &&
       (read.chatgptCoverageGaps?.length ?? 0) > 0
     ) {
-      return hasTakeover || legacyHead === null
-        ? {
-            kind: "refused",
-            refusal: {
-              status: "incomplete",
-              reason: "canonical_view_incomplete",
-              diagnostics: [
-                {
-                  stream: "messages",
-                  kind: "omitted",
-                  detail:
-                    "conversation branch exclusions cannot bypass retained message tombstones",
-                },
-              ],
+      return {
+        kind: "refused",
+        refusal: {
+          status: "incomplete",
+          reason: "canonical_view_incomplete",
+          diagnostics: [
+            {
+              stream: "messages",
+              kind: "omitted",
+              detail:
+                "conversation branch exclusions cannot bypass retained message tombstones",
             },
-          }
-        : { kind: "file" };
+          ],
+        },
+      };
     }
     // Whole-dataset replacement needs a fresh completion for every input.
     // Equal/older horizons retain the existing parity path, not deletion authority.
@@ -1396,6 +1396,36 @@ export function createLegacyScopeView(
       return body.kind === "file"
         ? { kind: "file", deletion: deletionFor(initial.decision) }
         : body;
+    },
+
+    legacyFileReadRefusal(scope) {
+      if (scope !== "chatgpt.conversations" && scope !== "chatgpt.messages") {
+        return null;
+      }
+      return authority.readSnapshot(() => {
+        const connections = authority.listMethodConnections([
+          ...scopeMethods("chatgpt.conversations").keys(),
+        ]);
+        if (
+          !connections.some((connection) =>
+            authority.hasRetainedTombstones(connection.instance, ["messages"]),
+          )
+        ) {
+          return null;
+        }
+        return {
+          status: "incomplete",
+          reason: "canonical_view_incomplete",
+          diagnostics: [
+            {
+              stream: "messages",
+              kind: "omitted",
+              detail:
+                "legacy file bodies cannot bypass retained message tombstones",
+            },
+          ],
+        };
+      });
     },
 
     listingFor,
