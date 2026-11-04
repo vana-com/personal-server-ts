@@ -1125,6 +1125,76 @@ describe("retained ChatGPT message evidence", () => {
     });
   });
 
+  it("does not waive nested message_count fields for an empty message", () => {
+    const emptyMessage = { ...message, content: "" };
+    const legacy = {
+      conversations: [
+        {
+          id: "conversation",
+          message_count: 1,
+          metadata: { message_count: 8 },
+          messages: [emptyMessage],
+        },
+      ],
+    };
+    const canonical = {
+      conversations: [
+        {
+          id: "conversation",
+          message_count: 0,
+          metadata: { message_count: 7 },
+          messages: [],
+        },
+      ],
+    };
+    const verdict = compareLegacyCoverage(legacy, canonical, {
+      ...options,
+      retainedChatgptMessages: [
+        {
+          scope: "chatgpt.conversations",
+          conversationId: "conversation",
+          message: emptyMessage,
+        },
+      ],
+    });
+
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reasonCounts.field_mismatch).toBeGreaterThan(0);
+  });
+
+  it("keeps an absent legacy content field unknown despite empty retained content", () => {
+    const legacyMessage = {
+      id: message.id,
+      role: message.role,
+      content_type: message.content_type,
+      create_time: message.create_time,
+      model: message.model,
+    };
+    const legacy = {
+      conversations: [
+        { id: "conversation", message_count: 1, messages: [legacyMessage] },
+      ],
+    };
+    const canonical = {
+      conversations: [{ id: "conversation", message_count: 1, messages: [] }],
+    };
+
+    const verdict = compareLegacyCoverage(legacy, canonical, {
+      ...options,
+      canonicalNewer: true,
+      retainedChatgptMessages: [
+        {
+          scope: "chatgpt.conversations",
+          conversationId: "conversation",
+          message: { ...message, content: "" },
+        },
+      ],
+    });
+
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("missing_entity");
+  });
+
   it("keeps unknown and same-time changed content blocking", () => {
     const emptyMessage = { ...message, content: "" };
     const legacy = {
