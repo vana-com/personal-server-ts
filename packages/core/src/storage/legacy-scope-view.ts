@@ -325,6 +325,8 @@ export type LegacyScopeRefusal =
   | {
       status: "incomplete";
       reason: "canonical_view_incomplete";
+      /** Missing proof may recover; observed data loss is a final refusal. */
+      confirmation: "confirmed" | "unconfirmed";
       diagnostics: {
         stream: string;
         kind: "omitted" | "partial" | "unproven";
@@ -932,6 +934,7 @@ export function createLegacyScopeView(
             refusal: {
               status: "incomplete",
               reason: "canonical_view_incomplete",
+              confirmation: "confirmed",
               diagnostics: [],
             },
           }
@@ -1091,6 +1094,7 @@ export function createLegacyScopeView(
             refusal: {
               status: "incomplete",
               reason: "canonical_view_incomplete",
+              confirmation: "confirmed",
               diagnostics: [],
             },
           }
@@ -1212,11 +1216,7 @@ export function createLegacyScopeView(
       }
       return {
         kind: "refused",
-        refusal: {
-          status: "incomplete",
-          reason: "canonical_view_incomplete",
-          diagnostics: incompleteness(read),
-        },
+        refusal: { ...incompleteView(read), confirmation: "confirmed" },
       };
     }
     if (
@@ -1228,6 +1228,7 @@ export function createLegacyScopeView(
         refusal: {
           status: "incomplete",
           reason: "canonical_view_incomplete",
+          confirmation: "confirmed",
           diagnostics: [
             {
               stream: "messages",
@@ -1298,11 +1299,7 @@ export function createLegacyScopeView(
       if (stillLegacyOwned) return { kind: "file" };
       return {
         kind: "refused",
-        refusal: {
-          status: "incomplete",
-          reason: "canonical_view_incomplete",
-          diagnostics: incompleteness(read),
-        },
+        refusal: incompleteView(read),
       };
     }
     if (legacyHead !== null && input.readLegacyHead) {
@@ -1421,6 +1418,7 @@ export function createLegacyScopeView(
               refusal: {
                 status: "incomplete",
                 reason: "canonical_view_incomplete",
+                confirmation: "confirmed",
                 diagnostics: [],
               },
             }
@@ -1453,11 +1451,7 @@ export function createLegacyScopeView(
       }
       return {
         kind: "refused",
-        refusal: {
-          status: "incomplete",
-          reason: "canonical_view_incomplete",
-          diagnostics: incompleteness(read),
-        },
+        refusal: incompleteView(read),
       };
     }
     const confirmed = authority.confirmRead(
@@ -1520,6 +1514,7 @@ export function createLegacyScopeView(
         return {
           status: "incomplete",
           reason: "canonical_view_incomplete",
+          confirmation: "confirmed",
           diagnostics: [
             {
               stream: "messages",
@@ -1797,29 +1792,34 @@ function listedCollectedAt(
   return Number.isFinite(newest) ? new Date(newest).toISOString() : null;
 }
 
-function incompleteness(
+function incompleteView(
   read: CanonicalLegacyReadOk,
-): Extract<
-  LegacyScopeRefusal,
-  { reason: "canonical_view_incomplete" }
->["diagnostics"] {
+): Extract<LegacyScopeRefusal, { reason: "canonical_view_incomplete" }> {
   const { omissions, partialRows, unproven } = read.diagnostics;
-  return [
-    ...omissions.map((entry) => ({
-      stream: entry.stream,
-      kind: "omitted" as const,
-      detail: `${entry.count} rows: ${entry.reasons.join("; ")}`,
-    })),
-    ...partialRows.map((entry) => ({
-      stream: entry.stream,
-      kind: "partial" as const,
-      detail: `${entry.count} rows: ${entry.reasons.join("; ")}`,
-    })),
-    // Optional on the canonical-legacy-view/4 contract: omitted when empty.
-    ...(unproven ?? []).map((entry) => ({
-      stream: entry.stream,
-      kind: "unproven" as const,
-      detail: `${entry.aspect}: ${entry.reason}`,
-    })),
-  ];
+  return {
+    status: "incomplete",
+    reason: "canonical_view_incomplete",
+    confirmation:
+      omissions.length > 0 || partialRows.length > 0
+        ? "confirmed"
+        : "unconfirmed",
+    diagnostics: [
+      ...omissions.map((entry) => ({
+        stream: entry.stream,
+        kind: "omitted" as const,
+        detail: `${entry.count} rows: ${entry.reasons.join("; ")}`,
+      })),
+      ...partialRows.map((entry) => ({
+        stream: entry.stream,
+        kind: "partial" as const,
+        detail: `${entry.count} rows: ${entry.reasons.join("; ")}`,
+      })),
+      // Optional on the canonical-legacy-view/4 contract: omitted when empty.
+      ...(unproven ?? []).map((entry) => ({
+        stream: entry.stream,
+        kind: "unproven" as const,
+        detail: `${entry.aspect}: ${entry.reason}`,
+      })),
+    ],
+  };
 }

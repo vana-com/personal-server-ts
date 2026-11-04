@@ -185,7 +185,7 @@ it("blob and replica mutations coarsely dirty every candidate, including shared-
   }
 });
 
-it("persists policy identity so a changed policy on restart dirties clean proofs", () => {
+it("invalidates clean proofs on restart while preserving policy and first-stale time", () => {
   const parent = join(homedir(), ".tmp");
   mkdirSync(parent, { recursive: true });
   const dir = mkdtempSync(join(parent, "swr-policy-"));
@@ -204,16 +204,17 @@ it("persists policy identity so a changed policy on restart dirties clean proofs
     raw = initializeDatabase(path);
     state = trackLegacyScopeMutations(raw, { ceilingMs: 2000, now: () => now });
     state.observePolicy("schema-v1:threshold-1.5", now);
-    expect(state.status("i", "oura.activity")?.dirty_since).toBeNull();
+    // ruled by lead 11-04: a clean marker crossing a process boundary is stale.
+    expect(state.status("i", "oura.activity")?.dirty_since).toBe(1500);
     now = 2000;
     state.observePolicy("schema-v2:threshold-1.0", now);
-    expect(state.status("i", "oura.activity")?.dirty_since).toBe(2000);
+    expect(state.status("i", "oura.activity")?.dirty_since).toBe(1500);
     raw.close();
     now = 3500;
     raw = initializeDatabase(path);
     state = trackLegacyScopeMutations(raw, { ceilingMs: 2000, now: () => now });
     state.observePolicy("schema-v2:threshold-1.0", now);
-    expect(state.status("i", "oura.activity")?.dirty_since).toBe(2000);
+    expect(state.status("i", "oura.activity")?.dirty_since).toBe(1500);
     now = 4000;
     expect(state.overdue("i", "oura.activity")).toBe(true);
   } finally {
@@ -286,3 +287,70 @@ it.each([
     }
   },
 );
+
+it.each(["sweep", "failure"] as const)(
+  "repairs a stale clean marker on %s without expiring an unchanged clean proof",
+  (recovery) => {
+    const raw = seed();
+    let now = 1000;
+    const state = trackLegacyScopeMutations(raw, {
+      ceilingMs: 2000,
+      now: () => now,
+    });
+    try {
+      state.complete("i", "oura.activity", state.revision("i"));
+      state.ensureDirty();
+      expect(state.status("i", "oura.activity")?.dirty_since).toBeNull();
+      now = 1500;
+      state.db.prepare("UPDATE pdpp_records SET version=version+1").run();
+      // Reproduce an older publisher clearing a marker after its read snapshot.
+      // The saved successful revision must still expose this stale clean row.
+      raw
+        .prepare("UPDATE legacy_scope_revalidation_scopes SET dirty_since=NULL")
+        .run();
+      expect(state.status("i", "oura.activity")?.dirty_since).toBeNull();
+      now = 2000;
+      if (recovery === "sweep") state.ensureDirty();
+      else state.fail("i", ["oura.activity"]);
+      expect(state.status("i", "oura.activity")).toMatchObject({
+        dirty_since: 2000,
+        error_count: recovery === "failure" ? 1 : 0,
+      });
+      now = 4000;
+      expect(state.overdue("i", "oura.activity")).toBe(true);
+    } finally {
+      raw.close();
+    }
+  },
+);
+
+it("recovers a clean marker migrated from the earlier bridge schema", () => {
+  const raw = seed();
+  raw.exec(`CREATE TABLE legacy_scope_revalidation_scopes (
+    instance TEXT NOT NULL,scope TEXT NOT NULL,dirty_since INTEGER,
+    ceiling_ms INTEGER NOT NULL,error_count INTEGER NOT NULL DEFAULT 0,reason TEXT,
+    PRIMARY KEY(instance,scope));
+    INSERT INTO legacy_scope_revalidation_scopes VALUES ('i','oura.activity',NULL,2000,0,NULL);`);
+  let now = 1000;
+  try {
+    const state = trackLegacyScopeMutations(raw, {
+      ceilingMs: 2000,
+      now: () => now,
+    });
+    state.ensureDirty();
+    expect(state.status("i", "oura.activity")).toMatchObject({
+      dirty_since: 1000,
+      confirmed_revision: null,
+    });
+    state.complete("i", "oura.activity", state.revision("i"));
+    now = 4000;
+    state.ensureDirty();
+    expect(state.status("i", "oura.activity")).toMatchObject({
+      dirty_since: null,
+      confirmed_revision: state.revision("i"),
+    });
+    expect(state.overdue("i", "oura.activity")).toBe(false);
+  } finally {
+    raw.close();
+  }
+});

@@ -203,6 +203,8 @@ if (isLegacyEvaluationWorker) {
         configureDatabaseConnection(raw);
         state = trackLegacyScopeMutations(raw, {
           ceilingMs: job.ceilingMs ?? 1800000,
+          // The main process already invalidated surviving proofs at boot.
+          processBoot: false,
         });
         db = state.db;
         if (job.replication) {

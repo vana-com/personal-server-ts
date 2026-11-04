@@ -1,4 +1,3 @@
-// Proposed file: packages/server/src/storage/legacy-scope-direct-read.test.ts
 // Synthetic projection/binding fixtures; real view, authority and tracker.
 import Database from "better-sqlite3";
 import { expect, it, vi } from "vitest";
@@ -127,6 +126,7 @@ function fixture() {
     state,
     authority,
     view,
+    records,
     setTime: (value: number) => {
       now = value;
     },
@@ -283,3 +283,44 @@ it("rejects a fresh projection raced by a newer revision without clearing its di
     f.raw.close();
   }
 });
+
+it.each([
+  { diagnostic: "omissions", kind: "omitted", confirmation: "confirmed" },
+  { diagnostic: "partialRows", kind: "partial", confirmation: "confirmed" },
+  { diagnostic: "unproven", kind: "unproven", confirmation: "unconfirmed" },
+] as const)(
+  "marks $kind incompleteness as $confirmation when parity cannot be checked",
+  async ({ diagnostic, kind, confirmation }) => {
+    const f = fixture();
+    try {
+      const view = createLegacyScopeView({
+        authority: f.authority,
+        records: f.records,
+        configuredMethods: () => ["test"],
+      });
+      hooks.project.mockResolvedValue({
+        ...projected("current"),
+        complete: false,
+        diagnostics: {
+          omissions: [],
+          partialRows: [],
+          unproven: [],
+          [diagnostic]:
+            diagnostic === "unproven"
+              ? [{ stream: "rows", aspect: "record_order", reason: "unknown" }]
+              : [{ stream: "rows", count: 1, reasons: ["incomplete row"] }],
+        },
+      });
+      expect(await view.readLatest(scope)).toMatchObject({
+        kind: "refused",
+        refusal: {
+          reason: "canonical_view_incomplete",
+          confirmation,
+          diagnostics: [{ stream: "rows", kind }],
+        },
+      });
+    } finally {
+      f.raw.close();
+    }
+  },
+);

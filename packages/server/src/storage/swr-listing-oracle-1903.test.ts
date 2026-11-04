@@ -880,12 +880,39 @@ describe("independent SWR listing oracle 1903", () => {
     expect(b.state.status(I, S)).toEqual(dirty);
     expect(b.view.listingFor(S).kind).not.toBe("canonical");
   });
-  it("18 retryable_transient_read_error_contract", async () => {
-    // ruled by lead 11-03: retain retryable + reason only; no retryAfterMs,
-    // action, scope or Retry-After contract belongs in this bridge.
+  it("18 retryable_only_for_unconfirmed_incomplete_view", async () => {
+    // ruled by lead 2026-11-04: retryable only for unconfirmed
+    // The bridge still requires only retryable + reason, without the fuller
+    // retryAfterMs/action/scope/Retry-After client contract.
     const h = await fixture();
-    h.put("messages", h.message("A"));
-    h.loader.mockRejectedValue(Error("synthetic unavailable file"));
+    for (const stream of ["conversations", "messages"]) {
+      h.store.replaceStream({
+        instance: I,
+        stream,
+        method: "chatgpt",
+        generation: G,
+        primaryKey: ["id"],
+        emittedAt: "2026-09-01T00:00:00.000Z",
+        sourceCollectedAt: "2026-09-01T00:00:00.000Z",
+        envelopes: ["A", "B"].map((id) => ({
+          instance: I,
+          stream,
+          key: stream === "messages" ? `m-${id}` : id,
+          data: stream === "messages" ? h.message(id) : h.conversation(id),
+          emitted_at: "2026-09-01T00:00:00.000Z",
+        })),
+      });
+    }
+    // A real view without the old body cannot confirm parity from these
+    // equal-time receipts. No projection omission or partial row is observed.
+    const pendingView = createLegacyScopeView({
+      authority: h.authority,
+      records: h.store,
+      configuredMethods: () => ["chatgpt"],
+    });
+    const pending = vi
+      .spyOn(h.view, "readLatest")
+      .mockImplementation((scope) => pendingView.readLatest(scope));
     expect(
       (await h.listed()).scopes.some((s: { scope: string }) => s.scope === S),
     ).toBe(true);
@@ -894,13 +921,24 @@ describe("independent SWR listing oracle 1903", () => {
     expect(response.status).toBe(503);
     expect(body).toMatchObject({
       error: "CANONICAL_VIEW_UNAVAILABLE",
-      status: "unavailable",
-      reason: "store_inconsistent_read",
+      status: "incomplete",
+      reason: "canonical_view_incomplete",
       retryable: true,
     });
     expect(JSON.stringify(body)).not.toContain(text);
     expect(JSON.stringify(body)).not.toContain(I);
     expect(body.message).not.toMatch(/reimport|delete/i);
+    pending.mockRestore();
+    // A fresh comparison observes a missing message body and confirms loss.
+    h.put("messages", h.message("B", null));
+    const confirmed = await h.request(`/v1/data/${S}`);
+    expect(confirmed.status).toBe(503);
+    expect(await confirmed.json()).toMatchObject({
+      error: "CANONICAL_VIEW_UNAVAILABLE",
+      reason: "canonical_view_incomplete",
+      retryable: false,
+    });
+    expect(h.authority.verdictFor(S)[0]?.verdict).toBe("not_covered");
   });
   it.each(["ambiguous", "deleted", "paid"] as const)(
     "19 nonretryable_refusals_not_mislabeled: %s",
@@ -1084,7 +1122,9 @@ describe("independent SWR listing oracle 1903", () => {
       () => ["id"],
       { method: "anthropic", generation: 1 },
     );
-    vi.spyOn(h.store, "getBlobBytes").mockReturnValue(undefined);
+    const sourceBytes = vi
+      .spyOn(h.store, "getBlobBytes")
+      .mockReturnValue(undefined);
     expect(view.listingFor(scope).kind).toBe("canonical");
     const response = await handlePersonalServerDataRequest(
       new Request(`http://localhost/v1/data/${scope}`),
@@ -1105,9 +1145,11 @@ describe("independent SWR listing oracle 1903", () => {
       { basePath: "/v1/data" },
     );
     expect(response.status).toBe(503);
+    expect(sourceBytes).toHaveBeenCalled();
     expect(await response.json()).toMatchObject({
       error: "CANONICAL_VIEW_UNAVAILABLE",
-      retryable: true,
+      // ruled by lead 2026-11-04: source-byte failures are not retryable.
+      retryable: false,
       reason: expect.any(String),
     });
   });

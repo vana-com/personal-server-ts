@@ -55,7 +55,12 @@ const closers: (() => void)[] = [];
 afterEach(() => {
   while (closers.length) closers.pop()!();
 });
-function fixture(replica = true, method = METHOD, sourceId = SOURCE) {
+function fixture(
+  replica = true,
+  method = METHOD,
+  sourceId = SOURCE,
+  takeover = true,
+) {
   const raw = initializeDatabase(":memory:");
   const state = trackLegacyScopeMutations(raw, { ceilingMs: 1_800_000 });
   const db = state.db;
@@ -70,12 +75,13 @@ function fixture(replica = true, method = METHOD, sourceId = SOURCE) {
       method: instance === PEER && method !== METHOD ? METHOD : method,
       label: "Synthetic",
     });
-    raw
-      .prepare(
-        `INSERT INTO legacy_scope_takeovers(scope,instance,generation,method,superseded_path,
+    if (takeover)
+      raw
+        .prepare(
+          `INSERT INTO legacy_scope_takeovers(scope,instance,generation,method,superseded_path,
       superseded_version,superseded_cas_revision,superseded_collected_at) VALUES (?, ?, 1, ?, 'audit.json',1,1,?)`,
-      )
-      .run(S, instance, method, at);
+        )
+        .run(S, instance, method, at);
   }
   raw
     .prepare(
@@ -378,6 +384,7 @@ type Fixture = ReturnType<typeof fixture>;
 type Writer = {
   name: string;
   replica?: boolean;
+  takeover?: boolean;
   ownBoundary?: boolean;
   method?: string;
   source?: string;
@@ -385,6 +392,15 @@ type Writer = {
   write(h: Fixture): void;
 };
 const writers: Writer[] = [
+  {
+    name: "record store: first-takeover blob writer",
+    replica: false,
+    takeover: false,
+    write: (h) => {
+      h.blob();
+    },
+  },
+
   {
     name: "record store: blob metadata upsert",
     replica: false,
@@ -1245,16 +1261,26 @@ const writers: Writer[] = [
 describe("every canonical blob/replica writer changes the body witness key", () => {
   it.each(writers)(
     "$name",
-    ({ name, replica, ownBoundary, method, source, prepare, write }) => {
-      const h = fixture(replica, method, source);
+    ({
+      name,
+      replica,
+      takeover,
+      ownBoundary,
+      method,
+      source,
+      prepare,
+      write,
+    }) => {
+      const h = fixture(replica, method, source, takeover);
       if (
         name.startsWith("replica:") &&
         !name.includes("baseline and declaration")
       )
         h.activate();
       prepare?.(h);
-      for (const instance of [I, PEER])
-        h.state.complete(instance, S, h.state.revision(instance));
+      if (takeover !== false)
+        for (const instance of [I, PEER])
+          h.state.complete(instance, S, h.state.revision(instance));
       const before = [h.key(I), h.key(PEER)];
       const revisions = [h.state.revision(I), h.state.revision(PEER)];
       if (h.replicated && !ownBoundary)

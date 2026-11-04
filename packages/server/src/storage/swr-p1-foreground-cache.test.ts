@@ -1,4 +1,4 @@
-// Red-only regression for dot review 1921 P1. Production code stays unchanged.
+// Regression coverage for cached bodies and first-takeover publication fences.
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -41,7 +41,7 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
-async function fixture() {
+async function fixture(takeover = true) {
   // No disk DB or data files: all records and source bytes are synthetic.
   const raw = initializeDatabase(":memory:");
   const state = trackLegacyScopeMutations(raw, { ceilingMs: CEILING });
@@ -131,11 +131,13 @@ async function fixture() {
     configuredMethods,
     readLegacyHead: loader,
   });
-  expect((await view.readLatest(S)).kind).toBe("canonical");
-  expect(authority.verdictFor(S)[0]?.verdict).toBe("covered");
-  // A second real read exercises the warmed body + cached confirmation path.
-  expect((await view.readLatest(S)).kind).toBe("canonical");
-  expect(state.status(I, S)?.dirty_since).toBeNull();
+  if (takeover) {
+    expect((await view.readLatest(S)).kind).toBe("canonical");
+    expect(authority.verdictFor(S)[0]?.verdict).toBe("covered");
+    // A second real read exercises the warmed body + cached confirmation path.
+    expect((await view.readLatest(S)).kind).toBe("canonical");
+    expect(state.status(I, S)?.dirty_since).toBeNull();
+  }
   const storage = createNodeDataStorage({
     indexManager: createIndexManager(db),
     hierarchyOptions: {
@@ -216,6 +218,43 @@ async function fixture() {
 }
 
 describe("P1 foreground proof must observe tracked dependency mutations", () => {
+  it("fences a tracked byte deletion during the first parity read without a takeover", async () => {
+    const h = await fixture(false);
+    const db = h.state.db;
+    expect(
+      db.prepare("SELECT COUNT(*) FROM legacy_scope_takeovers").pluck().get(),
+    ).toBe(0);
+    expect(h.state.status(I, S)).toBeUndefined();
+    const revision = h.state.revision(I);
+    const clocks = [h.authority.writeClock(), h.authority.arrivalRevision()];
+    const sourceReads = vi.spyOn(h.store, "getBlobBytes");
+    const paused = barrier();
+    const resume = barrier();
+    h.loader.mockImplementationOnce(async () => {
+      paused.release();
+      await resume.promise;
+      return h.envelope;
+    });
+    const request = h.view.readLatest(S);
+    await paused.promise;
+    expect(sourceReads).toHaveBeenCalled();
+    db.prepare("DELETE FROM pdpp_blob_bytes").run();
+    expect([h.authority.writeClock(), h.authority.arrivalRevision()]).toEqual(
+      clocks,
+    );
+    resume.release();
+    const result = await request;
+    expect.soft(h.state.revision(I)).toBeGreaterThan(revision);
+    expect.soft(result.kind).toBe("refused");
+    expect.soft(h.state.status(I, S)?.dirty_since).not.toBeNull();
+    expect
+      .soft(
+        db.prepare("SELECT COUNT(*) FROM legacy_scope_takeovers").pluck().get(),
+      )
+      .toBe(0);
+    expect.soft(h.authority.verdictFor(S)).toEqual([]);
+  });
+
   it.each(["covered", "not_covered"] as const)(
     "1924 minimal trace: dependency_change(%s) -> advance_to_ceiling -> direct_read",
     async (outcome) => {
@@ -236,7 +275,8 @@ describe("P1 foreground proof must observe tracked dependency mutations", () => 
         expect.soft(response.status).toBe(503);
         expect.soft(await response.json()).toMatchObject({
           error: "CANONICAL_VIEW_UNAVAILABLE",
-          retryable: true,
+          // ruled by lead 2026-11-04: confirmed loss and inconsistent reads are final.
+          retryable: false,
           reason: expect.any(String),
         });
       }
@@ -279,7 +319,8 @@ describe("P1 foreground proof must observe tracked dependency mutations", () => 
       expect.soft(response.status, boundary).toBe(503);
       expect.soft(await response.json(), boundary).toMatchObject({
         error: "CANONICAL_VIEW_UNAVAILABLE",
-        retryable: true,
+        // ruled by lead 2026-11-04: confirmed loss and inconsistent reads are final.
+        retryable: false,
         reason: expect.any(String),
       });
       // ruled by lead 11-04: a confirmed negative from a same-evaluation byte check is a valid outcome
@@ -345,7 +386,8 @@ describe("P1 foreground proof must observe tracked dependency mutations", () => 
     const response = await h.get();
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({
-      retryable: true,
+      // ruled by lead 2026-11-04: confirmed loss and inconsistent reads are final.
+      retryable: false,
       reason: expect.any(String),
     });
     expect(h.view.listingFor(S).kind).toBe("refused");

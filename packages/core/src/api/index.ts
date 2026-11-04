@@ -1349,6 +1349,33 @@ type PaidCanonicalReadRefusal = {
   reason: "paid_read_unsupported";
 };
 
+/** Retry only missing proof; a refusal reason alone must not promise recovery. */
+function retryableLegacyViewRefusal(
+  refusal: LegacyScopeRefusal | PaidCanonicalReadRefusal,
+): boolean {
+  switch (refusal.reason) {
+    case "canonical_view_incomplete":
+      return refusal.confirmation === "unconfirmed";
+    case "no_connection":
+    case "connection_unavailable":
+    case "ambiguous_connection":
+    case "paid_read_unsupported":
+    case "store_inconsistent_read":
+    case "unbound_scope":
+    case "scope_source_mismatch":
+    case "no_synced_data":
+    case "stream_completion_unknown":
+    case "invalid_collected_at":
+    case "blob_backed_records_unsupported":
+    case "blob_read_budget_exceeded":
+    case "blob_backed_record_invalid":
+    case "missing_raw_blob":
+    case "projection_rejected":
+    case "all_rows_rejected":
+      return false;
+  }
+}
+
 /**
  * 409 when the owner must choose between connections, 503 otherwise. The
  * body names the reason and stream names only: no instance id, no row data,
@@ -1362,7 +1389,7 @@ function legacyViewRefusalResponse(
   return jsonResponse(
     {
       error: "CANONICAL_VIEW_UNAVAILABLE",
-      retryable: status === 503 && refusal.reason !== "paid_read_unsupported",
+      retryable: retryableLegacyViewRefusal(refusal),
       message: `The latest data for scope "${scope}" cannot be served from the owner's connector records (${refusal.reason}).`,
       status: refusal.status,
       reason: refusal.reason,

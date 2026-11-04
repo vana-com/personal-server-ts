@@ -8,6 +8,7 @@ const dependencyTable =
 export interface LegacyRevalidationStatus {
   dirty_since: number | null;
   ceiling_ms: number;
+  confirmed_revision: number | null;
   deadline: number | null;
   error_count: number;
   reason: string | null;
@@ -32,10 +33,16 @@ export interface LegacyRevalidationState {
     reason: string;
   }[];
 }
+interface LegacyRevalidationOptions {
+  ceilingMs: number;
+  now?: () => number;
+  /** False only for an evaluation connection in the already-running process. */
+  processBoot?: boolean;
+}
 const tracked = new WeakMap<Database, LegacyRevalidationState>();
 export function trackLegacyScopeMutations(
   raw: Database,
-  options: { ceilingMs: number; now?: () => number },
+  options: LegacyRevalidationOptions,
 ): LegacyRevalidationState {
   const existing = tracked.get(raw);
   if (existing) return existing;
@@ -47,7 +54,7 @@ export function trackLegacyScopeMutations(
 
 function makeState(
   raw: Database,
-  options: { ceilingMs: number; now?: () => number },
+  options: LegacyRevalidationOptions,
 ): LegacyRevalidationState {
   const now = options.now ?? Date.now;
   raw.exec(`CREATE TABLE IF NOT EXISTS legacy_scope_revalidation_instances (
@@ -56,9 +63,22 @@ function makeState(
     CREATE TABLE IF NOT EXISTS legacy_scope_revalidation_scopes (
     instance TEXT NOT NULL,scope TEXT NOT NULL,dirty_since INTEGER,
     ceiling_ms INTEGER NOT NULL,error_count INTEGER NOT NULL DEFAULT 0,reason TEXT,
+    confirmed_revision INTEGER,
     PRIMARY KEY(instance,scope));
     CREATE TABLE IF NOT EXISTS legacy_scope_revalidation_policy (
     id INTEGER PRIMARY KEY CHECK(id=1),fingerprint TEXT NOT NULL);`);
+  // Older bridge versions did not retain the revision confirmed by a clean
+  // marker. Unknown revisions need recovery, not an assumed current proof.
+  if (
+    !(
+      raw.pragma("table_info(legacy_scope_revalidation_scopes)") as {
+        name: string;
+      }[]
+    ).some((column) => column.name === "confirmed_revision")
+  )
+    raw.exec(
+      "ALTER TABLE legacy_scope_revalidation_scopes ADD COLUMN confirmed_revision INTEGER",
+    );
   const bump =
     raw.prepare(`INSERT INTO legacy_scope_revalidation_instances(instance,revision) VALUES (?,1)
     ON CONFLICT(instance) DO UPDATE SET revision=revision+1`);
@@ -74,8 +94,16 @@ function makeState(
     )
     .pluck();
   const readStatus = raw.prepare(
-    "SELECT dirty_since,ceiling_ms,dirty_since+ceiling_ms AS deadline,error_count,reason FROM legacy_scope_revalidation_scopes WHERE instance=? AND scope=?",
+    "SELECT dirty_since,ceiling_ms,confirmed_revision,dirty_since+ceiling_ms AS deadline,error_count,reason FROM legacy_scope_revalidation_scopes WHERE instance=? AND scope=?",
   );
+  // A sweep is not a mutation: keep a matching clean proof clean. Recover a
+  // missing marker or a stale clean marker left by an older publisher instead.
+  const recover =
+    raw.prepare(`INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms) VALUES (?,?,?,?)
+    ON CONFLICT(instance,scope) DO UPDATE SET
+      dirty_since=CASE WHEN confirmed_revision IS NULL OR confirmed_revision<>? THEN COALESCE(dirty_since,excluded.dirty_since) ELSE dirty_since END,
+      ceiling_ms=excluded.ceiling_ms
+    WHERE (dirty_since IS NULL AND (confirmed_revision IS NULL OR confirmed_revision<>?)) OR ceiling_ms<>excluded.ceiling_ms`);
   let dirtyAt: number | null = null;
   let forceDirty = false;
   let transactionDepth = 0;
@@ -85,6 +113,7 @@ function makeState(
   );
   let bindingsReady = false;
   let candidateQuery: Statement<[]> | undefined;
+  let instanceQuery: Statement<[]> | undefined;
   function candidates() {
     if (!bindingsReady) bindingsReady = bindingTable.get() !== undefined;
     if (!bindingsReady) return [];
@@ -113,6 +142,16 @@ function makeState(
       const scopes = affected.get(candidate.instance) ?? new Set<string>();
       for (const scope of candidate.scopes) scopes.add(scope);
       affected.set(candidate.instance, scopes);
+    }
+    // Foreground selection precedes the first takeover. Fence every bound
+    // instance, including those with no inventory witness or scope marker yet.
+    // Keep scope discovery limited to takeovers for background scheduling.
+    if (bindingsReady) {
+      instanceQuery ??= raw.prepare(
+        "SELECT instance FROM pdpp_instance_binding",
+      );
+      for (const { instance } of instanceQuery.all() as { instance: string }[])
+        if (!affected.has(instance)) affected.set(instance, new Set());
     }
     for (const [instance, scopes] of affected) {
       bump.run(instance);
@@ -228,11 +267,35 @@ function makeState(
       | {
           dirty_since: number | null;
           ceiling_ms: number;
+          confirmed_revision: number | null;
           deadline: number | null;
           error_count: number;
           reason: string | null;
         }
       | undefined;
+  }
+  if (options.processBoot !== false) {
+    // An older or PDPP-disabled process may have written without this tracker.
+    // Invalidate both clean inventory markers and persisted coverage cursors.
+    // Never slide a dirty window that was already running before the restart.
+    raw
+      .transaction(() => {
+        const instances = raw
+          .prepare(
+            "SELECT DISTINCT instance FROM legacy_scope_revalidation_scopes",
+          )
+          .all() as { instance: string }[];
+        for (const { instance } of instances) bump.run(instance);
+        raw
+          .prepare(
+            `UPDATE legacy_scope_revalidation_scopes SET
+        dirty_since=COALESCE(dirty_since,?),ceiling_ms=?,
+        error_count=CASE WHEN dirty_since IS NULL THEN 0 ELSE error_count END,
+        reason=CASE WHEN dirty_since IS NULL THEN NULL ELSE reason END`,
+          )
+          .run(now(), options.ceilingMs);
+      })
+      .immediate();
   }
   return {
     db,
@@ -273,19 +336,21 @@ function makeState(
         .immediate();
     },
     ensureDirty() {
-      // Recovery seeds unknown witnesses, but a sweep is not a mutation.
-      // A previously refreshed, clean proof must not acquire an expiry merely
-      // because a later periodic evaluation fails.
-      const seed =
-        raw.prepare(`INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms) VALUES (?,?,?,?)
-        ON CONFLICT(instance,scope) DO UPDATE SET ceiling_ms=excluded.ceiling_ms
-        WHERE ceiling_ms<>excluded.ceiling_ms`);
       raw
         .transaction(() => {
           const since = now();
-          for (const candidate of candidates())
+          for (const candidate of candidates()) {
+            const revision = Number(readRevision.get(candidate.instance) ?? 0);
             for (const scope of candidate.scopes)
-              seed.run(candidate.instance, scope, since, options.ceilingMs);
+              recover.run(
+                candidate.instance,
+                scope,
+                since,
+                options.ceilingMs,
+                revision,
+                revision,
+              );
+          }
         })
         .immediate();
     },
@@ -293,20 +358,34 @@ function makeState(
       if (Number(readRevision.get(instance) ?? 0) !== revision) return false;
       raw
         .prepare(
-          `INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms) VALUES (?,?,NULL,?)
-         ON CONFLICT(instance,scope) DO UPDATE SET dirty_since=NULL,error_count=0,reason=NULL
-         WHERE dirty_since IS NOT NULL OR error_count<>0 OR reason IS NOT NULL`,
+          `INSERT INTO legacy_scope_revalidation_scopes(instance,scope,dirty_since,ceiling_ms,confirmed_revision) VALUES (?,?,NULL,?,?)
+         ON CONFLICT(instance,scope) DO UPDATE SET dirty_since=NULL,error_count=0,reason=NULL,confirmed_revision=excluded.confirmed_revision
+         WHERE dirty_since IS NOT NULL OR error_count<>0 OR reason IS NOT NULL OR confirmed_revision IS NOT excluded.confirmed_revision`,
         )
-        .run(instance, scope, options.ceilingMs);
+        .run(instance, scope, options.ceilingMs, revision);
       return true;
     },
     fail(instance: string, scopes: readonly string[]) {
       const statement = raw.prepare(
         "UPDATE legacy_scope_revalidation_scopes SET error_count=error_count+1 WHERE instance=? AND scope=? AND dirty_since IS NOT NULL",
       );
-      raw.transaction(() => {
-        for (const scope of scopes) statement.run(instance, scope);
-      })();
+      raw
+        .transaction(() => {
+          const since = now();
+          const revision = Number(readRevision.get(instance) ?? 0);
+          for (const scope of scopes) {
+            recover.run(
+              instance,
+              scope,
+              since,
+              options.ceilingMs,
+              revision,
+              revision,
+            );
+            statement.run(instance, scope);
+          }
+        })
+        .immediate();
     },
     status,
     overdue(instance: string, scope: string) {
