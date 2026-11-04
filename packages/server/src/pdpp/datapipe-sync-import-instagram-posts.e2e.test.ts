@@ -3,10 +3,8 @@
  * bounded snapshot stream (whole-object, keyed by the reserved constant
  * `pdpp_snapshot`, not a per-record id).
  *
- * The declaration and envelope-data fixtures below are captured verbatim
- * from unity-surfaces (worktree unity-datapipe-pdpp-0917, commit d85cfc50)
- * via its own `PDPP_DECLARATIONS`/`buildPdppIngestEnvelope`/
- * `buildPdppSyncAnnotatedData`, not hand-authored.
+ * The declaration and envelope-data fixtures below preserve the exact bytes
+ * emitted by the producer's declaration and envelope builders.
  */
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -54,10 +52,8 @@ const DOCUMENT_DIGEST = createHash("sha256")
   .digest("hex");
 
 /**
- * The digest the unity-surfaces producer's own `pdpp-sync-metadata.test.ts`
- * pins for this exact document (commit d85cfc50), independently reproduced
- * here by re-hashing the vendored bytes rather than trusting the copied
- * string.
+ * Expected digest of the published declaration document. Re-hashing the
+ * vendored bytes independently detects formatting or content changes.
  */
 const PUBLISHED_DIGEST =
   "71535891f772fb65f1d02329c5757ec526df207af44a9f6527d6885550f0333f";

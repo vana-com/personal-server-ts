@@ -4,7 +4,13 @@
  * newer canonical state may reorder or, with proof, delete entities.
  * Diagnostics contain paths and counts, never entity keys or field values.
  */
-import type { ProjectionOmission } from "../legacy-projection/types.js";
+import type {
+  ChatgptBranchWalkDiagnostic,
+  ChatgptConversationCoverageGap,
+  ProjectionOmission,
+  RetainedChatgptMessage,
+} from "../legacy-projection/types.js";
+import { chatgptConversationIdHash } from "../legacy-projection/chatgpt-conversation-hash.js";
 import {
   LEGACY_COVERAGE_EXCEPTIONS,
   LEGACY_INTEGER_ROUNDING_EXCEPTIONS,
@@ -22,6 +28,11 @@ export interface LegacyCoverageOptions {
   scope?: string;
   /** Raw-value-backed omissions emitted by this exact canonical projection. */
   projectionOmissions?: readonly ProjectionOmission[];
+  /** Internal stored-row evidence from this exact canonical projection. */
+  retainedChatgptMessages?: readonly RetainedChatgptMessage[];
+  /** Same-read receipts for conversations excluded after a broken branch fallback. */
+  chatgptCoverageGaps?: readonly ChatgptConversationCoverageGap[];
+  chatgptBranchDiagnostics?: readonly ChatgptBranchWalkDiagnostic[];
   /** JSON paths to entity arrays; [] marks each array element, e.g. $.posts[].comments. */
   entityKeys?: Readonly<Record<string, readonly string[]>>;
   /** Legacy payload schema. An `id` or `uuid` item field supplies a key. */
@@ -54,7 +65,10 @@ export interface LegacyCoverageVerdict {
   comparisonCase: "same_time" | "canonical_newer";
   covered: boolean;
   reason: LegacyCoverageReason | null;
-  /** Counts include accepted proven deletions, which do not block coverage. */
+  /**
+   * Counts include accepted proven deletions and receipted conversation
+   * exclusions, which do not block coverage.
+   */
   reasonCounts: Record<LegacyCoverageReason, number>;
   /** Reviewed legacy defects and provenance-backed omissions used in this evaluation. */
   appliedExceptions: {
@@ -62,6 +76,9 @@ export interface LegacyCoverageVerdict {
     reason: string;
     authority: "canonical";
   }[];
+  /** Full-hash receipts actually used to account for absent legacy conversations. */
+  excludedConversations?: readonly ChatgptConversationCoverageGap[];
+  chatgptBranchDiagnostics?: readonly ChatgptBranchWalkDiagnostic[];
   missingEntityCount: number;
   mismatchedFieldPaths: string[];
   legacyBytes: number;
@@ -148,6 +165,23 @@ function object(value: unknown): value is JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function matchesKnownEmptyChatgptMessage(
+  legacyMessage: unknown,
+  retained: RetainedChatgptMessage["message"] | undefined,
+  allowClearedContent: boolean,
+): legacyMessage is JsonObject {
+  if (!object(legacyMessage) || retained === undefined) return false;
+  return (
+    retained.content === "" &&
+    typeof legacyMessage.content === "string" &&
+    (legacyMessage.content === "" || allowClearedContent) &&
+    legacyMessage.id === retained.id &&
+    legacyMessage.role === retained.role &&
+    legacyMessage.content_type === retained.content_type &&
+    legacyMessage.create_time === retained.create_time
+  );
+}
+
 function stableKey(value: unknown, fields: readonly string[]): string | null {
   if (!object(value) || fields.length === 0) return null;
   const parts: (string | number | boolean)[] = [];
@@ -215,6 +249,164 @@ export function compareLegacyCoverage(
     projection_unavailable: 0,
   };
   let missingEntityCount = 0;
+  const coverageGapsByHash = new Map<
+    string,
+    ChatgptConversationCoverageGap | null
+  >();
+  if (options.scope === "chatgpt.conversations") {
+    for (const gap of options.chatgptCoverageGaps ?? []) {
+      if (coverageGapsByHash.has(gap.conversationIdHash)) {
+        coverageGapsByHash.set(gap.conversationIdHash, null);
+      } else {
+        coverageGapsByHash.set(gap.conversationIdHash, gap);
+      }
+    }
+  }
+  const eligibleCoverageGaps = new Map<
+    string,
+    ChatgptConversationCoverageGap
+  >();
+  if (
+    options.scope === "chatgpt.conversations" &&
+    object(legacyPayload) &&
+    object(canonicalPayload) &&
+    Array.isArray(legacyPayload.conversations) &&
+    Array.isArray(canonicalPayload.conversations)
+  ) {
+    const legacyConversationHashCounts = new Map<string, number>();
+    for (const conversation of legacyPayload.conversations) {
+      if (!object(conversation) || typeof conversation.id !== "string") {
+        continue;
+      }
+      const hash = chatgptConversationIdHash(conversation.id);
+      legacyConversationHashCounts.set(
+        hash,
+        (legacyConversationHashCounts.get(hash) ?? 0) + 1,
+      );
+    }
+    const canonicalConversationHashes = new Set<string>();
+    for (const conversation of canonicalPayload.conversations) {
+      if (object(conversation) && typeof conversation.id === "string") {
+        canonicalConversationHashes.add(
+          chatgptConversationIdHash(conversation.id),
+        );
+      }
+    }
+    for (const [hash, gap] of coverageGapsByHash) {
+      if (
+        gap !== null &&
+        /^[0-9a-f]{64}$/.test(hash) &&
+        legacyConversationHashCounts.get(hash) === 1 &&
+        !canonicalConversationHashes.has(hash)
+      ) {
+        eligibleCoverageGaps.set(hash, gap);
+      }
+    }
+  }
+  const usedCoverageGaps = new Map<string, ChatgptConversationCoverageGap>();
+  const retainedMessages = new Map<
+    string,
+    Map<string, RetainedChatgptMessage["message"] | undefined>
+  >();
+  if (options.scope === "chatgpt.conversations") {
+    for (const entry of options.retainedChatgptMessages ?? []) {
+      if (entry.scope !== "chatgpt.conversations") continue;
+      let messages = retainedMessages.get(entry.conversationId);
+      if (!messages) {
+        messages = new Map();
+        retainedMessages.set(entry.conversationId, messages);
+      }
+      // Conflicting or repeated evidence must not pick a convenient version.
+      messages.set(
+        entry.message.id,
+        messages.has(entry.message.id) ? undefined : entry.message,
+      );
+    }
+  }
+  const knownEmptyMessageCounts = new Map<string, number>();
+  if (
+    options.scope === "chatgpt.conversations" &&
+    object(legacyPayload) &&
+    object(canonicalPayload) &&
+    Array.isArray(legacyPayload.conversations) &&
+    Array.isArray(canonicalPayload.conversations)
+  ) {
+    const legacyConversationCounts = new Map<string, number>();
+    for (const conversation of legacyPayload.conversations) {
+      if (!object(conversation) || typeof conversation.id !== "string") {
+        continue;
+      }
+      legacyConversationCounts.set(
+        conversation.id,
+        (legacyConversationCounts.get(conversation.id) ?? 0) + 1,
+      );
+    }
+    const canonicalConversations = new Map<string, JsonObject | null>();
+    for (const conversation of canonicalPayload.conversations) {
+      if (!object(conversation) || typeof conversation.id !== "string") {
+        continue;
+      }
+      canonicalConversations.set(
+        conversation.id,
+        canonicalConversations.has(conversation.id) ? null : conversation,
+      );
+    }
+    for (const conversation of legacyPayload.conversations) {
+      if (
+        !object(conversation) ||
+        typeof conversation.id !== "string" ||
+        legacyConversationCounts.get(conversation.id) !== 1
+      ) {
+        continue;
+      }
+      const canonicalConversation = canonicalConversations.get(conversation.id);
+      if (
+        canonicalConversation === undefined ||
+        canonicalConversation === null ||
+        !Array.isArray(conversation.messages) ||
+        !Array.isArray(canonicalConversation.messages)
+      ) {
+        continue;
+      }
+
+      const legacyMessageCounts = new Map<string, number>();
+      for (const message of conversation.messages) {
+        if (!object(message) || typeof message.id !== "string") continue;
+        legacyMessageCounts.set(
+          message.id,
+          (legacyMessageCounts.get(message.id) ?? 0) + 1,
+        );
+      }
+      const canonicalMessageIds = new Set<string>();
+      for (const message of canonicalConversation.messages) {
+        if (object(message) && typeof message.id === "string") {
+          canonicalMessageIds.add(message.id);
+        }
+      }
+      let count = 0;
+      for (const message of conversation.messages) {
+        if (
+          !object(message) ||
+          typeof message.id !== "string" ||
+          legacyMessageCounts.get(message.id) !== 1 ||
+          canonicalMessageIds.has(message.id)
+        ) {
+          continue;
+        }
+        const retained = retainedMessages.get(conversation.id)?.get(message.id);
+        if (
+          matchesKnownEmptyChatgptMessage(
+            message,
+            retained,
+            options.canonicalNewer === true,
+          )
+        ) {
+          count += 1;
+        }
+      }
+      if (count > 0) knownEmptyMessageCounts.set(conversation.id, count);
+    }
+  }
 
   function mark(
     reason: LegacyCoverageReason,
@@ -238,6 +430,26 @@ export function compareLegacyCoverage(
     entityPath?: string,
     entityKey?: string | number | boolean,
   ): void {
+    const knownEmptyCount =
+      field === "message_count" &&
+      entityPath === "$.conversations[]" &&
+      /^\$\.conversations\[\d+\]\.message_count$/u.test(path) &&
+      typeof entityKey === "string"
+        ? (knownEmptyMessageCounts.get(entityKey) ?? 0)
+        : 0;
+    if (
+      knownEmptyCount > 0 &&
+      typeof legacy === "number" &&
+      Number.isInteger(legacy) &&
+      legacy >= 0 &&
+      typeof canonical === "number" &&
+      Number.isInteger(canonical) &&
+      canonical >= 0 &&
+      legacy - canonical === knownEmptyCount
+    ) {
+      mark("field_mismatch", undefined, false);
+      return;
+    }
     if (jsonType(legacy) !== jsonType(canonical)) {
       mark("type_mismatch", path);
       return;
@@ -285,17 +497,91 @@ export function compareLegacyCoverage(
             const key = stableKey(item, fields);
             // Every legacy key was checked above.
             const position = canonicalPositions.get(key!);
-            if (position === undefined) {
+            const coverageGap =
+              position === undefined &&
+              options.scope === "chatgpt.conversations" &&
+              arrayPath === "$.conversations" &&
+              entityFields.length === 1 &&
+              entityFields[0] === "id" &&
+              object(item) &&
+              typeof item.id === "string"
+                ? eligibleCoverageGaps.get(chatgptConversationIdHash(item.id))
+                : undefined;
+            if (coverageGap) {
+              missingEntityCount += 1;
+              mark("missing_entity", undefined, false);
+              usedCoverageGaps.set(coverageGap.conversationIdHash, coverageGap);
+              continue;
+            }
+            const retainedCandidate =
+              position === undefined &&
+              options.scope === "chatgpt.conversations" &&
+              arrayPath === "$.conversations[].messages" &&
+              entityPath === "$.conversations[]" &&
+              typeof entityKey === "string" &&
+              fields.length === 1 &&
+              fields[0] === "id" &&
+              object(item) &&
+              typeof item.id === "string"
+                ? retainedMessages.get(entityKey)?.get(item.id)
+                : undefined;
+            // Empty retained content can account for an omitted display row
+            // only when the legacy payload contains explicit matching text.
+            const retained =
+              retainedCandidate?.content === "" &&
+              !matchesKnownEmptyChatgptMessage(
+                item,
+                retainedCandidate,
+                options.canonicalNewer === true,
+              )
+                ? undefined
+                : retainedCandidate;
+            if (position === undefined && retained === undefined) {
               missingEntityCount += 1;
               mark("missing_entity", undefined, !deletionAllowed);
               continue;
             }
-            if (!options.canonicalNewer && position < lastPosition)
+            const knownEmpty =
+              position === undefined &&
+              options.scope === "chatgpt.conversations" &&
+              arrayPath === "$.conversations[].messages" &&
+              entityPath === "$.conversations[]" &&
+              typeof entityKey === "string" &&
+              matchesKnownEmptyChatgptMessage(
+                item,
+                retained,
+                options.canonicalNewer === true,
+              );
+            // Presence cannot establish same-time order in the displayed branch.
+            // Never invent a position from the legacy array.
+            if (
+              position === undefined &&
+              !options.canonicalNewer &&
+              !knownEmpty
+            ) {
               mark("array_order", path);
-            lastPosition = position;
+            }
+            if (position !== undefined) {
+              if (!options.canonicalNewer && position < lastPosition)
+                mark("array_order", path);
+              lastPosition = position;
+            }
+            const retainedWithLegacyContent =
+              knownEmpty && object(item) && retained !== undefined
+                ? { ...retained, content: item.content as string }
+                : retained;
+            if (
+              knownEmpty &&
+              object(item) &&
+              item.content !== retained?.content
+            ) {
+              mark("field_mismatch", undefined, false);
+            }
             compare(
               item,
-              canonical[position],
+              position === undefined
+                ? retainedWithLegacyContent
+                : canonical[position],
               `${path}[${index}]`,
               `${arrayPath}[]`,
               schema?.items,
@@ -502,6 +788,17 @@ export function compareLegacyCoverage(
     ) {
       return;
     }
+    if (
+      options.scope === "chatgpt.conversations" &&
+      path === "$.total" &&
+      typeof legacy === "number" &&
+      Number.isInteger(legacy) &&
+      typeof canonical === "number" &&
+      Number.isInteger(canonical) &&
+      legacy - canonical === eligibleCoverageGaps.size
+    ) {
+      return;
+    }
     const normalizedPath = path.replace(/\[\d+\]/g, "[]");
     if (
       typeof legacy === "number" &&
@@ -551,6 +848,7 @@ export function compareLegacyCoverage(
   const schema = options.schema?.schema ?? options.schema;
   compare(legacyPayload, canonicalPayload, "$", "$", schema);
   if (
+    options.canonicalNewer !== true &&
     canonicalBytes > legacyBytes * (options.maxPayloadRatio ?? 1.5) &&
     byteDelta > (options.maxExtraBytes ?? 256 * 1024)
   ) {
@@ -577,6 +875,12 @@ export function compareLegacyCoverage(
     reason,
     reasonCounts,
     appliedExceptions: [...appliedExceptions.values()],
+    ...(usedCoverageGaps.size > 0
+      ? { excludedConversations: [...usedCoverageGaps.values()] }
+      : {}),
+    ...(options.chatgptBranchDiagnostics?.length
+      ? { chatgptBranchDiagnostics: options.chatgptBranchDiagnostics }
+      : {}),
     missingEntityCount,
     mismatchedFieldPaths: [...paths],
     legacyBytes,

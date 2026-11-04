@@ -2563,7 +2563,11 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     });
 
     describe("message record ids (ChatGPT 0.3.0 names a message <conversation_id>:<node_id>)", () => {
-      const conversation = (id: string, count: number, tip = "n2") => ({
+      const conversation = (
+        id: string,
+        count: number,
+        tip: string | null = "n2",
+      ) => ({
         stream: "conversations",
         data: {
           id,
@@ -2608,6 +2612,447 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         if (!result.ok) throw new Error("not ok");
         return result;
       };
+
+      describe("retained off-branch canonical messages", () => {
+        it.each(["text", "multimodal_text"])(
+          "omits explicit current-empty %s and retains it without rescuing older alias text",
+          (content_type) => {
+            for (const reverse of [false, true]) {
+              const bare = message("c1", "n1", null, "old alias", {
+                scoped: false,
+              });
+              const current = message("c1", "n1", null, "");
+              current.data.content_type = content_type;
+              const rows = reverse ? [current, bare] : [bare, current];
+              const result = projected(
+                project([conversation("c1", 1, "n1"), ...rows]),
+              );
+              expect(result.payload).toMatchObject({
+                conversations: [
+                  {
+                    message_count: 0,
+                    messages: [],
+                  },
+                ],
+              });
+              expect(result.retainedChatgptMessages).toMatchObject([
+                {
+                  conversationId: "c1",
+                  message: { id: "n1", content: "", content_type },
+                },
+              ]);
+              validateAgainst(
+                { schema: chatgptConversationsSchema.schema },
+                result.payload,
+              );
+            }
+          },
+        );
+
+        const retained = (
+          conversationId = "c1",
+          node = "retired",
+          overrides: Record<string, unknown> = {},
+        ): PdppRecord => {
+          const row = message(conversationId, node, null, "canonical text", {
+            onBranch: false,
+          });
+          return { ...row, data: { ...row.data, ...overrides } };
+        };
+        const validParent = () => [
+          conversation("c1", 1, "n1"),
+          message("c1", "n1", null, "visible text"),
+        ];
+        const evidence = (records: PdppRecord[]) =>
+          projected(project(records)).retainedChatgptMessages ?? [];
+
+        it("returns actual retained fields separately without changing displayed bytes", () => {
+          const records = validParent();
+          const extra = retained("c1", "retired", {
+            role: "user",
+            content: "  canonical text  ",
+            content_type: "multimodal_text",
+            create_time: "raw timestamp",
+            model_slug: "canonical-model",
+          });
+          const options = {
+            fetchedStreams: ["conversations", "messages"],
+            now: "2026-09-22T10:06:00Z",
+          };
+          const before = projected(
+            projectPdppRecordsToLegacyPayload(
+              "chatgpt.conversations",
+              records,
+              options,
+            ),
+          );
+          const after = projected(
+            projectPdppRecordsToLegacyPayload(
+              "chatgpt.conversations",
+              [...records, extra],
+              options,
+            ),
+          );
+          assertByteForByte(after.payload, before.payload);
+          expect(after.diagnostics).toEqual(before.diagnostics);
+          expect(after.projectionOmissions).toEqual(before.projectionOmissions);
+          expect(after.payload).not.toHaveProperty("retainedChatgptMessages");
+          expect(after.retainedChatgptMessages).toEqual([
+            {
+              scope: "chatgpt.conversations",
+              conversationId: "c1",
+              message: {
+                id: "retired",
+                role: "user",
+                content: "  canonical text  ",
+                content_type: "multimodal_text",
+                create_time: "raw timestamp",
+                model: "canonical-model",
+              },
+            },
+          ]);
+        });
+
+        it.each([undefined, null, "false", true])(
+          "uses the walked branch rather than the stored %s flag for retained evidence",
+          (flag) => {
+            const row = retained("c1", "other", { on_current_branch: flag });
+            // A true row is represented on the current chain, not retained.
+            const parents =
+              flag === true
+                ? [conversation("c1", 1, "other")]
+                : [conversation("c1", 0, null)];
+            const result = projected(project([...parents, retained(), row]));
+            expect(
+              result.retainedChatgptMessages?.map((r) => r.message.id),
+            ).toEqual(flag === true ? ["retired"] : ["retired", "other"]);
+            if (flag === true) {
+              expect(result.payload).toMatchObject({
+                conversations: [
+                  {
+                    message_count: 1,
+                    messages: [{ id: "other", content: "canonical text" }],
+                  },
+                ],
+              });
+            }
+          },
+        );
+
+        it.each([
+          { role: "system" },
+          { role: "tool" },
+          { role: null },
+          { content_type: "code" },
+          { content_type: null },
+          { content: null },
+          { content: 7 },
+        ])("excludes ineligible off-branch fields %j", (overrides) => {
+          expect(
+            evidence([
+              ...validParent(),
+              retained(),
+              retained("c1", "ineligible", overrides),
+            ]).map((r) => r.message.id),
+          ).toEqual(["retired"]);
+        });
+
+        it("retains explicit empty off-branch text", () => {
+          expect(
+            evidence([
+              ...validParent(),
+              retained("c1", "retired", { content: "" }),
+            ]),
+          ).toMatchObject([{ message: { id: "retired", content: "" } }]);
+        });
+
+        it("does not invent missing off-branch content", () => {
+          const absent = retained("c1", "unknown");
+          delete absent.data.content;
+          expect(evidence([...validParent(), absent])).toEqual([]);
+        });
+
+        it("keeps whitespace and maps non-string optional fields to null", () => {
+          expect(
+            evidence([
+              ...validParent(),
+              retained("c1", "retired", {
+                content: " \n\t",
+                create_time: 123,
+                model_slug: {},
+              }),
+            ]),
+          ).toEqual([
+            {
+              scope: "chatgpt.conversations",
+              conversationId: "c1",
+              message: {
+                id: "retired",
+                role: "assistant",
+                content: " \n\t",
+                content_type: "text",
+                create_time: null,
+                model: null,
+              },
+            },
+          ]);
+        });
+
+        describe.each(["bare-first", "composite-first"])("%s", (order) => {
+          const orderedRows = (bare: PdppRecord, composite: PdppRecord) =>
+            order === "bare-first" ? [bare, composite] : [composite, bare];
+
+          it.each(["preferred", ""])(
+            "selects composite %j text before retaining a normalized node",
+            (content) => {
+              expect(
+                evidence([
+                  ...validParent(),
+                  ...orderedRows(
+                    retained("c1", "retired", {
+                      id: "retired",
+                      content: "stale",
+                    }),
+                    retained("c1", "retired", { content }),
+                  ),
+                ]).map((r) => r.message),
+              ).toEqual([
+                {
+                  id: "retired",
+                  role: "assistant",
+                  content,
+                  content_type: "text",
+                  create_time: null,
+                  model: null,
+                },
+              ]);
+            },
+          );
+
+          it.each([
+            { content: null },
+            { role: "tool" },
+            { content_type: "code" },
+            { on_current_branch: undefined },
+          ])("does not rescue an ineligible composite row %j", (overrides) => {
+            expect(
+              evidence([
+                ...validParent(),
+                retained("c1", "control"),
+                ...orderedRows(
+                  retained("c1", "retired", {
+                    id: "retired",
+                    content: "stale",
+                  }),
+                  retained("c1", "retired", overrides),
+                ),
+              ]).map((r) => r.message.id),
+            ).toEqual(
+              Object.hasOwn(overrides, "on_current_branch")
+                ? ["control", "retired"]
+                : ["control"],
+            );
+          });
+        });
+
+        it.each([false, true])(
+          "scopes shared retained nodes to exact parents (reverse=%s)",
+          (reverse) => {
+            const records = [
+              ...validParent(),
+              conversation("c2", 0, null),
+              retained("c1", "shared", { content: "first parent" }),
+              retained("c2", "shared", { content: "second parent" }),
+            ];
+            const result = evidence(reverse ? [...records].reverse() : records);
+            expect(
+              [...result]
+                .sort((a, b) =>
+                  a.conversationId.localeCompare(b.conversationId),
+                )
+                .map((r) => [
+                  r.conversationId,
+                  r.message.id,
+                  r.message.content,
+                ]),
+            ).toEqual([
+              ["c1", "shared", "first parent"],
+              ["c2", "shared", "second parent"],
+            ]);
+          },
+        );
+
+        it.each(["", " ", "c1:", "c1: ", null, 123])(
+          "rejects unusable retained message identity %j",
+          (id) => {
+            expect(
+              evidence([
+                ...validParent(),
+                retained("c1", "control"),
+                retained("c1", "invalid", { id }),
+              ]).map((r) => r.message.id),
+            ).toEqual(["control"]);
+          },
+        );
+
+        it.each(["bare-first", "composite-first"])(
+          "keeps preferred current-branch content visible without retained fallback (%s)",
+          (order) => {
+            const bare = retained("c1", "n1", { id: "n1", content: "stale" });
+            const current = message("c1", "n1", null, "visible canonical");
+            const result = projected(
+              project([
+                conversation("c1", 1, "n1"),
+                retained("c1", "control"),
+                ...(order === "bare-first" ? [bare, current] : [current, bare]),
+              ]),
+            );
+            expect(
+              result.retainedChatgptMessages?.map((r) => r.message.id),
+            ).toEqual(["control"]);
+            expect(result.payload).toMatchObject({
+              conversations: [
+                {
+                  message_count: 1,
+                  messages: [
+                    {
+                      id: "n1",
+                      content: "visible canonical",
+                      role: "user",
+                      content_type: "text",
+                      create_time: null,
+                      model: null,
+                    },
+                  ],
+                },
+              ],
+            });
+          },
+        );
+
+        it("retains bare-id text using the same canonical field mapping", () => {
+          expect(
+            evidence([
+              ...validParent(),
+              retained("c1", "retired", { id: "retired" }),
+            ]),
+          ).toEqual([
+            {
+              scope: "chatgpt.conversations",
+              conversationId: "c1",
+              message: {
+                id: "retired",
+                role: "assistant",
+                content: "canonical text",
+                content_type: "text",
+                create_time: null,
+                model: null,
+              },
+            },
+          ]);
+        });
+
+        it("uses existing first-row duplicate policy without eligibility fallback", () => {
+          expect(
+            evidence([
+              ...validParent(),
+              retained("c1", "control"),
+              retained("c1", "retired", { content: null }),
+              retained("c1", "retired", { content: "later duplicate" }),
+            ]).map((r) => r.message.id),
+          ).toEqual(["control"]);
+        });
+
+        it.each([
+          { label: "missing", parent: null, rows: [] },
+          {
+            label: "invalid timestamp",
+            parent: { create_time: 123 },
+            rows: [],
+          },
+          { label: "invalid id", parent: { id: "" }, rows: [] },
+          {
+            label: "invalid count",
+            parent: { message_count_on_current_branch: null },
+            rows: [],
+          },
+          {
+            label: "missing parent below declared count",
+            parent: { message_count_on_current_branch: 2 },
+            rootParent: "missing-parent",
+            rows: [],
+          },
+          {
+            label: "disconnected fallback flags",
+            parent: { message_count_on_current_branch: 2 },
+            rootParent: "missing-parent",
+            rows: [message("c1", "n2", null, "disconnected")],
+          },
+        ])(
+          "keeps $label data out of retained evidence",
+          ({ parent, rows, rootParent }) => {
+            // A rooted count mismatch remains usable. These negative controls need
+            // an unavailable current parent to exercise missing evidence.
+            const base = conversation("c1", 1, "n1");
+            const result = projected(
+              project([
+                ...(parent === null
+                  ? []
+                  : [
+                      {
+                        ...base,
+                        data: { ...base.data, ...parent },
+                      },
+                    ]),
+                message("c1", "n1", rootParent ?? null, "visible"),
+                ...rows,
+                retained(),
+                conversation("control", 0, null),
+                retained("control"),
+              ]),
+            );
+            expect(result.payload).toMatchObject({
+              total: 1,
+              conversations: [{ id: "control", messages: [] }],
+            });
+            expect(
+              result.retainedChatgptMessages?.map((r) => r.conversationId),
+            ).toEqual(["control"]);
+            if (rootParent !== undefined) {
+              expect(result.chatgptCoverageGaps).toHaveLength(1);
+            } else {
+              expect(result.chatgptCoverageGaps).toBeUndefined();
+              expect(result.diagnostics).toEqual(
+                expect.arrayContaining([
+                  expect.objectContaining({ kind: "records_dropped" }),
+                ]),
+              );
+            }
+          },
+        );
+
+        it("does not emit evidence when the messages stream was not fetched", () => {
+          const result = projected(
+            projectPdppRecordsToLegacyPayload(
+              "chatgpt.conversations",
+              [...validParent(), retained()],
+              {
+                fetchedStreams: ["conversations"],
+                allowMissingJoinStreams: true,
+              },
+            ),
+          );
+          expect(result.retainedChatgptMessages).toBeUndefined();
+          expect(result.payload).toMatchObject({
+            conversations: [{ messages: [], message_count: 0 }],
+          });
+          expect(result.diagnostics).toContainEqual({
+            kind: "stream_missing",
+            scope: "chatgpt.conversations",
+            stream: "messages",
+          });
+        });
+      });
 
       it("walks scoped parent links from current_node and gives legacy the node ids", () => {
         const result = projected(
@@ -2742,6 +3187,293 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         },
       );
 
+      it("derives the active branch from current_node when stored flags are stale after regeneration", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n3"),
+            message("c1", "n1", null, "shared", { onBranch: true }),
+            message("c1", "n2", "n1", "regenerated answer", {
+              onBranch: false,
+            }),
+            message("c1", "n3", "n1", "current answer", {
+              onBranch: false,
+            }),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 2,
+              messages: [
+                { id: "n1", content: "shared" },
+                { id: "n3", content: "current answer" },
+              ],
+            },
+          ],
+        });
+      });
+
+      it("uses the walked branch for the conversation and off-branch coverage evidence", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n3"),
+            message("c1", "n1", null, "shared"),
+            message("c1", "n2", "n1", "old sibling", {
+              onBranch: true,
+            }),
+            message("c1", "n3", "n1", "current sibling", {
+              onBranch: false,
+            }),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 2,
+              messages: [{ id: "n1" }, { id: "n3" }],
+            },
+          ],
+        });
+        expect(
+          result.retainedChatgptMessages?.map((entry) => entry.message.id),
+        ).toEqual(["n2"]);
+      });
+
+      it.each([
+        {
+          cause: "current_node_not_stored",
+          tip: "missing",
+          parent: "n1",
+          count: 2,
+          cycle: false,
+          recovered: true,
+        },
+        {
+          cause: "current_node_not_stored",
+          tip: "missing",
+          parent: null,
+          count: 0,
+          cycle: false,
+          recovered: false,
+        },
+        {
+          cause: "parent_not_stored",
+          tip: "n2",
+          parent: "missing",
+          count: 3,
+          cycle: false,
+          recovered: false,
+        },
+        {
+          cause: "cycle",
+          tip: "n2",
+          parent: "n1",
+          count: 2,
+          cycle: true,
+          recovered: false,
+        },
+      ])(
+        "falls back to stored flags and diagnoses $cause",
+        ({ cause, tip, parent, count, cycle, recovered }) => {
+          const records: PdppRecord[] = [
+            conversation("c1", count, tip),
+            ...(count === 0
+              ? []
+              : [
+                  message("c1", "n1", cycle ? "n2" : null, "first"),
+                  message("c1", "n2", parent, "second"),
+                ]),
+          ];
+          const result = projected(project(records));
+          if (recovered) {
+            expect(result.payload).toMatchObject({
+              conversations: [
+                {
+                  message_count: count,
+                  messages: [{ id: "n1" }, { id: "n2" }],
+                },
+              ],
+            });
+          } else {
+            expect(result.payload).toMatchObject({
+              conversations: [],
+              total: 0,
+            });
+          }
+          if (cycle) {
+            expect(result.chatgptCoverageGaps).toContainEqual(
+              expect.objectContaining({
+                reason: expect.stringContaining("cycle"),
+              }),
+            );
+            expect(result.diagnostics).toContainEqual({
+              kind: "branch_walk_fallback",
+              scope: "chatgpt.conversations",
+              stream: "conversations",
+              count: 1,
+              reasons: ["cycle"],
+            });
+          } else {
+            expect(result.diagnostics).toContainEqual({
+              kind: "branch_walk_fallback",
+              scope: "chatgpt.conversations",
+              stream: "conversations",
+              count: 1,
+              reasons: [cause],
+            });
+          }
+        },
+      );
+
+      it("recovers a coherent flagged chain after a current-branch cycle", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n2"),
+            message("c1", "n1", "n2", "stale cycle", {
+              onBranch: false,
+            }),
+            message("c1", "n2", "n1", "cycle tip", {
+              onBranch: false,
+            }),
+            message("c1", "n3", null, "flagged root"),
+            message("c1", "n4", "n3", "flagged tip"),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 2,
+              messages: [
+                { id: "n3", content: "flagged root" },
+                { id: "n4", content: "flagged tip" },
+              ],
+            },
+          ],
+          total: 1,
+        });
+        expect(result.diagnostics).toContainEqual({
+          kind: "branch_walk_fallback",
+          scope: "chatgpt.conversations",
+          stream: "conversations",
+          count: 1,
+          reasons: ["cycle"],
+        });
+        expect(result.chatgptCoverageGaps).toBeUndefined();
+      });
+
+      it("walks a relinked retained ancestor without falling back", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n3"),
+            message("c1", "n1", null, "retained ancestor"),
+            message("c1", "n3", "n1", "tip"),
+          ]),
+        );
+        expect(result.diagnostics).toBeUndefined();
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 2,
+              messages: [{ id: "n1" }, { id: "n3" }],
+            },
+          ],
+        });
+      });
+
+      it("accepts the omitted original parent when the expected count closes at that boundary", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n2"),
+            message("c1", "n1", "filtered-root", "retained root"),
+            message("c1", "n2", "n1", "tip"),
+          ]),
+        );
+        expect(result.diagnostics).toBeUndefined();
+        expect(result.payload).toMatchObject({
+          conversations: [
+            { message_count: 2, messages: [{ id: "n1" }, { id: "n2" }] },
+          ],
+        });
+      });
+
+      it("trusts a complete walk that passes an undercount and reaches an absent parent", () => {
+        const result = projected(
+          project([
+            conversation("c1", 1, "n2"),
+            message("c1", "n1", "filtered-root", "root"),
+            message("c1", "n2", "n1", "tip"),
+          ]),
+        );
+        expect(result.payload).toMatchObject({
+          conversations: [
+            { message_count: 2, messages: [{ id: "n1" }, { id: "n2" }] },
+          ],
+        });
+        expect(result.chatgptBranchDiagnostics).toContainEqual({
+          conversationIdHash:
+            "d0f631ca1ddba8db3bcfcb9e057cdc98d0379f1bee00e75a545147a27dadd982",
+          reason: "declared_count_below_walked",
+          declaredCount: 1,
+          walkedCount: 2,
+        });
+      });
+
+      it("keeps the first-version parent chain when it exceeds the declared count", () => {
+        const result = projected(
+          project([
+            conversation("c1", 2, "n3"),
+            message("c1", "n1", "filtered-root", "root"),
+            message("c1", "n2", "n1", "middle", { onBranch: false }),
+            message("c1", "n3", "n2", "tip", { onBranch: false }),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [
+            {
+              message_count: 3,
+              messages: [{ id: "n1" }, { id: "n2" }, { id: "n3" }],
+            },
+          ],
+        });
+        expect(result.chatgptBranchDiagnostics).toContainEqual({
+          conversationIdHash:
+            "d0f631ca1ddba8db3bcfcb9e057cdc98d0379f1bee00e75a545147a27dadd982",
+          reason: "declared_count_below_walked",
+          declaredCount: 2,
+          walkedCount: 3,
+        });
+      });
+
+      it("excludes a conversation with an unavailable old-flag fallback and hashes its id", () => {
+        const result = projected(
+          project([
+            conversation("broken", 2, "n2"),
+            conversation("healthy", 1, "h1"),
+            message("broken", "n1", null, "broken root"),
+            message("broken", "n2", "missing", "broken tip"),
+            message("healthy", "h1", null, "healthy"),
+          ]),
+        );
+
+        expect(result.payload).toMatchObject({
+          conversations: [{ id: "healthy", message_count: 1 }],
+          total: 1,
+        });
+        expect(result.chatgptCoverageGaps).toEqual([
+          {
+            conversationIdHash:
+              "f526795c95399cea27c055c842c3d6ab018ed0fa4f66f701c28ab22dec28237b",
+            reason: "parent_not_stored/flag_fallback_ambiguous",
+            declaredCount: 2,
+            walkedCount: 1,
+          },
+        ]);
+      });
+
       it("still projects a conversation that holds only old bare-id rows", () => {
         const result = projected(
           project([
@@ -2765,7 +3497,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           { layout: "scoped", scoped: true },
           { layout: "mixed", scoped: false },
         ])(
-          "drops an equal-count disconnected $layout branch with the chain diagnostic",
+          "receipts an equal-count disconnected $layout branch with the chain diagnostic",
           ({ scoped }) => {
             // Both rows are on-branch: count 2 passes, but n2 cannot reach n1.
             const records = [
@@ -2781,19 +3513,27 @@ describe("projectPdppRecordsToLegacyPayload", () => {
               payload: { conversations: [], total: 0 },
               diagnostics: [
                 {
-                  kind: "records_dropped",
+                  kind: "branch_walk_fallback",
                   scope: "chatgpt.conversations",
                   stream: "conversations",
                   count: 1,
-                  // copy-assertion-ok: identifies the chain guard rather than the earlier count guard.
-                  reasons: ["Current branch message chain is incomplete"],
+                  reasons: ["parent_not_stored"],
+                },
+              ],
+              chatgptCoverageGaps: [
+                {
+                  conversationIdHash:
+                    "d0f631ca1ddba8db3bcfcb9e057cdc98d0379f1bee00e75a545147a27dadd982",
+                  reason: "parent_not_stored/flag_fallback_ambiguous",
+                  declaredCount: 2,
+                  walkedCount: 1,
                 },
               ],
             });
           },
         );
 
-        it("drops an equal-count branch whose current tip is missing", () => {
+        it("recovers a current branch whose tip is missing from a complete flag chain", () => {
           const records = [
             conversation("c1", 1),
             message("c1", "n1", null, "present root"),
@@ -2801,20 +3541,25 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           const result = projected(
             project(order === "forward" ? records : [...records].reverse()),
           );
-          expect(result).toEqual({
+          expect(result).toMatchObject({
             ok: true,
-            payload: { conversations: [], total: 0 },
+            payload: {
+              conversations: [
+                { id: "c1", message_count: 1, messages: [{ id: "n1" }] },
+              ],
+              total: 1,
+            },
             diagnostics: [
               {
-                kind: "records_dropped",
+                kind: "branch_walk_fallback",
                 scope: "chatgpt.conversations",
                 stream: "conversations",
                 count: 1,
-                // copy-assertion-ok: identifies the chain guard rather than the earlier count guard.
-                reasons: ["Current branch message chain is incomplete"],
+                reasons: ["current_node_not_stored"],
               },
             ],
           });
+          expect(result.chatgptCoverageGaps).toBeUndefined();
         });
       });
     });
@@ -3051,7 +3796,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       });
     });
 
-    it("drops and counts the conversation when the current-branch message set is incomplete", () => {
+    it("receipts a conversation when the current tip is missing and flags cannot recover it", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -3075,18 +3820,26 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         payload: { conversations: [], total: 0 },
         diagnostics: [
           {
-            kind: "records_dropped",
+            kind: "branch_walk_fallback",
+            scope: "chatgpt.conversations",
             stream: "conversations",
             count: 1,
-            reasons: [
-              "Current branch message count does not match conversation",
-            ],
+            reasons: ["current_node_not_stored"],
+          },
+        ],
+        chatgptCoverageGaps: [
+          {
+            conversationIdHash:
+              "f8886d8016bf30b1dc77cc6c499fc1b47ee25d7ec2973dc6821b100bc6311b26",
+            reason: "current_node_not_stored/flag_fallback_count_mismatch",
+            declaredCount: 1,
+            walkedCount: 0,
           },
         ],
       });
     });
 
-    it("drops and counts the conversation when a current-branch message is orphaned from the current_node chain", () => {
+    it("receipts a conversation when a current-branch message is orphaned from the current_node chain", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -3134,10 +3887,20 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         payload: { conversations: [], total: 0 },
         diagnostics: [
           {
-            kind: "records_dropped",
+            kind: "branch_walk_fallback",
+            scope: "chatgpt.conversations",
             stream: "conversations",
             count: 1,
-            reasons: ["Current branch message chain is incomplete"],
+            reasons: ["parent_not_stored"],
+          },
+        ],
+        chatgptCoverageGaps: [
+          {
+            conversationIdHash:
+              "6f1aaf37cce99a9ab19aaebd8891d6374608e9d4f5b34c03d1b745299a1e0b41",
+            reason: "parent_not_stored/flag_fallback_ambiguous",
+            declaredCount: 2,
+            walkedCount: 1,
           },
         ],
       });
@@ -3184,11 +3947,11 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       expect(result.payload.total).toBe(1);
       expect(result.diagnostics).toEqual([
         {
-          kind: "records_dropped",
+          kind: "branch_walk_fallback",
           scope: "chatgpt.conversations",
           stream: "conversations",
           count: 1,
-          reasons: ["Current branch message count does not match conversation"],
+          reasons: ["current_node_not_stored"],
         },
         {
           kind: "records_dropped",
@@ -3196,6 +3959,15 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           stream: "messages",
           count: 1,
           reasons: ["Messages have no matching conversation"],
+        },
+      ]);
+      expect(result.chatgptCoverageGaps).toEqual([
+        {
+          conversationIdHash:
+            "5dc6fcec043ca1fe7b05065b20cb3d77c428c36f27b793ca1f2a4dcec68565ed",
+          reason: "current_node_not_stored/flag_fallback_count_mismatch",
+          declaredCount: 2,
+          walkedCount: 0,
         },
       ]);
       validateAgainst(
