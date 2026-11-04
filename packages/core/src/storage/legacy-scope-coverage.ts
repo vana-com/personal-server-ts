@@ -433,6 +433,7 @@ export function compareLegacyCoverage(
     const knownEmptyCount =
       field === "message_count" &&
       entityPath === "$.conversations[]" &&
+      /^\$\.conversations\[\d+\]\.message_count$/u.test(path) &&
       typeof entityKey === "string"
         ? (knownEmptyMessageCounts.get(entityKey) ?? 0)
         : 0;
@@ -512,7 +513,7 @@ export function compareLegacyCoverage(
               usedCoverageGaps.set(coverageGap.conversationIdHash, coverageGap);
               continue;
             }
-            const retained =
+            const retainedCandidate =
               position === undefined &&
               options.scope === "chatgpt.conversations" &&
               arrayPath === "$.conversations[].messages" &&
@@ -524,6 +525,17 @@ export function compareLegacyCoverage(
               typeof item.id === "string"
                 ? retainedMessages.get(entityKey)?.get(item.id)
                 : undefined;
+            // Empty retained content can account for an omitted display row
+            // only when the legacy payload contains explicit matching text.
+            const retained =
+              retainedCandidate?.content === "" &&
+              !matchesKnownEmptyChatgptMessage(
+                item,
+                retainedCandidate,
+                options.canonicalNewer === true,
+              )
+                ? undefined
+                : retainedCandidate;
             if (position === undefined && retained === undefined) {
               missingEntityCount += 1;
               mark("missing_entity", undefined, !deletionAllowed);
