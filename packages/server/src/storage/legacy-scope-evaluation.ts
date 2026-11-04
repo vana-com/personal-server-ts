@@ -3,6 +3,7 @@ import { readlinkSync } from "node:fs";
 import { setPriority } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
+import { configureDatabaseConnection } from "./index-schema.js";
 import {
   Worker,
   isMainThread,
@@ -199,7 +200,7 @@ if (isLegacyEvaluationWorker) {
     try {
       if (!db) {
         const raw = new Database(job.database);
-        raw.pragma("busy_timeout=0");
+        configureDatabaseConnection(raw);
         state = trackLegacyScopeMutations(raw, {
           ceilingMs: job.ceilingMs ?? 1800000,
         });
