@@ -84,7 +84,7 @@ export function createImportOperations(
     }
   }
 
-  function recover(own?: ReturnType<typeof key>): void {
+  function recover(own?: ReturnType<typeof key>, replicaPath?: string): void {
     const rows = db
       .prepare(
         "SELECT * FROM owner_import_operations WHERE state = 'prepared' OR (state IN ('deleted', 'cancelled') AND metadata_json IS NOT NULL) ORDER BY rowid",
@@ -95,11 +95,12 @@ export function createImportOperations(
         recoverRow(row);
       } catch (error) {
         if (
-          own &&
-          row.scope === own.scope &&
-          row.authority === own.authority &&
-          row.owner === own.owner &&
-          row.operation === own.operation
+          row.path === replicaPath ||
+          (own &&
+            row.scope === own.scope &&
+            row.authority === own.authority &&
+            row.owner === own.owner &&
+            row.operation === own.operation)
         ) {
           throw error;
         }
@@ -270,7 +271,20 @@ export function createImportOperations(
     let publishedPath: string | undefined;
     try {
       return immediate(() => {
-        recover();
+        // A replica cannot reuse a path still owned by failed import cleanup.
+        recover(
+          undefined,
+          command.kind === "replica"
+            ? relative(
+                options.dataDir,
+                buildDataFilePath(
+                  options.dataDir,
+                  command.envelope.scope,
+                  command.envelope.collectedAt,
+                ),
+              )
+            : undefined,
+        );
         const envelope =
           command.kind === "append"
             ? reserve(command.envelope)

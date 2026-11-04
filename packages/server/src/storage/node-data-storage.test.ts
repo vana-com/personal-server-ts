@@ -365,6 +365,7 @@ describe("an unrecoverable prepared import", () => {
       ).toMatchObject({ kind: "stored" });
 
       // The broken operation itself keeps failing visibly on retry.
+      // copy-assertion-ok: this storage-integrity diagnostic identifies the failed publication guard.
       await expect(
         storage.commitVersion!(append("broken.scope", "p")),
       ).rejects.toThrow("conflicts with publication");
@@ -378,6 +379,83 @@ describe("an unrecoverable prepared import", () => {
       ).not.toThrow();
     } finally {
       reopened?.close();
+      index.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a replica beside interrupted import cleanup", () => {
+  it("fences the retained path until cleanup succeeds without blocking unrelated writes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "import-cleanup-fence-"));
+    const dataDir = join(root, "data");
+    const db = initializeDatabase(join(root, "index.db"));
+    const index = createIndexManager(db);
+    const storage = createNodeDataStorage({
+      indexManager: index,
+      hierarchyOptions: { dataDir },
+    });
+    const scope = "github.events";
+    const operation = "a".repeat(64);
+    try {
+      const imported = await storage.commitVersion!({
+        kind: "append",
+        envelope: createDataFileEnvelope(scope, "2026-10-11T00:00:00Z", {
+          value: "original",
+        }),
+        metadata: {},
+        import: {
+          authority: "local",
+          owner: "owner",
+          operation,
+          bodySha256: "a".repeat(64),
+        },
+      });
+      if (imported.kind !== "stored") throw new Error("Import was not stored");
+      const blocker = `${imported.writeResult.path}.tmp.${operation}`;
+      await mkdir(blocker);
+      await writeFile(join(blocker, "interrupted-cleanup"), "blocked");
+      await storage.deleteVersion(scope, imported.envelope.collectedAt);
+      const replica = () =>
+        storage.commitVersion!({
+          kind: "replica",
+          envelope: createDataFileEnvelope(
+            scope,
+            imported.envelope.collectedAt,
+            { value: "replica" },
+          ),
+          metadata: { schemaId: null, dataPointId: "dp-1", version: 7 },
+        });
+
+      await expect(replica()).rejects.toMatchObject({ code: "ERR_FS_EISDIR" });
+      const healthy = await storage.commitVersion!({
+        kind: "append",
+        envelope: createDataFileEnvelope(
+          "other.scope",
+          "2026-10-12T00:00:00Z",
+          { value: "healthy" },
+        ),
+        metadata: {},
+      });
+      expect(healthy.kind).toBe("stored");
+      expect(storage.countVersions(scope)).toBe(0);
+
+      await rm(blocker, { recursive: true });
+      expect((await replica()).kind).toBe("stored");
+      await storage.commitVersion!({
+        kind: "append",
+        envelope: createDataFileEnvelope(
+          "other.scope",
+          "2026-10-13T00:00:00Z",
+          { value: "later" },
+        ),
+        metadata: {},
+      });
+      expect(
+        await storage.readEnvelope(scope, imported.envelope.collectedAt),
+      ).toMatchObject({ data: { value: "replica" } });
+      expect(storage.countVersions(scope)).toBe(1);
+    } finally {
       index.close();
       await rm(root, { recursive: true, force: true });
     }
