@@ -213,7 +213,7 @@ function assertDiagnostics(
     | undefined,
   expected: {
     conversationIdHash: string;
-    reason: "declared_count_below_walked";
+    reason: "declared_count_below_walked" | "declared_count_above_walked";
     declaredCount: number;
     walkedCount: number;
   }[],
@@ -1526,5 +1526,113 @@ describe("independent ChatGPT branch-walk oracle 1904", () => {
       scope: SCOPE,
       collectedAt: "2026-11-05T00:00:00.000Z",
     });
+  });
+});
+
+describe("Round 2 rooted-walk regressions", () => {
+  // ruled by lead 11-03: a rooted complete current walk wins at every declared count.
+  it.each([
+    { caseId: "R2a", withFlags: true },
+    { caseId: "R2b", withFlags: false },
+  ])(
+    "$caseId — a rooted current path wins over a stale high count (flags=$withFlags)",
+    async ({ withFlags }) => {
+      const cs = [C("A", "a1", 3)];
+      const ms = [
+        M("A", "a0", null, false),
+        M("A", "a1", "a0", false),
+        ...(withFlags
+          ? [
+              M("A", "b0", null, true, "old0"),
+              M("A", "b1", "b0", true, "old1"),
+              M("A", "b2", "b1", true, "old2"),
+            ]
+          : []),
+      ];
+      const expectedDiagnostic = [
+        {
+          conversationIdHash: HASH_A,
+          reason: "declared_count_above_walked" as const,
+          declaredCount: 3,
+          walkedCount: 2,
+        },
+      ];
+      const p = project(records(cs, ms));
+      expect(p.payload).toEqual(A2);
+      expect(p.chatgptCoverageGaps ?? []).toEqual([]);
+      expect(p.diagnostics ?? []).toEqual([]);
+      assertDiagnostics(p.chatgptBranchDiagnostics, expectedDiagnostic);
+
+      const f = createReadFixture(cs, ms);
+      for (const view of [f.view, f.view, createLegacyScopeView(f.config)]) {
+        const read = await view.readLatest(SCOPE);
+        expect(read.kind).toBe("canonical");
+        if (read.kind !== "canonical")
+          throw new Error("Rooted current path refused");
+        expect(read.envelope.data).toEqual(A2);
+        for (const oldValue of ["b0", "b1", "b2", "old0", "old1", "old2"]) {
+          expect(JSON.stringify(read.envelope.data)).not.toContain(oldValue);
+        }
+        assertGaps(read.chatgptCoverageGaps, []);
+        assertDiagnostics(read.chatgptBranchDiagnostics, expectedDiagnostic);
+      }
+    },
+  );
+
+  // ruled by lead 11-03: only parent_id === null proves the root; malformed parents do not.
+  it.each([undefined, 0, false, {}])(
+    "R2d — a non-string parent is not an explicit null root (%j)",
+    (parent) => {
+      const p = project(
+        records(
+          [C("A", "a1", 3)],
+          [
+            { ...M("A", "a0", null, false), parent_id: parent },
+            M("A", "a1", "a0", false),
+          ],
+        ),
+      );
+      expect(p.payload).toEqual({ conversations: [], total: 0 });
+      expect(p.chatgptBranchDiagnostics ?? []).toEqual([]);
+      expect(p.diagnostics).toContainEqual({
+        kind: "branch_walk_fallback",
+        scope: SCOPE,
+        stream: "conversations",
+        count: 1,
+        reasons: ["walked_count_below_declared"],
+      });
+      assertGaps(p.chatgptCoverageGaps, [
+        {
+          conversationIdHash: HASH_A,
+          category: "branch_incomplete",
+          declaredCount: 3,
+          walkedCount: 2,
+        },
+      ]);
+    },
+  );
+
+  // ruled by lead 11-03: a cyclic walk is not rooted and complete; coherent flag recovery may apply.
+  it("R2c — recovers a coherent flagged chain when current-node history cycles", async () => {
+    const cs = [C("A", "cycle", 2)];
+    const ms = [
+      M("A", "cycle", "cycle", false),
+      M("A", "a0", "synthetic-root", true),
+      M("A", "a1", "a0", true),
+    ];
+    const p = project(records(cs, ms));
+    expect(p.payload).toEqual(A2);
+    expect(p.chatgptCoverageGaps ?? []).toEqual([]);
+    expect(p.diagnostics).toContainEqual({
+      kind: "branch_walk_fallback",
+      scope: SCOPE,
+      stream: "conversations",
+      count: 1,
+      reasons: ["cycle"],
+    });
+    const f = createReadFixture(cs, ms);
+    const read = await readCanonical(f);
+    expect(read.envelope.data).toEqual(A2);
+    assertGaps(read.chatgptCoverageGaps, []);
   });
 });
