@@ -256,6 +256,8 @@ export function createStravaMethodTransition(
       store.clearStravaTransitionScope(scope);
     },
     ownsScope: (scope) => saved(scope) !== null || base.ownsScope(scope),
+    blocksScopeDeletion: (scope) =>
+      saved(scope) !== null || base.blocksScopeDeletion(scope),
   };
   return { transition, status, view };
 }

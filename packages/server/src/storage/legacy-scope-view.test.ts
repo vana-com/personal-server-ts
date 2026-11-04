@@ -1762,12 +1762,14 @@ describe("legacy scope view over the real SQLite record store", () => {
       expectedGeneration: 1,
       nextMethod: "oura",
     });
-    // Erased rows no longer block deletion of the file.
-    expect(view.ownsScope("oura.activity")).toBe(false);
+    // Historical ownership must still protect callers outside scope deletion.
+    expect(view.ownsScope("oura.activity")).toBe(true);
+    expect(view.blocksScopeDeletion("oura.activity")).toBe(false);
     expect((await view.readLatest("oura.activity")).kind).toBe("refused");
 
     store.deleteConnection("conn_a");
-    expect(view.ownsScope("oura.activity")).toBe(false);
+    expect(view.ownsScope("oura.activity")).toBe(true);
+    expect(view.blocksScopeDeletion("oura.activity")).toBe(false);
     expect(await view.readLatest("oura.activity")).toEqual({
       kind: "refused",
       refusal: {
@@ -2581,7 +2583,8 @@ describe("legacy scope view over the real SQLite record store", () => {
       kind: "file",
       deletion: "canonical",
     });
-    expect(view.ownsScope("oura.activity")).toBe(false);
+    expect(view.ownsScope("oura.activity")).toBe(true);
+    expect(view.blocksScopeDeletion("oura.activity")).toBe(false);
     expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
       [],
     );
@@ -2612,7 +2615,8 @@ describe("legacy scope view over the real SQLite record store", () => {
 
     expect((await view.readLatest("oura.activity")).kind).toBe("refused");
     expect(view.listingFor("oura.activity")).toEqual({ kind: "refused" });
-    expect(view.ownsScope("oura.activity")).toBe(false);
+    expect(view.ownsScope("oura.activity")).toBe(true);
+    expect(view.blocksScopeDeletion("oura.activity")).toBe(false);
   });
 
   it("does not classify an explicitly produced legacy row as an old connector file", async () => {

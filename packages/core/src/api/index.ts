@@ -2816,7 +2816,7 @@ export async function handlePersonalServerDataRequest(
       // and the account and its generation are the unit of erasure), so a
       // 200 here would leave the data readable. Refuse before any gateway or
       // file change; the connection's own delete erases its rows.
-      if (deps.legacyScopeView?.ownsScope(parsed.scope)) {
+      if (deps.legacyScopeView?.blocksScopeDeletion(parsed.scope)) {
         return jsonResponse(
           {
             error: "CANONICAL_DELETE_UNSUPPORTED",

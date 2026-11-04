@@ -338,6 +338,8 @@ export interface LegacyScopeViewPort {
    * `deletionHistoryOf`.
    */
   ownsScope(scope: string): boolean;
+  /** Whether deleting only the scope file could expose retained records. */
+  blocksScopeDeletion(scope: string): boolean;
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
   resetTakeover(scope: string): void;
   isReset(scope: string): boolean;
@@ -430,23 +432,26 @@ export function createLegacyScopeView(
     return authority.hasMethodTakeover(scope, method);
   }
 
-  /**
-   * Deletion safety asks the ungated question: do connection rows exist that
-   * a legacy-only deletion would let appear? Where the gate keeps the file
-   * over an opted-out method, check every connection for retained rows, even
-   * if it was deleted. Missing record tables or an unmounted store cannot
-   * establish that the rows are absent.
-   */
+  /** Historical ownership used by callers that require canonical availability. */
   function ownsScope(scope: string): boolean {
+    if (decide(scope, false).kind === "file") return false;
+    if (decide(scope).kind !== "file") return true;
+    return authority
+      .listMethodConnections([...optedOutMethods(scope)])
+      .some(
+        (connection) =>
+          connection.deletedAt === null &&
+          authority.hasHeldData(connection.instance, null),
+      );
+  }
+
+  /** Refuse a file-only deletion when canonical data may remain. */
+  function blocksScopeDeletion(scope: string): boolean {
     const connections = authority.listMethodConnections([
       ...scopeMethods(scope).keys(),
     ]);
-    if (
-      connections.length > 0 &&
-      (!records || !authority.heldDataAvailable())
-    ) {
+    if (connections.length > 0 && (!records || !authority.heldDataAvailable()))
       return true;
-    }
     const ungated = decide(scope, false);
     if (ungated.kind === "file") return false;
     if (
@@ -1360,6 +1365,9 @@ export function createLegacyScopeView(
 
     ownsScope(scope) {
       return authority.readSnapshot(() => ownsScope(scope));
+    },
+    blocksScopeDeletion(scope) {
+      return authority.readSnapshot(() => blocksScopeDeletion(scope));
     },
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),

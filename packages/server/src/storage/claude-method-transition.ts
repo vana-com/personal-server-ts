@@ -162,6 +162,8 @@ export function createClaudeMethodTransition(
       store.clearClaudeTransitionScope(scope);
     },
     ownsScope: (scope) => snapshot(scope) !== null || base.ownsScope(scope),
+    blocksScopeDeletion: (scope) =>
+      snapshot(scope) !== null || base.blocksScopeDeletion(scope),
   };
   return { transition, view };
 }
