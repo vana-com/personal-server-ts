@@ -52,7 +52,7 @@ export type ProjectionError =
     }
   | { kind: "empty_singleton"; scope: string };
 
-/** Same-read canonical off-branch text, separate from the served payload. */
+/** Same-read stored text omitted from the legacy payload, separate from it. */
 export interface RetainedChatgptMessage {
   scope: "chatgpt.conversations";
   conversationId: string;

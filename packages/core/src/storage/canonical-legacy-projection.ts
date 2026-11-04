@@ -57,7 +57,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/12";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/13";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -162,7 +162,7 @@ export interface CanonicalLegacyReadOk {
   ok: true;
   envelope: DataFileEnvelope;
   projectionOmissions?: ProjectionOmission[];
-  /** Stored off-branch fields from the same selected snapshot as the envelope. */
+  /** Stored text omitted from display, from the envelope's same snapshot. */
   retainedChatgptMessages?: readonly RetainedChatgptMessage[];
   /** Per-conversation fallback exclusions from this exact projection. */
   chatgptCoverageGaps?: readonly ChatgptConversationCoverageGap[];
@@ -182,7 +182,9 @@ export interface CanonicalLegacyReadOk {
   revision: string;
   /**
    * False when `diagnostics.omissions`, `diagnostics.partialRows` or
-   * `diagnostics.unproven` is not empty.
+   * `diagnostics.unproven` is not empty. Receipted ChatGPT branch exclusions
+   * are exposed separately and do not change this bit; they do not authorize
+   * whole-dataset deletion or replacement.
    */
   complete: boolean;
   diagnostics: CanonicalReadDiagnostics;

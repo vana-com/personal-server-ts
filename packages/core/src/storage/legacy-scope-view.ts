@@ -68,7 +68,7 @@ const BINDING_PROFILES = [
 ];
 
 // Invalidate witnesses predating exact conversation gaps and empty retained text.
-const COVERAGE_RULE_VERSION = 13;
+const COVERAGE_RULE_VERSION = 14;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the

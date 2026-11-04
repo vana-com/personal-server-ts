@@ -65,7 +65,10 @@ export interface LegacyCoverageVerdict {
   comparisonCase: "same_time" | "canonical_newer";
   covered: boolean;
   reason: LegacyCoverageReason | null;
-  /** Counts include accepted proven deletions, which do not block coverage. */
+  /**
+   * Counts include accepted proven deletions and receipted conversation
+   * exclusions, which do not block coverage.
+   */
   reasonCounts: Record<LegacyCoverageReason, number>;
   /** Reviewed legacy defects and provenance-backed omissions used in this evaluation. */
   appliedExceptions: {
@@ -160,6 +163,23 @@ function isIdentityField(field: string): boolean {
 
 function object(value: unknown): value is JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function matchesKnownEmptyChatgptMessage(
+  legacyMessage: unknown,
+  retained: RetainedChatgptMessage["message"] | undefined,
+  allowClearedContent: boolean,
+): legacyMessage is JsonObject {
+  if (!object(legacyMessage) || retained === undefined) return false;
+  return (
+    retained.content === "" &&
+    typeof legacyMessage.content === "string" &&
+    (legacyMessage.content === "" || allowClearedContent) &&
+    legacyMessage.id === retained.id &&
+    legacyMessage.role === retained.role &&
+    legacyMessage.content_type === retained.content_type &&
+    legacyMessage.create_time === retained.create_time
+  );
 }
 
 function stableKey(value: unknown, fields: readonly string[]): string | null {
@@ -303,6 +323,90 @@ export function compareLegacyCoverage(
       );
     }
   }
+  const knownEmptyMessageCounts = new Map<string, number>();
+  if (
+    options.scope === "chatgpt.conversations" &&
+    object(legacyPayload) &&
+    object(canonicalPayload) &&
+    Array.isArray(legacyPayload.conversations) &&
+    Array.isArray(canonicalPayload.conversations)
+  ) {
+    const legacyConversationCounts = new Map<string, number>();
+    for (const conversation of legacyPayload.conversations) {
+      if (!object(conversation) || typeof conversation.id !== "string") {
+        continue;
+      }
+      legacyConversationCounts.set(
+        conversation.id,
+        (legacyConversationCounts.get(conversation.id) ?? 0) + 1,
+      );
+    }
+    const canonicalConversations = new Map<string, JsonObject | null>();
+    for (const conversation of canonicalPayload.conversations) {
+      if (!object(conversation) || typeof conversation.id !== "string") {
+        continue;
+      }
+      canonicalConversations.set(
+        conversation.id,
+        canonicalConversations.has(conversation.id) ? null : conversation,
+      );
+    }
+    for (const conversation of legacyPayload.conversations) {
+      if (
+        !object(conversation) ||
+        typeof conversation.id !== "string" ||
+        legacyConversationCounts.get(conversation.id) !== 1
+      ) {
+        continue;
+      }
+      const canonicalConversation = canonicalConversations.get(conversation.id);
+      if (
+        canonicalConversation === undefined ||
+        canonicalConversation === null ||
+        !Array.isArray(conversation.messages) ||
+        !Array.isArray(canonicalConversation.messages)
+      ) {
+        continue;
+      }
+
+      const legacyMessageCounts = new Map<string, number>();
+      for (const message of conversation.messages) {
+        if (!object(message) || typeof message.id !== "string") continue;
+        legacyMessageCounts.set(
+          message.id,
+          (legacyMessageCounts.get(message.id) ?? 0) + 1,
+        );
+      }
+      const canonicalMessageIds = new Set<string>();
+      for (const message of canonicalConversation.messages) {
+        if (object(message) && typeof message.id === "string") {
+          canonicalMessageIds.add(message.id);
+        }
+      }
+      let count = 0;
+      for (const message of conversation.messages) {
+        if (
+          !object(message) ||
+          typeof message.id !== "string" ||
+          legacyMessageCounts.get(message.id) !== 1 ||
+          canonicalMessageIds.has(message.id)
+        ) {
+          continue;
+        }
+        const retained = retainedMessages.get(conversation.id)?.get(message.id);
+        if (
+          matchesKnownEmptyChatgptMessage(
+            message,
+            retained,
+            options.canonicalNewer === true,
+          )
+        ) {
+          count += 1;
+        }
+      }
+      if (count > 0) knownEmptyMessageCounts.set(conversation.id, count);
+    }
+  }
 
   function mark(
     reason: LegacyCoverageReason,
@@ -326,6 +430,25 @@ export function compareLegacyCoverage(
     entityPath?: string,
     entityKey?: string | number | boolean,
   ): void {
+    const knownEmptyCount =
+      field === "message_count" &&
+      entityPath === "$.conversations[]" &&
+      typeof entityKey === "string"
+        ? (knownEmptyMessageCounts.get(entityKey) ?? 0)
+        : 0;
+    if (
+      knownEmptyCount > 0 &&
+      typeof legacy === "number" &&
+      Number.isInteger(legacy) &&
+      legacy >= 0 &&
+      typeof canonical === "number" &&
+      Number.isInteger(canonical) &&
+      canonical >= 0 &&
+      legacy - canonical === knownEmptyCount
+    ) {
+      mark("field_mismatch", undefined, false);
+      return;
+    }
     if (jsonType(legacy) !== jsonType(canonical)) {
       mark("type_mismatch", path);
       return;
@@ -406,18 +529,47 @@ export function compareLegacyCoverage(
               mark("missing_entity", undefined, !deletionAllowed);
               continue;
             }
+            const knownEmpty =
+              position === undefined &&
+              options.scope === "chatgpt.conversations" &&
+              arrayPath === "$.conversations[].messages" &&
+              entityPath === "$.conversations[]" &&
+              typeof entityKey === "string" &&
+              matchesKnownEmptyChatgptMessage(
+                item,
+                retained,
+                options.canonicalNewer === true,
+              );
             // Presence cannot establish same-time order in the displayed branch.
             // Never invent a position from the legacy array.
-            if (position === undefined && !options.canonicalNewer)
+            if (
+              position === undefined &&
+              !options.canonicalNewer &&
+              !knownEmpty
+            ) {
               mark("array_order", path);
+            }
             if (position !== undefined) {
               if (!options.canonicalNewer && position < lastPosition)
                 mark("array_order", path);
               lastPosition = position;
             }
+            const retainedWithLegacyContent =
+              knownEmpty && object(item) && retained !== undefined
+                ? { ...retained, content: item.content as string }
+                : retained;
+            if (
+              knownEmpty &&
+              object(item) &&
+              item.content !== retained?.content
+            ) {
+              mark("field_mismatch", undefined, false);
+            }
             compare(
               item,
-              position === undefined ? retained : canonical[position],
+              position === undefined
+                ? retainedWithLegacyContent
+                : canonical[position],
               `${path}[${index}]`,
               `${arrayPath}[]`,
               schema?.items,
