@@ -1,0 +1,109 @@
+{
+  "vectorVersion": 1,
+  "kind": "canonical-json",
+  "cases": [
+    {
+      "name": "object keys are sorted",
+      "input": {
+        "b": 1,
+        "a": 2
+      },
+      "expected": "{\"a\":2,\"b\":1}"
+    },
+    {
+      "name": "nesting and arrays keep array order",
+      "input": {
+        "z": [
+          3,
+          {
+            "y": 1,
+            "x": null
+          }
+        ],
+        "a": true
+      },
+      "expected": "{\"a\":true,\"z\":[3,{\"x\":null,\"y\":1}]}"
+    },
+    {
+      "name": "empty containers",
+      "input": {
+        "a": [],
+        "b": {}
+      },
+      "expected": "{\"a\":[],\"b\":{}}"
+    },
+    {
+      "name": "negative zero prints as 0",
+      "input": [-0],
+      "expected": "[0]"
+    },
+    {
+      "name": "1e21 prints with a plus exponent",
+      "input": [1e21],
+      "expected": "[1e+21]"
+    },
+    {
+      "name": "small exponent",
+      "input": [1e-7],
+      "expected": "[1e-7]"
+    },
+    {
+      "name": "large exponent",
+      "input": [1.5e300],
+      "expected": "[1.5e+300]"
+    },
+    {
+      "name": "integer just below the exponent switch",
+      "input": [123456789012345680000],
+      "expected": "[123456789012345680000]"
+    },
+    {
+      "name": "millisecond timestamp stays an integer",
+      "input": {
+        "at": 1730851200000
+      },
+      "expected": "{\"at\":1730851200000}"
+    },
+    {
+      "name": "fractions",
+      "input": [0.1, 1.5, -2.25],
+      "expected": "[0.1,1.5,-2.25]"
+    },
+    {
+      "name": "non-ASCII text is not escaped",
+      "input": {
+        "n": "é😀"
+      },
+      "expected": "{\"n\":\"é😀\"}"
+    },
+    {
+      "name": "control characters and quotes are escaped",
+      "input": ["a\u0001\n\"\\"],
+      "expected": "[\"a\\u0001\\n\\\"\\\\\"]"
+    },
+    {
+      "name": "keys sort by UTF-16 code unit, not code point",
+      "input": {
+        "￿": 1,
+        "😀": 2
+      },
+      "expected": "{\"😀\":2,\"￿\":1}"
+    },
+    {
+      "name": "__proto__ is an ordinary key",
+      "input": {
+        "__proto__": 1,
+        "a": 2
+      },
+      "expected": "{\"__proto__\":1,\"a\":2}"
+    },
+    {
+      "name": "constructor is an ordinary key",
+      "input": {
+        "constructor": 1,
+        "a": 2
+      },
+      "expected": "{\"a\":2,\"constructor\":1}"
+    }
+  ]
+}

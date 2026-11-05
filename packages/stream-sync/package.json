@@ -1,0 +1,37 @@
+{
+  "name": "@opendatalabs/personal-server-ts-stream-sync",
+  "version": "0.0.1",
+  "private": true,
+  "description": "I/O-free core for whole-file stream sync: overlay, parts, head, assemble and the publish decision",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vana-com/personal-server-ts.git",
+    "directory": "packages/stream-sync"
+  },
+  "homepage": "https://github.com/vana-com/personal-server-ts#readme",
+  "bugs": {
+    "url": "https://github.com/vana-com/personal-server-ts/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./reference-host": {
+      "types": "./dist/reference-host.d.ts",
+      "import": "./dist/reference-host.js"
+    },
+    "./vectors/*": "./vectors/*"
+  },
+  "files": [
+    "dist",
+    "vectors"
+  ],
+  "scripts": {
+    "build": "tsc --build"
+  }
+}

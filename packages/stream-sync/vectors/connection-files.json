@@ -1,0 +1,100 @@
+{
+  "vectorVersion": 1,
+  "kind": "connection-files",
+  "cases": [
+    {
+      "name": "every stream, head and part of the connection, and nothing else",
+      "names": [
+        "pdpp.chatgpt.conversations",
+        "pdpp.chatgpt.conversations.head-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pdpp.chatgpt.conversations.part-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.chatgpt.messages",
+        "pdpp.chatgptx.messages",
+        "pdpp.pdpp.notes",
+        "chatgpt.conversations",
+        "pdpp.chatgpt.messages.part-short",
+        "pdpp.chatgpt.messages.tail-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.chatgpt",
+        "other"
+      ],
+      "connectionId": "chatgpt",
+      "expected": [
+        "pdpp.chatgpt.conversations",
+        "pdpp.chatgpt.conversations.head-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pdpp.chatgpt.conversations.part-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.chatgpt.messages"
+      ]
+    },
+    {
+      "name": "a connection named like the prefix owns only its own files",
+      "names": [
+        "pdpp.chatgpt.conversations",
+        "pdpp.chatgpt.conversations.head-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pdpp.chatgpt.conversations.part-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.chatgpt.messages",
+        "pdpp.chatgptx.messages",
+        "pdpp.pdpp.notes",
+        "chatgpt.conversations",
+        "pdpp.chatgpt.messages.part-short",
+        "pdpp.chatgpt.messages.tail-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.chatgpt",
+        "other"
+      ],
+      "connectionId": "pdpp",
+      "expected": ["pdpp.pdpp.notes"]
+    },
+    {
+      "name": "a longer connection id does not match a shorter one",
+      "names": [
+        "pdpp.chatgpt.conversations",
+        "pdpp.chatgpt.conversations.head-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pdpp.chatgpt.conversations.part-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.chatgpt.messages",
+        "pdpp.chatgptx.messages",
+        "pdpp.pdpp.notes",
+        "chatgpt.conversations",
+        "pdpp.chatgpt.messages.part-short",
+        "pdpp.chatgpt.messages.tail-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.chatgpt",
+        "other"
+      ],
+      "connectionId": "chatgptx",
+      "expected": ["pdpp.chatgptx.messages"]
+    },
+    {
+      "name": "an unknown connection owns nothing",
+      "names": [
+        "pdpp.chatgpt.conversations",
+        "pdpp.chatgpt.conversations.head-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pdpp.chatgpt.conversations.part-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.chatgpt.messages",
+        "pdpp.chatgptx.messages",
+        "pdpp.pdpp.notes",
+        "chatgpt.conversations",
+        "pdpp.chatgpt.messages.part-short",
+        "pdpp.chatgpt.messages.tail-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.chatgpt",
+        "other"
+      ],
+      "connectionId": "nobody",
+      "expected": []
+    },
+    {
+      "name": "the result is sorted and unique",
+      "names": [
+        "pdpp.c.b.part-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pdpp.c.b",
+        "pdpp.c.a",
+        "pdpp.c.a",
+        "pdpp.c.b.head-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "connectionId": "c",
+      "expected": [
+        "pdpp.c.a",
+        "pdpp.c.b",
+        "pdpp.c.b.head-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pdpp.c.b.part-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ]
+    }
+  ]
+}

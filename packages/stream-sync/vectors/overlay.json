@@ -1,0 +1,1132 @@
+{
+  "vectorVersion": 1,
+  "kind": "overlay",
+  "cases": [
+    {
+      "name": "empty base with records: sorted by key",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 2,
+            "v": "b"
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 1,
+            "v": "a"
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "v": "a"
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 2,
+            "v": "b"
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "empty run keeps the base",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "v": "a"
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [],
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "v": "a"
+          },
+          "observedAt": 100
+        }
+      ]
+    },
+    {
+      "name": "both empty",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [],
+      "expected": []
+    },
+    {
+      "name": "new key is added, existing key is replaced by a later run",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "v": "old"
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "id": 3,
+            "v": "c"
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "v": "new"
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 2,
+            "v": "b"
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "v": "new"
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 2,
+            "v": "b"
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 3,
+            "v": "c"
+          },
+          "observedAt": 100
+        }
+      ]
+    },
+    {
+      "name": "run that only changes existing keys",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "v": 1
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "id": 2,
+            "v": 2
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 2,
+            "v": 20
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 1,
+            "v": 10
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "v": 10
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 2,
+            "v": 20
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "a key repeated inside the run with equal times: last wins",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "v": "first"
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 1,
+            "v": "last"
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "v": "last"
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "incremental run: unchanged base records survive with their own times",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": "a",
+            "t": 1
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "id": "b",
+            "t": 1
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "id": "c",
+            "t": 1
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": "b",
+            "t": 2
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": "a",
+            "t": 1
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "id": "b",
+            "t": 2
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": "c",
+            "t": 1
+          },
+          "observedAt": 100
+        }
+      ]
+    },
+    {
+      "name": "30-day window run: older base records survive",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": "old1",
+            "at": 1700000000000
+          },
+          "observedAt": 1700000000001
+        },
+        {
+          "record": {
+            "id": "old2",
+            "at": 1700000100000
+          },
+          "observedAt": 1700000100001
+        },
+        {
+          "record": {
+            "id": "mid",
+            "at": 1730000000000
+          },
+          "observedAt": 1730000000001
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": "mid",
+            "at": 1730000005000
+          },
+          "observedAt": 1732000000001
+        },
+        {
+          "record": {
+            "id": "new",
+            "at": 1732000000000
+          },
+          "observedAt": 1732000000001
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": "mid",
+            "at": 1730000005000
+          },
+          "observedAt": 1732000000001
+        },
+        {
+          "record": {
+            "id": "new",
+            "at": 1732000000000
+          },
+          "observedAt": 1732000000001
+        },
+        {
+          "record": {
+            "id": "old1",
+            "at": 1700000000000
+          },
+          "observedAt": 1700000000001
+        },
+        {
+          "record": {
+            "id": "old2",
+            "at": 1700000100000
+          },
+          "observedAt": 1700000100001
+        }
+      ]
+    },
+    {
+      "name": "composite primary key",
+      "primaryKey": ["tenant", "id"],
+      "base": [
+        {
+          "record": {
+            "tenant": "a",
+            "id": 1,
+            "v": 0
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "tenant": "a",
+            "id": 2,
+            "v": 0
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "tenant": "b",
+            "id": 1,
+            "v": 0
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "tenant": "a",
+            "id": 2,
+            "v": 9
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "tenant": "b",
+            "id": 2,
+            "v": 9
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "tenant": "a",
+            "id": 1,
+            "v": 0
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "tenant": "a",
+            "id": 2,
+            "v": 9
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "tenant": "b",
+            "id": 1,
+            "v": 0
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "tenant": "b",
+            "id": 2,
+            "v": 9
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "composite key order matters",
+      "primaryKey": ["a", "b"],
+      "base": [
+        {
+          "record": {
+            "a": 1,
+            "b": 2,
+            "v": "x"
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "a": 2,
+            "b": 1,
+            "v": "y"
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "a": 1,
+            "b": 2,
+            "v": "x"
+          },
+          "observedAt": 100
+        },
+        {
+          "record": {
+            "a": 2,
+            "b": 1,
+            "v": "y"
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "1 and \"1\" are different keys; strings sort first",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "v": "num"
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": "1",
+            "v": "str"
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": "1",
+            "v": "str"
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 1,
+            "v": "num"
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "keys sort as canonical JSON text, so 10 comes before 2",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 2
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 10
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": 10
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": 2
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "0 and -0 are the same key",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 0,
+            "v": "old"
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": -0,
+            "v": "new"
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": 0,
+            "v": "new"
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "a record value of __proto__ is just a value",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": "__proto__",
+            "v": 1
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": "constructor",
+            "v": 2
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": "__proto__",
+            "v": 1
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "id": "constructor",
+            "v": 2
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "__proto__ as a key field name",
+      "primaryKey": ["__proto__"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "__proto__": "x",
+            "v": 1
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "__proto__": "y",
+            "v": 2
+          },
+          "observedAt": 200
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "__proto__": "x",
+            "v": 1
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "__proto__": "y",
+            "v": 2
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "a run observed earlier does not replace a newer base record",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "v": "newer"
+          },
+          "observedAt": 300
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "v": "older"
+          },
+          "observedAt": 100
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "v": "newer"
+          },
+          "observedAt": 300
+        }
+      ]
+    },
+    {
+      "name": "a tie on observation time goes to the run",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "v": "base"
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "v": "run"
+          },
+          "observedAt": 100
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "v": "run"
+          },
+          "observedAt": 100
+        }
+      ]
+    },
+    {
+      "name": "inside a run, a later record with an older time loses",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "v": "newer"
+          },
+          "observedAt": 300
+        },
+        {
+          "record": {
+            "id": 1,
+            "v": "older"
+          },
+          "observedAt": 100
+        }
+      ],
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "v": "newer"
+          },
+          "observedAt": 300
+        }
+      ]
+    },
+    {
+      "name": "order field: higher source version wins even when observed earlier",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 5,
+            "v": "rev5"
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 3,
+            "v": "rev3"
+          },
+          "observedAt": 900
+        }
+      ],
+      "orderField": "rev",
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 5,
+            "v": "rev5"
+          },
+          "observedAt": 100
+        }
+      ]
+    },
+    {
+      "name": "order field: a higher run version replaces despite an earlier observation",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 3,
+            "v": "rev3"
+          },
+          "observedAt": 900
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 7,
+            "v": "rev7"
+          },
+          "observedAt": 100
+        }
+      ],
+      "orderField": "rev",
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 7,
+            "v": "rev7"
+          },
+          "observedAt": 100
+        }
+      ]
+    },
+    {
+      "name": "order field: a tie goes to the run",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 4,
+            "v": "base"
+          },
+          "observedAt": 900
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 4,
+            "v": "run"
+          },
+          "observedAt": 100
+        }
+      ],
+      "orderField": "rev",
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 4,
+            "v": "run"
+          },
+          "observedAt": 100
+        }
+      ]
+    },
+    {
+      "name": "order field: strings compare by code unit",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "updated": "2024-02-01",
+            "v": "feb"
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "updated": "2024-01-01",
+            "v": "jan"
+          },
+          "observedAt": 900
+        }
+      ],
+      "orderField": "updated",
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "updated": "2024-02-01",
+            "v": "feb"
+          },
+          "observedAt": 100
+        }
+      ]
+    },
+    {
+      "name": "order field missing on one record falls back to observation time",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 5,
+            "v": "base"
+          },
+          "observedAt": 300
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "v": "run"
+          },
+          "observedAt": 100
+        }
+      ],
+      "orderField": "rev",
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 5,
+            "v": "base"
+          },
+          "observedAt": 300
+        }
+      ]
+    },
+    {
+      "name": "order field of different types falls back to observation time",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1,
+            "rev": "5",
+            "v": "base"
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 3,
+            "v": "run"
+          },
+          "observedAt": 200
+        }
+      ],
+      "orderField": "rev",
+      "expected": [
+        {
+          "record": {
+            "id": 1,
+            "rev": 3,
+            "v": "run"
+          },
+          "observedAt": 200
+        }
+      ]
+    },
+    {
+      "name": "an inherited name is not a key field",
+      "primaryKey": ["constructor"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1
+          },
+          "observedAt": 200
+        }
+      ],
+      "expectError": {
+        "code": "missing-key-field",
+        "source": "run",
+        "field": "constructor",
+        "index": 0
+      }
+    },
+    {
+      "name": "record missing a key field in the run",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1
+          },
+          "observedAt": 200
+        },
+        {
+          "record": {
+            "other": 2
+          },
+          "observedAt": 200
+        }
+      ],
+      "expectError": {
+        "code": "missing-key-field",
+        "source": "run",
+        "field": "id",
+        "index": 1
+      }
+    },
+    {
+      "name": "record missing a key field in the base",
+      "primaryKey": ["tenant", "id"],
+      "base": [
+        {
+          "record": {
+            "tenant": "a"
+          },
+          "observedAt": 100
+        }
+      ],
+      "run": [],
+      "expectError": {
+        "code": "missing-key-field",
+        "source": "base",
+        "field": "id",
+        "index": 0
+      }
+    },
+    {
+      "name": "empty primary key",
+      "primaryKey": [],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1
+          },
+          "observedAt": 200
+        }
+      ],
+      "expectError": {
+        "code": "invalid-primary-key"
+      }
+    },
+    {
+      "name": "repeated primary key field",
+      "primaryKey": ["id", "id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1
+          },
+          "observedAt": 200
+        }
+      ],
+      "expectError": {
+        "code": "invalid-primary-key"
+      }
+    },
+    {
+      "name": "empty order field",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1
+          },
+          "observedAt": 200
+        }
+      ],
+      "orderField": "",
+      "expectError": {
+        "code": "invalid-order-field"
+      }
+    },
+    {
+      "name": "record that is not an object",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": [1],
+          "observedAt": 200
+        }
+      ],
+      "expectError": {
+        "code": "invalid-record"
+      }
+    },
+    {
+      "name": "an entry without the stamped shape",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "id": 1
+        }
+      ],
+      "expectError": {
+        "code": "invalid-record"
+      }
+    },
+    {
+      "name": "negative observation time",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1
+          },
+          "observedAt": -1
+        }
+      ],
+      "expectError": {
+        "code": "invalid-observation-time"
+      }
+    },
+    {
+      "name": "fractional observation time",
+      "primaryKey": ["id"],
+      "base": [],
+      "run": [
+        {
+          "record": {
+            "id": 1
+          },
+          "observedAt": 1.5
+        }
+      ],
+      "expectError": {
+        "code": "invalid-observation-time"
+      }
+    },
+    {
+      "name": "missing observation time",
+      "primaryKey": ["id"],
+      "base": [
+        {
+          "record": {
+            "id": 1
+          }
+        }
+      ],
+      "run": [],
+      "expectError": {
+        "code": "invalid-observation-time"
+      }
+    }
+  ]
+}

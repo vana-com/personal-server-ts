@@ -2,6 +2,7 @@
   "references": [
     { "path": "packages/core" },
     { "path": "packages/lite" },
+    { "path": "packages/stream-sync" },
     { "path": "packages/server" },
     { "path": "packages/cli" },
     { "path": "packages/enclave" },
