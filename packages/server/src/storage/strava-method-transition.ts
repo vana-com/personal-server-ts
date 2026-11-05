@@ -256,6 +256,11 @@ export function createStravaMethodTransition(
       store.clearStravaTransitionScope(scope);
     },
     ownsScope: (scope) => saved(scope) !== null || base.ownsScope(scope),
+    blocksScopeDeletion: (scope, allowSharedScope) =>
+      saved(scope) !== null ||
+      base.blocksScopeDeletion(scope, allowSharedScope),
+    hasExclusiveRecords: (scope) =>
+      saved(scope) !== null || base.hasExclusiveRecords(scope),
   };
   return { transition, status, view };
 }

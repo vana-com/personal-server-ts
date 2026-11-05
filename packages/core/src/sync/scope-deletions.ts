@@ -105,6 +105,8 @@ export interface ScopeDeletionTracker {
   noteFeedSynced(at?: Date, options?: { full?: boolean }): void;
   /** Synchronous view: a known tombstone, or null when none is known. */
   knownDeletion(scope: string): ScopeTombstone | null;
+  /** Fresh positive registry version of an explicitly observed live point, never a 404. */
+  knownLiveVersion?(scope: string): string | null;
   /** Milliseconds since the last complete feed pass, or null if none yet. */
   feedAgeMs(): number | null;
   /** Async verdict, consulting the gateway only as described above. */
@@ -116,6 +118,10 @@ export interface ScopeDeletionTracker {
 }
 
 export interface ScopeTombstone {
+  /** True only when this exact deletion was atomically applied to canonical rows. */
+  eraseApplied?: boolean;
+  /** Full reset proved every stream of this scope empty after its erase. */
+  sharedFresh?: boolean;
   deletedAt: string;
   /** Registry version of the tombstone; null when unknown (covers everything). */
   version: string | null;
@@ -204,6 +210,7 @@ export function createScopeDeletionTracker(
   const deleted = new Map<string, KnownTombstone>();
   // scope -> when a gateway lookup last confirmed the scope live (ms).
   const live = new Map<string, number>();
+  const liveVersions = new Map<string, string>();
   let lastFeedSyncMs: number | null = null;
   let lastGatewayFailureMs: number | null = null;
   // Coalesce concurrent lookups of the same scope into one request.
@@ -229,20 +236,28 @@ export function createScopeDeletionTracker(
         get(scope) {
           // Preserve durable-read errors and the existing durable fact when
           // an update failed. Either fact is sufficient to refuse canonical.
-          return history.get(scope) ?? pendingHistory.get(scope) ?? null;
+          return pendingHistory.get(scope) ?? history.get(scope) ?? null;
         },
       }
     : undefined;
 
-  function rememberLive(scope: string, at: number): void {
+  function rememberLive(
+    scope: string,
+    at: number,
+    version?: string | null,
+  ): void {
     deleted.delete(scope);
     live.delete(scope);
     live.set(scope, at);
+    const normalized = normalizeVersion(version);
+    if (normalized === null) liveVersions.delete(scope);
+    else liveVersions.set(scope, normalized);
     // Map preserves insertion order; the first key is the oldest verdict.
     while (live.size > maxLiveEntries) {
       const oldest = live.keys().next().value;
       if (oldest === undefined) break;
       live.delete(oldest);
+      liveVersions.delete(oldest);
     }
   }
 
@@ -261,6 +276,7 @@ export function createScopeDeletionTracker(
       verifiedAtMs: nowMs(),
     });
     live.delete(scope);
+    liveVersions.delete(scope);
     deletionHistory?.remember(scope, normalized);
   }
 
@@ -284,7 +300,7 @@ export function createScopeDeletionTracker(
         verified: true,
       };
     }
-    rememberLive(scope, nowMs());
+    rememberLive(scope, nowMs(), record?.expectedVersion);
     return { deleted: false, source: "gateway", verified: true };
   }
 
@@ -404,6 +420,12 @@ export function createScopeDeletionTracker(
       return known === undefined
         ? null
         : { deletedAt: known.deletedAt, version: known.version };
+    },
+
+    knownLiveVersion(scope) {
+      return isFresh(live.get(scope) ?? null)
+        ? (liveVersions.get(scope) ?? null)
+        : null;
     },
 
     feedAgeMs() {

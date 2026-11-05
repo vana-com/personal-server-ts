@@ -106,6 +106,14 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       }));
     },
 
+    heldDataAvailable() {
+      return [
+        "pdpp_records",
+        "pdpp_record_changes",
+        "pdpp_stream_completion",
+      ].every(hasTable);
+    },
+
     hasHeldData(instance, streams) {
       if (streams?.length === 0) return false;
       const streamFilter = streams

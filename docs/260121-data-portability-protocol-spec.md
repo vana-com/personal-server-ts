@@ -286,7 +286,8 @@ GET /v1/data
     ?limit={limit}               # optional pagination
     ?offset={offset}             # optional pagination
 GET /v1/data/{scope}
-  Read data file (user-initiated; or builder-initiated with grantId + Web3Signed Authorization)
+  Read data (user-initiated; or builder-initiated with grantId + Web3Signed Authorization)
+  A deleted scope answers 410 DATA_DELETED and is omitted from the scope listing
   Query params:
     ?fileId={fileId}        # specific version by DataRegistry fileId
     ?at={ISO8601}           # specific version by collectedAt (closest <= at)
@@ -297,7 +298,13 @@ GET /v1/data/{scope}/versions
     ?limit={limit}               # optional pagination
     ?offset={offset}             # optional pagination
 DELETE /v1/data/{scope}
-  Delete data file
+  Delete file versions; a new tombstone also erases exclusive canonical streams and advances affected connection generations
+  409 CANONICAL_DELETE_UNSUPPORTED: reset or delete the connection first
+  409 SCOPE_ERASE_REPLICATION_ENABLED: canonical scopes only; disable replication and restart before recovery
+  503 CANONICAL_DELETE_NOT_DURABLE: shared-scope erase not confirmed; file cleanup may already have occurred
+  Shared streams remain available through other scopes
+  Unmarked deleted canonical scopes answer 410, including stream_completion_unknown
+  Non-native POST /v1/import/oura-browser: 409 fresh_collection_proof_required after any Oura deletion history
 GET /v1/grants
   List all grants for this user
 POST /v1/grants

@@ -145,6 +145,19 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
         : undefined,
       beforeCommit: (input) =>
         commitCanonicalBatch(deps, input, () => {
+          // A non-native batch carries no binding generation: its timestamps
+          // cannot prove when collection occurred relative to a deletion.
+          if (
+            !body.native &&
+            SCOPES.some((scope) =>
+              deps.scopeDeletions?.deletionHistory?.get(scope),
+            )
+          ) {
+            return {
+              ok: false as const,
+              reason: "fresh_collection_proof_required",
+            };
+          }
           if (canonicalEpoch(deps) !== expectedCanonicalEpoch)
             return { ok: false as const, reason: "canonical_history_changed" };
           if (
@@ -274,6 +287,8 @@ async function commitCanonicalBatch(
   > | void,
 ): Promise<Extract<OuraBrowserImportResult, { ok: false }> | void> {
   if (!deps.pdpp) {
+    const changed = validateCurrent?.();
+    if (changed) return changed;
     if (SCOPES.some((scope) => deps.legacyScopeView?.ownsScope(scope)))
       return { ok: false, reason: "canonical_store_unavailable" };
     return;

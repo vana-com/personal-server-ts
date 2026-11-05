@@ -1,3 +1,8 @@
+import {
+  assertScopeStreamsBound,
+  markEmptySharedScopes,
+} from "./scope-deletion-bindings.js";
+import { exclusiveScopeStreams } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { assertSupportedSchemaVersions } from "./schema-versions.js";
 import type { ReplicaCanonicalPort } from "./pdpp-replica-canonical-port.js";
 import {
@@ -710,6 +715,7 @@ export function createSqliteRecordStore(
   db: Database,
   options: SqliteRecordStoreOptions = {},
 ): PdppRecordStore & {
+  readonly database: Database;
   transitionClaudeToLive(input: ClaudeTransitionInput): PdppInstanceBinding;
   claudeTransition(instance: string): ClaudeTransition | null;
   listClaudeTransitions(): ClaudeTransition[];
@@ -721,6 +727,11 @@ export function createSqliteRecordStore(
   clearStravaTransitionScope(scope: string): void;
   confirmStravaTransition(instance: string, generation: number): void;
   transitionWriteClock(): number;
+  recordScopeDeletion(
+    scope: string,
+    writeHistory: () => boolean,
+    markApplied: () => void,
+  ): void;
   listConnections(sourceId: string): PdppInstanceBinding[];
   registerConnection(input: {
     instance: string;
@@ -1463,6 +1474,7 @@ export function createSqliteRecordStore(
         resetClock,
         input.instance,
       );
+      markEmptySharedScopes(db, replica !== undefined);
       replica?.captureLifecycle(input.instance, "connection-reset");
       replica?.notifyVisibility();
       return {
@@ -1525,7 +1537,10 @@ export function createSqliteRecordStore(
     );
   }
 
-  function clearClaudeTransitionScope(scope: string): void {
+  function clearClaudeTransitionScope(
+    scope: string,
+    preserveShared = false,
+  ): void {
     if (scope !== "claude.conversations" && scope !== "claude.projects") return;
     connectionMutation(
       () => listClaudeTransitions().map((transition) => transition.instance),
@@ -1539,7 +1554,7 @@ export function createSqliteRecordStore(
             scope === "claude.conversations"
               ? ["conversations", "messages"]
               : ["projects", "project_documents"];
-          if (Object.keys(transition.snapshots).length === 0)
+          if (Object.keys(transition.snapshots).length === 0 && !preserveShared)
             streams.push("account_profile");
           for (const table of [
             "pdpp_records",
@@ -1829,10 +1844,122 @@ export function createSqliteRecordStore(
       db.prepare(
         "UPDATE pdpp_instance_binding SET deleted_at = ?, generation = generation + 1, reset_clock = ? WHERE instance = ?",
       ).run(deletedAt, resetClock, instance);
+      markEmptySharedScopes(db, replica !== undefined);
       replica?.captureLifecycle(instance, "connection-delete");
       replica?.notifyVisibility();
       return getInstanceBinding(instance);
     });
+  }
+
+  function recordScopeDeletion(
+    scope: string,
+    writeHistory: () => boolean,
+    markApplied: () => void,
+  ): void {
+    const byMethod = exclusiveScopeStreams(scope);
+    const listBindings = () =>
+      db
+        .prepare(
+          "SELECT instance, method, deleted_at FROM pdpp_instance_binding WHERE method IS NOT NULL",
+        )
+        .all() as {
+        instance: string;
+        method: string;
+        deleted_at: string | null;
+      }[];
+    connectionMutation(
+      () => listBindings().map((binding) => binding.instance),
+      () => {
+        if (!writeHistory()) return;
+        assertScopeStreamsBound(db, scope);
+        const transitionInstances = new Set([
+          ...(scope === "claude.conversations" || scope === "claude.projects"
+            ? listClaudeTransitions().map((transition) => transition.instance)
+            : []),
+          ...(scope === "strava.activities" ||
+          scope === "strava.coverage_diagnostics"
+            ? listStravaTransitions().map((transition) => transition.instance)
+            : []),
+        ]);
+        clearClaudeTransitionScope(scope, true);
+        clearStravaTransitionScope(scope);
+        for (const { instance, method, deleted_at } of listBindings()) {
+          const streams = byMethod.get(method) ?? [];
+          // Even a fully shared scope must fence pre-deletion collectors.
+          // Otherwise an empty peer could write old rows after a full-reset proof.
+          if (!byMethod.has(method) && !transitionInstances.has(instance))
+            continue;
+          const marks = streams.length
+            ? streams.map(() => "?").join(",")
+            : "NULL";
+          const held = [
+            "pdpp_records",
+            "pdpp_record_changes",
+            "pdpp_stream_completion",
+            "pdpp_record_arrival",
+          ].some(
+            (table) =>
+              db
+                .prepare(
+                  `SELECT 1 FROM ${table} WHERE instance = ? AND stream IN (${marks}) LIMIT 1`,
+                )
+                .get(instance, ...streams) !== undefined,
+          );
+          if (
+            !held &&
+            !transitionInstances.has(instance) &&
+            deleted_at !== null
+          )
+            continue;
+          const candidates = db
+            .prepare(
+              `SELECT blob_id FROM pdpp_records WHERE instance = ? AND stream IN (${marks}) AND blob_id IS NOT NULL
+            UNION SELECT json_extract(data, '$.blob_ref.blob_id') AS blob_id FROM pdpp_record_changes WHERE instance = ? AND stream IN (${marks}) AND json_valid(data) AND json_extract(data, '$.blob_ref.blob_id') IS NOT NULL`,
+            )
+            .all(instance, ...streams, instance, ...streams) as {
+            blob_id: string;
+          }[];
+          for (const table of [
+            "pdpp_records",
+            "pdpp_record_changes",
+            "pdpp_stream_completion",
+            "pdpp_record_arrival",
+          ]) {
+            db.prepare(
+              `DELETE FROM ${table} WHERE instance = ? AND stream IN (${marks})`,
+            ).run(instance, ...streams);
+          }
+          for (const { blob_id } of candidates) {
+            db.prepare(
+              `DELETE FROM pdpp_blob_claims WHERE instance = ? AND blob_id = ?
+              AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
+              AND NOT EXISTS (SELECT 1 FROM pdpp_record_changes c WHERE c.instance = pdpp_blob_claims.instance AND CASE WHEN json_valid(c.data) THEN json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id ELSE c.data IS NOT NULL END)`,
+            ).run(instance, blob_id);
+          }
+          db.prepare(
+            "UPDATE pdpp_instance_binding SET generation = generation + 1, reset_clock = CASE WHEN ? THEN ? ELSE reset_clock END WHERE instance = ?",
+          ).run(
+            held || transitionInstances.has(instance) ? 1 : 0,
+            (nextWriteSeq.get() as { value: number }).value,
+            instance,
+          );
+          for (const table of [
+            "pdpp_stream_completion",
+            "pdpp_record_arrival",
+            "pdpp_blob_claims",
+            "pdpp_claude_transition",
+            "pdpp_strava_transition",
+          ]) {
+            db.prepare(
+              `UPDATE ${table} SET generation = (SELECT generation FROM pdpp_instance_binding WHERE instance = ?) WHERE instance = ?`,
+            ).run(instance, instance);
+          }
+        }
+        deleteUnclaimedBlobs(db);
+        markApplied();
+      },
+      "immediate",
+    );
   }
 
   function eraseInstanceData(instance: string): void {
@@ -2693,6 +2820,7 @@ export function createSqliteRecordStore(
   }
 
   return {
+    database: db,
     transitionClaudeToLive,
     claudeTransition,
     listClaudeTransitions,
@@ -2704,6 +2832,7 @@ export function createSqliteRecordStore(
     clearStravaTransitionScope,
     confirmStravaTransition,
     transitionWriteClock,
+    recordScopeDeletion,
     listConnections,
     registerConnection,
     deleteConnection,

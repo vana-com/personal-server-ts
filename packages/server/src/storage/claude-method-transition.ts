@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   coversClaudeTransition,
+  scopeHasSharedStreams,
   type LegacyScopeViewPort,
   type LegacyScopeLatest,
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
@@ -162,6 +163,12 @@ export function createClaudeMethodTransition(
       store.clearClaudeTransitionScope(scope);
     },
     ownsScope: (scope) => snapshot(scope) !== null || base.ownsScope(scope),
+    blocksScopeDeletion: (scope, allowSharedScope) =>
+      (snapshot(scope) !== null &&
+        !(allowSharedScope && scopeHasSharedStreams(scope))) ||
+      base.blocksScopeDeletion(scope, allowSharedScope),
+    hasExclusiveRecords: (scope) =>
+      snapshot(scope) !== null || base.hasExclusiveRecords(scope),
   };
   return { transition, view };
 }

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
+import { pdppInstanceBindingRoutes } from "../routes/pdpp-instance-bindings.js";
 
 const emittedAt = "2026-10-20T10:00:00.000Z";
 const binding = { method: "collector", generation: 1 };
@@ -311,6 +312,40 @@ describe("own-write log (replication enabled)", () => {
     },
   );
 
+  it("full reset still removes records and advances generation with replication enabled", async () => {
+    store.ingestBatch([envelope()], semantics, primaryKey, binding);
+    const app = pdppInstanceBindingRoutes({
+      store,
+      auth: {
+        resolveToken: async () => ({
+          active: true as const,
+          tokenKind: "owner" as const,
+          subjectId: "owner",
+          instanceIds: ["account-a"],
+        }),
+      },
+      ownerSubjectId: "owner",
+      instancesForSubject: () => ["account-a"],
+      configuredMethods: new Map([["account-a", ["collector"]]]),
+    });
+    const response = await app.request("/pdpp/instances/account-a/reset", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer owner-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        expected_method: "collector",
+        expected_generation: 1,
+        next_method: "collector",
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(
+      store.getRecord("account-a", "messages", "same-key"),
+    ).toBeUndefined();
+    expect(store.getInstanceBinding("account-a").generation).toBe(2);
+  });
   it("captures ingest deletes, blob references, and the actual generation", () => {
     store.resetInstanceBinding({
       instance: "account-a",

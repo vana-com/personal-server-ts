@@ -217,6 +217,7 @@ it("preserves the readable baseline through an authenticated transition, incompl
   expect((await request("owner")).status).toBe(200);
   method = "anthropic-live";
   const restarted = create();
+  expect(restarted.view.blocksScopeDeletion(saved.scope, true)).toBe(false);
   expect(await restarted.view.readLatest(saved.scope)).toMatchObject({
     kind: "canonical",
     envelope: saved,

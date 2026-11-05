@@ -149,6 +149,7 @@ export interface AppDeps {
   syncManager?: SyncManager | null;
   /** Read-side tombstone memory; reads of a deleted scope answer 410. */
   scopeDeletions?: ScopeDeletionTracker;
+  replicationEnabled?: boolean;
   serverSigner?: ServerSigner;
   tokenStore?: TokenStore;
   runtimeAvailability?: RuntimeAvailabilityPort;
@@ -516,6 +517,7 @@ export function createApp(deps: AppDeps): Hono {
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
       scopeDeletions: deps.scopeDeletions,
+      replicationEnabled: deps.replicationEnabled,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
       legacyScopeView,
