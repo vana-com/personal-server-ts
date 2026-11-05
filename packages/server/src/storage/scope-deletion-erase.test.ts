@@ -106,9 +106,9 @@ describe("scope deletion observations", () => {
       "INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted) VALUES ('orphan', 'activity', 'old', '{}', 1, '2026-09-10', 0)",
     ).run();
     const tracker = createScopeDeletionTracker({ deletionHistory: history });
-    expect(() => tracker.markDeleted(SCOPE, deleted)).toThrow(
-      "Cannot establish",
-    );
+    expect(() => tracker.markDeleted(SCOPE, deleted)).not.toThrow();
+    expect(history.get(SCOPE)).toMatchObject(deleted);
+    expect(history.get(SCOPE)?.eraseApplied).not.toBe(true);
     expect(tracker.deletionHistory?.get(SCOPE)?.eraseApplied).not.toBe(true);
     expect(store.getRecord("connection", "activity", "old")).toBeDefined();
   });

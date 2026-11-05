@@ -1,6 +1,18 @@
 import type { Database } from "better-sqlite3";
 import { exclusiveScopeStreams } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 
+/** Expected refusal: ownership is unknown, so records must remain held. */
+export class UnboundScopeStreamsError extends Error {
+  constructor(
+    readonly scope: string,
+    readonly instance: string,
+    readonly stream: string,
+  ) {
+    super("Cannot establish the owner of a stream");
+    this.name = "UnboundScopeStreamsError";
+  }
+}
+
 /** An unbound row cannot safely be assigned to a scope by stream name alone. */
 export function assertScopeStreamsBound(db: Database, scope: string): void {
   const streams = [
@@ -19,9 +31,6 @@ export function assertScopeStreamsBound(db: Database, scope: string): void {
       )
       .get(...streams) as { instance: string; stream: string } | undefined;
     if (row)
-      throw Object.assign(new Error("Cannot establish the owner of a stream"), {
-        scope,
-        ...row,
-      });
+      throw new UnboundScopeStreamsError(scope, row.instance, row.stream);
   }
 }

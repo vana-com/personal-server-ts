@@ -1,4 +1,7 @@
-import { assertScopeStreamsBound } from "./scope-deletion-bindings.js";
+import {
+  assertScopeStreamsBound,
+  UnboundScopeStreamsError,
+} from "./scope-deletion-bindings.js";
 import { exclusiveScopeStreams } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type { Database } from "better-sqlite3";
 import type {
@@ -158,6 +161,13 @@ export function createScopeDeletionHistory(
           },
           "Scope deletion observation failed; deletion remains hidden",
         );
+        if (error instanceof UnboundScopeStreamsError) {
+          // The erase transaction rolled back. Keep its observation durable and
+          // unmarked so reads refuse it and sync can move past this tombstone.
+          // A failure of this separate history write must still propagate.
+          db.transaction(write).immediate();
+          return;
+        }
         throw error;
       }
     },

@@ -116,7 +116,7 @@ describe("startup scope deletion migration", () => {
     ).toBe(true);
     expect(logger.info).toHaveBeenCalledWith(
       expect.objectContaining({ scope: "oura.activity", rule: "erase_all" }),
-      expect.any(String),
+      "Scope deletion migration",
     );
   });
   it("keeps history unmarked if exclusive rows lack a method binding", () => {
@@ -137,7 +137,15 @@ describe("startup scope deletion migration", () => {
     expect(
       store.getRecord("connection", "activity", "newer-client-time"),
     ).toBeDefined();
-    expect(logger.error).toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "oura.activity",
+        instance: "orphan",
+        stream: "activity",
+        error: "Cannot establish the owner of a stream",
+      }),
+      "Scope deletion migration failed; deletion remains hidden",
+    );
   });
 
   it("keeps a shared archived stream while removing a migrated scope", () => {
@@ -281,7 +289,7 @@ describe("startup scope deletion migration", () => {
           }),
         ]),
       }),
-      expect.any(String),
+      "Scope deletion migration preview",
     );
   });
   it("rolls back a failed entry, continues, and retries only unmarked entries", () => {
