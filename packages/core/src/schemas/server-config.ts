@@ -51,6 +51,11 @@ export const DEFAULTS = {
     enabled: false,
     lastProcessedTimestamp: null,
   },
+  streamSync: {
+    // Whole-file stream sync publish. Off by default; legacy uploads are
+    // unchanged either way.
+    write: false,
+  },
   replication: {
     // Off by default. When false, no replica code runs and no replica
     // schema is created. When true, the record store is built with the
@@ -215,6 +220,11 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.sync.lastProcessedTimestamp),
     })
     .default(DEFAULTS.sync),
+  streamSync: z
+    .object({
+      write: z.boolean().default(DEFAULTS.streamSync.write),
+    })
+    .default(DEFAULTS.streamSync),
   replication: z
     .object({
       enabled: z.boolean().default(DEFAULTS.replication.enabled),

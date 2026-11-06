@@ -42,6 +42,15 @@ export interface SyncManagerOptions {
   transferMode?: "upload-download" | "download-only";
   /** Exact owner scopes to hydrate before the first full download cycle. */
   hydrateScopes?: string[];
+  /**
+   * Whole-file stream sync (`streamSync.write`, default off). When `write`
+   * is true, each upload cycle runs the stream-sync publisher after the
+   * legacy upload. When it is false or absent, nothing changes.
+   */
+  streamSync?: {
+    readonly write: boolean;
+    readonly publisher: { cycle(): Promise<unknown> };
+  } | null;
 }
 
 export type SyncCanRunResult =
@@ -364,6 +373,23 @@ export function createSyncManager(
         { error: (err as Error).message },
         "Upload cycle failed",
       );
+    }
+
+    if (options?.streamSync?.write) {
+      try {
+        await options.streamSync.publisher.cycle();
+      } catch (err) {
+        pushError({
+          fileId: null,
+          scope: null,
+          message: `Stream sync publish failed: ${(err as Error).message}`,
+          timestamp: new Date().toISOString(),
+        });
+        uploadDeps.logger.warn(
+          { error: (err as Error).message },
+          "Stream sync publish failed",
+        );
+      }
     }
   }
 

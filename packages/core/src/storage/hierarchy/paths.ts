@@ -1,4 +1,14 @@
 import { scopeToPathSegments } from "@opendatalabs/vana-sdk/browser";
+import {
+  PhysicalScopeError,
+  isPhysicalScope,
+} from "../../stream-sync/scope-routing.js";
+
+/** Ruling Q7: a physical stream-sync name fails here, before the SDK. */
+function dataScopeSegments(scope: string): string[] {
+  if (isPhysicalScope(scope)) throw new PhysicalScopeError(scope);
+  return scopeToPathSegments(scope);
+}
 
 /** "2026-01-21T10:00:00Z" → "2026-01-21T10-00-00Z" */
 export function timestampToFilename(isoTimestamp: string): string {
@@ -23,14 +33,14 @@ export function buildDataFilePath(
   scope: string,
   collectedAt: string,
 ): string {
-  const segments = scopeToPathSegments(scope);
+  const segments = dataScopeSegments(scope);
   const filename = timestampToFilename(collectedAt) + ".json";
   return joinPath(baseDir, ...segments, filename);
 }
 
 /** Directory path for a scope */
 export function buildScopeDir(baseDir: string, scope: string): string {
-  const segments = scopeToPathSegments(scope);
+  const segments = dataScopeSegments(scope);
   return joinPath(baseDir, ...segments);
 }
 

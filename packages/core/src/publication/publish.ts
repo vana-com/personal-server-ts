@@ -97,7 +97,12 @@ export interface PublishOptions {
 }
 
 const sameHash = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
-function metadata(scope: string, collectedAt: string, sizeBytes: number) {
+/** The registry `metadataHash` of a published version. */
+export function publicationMetadataHash(
+  scope: string,
+  collectedAt: string,
+  sizeBytes: number,
+): `0x${string}` {
   return keccak256(
     stringToHex(JSON.stringify({ scope, collectedAt, sizeBytes })),
   );
@@ -122,7 +127,11 @@ export async function publishVersion(
   ): PublicationCandidate {
     return {
       dataHash: hash,
-      metadataHash: metadata(scope, env.collectedAt, bytes.byteLength),
+      metadataHash: publicationMetadataHash(
+        scope,
+        env.collectedAt,
+        bytes.byteLength,
+      ),
       sizeBytes: bytes.byteLength,
       lineage: readStoredLineage(env.data as Record<string, unknown>),
     };
