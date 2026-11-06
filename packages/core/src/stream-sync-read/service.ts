@@ -559,6 +559,15 @@ export class StreamSyncReadService {
   }
 }
 
+/**
+ * `{records}` of a stream with no legacy binding (`pdpp.<c>.<s>`).
+ *
+ * Record order is unspecified. The file read this replaces serves records in
+ * the order its writer chose, and no writer uses a record field: one pages
+ * the records route by import time and key, another keeps arrival order.
+ * A stream keeps no write order, so a view serves its parts in pkHash order
+ * and makes no promise about it. Readers that need an order sort by a field.
+ */
 async function* recordsPayload(
   lines: AsyncIterable<Line>,
 ): AsyncGenerator<string> {
