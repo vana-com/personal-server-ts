@@ -10,7 +10,10 @@
 
 const set = (xs) => `{${xs.join(", ")}}`;
 
-/** The design (revision 4.1 with the three-outcome base rule and Q9): every guard on. */
+/**
+ * The design (revision 4.1 with the three-outcome base rule and Q9, and
+ * run intake v2 as reduced by the owner's decisions): every guard on.
+ */
 export const DESIGN = {
   GenInNames: "TRUE",
   ClearOnGenChange: "TRUE",
@@ -28,11 +31,16 @@ export const DESIGN = {
   SeedWhateverBase: "TRUE",
   AckImmutable: "TRUE",
   ReadinessSame: "TRUE",
-  RawSeedChecksId: "TRUE",
   StaleGenStops: "TRUE",
   NoOpNeedsFull: "TRUE",
   NullBasePublishes: "TRUE",
   NeedsFullForcesFull: "TRUE",
+  PublishCoveredOnly: "TRUE",
+  WriterIssuesStart: "TRUE",
+  // Proposed fix, not in run intake v2 as written (see README.md):
+  // retry_pending keeps no cursor of a stream with spooled records.
+  RetryQuietOnly: "TRUE",
+  FullMerges: "TRUE",
 };
 
 /**
@@ -51,8 +59,13 @@ const base = {
   IdLess: "FALSE",
   OtherKey: "{}",
   LegacyFrom: "s1",
-  RawHasId: "TRUE",
+  // Streams declared incremental: false (run intake v2 3.0).
+  FullStreams: "{}",
   MaxRuns: 3,
+  // One run of the bound may end retry_pending; failed or cancelled runs
+  // (abortRun) only in the intake slice.
+  MaxRetry: 1,
+  MaxAbort: 0,
   MaxReruns: 0,
   MaxDeletes: 1,
   MaxLost: 1,
@@ -239,6 +252,19 @@ export const PROFILES = {
   // Settlement failure and a lagging reader on the late slice.
   "slice-settle": { ...base, Acct: set(["A"]), Streams: set(["s1"]), MaxLost: 0, MaxSessions: 0, MaxFail: 0, MaxSettleFail: 1 },
   "slice-lag": { ...base, Acct: set(["A"]), Streams: set(["s1"]), MaxLost: 0, MaxSessions: 0, MaxFail: 0, Readers: set(["r1"]) },
+  // Run intake v2: two streams, one declared incremental: false, partial
+  // coverage, a retry_pending run and an aborted run, one delete.
+  "slice-intake": {
+    ...base,
+    Acct: set(["A"]),
+    PK: set(["x1"]),
+    Streams: set(["s1", "s2"]),
+    FullStreams: set(["s2"]),
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    MaxAbort: 1,
+  },
   // The identity-less connector, two accounts.
   "slice-idless": {
     ...base,
@@ -270,6 +296,10 @@ export const SAFETY = [
   "HeadGenMonotone",
   "IncompleteOwned",
   "NeedsFullRunIsFull",
+  "CoveredOnly",
+  "IssuedStart",
+  "NoFalseDelete",
+  "LaterWriteSurvives",
 ];
 
 export const LIVENESS = [
@@ -303,6 +333,7 @@ export const CONFIGS = [
   ["Slice-idless", "the design: an identity-less connector, two accounts", "slice-idless", {}, "pass"],
   ["Slice-twice", "the design: two deletes and reconnects", "twice", {}, "pass"],
   ["Slice-q9", "the design: an old stream DELETE, a device that leaves, no-ops", "slice-q9", {}, "pass"],
+  ["Slice-intake", "the design: partial coverage, a stream declared incremental: false, retry_pending and abort", "slice-intake", {}, "pass"],
   ["Live", "liveness of the design", "live", {}, "pass", "liveness"],
   ["Live-fail", "liveness of the design with a failed entry", "live-fail", {}, "pass", "liveness"],
   ["Live-leave", "liveness of the design with an old stream DELETE and a device that leaves", "live-leave", {}, "pass", "liveness"],
@@ -349,12 +380,17 @@ export const CONFIGS = [
   ["C14-seed-only-empty-base", "the Desktop seeds only into an empty base", "late", { SeedWhateverBase: "FALSE" }, "S11_SeedCoverage"],
   ["C15-failed-row-replaceable", "a row that failed settlement can be replaced", "slice-settle", { AckImmutable: "FALSE" }, "S8_AckImmutable"],
   ["C16-readiness-live-only", "readiness uses live, reads use live and complete", "slice-q9", { ReadinessSame: "FALSE" }, "S10_ReadinessMatchesRead"],
-  ["C17-raw-seed-ignores-id", "the raw seed ignores the recorded identity", "slice-accounts", { RawSeedChecksId: "FALSE" }, "S4_NoAccountMix"],
   ["C19-no-q9", "a no-op onto a complete:false base sets no needsFull", "slice-q9", { NoOpNeedsFull: "FALSE" }, "IncompleteOwned"],
   ["C19L-no-q9", "the same, against liveness L3", "live-leave", { NoOpNeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
   ["C20-null-base-noop", "an incremental run onto an empty base with an empty spool is a no-op", "slice-q9", { NullBasePublishes: "FALSE" }, "IncompleteOwned"],
   ["C21-needsfull-not-full", "a device with needsFull and a checkpoint runs incrementally", "slice-accounts4", { NeedsFullForcesFull: "FALSE" }, "NeedsFullRunIsFull"],
   ["C18-immediate-delete", "the design against an immediate delete property", "slice-lag", {}, "S2_Immediate"],
+
+  // --- run intake v2 negative controls ---
+  ["C-publish-uncovered", "a stream the run did not cover is published", "late", { PublishCoveredOnly: "FALSE" }, "CoveredOnly"],
+  ["C-producer-state", "START takes a state the producer chose", "late", { WriterIssuesStart: "FALSE" }, "IssuedStart"],
+  ["C-retry-saves-spooled", "retry_pending saves the cursor of a stream whose records it drops (v2 2.3 as written)", "late", { RetryQuietOnly: "FALSE" }, "S7_CheckpointSafety"],
+  ["C-full-replaces", "a stream-full run replaces its base instead of merging", "late", { FullMerges: "FALSE", FullStreams: "{s1}" }, "NoFalseDelete"],
 
   // --- section 4 scenarios: each must be reachable (NotX violated) ---
   ["W-trace-a", "trace A: a lost create lands and is deleted before its resend", "lean", {}, "NotTraceA", "witness"],
