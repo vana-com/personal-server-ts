@@ -12,3 +12,4 @@ export {
   shardPath,
 } from "./spool.js";
 export { createMemoryStreamSyncFiles } from "./memory-files.js";
+export * from "./intake.js";

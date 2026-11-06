@@ -1,5 +1,8 @@
 import {
   StreamSyncWriter,
+  createStreamSyncIntake,
+  type ResolveArtifact,
+  type RunIntake,
   createGatewayStreamSyncRegistry,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
@@ -109,6 +112,12 @@ export interface PsLiteSyncOptions {
    * `config.streamSync.write` is on. Defaults to IndexedDB.
    */
   streamSyncFiles?: StreamSyncFiles;
+  /**
+   * Resolves a run's `artifactDigest` to declarations the host verified
+   * (run-intake contract v2 §6). Without it every run answers
+   * `unknown_artifact`.
+   */
+  streamSyncDeclarations?: ResolveArtifact;
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;
@@ -293,6 +302,8 @@ export async function createPsLiteSyncManager(
   dataPointFeed: DataPointFeedPort;
   scopeDeletions: ScopeDeletionTracker;
   streamSyncWriter: StreamSyncWriter | null;
+  /** In-process run intake for the host's own connector runs; null when writing is off. */
+  streamSyncIntake: RunIntake | null;
   streamSyncRead?: StreamSyncReadService;
 }> {
   const additionsTimeBudgetMs = options.additionsTimeBudgetMs ?? 10_000;
@@ -460,6 +471,12 @@ export async function createPsLiteSyncManager(
         signer,
       })
     : null;
+  const streamSyncIntake = streamSyncWriter
+    ? createStreamSyncIntake({
+        writer: streamSyncWriter,
+        resolveArtifact: options.streamSyncDeclarations ?? (() => null),
+      })
+    : null;
   const syncManager = createSyncManager(
     {
       additions,
@@ -529,6 +546,7 @@ export async function createPsLiteSyncManager(
     dataPointFeed,
     scopeDeletions,
     streamSyncWriter,
+    streamSyncIntake,
     streamSyncRead,
   };
 }
