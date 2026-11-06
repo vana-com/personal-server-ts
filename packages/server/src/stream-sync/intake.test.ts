@@ -19,16 +19,17 @@ import {
 import {
   OWNER,
   createOracleEnv,
+  artifactFor,
   finishedOutcome,
   freshConnector,
   readStream,
+  resolveTestArtifact,
   startLocalStorage,
   type OracleEnv,
 } from "./oracle.test-utils.js";
 
 const T0 = Date.UTC(2026, 10, 1);
-const DIGEST = "sha256:" + "ab".repeat(32);
-const DECLARATIONS: IntakeDeclarations = {
+const DECLARATIONS: Omit<IntakeDeclarations, "connector"> = {
   version: "1.2.0",
   streams: [
     { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
@@ -75,7 +76,7 @@ async function host(
   const writer = await env.writer(name, extra);
   const intake = createStreamSyncIntake({
     writer,
-    resolveArtifact: (digest) => (digest === DIGEST ? DECLARATIONS : null),
+    resolveArtifact: resolveTestArtifact,
     ...intakeOptions,
   });
   return { name, writer, intake };
@@ -83,7 +84,7 @@ async function host(
 
 const begin = (connector: string, extra: Partial<BeginRequest> = {}) => ({
   connector,
-  artifactDigest: DIGEST,
+  artifactDigest: artifactFor(connector, DECLARATIONS),
   owner: { address: OWNER, leaseId: null },
   observedAt: T0,
   ...extra,
@@ -628,6 +629,24 @@ describe("run intake", { timeout: 30_000 }, () => {
     expect((items as { head: { recordCount: number } }).head.recordCount).toBe(
       1,
     );
+  });
+
+  it("binds the connector to the artifact: a producer cannot publish under another name (B)", async () => {
+    const h = await host();
+    const bound = freshConnector("bound");
+    const other = freshConnector("other");
+    const digest = artifactFor(bound, DECLARATIONS);
+    const refused = await fails(
+      h.intake.begin("r1", { ...begin(other), artifactDigest: digest }),
+    );
+    expect(refused.code).toBe("invalid_request");
+    expect(refused.status).toBe(400);
+    // The refusal leaves no run behind, and the bound name still begins.
+    const started = await h.intake.begin("r1", {
+      ...begin(bound),
+      artifactDigest: digest,
+    });
+    expect(started.status).toBe("collecting");
   });
 
   it("refuses an unknown artifact, stream, key-less record and replayed begin body", async () => {

@@ -11,6 +11,7 @@
  * production Vana storage adapter.
  */
 
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -48,6 +49,8 @@ import {
   type StreamSyncRegistry,
   type StreamSyncSeedSource,
   type StreamSyncSigner,
+  type IntakeDeclarations,
+  type ResolveArtifact,
   type StreamSyncWriterOptions,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
@@ -597,3 +600,24 @@ export function finishedOutcome(
 ) {
   return status.finished.find((r) => r.runId === runId) ?? null;
 }
+
+const artifactTable = new Map<string, IntakeDeclarations>();
+/**
+ * A digest that resolves, through `resolveTestArtifact`, to `declarations`
+ * bound to `connector`. One digest per connector and shape, so concurrent
+ * runs of different tests never share a binding.
+ */
+export function artifactFor(
+  connector: string,
+  declarations: Omit<IntakeDeclarations, "connector">,
+): string {
+  const digest = `sha256:${createHash("sha256")
+    .update(connector)
+    .update("\0")
+    .update(JSON.stringify(declarations))
+    .digest("hex")}`;
+  artifactTable.set(digest, { connector, ...declarations });
+  return digest;
+}
+export const resolveTestArtifact: ResolveArtifact = (digest) =>
+  artifactTable.get(digest) ?? null;

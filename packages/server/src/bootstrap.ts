@@ -131,11 +131,12 @@ import {
   createStreamSyncIntake,
   type StreamSyncIntake,
   createGatewayStreamSyncRegistry,
+  retainedArtifactResolver,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { retainedConnectorKey } from "./stream-sync/retained-connector.js";
 import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
-import { retainedArtifactResolver } from "./stream-sync/retained-artifacts.js";
 import {
   createSeedStaging,
   type SeedStaging,
@@ -1225,6 +1226,7 @@ export async function createServer(
           resolveArtifact: retainedArtifactResolver(
             pdppAuth?.retainedDeclarations ?? [],
             pdppAuth?.retainedDocuments ?? new Map(),
+            retainedConnectorKey(pdppAuth),
           ),
         })
       : undefined;

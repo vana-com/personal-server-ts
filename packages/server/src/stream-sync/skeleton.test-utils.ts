@@ -41,7 +41,8 @@ import {
   StreamSyncWriter,
   createStreamSyncIntake,
   createStreamSyncKeyPorts,
-  type IntakeDeclarations,
+  documentDigest,
+  manifestArtifactResolver,
   type RunIntake,
   type StreamSyncIntake,
   createGatewayStreamSyncRegistry,
@@ -89,7 +90,9 @@ const OWNER_SIGNATURE = await privateKeyToAccount(OWNER_KEY).signMessage({
   message: buildPersonalServerLiteOwnerBindingMessage(OWNER),
 });
 
-const CONNECTOR = "skeleton";
+// A signed pin id such as `github-browser`: the key holds a hyphen, which the
+// SDK scope rule rejects as a category.
+const CONNECTOR = "skeleton-browser";
 const STREAM = "items";
 const T0 = Date.UTC(2026, 10, 1);
 const silent = { info() {}, warn() {}, error() {} };
@@ -123,12 +126,17 @@ export function stubReport(): { count: number; lines: string[] } {
 
 // ---------------------------------------------------------------- intake
 
-const DIGEST = `sha256:${"5e".repeat(32)}`;
-/** The declarations the fixture connector's artifact digest resolves to. */
-const DECLARATIONS: IntakeDeclarations = {
+/**
+ * The fixture connector's manifest document. Every host resolves the run's
+ * digest through the shared resolver, from the bytes of this document.
+ */
+const MANIFEST = JSON.stringify({
+  connector_key: CONNECTOR,
   version: "1.0.0",
-  streams: [{ name: STREAM, semantics: "mutable_state", primaryKey: ["id"] }],
-};
+  streams: [{ name: STREAM, semantics: "mutable_state", primary_key: ["id"] }],
+});
+const DIGEST = `sha256:${documentDigest(MANIFEST)}`;
+const resolveArtifact = manifestArtifactResolver([MANIFEST]);
 const TOKEN = "skeleton-owner-token";
 
 const noGateway = {
@@ -286,7 +294,7 @@ async function syncFullHost(
 const makeIntake = (writer: StreamSyncWriter): StreamSyncIntake =>
   createStreamSyncIntake({
     writer,
-    resolveArtifact: (digest) => (digest === DIGEST ? DECLARATIONS : null),
+    resolveArtifact,
   });
 
 type HostKind = "full" | "phone" | "frame";
@@ -398,8 +406,7 @@ async function makeHost(input: {
           // writer did; the host-verified table is the only artifact source.
           ownerSyncSigner: ownerSyncSigner(),
           streamSyncFiles: files,
-          streamSyncDeclarations: (digest: string) =>
-            digest === DIGEST ? DECLARATIONS : null,
+          streamSyncDeclarations: resolveArtifact,
         }
       : {}),
     auth: createBearerTokenPsLiteAuth({ ownerToken: "t", builderToken: "b" }),
@@ -427,17 +434,31 @@ async function makeHost(input: {
     writer,
     intake: viaLite ? lite.streamSyncIntake! : makeIntake(writer),
     read: async () => {
-      const res = await lite.runtime.fetch(
-        new Request(`https://ps.local/v1/data/pdpp.${CONNECTOR}.${STREAM}`, {
-          headers: { Authorization: "Bearer t" },
-        }),
-      );
-      if (res.status !== 200)
-        return { kind: `HTTP ${res.status}`, records: [] };
-      const body = (await res.json()) as {
-        data: { records: Record<string, unknown>[] };
-      };
-      return { kind: "view", records: body.data.records };
+      // The logical name and the identity-less physical alias (R23) answer
+      // the same records.
+      const names = [
+        `pdpp.${CONNECTOR}.${STREAM}`,
+        `pdpp.${CONNECTOR}~.${STREAM}`,
+      ];
+      const answers: Record<string, unknown>[][] = [];
+      for (const name of names) {
+        const res = await lite.runtime.fetch(
+          new Request(`https://ps.local/v1/data/${name}`, {
+            headers: { Authorization: "Bearer t" },
+          }),
+        );
+        if (res.status !== 200) {
+          return { kind: `HTTP ${res.status} for ${name}`, records: [] };
+        }
+        const body = (await res.json()) as {
+          data: { records: Record<string, unknown>[] };
+        };
+        answers.push(body.data.records);
+      }
+      if (JSON.stringify(answers[0]) !== JSON.stringify(answers[1])) {
+        return { kind: "logical and physical names differ", records: [] };
+      }
+      return { kind: "view", records: answers[0]! };
     },
     sync: async () => {
       await lite.syncManager!.trigger();

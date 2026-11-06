@@ -32,7 +32,11 @@ import {
   canonicalJson,
   type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import {
+  documentDigest,
+  manifestArtifactResolver,
+  type StreamSyncWriter,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createIndexedDbStreamSyncFiles } from "../packages/lite/src/index.js";
@@ -102,11 +106,14 @@ function stackEnv(): { gatewayUrl: string; storageUrl: string; pg: string } {
   };
 }
 
-const INTAKE_DIGEST = `sha256:${"5e".repeat(32)}`;
-const INTAKE_DECLARATIONS = {
+// The fixture connector's manifest document. PS-Lite resolves the run's digest
+// through the shared resolver, from the bytes of this document.
+const INTAKE_MANIFEST = JSON.stringify({
+  connector_key: CONNECTOR,
   version: "1.0.0",
-  streams: [{ name: STREAM, semantics: "mutable_state", primaryKey: ["id"] }],
-} as const;
+  streams: [{ name: STREAM, semantics: "mutable_state", primary_key: ["id"] }],
+});
+const INTAKE_DIGEST = `sha256:${documentDigest(INTAKE_MANIFEST)}`;
 
 const stubs = new Map<string, string>();
 const stub = (name: string, removedBy: string) => stubs.set(name, removedBy);
@@ -266,8 +273,7 @@ async function main(): Promise<number> {
       } as never,
       streamSyncRead: {},
       // The host's declaration table: only this digest resolves.
-      streamSyncDeclarations: (digest: string) =>
-        digest === INTAKE_DIGEST ? INTAKE_DECLARATIONS : null,
+      streamSyncDeclarations: manifestArtifactResolver([INTAKE_MANIFEST]),
     });
     const liteWriter = lite.streamSyncWriter;
     const liteIntake = lite.streamSyncIntake;
