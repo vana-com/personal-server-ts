@@ -7,6 +7,14 @@ const port = Number(process.argv[2]);
 const blobs = new Map();
 http
   .createServer((req, res) => {
+    res.setHeader("access-control-allow-origin", "*");
+    res.setHeader("access-control-allow-methods", "GET,PUT,DELETE,OPTIONS");
+    res.setHeader("access-control-allow-headers", "*");
+    if (req.method === "OPTIONS") {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
     const path = decodeURIComponent(
       new URL(req.url ?? "/", "http://x").pathname,
     );
