@@ -266,7 +266,7 @@ const lines = {
 
 // ---------- merge ----------
 
-function mergeCase(name, primaryKey, feed, prefix = "") {
+function mergeCase(name, primaryKey, feed, prefix = "", limitBytes) {
   const best = new Map();
   for (const l of feed) {
     const k = sha(cj(primaryKey.map((f) => l.v[f])));
@@ -276,10 +276,27 @@ function mergeCase(name, primaryKey, feed, prefix = "") {
   const keys = [...best.keys()].sort();
   const winners = keys.map((k) => ({ pkHash: k, text: lineText(best.get(k)) }));
   const partText = winners.map((w) => w.text + "\n").join("");
+  const bytes = Buffer.byteLength(partText, "utf8");
+  if (limitBytes !== undefined && bytes > limitBytes) {
+    // Ruling Q4: over the limit, split below the 16-bit cap; too large at it.
+    return {
+      name,
+      primaryKey,
+      prefix,
+      limitBytes,
+      feed,
+      expected: {
+        kind: prefix.length < 16 ? "split" : "bucket_too_large",
+        prefix,
+        bytes,
+      },
+    };
+  }
   return {
     name,
     primaryKey,
     prefix,
+    ...(limitBytes === undefined ? {} : { limitBytes }),
     feed,
     expected: {
       winners,
@@ -348,6 +365,30 @@ const merge = [
     ],
   ),
   mergeCase("empty feed: no part", ["id"], []),
+  mergeCase(
+    "over the limit below the cap: split (Q4)",
+    ["id"],
+    [
+      { o: 1, r: "r", v: { id: 1, pad: "x".repeat(200) } },
+      { o: 1, r: "r", v: { id: 2, pad: "y".repeat(200) } },
+    ],
+    "",
+    300,
+  ),
+  mergeCase(
+    "over the limit at the 16-bit cap: bucket_too_large (Q4)",
+    ["id"],
+    [{ o: 1, r: "r", v: { id: 1, pad: "x".repeat(200) } }],
+    bits(sha(cj([1])), 16),
+    100,
+  ),
+  mergeCase(
+    "at the limit exactly: ok",
+    ["id"],
+    [{ o: 1, r: "r", v: { id: 1 } }],
+    "",
+    Buffer.byteLength(lineText({ o: 1, r: "r", v: { id: 1 } }) + "\n"),
+  ),
 ];
 
 // ---------- planner (expectations derived by hand in the comments) ----------
@@ -680,10 +721,24 @@ const headRules = {
     { control: F(3), streamRow: "present", headGeneration: 3, live: false },
     { control: ABSENT, streamRow: "present", headGeneration: 1, live: false },
   ],
+  // Ruling F1: three outcomes.
   chooseBase: [
-    { streamRow: "present", headGeneration: 3, target: 3, base: "head" },
+    { streamRow: "present", headGeneration: 3, target: 3, base: "base" },
     { streamRow: "present", headGeneration: 1, target: 3, base: "empty" },
+    {
+      streamRow: "present",
+      headGeneration: 3,
+      target: 1,
+      base: "stale_generation",
+    },
+    {
+      streamRow: "present",
+      headGeneration: 4,
+      target: 3,
+      base: "stale_generation",
+    },
     { streamRow: "tombstoned", headGeneration: 3, target: 3, base: "empty" },
+    { streamRow: "tombstoned", headGeneration: 5, target: 3, base: "empty" },
     { streamRow: "absent", headGeneration: null, target: 1, base: "empty" },
   ],
   writerCompatibility: [
@@ -1085,6 +1140,56 @@ const decide = [
     { uc: true, full: true, phase: "after_write" },
     DISCARD,
   ),
+  // Ruling F1: re-read after chooseBase returned stale_generation.
+  row(
+    "stale base: start older than control → discard by the table",
+    A(1),
+    A(3),
+    { phase: "stale_base" },
+    { ...DISCARD, clearCheckpoints: true },
+  ),
+  row(
+    "stale base: start older than control → discard by the table",
+    ABSENT,
+    A(3),
+    { uc: true, full: true, phase: "stale_base" },
+    DISCARD,
+  ),
+  row(
+    "stale base: control still admits T → keep pending, registry_inconsistent",
+    A(3),
+    A(3),
+    { phase: "stale_base" },
+    { kind: "keep_pending", reason: "registry_inconsistent" },
+  ),
+  row(
+    "stale base: control still admits T → keep pending, registry_inconsistent",
+    ABSENT,
+    A(1),
+    { phase: "stale_base" },
+    { kind: "keep_pending", reason: "registry_inconsistent" },
+  ),
+  row(
+    "stale base: control would create or reconnect → keep pending, registry_inconsistent",
+    ABSENT,
+    ABSENT,
+    { phase: "stale_base" },
+    { kind: "keep_pending", reason: "registry_inconsistent" },
+  ),
+  row(
+    "stale base: control would create or reconnect → keep pending, registry_inconsistent",
+    D(2),
+    D(2),
+    { uc: true, full: true, phase: "stale_base" },
+    { kind: "keep_pending", reason: "registry_inconsistent" },
+  ),
+  row(
+    "stale base: foreign → keep pending, key_mismatch",
+    A(1),
+    F(3),
+    { phase: "stale_base" },
+    { kind: "keep_pending", reason: "key_mismatch" },
+  ),
 ];
 
 const startState = [
@@ -1104,6 +1209,36 @@ const committed = (generation, complete = true) => ({
   complete,
 });
 const traces = [
+  {
+    name: "late head from an older generation (F1)",
+    description:
+      "A run admitted at g=1 resumes after a delete (v2) and a reconnect elsewhere that committed a g=3 head. chooseBase returns stale_generation; the re-read decides discard and clears checkpoints. Nothing is published, so the g=3 keys stay intact.",
+    start: { [NS]: A(1) },
+    ns: NS,
+    userConnect: false,
+    full: false,
+    steps: [
+      {
+        op: "decide",
+        current: A(1),
+        phase: "first",
+        expected: { kind: "publish", target: 1 },
+      },
+      {
+        op: "chooseBase",
+        streamRow: "present",
+        headGeneration: 3,
+        target: 1,
+        expected: "stale_generation",
+      },
+      {
+        op: "decide",
+        current: A(3),
+        phase: "stale_base",
+        expected: { ...DISCARD, clearCheckpoints: true },
+      },
+    ],
+  },
   {
     name: "replay after delete (trace A)",
     description:
@@ -1327,13 +1462,12 @@ const checkpoint = [
     expected: { kind: "save", generation: 2 },
   },
   {
-    name: "no-op of an incomplete head does not block",
-    question: "Q9",
+    name: "no-op of an incomplete head blocks (ruling Q9)",
     target: 2,
     streams: { a: { state: "noop", generation: 2, complete: false } },
     control: A(2),
     seedReceiptsPending: false,
-    expected: { kind: "save", generation: 2 },
+    expected: { kind: "skip", reason: "published_incomplete" },
   },
   {
     name: "a stream published complete:false",

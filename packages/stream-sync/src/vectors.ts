@@ -190,7 +190,18 @@ export async function runVectors(
         line,
       });
     }
-    const result = mergeLines(entries, c.prefix);
+    let result: ReturnType<typeof mergeLines>;
+    try {
+      result = mergeLines(entries, c.prefix, c.limitBytes);
+    } catch (error) {
+      // A wrong hash port puts keys outside the case's prefix.
+      eq(`merge ${c.name}`, (error as Error).message, "no error");
+      continue;
+    }
+    if (c.expected.kind !== undefined) {
+      eq(`merge ${c.name}`, result, c.expected);
+      continue;
+    }
     if (result.kind !== "ok") {
       eq(`merge ${c.name}`, result.kind, "ok");
       continue;
@@ -277,7 +288,7 @@ export async function runVectors(
         : { ...base, generation: c.headGeneration };
     eq(
       `chooseBase ${canonicalJson(c)}`,
-      chooseBase(c.streamRow, head, c.target) ? "head" : "empty",
+      chooseBase(c.streamRow, head, c.target).kind,
       c.base,
     );
   }
@@ -336,6 +347,16 @@ export async function runVectors(
             full: t.full,
             phase: step.phase,
           }),
+          step.expected,
+        );
+      } else if (step.op === "chooseBase") {
+        const head =
+          step.headGeneration === null
+            ? null
+            : { ...base, generation: step.headGeneration };
+        eq(
+          label,
+          chooseBase(step.streamRow, head, step.target).kind,
           step.expected,
         );
       } else {

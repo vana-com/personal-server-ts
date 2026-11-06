@@ -5,6 +5,29 @@ or silent, the package takes the reading below, marks it in code and in
 `vectors/v1.json` (field `question`), and waits for an answer. No reading
 below can publish under a generation the start snapshot does not admit.
 
+## Rulings applied
+
+The lead ruled on Q1 to Q9. Q1, Q2, Q3, Q5, Q6 and Q8 are confirmed as the
+package reads them. These changed the package:
+
+- **Q4.** A bucket over 16 MiB below the 16-bit cap is re-planned, not
+  failed: `BucketReducer.finish` returns `split`, the host splits by the next
+  bit and reduces each half again. `bucket_too_large` is returned only at the
+  cap.
+- **Q7.** The package stays permissive. Physical names (`~`) never reach the
+  SDK scope schema; hosts route them with `parseScope` first.
+- **Q9.** A no-op onto a `complete:false` base blocks the checkpoint
+  (`published_incomplete`) and sets `needsFull`, the same as publishing
+  `complete:false`.
+- **F1.** `chooseBase` has three outcomes: `empty` (row absent or tombstoned,
+  or an older head), `base` (head of the target generation) and
+  `stale_generation` (head of a newer generation). On `stale_generation` the
+  host re-reads control and calls `decide` with phase `stale_base`: the table
+  discards, and a control that still admits T gives `keep_pending
+registry_inconsistent`.
+
+The original questions follow for the record.
+
 ## Questions
 
 **Q1. Start unknown, current foreign.** Two rows of the §2.4 table match

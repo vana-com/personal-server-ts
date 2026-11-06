@@ -133,10 +133,16 @@ describe("head", () => {
     );
   });
 
-  it("chooses an empty base for another generation", () => {
-    expect(chooseBase("present", head, 2)).toBe(head);
-    expect(chooseBase("present", head, 3)).toBeNull();
-    expect(chooseBase("tombstoned", head, 2)).toBeNull();
+  it("chooses the base by generation, with stale_generation (F1)", () => {
+    // head.generation is 2
+    expect(chooseBase("present", head, 2)).toEqual({ kind: "base", head });
+    expect(chooseBase("present", head, 3)).toEqual({ kind: "empty" });
+    expect(chooseBase("present", head, 1)).toEqual({
+      kind: "stale_generation",
+    });
+    expect(chooseBase("tombstoned", head, 2)).toEqual({ kind: "empty" });
+    expect(chooseBase("absent", null, 1)).toEqual({ kind: "empty" });
+    expect(() => chooseBase("present", null, 1)).toThrow(/verified head/);
   });
 
   it("applies the compatible-writer rule", () => {

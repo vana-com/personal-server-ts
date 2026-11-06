@@ -35,8 +35,10 @@ export function startState(start: StartSnapshot, ns: string): StartState {
  * `first`: first decision for this stream in this attempt.
  * `reread`: the host re-read control once after a `reread` decision.
  * `after_write`: the host re-read control after its create/reconnect reply.
+ * `stale_base`: the host re-read control after `chooseBase` returned
+ *   `stale_generation` (a stream head of a newer generation than T).
  */
-export type DecidePhase = "first" | "reread" | "after_write";
+export type DecidePhase = "first" | "reread" | "after_write" | "stale_base";
 
 export interface DecideInput {
   readonly start: StartState;
@@ -128,6 +130,16 @@ export function decide(input: DecideInput): Decision {
     // §2.4: after create/reconnect, C must re-read as active(T), else discard.
     return DISCARD;
   }
+  if (input.phase === "stale_base") {
+    // P0-RULINGS F1: a stream head of a newer generation than T exists, so
+    // the start snapshot is older than the registry. The table normally
+    // discards (with its §2.4 checkpoint rule). If control still admits T,
+    // the registry contradicts itself: keep pending, never publish or write.
+    if (decision.kind === "discard" || decision.kind === "keep_pending") {
+      return decision;
+    }
+    return { kind: "keep_pending", reason: "registry_inconsistent" };
+  }
   return decision;
 }
 
@@ -172,7 +184,8 @@ export type CheckpointDecision =
 /**
  * §2.4 checkpoint save: after every stream of the run is committed or no-op
  * at T, re-read control. Save tagged (ns, T) only if it is `active(T)` and
- * no stream was published `complete:false`. A `record_too_large` exclusion
+ * no stream was published `complete:false` or left a `complete:false` head
+ * unchanged (no-op, ruling Q9). A `record_too_large` exclusion
  * does not block; a `bucket_too_large` stream is not committed and does. §2.9:
  * the checkpoint also waits for every seed receipt of the run (a host merging its retained history).
  */
@@ -193,7 +206,9 @@ export function checkpointDecision(input: {
     }
   }
   for (const result of results) {
-    if (result.state === "committed" && !result.complete) {
+    // Q9 ruling: a no-op onto a `complete:false` base blocks the checkpoint
+    // the same as publishing `complete:false` (liveness L3).
+    if ("complete" in result && !result.complete) {
       return { kind: "skip", reason: "published_incomplete" };
     }
   }

@@ -354,17 +354,42 @@ export function isHeadLive(
   );
 }
 
+export type BaseChoice =
+  /** The stream row's head is of the target generation: merge onto it. */
+  | { readonly kind: "base"; readonly head: Head }
+  /** Row absent or tombstoned, or its head is older: fresh generation. */
+  | { readonly kind: "empty" }
+  /**
+   * The row's head is of a NEWER generation than the target: the run's start
+   * snapshot is older than the registry. Do not publish; re-read control and
+   * decide with phase `stale_base` (P0-RULINGS F1).
+   */
+  | { readonly kind: "stale_generation" };
+
 /**
- * §2.7: the publish base is empty if the stream row is tombstoned, absent, or
- * its head is of another generation than the target.
+ * §2.7 with ruling F1: three outcomes, never two.
+ *
+ * - row absent or tombstoned, or `head.generation < target` → `empty`
+ * - `head.generation == target` → `base`
+ * - `head.generation > target` → `stale_generation`
+ *
+ * A present row needs its verified head: a host that cannot read the head of
+ * a present row must not call this (it would take an empty base over data).
  */
 export function chooseBase(
   streamRow: StreamRow,
   head: Head | null,
   target: number,
-): Head | null {
-  if (streamRow !== "present" || head === null) return null;
-  return head.generation === target ? head : null;
+): BaseChoice {
+  if (streamRow !== "present") return { kind: "empty" };
+  if (head === null) {
+    throw new InvalidArgumentError(
+      "a present stream row needs its verified head",
+    );
+  }
+  if (head.generation < target) return { kind: "empty" };
+  if (head.generation === target) return { kind: "base", head };
+  return { kind: "stale_generation" };
 }
 
 export type VersionOrder = "higher" | "equal" | "lower";
