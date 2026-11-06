@@ -398,7 +398,7 @@ describe("stream-sync reads", () => {
     expect((await service.resolve(ask("pdpp.acme.items"))).kind).toBe("view");
   });
 
-  it("streams chatgpt.conversations by shard with the array projector's records", async () => {
+  it("streams chatgpt.conversations by shard with the array projector's records and order", async () => {
     const f = new Fixture(await testOwnerKey(masterKey(10)));
     const ns = await f.key.ns("chatgpt", "account-1");
     await f.activate("chatgpt", ns);
@@ -462,10 +462,8 @@ describe("stream-sync reads", () => {
     );
     if (!whole.ok) throw new Error("projection failed");
     const array = whole.payload as Record<string, any>;
-    const key = (c: any) => JSON.stringify(c);
-    expect(streamed.data.conversations.map(key).sort()).toEqual(
-      array.conversations.map(key).sort(),
-    );
+    // The array projector's order too: newest update first.
+    expect(streamed.data.conversations).toEqual(array.conversations);
     expect(streamed.data.total).toBe(array.total);
     expect({ ...streamed.data, conversations: [] }).toEqual({
       ...array,
