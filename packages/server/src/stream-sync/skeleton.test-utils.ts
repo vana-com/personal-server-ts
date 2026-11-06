@@ -250,11 +250,13 @@ async function makeHost(input: {
     files = createFsStreamSyncFiles(join(input.root, "full-write"));
     readFiles = createFsStreamSyncReadFiles(join(input.root, "full-read"));
   } else {
-    // SKELETON STUB (lanes U6 phone, U7 frame): the phone shell and the
-    // Account frame each host PS-Lite with their own IndexedDB; the two
-    // differ today only by database, so both are built from one recipe.
-    // Real differences (lease-less begin, identity source, the frame's
-    // postMessage transport) arrive with those lanes.
+    // SKELETON STUB (lanes U6 phone, U7 frame): no phone or frame host code
+    // that builds PS-Lite exists in a repo yet, so no production difference
+    // can be modelled from code. The design (DESIGN-V4.1) says the frame uses
+    // OPFS, else IndexedDB, via the same adapter as Web Lite; this recipe
+    // uses IndexedDB for both and differs only by database name. Open, to be
+    // checked against the real hosts: lease-less begin, identity source and
+    // the frame's postMessage transport. U6 and U7 replace this recipe.
     registerStub("phone/frame host recipe", "lanes U6 (phone), U7 (frame)");
     files = createIndexedDbStreamSyncFiles({
       dbName: `skeleton-${input.kind}`,
