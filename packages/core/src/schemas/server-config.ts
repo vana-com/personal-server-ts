@@ -55,6 +55,10 @@ export const DEFAULTS = {
     // Whole-file stream sync publish. Off by default; legacy uploads are
     // unchanged either way.
     write: false,
+    // Off by default. When true, this server imports stream-sync heads and
+    // serves logical reads from complete stream views (§2.10). When false,
+    // reads are exactly as before.
+    read: false,
   },
   replication: {
     // Off by default. When false, no replica code runs and no replica
@@ -223,6 +227,7 @@ export const ServerConfigSchema = z.object({
   streamSync: z
     .object({
       write: z.boolean().default(DEFAULTS.streamSync.write),
+      read: z.boolean().default(DEFAULTS.streamSync.read),
     })
     .default(DEFAULTS.streamSync),
   replication: z

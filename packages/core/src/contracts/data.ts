@@ -334,6 +334,10 @@ export interface DeleteDataScopeContractResult {
   deletedCount: number;
 }
 
+/** The SDK scope schema's message for a name that is not a scope. */
+const INVALID_SCOPE_FORMAT_MESSAGE =
+  "Scope must be {source}.{category}[.{subcategory}]; source lowercase, tail may keep the historical camelCase form (e.g. spotify.savedTracks)";
+
 function invalidScope(message: string): DataContractError {
   return {
     ok: false,

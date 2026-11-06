@@ -41,6 +41,11 @@ import {
   type DataPortabilityGatewayConfig,
 } from "@opendatalabs/vana-sdk/node";
 import { privateKeyToAccount } from "viem/accounts";
+import { encodeAbiParameters, keccak256 } from "viem";
+import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/api";
+import { request as httpRequest } from "node:http";
+import type { AddressInfo } from "node:net";
+import { listenHttpServer } from "../listen.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
@@ -2100,6 +2105,121 @@ describe("GET /v1/data/:scope", () => {
     expect(json.data).toEqual({ version: 1 });
     expect(json.collectedAt).toBe(json1.collectedAt);
   });
+
+  describe("a stream view that fails after the 200 status", () => {
+    // The envelope prefix a projection writes before it fails. No proper
+    // prefix of the envelope is valid JSON; the client must also see the
+    // connection abort, never a complete response.
+    const prefix = JSON.stringify({
+      version: "1.0",
+      scope: "instagram.posts",
+      collectedAt: "2026-11-01T00:00:00.000Z",
+      data: { posts: [{ id: "a" }, { id: "b" }] },
+    }).slice(0, -3);
+
+    function failingView(failAfterMs: number | null): StreamSyncReadPort {
+      return {
+        async resolve() {
+          let pulls = 0;
+          return {
+            kind: "view",
+            connector: "meta",
+            ns: "0123456789abcdef",
+            cursor: "pinned",
+            served: { scope: "pdpp.meta~0123456789abcdef.posts", version: 1 },
+            body: new ReadableStream<Uint8Array>({
+              async pull(controller) {
+                if (pulls++ === 0) {
+                  controller.enqueue(new TextEncoder().encode(prefix));
+                  return;
+                }
+                if (failAfterMs !== null) {
+                  await new Promise((r) => setTimeout(r, failAfterMs));
+                }
+                controller.error(new Error("projection failed"));
+              },
+            }),
+          };
+        },
+      };
+    }
+
+    async function readOverHttp(
+      app: ReturnType<typeof dataRoutes>,
+      scope: string,
+    ): Promise<{
+      status: number;
+      headers: Record<string, unknown>;
+      complete: boolean;
+      body: string;
+    }> {
+      const server = await listenHttpServer({
+        fetch: app.fetch,
+        port: 0,
+        hostname: "127.0.0.1",
+      });
+      try {
+        const { port } = server.address() as AddressInfo;
+        const uri = `/${scope}`;
+        const authorization = await buildWeb3SignedHeader({
+          wallet,
+          aud: SERVER_ORIGIN,
+          method: "GET",
+          uri,
+          grantId: "grant-123",
+        });
+        return await new Promise((resolve, reject) => {
+          const req = httpRequest(
+            {
+              hostname: "127.0.0.1",
+              port,
+              method: "GET",
+              path: uri,
+              headers: { authorization },
+            },
+            (res) => {
+              const chunks: Buffer[] = [];
+              res.on("data", (chunk: Buffer) => chunks.push(chunk));
+              res.on("error", () => {});
+              res.on("close", () =>
+                resolve({
+                  status: res.statusCode ?? 0,
+                  headers: res.headers,
+                  complete: res.complete,
+                  body: Buffer.concat(chunks).toString("utf8"),
+                }),
+              );
+            },
+          );
+          req.on("error", reject);
+          req.end();
+        });
+      } finally {
+        await new Promise((r) => server.close(r));
+      }
+    }
+
+    for (const [label, failAfterMs] of [
+      ["at once", null],
+      ["after a delay", 20],
+    ] as const) {
+      it(`aborts the connection when the body fails ${label}`, async () => {
+        const app = createApp({ streamSyncRead: failingView(failAfterMs) });
+        const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const res = await readOverHttp(app, "instagram.posts");
+          expect(res.status).toBe(200);
+          // Bytes written before the abort may or may not reach the client.
+          expect(prefix.startsWith(res.body)).toBe(true);
+          expect(res.headers["transfer-encoding"]).toBe("chunked");
+          expect(res.complete).toBe(false);
+          expect(() => JSON.parse(res.body)).toThrow();
+        } finally {
+          quiet.mockRestore();
+        }
+      });
+    }
+  });
 });
 
 describe("DELETE /v1/data/:scope", () => {
@@ -3136,6 +3256,147 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     const body = await res.json();
     expect(body.x402Version).toBe(1);
     expect(body.error).toBe("PAYMENT_REQUIRED");
+  });
+
+  it("charges a paid read of a stream view exactly as a paid read of a legacy file", async () => {
+    // A legacy file and a stream view serve the same records under two names
+    // the grant covers. A builder pays for each the same way: one challenge,
+    // the same price, one gateway payment, the same records. The access
+    // record binds the registered data point each body comes from.
+    const records = [
+      { id: "p1", caption: "first" },
+      { id: "p2", caption: "second" },
+    ];
+    const physical = "pdpp.meta~0123456789abcdef.posts";
+    const dataPointId = (scope: string) =>
+      keccak256(
+        encodeAbiParameters(
+          [
+            { name: "ownerAddress", type: "address" },
+            { name: "scope", type: "string" },
+          ],
+          [ownerForX402.address.toLowerCase() as `0x${string}`, scope],
+        ),
+      );
+    const resolves: string[] = [];
+    const streamSyncRead: StreamSyncReadPort = {
+      async resolve(input) {
+        resolves.push(input.scope);
+        if (input.scope !== "instagram.posts") return { kind: "pass" };
+        return {
+          kind: "view",
+          connector: "meta",
+          ns: "0123456789abcdef",
+          cursor: "pinned",
+          served: { scope: physical, version: 7 },
+          body: new Response(
+            JSON.stringify({
+              version: "1.0",
+              scope: "instagram.posts",
+              collectedAt: "2026-11-01T00:00:00.000Z",
+              data: { records },
+            }),
+          ).body!,
+        };
+      },
+    };
+    const payResponse = {
+      success: true,
+      breakdown: {
+        registrationFee: "10000000000000000",
+        dataAccessFee: "1000000000000000",
+        registrationPaid: true,
+      },
+      paidAt: "2026-01-21T10:00:05Z",
+    };
+    const gatewayFetch = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        new Response(JSON.stringify(payResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", gatewayFetch);
+
+    const app = createX402App({ streamSyncRead });
+    expect(
+      (await ingest(app, "instagram.saved_items", { records })).status,
+    ).toBe(201);
+    const entry = indexManager.findLatestByScope("instagram.saved_items")!;
+    indexManager.updateDataPointId(
+      entry.path,
+      dataPointId("instagram.saved_items"),
+    );
+
+    const payFor = async (scope: string) => {
+      const challenge = await getNoPayment(app, scope);
+      expect(challenge.status, scope).toBe(402);
+      const accept = (await challenge.json()).accepts[0];
+      const message = {
+        ...accept.message,
+        amount: BigInt(accept.message.amount),
+        paymentNonce: BigInt(accept.message.paymentNonce),
+      };
+      const signature = await builderWallet.signTypedData({
+        domain: escrowPaymentDomain(gatewayConfig),
+        types: GENERIC_PAYMENT_TYPES,
+        primaryType: "GenericPayment",
+        message,
+      });
+      const paid = await getWithPayment(
+        app,
+        scope,
+        encodePaymentHeader({
+          x402Version: 1,
+          scheme: "vana-escrow-grant",
+          network: accept.network,
+          payload: {
+            message: accept.message,
+            signature,
+            accessRecord: accept.accessRecord,
+          },
+        }),
+      );
+      return {
+        accept,
+        status: paid.status,
+        paymentResponse: paid.headers.get("X-PAYMENT-RESPONSE"),
+        body: await paid.json(),
+      };
+    };
+    const legacy = await payFor("instagram.saved_items");
+    const view = await payFor("instagram.posts");
+
+    const comparable = (accept: Record<string, any>) => ({
+      ...accept,
+      expiresAt: typeof accept.expiresAt,
+      message: { ...accept.message, paymentNonce: "fresh" },
+      accessRecord: Object.keys(accept.accessRecord).sort(),
+    });
+    expect(comparable(view.accept)).toEqual(comparable(legacy.accept));
+    expect(view.accept.amount).toBe("11000000000000000");
+    expect(legacy.accept.accessRecord.dataPointId).toBe(
+      dataPointId("instagram.saved_items"),
+    );
+    expect(view.accept.accessRecord).toMatchObject({
+      dataPointId: dataPointId(physical),
+      version: "7",
+      accessor: builderWallet.address,
+    });
+
+    expect(view.status).toBe(200);
+    expect(legacy.status).toBe(200);
+    expect(view.body.data).toEqual(legacy.body.data);
+    expect(view.paymentResponse).toBe(legacy.paymentResponse);
+    expect(view.paymentResponse).not.toBeNull();
+    expect(gatewayFetch).toHaveBeenCalledTimes(2);
+    const forwarded = gatewayFetch.mock.calls.map(([, init]) =>
+      JSON.parse(String(init?.body)),
+    );
+    expect(Object.keys(forwarded[1]).sort()).toEqual(
+      Object.keys(forwarded[0]).sort(),
+    );
+    expect(forwarded[1].accessRecord.dataPointId).toBe(dataPointId(physical));
   });
 
   it("relays gateway 402 (insufficient balance) verbatim", async () => {

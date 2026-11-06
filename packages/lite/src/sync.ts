@@ -11,6 +11,14 @@ import {
   type DurableAdditionsService,
 } from "@opendatalabs/personal-server-ts-core/additions";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  createMemoryStreamSyncReadFiles,
+  createStorageBlobReader,
+  createStreamSyncReadKeys,
+  StreamSyncReadService,
+  type StreamSyncOverlaySource,
+  type StreamSyncReadFiles,
+} from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import {
@@ -136,6 +144,16 @@ export interface PsLiteSyncOptions {
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   /** Post-index download hook (marks derivative questions stale). */
   onDataPointIndexed?: DownloadWorkerDeps["onDataPointIndexed"];
+  /**
+   * Stream-sync reads (`streamSync.read`). Present = on: the sync loop
+   * imports stream heads, and the returned `streamSyncRead` answers reads.
+   * Without `files`, state is in memory and rebuilt by a full listing on
+   * each start.
+   */
+  streamSyncRead?: {
+    readonly files?: StreamSyncReadFiles;
+    readonly overlay?: StreamSyncOverlaySource;
+  };
 }
 
 function createBrowserLogger(logger?: Logger): Logger {
@@ -275,6 +293,7 @@ export async function createPsLiteSyncManager(
   dataPointFeed: DataPointFeedPort;
   scopeDeletions: ScopeDeletionTracker;
   streamSyncWriter: StreamSyncWriter | null;
+  streamSyncRead?: StreamSyncReadService;
 }> {
   const additionsTimeBudgetMs = options.additionsTimeBudgetMs ?? 10_000;
   const additionsByteBudget = options.additionsByteBudget ?? 8 * 1024 * 1024;
@@ -411,6 +430,18 @@ export async function createPsLiteSyncManager(
       },
     }),
   );
+  const streamSyncRead = options.streamSyncRead
+    ? await StreamSyncReadService.open({
+        files:
+          options.streamSyncRead.files ?? createMemoryStreamSyncReadFiles(),
+        blobs: createStorageBlobReader(storageAdapter),
+        keys: await createStreamSyncReadKeys(masterKey),
+        logger: logger as never,
+        ...(options.streamSyncRead.overlay
+          ? { overlay: options.streamSyncRead.overlay }
+          : {}),
+      })
+    : undefined;
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
@@ -455,6 +486,7 @@ export async function createPsLiteSyncManager(
       dataPointFeed,
       scopeDeletions,
       onDataPointIndexed: options.onDataPointIndexed,
+      streamSync: streamSyncRead,
     },
     {
       streamSync: streamSyncWriter
@@ -497,5 +529,6 @@ export async function createPsLiteSyncManager(
     dataPointFeed,
     scopeDeletions,
     streamSyncWriter,
+    streamSyncRead,
   };
 }

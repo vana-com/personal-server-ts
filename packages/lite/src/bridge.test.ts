@@ -38,6 +38,40 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
 }
 
 describe("handlePsLiteBridgeRequest", () => {
+  // A body that fails after the status leaves the relay no response to send:
+  // the relay closes the stream (relay.ts drainHttpRequests), so the client
+  // never receives a well-formed shorter body.
+  it("rejects when the response body fails after the status", async () => {
+    let pulls = 0;
+    const runtime = {
+      fetch: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (pulls++ === 0) {
+                controller.enqueue(
+                  new TextEncoder().encode('{"data":{"records":[{"id":"a"}'),
+                );
+                return;
+              }
+              controller.error(new Error("projection failed"));
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    } as unknown as Parameters<typeof handlePsLiteBridgeRequest>[0];
+    await expect(
+      handlePsLiteBridgeRequest(runtime, {
+        requestId: "req-1",
+        method: "GET",
+        path: "/v1/data/instagram.posts",
+        query: "",
+        headers: {},
+        body: "",
+      }),
+    ).rejects.toThrow("projection failed");
+  });
+
   it("adapts relay-style requests to the ps-lite runtime", async () => {
     const runtime = createTestRuntime({
       storage: createMemoryPsLiteStorage(),

@@ -99,6 +99,12 @@ import {
   resolveReplication,
 } from "./pdpp/records-bootstrap.js";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
+import {
+  createStorageBlobReader,
+  createStreamSyncReadKeys,
+  StreamSyncReadService,
+} from "@opendatalabs/personal-server-ts-core/stream-sync-read";
+import { createFsStreamSyncReadFiles } from "./stream-sync-read/fs-files.js";
 import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import {
   createNodeReplication,
@@ -627,6 +633,7 @@ export async function createServer(
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
   let streamSyncWriter: StreamSyncWriter | null = null;
+  let streamSyncRead: StreamSyncReadService | undefined;
   /**
    * Late-bound PDPP importer.
    *
@@ -821,7 +828,19 @@ export async function createServer(
       scopeDeletions,
     };
 
+    if (config.streamSync.read) {
+      streamSyncRead = await StreamSyncReadService.open({
+        files: createFsStreamSyncReadFiles(
+          join(storageRoot, "stream-sync-read"),
+        ),
+        blobs: createStorageBlobReader(storageAdapter),
+        keys: await createStreamSyncReadKeys(masterKey),
+        logger,
+      });
+    }
+
     const downloadDeps = {
+      streamSync: streamSyncRead,
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -1218,6 +1237,7 @@ export async function createServer(
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
     additions,
+    streamSyncRead,
     // Latest legacy reads of connector scopes the owner collects into the
     // record store come from its rows: the same store and the same
     // configured methods the RS enforces. Composed with or without the RS,
