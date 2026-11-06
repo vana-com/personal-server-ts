@@ -99,10 +99,24 @@ describe("merge", () => {
     expect(decodeLine(result.winners[0]!.text).o).toBe(996);
   });
 
-  it("reports bucket_too_large over the limit", async () => {
+  it("asks for a split over the limit below the 16-bit cap (Q4)", async () => {
     const feed = await randomFeed(5, 50, 50);
     const result = mergeLines(feed, "", 100);
-    expect(result.kind).toBe("bucket_too_large");
+    expect(result).toMatchObject({ kind: "split", prefix: "" });
+  });
+
+  it("reports bucket_too_large over the limit only at the 16-bit cap", async () => {
+    const key = await pkHash(sha256, { id: 1 }, ["id"]);
+    const capped = pkHashBits(key, 16);
+    const reducer = new BucketReducer(capped);
+    reducer.add(key, { o: 1, r: "r", v: { id: 1, pad: "x".repeat(200) } });
+    expect(reducer.finish(100)).toMatchObject({
+      kind: "bucket_too_large",
+      prefix: capped,
+    });
+    const shallow = new BucketReducer(pkHashBits(key, 15));
+    shallow.add(key, { o: 1, r: "r", v: { id: 1, pad: "x".repeat(200) } });
+    expect(shallow.finish(100).kind).toBe("split");
   });
 
   it("rejects a key outside the bucket", async () => {

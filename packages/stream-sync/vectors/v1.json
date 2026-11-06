@@ -53,6 +53,69 @@
       }
     ]
   },
+  "streamMasterKey": {
+    "description": "The stream-sync master key is the 65-byte owner signature as r, low s and v = 27/28. Every encoding gives the same key, so the same K_ns = HKDF-SHA256(masterKey, salt 'vana', info 'scope:' + NAMESPACE_KEY_LABEL, 32), ns and keyCheck. Legacy scope keys keep the raw signature.",
+    "encodings": [
+      {
+        "name": "v 27/28, low s",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b"
+      },
+      {
+        "name": "v 0/1, low s",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d500"
+      },
+      {
+        "name": "v 27/28, high s",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7dbd555e6d21a3207991a060a0c6afd5992e4183bad14f5218f2fd6dc20cf515f6c1c"
+      },
+      {
+        "name": "v 0/1, high s",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7dbd555e6d21a3207991a060a0c6afd5992e4183bad14f5218f2fd6dc20cf515f6c01"
+      }
+    ],
+    "masterKeyHex": "1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b",
+    "kNsHex": "bf838c4611a9db905be4deb87716cc3303bb8f749c33655a474b8eb35457bc3f",
+    "keyCheck": "0984460d571fb7ff",
+    "ns": {
+      "connector": "chatgpt",
+      "accountId": "user-123",
+      "ns": "e36378891a6e2cfb"
+    },
+    "invalid": [
+      {
+        "name": "64 bytes",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d5"
+      },
+      {
+        "name": "66 bytes",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b00"
+      },
+      {
+        "name": "v = 29",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51d"
+      },
+      {
+        "name": "v = 2",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d502"
+      },
+      {
+        "name": "s = 0",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db00000000000000000000000000000000000000000000000000000000000000001b"
+      },
+      {
+        "name": "s = n",
+        "signature": "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7dbfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd03641411b"
+      },
+      {
+        "name": "r = 0",
+        "signature": "0x00000000000000000000000000000000000000000000000000000000000000002aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b"
+      },
+      {
+        "name": "no 0x prefix",
+        "signature": "1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b"
+      }
+    ]
+  },
   "scopes": {
     "build": [
       {
@@ -1064,6 +1127,82 @@
         "partText": "",
         "sha256": null
       }
+    },
+    {
+      "name": "over the limit below the cap: split (Q4)",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "limitBytes": 300,
+      "feed": [
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "id": 1,
+            "pad": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          }
+        },
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "id": 2,
+            "pad": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+          }
+        }
+      ],
+      "expected": {
+        "kind": "split",
+        "prefix": "",
+        "bytes": 476
+      }
+    },
+    {
+      "name": "over the limit at the 16-bit cap: bucket_too_large (Q4)",
+      "primaryKey": ["id"],
+      "prefix": "0000100000001010",
+      "limitBytes": 100,
+      "feed": [
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "id": 1,
+            "pad": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          }
+        }
+      ],
+      "expected": {
+        "kind": "bucket_too_large",
+        "prefix": "0000100000001010",
+        "bytes": 238
+      }
+    },
+    {
+      "name": "at the limit exactly: ok",
+      "primaryKey": ["id"],
+      "prefix": "",
+      "limitBytes": 29,
+      "feed": [
+        {
+          "o": 1,
+          "r": "r",
+          "v": {
+            "id": 1
+          }
+        }
+      ],
+      "expected": {
+        "winners": [
+          {
+            "pkHash": "080a9ed428559ef602668b4c00f114f1a11c3f6b02a435f0bdc154578e4d7f22",
+            "text": "{\"o\":1,\"r\":\"r\",\"v\":{\"id\":1}}"
+          }
+        ],
+        "bytes": 29,
+        "partText": "{\"o\":1,\"r\":\"r\",\"v\":{\"id\":1}}\n",
+        "sha256": "956134a8180c658b3caea56475cc04cff6c32be3a97a37f2fdbde764be236de8"
+      }
     }
   ],
   "planner": [
@@ -1761,7 +1900,7 @@
         "streamRow": "present",
         "headGeneration": 3,
         "target": 3,
-        "base": "head"
+        "base": "base"
       },
       {
         "streamRow": "present",
@@ -1770,8 +1909,26 @@
         "base": "empty"
       },
       {
+        "streamRow": "present",
+        "headGeneration": 3,
+        "target": 1,
+        "base": "stale_generation"
+      },
+      {
+        "streamRow": "present",
+        "headGeneration": 4,
+        "target": 3,
+        "base": "stale_generation"
+      },
+      {
         "streamRow": "tombstoned",
         "headGeneration": 3,
+        "target": 3,
+        "base": "empty"
+      },
+      {
+        "streamRow": "tombstoned",
+        "headGeneration": 5,
         "target": 3,
         "base": "empty"
       },
@@ -2756,9 +2913,183 @@
         "clearCheckpoints": false,
         "restartFull": false
       }
+    },
+    {
+      "row": "stale base: start older than control → discard by the table",
+      "start": {
+        "kind": "active",
+        "generation": 1
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": true,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "stale base: start older than control → discard by the table",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "discard",
+        "recollect": false,
+        "clearCheckpoints": false,
+        "restartFull": false
+      }
+    },
+    {
+      "row": "stale base: control still admits T → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "active",
+        "generation": 3
+      },
+      "current": {
+        "kind": "active",
+        "generation": 3
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "stale base: control still admits T → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "active",
+        "generation": 1
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "stale base: control would create or reconnect → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "absent"
+      },
+      "current": {
+        "kind": "absent"
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "stale base: control would create or reconnect → keep pending, registry_inconsistent",
+      "start": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "current": {
+        "kind": "deleted",
+        "version": 2
+      },
+      "userConnect": true,
+      "full": true,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "registry_inconsistent"
+      }
+    },
+    {
+      "row": "stale base: foreign → keep pending, key_mismatch",
+      "start": {
+        "kind": "active",
+        "generation": 1
+      },
+      "current": {
+        "kind": "foreign",
+        "version": 3
+      },
+      "userConnect": false,
+      "full": false,
+      "phase": "stale_base",
+      "expected": {
+        "kind": "keep_pending",
+        "reason": "key_mismatch"
+      }
     }
   ],
   "traces": [
+    {
+      "name": "late head from an older generation (F1)",
+      "description": "A run admitted at g=1 resumes after a delete (v2) and a reconnect elsewhere that committed a g=3 head. chooseBase returns stale_generation; the re-read decides discard and clears checkpoints. Nothing is published, so the g=3 keys stay intact.",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "active",
+          "generation": 1
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": false,
+      "full": false,
+      "steps": [
+        {
+          "op": "decide",
+          "current": {
+            "kind": "active",
+            "generation": 1
+          },
+          "phase": "first",
+          "expected": {
+            "kind": "publish",
+            "target": 1
+          }
+        },
+        {
+          "op": "chooseBase",
+          "streamRow": "present",
+          "headGeneration": 3,
+          "target": 1,
+          "expected": "stale_generation"
+        },
+        {
+          "op": "decide",
+          "current": {
+            "kind": "active",
+            "generation": 3
+          },
+          "phase": "stale_base",
+          "expected": {
+            "kind": "discard",
+            "recollect": false,
+            "clearCheckpoints": true,
+            "restartFull": false
+          }
+        }
+      ]
+    },
     {
       "name": "replay after delete (trace A)",
       "description": "Create v1 reply is lost. Another device deletes (v2). The resend is `replayed`. Re-read shows deleted(2): discard, no publish.",
@@ -3165,6 +3496,108 @@
           }
         }
       ]
+    },
+    {
+      "name": "no-op onto a complete:false base (ruling Q9)",
+      "description": "An old DELETE tombstoned s; another device published an empty complete:false head at g=1 and left. This device's incremental run finds nothing new: its parts equal the base and complete stays false, so it is a no-op. The no-op sets needsFull and saves no checkpoint. The next run is full, publishes complete:true, clears needsFull and saves the checkpoint.",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "active",
+          "generation": 1
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": false,
+      "full": false,
+      "needsFull": [],
+      "steps": [
+        {
+          "op": "noop",
+          "baseComplete": false,
+          "complete": false,
+          "expected": true
+        },
+        {
+          "op": "afterCommit",
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s",
+            "complete": false,
+            "runFull": false
+          },
+          "expected": {
+            "needsFull": [
+              {
+                "connector": "chatgpt",
+                "ns": "834ab4c2636bcdd5",
+                "stream": "s"
+              }
+            ],
+            "clearCheckpoint": true
+          },
+          "mustBeFull": {
+            "chatgpt": true
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 1,
+          "streams": {
+            "s": {
+              "state": "noop",
+              "generation": 1,
+              "complete": false
+            }
+          },
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "skip",
+            "reason": "published_incomplete"
+          }
+        },
+        {
+          "op": "afterCommit",
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s",
+            "complete": true,
+            "runFull": true
+          },
+          "expected": {
+            "needsFull": [],
+            "clearCheckpoint": false
+          },
+          "mustBeFull": {
+            "chatgpt": false
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 1,
+          "streams": {
+            "s": {
+              "state": "committed",
+              "generation": 1,
+              "complete": true
+            }
+          },
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "save",
+            "generation": 1
+          }
+        }
+      ]
     }
   ],
   "checkpoint": [
@@ -3194,8 +3627,7 @@
       }
     },
     {
-      "name": "no-op of an incomplete head does not block",
-      "question": "Q9",
+      "name": "no-op of an incomplete head blocks (ruling Q9)",
       "target": 2,
       "streams": {
         "a": {
@@ -3210,8 +3642,8 @@
       },
       "seedReceiptsPending": false,
       "expected": {
-        "kind": "save",
-        "generation": 2
+        "kind": "skip",
+        "reason": "published_incomplete"
       }
     },
     {

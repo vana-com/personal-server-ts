@@ -1,3 +1,4 @@
+import { isPhysicalScope } from "../stream-sync/scope-routing.js";
 import { isReplicaScope } from "../replication/namespace.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
@@ -349,6 +350,9 @@ export function parseDataScopeContract(
 ): { ok: true; scope: string } | DataContractError {
   if (isReplicaScope(scopeParam))
     return invalidScope("Replica transport scopes are reserved");
+  // Ruling Q7: physical stream-sync names never reach the SDK ScopeSchema.
+  if (isPhysicalScope(scopeParam))
+    return invalidScope("Stream-sync names are not data scopes");
   const scopeResult = ScopeSchema.safeParse(scopeParam);
   if (!scopeResult.success) {
     return invalidScope(

@@ -1,4 +1,12 @@
 import {
+  StreamSyncWriter,
+  createGatewayStreamSyncRegistry,
+  createStorageStreamSyncBlobs,
+  createStreamSyncKeyPorts,
+  type StreamSyncFiles,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
+import {
   createVersionInventoryClient,
   type DurableAdditionsService,
 } from "@opendatalabs/personal-server-ts-core/additions";
@@ -88,6 +96,11 @@ export interface PsLiteOwnerSyncSigner
 
 export interface PsLiteSyncOptions {
   config: ServerConfig;
+  /**
+   * Durable files for whole-file stream sync, used only when
+   * `config.streamSync.write` is on. Defaults to IndexedDB.
+   */
+  streamSyncFiles?: StreamSyncFiles;
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;
@@ -261,6 +274,7 @@ export async function createPsLiteSyncManager(
   serverOwner: `0x${string}`;
   dataPointFeed: DataPointFeedPort;
   scopeDeletions: ScopeDeletionTracker;
+  streamSyncWriter: StreamSyncWriter | null;
 }> {
   const additionsTimeBudgetMs = options.additionsTimeBudgetMs ?? 10_000;
   const additionsByteBudget = options.additionsByteBudget ?? 8 * 1024 * 1024;
@@ -400,6 +414,21 @@ export async function createPsLiteSyncManager(
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
+  // Whole-file stream sync publishes beside the legacy upload, only when
+  // `streamSync.write` is on. Legacy uploads run unchanged either way.
+  const streamSyncWriter = options.config.streamSync?.write
+    ? new StreamSyncWriter({
+        ownerAddress: serverOwner,
+        registry: createGatewayStreamSyncRegistry({
+          gatewayUrl: options.config.gateway.url,
+          ownerAddress: serverOwner,
+        }),
+        blobs: createStorageStreamSyncBlobs(storageAdapter),
+        files: options.streamSyncFiles ?? createIndexedDbStreamSyncFiles(),
+        keys: createStreamSyncKeyPorts(options.ownerSignature),
+        signer,
+      })
+    : null;
   const syncManager = createSyncManager(
     {
       additions,
@@ -428,6 +457,9 @@ export async function createPsLiteSyncManager(
       onDataPointIndexed: options.onDataPointIndexed,
     },
     {
+      streamSync: streamSyncWriter
+        ? { write: true, publisher: streamSyncWriter }
+        : null,
       deleteData,
       pendingBlobDeletions,
       tombstoneFinality,
@@ -458,5 +490,12 @@ export async function createPsLiteSyncManager(
     },
   );
   if (options.autoStartSync !== false) syncManager.start();
-  return { syncManager, additions, serverOwner, dataPointFeed, scopeDeletions };
+  return {
+    syncManager,
+    additions,
+    serverOwner,
+    dataPointFeed,
+    scopeDeletions,
+    streamSyncWriter,
+  };
 }

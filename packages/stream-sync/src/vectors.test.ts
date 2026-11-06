@@ -35,6 +35,7 @@ describe("vectors/v1.json", () => {
         "replay after delete (trace A)",
         "split run",
         "stale userConnect entry (trace B)",
+        "no-op onto a complete:false base (ruling Q9)",
       ]),
     );
   });
