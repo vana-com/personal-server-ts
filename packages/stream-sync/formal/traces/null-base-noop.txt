@@ -1,0 +1,36 @@
+An empty base that gives a no-op (the model before ruling M3,
+NullBasePublishes = FALSE): IncompleteOwned violated.
+
+Config: cfg/C20-null-base-noop.cfg (profile "slice-q9": devices d1
+(Desktop) and d2, one account A, record key x1, one stream s1, four
+runs, one old stream DELETE (limitation L11), one device may leave).
+TLC 2026.11.03, 4 workers: violation at depth 15 after 48,889 distinct
+states.
+
+Steps 10-11: d1's incremental run 2 decides s1 at generation 1; its
+spool for s1 is empty.  Step 12: an old app's DELETE tombstones s1 (v2,
+g0).  Step 13: the base is empty (the tombstone) and the spool is empty,
+so the run is a no-op.  Step 14: d1 saves its checkpoint and holds no
+needsFull.  Every later run of d1 is incremental, so the stream stays
+tombstoned until the source emits it again.  With M3 (the package's
+isNoop is false for a null base) step 13 publishes an empty
+complete:false head, which sets needsFull and blocks the checkpoint; the
+next run is full and restores what the source still serves.
+
+Rendered with traces/story.py from `-dumpTrace json`.  Heads: g0[] is the
+L11 tombstone.
+
+step | action | control | heads | entries | checkpoints
+2 | List(d1) | A:- | - | d1: -; d2: - | -
+3 | StartRun(d1,A,False) | A:- | - | d1: run1 full pks=x1 s1=planned; d2: - | -
+4 | Decide(d1,s1) | A:- | - | d1: run1 full pks=x1 s1=creating@g1; d2: - | -
+5 | CtlPost(d1,s1) | A:A | - | d1: run1 full pks=x1 s1=planned@g1; d2: - | -
+6 | Decide(d1,s1) | A:A | - | d1: run1 full pks=x1 s1=decided@g1; d2: - | -
+7 | PlanPublish(d1,s1) | A:A | - | d1: run1 full pks=x1 s1=posted@g1; d2: - | -
+8 | Post(d1,s1) | A:A | s1v1:g1[x1@run1]C | d1: run1 full pks=x1 s1=done; d2: - | -
+9 | Finish(d1) | A:A | s1v1:g1[x1@run1]C | d1: -; d2: - | d1:A/g1/run1
+10 | StartRun(d1,A,False) | A:A | s1v1:g1[x1@run1]C | d1: run2 incr pks=x1 s1=planned; d2: - | d1:A/g1/run1
+11 | Decide(d1,s1) | A:A | s1v1:g1[x1@run1]C | d1: run2 incr pks=x1 s1=decided@g1; d2: - | d1:A/g1/run1
+12 | OldDelete(A,s1) | A:A | s1v1:g1[x1@run1]C s1v2:g0[] | d1: run2 incr pks=x1 s1=decided@g1; d2: - | d1:A/g1/run1
+13 | PlanPublish(d1,s1) | A:A | s1v1:g1[x1@run1]C s1v2:g0[] | d1: run2 incr pks=x1 s1=done; d2: - | d1:A/g1/run1
+14 | Finish(d1) | A:A | s1v1:g1[x1@run1]C s1v2:g0[] | d1: -; d2: - | d1:A/g1/run2

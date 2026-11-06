@@ -74,7 +74,9 @@ CONSTANTS
   ReadinessSame,     \* readiness and reads use one predicate (2.10)
   RawSeedChecksId,   \* the raw seed is skipped on an identity mismatch (2.13)
   StaleGenStops,     \* a stream row of a higher generation stops the publish (2.7)
-  NoOpNeedsFull      \* a no-op onto a complete:false base sets needsFull (2.6, Q9)
+  NoOpNeedsFull,     \* a no-op onto a complete:false base sets needsFull (2.6, Q9)
+  NullBasePublishes, \* a run onto an empty base never no-ops (M3)
+  NeedsFullForcesFull \* any needsFull of the connector makes a run full
 
 ASSUME Desktop \in Devices /\ LegacyFrom \in Streams /\ OtherKey \subseteq Devices
 
@@ -347,11 +349,17 @@ PlanPublish(d, s) ==
               seeding == IF first THEN e.seeding \cup {s} ELSE e.seeding
               \* Q9: a no-op onto a complete:false base of generation T
               q9 == NoOpNeedsFull /\ base # NoHead /\ ~base.complete
-          IN \* No-op (2.6): every part and `complete` unchanged, or an empty
-             \* spool with no seed (generation > 1: the receipt records
-             \* "skipped", 2.9).  No upload and no POST.
-             IF \/ lines = base.lines /\ complete = base.complete
-                \/ s \notin e.emit /\ ~seeded /\ ~useRaw
+          IN \* No-op (2.6): a base of generation T, and every part and
+             \* `complete` unchanged, or an empty spool with no seed
+             \* (generation > 1: the receipt records "skipped", 2.9).  No
+             \* upload and no POST.  An empty base (no row, an L11 tombstone,
+             \* an older generation) never gives a no-op (M3, the package's
+             \* isNoop is false for a null base): the run publishes, at least
+             \* an empty complete:false head, so needsFull is set and the
+             \* checkpoint is not saved.
+             IF /\ base # NoHead \/ ~NullBasePublishes
+                /\ \/ lines = base.lines /\ complete = base.complete
+                   \/ s \notin e.emit /\ ~seeded /\ ~useRaw
              THEN \* the stream counts as committed at (n, T)
                   /\ ob' = [ob EXCEPT ![d].st[s] = "done", ![d].g[s] = 0,
                                       ![d].seeding = seeding, ![d].seen[s] = N,
@@ -460,7 +468,8 @@ Progress(d) ==
 \* stream that has no receipt yet (zero-emission seed).
 StartRunFor(d, a, uc) ==
   LET n == NSOf(a)
-      full == ckpt[d] = NoCk \/ needsFull[d] # {}
+      \* runMustBeFull: no checkpoint, or any needsFull of the connector.
+      full == ckpt[d] = NoCk \/ (NeedsFullForcesFull /\ needsFull[d] # {})
       rid == clock + 1
       tgt == IF d = Desktop /\ seedTarget = "none" THEN n ELSE seedTarget
   IN /\ d \notin left /\ ob[d] = NoEntry
@@ -729,24 +738,31 @@ Needs(name) == IF name = "legacy" THEN {LegacyFrom} ELSE {name}
 Legacies == {NoFile} \cup {[FileOf(a, "legacy", "none") EXCEPT !.at = t] : a \in Acct, t \in {0, clock + 1}}
 File(L, name) == IF name = "legacy" THEN L ELSE IF name = LegacyFrom THEN rawF ELSE NoFile
 ViewOKn(v, n, name) == \A s \in Needs(name) : LiveP(v, n, s) /\ HeadP(v, n, s).complete
-ViewNS(v, name) ==
-  IF OneConnectionRead
-  THEN IF Sel(v) # "none" /\ ViewOKn(v, Sel(v), name) THEN {Sel(v)} ELSE {}
-  ELSE {n \in NS : ViewOKn(v, n, name)}
-ViewLines(v, name) == UNION {HeadP(v, n, s).lines : n \in ViewNS(v, name), s \in Needs(name)}
-ViewAt(v, name) == SetMax({HeadP(v, n, s).at : n \in ViewNS(v, name), s \in Needs(name)})
 AnyDeletedP(v) == \E n \in NS : StP(v, n).k = "deleted"
 Unavailable == <<"unavailable", {}>>
-Read(v, L, name) ==
-  IF ViewNS(v, name) # {} /\ (OneWay \/ ~File(L, name).present \/ File(L, name).at <= ViewAt(v, name))
-  THEN <<"view", ViewLines(v, name)>>
-  ELSE IF LegacyHonoursDelete /\ AnyDeletedP(v) THEN Unavailable
-  ELSE IF File(L, name).present THEN <<"legacy", File(L, name).lines>>
+\* The part of a read that does not depend on the legacy file, computed
+\* once per snapshot and name (TLC does not cache operator calls).
+RV(v, name) ==
+  LET sel == Sel(v)
+      selOK == sel # "none" /\ ViewOKn(v, sel, name)
+      ns == IF OneConnectionRead THEN IF selOK THEN {sel} ELSE {}
+            ELSE {n \in NS : ViewOKn(v, n, name)}
+  IN [ns |-> ns, selOK |-> selOK,
+      selLive |-> sel # "none" /\ \A s \in Needs(name) : LiveP(v, sel, s),
+      lines |-> UNION {HeadP(v, n, s).lines : n \in ns, s \in Needs(name)},
+      at |-> SetMax({HeadP(v, n, s).at : n \in ns, s \in Needs(name)}),
+      del |-> AnyDeletedP(v)]
+\* A read with view part r and legacy file F.
+ReadR(r, F) ==
+  IF r.ns # {} /\ (OneWay \/ ~F.present \/ F.at <= r.at)
+  THEN <<"view", r.lines>>
+  ELSE IF LegacyHonoursDelete /\ r.del THEN Unavailable
+  ELSE IF F.present THEN <<"legacy", F.lines>>
   ELSE Unavailable
-Readiness(v, L, name) ==
-  IF ReadinessSame THEN Read(v, L, name) # Unavailable
-  ELSE \/ Sel(v) # "none" /\ \A s \in Needs(name) : LiveP(v, Sel(v), s)
-       \/ ~(LegacyHonoursDelete /\ AnyDeletedP(v)) /\ File(L, name).present
+ReadinessR(r, F) ==
+  IF ReadinessSame THEN ReadR(r, F) # Unavailable
+  ELSE \/ r.selLive
+       \/ ~(LegacyHonoursDelete /\ r.del) /\ F.present
 
 ----------------------------------------------------------------------------
 \* Safety properties (README.md gives the reading of each).
@@ -766,8 +782,10 @@ S1_NoLostCommit ==
       /\ \A l \in h.lines : \E m \in Latest(n, s).lines : m[1] = l[1] /\ Rank(m) >= Rank(l)
 
 S2a_DeleteHolds ==
-  \A v \in Snaps, L \in Legacies, n \in NS, name \in Names :
-    StP(v, n).k = "deleted" => \A l \in Read(v, L, name)[2] : AcctLine(l) => NSOf(l[3]) # n
+  \A v \in Snaps, name \in Names :
+    LET r == RV(v, name) IN
+    \A L \in Legacies, n \in NS :
+      StP(v, n).k = "deleted" => \A l \in ReadR(r, File(L, name))[2] : AcctLine(l) => NSOf(l[3]) # n
 
 S3_CleanGeneration ==
   \A n \in NS, s \in Streams : \A i \in 1..Len(hd[n][s]) :
@@ -779,9 +797,12 @@ S4_NoAccountMix ==
   ~IdLess =>
     /\ \A n \in NS, s \in Streams : \A i \in 1..Len(hd[n][s]) :
          \A l \in hd[n][s][i].lines : l[4] \in {"run", "raw"} => l[3] = n
-    /\ \A v \in Snaps, L \in Legacies, name \in Names :
-         Read(v, L, name)[1] = "view" =>
-           Cardinality({l[3] : l \in {m \in Read(v, L, name)[2] : m[4] \in {"run", "raw"}}}) <= 1
+    /\ \A v \in Snaps, name \in Names :
+         LET r == RV(v, name) IN
+         \A L \in Legacies :
+           LET x == ReadR(r, File(L, name)) IN
+           x[1] = "view" =>
+             Cardinality({l[3] : l \in {m \in x[2] : m[4] \in {"run", "raw"}}}) <= 1
 
 S5_CleanupSafety ==
   \A n \in NS, s \in Streams : Live(n, s) => Objects(n, s, Latest(n, s)) \subseteq store
@@ -801,11 +822,14 @@ S8_AckImmutable ==
   \A x \in acked : Len(hd[x[1]][x[2]]) >= x[3] /\ hd[x[1]][x[2]][x[3]] = x[4]
 
 S9_OneWay ==
-  \A v \in Snaps, L \in Legacies, name \in Names :
-    Read(v, L, name)[1] = "legacy" => ~(Sel(v) # "none" /\ ViewOKn(v, Sel(v), name))
+  \A v \in Snaps, name \in Names :
+    LET r == RV(v, name) IN
+    \A L \in Legacies : ReadR(r, File(L, name))[1] = "legacy" => ~r.selOK
 
 S10_ReadinessMatchesRead ==
-  \A v \in Snaps, L \in Legacies, name \in Names : Readiness(v, L, name) <=> Read(v, L, name) # Unavailable
+  \A v \in Snaps, name \in Names :
+    LET r == RV(v, name) IN
+    \A L \in Legacies : ReadinessR(r, File(L, name)) <=> ReadR(r, File(L, name)) # Unavailable
 
 S11_SeedCoverage ==
   \A x \in rcpt :
@@ -830,16 +854,28 @@ HeadGenMonotone ==
   \A n \in NS, s \in Streams : \A i, j \in 1..Len(hd[n][s]) :
     (i < j /\ ~IsTomb(hd[n][s][i]) /\ ~IsTomb(hd[n][s][j])) => hd[n][s][i].g <= hd[n][s][j].g
 
-\* L3 as bounded safety (Q9).  After a device that stays finishes a run at
-\* (n, T), a stream row it saw that is still current, live and
-\* complete:false is one it holds needsFull for, so its next run is full.
+\* L3 and M3 as bounded safety (Q9, M3).  After a device that stays
+\* finishes a run at (n, T), a stream row it saw that is still current and
+\* is live and complete:false, an L11 tombstone, or no row at all, is one
+\* it holds needsFull for, so its next run is full.
 IncompleteOwned ==
   \A d \in Devices \ left :
     (ob[d] = NoEntry /\ fin[d].n # "none") =>
       \A s \in Streams :
         LET n == fin[d].n  v == fin[d].seen[s] IN
-        (/\ v > 0 /\ Len(hd[n][s]) = v /\ CurGen(n) = fin[d].T
-         /\ Live(n, s) /\ ~Latest(n, s).complete) => <<n, s>> \in needsFull[d]
+        (/\ Len(hd[n][s]) = v /\ CurGen(n) = fin[d].T
+         /\ \/ v > 0 /\ Live(n, s) /\ ~Latest(n, s).complete
+            \/ v = 0
+            \/ v > 0 /\ IsTomb(hd[n][s][v])) => <<n, s>> \in needsFull[d]
+
+\* A run for a connection the device holds needsFull for is full.  The
+\* package's rule (any needsFull of the connector) is stronger.  A run that
+\* published complete:false itself (incomp) may hold needsFull it added.
+NeedsFullRunIsFull ==
+  \A d \in Devices :
+    LET e == ob[d] IN
+    (e # NoEntry /\ ~e.full /\ ~e.incomp) =>
+      \A s \in Streams : <<e.n, s>> \notin needsFull[d]
 
 \* The registry_inconsistent row of the table never applies.
 NeverInconsistent ==
@@ -854,13 +890,17 @@ TypeOK ==
 
 \* Control 18: deletion is not immediate (limitation 8); this must fail.
 S2_Immediate ==
-  \A v \in Snaps, L \in Legacies, n \in NS, name \in Names :
-    Deleted(n) => \A l \in Read(v, L, name)[2] : AcctLine(l) => NSOf(l[3]) # n
+  \A v \in Snaps, name \in Names :
+    LET r == RV(v, name) IN
+    \A L \in Legacies, n \in NS :
+      Deleted(n) => \A l \in ReadR(r, File(L, name))[2] : AcctLine(l) => NSOf(l[3]) # n
 
 ----------------------------------------------------------------------------
 \* Liveness.
 CleanFor(n) ==
-  \A v \in Snaps, L \in Legacies, name \in Names : \A l \in Read(v, L, name)[2] : AcctLine(l) => NSOf(l[3]) # n
+  \A v \in Snaps, name \in Names :
+    LET r == RV(v, name) IN
+    \A L \in Legacies : \A l \in ReadR(r, File(L, name))[2] : AcctLine(l) => NSOf(l[3]) # n
 L1_EventualDelete == \A n \in NS : Deleted(n) ~> (~Deleted(n) \/ CleanFor(n))
 
 Converged == \A d \in Devices \ left, n \in NS, s \in Streams : view[d][n][s] = Want(d, n, s)
@@ -871,9 +911,11 @@ L3_NoStuckIncomplete ==
     (Live(n, s) /\ ~Latest(n, s).complete /\ CtlLen(n) = v)
       ~> ((Live(n, s) /\ Latest(n, s).complete) \/ CtlLen(n) # v)
 
+\* A device that stays resumes (one that leaves is exempt from then on).
 L4_Resume ==
-  \A d \in Devices \ left, n \in NS :
-    (stopped[d][n] > 0 /\ ActiveAny(n) /\ CtlLen(n) > stopped[d][n]) ~> (stopped[d][n] = 0)
+  \A d \in Devices, n \in NS :
+    (d \notin left /\ stopped[d][n] > 0 /\ ActiveAny(n) /\ CtlLen(n) > stopped[d][n])
+      ~> (stopped[d][n] = 0 \/ d \in left)
 
 ----------------------------------------------------------------------------
 \* Scenario witnesses (section 4 "must be reachable").  Each NotX is the
@@ -932,6 +974,11 @@ NotSettleAfterAck == ~\E x \in acked : <<x[1], x[2], x[3]>> \in failed
 
 \* An incremental run after an account switch reuses the checkpoint.
 NotSwitchReusedCkpt == ~\E d \in Devices : ob[d] # NoEntry /\ ob[d].sw
+
+\* A device holds needsFull and a checkpoint at once (runMustBeFull
+\* decides the next run).
+NotNeedsFullWithCkpt ==
+  ~\E d \in Devices : ob[d] = NoEntry /\ needsFull[d] # {} /\ ckpt[d] # NoCk
 
 \* A permanently failed entry while newer heads arrive.
 NotFailedEntryNewerHeads ==

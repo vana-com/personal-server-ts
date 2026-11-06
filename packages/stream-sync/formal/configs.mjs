@@ -31,6 +31,8 @@ export const DESIGN = {
   RawSeedChecksId: "TRUE",
   StaleGenStops: "TRUE",
   NoOpNeedsFull: "TRUE",
+  NullBasePublishes: "TRUE",
+  NeedsFullForcesFull: "TRUE",
 };
 
 /**
@@ -124,15 +126,31 @@ export const PROFILES = {
     MaxSessions: 0,
     MaxFail: 0,
   },
-  // Liveness: one account, two streams, finite events, reruns allowed.
+  // Liveness: one account, one stream, a delete, reruns, a lagging reader
+  // and imports.  No lost replies or failed entries: with them, or with two
+  // streams, the run does not finish within the time bound.
   live: {
     ...base,
     Acct: set(["A"]),
     PK: set(["x1"]),
-    Streams: set(["s1", "s2"]),
+    Streams: set(["s1"]),
     MaxRuns: 2,
     MaxReruns: 2,
-    MaxLost: 1,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    Views: "TRUE",
+    Readers: set(["r1"]),
+  },
+  // Live with one failed entry (C13: a failed entry must not block import).
+  "live-fail": {
+    ...base,
+    Acct: set(["A"]),
+    PK: set(["x1"]),
+    Streams: set(["s1"]),
+    MaxRuns: 2,
+    MaxReruns: 2,
+    MaxLost: 0,
     MaxSessions: 0,
     MaxFail: 1,
     Views: "TRUE",
@@ -155,6 +173,20 @@ export const PROFILES = {
     ...base,
     PK: set(["x1"]),
     Streams: set(["s1"]),
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+  },
+  // One device, two accounts, four runs: a device that holds needsFull
+  // for one account and a checkpoint for the other starts a run (a
+  // control and a witness only).
+  "slice-accounts4": {
+    ...base,
+    Devices: set(["d1"]),
+    PK: set(["x1"]),
+    Streams: set(["s1"]),
+    MaxRuns: 4,
+    MaxDeletes: 0,
     MaxLost: 0,
     MaxSessions: 0,
     MaxFail: 0,
@@ -187,13 +219,16 @@ export const PROFILES = {
     MaxOldDelete: 1,
   },
   // Liveness with Q9: an old stream DELETE and a device that leaves.
+  // Three reruns: under Q9 a device that stays may need a no-op rerun
+  // (which sets needsFull) and then a full one, and the device that
+  // leaves may spend one first.
   "live-leave": {
     ...base,
     Acct: set(["A"]),
     PK: set(["x1"]),
     Streams: set(["s1"]),
     MaxRuns: 3,
-    MaxReruns: 2,
+    MaxReruns: 3,
     MaxDeletes: 0,
     MaxLost: 0,
     MaxSessions: 0,
@@ -234,6 +269,7 @@ export const SAFETY = [
   "NoHeadAboveControl",
   "HeadGenMonotone",
   "IncompleteOwned",
+  "NeedsFullRunIsFull",
 ];
 
 export const LIVENESS = [
@@ -268,6 +304,7 @@ export const CONFIGS = [
   ["Slice-twice", "the design: two deletes and reconnects", "twice", {}, "pass"],
   ["Slice-q9", "the design: an old stream DELETE, a device that leaves, no-ops", "slice-q9", {}, "pass"],
   ["Live", "liveness of the design", "live", {}, "pass", "liveness"],
+  ["Live-fail", "liveness of the design with a failed entry", "live-fail", {}, "pass", "liveness"],
   ["Live-leave", "liveness of the design with an old stream DELETE and a device that leaves", "live-leave", {}, "pass", "liveness"],
 
   // --- regression: the revision 4 counterexample (traces/split-run.txt) ---
@@ -307,14 +344,16 @@ export const CONFIGS = [
   ["C09-no-listing-needed", "start = null is read as absent", "slice-faults", { NeedListing: "FALSE" }, "S3_CleanGeneration"],
   ["C10-legacy-ignores-delete", "the legacy fallback ignores a deleted connection", "late", { LegacyHonoursDelete: "FALSE" }, "S2a_DeleteHolds"],
   ["C11-collectedat-competition", "a newer legacy file beats a live complete view", "late", { OneWay: "FALSE" }, "S9_OneWay"],
-  ["C12-no-needsfull", "complete:false does not force a full run", "live", { NeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
-  ["C13-pending-blocks-import", "a pending or failed entry blocks import", "live", { ImportPastPending: "FALSE" }, "L2_Convergence", "liveness"],
+  ["C12-no-needsfull", "complete:false does not force a full run", "slice-q9", { NeedsFull: "FALSE" }, "IncompleteOwned"],
+  ["C13-pending-blocks-import", "a pending or failed entry blocks import", "live-fail", { ImportPastPending: "FALSE" }, "L2_Convergence", "liveness"],
   ["C14-seed-only-empty-base", "the Desktop seeds only into an empty base", "late", { SeedWhateverBase: "FALSE" }, "S11_SeedCoverage"],
   ["C15-failed-row-replaceable", "a row that failed settlement can be replaced", "slice-settle", { AckImmutable: "FALSE" }, "S8_AckImmutable"],
   ["C16-readiness-live-only", "readiness uses live, reads use live and complete", "slice-q9", { ReadinessSame: "FALSE" }, "S10_ReadinessMatchesRead"],
   ["C17-raw-seed-ignores-id", "the raw seed ignores the recorded identity", "slice-accounts", { RawSeedChecksId: "FALSE" }, "S4_NoAccountMix"],
   ["C19-no-q9", "a no-op onto a complete:false base sets no needsFull", "slice-q9", { NoOpNeedsFull: "FALSE" }, "IncompleteOwned"],
   ["C19L-no-q9", "the same, against liveness L3", "live-leave", { NoOpNeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
+  ["C20-null-base-noop", "an incremental run onto an empty base with an empty spool is a no-op", "slice-q9", { NullBasePublishes: "FALSE" }, "IncompleteOwned"],
+  ["C21-needsfull-not-full", "a device with needsFull and a checkpoint runs incrementally", "slice-accounts4", { NeedsFullForcesFull: "FALSE" }, "NeedsFullRunIsFull"],
   ["C18-immediate-delete", "the design against an immediate delete property", "slice-lag", {}, "S2_Immediate"],
 
   // --- section 4 scenarios: each must be reachable (NotX violated) ---
@@ -324,10 +363,11 @@ export const CONFIGS = [
   ["W-late-old-head", "an old-generation head lands after control left its generation", "lean", {}, "NotLateOldHead", "witness"],
   ["W-twice", "delete and reconnect twice", "twice", {}, "NotTwice", "witness"],
   ["W-first-write-in-delete", "a stream's first head is in flight across a delete", "lean", {}, "NotFirstWriteDuringDelete", "witness"],
-  ["W-phone-first-seed", "a phone publishes first, the Desktop seed merges later", "lean", {}, "NotPhoneFirstThenSeed", "witness"],
-  ["W-zero-emission-seed", "the seed alone publishes a stream", "lean", {}, "NotZeroEmissionSeed", "witness"],
+  ["W-phone-first-seed", "a phone publishes first, the Desktop seed merges later", "late", {}, "NotPhoneFirstThenSeed", "witness"],
+  ["W-zero-emission-seed", "the seed alone publishes a stream", "slice-accounts", {}, "NotZeroEmissionSeed", "witness"],
   ["W-settle-after-ack", "a row fails settlement after its ack", "slice-settle", {}, "NotSettleAfterAck", "witness"],
   ["W-switch-reused-ckpt", "an account switch with a reused checkpoint", "slice-accounts", {}, "NotSwitchReusedCkpt", "witness"],
+  ["W-needsfull-with-ckpt", "a device holds needsFull and a checkpoint at once", "slice-accounts4", {}, "NotNeedsFullWithCkpt", "witness"],
   ["W-failed-entry", "a failed entry while newer heads arrive", "lean", {}, "NotFailedEntryNewerHeads", "witness"],
 ].map(([name, why, profile, changes, expect, kind = "safety", simulate]) => ({
   name,
@@ -349,7 +389,13 @@ export function configText(config) {
   const liveness = config.kind === "liveness";
   const checks = liveness
     ? config.expect === "pass"
-      ? ["INVARIANT TypeOK", ...LIVENESS.map((p) => `PROPERTY ${p}`)]
+      ? [
+          "INVARIANT TypeOK",
+          // L2 is about imports: a profile without views does not check it.
+          ...LIVENESS.filter((p) => constants.Views === "TRUE" || p !== "L2_Convergence").map(
+            (p) => `PROPERTY ${p}`,
+          ),
+        ]
       : ["INVARIANT TypeOK", `PROPERTY ${config.expect}`]
     : config.expect === "pass"
       ? SAFETY.map((p) => `INVARIANT ${p}`)

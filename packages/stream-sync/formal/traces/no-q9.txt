@@ -3,16 +3,17 @@ Ruling Q9 removed (NoOpNeedsFull = FALSE): IncompleteOwned violated.
 Config: cfg/C19-no-q9.cfg (profile "slice-q9": devices d1 (Desktop) and
 d2, one account A, record key x1, one stream s1, four runs, one old
 stream DELETE (limitation L11), one device may leave).  TLC 2026.11.03,
-4 workers: violation at depth 23 after 1,100,132 distinct states.
+4 workers: violation at depth 24 after 1,153,431 distinct states.
 
-Step 19: an old app's DELETE tombstones s1 (v2, g0).  Steps 20-21: d2's
-incremental run 4 has an empty base and publishes v3, complete:false;
-d2 now holds needsFull.  Step 22: d1's incremental run 3 merges onto v3;
-its x1 (run 3) ranks below v3's x1 (run 4), so every part and complete
-are unchanged: a no-op.  Step 23: without Q9, d1 saves its checkpoint and
-holds no needsFull, although the row it saw is live and complete:false.
-If d2 now leaves, no device will run a full run for s1.  With Q9, step 22
-sets needsFull on d1 and blocks the checkpoint.
+Step 19: an old app's DELETE tombstones s1 (v2, g0).  Steps 20-21: d1's
+incremental run 3 has an empty base (the tombstone) and an empty spool,
+so it publishes an empty complete:false head, v3 (M3); d1 now holds
+needsFull.  Step 22: d2's incremental run 4 merges onto v3 with an empty
+spool: every part and complete are unchanged, a no-op.  Step 23: without
+Q9, d2 saves its checkpoint and holds no needsFull, although the row it
+saw is live and complete:false.  If d1 now leaves, no device will run a
+full run for s1.  With Q9, step 22 sets needsFull on d2 and blocks the
+checkpoint.
 
 Rendered with traces/story.py from `-dumpTrace json`.  Heads: g0[] is the
 L11 tombstone.
@@ -20,11 +21,11 @@ L11 tombstone.
 step | action | control | heads | entries | checkpoints
 2 | List(d1) | A:- | - | d1: -; d2: - | -
 3 | StartRun(d1,A,False) | A:- | - | d1: run1 full pks=x1 s1=planned; d2: - | -
-4 | List(d2) | A:- | - | d1: run1 full pks=x1 s1=planned; d2: - | -
-5 | StartRun(d2,A,False) | A:- | - | d1: run1 full pks=x1 s1=planned; d2: run2 full pks=x1 s1=planned | -
-6 | Decide(d2,s1) | A:- | - | d1: run1 full pks=x1 s1=planned; d2: run2 full pks=x1 s1=creating@g1 | -
-7 | CtlPost(d2,s1) | A:A | - | d1: run1 full pks=x1 s1=planned; d2: run2 full pks=x1 s1=planned@g1 | -
-8 | Decide(d1,s1) | A:A | - | d1: run1 full pks=x1 s1=decided@g1; d2: run2 full pks=x1 s1=planned@g1 | -
+4 | Decide(d1,s1) | A:- | - | d1: run1 full pks=x1 s1=creating@g1; d2: - | -
+5 | List(d2) | A:- | - | d1: run1 full pks=x1 s1=creating@g1; d2: - | -
+6 | StartRun(d2,A,False) | A:- | - | d1: run1 full pks=x1 s1=creating@g1; d2: run2 full pks=x1 s1=planned | -
+7 | CtlPost(d1,s1) | A:A | - | d1: run1 full pks=x1 s1=planned@g1; d2: run2 full pks=x1 s1=planned | -
+8 | Decide(d1,s1) | A:A | - | d1: run1 full pks=x1 s1=decided@g1; d2: run2 full pks=x1 s1=planned | -
 9 | Decide(d2,s1) | A:A | - | d1: run1 full pks=x1 s1=decided@g1; d2: run2 full pks=x1 s1=decided@g1 | -
 10 | PlanPublish(d2,s1) | A:A | - | d1: run1 full pks=x1 s1=decided@g1; d2: run2 full pks=x1 s1=posted@g1 | -
 11 | Post(d2,s1) | A:A | s1v1:g1[x1@run2]C | d1: run1 full pks=x1 s1=decided@g1; d2: run2 full pks=x1 s1=done | -
@@ -36,7 +37,7 @@ step | action | control | heads | entries | checkpoints
 17 | StartRun(d2,A,False) | A:A | s1v1:g1[x1@run2]C | d1: run3 incr pks=x1 s1=decided@g1; d2: run4 incr pks=x1 s1=planned | d1:A/g1/run1 d2:A/g1/run2
 18 | Decide(d2,s1) | A:A | s1v1:g1[x1@run2]C | d1: run3 incr pks=x1 s1=decided@g1; d2: run4 incr pks=x1 s1=decided@g1 | d1:A/g1/run1 d2:A/g1/run2
 19 | OldDelete(A,s1) | A:A | s1v1:g1[x1@run2]C s1v2:g0[] | d1: run3 incr pks=x1 s1=decided@g1; d2: run4 incr pks=x1 s1=decided@g1 | d1:A/g1/run1 d2:A/g1/run2
-20 | PlanPublish(d2,s1) | A:A | s1v1:g1[x1@run2]C s1v2:g0[] | d1: run3 incr pks=x1 s1=decided@g1; d2: run4 incr pks=x1 s1=posted@g1 | d1:A/g1/run1
-21 | Post(d2,s1) | A:A | s1v1:g1[x1@run2]C s1v2:g0[] s1v3:g1[x1@run4] | d1: run3 incr pks=x1 s1=decided@g1; d2: run4 incr pks=x1 s1=done | d1:A/g1/run1
-22 | PlanPublish(d1,s1) | A:A | s1v1:g1[x1@run2]C s1v2:g0[] s1v3:g1[x1@run4] | d1: run3 incr pks=x1 s1=done; d2: run4 incr pks=x1 s1=done | d1:A/g1/run1
-23 | Finish(d1) | A:A | s1v1:g1[x1@run2]C s1v2:g0[] s1v3:g1[x1@run4] | d1: -; d2: run4 incr pks=x1 s1=done | d1:A/g1/run3
+20 | PlanPublish(d1,s1) | A:A | s1v1:g1[x1@run2]C s1v2:g0[] | d1: run3 incr pks=x1 s1=posted@g1; d2: run4 incr pks=x1 s1=decided@g1 | d2:A/g1/run2
+21 | Post(d1,s1) | A:A | s1v1:g1[x1@run2]C s1v2:g0[] s1v3:g1[] | d1: run3 incr pks=x1 s1=done; d2: run4 incr pks=x1 s1=decided@g1 | d2:A/g1/run2
+22 | PlanPublish(d2,s1) | A:A | s1v1:g1[x1@run2]C s1v2:g0[] s1v3:g1[] | d1: run3 incr pks=x1 s1=done; d2: run4 incr pks=x1 s1=done | d2:A/g1/run2
+23 | Finish(d2) | A:A | s1v1:g1[x1@run2]C s1v2:g0[] s1v3:g1[] | d1: run3 incr pks=x1 s1=done; d2: - | d2:A/g1/run4
