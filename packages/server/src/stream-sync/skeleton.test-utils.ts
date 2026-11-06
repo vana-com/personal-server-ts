@@ -15,7 +15,8 @@
  *
  * Stubbed (each marked `SKELETON STUB`): the intake adapter, the connector
  * fixture, the registry (in-memory, gateway rules) and its listing feed, and
- * the phone and frame host configuration. The list is in the hand-back.
+ * the phone and frame hosts' writers (their reads run through the real
+ * PS-Lite startup code). The list is in the hand-back.
  *
  * Run: `npm run e2e:stream-sync-skeleton` (needs `streamSync.write`).
  */
@@ -26,6 +27,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import { privateKeyToAccount } from "viem/accounts";
+import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
 import {
   canonicalJson,
   streamMasterKeyFromSignature,
@@ -34,15 +37,12 @@ import {
 import {
   StreamSyncWriter,
   createStreamSyncKeyPorts,
-  type StreamSyncFiles,
   createGatewayStreamSyncRegistry,
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
-  createMemoryStreamSyncReadFiles,
   createStreamSyncReadKeys,
   StreamSyncReadService,
-  type StreamSyncReadFiles,
 } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import {
   computeDataPointId,
@@ -53,13 +53,17 @@ import { createMemoryDataStorage } from "@opendatalabs/personal-server-ts-core/t
 import type { StorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import { createIndexedDbStreamSyncFiles } from "@opendatalabs/personal-server-ts-lite";
+import {
+  createBearerTokenPsLiteAuth,
+  createIndexedDbPsLiteRuntime,
+  createIndexedDbStreamSyncFiles,
+} from "@opendatalabs/personal-server-ts-lite";
+import { createMockPsLiteGateway } from "../../../lite/src/test-support/gateway.js";
 import { createFsStreamSyncFiles } from "./fs-files.js";
 import { createFsStreamSyncReadFiles } from "../stream-sync-read/fs-files.js";
 import {
   OWNER,
   OWNER_KEY,
-  OWNER_SIGNATURE,
   SERVER_KEY,
   SHAPE,
   accountSigner,
@@ -68,6 +72,14 @@ import {
   startLocalStorage,
   storageBlobs,
 } from "./oracle.test-utils.js";
+
+/**
+ * The owner's signature over the owner-binding message: what every real host
+ * (PS-Lite checks it) derives the stream master key from.
+ */
+const OWNER_SIGNATURE = await privateKeyToAccount(OWNER_KEY).signMessage({
+  message: buildPersonalServerLiteOwnerBindingMessage(OWNER),
+});
 
 const CONNECTOR = "skeleton";
 const STREAM = "items";
@@ -164,14 +176,20 @@ interface Host {
   readonly name: string;
   readonly writer: StreamSyncWriter;
   readonly intake: StubIntake;
-  readonly reader: StreamSyncReadService;
+  /** The host's records for the skeleton stream, read as an app would. */
+  readonly read: () => Promise<{
+    kind: string;
+    records: Record<string, unknown>[];
+  }>;
+  /** One sync pass: the host's own listing loop. */
+  readonly sync: (listing: RegistryListing) => Promise<void>;
 }
 
 /**
  * The registry's listing as a gateway serves it: `GET /v1/data?user=..` over
  * the rows the shared in-memory registry accepted. Only the HTTP origin is
  * faked; every host reads it through the production `createGatewayDataPointFeed`
- * and `downloadAll` loop (see `syncHost`).
+ * and `downloadAll` loop (see `syncFullHost` and the Lite sync manager).
  */
 class RegistryListing {
   private readonly rows = new Map<string, Record<string, unknown>>();
@@ -206,8 +224,11 @@ class RegistryListing {
   };
 }
 
-/** One sync pass of a host: the production `downloadAll` listing loop. */
-async function syncHost(host: Host, listing: RegistryListing): Promise<void> {
+/** One sync pass of the full server: the production `downloadAll` listing loop. */
+async function syncFullHost(
+  reader: StreamSyncReadService,
+  listing: RegistryListing,
+): Promise<void> {
   let stored: string | null = null;
   const storage = createMemoryDataStorage();
   await downloadAll({
@@ -227,7 +248,7 @@ async function syncHost(host: Host, listing: RegistryListing): Promise<void> {
     masterKey: new Uint8Array(65),
     serverOwner: OWNER,
     logger: { ...silent, debug() {} } as unknown as Logger,
-    streamSync: host.reader,
+    streamSync: reader,
   });
 }
 
@@ -239,59 +260,121 @@ async function makeHost(input: {
   registry: StreamSyncRegistry;
   storageUrl: string;
   root: string;
+  listing: RegistryListing;
 }): Promise<Host> {
   // The flag gate, as the hosts apply it: no flag, no writer.
   if (!input.config.streamSync.write) {
     throw new Error("streamSync.write is off: the skeleton needs it on");
   }
   const blobs = storageBlobs(input.storageUrl);
-  let files: StreamSyncFiles;
-  let readFiles: StreamSyncReadFiles;
   if (input.kind === "full") {
-    files = createFsStreamSyncFiles(join(input.root, "full-write"));
-    readFiles = createFsStreamSyncReadFiles(join(input.root, "full-read"));
-  } else {
-    // SKELETON STUB (lanes U6 phone, U7 frame): no phone or frame host code
-    // that builds PS-Lite exists in a repo yet, so no production difference
-    // can be modelled from code. The design (DESIGN-V4.1) says the frame uses
-    // OPFS, else IndexedDB, via the same adapter as Web Lite; this recipe
-    // uses IndexedDB for both and differs only by database name. Open, to be
-    // checked against the real hosts: lease-less begin, identity source and
-    // the frame's postMessage transport. U6 and U7 replace this recipe.
-    registerStub("phone/frame host recipe", "lanes U6 (phone), U7 (frame)");
-    files = createIndexedDbStreamSyncFiles({
-      dbName: `skeleton-${input.kind}`,
-      factory: new IDBFactory(),
-      keyRange: IDBKeyRange,
+    const writer = new StreamSyncWriter({
+      ownerAddress: OWNER,
+      registry: input.registry,
+      blobs,
+      files: createFsStreamSyncFiles(join(input.root, "full-write")),
+      keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
+      signer: accountSigner(SERVER_KEY),
     });
-    readFiles = createMemoryStreamSyncReadFiles();
+    const reader = await StreamSyncReadService.open({
+      files: createFsStreamSyncReadFiles(join(input.root, "full-read")),
+      blobs,
+      keys: await createStreamSyncReadKeys(
+        streamMasterKeyFromSignature(OWNER_SIGNATURE),
+      ),
+      logger: silent,
+    });
+    return {
+      name: input.kind,
+      writer,
+      intake: new StubIntake(writer),
+      read: () => readFromService(reader),
+      sync: (listing) => syncFullHost(reader, listing),
+    };
   }
+  // Phone and frame READ through the real PS-Lite startup code, flag from
+  // config, listing through its sync manager. Only the registry origin
+  // (listing feed) is injected.
+  // SKELETON STUB (lanes U6 phone, U7 frame): the WRITER is still built by
+  // hand, because Lite's own writer talks to the registry over HTTP and the
+  // in-memory registry has no origin. The design (DESIGN-V4.1) says the frame
+  // uses OPFS, else IndexedDB; both use IndexedDB here, differing by name.
+  registerStub(
+    "phone/frame host writer recipe",
+    "lanes U6 (phone), U7 (frame)",
+  );
+  const files = createIndexedDbStreamSyncFiles({
+    dbName: `skeleton-${input.kind}`,
+    factory: new IDBFactory(),
+    keyRange: IDBKeyRange,
+  });
   const writer = new StreamSyncWriter({
     ownerAddress: OWNER,
     registry: input.registry,
     blobs,
     files,
     keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
-    // The full server signs with its registered server key; Lite with the owner.
-    signer: accountSigner(input.kind === "full" ? SERVER_KEY : OWNER_KEY),
+    signer: accountSigner(OWNER_KEY),
   });
-  const reader = await StreamSyncReadService.open({
-    files: readFiles,
-    blobs,
-    keys: await createStreamSyncReadKeys(
-      streamMasterKeyFromSignature(OWNER_SIGNATURE),
-    ),
-    logger: silent,
+  // The runtime opens IndexedDB through the global; stub it once for all hosts
+  // (each host has its own database name).
+  const globals = globalThis as { indexedDB?: unknown; IDBKeyRange?: unknown };
+  globals.indexedDB ??= new IDBFactory();
+  globals.IDBKeyRange ??= IDBKeyRange;
+  const lite = await createIndexedDbPsLiteRuntime({
+    ownerAddress: OWNER,
+    ownerSignature: OWNER_SIGNATURE,
+    dbName: `skeleton-lite-${input.kind}`,
+    gateway: {
+      ...createMockPsLiteGateway(),
+      getServer: async () => ({ id: "server-1" }),
+    } as never,
+    dataPointFeed: createGatewayDataPointFeed({
+      gatewayUrl: "http://registry.invalid",
+      fetch: input.listing.fetch,
+    }),
+    auth: createBearerTokenPsLiteAuth({ ownerToken: "t", builderToken: "b" }),
+    active: true,
+    logger: { ...silent, debug() {} } as never,
+    configDefaults: {
+      gateway: { url: "http://registry.invalid" },
+      storage: {
+        backend: "vana",
+        config: { vana: { apiUrl: input.storageUrl } },
+      },
+      sync: { enabled: true },
+      streamSync: { write: false, read: input.config.streamSync.read },
+    } as never,
   });
-  return { name: input.kind, writer, intake: new StubIntake(writer), reader };
+  return {
+    name: input.kind,
+    writer,
+    intake: new StubIntake(writer),
+    read: async () => {
+      const res = await lite.runtime.fetch(
+        new Request(`https://ps.local/v1/data/pdpp.${CONNECTOR}.${STREAM}`, {
+          headers: { Authorization: "Bearer t" },
+        }),
+      );
+      if (res.status !== 200)
+        return { kind: `HTTP ${res.status}`, records: [] };
+      const body = (await res.json()) as {
+        data: { records: Record<string, unknown>[] };
+      };
+      return { kind: "view", records: body.data.records };
+    },
+    sync: async () => {
+      await lite.syncManager!.trigger();
+    },
+  };
 }
 
 // ----------------------------------------------------------------- checks
 
-async function readRecords(
-  host: Host,
+async function readFromService(
+  reader: StreamSyncReadService,
 ): Promise<{ kind: string; records: Record<string, unknown>[] }> {
-  const decision = await host.reader.resolve({
+  const decision = await reader.resolve({
     scope: `pdpp.${CONNECTOR}.${STREAM}`,
     connection: null,
     cursor: null,
@@ -342,7 +425,14 @@ export async function runSkeleton(): Promise<Hop[]> {
     hops.push({ name, pass, detail });
   try {
     const make = (kind: HostKind) =>
-      makeHost({ kind, config, registry, storageUrl: storage.url, root });
+      makeHost({
+        kind,
+        config,
+        registry,
+        storageUrl: storage.url,
+        root,
+        listing,
+      });
     const full = await make("full");
     const phone = await make("phone");
     const frame = await make("frame");
@@ -351,8 +441,8 @@ export async function runSkeleton(): Promise<Hop[]> {
     const second = { id: "skeleton-2", value: "written by PS-Lite" };
 
     const check = async (name: string, host: Host, want: unknown[]) => {
-      await syncHost(host, listing);
-      const got = await readRecords(host);
+      await host.sync(listing);
+      const got = await host.read();
       const ok =
         got.kind === "view" &&
         JSON.stringify(sorted(got.records)) ===
