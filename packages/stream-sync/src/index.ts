@@ -13,3 +13,4 @@ export * from "./decide.js";
 export * from "./needs-full.js";
 export * from "./eligible.js";
 export * from "./outbox.js";
+export * from "./vectors.js";
