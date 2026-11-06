@@ -75,8 +75,20 @@ export interface StreamSyncFiles {
   write(path: string, bytes: Uint8Array): Promise<void>;
   /** The whole file, or `null` when it does not exist. */
   read(path: string): Promise<Uint8Array | null>;
-  /** Append to a file, creating it. Durable when the promise resolves. */
-  append(path: string, bytes: Uint8Array): Promise<void>;
+  /**
+   * Append to files, creating them. The bytes are visible to later reads at
+   * once but are durable only after `sync` of a prefix that covers the path:
+   * spool intake appends many times and syncs once (§2.6).
+   */
+  appendMany(
+    entries: readonly { readonly path: string; readonly bytes: Uint8Array }[],
+  ): Promise<void>;
+  /**
+   * Make every earlier append under `prefix/` durable, and the files'
+   * directory entries with them. A host may release resources it holds for
+   * those files (open handles).
+   */
+  sync(prefix: string): Promise<void>;
   /** The file in chunks of bounded size; nothing when it does not exist. */
   readChunks(path: string): AsyncIterable<Uint8Array>;
   /** Size in bytes; 0 when the file does not exist. */

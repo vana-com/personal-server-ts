@@ -2,8 +2,11 @@
  * `StreamSyncFiles` on the local filesystem (§2.8, Desktop full server).
  *
  * `write` replaces a file atomically (temporary file, fsync, rename, fsync of
- * the directory). `append` fsyncs before it resolves. Paths are relative to
- * `root` and may not leave it.
+ * the directory). `appendMany` does not fsync: it keeps at most `MAX_OPEN`
+ * append handles open (least recently used closed first) and remembers which
+ * files are dirty. `sync(prefix)` fsyncs the dirty files under the prefix and
+ * their directories, then closes their handles. Paths are relative to `root`
+ * and may not leave it.
  */
 
 import { createReadStream } from "node:fs";
@@ -17,9 +20,14 @@ import {
   stat,
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import type { FileHandle } from "node:fs/promises";
 import type { StreamSyncFiles } from "@opendatalabs/personal-server-ts-core/stream-sync";
 
 const CHUNK_BYTES = 1024 * 1024;
+/** Append handles kept open at once; the spool has up to 256 shards. */
+const MAX_OPEN = 64;
+/** Files fsynced at once by `sync`; the disk can merge their journal commits. */
+const SYNC_PARALLEL = 128;
 
 async function fsyncDir(dir: string): Promise<void> {
   const handle = await open(dir, "r");
@@ -43,9 +51,55 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
   const missing = (error: unknown) =>
     (error as NodeJS.ErrnoException).code === "ENOENT";
 
+  // Open append handles in least-recently-used order (Map keeps insertion
+  // order) and the files appended since their last sync.
+  const handles = new Map<string, FileHandle>();
+  const dirty = new Set<string>();
+  const under = (prefix: string) => (full: string) =>
+    full === prefix || full.startsWith(`${prefix}${sep}`);
+
+  async function appendHandle(full: string): Promise<FileHandle> {
+    const cached = handles.get(full);
+    if (cached) {
+      handles.delete(full);
+      handles.set(full, cached);
+      return cached;
+    }
+    while (handles.size >= MAX_OPEN) {
+      const [oldest, handle] = handles.entries().next().value!;
+      handles.delete(oldest);
+      await handle.close();
+    }
+    // The directory exists after the first append of a run; create it only
+    // when `open` says it does not.
+    let handle: FileHandle;
+    try {
+      handle = await open(full, "a");
+    } catch (error) {
+      if (!missing(error)) throw error;
+      await mkdir(dirname(full), { recursive: true });
+      handle = await open(full, "a");
+    }
+    handles.set(full, handle);
+    return handle;
+  }
+
+  /** Close the handles of `full` and of every file under it, and forget them. */
+  async function release(full: string): Promise<void> {
+    const match = under(full);
+    for (const [path, handle] of [...handles]) {
+      if (!match(path)) continue;
+      handles.delete(path);
+      await handle.close();
+    }
+    for (const path of [...dirty]) if (match(path)) dirty.delete(path);
+  }
+
   return {
     async write(path, bytes) {
       const full = abs(path);
+      // The rename replaces the inode; an append handle would write to the old one.
+      await release(full);
       await mkdir(dirname(full), { recursive: true });
       tmpCounter += 1;
       const tmp = `${full}.tmp-${process.pid}-${tmpCounter}`;
@@ -67,14 +121,48 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
         throw error;
       }
     },
-    async append(path, bytes) {
-      const full = abs(path);
-      await mkdir(dirname(full), { recursive: true });
-      const handle = await open(full, "a");
-      try {
-        await handle.write(bytes);
-        await handle.sync();
-      } finally {
+    async appendMany(entries) {
+      for (const { path, bytes } of entries) {
+        const full = abs(path);
+        const handle = await appendHandle(full);
+        await handle.writeFile(bytes);
+        dirty.add(full);
+      }
+    },
+    async sync(prefix) {
+      const match = under(abs(prefix));
+      const files = [...dirty].filter(match);
+      const folders = new Set<string>();
+      let next = 0;
+      const worker = async () => {
+        while (next < files.length) {
+          const full = files[next++]!;
+          const cached = handles.get(full);
+          if (cached) await cached.sync();
+          else {
+            const handle = await open(full, "r");
+            try {
+              await handle.sync();
+            } finally {
+              await handle.close();
+            }
+          }
+          // New files add entries to their directory and, for new
+          // directories, to every ancestor up to the root.
+          for (let dir = dirname(full); under(base)(dir); dir = dirname(dir)) {
+            if (folders.has(dir)) break;
+            folders.add(dir);
+          }
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(SYNC_PARALLEL, files.length) }, worker),
+      );
+      for (const dir of folders) await fsyncDir(dir);
+      for (const full of files) dirty.delete(full);
+      for (const [path, handle] of [...handles]) {
+        if (!match(path)) continue;
+        handles.delete(path);
         await handle.close();
       }
     },
@@ -118,6 +206,7 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       }
     },
     async remove(prefix) {
+      await release(abs(prefix));
       await rm(abs(prefix), { recursive: true, force: true });
     },
   };

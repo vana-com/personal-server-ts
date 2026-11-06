@@ -24,11 +24,14 @@ export function createMemoryStreamSyncFiles(
       }
       return out;
     },
-    async append(path, bytes) {
-      const chunks = store.get(path) ?? [];
-      chunks.push(bytes.slice());
-      store.set(path, chunks);
+    async appendMany(entries) {
+      for (const { path, bytes } of entries) {
+        const chunks = store.get(path) ?? [];
+        chunks.push(bytes.slice());
+        store.set(path, chunks);
+      }
     },
+    async sync() {},
     async *readChunks(path) {
       for (const chunk of store.get(path) ?? []) {
         for (let i = 0; i < chunk.length; i += chunkBytes) {

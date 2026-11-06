@@ -3,9 +3,9 @@
  * and RSS frames use OPFS where available, else IndexedDB).
  *
  * One object store holds file chunks keyed `<path>\u0001<seq>`. `write`
- * replaces every chunk of a path in one transaction; `append` adds the next
- * chunk. A transaction that completes is durable, so both resolve only after
- * `oncomplete`.
+ * replaces every chunk of a path in one transaction; `appendMany` adds the
+ * next chunk of every path of a batch in one transaction. A transaction that
+ * completes is durable, so both resolve only after `oncomplete`.
  */
 
 import type { StreamSyncFiles } from "@opendatalabs/personal-server-ts-core/stream-sync";
@@ -110,16 +110,27 @@ export function createIndexedDbStreamSyncFiles(
       }
       return out;
     },
-    async append(path, bytes) {
+    async appendMany(entries) {
+      if (entries.length === 0) return;
+      // One transaction for the whole batch: a spool flush touches up to 256
+      // shard files, and a transaction per file would commit 256 times.
       const tx = (await db()).transaction(STORE, "readwrite");
       const store = tx.objectStore(STORE);
-      const seq = (await lastSeq(store, path)) + 1;
-      store.put({
-        key: chunkKey(path, seq),
-        bytes: bytes.slice(),
-      } satisfies Chunk);
-      await done(tx);
+      const committed = done(tx);
+      const next = new Map<string, number>();
+      for (const { path, bytes } of entries) {
+        let seq = next.get(path);
+        if (seq === undefined) seq = (await lastSeq(store, path)) + 1;
+        next.set(path, seq + 1);
+        store.put({
+          key: chunkKey(path, seq),
+          bytes: bytes.slice(),
+        } satisfies Chunk);
+      }
+      await committed;
     },
+    // A transaction that completed is durable: nothing is left to sync.
+    async sync() {},
     async *readChunks(path) {
       let after: string | null = null;
       for (;;) {

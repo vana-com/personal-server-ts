@@ -609,10 +609,12 @@ export class StreamSyncWriter {
         if (key.startsWith(`${runId}\u0000`)) this.streamCache.delete(key);
       }
       if (run.excluded.length > 0) {
-        await this.options.files.append(
-          `runs/${runId}/excluded.ndjson`,
-          encoder.encode(run.excluded.map((l) => `${l}\n`).join("")),
-        );
+        await this.options.files.appendMany([
+          {
+            path: `runs/${runId}/excluded.ndjson`,
+            bytes: encoder.encode(run.excluded.map((l) => `${l}\n`).join("")),
+          },
+        ]);
       }
       let ns: string;
       if (host.identity === "none") ns = IDENTITYLESS_NS;
@@ -642,6 +644,9 @@ export class StreamSyncWriter {
           await this.writeState(state);
         }
       }
+      // Intake appends are not durable one by one. The run becomes `ready`
+      // only after one sync of its whole spool (§2.6).
+      await this.options.files.sync(`runs/${runId}`);
       host.entry = {
         ...host.entry,
         ns,
@@ -982,6 +987,7 @@ export class StreamSyncWriter {
     }
     await writer.flush();
     await this.compact(dir, bytes);
+    await this.options.files.sync(dir);
     stream.seedShardBytes = bytes;
     await this.writeEntry(host);
   }

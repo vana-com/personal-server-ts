@@ -5,7 +5,8 @@
  * part bytes, so the planner can sum shard counts as run bytes.
  *
  * Appends are buffered and flushed in bounded batches, so intake memory does
- * not grow with the stream.
+ * not grow with the stream. A flush is not durable: the caller syncs the
+ * spool directory once, when intake ends (`StreamSyncFiles.sync`).
  */
 
 import {
@@ -16,7 +17,7 @@ import {
 import type { StreamSyncFiles } from "./ports.js";
 
 const encoder = new TextEncoder();
-const FLUSH_BYTES = 1024 * 1024;
+const FLUSH_BYTES = 8 * 1024 * 1024;
 
 export function shardName(shard: number): string {
   return shard.toString(16).padStart(2, "0");
@@ -60,9 +61,12 @@ export class SpoolWriter {
     const pending = [...this.buffers.entries()];
     this.buffers.clear();
     this.buffered = 0;
-    for (const [path, lines] of pending) {
-      await this.files.append(path, encoder.encode(lines.join("")));
-    }
+    await this.files.appendMany(
+      pending.map(([path, lines]) => ({
+        path,
+        bytes: encoder.encode(lines.join("")),
+      })),
+    );
   }
 }
 
@@ -145,7 +149,11 @@ export async function compactShard(
   if (result.kind !== "ok") return null;
   if (result.winners.length === seenLines) return null;
   const text = result.winners.map((w) => `${w.pkHash} ${w.text}\n`).join("");
-  await files.write(path, encoder.encode(text));
+  // Replace the shard without a durable write per file: the run is still
+  // collecting, and its one `sync` follows the last compaction (§2.6). A stop
+  // between the two calls fails the run, as any stop while collecting does.
+  await files.remove(path);
+  await files.appendMany([{ path, bytes: encoder.encode(text) }]);
   return result.bytes;
 }
 
