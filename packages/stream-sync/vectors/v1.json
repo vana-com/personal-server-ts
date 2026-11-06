@@ -3433,6 +3433,108 @@
           }
         }
       ]
+    },
+    {
+      "name": "no-op onto a complete:false base (ruling Q9)",
+      "description": "An old DELETE tombstoned s; another device published an empty complete:false head at g=1 and left. This device's incremental run finds nothing new: its parts equal the base and complete stays false, so it is a no-op. The no-op sets needsFull and saves no checkpoint. The next run is full, publishes complete:true, clears needsFull and saves the checkpoint.",
+      "start": {
+        "834ab4c2636bcdd5": {
+          "kind": "active",
+          "generation": 1
+        }
+      },
+      "ns": "834ab4c2636bcdd5",
+      "userConnect": false,
+      "full": false,
+      "needsFull": [],
+      "steps": [
+        {
+          "op": "noop",
+          "baseComplete": false,
+          "complete": false,
+          "expected": true
+        },
+        {
+          "op": "afterCommit",
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s",
+            "complete": false,
+            "runFull": false
+          },
+          "expected": {
+            "needsFull": [
+              {
+                "connector": "chatgpt",
+                "ns": "834ab4c2636bcdd5",
+                "stream": "s"
+              }
+            ],
+            "clearCheckpoint": true
+          },
+          "mustBeFull": {
+            "chatgpt": true
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 1,
+          "streams": {
+            "s": {
+              "state": "noop",
+              "generation": 1,
+              "complete": false
+            }
+          },
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "skip",
+            "reason": "published_incomplete"
+          }
+        },
+        {
+          "op": "afterCommit",
+          "commit": {
+            "connector": "chatgpt",
+            "ns": "834ab4c2636bcdd5",
+            "stream": "s",
+            "complete": true,
+            "runFull": true
+          },
+          "expected": {
+            "needsFull": [],
+            "clearCheckpoint": false
+          },
+          "mustBeFull": {
+            "chatgpt": false
+          }
+        },
+        {
+          "op": "checkpoint",
+          "target": 1,
+          "streams": {
+            "s": {
+              "state": "committed",
+              "generation": 1,
+              "complete": true
+            }
+          },
+          "control": {
+            "kind": "active",
+            "generation": 1
+          },
+          "seedReceiptsPending": false,
+          "expected": {
+            "kind": "save",
+            "generation": 1
+          }
+        }
+      ]
     }
   ],
   "checkpoint": [

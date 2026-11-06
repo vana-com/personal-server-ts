@@ -1447,6 +1447,62 @@ const traces = [
       },
     ],
   },
+  {
+    name: "no-op onto a complete:false base (ruling Q9)",
+    description:
+      "An old DELETE tombstoned s; another device published an empty complete:false head at g=1 and left. This device's incremental run finds nothing new: its parts equal the base and complete stays false, so it is a no-op. The no-op sets needsFull and saves no checkpoint. The next run is full, publishes complete:true, clears needsFull and saves the checkpoint.",
+    start: { [NS]: A(1) },
+    ns: NS,
+    userConnect: false,
+    full: false,
+    needsFull: [],
+    steps: [
+      { op: "noop", baseComplete: false, complete: false, expected: true },
+      {
+        op: "afterCommit",
+        commit: {
+          connector: "chatgpt",
+          ns: NS,
+          stream: "s",
+          complete: false,
+          runFull: false,
+        },
+        expected: {
+          needsFull: [{ connector: "chatgpt", ns: NS, stream: "s" }],
+          clearCheckpoint: true,
+        },
+        mustBeFull: { chatgpt: true },
+      },
+      {
+        op: "checkpoint",
+        target: 1,
+        streams: { s: { state: "noop", generation: 1, complete: false } },
+        control: A(1),
+        seedReceiptsPending: false,
+        expected: { kind: "skip", reason: "published_incomplete" },
+      },
+      {
+        op: "afterCommit",
+        commit: {
+          connector: "chatgpt",
+          ns: NS,
+          stream: "s",
+          complete: true,
+          runFull: true,
+        },
+        expected: { needsFull: [], clearCheckpoint: false },
+        mustBeFull: { chatgpt: false },
+      },
+      {
+        op: "checkpoint",
+        target: 1,
+        streams: { s: committed(1) },
+        control: A(1),
+        seedReceiptsPending: false,
+        expected: { kind: "save", generation: 1 },
+      },
+    ],
+  },
 ];
 
 const checkpoint = [

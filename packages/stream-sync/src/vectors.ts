@@ -335,9 +335,31 @@ export async function runVectors(
   }
   for (const t of vectors.traces) {
     const s: StartState = startState(t.start, t.ns);
+    let needsFull: NeedsFull = t.needsFull ?? [];
     t.steps.forEach((step: any, i: number) => {
       const label = `trace ${t.name} step ${i}`;
-      if (step.op === "decide") {
+      if (step.op === "noop") {
+        eq(
+          label,
+          isNoop(
+            { ...base, complete: step.baseComplete },
+            base.parts,
+            step.complete,
+          ),
+          step.expected,
+        );
+      } else if (step.op === "afterCommit") {
+        const effect = afterCommit(needsFull, step.commit);
+        eq(label, effect, step.expected);
+        needsFull = effect.needsFull;
+        for (const [connector, must] of Object.entries(step.mustBeFull)) {
+          eq(
+            `${label} mustBeFull ${connector}`,
+            runMustBeFull(needsFull, connector),
+            must,
+          );
+        }
+      } else if (step.op === "decide") {
         eq(
           label,
           decide({
@@ -359,8 +381,10 @@ export async function runVectors(
           chooseBase(step.streamRow, head, step.target).kind,
           step.expected,
         );
-      } else {
+      } else if (step.op === "checkpoint") {
         eq(label, checkpointDecision(step), step.expected);
+      } else {
+        throw new Error(`${label}: unknown op ${String(step.op)}`);
       }
     });
   }
