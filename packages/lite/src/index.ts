@@ -263,3 +263,4 @@ export {
 } from "./oura-import.js";
 
 export { OURA_LEGACY_TAKEOVER_CONTRACT } from "@opendatalabs/personal-server-ts-core/api";
+export { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";

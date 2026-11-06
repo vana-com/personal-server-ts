@@ -121,6 +121,13 @@ import {
 } from "./storage/node-data-storage.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
 import {
+  StreamSyncWriter,
+  createGatewayStreamSyncRegistry,
+  createStorageStreamSyncBlobs,
+  createStreamSyncKeyPorts,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
+import {
   computeQuestion,
   createOpenAiCompatibleInferenceProvider,
   createPhalaE2eeEncryption,
@@ -144,6 +151,8 @@ export interface ServerContext {
   serverAccount?: ServerAccount;
   serverSigner?: ServerSigner;
   syncManager: SyncManager | null;
+  /** Whole-file stream sync writer; `null` unless `streamSync.write` is on. */
+  streamSyncWriter: StreamSyncWriter | null;
   tunnelManager?: TunnelManager;
   tunnelUrl?: string;
   isServerRegistered: () => boolean;
@@ -617,6 +626,7 @@ export async function createServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
+  let streamSyncWriter: StreamSyncWriter | null = null;
   /**
    * Late-bound PDPP importer.
    *
@@ -879,7 +889,26 @@ export async function createServer(
       );
     }
 
+    // Whole-file stream sync publishes beside the legacy upload, only when
+    // `streamSync.write` is on. Legacy uploads run unchanged either way.
+    if (config.streamSync.write && !isEnclave) {
+      streamSyncWriter = new StreamSyncWriter({
+        ownerAddress: serverOwner,
+        registry: createGatewayStreamSyncRegistry({
+          gatewayUrl: config.gateway.url,
+          ownerAddress: serverOwner,
+        }),
+        blobs: createStorageStreamSyncBlobs(storageAdapter),
+        files: createFsStreamSyncFiles(join(storageRoot, "stream-sync")),
+        keys: createStreamSyncKeyPorts(masterKeySignature),
+        signer: serverSigner,
+      });
+    }
+
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
+      streamSync: streamSyncWriter
+        ? { write: true, publisher: streamSyncWriter }
+        : null,
       deleteData,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
@@ -1276,6 +1305,7 @@ export async function createServer(
     serverAccount,
     serverSigner,
     syncManager,
+    streamSyncWriter,
     tunnelManager,
     tunnelUrl: undefined,
     isServerRegistered: () => Boolean(identity?.serverId),

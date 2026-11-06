@@ -2,7 +2,9 @@
  * §2.4, §2.7 durable `needsFull[c, ns, s]`.
  *
  * - Publishing `complete:false` sets `needsFull[c, ns, s]` and clears the
- *   checkpoint for c, so the next run is full.
+ *   checkpoint for c, so the next run is full. A no-op onto a
+ *   `complete:false` base does the same (ruling Q9): hosts call
+ *   `afterCommit` for a committed head and for an unchanged (no-op) head.
  * - A full run that commits `complete:true` clears it.
  * - Any `needsFull` for c forces the next run of c to be full.
  *
@@ -43,7 +45,7 @@ export interface CommitEffect {
   readonly clearCheckpoint: boolean;
 }
 
-/** Apply one committed head to the `needsFull` set. */
+/** Apply one committed or unchanged (no-op) head to the `needsFull` set. */
 export function afterCommit(
   needsFull: NeedsFull,
   commit: NeedsFullKey & {

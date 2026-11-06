@@ -1,4 +1,8 @@
 import {
+  PhysicalScopeError,
+  isPhysicalScope,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import {
   access,
   mkdir,
   open,
@@ -365,6 +369,8 @@ export async function readDataFilePreview(
  * is not a version and nothing that lists, uploads or serves data reaches it.
  */
 function buildFirstSeenLedgerPath(dataDir: string, scope: string): string {
+  // Ruling Q7: a physical stream-sync name fails here, before the SDK.
+  if (isPhysicalScope(scope)) throw new PhysicalScopeError(scope);
   // Throws for anything that is not a well-formed scope, so the scope can
   // never carry a path separator or `..` into the file name.
   scopeToPathSegments(scope);
@@ -376,6 +382,8 @@ export async function readFirstSeenLedger(
   options: HierarchyManagerOptions,
   scope: string,
 ): Promise<unknown | null> {
+  // Ruling Q7: a stream-sync name has no ledger; route it away.
+  if (isPhysicalScope(scope)) return null;
   try {
     return JSON.parse(
       await readFile(buildFirstSeenLedgerPath(options.dataDir, scope), "utf-8"),

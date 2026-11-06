@@ -10,7 +10,7 @@
  * distinct keys of the bucket, not with the versions fed to it.
  */
 
-import { PART_LIMIT_BYTES, utf8Length } from "./bytes.js";
+import { PART_LIMIT_BYTES, PLANNER_DEPTH_CAP, utf8Length } from "./bytes.js";
 import { InvalidArgumentError } from "./errors.js";
 import { encodeLine, inPrefix, type Line } from "./records.js";
 
@@ -41,6 +41,18 @@ export type BucketResult =
       /** Part size: sum of line bytes plus one `\n` per line. */
       readonly bytes: number;
     }
+  /**
+   * Ruling Q4: winners over the limit in a bucket shallower than the 16-bit
+   * cap. The estimate was wrong; the host re-plans: it splits the bucket by
+   * the next bit (`prefix + "0"`, `prefix + "1"`, with the counting pass when
+   * the children are deeper than 8 bits) and reduces each child again.
+   */
+  | {
+      readonly kind: "split";
+      readonly prefix: string;
+      readonly bytes: number;
+    }
+  /** Winners over the limit at the 16-bit cap: the stream cannot publish. */
   | {
       readonly kind: "bucket_too_large";
       readonly prefix: string;
@@ -87,7 +99,10 @@ export class BucketReducer {
     return this.winners.size;
   }
 
-  /** Winners sorted by pkHash, or `bucket_too_large` over `limitBytes`. */
+  /**
+   * Winners sorted by pkHash. Over `limitBytes`: `split` below the 16-bit cap
+   * (ruling Q4), `bucket_too_large` only at the cap.
+   */
   finish(limitBytes: number = PART_LIMIT_BYTES): BucketResult {
     const keys = [...this.winners.keys()].sort();
     let bytes = 0;
@@ -98,7 +113,9 @@ export class BucketReducer {
       winners.push({ pkHash, text });
     }
     if (bytes > limitBytes) {
-      return { kind: "bucket_too_large", prefix: this.prefix, bytes };
+      return this.prefix.length < PLANNER_DEPTH_CAP
+        ? { kind: "split", prefix: this.prefix, bytes }
+        : { kind: "bucket_too_large", prefix: this.prefix, bytes };
     }
     return { kind: "ok", prefix: this.prefix, winners, bytes };
   }

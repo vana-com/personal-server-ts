@@ -10,7 +10,7 @@
  *   node packages/stream-sync/scripts/generate-vectors.mjs [--check]
  */
 
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, hkdfSync } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +77,74 @@ const namespace = {
   keyCheck,
   controlHashes: hashes,
   cases: nsCases,
+};
+
+// ---------- stream master key (ruling R4, U1-Q1) ----------
+
+// Anvil account #0 signs "vana-master-key-v1" (personal_sign). viem gives
+// this low-s, v = 27 encoding; the other two are the same signature.
+const OWNER_SIGNATURE =
+  "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b";
+const SECP256K1_N =
+  0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+const sigR = OWNER_SIGNATURE.slice(2, 66);
+const sigS = BigInt("0x" + OWNER_SIGNATURE.slice(66, 130));
+const sigV = parseInt(OWNER_SIGNATURE.slice(130), 16);
+const hex32 = (n) => n.toString(16).padStart(64, "0");
+const hex1 = (n) => n.toString(16).padStart(2, "0");
+const masterKeyHex = OWNER_SIGNATURE.slice(2);
+const streamKNs = Buffer.from(
+  hkdfSync(
+    "sha256",
+    Buffer.from(masterKeyHex, "hex"),
+    Buffer.from("vana", "utf8"),
+    Buffer.from("scope:pdpp-stream-sync/namespace/v1", "utf8"),
+    32,
+  ),
+);
+const streamHmac8 = (text) =>
+  createHmac("sha256", streamKNs)
+    .update(text, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+const streamMasterKey = {
+  description:
+    "The stream-sync master key is the 65-byte owner signature as r, low s and v = 27/28. Every encoding gives the same key, so the same K_ns = HKDF-SHA256(masterKey, salt 'vana', info 'scope:' + NAMESPACE_KEY_LABEL, 32), ns and keyCheck. Legacy scope keys keep the raw signature.",
+  encodings: [
+    { name: "v 27/28, low s", signature: OWNER_SIGNATURE },
+    {
+      name: "v 0/1, low s",
+      signature: "0x" + sigR + hex32(sigS) + hex1(sigV - 27),
+    },
+    {
+      name: "v 27/28, high s",
+      signature:
+        "0x" + sigR + hex32(SECP256K1_N - sigS) + hex1(sigV === 27 ? 28 : 27),
+    },
+    {
+      name: "v 0/1, high s",
+      signature:
+        "0x" + sigR + hex32(SECP256K1_N - sigS) + hex1(sigV === 27 ? 1 : 0),
+    },
+  ],
+  masterKeyHex,
+  kNsHex: streamKNs.toString("hex"),
+  keyCheck: streamHmac8("key-check"),
+  ns: {
+    connector: "chatgpt",
+    accountId: "user-123",
+    ns: streamHmac8(cj(["chatgpt", "user-123"])),
+  },
+  invalid: [
+    { name: "64 bytes", signature: "0x" + masterKeyHex.slice(0, 128) },
+    { name: "66 bytes", signature: "0x" + masterKeyHex + "00" },
+    { name: "v = 29", signature: "0x" + sigR + hex32(sigS) + "1d" },
+    { name: "v = 2", signature: "0x" + sigR + hex32(sigS) + "02" },
+    { name: "s = 0", signature: "0x" + sigR + hex32(0n) + "1b" },
+    { name: "s = n", signature: "0x" + sigR + hex32(SECP256K1_N) + "1b" },
+    { name: "r = 0", signature: "0x" + hex32(0n) + hex32(sigS) + "1b" },
+    { name: "no 0x prefix", signature: masterKeyHex },
+  ],
 };
 
 // ---------- scopes and blob names ----------
@@ -266,7 +334,7 @@ const lines = {
 
 // ---------- merge ----------
 
-function mergeCase(name, primaryKey, feed, prefix = "") {
+function mergeCase(name, primaryKey, feed, prefix = "", limitBytes) {
   const best = new Map();
   for (const l of feed) {
     const k = sha(cj(primaryKey.map((f) => l.v[f])));
@@ -276,10 +344,27 @@ function mergeCase(name, primaryKey, feed, prefix = "") {
   const keys = [...best.keys()].sort();
   const winners = keys.map((k) => ({ pkHash: k, text: lineText(best.get(k)) }));
   const partText = winners.map((w) => w.text + "\n").join("");
+  const bytes = Buffer.byteLength(partText, "utf8");
+  if (limitBytes !== undefined && bytes > limitBytes) {
+    // Ruling Q4: over the limit, split below the 16-bit cap; too large at it.
+    return {
+      name,
+      primaryKey,
+      prefix,
+      limitBytes,
+      feed,
+      expected: {
+        kind: prefix.length < 16 ? "split" : "bucket_too_large",
+        prefix,
+        bytes,
+      },
+    };
+  }
   return {
     name,
     primaryKey,
     prefix,
+    ...(limitBytes === undefined ? {} : { limitBytes }),
     feed,
     expected: {
       winners,
@@ -348,6 +433,30 @@ const merge = [
     ],
   ),
   mergeCase("empty feed: no part", ["id"], []),
+  mergeCase(
+    "over the limit below the cap: split (Q4)",
+    ["id"],
+    [
+      { o: 1, r: "r", v: { id: 1, pad: "x".repeat(200) } },
+      { o: 1, r: "r", v: { id: 2, pad: "y".repeat(200) } },
+    ],
+    "",
+    300,
+  ),
+  mergeCase(
+    "over the limit at the 16-bit cap: bucket_too_large (Q4)",
+    ["id"],
+    [{ o: 1, r: "r", v: { id: 1, pad: "x".repeat(200) } }],
+    bits(sha(cj([1])), 16),
+    100,
+  ),
+  mergeCase(
+    "at the limit exactly: ok",
+    ["id"],
+    [{ o: 1, r: "r", v: { id: 1 } }],
+    "",
+    Buffer.byteLength(lineText({ o: 1, r: "r", v: { id: 1 } }) + "\n"),
+  ),
 ];
 
 // ---------- planner (expectations derived by hand in the comments) ----------
@@ -680,10 +789,24 @@ const headRules = {
     { control: F(3), streamRow: "present", headGeneration: 3, live: false },
     { control: ABSENT, streamRow: "present", headGeneration: 1, live: false },
   ],
+  // Ruling F1: three outcomes.
   chooseBase: [
-    { streamRow: "present", headGeneration: 3, target: 3, base: "head" },
+    { streamRow: "present", headGeneration: 3, target: 3, base: "base" },
     { streamRow: "present", headGeneration: 1, target: 3, base: "empty" },
+    {
+      streamRow: "present",
+      headGeneration: 3,
+      target: 1,
+      base: "stale_generation",
+    },
+    {
+      streamRow: "present",
+      headGeneration: 4,
+      target: 3,
+      base: "stale_generation",
+    },
     { streamRow: "tombstoned", headGeneration: 3, target: 3, base: "empty" },
+    { streamRow: "tombstoned", headGeneration: 5, target: 3, base: "empty" },
     { streamRow: "absent", headGeneration: null, target: 1, base: "empty" },
   ],
   writerCompatibility: [
@@ -1085,6 +1208,56 @@ const decide = [
     { uc: true, full: true, phase: "after_write" },
     DISCARD,
   ),
+  // Ruling F1: re-read after chooseBase returned stale_generation.
+  row(
+    "stale base: start older than control → discard by the table",
+    A(1),
+    A(3),
+    { phase: "stale_base" },
+    { ...DISCARD, clearCheckpoints: true },
+  ),
+  row(
+    "stale base: start older than control → discard by the table",
+    ABSENT,
+    A(3),
+    { uc: true, full: true, phase: "stale_base" },
+    DISCARD,
+  ),
+  row(
+    "stale base: control still admits T → keep pending, registry_inconsistent",
+    A(3),
+    A(3),
+    { phase: "stale_base" },
+    { kind: "keep_pending", reason: "registry_inconsistent" },
+  ),
+  row(
+    "stale base: control still admits T → keep pending, registry_inconsistent",
+    ABSENT,
+    A(1),
+    { phase: "stale_base" },
+    { kind: "keep_pending", reason: "registry_inconsistent" },
+  ),
+  row(
+    "stale base: control would create or reconnect → keep pending, registry_inconsistent",
+    ABSENT,
+    ABSENT,
+    { phase: "stale_base" },
+    { kind: "keep_pending", reason: "registry_inconsistent" },
+  ),
+  row(
+    "stale base: control would create or reconnect → keep pending, registry_inconsistent",
+    D(2),
+    D(2),
+    { uc: true, full: true, phase: "stale_base" },
+    { kind: "keep_pending", reason: "registry_inconsistent" },
+  ),
+  row(
+    "stale base: foreign → keep pending, key_mismatch",
+    A(1),
+    F(3),
+    { phase: "stale_base" },
+    { kind: "keep_pending", reason: "key_mismatch" },
+  ),
 ];
 
 const startState = [
@@ -1104,6 +1277,36 @@ const committed = (generation, complete = true) => ({
   complete,
 });
 const traces = [
+  {
+    name: "late head from an older generation (F1)",
+    description:
+      "A run admitted at g=1 resumes after a delete (v2) and a reconnect elsewhere that committed a g=3 head. chooseBase returns stale_generation; the re-read decides discard and clears checkpoints. Nothing is published, so the g=3 keys stay intact.",
+    start: { [NS]: A(1) },
+    ns: NS,
+    userConnect: false,
+    full: false,
+    steps: [
+      {
+        op: "decide",
+        current: A(1),
+        phase: "first",
+        expected: { kind: "publish", target: 1 },
+      },
+      {
+        op: "chooseBase",
+        streamRow: "present",
+        headGeneration: 3,
+        target: 1,
+        expected: "stale_generation",
+      },
+      {
+        op: "decide",
+        current: A(3),
+        phase: "stale_base",
+        expected: { ...DISCARD, clearCheckpoints: true },
+      },
+    ],
+  },
   {
     name: "replay after delete (trace A)",
     description:
@@ -1312,6 +1515,62 @@ const traces = [
       },
     ],
   },
+  {
+    name: "no-op onto a complete:false base (ruling Q9)",
+    description:
+      "An old DELETE tombstoned s; another device published an empty complete:false head at g=1 and left. This device's incremental run finds nothing new: its parts equal the base and complete stays false, so it is a no-op. The no-op sets needsFull and saves no checkpoint. The next run is full, publishes complete:true, clears needsFull and saves the checkpoint.",
+    start: { [NS]: A(1) },
+    ns: NS,
+    userConnect: false,
+    full: false,
+    needsFull: [],
+    steps: [
+      { op: "noop", baseComplete: false, complete: false, expected: true },
+      {
+        op: "afterCommit",
+        commit: {
+          connector: "chatgpt",
+          ns: NS,
+          stream: "s",
+          complete: false,
+          runFull: false,
+        },
+        expected: {
+          needsFull: [{ connector: "chatgpt", ns: NS, stream: "s" }],
+          clearCheckpoint: true,
+        },
+        mustBeFull: { chatgpt: true },
+      },
+      {
+        op: "checkpoint",
+        target: 1,
+        streams: { s: { state: "noop", generation: 1, complete: false } },
+        control: A(1),
+        seedReceiptsPending: false,
+        expected: { kind: "skip", reason: "published_incomplete" },
+      },
+      {
+        op: "afterCommit",
+        commit: {
+          connector: "chatgpt",
+          ns: NS,
+          stream: "s",
+          complete: true,
+          runFull: true,
+        },
+        expected: { needsFull: [], clearCheckpoint: false },
+        mustBeFull: { chatgpt: false },
+      },
+      {
+        op: "checkpoint",
+        target: 1,
+        streams: { s: committed(1) },
+        control: A(1),
+        seedReceiptsPending: false,
+        expected: { kind: "save", generation: 1 },
+      },
+    ],
+  },
 ];
 
 const checkpoint = [
@@ -1327,13 +1586,12 @@ const checkpoint = [
     expected: { kind: "save", generation: 2 },
   },
   {
-    name: "no-op of an incomplete head does not block",
-    question: "Q9",
+    name: "no-op of an incomplete head blocks (ruling Q9)",
     target: 2,
     streams: { a: { state: "noop", generation: 2, complete: false } },
     control: A(2),
     seedReceiptsPending: false,
-    expected: { kind: "save", generation: 2 },
+    expected: { kind: "skip", reason: "published_incomplete" },
   },
   {
     name: "a stream published complete:false",
@@ -1647,6 +1905,7 @@ const vectors = {
     "Cases with a `question` field follow a provisional reading; see DESIGN-QUESTIONS.md.",
   ],
   namespace,
+  streamMasterKey,
   scopes,
   pkHash: pkCases,
   lines,
