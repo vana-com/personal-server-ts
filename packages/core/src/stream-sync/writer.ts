@@ -232,8 +232,9 @@ export interface StreamSyncRunStart {
   /**
    * Issue the START from the saved state (V2 §2.1, R16): the run is full when
    * the caller asks, a `needsFull` entry forces it, or no checkpoint exists.
-   * An owner-started full run keeps the stored state; only a forced or
-   * checkpoint-less full run gets `null`. Replaces `checkpointUsed`.
+   * The returned state is the stored value (`null` when forced or without a
+   * checkpoint); the intake adapter strips cursors of full_refresh streams
+   * before it sends START (R24). Replaces `checkpointUsed`.
    */
   readonly issue?: { readonly wantFull: boolean };
   /** The write lease the run is bound to; `null` on hosts with no lease. */
