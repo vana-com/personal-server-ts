@@ -1,0 +1,334 @@
+/**
+ * Walking skeleton of whole-file stream sync: ONE record flows through the
+ * real path on three hosts.
+ *
+ *   connector run -> run intake (begin -> batches -> end) -> publish
+ *     -> read on the full server
+ *     -> read on PS-Lite as the phone hosts it
+ *     -> read on PS-Lite as the Account frame hosts it
+ *   and back: PS-Lite writes, the full server (and the frame) read.
+ *
+ * Real: the stream-sync writer, publish driver, encryption, heads and parts,
+ * the read service (mirror, import, view, legacy `{records}` projection), the
+ * production storage adapter against a local write-once blob store, the full
+ * server's filesystem adapters and Lite's IndexedDB adapter.
+ *
+ * Stubbed (each marked `SKELETON STUB`): the intake adapter, the connector
+ * fixture, the registry (in-memory, gateway rules) and its listing feed, and
+ * the phone and frame host configuration. The list is in the hand-back.
+ *
+ * Run: `npm run e2e:stream-sync-skeleton` (needs `streamSync.write`).
+ */
+
+import { createHash } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import {
+  canonicalJson,
+  streamMasterKeyFromSignature,
+  type JsonValue,
+} from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  StreamSyncWriter,
+  createStreamSyncKeyPorts,
+  type StreamSyncFiles,
+  type StreamSyncRegistry,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import {
+  createMemoryStreamSyncReadFiles,
+  createStreamSyncReadKeys,
+  StreamSyncReadService,
+  type MirrorFeedRow,
+  type StreamSyncReadFiles,
+} from "@opendatalabs/personal-server-ts-core/stream-sync-read";
+import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import { createIndexedDbStreamSyncFiles } from "@opendatalabs/personal-server-ts-lite";
+import { createFsStreamSyncFiles } from "./fs-files.js";
+import { createFsStreamSyncReadFiles } from "../stream-sync-read/fs-files.js";
+import {
+  OWNER,
+  OWNER_KEY,
+  OWNER_SIGNATURE,
+  SERVER_KEY,
+  SHAPE,
+  accountSigner,
+  createFakeStreamSyncRegistry,
+  interpose,
+  startLocalStorage,
+  storageBlobs,
+} from "./oracle.test-utils.js";
+
+const CONNECTOR = "skeleton";
+const STREAM = "items";
+const ACCOUNT_ID = "skeleton-account";
+const T0 = Date.UTC(2026, 10, 1);
+const silent = { info() {}, warn() {}, error() {} };
+
+export interface Hop {
+  readonly name: string;
+  readonly pass: boolean;
+  readonly detail: string;
+}
+
+const hash = (value: unknown): string =>
+  createHash("sha256").update(canonicalJson(value)).digest("hex").slice(0, 12);
+
+// ---------------------------------------------------------------- intake
+
+/**
+ * SKELETON STUB (lane P6 replaces it with the real `begin/batches/end`
+ * adapter in `packages/core/src/stream-sync/intake.ts`): the same three calls
+ * over the writer's own beginRun/append/finishRun, without START issue,
+ * binding checks, ordinals or tombstones.
+ */
+class StubIntake {
+  constructor(private readonly writer: StreamSyncWriter) {}
+
+  begin(runId: string, observedAt: number): Promise<void> {
+    // SKELETON STUB: identity is always required and `wantFull` is not modelled.
+    return this.writer.beginRun({
+      runId,
+      connector: CONNECTOR,
+      userConnect: false,
+      observedAt,
+      identity: "required",
+      checkpointUsed: null,
+    });
+  }
+
+  async batch(
+    runId: string,
+    records: readonly Record<string, unknown>[],
+  ): Promise<void> {
+    // SKELETON STUB: stream name and shape come from constants, not from a
+    // declaration resolved from the connector artifact digest.
+    await this.writer.declareStream(runId, STREAM, SHAPE);
+    for (const record of records) {
+      await this.writer.append(runId, STREAM, record);
+    }
+  }
+
+  async end(runId: string, checkpoint: JsonValue): Promise<void> {
+    await this.writer.setAccountIdentity(runId, ACCOUNT_ID);
+    await this.writer.finishRun(runId, { checkpointCandidate: checkpoint });
+  }
+}
+
+/** SKELETON STUB (lane P6): one fixture connector run of one stream. */
+async function fixtureRun(
+  intake: StubIntake,
+  runId: string,
+  observedAt: number,
+  records: readonly Record<string, unknown>[],
+): Promise<void> {
+  await intake.begin(runId, observedAt);
+  await intake.batch(runId, records);
+  await intake.end(runId, { cursor: runId });
+}
+
+// ----------------------------------------------------------------- hosts
+
+interface Host {
+  readonly name: string;
+  readonly writer: StreamSyncWriter;
+  readonly intake: StubIntake;
+  readonly reader: StreamSyncReadService;
+}
+
+/**
+ * SKELETON STUB (lane U1/U5 for the listing worker): the real hosts feed the
+ * read mirror from `downloadAll`'s registry listing. Here every host is fed
+ * the rows the shared registry accepted.
+ */
+class RegistryFeed {
+  private readonly rows = new Map<string, MirrorFeedRow>();
+  private clock = T0;
+
+  wrap(inner: StreamSyncRegistry): StreamSyncRegistry {
+    return interpose(inner, {
+      afterPost: async (request, result) => {
+        if (result.kind !== "committed") return;
+        this.clock += 1000;
+        this.rows.set(request.scope, {
+          scope: request.scope,
+          dataHash: request.dataHash,
+          metadataHash: request.metadataHash,
+          expectedVersion: request.expectedVersion,
+          addedAt: new Date(this.clock).toISOString(),
+          deletedAt: null,
+        });
+      },
+    });
+  }
+
+  async sync(reader: StreamSyncReadService): Promise<void> {
+    await reader.observe([...this.rows.values()], {
+      fromStart: true,
+      lastPage: true,
+    });
+    await reader.importPending();
+  }
+}
+
+type HostKind = "full" | "phone" | "frame";
+
+async function makeHost(input: {
+  kind: HostKind;
+  config: ReturnType<typeof ServerConfigSchema.parse>;
+  registry: StreamSyncRegistry;
+  storageUrl: string;
+  root: string;
+}): Promise<Host> {
+  // The flag gate, as the hosts apply it: no flag, no writer.
+  if (!input.config.streamSync.write) {
+    throw new Error("streamSync.write is off: the skeleton needs it on");
+  }
+  const blobs = storageBlobs(input.storageUrl);
+  let files: StreamSyncFiles;
+  let readFiles: StreamSyncReadFiles;
+  if (input.kind === "full") {
+    files = createFsStreamSyncFiles(join(input.root, "full-write"));
+    readFiles = createFsStreamSyncReadFiles(join(input.root, "full-read"));
+  } else {
+    // SKELETON STUB (lanes U6 phone, U7 frame): the phone shell and the
+    // Account frame each host PS-Lite with their own IndexedDB; the two
+    // differ today only by database, so both are built from one recipe.
+    // Real differences (lease-less begin, identity source, the frame's
+    // postMessage transport) arrive with those lanes.
+    files = createIndexedDbStreamSyncFiles({
+      dbName: `skeleton-${input.kind}`,
+      factory: new IDBFactory(),
+      keyRange: IDBKeyRange,
+    });
+    readFiles = createMemoryStreamSyncReadFiles();
+  }
+  const writer = new StreamSyncWriter({
+    ownerAddress: OWNER,
+    registry: input.registry,
+    blobs,
+    files,
+    keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
+    // The full server signs with its registered server key; Lite with the owner.
+    signer: accountSigner(input.kind === "full" ? SERVER_KEY : OWNER_KEY),
+  });
+  const reader = await StreamSyncReadService.open({
+    files: readFiles,
+    blobs,
+    keys: await createStreamSyncReadKeys(
+      streamMasterKeyFromSignature(OWNER_SIGNATURE),
+    ),
+    logger: silent,
+  });
+  return { name: input.kind, writer, intake: new StubIntake(writer), reader };
+}
+
+// ----------------------------------------------------------------- checks
+
+async function readRecords(
+  host: Host,
+): Promise<{ kind: string; records: Record<string, unknown>[] }> {
+  const decision = await host.reader.resolve({
+    scope: `pdpp.${CONNECTOR}.${STREAM}`,
+    connection: null,
+    cursor: null,
+    legacyFile: false,
+  });
+  if (decision.kind !== "view") return { kind: decision.kind, records: [] };
+  const body = JSON.parse(await new Response(decision.body).text()) as {
+    data: { records: Record<string, unknown>[] };
+  };
+  return { kind: "view", records: body.data.records };
+}
+
+function sorted(records: readonly Record<string, unknown>[]): string[] {
+  return records.map((r) => hash(r)).sort();
+}
+
+export async function runSkeleton(): Promise<Hop[]> {
+  const config = ServerConfigSchema.parse({
+    streamSync: { write: true, read: true },
+  });
+  const root = await mkdtemp(join(tmpdir(), "stream-sync-skeleton-"));
+  const storage = await startLocalStorage();
+  const feed = new RegistryFeed();
+  // SKELETON STUB (oracle lane): in-memory registry with the gateway's
+  // exclusive-version rules, in place of the real data-gateway.
+  const registry = feed.wrap(createFakeStreamSyncRegistry());
+  const hops: Hop[] = [];
+  const hop = (name: string, pass: boolean, detail: string) =>
+    hops.push({ name, pass, detail });
+  try {
+    const make = (kind: HostKind) =>
+      makeHost({ kind, config, registry, storageUrl: storage.url, root });
+    const full = await make("full");
+    const phone = await make("phone");
+    const frame = await make("frame");
+
+    const first = { id: "skeleton-1", value: "written by the full server" };
+    const second = { id: "skeleton-2", value: "written by PS-Lite" };
+
+    const check = async (name: string, host: Host, want: unknown[]) => {
+      await feed.sync(host.reader);
+      const got = await readRecords(host);
+      const ok =
+        got.kind === "view" &&
+        JSON.stringify(sorted(got.records)) ===
+          JSON.stringify(sorted(want as Record<string, unknown>[]));
+      hop(
+        name,
+        ok,
+        got.kind === "view"
+          ? `records=${got.records.length} hashes=${sorted(got.records).join(",")}`
+          : `read answered ${got.kind}`,
+      );
+    };
+
+    // Forward: the full server writes, three hosts read.
+    await full.writer.refreshControls();
+    await fixtureRun(full.intake, "skeleton-run-1", T0, [first]);
+    const report = await full.writer.cycle();
+    const run1 = report.runs.find((r) => r.runId === "skeleton-run-1");
+    hop(
+      "write: full server publishes run 1",
+      run1?.outcome?.kind === "checkpointed",
+      `outcome=${run1?.outcome?.kind ?? "none"} expected=${hash(first)}`,
+    );
+    await check("read: full server sees the record", full, [first]);
+    await check("read: PS-Lite (phone) sees the record", phone, [first]);
+    await check("read: PS-Lite (Account frame) sees the record", frame, [
+      first,
+    ]);
+
+    // Reverse: PS-Lite (phone) writes, the full server and the frame read.
+    await phone.writer.refreshControls();
+    await fixtureRun(phone.intake, "skeleton-run-2", T0 + 60_000, [second]);
+    const report2 = await phone.writer.cycle();
+    const run2 = report2.runs.find((r) => r.runId === "skeleton-run-2");
+    hop(
+      "write: PS-Lite (phone) publishes run 2",
+      run2?.outcome?.kind === "checkpointed",
+      `outcome=${run2?.outcome?.kind ?? "none"} expected=${hash(second)}`,
+    );
+    await check("read: full server sees both records", full, [first, second]);
+    await check("read: PS-Lite (Account frame) sees both records", frame, [
+      first,
+      second,
+    ]);
+    await check("read: PS-Lite (phone) sees both records", phone, [
+      first,
+      second,
+    ]);
+    return hops;
+  } finally {
+    await storage.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+export function formatHops(hops: readonly Hop[]): string {
+  return hops
+    .map((h) => `${h.pass ? "PASS" : "FAIL"} ${h.name} (${h.detail})`)
+    .join("\n");
+}

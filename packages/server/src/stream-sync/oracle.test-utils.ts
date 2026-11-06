@@ -75,7 +75,7 @@ const GATEWAY_CONFIG = {
 export const PROFILE: HeadProfile = { key: null, version: "1.0.0" };
 export const SHAPE = { primaryKey: ["id"], profile: PROFILE } as const;
 
-function accountSigner(key: `0x${string}`): StreamSyncSigner {
+export function accountSigner(key: `0x${string}`): StreamSyncSigner {
   const account = privateKeyToAccount(key);
   return createServerSigner(
     {
