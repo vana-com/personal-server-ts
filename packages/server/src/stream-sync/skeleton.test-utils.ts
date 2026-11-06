@@ -21,6 +21,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,9 +42,16 @@ import {
   createMemoryStreamSyncReadFiles,
   createStreamSyncReadKeys,
   StreamSyncReadService,
-  type MirrorFeedRow,
   type StreamSyncReadFiles,
 } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
+import {
+  computeDataPointId,
+  createGatewayDataPointFeed,
+  downloadAll,
+} from "@opendatalabs/personal-server-ts-core/sync";
+import { createMemoryDataStorage } from "@opendatalabs/personal-server-ts-core/test-utils";
+import type { StorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createIndexedDbStreamSyncFiles } from "@opendatalabs/personal-server-ts-lite";
 import { createFsStreamSyncFiles } from "./fs-files.js";
@@ -76,6 +84,24 @@ export interface Hop {
 const hash = (value: unknown): string =>
   createHash("sha256").update(canonicalJson(value)).digest("hex").slice(0, 12);
 
+// ----------------------------------------------------------- stub counter
+
+/**
+ * Every stub registers itself when it is constructed or first used, so the
+ * count reflects what ran, not what a grep finds. Keyed by name: a stub
+ * built once per host counts once. The value says who removes it.
+ */
+const usedStubs = new Map<string, string>();
+
+function registerStub(name: string, removedBy: string): void {
+  usedStubs.set(name, removedBy);
+}
+
+export function stubReport(): { count: number; lines: string[] } {
+  const lines = [...usedStubs].map(([name, by]) => `  ${name} -> ${by}`);
+  return { count: usedStubs.size, lines };
+}
+
 // ---------------------------------------------------------------- intake
 
 /**
@@ -85,7 +111,9 @@ const hash = (value: unknown): string =>
  * binding checks, ordinals or tombstones.
  */
 class StubIntake {
-  constructor(private readonly writer: StreamSyncWriter) {}
+  constructor(private readonly writer: StreamSyncWriter) {
+    registerStub("intake adapter (StubIntake)", "lane P6");
+  }
 
   begin(runId: string, observedAt: number): Promise<void> {
     // SKELETON STUB: identity is always required and `wantFull` is not modelled.
@@ -124,6 +152,7 @@ async function fixtureRun(
   observedAt: number,
   records: readonly Record<string, unknown>[],
 ): Promise<void> {
+  registerStub("connector fixture (fixtureRun)", "lane P6");
   await intake.begin(runId, observedAt);
   await intake.batch(runId, records);
   await intake.end(runId, { cursor: runId });
@@ -139,12 +168,13 @@ interface Host {
 }
 
 /**
- * SKELETON STUB (lane U1/U5 for the listing worker): the real hosts feed the
- * read mirror from `downloadAll`'s registry listing. Here every host is fed
- * the rows the shared registry accepted.
+ * The registry's listing as a gateway serves it: `GET /v1/data?user=..` over
+ * the rows the shared in-memory registry accepted. Only the HTTP origin is
+ * faked; every host reads it through the production `createGatewayDataPointFeed`
+ * and `downloadAll` loop (see `syncHost`).
  */
-class RegistryFeed {
-  private readonly rows = new Map<string, MirrorFeedRow>();
+class RegistryListing {
+  private readonly rows = new Map<string, Record<string, unknown>>();
   private clock = T0;
 
   wrap(inner: StreamSyncRegistry): StreamSyncRegistry {
@@ -153,6 +183,8 @@ class RegistryFeed {
         if (result.kind !== "committed") return;
         this.clock += 1000;
         this.rows.set(request.scope, {
+          id: computeDataPointId(OWNER, request.scope),
+          ownerAddress: OWNER,
           scope: request.scope,
           dataHash: request.dataHash,
           metadataHash: request.metadataHash,
@@ -164,13 +196,39 @@ class RegistryFeed {
     });
   }
 
-  async sync(reader: StreamSyncReadService): Promise<void> {
-    await reader.observe([...this.rows.values()], {
-      fromStart: true,
-      lastPage: true,
+  readonly fetch: typeof fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname !== "/v1/data") return new Response("{}", { status: 404 });
+    return Response.json({
+      data: { dataPoints: [...this.rows.values()] },
+      pagination: { hasMore: false, nextCursor: null },
     });
-    await reader.importPending();
-  }
+  };
+}
+
+/** One sync pass of a host: the production `downloadAll` listing loop. */
+async function syncHost(host: Host, listing: RegistryListing): Promise<void> {
+  let stored: string | null = null;
+  const storage = createMemoryDataStorage();
+  await downloadAll({
+    storage,
+    storageAdapter: {} as StorageAdapter,
+    gateway: {} as GatewayClient,
+    dataPointFeed: createGatewayDataPointFeed({
+      gatewayUrl: "http://registry.invalid",
+      fetch: listing.fetch,
+    }),
+    cursor: {
+      read: async () => stored,
+      write: async (value) => {
+        stored = value;
+      },
+    },
+    masterKey: new Uint8Array(65),
+    serverOwner: OWNER,
+    logger: { ...silent, debug() {} } as unknown as Logger,
+    streamSync: host.reader,
+  });
 }
 
 type HostKind = "full" | "phone" | "frame";
@@ -193,11 +251,14 @@ async function makeHost(input: {
     files = createFsStreamSyncFiles(join(input.root, "full-write"));
     readFiles = createFsStreamSyncReadFiles(join(input.root, "full-read"));
   } else {
-    // SKELETON STUB (lanes U6 phone, U7 frame): the phone shell and the
-    // Account frame each host PS-Lite with their own IndexedDB; the two
-    // differ today only by database, so both are built from one recipe.
-    // Real differences (lease-less begin, identity source, the frame's
-    // postMessage transport) arrive with those lanes.
+    // SKELETON STUB (lanes U6 phone, U7 frame): no phone or frame host code
+    // that builds PS-Lite exists in a repo yet, so no production difference
+    // can be modelled from code. The design (DESIGN-V4.1) says the frame uses
+    // OPFS, else IndexedDB, via the same adapter as Web Lite; this recipe
+    // uses IndexedDB for both and differs only by database name. Open, to be
+    // checked against the real hosts: lease-less begin, identity source and
+    // the frame's postMessage transport. U6 and U7 replace this recipe.
+    registerStub("phone/frame host recipe", "lanes U6 (phone), U7 (frame)");
     files = createIndexedDbStreamSyncFiles({
       dbName: `skeleton-${input.kind}`,
       factory: new IDBFactory(),
@@ -253,12 +314,22 @@ export async function runSkeleton(): Promise<Hop[]> {
   });
   const root = await mkdtemp(join(tmpdir(), "stream-sync-skeleton-"));
   const storage = await startLocalStorage();
-  const feed = new RegistryFeed();
+  const listing = new RegistryListing();
   // With STREAM_SYNC_ORACLE_GATEWAY_URL set the registry is the real
   // data-gateway. Otherwise it is an in-memory registry with the gateway's
-  // exclusive-version rules, which is a SKELETON STUB.
+  // exclusive-version rules, which counts as a stub.
   const gatewayUrl = process.env.STREAM_SYNC_ORACLE_GATEWAY_URL;
-  const registry = feed.wrap(
+  if (!gatewayUrl) {
+    registerStub(
+      "in-memory registry (set STREAM_SYNC_ORACLE_GATEWAY_URL for the real data-gateway)",
+      "durable-registry lane (CI default until CI can start the gateway)",
+    );
+  }
+  registerStub(
+    "registry listing origin",
+    "stubs-burn lane (real registry feed)",
+  );
+  const registry = listing.wrap(
     gatewayUrl
       ? createGatewayStreamSyncRegistry({ gatewayUrl, ownerAddress: OWNER })
       : createFakeStreamSyncRegistry(),
@@ -280,7 +351,7 @@ export async function runSkeleton(): Promise<Hop[]> {
     const second = { id: "skeleton-2", value: "written by PS-Lite" };
 
     const check = async (name: string, host: Host, want: unknown[]) => {
-      await feed.sync(host.reader);
+      await syncHost(host, listing);
       const got = await readRecords(host);
       const ok =
         got.kind === "view" &&
@@ -335,6 +406,11 @@ export async function runSkeleton(): Promise<Hop[]> {
     await storage.close();
     await rm(root, { recursive: true, force: true });
   }
+}
+
+export function formatStubs(): string {
+  const { count, lines } = stubReport();
+  return [`stubs: ${count}`, ...lines].join("\n");
 }
 
 export function formatHops(hops: readonly Hop[]): string {
