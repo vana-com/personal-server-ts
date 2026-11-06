@@ -33,6 +33,7 @@ import {
   type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createIndexedDbStreamSyncFiles } from "../packages/lite/src/index.js";
 import { createPsLiteSyncManager } from "../packages/lite/src/sync.js";
@@ -52,7 +53,6 @@ import {
   OWNER_SIGNATURE,
   SERVER_KEY,
   SHAPE,
-  accountSigner,
 } from "../packages/server/src/stream-sync/oracle.test-utils.js";
 
 const CONNECTOR = "realsync";
@@ -226,7 +226,18 @@ async function main(): Promise<number> {
       store: stateStore,
       ownerSignature: OWNER_SIGNATURE,
     });
-    const ownerSigner = accountSigner(OWNER_KEY);
+    const ownerSigner = createServerSigner(
+      {
+        address: owner.address,
+        publicKey: owner.publicKey,
+        signTypedData: (params) =>
+          owner.signTypedData(
+            params as Parameters<typeof owner.signTypedData>[0],
+          ),
+        signMessage: (message) => owner.signMessage({ message }),
+      },
+      { chainId: CHAIN, contracts: config.gateway.contracts },
+    );
     lite = await createPsLiteSyncManager({
       config: liteConfig,
       stateStore,
