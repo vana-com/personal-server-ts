@@ -134,6 +134,10 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
 import {
+  createSeedStaging,
+  type SeedStaging,
+} from "./stream-sync/seed-staging.js";
+import {
   computeQuestion,
   createOpenAiCompatibleInferenceProvider,
   createPhalaE2eeEncryption,
@@ -634,6 +638,10 @@ export async function createServer(
   let syncManager: SyncManager | null = null;
   let streamSyncWriter: StreamSyncWriter | null = null;
   let streamSyncRead: StreamSyncReadService | undefined;
+  let streamSyncSeed: {
+    writer: StreamSyncWriter;
+    staging: SeedStaging;
+  } | null = null;
   /**
    * Late-bound PDPP importer.
    *
@@ -911,6 +919,19 @@ export async function createServer(
     // Whole-file stream sync publishes beside the legacy upload, only when
     // `streamSync.write` is on. Legacy uploads run unchanged either way.
     if (config.streamSync.write && !isEnclave) {
+      // Desktop seed intake (§2.9): retained rows staged by the seed route.
+      // The receipts lookup binds late because the writer owns the receipts.
+      const seedStaging = createSeedStaging(
+        createFsStreamSyncFiles(join(storageRoot, "stream-sync-seed")),
+      );
+      let writerForSeed: StreamSyncWriter | null = null;
+      const seedSource = seedStaging.source(
+        await seedStaging.installId(),
+        async (connector) =>
+          writerForSeed
+            ? (await writerForSeed.seedStatus(connector)).receipts
+            : {},
+      );
       streamSyncWriter = new StreamSyncWriter({
         ownerAddress: serverOwner,
         registry: createGatewayStreamSyncRegistry({
@@ -921,7 +942,10 @@ export async function createServer(
         files: createFsStreamSyncFiles(join(storageRoot, "stream-sync")),
         keys: createStreamSyncKeyPorts(masterKeySignature),
         signer: serverSigner,
+        seed: seedSource,
       });
+      writerForSeed = streamSyncWriter;
+      streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
     }
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
@@ -1282,6 +1306,7 @@ export async function createServer(
     tokenStore,
     configPath,
     syncManager,
+    streamSyncSeed,
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
