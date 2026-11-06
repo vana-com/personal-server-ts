@@ -228,3 +228,21 @@ describe("stream-sync storage home", () => {
     expect(result.syncManager).toBeDefined();
   });
 });
+
+describe("stream-sync home lock", () => {
+  it("is released when the first instance closes, so another can take it", async () => {
+    const first = await manager("12");
+    const blocked = await manager("12");
+    expect(blocked.streamSyncWriter).toBeNull();
+    await first.closeStreamSync();
+    const second = await manager("12");
+    expect(second.streamSyncWriter).not.toBeNull();
+  });
+
+  it("lets two owners on one origin hold their own locks", async () => {
+    const a = await manager("12");
+    const b = await manager("34");
+    expect(a.streamSyncWriter).not.toBeNull();
+    expect(b.streamSyncWriter).not.toBeNull();
+  });
+});

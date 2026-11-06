@@ -133,8 +133,10 @@ import {
   createGatewayStreamSyncRegistry,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
+  streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
+import { openFsStreamSyncHome } from "./stream-sync/fs-home.js";
 import { retainedArtifactResolver } from "./stream-sync/retained-artifacts.js";
 import {
   createSeedStaging,
@@ -640,6 +642,7 @@ export async function createServer(
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
   let streamSyncWriter: StreamSyncWriter | null = null;
+  let releaseStreamSyncHome: (() => Promise<void>) | null = null;
   let streamSyncRead: StreamSyncReadService | undefined;
   let streamSyncSeed: {
     writer: StreamSyncWriter;
@@ -935,20 +938,34 @@ export async function createServer(
             ? (await writerForSeed.seedStatus(connector)).receipts
             : {},
       );
-      streamSyncWriter = new StreamSyncWriter({
+      const streamSyncHome = await openFsStreamSyncHome({
+        root: storageRoot,
         ownerAddress: serverOwner,
-        registry: createGatewayStreamSyncRegistry({
-          gatewayUrl: config.gateway.url,
-          ownerAddress: serverOwner,
-        }),
-        blobs: createStorageStreamSyncBlobs(storageAdapter),
-        files: createFsStreamSyncFiles(join(storageRoot, "stream-sync")),
-        keys: createStreamSyncKeyPorts(masterKeySignature),
-        signer: serverSigner,
-        seed: seedSource,
+        network: streamSyncNetwork(config.gateway),
       });
+      if (!streamSyncHome) {
+        logger.warn(
+          "Stream sync is off in this process: another process holds this owner's stream-sync storage",
+        );
+      } else {
+        releaseStreamSyncHome = () => streamSyncHome.close();
+        streamSyncWriter = new StreamSyncWriter({
+          ownerAddress: serverOwner,
+          registry: createGatewayStreamSyncRegistry({
+            gatewayUrl: config.gateway.url,
+            ownerAddress: serverOwner,
+          }),
+          blobs: createStorageStreamSyncBlobs(storageAdapter),
+          home: streamSyncHome.home,
+          keys: createStreamSyncKeyPorts(masterKeySignature),
+          signer: serverSigner,
+          seed: seedSource,
+        });
+      }
       writerForSeed = streamSyncWriter;
-      streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
+      if (streamSyncWriter) {
+        streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
+      }
     }
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
@@ -1354,6 +1371,7 @@ export async function createServer(
     if (syncManager) {
       await syncManager.stop();
     }
+    await releaseStreamSyncHome?.();
     indexManager.close();
   };
 

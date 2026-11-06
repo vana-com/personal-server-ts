@@ -1,4 +1,5 @@
 export * from "./ports.js";
+export * from "./home.js";
 export * from "./crypto.js";
 export * from "./registry.js";
 export * from "./blobs.js";

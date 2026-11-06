@@ -86,13 +86,13 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { publicationMetadataHash } from "../publication/publish.js";
 import { streamSyncHashes } from "./crypto.js";
+import type { StreamSyncHome } from "./home.js";
 import {
   AmbiguousRegistryReplyError,
   RegistryRefusedError,
   type SignedRegistryPost,
   type StreamSyncBlobs,
   type StreamSyncFaultPoint,
-  type StreamSyncFiles,
   type StreamSyncKeyPorts,
   type StreamSyncRegistry,
   type StreamSyncSeedSource,
@@ -272,7 +272,8 @@ export interface StreamSyncWriterOptions {
   readonly ownerAddress: `0x${string}`;
   readonly registry: StreamSyncRegistry;
   readonly blobs: StreamSyncBlobs;
-  readonly files: StreamSyncFiles;
+  /** The one storage home of this owner and network (see `bindStreamSyncHome`). */
+  readonly home: StreamSyncHome;
   readonly keys: StreamSyncKeyPorts;
   readonly signer: StreamSyncSigner;
   /** Desktop only: this install's retained rows (§2.9). */
@@ -366,6 +367,12 @@ export class StreamSyncWriter {
   private recovered = false;
 
   constructor(private readonly options: StreamSyncWriterOptions) {
+    if (
+      options.home.ownerAddress.toLowerCase() !==
+      options.ownerAddress.toLowerCase()
+    ) {
+      throw new Error("Stream-sync home belongs to a different owner");
+    }
     this.targetBytes = options.partTargetBytes ?? DEFAULT_PART_TARGET_BYTES;
     this.reduceBudget = options.reduceBudgetBytes ?? PART_LIMIT_BYTES;
     this.now = options.now ?? (() => Date.now());
@@ -374,13 +381,13 @@ export class StreamSyncWriter {
   // ---------------------------------------------------------------- state
 
   private async readState(): Promise<WriterState> {
-    const bytes = await this.options.files.read("state.json");
+    const bytes = await this.options.home.files.read("state.json");
     if (!bytes) return emptyState();
     return JSON.parse(decoder.decode(bytes)) as WriterState;
   }
 
   private async writeState(state: WriterState): Promise<void> {
-    await this.options.files.write("state.json", json(state));
+    await this.options.home.files.write("state.json", json(state));
   }
 
   /**
@@ -402,12 +409,14 @@ export class StreamSyncWriter {
   }
 
   private async readEntry(runId: string): Promise<HostEntry | null> {
-    const bytes = await this.options.files.read(`runs/${runId}/entry.json`);
+    const bytes = await this.options.home.files.read(
+      `runs/${runId}/entry.json`,
+    );
     return bytes ? (JSON.parse(decoder.decode(bytes)) as HostEntry) : null;
   }
 
   private async writeEntry(host: HostEntry): Promise<void> {
-    await this.options.files.write(
+    await this.options.home.files.write(
       `runs/${host.entry.runId}/entry.json`,
       json(host),
     );
@@ -556,7 +565,7 @@ export class StreamSyncWriter {
     return this.intake(async () => {
       if (!RUN_ID.test(input.runId))
         throw new Error(`bad runId ${input.runId}`);
-      if (await this.options.files.read(`results/${input.runId}.json`)) {
+      if (await this.options.home.files.read(`results/${input.runId}.json`)) {
         throw new RunGoneError(input.runId);
       }
       if (await this.readEntry(input.runId)) {
@@ -615,7 +624,7 @@ export class StreamSyncWriter {
       // Active before the entry exists, so a recovery pass on the publish
       // queue never mistakes this run for one a dead process left behind.
       this.active.set(input.runId, {
-        spool: new SpoolWriter(this.options.files),
+        spool: new SpoolWriter(this.options.home.files),
         shardBytes: new Map(),
         recordTooLarge: new Map(),
         records: new Map(),
@@ -787,7 +796,7 @@ export class StreamSyncWriter {
         await run.spool.flush();
         if (input.coveredStreams) this.keepCovered(host, input.coveredStreams);
         if (run.excluded.length > 0) {
-          await this.options.files.appendMany([
+          await this.options.home.files.appendMany([
             {
               path: `runs/${runId}/excluded.ndjson`,
               bytes: encoder.encode(run.excluded.map((l) => `${l}\n`).join("")),
@@ -807,7 +816,7 @@ export class StreamSyncWriter {
         }
         // Intake appends are not durable one by one. The run becomes `ready`
         // only after one sync of its intake logs (§2.6).
-        await this.options.files.sync(`runs/${runId}`);
+        await this.options.home.files.sync(`runs/${runId}`);
         host.entry = {
           ...host.entry,
           ns,
@@ -945,7 +954,7 @@ export class StreamSyncWriter {
     for (let shard = 0; shard < shardBytes.length; shard += 1) {
       if (shardBytes[shard]! <= this.targetBytes / 4) continue;
       const after = await compactShard(
-        this.options.files,
+        this.options.home.files,
         shardPath(dir, shard),
         shard,
         this.reduceBudget,
@@ -986,7 +995,7 @@ export class StreamSyncWriter {
 
   private async runIds(): Promise<string[]> {
     const ids = new Set<string>();
-    for (const path of await this.options.files.list("runs")) {
+    for (const path of await this.options.home.files.list("runs")) {
       const match = /^runs\/([^/]+)\/entry\.json$/.exec(path);
       if (match) ids.add(match[1]!);
     }
@@ -1006,7 +1015,7 @@ export class StreamSyncWriter {
           why: "the process stopped before the run finished collecting",
         });
       } else if (host?.phase === "done") {
-        await this.options.files.remove(`runs/${runId}`);
+        await this.options.home.files.remove(`runs/${runId}`);
       }
     }
   }
@@ -1261,10 +1270,10 @@ export class StreamSyncWriter {
     const stream = host.streams[name]!;
     if (stream.seedShardBytes !== null) return;
     const dir = `runs/${host.entry.runId}/seed/s${stream.index}`;
-    await this.options.files.remove(dir);
-    await this.options.files.remove(spoolLogPath(dir));
+    await this.options.home.files.remove(dir);
+    await this.options.home.files.remove(spoolLogPath(dir));
     this.derived.delete(dir);
-    const writer = new SpoolWriter(this.options.files);
+    const writer = new SpoolWriter(this.options.home.files);
     const bytes = emptyShardBytes();
     for await (const record of seed.records(host.entry.connector, name)) {
       if (!isPlainObject(record)) continue;
@@ -1285,7 +1294,7 @@ export class StreamSyncWriter {
       await writer.add(spoolLogPath(dir), hash, text, size.bytes);
     }
     await writer.flush();
-    await this.options.files.sync(spoolLogPath(dir));
+    await this.options.home.files.sync(spoolLogPath(dir));
     stream.seedShardBytes = bytes;
     await this.writeEntry(host);
   }
@@ -1303,7 +1312,7 @@ export class StreamSyncWriter {
   ): Promise<number[]> {
     const known = this.derived.get(dir);
     if (known) return known;
-    await deriveShards(this.options.files, dir);
+    await deriveShards(this.options.home.files, dir);
     const bytes = [...counted];
     await this.compact(dir, bytes);
     this.derived.set(dir, bytes);
@@ -1337,9 +1346,9 @@ export class StreamSyncWriter {
     const runId = host.entry.runId;
     const outbox = host.entry.streams[name]!;
     const request = JSON.parse(
-      decoder.decode((await this.options.files.read(outbox.requestRef!))!),
+      decoder.decode((await this.options.home.files.read(outbox.requestRef!))!),
     ) as SignedRegistryPost;
-    const cipher = await this.options.files.read(outbox.headCipherRef!);
+    const cipher = await this.options.home.files.read(outbox.headCipherRef!);
     const head = parseHeadKey(request);
     if (cipher) await this.options.blobs.put(head, cipher);
     const result = await this.options.registry.post(request);
@@ -1470,8 +1479,8 @@ export class StreamSyncWriter {
     );
     const requestRef = `runs/${runId}/request-s${stream.index}.json`;
     const headCipherRef = `runs/${runId}/head-s${stream.index}.bin`;
-    await this.options.files.write(headCipherRef, cipher);
-    await this.options.files.write(requestRef, json(request));
+    await this.options.home.files.write(headCipherRef, cipher);
+    await this.options.home.files.write(requestRef, json(request));
     this.setStream(host, name, {
       state: "request_persisted",
       requestRef,
@@ -1614,11 +1623,11 @@ export class StreamSyncWriter {
     host.phase = "done";
     const runId = host.entry.runId;
     await this.writeEntry(host);
-    await this.options.files.write(
+    await this.options.home.files.write(
       `results/${runId}.json`,
       json(this.statusOf(host)),
     );
-    await this.options.files.remove(`runs/${runId}`);
+    await this.options.home.files.remove(`runs/${runId}`);
     if (!(outcome.kind === "aborted" && outcome.reason === "cancelled")) {
       const bad =
         outcome.kind === "failed" ||
@@ -1712,7 +1721,7 @@ export class StreamSyncWriter {
     if (plan.kind === "needs_counts") {
       const counts: Record<number, number[]> = {};
       for (const shard of plan.shards) {
-        counts[shard] = await countShard(this.options.files, [
+        counts[shard] = await countShard(this.options.home.files, [
           shardPath(runDir, shard),
           shardPath(seedDir, shard),
         ]);
@@ -1851,7 +1860,7 @@ export class StreamSyncWriter {
     for (const dir of [...dirs].reverse()) {
       for (const shard of [...shards].sort((a, b) => a - b)) {
         for await (const line of readSpool(
-          this.options.files,
+          this.options.home.files,
           shardPath(dir, shard),
         )) {
           route(line.pkHash)?.add(line.pkHash, lineStamp(line.text), line.text);
@@ -1903,8 +1912,8 @@ export class StreamSyncWriter {
       if (host) pending.push(this.statusOf(host));
     }
     const finished: StreamSyncRunStatus[] = [];
-    for (const path of await this.options.files.list("results")) {
-      const bytes = await this.options.files.read(path);
+    for (const path of await this.options.home.files.list("results")) {
+      const bytes = await this.options.home.files.read(path);
       if (bytes)
         finished.push(JSON.parse(decoder.decode(bytes)) as StreamSyncRunStatus);
     }

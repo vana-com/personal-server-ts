@@ -77,6 +77,7 @@ import {
   interpose,
   startLocalStorage,
   storageBlobs,
+  testStreamSyncHome,
 } from "./oracle.test-utils.js";
 
 /**
@@ -304,7 +305,9 @@ async function makeHost(input: {
       ownerAddress: OWNER,
       registry: input.registry,
       blobs,
-      files: createFsStreamSyncFiles(join(input.root, "full-write")),
+      home: testStreamSyncHome(
+        createFsStreamSyncFiles(join(input.root, "full-write")),
+      ),
       keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
       signer: accountSigner(SERVER_KEY),
     });
@@ -344,7 +347,7 @@ async function makeHost(input: {
     ownerAddress: OWNER,
     registry: input.registry,
     blobs,
-    files,
+    home: testStreamSyncHome(files),
     keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
     signer: accountSigner(OWNER_KEY),
   });

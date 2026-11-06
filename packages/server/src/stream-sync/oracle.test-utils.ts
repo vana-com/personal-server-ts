@@ -45,6 +45,7 @@ import {
   type SignedRegistryPost,
   type StreamSyncBlobs,
   type StreamSyncFiles,
+  bindStreamSyncHome,
   type StreamSyncRegistry,
   type StreamSyncSeedSource,
   type StreamSyncSigner,
@@ -301,11 +302,25 @@ export interface OracleEnv {
   files(device: string): Promise<StreamSyncFiles>;
   writer(
     device: string,
-    extra?: Partial<StreamSyncWriterOptions> & {
+    extra?: Partial<Omit<StreamSyncWriterOptions, "home">> & {
       registry?: StreamSyncRegistry;
+      /** Replaces the device's files (a wrapper that holds or fails calls). */
+      files?: StreamSyncFiles;
     },
   ): Promise<StreamSyncWriter>;
   cleanup(): Promise<void>;
+}
+
+/** A home for tests: the device's files, bound to the test owner. */
+export function testStreamSyncHome(
+  files: StreamSyncFiles,
+  ownerAddress: `0x${string}` = OWNER,
+) {
+  return bindStreamSyncHome({
+    ownerAddress,
+    network: "test",
+    open: () => files,
+  });
 }
 
 export async function createOracleEnv(input: {
@@ -343,12 +358,15 @@ export async function createOracleEnv(input: {
     registry: newRegistry(),
     newRegistry,
     files,
-    async writer(device, extra = {}) {
+    async writer(device, { files: override, ...extra } = {}) {
       return new StreamSyncWriter({
         ownerAddress: OWNER,
         registry: newRegistry(),
         blobs,
-        files: await files(device),
+        home: testStreamSyncHome(
+          override ?? (await files(device)),
+          extra.ownerAddress,
+        ),
         keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
         // Full server signs with its registered server key; Lite with the owner.
         signer: accountSigner(

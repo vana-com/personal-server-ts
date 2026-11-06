@@ -6,9 +6,11 @@ import {
   createGatewayStreamSyncRegistry,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
+  bindStreamSyncHome,
+  streamSyncNetwork,
   type StreamSyncFiles,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
+import { openIndexedDbStreamSyncHome } from "./stream-sync-files.js";
 import {
   createVersionInventoryClient,
   type DurableAdditionsService,
@@ -109,9 +111,12 @@ export interface PsLiteSyncOptions {
   config: ServerConfig;
   /**
    * Durable files for whole-file stream sync, used only when
-   * `config.streamSync.write` is on. Defaults to IndexedDB.
+   * `config.streamSync.write` is on. Given the home id of the (owner,
+   * network), it returns files stored at a location derived from that id. The
+   * host then owns "one live writer per home". Defaults to IndexedDB named by
+   * the home id, held under an exclusive Web Lock.
    */
-  streamSyncFiles?: StreamSyncFiles;
+  streamSyncFiles?: (homeId: string) => StreamSyncFiles;
   /**
    * Resolves a run's `artifactDigest` to declarations the host verified
    * (run-intake contract v2 §6). Without it every run answers
@@ -301,7 +306,14 @@ export async function createPsLiteSyncManager(
   serverOwner: `0x${string}`;
   dataPointFeed: DataPointFeedPort;
   scopeDeletions: ScopeDeletionTracker;
+  /**
+   * Null when writing is off, or when another instance holds this owner's
+   * stream-sync home (or the runtime has no `navigator.locks`): stream sync
+   * does not run here; legacy sync does.
+   */
   streamSyncWriter: StreamSyncWriter | null;
+  /** Releases the stream-sync home's lock and database. */
+  closeStreamSync(): Promise<void>;
   /** In-process run intake for the host's own connector runs; null when writing is off. */
   streamSyncIntake: RunIntake | null;
   streamSyncRead?: StreamSyncReadService;
@@ -458,7 +470,29 @@ export async function createPsLiteSyncManager(
     : undefined;
   // Whole-file stream sync publishes beside the legacy upload, only when
   // `streamSync.write` is on. Legacy uploads run unchanged either way.
-  const streamSyncWriter = options.config.streamSync?.write
+  const streamSyncNet = streamSyncNetwork(options.config.gateway);
+  const streamSyncHome = options.config.streamSync?.write
+    ? options.streamSyncFiles
+      ? {
+          home: bindStreamSyncHome({
+            ownerAddress: serverOwner,
+            network: streamSyncNet,
+            open: options.streamSyncFiles,
+          }),
+          close: async () => {},
+        }
+      : await openIndexedDbStreamSyncHome({
+          ownerAddress: serverOwner,
+          network: streamSyncNet,
+        })
+    : null;
+  if (options.config.streamSync?.write && !streamSyncHome) {
+    logger.info(
+      {},
+      "Stream sync is off in this instance: its storage is held by another instance, or Web Locks are unavailable",
+    );
+  }
+  const streamSyncWriter = streamSyncHome
     ? new StreamSyncWriter({
         ownerAddress: serverOwner,
         registry: createGatewayStreamSyncRegistry({
@@ -466,7 +500,7 @@ export async function createPsLiteSyncManager(
           ownerAddress: serverOwner,
         }),
         blobs: createStorageStreamSyncBlobs(storageAdapter),
-        files: options.streamSyncFiles ?? createIndexedDbStreamSyncFiles(),
+        home: streamSyncHome.home,
         keys: createStreamSyncKeyPorts(options.ownerSignature),
         signer,
       })
@@ -546,6 +580,9 @@ export async function createPsLiteSyncManager(
     dataPointFeed,
     scopeDeletions,
     streamSyncWriter,
+    closeStreamSync: async () => {
+      await streamSyncHome?.close();
+    },
     streamSyncIntake,
     streamSyncRead,
   };

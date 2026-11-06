@@ -41,11 +41,12 @@ async function manager(streamSync: { write: boolean } | undefined) {
       getDataPoint: async () => null,
       listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
     },
-    streamSyncFiles: createIndexedDbStreamSyncFiles({
-      dbName: `intake-${Math.random()}`,
-      factory: new IDBFactory(),
-      keyRange: IDBKeyRange,
-    }),
+    streamSyncFiles: (id) =>
+      createIndexedDbStreamSyncFiles({
+        dbName: id,
+        factory: new IDBFactory(),
+        keyRange: IDBKeyRange,
+      }),
   });
   await result.syncManager.stop();
   return { ...result, owner: owner.address };
