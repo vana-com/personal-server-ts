@@ -1,169 +1,429 @@
-import { MalformedHeadError, UnsupportedFormatVersionError } from "./errors.js";
-import { SHA256_HEX } from "./hash.js";
-import { canonicalJson, hasOwn, isPlainObject } from "./json.js";
-import type { Part } from "./parts.js";
-
 /**
- * The head file of one stream of one connection. It names the exact parts of
- * one published state, in order, with their sizes. Readers trust nothing but
- * the head: they fetch only the parts it lists and check each one.
+ * §2.5 head format 1, and the head rules of §2.4, §2.5, §2.6 and §2.7:
+ * liveness, base choice, the compatible-writer rule, `complete` and no-op.
+ *
+ * Clear head bytes are canonical JSON:
+ *
+ *   {"complete":bool,"connector":c,"format":1,"generation":"<dec>",
+ *    "keyCheck":"<16 hex>","ns":ns,"observedAt":<ms>,
+ *    "parts":[{"bytes":n,"count":n,"hash":"<sha256>","prefix":"<bits>"}],
+ *    "primaryKey":[...],"profile":{"key":<string|null>,"version":"<v>"},
+ *    "recordCount":n,"stream":s}
+ *
+ * The registry `dataHash` of a head is Keccak-256 of these bytes; its blob
+ * name is `h-<that hash in hex>`.
  */
 
-/** The head format this package writes and reads. */
-export const FORMAT_VERSION = 1;
+import {
+  HEAD_LIMIT_BYTES,
+  HEX16,
+  HEX64,
+  PART_LIMIT_BYTES,
+  PLANNER_DEPTH_CAP,
+  keccakHex,
+  utf8,
+  type Keccak256,
+} from "./bytes.js";
+import { InvalidArgumentError } from "./errors.js";
+import { canonicalJson, hasOwn, isPlainObject } from "./json.js";
+import { headBlobName } from "./names.js";
+import type { HeadPart } from "./parts.js";
+import type { ControlState } from "./control.js";
 
-/** A registry version. Opaque to the core: it is only stored and compared. */
-export type Version = string;
+export const HEAD_FORMAT = 1;
 
-export interface HeadPart {
-  readonly hash: string;
-  readonly bytes: number;
+export interface HeadProfile {
+  /** The legacy projector's profile key, or `null`. */
+  readonly key: string | null;
+  /** The connector version that wrote the head. */
+  readonly version: string;
 }
 
 export interface Head {
-  readonly format: number;
-  readonly stream: string;
-  readonly connectionId: string;
+  readonly complete: boolean;
+  readonly connector: string;
+  readonly format: 1;
+  /** Positive integer; written as a decimal string. */
+  readonly generation: number;
+  readonly keyCheck: string;
+  readonly ns: string;
+  readonly observedAt: number;
   readonly parts: readonly HeadPart[];
+  readonly primaryKey: readonly string[];
+  readonly profile: HeadProfile;
   readonly recordCount: number;
-  /** The version this state was built from; `null` when built from nothing. */
-  readonly baseVersion: Version | null;
+  readonly stream: string;
 }
 
 const HEAD_FIELDS = [
-  "baseVersion",
-  "connectionId",
+  "complete",
+  "connector",
   "format",
+  "generation",
+  "keyCheck",
+  "ns",
+  "observedAt",
   "parts",
+  "primaryKey",
+  "profile",
   "recordCount",
   "stream",
 ];
+const PART_FIELDS = ["bytes", "count", "hash", "prefix"];
+const PROFILE_FIELDS = ["key", "version"];
+const GENERATION = /^[1-9][0-9]*$/;
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
+function exactKeys(value: object, expected: readonly string[]): boolean {
+  const keys = Object.keys(value).sort();
+  return (
+    keys.length === expected.length && keys.every((k, i) => k === expected[i])
+  );
+}
 
-export function buildHead(input: {
-  stream: string;
-  connectionId: string;
-  parts: readonly Part[];
-  recordCount: number;
-  baseVersion: Version | null;
-}): Head {
+function isCount(value: unknown, min: number): value is number {
+  return (
+    typeof value === "number" && Number.isSafeInteger(value) && value >= min
+  );
+}
+
+/** Why a head is malformed, or `null` when it is a valid format-1 head. */
+function headProblem(value: Record<string, unknown>): string | null {
+  if (!exactKeys(value, HEAD_FIELDS)) {
+    return `fields must be exactly: ${HEAD_FIELDS.join(", ")}`;
+  }
+  const v = value;
+  if (typeof v["complete"] !== "boolean") return "complete must be a boolean";
+  const connector = v["connector"];
+  if (
+    typeof connector !== "string" ||
+    connector === "" ||
+    connector.includes("~")
+  ) {
+    return "connector must be non-empty with no ~";
+  }
+  const generation = v["generation"];
+  if (
+    typeof generation !== "string" ||
+    !GENERATION.test(generation) ||
+    !Number.isSafeInteger(Number(generation))
+  ) {
+    return "generation must be a positive decimal string";
+  }
+  if (typeof v["keyCheck"] !== "string" || !HEX16.test(v["keyCheck"])) {
+    return "keyCheck must be 16 lowercase hex";
+  }
+  const ns = v["ns"];
+  if (typeof ns !== "string" || (ns !== "" && !HEX16.test(ns))) {
+    return "ns must be empty or 16 lowercase hex";
+  }
+  if (!isCount(v["observedAt"], 0))
+    return "observedAt must be a non-negative integer";
+  if (typeof v["stream"] !== "string" || v["stream"] === "") {
+    return "stream must be a non-empty string";
+  }
+  const primaryKey = v["primaryKey"];
+  if (
+    !Array.isArray(primaryKey) ||
+    primaryKey.length === 0 ||
+    primaryKey.some((f) => typeof f !== "string" || f === "") ||
+    new Set(primaryKey).size !== primaryKey.length
+  ) {
+    return "primaryKey must be a non-empty list of distinct non-empty strings";
+  }
+  const profile = v["profile"];
+  if (
+    !isPlainObject(profile) ||
+    !exactKeys(profile, PROFILE_FIELDS) ||
+    (profile["key"] !== null && typeof profile["key"] !== "string") ||
+    typeof profile["version"] !== "string" ||
+    profile["version"] === ""
+  ) {
+    return "profile must be {key: string|null, version: non-empty string}";
+  }
+  if (!isCount(v["recordCount"], 0))
+    return "recordCount must be a non-negative integer";
+  const parts = v["parts"];
+  if (!Array.isArray(parts)) return "parts must be an array";
+  let total = 0;
+  let previous: string | null = null;
+  for (let i = 0; i < parts.length; i += 1) {
+    const part: unknown = parts[i];
+    if (!isPlainObject(part) || !exactKeys(part, PART_FIELDS)) {
+      return `part ${i} must have exactly ${PART_FIELDS.join(", ")}`;
+    }
+    const { bytes, count, hash, prefix } = part;
+    if (!isCount(count, 1)) return `part ${i} count must be a positive integer`;
+    if (!isCount(bytes, 1) || bytes > PART_LIMIT_BYTES) {
+      return `part ${i} bytes must be in [1, ${PART_LIMIT_BYTES}]`;
+    }
+    if (typeof hash !== "string" || !HEX64.test(hash)) {
+      return `part ${i} hash must be 64 lowercase hex`;
+    }
+    if (
+      typeof prefix !== "string" ||
+      !/^[01]*$/.test(prefix) ||
+      prefix.length > PLANNER_DEPTH_CAP
+    ) {
+      return `part ${i} prefix must be at most 16 bits of 0 and 1`;
+    }
+    if (previous !== null) {
+      if (prefix <= previous) return "parts must be sorted by prefix";
+      if (prefix.startsWith(previous))
+        return "part prefixes must be prefix-free";
+    }
+    previous = prefix;
+    total += count;
+  }
+  if (total !== v["recordCount"])
+    return "recordCount must equal the sum of part counts";
+  return null;
+}
+
+function toWire(head: Head): Record<string, unknown> {
   return {
-    format: FORMAT_VERSION,
-    stream: input.stream,
-    connectionId: input.connectionId,
-    parts: input.parts.map((part) => ({
-      hash: part.hash,
-      bytes: part.bytes.length,
+    complete: head.complete,
+    connector: head.connector,
+    format: head.format,
+    generation: String(head.generation),
+    keyCheck: head.keyCheck,
+    ns: head.ns,
+    observedAt: head.observedAt,
+    parts: head.parts.map((p) => ({
+      bytes: p.bytes,
+      count: p.count,
+      hash: p.hash,
+      prefix: p.prefix,
     })),
-    recordCount: input.recordCount,
-    baseVersion: input.baseVersion,
+    primaryKey: [...head.primaryKey],
+    profile: { key: head.profile.key, version: head.profile.version },
+    recordCount: head.recordCount,
+    stream: head.stream,
   };
 }
 
+/** Canonical clear head bytes. Throws on a head this package would reject. */
 export function encodeHead(head: Head): Uint8Array {
-  return encoder.encode(canonicalJson(head));
+  if (head.format !== HEAD_FORMAT) {
+    throw new InvalidArgumentError("only format 1 heads can be written");
+  }
+  if (!Number.isSafeInteger(head.generation) || head.generation < 1) {
+    throw new InvalidArgumentError(
+      "generation must be a positive safe integer",
+    );
+  }
+  const wire = toWire(head);
+  const problem = headProblem(wire);
+  if (problem) throw new InvalidArgumentError(`invalid head: ${problem}`);
+  const bytes = utf8(canonicalJson(wire));
+  if (bytes.length > HEAD_LIMIT_BYTES) {
+    throw new InvalidArgumentError("head exceeds the 1 MiB head limit");
+  }
+  return bytes;
 }
 
-/** Parse and validate head bytes (or text). Fails closed. */
-export function decodeHead(source: Uint8Array | string): Head {
-  let text: string;
-  try {
-    text = typeof source === "string" ? source : decoder.decode(source);
-  } catch (cause) {
-    throw new MalformedHeadError(`head is not valid UTF-8: ${String(cause)}`);
+export interface HeadDigest {
+  /** Registry form: `0x` + 64 lowercase hex. */
+  readonly dataHash: `0x${string}`;
+  /** `h-<hex>`. */
+  readonly blobName: string;
+}
+
+export async function digestHead(
+  keccak256: Keccak256,
+  bytes: Uint8Array,
+): Promise<HeadDigest> {
+  const dataHash = await keccakHex(keccak256, bytes);
+  return { dataHash, blobName: headBlobName(dataHash) };
+}
+
+export type DecodedHead =
+  | { readonly kind: "ok"; readonly head: Head }
+  | { readonly kind: "unsupported_format"; readonly format: unknown }
+  | { readonly kind: "malformed"; readonly reason: string };
+
+const decoder = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * Parse clear head bytes. Any `format` other than 1 is `unsupported_format`.
+ * A format-1 head must be canonical, so every host derives the same hash.
+ */
+export function decodeHead(bytes: Uint8Array): DecodedHead {
+  if (bytes.length > HEAD_LIMIT_BYTES) {
+    return {
+      kind: "malformed",
+      reason: "head exceeds the 1 MiB decoder limit",
+    };
   }
+  let text: string;
   let parsed: unknown;
   try {
+    text = decoder.decode(bytes);
     parsed = JSON.parse(text);
-  } catch (cause) {
-    throw new MalformedHeadError(`head is not valid JSON: ${String(cause)}`);
+  } catch {
+    return { kind: "malformed", reason: "head is not UTF-8 JSON" };
   }
-  return parseHead(parsed);
+  if (!isPlainObject(parsed))
+    return { kind: "malformed", reason: "head is not an object" };
+  const format = hasOwn(parsed, "format") ? parsed["format"] : undefined;
+  if (format !== HEAD_FORMAT) return { kind: "unsupported_format", format };
+  const problem = headProblem(parsed);
+  if (problem) return { kind: "malformed", reason: problem };
+  if (canonicalJson(parsed) !== text) {
+    return { kind: "malformed", reason: "head is not canonical JSON" };
+  }
+  const p = parsed as Record<string, unknown> & {
+    profile: HeadProfile;
+    parts: HeadPart[];
+  };
+  return {
+    kind: "ok",
+    head: {
+      complete: p["complete"] as boolean,
+      connector: p["connector"] as string,
+      format: HEAD_FORMAT,
+      generation: Number(p["generation"]),
+      keyCheck: p["keyCheck"] as string,
+      ns: p["ns"] as string,
+      observedAt: p["observedAt"] as number,
+      parts: p.parts,
+      primaryKey: p["primaryKey"] as string[],
+      profile: p.profile,
+      recordCount: p["recordCount"] as number,
+      stream: p["stream"] as string,
+    },
+  };
+}
+
+export type VerifiedHead =
+  | { readonly kind: "ok"; readonly head: Head }
+  | { readonly kind: "hash_mismatch" }
+  | { readonly kind: "unsupported_format"; readonly format: unknown }
+  | { readonly kind: "malformed"; readonly reason: string }
+  | { readonly kind: "name_mismatch" }
+  | { readonly kind: "key_mismatch" };
+
+/**
+ * §2.5 reader checks on decrypted head bytes: `keccak = dataHash`, format,
+ * shape, name fields against the scope, and `keyCheck`. Part SHA-256 is
+ * checked per part by `decodePart`.
+ */
+export async function verifyHead(
+  keccak256: Keccak256,
+  bytes: Uint8Array,
+  expected: {
+    readonly dataHash: string;
+    readonly connector: string;
+    readonly ns: string;
+    readonly stream: string;
+    readonly keyCheck: string;
+  },
+): Promise<VerifiedHead> {
+  const dataHash = await keccakHex(keccak256, bytes);
+  if (dataHash !== expected.dataHash.toLowerCase())
+    return { kind: "hash_mismatch" };
+  const decoded = decodeHead(bytes);
+  if (decoded.kind !== "ok") return decoded;
+  const { head } = decoded;
+  if (
+    head.connector !== expected.connector ||
+    head.ns !== expected.ns ||
+    head.stream !== expected.stream
+  ) {
+    return { kind: "name_mismatch" };
+  }
+  if (head.keyCheck !== expected.keyCheck) return { kind: "key_mismatch" };
+  return decoded;
+}
+
+/** The stream row as read from the registry. */
+export type StreamRow = "absent" | "tombstoned" | "present";
+
+/**
+ * §2.4: a stream head is live iff the control is `active(g)`, the stream row
+ * is not tombstoned, and the head's generation is g.
+ */
+export function isHeadLive(
+  control: ControlState,
+  streamRow: StreamRow,
+  headGeneration: number | null,
+): boolean {
+  return (
+    control.kind === "active" &&
+    streamRow === "present" &&
+    headGeneration === control.generation
+  );
 }
 
 /**
- * Validate an already-parsed head. An unknown future format version is
- * reported before anything else, because its other fields may have changed.
+ * §2.7: the publish base is empty if the stream row is tombstoned, absent, or
+ * its head is of another generation than the target.
  */
-export function parseHead(value: unknown): Head {
-  if (!isPlainObject(value))
-    throw new MalformedHeadError("head is not a JSON object");
-  const format = hasOwn(value, "format") ? value["format"] : undefined;
-  if (
-    typeof format === "number" &&
-    Number.isInteger(format) &&
-    format > FORMAT_VERSION
-  ) {
-    throw new UnsupportedFormatVersionError(format);
-  }
-  if (format !== FORMAT_VERSION) {
-    throw new MalformedHeadError(`head format is not ${FORMAT_VERSION}`);
-  }
-  const keys = Object.keys(value).sort();
-  if (
-    keys.length !== HEAD_FIELDS.length ||
-    keys.some((k, i) => k !== HEAD_FIELDS[i])
-  ) {
-    throw new MalformedHeadError(
-      `head fields must be exactly: ${HEAD_FIELDS.join(", ")}`,
+export function chooseBase(
+  streamRow: StreamRow,
+  head: Head | null,
+  target: number,
+): Head | null {
+  if (streamRow !== "present" || head === null) return null;
+  return head.generation === target ? head : null;
+}
+
+export type VersionOrder = "higher" | "equal" | "lower";
+
+export type WriterCompatibility =
+  /** Same primary key: merge onto the base. */
+  | { readonly kind: "use_base" }
+  /** Newer connector changed the primary key: empty base, base complete false. */
+  | { readonly kind: "empty_base" }
+  /** Older (or same-version) connector meets a changed key: do not publish. */
+  | { readonly kind: "connector_update_required" };
+
+/**
+ * §2.5 compatible-writer rule. `writerVersusBase` is the host's comparison
+ * of the writer's connector version with `base.profile.version`.
+ */
+export function writerCompatibility(
+  base: Head | null,
+  writerPrimaryKey: readonly string[],
+  writerVersusBase: VersionOrder,
+): WriterCompatibility {
+  if (base === null) return { kind: "use_base" };
+  const same =
+    base.primaryKey.length === writerPrimaryKey.length &&
+    base.primaryKey.every((field, i) => field === writerPrimaryKey[i]);
+  if (same) return { kind: "use_base" };
+  return writerVersusBase === "higher"
+    ? { kind: "empty_base" }
+    : { kind: "connector_update_required" };
+}
+
+/**
+ * §2.5: `complete` = run `full` OR base `complete` OR seed merged (a host merged its retained history).
+ * An empty base (none, tombstoned, other generation, or replaced by
+ * `empty_base`) counts as not complete.
+ */
+export function headComplete(input: {
+  readonly full: boolean;
+  readonly baseComplete: boolean;
+  readonly seedMerged: boolean;
+}): boolean {
+  return input.full || input.baseComplete || input.seedMerged;
+}
+
+/** §2.6: every part and `complete` unchanged against the base → skip upload and POST. */
+export function isNoop(
+  base: Head | null,
+  parts: readonly HeadPart[],
+  complete: boolean,
+): boolean {
+  if (base === null || base.complete !== complete) return false;
+  if (base.parts.length !== parts.length) return false;
+  return base.parts.every((p, i) => {
+    const q = parts[i]!;
+    return (
+      p.prefix === q.prefix &&
+      p.hash === q.hash &&
+      p.bytes === q.bytes &&
+      p.count === q.count
     );
-  }
-  const { stream, connectionId, parts, recordCount, baseVersion } = value;
-  if (typeof stream !== "string" || stream === "") {
-    throw new MalformedHeadError("head stream must be a non-empty string");
-  }
-  if (typeof connectionId !== "string" || connectionId === "") {
-    throw new MalformedHeadError(
-      "head connectionId must be a non-empty string",
-    );
-  }
-  if (!Number.isSafeInteger(recordCount) || (recordCount as number) < 0) {
-    throw new MalformedHeadError(
-      "head recordCount must be a non-negative integer",
-    );
-  }
-  if (baseVersion !== null && typeof baseVersion !== "string") {
-    throw new MalformedHeadError("head baseVersion must be a string or null");
-  }
-  if (!Array.isArray(parts))
-    throw new MalformedHeadError("head parts must be an array");
-  const checked: HeadPart[] = parts.map((entry: unknown, i) => {
-    if (!isPlainObject(entry))
-      throw new MalformedHeadError(`head part ${i} is not an object`);
-    const entryKeys = Object.keys(entry).sort();
-    if (
-      entryKeys.length !== 2 ||
-      entryKeys[0] !== "bytes" ||
-      entryKeys[1] !== "hash"
-    ) {
-      throw new MalformedHeadError(
-        `head part ${i} must have exactly bytes and hash`,
-      );
-    }
-    const { hash, bytes } = entry;
-    if (typeof hash !== "string" || !SHA256_HEX.test(hash)) {
-      throw new MalformedHeadError(
-        `head part ${i} hash is not 64 lowercase hex characters`,
-      );
-    }
-    if (!Number.isSafeInteger(bytes) || (bytes as number) < 0) {
-      throw new MalformedHeadError(
-        `head part ${i} bytes must be a non-negative integer`,
-      );
-    }
-    return { hash, bytes: bytes as number };
   });
-  if ((recordCount as number) === 0 && checked.length > 0) {
-    throw new MalformedHeadError("head lists parts for zero records");
-  }
-  return {
-    format: FORMAT_VERSION,
-    stream,
-    connectionId,
-    parts: checked,
-    recordCount: recordCount as number,
-    baseVersion,
-  };
 }

@@ -2,7 +2,7 @@
   "name": "@opendatalabs/personal-server-ts-stream-sync",
   "version": "0.0.1",
   "private": true,
-  "description": "I/O-free core for whole-file stream sync: overlay, parts, head, assemble and the publish decision",
+  "description": "I/O-free core for whole-file stream sync: names, namespace, part and head codecs, merge, planner, admission, eligibility",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -21,10 +21,6 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./reference-host": {
-      "types": "./dist/reference-host.d.ts",
-      "import": "./dist/reference-host.js"
-    },
     "./vectors/*": "./vectors/*"
   },
   "files": [
@@ -33,5 +29,8 @@
   ],
   "scripts": {
     "build": "tsc --build"
+  },
+  "devDependencies": {
+    "@noble/hashes": "1.8.0"
   }
 }

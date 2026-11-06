@@ -1,51 +1,170 @@
-import { InvalidObservationTimeError, InvalidRecordError } from "./errors.js";
-import { isPlainObject, type JsonObject } from "./json.js";
+/**
+ * §2.2 records and part lines.
+ *
+ *   pkHash = sha256(canonicalJson([pk values])), used as a bit string
+ *   line   = canonicalJson({"o": <run start ms>, "r": "<runId>", "v": <record>})
+ *
+ * Canonical JSON sorts keys, so a line always reads `{"o":...,"r":...,"v":...}`.
+ */
+
+import {
+  HEX64,
+  RECORD_LINE_LIMIT_BYTES,
+  sha256Hex,
+  utf8,
+  utf8Length,
+  type Sha256,
+} from "./bytes.js";
+import {
+  InvalidArgumentError,
+  InvalidLineError,
+  InvalidRecordError,
+  MissingKeyFieldError,
+} from "./errors.js";
+import {
+  canonicalJson,
+  hasOwn,
+  isPlainObject,
+  type JsonObject,
+} from "./json.js";
+
+/** `o` and `r` of seed lines (a host's retained history) (§2.6, §2.9). */
+export const SEED_OBSERVED_AT = 0;
+export const SEED_RUN_ID = "seed";
+
+export interface Line {
+  /** Run start, in milliseconds since the epoch. */
+  readonly o: number;
+  /** Run id. */
+  readonly r: string;
+  /** The record exactly as the source gave it. */
+  readonly v: JsonObject;
+}
+
+function checkLineFields(o: unknown, r: unknown, v: unknown): void {
+  if (typeof o !== "number" || !Number.isSafeInteger(o) || o < 0) {
+    throw new InvalidLineError("o must be a non-negative safe integer");
+  }
+  if (typeof r !== "string" || r === "") {
+    throw new InvalidLineError("r must be a non-empty string");
+  }
+  if (!isPlainObject(v)) throw new InvalidLineError("v must be a JSON object");
+}
+
+/** Canonical line text, without a line terminator. */
+export function encodeLine(line: Line): string {
+  checkLineFields(line.o, line.r, line.v);
+  return canonicalJson({ o: line.o, r: line.r, v: line.v });
+}
+
+/** Parse one line. Fails unless the text is exactly the canonical form. */
+export function decodeLine(text: string): Line {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new InvalidLineError("line is not valid JSON");
+  }
+  if (!isPlainObject(parsed))
+    throw new InvalidLineError("line is not an object");
+  const keys = Object.keys(parsed).sort();
+  if (
+    keys.length !== 3 ||
+    keys[0] !== "o" ||
+    keys[1] !== "r" ||
+    keys[2] !== "v"
+  ) {
+    throw new InvalidLineError("line fields must be exactly o, r, v");
+  }
+  const line = parsed as unknown as Line;
+  checkLineFields(line.o, line.r, line.v);
+  if (canonicalJson(parsed) !== text) {
+    throw new InvalidLineError("line is not in canonical form");
+  }
+  return line;
+}
+
+/** The primary-key values of a record, in primary-key order. */
+export function primaryKeyValues(
+  record: JsonObject,
+  primaryKey: readonly string[],
+): unknown[] {
+  if (!isPlainObject(record))
+    throw new InvalidRecordError("record is not a JSON object");
+  if (primaryKey.length === 0) {
+    throw new InvalidArgumentError("primaryKey must name at least one field");
+  }
+  return primaryKey.map((field) => {
+    if (!hasOwn(record, field)) throw new MissingKeyFieldError(field);
+    return record[field];
+  });
+}
+
+/** sha256(canonicalJson([pk values])) as 64 lowercase hex. */
+export async function pkHash(
+  sha256: Sha256,
+  record: JsonObject,
+  primaryKey: readonly string[],
+): Promise<string> {
+  return sha256Hex(
+    sha256,
+    utf8(canonicalJson(primaryKeyValues(record, primaryKey))),
+  );
+}
+
+function checkPkHash(hash: string): void {
+  if (!HEX64.test(hash)) {
+    throw new InvalidArgumentError(
+      "pkHash must be 64 lowercase hex characters",
+    );
+  }
+}
+
+/** The spool shard of a key: its first byte (§2.6). */
+export function shardOf(hash: string): number {
+  checkPkHash(hash);
+  return parseInt(hash.slice(0, 2), 16);
+}
+
+/** The first `bits` bits of a pkHash as a string of `0`/`1`. */
+export function pkHashBits(hash: string, bits: number): string {
+  checkPkHash(hash);
+  if (!Number.isInteger(bits) || bits < 0 || bits > 256) {
+    throw new InvalidArgumentError("bits must be an integer in [0, 256]");
+  }
+  let out = "";
+  for (let i = 0; out.length < bits; i += 1) {
+    out += parseInt(hash[i]!, 16).toString(2).padStart(4, "0");
+  }
+  return out.slice(0, bits);
+}
+
+export const BIT_PREFIX = /^[01]*$/;
+
+/** True when the key's bit string starts with `prefix`. */
+export function inPrefix(hash: string, prefix: string): boolean {
+  if (!BIT_PREFIX.test(prefix)) {
+    throw new InvalidArgumentError("prefix must be a string of 0 and 1");
+  }
+  return pkHashBits(hash, prefix.length) === prefix;
+}
+
+export type LineSize =
+  | { readonly fits: true; readonly bytes: number }
+  | {
+      readonly fits: false;
+      readonly bytes: number;
+      readonly reason: "record_too_large";
+    };
 
 /**
- * A record together with the time its run observed it, in milliseconds since
- * the epoch. The time is metadata: it lives beside the record in the file and
- * never inside the record body, so the body stays exactly what the source gave.
+ * §2.2 single-record limit on canonical line bytes (no terminator). A line
+ * that does not fit is not published; the host counts it, keeps its key
+ * digest and size locally, and the run continues.
  */
-export interface StampedRecord {
-  readonly record: JsonObject;
-  readonly observedAt: number;
-}
-
-/** One completed collection run: its records and when it collected them. */
-export interface Run {
-  readonly records: readonly JsonObject[];
-  readonly observedAt: number;
-}
-
-export function checkObservedAt(value: unknown, where: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new InvalidObservationTimeError(
-      `${where} observation time must be a non-negative integer of milliseconds`,
-    );
-  }
-  return value;
-}
-
-/** Give every record of a run the run's observation time. */
-export function stampRun(run: Run): StampedRecord[] {
-  const observedAt = checkObservedAt(run.observedAt, "run");
-  return run.records.map((record) => ({ record, observedAt }));
-}
-
-export function plainRecords(stamped: readonly StampedRecord[]): JsonObject[] {
-  return stamped.map((entry) => entry.record);
-}
-
-export function checkStamped(
-  entry: unknown,
-  source: "base" | "run",
-  index: number,
-): StampedRecord {
-  if (!isPlainObject(entry) || !isPlainObject(entry["record"])) {
-    throw new InvalidRecordError(
-      `${source} record ${index} is not a stamped JSON object`,
-    );
-  }
-  checkObservedAt(entry["observedAt"], `${source} record ${index}`);
-  return entry as unknown as StampedRecord;
+export function lineSize(text: string): LineSize {
+  const bytes = utf8Length(text);
+  return bytes > RECORD_LINE_LIMIT_BYTES
+    ? { fits: false, bytes, reason: "record_too_large" }
+    : { fits: true, bytes };
 }

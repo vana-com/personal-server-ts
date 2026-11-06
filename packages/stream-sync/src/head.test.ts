@@ -1,114 +1,150 @@
 import { describe, expect, it } from "vitest";
+import { utf8 } from "./bytes.js";
+import { InvalidArgumentError } from "./errors.js";
 import {
-  buildHead,
+  chooseBase,
   decodeHead,
+  digestHead,
   encodeHead,
-  FORMAT_VERSION,
-  parseHead,
+  isHeadLive,
+  verifyHead,
+  writerCompatibility,
+  type Head,
 } from "./head.js";
-import { MalformedHeadError, UnsupportedFormatVersionError } from "./errors.js";
-import { split } from "./parts.js";
-import { nodeSha256, stamped } from "./test-support/index.js";
+import { int, keccak256, pick, rng } from "./test-support/ports.js";
+
+const head: Head = {
+  complete: true,
+  connector: "c",
+  format: 1,
+  generation: 2,
+  keyCheck: "0123456789abcdef",
+  ns: "fedcba9876543210",
+  observedAt: 1,
+  parts: [{ bytes: 10, count: 1, hash: "a".repeat(64), prefix: "" }],
+  primaryKey: ["id"],
+  profile: { key: null, version: "1.0.0" },
+  recordCount: 1,
+  stream: "s",
+};
+
+function randomHead(random: () => number): Head {
+  const parts = [];
+  const depth = int(random, 5);
+  let total = 0;
+  for (let b = 0; b < 2 ** depth; b += 1) {
+    if (random() < 0.3) continue;
+    const count = 1 + int(random, 1000);
+    total += count;
+    parts.push({
+      bytes: 1 + int(random, 1 << 20),
+      count,
+      hash: [...Array(64)]
+        .map(() => pick(random, [..."0123456789abcdef"]))
+        .join(""),
+      prefix: depth === 0 ? "" : b.toString(2).padStart(depth, "0"),
+    });
+  }
+  return {
+    ...head,
+    complete: random() < 0.5,
+    generation: 1 + int(random, 1e9),
+    ns: random() < 0.3 ? "" : head.ns,
+    observedAt: int(random, 2 ** 45),
+    parts,
+    primaryKey: random() < 0.5 ? ["id"] : ["a", "é"],
+    profile: { key: random() < 0.5 ? null : "pk ✓", version: "2.0.0-beta.1" },
+    recordCount: total,
+    stream: pick(random, ["s", "a.b", "é"]),
+  };
+}
 
 describe("head", () => {
-  it("starts at format version 1", () => {
-    expect(FORMAT_VERSION).toBe(1);
+  it("round-trips canonical bytes (property)", () => {
+    const random = rng(21);
+    for (let i = 0; i < 300; i += 1) {
+      const h = randomHead(random);
+      const bytes = encodeHead(h);
+      const decoded = decodeHead(bytes);
+      expect(decoded).toEqual({ kind: "ok", head: h });
+      if (decoded.kind === "ok")
+        expect(encodeHead(decoded.head)).toEqual(bytes);
+    }
   });
 
-  it("records version, stream, connection, ordered parts with lengths, count and base version", async () => {
-    const { parts } = await split(
-      stamped([{ id: 1 }, { id: 2 }], 1),
-      nodeSha256,
-      45,
-    );
-    const head = buildHead({
+  it("verifies hash, names and key check", async () => {
+    const bytes = encodeHead(head);
+    const { dataHash, blobName } = await digestHead(keccak256, bytes);
+    expect(blobName).toBe(`h-${dataHash.slice(2)}`);
+    const expected = {
+      dataHash,
+      connector: "c",
+      ns: head.ns,
       stream: "s",
-      connectionId: "c",
-      parts,
-      recordCount: 2,
-      baseVersion: "4",
+      keyCheck: head.keyCheck,
+    };
+    expect((await verifyHead(keccak256, bytes, expected)).kind).toBe("ok");
+    expect(
+      (
+        await verifyHead(keccak256, bytes, {
+          ...expected,
+          dataHash: dataHash.toUpperCase().replace("0X", "0x"),
+        })
+      ).kind,
+    ).toBe("ok");
+    expect(
+      (
+        await verifyHead(keccak256, bytes, {
+          ...expected,
+          keyCheck: "f".repeat(16),
+        })
+      ).kind,
+    ).toBe("key_mismatch");
+    const tampered = bytes.slice();
+    tampered[3] = tampered[3]! ^ 1;
+    expect((await verifyHead(keccak256, tampered, expected)).kind).toBe(
+      "hash_mismatch",
+    );
+  });
+
+  it("refuses to write a head readers would reject", () => {
+    expect(() => encodeHead({ ...head, generation: 0 })).toThrow(
+      InvalidArgumentError,
+    );
+    expect(() => encodeHead({ ...head, recordCount: 2 })).toThrow(
+      InvalidArgumentError,
+    );
+    expect(() => encodeHead({ ...head, format: 2 as 1 })).toThrow(
+      InvalidArgumentError,
+    );
+  });
+
+  it("rejects a head over 1 MiB", () => {
+    const big = utf8(`{"format":1,"x":"${"a".repeat(1024 * 1024)}"}`);
+    expect(decodeHead(big).kind).toBe("malformed");
+  });
+
+  it("is live only at the control generation", () => {
+    expect(isHeadLive({ kind: "active", generation: 2 }, "present", 2)).toBe(
+      true,
+    );
+    expect(isHeadLive({ kind: "active", generation: 3 }, "present", 2)).toBe(
+      false,
+    );
+  });
+
+  it("chooses an empty base for another generation", () => {
+    expect(chooseBase("present", head, 2)).toBe(head);
+    expect(chooseBase("present", head, 3)).toBeNull();
+    expect(chooseBase("tombstoned", head, 2)).toBeNull();
+  });
+
+  it("applies the compatible-writer rule", () => {
+    expect(writerCompatibility(head, ["id", "t"], "higher")).toEqual({
+      kind: "empty_base",
     });
-    expect(head).toEqual({
-      format: 1,
-      stream: "s",
-      connectionId: "c",
-      parts: parts.map((p) => ({ hash: p.hash, bytes: p.bytes.length })),
-      recordCount: 2,
-      baseVersion: "4",
+    expect(writerCompatibility(head, ["id", "t"], "lower")).toEqual({
+      kind: "connector_update_required",
     });
-    expect(decodeHead(encodeHead(head))).toEqual(head);
-  });
-
-  it("encodes to canonical bytes", () => {
-    const bytes = encodeHead(
-      buildHead({
-        stream: "s",
-        connectionId: "c",
-        parts: [],
-        recordCount: 0,
-        baseVersion: null,
-      }),
-    );
-    expect(new TextDecoder().decode(bytes)).toBe(
-      '{"baseVersion":null,"connectionId":"c","format":1,"parts":[],"recordCount":0,"stream":"s"}',
-    );
-  });
-
-  const valid = {
-    format: 1,
-    stream: "s",
-    connectionId: "c",
-    parts: [{ hash: "a".repeat(64), bytes: 10 }],
-    recordCount: 1,
-    baseVersion: null,
-  };
-
-  it.each([
-    ["format 2", { ...valid, format: 2 }],
-    ["format 1000", { ...valid, format: 1000 }],
-  ])("rejects an unknown future version: %s", (_n, head) => {
-    expect(() => parseHead(head)).toThrow(UnsupportedFormatVersionError);
-  });
-
-  it("reports a future version even when the rest of the head has another shape", () => {
-    expect(() => parseHead({ format: 2, somethingNew: true })).toThrow(
-      UnsupportedFormatVersionError,
-    );
-  });
-
-  it.each([
-    ["format 0", { ...valid, format: 0 }],
-    ["format as string", { ...valid, format: "1" }],
-    ["fractional format", { ...valid, format: 1.5 }],
-    ["missing field", { ...valid, baseVersion: undefined }],
-    ["extra field", { ...valid, extra: 1 }],
-    ["empty stream", { ...valid, stream: "" }],
-    [
-      "upper-case hash",
-      { ...valid, parts: [{ hash: "A".repeat(64), bytes: 1 }] },
-    ],
-    ["short hash", { ...valid, parts: [{ hash: "a", bytes: 1 }] }],
-    [
-      "negative bytes",
-      { ...valid, parts: [{ hash: "a".repeat(64), bytes: -1 }] },
-    ],
-    [
-      "part with extra field",
-      { ...valid, parts: [{ hash: "a".repeat(64), bytes: 1, x: 1 }] },
-    ],
-    ["numeric base version", { ...valid, baseVersion: 3 }],
-    ["parts for zero records", { ...valid, recordCount: 0 }],
-    ["negative count", { ...valid, recordCount: -1 }],
-    ["array", []],
-    ["null", null],
-  ])("fails closed on %s", (_n, head) => {
-    expect(() => parseHead(head)).toThrow(MalformedHeadError);
-  });
-
-  it("fails closed on bytes that are not UTF-8 or not JSON", () => {
-    expect(() => decodeHead(new Uint8Array([0xff, 0xfe]))).toThrow(
-      MalformedHeadError,
-    );
-    expect(() => decodeHead("{")).toThrow(MalformedHeadError);
   });
 });

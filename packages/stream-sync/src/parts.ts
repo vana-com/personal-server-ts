@@ -1,127 +1,133 @@
-import { InvalidPartSizeError } from "./errors.js";
-import { sha256Hex, type Sha256 } from "./hash.js";
-import { canonicalJson } from "./json.js";
-import type { StampedRecord } from "./records.js";
+/**
+ * §2.2 part codec. A part is NDJSON: one canonical line per winning record,
+ * sorted by pkHash, each line terminated by `\n`. A prefix with no records
+ * has no part.
+ */
 
-/** Default part size limit: 4 MiB. Hosts pass their own budget. */
-export const DEFAULT_PART_SIZE_BYTES = 4 * 1024 * 1024;
+import { PART_LIMIT_BYTES, sha256Hex, utf8, type Sha256 } from "./bytes.js";
+import { InvalidArgumentError, InvalidPartError } from "./errors.js";
+import type { BucketResult, Winner } from "./merge.js";
+import { decodeLine, inPrefix, pkHash, type Line } from "./records.js";
 
-const encoder = new TextEncoder();
-const OPEN_TIMES = encoder.encode('{"observedAt":[');
-const MID = encoder.encode('],"records":[');
-const CLOSE = encoder.encode("]}");
-const FRAME_BYTES = OPEN_TIMES.length + MID.length + CLOSE.length;
-const COMMA = 0x2c;
-
-export interface Part {
-  /** Lowercase hex SHA-256 of `bytes`. */
+/** One entry of a head's `parts` list. */
+export interface HeadPart {
+  readonly bytes: number;
+  readonly count: number;
+  /** SHA-256 of the clear part bytes, 64 lowercase hex. */
   readonly hash: string;
-  /** The exact bytes: canonical JSON `{"observedAt":[...],"records":[...]}`. */
-  readonly bytes: Uint8Array;
-  readonly recordCount: number;
+  /** The bucket's bit prefix, e.g. `""`, `"0"`, `"1011"`. */
+  readonly prefix: string;
 }
 
-export interface OversizedRecordWarning {
-  readonly code: "oversized-record";
-  /** Index of the part that holds the record alone. */
-  readonly partIndex: number;
-  readonly partBytes: number;
-  readonly limit: number;
+export interface EncodedPart {
+  readonly entry: HeadPart;
+  readonly data: Uint8Array;
 }
 
-export type SplitWarning = OversizedRecordWarning;
-
-export interface SplitResult {
-  readonly parts: Part[];
-  readonly warnings: SplitWarning[];
+/** Encode a reduced bucket. Returns `null` for an empty bucket. */
+export async function encodePart(
+  sha256: Sha256,
+  bucket: Extract<BucketResult, { kind: "ok" }>,
+): Promise<EncodedPart | null> {
+  return encodeWinners(sha256, bucket.prefix, bucket.winners);
 }
 
-interface Encoded {
-  readonly time: Uint8Array;
-  readonly record: Uint8Array;
+export async function encodeWinners(
+  sha256: Sha256,
+  prefix: string,
+  winners: readonly Winner[],
+): Promise<EncodedPart | null> {
+  if (winners.length === 0) return null;
+  let text = "";
+  let previous: string | null = null;
+  for (const winner of winners) {
+    if (previous !== null && winner.pkHash <= previous) {
+      throw new InvalidArgumentError(
+        "winners must be strictly sorted by pkHash",
+      );
+    }
+    previous = winner.pkHash;
+    text += `${winner.text}\n`;
+  }
+  const data = utf8(text);
+  if (data.length > PART_LIMIT_BYTES) {
+    throw new InvalidArgumentError("part exceeds the 16 MiB part limit");
+  }
+  return {
+    data,
+    entry: {
+      bytes: data.length,
+      count: winners.length,
+      hash: await sha256Hex(sha256, data),
+      prefix,
+    },
+  };
 }
+
+export interface DecodedLine {
+  readonly text: string;
+  readonly line: Line;
+}
+
+const decoder = new TextDecoder("utf-8", { fatal: true });
 
 /**
- * Pack stamped records, in the order given, into parts of at most
- * `partSizeBytes` bytes each. A part is canonical JSON
- * `{"observedAt":[t1,t2,...],"records":[r1,r2,...]}`: the two arrays are the
- * same length, and `observedAt[i]` is the observation time of `records[i]`.
- * The records array stays a plain `{records}` list that a reader unaware of
- * observation times can still use. A part exactly at the limit is allowed. A
- * record too large for any part gets a part of its own and an
- * `oversized-record` warning. No records gives no parts.
- *
- * The caller supplies the order; `overlay` already returns the canonical one.
+ * Verify part bytes against their head entry and decode the lines. When
+ * `primaryKey` is given, also check every line is inside the part's prefix
+ * and lines are strictly sorted by pkHash.
  */
-export async function split(
-  records: readonly StampedRecord[],
+export async function decodePart(
   sha256: Sha256,
-  partSizeBytes: number = DEFAULT_PART_SIZE_BYTES,
-): Promise<SplitResult> {
-  if (!Number.isSafeInteger(partSizeBytes) || partSizeBytes <= 0) {
-    throw new InvalidPartSizeError(partSizeBytes);
+  data: Uint8Array,
+  entry: HeadPart,
+  primaryKey?: readonly string[],
+): Promise<DecodedLine[]> {
+  if (data.length > PART_LIMIT_BYTES) {
+    throw new InvalidPartError("part exceeds the 16 MiB decoder limit");
   }
-  const groups: Encoded[][] = [];
-  let current: Encoded[] = [];
-  let currentSize = FRAME_BYTES;
-  for (const entry of records) {
-    const item: Encoded = {
-      time: encoder.encode(canonicalJson(entry.observedAt)),
-      record: encoder.encode(canonicalJson(entry.record)),
-    };
-    const cost =
-      item.time.length + item.record.length + (current.length > 0 ? 2 : 0);
-    if (current.length > 0 && currentSize + cost > partSizeBytes) {
-      groups.push(current);
-      current = [];
-      currentSize = FRAME_BYTES;
+  if (data.length !== entry.bytes) {
+    throw new InvalidPartError(
+      `part has ${data.length} bytes, head says ${entry.bytes}`,
+    );
+  }
+  if ((await sha256Hex(sha256, data)) !== entry.hash) {
+    throw new InvalidPartError("part SHA-256 does not match the head");
+  }
+  let text: string;
+  try {
+    text = decoder.decode(data);
+  } catch {
+    throw new InvalidPartError("part is not valid UTF-8");
+  }
+  if (!text.endsWith("\n")) {
+    throw new InvalidPartError("part does not end with a line terminator");
+  }
+  const lines = text.slice(0, -1).split("\n");
+  if (lines.length !== entry.count) {
+    throw new InvalidPartError(
+      `part has ${lines.length} lines, head says ${entry.count}`,
+    );
+  }
+  const out: DecodedLine[] = [];
+  let previous: string | null = null;
+  for (const lineText of lines) {
+    let line: Line;
+    try {
+      line = decodeLine(lineText);
+    } catch (cause) {
+      throw new InvalidPartError(`bad line: ${(cause as Error).message}`);
     }
-    currentSize +=
-      item.time.length + item.record.length + (current.length > 0 ? 2 : 0);
-    current.push(item);
-  }
-  if (current.length > 0) groups.push(current);
-
-  const parts: Part[] = [];
-  const warnings: SplitWarning[] = [];
-  for (const [partIndex, group] of groups.entries()) {
-    const bytes = join(group);
-    if (group.length === 1 && bytes.length > partSizeBytes) {
-      warnings.push({
-        code: "oversized-record",
-        partIndex,
-        partBytes: bytes.length,
-        limit: partSizeBytes,
-      });
+    if (primaryKey) {
+      const hash = await pkHash(sha256, line.v, primaryKey);
+      if (!inPrefix(hash, entry.prefix)) {
+        throw new InvalidPartError("line key is outside the part prefix");
+      }
+      if (previous !== null && hash <= previous) {
+        throw new InvalidPartError("lines are not strictly sorted by pkHash");
+      }
+      previous = hash;
     }
-    parts.push({
-      hash: await sha256Hex(sha256, bytes),
-      bytes,
-      recordCount: group.length,
-    });
+    out.push({ text: lineText, line });
   }
-  return { parts, warnings };
-}
-
-function join(items: readonly Encoded[]): Uint8Array {
-  let total = FRAME_BYTES + 2 * (items.length - 1);
-  for (const item of items) total += item.time.length + item.record.length;
-  const out = new Uint8Array(total);
-  let at = 0;
-  const put = (bytes: Uint8Array) => {
-    out.set(bytes, at);
-    at += bytes.length;
-  };
-  put(OPEN_TIMES);
-  items.forEach((item, i) => {
-    if (i > 0) out[at++] = COMMA;
-    put(item.time);
-  });
-  put(MID);
-  items.forEach((item, i) => {
-    if (i > 0) out[at++] = COMMA;
-    put(item.record);
-  });
-  put(CLOSE);
   return out;
 }
