@@ -160,7 +160,7 @@ describe("run intake", { timeout: 30_000 }, () => {
       collection_mode: "incremental",
       state: { items: "c1" },
     });
-    // R16: an owner-started full run keeps the stored state.
+    // R24: a full run's START carries no cursor, yet the stored one stays.
     await h.intake.abort("r2", "cancelled");
     const third = await h.intake.begin(
       "r3",
@@ -168,7 +168,7 @@ describe("run intake", { timeout: 30_000 }, () => {
     );
     expect(third.start).toEqual({
       collection_mode: "full_refresh",
-      state: { items: "c1" },
+      state: null,
     });
     await h.intake.abort("r3", "cancelled");
 
@@ -187,6 +187,30 @@ describe("run intake", { timeout: 30_000 }, () => {
       collection_mode: "full_refresh",
       state: null,
     });
+  });
+
+  it("sends no cursor for a full_refresh stream; its incremental sibling keeps its cursor (R24)", async () => {
+    const c = freshConnector("r24");
+    const h = await host();
+    await run(h, "r1", c, {
+      records: [
+        { stream: "items", data: row("a") },
+        { stream: "snapshot", data: row("s") },
+      ],
+      covered: ["items", "snapshot"],
+      candidate: { items: "i1", snapshot: "s1" },
+    });
+    await publish(h, "r1");
+    const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
+    // Incremental run: `snapshot` is declared incremental:false.
+    expect(next.start.collection_mode).toBe("incremental");
+    expect(next.start.state).toEqual({ items: "i1" });
+    expect(next.streams.map((s) => [s.name, s.mode])).toEqual(
+      expect.arrayContaining([
+        ["items", "incremental"],
+        ["snapshot", "full_refresh"],
+      ]),
+    );
   });
 
   it("skips and counts deletes, never storing a stub row (R17)", async () => {

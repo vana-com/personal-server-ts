@@ -233,6 +233,25 @@ function checkName(connector: string, stream: string): void {
   }
 }
 
+/**
+ * R24: START never carries a cursor for a stream whose issued mode is
+ * `full_refresh`. A producer runtime reads "a cursor is present" as
+ * "read incrementally", so the rule lives here, once, not in each producer.
+ * The writer keeps the stored checkpoint; only what is sent is filtered.
+ */
+function withoutFullCursors(
+  state: JsonValue | null,
+  modes: ReadonlyMap<string, "full_refresh" | "incremental">,
+): JsonValue | null {
+  if (state === null || !isPlainObject(state as JsonObject)) return state;
+  const kept = Object.fromEntries(
+    Object.entries(state as JsonObject).filter(
+      ([stream]) => modes.get(stream) !== "full_refresh",
+    ),
+  );
+  return Object.keys(kept).length > 0 ? kept : null;
+}
+
 export class StreamSyncIntake implements RunIntake {
   private readonly runs = new Map<string, Run>();
   private readonly ended = new Set<string>();
@@ -353,23 +372,31 @@ export class StreamSyncIntake implements RunIntake {
       }
     }
     const runFull = collection === "full_refresh";
+    const modes = new Map(
+      declarations.streams.map((d) => [
+        d.name,
+        runFull || d.incremental === false
+          ? ("full_refresh" as const)
+          : ("incremental" as const),
+      ]),
+    );
     const response: BeginResponse = {
       runId,
       status: willDiscard ? "will_discard" : "collecting",
       discardReason: willDiscard ? "registry_unreachable" : null,
       stuck: await writer.stuck(connector),
       binding: { keyCheck },
-      start: { collection_mode: collection, state },
+      start: {
+        collection_mode: collection,
+        state: withoutFullCursors(state, modes),
+      },
       streams: declarations.streams.map((d) => ({
         name: d.name,
         semantics: d.semantics,
         primaryKey: d.primaryKey,
         incremental: d.incremental !== false,
         ...(d.consentTimeField ? { consentTimeField: d.consentTimeField } : {}),
-        mode:
-          runFull || d.incremental === false
-            ? ("full_refresh" as const)
-            : ("incremental" as const),
+        mode: modes.get(d.name)!,
       })),
     };
     this.runs.set(runId, {
