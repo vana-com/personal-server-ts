@@ -27,6 +27,7 @@ import { generateMcpGrantee } from "./grantee.js";
 import { createGrantContract } from "../contracts/index.js";
 import { isWriteScopeEntry, WRITE_SCOPE_PREFIX } from "../policy/data-write.js";
 import { isMemoryScope, isSystemScope } from "../policy/reserved-scopes.js";
+import { isPhysicalScope } from "../stream-sync-read/routing.js";
 import {
   ScopeSchema,
   type DataPortabilityGatewayConfig,
@@ -678,6 +679,7 @@ function requirePendingScopeRequest(
  * wildcard). MCP clients only ever write memories.
  */
 function isApprovableScope(scope: string): boolean {
+  if (isPhysicalScope(scope)) return false;
   if (!isWriteScopeEntry(scope)) return ScopeSchema.safeParse(scope).success;
   const target = scope.slice(WRITE_SCOPE_PREFIX.length);
   return (

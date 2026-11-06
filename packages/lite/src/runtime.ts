@@ -42,6 +42,7 @@ import {
   type PersonalServerReadAuthResult,
   type PersonalServerReadFulfillmentReporter,
   type PreparedScopeUploadBatch,
+  type StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   handlePersonalServerDerivativesRequest,
@@ -179,6 +180,11 @@ export interface PsLiteRuntimeOptions {
    * alongside the sync manager, which keeps it current.
    */
   scopeDeletions?: ScopeDeletionTracker;
+  /**
+   * Stream-sync reads, from `createPsLiteSyncManager`'s `streamSyncRead`.
+   * Absent = reads as before.
+   */
+  streamSyncRead?: StreamSyncReadPort;
   /** Receives the cause of every 500 the runtime answers. */
   logger?: PersonalServerApiLogger;
   additions?: DurableAdditionsService;
@@ -1269,6 +1275,7 @@ export function createPsLiteRuntime(
               additions: options.additions,
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
+              streamSyncRead: options.streamSyncRead,
               scopeUploads,
               now,
               createLogId,

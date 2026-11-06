@@ -51,6 +51,12 @@ export const DEFAULTS = {
     enabled: false,
     lastProcessedTimestamp: null,
   },
+  streamSync: {
+    // Off by default. When true, this server imports stream-sync heads and
+    // serves logical reads from complete stream views (§2.10). When false,
+    // reads are exactly as before.
+    read: false,
+  },
   replication: {
     // Off by default. When false, no replica code runs and no replica
     // schema is created. When true, the record store is built with the
@@ -215,6 +221,11 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.sync.lastProcessedTimestamp),
     })
     .default(DEFAULTS.sync),
+  streamSync: z
+    .object({
+      read: z.boolean().default(DEFAULTS.streamSync.read),
+    })
+    .default(DEFAULTS.streamSync),
   replication: z
     .object({
       enabled: z.boolean().default(DEFAULTS.replication.enabled),

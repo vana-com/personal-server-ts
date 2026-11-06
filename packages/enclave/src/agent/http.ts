@@ -565,6 +565,11 @@ function prewarmRequestBody(value: unknown): PrewarmRequestBody {
   const body = record(value);
   const sealedEnvelope = record(body.sealedEnvelope);
   const wrappedContentKey = record(sealedEnvelope.wrappedContentKey);
+  // Stream-sync names (`~`) are internal registry names, never SDK scopes;
+  // they do not reach the SDK schema.
+  if (typeof body.scope === "string" && body.scope.includes("~")) {
+    throw new BadRequest();
+  }
   const scope = ScopeSchema.safeParse(body.scope);
   if (
     !isHex(body.userPsId, { strict: true }) ||

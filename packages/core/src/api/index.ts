@@ -94,6 +94,10 @@ import {
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
+import type {
+  ReadDecision,
+  ResolveInput,
+} from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
   deletionHistoryOf,
@@ -316,6 +320,11 @@ export interface PersonalServerIngestSyncManager {
   deleteScope?(scope: string): Promise<DeleteScopeResult>;
 }
 
+/** The read side of stream sync, as the data API uses it. */
+export interface StreamSyncReadPort {
+  resolve(input: ResolveInput): Promise<ReadDecision>;
+}
+
 export interface PersonalServerDataApiDeps {
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
@@ -325,6 +334,13 @@ export interface PersonalServerDataApiDeps {
    * Explicit versions (`fileId`, `at`) always read from `storage`.
    */
   legacyScopeView?: LegacyScopeViewPort;
+  /**
+   * Stream-sync reads (`streamSync.read`). Absent = every read takes the
+   * existing path, unchanged. Present: a latest read of a name a stream view
+   * can serve is answered from the view (§2.10); a deleted connector's
+   * names are refused at every version.
+   */
+  streamSyncRead?: StreamSyncReadPort;
   auth: PersonalServerApiAuthPort;
   accessLogWriter: AccessLogWriter;
   syncManager?: PersonalServerIngestSyncManager | null;
@@ -615,6 +631,130 @@ function errorResponse(
     },
     { status },
   );
+}
+
+/** The response for a stream-sync decision that serves nothing; `null` otherwise. */
+function streamSyncRefusal(decision: ReadDecision): Response | null {
+  switch (decision.kind) {
+    case "unavailable":
+      return decision.reason === "connection_not_found"
+        ? errorResponse(
+            404,
+            "CONNECTION_NOT_FOUND",
+            "No connection of this name's connector matches the connection parameter",
+          )
+        : null;
+    case "key_mismatch":
+      return errorResponse(
+        503,
+        "KEY_MISMATCH",
+        "This data was written with another owner key and cannot be read here",
+      );
+    case "cursor_stale":
+      return errorResponse(
+        409,
+        "CURSOR_STALE",
+        "The cursor names a version this server no longer holds; read again without it",
+      );
+    case "invalid_cursor":
+      return errorResponse(400, "INVALID_CURSOR", "cursor is not valid");
+    case "invalid_connection":
+      return errorResponse(
+        400,
+        "INVALID_CONNECTION",
+        "connection must be empty or 16 lowercase hex characters",
+      );
+    case "too_large":
+      return errorResponse(
+        503,
+        "TOO_LARGE",
+        "This legacy view is larger than this server can build; read its streams instead",
+      );
+    default:
+      return null;
+  }
+}
+
+/**
+ * Serve a stream view: the envelope streams part by part. Paid reads of a
+ * view are refused like paid canonical reads: payment binds a stored file.
+ */
+async function serveStreamSyncView(
+  deps: PersonalServerDataApiDeps,
+  request: Request,
+  input: {
+    scope: string;
+    grantId: string | undefined;
+    authResult: Awaited<
+      ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+    >;
+    decision: Extract<ReadDecision, { kind: "view" }>;
+  },
+): Promise<Response> {
+  const { authResult, decision } = input;
+  const isOwnerSignal =
+    authResult?.grantId === "owner" || authResult?.grantId === "policy-bypass";
+  const builder = authResult?.builder;
+  if (
+    deps.paymentEnabled &&
+    !isOwnerSignal &&
+    typeof builder === "string" &&
+    builder.startsWith("0x") &&
+    authResult?.grantId &&
+    deps.gateway &&
+    deps.gatewayConfig &&
+    deps.gatewayUrl
+  ) {
+    await decision.body.cancel();
+    return legacyViewRefusalResponse(input.scope, {
+      status: "unavailable",
+      reason: "paid_read_unsupported",
+    });
+  }
+  const logId = deps.createLogId?.() ?? crypto.randomUUID();
+  const timestamp = (deps.now ?? (() => new Date()))().toISOString();
+  const ipAddress =
+    request.headers.get("x-forwarded-for") ??
+    request.headers.get("x-real-ip") ??
+    "unknown";
+  const userAgent = request.headers.get("user-agent") ?? "unknown";
+  try {
+    await deps.accessLogWriter.write({
+      logId,
+      grantId: authResult?.grantId ?? input.grantId ?? "unknown",
+      builder: authResult?.builder ?? "unknown",
+      action: "read",
+      scope: input.scope,
+      timestamp,
+      ipAddress,
+      userAgent,
+    });
+  } catch (error) {
+    await decision.body.cancel();
+    throw error;
+  }
+  if (authResult?.grantId && authResult.builder) {
+    reportPersonalServerReadFulfillment(deps, {
+      builder: authResult.builder,
+      fileId: undefined,
+      grantId: authResult.grantId,
+      ipAddress,
+      logId,
+      outcome: "served",
+      scope: input.scope,
+      servedAt: timestamp,
+      source: "api",
+      userAgent,
+    });
+  }
+  return new Response(decision.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Vana-Data-Source": "stream-sync",
+      "X-Stream-Sync-Cursor": decision.cursor,
+    },
+  });
 }
 
 function methodNotAllowed(): Response {
@@ -2241,6 +2381,36 @@ export async function handlePersonalServerDataRequest(
         fileIdParam === undefined && atParam === undefined && view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
+      // Stream-sync (§2.10): the one eligibility rule decides between the
+      // stream view, the existing body and a refusal. Explicit versions stay
+      // legacy history, but a deleted connector serves nothing at all.
+      const latestRead =
+        fileIdParam === undefined && atParam === undefined && view === null;
+      if (deps.streamSyncRead) {
+        const decision = await deps.streamSyncRead.resolve({
+          scope: scopeResult.scope,
+          connection: latestRead ? url.searchParams.get("connection") : null,
+          cursor: latestRead ? url.searchParams.get("cursor") : null,
+          legacyFile: Boolean(selectedEntry) || latest?.kind === "canonical",
+        });
+        if (decision.kind === "unavailable" && decision.reason === "deleted") {
+          throw new DataDeletedError({ scope: scopeResult.scope });
+        }
+        if (latestRead) {
+          const refusal = streamSyncRefusal(decision);
+          if (refusal) return refusal;
+          if (decision.kind === "view") {
+            notifyDataRead(deps, { scope: scopeResult.scope });
+            return serveStreamSyncView(deps, request, {
+              scope: scopeResult.scope,
+              grantId,
+              authResult,
+              decision,
+            });
+          }
+        }
+      }
+
       // The deletion history comes with the body the view chose, never from
       // a later ownership query a concurrent write could change.
       const canonicalOwned =

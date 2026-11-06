@@ -168,6 +168,14 @@
       "types": "./dist/sync/index.d.ts",
       "import": "./dist/sync/index.js"
     },
+    "./stream-sync-read": {
+      "types": "./dist/stream-sync-read/index.d.ts",
+      "import": "./dist/stream-sync-read/index.js"
+    },
+    "./stream-sync-read/testing": {
+      "types": "./dist/stream-sync-read/testing.d.ts",
+      "import": "./dist/stream-sync-read/testing.js"
+    },
     "./sync/manager": {
       "types": "./dist/sync/engine/sync-manager.d.ts",
       "import": "./dist/sync/engine/sync-manager.js"
@@ -233,6 +241,7 @@
     "unpdf": "^1.6.2",
     "viem": "^2.54.2",
     "zod": "^4.4.3",
-    "@noble/hashes": "1.8.0"
+    "@noble/hashes": "1.8.0",
+    "@opendatalabs/personal-server-ts-stream-sync": "*"
   }
 }

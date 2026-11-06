@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { ScopeSchema } from "@opendatalabs/vana-sdk/protocol/scopes";
+import { isPhysicalScope } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import { createBodyLimit } from "../middleware/body-limit.js";
 
 /** Sandbox-local endpoint. Never mounted on a full PS or a public router. */
@@ -34,6 +35,9 @@ export function enclaveFleetRoutes(deps: {
       body.scopes.some(
         (s) =>
           !s ||
+          typeof s.scope !== "string" ||
+          // Stream-sync names never reach the SDK schema.
+          isPhysicalScope(s.scope) ||
           !ScopeSchema.safeParse(s.scope).success ||
           (s.minimumVersion !== undefined &&
             (!Number.isSafeInteger(s.minimumVersion) || s.minimumVersion < 1)),

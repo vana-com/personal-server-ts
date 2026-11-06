@@ -4,6 +4,7 @@ import {
   handlePersonalServerDataRequest,
   type PersonalServerApiDispatchOptions,
   type PersonalServerReadFulfillmentReporter,
+  type StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -94,6 +95,8 @@ export interface DataRouteDeps {
    * `PersonalServerDataApiDeps.legacyScopeView`. Absent = file reads only.
    */
   legacyScopeView?: LegacyScopeViewPort;
+  /** See `PersonalServerDataApiDeps.streamSyncRead`. Absent = reads as before. */
+  streamSyncRead?: StreamSyncReadPort;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /**
    * Write API sessions (POST /v1/write/session). When present, the ingest
@@ -367,6 +370,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         additions: deps.additions,
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
+        streamSyncRead: deps.streamSyncRead,
         auth,
         accessLogWriter: deps.accessLogWriter,
         readFulfillmentReporter: deps.readFulfillmentReporter,

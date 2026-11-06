@@ -1,4 +1,5 @@
 import { isReplicaScope } from "../replication/namespace.js";
+import { isPhysicalScope } from "../stream-sync-read/routing.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import {
@@ -333,6 +334,10 @@ export interface DeleteDataScopeContractResult {
   deletedCount: number;
 }
 
+/** The SDK scope schema's message for a name that is not a scope. */
+const INVALID_SCOPE_FORMAT_MESSAGE =
+  "Scope must be {source}.{category}[.{subcategory}]; source lowercase, tail may keep the historical camelCase form (e.g. spotify.savedTracks)";
+
 function invalidScope(message: string): DataContractError {
   return {
     ok: false,
@@ -349,6 +354,11 @@ export function parseDataScopeContract(
 ): { ok: true; scope: string } | DataContractError {
   if (isReplicaScope(scopeParam))
     return invalidScope("Replica transport scopes are reserved");
+  // Stream-sync names (`~`) are internal; reads use the logical name and
+  // pick a connection with `connection=`. They never reach the SDK schema,
+  // and are refused with the answer the schema gave them before.
+  if (isPhysicalScope(scopeParam))
+    return invalidScope(INVALID_SCOPE_FORMAT_MESSAGE);
   const scopeResult = ScopeSchema.safeParse(scopeParam);
   if (!scopeResult.success) {
     return invalidScope(

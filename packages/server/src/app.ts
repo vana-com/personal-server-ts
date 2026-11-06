@@ -15,7 +15,10 @@ import type {
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
-import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
+import type {
+  PersonalServerReadFulfillmentReporter,
+  StreamSyncReadPort,
+} from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import {
@@ -155,6 +158,8 @@ export interface AppDeps {
   dataStorage?: DataStoragePort;
   /** Canonical latest bodies for GET /v1/data; absent = file reads only. */
   legacyScopeView?: LegacyScopeViewPort;
+  /** Stream-sync reads (`streamSync.read`); absent = reads as before. */
+  streamSyncRead?: StreamSyncReadPort;
   /**
    * Gateway base URL — wired into the data route so the GET handler can
    * forward validated X-PAYMENTs to POST /v1/escrow/pay via direct fetch.
@@ -519,6 +524,7 @@ export function createApp(deps: AppDeps): Hono {
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
       legacyScopeView,
+      streamSyncRead: deps.streamSyncRead,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,
