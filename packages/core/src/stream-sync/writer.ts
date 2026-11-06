@@ -43,7 +43,6 @@ import {
   decide,
   decodePart,
   deriveKeyCheck,
-  deriveNs,
   digestHead,
   encodeHead,
   encodeLine,
@@ -194,8 +193,6 @@ interface HostEntry {
   version: 1;
   phase: Phase;
   entry: OutboxEntry;
-  identity: "required" | "none";
-  accountId: string | null;
   /** The checkpoint the run started from, `null` for a full run. */
   checkpointUsed: { ns: string; generation: number } | null;
   /** Target generation, once admission decided `publish`. */
@@ -222,8 +219,8 @@ export interface StreamSyncRunStart {
   readonly userConnect: boolean;
   /** Run start in ms; the `o` of every line. Defaults to the clock. */
   readonly observedAt?: number;
-  /** `required` when the manifest declares an account identity (§2.12). */
-  readonly identity: "required" | "none";
+  /** Every run is identity-less (R23); kept so existing callers compile. */
+  readonly identity?: "none";
   /** The checkpoint the run resumes from; omit for a full run. */
   readonly checkpointUsed?: {
     readonly ns: string;
@@ -602,8 +599,6 @@ export class StreamSyncWriter {
         version: 1,
         phase: "collecting",
         entry,
-        identity: input.identity,
-        accountId: null,
         checkpointUsed: checkpointUsed
           ? { ns: checkpointUsed.ns, generation: checkpointUsed.generation }
           : null,
@@ -766,15 +761,6 @@ export class StreamSyncWriter {
     { index: number; primaryKey: string[]; observedAt: number }
   >();
 
-  /** §2.12: the account identity the connector emitted for this run. */
-  setAccountIdentity(runId: string, accountId: string): Promise<void> {
-    return this.intake(async () => {
-      const host = await this.collecting(runId);
-      host.accountId = accountId;
-      await this.writeEntry(host);
-    });
-  }
-
   /**
    * End intake. The run becomes publishable.
    *
@@ -782,8 +768,7 @@ export class StreamSyncWriter {
    * covered (§3.5): the others are dropped with their spool lines, never
    * published empty. Omit it to publish every declared stream.
    *
-   * An identity-less run (`identity: "none"`, every run the intake adapter
-   * starts, R23) publishes under the identity-less name.
+   * Every run (R23) publishes under the identity-less name.
    */
   finishRun(
     runId: string,
@@ -795,52 +780,44 @@ export class StreamSyncWriter {
     return this.intake(async () => {
       const host = await this.collecting(runId);
       const run = this.active.get(runId)!;
-      await run.spool.flush();
-      this.forget(runId);
-      if (input.coveredStreams) this.keepCovered(host, input.coveredStreams);
-      if (run.excluded.length > 0) {
-        await this.options.files.appendMany([
-          {
-            path: `runs/${runId}/excluded.ndjson`,
-            bytes: encoder.encode(run.excluded.map((l) => `${l}\n`).join("")),
-          },
-        ]);
+      // The run stays active until its `ready` write is durable, so a
+      // recovery pass on the publish queue cannot take it for an abandoned
+      // run. It is forgotten on any failure and once it is `ready`.
+      try {
+        await run.spool.flush();
+        if (input.coveredStreams) this.keepCovered(host, input.coveredStreams);
+        if (run.excluded.length > 0) {
+          await this.options.files.appendMany([
+            {
+              path: `runs/${runId}/excluded.ndjson`,
+              bytes: encoder.encode(run.excluded.map((l) => `${l}\n`).join("")),
+            },
+          ]);
+        }
+        const connector = host.entry.connector;
+        const ns = IDENTITYLESS_NS;
+        for (const [name, stream] of Object.entries(host.streams)) {
+          stream.shardBytes = run.shardBytes.get(name) ?? emptyShardBytes();
+          stream.recordTooLarge = run.recordTooLarge.get(name) ?? 0;
+        }
+        if (this.options.seed) {
+          await this.withState((state) => {
+            state.seedTargets[connector] ??= ns;
+          });
+        }
+        // Intake appends are not durable one by one. The run becomes `ready`
+        // only after one sync of its intake logs (§2.6).
+        await this.options.files.sync(`runs/${runId}`);
+        host.entry = {
+          ...host.entry,
+          ns,
+          checkpointCandidate: input.checkpointCandidate,
+        };
+        host.phase = "ready";
+        await this.writeEntry(host);
+      } finally {
+        this.forget(runId);
       }
-      const connector = host.entry.connector;
-      let ns: string;
-      if (host.identity === "none") ns = IDENTITYLESS_NS;
-      else if (host.accountId !== null && host.accountId !== "") {
-        ns = await deriveNs(
-          (m) => this.options.keys.namespaceHmac(m),
-          connector,
-          host.accountId,
-        );
-      } else {
-        await this.finish(host, {
-          kind: "failed",
-          why: "the connector declares an account identity and emitted none",
-        });
-        return this.statusOf(host);
-      }
-      for (const [name, stream] of Object.entries(host.streams)) {
-        stream.shardBytes = run.shardBytes.get(name) ?? emptyShardBytes();
-        stream.recordTooLarge = run.recordTooLarge.get(name) ?? 0;
-      }
-      if (this.options.seed) {
-        await this.withState((state) => {
-          state.seedTargets[connector] ??= ns;
-        });
-      }
-      // Intake appends are not durable one by one. The run becomes `ready`
-      // only after one sync of its intake logs (§2.6).
-      await this.options.files.sync(`runs/${runId}`);
-      host.entry = {
-        ...host.entry,
-        ns,
-        checkpointCandidate: input.checkpointCandidate,
-      };
-      host.phase = "ready";
-      await this.writeEntry(host);
       return this.statusOf(host);
     });
   }
@@ -878,8 +855,11 @@ export class StreamSyncWriter {
       }
       // Buffered lines are dropped, not written to be removed again.
       run.spool.clear();
-      this.forget(runId);
-      await this.finish(host, { kind: "aborted", reason });
+      try {
+        await this.finish(host, { kind: "aborted", reason });
+      } finally {
+        this.forget(runId);
+      }
     });
   }
 
@@ -902,53 +882,40 @@ export class StreamSyncWriter {
         if ((run.records.get(stream) ?? 0) === 0) kept[stream] = cursor;
       }
       run.spool.clear();
-      this.forget(runId);
-      this.keepCovered(host, []);
-      const connector = host.entry.connector;
-      const ns =
-        host.identity === "none"
-          ? IDENTITYLESS_NS
-          : host.accountId !== null && host.accountId !== ""
-            ? await deriveNs(
-                (m) => this.options.keys.namespaceHmac(m),
-                connector,
-                host.accountId,
-              )
-            : undefined;
-      if (ns === undefined) {
-        await this.finish(host, {
-          kind: "failed",
-          why: "the connector's account is unknown, so no checkpoint is saved",
-        });
-        return this.statusOf(host);
-      }
-      host.entry = {
-        ...host.entry,
-        ns,
-        checkpointCandidate: Object.keys(kept).length > 0 ? kept : null,
-      };
+      // Active until the run has ended, so recovery cannot end it first.
       try {
-        host.target = await this.admit(host, "first");
-      } catch (error) {
-        if (error instanceof Discard) {
-          await this.discard(host, error);
-          return this.statusOf(host);
+        this.keepCovered(host, []);
+        const ns = IDENTITYLESS_NS;
+        host.entry = {
+          ...host.entry,
+          ns,
+          checkpointCandidate: Object.keys(kept).length > 0 ? kept : null,
+        };
+        try {
+          host.target = await this.admit(host, "first");
+        } catch (error) {
+          if (error instanceof Discard) {
+            await this.discard(host, error);
+            return this.statusOf(host);
+          }
+          if (
+            error instanceof PendingStream ||
+            error instanceof RegistryRefusedError
+          ) {
+            await this.finish(host, {
+              kind: "no_checkpoint",
+              generation: 0,
+              reason: "control_changed",
+            });
+            return this.statusOf(host);
+          }
+          throw error;
         }
-        if (
-          error instanceof PendingStream ||
-          error instanceof RegistryRefusedError
-        ) {
-          await this.finish(host, {
-            kind: "no_checkpoint",
-            generation: 0,
-            reason: "control_changed",
-          });
-          return this.statusOf(host);
-        }
-        throw error;
+        await this.checkpoint(host);
+        return this.statusOf(host);
+      } finally {
+        this.forget(runId);
       }
-      await this.checkpoint(host);
-      return this.statusOf(host);
     });
   }
 

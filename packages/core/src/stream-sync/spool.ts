@@ -46,6 +46,7 @@ export function emptyShardBytes(): number[] {
 export class SpoolWriter {
   private readonly buffers = new Map<string, string[]>();
   private buffered = 0;
+  private failure: unknown = null;
 
   constructor(private readonly files: StreamSyncFiles) {}
 
@@ -72,16 +73,27 @@ export class SpoolWriter {
     this.buffered = 0;
   }
 
+  /**
+   * Append the buffered lines. The buffers are taken before the append, so a
+   * failed append has lost lines. Every later flush then fails too, and the
+   * run cannot end as if its log were whole.
+   */
   async flush(): Promise<void> {
+    if (this.failure) throw this.failure;
     const pending = [...this.buffers.entries()];
     this.buffers.clear();
     this.buffered = 0;
-    await this.files.appendMany(
-      pending.map(([path, lines]) => ({
-        path,
-        bytes: encoder.encode(lines.join("")),
-      })),
-    );
+    try {
+      await this.files.appendMany(
+        pending.map(([path, lines]) => ({
+          path,
+          bytes: encoder.encode(lines.join("")),
+        })),
+      );
+    } catch (error) {
+      this.failure = error;
+      throw error;
+    }
   }
 }
 

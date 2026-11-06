@@ -76,3 +76,28 @@ describe("deriveShards", () => {
     expect(await files.list("runs/r/spool/s0")).toEqual([]);
   });
 });
+
+describe("SpoolWriter.flush", () => {
+  it("fails every later flush once an append has failed", async () => {
+    const files = createMemoryStreamSyncFiles();
+    let fail = true;
+    const failing = {
+      ...files,
+      async appendMany(entries: Parameters<typeof files.appendMany>[0]) {
+        if (fail) throw new Error("disk full");
+        return files.appendMany(entries);
+      },
+    };
+    const log = spoolLogPath("runs/r/spool/s0");
+    const writer = new SpoolWriter(failing);
+    await writer.add(log, hashOf(1), "early", 2);
+    // The second add crosses the flush threshold, so its flush fails and
+    // takes the earlier line down with it.
+    await expect(
+      writer.add(log, hashOf(2), "late", 9 * 1024 * 1024),
+    ).rejects.toThrow("disk full");
+    fail = false;
+    // The run must not be able to end as if every line were durable.
+    await expect(writer.flush()).rejects.toThrow();
+  });
+});
