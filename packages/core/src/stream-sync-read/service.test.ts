@@ -167,6 +167,10 @@ describe("stream-sync reads", () => {
     await f.sync(service);
 
     const decision = await service.resolve(ask("pdpp.acme.items"));
+    // A paid read binds its access record to the served head.
+    expect(decision).toMatchObject({
+      served: { scope: `pdpp.acme~${ns}.items`, version: 1 },
+    });
     const envelope = await body(decision);
     expect(envelope.version).toBe("1.0");
     expect(envelope.scope).toBe("pdpp.acme.items");
@@ -444,9 +448,12 @@ describe("stream-sync reads", () => {
     });
     const service = await f.service();
     await f.sync(service);
-    const streamed = await body(
-      await service.resolve(ask("chatgpt.conversations")),
-    );
+    const decision = await service.resolve(ask("chatgpt.conversations"));
+    // A joined name binds a paid read to the window's parent stream head.
+    expect(decision).toMatchObject({
+      served: { scope: `pdpp.chatgpt~${ns}.conversations`, version: 1 },
+    });
+    const streamed = await body(decision);
     const whole = projectPdppRecordsToLegacyPayload(
       "chatgpt.conversations",
       [

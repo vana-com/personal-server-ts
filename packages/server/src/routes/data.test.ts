@@ -41,6 +41,8 @@ import {
   type DataPortabilityGatewayConfig,
 } from "@opendatalabs/vana-sdk/node";
 import { privateKeyToAccount } from "viem/accounts";
+import { encodeAbiParameters, keccak256 } from "viem";
+import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/api";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
@@ -3136,6 +3138,147 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     const body = await res.json();
     expect(body.x402Version).toBe(1);
     expect(body.error).toBe("PAYMENT_REQUIRED");
+  });
+
+  it("charges a paid read of a stream view exactly as a paid read of a legacy file", async () => {
+    // A legacy file and a stream view serve the same records under two names
+    // the grant covers. A builder pays for each the same way: one challenge,
+    // the same price, one gateway payment, the same records. The access
+    // record binds the registered data point each body comes from.
+    const records = [
+      { id: "p1", caption: "first" },
+      { id: "p2", caption: "second" },
+    ];
+    const physical = "pdpp.meta~0123456789abcdef.posts";
+    const dataPointId = (scope: string) =>
+      keccak256(
+        encodeAbiParameters(
+          [
+            { name: "ownerAddress", type: "address" },
+            { name: "scope", type: "string" },
+          ],
+          [ownerForX402.address.toLowerCase() as `0x${string}`, scope],
+        ),
+      );
+    const resolves: string[] = [];
+    const streamSyncRead: StreamSyncReadPort = {
+      async resolve(input) {
+        resolves.push(input.scope);
+        if (input.scope !== "instagram.posts") return { kind: "pass" };
+        return {
+          kind: "view",
+          connector: "meta",
+          ns: "0123456789abcdef",
+          cursor: "pinned",
+          served: { scope: physical, version: 7 },
+          body: new Response(
+            JSON.stringify({
+              version: "1.0",
+              scope: "instagram.posts",
+              collectedAt: "2026-11-01T00:00:00.000Z",
+              data: { records },
+            }),
+          ).body!,
+        };
+      },
+    };
+    const payResponse = {
+      success: true,
+      breakdown: {
+        registrationFee: "10000000000000000",
+        dataAccessFee: "1000000000000000",
+        registrationPaid: true,
+      },
+      paidAt: "2026-01-21T10:00:05Z",
+    };
+    const gatewayFetch = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        new Response(JSON.stringify(payResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", gatewayFetch);
+
+    const app = createX402App({ streamSyncRead });
+    expect(
+      (await ingest(app, "instagram.saved_items", { records })).status,
+    ).toBe(201);
+    const entry = indexManager.findLatestByScope("instagram.saved_items")!;
+    indexManager.updateDataPointId(
+      entry.path,
+      dataPointId("instagram.saved_items"),
+    );
+
+    const payFor = async (scope: string) => {
+      const challenge = await getNoPayment(app, scope);
+      expect(challenge.status, scope).toBe(402);
+      const accept = (await challenge.json()).accepts[0];
+      const message = {
+        ...accept.message,
+        amount: BigInt(accept.message.amount),
+        paymentNonce: BigInt(accept.message.paymentNonce),
+      };
+      const signature = await builderWallet.signTypedData({
+        domain: escrowPaymentDomain(gatewayConfig),
+        types: GENERIC_PAYMENT_TYPES,
+        primaryType: "GenericPayment",
+        message,
+      });
+      const paid = await getWithPayment(
+        app,
+        scope,
+        encodePaymentHeader({
+          x402Version: 1,
+          scheme: "vana-escrow-grant",
+          network: accept.network,
+          payload: {
+            message: accept.message,
+            signature,
+            accessRecord: accept.accessRecord,
+          },
+        }),
+      );
+      return {
+        accept,
+        status: paid.status,
+        paymentResponse: paid.headers.get("X-PAYMENT-RESPONSE"),
+        body: await paid.json(),
+      };
+    };
+    const legacy = await payFor("instagram.saved_items");
+    const view = await payFor("instagram.posts");
+
+    const comparable = (accept: Record<string, any>) => ({
+      ...accept,
+      expiresAt: typeof accept.expiresAt,
+      message: { ...accept.message, paymentNonce: "fresh" },
+      accessRecord: Object.keys(accept.accessRecord).sort(),
+    });
+    expect(comparable(view.accept)).toEqual(comparable(legacy.accept));
+    expect(view.accept.amount).toBe("11000000000000000");
+    expect(legacy.accept.accessRecord.dataPointId).toBe(
+      dataPointId("instagram.saved_items"),
+    );
+    expect(view.accept.accessRecord).toMatchObject({
+      dataPointId: dataPointId(physical),
+      version: "7",
+      accessor: builderWallet.address,
+    });
+
+    expect(view.status).toBe(200);
+    expect(legacy.status).toBe(200);
+    expect(view.body.data).toEqual(legacy.body.data);
+    expect(view.paymentResponse).toBe(legacy.paymentResponse);
+    expect(view.paymentResponse).not.toBeNull();
+    expect(gatewayFetch).toHaveBeenCalledTimes(2);
+    const forwarded = gatewayFetch.mock.calls.map(([, init]) =>
+      JSON.parse(String(init?.body)),
+    );
+    expect(Object.keys(forwarded[1]).sort()).toEqual(
+      Object.keys(forwarded[0]).sort(),
+    );
+    expect(forwarded[1].accessRecord.dataPointId).toBe(dataPointId(physical));
   });
 
   it("relays gateway 402 (insufficient balance) verbatim", async () => {

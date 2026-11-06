@@ -17,6 +17,7 @@ import {
   eligible,
   isHeadLive,
   selectConnection,
+  streamScope,
   type ConnectionView,
   type ControlState,
   type Eligibility,
@@ -85,6 +86,12 @@ export type ReadDecision =
       readonly ns: string;
       /** Pins `(stream → head version)` of every input head. */
       readonly cursor: string;
+      /**
+       * The registered stream head a paid read's access record binds: the
+       * window's parent stream of a windowed legacy name, else the first
+       * stream read. Physical name and registry version.
+       */
+      readonly served: { readonly scope: string; readonly version: number };
       readonly body: ReadableStream<Uint8Array>;
     };
 
@@ -531,12 +538,18 @@ export class StreamSyncReadService {
         }
         payload = plan.payload;
       }
+      const servedStream =
+        target.binding?.window?.parentStream ?? target.streams[0]!;
       const body = toStream(envelope(open, payload), releaseAll);
       return {
         kind: "view",
         connector: target.connector,
         ns,
         cursor: nextCursor,
+        served: {
+          scope: streamScope(target.connector, ns, servedStream),
+          version: byStream.get(servedStream)!.version.version,
+        },
         body,
       };
     } catch (error) {

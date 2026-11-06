@@ -676,8 +676,8 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
 }
 
 /**
- * Serve a stream view: the envelope streams part by part. Paid reads of a
- * view are refused like paid canonical reads: payment binds a stored file.
+ * Serve a stream view: the envelope streams part by part. A charged read
+ * has already paid (`paymentResponseHeader`).
  */
 async function serveStreamSyncView(
   deps: PersonalServerDataApiDeps,
@@ -689,28 +689,10 @@ async function serveStreamSyncView(
       ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
     >;
     decision: Extract<ReadDecision, { kind: "view" }>;
+    paymentResponseHeader: string | undefined;
   },
 ): Promise<Response> {
   const { authResult, decision } = input;
-  const isOwnerSignal =
-    authResult?.grantId === "owner" || authResult?.grantId === "policy-bypass";
-  const builder = authResult?.builder;
-  if (
-    deps.paymentEnabled &&
-    !isOwnerSignal &&
-    typeof builder === "string" &&
-    builder.startsWith("0x") &&
-    authResult?.grantId &&
-    deps.gateway &&
-    deps.gatewayConfig &&
-    deps.gatewayUrl
-  ) {
-    await decision.body.cancel();
-    return legacyViewRefusalResponse(input.scope, {
-      status: "unavailable",
-      reason: "paid_read_unsupported",
-    });
-  }
   const logId = deps.createLogId?.() ?? crypto.randomUUID();
   const timestamp = (deps.now ?? (() => new Date()))().toISOString();
   const ipAddress =
@@ -753,6 +735,9 @@ async function serveStreamSyncView(
       "Content-Type": "application/json",
       "X-Vana-Data-Source": "stream-sync",
       "X-Stream-Sync-Cursor": decision.cursor,
+      ...(input.paymentResponseHeader
+        ? { "X-PAYMENT-RESPONSE": input.paymentResponseHeader }
+        : {}),
     },
   });
 }
@@ -932,12 +917,155 @@ function listAuthCovers(
   );
 }
 
+/** What a charged builder read pays with; see `readCharge`. */
+interface ReadCharge {
+  grantId: string;
+  builder: `0x${string}`;
+  gateway: Pick<GatewayClient, "getGrant">;
+  gatewayConfig: DataPortabilityGatewayConfig;
+  gatewayUrl: string;
+}
+
+/**
+ * Whether a read is charged, and with what. Owner-exempt reads (the grantId
+ * sentinels "owner" / "policy-bypass") are never charged: there is no
+ * payable op to attach the payment to. The grantId paid against is the one
+ * verifyDataReadPolicy resolved from the Web3Signed payload (authoritative
+ * source), not the URL / header hint, which may be absent when the payload
+ * carries it. `null` = served free.
+ */
+function readCharge(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+  authResult: Awaited<
+    ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+  >,
+): ReadCharge | null {
+  const isOwnerSignal =
+    authResult?.grantId === "owner" || authResult?.grantId === "policy-bypass";
+  const builder = authResult?.builder;
+  const resolvedGrantId =
+    !isOwnerSignal && authResult?.grantId ? authResult.grantId : undefined;
+  const willCharge = Boolean(
+    deps.paymentEnabled &&
+    !isOwnerSignal &&
+    typeof builder === "string" &&
+    builder.startsWith("0x") &&
+    resolvedGrantId &&
+    deps.gateway &&
+    deps.gatewayConfig &&
+    deps.gatewayUrl,
+  );
+  // Diagnostic: makes it explicit why a read is/isn't charged. x402 has
+  // many "served free" branches (owner read, payment disabled, missing
+  // gateway deps); this surfaces the deciding inputs.
+  //
+  // Routing: when a logger is wired (the Node server always provides one),
+  // log the full detail through it at debug level so the operator's level
+  // controls + redaction apply and access metadata (scope/grantId/builder)
+  // doesn't unconditionally hit stdout. The browser PS-Lite runtime wires
+  // no logger; there we fall back to console but log ONLY the non-identifying
+  // decision booleans — never scope/grantId/builder.
+  if (deps.logger?.debug) {
+    deps.logger.debug(
+      {
+        scope,
+        grantId: authResult?.grantId,
+        isOwnerSignal,
+        builder,
+        resolvedGrantId,
+        paymentEnabled: Boolean(deps.paymentEnabled),
+        hasGateway: Boolean(deps.gateway),
+        hasGatewayConfig: Boolean(deps.gatewayConfig),
+        hasGatewayUrl: Boolean(deps.gatewayUrl),
+        willCharge,
+      },
+      "[x402-gate] read",
+    );
+  } else {
+    console.info("[x402-gate] read", {
+      isOwnerSignal,
+      paymentEnabled: Boolean(deps.paymentEnabled),
+      hasGateway: Boolean(deps.gateway),
+      hasGatewayConfig: Boolean(deps.gatewayConfig),
+      hasGatewayUrl: Boolean(deps.gatewayUrl),
+      willCharge,
+    });
+  }
+  if (
+    !willCharge ||
+    !resolvedGrantId ||
+    !deps.gateway ||
+    !deps.gatewayConfig ||
+    !deps.gatewayUrl
+  ) {
+    return null;
+  }
+  return {
+    grantId: resolvedGrantId,
+    builder: builder as `0x${string}`,
+    gateway: deps.gateway,
+    gatewayConfig: deps.gatewayConfig,
+    gatewayUrl: deps.gatewayUrl,
+  };
+}
+
+/**
+ * The X402 step of a charged read: a response to return instead of the
+ * body (a fresh 402 challenge, or the gateway's error relayed verbatim so
+ * the builder can dispatch on it), or the X-PAYMENT-RESPONSE value to send
+ * with the body once the gateway accepted the payment.
+ */
+async function payForRead(
+  deps: PersonalServerDataApiDeps,
+  request: Request,
+  charge: ReadCharge,
+  read: Pick<
+    X402CycleInput,
+    "scope" | "fileIdParam" | "atParam" | "servedEntry"
+  >,
+): Promise<
+  | { kind: "refused"; response: Response }
+  | { kind: "paid"; paymentResponseHeader: string | undefined }
+> {
+  const x402Result = await handleX402Cycle({
+    deps,
+    request,
+    ...read,
+    ...charge,
+  });
+  if (x402Result.kind === "challenge") {
+    return {
+      kind: "refused",
+      response: jsonResponse(x402Result.body, { status: 402 }),
+    };
+  }
+  if (x402Result.kind === "gateway-error") {
+    return {
+      kind: "refused",
+      response: jsonResponse(x402Result.body, { status: x402Result.status }),
+    };
+  }
+  // The gateway's success body goes back to the builder in
+  // X-PAYMENT-RESPONSE (canonical X402 convention) so callers can see
+  // breakdown / paidAt / paymentNonce without a second gateway round-trip.
+  return {
+    kind: "paid",
+    paymentResponseHeader: encodePaymentResponseHeader(x402Result.payResponse),
+  };
+}
+
 export interface X402CycleInput {
   deps: PersonalServerDataApiDeps;
   request: Request;
   scope: string;
   fileIdParam?: string;
   atParam?: string;
+  /**
+   * The registered data point version the served body comes from, when it
+   * is not the stored entry of `scope`: a stream view serves a stream head.
+   */
+  servedEntry?: { scope: string; version: number };
   grantId: string;
   builder: `0x${string}`;
   gateway: Pick<GatewayClient, "getGrant">;
@@ -990,19 +1118,30 @@ export async function handleX402Cycle(
   }
 
   // Bind the accessRecord to the entry being served, if it exists and has
-  // been registered with DPv2 yet.
-  const entryRow = deps.storage.findEntry({
-    scope,
-    fileId: input.fileIdParam,
-    at: input.atParam,
-  });
-  const entryForChallenge = entryRow
-    ? {
-        dataPointId: entryRow.dataPointId as `0x${string}` | null,
+  // been registered with DPv2 yet. A served stream head is registered: it
+  // was listed from the registry.
+  const entryRow = input.servedEntry
+    ? undefined
+    : deps.storage.findEntry({
         scope,
-        version: entryRow.version,
+        fileId: input.fileIdParam,
+        at: input.atParam,
+      });
+  const entryForChallenge = input.servedEntry
+    ? {
+        dataPointId: deps.serverOwner
+          ? computeDataPointId(deps.serverOwner, input.servedEntry.scope)
+          : null,
+        scope: input.servedEntry.scope,
+        version: input.servedEntry.version,
       }
-    : undefined;
+    : entryRow
+      ? {
+          dataPointId: entryRow.dataPointId as `0x${string}` | null,
+          scope,
+          version: entryRow.version,
+        }
+      : undefined;
 
   // `grant` is narrowed to non-null above, but that narrowing is not carried
   // into this closure (vana-sdk 3.14.0 made getGrant return `... | null`), so
@@ -2401,11 +2540,33 @@ export async function handlePersonalServerDataRequest(
           if (refusal) return refusal;
           if (decision.kind === "view") {
             notifyDataRead(deps, { scope: scopeResult.scope });
+            // The same charge as a file read; the access record binds the
+            // stream head the view serves.
+            let paymentResponseHeader: string | undefined;
+            const charge = readCharge(deps, scopeResult.scope, authResult);
+            if (charge) {
+              let paid: Awaited<ReturnType<typeof payForRead>>;
+              try {
+                paid = await payForRead(deps, request, charge, {
+                  scope: scopeResult.scope,
+                  servedEntry: decision.served,
+                });
+              } catch (error) {
+                await decision.body.cancel();
+                throw error;
+              }
+              if (paid.kind === "refused") {
+                await decision.body.cancel();
+                return paid.response;
+              }
+              paymentResponseHeader = paid.paymentResponseHeader;
+            }
             return serveStreamSyncView(deps, request, {
               scope: scopeResult.scope,
               grantId,
               authResult,
               decision,
+              paymentResponseHeader,
             });
           }
         }
@@ -2452,110 +2613,22 @@ export async function handlePersonalServerDataRequest(
         return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
       }
 
-      // X402 payment dance for builder reads. Owner-exempt reads (the
-      // grantId sentinels "owner" / "policy-bypass") skip payment entirely
-      // since there's no payable op to attach the payment to.
-      //
-      // The grantId we pay against is the one verifyDataReadPolicy resolved
-      // from the Web3Signed payload (authoritative source) — not the URL /
-      // header hint, which may be absent when the payload carries it.
-      const isOwnerSignal =
-        authResult?.grantId === "owner" ||
-        authResult?.grantId === "policy-bypass";
-      const builder = authResult?.builder;
-      const resolvedGrantId =
-        !isOwnerSignal && authResult?.grantId ? authResult.grantId : undefined;
-      const willCharge = Boolean(
-        deps.paymentEnabled &&
-        !isOwnerSignal &&
-        typeof builder === "string" &&
-        builder.startsWith("0x") &&
-        resolvedGrantId &&
-        deps.gateway &&
-        deps.gatewayConfig &&
-        deps.gatewayUrl,
-      );
-      // Diagnostic: makes it explicit why a read is/isn't charged. x402 has
-      // many "served free" branches (owner read, payment disabled, missing
-      // gateway deps); this surfaces the deciding inputs.
-      //
-      // Routing: when a logger is wired (the Node server always provides one),
-      // log the full detail through it at debug level so the operator's level
-      // controls + redaction apply and access metadata (scope/grantId/builder)
-      // doesn't unconditionally hit stdout. The browser PS-Lite runtime wires
-      // no logger; there we fall back to console but log ONLY the non-identifying
-      // decision booleans — never scope/grantId/builder.
-      if (deps.logger?.debug) {
-        deps.logger.debug(
-          {
-            scope: scopeResult.scope,
-            grantId: authResult?.grantId,
-            isOwnerSignal,
-            builder,
-            resolvedGrantId,
-            paymentEnabled: Boolean(deps.paymentEnabled),
-            hasGateway: Boolean(deps.gateway),
-            hasGatewayConfig: Boolean(deps.gatewayConfig),
-            hasGatewayUrl: Boolean(deps.gatewayUrl),
-            willCharge,
-          },
-          "[x402-gate] read",
-        );
-      } else {
-        console.info("[x402-gate] read", {
-          isOwnerSignal,
-          paymentEnabled: Boolean(deps.paymentEnabled),
-          hasGateway: Boolean(deps.gateway),
-          hasGatewayConfig: Boolean(deps.gatewayConfig),
-          hasGatewayUrl: Boolean(deps.gatewayUrl),
-          willCharge,
-        });
-      }
-      if (willCharge && latest?.kind === "canonical") {
+      // X402 payment dance for builder reads (see `readCharge`).
+      const charge = readCharge(deps, scopeResult.scope, authResult);
+      if (charge && latest?.kind === "canonical") {
         return legacyViewRefusalResponse(scopeResult.scope, {
           status: "unavailable",
           reason: "paid_read_unsupported",
         });
       }
-      // Keep the full condition inline (not `if (willCharge)`) so TS narrows
-      // deps.gateway/gatewayConfig/gatewayUrl to non-undefined in the block.
-      if (
-        deps.paymentEnabled &&
-        !isOwnerSignal &&
-        typeof builder === "string" &&
-        builder.startsWith("0x") &&
-        resolvedGrantId &&
-        deps.gateway &&
-        deps.gatewayConfig &&
-        deps.gatewayUrl
-      ) {
-        const x402Result = await handleX402Cycle({
-          deps,
-          request,
+      if (charge) {
+        const paid = await payForRead(deps, request, charge, {
           scope: scopeResult.scope,
           fileIdParam,
           atParam,
-          grantId: resolvedGrantId,
-          builder: builder as `0x${string}`,
-          gateway: deps.gateway,
-          gatewayConfig: deps.gatewayConfig,
-          gatewayUrl: deps.gatewayUrl,
         });
-        if (x402Result.kind === "challenge") {
-          return jsonResponse(x402Result.body, { status: 402 });
-        }
-        if (x402Result.kind === "gateway-error") {
-          // Relay the gateway's structured body verbatim so the builder can
-          // dispatch on it (insufficient balance vs. replay vs. race etc.).
-          return jsonResponse(x402Result.body, { status: x402Result.status });
-        }
-        // x402Result.kind === "ok" — payment accepted, proceed to read.
-        // The gateway's success body is forwarded back to the builder via
-        // X-PAYMENT-RESPONSE (canonical X402 convention) so callers can see
-        // breakdown / paidAt / paymentNonce without a second gateway round-trip.
-        paymentResponseHeader = encodePaymentResponseHeader(
-          x402Result.payResponse,
-        );
+        if (paid.kind === "refused") return paid.response;
+        paymentResponseHeader = paid.paymentResponseHeader;
       }
 
       const headers: Record<string, string> = {};
