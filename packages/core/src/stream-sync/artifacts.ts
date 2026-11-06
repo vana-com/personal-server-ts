@@ -5,13 +5,15 @@
  * A host verifies an artifact and hands over its document bytes. The resolver
  * hashes those bytes itself, so a digest a producer sends matches only a
  * document the host holds, and no producer can name keys for a document the
- * host did not verify. The full server feeds it the declarations it retained.
- * PS-Lite feeds it the manifest documents the phone shell verified.
+ * host did not verify. Every host feeds it the connector manifest documents it
+ * verified: the full server the ones its operator pinned by digest, PS-Lite the
+ * ones its embedding app verified. The connector key is the manifest's own
+ * `connector_key`, the signed pin id, so no host names a key and two hosts that
+ * verified the same bytes publish under the same physical name.
  */
 
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
-import type { DeclarationSnapshot } from "../pdpp/types.js";
 import type {
   IntakeDeclarations,
   IntakeStreamDeclaration,
@@ -64,37 +66,6 @@ function streamDeclaration(
       ? { consentTimeField: stream.consent_time_field }
       : {}),
   };
-}
-
-/**
- * The declarations a full server retained, with the bytes it retrieved them
- * from. `connectorOf` names the connector key a retained source publishes as;
- * `null` leaves the source unresolvable (fail closed).
- */
-export function retainedArtifactResolver(
-  snapshots: readonly DeclarationSnapshot[],
-  documents: ReadonlyMap<string, string>,
-  connectorOf: (snapshot: DeclarationSnapshot) => string | null,
-): ResolveArtifact {
-  const artifacts: VerifiedArtifact[] = [];
-  for (const snapshot of snapshots) {
-    const document = documents.get(snapshot.source_id);
-    const connector = connectorOf(snapshot);
-    if (document === undefined || document === "" || connector === null) {
-      continue;
-    }
-    artifacts.push({
-      document,
-      declarations: {
-        connector,
-        version: snapshot.version,
-        streams: snapshot.streams.map((stream) =>
-          streamDeclaration(stream as unknown as DeclaredStreamShape),
-        ),
-      },
-    });
-  }
-  return artifactResolver(artifacts);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

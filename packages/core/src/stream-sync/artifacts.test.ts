@@ -1,12 +1,10 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import type { DeclarationSnapshot } from "../pdpp/types.js";
 import {
   artifactResolver,
   documentDigest,
   manifestArtifact,
   manifestArtifactResolver,
-  retainedArtifactResolver,
 } from "./artifacts.js";
 
 const MANIFEST = JSON.stringify({
@@ -53,6 +51,23 @@ describe("manifestArtifactResolver", () => {
     expect(await resolve(sha(MANIFEST).toUpperCase())).toEqual(expected);
   });
 
+  it("takes the connector key from the manifest bytes, never from a host", async () => {
+    const other = JSON.stringify({
+      ...JSON.parse(MANIFEST),
+      connector_key: "github-api",
+    });
+    const resolve = manifestArtifactResolver([MANIFEST, other]);
+    expect((await resolve(sha(MANIFEST)))?.connector).toBe("github-browser");
+    expect((await resolve(sha(other)))?.connector).toBe("github-api");
+  });
+
+  it("leaves a manifest with no connector key unresolvable", async () => {
+    const { connector_key: _dropped, ...keyless } = JSON.parse(MANIFEST);
+    const document = JSON.stringify(keyless);
+    const resolve = manifestArtifactResolver([document]);
+    expect(await resolve(sha(document))).toBeNull();
+  });
+
   it("does not resolve bytes that differ or a digest nobody verified", async () => {
     const resolve = manifestArtifactResolver([MANIFEST]);
     expect(await resolve(`sha256:${sha(`${MANIFEST} `)}`)).toBeNull();
@@ -89,58 +104,6 @@ describe("manifestArtifactResolver", () => {
       }),
     ];
     for (const document of bad) expect(manifestArtifact(document)).toBeNull();
-  });
-});
-
-describe("retainedArtifactResolver", () => {
-  const snapshot = {
-    source_id: "github",
-    source_kind: "connector",
-    version: "0.5.1",
-    digest: "x",
-    streams: [
-      {
-        name: "user",
-        semantics: "mutable_state",
-        primary_key: ["id"],
-        consent_time_field: "updated_at",
-      },
-    ],
-  } as unknown as DeclarationSnapshot;
-
-  it("binds each retained document to the connector key the host names", async () => {
-    const resolve = retainedArtifactResolver(
-      [snapshot],
-      new Map([["github", "doc-bytes"]]),
-      () => "github-browser",
-    );
-    expect(await resolve(`sha256:${sha("doc-bytes")}`)).toEqual({
-      connector: "github-browser",
-      version: "0.5.1",
-      streams: [
-        {
-          name: "user",
-          semantics: "mutable_state",
-          primaryKey: ["id"],
-          consentTimeField: "updated_at",
-        },
-      ],
-    });
-  });
-
-  it("leaves a source with no document or no connector key unresolvable", async () => {
-    const noKey = retainedArtifactResolver(
-      [snapshot],
-      new Map([["github", "doc-bytes"]]),
-      () => null,
-    );
-    expect(await noKey(`sha256:${sha("doc-bytes")}`)).toBeNull();
-    const noDocument = retainedArtifactResolver(
-      [snapshot],
-      new Map(),
-      () => "github",
-    );
-    expect(await noDocument(`sha256:${sha("")}`)).toBeNull();
   });
 });
 

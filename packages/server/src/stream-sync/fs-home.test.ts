@@ -9,7 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { openFsStreamSyncHome } from "./fs-home.js";
+import { openFsStreamSyncHome, StreamSyncLockLostError } from "./fs-home.js";
 import { createSeedStaging } from "./seed-staging.js";
 
 const A = "0x1C5A77d9FA7eF466951B2F01F724BCa3A5820b63" as const;
@@ -170,5 +170,43 @@ describe("full-server stream-sync home", () => {
       await openFsStreamSyncHome({ root, ownerAddress: A, network: NET }),
     ).toBeNull();
     await second!.close();
+  });
+
+  it("fences a holder whose lock was taken over between heartbeats", async () => {
+    let lostCalls = 0;
+    const first = await openFsStreamSyncHome({
+      root,
+      ownerAddress: A,
+      network: NET,
+      heartbeatMs: 40,
+      onLost: () => {
+        lostCalls += 1;
+      },
+    });
+    await first!.home.files.write("state.json", new Uint8Array([1]));
+    const lock = join(root, "stream-sync-homes", `${first!.home.id}.lock`);
+    // A second process takes the lock over after a stall.
+    await writeFile(lock, `${process.pid}\nsomeone-else`);
+    const taken = new Date(Date.now() - 5_000);
+    await utimes(lock, taken, taken);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(lostCalls).toBe(1);
+    // The fenced holder neither touches the new lock nor writes through its home.
+    expect(Date.now() - (await stat(lock)).mtimeMs).toBeGreaterThan(4_000);
+    await expect(
+      first!.home.files.write("state.json", new Uint8Array([2])),
+    ).rejects.toBeInstanceOf(StreamSyncLockLostError);
+    await expect(first!.home.files.read("state.json")).rejects.toBeInstanceOf(
+      StreamSyncLockLostError,
+    );
+    await expect(first!.seedFiles.list("")).rejects.toBeInstanceOf(
+      StreamSyncLockLostError,
+    );
+    // Closing the fenced holder leaves the new holder's lock in place.
+    await first!.close();
+    expect(
+      await openFsStreamSyncHome({ root, ownerAddress: A, network: NET }),
+    ).toBeNull();
+    expect(lostCalls).toBe(1);
   });
 });

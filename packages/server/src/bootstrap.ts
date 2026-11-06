@@ -131,13 +131,12 @@ import {
   createStreamSyncIntake,
   type StreamSyncIntake,
   createGatewayStreamSyncRegistry,
-  retainedArtifactResolver,
+  manifestArtifactResolver,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
   streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openFsStreamSyncHome } from "./stream-sync/fs-home.js";
-import { retainedConnectorKey } from "./stream-sync/retained-connector.js";
 import {
   createSeedStaging,
   type SeedStaging,
@@ -930,6 +929,10 @@ export async function createServer(
         root: storageRoot,
         ownerAddress: serverOwner,
         network: streamSyncNetwork(config.gateway),
+        onLost: () =>
+          logger.warn(
+            "Stream sync stopped: another process took over this owner's stream-sync storage lock",
+          ),
       });
       if (!streamSyncHome) {
         logger.warn(
@@ -1230,16 +1233,14 @@ export async function createServer(
       : undefined;
 
   // Run intake (V2 §2): mounted only with `streamSync.write`. An artifact
-  // digest resolves only to a retained declaration whose bytes this boot
+  // digest resolves only to a pinned connector manifest whose bytes this boot
   // verified (§6); an unknown digest answers `unknown_artifact`.
   const streamSyncIntake: StreamSyncIntake | undefined =
     streamSyncWriter && !isEnclave
       ? createStreamSyncIntake({
           writer: streamSyncWriter,
-          resolveArtifact: retainedArtifactResolver(
-            pdppAuth?.retainedDeclarations ?? [],
-            pdppAuth?.retainedDocuments ?? new Map(),
-            retainedConnectorKey(pdppAuth),
+          resolveArtifact: manifestArtifactResolver(
+            pdppAuth?.retainedManifests ?? [],
           ),
         })
       : undefined;

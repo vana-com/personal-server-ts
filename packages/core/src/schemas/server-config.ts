@@ -101,7 +101,18 @@ export const DEFAULTS = {
     declarationPaths: [] as Array<string | { path: string; sha256: string }>,
     // At most one acquisition method may write each retained source. The
     // declaration path ties an artifact method id to the source it produces.
-    methods: [] as Array<{ method_id: string; declaration_path: string }>,
+    //
+    // A method may also pin the connector's signed manifest document
+    // (`manifest_path` plus the sha256 of its exact bytes). The stream-sync
+    // run intake resolves a run's artifact digest only to a manifest pinned
+    // this way, and takes the connector key from the manifest's own
+    // `connector_key`, which must equal `method_id` (the signed pin id).
+    methods: [] as Array<{
+      method_id: string;
+      declaration_path: string;
+      manifest_path?: string;
+      manifest_sha256?: string;
+    }>,
     optInMethods: [] as string[],
     // Per-source connection methods are independent of canonical record
     // declarations. They let Desktop manage account handles while canonical
@@ -301,6 +312,11 @@ export const ServerConfigSchema = z.object({
           z.object({
             method_id: z.string().min(1),
             declaration_path: z.string().min(1),
+            manifest_path: z.string().min(1).optional(),
+            manifest_sha256: z
+              .string()
+              .regex(/^[0-9a-f]{64}$/, "lowercase hex sha256")
+              .optional(),
           }),
         )
         .default(DEFAULTS.pdpp.methods),
