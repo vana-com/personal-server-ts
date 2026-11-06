@@ -1,0 +1,13 @@
+ # action                 ctl        | heads | d2 entry | checkpoints | commits
+ 2 Collect(d1,n1)         absent     | - | - | - | -
+ 3 Collect(d2,n1)         absent     | - | run2 bound=0 uc=True full=True s1=planned@g0 s2=planned@g0 | - | -
+ 4 Decide(d2,s1)          absent     | - | run2 bound=0 uc=True full=True s1=creating@g0 s2=planned@g0 | - | -
+ 5 Create(d2,s1)          A          | - | run2 bound=1 uc=True full=True s1=decided@g1 s2=planned@g0 | - | -
+ 6 Plan(d2,s1)            A          | - | run2 bound=1 uc=True full=True s1=posted@g1 s2=planned@g0 | - | -
+ 7 Post(d2,s1)            A          | s1v1:g1[k1@run2]C | run2 bound=1 uc=True full=True s1=done@g1 s2=planned@g0 | - | (s1,g1,run2)
+ 8 Delete(d1,n1)          AT         | s1v1:g1[k1@run2]C | run2 bound=1 uc=True full=True s1=done@g1 s2=planned@g0 | - | (s1,g1,run2)
+ 9 Decide(d2,s2)          AT         | s1v1:g1[k1@run2]C | run2 bound=1 uc=True full=True s1=done@g1 s2=reconnecting@g3 | - | (s1,g1,run2)
+10 ReconnectPost(d2,s2)   ATA        | s1v1:g1[k1@run2]C | run2 bound=3 uc=True full=True s1=done@g1 s2=decided@g3 | - | (s1,g1,run2)
+11 Plan(d2,s2)            ATA        | s1v1:g1[k1@run2]C | run2 bound=3 uc=True full=True s1=done@g1 s2=posted@g3 | - | (s1,g1,run2)
+12 Post(d2,s2)            ATA        | s1v1:g1[k1@run2]C s2v1:g3[k1@run2]C | run2 bound=3 uc=True full=True s1=done@g1 s2=done@g3 | - | (s1,g1,run2) (s2,g3,run2)
+13 Finish(d2)             ATA        | s1v1:g1[k1@run2]C s2v1:g3[k1@run2]C | - | d2:n1/g3/run2/s1+s2 | (s1,g1,run2) (s2,g3,run2)
