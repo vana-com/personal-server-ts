@@ -1,8 +1,9 @@
 ----------------------------- MODULE StreamSync -----------------------------
 (***************************************************************************)
 (* Bounded model of whole-file stream sync, design revision 4.1, section  *)
-(* 4.  README.md states the bounds, the abstractions, how each property   *)
-(* reads here, and the results.  Section numbers refer to the design.    *)
+(* 4, with the three-outcome base rule (stale_generation).  README.md     *)
+(* states the bounds, the abstractions, how each property reads here,     *)
+(* and the results.  Section numbers refer to the design.                 *)
 (*                                                                         *)
 (* One connector c.  A connection is a namespace n: the account itself,   *)
 (* or "" for an identity-less connector.  ctl[n] is the control row chain *)
@@ -20,10 +21,15 @@
 (*                    decisions lost, outbox kept                         *)
 (*   Decide           decide(start, control), the table of 2.4            *)
 (*   CtlPost          create / reconnect POST with exact resend           *)
-(*   Plan             read stream row, base, merge, seeds, upload parts,  *)
+(*   PlanPublish      read stream row, base, merge, seeds, upload parts,  *)
 (*                    PUT head, persist request (2.6, 2.7, 2.9, 2.13)     *)
+(*   PlanStale        the stream row has a higher generation:             *)
+(*                    stale_generation, decide again (2.7)                *)
 (*   Post             head POST: commit, replay, 409, lost reply          *)
 (*   LateApply        a request whose reply was lost reaches the registry *)
+(*   OldDelete        an old app's non-exclusive DELETE tombstones a      *)
+(*                    stream row (limitation L11)                         *)
+(*   Leave            a device stops forever and loses its local state    *)
 (*   SettleFail       a head row fails settlement after its ack           *)
 (*   Finish           checkpoint save with control re-check (2.4)         *)
 (*   FailEntry        an outbox entry fails permanently                   *)
@@ -46,6 +52,8 @@ CONSTANTS
   RawHasId,        \* the old raw file records the account identity
   MaxRuns, MaxReruns, MaxDeletes, MaxLost, MaxSessions, MaxSettleFail,
   MaxFail, MaxVer,
+  MaxLeave,        \* devices that may leave (stop forever, local state lost)
+  MaxOldDelete,    \* old non-exclusive stream DELETEs (limitation L11)
   Views,           \* model device imports (key and liveness profiles)
   \* --- guards, all TRUE in the design; each control turns one off ---
   GenInNames,        \* part names carry the generation (2.1)
@@ -64,7 +72,9 @@ CONSTANTS
   SeedWhateverBase,  \* the Desktop seed merges into any base (2.9)
   AckImmutable,      \* an acknowledged row stays at its version (2.3, GW (a))
   ReadinessSame,     \* readiness and reads use one predicate (2.10)
-  RawSeedChecksId    \* the raw seed is skipped on an identity mismatch (2.13)
+  RawSeedChecksId,   \* the raw seed is skipped on an identity mismatch (2.13)
+  StaleGenStops,     \* a stream row of a higher generation stops the publish (2.7)
+  NoOpNeedsFull      \* a no-op onto a complete:false base sets needsFull (2.6, Q9)
 
 ASSUME Desktop \in Devices /\ LegacyFrom \in Streams /\ OtherKey \subseteq Devices
 
@@ -91,13 +101,16 @@ VARIABLES
   commits,   \* ghost: <<n, s, g, rid, pks>> per committed (or no-op) stream of a run
   admitted,  \* ghost: <<rid, g>> when a run was bound to g and decide(start, control) = g
   inserted,  \* ghost: <<n, s, version, head>> for every head row written
+  lateOld,   \* ghost: a head was written while control was not active(its generation)
+  left,      \* devices that left for good
+  fin,       \* fin[d]: (n, T, stream row version seen per stream) of d's last finished run
   acked,     \* ghost: <<n, s, version, head>> for every head commit acknowledged
   selfConflict, \* ghost: a request was refused because of its own row
   cnt
 
 vars == <<ctl, hd, failed, store, rawF, legacyDue, login, listing, known,
           stopped, needsFull, ckpt, ob, view, psv, inflight, seedTarget, rcpt, clock,
-          commits, admitted, inserted, acked, selfConflict, cnt>>
+          commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, cnt>>
 
 ----------------------------------------------------------------------------
 Null == [x \in {} |-> 0]  \* no listing this session (a function, so it compares with listings)
@@ -116,7 +129,12 @@ NoEntry == [rid |-> 0, a |-> "none", n |-> "none", start |-> Null, uc |-> FALSE,
             full |-> FALSE, sw |-> FALSE, pks |-> {}, emit |-> {}, dead |-> FALSE,
             incomp |-> FALSE, T |-> 0,
             st |-> [s \in Streams |-> "none"], g |-> [s \in Streams |-> 0],
-            req |-> [s \in Streams |-> NoReq], seeding |-> {}]
+            req |-> [s \in Streams |-> NoReq], seeding |-> {},
+            seen |-> [s \in Streams |-> 0]]
+NoFin == [n |-> "none", T |-> 0, seen |-> [s \in Streams |-> 0]]
+\* An old app's non-exclusive DELETE writes this row (limitation L11).
+TombHead == [g |-> 0, lines |-> {}, complete |-> FALSE, key |-> "old", at |-> 0]
+IsTomb(h) == h.key = "old"
 
 Max(a, b) == IF a > b THEN a ELSE b
 SetMax(S) == IF S = {} THEN 0 ELSE CHOOSE x \in S : \A y \in S : y <= x
@@ -148,8 +166,12 @@ PKsOf(L) == {l[1] : l \in L}
 Best(L, p) == CHOOSE l \in L : l[1] = p /\ \A m \in L : m[1] = p => Rank(m) <= Rank(l)
 Merge(L) == {Best(L, p) : p \in PKsOf(L)}
 
-\* Blob names (2.1).  A part per line; generation in the name unless the control.
-PartName(n, s, g, l) == IF GenInNames THEN <<"p", n, s, g, l>> ELSE <<"p", n, s, 0, l>>
+\* Blob names (2.1).  Parts are named by content.  Record values are not
+\* modelled, so the worst case holds: a record of key pk has the same
+\* content in every run, and its part name is (n, s, g, pk).  Without the
+\* generation in the name (control C01), equal records of two generations
+\* share a part.
+PartName(n, s, g, l) == IF GenInNames THEN <<"p", n, s, g, l[1]>> ELSE <<"p", n, s, 0, l[1]>>
 Objects(n, s, h) == {<<"h", n, s, h>>} \cup {PartName(n, s, h.g, l) : l \in h.lines}
 
 ----------------------------------------------------------------------------
@@ -174,12 +196,16 @@ Table(S, C, uc, full) ==
 Admits(d, e) == Table(StartState(d, e), CtlNow(e.n, Key(d)), e.uc, e.full)
 
 \* What the device acts on.  Only the controls make it differ from Admits.
+\* Without NoRebind (control C08) a userConnect entry decides as if it had
+\* started at the current generation: it reconnects a deleted connection
+\* and publishes under whatever generation is current.
 EffStart(d, e) ==
-  IF e.start = Null /\ ~NeedListing THEN [k |-> "absent", g |-> 0] ELSE StartState(d, e)
-EffTable(d, e) ==
-  LET C == CtlNow(e.n, Key(d))
-      t == Table(EffStart(d, e), C, e.uc, e.full)
-  IN IF ~NoRebind /\ e.uc /\ C.k = "deleted" /\ t = 0 THEN -3 ELSE t
+  LET C == CtlNow(e.n, Key(d)) IN
+  IF ~NoRebind /\ e.uc /\ C.k = "deleted" THEN C
+  ELSE IF ~NoRebind /\ e.uc /\ C.k = "active" THEN [k |-> "deleted", g |-> C.g - 1]
+  ELSE IF e.start = Null /\ ~NeedListing THEN [k |-> "absent", g |-> 0]
+  ELSE StartState(d, e)
+EffTable(d, e) == Table(EffStart(d, e), CtlNow(e.n, Key(d)), e.uc, e.full)
 
 \* Bind stream s of d's entry to generation t, recording admission.
 Bind(d, s, t) ==
@@ -207,7 +233,7 @@ Decide(d, s) ==
                       /\ UNCHANGED <<admitted, known>>
   /\ UNCHANGED <<ctl, hd, failed, store, rawF, legacyDue, login, listing, stopped,
                  needsFull, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 inserted, acked, selfConflict, cnt>>
+                 inserted, lateOld, left, fin, acked, selfConflict, cnt>>
 
 \* Create or reconnect POST (2.3): exclusive, identical bytes, exact resend
 \* after a lost reply.  A success or replay is followed by a re-read: the
@@ -243,7 +269,7 @@ CtlPost(d, s) ==
            /\ cnt' = [cnt EXCEPT !.lost = @ + 1]
            /\ UNCHANGED <<ctl, ob, admitted, known>>
   /\ UNCHANGED <<hd, failed, store, rawF, legacyDue, login, listing, stopped,
-                 needsFull, ckpt, view, psv, seedTarget, rcpt, clock, commits, inserted,
+                 needsFull, ckpt, view, psv, seedTarget, rcpt, clock, commits, inserted, lateOld, left, fin,
                  acked, selfConflict>>
 
 ----------------------------------------------------------------------------
@@ -269,16 +295,34 @@ WriteHead(n, s, ver, h, rid, pks, out) ==
                                        ELSE [@ EXCEPT ![ver] = h]]
        /\ commits' = commits \cup {<<n, s, h.g, rid, pks>>}
        /\ inserted' = inserted \cup {<<n, s, ver, h>>}
+       /\ lateOld' = (lateOld \/ ~(ActiveAny(n) /\ CurGen(n) = h.g))
        /\ failed' = failed \ {<<n, s, ver>>}
-  ELSE UNCHANGED <<hd, commits, inserted, failed>>
+  ELSE UNCHANGED <<hd, commits, inserted, lateOld, failed>>
 
 \* The record keys a run collected for stream s (none if it emitted nothing).
 RunPKs(e, s) == IF s \in e.emit THEN e.pks ELSE {}
 
 \* Read the stream row, plan and upload (2.6, 2.7, 2.9, 2.13), persist the
-\* request.  Base: the row at BaseVer if it has the target generation,
-\* else empty (2.7).
-Plan(d, s) ==
+\* request.  Base (2.7), three outcomes on the row at BaseVer:
+\*   generation < T, or no row      -> empty base;
+\*   generation = T                 -> that row is the base;
+\*   generation > T                 -> stale_generation: publish nothing,
+\*                                     re-read control and decide again.
+\* Without StaleGenStops (control) a higher generation gives an empty base.
+PlanStale(d, s) ==
+  LET e == ob[d]
+      N == BaseVer(e.n, s)
+      top == IF N = 0 THEN NoHead ELSE hd[e.n][s][N]
+  IN /\ ~e.dead /\ e.st[s] = "decided"
+     /\ StaleGenStops /\ top.g > e.g[s]
+     /\ ob' = [ob EXCEPT ![d].st[s] = "planned"]
+  /\ UNCHANGED <<store, needsFull, ckpt, commits, rcpt>>
+  /\ UNCHANGED <<ctl, hd, failed, rawF, legacyDue, login, listing, known, stopped,
+                 view, psv, inflight, seedTarget, clock, admitted, inserted, lateOld, left, fin, acked,
+                 selfConflict, cnt>>
+
+\* The publish half: the row's generation is at most T.
+PlanPublish(d, s) ==
   LET e == ob[d]
       n == e.n
       T == e.g[s]
@@ -293,6 +337,7 @@ Plan(d, s) ==
       rawOK == /\ d # Desktop /\ T = 1 /\ base = NoHead /\ s = LegacyFrom /\ rawF.present
                /\ (RawSeedChecksId => rawF.id \in {"none", e.a})
   IN /\ ~e.dead /\ e.st[s] = "decided"
+     /\ ~(StaleGenStops /\ top.g > T)
      /\ \E useRaw \in (IF rawOK THEN BOOLEAN ELSE {FALSE}) :
           LET rawLines == IF useRaw THEN rawF.lines ELSE {}
               lines == Merge(base.lines \cup seedLines \cup runLines \cup rawLines)
@@ -300,16 +345,23 @@ Plan(d, s) ==
               h == [g |-> T, lines |-> lines, complete |-> complete, key |-> Key(d),
                     at |-> e.rid]
               seeding == IF first THEN e.seeding \cup {s} ELSE e.seeding
-          IN \* no-op (2.6), or a stream planned only for the seed that gets none
-             \* (generation > 1: the receipt records "skipped", 2.9)
+              \* Q9: a no-op onto a complete:false base of generation T
+              q9 == NoOpNeedsFull /\ base # NoHead /\ ~base.complete
+          IN \* No-op (2.6): every part and `complete` unchanged, or an empty
+             \* spool with no seed (generation > 1: the receipt records
+             \* "skipped", 2.9).  No upload and no POST.
              IF \/ lines = base.lines /\ complete = base.complete
                 \/ s \notin e.emit /\ ~seeded /\ ~useRaw
              THEN \* the stream counts as committed at (n, T)
                   /\ ob' = [ob EXCEPT ![d].st[s] = "done", ![d].g[s] = 0,
-                                      ![d].seeding = seeding]
+                                      ![d].seeding = seeding, ![d].seen[s] = N,
+                                      ![d].incomp = @ \/ q9]
                   /\ commits' = commits \cup {<<n, s, T, e.rid, RunPKs(e, s)>>}
                   /\ rcpt' = IF first THEN rcpt \cup {<<n, s>>} ELSE rcpt
-                  /\ UNCHANGED <<store, needsFull, ckpt>>
+                  /\ needsFull' = IF q9 THEN [needsFull EXCEPT ![d] = @ \cup {<<n, s>>}]
+                                  ELSE needsFull
+                  /\ ckpt' = IF q9 THEN [ckpt EXCEPT ![d] = NoCk] ELSE ckpt
+                  /\ UNCHANGED store
              ELSE /\ store' = store \cup Objects(n, s, h)
                   /\ ob' = [ob EXCEPT ![d].st[s] = "posted", ![d].seeding = seeding,
                                       ![d].req[s] = [ver |-> N + 1, h |-> h],
@@ -320,7 +372,7 @@ Plan(d, s) ==
                   /\ ckpt' = IF ~complete THEN [ckpt EXCEPT ![d] = NoCk] ELSE ckpt
                   /\ UNCHANGED <<commits, rcpt>>
   /\ UNCHANGED <<ctl, hd, failed, rawF, legacyDue, login, listing, known, stopped,
-                 view, psv, inflight, seedTarget, clock, admitted, inserted, acked,
+                 view, psv, inflight, seedTarget, clock, admitted, inserted, lateOld, left, fin, acked,
                  selfConflict, cnt>>
 
 \* Without CheckpointAfterAll the checkpoint is saved at the first commit.
@@ -343,7 +395,7 @@ Post(d, s) ==
                                        (Len(hd[n][s]) >= r.ver /\ hd[n][s][r.ver] = r.h))
                    /\ UNCHANGED <<ckpt, acked, rcpt, needsFull>>
               ELSE /\ ob' = [ob EXCEPT ![d].st[s] = "done", ![d].g[s] = 0,
-                                        ![d].req[s] = NoReq]
+                                        ![d].req[s] = NoReq, ![d].seen[s] = r.ver]
                    /\ acked' = acked \cup {<<n, s, r.ver, r.h>>}
                    /\ rcpt' = IF s \in e.seeding THEN rcpt \cup {<<n, s>>} ELSE rcpt
                    /\ needsFull' = IF r.h.complete /\ e.full
@@ -356,10 +408,10 @@ Post(d, s) ==
            /\ inflight' = inflight \cup {[kind |-> "head", n |-> n, s |-> s, ver |-> r.ver,
                                          h |-> r.h, rid |-> e.rid, pks |-> RunPKs(e, s)]}
            /\ cnt' = [cnt EXCEPT !.lost = @ + 1]
-           /\ UNCHANGED <<hd, commits, inserted, failed, ob, ckpt, acked, rcpt, needsFull,
+           /\ UNCHANGED <<hd, commits, inserted, lateOld, left, fin, failed, ob, ckpt, acked, rcpt, needsFull,
                           selfConflict>>
   /\ UNCHANGED <<ctl, store, rawF, legacyDue, login, listing, known, stopped,
-                 view, psv, seedTarget, clock, admitted>>
+                 view, psv, seedTarget, clock, admitted, left, fin>>
 
 LateApply ==
   \E x \in inflight :
@@ -367,11 +419,11 @@ LateApply ==
     /\ IF x.kind = "ctl"
        THEN /\ ctl' = IF CtlOutcome(x.n, x.ver, x.row) = "insert"
                       THEN [ctl EXCEPT ![x.n] = Append(@, x.row)] ELSE ctl
-            /\ UNCHANGED <<hd, commits, inserted, failed>>
+            /\ UNCHANGED <<hd, commits, inserted, lateOld, failed>>
        ELSE /\ WriteHead(x.n, x.s, x.ver, x.h, x.rid, x.pks, HeadOutcome(x.n, x.s, x.ver, x.h))
             /\ UNCHANGED ctl
     /\ UNCHANGED <<store, rawF, legacyDue, login, listing, known, stopped, needsFull,
-                   ckpt, ob, view, psv, seedTarget, rcpt, clock, admitted, acked,
+                   ckpt, ob, view, psv, seedTarget, rcpt, clock, admitted, left, fin, acked,
                    selfConflict, cnt>>
 
 \* Every stream committed or no-op: re-read control; save the checkpoint
@@ -390,12 +442,14 @@ Finish(d) ==
                                           streams |-> {s \in Streams : e.st[s] = "done"},
                                           ctlOk |-> ctlOk]]
                 ELSE ckpt
+     /\ fin' = [fin EXCEPT ![d] = [n |-> e.n, T |-> e.T, seen |-> e.seen]]
   /\ UNCHANGED <<ctl, hd, failed, store, rawF, legacyDue, login, listing, known,
                  stopped, needsFull, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, acked, selfConflict, cnt>>
+                 admitted, inserted, lateOld, left, acked, selfConflict, cnt>>
 
 Progress(d) ==
-  \/ \E s \in Streams : Decide(d, s) \/ CtlPost(d, s) \/ Plan(d, s) \/ Post(d, s)
+  \/ \E s \in Streams : Decide(d, s) \/ CtlPost(d, s) \/ PlanStale(d, s) \/ PlanPublish(d, s)
+     \/ Post(d, s)
   \/ Finish(d)
 
 ----------------------------------------------------------------------------
@@ -409,21 +463,26 @@ StartRunFor(d, a, uc) ==
       full == ckpt[d] = NoCk \/ needsFull[d] # {}
       rid == clock + 1
       tgt == IF d = Desktop /\ seedTarget = "none" THEN n ELSE seedTarget
-      seedS == IF d = Desktop /\ n = tgt THEN {s \in Streams : <<n, s>> \notin rcpt} ELSE {}
-  IN /\ ob[d] = NoEntry
+  IN /\ d \notin left /\ ob[d] = NoEntry
      /\ uc \/ stopped[d][n] = 0
-     /\ \E E \in (SUBSET Streams) \ {{}}, P \in (SUBSET PK) \ {{}} :
-          /\ full => P = PK
+     \* Every stream of c is planned.  E: the streams the source emitted
+     \* records for (a stream outside E has an empty spool); P: the keys
+     \* collected.  A full run emits every stream with every key the source
+     \* still holds, which may be fewer than PK (the Desktop seed and the raw
+     \* seed may hold keys the source no longer serves).
+     /\ \E E \in SUBSET Streams, P \in (SUBSET PK) \ {{}} :
+          /\ full => E = Streams
+          /\ E = {} => P = PK
           /\ ob' = [ob EXCEPT ![d] = [NoEntry EXCEPT
                       !.rid = rid, !.a = a, !.n = n, !.start = listing[d], !.uc = uc,
                       !.full = full, !.sw = (~full /\ ckpt[d].n # n), !.pks = P, !.emit = E,
-                      !.st = [s \in Streams |-> IF s \in E \cup seedS THEN "planned" ELSE "none"]]]
+                      !.st = [s \in Streams |-> "planned"]]]
      /\ login' = [login EXCEPT ![d] = a]
      /\ stopped' = IF uc THEN [stopped EXCEPT ![d][n] = 0] ELSE stopped
      /\ seedTarget' = tgt
      /\ clock' = rid
   /\ UNCHANGED <<ctl, hd, failed, store, rawF, legacyDue, listing, known, needsFull,
-                 ckpt, view, psv, inflight, rcpt, commits, admitted, inserted, acked,
+                 ckpt, view, psv, inflight, rcpt, commits, admitted, inserted, lateOld, left, fin, acked,
                  selfConflict>>
 
 StartRun(d, a, uc) ==
@@ -453,20 +512,21 @@ StopNext(d, n) ==
 List(d) ==
   LET lens == [n \in NS |-> CtlLen(n)]
       clear(n) == ClearOnGenChange /\ known[d][n] > 0 /\ lens[n] > known[d][n]
-  IN /\ listing[d] # lens \/ known[d] # lens \/ \E n \in NS : StopNext(d, n) # stopped[d][n]
+  IN /\ d \notin left
+     /\ listing[d] # lens \/ known[d] # lens \/ \E n \in NS : StopNext(d, n) # stopped[d][n]
      /\ listing' = [listing EXCEPT ![d] = lens]
      /\ known' = [known EXCEPT ![d] = lens]
      /\ ckpt' = IF ckpt[d] # NoCk /\ clear(ckpt[d].n) THEN [ckpt EXCEPT ![d] = NoCk] ELSE ckpt
      /\ ob' = IF ob[d] # NoEntry /\ clear(ob[d].n) THEN [ob EXCEPT ![d] = NoEntry] ELSE ob
      /\ stopped' = [stopped EXCEPT ![d] = [n \in NS |-> StopNext(d, n)]]
   /\ UNCHANGED <<ctl, hd, failed, store, rawF, legacyDue, login, needsFull, view,
-                 psv, inflight, seedTarget, rcpt, clock, commits, admitted, inserted, acked,
+                 psv, inflight, seedTarget, rcpt, clock, commits, admitted, inserted, lateOld, left, fin, acked,
                  selfConflict, cnt>>
 
 \* App restart or crash: no listing this session; decisions in memory are
 \* lost; persisted requests stay.
 NewSession(d) ==
-  /\ cnt.sessions < MaxSessions
+  /\ d \notin left /\ cnt.sessions < MaxSessions
   /\ listing' = [listing EXCEPT ![d] = Null]
   /\ ob' = IF ob[d] = NoEntry THEN ob
            ELSE [ob EXCEPT ![d].st = [s \in Streams |->
@@ -475,7 +535,7 @@ NewSession(d) ==
   /\ cnt' = [cnt EXCEPT !.sessions = @ + 1]
   /\ UNCHANGED <<ctl, hd, failed, store, rawF, legacyDue, login, known, stopped,
                  needsFull, ckpt, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, acked, selfConflict>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict>>
 
 \* A permanent failure of the entry: it stays, never publishes, and its
 \* local rows stay a read-time overlay (2.9).
@@ -485,7 +545,7 @@ FailEntry(d) ==
   /\ cnt' = [cnt EXCEPT !.fails = @ + 1]
   /\ UNCHANGED <<ctl, hd, failed, store, rawF, legacyDue, login, listing, known,
                  stopped, needsFull, ckpt, view, psv, inflight, seedTarget, rcpt, clock,
-                 commits, admitted, inserted, acked, selfConflict>>
+                 commits, admitted, inserted, lateOld, left, fin, acked, selfConflict>>
 
 \* Import (2.9): one pass of the sync loop.  Every stream's local rows
 \* become the live verified head (own key), or are purged.  Without
@@ -496,20 +556,20 @@ Want(d, n, s) == IF Live(n, s) /\ Latest(n, s).key = Key(d) THEN Len(hd[n][s]) E
 Pending(d, n, s) == ob[d] # NoEntry /\ ob[d].n = n /\ ob[d].st[s] \notin {"none", "done"}
 Blocked(d, n, s) == ~ImportPastPending /\ Pending(d, n, s)
 Import(d) ==
-  /\ Views
+  /\ Views /\ d \notin left
   /\ \E n \in NS, s \in Streams : view[d][n][s] # Want(d, n, s) /\ ~Blocked(d, n, s)
   /\ view' = [view EXCEPT ![d] = [n \in NS |-> [s \in Streams |->
                  IF Blocked(d, n, s) THEN view[d][n][s] ELSE Want(d, n, s)]]]
   /\ UNCHANGED <<ctl, hd, failed, store, rawF, legacyDue, login, listing, known,
                  stopped, needsFull, ckpt, ob, psv, inflight, seedTarget, rcpt, clock,
-                 commits, admitted, inserted, acked, selfConflict, cnt>>
+                 commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, cnt>>
 
 \* Delete the connector (2.11): tombstone every active control row of c,
 \* foreign ones too; purge local rows, entries and the checkpoint; stop;
 \* start the legacy delete loop.
 UserDelete(d) ==
   LET on == {n \in NS : ActiveAny(n)} IN
-  /\ cnt.deletes < MaxDeletes /\ on # {}
+  /\ d \notin left /\ cnt.deletes < MaxDeletes /\ on # {}
   /\ ctl' = [n \in NS |-> IF n \in on THEN Append(ctl[n], [k |-> "T", key |-> ""]) ELSE ctl[n]]
   /\ view' = [view EXCEPT ![d] = [n \in NS |-> [s \in Streams |-> 0]]]
   /\ ob' = [ob EXCEPT ![d] = NoEntry]
@@ -519,14 +579,40 @@ UserDelete(d) ==
   /\ legacyDue' = TRUE
   /\ cnt' = [cnt EXCEPT !.deletes = @ + 1]
   /\ UNCHANGED <<hd, failed, store, rawF, login, listing, needsFull, psv, inflight,
-                 seedTarget, rcpt, clock, commits, admitted, inserted, acked, selfConflict>>
+                 seedTarget, rcpt, clock, commits, admitted, inserted, lateOld, left, fin, acked, selfConflict>>
+
+\* A device stops forever (uninstall, cleared browser storage): its
+\* outbox entry, needsFull and checkpoint are gone.
+Leave(d) ==
+  /\ d \notin left /\ cnt.leaves < MaxLeave
+  /\ left' = left \cup {d}
+  /\ ob' = [ob EXCEPT ![d] = NoEntry]
+  /\ needsFull' = [needsFull EXCEPT ![d] = {}]
+  /\ ckpt' = [ckpt EXCEPT ![d] = NoCk]
+  /\ view' = [view EXCEPT ![d] = [n \in NS |-> [s \in Streams |-> 0]]]
+  /\ fin' = [fin EXCEPT ![d] = NoFin]
+  /\ cnt' = [cnt EXCEPT !.leaves = @ + 1]
+  /\ UNCHANGED <<ctl, hd, failed, store, rawF, legacyDue, login, listing, known, stopped,
+                 psv, inflight, seedTarget, rcpt, clock, commits, admitted, inserted,
+                 lateOld, acked, selfConflict>>
+
+\* Limitation L11: an old app's non-exclusive DELETE writes a tombstone at
+\* the next stream version; earlier versions stay.
+OldDelete(n, s) ==
+  /\ cnt.olddel < MaxOldDelete
+  /\ hd[n][s] # <<>> /\ ~IsTomb(Latest(n, s))
+  /\ hd' = [hd EXCEPT ![n][s] = Append(@, TombHead)]
+  /\ cnt' = [cnt EXCEPT !.olddel = @ + 1]
+  /\ UNCHANGED <<ctl, failed, store, rawF, legacyDue, login, listing, known, stopped,
+                 needsFull, ckpt, ob, view, psv, inflight, seedTarget, rcpt, clock, commits,
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict>>
 
 LegacyDelete ==
   /\ legacyDue /\ rawF.present
   /\ rawF' = NoFile
   /\ UNCHANGED <<ctl, hd, failed, store, legacyDue, login, listing, known, stopped,
                  needsFull, ckpt, ob, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, acked, selfConflict, cnt>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict, cnt>>
 
 \* Best-effort cleanup (2.11): the objects of every head of generation
 \* <= a deleted D, all streams of n in one step.
@@ -538,7 +624,7 @@ Cleanup(n, D) ==
         /\ store' = store \ gone
   /\ UNCHANGED <<ctl, hd, failed, rawF, legacyDue, login, listing, known, stopped,
                  needsFull, ckpt, ob, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, acked, selfConflict, cnt>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict, cnt>>
 
 SettleFail(n, s, i) ==
   /\ cnt.settle < MaxSettleFail
@@ -547,7 +633,7 @@ SettleFail(n, s, i) ==
   /\ cnt' = [cnt EXCEPT !.settle = @ + 1]
   /\ UNCHANGED <<ctl, hd, store, rawF, legacyDue, login, listing, known, stopped,
                  needsFull, ckpt, ob, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, acked, selfConflict>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict>>
 
 Lens == [n \in NS |-> [c |-> CtlLen(n), h |-> [s \in Streams |-> Len(hd[n][s])]]]
 PsSync(p) ==
@@ -555,7 +641,7 @@ PsSync(p) ==
   /\ psv' = [psv EXCEPT ![p] = Lens]
   /\ UNCHANGED <<ctl, hd, failed, store, rawF, legacyDue, login, listing, known,
                  stopped, needsFull, ckpt, ob, view, inflight, seedTarget, rcpt, clock,
-                 commits, admitted, inserted, acked, selfConflict, cnt>>
+                 commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, cnt>>
 
 ----------------------------------------------------------------------------
 Init ==
@@ -581,10 +667,13 @@ Init ==
   /\ commits = {}
   /\ admitted = {}
   /\ inserted = {}
+  /\ lateOld = FALSE
+  /\ left = {}
+  /\ fin = [d \in Devices |-> NoFin]
   /\ acked = {}
   /\ selfConflict = FALSE
   /\ cnt = [runs |-> 0, reruns |-> 0, deletes |-> 0, lost |-> 0, sessions |-> 0,
-            settle |-> 0, fails |-> 0]
+            settle |-> 0, fails |-> 0, leaves |-> 0, olddel |-> 0]
 
 Next ==
   \/ \E d \in Devices, a \in Acct, uc \in BOOLEAN : StartRun(d, a, uc)
@@ -593,6 +682,8 @@ Next ==
   \/ LateApply
   \/ \E d \in Devices : Import(d)
   \/ \E d \in Devices : UserDelete(d)
+  \/ \E d \in Devices : Leave(d)
+  \/ \E n \in NS, s \in Streams : OldDelete(n, s)
   \/ LegacyDelete
   \/ \E n \in NS, D \in 1..MaxVer : Cleanup(n, D)
   \/ \E n \in NS, s \in Streams, i \in 1..MaxVer : SettleFail(n, s, i)
@@ -600,7 +691,7 @@ Next ==
 
 Fairness ==
   /\ \A d \in Devices : WF_vars(Progress(d)) /\ WF_vars(List(d))
-  /\ \A d \in Devices, a \in Acct : SF_vars(Rerun(d, a))
+  /\ \A d \in Devices, a \in Acct : WF_vars(Rerun(d, a))
   /\ \A d \in Devices : WF_vars(Import(d))
   /\ \A p \in Readers : WF_vars(PsSync(p))
   /\ WF_vars(LateApply)
@@ -661,11 +752,18 @@ Readiness(v, L, name) ==
 \* Safety properties (README.md gives the reading of each).
 AcctLine(l) == l[4] \in {"run", "raw", "legacy"}
 
+\* An L11 tombstone above version v (an accepted limitation).
+TombAfter(n, s, v) == \E i \in v + 1..Len(hd[n][s]) : IsTomb(hd[n][s][i])
+
+\* S1 against the current stream row: while control is active(g), every
+\* acknowledged head of generation g is covered by the current row, which
+\* is a head of generation g holding each of its lines or a greater one.
 S1_NoLostCommit ==
-  \A c \in commits :
-    LET n == c[1]  s == c[2]  g == c[3]  rid == c[4] IN
-    CurGen(n) = g =>
-      \A p \in c[5] : \E l \in LatestOfGen(n, s, g).lines : l[1] = p /\ Rank(l) >= rid * 3
+  \A x \in acked :
+    LET n == x[1]  s == x[2]  v == x[3]  h == x[4] IN
+    (CurGen(n) = h.g /\ ~TombAfter(n, s, v)) =>
+      /\ Latest(n, s).g = h.g
+      /\ \A l \in h.lines : \E m \in Latest(n, s).lines : m[1] = l[1] /\ Rank(m) >= Rank(l)
 
 S2a_DeleteHolds ==
   \A v \in Snaps, L \in Legacies, n \in NS, name \in Names :
@@ -711,14 +809,37 @@ S10_ReadinessMatchesRead ==
 
 S11_SeedCoverage ==
   \A x \in rcpt :
-    CurGen(x[1]) = 1 => (Live(x[1], x[2]) /\ PK \subseteq PKsOf(Latest(x[1], x[2]).lines))
+    (CurGen(x[1]) = 1 /\ ~TombAfter(x[1], x[2], 0)) =>
+      (Live(x[1], x[2]) /\ PK \subseteq PKsOf(Latest(x[1], x[2]).lines))
 
 S12_KeyIsolation ==
   /\ \A n \in NS, s \in Streams : \A i \in 1..Len(hd[n][s]) :
        LET h == hd[n][s][i] IN
-       (h.g <= CtlLen(n) /\ ctl[n][h.g].k = "A") => h.key = ctl[n][h.g].key
+       (h.g > 0 /\ h.g <= CtlLen(n) /\ ctl[n][h.g].k = "A") => h.key = ctl[n][h.g].key
   /\ \A d \in Devices, n \in NS, s \in Streams :
        view[d][n][s] > 0 => hd[n][s][view[d][n][s]].key = Key(d)
+
+\* Head generations never exceed the control chain, so stale_generation
+\* never meets a control that still reads active(T).
+NoHeadAboveControl ==
+  \A n \in NS, s \in Streams : \A i \in 1..Len(hd[n][s]) : hd[n][s][i].g <= CtlLen(n)
+
+\* Along a stream row chain the generation never goes down: no head of an
+\* old generation lands above a head of a newer one.
+HeadGenMonotone ==
+  \A n \in NS, s \in Streams : \A i, j \in 1..Len(hd[n][s]) :
+    (i < j /\ ~IsTomb(hd[n][s][i]) /\ ~IsTomb(hd[n][s][j])) => hd[n][s][i].g <= hd[n][s][j].g
+
+\* L3 as bounded safety (Q9).  After a device that stays finishes a run at
+\* (n, T), a stream row it saw that is still current, live and
+\* complete:false is one it holds needsFull for, so its next run is full.
+IncompleteOwned ==
+  \A d \in Devices \ left :
+    (ob[d] = NoEntry /\ fin[d].n # "none") =>
+      \A s \in Streams :
+        LET n == fin[d].n  v == fin[d].seen[s] IN
+        (/\ v > 0 /\ Len(hd[n][s]) = v /\ CurGen(n) = fin[d].T
+         /\ Live(n, s) /\ ~Latest(n, s).complete) => <<n, s>> \in needsFull[d]
 
 \* The registry_inconsistent row of the table never applies.
 NeverInconsistent ==
@@ -742,7 +863,7 @@ CleanFor(n) ==
   \A v \in Snaps, L \in Legacies, name \in Names : \A l \in Read(v, L, name)[2] : AcctLine(l) => NSOf(l[3]) # n
 L1_EventualDelete == \A n \in NS : Deleted(n) ~> (~Deleted(n) \/ CleanFor(n))
 
-Converged == \A d \in Devices, n \in NS, s \in Streams : view[d][n][s] = Want(d, n, s)
+Converged == \A d \in Devices \ left, n \in NS, s \in Streams : view[d][n][s] = Want(d, n, s)
 L2_Convergence == <>[]Converged
 
 L3_NoStuckIncomplete ==
@@ -751,7 +872,7 @@ L3_NoStuckIncomplete ==
       ~> ((Live(n, s) /\ Latest(n, s).complete) \/ CtlLen(n) # v)
 
 L4_Resume ==
-  \A d \in Devices, n \in NS :
+  \A d \in Devices \ left, n \in NS :
     (stopped[d][n] > 0 /\ ActiveAny(n) /\ CtlLen(n) > stopped[d][n]) ~> (stopped[d][n] = 0)
 
 ----------------------------------------------------------------------------
@@ -784,11 +905,9 @@ NotOfflineVs5 ==
      /\ StartState(d, ob[d]) = [k |-> "active", g |-> 1]
      /\ CtlNow(ob[d].n, Key(d)) = [k |-> "active", g |-> 5]
 
-\* A head of an old generation lands above a head of the current one.
-NotLateOldHead ==
-  ~\E n \in NS, s \in Streams :
-     /\ ActiveAny(n) /\ hd[n][s] # <<>> /\ Latest(n, s).g < CurGen(n)
-     /\ \E i \in 1..Len(hd[n][s]) : hd[n][s][i].g = CurGen(n)
+\* A head of an old generation lands after control left that generation.
+\* (Above a head of a newer generation it cannot: HeadGenMonotone.)
+NotLateOldHead == ~lateOld
 
 \* Delete and reconnect twice.
 NotTwice == ~\E n \in NS : CtlLen(n) >= 5 /\ ActiveAny(n)

@@ -7,6 +7,9 @@
 //   node formal/check.mjs --run NAME…  run TLC on each config and compare the
 //                                      result with its expectation
 //
+// A config with `simulate` runs TLC in simulation mode (random behaviours
+// with a fixed seed and depth). Its "pass" is evidence, not proof.
+//
 // --run needs TLA2TOOLS (path to tla2tools.jar, TLC 1.8 or later). Optional:
 // WORKERS (default 4), HEAP (default 4g). TLC state files go to a fresh
 // directory under the OS temp directory and are deleted after each run.
@@ -62,6 +65,16 @@ if (args[0] === "--write") {
         process.env.WORKERS ?? "4",
         "-deadlock",
         "-noGenerateSpecTE",
+        ...(config.simulate
+          ? [
+              "-simulate",
+              `num=${config.simulate.traces}`,
+              "-depth",
+              String(config.simulate.depth),
+              "-seed",
+              String(config.simulate.seed),
+            ]
+          : []),
         "-metadir",
         meta,
         "-config",

@@ -10,7 +10,7 @@
 
 const set = (xs) => `{${xs.join(", ")}}`;
 
-/** The design (revision 4.1): every guard on. */
+/** The design (revision 4.1 with the three-outcome base rule and Q9): every guard on. */
 export const DESIGN = {
   GenInNames: "TRUE",
   ClearOnGenChange: "TRUE",
@@ -29,6 +29,8 @@ export const DESIGN = {
   AckImmutable: "TRUE",
   ReadinessSame: "TRUE",
   RawSeedChecksId: "TRUE",
+  StaleGenStops: "TRUE",
+  NoOpNeedsFull: "TRUE",
 };
 
 /**
@@ -58,6 +60,9 @@ const base = {
   MaxSettleFail: 0,
   MaxFail: 1,
   MaxVer: 6,
+  // Leave and the old stream DELETE (limitation L11) only in the Q9 profiles.
+  MaxLeave: 0,
+  MaxOldDelete: 0,
   // Device imports feed only S12 (second key) and L2.
   Views: "FALSE",
 };
@@ -135,6 +140,80 @@ export const PROFILES = {
   },
   // A reader PS that lags the registry (C18).
   lag: { ...base, Readers: set(["r1"]) },
+
+  // Exhaustive slices of the small profile: each keeps one dimension of
+  // it and cuts the rest, so that breadth-first search finishes.
+  // One account, key and stream, three runs, one of each fault.
+  "slice-faults": {
+    ...base,
+    Acct: set(["A"]),
+    PK: set(["x1"]),
+    Streams: set(["s1"]),
+  },
+  // Two accounts, one key, one stream, three runs, no faults.
+  "slice-accounts": {
+    ...base,
+    PK: set(["x1"]),
+    Streams: set(["s1"]),
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+  },
+  // A second owner key on d2, with imports.
+  "slice-key": {
+    ...base,
+    Acct: set(["A"]),
+    PK: set(["x1"]),
+    Streams: set(["s1"]),
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    OtherKey: set(["d2"]),
+    Views: "TRUE",
+  },
+  // Ruling Q9 (a no-op onto a complete:false base): an old stream DELETE,
+  // a device that leaves, four runs on one account, key and stream.
+  "slice-q9": {
+    ...base,
+    Acct: set(["A"]),
+    PK: set(["x1"]),
+    Streams: set(["s1"]),
+    MaxRuns: 4,
+    MaxDeletes: 0,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    MaxLeave: 1,
+    MaxOldDelete: 1,
+  },
+  // Liveness with Q9: an old stream DELETE and a device that leaves.
+  "live-leave": {
+    ...base,
+    Acct: set(["A"]),
+    PK: set(["x1"]),
+    Streams: set(["s1"]),
+    MaxRuns: 3,
+    MaxReruns: 2,
+    MaxDeletes: 0,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    MaxLeave: 1,
+    MaxOldDelete: 1,
+  },
+  // Settlement failure and a lagging reader on the late slice.
+  "slice-settle": { ...base, Acct: set(["A"]), Streams: set(["s1"]), MaxLost: 0, MaxSessions: 0, MaxFail: 0, MaxSettleFail: 1 },
+  "slice-lag": { ...base, Acct: set(["A"]), Streams: set(["s1"]), MaxLost: 0, MaxSessions: 0, MaxFail: 0, Readers: set(["r1"]) },
+  // The identity-less connector, two accounts.
+  "slice-idless": {
+    ...base,
+    IdLess: "TRUE",
+    PK: set(["x1"]),
+    Streams: set(["s1"]),
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+  },
 };
 
 export const SAFETY = [
@@ -152,6 +231,9 @@ export const SAFETY = [
   "S11_SeedCoverage",
   "S12_KeyIsolation",
   "NeverInconsistent",
+  "NoHeadAboveControl",
+  "HeadGenMonotone",
+  "IncompleteOwned",
 ];
 
 export const LIVENESS = [
@@ -161,19 +243,32 @@ export const LIVENESS = [
   "L4_Resume",
 ];
 
+/** Simulation bounds for the profiles that breadth-first search cannot finish. */
+const SIM = { traces: 200000, depth: 60, seed: 1 };
+
 /**
- * name, what it shows, profile, changed constants, expected result, kind.
+ * name, what it shows, profile, changed constants, expected result, kind,
+ * and optional simulation bounds.
  * A safety positive checks every safety property. A liveness positive
  * checks every liveness property. A control checks TypeOK and `expect`, so
  * that TLC's first violation is that one.
  */
 export const CONFIGS = [
   // --- positives ---
-  ["Small", "the design, small profile", "small", {}, "pass"],
-  ["Key", "the design, key profile (a second owner key)", "key", {}, "pass"],
-  ["Full", "the design, full profile, symmetry on Acct and PK", "full", {}, "pass"],
-  ["IdLess", "the design, an identity-less connector", "idless", {}, "pass"],
+  // Section 4 profiles: too large for breadth-first search on this host.
+  ["Small", "the design, small profile", "small", {}, "pass", "safety", SIM],
+  ["Key", "the design, key profile (a second owner key)", "key", {}, "pass", "safety", SIM],
+  ["Full", "the design, full profile", "full", {}, "pass", "safety", SIM],
+  ["IdLess", "the design, an identity-less connector", "idless", {}, "pass", "safety", SIM],
+  // Exhaustive slices of the small profile.
+  ["Slice-faults", "the design: lost replies, a restart and a failed entry", "slice-faults", {}, "pass"],
+  ["Slice-accounts", "the design: two accounts", "slice-accounts", {}, "pass"],
+  ["Slice-key", "the design: a second owner key with imports", "slice-key", {}, "pass"],
+  ["Slice-idless", "the design: an identity-less connector, two accounts", "slice-idless", {}, "pass"],
+  ["Slice-twice", "the design: two deletes and reconnects", "twice", {}, "pass"],
+  ["Slice-q9", "the design: an old stream DELETE, a device that leaves, no-ops", "slice-q9", {}, "pass"],
   ["Live", "liveness of the design", "live", {}, "pass", "liveness"],
+  ["Live-leave", "liveness of the design with an old stream DELETE and a device that leaves", "live-leave", {}, "pass", "liveness"],
 
   // --- regression: the revision 4 counterexample (traces/split-run.txt) ---
   [
@@ -184,54 +279,64 @@ export const CONFIGS = [
     "pass",
   ],
 
-  // --- counterexample to revision 4.1 (traces/late-head.txt) ---
+  // --- regression: the revision 4.1 counterexample (traces/late-head.txt) ---
   [
     "CE-late-head",
-    "the design: an old-generation head lands above a newer generation's head, the next incremental run of that generation drops records",
+    "an old-generation run resumes after a delete and reconnect elsewhere; the stream row has a newer generation",
     "late",
     {},
+    "pass",
+  ],
+  [
+    "C-late-head-old-rule",
+    "the two-outcome base rule: a newer-generation row gives an empty base (only S1 checked)",
+    "late",
+    { StaleGenStops: "FALSE" },
     "S1_NoLostCommit",
   ],
 
   // --- section 4 negative controls: each removes one guard ---
-  ["C01-no-gen-in-names", "part names without the generation", "small", { GenInNames: "FALSE" }, "S5_CleanupSafety"],
-  ["C02-no-clear-on-gen-change", "checkpoints and entries kept on a generation change", "small", { ClearOnGenChange: "FALSE" }, "S3_CleanGeneration"],
-  ["C03-non-exclusive", "an occupied head version is replaced", "small", { ExclusiveHeads: "FALSE" }, "S1_NoLostCommit"],
-  ["C04-reader-unions", "a plain-name read unions the connections", "small", { OneConnectionRead: "FALSE" }, "S4_NoAccountMix"],
-  ["C05-seed-any-gen", "the Desktop seeds at any generation", "small", { SeedOnlyGen1: "FALSE" }, "S3_CleanGeneration"],
-  ["C06-early-checkpoint", "the checkpoint is saved at the first stream commit", "small", { CheckpointAfterAll: "FALSE" }, "S7_CheckpointSafety"],
-  ["C07-no-reread-after-create", "publish after a create or reconnect reply without a re-read", "small", { ReReadAfterCtl: "FALSE" }, "S3_CleanGeneration"],
-  ["C08-rebind-old-spool", "a userConnect spool reconnects whatever its start", "small", { NoRebind: "FALSE" }, "S3_CleanGeneration"],
-  ["C09-no-listing-needed", "start = null is read as absent", "small", { NeedListing: "FALSE" }, "S3_CleanGeneration"],
-  ["C10-legacy-ignores-delete", "the legacy fallback ignores a deleted connection", "small", { LegacyHonoursDelete: "FALSE" }, "S2a_DeleteHolds"],
-  ["C11-collectedat-competition", "a newer legacy file beats a live complete view", "small", { OneWay: "FALSE" }, "S9_OneWay"],
+  ["C01-no-gen-in-names", "part names without the generation", "late", { GenInNames: "FALSE" }, "S5_CleanupSafety"],
+  ["C02-no-clear-on-gen-change", "checkpoints and entries kept on a generation change", "slice-faults", { ClearOnGenChange: "FALSE" }, "S3_CleanGeneration"],
+  ["C03-non-exclusive", "an occupied head version is replaced", "late", { ExclusiveHeads: "FALSE" }, "S1_NoLostCommit"],
+  ["C04-reader-unions", "a plain-name read unions the connections", "slice-accounts", { OneConnectionRead: "FALSE" }, "S4_NoAccountMix"],
+  ["C05-seed-any-gen", "the Desktop seeds at any generation", "late", { SeedOnlyGen1: "FALSE" }, "S3_CleanGeneration"],
+  ["C06-early-checkpoint", "the checkpoint is saved at the first stream commit", "split", { CheckpointAfterAll: "FALSE" }, "S7_CheckpointSafety"],
+  ["C07-no-reread-after-create", "publish after a create or reconnect reply without a re-read", "late", { ReReadAfterCtl: "FALSE" }, "S3_CleanGeneration"],
+  ["C08-rebind-old-spool", "a userConnect spool reconnects whatever its start", "late", { NoRebind: "FALSE" }, "S3_CleanGeneration"],
+  ["C09-no-listing-needed", "start = null is read as absent", "slice-faults", { NeedListing: "FALSE" }, "S3_CleanGeneration"],
+  ["C10-legacy-ignores-delete", "the legacy fallback ignores a deleted connection", "late", { LegacyHonoursDelete: "FALSE" }, "S2a_DeleteHolds"],
+  ["C11-collectedat-competition", "a newer legacy file beats a live complete view", "late", { OneWay: "FALSE" }, "S9_OneWay"],
   ["C12-no-needsfull", "complete:false does not force a full run", "live", { NeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
   ["C13-pending-blocks-import", "a pending or failed entry blocks import", "live", { ImportPastPending: "FALSE" }, "L2_Convergence", "liveness"],
-  ["C14-seed-only-empty-base", "the Desktop seeds only into an empty base", "small", { SeedWhateverBase: "FALSE" }, "S11_SeedCoverage"],
-  ["C15-failed-row-replaceable", "a row that failed settlement can be replaced", "settle", { AckImmutable: "FALSE" }, "S8_AckImmutable"],
-  ["C16-readiness-live-only", "readiness uses live, reads use live and complete", "small", { ReadinessSame: "FALSE" }, "S10_ReadinessMatchesRead"],
-  ["C17-raw-seed-ignores-id", "the raw seed ignores the recorded identity", "small", { RawSeedChecksId: "FALSE" }, "S4_NoAccountMix"],
-  ["C18-immediate-delete", "the design against an immediate delete property", "lag", {}, "S2_Immediate"],
+  ["C14-seed-only-empty-base", "the Desktop seeds only into an empty base", "late", { SeedWhateverBase: "FALSE" }, "S11_SeedCoverage"],
+  ["C15-failed-row-replaceable", "a row that failed settlement can be replaced", "slice-settle", { AckImmutable: "FALSE" }, "S8_AckImmutable"],
+  ["C16-readiness-live-only", "readiness uses live, reads use live and complete", "slice-q9", { ReadinessSame: "FALSE" }, "S10_ReadinessMatchesRead"],
+  ["C17-raw-seed-ignores-id", "the raw seed ignores the recorded identity", "slice-accounts", { RawSeedChecksId: "FALSE" }, "S4_NoAccountMix"],
+  ["C19-no-q9", "a no-op onto a complete:false base sets no needsFull", "slice-q9", { NoOpNeedsFull: "FALSE" }, "IncompleteOwned"],
+  ["C19L-no-q9", "the same, against liveness L3", "live-leave", { NoOpNeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
+  ["C18-immediate-delete", "the design against an immediate delete property", "slice-lag", {}, "S2_Immediate"],
 
   // --- section 4 scenarios: each must be reachable (NotX violated) ---
   ["W-trace-a", "trace A: a lost create lands and is deleted before its resend", "lean", {}, "NotTraceA", "witness"],
   ["W-trace-b", "trace B: a userConnect entry meets a delete and reconnect", "lean", {}, "NotTraceB", "witness"],
   ["W-offline-vs-5", "a run started at active(1) is pending against active(5)", "twice", {}, "NotOfflineVs5", "witness"],
-  ["W-late-old-head", "an old-generation head lands above a current one", "lean", {}, "NotLateOldHead", "witness"],
+  ["W-late-old-head", "an old-generation head lands after control left its generation", "lean", {}, "NotLateOldHead", "witness"],
   ["W-twice", "delete and reconnect twice", "twice", {}, "NotTwice", "witness"],
   ["W-first-write-in-delete", "a stream's first head is in flight across a delete", "lean", {}, "NotFirstWriteDuringDelete", "witness"],
   ["W-phone-first-seed", "a phone publishes first, the Desktop seed merges later", "lean", {}, "NotPhoneFirstThenSeed", "witness"],
   ["W-zero-emission-seed", "the seed alone publishes a stream", "lean", {}, "NotZeroEmissionSeed", "witness"],
-  ["W-settle-after-ack", "a row fails settlement after its ack", "settle", {}, "NotSettleAfterAck", "witness"],
-  ["W-switch-reused-ckpt", "an account switch with a reused checkpoint", "small", {}, "NotSwitchReusedCkpt", "witness"],
+  ["W-settle-after-ack", "a row fails settlement after its ack", "slice-settle", {}, "NotSettleAfterAck", "witness"],
+  ["W-switch-reused-ckpt", "an account switch with a reused checkpoint", "slice-accounts", {}, "NotSwitchReusedCkpt", "witness"],
   ["W-failed-entry", "a failed entry while newer heads arrive", "lean", {}, "NotFailedEntryNewerHeads", "witness"],
-].map(([name, why, profile, changes, expect, kind = "safety"]) => ({
+].map(([name, why, profile, changes, expect, kind = "safety", simulate]) => ({
   name,
   why,
   profile,
   changes,
   expect,
   kind,
+  simulate,
 }));
 
 export function configText(config) {
@@ -253,6 +358,11 @@ export function configText(config) {
     `\\* ${config.name}: ${config.why}.`,
     `\\* Generated from formal/configs.mjs. Profile: ${config.profile}. Changed: ${changed.join(", ") || "nothing"}.`,
     `\\* Expected: ${config.expect === "pass" ? "no violation" : `${config.expect} violated`}.`,
+    ...(config.simulate
+      ? [
+          `\\* Mode: simulation, not proof: ${config.simulate.traces} random behaviours of depth <= ${config.simulate.depth}, seed ${config.simulate.seed}.`,
+        ]
+      : []),
     "SPECIFICATION Spec",
     "CONSTANTS",
     ...Object.entries(constants).map(([k, v]) => `  ${k} = ${v}`),

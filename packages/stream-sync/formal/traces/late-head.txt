@@ -1,9 +1,14 @@
-Counterexample to design revision 4.1: S1_NoLostCommit.
+Counterexample to design revision 4.1 (two-outcome base rule): S1_NoLostCommit.
 
-Config: cfg/CE-late-head.cfg (profile "late": devices d1 (Desktop) and d2,
-one account A, record keys x1 and x2, one stream s1, three runs, one
-delete).  TLC 2026.11.03, 4 workers: violation at depth 22 after about
-320,000 distinct states.
+Reproduced by the negative control cfg/C-late-head-old-rule.cfg (profile
+"late": devices d1 (Desktop) and d2, one account A, record keys x1 and
+x2, one stream s1, three runs, one delete; StaleGenStops = FALSE; only
+TypeOK and S1 checked).  TLC 2026.11.03, 4 workers: violation at depth 16
+after 150,481 distinct states.  S1 reads the current stream row: at step
+16 control is active(3) and the current row is d1's generation-1 head, so
+run 2's acknowledged generation-3 head is no longer the live row.  With
+the three-outcome rule (cfg/CE-late-head.cfg) step 15 is stale_generation:
+d1 publishes nothing and its run is discarded.
 
 Rendered with traces/story.py from `-dumpTrace json`.  Control: A = active
 row, T = tombstone, one letter per registry version.  Heads: version,
@@ -11,23 +16,17 @@ generation, lines (pk@run), C = complete.
 
 step | action | control | heads | entries | checkpoints
 2 | List(d1) | A:- | - | d1: -; d2: - | -
-3 | StartRun(d1,A,False) | A:- | - | d1: run1 full pks=x1+x2 s1=planned; d2: - | -
-4 | Decide(d1,s1) | A:- | - | d1: run1 full pks=x1+x2 s1=creating@g1; d2: - | -
-5 | CtlPost(d1,s1) | A:A | - | d1: run1 full pks=x1+x2 s1=planned@g1; d2: - | -
-6 | Decide(d1,s1) | A:A | - | d1: run1 full pks=x1+x2 s1=decided@g1; d2: - | -
-7 | UserDelete(d2) | A:AT | - | d1: run1 full pks=x1+x2 s1=decided@g1; d2: - | -
-8 | List(d2) | A:AT | - | d1: run1 full pks=x1+x2 s1=decided@g1; d2: - | -
-9 | StartRun(d2,A,True) | A:AT | - | d1: run1 full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=planned | -
-10 | Decide(d2,s1) | A:AT | - | d1: run1 full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=reconnecting@g3 | -
-11 | CtlPost(d2,s1) | A:ATA | - | d1: run1 full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=planned@g3 | -
-12 | Decide(d2,s1) | A:ATA | - | d1: run1 full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=decided@g3 | -
-13 | List(d2) | A:ATA | - | d1: run1 full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=decided@g3 | -
-14 | Plan(d2,s1) | A:ATA | - | d1: run1 full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=posted@g3 | -
-15 | Post(d2,s1) | A:ATA | s1v1:g3[x1@run2,x2@run2]C | d1: run1 full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=done | -
-16 | Plan(d1,s1) | A:ATA | s1v1:g3[x1@run2,x2@run2]C | d1: run1 full pks=x1+x2 s1=posted@g1; d2: run2 uc full pks=x1+x2 s1=done | -
-17 | Post(d1,s1) | A:ATA | s1v1:g3[x1@run2,x2@run2]C s1v2:g1[x1@run1,x2@run1]C | d1: run1 full pks=x1+x2 s1=done; d2: run2 uc full pks=x1+x2 s1=done | -
-18 | Finish(d2) | A:ATA | s1v1:g3[x1@run2,x2@run2]C s1v2:g1[x1@run1,x2@run1]C | d1: run1 full pks=x1+x2 s1=done; d2: - | d2:A/g3/run2
-19 | StartRun(d2,A,False) | A:ATA | s1v1:g3[x1@run2,x2@run2]C s1v2:g1[x1@run1,x2@run1]C | d1: run1 full pks=x1+x2 s1=done; d2: run3 incr pks=x1 s1=planned | d2:A/g3/run2
-20 | Decide(d2,s1) | A:ATA | s1v1:g3[x1@run2,x2@run2]C s1v2:g1[x1@run1,x2@run1]C | d1: run1 full pks=x1+x2 s1=done; d2: run3 incr pks=x1 s1=decided@g3 | d2:A/g3/run2
-21 | Plan(d2,s1) | A:ATA | s1v1:g3[x1@run2,x2@run2]C s1v2:g1[x1@run1,x2@run1]C | d1: run1 full pks=x1+x2 s1=done; d2: run3 incr pks=x1 s1=posted@g3 | -
-22 | Post(d2,s1) | A:ATA | s1v1:g3[x1@run2,x2@run2]C s1v2:g1[x1@run1,x2@run1]C s1v3:g3[x1@run3] | d1: run1 full pks=x1+x2 s1=done; d2: run3 incr pks=x1 s1=done | -
+3 | StartRun(d1,A,True) | A:- | - | d1: run1 uc full pks=x1+x2 s1=planned; d2: - | -
+4 | Decide(d1,s1) | A:- | - | d1: run1 uc full pks=x1+x2 s1=creating@g1; d2: - | -
+5 | CtlPost(d1,s1) | A:A | - | d1: run1 uc full pks=x1+x2 s1=planned@g1; d2: - | -
+6 | Decide(d1,s1) | A:A | - | d1: run1 uc full pks=x1+x2 s1=decided@g1; d2: - | -
+7 | UserDelete(d2) | A:AT | - | d1: run1 uc full pks=x1+x2 s1=decided@g1; d2: - | -
+8 | List(d2) | A:AT | - | d1: run1 uc full pks=x1+x2 s1=decided@g1; d2: - | -
+9 | StartRun(d2,A,True) | A:AT | - | d1: run1 uc full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=planned | -
+10 | Decide(d2,s1) | A:AT | - | d1: run1 uc full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=reconnecting@g3 | -
+11 | CtlPost(d2,s1) | A:ATA | - | d1: run1 uc full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=planned@g3 | -
+12 | Decide(d2,s1) | A:ATA | - | d1: run1 uc full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=decided@g3 | -
+13 | PlanPublish(d2,s1) | A:ATA | - | d1: run1 uc full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=posted@g3 | -
+14 | Post(d2,s1) | A:ATA | s1v1:g3[x1@run2,x2@run2]C | d1: run1 uc full pks=x1+x2 s1=decided@g1; d2: run2 uc full pks=x1+x2 s1=done | -
+15 | PlanPublish(d1,s1) | A:ATA | s1v1:g3[x1@run2,x2@run2]C | d1: run1 uc full pks=x1+x2 s1=posted@g1; d2: run2 uc full pks=x1+x2 s1=done | -
+16 | Post(d1,s1) | A:ATA | s1v1:g3[x1@run2,x2@run2]C s1v2:g1[x1@run1,x2@run1]C | d1: run1 uc full pks=x1+x2 s1=done; d2: run2 uc full pks=x1+x2 s1=done | -
