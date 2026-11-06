@@ -135,7 +135,6 @@ import {
   createStreamSyncKeyPorts,
   streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
 import { openFsStreamSyncHome } from "./stream-sync/fs-home.js";
 import { retainedArtifactResolver } from "./stream-sync/retained-artifacts.js";
 import {
@@ -925,19 +924,7 @@ export async function createServer(
     // Whole-file stream sync publishes beside the legacy upload, only when
     // `streamSync.write` is on. Legacy uploads run unchanged either way.
     if (config.streamSync.write && !isEnclave) {
-      // Desktop seed intake (§2.9): retained rows staged by the seed route.
-      // The receipts lookup binds late because the writer owns the receipts.
-      const seedStaging = createSeedStaging(
-        createFsStreamSyncFiles(join(storageRoot, "stream-sync-seed")),
-      );
       let writerForSeed: StreamSyncWriter | null = null;
-      const seedSource = seedStaging.source(
-        await seedStaging.installId(),
-        async (connector) =>
-          writerForSeed
-            ? (await writerForSeed.seedStatus(connector)).receipts
-            : {},
-      );
       const streamSyncHome = await openFsStreamSyncHome({
         root: storageRoot,
         ownerAddress: serverOwner,
@@ -949,6 +936,17 @@ export async function createServer(
         );
       } else {
         releaseStreamSyncHome = () => streamSyncHome.close();
+        // Desktop seed intake (§2.9): retained rows staged by the seed route,
+        // kept in this owner's home so another owner never merges them.
+        // The receipts lookup binds late because the writer owns the receipts.
+        const seedStaging = createSeedStaging(streamSyncHome.seedFiles);
+        const seedSource = seedStaging.source(
+          await seedStaging.installId(),
+          async (connector) =>
+            writerForSeed
+              ? (await writerForSeed.seedStatus(connector)).receipts
+              : {},
+        );
         streamSyncWriter = new StreamSyncWriter({
           ownerAddress: serverOwner,
           registry: createGatewayStreamSyncRegistry({
@@ -961,9 +959,7 @@ export async function createServer(
           signer: serverSigner,
           seed: seedSource,
         });
-      }
-      writerForSeed = streamSyncWriter;
-      if (streamSyncWriter) {
+        writerForSeed = streamSyncWriter;
         streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
       }
     }
