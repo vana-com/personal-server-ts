@@ -128,11 +128,14 @@ import {
 import { createSqliteQuestionStore } from "./storage/question-store.js";
 import {
   StreamSyncWriter,
+  createStreamSyncIntake,
+  type StreamSyncIntake,
   createGatewayStreamSyncRegistry,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
+import { retainedArtifactResolver } from "./stream-sync/retained-artifacts.js";
 import {
   createSeedStaging,
   type SeedStaging,
@@ -1212,6 +1215,20 @@ export async function createServer(
         })
       : undefined;
 
+  // Run intake (V2 §2): mounted only with `streamSync.write`. An artifact
+  // digest resolves only to a retained declaration whose bytes this boot
+  // verified (§6); an unknown digest answers `unknown_artifact`.
+  const streamSyncIntake: StreamSyncIntake | undefined =
+    streamSyncWriter && !isEnclave
+      ? createStreamSyncIntake({
+          writer: streamSyncWriter,
+          resolveArtifact: retainedArtifactResolver(
+            pdppAuth?.retainedDeclarations ?? [],
+            pdppAuth?.retainedDocuments ?? new Map(),
+          ),
+        })
+      : undefined;
+
   const app = createApp({
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
@@ -1307,6 +1324,7 @@ export async function createServer(
     configPath,
     syncManager,
     streamSyncSeed,
+    streamSyncIntake,
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,

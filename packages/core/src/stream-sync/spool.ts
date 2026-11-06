@@ -66,6 +66,12 @@ export class SpoolWriter {
     if (this.buffered >= FLUSH_BYTES) await this.flush();
   }
 
+  /** Drop every buffered line without writing it. */
+  clear(): void {
+    this.buffers.clear();
+    this.buffered = 0;
+  }
+
   async flush(): Promise<void> {
     const pending = [...this.buffers.entries()];
     this.buffers.clear();

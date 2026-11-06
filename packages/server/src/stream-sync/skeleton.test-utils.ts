@@ -13,9 +13,11 @@
  * production storage adapter against a local write-once blob store, the full
  * server's filesystem adapters and Lite's IndexedDB adapter.
  *
- * Stubbed (each marked `SKELETON STUB`): the intake adapter, the connector
- * fixture, the registry (in-memory, gateway rules) and its listing feed, and
- * the phone and frame host configuration. The list is in the hand-back.
+ * Real: the run intake (`createStreamSyncIntake`; the full server reaches it
+ * through its HTTP route, PS-Lite in process) and the account taken from the
+ * run's own records (R20). Stubbed (each marked `SKELETON STUB`): the
+ * connector fixture, the registry (in-memory, gateway rules) and its listing
+ * feed, and the phone and frame host configuration.
  *
  * Run: `npm run e2e:stream-sync-skeleton` (needs `streamSync.write`).
  */
@@ -28,12 +30,15 @@ import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import {
   canonicalJson,
   streamMasterKeyFromSignature,
-  type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   StreamSyncWriter,
+  createStreamSyncIntake,
   createStreamSyncKeyPorts,
+  type IntakeDeclarations,
+  type RunIntake,
   type StreamSyncFiles,
+  type StreamSyncIntake,
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
@@ -45,6 +50,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createIndexedDbStreamSyncFiles } from "@opendatalabs/personal-server-ts-lite";
+import { Hono } from "hono";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import { streamSyncRunsRoutes } from "../routes/stream-sync-runs.js";
 import { createFsStreamSyncFiles } from "./fs-files.js";
 import { createFsStreamSyncReadFiles } from "../stream-sync-read/fs-files.js";
 import {
@@ -52,7 +60,6 @@ import {
   OWNER_KEY,
   OWNER_SIGNATURE,
   SERVER_KEY,
-  SHAPE,
   accountSigner,
   createFakeStreamSyncRegistry,
   interpose,
@@ -77,55 +84,87 @@ const hash = (value: unknown): string =>
 
 // ---------------------------------------------------------------- intake
 
-/**
- * SKELETON STUB (lane P6 replaces it with the real `begin/batches/end`
- * adapter in `packages/core/src/stream-sync/intake.ts`): the same three calls
- * over the writer's own beginRun/append/finishRun, without START issue,
- * binding checks, ordinals or tombstones.
- */
-class StubIntake {
-  constructor(private readonly writer: StreamSyncWriter) {}
+const DIGEST = `sha256:${"5e".repeat(32)}`;
+/** The declarations the fixture connector's artifact digest resolves to. */
+const DECLARATIONS: IntakeDeclarations = {
+  version: "1.0.0",
+  streams: [
+    { name: "profile", semantics: "mutable_state", primaryKey: ["id"] },
+    { name: STREAM, semantics: "mutable_state", primaryKey: ["id"] },
+  ],
+};
+/** R20: the account is the `id` of the run's `profile` record. */
+const ACCOUNT_KEY = { stream: "profile", field: "id" };
+const TOKEN = "skeleton-owner-token";
 
-  begin(runId: string, observedAt: number): Promise<void> {
-    // SKELETON STUB: identity is always required and `wantFull` is not modelled.
-    return this.writer.beginRun({
-      runId,
-      connector: CONNECTOR,
-      userConnect: false,
-      observedAt,
-      identity: "required",
-      checkpointUsed: null,
+const noGateway = {
+  getServer: async () => null,
+} as unknown as GatewayClient;
+
+/** The adapter the full server mounts, driven through its HTTP route. */
+function httpIntake(intake: StreamSyncIntake): RunIntake {
+  const app = new Hono();
+  app.route(
+    "/v1/stream-sync/runs",
+    streamSyncRunsRoutes({
+      serverOrigin: "http://127.0.0.1",
+      serverOwner: OWNER,
+      gateway: noGateway,
+      accessToken: TOKEN,
+      intake,
+    }),
+  );
+  const call = async (method: "PUT" | "POST", path: string, body: unknown) => {
+    const res = await app.request(`/v1/stream-sync/runs/${path}`, {
+      method,
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${TOKEN}`,
+      },
+      body: JSON.stringify(body),
     });
-  }
-
-  async batch(
-    runId: string,
-    records: readonly Record<string, unknown>[],
-  ): Promise<void> {
-    // SKELETON STUB: stream name and shape come from constants, not from a
-    // declaration resolved from the connector artifact digest.
-    await this.writer.declareStream(runId, STREAM, SHAPE);
-    for (const record of records) {
-      await this.writer.append(runId, STREAM, record);
+    if (res.status !== 200) {
+      throw new Error(`${method} ${path}: ${res.status} ${await res.text()}`);
     }
-  }
-
-  async end(runId: string, checkpoint: JsonValue): Promise<void> {
-    await this.writer.setAccountIdentity(runId, ACCOUNT_ID);
-    await this.writer.finishRun(runId, { checkpointCandidate: checkpoint });
-  }
+    return res.json();
+  };
+  return {
+    begin: (runId, req) => call("PUT", runId, req),
+    batch: (runId, req) => call("POST", `${runId}/batches`, req),
+    end: (runId, req) => call("POST", `${runId}/end`, req),
+    abort: async (runId, reason) => {
+      await call("POST", `${runId}/abort`, { reason });
+    },
+  };
 }
 
-/** SKELETON STUB (lane P6): one fixture connector run of one stream. */
+/** One fixture connector run: the account record, then the items. */
 async function fixtureRun(
-  intake: StubIntake,
+  intake: RunIntake,
   runId: string,
   observedAt: number,
   records: readonly Record<string, unknown>[],
 ): Promise<void> {
-  await intake.begin(runId, observedAt);
-  await intake.batch(runId, records);
-  await intake.end(runId, { cursor: runId });
+  await intake.begin(runId, {
+    connector: CONNECTOR,
+    artifactDigest: DIGEST,
+    owner: { address: OWNER, leaseId: null },
+    observedAt,
+    accountKey: ACCOUNT_KEY,
+  });
+  await intake.batch(runId, {
+    batch: 0,
+    records: [
+      { stream: "profile", data: { id: ACCOUNT_ID } },
+      ...records.map((data) => ({ stream: STREAM, data })),
+    ],
+  });
+  await intake.end(runId, {
+    outcome: "succeeded",
+    coveredStreams: ["profile", STREAM],
+    checkpointCandidate: { [STREAM]: runId },
+    lastBatch: 0,
+  });
 }
 
 // ----------------------------------------------------------------- hosts
@@ -133,7 +172,7 @@ async function fixtureRun(
 interface Host {
   readonly name: string;
   readonly writer: StreamSyncWriter;
-  readonly intake: StubIntake;
+  readonly intake: RunIntake;
   readonly reader: StreamSyncReadService;
 }
 
@@ -221,7 +260,16 @@ async function makeHost(input: {
     ),
     logger: silent,
   });
-  return { name: input.kind, writer, intake: new StubIntake(writer), reader };
+  const intake = createStreamSyncIntake({
+    writer,
+    resolveArtifact: (digest) => (digest === DIGEST ? DECLARATIONS : null),
+  });
+  return {
+    name: input.kind,
+    writer,
+    intake: input.kind === "full" ? httpIntake(intake) : intake,
+    reader,
+  };
 }
 
 // ----------------------------------------------------------------- checks
