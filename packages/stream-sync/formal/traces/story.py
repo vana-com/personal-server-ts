@@ -1,28 +1,68 @@
-import json, sys
-d = json.load(open(sys.argv[1]))
-ce = d["counterexample"]
-states = {s[0]: s[1] for s in ce["state"]}
-acts = ce["action"]
+"""Print a TLC counterexample of StreamSync.tla as one line per step.
+
+Usage: python3 story.py trace.json
+where trace.json comes from `tlc2.TLC ... -dumpTrace json trace.json`.
+
+Columns: step, action, control chain per connection (A = active row,
+T = tombstone), stream heads (version:generation[lines]; C marks
+complete), each device's outbox entry, checkpoints.  A line is
+pk@origin+run, e.g. x1@run3; seed lines show as x1@seed.
+"""
+import json
+import sys
+
+
+def ctl(st):
+    out = []
+    for n, rows in st["ctl"].items():
+        name = n or '""'
+        out.append(f"{name}:" + ("".join(r["k"] for r in rows) or "-"))
+    return " ".join(out)
+
+
+def line(l):
+    pk, rid, _acct, origin = l
+    return f"{pk}@{origin}" if origin != "run" else f"{pk}@run{rid}"
+
+
 def heads(st):
     out = []
-    for n, ss in st["srow"].items():
-        for s, rows in ss.items():
+    for n, streams in st["hd"].items():
+        for s, rows in streams.items():
             for i, h in enumerate(rows, 1):
-                ls = ",".join(f"k{l[1]}@run{l[2]}" for l in h["lines"])
+                ls = ",".join(sorted(line(l) for l in h["lines"]))
                 out.append(f"{s}v{i}:g{h['g']}[{ls}]{'C' if h['complete'] else ''}")
     return " ".join(out) or "-"
-def entry(st, dev):
-    e = st["ob"][dev]
-    if e["rid"] == 0: return "-"
-    sts = " ".join(f"{s}={e['st'][s]}@g{e['g'][s]}" for s in e["st"] if e["st"][s] != "none")
-    return f"run{e['rid']} bound={e['bound']} uc={e['uc']} full={e['full']} {sts}"
-print(f"{'#':>2} {'action':<22} ctl        | heads | d2 entry | checkpoints | commits")
-prev = 1
-for a in acts:
-    (i, _), act, (j, st) = a[0], a[1], a[2]
-    name = act["name"]; ctx = act.get("context", {})
-    args = ",".join(str(v) for v in ctx.values())
-    ctl = "".join(st["ctl"]["n1"]) or "absent"
-    chk = " ".join(f"{k}:{v['n']}/g{v['g']}/run{v['rid']}/{'+'.join(v['streams'])}" for k, v in st["chk"].items() if v["n"] != "none") or "-"
-    com = " ".join(f"({c[1]},g{c[2]},run{c[3]})" for c in st["commits"]) or "-"
-    print(f"{j:>2} {name+'('+args+')':<22} {ctl:<10} | {heads(st)} | {entry(st,'d2')} | {chk} | {com}")
+
+
+def entry(e):
+    if e["rid"] == 0:
+        return "-"
+    sts = " ".join(
+        f"{s}={e['st'][s]}" + (f"@g{e['g'][s]}" if e["g"][s] else "")
+        for s in e["st"]
+        if e["st"][s] != "none"
+    )
+    flags = ("uc " if e["uc"] else "") + ("full" if e["full"] else "incr")
+    return f"run{e['rid']} {flags} pks={'+'.join(sorted(e['pks']))} {sts}"
+
+
+def ckpts(st):
+    out = [
+        f"{d}:{c['n']}/g{c['g']}/run{c['rid']}"
+        for d, c in st["ckpt"].items()
+        if c["n"] != "none"
+    ]
+    return " ".join(out) or "-"
+
+
+def main():
+    trace = json.load(open(sys.argv[1]))["counterexample"]
+    print("step | action | control | heads | entries | checkpoints")
+    for (_, _), act, (j, st) in trace["action"]:
+        args = ",".join(str(v) for v in act.get("context", {}).values())
+        entries = "; ".join(f"{d}: {entry(e)}" for d, e in st["ob"].items())
+        print(f"{j} | {act['name']}({args}) | {ctl(st)} | {heads(st)} | {entries} | {ckpts(st)}")
+
+
+main()
