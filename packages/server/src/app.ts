@@ -1,4 +1,8 @@
 import { ouraRoutes } from "./routes/oura.js";
+import {
+  streamSyncSeedRoutes,
+  type StreamSyncSeedRouteDeps,
+} from "./routes/stream-sync-seed.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -147,6 +151,8 @@ export interface AppDeps {
   accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
+  /** Desktop seed intake (§2.9); null or absent when stream sync writing is off. */
+  streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
   /** Read-side tombstone memory; reads of a deleted scope answer 410. */
   scopeDeletions?: ScopeDeletionTracker;
   serverSigner?: ServerSigner;
@@ -497,6 +503,19 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   app.route("/v1/import/oura-browser", ouraRoutes(deps));
+
+  app.route(
+    "/v1/stream-sync/seed",
+    streamSyncSeedRoutes({
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      streamSyncSeed: deps.streamSyncSeed ?? null,
+    }),
+  );
 
   // Mount data routes (ingest + read + delete)
   app.route(

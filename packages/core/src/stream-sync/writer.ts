@@ -424,6 +424,29 @@ export class StreamSyncWriter {
     };
   }
 
+  /**
+   * §2.9 seed state of `connector` on this install: whether the seed target
+   * is known (set by the first identified run of the connector) and the
+   * receipt of each stream for that target. Empty without a seed source.
+   */
+  async seedStatus(connector: string): Promise<{
+    targetKnown: boolean;
+    receipts: Readonly<Record<string, SeedReceipt>>;
+  }> {
+    const seed = this.options.seed;
+    const state = await this.readState();
+    const target = state.seedTargets[connector];
+    const receipts: Record<string, SeedReceipt> = {};
+    if (seed && target !== undefined) {
+      const prefix = `${seed.installId}|${connector}|${target}|`;
+      for (const [key, receipt] of Object.entries(state.receipts)) {
+        if (key.startsWith(prefix))
+          receipts[key.slice(prefix.length)] = receipt;
+      }
+    }
+    return { targetKnown: target !== undefined, receipts };
+  }
+
   beginRun(input: StreamSyncRunStart): Promise<void> {
     return this.serial(async () => {
       if (!RUN_ID.test(input.runId))
