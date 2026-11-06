@@ -43,6 +43,7 @@ import {
   listAccessLogsContract,
   listDataScopesContract,
   listDataVersionsContract,
+  parseDataReadScopeContract,
   parseDataScopeContract,
   parseJsonObjectBody,
   readDataContract,
@@ -2484,7 +2485,11 @@ export async function handlePersonalServerDataRequest(
     logContext.route = `${request.method} ${options.basePath ?? "/v1/data"}/:scope`;
 
     if (request.method === "GET") {
-      const scopeResult = parseDataScopeContract(scopeParam);
+      // Stream names are read names only while stream-sync reads are on; with
+      // the flag off every read answers as before.
+      const scopeResult = deps.streamSyncRead
+        ? parseDataReadScopeContract(scopeParam)
+        : parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       logContext.detail = { scope: scopeResult.scope };
       // An empty `fileId=` or `at=` selects no version: it is the latest

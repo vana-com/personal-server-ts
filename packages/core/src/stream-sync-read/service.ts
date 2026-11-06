@@ -40,7 +40,7 @@ import type {
   StreamSyncReadLogger,
 } from "./ports.js";
 import { planProjection } from "./projection.js";
-import { isPhysicalScope } from "./routing.js";
+import { isPhysicalScope, logicalStreamScopeParts } from "./routing.js";
 import { ViewStore, type ViewKey, type ViewLease } from "./view-store.js";
 
 export interface StreamSyncReadOptions {
@@ -141,9 +141,12 @@ function legacyConnectorKey(pdppSource: string): string {
 export function readTargets(scope: string): Target[] {
   if (isPhysicalScope(scope)) return [];
   const targets = new Map<string, Target>();
-  const plain = /^pdpp\.([^.~]+)\.([^~]+)$/.exec(scope);
+  const plain = logicalStreamScopeParts(scope);
   if (plain) {
-    targets.set(plain[1]!, { connector: plain[1]!, streams: [plain[2]!] });
+    targets.set(plain.connector, {
+      connector: plain.connector,
+      streams: [plain.stream],
+    });
   }
   const original = LEGACY_SCOPE_BINDINGS.get(scope);
   if (original) {

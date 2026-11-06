@@ -2051,6 +2051,41 @@ describe("GET /v1/data/:scope", () => {
     expect(json.error.errorCode).toBe("PS_UNAVAILABLE");
   });
 
+  it("reads a stream-sync stream by a connector key the SDK scope rule rejects", async () => {
+    const app = createApp({
+      streamSyncRead: { resolve: async () => ({ kind: "pass" }) },
+    });
+    // `pdpp.github-browser~.repositories` is the identity-less physical
+    // scope (R23); `pdpp.github-browser.repositories` is its logical name.
+    for (const name of [
+      "pdpp.github-browser.repositories",
+      "pdpp.github-browser~.repositories",
+    ]) {
+      const res = await getWithAuth(app, name);
+      const json = (await res.json()) as { error?: unknown };
+      expect(json.error, name).not.toBe("INVALID_SCOPE");
+      expect(res.status, name).not.toBe(400);
+    }
+    // With stream-sync reads off, every read answers as before.
+    const off = await getWithAuth(
+      createApp(),
+      "pdpp.github-browser.repositories",
+    );
+    expect(off.status).toBe(400);
+    // Physical names with a namespace, and control scopes, stay internal (Q7).
+    for (const name of [
+      "pdpp.github-browser~0123456789abcdef.repositories",
+      "pdpp.github-browser~",
+      "pdpp.github-browser~0123456789abcdef",
+    ]) {
+      const res = await getWithAuth(app, name);
+      expect(res.status, name).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe(
+        "INVALID_SCOPE",
+      );
+    }
+  });
+
   it("returns 404 for nonexistent scope", async () => {
     const app = createApp();
 

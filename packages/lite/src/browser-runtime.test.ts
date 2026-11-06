@@ -5,11 +5,12 @@
  * environment. Browser defaults remain exercised by the existing suite.
  */
 
-import { IDBFactory } from "fake-indexeddb";
+import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
 import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
+import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
 import type { PsLitePersistenceBundle } from "./persistence.js";
@@ -224,6 +225,80 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
       scopes: [{ scope: "instagram.profile" }],
       total: 1,
     });
+  });
+});
+
+describe("createIndexedDbPsLiteRuntime run intake", () => {
+  const options = (extra: Record<string, unknown>) => ({
+    ownerAddress,
+    ownerSignature,
+    dbName: `ps-lite-intake-${Math.random()}`,
+    storageDbName: `ps-lite-intake-storage-${Math.random()}`,
+    gateway: createMockPsLiteGateway(),
+    auth: createBearerTokenPsLiteAuth({
+      ownerToken: "owner-token",
+      builderToken: "builder-token",
+    }),
+    active: true,
+    ...extra,
+  });
+  const digest = `sha256:${"ab".repeat(32)}`;
+  const begin = (
+    owner: string,
+    intake: NonNullable<
+      Awaited<
+        ReturnType<typeof createIndexedDbPsLiteRuntime>
+      >["streamSyncIntake"]
+    >,
+    artifactDigest: string,
+  ) =>
+    intake.begin("r1", {
+      connector: "c",
+      artifactDigest,
+      owner: { address: owner, leaseId: null },
+      observedAt: Date.now(),
+    });
+
+  it("exposes the sync manager's intake and resolves digests from the host table", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const resolve = vi.fn((d: string) =>
+      d === digest ? { connector: "c", version: "1", streams: [] } : null,
+    );
+    const { streamSyncIntake } = await createIndexedDbPsLiteRuntime(
+      options({
+        streamSyncDeclarations: resolve,
+        streamSyncFiles: () =>
+          createIndexedDbStreamSyncFiles({
+            dbName: "intake-files",
+            factory: new IDBFactory(),
+            keyRange: IDBKeyRange,
+          }),
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: true },
+          streamSync: { write: true },
+        },
+      }),
+    );
+    expect(streamSyncIntake).not.toBeNull();
+    const unknown = `sha256:${"cd".repeat(32)}`;
+    await expect(
+      begin(ownerAddress, streamSyncIntake!, unknown),
+    ).rejects.toMatchObject({ code: "unknown_artifact" });
+    expect(resolve).toHaveBeenCalledWith(unknown);
+  });
+
+  it("is null with streamSync.write off", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const { streamSyncIntake } = await createIndexedDbPsLiteRuntime(
+      options({
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: true },
+        },
+      }),
+    );
+    expect(streamSyncIntake).toBeNull();
   });
 });
 

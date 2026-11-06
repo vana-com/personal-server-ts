@@ -38,6 +38,7 @@
     "e2e:job": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-job.ts",
     "e2e:x402": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-x402-flow.ts",
     "e2e:stream-sync-skeleton": "vitest run --maxWorkers=4 packages/server/src/stream-sync/skeleton.test.ts",
+    "e2e:stream-sync-real": "tsx scripts/e2e-stream-sync-real.ts",
     "e2e:stream-sync-skeleton:gateway": "bash scripts/e2e-stream-sync-gateway.sh",
     "e2e:x402-lite": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-x402-lite.ts",
     "e2e:sync": "tsx --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/e2e-storage-sync.ts",

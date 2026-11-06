@@ -82,6 +82,11 @@ export interface IntakeStreamDeclaration {
 }
 
 export interface IntakeDeclarations {
+  /**
+   * The connector key of the verified artifact. A run's `connector` must
+   * equal it: the artifact fixes which connector a producer may publish as.
+   */
+  readonly connector: string;
   /** The connector version; it becomes the head profile version. */
   readonly version: string;
   readonly streams: readonly IntakeStreamDeclaration[];
@@ -313,6 +318,11 @@ export class StreamSyncIntake implements RunIntake {
 
     const declarations = await this.options.resolveArtifact(artifactDigest);
     if (!declarations) throw new RunIntakeError("unknown_artifact");
+    // The artifact binds the connector (owner decision B): a producer cannot
+    // publish under a name its verified artifact does not carry.
+    if (declarations.connector !== connector) {
+      throw invalid("connector does not match the artifact");
+    }
     const decl = new Map(declarations.streams.map((d) => [d.name, d]));
     for (const d of declarations.streams) checkName(connector, d.name);
     for (const entry of req.streams ?? []) {

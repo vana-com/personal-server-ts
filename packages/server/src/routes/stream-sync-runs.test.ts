@@ -16,16 +16,17 @@ import {
   OWNER,
   createOracleEnv,
   finishedOutcome,
+  artifactFor,
   freshConnector,
   readStream,
+  resolveTestArtifact,
   startLocalStorage,
   type OracleEnv,
 } from "../stream-sync/oracle.test-utils.js";
 import { MAX_BATCH_BYTES, streamSyncRunsRoutes } from "./stream-sync-runs.js";
 
 const TOKEN = "runs-route-test-token";
-const DIGEST = "sha256:" + "cd".repeat(32);
-const DECLARATIONS: IntakeDeclarations = {
+const DECLARATIONS: Omit<IntakeDeclarations, "connector"> = {
   version: "1.0.0",
   streams: [{ name: "items", semantics: "mutable_state", primaryKey: ["id"] }],
 };
@@ -51,7 +52,7 @@ async function build(device: string) {
   const writer = await env.writer(device);
   const intake = createStreamSyncIntake({
     writer,
-    resolveArtifact: (digest) => (digest === DIGEST ? DECLARATIONS : null),
+    resolveArtifact: resolveTestArtifact,
   });
   const outer = new Hono();
   outer.route(
@@ -88,13 +89,16 @@ async function build(device: string) {
   return { writer, call };
 }
 
-const beginBody = (extra: Record<string, unknown> = {}) => ({
-  connector: freshConnector("http"),
-  artifactDigest: DIGEST,
-  owner: { address: OWNER, leaseId: null },
-  observedAt: T0,
-  ...extra,
-});
+const beginBody = (extra: Record<string, unknown> = {}) => {
+  const connector = freshConnector("http");
+  return {
+    connector,
+    artifactDigest: artifactFor(connector, DECLARATIONS),
+    owner: { address: OWNER, leaseId: null },
+    observedAt: T0,
+    ...extra,
+  };
+};
 
 describe("stream-sync run intake route", () => {
   it("takes a run from begin to a published, readable stream", async () => {
