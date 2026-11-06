@@ -180,6 +180,35 @@ describe("stream-sync reads", () => {
     );
   });
 
+  it("maps a source name to no other connector without signed alias data", async () => {
+    // claude.conversations reads the connector its binding names. A raw
+    // `pdpp.<source>.<stream>` name reads connector <source> only: no signed
+    // connector data carries a source alias yet, and a list in code may not.
+    const f = new Fixture(await testOwnerKey(masterKey(12)));
+    const ns = await f.key.ns("anthropic", "account-1");
+    await f.activate("anthropic", ns);
+    for (const stream of ["account_profile", "conversations", "messages"]) {
+      await f.publish({
+        connector: "anthropic",
+        ns,
+        stream,
+        generation: 1,
+        records: [],
+      });
+    }
+    const service = await f.service();
+    await f.sync(service);
+    expect((await service.resolve(ask("claude.conversations"))).kind).toBe(
+      "view",
+    );
+    expect(
+      (await service.resolve(ask("pdpp.anthropic.conversations"))).kind,
+    ).toBe("view");
+    expect((await service.resolve(ask("pdpp.claude.conversations"))).kind).toBe(
+      "pass",
+    );
+  });
+
   it("never accepts a physical name as a requested name", () => {
     expect(readTargets("pdpp.acme~0123456789abcdef.items")).toEqual([]);
     expect(readTargets("pdpp.acme~.items")).toEqual([]);
