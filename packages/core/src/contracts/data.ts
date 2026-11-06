@@ -356,7 +356,7 @@ export function parseDataScopeContract(
     return invalidScope("Replica transport scopes are reserved");
   // Ruling Q7: physical stream-sync names never reach the SDK ScopeSchema.
   if (isPhysicalScope(scopeParam))
-    return invalidScope("Stream-sync names are not data scopes");
+    return invalidScope(INVALID_SCOPE_FORMAT_MESSAGE);
   const scopeResult = ScopeSchema.safeParse(scopeParam);
   if (!scopeResult.success) {
     return invalidScope(
