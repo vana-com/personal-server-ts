@@ -112,4 +112,20 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     expect(dec.decode((await files.read("y/0"))!)).toBe("yy2");
     expect(dec.decode((await files.read("x/0"))!)).toBe("x");
   });
+  it("closes idle handles by itself, and sync still reaches the files", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.appendMany([
+      { path: "idle/0", bytes: enc.encode("a") },
+      { path: "idle/1", bytes: enc.encode("b") },
+    ]);
+    expect(await openUnderRoot()).toBeGreaterThan(0);
+    const deadline = Date.now() + 5000;
+    while ((await openUnderRoot()) > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(await openUnderRoot()).toBe(0);
+    await files.appendMany([{ path: "idle/0", bytes: enc.encode("c") }]);
+    await files.sync("idle");
+    expect(dec.decode((await files.read("idle/0"))!)).toBe("ac");
+  });
 });

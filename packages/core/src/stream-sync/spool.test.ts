@@ -1,0 +1,78 @@
+import { describe, expect, it } from "vitest";
+import { shardOf } from "@opendatalabs/personal-server-ts-stream-sync";
+import { createMemoryStreamSyncFiles } from "./memory-files.js";
+import {
+  SpoolWriter,
+  deriveShards,
+  readSpool,
+  shardPath,
+  spoolLogPath,
+} from "./spool.js";
+
+const hashOf = (n: number) => n.toString(16).padStart(64, "0");
+
+async function lines(
+  files: ReturnType<typeof createMemoryStreamSyncFiles>,
+  path: string,
+) {
+  const out: { pkHash: string; text: string }[] = [];
+  for await (const line of readSpool(files, path)) out.push(line);
+  return out;
+}
+
+describe("deriveShards", () => {
+  it("splits the intake log into shards and keeps log order inside each", async () => {
+    const files = createMemoryStreamSyncFiles();
+    const dir = "runs/r/spool/s0";
+    const writer = new SpoolWriter(files);
+    const log = spoolLogPath(dir);
+    // Two keys, each written three times; log order must survive.
+    for (let i = 0; i < 3; i++) {
+      await writer.add(log, hashOf(1), `a${i}`, 2);
+      await writer.add(log, hashOf(2), `b${i}`, 2);
+    }
+    await writer.flush();
+
+    await deriveShards(files, dir);
+
+    for (const key of [1, 2]) {
+      const shard = await lines(files, shardPath(dir, shardOf(hashOf(key))));
+      const own = shard.filter((l) => l.pkHash === hashOf(key));
+      expect(own.map((l) => l.text)).toEqual(
+        [0, 1, 2].map((i) => `${key === 1 ? "a" : "b"}${i}`),
+      );
+    }
+  });
+
+  it("replaces stale or short shards, so a restart can derive again", async () => {
+    const files = createMemoryStreamSyncFiles();
+    const dir = "runs/r/spool/s0";
+    const writer = new SpoolWriter(files);
+    const log = spoolLogPath(dir);
+    for (let i = 0; i < 50; i++) await writer.add(log, hashOf(i), `v${i}`, 3);
+    await writer.flush();
+    await deriveShards(files, dir);
+    const first = new Map<string, string>();
+    for (const path of await files.list(dir)) {
+      first.set(path, new TextDecoder().decode((await files.read(path))!));
+    }
+
+    // A crash left one shard short and one extra shard behind.
+    const [victim] = [...first.keys()];
+    await files.write(victim!, new TextEncoder().encode("garbage\n"));
+    await files.write(`${dir}/zz`, new TextEncoder().encode("extra\n"));
+
+    await deriveShards(files, dir);
+    const second = new Map<string, string>();
+    for (const path of await files.list(dir)) {
+      second.set(path, new TextDecoder().decode((await files.read(path))!));
+    }
+    expect(second).toEqual(first);
+  });
+
+  it("writes nothing for an empty log", async () => {
+    const files = createMemoryStreamSyncFiles();
+    await deriveShards(files, "runs/r/spool/s0");
+    expect(await files.list("runs/r/spool/s0")).toEqual([]);
+  });
+});

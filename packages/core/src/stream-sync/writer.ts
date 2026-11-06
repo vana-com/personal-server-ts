@@ -12,8 +12,10 @@
  *
  *   state.json                         needsFull, checkpoints, seed targets, receipts
  *   runs/<runId>/entry.json            the outbox entry and per-stream host data
- *   runs/<runId>/spool/s<i>/<shard>    run spool of stream i
- *   runs/<runId>/seed/s<i>/<shard>     seed spool of stream i
+ *   runs/<runId>/spool/s<i>.log        intake log of stream i (durable)
+ *   runs/<runId>/spool/s<i>/<shard>    shards of that log (derived, never synced)
+ *   runs/<runId>/seed/s<i>.log         seed log of stream i (durable)
+ *   runs/<runId>/seed/s<i>/<shard>     shards of that log (derived, never synced)
  *   runs/<runId>/excluded.ndjson       record_too_large: stream, key digest, bytes
  *   runs/<runId>/request-s<i>.json     persisted signed request of stream i
  *   runs/<runId>/head-s<i>.bin         persisted head ciphertext of stream i
@@ -99,6 +101,8 @@ import {
 } from "./ports.js";
 import {
   SpoolWriter,
+  deriveShards,
+  spoolLogPath,
   compactShard,
   countShard,
   emptyShardBytes,
@@ -569,13 +573,15 @@ export class StreamSyncWriter {
     }
     bytes[shard]! += size.bytes + 1;
     await run.spool.add(
-      `runs/${runId}/spool/s${info.index}`,
-      shard,
+      spoolLogPath(`runs/${runId}/spool/s${info.index}`),
       hash,
       text,
       size.bytes,
     );
   }
+
+  /** Spool directories whose shards were derived by this process, with bytes. */
+  private readonly derived = new Map<string, number[]>();
 
   private readonly streamCache = new Map<
     string,
@@ -632,9 +638,7 @@ export class StreamSyncWriter {
         return this.statusOf(host);
       }
       for (const [name, stream] of Object.entries(host.streams)) {
-        const bytes = run.shardBytes.get(name) ?? emptyShardBytes();
-        await this.compact(`runs/${runId}/spool/s${stream.index}`, bytes);
-        stream.shardBytes = bytes;
+        stream.shardBytes = run.shardBytes.get(name) ?? emptyShardBytes();
         stream.recordTooLarge = run.recordTooLarge.get(name) ?? 0;
       }
       if (this.options.seed) {
@@ -645,7 +649,7 @@ export class StreamSyncWriter {
         }
       }
       // Intake appends are not durable one by one. The run becomes `ready`
-      // only after one sync of its whole spool (§2.6).
+      // only after one sync of its intake logs (§2.6).
       await this.options.files.sync(`runs/${runId}`);
       host.entry = {
         ...host.entry,
@@ -965,6 +969,8 @@ export class StreamSyncWriter {
     if (stream.seedShardBytes !== null) return;
     const dir = `runs/${host.entry.runId}/seed/s${stream.index}`;
     await this.options.files.remove(dir);
+    await this.options.files.remove(spoolLogPath(dir));
+    this.derived.delete(dir);
     const writer = new SpoolWriter(this.options.files);
     const bytes = emptyShardBytes();
     for await (const record of seed.records(host.entry.connector, name)) {
@@ -983,13 +989,32 @@ export class StreamSyncWriter {
       }
       const shard = shardOf(hash);
       bytes[shard]! += size.bytes + 1;
-      await writer.add(dir, shard, hash, text, size.bytes);
+      await writer.add(spoolLogPath(dir), hash, text, size.bytes);
     }
     await writer.flush();
-    await this.compact(dir, bytes);
-    await this.options.files.sync(dir);
+    await this.options.files.sync(spoolLogPath(dir));
     stream.seedShardBytes = bytes;
     await this.writeEntry(host);
+  }
+
+  /**
+   * Shard counts of a spool whose shards are ready to read. The shards are
+   * derived from the durable intake log and compacted once per process; a
+   * run found after a restart derives them again, because the files were
+   * never synced and may be missing or short. `counted` is the intake count
+   * per shard, which the log still holds.
+   */
+  private async readyShards(
+    dir: string,
+    counted: readonly number[],
+  ): Promise<number[]> {
+    const known = this.derived.get(dir);
+    if (known) return known;
+    await deriveShards(this.options.files, dir);
+    const bytes = [...counted];
+    await this.compact(dir, bytes);
+    this.derived.set(dir, bytes);
+    return bytes;
   }
 
   private async publishStream(host: HostEntry, name: string): Promise<void> {
@@ -1290,6 +1315,9 @@ export class StreamSyncWriter {
       json(this.statusOf(host)),
     );
     await this.options.files.remove(`runs/${runId}`);
+    for (const dir of [...this.derived.keys()]) {
+      if (dir.startsWith(`runs/${runId}/`)) this.derived.delete(dir);
+    }
   }
 
   // --------------------------------------------------------------- merge
@@ -1355,8 +1383,13 @@ export class StreamSyncWriter {
     const stream = host.streams[name]!;
     const runDir = `runs/${host.entry.runId}/spool/s${stream.index}`;
     const seedDir = `runs/${host.entry.runId}/seed/s${stream.index}`;
-    const runBytes = stream.shardBytes ?? emptyShardBytes();
-    const seedBytes = stream.seedShardBytes ?? emptyShardBytes();
+    const runBytes = await this.readyShards(
+      runDir,
+      stream.shardBytes ?? emptyShardBytes(),
+    );
+    const seedBytes = stream.seedShardBytes
+      ? await this.readyShards(seedDir, stream.seedShardBytes)
+      : emptyShardBytes();
     const shardBytes = runBytes.map((b, i) => b + seedBytes[i]!);
     const baseParts = base?.parts ?? [];
 

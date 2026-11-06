@@ -38,6 +38,8 @@ async function fsyncDir(dir: string): Promise<void> {
   }
 }
 
+const IDLE_CLOSE_MS = 200;
+
 export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
   const base = resolve(root);
   let tmpCounter = 0;
@@ -84,6 +86,22 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
     return handle;
   }
 
+  // Idle handles are closed so a finished or abandoned writer holds no
+  // descriptors; the dirty set still lets `sync` reach their files.
+  let appending = 0;
+  let idleTimer: NodeJS.Timeout | undefined;
+  const armIdleClose = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimer = undefined;
+      if (appending > 0) return armIdleClose();
+      const open = [...handles.values()];
+      handles.clear();
+      for (const handle of open) void handle.close().catch(() => {});
+    }, IDLE_CLOSE_MS);
+    idleTimer.unref();
+  };
+
   /** Close the handles of `full` and of every file under it, and forget them. */
   async function release(full: string): Promise<void> {
     const match = under(full);
@@ -93,6 +111,44 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       await handle.close();
     }
     for (const path of [...dirty]) if (match(path)) dirty.delete(path);
+  }
+
+  async function syncUnder(prefix: string): Promise<void> {
+    const match = under(abs(prefix));
+    const files = [...dirty].filter(match);
+    const folders = new Set<string>();
+    let next = 0;
+    const worker = async () => {
+      while (next < files.length) {
+        const full = files[next++]!;
+        const cached = handles.get(full);
+        if (cached) await cached.sync();
+        else {
+          const handle = await open(full, "r");
+          try {
+            await handle.sync();
+          } finally {
+            await handle.close();
+          }
+        }
+        // New files add entries to their directory and, for new
+        // directories, to every ancestor up to the root.
+        for (let dir = dirname(full); under(base)(dir); dir = dirname(dir)) {
+          if (folders.has(dir)) break;
+          folders.add(dir);
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(SYNC_PARALLEL, files.length) }, worker),
+    );
+    for (const dir of folders) await fsyncDir(dir);
+    for (const full of files) dirty.delete(full);
+    for (const [path, handle] of [...handles]) {
+      if (!match(path)) continue;
+      handles.delete(path);
+      await handle.close();
+    }
   }
 
   return {
@@ -122,48 +178,26 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       }
     },
     async appendMany(entries) {
-      for (const { path, bytes } of entries) {
-        const full = abs(path);
-        const handle = await appendHandle(full);
-        await handle.writeFile(bytes);
-        dirty.add(full);
+      appending += 1;
+      try {
+        for (const { path, bytes } of entries) {
+          const full = abs(path);
+          const handle = await appendHandle(full);
+          await handle.writeFile(bytes);
+          dirty.add(full);
+        }
+      } finally {
+        appending -= 1;
+        armIdleClose();
       }
     },
     async sync(prefix) {
-      const match = under(abs(prefix));
-      const files = [...dirty].filter(match);
-      const folders = new Set<string>();
-      let next = 0;
-      const worker = async () => {
-        while (next < files.length) {
-          const full = files[next++]!;
-          const cached = handles.get(full);
-          if (cached) await cached.sync();
-          else {
-            const handle = await open(full, "r");
-            try {
-              await handle.sync();
-            } finally {
-              await handle.close();
-            }
-          }
-          // New files add entries to their directory and, for new
-          // directories, to every ancestor up to the root.
-          for (let dir = dirname(full); under(base)(dir); dir = dirname(dir)) {
-            if (folders.has(dir)) break;
-            folders.add(dir);
-          }
-        }
-      };
-      await Promise.all(
-        Array.from({ length: Math.min(SYNC_PARALLEL, files.length) }, worker),
-      );
-      for (const dir of folders) await fsyncDir(dir);
-      for (const full of files) dirty.delete(full);
-      for (const [path, handle] of [...handles]) {
-        if (!match(path)) continue;
-        handles.delete(path);
-        await handle.close();
+      appending += 1;
+      try {
+        await syncUnder(prefix);
+      } finally {
+        appending -= 1;
+        armIdleClose();
       }
     },
     async *readChunks(path) {

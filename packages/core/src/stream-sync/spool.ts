@@ -1,17 +1,23 @@
 /**
- * Run spool (§2.6): 256 shard files per stream, keyed by the first pkHash
- * byte. A spool line is `<pkHash> <canonical line>\n`. The byte count of a
+ * Run spool (§2.6). A spool line is `<pkHash> <canonical line>\n`.
+ *
+ * Intake appends every line of a stream to one intake log, `<dir>.log`, in
+ * bounded batches, so intake memory does not grow with the stream. The log
+ * is the durable copy: the caller syncs it once, when intake ends
+ * (`StreamSyncFiles.sync`). One file per stream means one fsync per stream,
+ * not one per shard.
+ *
+ * The 256 shard files of `<dir>/<hh>`, keyed by the first pkHash byte, are
+ * derived from the log (`deriveShards`) when a run is planned. They are
+ * never synced and can be derived again at any time. The byte count of a
  * shard counts each canonical line plus its terminator, the same measure as
  * part bytes, so the planner can sum shard counts as run bytes.
- *
- * Appends are buffered and flushed in bounded batches, so intake memory does
- * not grow with the stream. A flush is not durable: the caller syncs the
- * spool directory once, when intake ends (`StreamSyncFiles.sync`).
  */
 
 import {
   BucketReducer,
   SHARD_COUNT,
+  shardOf,
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { StreamSyncFiles } from "./ports.js";
@@ -27,11 +33,16 @@ export function shardPath(dir: string, shard: number): string {
   return `${dir}/${shardName(shard)}`;
 }
 
+/** The durable intake log of the spool whose shards live under `dir`. */
+export function spoolLogPath(dir: string): string {
+  return `${dir}.log`;
+}
+
 export function emptyShardBytes(): number[] {
   return new Array<number>(SHARD_COUNT).fill(0);
 }
 
-/** Buffered appender for the spool shards of one directory. */
+/** Buffered appender for the intake logs of a run. */
 export class SpoolWriter {
   private readonly buffers = new Map<string, string[]>();
   private buffered = 0;
@@ -40,17 +51,15 @@ export class SpoolWriter {
 
   /** Queue one line. `bytes` is the canonical line's UTF-8 length. */
   async add(
-    dir: string,
-    shard: number,
+    logPath: string,
     pkHash: string,
     text: string,
     bytes: number,
   ): Promise<void> {
-    const path = shardPath(dir, shard);
-    let buffer = this.buffers.get(path);
+    let buffer = this.buffers.get(logPath);
     if (!buffer) {
       buffer = [];
-      this.buffers.set(path, buffer);
+      this.buffers.set(logPath, buffer);
     }
     buffer.push(`${pkHash} ${text}\n`);
     this.buffered += bytes + 66;
@@ -68,6 +77,42 @@ export class SpoolWriter {
       })),
     );
   }
+}
+
+/**
+ * Write the 256 shard files of `dir` from the intake log, in log order, so a
+ * later line stays later. Replaces what is there. Memory is one flush batch.
+ */
+export async function deriveShards(
+  files: StreamSyncFiles,
+  dir: string,
+): Promise<void> {
+  await files.remove(dir);
+  const buffers = new Map<number, string[]>();
+  let buffered = 0;
+  const flush = async () => {
+    const pending = [...buffers.entries()];
+    buffers.clear();
+    buffered = 0;
+    await files.appendMany(
+      pending.map(([shard, lines]) => ({
+        path: shardPath(dir, shard),
+        bytes: encoder.encode(lines.join("")),
+      })),
+    );
+  };
+  for await (const line of readSpool(files, spoolLogPath(dir))) {
+    const shard = shardOf(line.pkHash);
+    let buffer = buffers.get(shard);
+    if (!buffer) {
+      buffer = [];
+      buffers.set(shard, buffer);
+    }
+    buffer.push(`${line.pkHash} ${line.text}\n`);
+    buffered += line.text.length + 66;
+    if (buffered >= FLUSH_BYTES) await flush();
+  }
+  await flush();
 }
 
 export interface SpoolLine {
