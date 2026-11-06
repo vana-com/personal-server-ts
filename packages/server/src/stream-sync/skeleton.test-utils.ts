@@ -75,6 +75,24 @@ export interface Hop {
 const hash = (value: unknown): string =>
   createHash("sha256").update(canonicalJson(value)).digest("hex").slice(0, 12);
 
+// ----------------------------------------------------------- stub counter
+
+/**
+ * Every stub registers itself when it is constructed or first used, so the
+ * count reflects what ran, not what a grep finds. Keyed by name: a stub
+ * built once per host counts once. The value says who removes it.
+ */
+const usedStubs = new Map<string, string>();
+
+function registerStub(name: string, removedBy: string): void {
+  usedStubs.set(name, removedBy);
+}
+
+export function stubReport(): { count: number; lines: string[] } {
+  const lines = [...usedStubs].map(([name, by]) => `  ${name} -> ${by}`);
+  return { count: usedStubs.size, lines };
+}
+
 // ---------------------------------------------------------------- intake
 
 /**
@@ -84,7 +102,9 @@ const hash = (value: unknown): string =>
  * binding checks, ordinals or tombstones.
  */
 class StubIntake {
-  constructor(private readonly writer: StreamSyncWriter) {}
+  constructor(private readonly writer: StreamSyncWriter) {
+    registerStub("intake adapter (StubIntake)", "lane P6");
+  }
 
   begin(runId: string, observedAt: number): Promise<void> {
     // SKELETON STUB: identity is always required and `wantFull` is not modelled.
@@ -123,6 +143,7 @@ async function fixtureRun(
   observedAt: number,
   records: readonly Record<string, unknown>[],
 ): Promise<void> {
+  registerStub("connector fixture (fixtureRun)", "lane P6");
   await intake.begin(runId, observedAt);
   await intake.batch(runId, records);
   await intake.end(runId, { cursor: runId });
@@ -145,6 +166,10 @@ interface Host {
 class RegistryFeed {
   private readonly rows = new Map<string, MirrorFeedRow>();
   private clock = T0;
+
+  constructor() {
+    registerStub("registry listing feed (RegistryFeed)", "step 2 of this lane");
+  }
 
   wrap(inner: StreamSyncRegistry): StreamSyncRegistry {
     return interpose(inner, {
@@ -197,6 +222,7 @@ async function makeHost(input: {
     // differ today only by database, so both are built from one recipe.
     // Real differences (lease-less begin, identity source, the frame's
     // postMessage transport) arrive with those lanes.
+    registerStub("phone/frame host recipe", "lanes U6 (phone), U7 (frame)");
     files = createIndexedDbStreamSyncFiles({
       dbName: `skeleton-${input.kind}`,
       factory: new IDBFactory(),
@@ -255,6 +281,7 @@ export async function runSkeleton(): Promise<Hop[]> {
   const feed = new RegistryFeed();
   // SKELETON STUB (oracle lane): in-memory registry with the gateway's
   // exclusive-version rules, in place of the real data-gateway.
+  registerStub("in-memory registry", "step 3 of this lane");
   const registry = feed.wrap(createFakeStreamSyncRegistry());
   const hops: Hop[] = [];
   const hop = (name: string, pass: boolean, detail: string) =>
@@ -325,6 +352,11 @@ export async function runSkeleton(): Promise<Hop[]> {
     await storage.close();
     await rm(root, { recursive: true, force: true });
   }
+}
+
+export function formatStubs(): string {
+  const { count, lines } = stubReport();
+  return [`stubs: ${count}`, ...lines].join("\n");
 }
 
 export function formatHops(hops: readonly Hop[]): string {
