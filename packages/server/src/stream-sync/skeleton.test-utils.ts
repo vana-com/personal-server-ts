@@ -14,8 +14,8 @@
  * server's filesystem adapters and Lite's IndexedDB adapter.
  *
  * Real: the run intake (`createStreamSyncIntake`; the full server reaches it
- * through its HTTP route, PS-Lite in process) and the account taken from the
- * run's own records (R20). Stubbed (each marked `SKELETON STUB`): the
+ * through its HTTP route, PS-Lite in process); every run publishes under the
+ * identity-less name (R23). Stubbed (each marked `SKELETON STUB`): the
  * connector fixture, the registry (in-memory, gateway rules) and its listing
  * feed, and the phone and frame host configuration.
  *
@@ -69,7 +69,6 @@ import {
 
 const CONNECTOR = "skeleton";
 const STREAM = "items";
-const ACCOUNT_ID = "skeleton-account";
 const T0 = Date.UTC(2026, 10, 1);
 const silent = { info() {}, warn() {}, error() {} };
 
@@ -88,13 +87,8 @@ const DIGEST = `sha256:${"5e".repeat(32)}`;
 /** The declarations the fixture connector's artifact digest resolves to. */
 const DECLARATIONS: IntakeDeclarations = {
   version: "1.0.0",
-  streams: [
-    { name: "profile", semantics: "mutable_state", primaryKey: ["id"] },
-    { name: STREAM, semantics: "mutable_state", primaryKey: ["id"] },
-  ],
+  streams: [{ name: STREAM, semantics: "mutable_state", primaryKey: ["id"] }],
 };
-/** R20: the account is the `id` of the run's `profile` record. */
-const ACCOUNT_KEY = { stream: "profile", field: "id" };
 const TOKEN = "skeleton-owner-token";
 
 const noGateway = {
@@ -138,7 +132,7 @@ function httpIntake(intake: StreamSyncIntake): RunIntake {
   };
 }
 
-/** One fixture connector run: the account record, then the items. */
+/** One fixture connector run of one stream; identity-less (R23). */
 async function fixtureRun(
   intake: RunIntake,
   runId: string,
@@ -150,18 +144,14 @@ async function fixtureRun(
     artifactDigest: DIGEST,
     owner: { address: OWNER, leaseId: null },
     observedAt,
-    accountKey: ACCOUNT_KEY,
   });
   await intake.batch(runId, {
     batch: 0,
-    records: [
-      { stream: "profile", data: { id: ACCOUNT_ID } },
-      ...records.map((data) => ({ stream: STREAM, data })),
-    ],
+    records: [...records.map((data) => ({ stream: STREAM, data }))],
   });
   await intake.end(runId, {
     outcome: "succeeded",
-    coveredStreams: ["profile", STREAM],
+    coveredStreams: [STREAM],
     checkpointCandidate: { [STREAM]: runId },
     lastBatch: 0,
   });

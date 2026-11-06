@@ -142,8 +142,6 @@ interface WriterState {
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
   receipts: Record<string, SeedReceipt>;
-  /** R20: the namespace the last identified run of a connector used. */
-  lastNs?: Record<string, string>;
   /** The last three finished-run verdicts per connector, newest last. */
   recent?: Record<string, ("good" | "bad")[]>;
 }
@@ -190,7 +188,7 @@ export type RunOutcome =
   | { readonly kind: "aborted"; readonly reason: AbortReason };
 
 /** Why a run ended without publishing; `discarded` is a run intake dropped. */
-export type AbortReason = "failed" | "cancelled" | "discarded";
+export type AbortReason = "failed" | "cancelled";
 
 interface HostEntry {
   version: 1;
@@ -783,10 +781,8 @@ export class StreamSyncWriter {
    * covered (§3.5): the others are dropped with their spool lines, never
    * published empty. Omit it to publish every declared stream.
    *
-   * The namespace comes from `setAccountIdentity`'s value, else from the one
-   * this connector's last identified run used (R20). A connector that needs
-   * an account and has neither ends `failed` with nothing published and no
-   * checkpoint moved.
+   * An identity-less run (`identity: "none"`, every run the intake adapter
+   * starts, R23) publishes under the identity-less name.
    */
   finishRun(
     runId: string,
@@ -818,19 +814,12 @@ export class StreamSyncWriter {
           connector,
           host.accountId,
         );
-        await this.withState((state) => {
-          (state.lastNs ??= {})[connector] = ns;
-        });
       } else {
-        const last = (await this.readState()).lastNs?.[connector];
-        if (last === undefined) {
-          await this.finish(host, {
-            kind: "failed",
-            why: "the connector's account is in no record of this run and no earlier run named it",
-          });
-          return this.statusOf(host);
-        }
-        ns = last;
+        await this.finish(host, {
+          kind: "failed",
+          why: "the connector declares an account identity and emitted none",
+        });
+        return this.statusOf(host);
       }
       for (const [name, stream] of Object.entries(host.streams)) {
         stream.shardBytes = run.shardBytes.get(name) ?? emptyShardBytes();
@@ -875,8 +864,8 @@ export class StreamSyncWriter {
   }
 
   /**
-   * End a run that must publish nothing (V2 §3.7): `failed`, `cancelled`, or
-   * `discarded` (intake dropped it). Idempotent for a run this process
+   * End a run that must publish nothing (V2 §3.7): `failed` or `cancelled`.
+   * Idempotent for a run this process
    * already ended; a run it never drove answers `RunGoneError`.
    */
   abortRun(runId: string, reason: AbortReason): Promise<void> {
@@ -915,7 +904,6 @@ export class StreamSyncWriter {
       this.forget(runId);
       this.keepCovered(host, []);
       const connector = host.entry.connector;
-      const last = (await this.readState()).lastNs?.[connector];
       const ns =
         host.identity === "none"
           ? IDENTITYLESS_NS
@@ -925,7 +913,7 @@ export class StreamSyncWriter {
                 connector,
                 host.accountId,
               )
-            : last;
+            : undefined;
       if (ns === undefined) {
         await this.finish(host, {
           kind: "failed",

@@ -1,6 +1,6 @@
 /**
  * Run intake: the entry point every app uses to feed whole-file stream sync
- * (run-intake contract v2, §2, as reduced by rulings R17-R20).
+ * (run-intake contract v2, §2, as reduced by rulings R17-R19 and R23).
  *
  *   begin  -> batches (ordered) -> end      or      abort
  *
@@ -14,10 +14,9 @@
  * producer name a primary key: the stream shapes come from a declaration
  * table that host code filled after it verified the artifact (§6).
  *
- * The account is read from the run's own records (R20). `begin` names one
- * `accountKey {stream, field}`; the adapter takes that field from the
- * records of that stream. Two different values, or an unusable one, make the
- * run `will_discard`: stream sync drops it, the legacy copy is unaffected.
+ * There is no account derivation (R23): every run publishes under the
+ * identity-less name. A run is `will_discard` only while the registry is
+ * unreachable; stream sync drops it, the legacy copy is unaffected.
  */
 
 import {
@@ -103,8 +102,6 @@ export interface BeginRequest {
   /** True only for an owner-started run whose profile mode is full. */
   readonly wantFull?: boolean;
   readonly observedAt?: number;
-  /** Where the account id sits in this connector's records (R20). */
-  readonly accountKey?: { readonly stream: string; readonly field: string };
   /**
    * The scope the producer will put in START, per stream. Used only to
    * refuse `fields` and `resources` (R17).
@@ -192,7 +189,6 @@ export interface StreamSyncIntakeOptions {
 
 const RUN_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const OWNER = /^0x[0-9a-fA-F]{40}$/;
-const ACCOUNT_VALUE_MAX = 256;
 const ENDED_MEMORY = 1024;
 
 interface Run {
@@ -202,17 +198,13 @@ interface Run {
   readonly decl: Map<string, IntakeStreamDeclaration>;
   readonly version: string;
   readonly binding: { owner: string; keyCheck: string; leaseId: string | null };
-  readonly accountKey: { stream: string; field: string } | null;
   /** The run reached the writer; a dropped one never did. */
   inWriter: boolean;
   willDiscard: boolean;
-  account: string | null;
   lastBatch: number;
   deletesSkipped: number;
   /** A stream with at least one record: its candidate cursor is not safe. */
   hadRecords: boolean;
-  /** The writer already counted this run as a failure. */
-  counted: boolean;
 }
 
 function invalid(message: string): RunIntakeError {
@@ -239,18 +231,6 @@ function checkName(connector: string, stream: string): void {
   if (connector.includes("|") || stream.includes("|")) {
     throw invalid("names may not contain '|'");
   }
-}
-
-/** R20: one provider id, a string or an integer, 1-256 characters. */
-function accountValue(value: unknown): string | null {
-  const text =
-    typeof value === "string"
-      ? value
-      : typeof value === "number" && Number.isSafeInteger(value)
-        ? String(value)
-        : null;
-  if (text === null) return null;
-  return text.length >= 1 && text.length <= ACCOUNT_VALUE_MAX ? text : null;
 }
 
 export class StreamSyncIntake implements RunIntake {
@@ -316,17 +296,6 @@ export class StreamSyncIntake implements RunIntake {
     if (!declarations) throw new RunIntakeError("unknown_artifact");
     const decl = new Map(declarations.streams.map((d) => [d.name, d]));
     for (const d of declarations.streams) checkName(connector, d.name);
-    if (req.accountKey) {
-      const key = req.accountKey;
-      if (
-        typeof key.stream !== "string" ||
-        typeof key.field !== "string" ||
-        key.field === "" ||
-        !decl.has(key.stream)
-      ) {
-        throw invalid("accountKey must name a declared stream and a field");
-      }
-    }
     for (const entry of req.streams ?? []) {
       if (!decl.has(entry.name)) {
         throw invalid(`stream ${String(entry.name)} is not declared`);
@@ -354,7 +323,6 @@ export class StreamSyncIntake implements RunIntake {
     }
 
     const wantFull = req.wantFull === true;
-    const identity = req.accountKey ? "required" : "none";
     let collection: "full_refresh" | "incremental";
     let state: JsonValue | null;
     let keyCheck: string;
@@ -372,7 +340,7 @@ export class StreamSyncIntake implements RunIntake {
           ...(req.observedAt !== undefined
             ? { observedAt: req.observedAt }
             : {}),
-          identity,
+          identity: "none",
           issue: { wantFull },
           leaseId: owner.leaseId,
         });
@@ -411,16 +379,11 @@ export class StreamSyncIntake implements RunIntake {
       decl,
       version: declarations.version,
       binding: { owner: now.owner, keyCheck, leaseId: owner.leaseId },
-      accountKey: req.accountKey
-        ? { stream: req.accountKey.stream, field: req.accountKey.field }
-        : null,
       inWriter: !willDiscard,
       willDiscard,
-      account: null,
       lastBatch: -1,
       deletesSkipped: 0,
       hadRecords: false,
-      counted: false,
     });
     return response;
   }
@@ -494,14 +457,6 @@ export class StreamSyncIntake implements RunIntake {
         continue;
       }
       if (run.willDiscard) continue;
-      if (run.accountKey?.stream === record.stream) {
-        const value = accountValue(record.data[run.accountKey.field]);
-        if (value === null || (run.account !== null && value !== run.account)) {
-          await this.discard(runId, run);
-          continue;
-        }
-        run.account = value;
-      }
       const decl = run.decl.get(record.stream)!;
       const profile: HeadProfile = { key: null, version: run.version };
       const spooled = await this.options.writer.append(
@@ -573,14 +528,13 @@ export class StreamSyncIntake implements RunIntake {
     }
 
     if (run.willDiscard) {
-      await this.finishWithout(runId, run, "discarded");
+      // Never reached the writer: count it for the stuck check and forget it.
+      await writer.noteDropped(run.connector);
+      this.forget(runId);
       return { result: "discarded", stuck: await writer.stuck(run.connector) };
     }
 
     if (req.outcome === "retry_pending") {
-      if (run.account !== null) {
-        await writer.setAccountIdentity(runId, run.account);
-      }
       const status = await writer.saveCheckpointOnly(
         runId,
         (candidate ?? {}) as Record<string, JsonValue>,
@@ -614,8 +568,6 @@ export class StreamSyncIntake implements RunIntake {
         incremental: decl.incremental !== false,
       });
     }
-    if (run.account !== null)
-      await writer.setAccountIdentity(runId, run.account);
     const status = await writer.finishRun(runId, {
       checkpointCandidate: keys.length > 0 ? (candidate as JsonValue) : null,
       coveredStreams: covered,
@@ -666,7 +618,7 @@ export class StreamSyncIntake implements RunIntake {
   private async finishWithout(
     runId: string,
     run: Run,
-    reason: "failed" | "cancelled" | "discarded",
+    reason: "failed" | "cancelled",
   ): Promise<void> {
     if (run.inWriter) {
       try {
@@ -674,23 +626,10 @@ export class StreamSyncIntake implements RunIntake {
       } catch (error) {
         if (!(error instanceof RunGoneError)) throw error;
       }
-    } else if (reason !== "cancelled" && !run.counted) {
+    } else if (reason !== "cancelled") {
       await this.options.writer.noteDropped(run.connector);
     }
     this.forget(runId);
-  }
-
-  /** The run's account is unusable: stream sync drops it, legacy delivers. */
-  private async discard(runId: string, run: Run): Promise<void> {
-    run.willDiscard = true;
-    if (!run.inWriter) return;
-    run.inWriter = false;
-    run.counted = true;
-    try {
-      await this.options.writer.abortRun(runId, "discarded");
-    } catch (error) {
-      if (!(error instanceof RunGoneError)) throw error;
-    }
   }
 
   private forget(runId: string): void {

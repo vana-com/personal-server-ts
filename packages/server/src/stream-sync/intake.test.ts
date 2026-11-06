@@ -1,5 +1,5 @@
 /**
- * Run intake (run-intake contract v2, rulings R17-R20): the real adapter over
+ * Run intake (run-intake contract v2, rulings R17-R19 and R23): the real adapter over
  * the real writer, the production storage adapter against a local blob store
  * and the in-memory exclusive-version registry.
  */
@@ -9,7 +9,6 @@ import type { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/str
 import {
   RunIntakeError,
   createStreamSyncIntake,
-  createStreamSyncKeyPorts,
   type BeginRequest,
   type IntakeDeclarations,
   type StreamSyncBlobs,
@@ -17,10 +16,8 @@ import {
   type StreamSyncRegistry,
   type StreamSyncWriterOptions,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import { deriveNs } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   OWNER,
-  OWNER_SIGNATURE,
   createOracleEnv,
   finishedOutcome,
   freshConnector,
@@ -46,7 +43,6 @@ const DECLARATIONS: IntakeDeclarations = {
     { name: "export", semantics: "mutable_state", primaryKey: ["id"] },
   ],
 };
-const keys = createStreamSyncKeyPorts(OWNER_SIGNATURE);
 
 let storage: Awaited<ReturnType<typeof startLocalStorage>>;
 let env: OracleEnv;
@@ -701,186 +697,24 @@ describe("run intake", { timeout: 30_000 }, () => {
   });
 });
 
-describe(
-  "run intake: the account comes from the records (R20)",
-  { timeout: 30_000 },
-  () => {
-    const key = { stream: "profile", field: "id" };
-    const nsOf = (c: string, account: string) =>
-      deriveNs((m) => keys.namespaceHmac(m), c, account);
-
-    it("publishes under the namespace of the key stream's value", async () => {
-      const c = freshConnector("acct");
-      const h = await host();
-      const { ended } = await run(h, "r1", c, {
-        records: [
-          { stream: "profile", data: { id: "acct-1" } },
-          { stream: "items", data: row("a") },
-        ],
-        covered: ["profile", "items"],
-        candidate: { items: "c1" },
-        begin: { accountKey: key },
-      });
-      expect(ended.result).toBe("queued");
-      const { finished } = await publish(h, "r1");
-      expect(finished?.ns).toBe(await nsOf(c, "acct-1"));
-      expect(finished?.outcome?.kind).toBe("checkpointed");
-      const items = await readStream(
-        env.registry,
-        env.blobs,
-        c,
-        finished!.ns!,
-        "items",
-      );
-      expect(items).not.toBeNull();
+describe("run intake: no account derivation (R23)", { timeout: 30_000 }, () => {
+  it("publishes every connector under the identity-less name", async () => {
+    const c = freshConnector("acct-less");
+    const h = await host();
+    await run(h, "r1", c, {
+      records: [
+        { stream: "profile", data: { id: "acct-1" } },
+        { stream: "items", data: row("a") },
+      ],
+      covered: ["profile", "items"],
+      candidate: { items: "c1" },
     });
-
-    it("accepts an integer account value", async () => {
-      const c = freshConnector("acct-int");
-      const h = await host();
-      const { ended } = await run(h, "r1", c, {
-        records: [{ stream: "profile", data: { id: 42 } }],
-        covered: ["profile"],
-        begin: { accountKey: key },
-      });
-      expect(ended.result).toBe("queued");
-      expect((await publish(h, "r1")).finished?.ns).toBe(await nsOf(c, "42"));
-    });
-
-    it.each([
-      ["an empty string", ""],
-      ["a string over 256 characters", "x".repeat(257)],
-      ["a non-integer number", 1.5],
-      ["an object", { nested: true }],
-      ["null", null],
-    ])("drops a run whose account value is %s", async (_label, value) => {
-      const c = freshConnector("acct-bad");
-      const h = await host();
-      const { ended } = await run(h, "r1", c, {
-        records: [
-          { stream: "profile", data: { id: value } },
-          { stream: "items", data: row("a") },
-        ],
-        covered: ["profile", "items"],
-        candidate: { items: "c" },
-        begin: { accountKey: key },
-      });
-      expect(ended.result).toBe("discarded");
-      const { status } = await publish(h, "r1");
-      expect(status.checkpoints[c]).toBeUndefined();
-      expect(
-        await readStream(env.registry, env.blobs, c, "", "items"),
-      ).toBeNull();
-    });
-
-    it("accepts a 256-character account value", async () => {
-      const c = freshConnector("acct-256");
-      const h = await host();
-      const { ended } = await run(h, "r1", c, {
-        records: [{ stream: "profile", data: { id: "x".repeat(256) } }],
-        covered: ["profile"],
-        begin: { accountKey: key },
-      });
-      expect(ended.result).toBe("queued");
-    });
-
-    it("drops a run with two different account values (will_discard)", async () => {
-      const c = freshConnector("acct-two");
-      const h = await host();
-      const { ended } = await run(h, "r1", c, {
-        records: [
-          { stream: "profile", data: { id: "one" } },
-          { stream: "profile", data: { id: "two" } },
-          { stream: "items", data: row("a") },
-        ],
-        covered: ["profile", "items"],
-        candidate: { items: "c" },
-        begin: { accountKey: key },
-      });
-      expect(ended.result).toBe("discarded");
-      const { status } = await publish(h, "r1");
-      expect(status.checkpoints[c]).toBeUndefined();
-      expect(
-        await readStream(
-          env.registry,
-          env.blobs,
-          c,
-          await nsOf(c, "one"),
-          "items",
-        ),
-      ).toBeNull();
-      expect(
-        await readStream(
-          env.registry,
-          env.blobs,
-          c,
-          await nsOf(c, "two"),
-          "items",
-        ),
-      ).toBeNull();
-    });
-
-    it("reuses the stored namespace when the key stream is absent", async () => {
-      const c = freshConnector("acct-reuse");
-      const h = await host();
-      await run(h, "r1", c, {
-        records: [
-          { stream: "profile", data: { id: "acct-9" } },
-          { stream: "items", data: row("a") },
-        ],
-        covered: ["profile", "items"],
-        candidate: { items: "c1" },
-        begin: { accountKey: key },
-      });
-      await publish(h, "r1");
-      const { ended } = await run(h, "r2", c, {
-        records: [{ stream: "items", data: row("b") }],
-        covered: ["items"],
-        candidate: { items: "c2" },
-        begin: { accountKey: key, observedAt: T0 + 10 },
-      });
-      expect(ended.result).toBe("queued");
-      const { finished } = await publish(h, "r2");
-      expect(finished?.ns).toBe(await nsOf(c, "acct-9"));
-      const items = await readStream(
-        env.registry,
-        env.blobs,
-        c,
-        finished!.ns!,
-        "items",
-      );
-      expect(
-        [...(items as { records: Map<string, unknown> }).records.keys()].sort(),
-      ).toEqual(["a", "b"]);
-    });
-
-    it("drops a first run without the key stream (legacy only)", async () => {
-      const c = freshConnector("acct-none");
-      const h = await host();
-      const { ended } = await run(h, "r1", c, {
-        records: [{ stream: "items", data: row("a") }],
-        covered: ["items"],
-        candidate: { items: "c1" },
-        begin: { accountKey: key },
-      });
-      expect(ended.result).toBe("discarded");
-      const { status, finished } = await publish(h, "r1");
-      expect(finished?.outcome?.kind).toBe("failed");
-      expect(status.checkpoints[c]).toBeUndefined();
-      expect(
-        await readStream(env.registry, env.blobs, c, "", "items"),
-      ).toBeNull();
-    });
-
-    it("uses the identity-less name when the connector has no account key", async () => {
-      const c = freshConnector("acct-less");
-      const h = await host();
-      await run(h, "r1", c, {
-        records: [{ stream: "items", data: row("a") }],
-        covered: ["items"],
-      });
-      const { finished } = await publish(h, "r1");
-      expect(finished?.ns).toBe("");
-    });
-  },
-);
+    const { finished } = await publish(h, "r1");
+    expect(finished?.ns).toBe("");
+    expect(finished?.outcome?.kind).toBe("checkpointed");
+    // The scope is pdpp.<connector>~.<stream>: nothing is derived from a record.
+    expect(
+      await readStream(env.registry, env.blobs, c, "", "items"),
+    ).not.toBeNull();
+  });
+});
