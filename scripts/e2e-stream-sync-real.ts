@@ -12,9 +12,9 @@
  * Stop the stack:
  *   bash scripts/stream-sync-real/down.sh
  *
- * Run drivers (how a connector run reaches a writer):
- *   STREAM_SYNC_REAL_DRIVER=writer  (default today) calls the writer in the
- *     process that owns it. Counted as a stub until run intake lands.
+ * How a connector run reaches a writer: the full server's run is still a
+ * fixture that calls its writer in-process (a stub); PS-Lite's run goes through
+ * its run intake, the same code the phone app calls.
  *
  * Prints counts and truncated hashes only, never record bodies or ids.
  */
@@ -101,6 +101,12 @@ function stackEnv(): { gatewayUrl: string; storageUrl: string; pg: string } {
     pg: get("STREAM_SYNC_REAL_PG_NAME"),
   };
 }
+
+const INTAKE_DIGEST = `sha256:${"5e".repeat(32)}`;
+const INTAKE_DECLARATIONS = {
+  version: "1.0.0",
+  streams: [{ name: STREAM, semantics: "mutable_state", primaryKey: ["id"] }],
+} as const;
 
 const stubs = new Map<string, string>();
 const stub = (name: string, removedBy: string) => stubs.set(name, removedBy);
@@ -259,9 +265,15 @@ async function main(): Promise<number> {
           ownerSigner.signLineageAttestation.bind(ownerSigner),
       } as never,
       streamSyncRead: {},
+      // The host's declaration table: only this digest resolves.
+      streamSyncDeclarations: (digest: string) =>
+        digest === INTAKE_DIGEST ? INTAKE_DECLARATIONS : null,
     });
     const liteWriter = lite.streamSyncWriter;
-    if (!liteWriter) throw new Error("PS-Lite has no stream-sync writer");
+    const liteIntake = lite.streamSyncIntake;
+    if (!liteWriter || !liteIntake) {
+      throw new Error("PS-Lite has no stream-sync writer or run intake");
+    }
     const accessLog = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
       storage,
@@ -346,13 +358,32 @@ async function main(): Promise<number> {
     await check("read: PS-Lite (app runtime) sees the record", "lite", [first]);
 
     // Reverse: PS-Lite publishes, both read.
-    await liteWriter.refreshControls();
-    await fixtureRun(liteWriter, "real-run-2", T0 + 60_000, [second]);
+    // The phone's path: PS-Lite's own run intake (begin, batch, end), then the
+    // sync manager's publish pass. Only the fixture records are a stand-in.
+    stub("connector fixture (synthetic records)", "a real connector run");
+    await liteIntake.begin("real-run-2", {
+      connector: CONNECTOR,
+      artifactDigest: INTAKE_DIGEST,
+      owner: { address: owner.address, leaseId: null },
+      observedAt: T0 + 60_000,
+    });
+    await liteIntake.batch("real-run-2", {
+      batch: 0,
+      // A full-refresh run of a mutable stream is a snapshot: it carries the
+      // record run 1 published too, or the stream would lose it.
+      records: [first, second].map((data) => ({ stream: STREAM, data })),
+    });
+    await liteIntake.end("real-run-2", {
+      outcome: "succeeded",
+      coveredStreams: [STREAM],
+      checkpointCandidate: { [STREAM]: "real-run-2" },
+      lastBatch: 0,
+    });
     const r2 = (await liteWriter.cycle()).runs.find(
       (r) => r.runId === "real-run-2",
     );
     hop(
-      "write: PS-Lite publishes run 2",
+      "write: PS-Lite publishes run 2 (through its run intake)",
       r2?.outcome?.kind === "checkpointed",
       `outcome=${r2?.outcome?.kind ?? "none"} expected=${hash(second)}`,
     );
