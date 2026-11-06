@@ -34,6 +34,7 @@ import {
   StreamSyncWriter,
   createStreamSyncKeyPorts,
   type StreamSyncFiles,
+  createGatewayStreamSyncRegistry,
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
@@ -253,9 +254,18 @@ export async function runSkeleton(): Promise<Hop[]> {
   const root = await mkdtemp(join(tmpdir(), "stream-sync-skeleton-"));
   const storage = await startLocalStorage();
   const feed = new RegistryFeed();
-  // SKELETON STUB (oracle lane): in-memory registry with the gateway's
-  // exclusive-version rules, in place of the real data-gateway.
-  const registry = feed.wrap(createFakeStreamSyncRegistry());
+  // With STREAM_SYNC_ORACLE_GATEWAY_URL set the registry is the real
+  // data-gateway. Otherwise it is an in-memory registry with the gateway's
+  // exclusive-version rules, which is a SKELETON STUB.
+  const gatewayUrl = process.env.STREAM_SYNC_ORACLE_GATEWAY_URL;
+  const registry = feed.wrap(
+    gatewayUrl
+      ? createGatewayStreamSyncRegistry({ gatewayUrl, ownerAddress: OWNER })
+      : createFakeStreamSyncRegistry(),
+  );
+  process.stdout.write(
+    `registry: ${gatewayUrl ? "real data-gateway" : "in-memory STUB"}\n`,
+  );
   const hops: Hop[] = [];
   const hop = (name: string, pass: boolean, detail: string) =>
     hops.push({ name, pass, detail });
