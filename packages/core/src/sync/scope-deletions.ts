@@ -508,3 +508,46 @@ export function isEntryCoveredByTombstone(
   }
   return BigInt(marker) < tombstoned;
 }
+
+/**
+ * True when a gateway tombstone covers a canonical body whose re-add marker
+ * acknowledges `readd` (see `LegacyScopeAuthority.canonicalReaddVersion`),
+ * decided by registry versions exactly as `isEntryCoveredByTombstone` decides
+ * a file's ingest marker, never by clocks:
+ *   - no marker covers it (the rows cannot show they came after the delete);
+ *   - a tombstone of unknown version covers it;
+ *   - a tombstone later than the acknowledged one covers it.
+ */
+export function isCanonicalReaddCoveredByTombstone(
+  readd: string | null | undefined,
+  tombstone: Pick<ScopeTombstone, "version">,
+): boolean {
+  const acknowledged = normalizeVersion(readd ?? null);
+  const version = normalizeVersion(tombstone.version);
+  if (acknowledged === null || version === null) return true;
+  return BigInt(acknowledged) < BigInt(version);
+}
+
+/**
+ * The tombstone `scope` currently stands under when a write commits, from
+ * the tracker's local state only (no gateway round trip on the write path).
+ * This mirrors a file's ingest marker, which records the current verdict and
+ * never the durable history: a write is a re-add only when it lands on top of
+ * the deletion. While the registry shows the scope live (a re-add elsewhere),
+ * the write acknowledges nothing, so the retained history keeps covering it.
+ *   - `none`: the scope is not known to be deleted now.
+ *   - `unknown`: the tombstone has no registry version; nothing can be
+ *     acknowledged (such a tombstone covers everything).
+ *   - otherwise that tombstone's version.
+ * A tombstone learned after the write is not acknowledged by it, so it still
+ * covers the rows: the same causal rule as `afterTombstoneVersion`.
+ */
+export function knownTombstoneVersion(
+  tracker: Pick<ScopeDeletionTracker, "knownDeletion">,
+  scope: string,
+): { kind: "none" } | { kind: "unknown" } | { kind: "known"; version: string } {
+  const current = tracker.knownDeletion(scope);
+  if (current === null) return { kind: "none" };
+  const version = normalizeVersion(current.version);
+  return version === null ? { kind: "unknown" } : { kind: "known", version };
+}

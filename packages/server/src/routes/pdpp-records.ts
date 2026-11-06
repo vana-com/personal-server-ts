@@ -42,6 +42,11 @@ import {
   StreamCompletionError,
   type StreamCompletionFailure,
 } from "../storage/pdpp-stream-completion.js";
+import type { StreamCompletionReceipt } from "../storage/pdpp-records-sqlite-store.js";
+import type {
+  CanonicalReaddIntent,
+  CanonicalReaddMarkers,
+} from "../storage/canonical-readd-markers.js";
 
 export const MAX_BLOB_UPLOAD_BYTES = REPLICA_SOURCE_MAX_BLOB_BYTES;
 
@@ -225,12 +230,22 @@ export interface PdppRecordsRouteDeps {
       mimeType: string;
     }): ReturnType<PdppRecordStore["storeBlobBytes"]>;
     replaceStream: ReturnType<typeof createSqliteRecordStore>["replaceStream"];
+    /** Read right after a proven replace for its fresh receipt. */
+    listStreamCompletions?: ReturnType<
+      typeof createSqliteRecordStore
+    >["listStreamCompletions"];
     /** Absent on a store that cannot record completion metadata. */
     completeStreams?: ReturnType<
       typeof createSqliteRecordStore
     >["completeStreams"];
   };
   configuredMethods?: Map<string, string[]>;
+  /**
+   * Canonical re-add markers (see `createCanonicalReaddMarkers`). Each proven
+   * full replacement records the tombstones this server knew before it
+   * committed. Absent: no proven write re-adds a deleted scope.
+   */
+  canonicalReadd?: CanonicalReaddMarkers;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   /** The exact owner of this Personal Server; required for ingest. */
@@ -410,6 +425,76 @@ function logApiError(
     },
     "PDPP resource server error",
   );
+}
+
+type ReceiptIdentity = {
+  stream: string;
+  writeSeq: number;
+  sourceCollectedAt: string;
+};
+
+/** Receipts stored now; undefined when this store cannot list them. */
+function receiptsOf(
+  bindingStore: NonNullable<PdppRecordsRouteDeps["bindingStore"]>,
+  instance: string,
+): StreamCompletionReceipt[] | undefined {
+  return bindingStore.listStreamCompletions?.(instance);
+}
+
+/**
+ * Receipts this write created or replaced. One identical to a receipt stored
+ * before the write (an exact completion replay) is not fresh evidence.
+ */
+function freshReceipts<T extends ReceiptIdentity>(
+  prior: readonly ReceiptIdentity[],
+  after: readonly T[],
+): T[] {
+  return after.filter(
+    (receipt) =>
+      !prior.some(
+        (old) =>
+          old.stream === receipt.stream &&
+          old.writeSeq === receipt.writeSeq &&
+          old.sourceCollectedAt === receipt.sourceCollectedAt,
+      ),
+  );
+}
+
+/** The tombstones a proven write acknowledges; none when they cannot be read. */
+function acknowledgeReadd(
+  deps: PdppRecordsRouteDeps,
+  method: string,
+  streams: readonly string[],
+): CanonicalReaddIntent | undefined {
+  try {
+    return deps.canonicalReadd?.acknowledge(method, streams);
+  } catch (err) {
+    deps.logger?.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      "Deletion state was unreadable; this write re-adds no deleted scope",
+    );
+    return undefined;
+  }
+}
+
+/**
+ * Record canonical re-add markers for a committed proven write. The write has
+ * already succeeded: a failure here leaves the scope refused (no marker), so
+ * it is logged, never turned into a failed write the producer would retry.
+ */
+function recordReadd(
+  deps: PdppRecordsRouteDeps,
+  intent: CanonicalReaddIntent,
+  receipts: Parameters<CanonicalReaddMarkers["record"]>[1],
+): void {
+  try {
+    deps.canonicalReadd?.record(intent, receipts);
+  } catch (err) {
+    deps.logger?.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      "Canonical re-add marker was not recorded; the deleted scope stays refused",
+    );
+  }
 }
 
 /**
@@ -1524,6 +1609,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           );
         }
 
+        // Proven only with a fresh receipt: `source_collected_at`. Taken in
+        // the same synchronous turn as the write, so a tombstone learned
+        // after it is never acknowledged by it.
+        const readdIntent =
+          sourceCollectedAt === undefined
+            ? undefined
+            : acknowledgeReadd(deps, method, [stream]);
+        const priorReceipts = readdIntent
+          ? receiptsOf(bindingStore, instance)
+          : undefined;
         const result = bindingStore.replaceStream({
           instance,
           stream,
@@ -1550,6 +1645,21 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             };
           }),
         });
+        if (result.applied && readdIntent && priorReceipts) {
+          recordReadd(
+            deps,
+            readdIntent,
+            freshReceipts(
+              priorReceipts,
+              (receiptsOf(bindingStore, instance) ?? []).filter(
+                (receipt) =>
+                  receipt.stream === stream &&
+                  receipt.method === method &&
+                  receipt.generation === generation,
+              ),
+            ),
+          );
+        }
         if (!result.applied) {
           return c.json(
             {
@@ -1733,6 +1843,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           throw new PdppBindingError("source_mismatch");
         }
 
+        const readdIntent = acknowledgeReadd(
+          deps,
+          method,
+          (streams as Record<string, unknown>[]).map(
+            (entry) => entry.stream as string,
+          ),
+        );
+        const priorReceipts = readdIntent
+          ? receiptsOf(bindingStore, wire.instance)
+          : undefined;
         const result = completeStreams(
           {
             instance: wire.instance,
@@ -1752,6 +1872,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           (sourceId, stream) =>
             deps.declarations.get(stream, sourceId)?.primaryKey,
         );
+        if (readdIntent && priorReceipts) {
+          // An exact replay keeps the prior receipt; it proves nothing new.
+          recordReadd(
+            deps,
+            readdIntent,
+            freshReceipts(priorReceipts, result.receipts),
+          );
+        }
         return c.json(
           {
             receipts: result.receipts.map((receipt) => ({

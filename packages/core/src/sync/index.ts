@@ -72,7 +72,9 @@ export { computeDataPointId } from "./data-point-id.js";
 export {
   createScopeDeletionTracker,
   deletionTimestamp,
+  isCanonicalReaddCoveredByTombstone,
   isEntryCoveredByTombstone,
+  knownTombstoneVersion,
   tombstoneVersion,
   DEFAULT_SCOPE_DELETION_GATEWAY_RETRY_MS,
   DEFAULT_SCOPE_DELETION_MAX_STALENESS_MS,

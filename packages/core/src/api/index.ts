@@ -21,8 +21,10 @@ import type { DataReadPolicyPorts } from "../policy/index.js";
 import type { SyncManager } from "../sync/index.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
+  isCanonicalReaddCoveredByTombstone,
   isEntryCoveredByTombstone,
   type ScopeDeletionTracker,
+  type ScopeTombstone,
 } from "../sync/scope-deletions.js";
 import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
 import {
@@ -96,6 +98,7 @@ import type { LineageGatewayPort } from "../lineage/gateway.js";
 import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
+  canonicalReaddOf,
   deletionHistoryOf,
   type LegacyScopeRefusal,
   type LegacyScopeViewPort,
@@ -1153,6 +1156,21 @@ async function parseProducerProvenance(
 }
 
 /**
+ * What a body judged by its canonical deletion history brings to the
+ * judgement, decided by the view together with the body.
+ *
+ * - `readd`: the tombstone version the scope's canonical re-add marker
+ *   acknowledges (`canonicalReaddOf`), or null.
+ * - `servedFile`: when the body is a legacy file (the view kept it while
+ *   connection rows own the scope), that file's index entry; null when it is
+ *   unknown. Absent for a canonical body.
+ */
+export interface CanonicalDeletionEvidence {
+  readd: string | null;
+  servedFile?: ReadDeletionEntry | null;
+}
+
+/**
  * The deletion that applies to a read of `scope`, or null when the read may
  * be served. `entry` is the local version the read would serve (undefined
  * on a local miss).
@@ -1160,6 +1178,11 @@ async function parseProducerProvenance(
  * - A local copy is refused when the gateway holds a tombstone that covers
  *   it (see `isEntryCoveredByTombstone`: registry versions and the ingest
  *   marker, never clocks). A local re-add on top of the tombstone is served.
+ * - A body judged by its canonical history (`body: "canonical"`) is refused
+ *   while any known tombstone (the durable deletion history or the current
+ *   verdict) covers its canonical re-add marker (see
+ *   `isCanonicalReaddCoveredByTombstone`). A live DPv2 file never clears it.
+ *   A file served under that history must also clear its own marker.
  * - A local miss asks the tracker to consult the gateway (bounded by its
  *   per-scope verdict cache and failure back-off): the local index cannot
  *   tell "deleted long ago" from "never had it".
@@ -1172,6 +1195,7 @@ export async function resolveReadDeletion(
   entry: ReadDeletionEntry | null | undefined,
   body: "file" | "canonical" = "file",
   gatewayTimeoutMs?: number,
+  canonical?: CanonicalDeletionEvidence,
 ): Promise<{
   scope: string;
   dataPointId: string | null;
@@ -1182,29 +1206,40 @@ export async function resolveReadDeletion(
     consultGateway: entry ? "if-stale" : "always",
     ...(gatewayTimeoutMs === undefined ? {} : { gatewayTimeoutMs }),
   });
-  // A live DPv2 file cannot establish that a different canonical body was
-  // re-added. Keep this refusal until a genuine canonical re-add seam exists.
-  const tombstone =
-    body === "canonical"
-      ? (deps.scopeDeletions.deletionHistory?.get(scope) ??
-        (verdict.deleted ? verdict : null))
-      : verdict.deleted
-        ? verdict
+  const current: ScopeTombstone | null = verdict.deleted ? verdict : null;
+  let covering: ScopeTombstone | null;
+  if (body === "canonical") {
+    // Only a canonical re-add marker can clear a canonical body; a live DPv2
+    // file cannot establish that a different canonical body was re-added.
+    const known = [
+      deps.scopeDeletions.deletionHistory?.get(scope) ?? null,
+      current,
+    ].filter((tombstone): tombstone is ScopeTombstone => tombstone !== null);
+    const readd = canonical?.readd ?? null;
+    covering =
+      known.find((tombstone) =>
+        isCanonicalReaddCoveredByTombstone(readd, tombstone),
+      ) ?? null;
+    if (!covering && canonical?.servedFile !== undefined) {
+      const file = canonical.servedFile;
+      covering =
+        known.find(
+          (tombstone) => !file || isEntryCoveredByTombstone(file, tombstone),
+        ) ?? null;
+    }
+  } else {
+    covering =
+      current && !(entry && !isEntryCoveredByTombstone(entry, current))
+        ? current
         : null;
-  if (!tombstone) return null;
-  if (
-    body === "file" &&
-    entry &&
-    !isEntryCoveredByTombstone(entry, tombstone)
-  ) {
-    return null;
   }
+  if (!covering) return null;
   return {
     scope,
     dataPointId: deps.serverOwner
       ? computeDataPointId(deps.serverOwner, scope)
       : null,
-    deletedAt: tombstone.deletedAt,
+    deletedAt: covering.deletedAt,
   };
 }
 
@@ -1218,8 +1253,16 @@ export async function assertScopeNotDeleted(
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
   body: "file" | "canonical" = "file",
+  canonical?: CanonicalDeletionEvidence,
 ): Promise<void> {
-  const deletion = await resolveReadDeletion(deps, scope, entry, body);
+  const deletion = await resolveReadDeletion(
+    deps,
+    scope,
+    entry,
+    body,
+    undefined,
+    canonical,
+  );
   if (deletion) throw new DataDeletedError(deletion);
 }
 
@@ -1264,7 +1307,7 @@ function listingVisibility(
     if (listing.kind === "refused") return false;
     const canonicalOwned = deletionHistoryOf(listing) === "canonical";
     // A file's re-add marker cannot revive the canonical body this row
-    // describes. Canonical re-adds have no registered version yet.
+    // describes; only the canonical re-add marker decided with it can.
     return (
       (await resolveReadDeletion(
         deps,
@@ -1272,6 +1315,12 @@ function listingVisibility(
         canonicalOwned ? undefined : entry,
         canonicalOwned ? "canonical" : "file",
         Math.max(0, deadlineAtMs - Date.now()),
+        canonicalOwned
+          ? {
+              readd: canonicalReaddOf(listing),
+              ...(listing.kind === "file" ? { servedFile: entry } : {}),
+            }
+          : undefined,
       )) === null
     );
   };
@@ -1298,9 +1347,11 @@ function canonicalOnlyScopes(
   if (!view) return undefined;
   return async (scopePrefix, stored) => {
     const listed: ScopeSummary[] = [];
-    for (const { scope, collectedAt } of view.listCanonicalScopes(
-      scopePrefix,
-    )) {
+    for (const {
+      scope,
+      collectedAt,
+      canonicalReadd,
+    } of view.listCanonicalScopes(scopePrefix)) {
       if (stored.has(scope)) continue;
       if (
         (await resolveReadDeletion(
@@ -1309,6 +1360,7 @@ function canonicalOnlyScopes(
           undefined,
           "canonical",
           Math.max(0, deadlineAtMs - Date.now()),
+          { readd: canonicalReadd ?? null },
         )) !== null
       ) {
         continue;
@@ -2254,6 +2306,15 @@ export async function handlePersonalServerDataRequest(
         scopeResult.scope,
         canonicalOwned ? undefined : selectedEntry,
         canonicalOwned ? "canonical" : "file",
+        canonicalOwned
+          ? {
+              readd: canonicalReaddOf(latest),
+              // The view kept the legacy file: it must clear its own marker.
+              ...(latest.kind === "file"
+                ? { servedFile: selectedEntry ?? null }
+                : {}),
+            }
+          : undefined,
       );
 
       if (view === "stored" && !isOwnerView(authResult)) {
