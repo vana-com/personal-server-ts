@@ -180,6 +180,49 @@ describe("stream-sync reads", () => {
     );
   });
 
+  it("errors the body, never ends it, when a part fails after bytes are sent", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(13)));
+    const ns = await f.key.ns("acme", "account-1");
+    await f.activate("acme", ns);
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      records: Array.from({ length: 80 }, (_, i) => ({
+        id: `r${i}`,
+        pad: "x".repeat(2048),
+      })),
+      prefixes: ["0", "1"],
+    });
+    const service = await f.service();
+    await f.sync(service);
+    const decision = await service.resolve(ask("pdpp.acme.items"));
+    if (decision.kind !== "view") throw new Error(decision.kind);
+
+    const read = f.files.read.bind(f.files);
+    let partReads = 0;
+    f.files.read = async (path) => {
+      if (path.includes("/parts/") && partReads++ > 0) {
+        throw new Error("part unreadable");
+      }
+      return read(path);
+    };
+    const reader = decision.body.getReader();
+    const chunks: Uint8Array[] = [];
+    const outcome = await (async () => {
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) return "ended";
+        chunks.push(next.value);
+      }
+    })().catch((error: Error) => error.message);
+    const text = new TextDecoder().decode(Buffer.concat(chunks));
+    expect(outcome).toBe("part unreadable");
+    expect(text.length).toBeGreaterThan(0);
+    expect(() => JSON.parse(text)).toThrow();
+  });
+
   it("maps a source name to no other connector without signed alias data", async () => {
     // claude.conversations reads the connector its binding names. A raw
     // `pdpp.<source>.<stream>` name reads connector <source> only: no signed

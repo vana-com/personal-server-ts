@@ -43,6 +43,9 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { encodeAbiParameters, keccak256 } from "viem";
 import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/api";
+import { request as httpRequest } from "node:http";
+import type { AddressInfo } from "node:net";
+import { listenHttpServer } from "../listen.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
@@ -2101,6 +2104,121 @@ describe("GET /v1/data/:scope", () => {
     const json = await res.json();
     expect(json.data).toEqual({ version: 1 });
     expect(json.collectedAt).toBe(json1.collectedAt);
+  });
+
+  describe("a stream view that fails after the 200 status", () => {
+    // The envelope prefix a projection writes before it fails. No proper
+    // prefix of the envelope is valid JSON; the client must also see the
+    // connection abort, never a complete response.
+    const prefix = JSON.stringify({
+      version: "1.0",
+      scope: "instagram.posts",
+      collectedAt: "2026-11-01T00:00:00.000Z",
+      data: { posts: [{ id: "a" }, { id: "b" }] },
+    }).slice(0, -3);
+
+    function failingView(failAfterMs: number | null): StreamSyncReadPort {
+      return {
+        async resolve() {
+          let pulls = 0;
+          return {
+            kind: "view",
+            connector: "meta",
+            ns: "0123456789abcdef",
+            cursor: "pinned",
+            served: { scope: "pdpp.meta~0123456789abcdef.posts", version: 1 },
+            body: new ReadableStream<Uint8Array>({
+              async pull(controller) {
+                if (pulls++ === 0) {
+                  controller.enqueue(new TextEncoder().encode(prefix));
+                  return;
+                }
+                if (failAfterMs !== null) {
+                  await new Promise((r) => setTimeout(r, failAfterMs));
+                }
+                controller.error(new Error("projection failed"));
+              },
+            }),
+          };
+        },
+      };
+    }
+
+    async function readOverHttp(
+      app: ReturnType<typeof dataRoutes>,
+      scope: string,
+    ): Promise<{
+      status: number;
+      headers: Record<string, unknown>;
+      complete: boolean;
+      body: string;
+    }> {
+      const server = await listenHttpServer({
+        fetch: app.fetch,
+        port: 0,
+        hostname: "127.0.0.1",
+      });
+      try {
+        const { port } = server.address() as AddressInfo;
+        const uri = `/${scope}`;
+        const authorization = await buildWeb3SignedHeader({
+          wallet,
+          aud: SERVER_ORIGIN,
+          method: "GET",
+          uri,
+          grantId: "grant-123",
+        });
+        return await new Promise((resolve, reject) => {
+          const req = httpRequest(
+            {
+              hostname: "127.0.0.1",
+              port,
+              method: "GET",
+              path: uri,
+              headers: { authorization },
+            },
+            (res) => {
+              const chunks: Buffer[] = [];
+              res.on("data", (chunk: Buffer) => chunks.push(chunk));
+              res.on("error", () => {});
+              res.on("close", () =>
+                resolve({
+                  status: res.statusCode ?? 0,
+                  headers: res.headers,
+                  complete: res.complete,
+                  body: Buffer.concat(chunks).toString("utf8"),
+                }),
+              );
+            },
+          );
+          req.on("error", reject);
+          req.end();
+        });
+      } finally {
+        await new Promise((r) => server.close(r));
+      }
+    }
+
+    for (const [label, failAfterMs] of [
+      ["at once", null],
+      ["after a delay", 20],
+    ] as const) {
+      it(`aborts the connection when the body fails ${label}`, async () => {
+        const app = createApp({ streamSyncRead: failingView(failAfterMs) });
+        const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const res = await readOverHttp(app, "instagram.posts");
+          expect(res.status).toBe(200);
+          // Bytes written before the abort may or may not reach the client.
+          expect(prefix.startsWith(res.body)).toBe(true);
+          expect(res.headers["transfer-encoding"]).toBe("chunked");
+          expect(res.complete).toBe(false);
+          expect(() => JSON.parse(res.body)).toThrow();
+        } finally {
+          quiet.mockRestore();
+        }
+      });
+    }
   });
 });
 

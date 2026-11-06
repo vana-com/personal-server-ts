@@ -729,10 +729,16 @@ async function serveStreamSyncView(
       userAgent,
     });
   }
+  // A projection can fail after the 200 status. The client must then see
+  // the connection abort, never a complete shorter body. Chunked framing
+  // also keeps @hono/node-server from reading the body ahead of the status:
+  // a failure in that read-ahead would end the response with a
+  // content-length of the bytes read so far, as if it were whole.
   return new Response(decision.body, {
     status: 200,
     headers: {
       "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
       "X-Vana-Data-Source": "stream-sync",
       "X-Stream-Sync-Cursor": decision.cursor,
       ...(input.paymentResponseHeader
