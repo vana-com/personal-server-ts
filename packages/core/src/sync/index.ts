@@ -22,7 +22,11 @@ export type {
 } from "./workers/download.js";
 // The single-data-point download path, exported so an integration test can
 // drive the REAL decrypt-and-index worker end to end rather than restate it.
-export { downloadOne, type DownloadResult } from "./workers/download.js";
+export {
+  downloadAll,
+  downloadOne,
+  type DownloadResult,
+} from "./workers/download.js";
 export {
   createPdppImporter,
   isPermanentRejection,

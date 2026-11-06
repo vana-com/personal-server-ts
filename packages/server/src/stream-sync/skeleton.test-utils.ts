@@ -21,6 +21,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,9 +41,16 @@ import {
   createMemoryStreamSyncReadFiles,
   createStreamSyncReadKeys,
   StreamSyncReadService,
-  type MirrorFeedRow,
   type StreamSyncReadFiles,
 } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
+import {
+  computeDataPointId,
+  createGatewayDataPointFeed,
+  downloadAll,
+} from "@opendatalabs/personal-server-ts-core/sync";
+import { createMemoryDataStorage } from "@opendatalabs/personal-server-ts-core/test-utils";
+import type { StorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createIndexedDbStreamSyncFiles } from "@opendatalabs/personal-server-ts-lite";
 import { createFsStreamSyncFiles } from "./fs-files.js";
@@ -159,17 +167,14 @@ interface Host {
 }
 
 /**
- * SKELETON STUB (lane U1/U5 for the listing worker): the real hosts feed the
- * read mirror from `downloadAll`'s registry listing. Here every host is fed
- * the rows the shared registry accepted.
+ * The registry's listing as a gateway serves it: `GET /v1/data?user=..` over
+ * the rows the shared in-memory registry accepted. Only the HTTP origin is
+ * faked; every host reads it through the production `createGatewayDataPointFeed`
+ * and `downloadAll` loop (see `syncHost`).
  */
-class RegistryFeed {
-  private readonly rows = new Map<string, MirrorFeedRow>();
+class RegistryListing {
+  private readonly rows = new Map<string, Record<string, unknown>>();
   private clock = T0;
-
-  constructor() {
-    registerStub("registry listing feed (RegistryFeed)", "step 2 of this lane");
-  }
 
   wrap(inner: StreamSyncRegistry): StreamSyncRegistry {
     return interpose(inner, {
@@ -177,6 +182,8 @@ class RegistryFeed {
         if (result.kind !== "committed") return;
         this.clock += 1000;
         this.rows.set(request.scope, {
+          id: computeDataPointId(OWNER, request.scope),
+          ownerAddress: OWNER,
           scope: request.scope,
           dataHash: request.dataHash,
           metadataHash: request.metadataHash,
@@ -188,13 +195,39 @@ class RegistryFeed {
     });
   }
 
-  async sync(reader: StreamSyncReadService): Promise<void> {
-    await reader.observe([...this.rows.values()], {
-      fromStart: true,
-      lastPage: true,
+  readonly fetch: typeof fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname !== "/v1/data") return new Response("{}", { status: 404 });
+    return Response.json({
+      data: { dataPoints: [...this.rows.values()] },
+      pagination: { hasMore: false, nextCursor: null },
     });
-    await reader.importPending();
-  }
+  };
+}
+
+/** One sync pass of a host: the production `downloadAll` listing loop. */
+async function syncHost(host: Host, listing: RegistryListing): Promise<void> {
+  let stored: string | null = null;
+  const storage = createMemoryDataStorage();
+  await downloadAll({
+    storage,
+    storageAdapter: {} as StorageAdapter,
+    gateway: {} as GatewayClient,
+    dataPointFeed: createGatewayDataPointFeed({
+      gatewayUrl: "http://registry.invalid",
+      fetch: listing.fetch,
+    }),
+    cursor: {
+      read: async () => stored,
+      write: async (value) => {
+        stored = value;
+      },
+    },
+    masterKey: new Uint8Array(65),
+    serverOwner: OWNER,
+    logger: { ...silent, debug() {} } as unknown as Logger,
+    streamSync: host.reader,
+  });
 }
 
 type HostKind = "full" | "phone" | "frame";
@@ -278,11 +311,14 @@ export async function runSkeleton(): Promise<Hop[]> {
   });
   const root = await mkdtemp(join(tmpdir(), "stream-sync-skeleton-"));
   const storage = await startLocalStorage();
-  const feed = new RegistryFeed();
+  const listing = new RegistryListing();
   // SKELETON STUB (oracle lane): in-memory registry with the gateway's
   // exclusive-version rules, in place of the real data-gateway.
-  registerStub("in-memory registry", "step 3 of this lane");
-  const registry = feed.wrap(createFakeStreamSyncRegistry());
+  registerStub(
+    "in-memory registry and its listing origin",
+    "durable-registry lane (real data-gateway)",
+  );
+  const registry = listing.wrap(createFakeStreamSyncRegistry());
   const hops: Hop[] = [];
   const hop = (name: string, pass: boolean, detail: string) =>
     hops.push({ name, pass, detail });
@@ -297,7 +333,7 @@ export async function runSkeleton(): Promise<Hop[]> {
     const second = { id: "skeleton-2", value: "written by PS-Lite" };
 
     const check = async (name: string, host: Host, want: unknown[]) => {
-      await feed.sync(host.reader);
+      await syncHost(host, listing);
       const got = await readRecords(host);
       const ok =
         got.kind === "view" &&
