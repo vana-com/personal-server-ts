@@ -16,9 +16,11 @@
  * Real: the run intake (`createStreamSyncIntake`; the full server reaches it
  * through its HTTP route, PS-Lite in process); every run publishes under the
  * identity-less name (R23). Stubbed (each marked `SKELETON STUB`): the
- * connector fixture, the registry (in-memory, gateway rules) and its listing
- * feed, and the phone and frame hosts' writers
- * (their reads run through the real PS-Lite startup code).
+ * connector fixture and, without STREAM_SYNC_ORACLE_GATEWAY_URL, the registry
+ * (in-memory, gateway rules), its listing feed, and the phone and frame
+ * hosts' writers (their reads run through the real PS-Lite startup code).
+ * With a real gateway the phone and frame publish through PS-Lite's own run
+ * intake and writer, list through the gateway, and only the fixture is a stub.
  *
  * Run: `npm run e2e:stream-sync-skeleton` (needs `streamSync.write`).
  */
@@ -254,6 +256,7 @@ class RegistryListing {
 async function syncFullHost(
   reader: StreamSyncReadService,
   listing: RegistryListing,
+  gatewayUrl?: string,
 ): Promise<void> {
   let stored: string | null = null;
   const storage = createMemoryDataStorage();
@@ -261,10 +264,12 @@ async function syncFullHost(
     storage,
     storageAdapter: {} as StorageAdapter,
     gateway: {} as GatewayClient,
-    dataPointFeed: createGatewayDataPointFeed({
-      gatewayUrl: "http://registry.invalid",
-      fetch: listing.fetch,
-    }),
+    dataPointFeed: gatewayUrl
+      ? createGatewayDataPointFeed({ gatewayUrl })
+      : createGatewayDataPointFeed({
+          gatewayUrl: "http://registry.invalid",
+          fetch: listing.fetch,
+        }),
     cursor: {
       read: async () => stored,
       write: async (value) => {
@@ -286,6 +291,18 @@ const makeIntake = (writer: StreamSyncWriter): StreamSyncIntake =>
 
 type HostKind = "full" | "phone" | "frame";
 
+/** The owner key as PS-Lite's sync signer: the owner signs registry writes. */
+function ownerSyncSigner() {
+  const account = privateKeyToAccount(OWNER_KEY);
+  const signer = accountSigner(OWNER_KEY);
+  return {
+    address: account.address,
+    signMessage: (message: string) => account.signMessage({ message }),
+    signAddData: signer.signAddData.bind(signer),
+    signLineageAttestation: signer.signLineageAttestation.bind(signer),
+  } as never;
+}
+
 async function makeHost(input: {
   kind: HostKind;
   config: ReturnType<typeof ServerConfigSchema.parse>;
@@ -293,6 +310,8 @@ async function makeHost(input: {
   storageUrl: string;
   root: string;
   listing: RegistryListing;
+  /** Set for the real-gateway run: Lite writes and lists through it. */
+  gatewayUrl?: string;
 }): Promise<Host> {
   // The flag gate, as the hosts apply it: no flag, no writer.
   if (!input.config.streamSync.write) {
@@ -321,33 +340,39 @@ async function makeHost(input: {
       writer,
       intake: httpIntake(makeIntake(writer)),
       read: () => readFromService(reader),
-      sync: (listing) => syncFullHost(reader, listing),
+      sync: (listing) => syncFullHost(reader, listing, input.gatewayUrl),
     };
   }
   // Phone and frame READ through the real PS-Lite startup code, flag from
   // config, listing through its sync manager. Only the registry origin
   // (listing feed) is injected.
-  // SKELETON STUB (lanes U6 phone, U7 frame): the WRITER is still built by
-  // hand, because Lite's own writer talks to the registry over HTTP and the
-  // in-memory registry has no origin. The design (DESIGN-V4.1) says the frame
-  // uses OPFS, else IndexedDB; both use IndexedDB here, differing by name.
-  registerStub(
-    "phone/frame host writer recipe",
-    "lanes U6 (phone), U7 (frame)",
-  );
+  // With a real gateway, Lite's own writer talks to it over HTTP, so the
+  // phone and frame publish through Lite's run intake and writer. Without
+  // one, the in-memory registry has no origin: the writer is built by hand
+  // (design: the frame uses OPFS, else IndexedDB; both use IndexedDB here,
+  // differing by name).
   const files = createIndexedDbStreamSyncFiles({
     dbName: `skeleton-${input.kind}`,
     factory: new IDBFactory(),
     keyRange: IDBKeyRange,
   });
-  const writer = new StreamSyncWriter({
-    ownerAddress: OWNER,
-    registry: input.registry,
-    blobs,
-    files,
-    keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
-    signer: accountSigner(OWNER_KEY),
-  });
+  const viaLite = Boolean(input.gatewayUrl);
+  const handBuilt = viaLite
+    ? null
+    : new StreamSyncWriter({
+        ownerAddress: OWNER,
+        registry: input.registry,
+        blobs,
+        files,
+        keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
+        signer: accountSigner(OWNER_KEY),
+      });
+  if (!viaLite) {
+    registerStub(
+      "phone/frame host writer recipe",
+      "set STREAM_SYNC_ORACLE_GATEWAY_URL (Lite's writer needs a registry over HTTP)",
+    );
+  }
   // The runtime opens IndexedDB through the global; stub it once for all hosts
   // (each host has its own database name).
   const globals = globalThis as { indexedDB?: unknown; IDBKeyRange?: unknown };
@@ -361,27 +386,46 @@ async function makeHost(input: {
       ...createMockPsLiteGateway(),
       getServer: async () => ({ id: "server-1" }),
     } as never,
-    dataPointFeed: createGatewayDataPointFeed({
-      gatewayUrl: "http://registry.invalid",
-      fetch: input.listing.fetch,
-    }),
+    dataPointFeed: input.gatewayUrl
+      ? createGatewayDataPointFeed({ gatewayUrl: input.gatewayUrl })
+      : createGatewayDataPointFeed({
+          gatewayUrl: "http://registry.invalid",
+          fetch: input.listing.fetch,
+        }),
+    ...(viaLite
+      ? {
+          // The owner signs registry writes directly, as the hand-built
+          // writer did; the host-verified table is the only artifact source.
+          ownerSyncSigner: ownerSyncSigner(),
+          streamSyncFiles: files,
+          streamSyncDeclarations: (digest: string) =>
+            digest === DIGEST ? DECLARATIONS : null,
+        }
+      : {}),
     auth: createBearerTokenPsLiteAuth({ ownerToken: "t", builderToken: "b" }),
     active: true,
     logger: { ...silent, debug() {} } as never,
     configDefaults: {
-      gateway: { url: "http://registry.invalid" },
+      gateway: { url: input.gatewayUrl ?? "http://registry.invalid" },
       storage: {
         backend: "vana",
         config: { vana: { apiUrl: input.storageUrl } },
       },
       sync: { enabled: true },
-      streamSync: { write: false, read: input.config.streamSync.read },
+      streamSync: {
+        write: viaLite,
+        read: input.config.streamSync.read,
+      },
     } as never,
   });
+  const writer = viaLite ? lite.streamSyncWriter : handBuilt;
+  if (!writer || (viaLite && !lite.streamSyncIntake)) {
+    throw new Error("PS-Lite has no stream-sync writer or intake");
+  }
   return {
     name: input.kind,
     writer,
-    intake: makeIntake(writer),
+    intake: viaLite ? lite.streamSyncIntake! : makeIntake(writer),
     read: async () => {
       const res = await lite.runtime.fetch(
         new Request(`https://ps.local/v1/data/pdpp.${CONNECTOR}.${STREAM}`, {
@@ -440,10 +484,12 @@ export async function runSkeleton(): Promise<Hop[]> {
       "durable-registry lane (CI default until CI can start the gateway)",
     );
   }
-  registerStub(
-    "registry listing origin",
-    "stubs-burn lane (real registry feed)",
-  );
+  if (!gatewayUrl) {
+    registerStub(
+      "registry listing origin",
+      "stubs-burn lane (real registry feed)",
+    );
+  }
   const registry = listing.wrap(
     gatewayUrl
       ? createGatewayStreamSyncRegistry({ gatewayUrl, ownerAddress: OWNER })
@@ -464,6 +510,7 @@ export async function runSkeleton(): Promise<Hop[]> {
         storageUrl: storage.url,
         root,
         listing,
+        gatewayUrl,
       });
     const full = await make("full");
     const phone = await make("phone");

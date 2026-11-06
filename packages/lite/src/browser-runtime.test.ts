@@ -5,11 +5,12 @@
  * environment. Browser defaults remain exercised by the existing suite.
  */
 
-import { IDBFactory } from "fake-indexeddb";
+import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
 import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
+import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
 import type { PsLitePersistenceBundle } from "./persistence.js";
@@ -266,6 +267,11 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
     const { streamSyncIntake } = await createIndexedDbPsLiteRuntime(
       options({
         streamSyncDeclarations: resolve,
+        streamSyncFiles: createIndexedDbStreamSyncFiles({
+          dbName: "intake-files",
+          factory: new IDBFactory(),
+          keyRange: IDBKeyRange,
+        }),
         configDefaults: {
           gateway: { url: "https://gateway.local" },
           sync: { enabled: true },
@@ -274,11 +280,11 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
       }),
     );
     expect(streamSyncIntake).not.toBeNull();
+    const unknown = `sha256:${"cd".repeat(32)}`;
     await expect(
-      begin(ownerAddress, streamSyncIntake!, `sha256:${"cd".repeat(32)}`),
+      begin(ownerAddress, streamSyncIntake!, unknown),
     ).rejects.toMatchObject({ code: "unknown_artifact" });
-    await begin(ownerAddress, streamSyncIntake!, digest).catch(() => {});
-    expect(resolve).toHaveBeenCalledWith(digest);
+    expect(resolve).toHaveBeenCalledWith(unknown);
   });
 
   it("is null with streamSync.write off", async () => {

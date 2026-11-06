@@ -38,6 +38,7 @@ import {
   type PersonalServerSyncTriggerResult,
 } from "@opendatalabs/personal-server-ts-core/client";
 import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
+import type { RunIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   prepareScopeUploadBatches,
   type PreparedScopeUploadBatch,
@@ -96,9 +97,15 @@ export interface StartPersonalServerLiteOptions extends Omit<
   onStatus?: (status: PersonalServerStatus) => void;
 }
 
+/** The Lite handle: the shared handle plus the host's run-intake door. */
+export type PersonalServerLiteHandle = PersonalServerHandle & {
+  /** In-process run intake; `null` unless `config.streamSync.write` is on. */
+  readonly streamSyncIntake: RunIntake | null;
+};
+
 export async function startPersonalServer(
   options: StartPersonalServerLiteOptions,
-): Promise<PersonalServerHandle> {
+): Promise<PersonalServerLiteHandle> {
   if (options.persistence && options.runtime) {
     throw new Error(
       "runtime cannot be supplied with a complete persistence bundle",
@@ -710,6 +717,7 @@ export async function startPersonalServer(
     revokeGrant,
     syncStatus,
     syncNow,
+    streamSyncIntake: runtimeBundle?.streamSyncIntake ?? null,
     stop,
   };
 }
