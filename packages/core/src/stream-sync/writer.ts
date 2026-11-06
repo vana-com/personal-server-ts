@@ -116,6 +116,8 @@ const decoder = new TextDecoder();
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** Conflicts handled within one publish pass before the stream waits for the next pass. */
 const CONFLICTS_PER_PASS = 8;
+/** m1: the furthest a producer clock may run ahead of this process. */
+const SKEW_MS = 5 * 60 * 1000;
 
 /** Problems a host shows on top of the package's outbox problems. */
 export type StreamSyncHostProblem =
@@ -140,6 +142,8 @@ interface WriterState {
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
   receipts: Record<string, SeedReceipt>;
+  /** The last three finished-run verdicts per connector, newest last. */
+  recent?: Record<string, ("good" | "bad")[]>;
 }
 
 interface HostStream {
@@ -152,6 +156,8 @@ interface HostStream {
   seedShardBytes: number[] | null;
   /** A seed stream added at publish (§2.9), with no run records. */
   seedOnly: boolean;
+  /** Declared `incremental: false`: every run of it is a full read (§3.0). */
+  fullStream: boolean;
   /** The seed is merged into this stream's publish. */
   seedApplies: boolean;
   recordTooLarge: number;
@@ -178,7 +184,11 @@ export type RunOutcome =
       readonly restartFull: boolean;
       readonly why: string;
     }
-  | { readonly kind: "failed"; readonly why: string };
+  | { readonly kind: "failed"; readonly why: string }
+  | { readonly kind: "aborted"; readonly reason: AbortReason };
+
+/** Why a run ended without publishing; `discarded` is a run intake dropped. */
+export type AbortReason = "failed" | "cancelled";
 
 interface HostEntry {
   version: 1;
@@ -194,6 +204,15 @@ interface HostEntry {
   outcome: RunOutcome | null;
   /** Seed streams this run must hold receipts for before its checkpoint. */
   seedStreams: string[];
+  /** M5: who the run writes for; checked again before it publishes. */
+  binding?: { owner: string; keyCheck: string; leaseId: string | null };
+}
+
+/** The START the writer issued to a run (V2 §2.1). */
+export interface IssuedStart {
+  readonly collectionMode: "full_refresh" | "incremental";
+  readonly state: JsonValue | null;
+  readonly keyCheck: string;
 }
 
 export interface StreamSyncRunStart {
@@ -210,6 +229,22 @@ export interface StreamSyncRunStart {
     readonly ns: string;
     readonly generation: number;
   } | null;
+  /**
+   * Issue the START from the saved state (V2 §2.1, R16): the run is full when
+   * the caller asks, a `needsFull` entry forces it, or no checkpoint exists.
+   * An owner-started full run keeps the stored state; only a forced or
+   * checkpoint-less full run gets `null`. Replaces `checkpointUsed`.
+   */
+  readonly issue?: { readonly wantFull: boolean };
+  /** The write lease the run is bound to; `null` on hosts with no lease. */
+  readonly leaseId?: string | null;
+}
+
+/** A run id that finished, or whose entry this process no longer drives. */
+export class RunGoneError extends Error {
+  constructor(readonly runId: string) {
+    super(`run ${runId} is gone`);
+  }
 }
 
 export interface StreamSyncStreamStatus {
@@ -312,6 +347,8 @@ interface ActiveRun {
   readonly spool: SpoolWriter;
   readonly shardBytes: Map<string, number[]>;
   recordTooLarge: Map<string, number>;
+  /** Records appended per stream (R19: a retry-pending cursor needs none). */
+  readonly records: Map<string, number>;
   excluded: string[];
 }
 
@@ -325,7 +362,9 @@ export class StreamSyncWriter {
   /** §2.4 `controls`: the last listing completed in this app session. */
   private controls: Map<string, Record<string, ControlState>> | null = null;
   private readonly active = new Map<string, ActiveRun>();
-  private queue: Promise<unknown> = Promise.resolve();
+  private intakeQueue: Promise<unknown> = Promise.resolve();
+  private publishQueue: Promise<unknown> = Promise.resolve();
+  private stateQueue: Promise<unknown> = Promise.resolve();
   private recovered = false;
 
   constructor(private readonly options: StreamSyncWriterOptions) {
@@ -344,6 +383,24 @@ export class StreamSyncWriter {
 
   private async writeState(state: WriterState): Promise<void> {
     await this.options.files.write("state.json", json(state));
+  }
+
+  /**
+   * Read-modify-write of `state.json` under one short lock (V2 §3.8). The
+   * intake and publish queues both write it; `change` does no network I/O.
+   */
+  private withState<T>(
+    change: (state: WriterState) => T | Promise<T>,
+  ): Promise<T> {
+    const run = async () => {
+      const state = await this.readState();
+      const result = await change(state);
+      await this.writeState(state);
+      return result;
+    };
+    const next = this.stateQueue.then(run, run);
+    this.stateQueue = next.catch(() => undefined);
+    return next;
   }
 
   private async readEntry(runId: string): Promise<HostEntry | null> {
@@ -372,10 +429,17 @@ export class StreamSyncWriter {
     return { keyCheck: this.keyCheck, control: this.control };
   }
 
-  /** Serialize public operations: intake and publish share files. */
-  private serial<T>(work: () => Promise<T>): Promise<T> {
-    const next = this.queue.then(work, work);
-    this.queue = next.catch(() => undefined);
+  /** Run intake work in order: begin, declare, finish, abort (V2 §3.8). */
+  private intake<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.intakeQueue.then(work, work);
+    this.intakeQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  /** Run publish work in order. It never blocks intake. */
+  private publish<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.publishQueue.then(work, work);
+    this.publishQueue = next.catch(() => undefined);
     return next;
   }
 
@@ -386,7 +450,7 @@ export class StreamSyncWriter {
    * app session's `controls`. Runs that start after this use it as `start`.
    */
   refreshControls(): Promise<void> {
-    return this.serial(async () => {
+    return this.intake(async () => {
       const { control } = await this.keys();
       const rows = await this.options.registry.listControlRows();
       const next = new Map<string, Record<string, ControlState>>();
@@ -447,22 +511,88 @@ export class StreamSyncWriter {
     return { targetKnown: target !== undefined, receipts };
   }
 
-  beginRun(input: StreamSyncRunStart): Promise<void> {
-    return this.serial(async () => {
+  /** The owner and key check a run is bound to (V2 §2.1, M5). */
+  async binding(): Promise<{ owner: string; keyCheck: string }> {
+    const { keyCheck } = await this.keys();
+    return { owner: this.options.ownerAddress, keyCheck };
+  }
+
+  /** Whether `controls` was listed in this app session (§2.4). */
+  hasControls(): boolean {
+    return this.controls !== null;
+  }
+
+  /**
+   * The START a run of `connector` would be issued now (V2 §2.1, R16). Full
+   * when asked, forced by `needsFull`, or without a checkpoint. `state` is
+   * the stored value unless a `needsFull` entry cleared it.
+   */
+  async issueStart(
+    connector: string,
+    wantFull: boolean,
+  ): Promise<{
+    start: IssuedStart;
+    checkpoint: StreamSyncCheckpoint | null;
+    full: boolean;
+  }> {
+    const plan = await this.runPlan(connector);
+    const full = wantFull || plan.mustBeFull || plan.checkpoint === null;
+    const { keyCheck } = await this.keys();
+    return {
+      start: {
+        collectionMode: full ? "full_refresh" : "incremental",
+        state: plan.checkpoint?.value ?? null,
+        keyCheck,
+      },
+      checkpoint: plan.checkpoint,
+      full,
+    };
+  }
+
+  /**
+   * Start a run. With `issue` the writer issues the START (returned) and
+   * records mode and checkpoint in the entry. A finished run id, or one whose
+   * entry this process does not drive (a restart), answers `RunGoneError`.
+   */
+  beginRun(input: StreamSyncRunStart): Promise<IssuedStart> {
+    return this.intake(async () => {
       if (!RUN_ID.test(input.runId))
         throw new Error(`bad runId ${input.runId}`);
+      if (await this.options.files.read(`results/${input.runId}.json`)) {
+        throw new RunGoneError(input.runId);
+      }
       if (await this.readEntry(input.runId)) {
+        if (!this.active.has(input.runId)) throw new RunGoneError(input.runId);
         throw new Error(`run ${input.runId} already exists`);
       }
       const state = await this.readState();
-      const checkpointUsed = input.checkpointUsed ?? null;
+      let checkpointUsed = input.checkpointUsed ?? null;
+      let full = checkpointUsed === null;
+      let issued: IssuedStart | null = null;
+      if (input.issue) {
+        const plan = await this.issueStart(
+          input.connector,
+          input.issue.wantFull,
+        );
+        issued = plan.start;
+        full = plan.full;
+        checkpointUsed = plan.checkpoint
+          ? {
+              ns: plan.checkpoint.ns,
+              generation: plan.checkpoint.generation,
+            }
+          : null;
+      }
+      const { keyCheck } = await this.keys();
+      const now = this.now();
       const entry = createOutboxEntry({
         runId: input.runId,
         connector: input.connector,
         start: this.startSnapshot(input.connector),
         userConnect: input.userConnect,
-        full: checkpointUsed === null,
-        observedAt: input.observedAt ?? this.now(),
+        full,
+        // m1: a producer clock cannot place lines more than 5 min ahead.
+        observedAt: Math.min(input.observedAt ?? now, now + SKEW_MS),
         spoolRef: `runs/${input.runId}/spool`,
         checkpointCandidate: null,
         needsFull: state.needsFull,
@@ -480,14 +610,34 @@ export class StreamSyncWriter {
         streams: {},
         outcome: null,
         seedStreams: [],
+        binding: {
+          owner: this.options.ownerAddress,
+          keyCheck,
+          leaseId: input.leaseId ?? null,
+        },
       };
-      await this.writeEntry(host);
+      // Active before the entry exists, so a recovery pass on the publish
+      // queue never mistakes this run for one a dead process left behind.
       this.active.set(input.runId, {
         spool: new SpoolWriter(this.options.files),
         shardBytes: new Map(),
         recordTooLarge: new Map(),
+        records: new Map(),
         excluded: [],
       });
+      try {
+        await this.writeEntry(host);
+      } catch (error) {
+        this.active.delete(input.runId);
+        throw error;
+      }
+      return (
+        issued ?? {
+          collectionMode: full ? "full_refresh" : "incremental",
+          state: null,
+          keyCheck,
+        }
+      );
     });
   }
 
@@ -497,15 +647,14 @@ export class StreamSyncWriter {
     shape: {
       readonly primaryKey: readonly string[];
       readonly profile: HeadProfile;
+      /** `false` = every run reads the whole stream (§3.0). */
+      readonly incremental?: boolean;
     },
   ): Promise<void> {
-    return this.serial(async () => {
+    return this.intake(async () => {
       const host = await this.collecting(runId);
       if (host.streams[stream]) return;
-      host.streams[stream] = this.newStream(
-        Object.keys(host.streams).length,
-        shape,
-      );
+      host.streams[stream] = this.newStream(nextIndex(host), shape);
       host.entry = {
         ...host.entry,
         streams: { ...host.entry.streams, [stream]: { state: "planned" } },
@@ -519,6 +668,7 @@ export class StreamSyncWriter {
     shape: {
       readonly primaryKey: readonly string[];
       readonly profile: HeadProfile;
+      readonly incremental?: boolean;
     },
   ): HostStream {
     if (shape.primaryKey.length === 0) {
@@ -531,6 +681,7 @@ export class StreamSyncWriter {
       shardBytes: null,
       seedShardBytes: null,
       seedOnly: false,
+      fullStream: shape.incremental === false,
       seedApplies: false,
       recordTooLarge: 0,
       problem: null,
@@ -558,8 +709,9 @@ export class StreamSyncWriter {
     shape?: {
       readonly primaryKey: readonly string[];
       readonly profile: HeadProfile;
+      readonly incremental?: boolean;
     },
-  ): Promise<void> {
+  ): Promise<"spooled" | "too_large"> {
     const run = this.active.get(runId);
     if (!run) throw new Error(`run ${runId} is not collecting in this process`);
     let info = this.streamCache.get(`${runId}\u0000${stream}`);
@@ -586,7 +738,7 @@ export class StreamSyncWriter {
       run.excluded.push(
         JSON.stringify({ stream, pkHash: hash, bytes: size.bytes }),
       );
-      return;
+      return "too_large";
     }
     const shard = shardOf(hash);
     let bytes = run.shardBytes.get(stream);
@@ -595,12 +747,14 @@ export class StreamSyncWriter {
       run.shardBytes.set(stream, bytes);
     }
     bytes[shard]! += size.bytes + 1;
+    run.records.set(stream, (run.records.get(stream) ?? 0) + 1);
     await run.spool.add(
       spoolLogPath(`runs/${runId}/spool/s${info.index}`),
       hash,
       text,
       size.bytes,
     );
+    return "spooled";
   }
 
   /** Spool directories whose shards were derived by this process, with bytes. */
@@ -613,7 +767,7 @@ export class StreamSyncWriter {
 
   /** §2.12: the account identity the connector emitted for this run. */
   setAccountIdentity(runId: string, accountId: string): Promise<void> {
-    return this.serial(async () => {
+    return this.intake(async () => {
       const host = await this.collecting(runId);
       host.accountId = accountId;
       await this.writeEntry(host);
@@ -621,22 +775,28 @@ export class StreamSyncWriter {
   }
 
   /**
-   * End intake. The run becomes publishable, or fails when its connector
-   * declares an identity and none arrived (§2.12: nothing is published and
-   * no checkpoint advances).
+   * End intake. The run becomes publishable.
+   *
+   * `coveredStreams` limits the run to the streams its connector fully
+   * covered (§3.5): the others are dropped with their spool lines, never
+   * published empty. Omit it to publish every declared stream.
+   *
+   * An identity-less run (`identity: "none"`, every run the intake adapter
+   * starts, R23) publishes under the identity-less name.
    */
   finishRun(
     runId: string,
-    input: { readonly checkpointCandidate: JsonValue | null },
+    input: {
+      readonly checkpointCandidate: JsonValue | null;
+      readonly coveredStreams?: readonly string[];
+    },
   ): Promise<StreamSyncRunStatus> {
-    return this.serial(async () => {
+    return this.intake(async () => {
       const host = await this.collecting(runId);
       const run = this.active.get(runId)!;
       await run.spool.flush();
-      this.active.delete(runId);
-      for (const key of [...this.streamCache.keys()]) {
-        if (key.startsWith(`${runId}\u0000`)) this.streamCache.delete(key);
-      }
+      this.forget(runId);
+      if (input.coveredStreams) this.keepCovered(host, input.coveredStreams);
       if (run.excluded.length > 0) {
         await this.options.files.appendMany([
           {
@@ -645,12 +805,13 @@ export class StreamSyncWriter {
           },
         ]);
       }
+      const connector = host.entry.connector;
       let ns: string;
       if (host.identity === "none") ns = IDENTITYLESS_NS;
       else if (host.accountId !== null && host.accountId !== "") {
         ns = await deriveNs(
           (m) => this.options.keys.namespaceHmac(m),
-          host.entry.connector,
+          connector,
           host.accountId,
         );
       } else {
@@ -665,11 +826,9 @@ export class StreamSyncWriter {
         stream.recordTooLarge = run.recordTooLarge.get(name) ?? 0;
       }
       if (this.options.seed) {
-        const state = await this.readState();
-        if (state.seedTargets[host.entry.connector] === undefined) {
-          state.seedTargets[host.entry.connector] = ns;
-          await this.writeState(state);
-        }
+        await this.withState((state) => {
+          state.seedTargets[connector] ??= ns;
+        });
       }
       // Intake appends are not durable one by one. The run becomes `ready`
       // only after one sync of its intake logs (§2.6).
@@ -682,6 +841,135 @@ export class StreamSyncWriter {
       host.phase = "ready";
       await this.writeEntry(host);
       return this.statusOf(host);
+    });
+  }
+
+  private forget(runId: string): void {
+    this.active.delete(runId);
+    for (const key of [...this.streamCache.keys()]) {
+      if (key.startsWith(`${runId}\u0000`)) this.streamCache.delete(key);
+    }
+  }
+
+  /** Drop every declared stream outside `covered` from the run (§3.5). */
+  private keepCovered(host: HostEntry, covered: readonly string[]): void {
+    const keep = new Set(covered);
+    const streams = { ...host.entry.streams };
+    for (const name of Object.keys(host.streams)) {
+      if (keep.has(name)) continue;
+      delete host.streams[name];
+      delete streams[name];
+    }
+    host.entry = { ...host.entry, streams };
+  }
+
+  /**
+   * End a run that must publish nothing (V2 §3.7): `failed` or `cancelled`.
+   * Idempotent for a run this process
+   * already ended; a run it never drove answers `RunGoneError`.
+   */
+  abortRun(runId: string, reason: AbortReason): Promise<void> {
+    return this.intake(async () => {
+      const run = this.active.get(runId);
+      const host = await this.readEntry(runId);
+      if (!run || !host || host.phase !== "collecting") {
+        throw new RunGoneError(runId);
+      }
+      // Buffered lines are dropped, not written to be removed again.
+      run.spool.clear();
+      this.forget(runId);
+      await this.finish(host, { kind: "aborted", reason });
+    });
+  }
+
+  /**
+   * End a `retry_pending` run (V2 §3.6, R19): save its cursors, publish
+   * nothing. A cursor of a stream that emitted records in this run is
+   * dropped, because those records are not published and the next run
+   * must read them again. Same admission as a publish: a stale namespace or
+   * generation saves nothing.
+   */
+  saveCheckpointOnly(
+    runId: string,
+    candidate: Readonly<Record<string, JsonValue>>,
+  ): Promise<StreamSyncRunStatus> {
+    return this.intake(async () => {
+      const host = await this.collecting(runId);
+      const run = this.active.get(runId)!;
+      const kept: Record<string, JsonValue> = {};
+      for (const [stream, cursor] of Object.entries(candidate)) {
+        if ((run.records.get(stream) ?? 0) === 0) kept[stream] = cursor;
+      }
+      run.spool.clear();
+      this.forget(runId);
+      this.keepCovered(host, []);
+      const connector = host.entry.connector;
+      const ns =
+        host.identity === "none"
+          ? IDENTITYLESS_NS
+          : host.accountId !== null && host.accountId !== ""
+            ? await deriveNs(
+                (m) => this.options.keys.namespaceHmac(m),
+                connector,
+                host.accountId,
+              )
+            : undefined;
+      if (ns === undefined) {
+        await this.finish(host, {
+          kind: "failed",
+          why: "the connector's account is unknown, so no checkpoint is saved",
+        });
+        return this.statusOf(host);
+      }
+      host.entry = {
+        ...host.entry,
+        ns,
+        checkpointCandidate: Object.keys(kept).length > 0 ? kept : null,
+      };
+      try {
+        host.target = await this.admit(host, "first");
+      } catch (error) {
+        if (error instanceof Discard) {
+          await this.discard(host, error);
+          return this.statusOf(host);
+        }
+        if (
+          error instanceof PendingStream ||
+          error instanceof RegistryRefusedError
+        ) {
+          await this.finish(host, {
+            kind: "no_checkpoint",
+            generation: 0,
+            reason: "control_changed",
+          });
+          return this.statusOf(host);
+        }
+        throw error;
+      }
+      await this.checkpoint(host);
+      return this.statusOf(host);
+    });
+  }
+
+  /**
+   * M4: three finished runs in a row of one connector that published
+   * nothing (failed, discarded or dropped by intake). A cancel is not a
+   * failure.
+   */
+  async stuck(connector: string): Promise<boolean> {
+    const recent = (await this.readState()).recent?.[connector] ?? [];
+    return recent.length >= 3 && recent.every((v) => v === "bad");
+  }
+
+  /** Count a run intake dropped before the writer saw it (`will_discard`). */
+  noteDropped(connector: string): Promise<void> {
+    return this.note(connector, "bad");
+  }
+
+  private note(connector: string, verdict: "good" | "bad"): Promise<void> {
+    return this.withState((state) => {
+      const recent = (state.recent ??= {});
+      recent[connector] = [...(recent[connector] ?? []), verdict].slice(-3);
     });
   }
 
@@ -707,7 +995,7 @@ export class StreamSyncWriter {
   }
 
   publishPending(): Promise<StreamSyncPublishReport> {
-    return this.serial(async () => {
+    return this.publish(async () => {
       await this.recover();
       const runs: StreamSyncRunStatus[] = [];
       const hosts: HostEntry[] = [];
@@ -845,17 +1133,17 @@ export class StreamSyncWriter {
     ns: string,
     current: ControlState,
   ): Promise<void> {
-    const state = await this.readState();
-    const checkpoint = state.checkpoints[connector];
-    if (!checkpoint || checkpoint.ns !== ns) return;
-    if (
-      current.kind === "active" &&
-      current.generation === checkpoint.generation
-    ) {
-      return;
-    }
-    delete state.checkpoints[connector];
-    await this.writeState(state);
+    await this.withState((state) => {
+      const checkpoint = state.checkpoints[connector];
+      if (!checkpoint || checkpoint.ns !== ns) return;
+      if (
+        current.kind === "active" &&
+        current.generation === checkpoint.generation
+      ) {
+        return;
+      }
+      delete state.checkpoints[connector];
+    });
   }
 
   private async sign(
@@ -883,6 +1171,18 @@ export class StreamSyncWriter {
 
   private async publishEntry(host: HostEntry): Promise<void> {
     try {
+      // M5: a run publishes only for the owner and key it began with.
+      const bound = host.binding;
+      if (bound) {
+        const now = await this.binding();
+        if (bound.owner !== now.owner || bound.keyCheck !== now.keyCheck) {
+          await this.finish(host, {
+            kind: "failed",
+            why: "owner_mismatch: the owner or key changed since the run began",
+          });
+          return;
+        }
+      }
       const target = await this.admit(host, "first");
       if (host.target !== null && host.target !== target) {
         throw new PendingStream(
@@ -958,21 +1258,23 @@ export class StreamSyncWriter {
     const receiptKey = (stream: string) =>
       `${seed.installId}|${entry.connector}|${entry.ns}|${stream}`;
     if (host.target !== 1) {
-      let changed = false;
-      for (const s of seedStreams) {
-        if (state.receipts[receiptKey(s.stream)] === undefined) {
-          state.receipts[receiptKey(s.stream)] = "skipped";
-          changed = true;
-        }
+      const open = seedStreams.filter(
+        (s) => state.receipts[receiptKey(s.stream)] === undefined,
+      );
+      if (open.length > 0) {
+        await this.withState((fresh) => {
+          for (const s of open) {
+            fresh.receipts[receiptKey(s.stream)] ??= "skipped";
+          }
+        });
       }
-      if (changed) await this.writeState(state);
       return;
     }
     for (const s of seedStreams) {
       if (state.receipts[receiptKey(s.stream)] !== undefined) continue;
       let stream = host.streams[s.stream];
       if (!stream) {
-        stream = this.newStream(Object.keys(host.streams).length, s);
+        stream = this.newStream(nextIndex(host), s);
         stream.shardBytes = emptyShardBytes();
         stream.seedOnly = true;
         host.streams[s.stream] = stream;
@@ -1156,7 +1458,7 @@ export class StreamSyncWriter {
     if (stream.seedApplies) await this.spoolSeed(host, name);
 
     let complete = headComplete({
-      full: entry.full,
+      full: entry.full || stream.fullStream,
       baseComplete: base?.complete ?? false,
       seedMerged: stream.seedApplies,
     });
@@ -1233,22 +1535,23 @@ export class StreamSyncWriter {
   ): Promise<void> {
     const { entry } = host;
     const stream = host.streams[name]!;
-    const state = await this.readState();
-    const effect = afterCommit(state.needsFull, {
-      connector: entry.connector,
-      ns: entry.ns!,
-      stream: name,
-      complete,
-      runFull: entry.full,
+    await this.withState((state) => {
+      // §3.0: a stream declared `incremental: false` is read whole every run.
+      const effect = afterCommit(state.needsFull, {
+        connector: entry.connector,
+        ns: entry.ns!,
+        stream: name,
+        complete,
+        runFull: entry.full || stream.fullStream,
+      });
+      state.needsFull = effect.needsFull;
+      if (effect.clearCheckpoint) delete state.checkpoints[entry.connector];
+      if (stream.seedApplies && this.options.seed) {
+        state.receipts[
+          `${this.options.seed.installId}|${entry.connector}|${entry.ns}|${name}`
+        ] = "merged";
+      }
     });
-    state.needsFull = effect.needsFull;
-    if (effect.clearCheckpoint) delete state.checkpoints[entry.connector];
-    if (stream.seedApplies && this.options.seed) {
-      state.receipts[
-        `${this.options.seed.installId}|${entry.connector}|${entry.ns}|${name}`
-      ] = "merged";
-    }
-    await this.writeState(state);
     this.setStream(host, name, {
       state: kind,
       generation,
@@ -1265,30 +1568,40 @@ export class StreamSyncWriter {
     const { entry } = host;
     const ns = entry.ns!;
     const control = await this.readControl(controlScope(entry.connector, ns));
-    const state = await this.readState();
     const seed = this.options.seed;
-    const seedReceiptsPending = host.seedStreams.some(
-      (s) =>
-        seed !== undefined &&
-        state.receipts[`${seed.installId}|${entry.connector}|${ns}|${s}`] ===
-          undefined,
-    );
     const streams = Object.fromEntries(
       Object.entries(entry.streams).map(([k, v]) => [k, streamRunResult(v)]),
     );
-    const decision = checkpointDecision({
-      target: host.target!,
-      streams,
-      control,
-      seedReceiptsPending,
+    const decision = await this.withState((state) => {
+      const seedReceiptsPending = host.seedStreams.some(
+        (s) =>
+          seed !== undefined &&
+          state.receipts[`${seed.installId}|${entry.connector}|${ns}|${s}`] ===
+            undefined,
+      );
+      const decided = checkpointDecision({
+        target: host.target!,
+        streams,
+        control,
+        seedReceiptsPending,
+      });
+      if (decided.kind === "save") {
+        // §3.6: this run's cursors join the saved ones of the same namespace
+        // and generation, so a stream the run did not cover keeps its own.
+        const prev = state.checkpoints[entry.connector];
+        const same = prev?.ns === ns && prev.generation === decided.generation;
+        state.checkpoints[entry.connector] = {
+          ns,
+          generation: decided.generation,
+          value: mergeCursors(
+            same ? prev.value : null,
+            entry.checkpointCandidate,
+          ),
+        };
+      }
+      return decided;
     });
     if (decision.kind === "save") {
-      state.checkpoints[entry.connector] = {
-        ns,
-        generation: decision.generation,
-        value: entry.checkpointCandidate,
-      };
-      await this.writeState(state);
       this.fault("after_checkpoint_saved", entry.runId);
       await this.finish(host, {
         kind: "checkpointed",
@@ -1307,11 +1620,11 @@ export class StreamSyncWriter {
     const { entry } = host;
     const { decision } = error;
     if (decision.clearCheckpoints) {
-      const state = await this.readState();
-      if (state.checkpoints[entry.connector]?.ns === entry.ns) {
-        delete state.checkpoints[entry.connector];
-        await this.writeState(state);
-      }
+      await this.withState((state) => {
+        if (state.checkpoints[entry.connector]?.ns === entry.ns) {
+          delete state.checkpoints[entry.connector];
+        }
+      });
     }
     for (const [name, stream] of Object.entries(entry.streams)) {
       if (stream.state !== "committed" && stream.state !== "noop") {
@@ -1338,6 +1651,13 @@ export class StreamSyncWriter {
       json(this.statusOf(host)),
     );
     await this.options.files.remove(`runs/${runId}`);
+    if (!(outcome.kind === "aborted" && outcome.reason === "cancelled")) {
+      const bad =
+        outcome.kind === "failed" ||
+        outcome.kind === "discarded" ||
+        outcome.kind === "aborted";
+      await this.note(host.entry.connector, bad ? "bad" : "good");
+    }
     for (const dir of [...this.derived.keys()]) {
       if (dir.startsWith(`runs/${runId}/`)) this.derived.delete(dir);
     }
@@ -1629,6 +1949,24 @@ export class StreamSyncWriter {
       receipts: state.receipts,
     };
   }
+}
+
+function mergeCursors(
+  prev: JsonValue | null,
+  candidate: JsonValue | null,
+): JsonValue | null {
+  if (candidate === null) return prev;
+  if (isPlainObject(prev) && isPlainObject(candidate)) {
+    return { ...(prev as JsonObject), ...(candidate as JsonObject) };
+  }
+  return candidate;
+}
+
+function nextIndex(host: HostEntry): number {
+  return Object.values(host.streams).reduce(
+    (n, v) => Math.max(n, v.index + 1),
+    0,
+  );
 }
 
 function streamRowKind(read: ControlRead, hashes: ControlHashes): StreamRow {

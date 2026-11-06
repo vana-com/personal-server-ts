@@ -234,6 +234,45 @@ describe("createApp", () => {
     expect(enclaveResponse.status).toBe(401);
   });
 
+  it("mounts the stream-sync run intake only when an intake is passed", async () => {
+    const common = {
+      logger: pino({ level: "silent" }),
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accessToken: CONTROL_PLANE_TOKEN,
+    };
+    const intake = {
+      begin: vi.fn(),
+      batch: vi.fn(),
+      end: vi.fn(),
+      abort: vi.fn(),
+    };
+    const off = createApp(common);
+    const on = createApp({ ...common, streamSyncIntake: intake });
+    const put = (app: ReturnType<typeof createApp>, token?: string) =>
+      app.request("/v1/stream-sync/runs/r1", {
+        method: "PUT",
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+        body: "{}",
+      });
+
+    // Flag off: the path does not exist, whoever asks.
+    expect((await put(off)).status).toBe(404);
+    expect((await put(off, CONTROL_PLANE_TOKEN)).status).toBe(404);
+    // Flag on: the owner token reaches the adapter and nobody else does.
+    expect((await put(on)).status).toBe(401);
+    intake.begin.mockRejectedValueOnce(new Error("reached the adapter"));
+    await put(on, CONTROL_PLANE_TOKEN);
+    expect(intake.begin).toHaveBeenCalledTimes(1);
+  });
+
   it("GET /v1/mcp/activity returns the owner activity snapshot", async () => {
     const app = makeApp();
     const auth = await buildWeb3SignedHeader({

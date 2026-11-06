@@ -3,6 +3,8 @@ import {
   streamSyncSeedRoutes,
   type StreamSyncSeedRouteDeps,
 } from "./routes/stream-sync-seed.js";
+import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
+import type { StreamSyncIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -156,6 +158,8 @@ export interface AppDeps {
   syncManager?: SyncManager | null;
   /** Desktop seed intake (§2.9); null or absent when stream sync writing is off. */
   streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
+  /** Run intake (V2 §2); absent when stream sync writing is off. */
+  streamSyncIntake?: StreamSyncIntake;
   /** Read-side tombstone memory; reads of a deleted scope answer 410. */
   scopeDeletions?: ScopeDeletionTracker;
   serverSigner?: ServerSigner;
@@ -521,6 +525,21 @@ export function createApp(deps: AppDeps): Hono {
       streamSyncSeed: deps.streamSyncSeed ?? null,
     }),
   );
+
+  if (deps.streamSyncIntake) {
+    app.route(
+      "/v1/stream-sync/runs",
+      streamSyncRunsRoutes({
+        serverOrigin: deps.serverOrigin,
+        serverOwner: deps.serverOwner,
+        gateway: deps.gateway,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
+        tokenStore: deps.tokenStore,
+        intake: deps.streamSyncIntake,
+      }),
+    );
+  }
 
   // Mount data routes (ingest + read + delete)
   app.route(
