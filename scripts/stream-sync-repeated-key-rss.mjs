@@ -67,7 +67,9 @@ const writer = new StreamSyncWriter({
   }),
   blobs,
   files: createFsStreamSyncFiles(join(root, "outbox")),
-  keys: createStreamSyncKeyPorts(new Uint8Array(32).fill(7)),
+  keys: createStreamSyncKeyPorts(
+    await account.signMessage({ message: "vana-master-key-v1" }),
+  ),
   signer: createServerSigner(
     {
       address: account.address,

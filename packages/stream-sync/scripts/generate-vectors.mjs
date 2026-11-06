@@ -10,7 +10,7 @@
  *   node packages/stream-sync/scripts/generate-vectors.mjs [--check]
  */
 
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, hkdfSync } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +77,74 @@ const namespace = {
   keyCheck,
   controlHashes: hashes,
   cases: nsCases,
+};
+
+// ---------- stream master key (ruling R4, U1-Q1) ----------
+
+// Anvil account #0 signs "vana-master-key-v1" (personal_sign). viem gives
+// this low-s, v = 27 encoding; the other two are the same signature.
+const OWNER_SIGNATURE =
+  "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b";
+const SECP256K1_N =
+  0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+const sigR = OWNER_SIGNATURE.slice(2, 66);
+const sigS = BigInt("0x" + OWNER_SIGNATURE.slice(66, 130));
+const sigV = parseInt(OWNER_SIGNATURE.slice(130), 16);
+const hex32 = (n) => n.toString(16).padStart(64, "0");
+const hex1 = (n) => n.toString(16).padStart(2, "0");
+const masterKeyHex = OWNER_SIGNATURE.slice(2);
+const streamKNs = Buffer.from(
+  hkdfSync(
+    "sha256",
+    Buffer.from(masterKeyHex, "hex"),
+    Buffer.from("vana", "utf8"),
+    Buffer.from("scope:pdpp-stream-sync/namespace/v1", "utf8"),
+    32,
+  ),
+);
+const streamHmac8 = (text) =>
+  createHmac("sha256", streamKNs)
+    .update(text, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+const streamMasterKey = {
+  description:
+    "The stream-sync master key is the 65-byte owner signature as r, low s and v = 27/28. Every encoding gives the same key, so the same K_ns = HKDF-SHA256(masterKey, salt 'vana', info 'scope:' + NAMESPACE_KEY_LABEL, 32), ns and keyCheck. Legacy scope keys keep the raw signature.",
+  encodings: [
+    { name: "v 27/28, low s", signature: OWNER_SIGNATURE },
+    {
+      name: "v 0/1, low s",
+      signature: "0x" + sigR + hex32(sigS) + hex1(sigV - 27),
+    },
+    {
+      name: "v 27/28, high s",
+      signature:
+        "0x" + sigR + hex32(SECP256K1_N - sigS) + hex1(sigV === 27 ? 28 : 27),
+    },
+    {
+      name: "v 0/1, high s",
+      signature:
+        "0x" + sigR + hex32(SECP256K1_N - sigS) + hex1(sigV === 27 ? 1 : 0),
+    },
+  ],
+  masterKeyHex,
+  kNsHex: streamKNs.toString("hex"),
+  keyCheck: streamHmac8("key-check"),
+  ns: {
+    connector: "chatgpt",
+    accountId: "user-123",
+    ns: streamHmac8(cj(["chatgpt", "user-123"])),
+  },
+  invalid: [
+    { name: "64 bytes", signature: "0x" + masterKeyHex.slice(0, 128) },
+    { name: "66 bytes", signature: "0x" + masterKeyHex + "00" },
+    { name: "v = 29", signature: "0x" + sigR + hex32(sigS) + "1d" },
+    { name: "v = 2", signature: "0x" + sigR + hex32(sigS) + "02" },
+    { name: "s = 0", signature: "0x" + sigR + hex32(0n) + "1b" },
+    { name: "s = n", signature: "0x" + sigR + hex32(SECP256K1_N) + "1b" },
+    { name: "r = 0", signature: "0x" + hex32(0n) + hex32(sigS) + "1b" },
+    { name: "no 0x prefix", signature: masterKeyHex },
+  ],
 };
 
 // ---------- scopes and blob names ----------
@@ -1837,6 +1905,7 @@ const vectors = {
     "Cases with a `question` field follow a provisional reading; see DESIGN-QUESTIONS.md.",
   ],
   namespace,
+  streamMasterKey,
   scopes,
   pkHash: pkCases,
   lines,

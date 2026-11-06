@@ -3,6 +3,7 @@ export * from "./json.js";
 export * from "./bytes.js";
 export * from "./names.js";
 export * from "./namespace.js";
+export * from "./master-key.js";
 export * from "./records.js";
 export * from "./merge.js";
 export * from "./parts.js";

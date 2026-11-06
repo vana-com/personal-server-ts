@@ -14,6 +14,7 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 import {
   NAMESPACE_KEY_LABEL,
+  streamMasterKeyFromSignature,
   type HashPorts,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { StreamSyncKeyPorts } from "./ports.js";
@@ -28,12 +29,20 @@ function hex(bytes: Uint8Array): string {
 }
 
 /**
- * Key ports bound to the owner's master key. `deriveScopeKey` is HKDF over
- * the name; it does not validate the scope, so physical names are safe here.
+ * Key ports bound to the stream-sync master key of the owner signature.
+ *
+ * The ports take the signature, not a master key: the stream-sync master key
+ * is the signature in one normal form (`streamMasterKeyFromSignature`), so
+ * every encoding of one signature gives the same `ns`, `keyCheck`, head and
+ * part keys. Legacy scope keys keep the raw signature and do not use this.
+ *
+ * `deriveScopeKey` is HKDF over the name; it does not validate the scope, so
+ * physical names are safe here.
  */
 export function createStreamSyncKeyPorts(
-  masterKey: Uint8Array,
+  ownerSignature: Uint8Array | string,
 ): StreamSyncKeyPorts {
+  const masterKey = streamMasterKeyFromSignature(ownerSignature);
   const kNs = deriveScopeKey(masterKey, NAMESPACE_KEY_LABEL);
   const password = (scope: string) => hex(deriveScopeKey(masterKey, scope));
   return {

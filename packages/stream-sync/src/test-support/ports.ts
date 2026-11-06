@@ -1,4 +1,4 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, hkdfSync } from "node:crypto";
 import { keccak_256 } from "@noble/hashes/sha3";
 import type { Keccak256, NamespaceHmac, Sha256 } from "../bytes.js";
 
@@ -6,6 +6,7 @@ interface NodePorts {
   readonly sha256: Sha256;
   readonly keccak256: Keccak256;
   readonly namespaceHmac: (kNs: Uint8Array) => NamespaceHmac;
+  readonly namespaceKey: (masterKey: Uint8Array) => Uint8Array;
 }
 
 /** Test ports: node:crypto SHA-256 and HMAC, @noble/hashes Keccak-256. */
@@ -15,6 +16,17 @@ export const nodePorts: NodePorts = {
   keccak256: async (data) => keccak_256(data),
   namespaceHmac: (kNs) => async (message) =>
     new Uint8Array(createHmac("sha256", kNs).update(message).digest()),
+  // deriveScopeKey(masterKey, NAMESPACE_KEY_LABEL): HKDF-SHA256, salt "vana".
+  namespaceKey: (masterKey) =>
+    new Uint8Array(
+      hkdfSync(
+        "sha256",
+        masterKey,
+        "vana",
+        "scope:pdpp-stream-sync/namespace/v1",
+        32,
+      ),
+    ),
 };
 
 export const { sha256, keccak256 } = nodePorts;

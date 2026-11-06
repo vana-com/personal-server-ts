@@ -900,7 +900,7 @@ export async function createServer(
         }),
         blobs: createStorageStreamSyncBlobs(storageAdapter),
         files: createFsStreamSyncFiles(join(storageRoot, "stream-sync")),
-        keys: createStreamSyncKeyPorts(masterKey),
+        keys: createStreamSyncKeyPorts(masterKeySignature),
         signer: serverSigner,
       });
     }

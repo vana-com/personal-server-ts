@@ -6,7 +6,7 @@
  * The runner does no I/O.
  */
 
-import { utf8, type HashPorts, type NamespaceHmac } from "./bytes.js";
+import { toHex, utf8, type HashPorts, type NamespaceHmac } from "./bytes.js";
 import { classifyControl, type ControlState } from "./control.js";
 import {
   checkpointDecision,
@@ -38,6 +38,7 @@ import {
   streamScope,
 } from "./names.js";
 import { controlHashes, deriveKeyCheck, deriveNs } from "./namespace.js";
+import { streamMasterKeyFromSignature } from "./master-key.js";
 import { afterCommit, runMustBeFull, type NeedsFull } from "./needs-full.js";
 import { decodePart, encodePart } from "./parts.js";
 import { planBuckets } from "./planner.js";
@@ -53,6 +54,11 @@ import {
 export interface VectorPorts extends HashPorts {
   /** An HMAC-SHA256 port keyed with the given raw `K_ns` bytes. */
   readonly namespaceHmac: (kNs: Uint8Array) => NamespaceHmac;
+  /**
+   * The host's `K_ns` derivation from a master key:
+   * `deriveScopeKey(masterKey, NAMESPACE_KEY_LABEL)`.
+   */
+  readonly namespaceKey: (masterKey: Uint8Array) => Uint8Array;
 }
 
 export interface VectorReport {
@@ -119,6 +125,31 @@ export async function runVectors(
       `ns message ${c.connector}`,
       canonicalJson([c.connector, c.accountId]),
       c.message,
+    );
+  }
+
+  // stream master key (ruling R4): every encoding gives one key, ns and keyCheck
+  const smk = vectors.streamMasterKey;
+  for (const e of smk.encodings) {
+    const masterKey = streamMasterKeyFromSignature(e.signature);
+    eq(`streamMasterKey ${e.name}`, toHex(masterKey), smk.masterKeyHex);
+    const kNs = ports.namespaceKey(masterKey);
+    eq(`streamMasterKey K_ns ${e.name}`, toHex(kNs), smk.kNsHex);
+    const encodingHmac = ports.namespaceHmac(kNs);
+    eq(
+      `streamMasterKey keyCheck ${e.name}`,
+      await deriveKeyCheck(encodingHmac),
+      smk.keyCheck,
+    );
+    eq(
+      `streamMasterKey ns ${e.name}`,
+      await deriveNs(encodingHmac, smk.ns.connector, smk.ns.accountId),
+      smk.ns.ns,
+    );
+  }
+  for (const bad of smk.invalid) {
+    await throws(`streamMasterKey rejects ${bad.name}`, () =>
+      streamMasterKeyFromSignature(bad.signature),
     );
   }
 

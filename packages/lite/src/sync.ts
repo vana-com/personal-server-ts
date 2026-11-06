@@ -425,7 +425,7 @@ export async function createPsLiteSyncManager(
         }),
         blobs: createStorageStreamSyncBlobs(storageAdapter),
         files: options.streamSyncFiles ?? createIndexedDbStreamSyncFiles(),
-        keys: createStreamSyncKeyPorts(masterKey),
+        keys: createStreamSyncKeyPorts(options.ownerSignature),
         signer,
       })
     : null;

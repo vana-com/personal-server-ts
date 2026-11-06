@@ -63,7 +63,9 @@ export const OWNER_KEY =
 export const SERVER_KEY =
   "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 export const OWNER = privateKeyToAccount(OWNER_KEY).address;
-const MASTER_KEY = new Uint8Array(32).fill(7);
+/** OWNER_KEY's signature over the master-key message (deterministic). */
+export const OWNER_SIGNATURE =
+  "0x1f5c9b3bafc291e8ea7aa4e0c5700a109e68aa2431fdbea08b49f9bf91b5c7db2aaa192de5cdf866e5f9f5f39502a66bd696a1399a537eac8ffb826c00e4e1d51b";
 const CONFIG = ServerConfigSchema.parse({});
 const GATEWAY_CONFIG = {
   chainId: CONFIG.gateway.chainId,
@@ -347,7 +349,7 @@ export async function createOracleEnv(input: {
         registry: newRegistry(),
         blobs,
         files: await files(device),
-        keys: createStreamSyncKeyPorts(MASTER_KEY),
+        keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
         // Full server signs with its registered server key; Lite with the owner.
         signer: accountSigner(
           input.surface === "full" ? SERVER_KEY : OWNER_KEY,
@@ -363,7 +365,7 @@ export async function createOracleEnv(input: {
 
 // ------------------------------------------------------------ test actions
 
-const keys = createStreamSyncKeyPorts(MASTER_KEY);
+const keys = createStreamSyncKeyPorts(OWNER_SIGNATURE);
 const ownerSigner = accountSigner(OWNER_KEY);
 
 async function ownHashes() {
