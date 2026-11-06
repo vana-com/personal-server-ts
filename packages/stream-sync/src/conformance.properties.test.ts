@@ -9,7 +9,7 @@
 
 import { createHash } from "node:crypto";
 import fc from "fast-check";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   BucketReducer,
   PLANNER_DEPTH_CAP,
@@ -42,6 +42,9 @@ const RUNS = Number(process.env["FC_RUNS"] ?? 300);
 const seed = process.env["FC_SEED"]
   ? Number(process.env["FC_SEED"])
   : undefined;
+// A larger FC_RUNS needs more time per test than the default 5 s.
+vi.setConfig({ testTimeout: Math.max(5_000, RUNS * 20) });
+
 const params = (numRuns = RUNS) => ({
   numRuns,
   ...(seed === undefined ? {} : { seed }),
@@ -162,7 +165,72 @@ describe("merge (§2.6)", () => {
   });
 });
 
+const bitsOf = (hash: string) =>
+  BigInt(`0x${hash}`).toString(2).padStart(256, "0");
+
 describe("BucketReducer", () => {
+  it("over the part limit, splits below the 16-bit cap and stops at it (Q4)", () => {
+    let splitRuns = 0;
+    let cappedRuns = 0;
+    fc.assert(
+      fc.property(
+        fc.uniqueArray(hex64, { minLength: 1, maxLength: 60 }),
+        fc.integer({ min: 20, max: 3000 }),
+        (hashes, limit) => {
+          const entries = hashes.map((pkHash, i) => ({
+            pkHash,
+            line: { o: 1, r: "run-000001", v: { id: i } },
+          }));
+          // The host's re-plan loop: reduce a bucket, split it on `split`.
+          const queue = [""];
+          const finished: { prefix: string; keys: string[]; bytes: number }[] =
+            [];
+          const tooLarge: string[] = [];
+          let reductions = 0;
+          while (queue.length > 0) {
+            reductions += 1;
+            expect(reductions).toBeLessThanOrEqual(
+              hashes.length * 2 * PLANNER_DEPTH_CAP + 1,
+            );
+            const prefix = queue.pop()!;
+            const reducer = new BucketReducer(prefix);
+            for (const e of entries) {
+              if (bitsOf(e.pkHash).startsWith(prefix))
+                reducer.add(e.pkHash, e.line);
+            }
+            const result = reducer.finish(limit);
+            if (result.kind === "ok") {
+              finished.push({
+                prefix,
+                keys: result.winners.map((w) => w.pkHash),
+                bytes: result.bytes,
+              });
+            } else if (result.kind === "split") {
+              expect(prefix.length).toBeLessThan(PLANNER_DEPTH_CAP);
+              queue.push(`${prefix}0`, `${prefix}1`);
+            } else {
+              expect(prefix.length).toBe(PLANNER_DEPTH_CAP);
+              tooLarge.push(prefix);
+            }
+          }
+          if (reductions > 1) splitRuns += 1;
+          if (tooLarge.length > 0) cappedRuns += 1;
+          for (const f of finished) expect(f.bytes).toBeLessThanOrEqual(limit);
+          // Every key lands in exactly one finished or capped bucket.
+          const placed = hashes.map(
+            (h) =>
+              finished.filter((f) => f.keys.includes(h)).length +
+              tooLarge.filter((p) => bitsOf(h).startsWith(p)).length,
+          );
+          expect(placed.every((n) => n === 1)).toBe(true);
+        },
+      ),
+      params(),
+    );
+    expect(splitRuns).toBeGreaterThan(0);
+    expect(cappedRuns).toBeGreaterThan(0);
+  });
+
   it("keeps exactly the winning line per key", () => {
     fc.assert(
       fc.property(versionsArb, (vs) => {
@@ -504,21 +572,37 @@ describe("scope names (§2.1)", () => {
   });
 
   it("parse accepts only names the builders produce", () => {
+    const builtArb = fc.oneof(
+      fc
+        .tuple(connectorArb, nsArb, streamArb)
+        .map(([c, ns, s]) => streamScope(c, ns, s)),
+      fc.tuple(connectorArb, nsArb).map(([c, ns]) => controlScope(c, ns)),
+    );
+    // A built name with one character replaced by 0-2 others.
+    const nearMissArb = fc
+      .tuple(builtArb, fc.nat(), fc.string({ maxLength: 2 }))
+      .map(([name, i, insert]) => {
+        const at = i % (name.length + 1);
+        return name.slice(0, at) + insert + name.slice(at + 1);
+      });
     let parsedRuns = 0;
     fc.assert(
-      fc.property(fc.oneof(scopeLikeArb, fc.string()), (name) => {
-        const parsed = parseScope(name);
-        if (parsed === null) return;
-        parsedRuns += 1;
-        const rebuilt =
-          parsed.kind === "stream"
-            ? streamScope(parsed.connector, parsed.ns, parsed.stream)
-            : controlScope(parsed.connector, parsed.ns);
-        expect(rebuilt).toBe(name);
-      }),
+      fc.property(
+        fc.oneof(builtArb, nearMissArb, scopeLikeArb, fc.string()),
+        (name) => {
+          const parsed = parseScope(name);
+          if (parsed === null) return;
+          parsedRuns += 1;
+          const rebuilt =
+            parsed.kind === "stream"
+              ? streamScope(parsed.connector, parsed.ns, parsed.stream)
+              : controlScope(parsed.connector, parsed.ns);
+          expect(rebuilt).toBe(name);
+        },
+      ),
       params(RUNS * 10),
     );
-    expect(parsedRuns).toBeGreaterThan(RUNS / 10);
+    expect(parsedRuns).toBeGreaterThan(RUNS);
   });
 
   it("rejects malformed names", () => {

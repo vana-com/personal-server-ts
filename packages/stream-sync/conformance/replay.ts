@@ -261,21 +261,6 @@ async function headLines(built: Built): Promise<Line[]> {
 
 // ------------------------------------------------- package adapters
 
-/** `chooseBase` at 121a6f7c returns `Head | null`; ruling F1 adds kinds. */
-export type BaseOutcome = "base" | "empty" | "stale_generation";
-function baseOutcome(result: unknown): {
-  kind: BaseOutcome;
-  head: Head | null;
-} {
-  if (result === null) return { kind: "empty", head: null };
-  const r = result as { kind?: string; head?: Head };
-  if (r.kind === "base") return { kind: "base", head: r.head! };
-  if (r.kind === "empty") return { kind: "empty", head: null };
-  if (r.kind === "stale_generation")
-    return { kind: "stale_generation", head: null };
-  return { kind: "base", head: result as Head };
-}
-
 function needsFullOf(st: ModelState, d: string): NeedsFull {
   const set: [string, string][] = st.needsFull[d] ?? [];
   return [...set]
@@ -332,7 +317,6 @@ export interface ReplayStats {
   modelOnly: Record<string, number>;
 }
 
-type Phase = DecidePhase | "stale_base";
 type Result = {
   state: "committed" | "noop";
   generation: number;
@@ -390,7 +374,7 @@ export async function replayTrace(
   };
 
   // Host-side memory the model keeps implicitly.
-  const phase = new Map<string, Phase>(); // `${d}/${s}` -> decide phase
+  const phase = new Map<string, DecidePhase>(); // `${d}/${s}` -> decide phase
   const results = new Map<string, Map<string, Result>>(); // d -> s -> result
 
   for (let i = 0; i < states.length; i += 1) {
@@ -707,12 +691,12 @@ export async function replayTrace(
     const row = rowOf(rows);
     const topBuilt = row === "present" ? await toHead(n, s, top) : null;
     point("chooseBase", [row, top?.g ?? null, T]);
-    const chosen = baseOutcome(api.chooseBase(row, topBuilt?.head ?? null, T));
+    const chosen = api.chooseBase(row, topBuilt?.head ?? null, T);
     const pe = post.ob[d];
 
     if (action === "PlanStale") {
       // The host re-reads control and decides again with phase `stale_base`
-      // (ruling F1; a package without that phase decides it as `first`).
+      // (ruling F1).
       phase.set(`${d}/${s}`, "stale_base");
       if (chosen.kind !== "stale_generation") {
         diverge(

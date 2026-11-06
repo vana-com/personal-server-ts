@@ -1,0 +1,20 @@
+{
+  "about": "Divergences between the model and the package that the replay expects. src/conformance.test.ts fails on any divergence not matched here and on any entry here that no longer occurs. Match fields are regular expressions over the whole field. An entry with requiresDesign is expected only when the corpus model ran with that design constant TRUE.",
+  "divergences": [
+    {
+      "id": "noop-onto-tombstone",
+      "match": {
+        "check": "checkpointDecision",
+        "action": "Finish",
+        "model": "save:[0-9]+",
+        "package": "skip published_incomplete",
+        "detail": ".*\"state\":\"noop\",\"generation\":[0-9]+,\"complete\":false.*incomp=false"
+      },
+      "requiresDesign": "NoOpNeedsFull",
+      "wrongSide": "design",
+      "why": "An old app's DELETE tombstoned the stream row (limitation L11). The next run is incremental and emits nothing for the stream, so the stream ends the run with no head at T. The model counts this as a no-op with no base: Q9 does not apply (it needs a base), and the checkpoint is saved. StreamRunResult has no state for a stream with no head at T; its `complete` is the `complete` of an unchanged head, and there is none. The replay passes {state: \"noop\", complete: false}. checkpointDecision then skips the checkpoint (Q9), so the next run is full and publishes again the records the old app deleted. Every occurrence in the corpus follows an OldDelete (slice-q9 traces).",
+      "recommendation": "Give StreamRunResult an explicit state for a stream that ends the run with no head at T (for example {state: \"skipped\", generation}, the word the receipt already uses in §2.9), and let checkpointDecision accept it as the model does. Separately, the design decides whether a full run after an old app's DELETE is wanted (L11); if it is, the model must set needsFull there too.",
+      "fixedBy": "Lane P1 (StreamRunResult state) and a design ruling on L11; open."
+    }
+  ]
+}
