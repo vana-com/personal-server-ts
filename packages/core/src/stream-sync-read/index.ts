@@ -1,4 +1,8 @@
-export { isPhysicalScope } from "./routing.js";
+export {
+  isPhysicalScope,
+  logicalStreamScopeParts,
+  streamReadScope,
+} from "./routing.js";
 export type {
   StreamSyncBlobReader,
   StreamSyncOverlayEntry,

@@ -14,9 +14,12 @@ vi.mock("@opendatalabs/vana-sdk/browser", async (importOriginal) => {
 });
 
 import { ScopeSchema } from "@opendatalabs/vana-sdk/browser";
-import { parseDataScopeContract } from "../contracts/data.js";
+import {
+  parseDataReadScopeContract,
+  parseDataScopeContract,
+} from "../contracts/data.js";
 import { createGrantContract } from "../contracts/grants.js";
-import { isPhysicalScope } from "./routing.js";
+import { isPhysicalScope, streamReadScope } from "./routing.js";
 
 const PHYSICAL = [
   "pdpp.chatgpt~0123456789abcdef.conversations",
@@ -73,5 +76,79 @@ describe("physical stream-sync names", () => {
     } as never);
     expect(result).toMatchObject({ status: 400 });
     expect(getBuilder).not.toHaveBeenCalled();
+  });
+});
+
+describe("stream-sync read names", () => {
+  it("maps the logical name and the identity-less physical scope to the logical name", () => {
+    expect(streamReadScope("pdpp.github-browser.repositories")).toBe(
+      "pdpp.github-browser.repositories",
+    );
+    expect(streamReadScope("pdpp.github-browser~.repositories")).toBe(
+      "pdpp.github-browser.repositories",
+    );
+    expect(streamReadScope("pdpp.chatgpt~.conversations")).toBe(
+      "pdpp.chatgpt.conversations",
+    );
+  });
+
+  it("refuses a namespaced scope, a control scope, a path and a non-stream name", () => {
+    for (const name of [
+      "pdpp.chatgpt~0123456789abcdef.conversations",
+      "pdpp.chatgpt~0123456789abcdef",
+      "pdpp.chatgpt~",
+      "chatgpt.conversations",
+      "pdpp.chatgpt",
+      "pdpp.a.b/../c",
+      "pdpp.a b.c",
+      "pdpp.a.b\nc",
+      "pdpp.a~b.c",
+    ]) {
+      expect(streamReadScope(name), name).toBeNull();
+    }
+  });
+
+  it("a read takes the names, and no other contract does", () => {
+    const safeParse = vi.mocked(ScopeSchema.safeParse);
+    safeParse.mockClear();
+    for (const name of [
+      "pdpp.github-browser.repositories",
+      "pdpp.github-browser~.repositories",
+    ]) {
+      expect(parseDataReadScopeContract(name)).toEqual({
+        ok: true,
+        scope: "pdpp.github-browser.repositories",
+      });
+    }
+    expect(safeParse).not.toHaveBeenCalled();
+    // The strict rule is unchanged: writes, deletes and imports never take them.
+    expect(
+      parseDataScopeContract("pdpp.github-browser.repositories"),
+    ).toMatchObject({
+      ok: false,
+      body: { error: "INVALID_SCOPE" },
+    });
+    expect(
+      parseDataScopeContract("pdpp.github-browser~.repositories"),
+    ).toMatchObject({
+      ok: false,
+      body: { error: "INVALID_SCOPE" },
+    });
+    // A read still refuses the other physical names.
+    for (const name of [
+      "pdpp.chatgpt~0123456789abcdef.conversations",
+      "pdpp.chatgpt~0123456789abcdef",
+      "pdpp.chatgpt~",
+    ]) {
+      expect(parseDataReadScopeContract(name)).toMatchObject({
+        ok: false,
+        body: { error: "INVALID_SCOPE" },
+      });
+    }
+    // Names that were valid stay valid and unchanged.
+    expect(parseDataReadScopeContract("instagram.profile")).toEqual({
+      ok: true,
+      scope: "instagram.profile",
+    });
   });
 });

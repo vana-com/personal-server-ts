@@ -1,4 +1,5 @@
 import { isPhysicalScope } from "../stream-sync/scope-routing.js";
+import { streamReadScope } from "../stream-sync-read/routing.js";
 import { isReplicaScope } from "../replication/namespace.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
@@ -366,6 +367,24 @@ export function parseDataScopeContract(
   return { ok: true, scope: scopeResult.data };
 }
 
+/**
+ * The scope rule of a read. It is `parseDataScopeContract` plus the names of
+ * stream-sync streams: a stream is read by its logical name
+ * (`pdpp.<c>.<s>`), and its identity-less physical scope (`pdpp.<c>~.<s>`,
+ * R23) is an alias for that name. Neither reaches the SDK ScopeSchema, which
+ * rejects a connector key such as `github-browser`. Writes, deletes and
+ * imports keep the strict rule.
+ */
+export function parseDataReadScopeContract(
+  scopeParam: string,
+): { ok: true; scope: string } | DataContractError {
+  if (isReplicaScope(scopeParam))
+    return invalidScope("Replica transport scopes are reserved");
+  const stream = streamReadScope(scopeParam);
+  if (stream !== null) return { ok: true, scope: stream };
+  return parseDataScopeContract(scopeParam);
+}
+
 function normalizeLimit(value: number | undefined): number {
   return value ?? 20;
 }
@@ -621,7 +640,7 @@ export async function summarizeDataAdditionsContract(
 export async function readDataContract(
   input: ReadDataContractInput,
 ): Promise<ReadDataContractResult | DataContractError> {
-  const scopeResult = parseDataScopeContract(input.scopeParam);
+  const scopeResult = parseDataReadScopeContract(input.scopeParam);
   if (!scopeResult.ok) return scopeResult;
 
   const entry = input.storage.findEntry({

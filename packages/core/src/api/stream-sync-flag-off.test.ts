@@ -137,8 +137,12 @@ describe("data reads with streamSync.read off", () => {
 
   it("answer the same with the flag on and nothing published", async () => {
     // `connection` and `cursor` mean something once the flag is on.
+    // The identity-less physical name is a read alias of the logical name once
+    // the flag is on, so it is compared with the logical name below.
     const plain = REQUESTS.filter(
-      (r) => !/[?&](connection|cursor)=/.test(r.path),
+      (r) =>
+        !/[?&](connection|cursor)=/.test(r.path) &&
+        r.name !== "identity-less physical name",
     );
     const off = await observe(await seededDeps(), plain);
     const service = await StreamSyncReadService.open({
@@ -153,5 +157,30 @@ describe("data reads with streamSync.read off", () => {
     );
     expect(Object.keys(on)).toHaveLength(plain.length);
     expect(on).toEqual(off);
+  });
+
+  it("reads the identity-less physical name as its logical name only with the flag on", async () => {
+    const alias = [
+      REQUESTS.find((r) => r.name === "identity-less physical name")!,
+    ];
+    const logical = [REQUESTS.find((r) => r.name === "raw pdpp stream")!];
+    const service = await StreamSyncReadService.open({
+      files: createMemoryStreamSyncReadFiles(),
+      blobs: { get: async () => null },
+      keys: await createStreamSyncReadKeys(new Uint8Array(65).fill(7)),
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const flagOff = await observe(await seededDeps(), alias);
+    expect(flagOff["identity-less physical name"]?.status).toBe(400);
+    const flagOn = await observe(
+      { ...(await seededDeps()), streamSyncRead: service },
+      [...alias, ...logical],
+    );
+    const { status, bytes, sha256 } = flagOn["identity-less physical name"]!;
+    expect({ status, bytes, sha256 }).toEqual({
+      status: flagOn["raw pdpp stream"]!.status,
+      bytes: flagOn["raw pdpp stream"]!.bytes,
+      sha256: flagOn["raw pdpp stream"]!.sha256,
+    });
   });
 });
