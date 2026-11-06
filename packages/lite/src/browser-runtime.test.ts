@@ -227,6 +227,74 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
   });
 });
 
+describe("createIndexedDbPsLiteRuntime run intake", () => {
+  const options = (extra: Record<string, unknown>) => ({
+    ownerAddress,
+    ownerSignature,
+    dbName: `ps-lite-intake-${Math.random()}`,
+    storageDbName: `ps-lite-intake-storage-${Math.random()}`,
+    gateway: createMockPsLiteGateway(),
+    auth: createBearerTokenPsLiteAuth({
+      ownerToken: "owner-token",
+      builderToken: "builder-token",
+    }),
+    active: true,
+    ...extra,
+  });
+  const digest = `sha256:${"ab".repeat(32)}`;
+  const begin = (
+    owner: string,
+    intake: NonNullable<
+      Awaited<
+        ReturnType<typeof createIndexedDbPsLiteRuntime>
+      >["streamSyncIntake"]
+    >,
+    artifactDigest: string,
+  ) =>
+    intake.begin("r1", {
+      connector: "c",
+      artifactDigest,
+      owner: { address: owner, leaseId: null },
+      observedAt: Date.now(),
+    });
+
+  it("exposes the sync manager's intake and resolves digests from the host table", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const resolve = vi.fn((d: string) =>
+      d === digest ? { version: "1", streams: [] } : null,
+    );
+    const { streamSyncIntake } = await createIndexedDbPsLiteRuntime(
+      options({
+        streamSyncDeclarations: resolve,
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: true },
+          streamSync: { write: true },
+        },
+      }),
+    );
+    expect(streamSyncIntake).not.toBeNull();
+    await expect(
+      begin(ownerAddress, streamSyncIntake!, `sha256:${"cd".repeat(32)}`),
+    ).rejects.toMatchObject({ code: "unknown_artifact" });
+    await begin(ownerAddress, streamSyncIntake!, digest).catch(() => {});
+    expect(resolve).toHaveBeenCalledWith(digest);
+  });
+
+  it("is null with streamSync.write off", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const { streamSyncIntake } = await createIndexedDbPsLiteRuntime(
+      options({
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: true },
+        },
+      }),
+    );
+    expect(streamSyncIntake).toBeNull();
+  });
+});
+
 describe("createIndexedDbPsLiteRuntime write sessions", () => {
   it("mounts the write-session handshake by default and skips it for a caller-owned auth adapter", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());

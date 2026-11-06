@@ -4,6 +4,7 @@ import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/
 import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import { createGatewayDataPointFeed } from "@opendatalabs/personal-server-ts-core/sync";
 import type { StreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
+import type { RunIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   createLiteReplication,
   liteVanaReplicaObjects,
@@ -117,6 +118,13 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    */
   streamSyncReadFiles?: StreamSyncReadFiles;
   /**
+   * Artifact digest -> stream declarations, filled by the host after it
+   * verified each artifact. The run intake trusts only this table; with none
+   * given, every digest answers `unknown_artifact`. Used only when
+   * `config.streamSync.write` is on.
+   */
+  streamSyncDeclarations?: PsLiteSyncOptions["streamSyncDeclarations"];
+  /**
    * The host's replication ports (host contract §4): native persistence
    * with replica support and native object transfers. With the door on and
    * `config.enabled`, this factory builds replication over them and passes
@@ -150,6 +158,11 @@ export interface IndexedDbPsLiteRuntime {
   tokenStore: PsLiteRuntimeOptions["tokenStore"];
   accessLogStore: AccessLogReader & AccessLogWriter;
   syncManager: PsLiteRuntimeOptions["syncManager"];
+  /**
+   * The run intake over the stream-sync writer, for host code to call in
+   * process. `null` unless `config.streamSync.write` is on.
+   */
+  streamSyncIntake: RunIntake | null;
   /** The compute layer; hosts call `scheduler.stop()` on teardown. */
   derivatives: PsLiteRuntimeOptions["derivatives"];
   /** This boot's replication door, from `resolveLiteReplication`. */
@@ -237,6 +250,7 @@ export async function createIndexedDbPsLiteRuntime(
   let scopeDeletions = options.scopeDeletions;
   let additions = options.additions;
   let streamSyncRead = options.streamSyncRead;
+  let streamSyncIntake: RunIntake | null = null;
   let runtimeRef: PsLiteRuntime | null = null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
@@ -288,6 +302,7 @@ export async function createIndexedDbPsLiteRuntime(
       gateway,
       dataPointFeed: options.dataPointFeed,
       scopeDeletions,
+      streamSyncDeclarations: options.streamSyncDeclarations,
       // Stream-sync reads: on only when `config.streamSync.read` is on.
       ...(config.streamSync.read
         ? {
@@ -311,6 +326,7 @@ export async function createIndexedDbPsLiteRuntime(
     scopeDeletions = sync.scopeDeletions;
     dataPointFeed = sync.dataPointFeed;
     streamSyncRead = sync.streamSyncRead ?? streamSyncRead;
+    streamSyncIntake = sync.streamSyncIntake;
   }
   const replicationHost = options.replicaHost
     ? await createLiteReplication({
@@ -436,6 +452,7 @@ export async function createIndexedDbPsLiteRuntime(
     tokenStore,
     accessLogStore,
     syncManager,
+    streamSyncIntake,
     derivatives,
     replication,
     replicationHost,
