@@ -41,40 +41,36 @@ jobs:
 
           const canaryVersion = process.env.CANARY_VERSION;
           const packageFiles = [
+            "packages/stream-sync/package.json",
             "packages/core/package.json",
             "packages/lite/package.json",
             "packages/server/package.json",
             "packages/cli/package.json",
           ];
+          const internalDependency =
+            /^@opendatalabs\/personal-server-ts(-|$)/;
 
+          // Every internal dependency is pinned to the canary: a `*` range
+          // never matches a prerelease, so an unpinned one cannot install.
           for (const path of packageFiles) {
             const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
             pkg.version = canaryVersion;
 
-            if (path === "packages/server/package.json") {
-              pkg.dependencies["@opendatalabs/personal-server-ts-core"] =
-                canaryVersion;
-              pkg.dependencies["@opendatalabs/personal-server-ts-lite"] =
-                canaryVersion;
-            }
-
-            if (path === "packages/lite/package.json") {
-              pkg.dependencies["@opendatalabs/personal-server-ts-core"] =
-                canaryVersion;
-            }
-
-            if (path === "packages/cli/package.json") {
-              pkg.dependencies["@opendatalabs/personal-server-ts-core"] =
-                canaryVersion;
-              pkg.dependencies["@opendatalabs/personal-server-ts-lite"] =
-                canaryVersion;
-              pkg.dependencies["@opendatalabs/personal-server-ts-server"] =
-                canaryVersion;
+            for (const field of ["dependencies", "peerDependencies"]) {
+              for (const name of Object.keys(pkg[field] ?? {})) {
+                if (internalDependency.test(name)) {
+                  pkg[field][name] = canaryVersion;
+                }
+              }
             }
 
             fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
           }
           EOF
+      - name: Publish stream-sync canary
+        run: cd packages/stream-sync && npm publish --tag canary --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish core canary
         run: cd packages/core && npm publish --tag canary --access public
         env:
