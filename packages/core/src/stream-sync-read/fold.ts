@@ -33,6 +33,11 @@ export interface FoldBase {
 }
 
 export interface Fold {
+  /**
+   * Every run the writer will publish, in publish order, including those a
+   * later key change replaced. `merged` is the tail of it that the view shows.
+   */
+  readonly chain: readonly Contribution[];
   /** Runs the view shows, in publish order. */
   readonly merged: readonly Contribution[];
   /** Runs the writer will not publish until the connector is newer. */
@@ -63,6 +68,7 @@ export function foldContributions(
   let state: FoldBase | null = base;
   let baseDropped = false;
   let merged: Contribution[] = [];
+  const chain: Contribution[] = [];
   const withheld: Contribution[] = [];
   for (const c of [...candidates].sort(publishOrder)) {
     const compat = writerCompatibility(
@@ -87,6 +93,7 @@ export function foldContributions(
       baseDropped = true;
       merged = [];
     }
+    chain.push(c);
     merged.push(c);
     state = {
       primaryKey: c.stream.primaryKey,
@@ -95,6 +102,7 @@ export function foldContributions(
     };
   }
   return {
+    chain,
     merged,
     withheld,
     baseDropped,

@@ -226,6 +226,14 @@ interface CursorStream {
    * cursor from before overlay pins: it pinned no member.
    */
   readonly m?: readonly (readonly [string, string])[];
+  /**
+   * The whole fold the response was built from: every run the writer would
+   * publish, in publish order, `[runId, contentRevision]`, including those a
+   * later key change replaced. Absent in a cursor from before fold pins.
+   */
+  readonly p?: readonly (readonly [string, string])[];
+  /** The fold replaced the imported base. Pinned with `p`. */
+  readonly d?: boolean;
 }
 
 interface Cursor {
@@ -316,26 +324,30 @@ function decodeCursor(text: string): Cursor | null {
     const streams: Record<string, CursorStream> = {};
     if (typeof parsed.s === "object" && parsed.s !== null) {
       for (const [name, pin] of Object.entries(parsed.s)) {
-        const { b, m } = (pin ?? {}) as { b?: unknown; m?: unknown };
+        const { b, m, p, d } = (pin ?? {}) as {
+          b?: unknown;
+          m?: unknown;
+          p?: unknown;
+          d?: unknown;
+        };
         if (b !== null && !Number.isSafeInteger(b)) return null;
-        if (
-          m !== undefined &&
-          !(
-            Array.isArray(m) &&
-            m.every(
-              (x) =>
-                Array.isArray(x) &&
-                x.length === 2 &&
-                typeof x[0] === "string" &&
-                typeof x[1] === "string",
-            )
-          )
-        ) {
-          return null;
-        }
+        const pairs = (x: unknown) =>
+          Array.isArray(x) &&
+          x.every(
+            (y) =>
+              Array.isArray(y) &&
+              y.length === 2 &&
+              typeof y[0] === "string" &&
+              typeof y[1] === "string",
+          );
+        if (m !== undefined && !pairs(m)) return null;
+        if (p !== undefined && !pairs(p)) return null;
+        if (d !== undefined && typeof d !== "boolean") return null;
         streams[name] = {
           b: b as number | null,
           ...(m ? { m: m as [string, string][] } : {}),
+          ...(p ? { p: p as [string, string][] } : {}),
+          ...(d !== undefined ? { d } : {}),
         };
       }
     } else if (typeof parsed.v === "object" && parsed.v !== null) {
@@ -533,9 +545,9 @@ export class StreamSyncReadService {
    * `pending` reads this device's own rows that no verified activation of
    * their generation covers. `foldBase` is the head the writer would meet
    * (default `base`); a pending read passes the live imported head here
-   * without letting it cover or join the rows. `members`, from a cursor,
-   * replays exactly those runs; the withheld runs are still every run that is
-   * withheld now.
+   * without letting it cover or join the rows. `steps`, from a cursor,
+   * replays the fold of exactly those runs; the withheld runs are still every
+   * run that is withheld now.
    */
   private contributions(
     snapshot: StreamSyncOverlaySnapshot | undefined,
@@ -548,10 +560,10 @@ export class StreamSyncReadService {
     options: {
       readonly pending?: boolean;
       readonly foldBase?: ImportedVersion | null;
-      readonly members?: readonly (readonly [string, string])[];
+      readonly steps?: readonly (readonly [string, string])[];
     } = {},
   ): Fold {
-    const { pending = false, members } = options;
+    const { pending = false, steps } = options;
     const foldBase = toFoldBase(
       options.foldBase === undefined ? base : options.foldBase,
     );
@@ -585,11 +597,11 @@ export class StreamSyncReadService {
       candidates.push({ run, stream: local });
     }
     const all = foldContributions(foldBase, candidates);
-    if (!members) return all;
+    if (!steps) return all;
     const replay = foldContributions(
       foldBase,
       candidates.filter((c) =>
-        members.some(
+        steps.some(
           ([runId, revision]) =>
             runId === c.run.runId && revision === c.stream.contentRevision,
         ),
@@ -970,9 +982,10 @@ export class StreamSyncReadService {
           lease = this.views.lease(key);
         }
         if (lease) leases.push(lease);
-        // Replay exactly the recorded members of a cursor: a retired or
-        // changed one makes the cursor stale, and a new run does not join.
-        const members = cursor ? (pin!.m ?? []) : undefined;
+        // Replay the fold a cursor recorded: a retired or changed run makes
+        // the cursor stale, and a new run does not join. A cursor from before
+        // fold pins recorded the shown members alone.
+        const steps = cursor ? (pin!.p ?? pin!.m ?? []) : undefined;
         const fold = this.contributions(
           snapshot,
           target.connector,
@@ -988,10 +1001,10 @@ export class StreamSyncReadService {
             foldBase: pending
               ? this.liveImported(target.connector, ns, stream, control, row)
               : (lease?.version ?? null),
-            ...(members ? { members } : {}),
+            ...(steps ? { steps } : {}),
           },
         );
-        if (members && fold.merged.length !== members.length) {
+        if (cursor && !replaysPin(fold, pin!)) {
           releaseAll();
           return { kind: "cursor_stale" };
         }
@@ -1054,6 +1067,10 @@ export class StreamSyncReadService {
               m: i.fold.merged
                 .map((c) => [c.run.runId, c.stream.contentRevision] as const)
                 .sort(),
+              p: i.fold.chain.map(
+                (c) => [c.run.runId, c.stream.contentRevision] as const,
+              ),
+              d: i.fold.baseDropped,
             },
           ]),
         ),
@@ -1160,6 +1177,37 @@ interface StreamInput {
   readonly lease: ViewLease | null;
   /** The local runs the view shows, as the writer will publish them. */
   readonly fold: Fold;
+}
+
+const stepKey = (c: Contribution) =>
+  `${c.run.runId}\0${c.stream.contentRevision}`;
+const pairKey = ([runId, revision]: readonly [string, string]) =>
+  `${runId}\0${revision}`;
+
+/**
+ * The replayed fold is the one the cursor recorded: the same published runs
+ * in the same order, the same shown members, the same base decision.
+ * Otherwise a replay would mix rows the first response had replaced.
+ */
+function replaysPin(fold: Fold, pin: CursorStream): boolean {
+  const members = (pin.m ?? []).map(pairKey).sort();
+  const shown = fold.merged.map(stepKey).sort();
+  if (
+    members.length !== shown.length ||
+    members.some((key, i) => key !== shown[i])
+  ) {
+    return false;
+  }
+  if (pin.p) {
+    const chain = fold.chain.map(stepKey);
+    if (
+      pin.p.length !== chain.length ||
+      pin.p.some((pair, i) => pairKey(pair) !== chain[i])
+    ) {
+      return false;
+    }
+  }
+  return pin.d === undefined || pin.d === fold.baseDropped;
 }
 
 /** The imported view whose rows the stream shows: none once a run replaced it. */
