@@ -103,6 +103,24 @@ describe("RegistryMirror durable publication", () => {
     expect(version(await RegistryMirror.open(files))).toBeUndefined();
   });
 
+  it("raises and persists the deletion floor from a tombstone the kept row outranks, and reports the connector", async () => {
+    const { files, mirror } = await fixture(true);
+    expect(await mirror.observe([row(3)], page)).toEqual(["test-connector"]);
+
+    const tombstone: MirrorFeedRow = {
+      ...row(2),
+      deletedAt: "2026-11-01T00:00:00.000Z",
+    };
+    expect(await mirror.observe([tombstone], page)).toEqual(["test-connector"]);
+
+    expect(version(mirror)).toBe(3);
+    expect(mirror.deletionFloor("test-stream")).toBe(2);
+    const reopened = await RegistryMirror.open(files);
+    expect(version(reopened)).toBe(3);
+    expect(reopened.deletionFloor("test-stream")).toBe(2);
+    expect(await mirror.observe([tombstone], page)).toEqual([]);
+  });
+
   it("serializes overlapping writes and exposes only persisted rows", async () => {
     const memory = createMemoryStreamSyncReadFiles();
     await memory.write(

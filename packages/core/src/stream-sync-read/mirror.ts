@@ -185,14 +185,16 @@ export class RegistryMirror {
   ): Promise<string[]> {
     const nextRows = new Map(this.rows);
     const nextFloors = new Map(this.floors);
-    const raise = (row: MirrorRow) => {
+    const raise = (row: MirrorRow): boolean => {
       if (
-        parseScope(row.scope)?.kind === "stream" &&
-        this.isTombstone(row) &&
-        row.version > (nextFloors.get(row.scope) ?? 0)
+        parseScope(row.scope)?.kind !== "stream" ||
+        !this.isTombstone(row) ||
+        row.version <= (nextFloors.get(row.scope) ?? 0)
       ) {
-        nextFloors.set(row.scope, row.version);
+        return false;
       }
+      nextFloors.set(row.scope, row.version);
+      return true;
     };
     const fullListingStarted = this.fullListingStarted || page.fromStart;
     const changed = new Set<string>();
@@ -202,12 +204,14 @@ export class RegistryMirror {
       const row = rowFromFeed(feed);
       if (!row) continue;
       const current = nextRows.get(feed.scope);
-      if (!replaces(row, current)) continue;
-      // A file written before floors existed may hold the tombstone row only.
-      if (current) raise(current);
-      raise(row);
-      nextRows.set(feed.scope, row);
-      changed.add(parsed.connector);
+      // The floor is the highest tombstone ever observed, whatever row the
+      // mirror keeps. A file written before floors existed may hold the
+      // tombstone row only, so the kept row counts too.
+      let floorRaised = current ? raise(current) : false;
+      floorRaised = raise(row) || floorRaised;
+      const replaced = replaces(row, current);
+      if (replaced) nextRows.set(feed.scope, row);
+      if (replaced || floorRaised) changed.add(parsed.connector);
     }
     const nowListed = !this.listed && fullListingStarted && page.lastPage;
     const listed = this.listed || nowListed;

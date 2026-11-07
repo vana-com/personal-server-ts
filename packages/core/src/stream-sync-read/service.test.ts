@@ -757,6 +757,77 @@ describe("stream-sync reads", () => {
       });
     }
 
+    for (const encoding of encodings) {
+      for (const order of ["tombstone first", "live first"] as const) {
+        for (const layout of ["one page", "two pages"] as const) {
+          for (const restart of [false, true]) {
+            it(`never serves the deleted version once its tombstone was observed, ${order}, ${layout}${restart ? ", restarting after each step" : ""} (${encoding})`, async () => {
+              const seed = 40 + encodings.indexOf(encoding);
+              const {
+                f,
+                ns,
+                first,
+                service: initial,
+              } = await importedLive(seed);
+              await tombstone(f, first.scope, encoding);
+              const tombstoneRow = { ...f.rows.get(first.scope)! };
+              const later = await f.publish({
+                connector: "acme",
+                ns,
+                stream: "items",
+                generation: 1,
+                records: [{ id: "c" }],
+                withholdBlobs: true,
+              });
+              const liveRow = { ...f.rows.get(later.scope)! };
+              expect(
+                [tombstoneRow, liveRow].map((r) => r.expectedVersion),
+              ).toEqual(["2", "3"]);
+              const rows =
+                order === "tombstone first"
+                  ? [tombstoneRow, liveRow]
+                  : [liveRow, tombstoneRow];
+              const pages =
+                layout === "one page" ? [rows] : rows.map((row) => [row]);
+
+              let service = initial;
+              const ids = async (s: StreamSyncReadService) => {
+                const decision = await s.resolve(ask("pdpp.acme.items"));
+                return decision.kind === "view"
+                  ? (await body(decision)).data.records
+                      .map((r: any) => r.id)
+                      .sort()
+                  : decision.kind;
+              };
+              let tombstoneSeen = false;
+              for (const [index, listed] of pages.entries()) {
+                await service.observe(listed, {
+                  fromStart: false,
+                  lastPage: index === pages.length - 1,
+                });
+                tombstoneSeen ||= listed.includes(tombstoneRow);
+                await service.importPending();
+                if (restart) service = await f.service();
+                if (tombstoneSeen) {
+                  expect(await ids(service)).not.toEqual(["a", "b"]);
+                  expect(await view(service)).not.toBe("view");
+                } else {
+                  expect(await ids(service)).toEqual(["a", "b"]);
+                }
+                await service.importPending();
+                if (tombstoneSeen) expect(await view(service)).not.toBe("view");
+              }
+
+              for (const [k, v] of later.blobs) f.blobs.set(k, v);
+              await service.importPending();
+              expect(await ids(service)).toEqual(["c"]);
+              expect(await ids(await f.service())).toEqual(["c"]);
+            });
+          }
+        }
+      }
+    }
+
     it("still serves the older view while a replacement is not downloadable and nothing was deleted", async () => {
       const { f, ns, service } = await importedLive(24);
       await f.publish({
