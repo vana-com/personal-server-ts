@@ -81,11 +81,11 @@ after the table explains it.
 | `Full` | full | pass | no violation, stopped at 900 s | 8,188,425 checked, 21,095 behaviours | | simulation | 901 | `f2c42e6d2504` |
 | `IdLess` | idless | pass | no violation, stopped at 900 s | 9,780,709 checked, 25,119 behaviours | | simulation | 900 | `f2c42e6d2504` |
 | `Slice-faults` | slice-faults (cut, lost replies only) | pass | pass | 9,222,368 | 31 | exhaustive | 962 | `23acd6410d61` |
-| `Slice-faults2` | slice-faults (cut, no lost replies) | pass | queued | | | | | |
+| `Slice-faults2` | slice-faults (cut, no lost replies) | pass | pass | 15,874,769 | 30 | exhaustive | 1390 | `a14998644a62` |
 | `Slice-accounts` | slice-accounts (cut) | pass | pass | 23,627,834 | 30 | exhaustive | 3085 | `23acd6410d61` |
 | `Slice-key` | slice-key | pass | pass | 3,501,147 | 28 | exhaustive | 226 | `f2c42e6d2504` |
 | `Slice-idless` | slice-idless | pass | pass | 10,549,465 | 28 | exhaustive | 899 | `b48bf8a62957` |
-| `Slice-twice` | twice (cut, 3 runs) | pass | queued | | | | | |
+| `Slice-twice` | twice (cut, 3 runs) | pass | pass | 3,818,141 | 30 | exhaustive | 273 | `a14998644a62` |
 | `Slice-q9` | slice-q9 | pass | pass | 22,987,926 | 37 | exhaustive | 1841 | `b48bf8a62957` |
 | `Slice-intake` | slice-intake | pass | pass | 12,345,919 | 29 | exhaustive | 1269 | `f2c42e6d2504` |
 | `Slice-intake1` | slice-intake1 | pass | pass | 9,668,164 | 41 | exhaustive | 966 | `f2c42e6d2504` |
@@ -94,8 +94,8 @@ after the table explains it.
 | `Live-leave` | live-leave (every run covers s1) | pass | L3_NoStuckIncomplete | 358,958 | 17 | breadth-first, stopped | 325 | `23acd6410d61` |
 | `Live-cover` | live-cover | pass | pass | 42,776 | 29 | exhaustive | 36 | `f2c42e6d2504` |
 | `Fix-live-leave` | live-leave | pass | pass | 2,435,418 | 47 | exhaustive | 3215 | `f2c42e6d2504` |
-| `Fix-idless` | slice-idless | pass | queued | | | | | |
-| `Fix-split` | split | pass | queued | | | | | |
+| `Fix-idless` | slice-idless | pass | pass | 10,470,273 | 28 | exhaustive | 743 | `a14998644a62` |
+| `Fix-split` | split | pass | pass | 12,176,674 | 29 | exhaustive | 1344 | `a14998644a62` |
 | `CE-split-run` | split | pass | pass | 12,176,674 | 29 | exhaustive | 1012 | `b48bf8a62957` |
 | `CE-late-head` | late (cut) | pass | pass | 6,998,289 | 30 | exhaustive | 728 | `23acd6410d61` |
 | `C-late-head-old-rule` | late | S1_NoLostCommit | S1_NoLostCommit | 2,662,050 | 17 | breadth-first, stopped | 60 | `b48bf8a62957` |
@@ -118,7 +118,7 @@ after the table explains it.
 | `C15-failed-row-replaceable` | slice-settle | S8_AckImmutable | S8_AckImmutable | 1,274,854 | 16 | breadth-first, stopped | 24 | `b48bf8a62957` |
 | `C16-readiness-live-only` | slice-q9 | S10_ReadinessMatchesRead | S10_ReadinessMatchesRead | 239,798 | 15 | breadth-first, stopped | 8 | `b48bf8a62957` |
 | `C19-no-q9` | slice-q9 | IncompleteOwned | IncompleteOwned | 5,855,555 | 21 | breadth-first, stopped | 101 | `b48bf8a62957` |
-| `C12L-fix` | live-leave | pass | queued | | | | | |
+| `C12L-fix` | live-leave | pass | stopped at 3600 s | 2,321,769 |  | breadth-first, timed out | 3601 | `a14998644a62` |
 | `C19L-no-q9` | live-leave | L3_NoStuckIncomplete | L3_NoStuckIncomplete | 591,731 | 17 | breadth-first, stopped | 589 | `b48bf8a62957` |
 | `C20-null-base-noop` | slice-q9 | IncompleteOwned | IncompleteOwned | 37,407 | 10 | breadth-first, stopped | 1 | `b48bf8a62957` |
 | `C21-needsfull-not-full` | slice-accounts4 | NeedsFullRunIsFull | NeedsFullRunIsFull | 35,830 | 22 | breadth-first, stopped | 2 | `b48bf8a62957` |
@@ -153,8 +153,9 @@ The Model column is the first 12 hex digits of the sha256 of
   three comments.
 
 `Slice-key` reached the same 3,501,147 distinct states and 18,500,789
-states generated on all three versions. So the rows of the two earlier
-versions hold for the final model with its defaults.
+states generated on the first three versions, and the fourth changes
+only comments. So every row holds for the final model with its
+defaults.
 
 Findings and open rows:
 
@@ -165,15 +166,15 @@ Findings and open rows:
   at 932 seconds; the others stopped at their 900-second cap. The table
   gives states checked and random behaviours at the last progress
   report.
-- Rows marked "queued" wait for host capacity. Earlier runs of two of
-  them found no violation before they stopped: `Fix-idless` was stopped
-  at 631 seconds by a host load limit, with 8,352,552 distinct states to
-  depth 21; `Slice-twice` with four runs and the cut timed out at 3600
-  seconds with 40,787,341 distinct states to depth 28.
+- `C12L-fix` timed out at 3600 seconds with no violation. Read "C02 and
+  C12".
+- `Fix-split` reached the same state count as `CE-split-run`: on
+  `split` the fix changes no reachable state.
 - These bounds timed out at 3600 seconds with no violation, and were
   then cut to the bounds in the table: `slice-intake` with three runs
   (33.7 million distinct states, depth 17) and with no delete
-  (30,378,089, depth 18); `live-fail` with the reader PS and the cut
+  (30,378,089, depth 18); `twice` with four runs and the cut
+  (40,787,341, depth 28); `live-fail` with the reader PS and the cut
   (1,512,262, depth 23).
 
 Positive configs check every safety invariant: TypeOK, S1 to S12,
@@ -189,8 +190,8 @@ expected result.
 
 ### C02 and C12
 
-Each of these guards was a control that did not fail. Neither is removed
-from the package.
+For each of these guards, no control shows that the model needs it.
+Neither is removed from the package.
 
 **`C02`, `ClearOnGenChange`.** With the guard off, a device keeps its
 checkpoint and outbox entry when the generation changes. Every safety
@@ -215,11 +216,23 @@ is full without `needsFull`, because the device has no checkpoint. The
 one exception is a `retry_pending` end between the publish and the next
 run that saves a job token: the next run is then incremental. In the
 ruled contract only `needsFull` keeps that run full. With the proposed
-fix (`RetryCkptStaysFull`) the run stays full anyway. `C12L-fix` checks
-that (queued). `live-cover` cannot decide it: no `complete:false` head is
-reachable there, because the state count is the same with `NeedsFull` on
-and off. In the package, `afterCommit` in `needs-full.ts` adds the key,
-and `runMustBeFull` and `runPlan` in `writer.ts` read it.
+fix (`RetryCkptStaysFull`) the run stays full anyway, so `needsFull`
+may be redundant for liveness then. No config within the load limit
+decides this:
+
+- `C12L-fix` (`live-leave`, fix on, `needsFull` off) timed out at 3600
+  seconds with no violation: 2,321,769 distinct states, 46,134 still
+  queued. TLC checks liveness only on the graph it has built, so this
+  is weaker than a pass.
+- On `live-cover`, and on `live-leave` cut to `d1` with no leave, the
+  state count is the same with `NeedsFull` on and off (42,776 and
+  5,818). The path never occurs there, so those profiles cannot decide
+  it, and their rows are not kept.
+
+So the case for `needsFull` is argued, not checked: in the ruled
+contract it is the only guard on the retry-token path. Keep it. In the
+package, `afterCommit` in `needs-full.ts` adds the key, and
+`runMustBeFull` and `runPlan` in `writer.ts` read it.
 
 ### Bounds
 
@@ -293,15 +306,17 @@ choices. So this model checks those profiles in two ways:
 
 - Every safety invariant, including the four intake properties, holds
   on the exhaustive slices (`slice-key`, `slice-idless`, `slice-q9`,
-  `slice-intake`, `slice-intake1`), on the cut slices (`slice-faults`,
-  `slice-accounts`) and on the two counterexample profiles (`split`,
-  `late` with the cut).
+  `slice-intake`, `slice-intake1`), on the cut slices (`slice-faults`
+  twice, `slice-accounts`, `twice`) and on the two counterexample
+  profiles (`split`, `late` with the cut). With the proposed fix on,
+  they hold on `slice-idless` and `split`.
 - The intake controls fail as expected. Publishing an uncovered stream
   breaks `CoveredOnly`. A producer-chosen START state breaks
   `IssuedStart`. Section 9's `retry_pending` save as written breaks S7.
   A full run that replaces its base breaks `NoFalseDelete`.
 - L1 to L4 hold on `live` and `live-fail` (both cut). L1, L3 and L4 hold
-  on `live-cover` and, with the proposed fix, on `live-leave`.
+  on `live-leave` with the proposed fix. L1 and L4 hold on `live-cover`,
+  where L3 is vacuous (no `complete:false` head is reachable).
 - L3 fails on `live-leave` with the ruled contract (see
   "Counterexamples").
 - Q9 is needed. Without it L3 fails on `live-leave` (`C19L-no-q9`) and
@@ -327,9 +342,8 @@ violation.
 - Liveness with two streams and a reachable `complete:false` head, lost
   replies, restarts, or a failed entry together with a leave. Profiles
   with these did not finish on this host.
-- Whether `needsFull` is needed for liveness: open until `C12L-fix`
-  runs (read "C02 and C12").
-- The rows marked "queued".
+- Whether `needsFull` is needed for liveness once `RetryCkptStaysFull`
+  holds (read "C02 and C12").
 - That the package matches the model. This directory checks the model
   only.
 - Everything under "Not modelled" below.
@@ -355,10 +369,11 @@ violation.
   `retry_pending` with a cursor for `s1`, and saves it at generation 1
   after `d1` creates the control row. The records are dropped, and the
   next incremental run starts after them (`C-retry-saves-spooled`, S7).
-  Proposed fix, the model's default `RetryQuietOnly`: a `retry_pending`
+  Fix, adopted and the model's default (`RetryQuietOnly`): a `retry_pending`
   end keeps no cursor of a stream that had records in the run. It can
   keep a cursor such as a job token only for a stream with no records.
-  An equal fix is to accept the candidate only with no record batches.
+  An equivalent fix accepts the candidate only when the run has no
+  record batches.
 - [traces/late-head.txt](traces/late-head.txt): the two-outcome base rule
   (revision 4.1 before F1). A run of generation 1 resumes after a delete
   and a reconnect elsewhere, and commits a generation-1 head over an

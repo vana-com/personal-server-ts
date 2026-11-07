@@ -458,6 +458,9 @@ export const CONFIGS = [
   // retry_pending save before the next run could make it incremental, and
   // the fix keeps that run full.  Expected to pass (README.md, C02 and C12).
   ["C12L-fix", "complete:false sets no needsFull, with the proposed fix", "live-leave", { PartialCover: "FALSE", RetryCkptStaysFull: "TRUE", NeedsFull: "FALSE" }, "pass", "liveness"],
+  // C12L-fix does not finish within an hour.  A cut to d1 only and no
+  // leave gives the same state count with NeedsFull on and off, so it
+  // cannot decide the question and is not kept (README.md, C02 and C12).
   ["C19L-no-q9", "the same, against liveness L3", "live-leave", { NoOpNeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
   ["C20-null-base-noop", "an incremental run onto an empty base with an empty spool is a no-op", "slice-q9", { NullBasePublishes: "FALSE" }, "IncompleteOwned"],
   ["C21-needsfull-not-full", "a device with needsFull and a checkpoint runs incrementally", "slice-accounts4", { NeedsFullForcesFull: "FALSE" }, "NeedsFullRunIsFull"],
