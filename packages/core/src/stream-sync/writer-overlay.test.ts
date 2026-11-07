@@ -13,6 +13,7 @@ import { bindStreamSyncHome } from "./home.js";
 import { createMemoryStreamSyncFiles } from "./memory-files.js";
 import {
   AmbiguousRegistryReplyError,
+  RegistryRefusedError,
   type StreamSyncRegistry,
   type StreamSyncFaultPoint,
 } from "./ports.js";
@@ -35,6 +36,7 @@ async function fixture() {
   let posts = 0;
   let ambiguous = false;
   let fault: StreamSyncFaultPoint | undefined;
+  let onPoint: ((point: StreamSyncFaultPoint) => void) | undefined;
   const mac = async (m: Uint8Array) =>
     hmac(sha256, new Uint8Array(32).fill(4), m);
   const hashes = await controlHashes(
@@ -115,6 +117,7 @@ async function fixture() {
       },
       now: () => 1000,
       fault(point) {
+        onPoint?.(point);
         if (point === fault) {
           fault = undefined;
           throw new Error("crash");
@@ -145,6 +148,9 @@ async function fixture() {
       ambiguous = true;
     },
     posts: () => posts,
+    onPoint: (callback: (point: StreamSyncFaultPoint) => void) => {
+      onPoint = callback;
+    },
   };
 }
 async function collect(
@@ -512,6 +518,376 @@ describe("writer snapshot provenance", () => {
         (l) => l.v.id,
       ),
     ).toEqual(["kept"]);
+    snap.release();
+  });
+});
+
+async function coverageOf(f: Awaited<ReturnType<typeof fixture>>) {
+  const receipt = (await f.read()).streams.s.receipt;
+  return { connector, ns: "", stream: "s", ...receipt };
+}
+
+describe("writer durable read acknowledgment", () => {
+  it("reclaims a completed run only after matching durable coverage", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    const source = createWriterOverlaySource(w);
+    const coverage = await coverageOf(f);
+    await source.acknowledge(coverage);
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+    await source.acknowledge(coverage);
+    expect((await source.snapshot(connector)).runs).toEqual([]);
+    expect(await f.files.read("results/r1.json")).not.toBeNull();
+  });
+  it.each([
+    { registryVersion: 0 },
+    { registryVersion: 2, generation: 3 },
+    { dataHash: "wrong" },
+    { connector: "other" },
+    { ns: "other" },
+    { stream: "other" },
+    { generation: 3 },
+  ])("never retires unrelated coverage %j", async (change) => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    const source = createWriterOverlaySource(w);
+    const coverage = await coverageOf(f);
+    await source.acknowledge({ ...coverage, ...change });
+    const snap = await source.snapshot(connector);
+    expect(snap.runs).toHaveLength(1);
+    snap.release();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+    await source.acknowledge(coverage);
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+  });
+  it("accepts a later version in the same generation", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    await createWriterOverlaySource(w).acknowledge({
+      ...(await coverageOf(f)),
+      registryVersion: 2,
+      dataHash: "later",
+    });
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+  });
+  it("keeps bytes for two pinned readers until both idempotent releases", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    const source = createWriterOverlaySource(w);
+    const first = await source.snapshot(connector);
+    const second = await source.snapshot(connector);
+    await source.acknowledge(await coverageOf(f));
+    expect((await source.snapshot(connector)).runs).toEqual([]);
+    expect(
+      await Array.fromAsync(first.lines(first.runs[0]!, "s")),
+    ).toHaveLength(1);
+    first.release();
+    first.release();
+    // A new snapshot waits for queued unpins.
+    (await source.snapshot(connector)).release();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+    expect(
+      await Array.fromAsync(second.lines(second.runs[0]!, "s")),
+    ).toHaveLength(1);
+    second.release();
+    (await source.snapshot(connector)).release();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+  });
+  it("does not retire a generation-mismatched receipt, even during restart recovery", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    const coverage = await coverageOf(f);
+    await f.edit((e) => {
+      e.generation = 3;
+    });
+    const source = createWriterOverlaySource(f.make());
+    await source.acknowledge(coverage);
+    expect((await source.snapshot(connector)).runs).toEqual([]);
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+  });
+  it("never acknowledges an unbound or unattributed run", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await collect(w);
+    const source = createWriterOverlaySource(w);
+    await source.acknowledge({
+      connector,
+      ns: "",
+      stream: "s",
+      generation: 1,
+      registryVersion: 1,
+      dataHash: "unknown",
+    });
+    const snap = await source.snapshot(connector);
+    expect(snap.runs).toHaveLength(1);
+    snap.release();
+    await f.edit((e) => {
+      e.entry.ns = null;
+    });
+    await source.acknowledge({
+      connector,
+      ns: "",
+      stream: "s",
+      generation: 1,
+      registryVersion: 1,
+      dataHash: "unknown",
+    });
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+  });
+  it("retains A's receipt after B fails then is discarded, and reads a pin after acknowledgment", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await w.beginRun({ runId: "r1", connector, userConnect: false });
+    await w.append("r1", "s", { id: "a" }, shape);
+    await w.append("r1", "z", { id: "b" }, shape);
+    await w.finishRun("r1", { checkpointCandidate: null });
+    const post = f.registry.post;
+    f.registry.post = async (request) => {
+      if (request.scope === streamScope(connector, "", "z"))
+        throw new RegistryRefusedError("refused", 403);
+      return post(request);
+    };
+    await w.publishPending();
+    const source = createWriterOverlaySource(w);
+    const failed = await source.snapshot(connector);
+    expect(failed.runs[0]!.streams.map((s) => s.state)).toEqual([
+      "published",
+      "failed",
+    ]);
+    failed.release();
+    const hashes = await controlHashes(
+      streamSyncHashes.keccak256,
+      await deriveKeyCheck(async (m) =>
+        hmac(sha256, new Uint8Array(32).fill(4), m),
+      ),
+    );
+    f.rows.set(controlScope(connector, ""), {
+      found: true,
+      version: 2,
+      dataHash: hashes.tombstoneData,
+      metadataHash: hashes.tombstoneMetadata,
+      deleted: false,
+    });
+    await w.publishPending();
+    const discarded = await source.snapshot(connector);
+    expect(discarded.runs[0]!.streams.map((s) => s.name)).toEqual(["s"]);
+    expect(discarded.runs[0]!.streams[0]!.state).toBe("published");
+    await source.acknowledge(await coverageOf(f));
+    expect(
+      (await Array.fromAsync(discarded.lines(discarded.runs[0]!, "s"))).map(
+        (l) => l.v.id,
+      ),
+    ).toEqual(["a"]);
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+    discarded.release();
+    (await source.snapshot(connector)).release();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+  });
+  it("acknowledging A leaves a failed B readable", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await w.beginRun({ runId: "r1", connector, userConnect: false });
+    await w.append("r1", "s", { id: "a" }, shape);
+    await w.append("r1", "z", { id: "b" }, shape);
+    await w.finishRun("r1", { checkpointCandidate: null });
+    const post = f.registry.post;
+    f.registry.post = async (request) => {
+      if (request.scope === streamScope(connector, "", "z"))
+        throw new RegistryRefusedError("refused", 403);
+      return post(request);
+    };
+    await w.publishPending();
+    const source = createWriterOverlaySource(w);
+    await source.acknowledge(await coverageOf(f));
+    const snap = await source.snapshot(connector);
+    expect(snap.runs[0]!.streams.map((s) => s.name)).toEqual(["z"]);
+    expect(
+      (await Array.fromAsync(snap.lines(snap.runs[0]!, "z"))).map(
+        (l) => l.v.id,
+      ),
+    ).toEqual(["b"]);
+    snap.release();
+    // An acknowledgment is not persisted independently of the reader's store.
+    const reopened = await createWriterOverlaySource(f.make()).snapshot(
+      connector,
+    );
+    expect(reopened.runs[0]!.streams.map((s) => s.name)).toEqual(["s", "z"]);
+    reopened.release();
+  });
+});
+
+describe("writer crash/read handoff", () => {
+  it.each<StreamSyncFaultPoint>([
+    "after_control_write",
+    "after_parts_upload",
+    "after_head_upload",
+    "after_request_persisted",
+    "after_post_reply",
+    "after_commit_recorded",
+    "after_checkpoint_saved",
+  ])("retains readable rows across a crash at %s", async (point) => {
+    const f = await fixture();
+    if (point === "after_control_write") f.rows.clear();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    f.fault(point);
+    await expect(w.publishPending()).rejects.toThrow("crash");
+    const restarted = f.make();
+    const source = createWriterOverlaySource(restarted);
+    // Recovery and snapshot acquisition must not access the registry or blobs.
+    const read = f.registry.read;
+    f.registry.read = async () => {
+      throw new Error("offline");
+    };
+    const snapshot = await source.snapshot(connector);
+    expect(snapshot.runs).toHaveLength(1);
+    expect(
+      (await Array.fromAsync(snapshot.lines(snapshot.runs[0]!, "s"))).map(
+        (l) => l.v.id,
+      ),
+    ).toEqual(["one"]);
+    snapshot.release();
+    f.registry.read = read;
+    await restarted.publishPending();
+    const coverage = await coverageOf(f);
+    const published = await source.snapshot(connector);
+    expect(published.runs[0]!.streams[0]!.receipt).toMatchObject({
+      registryVersion: 1,
+      generation: 1,
+    });
+    published.release();
+    const posts = f.posts();
+    await f.make().publishPending();
+    expect(f.posts()).toBe(posts);
+    await source.acknowledge(coverage);
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+  });
+  it("keeps a pre-publish snapshot pinned through commit and acknowledgment", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    const source = createWriterOverlaySource(w);
+    const snapshot = await source.snapshot(connector);
+    await w.publishPending();
+    await source.acknowledge(await coverageOf(f));
+    expect(snapshot.runs[0]!.streams[0]!.state).toBe("pending");
+    expect(
+      await Array.fromAsync(snapshot.lines(snapshot.runs[0]!, "s")),
+    ).toHaveLength(1);
+    snapshot.release();
+    (await source.snapshot(connector)).release();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+  });
+  it("releases a pin after a log failure without double-releasing another reader", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    const source = createWriterOverlaySource(w);
+    const bad = await source.snapshot(connector);
+    const good = await source.snapshot(connector);
+    const bytes = (await f.files.read("runs/r1/spool/s0.log"))!;
+    await f.files.remove("runs/r1/spool/s0.log");
+    await expect(
+      Array.fromAsync(bad.lines(bad.runs[0]!, "s")),
+    ).rejects.toThrow();
+    bad.release();
+    bad.release();
+    await f.files.write("runs/r1/spool/s0.log", bytes);
+    await source.acknowledge(await coverageOf(f));
+    expect(await Array.fromAsync(good.lines(good.runs[0]!, "s"))).toHaveLength(
+      1,
+    );
+    good.release();
+    (await source.snapshot(connector)).release();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+  });
+});
+
+describe("writer checkpoint outcome retention", () => {
+  it("retains published rows and receipt through a no_checkpoint result", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    const initial = f.rows.get(controlScope(connector, ""))!;
+    f.onPoint((point) => {
+      if (point === "after_commit_recorded" && initial.found)
+        f.rows.set(controlScope(connector, ""), { ...initial, version: 3 });
+    });
+    const report = await w.publishPending();
+    expect(report.runs[0]!.outcome?.kind).toBe("no_checkpoint");
+    const source = createWriterOverlaySource(f.make());
+    const snap = await source.snapshot(connector);
+    expect(snap.runs[0]!.streams[0]!.state).toBe("published");
+    expect(await Array.fromAsync(snap.lines(snap.runs[0]!, "s"))).toHaveLength(
+      1,
+    );
+    snap.release();
+    await source.acknowledge(await coverageOf(f));
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+  });
+});
+
+describe("writer public run status", () => {
+  it("reports a retained done run only in finished, never in pending", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    const status = await w.status();
+    expect(status.pending).toEqual([]);
+    expect(status.finished.map((r) => r.runId)).toEqual(["r1"]);
+  });
+});
+
+describe("writer recovery exclusions", () => {
+  it("excludes and removes an abandoned collecting run on local recovery", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.beginRun({ runId: "r1", connector, userConnect: false });
+    await w.append("r1", "s", { id: "partial" }, shape);
+    const snap = await createWriterOverlaySource(f.make()).snapshot(connector);
+    expect(snap.runs).toEqual([]);
+    snap.release();
+    expect(await f.files.read("runs/r1/entry.json")).toBeNull();
+  });
+  it("does not treat null namespace as the identity-less namespace for a receipt", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    const coverage = await coverageOf(f);
+    await f.edit((e) => {
+      e.entry.ns = null;
+    });
+    const source = createWriterOverlaySource(f.make());
+    await source.acknowledge(coverage);
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+    const snap = await source.snapshot(connector);
+    expect(snap.runs).toEqual([]);
     snap.release();
   });
 });

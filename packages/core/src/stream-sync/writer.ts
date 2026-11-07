@@ -401,6 +401,8 @@ export class StreamSyncWriter {
   private lifecycleQueue: Promise<unknown> = Promise.resolve();
   private lifecycleError: unknown = null;
   private readonly pins = new Map<string, number>();
+  /** Coverage belongs to this reader/store lifetime; startup must reconcile it again. */
+  private readonly covered = new Map<string, Set<string>>();
 
   constructor(private readonly options: StreamSyncWriterOptions) {
     if (
@@ -1778,7 +1780,8 @@ export class StreamSyncWriter {
     return Object.keys(host.streams).filter(
       (name) =>
         !host.streams[name]!.seedOnly &&
-        host.entry.streams[name]?.state !== "discarded",
+        host.entry.streams[name]?.state !== "discarded" &&
+        !this.covered.get(host.entry.runId)?.has(name),
     );
   }
 
@@ -1787,12 +1790,14 @@ export class StreamSyncWriter {
   }
 
   private async reclaimLocked(host: HostEntry): Promise<void> {
+    if (host.phase !== "done" || this.inconsistentReceipt(host)) return;
     if (
       (this.pins.get(host.entry.runId) ?? 0) > 0 ||
       this.retainedStreams(host).length > 0
     )
       return;
     await this.options.home.files.remove(`runs/${host.entry.runId}`);
+    this.covered.delete(host.entry.runId);
   }
 
   /** Called only by the home-bound overlay adapter. Does no network I/O. */
@@ -1822,14 +1827,7 @@ export class StreamSyncWriter {
           continue;
         const generation = host.generation ?? null;
         // Never expose or reclaim an inconsistent run, including a discarded receipt.
-        if (
-          Object.values(host.streams).some(
-            (s) =>
-              s.receipt &&
-              (generation === null || s.receipt.generation !== generation),
-          )
-        )
-          continue;
+        if (this.inconsistentReceipt(host)) continue;
         if (!host.overlayRevision) {
           host.overlayRevision = globalThis.crypto.randomUUID();
           await this.options.home.files.write(
@@ -1908,6 +1906,8 @@ export class StreamSyncWriter {
               const count = this.pins.get(run.runId)! - 1;
               if (count === 0) this.pins.delete(run.runId);
               else this.pins.set(run.runId, count);
+            }
+            for (const run of runs) {
               const host = await this.readEntry(run.runId);
               if (host?.phase === "done") await this.reclaimLocked(host);
             }
@@ -1919,10 +1919,55 @@ export class StreamSyncWriter {
     });
   }
 
-  /** Reader retirement is added separately from snapshot acquisition. */
+  private inconsistentReceipt(host: HostEntry): boolean {
+    return Object.values(host.streams).some(
+      (stream) =>
+        stream.receipt &&
+        (host.generation == null ||
+          stream.receipt.generation !== host.generation),
+    );
+  }
+
+  /** The caller has committed these bytes to its durable read store. */
   async acknowledgeOverlay(
-    _coverage: StreamSyncImportedCoverage,
-  ): Promise<void> {}
+    coverage: StreamSyncImportedCoverage,
+  ): Promise<void> {
+    await this.recover();
+    const binding = await this.binding();
+    await this.lifecycle(async () => {
+      if (this.lifecycleError) throw this.lifecycleError;
+      for (const runId of await this.runIds()) {
+        const host = await this.readEntry(runId);
+        if (
+          !host ||
+          host.entry.connector !== coverage.connector ||
+          host.entry.ns === null ||
+          host.entry.ns !== coverage.ns ||
+          host.generation == null ||
+          host.generation !== coverage.generation ||
+          this.inconsistentReceipt(host) ||
+          !host.binding ||
+          host.binding.owner.toLowerCase() !== binding.owner.toLowerCase() ||
+          host.binding.keyCheck !== binding.keyCheck
+        )
+          continue;
+        const receipt = host.streams[coverage.stream]?.receipt;
+        if (
+          !receipt ||
+          !(
+            coverage.registryVersion > receipt.registryVersion ||
+            (coverage.registryVersion === receipt.registryVersion &&
+              coverage.dataHash === receipt.dataHash)
+          )
+        )
+          continue;
+        const covered = this.covered.get(runId) ?? new Set<string>();
+        covered.add(coverage.stream);
+        this.covered.set(runId, covered);
+        await this.reclaimLocked(host);
+      }
+    });
+  }
 
   // --------------------------------------------------------------- merge
 
@@ -2193,7 +2238,7 @@ export class StreamSyncWriter {
     const pending: StreamSyncRunStatus[] = [];
     for (const runId of await this.runIds()) {
       const host = await this.readEntry(runId);
-      if (host) pending.push(this.statusOf(host));
+      if (host && host.phase !== "done") pending.push(this.statusOf(host));
     }
     const finished: StreamSyncRunStatus[] = [];
     for (const path of await this.options.home.files.list("results")) {
@@ -2319,3 +2364,5 @@ function verifiedGeneration(
   const control = state.observedControl?.[connector]?.[IDENTITYLESS_NS];
   return control?.kind === "active" ? control.generation : null;
 }
+
+export { createWriterOverlaySource } from "./writer-overlay.js";
