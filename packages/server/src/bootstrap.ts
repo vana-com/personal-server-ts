@@ -929,10 +929,6 @@ export async function createServer(
         root: storageRoot,
         ownerAddress: serverOwner,
         network: streamSyncNetwork(config.gateway),
-        onLost: () =>
-          logger.warn(
-            "Stream sync stopped: another process took over this owner's stream-sync storage lock",
-          ),
       });
       if (!streamSyncHome) {
         logger.warn(

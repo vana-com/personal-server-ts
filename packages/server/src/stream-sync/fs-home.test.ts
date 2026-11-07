@@ -1,15 +1,10 @@
-import {
-  mkdtemp,
-  readdir,
-  rm,
-  stat,
-  utimes,
-  writeFile,
-} from "node:fs/promises";
+import { spawn, type ChildProcess } from "node:child_process";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { openFsStreamSyncHome, StreamSyncLockLostError } from "./fs-home.js";
+import { openFsStreamSyncHome } from "./fs-home.js";
 import { createSeedStaging } from "./seed-staging.js";
 
 const A = "0x1C5A77d9FA7eF466951B2F01F724BCa3A5820b63" as const;
@@ -62,21 +57,6 @@ describe("full-server stream-sync home", () => {
     );
   });
 
-  it("takes over a lock whose process is gone", async () => {
-    const first = await openFsStreamSyncHome({
-      root,
-      ownerAddress: A,
-      network: NET,
-    });
-    await writeFile(
-      join(root, "stream-sync-homes", `${first!.home.id}.lock`),
-      "2147483646",
-    );
-    expect(
-      await openFsStreamSyncHome({ root, ownerAddress: A, network: NET }),
-    ).not.toBeNull();
-  });
-
   it("stages seed rows in the owner's home: another owner never sees them", async () => {
     const a = await openFsStreamSyncHome({
       root,
@@ -124,89 +104,167 @@ describe("full-server stream-sync home", () => {
     expect((await sourceA.streams("c")).length).toBe(1);
   });
 
-  it("respects a lock held by a live server, and its heartbeat keeps it fresh", async () => {
+  it("ignores a leftover lease file from the old lock scheme", async () => {
     const first = await openFsStreamSyncHome({
       root,
       ownerAddress: A,
       network: NET,
-      staleMs: 300,
-      heartbeatMs: 50,
     });
-    const lock = join(root, "stream-sync-homes", `${first!.home.id}.lock`);
-    await new Promise((r) => setTimeout(r, 700));
-    expect(Date.now() - (await stat(lock)).mtimeMs).toBeLessThan(300);
-    expect(
-      await openFsStreamSyncHome({
-        root,
-        ownerAddress: A,
-        network: NET,
-        staleMs: 300,
-      }),
-    ).toBeNull();
+    const id = first!.home.id;
     await first!.close();
+    await writeFile(
+      join(root, "stream-sync-homes", `${id}.lock`),
+      `${process.pid}\nold`,
+    );
+    const again = await openFsStreamSyncHome({
+      root,
+      ownerAddress: A,
+      network: NET,
+    });
+    expect(again).not.toBeNull();
+    await again!.close();
   });
 
-  it("takes over a lock whose pid is live but unrelated (reused pid, no heartbeat)", async () => {
+  it("closes twice without error and frees the home", async () => {
     const first = await openFsStreamSyncHome({
       root,
       ownerAddress: A,
       network: NET,
-      heartbeatMs: 3_600_000,
     });
-    const lock = join(root, "stream-sync-homes", `${first!.home.id}.lock`);
-    // A crashed holder left a pid that a live process now owns (this one).
-    await writeFile(lock, `${process.pid}\nold`);
-    const old = new Date(Date.now() - 10 * 60_000);
-    await utimes(lock, old, old);
-    const second = await openFsStreamSyncHome({
+    await first!.close();
+    await first!.close();
+    const again = await openFsStreamSyncHome({
       root,
       ownerAddress: A,
       network: NET,
     });
-    expect(second).not.toBeNull();
-    // The first holder, stalled and replaced, must not delete the new lock.
-    await first!.close();
+    expect(again).not.toBeNull();
+    await again!.close();
+  });
+});
+
+const CHILD = fileURLToPath(
+  new URL("./fs-home.child.test-utils.ts", import.meta.url),
+);
+
+interface Child {
+  readonly process: ChildProcess;
+  /** `held` or `busy`: what the child's open returned. */
+  readonly result: Promise<"held" | "busy">;
+  readonly exited: Promise<void>;
+}
+
+const children: ChildProcess[] = [];
+
+function startChild(dir: string): Child {
+  const process_ = spawn(
+    process.execPath,
+    ["--import", "tsx", CHILD, dir, A, NET],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  children.push(process_);
+  const result = new Promise<"held" | "busy">((resolve, reject) => {
+    let out = "";
+    process_.stdout!.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+      if (out.includes("\n")) resolve(out.trim() as "held" | "busy");
+    });
+    process_.once("error", reject);
+    process_.once("exit", (code, signal) =>
+      reject(new Error(`child ended early: ${code ?? signal}`)),
+    );
+  });
+  result.catch(() => {});
+  const exited = new Promise<void>((resolve) => {
+    if (process_.exitCode !== null || process_.signalCode !== null) resolve();
+    else process_.once("exit", () => resolve());
+  });
+  return { process: process_, result, exited };
+}
+
+afterEach(() => {
+  for (const child of children.splice(0)) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+  }
+});
+
+describe("full-server stream-sync home: one kernel-held lock", () => {
+  it("gives exactly one of many in-process openers the home, every time", async () => {
+    for (let round = 0; round < 100; round += 1) {
+      const dir = join(root, `in-process-${round}`);
+      const opened = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          openFsStreamSyncHome({ root: dir, ownerAddress: A, network: NET }),
+        ),
+      );
+      expect(opened.filter((h) => h !== null)).toHaveLength(1);
+      await Promise.all(opened.map((h) => h?.close()));
+    }
+  }, 60_000);
+
+  it("gives exactly one of several racing processes the home, every time", async () => {
+    for (let round = 0; round < 12; round += 1) {
+      const dir = join(root, `race-${round}`);
+      const racers = Array.from({ length: 4 }, () => startChild(dir));
+      const results = await Promise.all(racers.map((r) => r.result));
+      expect(results.filter((r) => r === "held")).toHaveLength(1);
+      // The winner still lives, so the parent cannot take the home either.
+      expect(
+        await openFsStreamSyncHome({
+          root: dir,
+          ownerAddress: A,
+          network: NET,
+        }),
+      ).toBeNull();
+      for (const r of racers) r.process.kill("SIGKILL");
+      await Promise.all(racers.map((r) => r.exited));
+    }
+  }, 120_000);
+
+  it("frees the home when the holder is killed without cleanup", async () => {
+    const holder = startChild(root);
+    expect(await holder.result).toBe("held");
     expect(
       await openFsStreamSyncHome({ root, ownerAddress: A, network: NET }),
     ).toBeNull();
-    await second!.close();
-  });
-
-  it("fences a holder whose lock was taken over between heartbeats", async () => {
-    let lostCalls = 0;
-    const first = await openFsStreamSyncHome({
+    holder.process.kill("SIGKILL");
+    await holder.exited;
+    const next = await openFsStreamSyncHome({
       root,
       ownerAddress: A,
       network: NET,
-      heartbeatMs: 40,
-      onLost: () => {
-        lostCalls += 1;
-      },
     });
-    await first!.home.files.write("state.json", new Uint8Array([1]));
-    const lock = join(root, "stream-sync-homes", `${first!.home.id}.lock`);
-    // A second process takes the lock over after a stall.
-    await writeFile(lock, `${process.pid}\nsomeone-else`);
-    const taken = new Date(Date.now() - 5_000);
-    await utimes(lock, taken, taken);
-    await new Promise((r) => setTimeout(r, 200));
-    expect(lostCalls).toBe(1);
-    // The fenced holder neither touches the new lock nor writes through its home.
-    expect(Date.now() - (await stat(lock)).mtimeMs).toBeGreaterThan(4_000);
-    await expect(
-      first!.home.files.write("state.json", new Uint8Array([2])),
-    ).rejects.toBeInstanceOf(StreamSyncLockLostError);
-    await expect(first!.home.files.read("state.json")).rejects.toBeInstanceOf(
-      StreamSyncLockLostError,
-    );
-    await expect(first!.seedFiles.list("")).rejects.toBeInstanceOf(
-      StreamSyncLockLostError,
-    );
-    // Closing the fenced holder leaves the new holder's lock in place.
-    await first!.close();
+    expect(next).not.toBeNull();
+    await next!.close();
+  }, 30_000);
+
+  it("never takes the home from a holder that is stalled", async () => {
+    const holder = startChild(root);
+    expect(await holder.result).toBe("held");
+    holder.process.kill("SIGSTOP");
+    // No clock takes part in who holds the home, so how long the holder stays
+    // stopped (the old lease expired after 60 s) cannot matter. A short stop
+    // proves the lock does not depend on the holder running.
+    await new Promise((r) => setTimeout(r, 1_500));
     expect(
       await openFsStreamSyncHome({ root, ownerAddress: A, network: NET }),
     ).toBeNull();
-    expect(lostCalls).toBe(1);
-  });
+    const rival = startChild(root);
+    expect(await rival.result).toBe("busy");
+    holder.process.kill("SIGCONT");
+    expect(
+      await openFsStreamSyncHome({ root, ownerAddress: A, network: NET }),
+    ).toBeNull();
+    holder.process.kill("SIGKILL");
+    await holder.exited;
+    const next = await openFsStreamSyncHome({
+      root,
+      ownerAddress: A,
+      network: NET,
+    });
+    expect(next).not.toBeNull();
+    await next!.close();
+  }, 30_000);
 });
