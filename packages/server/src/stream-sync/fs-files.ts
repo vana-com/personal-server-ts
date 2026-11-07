@@ -30,6 +30,11 @@ const MAX_OPEN = 64;
 const SYNC_PARALLEL = 128;
 
 async function fsyncDir(dir: string): Promise<void> {
+  // On Windows, Node opens a directory for reading but fsync calls
+  // FlushFileBuffers, which needs write access, so it fails. A resolved write
+  // there guarantees the file contents are flushed, but not that the rename
+  // is durable, because Node's rename does not use MOVEFILE_WRITE_THROUGH.
+  if (process.platform === "win32") return;
   const handle = await open(dir, "r");
   try {
     await handle.sync();

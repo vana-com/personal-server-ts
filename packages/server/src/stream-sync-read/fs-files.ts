@@ -26,6 +26,11 @@ function inside(root: string, path: string): string {
 }
 
 async function syncDirectory(path: string): Promise<void> {
+  // On Windows, Node opens a directory for reading but fsync calls
+  // FlushFileBuffers, which needs write access, so it fails. A resolved write
+  // there guarantees the file contents are flushed, but not that the rename
+  // is durable, because Node's rename does not use MOVEFILE_WRITE_THROUGH.
+  if (process.platform === "win32") return;
   const handle = await open(path, "r");
   try {
     await handle.sync();
