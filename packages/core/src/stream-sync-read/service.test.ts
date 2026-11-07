@@ -414,7 +414,7 @@ describe("stream-sync reads", () => {
     ).toBe("cursor_stale");
   });
 
-  it("counts only live heads, and a live count is the number of rows an owner read returns", async () => {
+  it("counts only live heads, and a live count equals a named-connection read of that stream", async () => {
     const f = new Fixture(await testOwnerKey(masterKey(21)));
     const rows = (n: number) =>
       Array.from({ length: n }, (_, i) => ({ id: `r${i}` }));
@@ -452,7 +452,8 @@ describe("stream-sync reads", () => {
     await publishAll("gamma", nsDeleted);
     const service = await f.service();
     await f.sync(service);
-    // Everything above was imported while live. Now each one loses liveness.
+    // Everything above except the withheld pending stream was imported while
+    // live. Now each imported one loses liveness.
     const gone = [...f.rows.values()].find((r) => r.scope.endsWith(".gone"))!;
     f.rows.set(gone.scope, { ...gone, deletedAt: gone.addedAt });
     // A newer control generation after the head was imported.
@@ -466,7 +467,7 @@ describe("stream-sync reads", () => {
       ]),
     );
 
-    // Live: the count is what an owner read returns for that stream.
+    // Live: the count equals a named-connection read of the stream.
     expect(byName.get("acme.items")).toBe(7);
     const read = await body(
       await service.resolve(ask("pdpp.acme.items", { connection: ns })),

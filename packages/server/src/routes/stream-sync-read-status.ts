@@ -4,10 +4,11 @@
  *   GET /v1/stream-sync/read-status
  *     -> 200 {listed, streams: [{connector, ns, stream, records}], issues}
  *
- * `records` is the live head's record count: the rows an owner read of that
- * stream returns (local outbox overlay rows are not counted). It is `null`
- * for a head that is pending import, tombstoned, of an older generation, or of
- * a deleted connection. The body has
+ * `records` is the record count of the stream-sync head imported for that
+ * (connector, ns, stream), while that head is live. Logical connection
+ * selection, a legacy-file fallback and local outbox overlay rows are outside
+ * this count. It is `null` for a head that is pending import, tombstoned, of
+ * an older generation, or of a deleted connection. The body has
  * stream names and counts only: never a record, a blob key or an issue detail.
  * `issues` counts import problems still open.
  *

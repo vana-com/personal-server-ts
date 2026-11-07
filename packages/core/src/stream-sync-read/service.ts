@@ -118,10 +118,11 @@ export interface StreamSyncReadStatus {
 
 /**
  * One row per stream the read side knows, for owner diagnostics. `records` is
- * the imported head's record count only while that head is live (§2.4), the
- * same condition under which an owner read serves the stream. A pending
- * (unimported), tombstoned, superseded-generation or deleted-connection head
- * counts `null`. Rows from the local outbox overlay are not counted.
+ * the imported head's record count only while that head is live (§2.4). A
+ * pending (unimported), tombstoned, superseded-generation or
+ * deleted-connection head counts `null`. Logical connection selection, a
+ * legacy-file fallback and rows from the local outbox overlay are outside
+ * this count.
  */
 export function liveStreamCounts(status: StreamSyncReadStatus): {
   readonly connector: string;
