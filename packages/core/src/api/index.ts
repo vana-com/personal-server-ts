@@ -99,6 +99,7 @@ import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
 import type {
   ReadDecision,
   ResolveInput,
+  StreamSyncReadStatus,
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
@@ -325,6 +326,8 @@ export interface PersonalServerIngestSyncManager {
 /** The read side of stream sync, as the data API uses it. */
 export interface StreamSyncReadPort {
   resolve(input: ResolveInput): Promise<ReadDecision>;
+  /** Per-stream counts and open import problems, for owner diagnostics. */
+  status?(): StreamSyncReadStatus;
 }
 
 export interface PersonalServerDataApiDeps {
