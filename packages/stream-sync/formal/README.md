@@ -45,150 +45,266 @@ rejected, so the model does not have one. The intake parts are:
   account check (`RawSeedChecksId`, `C17`) are removed. The old raw
   file stays as one of the legacy files that reads are checked against.
 
-The intake model found two defects. Read "Counterexamples".
-
-- **Safety (S7).** In section 9 as written, a `retry_pending` end can
-  save the cursor of a stream whose records it drops. The fix keeps a
-  `retry_pending` cursor only for a stream with no records in the run.
-  It is adopted, and it is the model's default (`RetryQuietOnly`).
-- **Liveness (L3).** With that fix, a job token that a `retry_pending`
-  end saved makes the device's next run incremental, before any head of
-  the generation exists. That run publishes `complete:false`. If an old
-  app's DELETE then tombstones the stream, no run is required to follow,
-  and L3 fails on `Live-leave`. The proposed fix, `RetryCkptStaysFull`,
-  is not in the ruled contract, so it is off by default. The `Fix-*`
-  rows check it.
+The intake model found two defects (S7 on a `retry_pending` end, and L3
+on `Live-leave`). Their F2 fixes (`RetryQuietOnly`, `RetryCkptStaysFull`
+and the `Fix-*` configs) are superseded by R28 and removed from the
+model. Read "R28" below.
 
 No other counterexample was found within the bounds below. Read
 "Results" for what was checked at which bounds and in which mode.
 
-Model: `StreamSync.tla`, sha256 `a14998644a6207f78d759175a196c12335c8e487fd6ee2c640f14d8faea2cf22`. TLC 2026.11.03
+Model: `StreamSync.tla`, sha256 prefix `3cc40833c1f1`. TLC 2026.11.03
 (`tla2tools.jar`).
 
-## Results
 
-Every run used 4 workers under `nice -n 19` on a shared, loaded host, so
-the times show that load. "Exhaustive" means breadth-first search
-finished: every reachable state within the bounds was checked. A control
-or witness passes when TLC stops at the expected violation. A row whose
-Observed column differs from its Expected column is a finding; the text
-after the table explains it.
+## R28 (F3): retry_pending publishes progress
 
-| Config | Slice | Expected | Observed | Distinct states | Depth | Mode | Seconds | Model |
-| ------ | ----- | -------- | -------- | --------------: | ----: | ---- | ------: | ----- |
-| `Small` | small | pass | no violation, stopped by hand | 9,562,741 checked, 24,639 behaviours | | simulation | 932 | `f2c42e6d2504` |
-| `Key` | key | pass | no violation, stopped at 900 s | 8,945,417 checked, 23,066 behaviours | | simulation | 900 | `f2c42e6d2504` |
-| `Full` | full | pass | no violation, stopped at 900 s | 8,188,425 checked, 21,095 behaviours | | simulation | 901 | `f2c42e6d2504` |
-| `IdLess` | idless | pass | no violation, stopped at 900 s | 9,780,709 checked, 25,119 behaviours | | simulation | 900 | `f2c42e6d2504` |
-| `Slice-faults` | slice-faults (cut, lost replies only) | pass | pass | 9,222,368 | 31 | exhaustive | 962 | `23acd6410d61` |
-| `Slice-faults2` | slice-faults (cut, no lost replies) | pass | pass | 15,874,769 | 30 | exhaustive | 1390 | `a14998644a62` |
-| `Slice-accounts` | slice-accounts (cut) | pass | pass | 23,627,834 | 30 | exhaustive | 3085 | `23acd6410d61` |
-| `Slice-key` | slice-key | pass | pass | 3,501,147 | 28 | exhaustive | 226 | `f2c42e6d2504` |
-| `Slice-idless` | slice-idless | pass | pass | 10,549,465 | 28 | exhaustive | 899 | `b48bf8a62957` |
-| `Slice-twice` | twice (cut, 3 runs) | pass | pass | 3,818,141 | 30 | exhaustive | 273 | `a14998644a62` |
-| `Slice-q9` | slice-q9 | pass | pass | 22,987,926 | 37 | exhaustive | 1841 | `b48bf8a62957` |
-| `Slice-intake` | slice-intake | pass | pass | 12,345,919 | 29 | exhaustive | 1269 | `f2c42e6d2504` |
-| `Slice-intake1` | slice-intake1 | pass | pass | 9,668,164 | 41 | exhaustive | 966 | `f2c42e6d2504` |
-| `Live` | live (cut) | pass | pass | 665,867 | 24 | exhaustive | 1299 | `23acd6410d61` |
-| `Live-fail` | live-fail (cut, no reader PS) | pass | pass | 366,930 | 23 | exhaustive | 522 | `f2c42e6d2504` |
-| `Live-leave` | live-leave (every run covers s1) | pass | L3_NoStuckIncomplete | 358,958 | 17 | breadth-first, stopped | 325 | `23acd6410d61` |
-| `Live-cover` | live-cover | pass | pass | 42,776 | 29 | exhaustive | 36 | `f2c42e6d2504` |
-| `Fix-live-leave` | live-leave | pass | pass | 2,435,418 | 47 | exhaustive | 3215 | `f2c42e6d2504` |
-| `Fix-idless` | slice-idless | pass | pass | 10,470,273 | 28 | exhaustive | 743 | `a14998644a62` |
-| `Fix-split` | split | pass | pass | 12,176,674 | 29 | exhaustive | 1344 | `a14998644a62` |
-| `CE-split-run` | split | pass | pass | 12,176,674 | 29 | exhaustive | 1012 | `b48bf8a62957` |
-| `CE-late-head` | late (cut) | pass | pass | 6,998,289 | 30 | exhaustive | 728 | `23acd6410d61` |
-| `C-late-head-old-rule` | late | S1_NoLostCommit | S1_NoLostCommit | 2,662,050 | 17 | breadth-first, stopped | 60 | `b48bf8a62957` |
-| `C01-no-gen-in-names` | late | S5_CleanupSafety | S5_CleanupSafety | 3,723,528 | 18 | breadth-first, stopped | 83 | `b48bf8a62957` |
-| `C02-key` | slice-key | pass | pass | 4,505,291 | 28 | exhaustive | 341 | `f2c42e6d2504` |
-| `C02-split` | split | pass | pass | 16,238,496 | 29 | exhaustive | 2005 | `f2c42e6d2504` |
-| `C02-idless` | slice-idless | pass | pass | 13,483,670 | 29 | exhaustive | 939 | `f2c42e6d2504` |
-| `C03-non-exclusive` | late | S1_NoLostCommit | S1_NoLostCommit | 678,999 | 15 | breadth-first, stopped | 13 | `b48bf8a62957` |
-| `C04-reader-unions` | slice-accounts | S4_NoAccountMix | S4_NoAccountMix | 5,921,144 | 16 | breadth-first, stopped | 165 | `b48bf8a62957` |
-| `C05-seed-any-gen` | late | S3_CleanGeneration | S3_CleanGeneration | 609,722 | 15 | breadth-first, stopped | 12 | `b48bf8a62957` |
-| `C06-early-checkpoint` | split | S7_CheckpointSafety | S7_CheckpointSafety | 101,173 | 9 | breadth-first, stopped | 3 | `b48bf8a62957` |
-| `C07-no-reread-after-create` | late | S3_CleanGeneration | S3_CleanGeneration | 21,902 | 9 | breadth-first, stopped | 1 | `b48bf8a62957` |
-| `C08-rebind-old-spool` | late | S3_CleanGeneration | S3_CleanGeneration | 54,520 | 11 | breadth-first, stopped | 2 | `b48bf8a62957` |
-| `C09-no-listing-needed` | slice-faults | S3_CleanGeneration | S3_CleanGeneration | 36,746 | 8 | breadth-first, stopped | 2 | `b48bf8a62957` |
-| `C10-legacy-ignores-delete` | late | S2a_DeleteHolds | S2a_DeleteHolds | 13,414 | 9 | breadth-first, stopped | 1 | `b48bf8a62957` |
-| `C11-collectedat-competition` | late | S9_OneWay | S9_OneWay | 32,538 | 10 | breadth-first, stopped | 2 | `b48bf8a62957` |
-| `C12-no-needsfull` | slice-q9 | IncompleteOwned | IncompleteOwned | 370,739 | 15 | breadth-first, stopped | 6 | `b48bf8a62957` |
-| `C13-pending-blocks-import` | live-fail | L2_Convergence | L2_Convergence | 1,010,722 | 17 | breadth-first, stopped | 199 | `b48bf8a62957` |
-| `C14-seed-only-empty-base` | late | S11_SeedCoverage | S11_SeedCoverage | 387,003 | 15 | breadth-first, stopped | 9 | `b48bf8a62957` |
-| `C15-failed-row-replaceable` | slice-settle | S8_AckImmutable | S8_AckImmutable | 1,274,854 | 16 | breadth-first, stopped | 24 | `b48bf8a62957` |
-| `C16-readiness-live-only` | slice-q9 | S10_ReadinessMatchesRead | S10_ReadinessMatchesRead | 239,798 | 15 | breadth-first, stopped | 8 | `b48bf8a62957` |
-| `C19-no-q9` | slice-q9 | IncompleteOwned | IncompleteOwned | 5,855,555 | 21 | breadth-first, stopped | 101 | `b48bf8a62957` |
-| `C12L-fix` | live-leave | pass | stopped at 3600 s | 2,321,769 |  | breadth-first, timed out | 3601 | `a14998644a62` |
-| `C19L-no-q9` | live-leave | L3_NoStuckIncomplete | L3_NoStuckIncomplete | 591,731 | 17 | breadth-first, stopped | 589 | `b48bf8a62957` |
-| `C20-null-base-noop` | slice-q9 | IncompleteOwned | IncompleteOwned | 37,407 | 10 | breadth-first, stopped | 1 | `b48bf8a62957` |
-| `C21-needsfull-not-full` | slice-accounts4 | NeedsFullRunIsFull | NeedsFullRunIsFull | 35,830 | 22 | breadth-first, stopped | 2 | `b48bf8a62957` |
-| `C18-immediate-delete` | slice-lag | S2_Immediate | S2_Immediate | 13,117 | 9 | breadth-first, stopped | 1 | `b48bf8a62957` |
-| `C-publish-uncovered` | late | CoveredOnly | CoveredOnly | 50,684 | 10 | breadth-first, stopped | 3 | `b48bf8a62957` |
-| `C-producer-state` | late | IssuedStart | IssuedStart | 63,959 | 12 | breadth-first, stopped | 2 | `b48bf8a62957` |
-| `C-retry-saves-spooled` | late | S7_CheckpointSafety | S7_CheckpointSafety | 41,356 | 10 | breadth-first, stopped | 2 | `b48bf8a62957` |
-| `C-full-replaces` | late | NoFalseDelete | NoFalseDelete | 623,640 | 15 | breadth-first, stopped | 13 | `b48bf8a62957` |
-| `W-trace-a` | lean | NotTraceA | NotTraceA | 525,071 | 9 | breadth-first, stopped | 7 | `b48bf8a62957` |
-| `W-trace-b` | lean | NotTraceB | NotTraceB | 64,867,358 | 15 | breadth-first, stopped | 1008 | `b48bf8a62957` |
-| `W-offline-vs-5` | twice | NotOfflineVs5 | NotOfflineVs5 | 8,649,332 | 20 | breadth-first, stopped | 148 | `b48bf8a62957` |
-| `W-late-old-head` | lean | NotLateOldHead | NotLateOldHead | 3,352,083 | 11 | breadth-first, stopped | 34 | `b48bf8a62957` |
-| `W-twice` | twice | NotTwice | NotTwice | 2,743,602 | 17 | breadth-first, stopped | 41 | `b48bf8a62957` |
-| `W-first-write-in-delete` | lean | NotFirstWriteDuringDelete | NotFirstWriteDuringDelete | 3,379,581 | 11 | breadth-first, stopped | 40 | `b48bf8a62957` |
-| `W-phone-first-seed` | late | NotPhoneFirstThenSeed | NotPhoneFirstThenSeed | 679,159 | 16 | breadth-first, stopped | 14 | `b48bf8a62957` |
-| `W-zero-emission-seed` | slice-accounts | NotZeroEmissionSeed | NotZeroEmissionSeed | 75,590 | 9 | breadth-first, stopped | 3 | `b48bf8a62957` |
-| `W-settle-after-ack` | slice-settle | NotSettleAfterAck | NotSettleAfterAck | 54,122 | 11 | breadth-first, stopped | 3 | `b48bf8a62957` |
-| `W-switch-reused-ckpt` | slice-accounts | NotSwitchReusedCkpt | NotSwitchReusedCkpt | 130,758 | 10 | breadth-first, stopped | 4 | `b48bf8a62957` |
-| `W-needsfull-with-ckpt` | slice-accounts4 | NotNeedsFullWithCkpt | NotNeedsFullWithCkpt | 25,331 | 21 | breadth-first, stopped | 1 | `b48bf8a62957` |
-| `W-failed-entry` | lean | NotFailedEntryNewerHeads | NotFailedEntryNewerHeads | 3,344,717 | 11 | breadth-first, stopped | 38 | `b48bf8a62957` |
+Ruling R28 replaces R19 ("retry_pending saves its checkpoint only"). The
+model now has these rules. Each one is a guard, and each guard has a
+negative control that must fail with its named property.
 
-The Model column is the first 12 hex digits of the sha256 of
-`StreamSync.tla` for that run. Four versions ran:
+- **Publication.** A `retry_pending` end that received records publishes
+  its covered streams by the ordinary rules and its record-bearing
+  uncovered streams as keyed merges, always `complete:false`
+  (`PubSet`, `CovD`; control `C-retry-head-complete`, `C-retry-replace`).
+  An uncovered stream with no records gets no head. An end with no
+  records at all is checkpoint-only (`RetryEmpty`).
+- **Checkpoint after publish.** The retained streams are the
+  `candidate` of a retry end and the covered streams of a succeeded or
+  partial end. The checkpoint is saved by `Finish`, after every planned
+  stream committed (control `C-retry-checkpoint-before-publish`,
+  action `RetryEarly`).
+- **Provenance.** `ckpt[d].prov[s]` is the run whose cursor carries retry
+  provenance, saved in the same update as the cursor under the same
+  `(n, g)`. A retry end gives it to a stream with `needsFull` debt. A
+  later succeeded run keeps it while the debt remains (control
+  `C-drop-provenance-on-success`). A covered full repair clears the debt,
+  and so the provenance. Invalidation clears the whole checkpoint.
+- **runPlan.** Per stream, explicit `wantFull` issues no state. A stream
+  with `needsFull` is issued no state unless it holds eligible
+  provenance, in which case it is issued its cursor (control
+  `C-needsfull-hides-token`: today's rule, any `needsFull` hides every
+  cursor). The run-wide START mode is `full_refresh` only when no stream
+  is issued a state (`R24_CursorImpliesIncremental`, control
+  `C-full-with-cursor`: an explicit full request issued with the saved
+  cursor). A stream's full-read status is "issued no state"
+  (`FullS`), not the run's mode.
+- **Retry-progress streams do not clear their checkpoint.** A
+  `complete:false` commit (publish or no-op) of a stream that is retry
+  progress (`RP`) keeps `needsFull` debt visible but does not clear the
+  checkpoint or block the save. Any other stream keeps F2's rule.
+- **Checkpoint shape.** `ckpt` gains `pg` (the page a cursor names) and
+  `prov`; `byRun` and `RetryCkptStaysFull` are gone (R27 rejected the
+  fix). `RetryQuietOnly` is gone: a record-bearing retry stream may keep
+  its cursor once it is published.
+- **Budgeted connector.** `Budgeted` streams need two pages
+  (`Page1`, `Page2`), one page per run. The next page is the one after
+  the used cursor, a run before the last page ends `retry_pending`
+  with a candidate, and a run at or past the last page may succeed.
+  The budget profiles set `Desktop` to a model value outside `Devices`,
+  because the Desktop seed would publish every key on the first run.
 
-- `b48bf8a62957`: the intake model.
-- `23acd6410d61`: adds the bound `PartialCover`. It is TRUE, so it
-  changes nothing, except in the rows marked "cut".
-- `f2c42e6d2504`: adds the proposed guard `RetryCkptStaysFull` and the
-  checkpoint field `byRun`. Both are inert while the guard is FALSE,
-  which is the default.
-- `a14998644a62`, the final model: differs from `f2c42e6d2504` only in
-  three comments.
+New properties: `S7_CheckpointSafety` (unchanged text; now also covers
+retry cursors of record-bearing streams), `CoveredOnly` (an uncovered
+head is never `complete:true`), `NoFalseDelete` (unchanged, now over retry
+merges), `R24_CursorImpliesIncremental`, `ProvenanceAtomic`,
+`NeedsFullRunIsFull` (per stream, exempting streams issued from
+provenance), and liveness `L5_BudgetProgress` = `[]NoRestart /\ <>(every
+page published)`. TLC reports the `[]` half as `Invariant NoRestart`.
+`check.mjs` maps it to `L5_BudgetProgress`.
 
-`Slice-key` reached the same 3,501,147 distinct states and 18,500,789
-states generated on the first three versions, and the fourth changes
-only comments. So every row holds for the final model with its
-defaults.
+## Results (F3, model `3cc40833c1f1`)
 
-Findings and open rows:
+Every run used 4 workers under `nice -n 19` on a shared, loaded host.
+"Violates X" for a control or witness is the expected outcome: TLC stops
+at the first violation, which must be the named property. The table was
+generated from the run log; a row with "not run" had no completed run on
+this model (see "Open gaps").
 
-- `Live-leave` fails L3 with the ruled contract. Read
-  `traces/retry-token-incremental.txt`. `Fix-live-leave` passes with the
-  proposed fix on.
-- The four simulations found no violation. `Small` was stopped by hand
-  at 932 seconds; the others stopped at their 900-second cap. The table
-  gives states checked and random behaviours at the last progress
-  report.
-- `C12L-fix` timed out at 3600 seconds with no violation. Read "C02 and
-  C12".
-- `Fix-split` reached the same state count as `CE-split-run`: on
-  `split` the fix changes no reachable state.
-- These bounds timed out at 3600 seconds with no violation, and were
-  then cut to the bounds in the table: `slice-intake` with three runs
-  (33.7 million distinct states, depth 17) and with no delete
-  (30,378,089, depth 18); `twice` with four runs and the cut
-  (40,787,341, depth 28); `live-fail` with the reader PS and the cut
-  (1,512,262, depth 23).
+| Config | Property | Expected | Result | Distinct states | Depth | Seconds |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| `Small` | small | pass | not run (queue stopped) |  |  |  |
+| `Key` | key | pass | not run (queue stopped) |  |  |  |
+| `Full` | full | pass | not run (queue stopped) |  |  |  |
+| `IdLess` | idless | pass | not run (queue stopped) |  |  |  |
+| `Slice-faults` | slice-faults | pass | not run (queue stopped) |  |  |  |
+| `Slice-faults2` | slice-faults | pass | not run (queue stopped) |  |  |  |
+| `Slice-accounts` | slice-accounts | pass | not run (queue stopped) |  |  |  |
+| `Slice-key` | slice-key | pass | not run (queue stopped) |  |  |  |
+| `Slice-idless` | slice-idless | pass | not run (queue stopped) |  |  |  |
+| `Slice-twice` | twice | pass | not run (queue stopped) |  |  |  |
+| `Slice-q9` | slice-q9 | pass | not run (queue stopped) |  |  |  |
+| `Slice-intake` | slice-intake | pass | not run (queue stopped) |  |  |  |
+| `Slice-intake1` | slice-intake1 | pass | not run (queue stopped) |  |  |  |
+| `Bud-delete` | bud | pass | not run (queue stopped) |  |  |  |
+| `Bud-restart` | bud | pass | not run (queue stopped) |  |  |  |
+| `Bud2` | bud2 | pass | not run (queue stopped) |  |  |  |
+| `Retry1` | retry1 | pass | not run (queue stopped) |  |  |  |
+| `Bud-live` | bud-live | pass | pass | 5339 | 25 | 2 |
+| `Live` | live | pass | not run (queue stopped) |  |  |  |
+| `Live-fail` | live-fail | pass | not run (queue stopped) |  |  |  |
+| `Live-leave` | live-leave | pass | not run (queue stopped) |  |  |  |
+| `Live-cover` | live-cover | pass | not run (queue stopped) |  |  |  |
+| `CE-split-run` | split | pass | pass | 5018904 | 29 | 638 |
+| `CE-late-head` | late | pass | pass | 6998289 | 30 | 656 |
+| `C-late-head-old-rule` | late | violate S1_NoLostCommit | violates S1_NoLostCommit | 9078242 | 17 | 312 |
+| `C01-no-gen-in-names` | late | violate S5_CleanupSafety | violates S5_CleanupSafety | 13291049 | 18 | 495 |
+| `C02-key` | slice-key | pass | not run (queue stopped) |  |  |  |
+| `C02-split` | split | pass | not run (queue stopped) |  |  |  |
+| `C02-idless` | slice-idless | pass | not run (queue stopped) |  |  |  |
+| `C03-non-exclusive` | late | violate S1_NoLostCommit | violates S1_NoLostCommit | 2081245 | 16 | 75 |
+| `C04-reader-unions` | slice-accounts | violate S4_NoAccountMix | violates S4_NoAccountMix | 11525532 | 16 | 588 |
+| `C05-seed-any-gen` | late | violate S3_CleanGeneration | violates S3_CleanGeneration | 1863978 | 15 | 109 |
+| `C06-early-checkpoint` | split | violate S7_CheckpointSafety | violates S7_CheckpointSafety | 13226 | 9 | 3 |
+| `C07-no-reread-after-create` | late | violate S3_CleanGeneration | violates S3_CleanGeneration | 52171 | 9 | 6 |
+| `C08-rebind-old-spool` | late | violate S3_CleanGeneration | violates S3_CleanGeneration | 182257 | 13 | 13 |
+| `C09-no-listing-needed` | slice-faults | violate S3_CleanGeneration | violates S3_CleanGeneration | 35338 | 8 | 4 |
+| `C10-legacy-ignores-delete` | late | violate S2a_DeleteHolds | violates S2a_DeleteHolds | 33797 | 9 | 4 |
+| `C11-collectedat-competition` | late | violate S9_OneWay | violates S9_OneWay | 86777 | 9 | 6 |
+| `C12-no-needsfull` | slice-q9 | violate IncompleteOwned | violates IncompleteOwned | 118135 | 12 | 10 |
+| `C13-pending-blocks-import` | live-fail | violate L2_Convergence | violates L2_Convergence | 1854021 | 16 | 722 |
+| `C14-seed-only-empty-base` | late | violate S11_SeedCoverage | violates S11_SeedCoverage | 1150247 | 15 | 42 |
+| `C15-failed-row-replaceable` | slice-settle | violate S8_AckImmutable | violates S8_AckImmutable | 3883509 | 16 | 188 |
+| `C16-readiness-live-only` | slice-q9 | violate S10_ReadinessMatchesRead | violates S10_ReadinessMatchesRead | 60253 | 9 | 10 |
+| `C19-no-q9` | slice-q9 | violate IncompleteOwned | violates IncompleteOwned | 9367787 | 21 | 691 |
+| `C19L-no-q9` | live-leave | violate L3_NoStuckIncomplete | violates L3_NoStuckIncomplete | 337612 | 14 | 323 |
+| `C20-null-base-noop` | slice-q9 | violate IncompleteOwned | violates IncompleteOwned | 61657 | 10 | 6 |
+| `C21-needsfull-not-full` | slice-accounts4 | violate NeedsFullRunIsFull | violates NeedsFullRunIsFull | 17457 | 17 | 2 |
+| `C18-immediate-delete` | slice-lag | violate S2_Immediate | violates S2_Immediate | 30610 | 9 | 4 |
+| `C-publish-uncovered` | late | violate CoveredOnly | violates CoveredOnly | 109804 | 10 | 4 |
+| `C-producer-state` | late | violate IssuedStart | violates IssuedStart | 186925 | 12 | 8 |
+| `C-retry-checkpoint-before-publish` | late | violate S7_CheckpointSafety | violates S7_CheckpointSafety | 29805 | 9 | 2 |
+| `C-retry-head-complete` | late | violate CoveredOnly | violates CoveredOnly | 90701 | 11 | 4 |
+| `C-retry-replace` | late | violate NoFalseDelete | violates NoFalseDelete | 1817255 | 15 | 50 |
+| `C-full-with-cursor` | late | violate R24_CursorImpliesIncremental | violates R24_CursorImpliesIncremental | 179867 | 12 | 7 |
+| `C-drop-provenance-on-success` | bud-live | violate L5_BudgetProgress | violates L5_BudgetProgress | 1245 | 16 | 1 |
+| `C-needsfull-hides-token` | bud-live | violate L5_BudgetProgress | violates L5_BudgetProgress | 256 | 10 | 1 |
+| `C-full-replaces` | late | violate NoFalseDelete | violates NoFalseDelete | 1839937 | 15 | 49 |
+| `W-trace-a` | lean | violate NotTraceA | violates NotTraceA | 2415753 | 8 | 53 |
+| `W-trace-b` | lean | violate NotTraceB | not run (queue stopped) |  |  |  |
+| `W-offline-vs-5` | twice | violate NotOfflineVs5 | not run (queue stopped) |  |  |  |
+| `W-late-old-head` | lean | violate NotLateOldHead | not run (queue stopped) |  |  |  |
+| `W-twice` | twice | violate NotTwice | not run (queue stopped) |  |  |  |
+| `W-first-write-in-delete` | lean | violate NotFirstWriteDuringDelete | not run (queue stopped) |  |  |  |
+| `W-phone-first-seed` | late | violate NotPhoneFirstThenSeed | not run (queue stopped) |  |  |  |
+| `W-zero-emission-seed` | slice-accounts | violate NotZeroEmissionSeed | not run (queue stopped) |  |  |  |
+| `W-settle-after-ack` | slice-settle | violate NotSettleAfterAck | not run (queue stopped) |  |  |  |
+| `W-switch-reused-ckpt` | slice-accounts | violate NotSwitchReusedCkpt | not run (queue stopped) |  |  |  |
+| `W-needsfull-with-ckpt` | slice-accounts4 | violate NotNeedsFullWithCkpt | not run (queue stopped) |  |  |  |
+| `W-failed-entry` | lean | violate NotFailedEntryNewerHeads | not run (queue stopped) |  |  |  |
+| `W-budget-resume` | bud | violate NotBudgetResume | violates NotBudgetResume | 22468 | 11 | 3 |
+| `W-token-resume` | retry1 | violate NotTokenResume | violates NotTokenResume | 1387862 | 20 | 27 |
+| `W-mixed-modes` | retry1 | violate NotMixedModes | violates NotMixedModes | 14880439 | 23 | 335 |
+| `W-retry-merge` | retry1 | violate NotRetryMerge | violates NotRetryMerge | 518764 | 18 | 13 |
 
-Positive configs check every safety invariant: TypeOK, S1 to S12,
-NeverInconsistent, NoHeadAboveControl, HeadGenMonotone, IncompleteOwned,
-NeedsFullRunIsFull, CoveredOnly, IssuedStart, NoFalseDelete and
-LaterWriteSurvives. Liveness configs check TypeOK and L1 to L4, except
-L2 on a profile without imports (`live-leave`, `live-cover`). A control
-or witness checks TypeOK and its one expected property, so TLC's first
-violation is that one.
+Run state: the queue stopped after `W-trace-a` (cause unknown), so 35
+configs have **no run on this model**: the four simulations, every
+exhaustive slice, `Live*`, `Bud-delete`, `Bud-restart`, `Bud2`, `Retry1`,
+`C02-*` and the older witnesses. Their F2 results (model
+`a14998644a62`) no longer apply, because R28 changed the transition
+relation. They are not claimed.
 
-`node formal/check.mjs --list` prints every config with its slice and
-expected result.
+### Bounds changed in F3, and what each removes
+
+- **`split` profile** (used by `CE-split-run`, `C02-split`,
+  `C06-early-checkpoint`): `MaxRetry 0`, `PartialCover FALSE`, `MaxVer 3`.
+  Before the cut `CE-split-run` reached 24.4M distinct states at depth 14
+  after 55 minutes with the queue still growing. After it: 5,018,904
+  distinct states, depth 29, 638 s, exhaustive. Removed: retry ends and
+  partial coverage in the split scenario, so every head there is
+  complete. It still reaches the split case (a delete lands between two
+  streams of one user-connect run). `MaxVer 3` removes nothing there; the
+  review found the saving comes from the retry and coverage cut. As a
+  result `CoveredOnly`, `ProvenanceAtomic`, `NeedsFullRunIsFull`,
+  `IncompleteOwned` and `LaterWriteSurvives` are vacuous on this profile.
+  Its pass is not R28 coverage.
+- **`bud` split** into `Bud-delete` (`MaxSessions 0`) and `Bud-restart`
+  (`MaxDeletes 0`): the joint delete-and-restart run did not finish.
+  Restart together with delete is unchecked.
+- **`Bud2`, `Retry1`:** `MaxRuns 3` instead of 4 (4 runs passed 7.0M and
+  3.3M distinct states with no violation and no end). Removed: a fourth
+  run that consumes a preserved result.
+- **`Desktop = nodesk`** on the budget profiles: the Desktop seed would
+  publish every key on the first run and hide the paging.
+- The comment that names `split` as a place where partial coverage and
+  `retry_pending` are checked is out of date.
+
+### Counterexample summaries (negative controls, all as required)
+
+- `C-retry-checkpoint-before-publish` (S7): a retry end saves the cursor
+  of a stream whose records are not yet published; a crash after the save
+  loses them. Depth 9.
+- `C-retry-head-complete` (CoveredOnly): a retry merge for an uncovered
+  stream is written `complete:true`, so a later full read believes the
+  stream is whole. Depth 11.
+- `C-retry-replace` (NoFalseDelete): a retry head replaces the base
+  instead of merging; keys that the spool did not carry are deleted.
+  Depth 15.
+- `C-full-with-cursor` (R24): an explicit full request is issued with the
+  retry cursor, so the run is full in name and incremental in fact.
+  Depth 12.
+- `C-drop-provenance-on-success` (L5): a later incremental success drops
+  the provenance while the stream is still incomplete; the next run
+  restarts at page 1. Depth 16.
+- `C-needsfull-hides-token` (L5): today's rule, any `needsFull` hides the
+  saved token, so the connector restarts at page 1. Depth 10.
+- `C06-early-checkpoint` still fails S7, now on the cut `split` profile.
+- No positive config found a counterexample. No R28 rule needed a fix
+  after the push of `6c591823`; `StreamSync.tla` is unchanged since.
+
+### Property to test map (RETRY-PROGRESS-DESIGN.md section 6)
+
+- S7_CheckpointSafety (retry cursors included): tests 7, 8, 13.
+- NoFalseDelete across retry merges: test 6.
+- CoveredOnly: tests 1, 2, 12.
+- R24_CursorImpliesIncremental: tests 3, 10.
+- ProvenanceAtomic: tests 7, 11.
+- L5_BudgetProgress: test 4; test 5 for the non-resumable cap.
+- Admission and isolation (S2a, S3, unchanged): test 9.
+- No test in section 6 covers: a run that mixes a resumed stream with a
+  stream issued no state (witness `W-mixed-modes` reaches it, depth 23);
+  cumulative coverage across several retry ends; a delete between two
+  commits of a retry run. These need tests.
+
+### Open gaps (for F3b)
+
+The shrunk `split` and the missing positive runs leave these R28 plus
+delete combinations without an exhaustive check (from the dot review):
+
+- Retry, success that keeps provenance, a further continuation, and a
+  remote delete in the third run, with two ordinary streams.
+- Two-key retry merge with a delete splitting a two-stream run.
+- Two or more retry ends (record retry, token-only retry, continuation)
+  with a mid-run delete in a multi-stream history.
+- A budgeted stream with a normal sibling and a remote delete; a budgeted
+  continuation with a restart and a delete together.
+- A retry head whose reply is lost across a delete.
+- Liveness with retry debt and a delete: no positive liveness config
+  has both. `Bud-live` has no delete, and L5 across a delete needs a
+  generation-conditional property.
+- The 35 configs listed under "Run state" must run on the final model.
+
+Proposed constant-only configs are in the dot review report
+(`f3-shrunk-constants-review.report.md`, section 3).
+
+### R28 ambiguities and how they were resolved
+
+- The full-read status is per stream by presence of issued state, not by
+  the run's mode.
+- A retry end with no records is checkpoint-only even when it covers
+  streams.
+- Provenance is saved only while `needsFull` debt exists.
+- An explicit full request issues no cursor. This overrides F2's "an
+  owner-started full run keeps the stored checkpoint".
+- The model uses two pages (K=2).
+- Crash points are modelled by a restart, a failed entry and a leaving
+  device, with an outbox that persists.
+- The `Live-leave` gap (a retry token, an old-app DELETE, the creator
+  leaves) stays a known gap, as ruled in R27.
 
 ### C02 and C12
+
+F2 text. `RetryCkptStaysFull`, `C12L-fix` and `Fix-*` are superseded by R28 and are no longer in the model.
 
 For each of these guards, no control shows that the model needs it.
 Neither is removed from the package.
@@ -235,6 +351,8 @@ package, `afterCommit` in `needs-full.ts` adds the key, and
 `runMustBeFull` and `runPlan` in `writer.ts` read it.
 
 ### Bounds
+
+Superseded by R28: mentions below of `RetryQuietOnly`, `RetryCkptStaysFull` and the `Fix-*` configs describe the F2 model. R28 removed them.
 
 All guards are TRUE except the one a control turns off, and
 `RetryCkptStaysFull`, which only the `Fix-*` rows and `C12L-fix` turn
@@ -350,6 +468,8 @@ violation.
 
 ## Counterexamples kept as controls
 
+Superseded by R28: mentions below of `RetryQuietOnly`, `RetryCkptStaysFull` and the `Fix-*` configs describe the F2 model. R28 removed them.
+
 - [traces/retry-token-incremental.txt](traces/retry-token-incremental.txt):
   the ruled contract, found by the positive config `Live-leave`. `d2`
   has no checkpoint, so its run 2 is full. The run ends `retry_pending`
@@ -396,6 +516,8 @@ Reproduce a trace: add `-dumpTrace json FILE` to the TLC command and run
 `python3 formal/traces/story.py FILE`.
 
 ## What the model is
+
+Superseded by R28: mentions below of `RetryQuietOnly`, `RetryCkptStaysFull` and the `Fix-*` configs describe the F2 model. R28 removed them.
 
 `StreamSync.tla` models one connector `c`. Each action maps to one
 package function or host step; the module header lists the map. It
