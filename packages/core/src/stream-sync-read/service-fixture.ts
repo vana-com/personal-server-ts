@@ -226,7 +226,7 @@ export class FakeOverlay implements StreamSyncOverlaySnapshotSource {
         profile: { key: s.profileKey ?? null, version: s.version ?? "1.0.0" },
         complete: s.complete ?? false,
         recordCount: s.rows.length,
-        ...(s.incompleteOverBase ? { incompleteOverBase: true } : {}),
+        incompleteOverBase: s.incompleteOverBase ?? false,
         contentRevision: s.contentRevision ?? "r1",
         state: s.receipt
           ? "published"

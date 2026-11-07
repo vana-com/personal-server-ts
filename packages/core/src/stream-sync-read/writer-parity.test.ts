@@ -84,7 +84,6 @@ async function compare(input: {
     await rig.sync();
   }
   for (const spec of input.runs) await rig.collect(spec);
-  rig.overlay.runs = input.runs.map((spec) => rig.describe(spec));
   const before = await observe(rig);
 
   const statuses = await rig.publish();
@@ -93,9 +92,6 @@ async function compare(input: {
     .filter((s) => s.streams["items"]?.problem === "connector_update_required")
     .map((s) => s.runId)
     .sort();
-  rig.overlay.runs = input.runs
-    .filter((spec) => refused.includes(spec.runId))
-    .map((spec) => rig.describe(spec));
   const after = await observe(rig);
   return { before, after, refused };
 }
@@ -246,25 +242,19 @@ describe("the overlay read equals the read after the real writer publishes", () 
 });
 
 describe("a seeded first publish", () => {
-  it("is complete before and after, whatever the run read", async () => {
+  it("is complete after, and never claimed complete before", async () => {
     // The seed (a host's retained history) merges into the first publish, so
-    // the head is complete although the run resumed from a checkpoint. An
-    // overlay source reports that as `complete`. The seed's rows are read by
-    // the writer at publish time, so only the run's own rows are in the
-    // overlay before it.
+    // the head is complete although the run resumed from a checkpoint. The
+    // overlay descriptor cannot say so: the seed is read at publish time. The
+    // reader takes the cautious side: incomplete before, complete after.
     const rig = new Rig({
       key: "id",
       version: "1.0.0",
       rows: [{ id: "seed" }],
     });
     await rig.open();
-    const spec = run({
-      runId: "r1",
-      rows: [{ id: "c", v: 1 }],
-      complete: true,
-    });
+    const spec = run({ runId: "r1", rows: [{ id: "c", v: 1 }] });
     await rig.collect(spec);
-    rig.overlay.runs = [rig.describe(spec)];
     const snapshot = await rig.overlay.snapshot(CONNECTOR);
     const pending = snapshot.runs[0]!;
     const folded = foldContributions(null, [
@@ -274,13 +264,12 @@ describe("a seeded first publish", () => {
 
     await rig.publish();
     await rig.sync();
-    rig.overlay.runs = [];
     const head = rig.service
       .connectionViews(CONNECTOR)
       .find((c) => c.ns === rig.ns)?.streams["items"];
     expect(head?.live).toBe(true);
-    expect(folded.complete).toBe(true);
-    expect(head?.complete).toBe(folded.complete);
+    expect(folded.complete).toBe(false);
+    expect(head?.complete).toBe(true);
     const read = await observe(rig);
     expect(read.records).toContain(JSON.stringify({ id: "c", v: 1 }));
     expect(read.records).toContain(JSON.stringify({ id: "seed" }));

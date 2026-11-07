@@ -617,8 +617,35 @@ async function supersedeAfterCommit(
   }
 }
 
-function contractErrorResponse(err: DataContractError): Response {
-  return jsonResponse(err.body, { status: err.status });
+function contractErrorResponse(
+  err: DataContractError,
+  notes?: OwnerNotes,
+): Response {
+  return jsonResponse(withOwnerBody(err.body, notes), {
+    status: err.status,
+    headers: ownerNoteHeaders(notes),
+  });
+}
+
+/** What only the owner is told when the existing path answers a stream read. */
+function ownerNoteHeaders(
+  notes: OwnerNotes | undefined,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (notes?.withheld?.length) {
+    headers["X-Stream-Sync-Withheld"] = withheldReasons(notes.withheld);
+  }
+  if (notes?.pending) {
+    headers["X-Stream-Sync-Pending"] = String(notes.pending.runs);
+  }
+  return headers;
+}
+
+function withOwnerBody<T extends object>(
+  body: T,
+  notes: OwnerNotes | undefined,
+): T | (T & { withheld: readonly WithheldRun[] }) {
+  return notes?.withheld?.length ? { ...body, withheld: notes.withheld } : body;
 }
 
 function protocolErrorResponse(err: ProtocolError): Response {
@@ -629,16 +656,20 @@ function errorResponse(
   status: JsonStatus,
   errorCode: string,
   message: string,
+  notes?: OwnerNotes,
 ): Response {
   return jsonResponse(
-    {
-      error: {
-        code: status,
-        errorCode,
-        message,
+    withOwnerBody(
+      {
+        error: {
+          code: status,
+          errorCode,
+          message,
+        },
       },
-    },
-    { status },
+      notes,
+    ),
+    { status, headers: ownerNoteHeaders(notes) },
   );
 }
 
@@ -651,6 +682,7 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
             404,
             "CONNECTION_NOT_FOUND",
             "No connection of this name's connector matches the connection parameter",
+            decision,
           )
         : null;
     case "key_mismatch":
@@ -2617,8 +2649,6 @@ export async function handlePersonalServerDataRequest(
           throw new DataDeletedError({ scope: scopeResult.scope });
         }
         if (latestRead) {
-          const refusal = streamSyncRefusal(decision);
-          if (refusal) return refusal;
           if (
             decision.kind === "pass" ||
             decision.kind === "legacy" ||
@@ -2626,6 +2656,8 @@ export async function handlePersonalServerDataRequest(
           ) {
             ownerNotes = decision;
           }
+          const refusal = streamSyncRefusal(decision);
+          if (refusal) return refusal;
           if (decision.kind === "local_pending") {
             // Owner-only and unregistered: nothing to bill and no version to
             // bind in an access record.
@@ -2748,15 +2780,7 @@ export async function handlePersonalServerDataRequest(
         paymentResponseHeader = paid.paymentResponseHeader;
       }
 
-      const headers: Record<string, string> = {};
-      if (ownerNotes?.withheld?.length) {
-        headers["X-Stream-Sync-Withheld"] = withheldReasons(
-          ownerNotes.withheld,
-        );
-      }
-      if (ownerNotes?.pending) {
-        headers["X-Stream-Sync-Pending"] = String(ownerNotes.pending.runs);
-      }
+      const headers = ownerNoteHeaders(ownerNotes);
       if (ownApp) headers["X-Vana-Payment-Exemption"] = "own-app";
       headers["X-Vana-Data-Source"] =
         latest?.kind === "canonical" ? "canonical" : "legacy";
@@ -2780,7 +2804,7 @@ export async function handlePersonalServerDataRequest(
             // 404, when that is why.
             await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
           }
-          return contractErrorResponse(result);
+          return contractErrorResponse(result, ownerNotes);
         }
         envelope = result.envelope;
         servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
@@ -2862,12 +2886,9 @@ export async function handlePersonalServerDataRequest(
         });
         return response;
       }
-      const response = jsonResponse(
-        ownerNotes?.withheld?.length
-          ? { ...servedEnvelope, withheld: ownerNotes.withheld }
-          : servedEnvelope,
-        { headers },
-      );
+      const response = jsonResponse(withOwnerBody(servedEnvelope, ownerNotes), {
+        headers,
+      });
       reportReadFulfillment();
       return response;
     }

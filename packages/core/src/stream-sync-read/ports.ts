@@ -80,7 +80,8 @@ export interface StreamSyncOverlayStream {
   /**
    * The run resumed from a checkpoint of another namespace (writer.ts:1465):
    * the head the writer publishes for it is incomplete even over a complete
-   * base. `complete` is then false as well.
+   * base. `complete` is then false as well. Absent = unknown: the reader takes
+   * the incomplete side and counts the head complete only by `complete`.
    */
   readonly incompleteOverBase?: boolean;
   /**

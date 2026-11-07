@@ -1,8 +1,8 @@
 /**
  * Test rig for the writer-parity tests: the real `StreamSyncWriter` publishes
- * to a registry fake, and the real `StreamSyncReadService` reads with a
- * snapshot overlay whose runs the test describes the way an overlay source
- * would describe the writer's pending runs.
+ * to a registry fake, and the real `StreamSyncReadService` reads through the
+ * writer's own overlay source, so every descriptor the reader folds is the one
+ * the production producer emits.
  */
 
 import {
@@ -16,6 +16,7 @@ import {
   type StreamSyncRegistry,
   type StreamSyncRunStatus,
 } from "../stream-sync/index.js";
+import { createWriterOverlaySource } from "../stream-sync/writer.js";
 import {
   parseScope,
   streamMasterKeyFromSignature,
@@ -25,7 +26,11 @@ import { createStreamSyncReadKeys } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
 import { StreamSyncReadService } from "./service.js";
-import { FakeOverlay, type FakeRun } from "./service-fixture.js";
+import type {
+  StreamSyncOverlaySnapshot,
+  StreamSyncOverlaySnapshotSource,
+  StreamSyncOverlayStream,
+} from "./ports.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
 const SIGNATURE = `0x${"1f".repeat(32)}${"2a".repeat(32)}1b` as const;
@@ -91,9 +96,11 @@ class Gateway implements StreamSyncRegistry {
   }
 }
 
-/** One run of the `items` stream, as a connector would deliver it. */
+/** One run of one stream (default `items`), as a connector would deliver it. */
 export interface RunSpec {
   readonly runId: string;
+  /** The stream the run delivers; default `items`. */
+  readonly stream?: string;
   readonly key: string;
   readonly version: string;
   readonly rows: readonly Record<string, unknown>[];
@@ -101,9 +108,10 @@ export interface RunSpec {
   readonly full: boolean;
   /** Resume from a checkpoint of another namespace (writer.ts:1465). */
   readonly otherNamespace?: boolean;
-  /** The run's `complete` as an overlay source reports it (default `full`). */
-  readonly complete?: boolean;
 }
+
+/** Descriptor fields a producer may leave out. */
+export type OptionalDescriptorField = "recordCount" | "incompleteOverBase";
 
 export interface SeedRows {
   readonly key: string;
@@ -115,15 +123,22 @@ export class Rig {
   readonly gateway = new Gateway();
   readonly blobMap = new Map<string, Uint8Array>();
   readonly files = createMemoryStreamSyncFiles();
-  readonly overlay = new FakeOverlay();
   readonly writer: StreamSyncWriter;
+  /**
+   * Descriptor fields the overlay leaves out: a producer that does not emit
+   * them. Empty = the writer's own descriptors, unchanged.
+   */
+  readonly omit = new Set<OptionalDescriptorField>();
+  readonly overlay: StreamSyncOverlaySnapshotSource;
   service!: StreamSyncReadService;
   /** Every run is identity-less: one namespace, the empty one. */
   readonly ns = "";
   private order = 0;
-  private readonly observed = new Map<string, number>();
 
-  constructor(seed?: SeedRows) {
+  constructor(
+    seed?: SeedRows,
+    readonly connector: string = CONNECTOR,
+  ) {
     const blobs: StreamSyncBlobs = {
       put: async (key, bytes) => void this.blobMap.set(key, bytes.slice()),
       get: async (key) => this.blobMap.get(key) ?? null,
@@ -158,6 +173,36 @@ export class Rig {
           }
         : {}),
     });
+    const source = createWriterOverlaySource(this.writer);
+    this.overlay = {
+      snapshot: async (connector) =>
+        this.withoutOmitted(await source.snapshot(connector)),
+      acknowledge: (coverage) => source.acknowledge(coverage),
+    };
+  }
+
+  private withoutOmitted(
+    snapshot: StreamSyncOverlaySnapshot,
+  ): StreamSyncOverlaySnapshot {
+    if (this.omit.size === 0) return snapshot;
+    const original = new Map<object, (typeof snapshot.runs)[number]>();
+    const runs = snapshot.runs.map((run) => {
+      const stripped = Object.freeze({
+        ...run,
+        streams: run.streams.map((stream) => {
+          const copy: Partial<StreamSyncOverlayStream> = { ...stream };
+          for (const field of this.omit) delete copy[field];
+          return Object.freeze(copy as StreamSyncOverlayStream);
+        }),
+      });
+      original.set(stripped, run);
+      return stripped;
+    });
+    return {
+      runs,
+      lines: (run, stream) => snapshot.lines(original.get(run)!, stream),
+      release: () => snapshot.release(),
+    };
   }
 
   async open(): Promise<void> {
@@ -185,11 +230,10 @@ export class Rig {
   /** A finished run of `items` whose publish has not started. */
   async collect(spec: RunSpec): Promise<void> {
     const observedAt = T0 + (this.order += 1) * 1000;
-    this.observed.set(spec.runId, observedAt);
     await this.writer.refreshControls();
     await this.writer.beginRun({
       runId: spec.runId,
-      connector: CONNECTOR,
+      connector: this.connector,
       userConnect: false,
       observedAt,
       identity: "none",
@@ -200,41 +244,17 @@ export class Rig {
             generation: 1,
           },
     });
-    await this.writer.declareStream(spec.runId, "items", {
+    const stream = spec.stream ?? "items";
+    await this.writer.declareStream(spec.runId, stream, {
       primaryKey: [spec.key],
       profile: { key: null, version: spec.version },
     });
     for (const row of spec.rows) {
-      await this.writer.append(spec.runId, "items", { ...row });
+      await this.writer.append(spec.runId, stream, { ...row });
     }
     await this.writer.finishRun(spec.runId, {
       checkpointCandidate: { cursor: spec.runId },
     });
-  }
-
-  /** The overlay's description of a pending run. */
-  describe(spec: RunSpec): FakeRun {
-    const observedAt = this.observed.get(spec.runId)!;
-    return {
-      runId: spec.runId,
-      ns: this.ns,
-      generation: 1,
-      observedAt,
-      streams: [
-        {
-          name: "items",
-          primaryKey: [spec.key],
-          version: spec.version,
-          complete: spec.complete ?? spec.full,
-          ...(spec.otherNamespace ? { incompleteOverBase: true } : {}),
-          rows: spec.rows.map((v) => ({
-            o: observedAt,
-            r: spec.runId,
-            v: v as never,
-          })),
-        },
-      ],
-    };
   }
 
   /** Publish every ready run and say what the writer did with each. */

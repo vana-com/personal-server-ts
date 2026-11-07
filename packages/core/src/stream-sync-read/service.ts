@@ -913,7 +913,9 @@ export class StreamSyncReadService {
         let at = 0;
         let atAny = 0;
         const withRecords = new Set<string>();
-        const complete = target.streams.every((stream) => {
+        // Every stream is scanned, whether or not an earlier one has a local
+        // run: a run the writer will not publish is reported either way.
+        const covered = target.streams.map((stream) => {
           const row = rows.streams.get(ns)?.get(stream);
           const local = this.contributions(
             snapshot,
@@ -945,7 +947,7 @@ export class StreamSyncReadService {
           }
           return local.merged.length > 0;
         });
-        if (!complete) continue;
+        if (!covered.every(Boolean)) continue;
         if (
           !best ||
           at > best.at ||
