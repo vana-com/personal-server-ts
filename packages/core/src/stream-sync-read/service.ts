@@ -94,6 +94,12 @@ export interface ResolveInput {
   readonly legacyFile: boolean;
   /** The caller reads as the owner (`isOwnerView`), not as a grantee. */
   readonly isOwnerView: boolean;
+  /**
+   * When the legacy body was collected, in epoch milliseconds; absent or
+   * `null` when unknown. An owner's pending local run answers instead of the
+   * legacy body only when it is strictly newer than this.
+   */
+  readonly legacyCollectedAt?: number | null;
 }
 
 /**
@@ -750,15 +756,22 @@ export class StreamSyncReadService {
         e.eligibility.kind === "unavailable" &&
         e.eligibility.reason === "deleted",
     );
-    // The owner's own unactivated rows, unless a body already answers or a
-    // deletion hides the connector.
-    if (input.isOwnerView && !input.legacyFile && !deleted) {
+    // The owner's own unactivated rows, unless a deletion hides the
+    // connector. A legacy body answers instead, unless the pending rows were
+    // collected strictly after it: the owner reads the newer collection and
+    // the two are never merged.
+    if (input.isOwnerView && !deleted) {
       const pending = this.pendingChoice(
         input,
         [...targets, ...candidates],
         snapshots,
       );
-      if (pending) {
+      if (
+        pending &&
+        (!input.legacyFile ||
+          (typeof input.legacyCollectedAt === "number" &&
+            pending.at > input.legacyCollectedAt))
+      ) {
         const snapshot = snapshots.get(pending.target.connector)!;
         snapshots.delete(pending.target.connector);
         return this.serveView(
@@ -820,12 +833,15 @@ export class StreamSyncReadService {
       : null;
   }
 
-  /** The target and connection whose local runs every needed stream has. */
+  /**
+   * The target and connection whose local runs every needed stream has, with
+   * `at`, the newest observedAt among those runs.
+   */
   private pendingChoice(
     input: ResolveInput,
     targets: readonly Target[],
     snapshots: ReadonlyMap<string, StreamSyncOverlaySnapshot>,
-  ): { target: Target; ns: string } | null {
+  ): { target: Target; ns: string; at: number } | null {
     let best: { target: Target; ns: string; at: number } | null = null;
     for (const target of targets) {
       const snapshot = snapshots.get(target.connector);

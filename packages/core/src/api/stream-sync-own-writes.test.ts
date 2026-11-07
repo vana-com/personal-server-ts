@@ -109,7 +109,12 @@ describe("data reads of a device's own rows", () => {
   });
 
   it("answers the owner with today's stored body when activation is not verified", async () => {
-    const { deps } = await setup(73, false);
+    const { f, deps } = await setup(73, false);
+    // The stored body (2026-10-01) is the newer collection.
+    f.overlay.runs = f.overlay.runs.map((r) => ({
+      ...r,
+      observedAt: Date.parse("2026-09-01T00:00:00Z"),
+    }));
     const read = await get(deps, false);
     expect(read.source).toBe("legacy");
     expect(read.body.data.records).toEqual(STORED);
@@ -129,6 +134,36 @@ describe("data reads of a device's own rows", () => {
   it("never serves unactivated rows to a grantee", async () => {
     const { f, deps } = await setup(75, false);
     f.overlay.runs = f.overlay.runs.map((r) => ({ ...r, generation: null }));
+    const read = await get(deps, true);
+    expect(read.source).toBe("legacy");
+    expect(read.origin).toBeNull();
+    expect(read.body.data.records).toEqual(STORED);
+  });
+});
+
+describe("data reads of a device's own rows against a stored body", () => {
+  it("serves the owner the pending run when it is newer than the stored body", async () => {
+    const { deps } = await setup(76, false);
+    // The stored body was collected 2026-10-01; the run, 2026-11-01.
+    const read = await get(deps, false);
+    expect(read.source).toBe("stream-sync");
+    expect(read.origin).toBe("local-pending");
+    expect(read.body.data.records).toEqual([{ id: "local", v: 1 }]);
+  });
+
+  it("serves the stored body when it is newer than the pending run", async () => {
+    const { f, deps } = await setup(77, false);
+    f.overlay.runs = f.overlay.runs.map((r) => ({
+      ...r,
+      observedAt: Date.parse("2026-09-01T00:00:00Z"),
+    }));
+    const read = await get(deps, false);
+    expect(read.source).toBe("legacy");
+    expect(read.body.data.records).toEqual(STORED);
+  });
+
+  it("never serves a grantee the pending run", async () => {
+    const { deps } = await setup(78, false);
     const read = await get(deps, true);
     expect(read.source).toBe("legacy");
     expect(read.origin).toBeNull();

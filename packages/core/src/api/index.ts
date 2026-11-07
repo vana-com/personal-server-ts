@@ -767,6 +767,12 @@ async function serveStreamSyncView(
   });
 }
 
+/** Epoch milliseconds of an ISO time, or null when absent or unparsable. */
+function epochMs(time: string | undefined): number | null {
+  const ms = time === undefined ? Number.NaN : Date.parse(time);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 function methodNotAllowed(): Response {
   return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
 }
@@ -2605,6 +2611,11 @@ export async function handlePersonalServerDataRequest(
           connection: latestRead ? url.searchParams.get("connection") : null,
           cursor: latestRead ? url.searchParams.get("cursor") : null,
           legacyFile: Boolean(selectedEntry) || latest?.kind === "canonical",
+          legacyCollectedAt: epochMs(
+            latest?.kind === "canonical"
+              ? latest.envelope.collectedAt
+              : selectedEntry?.collectedAt,
+          ),
           isOwnerView: isOwnerView(authResult),
         });
         if (decision.kind === "unavailable" && decision.reason === "deleted") {
