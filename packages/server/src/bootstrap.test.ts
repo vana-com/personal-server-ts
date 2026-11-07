@@ -12,6 +12,7 @@ import { createServer as createHttpServer } from "node:http";
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer } from "./bootstrap.js";
+import { StreamSyncReadService } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
@@ -96,6 +97,35 @@ describe("createServer", () => {
       await ctx?.cleanup();
       gateway.closeAllConnections();
       await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    }
+  });
+
+  // Skipped: createServer opens better-sqlite3, whose native binding is not
+  // built in the checkout this test was written in. Unskip when fixing G1-G3.
+  it.skip("opens the stream-sync reader with an overlay backed by its writer", async () => {
+    const open = vi.spyOn(StreamSyncReadService, "open");
+    const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
+    const ownerSignature = await owner.signMessage({
+      message: "vana-master-key-v1",
+    });
+    const config = ServerConfigSchema.parse({
+      tunnel: { enabled: false },
+      sync: { enabled: false },
+      logging: { level: "fatal", pretty: false },
+      streamSync: { read: true, write: true },
+    });
+    const ctx = await createServer(config, {
+      rootPath: tempDir,
+      ownerSignature,
+    });
+    try {
+      // A device must read what it collected itself while its publish is
+      // pending, so the reader needs a source of the writer's pending rows.
+      expect(open).toHaveBeenCalledTimes(1);
+      expect(open.mock.calls[0]![0].overlay).toBeDefined();
+    } finally {
+      await ctx.cleanup();
+      open.mockRestore();
     }
   });
 
