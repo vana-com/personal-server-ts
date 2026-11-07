@@ -1943,6 +1943,18 @@ export class StreamSyncWriter {
               (host.entry.full || stream.fullStream) &&
               (!host.checkpointUsed ||
                 host.checkpointUsed.ns === host.entry.ns),
+            // The run resumed from another namespace's checkpoint: the head
+            // it publishes is incomplete even over a complete base (§2.12).
+            incompleteOverBase:
+              host.checkpointUsed !== null &&
+              host.checkpointUsed.ns !== host.entry.ns,
+            // Spool bytes are zero exactly when the run holds no record. A
+            // seed merged at publish adds records the spool does not hold,
+            // so those streams say nothing.
+            ...(!stream.seedApplies &&
+            stream.shardBytes.every((bytes) => bytes === 0)
+              ? { recordCount: 0 }
+              : {}),
             state: stream.receipt
               ? ("published" as const)
               : stream.problem

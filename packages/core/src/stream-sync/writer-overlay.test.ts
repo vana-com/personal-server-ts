@@ -313,6 +313,35 @@ describe("writer retained completed runs", () => {
 });
 
 describe("writer overlay snapshots", () => {
+  it("says when a run holds no record and when it resumed from another namespace", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w, "empty", []);
+    await w.beginRun({
+      runId: "other",
+      connector,
+      userConnect: false,
+      observedAt: 2000,
+      identity: "none",
+      checkpointUsed: { ns: "0123456789abcdef", generation: 1 },
+    });
+    await w.declareStream("other", "s", shape);
+    await w.append("other", "s", { id: "two" });
+    await w.finishRun("other", { checkpointCandidate: null });
+    const snapshot = await createWriterOverlaySource(w).snapshot(connector);
+    const byId = new Map(snapshot.runs.map((r) => [r.runId, r.streams[0]!]));
+    expect(byId.get("empty")).toMatchObject({
+      recordCount: 0,
+      incompleteOverBase: false,
+    });
+    expect(byId.get("other")).toMatchObject({
+      complete: false,
+      incompleteOverBase: true,
+    });
+    expect(byId.get("other")).not.toHaveProperty("recordCount");
+    snapshot.release();
+  });
   it("lists ready offline rows including an unactivated null-generation run", async () => {
     const f = await fixture();
     f.rows.clear();
