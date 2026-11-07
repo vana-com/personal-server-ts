@@ -43,6 +43,7 @@ import {
 } from "./mirror.js";
 import type {
   StreamSyncBlobReader,
+  StreamSyncImportedCoverage,
   StreamSyncOverlayRun,
   StreamSyncOverlaySnapshot,
   StreamSyncOverlaySnapshotSource,
@@ -386,7 +387,25 @@ export class StreamSyncReadService {
         options.keys.keyCheck,
       ),
       logger: options.logger,
+      // Only durable files may let the source retire what they cover.
+      ...(options.durable && options.overlay
+        ? {
+            acknowledge: (coverage: StreamSyncImportedCoverage) =>
+              options.overlay!.acknowledge(coverage),
+          }
+        : {}),
     });
+    // Every durable current view is covered already: say so, so a restart
+    // retires what an interrupted acknowledgment left behind.
+    if (options.durable && options.overlay) {
+      for (const { key, version } of views.views()) {
+        await importer.acknowledge(key, {
+          version: version.version,
+          dataHash: version.dataHash,
+          generation: version.head.generation,
+        });
+      }
+    }
     // Import whatever the mirror holds that a crash left unimported.
     return new StreamSyncReadService(
       options,

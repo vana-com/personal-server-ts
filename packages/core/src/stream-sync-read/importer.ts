@@ -29,6 +29,7 @@ import {
 } from "./mirror.js";
 import type {
   StreamSyncBlobReader,
+  StreamSyncImportedCoverage,
   StreamSyncReadKeys,
   StreamSyncReadLogger,
 } from "./ports.js";
@@ -90,8 +91,39 @@ export class StreamSyncImporter {
       readonly keys: StreamSyncReadKeys;
       readonly controlHashes: ControlHashes;
       readonly logger: StreamSyncReadLogger;
+      /**
+       * Called after a durable commit with what is now installed. Set only
+       * when the read files are durable. A failure is logged and retried at
+       * the next commit or start: it never fails the import.
+       */
+      readonly acknowledge?: (
+        coverage: StreamSyncImportedCoverage,
+      ) => Promise<void>;
     },
   ) {}
+
+  /** Report one durable current view; never throws. */
+  async acknowledge(
+    key: ViewKey,
+    installed: { version: number; dataHash: string; generation: number },
+  ): Promise<void> {
+    if (!this.options.acknowledge) return;
+    try {
+      await this.options.acknowledge({
+        connector: key.connector,
+        ns: key.ns,
+        stream: key.stream,
+        generation: installed.generation,
+        registryVersion: installed.version,
+        dataHash: installed.dataHash.toLowerCase(),
+      });
+    } catch (error) {
+      this.options.logger.warn(
+        { connector: key.connector, stream: key.stream },
+        `stream-sync acknowledgment failed: ${(error as Error).message}`,
+      );
+    }
+  }
 
   controlState(row: MirrorRow | undefined): ControlState {
     return classifyControl(toControlRead(row), this.options.controlHashes);
@@ -246,6 +278,12 @@ export class StreamSyncImporter {
         await tx.putPart(part.hash, partClear);
       }
       await tx.commit(row.version, row.dataHash, clear, head);
+    });
+    // The current pointer is durable: tell the overlay source what it holds.
+    await this.acknowledge(key, {
+      version: row.version,
+      dataHash: row.dataHash,
+      generation: head.generation,
     });
   }
 }
