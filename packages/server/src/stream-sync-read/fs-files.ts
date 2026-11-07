@@ -6,7 +6,7 @@
 
 import { createReadStream } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import type { StreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 
 function inside(root: string, path: string): string {
@@ -18,12 +18,22 @@ function inside(root: string, path: string): string {
   return full;
 }
 
+async function syncDirectory(path: string): Promise<void> {
+  const handle = await open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 export function createFsStreamSyncReadFiles(root: string): StreamSyncReadFiles {
   let counter = 0;
   return {
     async write(path, bytes) {
       const target = inside(root, path);
-      await mkdir(dirname(target), { recursive: true });
+      const parent = dirname(target);
+      const created = await mkdir(parent, { recursive: true });
       const temp = `${target}.tmp-${process.pid}-${counter++}`;
       const handle = await open(temp, "w");
       try {
@@ -33,6 +43,14 @@ export function createFsStreamSyncReadFiles(root: string): StreamSyncReadFiles {
         await handle.close();
       }
       await rename(temp, target);
+      // Publish the file entry, then each new directory entry up to the
+      // first existing ancestor. A later pointer write may rely on this.
+      const last =
+        created === undefined ? resolve(parent) : dirname(resolve(created));
+      for (let directory = resolve(parent); ; directory = dirname(directory)) {
+        await syncDirectory(directory);
+        if (directory === last) break;
+      }
     },
     async read(path) {
       try {
@@ -76,7 +94,14 @@ export function createFsStreamSyncReadFiles(root: string): StreamSyncReadFiles {
       return out.sort();
     },
     async remove(prefix) {
-      await rm(inside(root, prefix), { recursive: true, force: true });
+      const target = inside(root, prefix);
+      await rm(target, { recursive: true, force: true });
+      try {
+        await syncDirectory(dirname(target));
+      } catch (error) {
+        // Preserve idempotent removal when even the parent is absent.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     },
   };
 }

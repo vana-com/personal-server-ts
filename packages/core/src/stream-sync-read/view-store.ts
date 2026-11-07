@@ -121,9 +121,25 @@ export class ViewStore {
       const headBytes = await files.read(
         `${dir(key)}/heads/${pointer.version}.json`,
       );
-      if (!headBytes) continue;
+      if (!headBytes) {
+        await files.remove(path);
+        continue;
+      }
       const decoded = decodeHead(headBytes);
       if (decoded.kind !== "ok") continue;
+      // A restore can bring back a pointer without all its parts. Drop the
+      // pointer so the stream imports again; surviving parts stay reusable.
+      let complete = true;
+      for (const part of decoded.head.parts) {
+        if (!(await store.hasPart(key, part.hash))) {
+          complete = false;
+          break;
+        }
+      }
+      if (!complete) {
+        await files.remove(path);
+        continue;
+      }
       const id = viewKeyId(key);
       store.keys.set(id, key);
       store.current.set(id, {
