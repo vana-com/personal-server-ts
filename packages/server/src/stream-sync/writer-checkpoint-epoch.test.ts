@@ -485,8 +485,8 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
     expect(await watermark(files, c)).toContain("3");
   });
 
-  // Admission's first read lags (absent); the reread is the only read that
-  // sees a newer row, and it ends in keep_pending, not a discard.
+  // Admission's first read lags (absent) and the writer decides on the known
+  // active(1); the next read sees a newer foreign row and ends in keep_pending.
   it("a reread observation stops a late save", async () => {
     const c = freshConnector("ckpt-epoch-reread");
     const held = controlReadHooks(env.newRegistry());
@@ -540,9 +540,10 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
     expect(await watermark(files, c)).toContain("3");
   });
 
-  // The after_write read is the only read that sees the change: B starts
-  // from an absent snapshot, its admission read lags, it writes control, and
-  // the owner deletes and reconnects before it reads again.
+  // B starts from an absent snapshot and its admission read lags (absent). The
+  // writer decides on the newest state it knows, active(1), so B does not
+  // write control; the owner then deletes and reconnects, and B's next read
+  // records the change.
   it("an after_write observation stops a late save", async () => {
     const c = freshConnector("ckpt-epoch-afterwrite");
     const held = controlReadHooks(env.newRegistry());
@@ -581,7 +582,7 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
         },
       ]);
       const b = await w.saveCheckpointOnly("rB", { s1: "U2" });
-      expect(b.outcome.kind).toBe("discarded");
+      expect(b.outcome.kind).toBe("no_checkpoint");
       expect(await watermark(files, c)).toContain("3");
     });
     await publishing;
