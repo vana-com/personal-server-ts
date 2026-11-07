@@ -8,6 +8,8 @@ import { createFsStreamSyncReadFiles } from "./fs-files.js";
 const trace = vi.hoisted(() => ({
   events: [] as string[],
   failNextRename: false,
+  /** Fails a sync past this many events, so an endless walk ends the test. */
+  syncLimit: Number.POSITIVE_INFINITY,
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -18,6 +20,9 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       const handle = await actual.open(...args);
       const sync = handle.sync.bind(handle);
       handle.sync = async () => {
+        if (trace.events.length >= trace.syncLimit) {
+          throw new Error("sync walk did not stop");
+        }
         trace.events.push(`sync:${String(args[0])}`);
         return sync();
       };
@@ -45,6 +50,7 @@ describe("filesystem publication durability", () => {
     root = await mkdtemp(join(tmpdir(), "stream-sync-files-"));
     trace.events.length = 0;
     trace.failNextRename = false;
+    trace.syncLimit = Number.POSITIVE_INFINITY;
   });
 
   afterEach(async () => {
@@ -162,6 +168,36 @@ describe("filesystem publication durability", () => {
       "sync:<root>/views",
     ]);
     expect(await files.read("views/current.json")).toBeNull();
+  });
+
+  it("keeps a relative root and its sync boundary where it was opened after the working directory changes", async () => {
+    const opened = join(root, "a");
+    const moved = join(root, "b");
+    await mkdir(opened);
+    await mkdir(moved);
+    const cwd = process.cwd();
+    try {
+      process.chdir(opened);
+      const files = await createFsStreamSyncReadFiles("store");
+      process.chdir(moved);
+      trace.events.length = 0;
+      trace.syncLimit = 50;
+
+      await files.write("deep/data", new Uint8Array([9]));
+
+      expect(events()).toEqual([
+        "sync:<root>/a/store/deep/data.tmp",
+        "rename:<root>/a/store/deep/data",
+        "sync:<root>/a/store/deep",
+        "sync:<root>/a/store",
+      ]);
+      expect(await files.read("deep/data")).toEqual(new Uint8Array([9]));
+      expect(await files.list("deep")).toEqual(["deep/data"]);
+      await files.remove("deep");
+      expect(await files.read("deep/data")).toBeNull();
+    } finally {
+      process.chdir(cwd);
+    }
   });
 
   it("keeps removal idempotent when the parent does not exist", async () => {

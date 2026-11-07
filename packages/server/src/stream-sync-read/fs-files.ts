@@ -6,14 +6,18 @@
  * Durability by ownership: the adapter owns the root and everything below it.
  * The root's parent and the directories above belong to whoever provisions
  * the storage root. Opening makes the root exist and syncs the root and its
- * parent; each write syncs every directory from the file's parent up to and
- * including the root. The adapter never opens a directory above the root's
- * parent.
+ * parent; each write syncs every directory on the written file's ancestor
+ * chain, from its parent up to and including the root. A directory that only
+ * a failed write created is synced when a later write passes through it. The
+ * adapter never opens a directory above the root's parent.
+ *
+ * A relative root is resolved once, at open, so a later change of the working
+ * directory moves neither the files nor the sync boundary.
  */
 
 import { createReadStream } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { StreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 
 function inside(root: string, path: string): string {
@@ -52,7 +56,7 @@ export async function createFsStreamSyncReadFiles(
   let counter = 0;
   return {
     async write(path, bytes) {
-      const target = inside(root, path);
+      const target = inside(base, path);
       const parent = dirname(target);
       await mkdir(parent, { recursive: true });
       const temp = `${target}.tmp-${process.pid}-${counter++}`;
@@ -68,14 +72,18 @@ export async function createFsStreamSyncReadFiles(
       // and including the root. Existence of a directory is no proof that its
       // entry was synced, so nothing is remembered between attempts. The
       // root's parent was synced when the adapter opened.
-      for (let directory = resolve(parent); ; directory = dirname(directory)) {
+      for (let directory = parent; ; directory = dirname(directory)) {
+        const rel = relative(base, directory);
+        if (rel.startsWith("..") || isAbsolute(rel)) {
+          throw new Error("sync walk left the stream-sync directory");
+        }
         await syncDirectory(directory);
         if (directory === base) break;
       }
     },
     async read(path) {
       try {
-        return new Uint8Array(await readFile(inside(root, path)));
+        return new Uint8Array(await readFile(inside(base, path)));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw error;
@@ -83,7 +91,7 @@ export async function createFsStreamSyncReadFiles(
     },
     async *readChunks(path) {
       try {
-        for await (const chunk of createReadStream(inside(root, path), {
+        for await (const chunk of createReadStream(inside(base, path), {
           highWaterMark: 64 * 1024,
         })) {
           yield new Uint8Array(chunk as Buffer);
@@ -94,16 +102,16 @@ export async function createFsStreamSyncReadFiles(
       }
     },
     async list(prefix) {
-      const base = inside(root, prefix);
+      const dir = inside(base, prefix);
       const out: string[] = [];
       try {
-        for (const entry of await readdir(base, {
+        for (const entry of await readdir(dir, {
           recursive: true,
           withFileTypes: true,
         })) {
           if (!entry.isFile() || entry.name.includes(".tmp-")) continue;
           out.push(
-            relative(root, join(entry.parentPath, entry.name))
+            relative(base, join(entry.parentPath, entry.name))
               .split(sep)
               .join("/"),
           );
@@ -115,7 +123,7 @@ export async function createFsStreamSyncReadFiles(
       return out.sort();
     },
     async remove(prefix) {
-      const target = inside(root, prefix);
+      const target = inside(base, prefix);
       await rm(target, { recursive: true, force: true });
       try {
         await syncDirectory(dirname(target));
