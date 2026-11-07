@@ -34,6 +34,7 @@ async function fsyncDir(dir: string): Promise<void> {
   // FlushFileBuffers, which needs write access, so it fails. A resolved write
   // there guarantees the file contents are flushed, but not that the rename
   // is durable, because Node's rename does not use MOVEFILE_WRITE_THROUGH.
+  // See #553.
   if (process.platform === "win32") return;
   const handle = await open(dir, "r");
   try {
