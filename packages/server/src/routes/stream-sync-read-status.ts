@@ -4,8 +4,10 @@
  *   GET /v1/stream-sync/read-status
  *     -> 200 {listed, streams: [{connector, ns, stream, records}], issues}
  *
- * `records` is the exact count of live rows the read side holds for that
- * stream, or `null` while the stream head is not imported yet. The body has
+ * `records` is the live head's record count: the rows an owner read of that
+ * stream returns (local outbox overlay rows are not counted). It is `null`
+ * for a head that is pending import, tombstoned, of an older generation, or of
+ * a deleted connection. The body has
  * stream names and counts only: never a record, a blob key or an issue detail.
  * `issues` counts import problems still open.
  *
@@ -13,7 +15,7 @@
  */
 
 import { Hono } from "hono";
-import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import { liveStreamCounts } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/api";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { TokenStore } from "../token-store.js";
@@ -47,20 +49,20 @@ export function streamSyncReadStatusRoutes(
     await auth.authorizeOwner(c.req.raw);
     const status = deps.streamSyncRead?.status?.();
     if (!status) {
-      throw new ProtocolError(
+      // An expected state while a diagnostic polls: answered here, not thrown,
+      // so the global error handler does not log a warning per request.
+      return c.json(
+        {
+          error: {
+            code: 404,
+            errorCode: "STREAM_SYNC_READ_OFF",
+            message: "Stream sync reading is off on this server",
+          },
+        },
         404,
-        "STREAM_SYNC_READ_OFF",
-        "Stream sync reading is off on this server",
       );
     }
-    const streams = status.connections.flatMap((connection) =>
-      Object.entries(connection.streams).map(([stream, head]) => ({
-        connector: connection.connector,
-        ns: connection.ns,
-        stream,
-        records: head.records,
-      })),
-    );
+    const streams = liveStreamCounts(status);
     return c.json({
       listed: status.listed,
       streams,

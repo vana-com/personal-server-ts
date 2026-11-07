@@ -20,6 +20,7 @@ export {
 export type { MirrorFeedRow } from "./mirror.js";
 export type { ImportIssue, ImportProblem } from "./importer.js";
 export {
+  liveStreamCounts,
   readTargets,
   StreamSyncReadService,
   type ReadDecision,

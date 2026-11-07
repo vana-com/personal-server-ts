@@ -274,6 +274,37 @@ describe("createApp", () => {
     expect(intake.begin).toHaveBeenCalledTimes(1);
   });
 
+  it("answers read-status 404 with reading off, without logging a warning per poll", async () => {
+    const warn = vi.fn();
+    const logger = {
+      ...pino({ level: "silent" }),
+      warn,
+    } as unknown as ReturnType<typeof pino>;
+    const app = createApp({
+      logger,
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accessToken: CONTROL_PLANE_TOKEN,
+    });
+    for (let i = 0; i < 3; i++) {
+      const res = await app.request("/v1/stream-sync/read-status", {
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toMatchObject({
+        error: { code: 404, errorCode: "STREAM_SYNC_READ_OFF" },
+      });
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("stops admitting stream-sync intake and seed requests once shutdown begins", async () => {
     let admitting = true;
     const intake = {

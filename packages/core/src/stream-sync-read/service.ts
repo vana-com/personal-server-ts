@@ -116,6 +116,29 @@ export interface StreamSyncReadStatus {
   readonly issues: readonly ImportIssue[];
 }
 
+/**
+ * One row per stream the read side knows, for owner diagnostics. `records` is
+ * the imported head's record count only while that head is live (§2.4), the
+ * same condition under which an owner read serves the stream. A pending
+ * (unimported), tombstoned, superseded-generation or deleted-connection head
+ * counts `null`. Rows from the local outbox overlay are not counted.
+ */
+export function liveStreamCounts(status: StreamSyncReadStatus): {
+  readonly connector: string;
+  readonly ns: string;
+  readonly stream: string;
+  readonly records: number | null;
+}[] {
+  return status.connections.flatMap((connection) =>
+    Object.entries(connection.streams).map(([stream, head]) => ({
+      connector: connection.connector,
+      ns: connection.ns,
+      stream,
+      records: head.live ? head.records : null,
+    })),
+  );
+}
+
 interface Target {
   readonly connector: string;
   readonly streams: readonly string[];

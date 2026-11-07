@@ -10,6 +10,7 @@ import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
 import type { StreamSyncOverlayEntry } from "./ports.js";
 import {
+  liveStreamCounts,
   readTargets,
   StreamSyncReadService,
   type ReadDecision,
@@ -411,6 +412,78 @@ describe("stream-sync reads", () => {
       (await service.resolve(ask("pdpp.acme.items", { cursor: first.cursor })))
         .kind,
     ).toBe("cursor_stale");
+  });
+
+  it("counts only live heads, and a live count is the number of rows an owner read returns", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(21)));
+    const rows = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({ id: `r${i}` }));
+    const publishAll = async (connector: string, ns: string) => {
+      await f.activate(connector, ns);
+      await f.publish({
+        connector,
+        ns,
+        stream: "items",
+        generation: 1,
+        records: rows(7),
+      });
+    };
+    // A live connection with a live stream, a pending head and a tombstoned stream.
+    const ns = await f.key.ns("acme", "account-1");
+    await publishAll("acme", ns);
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "pending",
+      generation: 1,
+      records: rows(3),
+      withholdBlobs: true,
+    });
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "gone",
+      generation: 1,
+      records: rows(4),
+    });
+    const nsGen = await f.key.ns("beta", "account-1");
+    await publishAll("beta", nsGen);
+    const nsDeleted = await f.key.ns("gamma", "account-1");
+    await publishAll("gamma", nsDeleted);
+    const service = await f.service();
+    await f.sync(service);
+    // Everything above was imported while live. Now each one loses liveness.
+    const gone = [...f.rows.values()].find((r) => r.scope.endsWith(".gone"))!;
+    f.rows.set(gone.scope, { ...gone, deletedAt: gone.addedAt });
+    // A newer control generation after the head was imported.
+    await f.activate("beta", nsGen);
+    await f.deleteConnection("gamma", nsDeleted);
+    await f.sync(service);
+    const byName = new Map(
+      liveStreamCounts(service.status()).map((row) => [
+        `${row.connector}.${row.stream}`,
+        row.records,
+      ]),
+    );
+
+    // Live: the count is what an owner read returns for that stream.
+    expect(byName.get("acme.items")).toBe(7);
+    const read = await body(
+      await service.resolve(ask("pdpp.acme.items", { connection: ns })),
+    );
+    expect(read.data.records).toHaveLength(7);
+    // Not live: no count, and an owner read does not serve the stream.
+    expect(byName.get("acme.pending")).toBeNull();
+    expect(byName.get("acme.gone")).toBeNull();
+    expect(byName.get("beta.items")).toBeNull();
+    expect(byName.get("gamma.items")).toBeNull();
+    expect(
+      await service.resolve(ask("pdpp.gamma.items", { connection: nsDeleted })),
+    ).toEqual({ kind: "unavailable", reason: "deleted" });
+    expect(
+      (await service.resolve(ask("pdpp.beta.items", { connection: nsGen })))
+        .kind,
+    ).not.toBe("view");
   });
 
   it("does not block import on local outbox entries and overlays their rows", async () => {
