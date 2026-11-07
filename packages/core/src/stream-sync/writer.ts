@@ -316,6 +316,8 @@ export interface StreamSyncWriterOptions {
   /** Budget for one reduce pass and one shard compaction, in line bytes. */
   readonly reduceBudgetBytes?: number;
   readonly now?: () => number;
+  /** Receives cleanup failures; the payload holds a run id and a message, never row data. */
+  readonly logger?: { warn(obj: Record<string, unknown>, msg?: string): void };
   /** Test hook: throw at a named point to model a crash. */
   readonly fault?: (
     point: StreamSyncFaultPoint,
@@ -416,7 +418,13 @@ export class StreamSyncWriter {
   private stateQueue: Promise<unknown> = Promise.resolve();
   private recovery: Promise<void> | null = null;
   private lifecycleQueue: Promise<unknown> = Promise.resolve();
-  private lifecycleError: unknown = null;
+  /**
+   * Runs whose removal failed. They stay on disk, already covered and hidden
+   * from snapshots, and each later lifecycle step retries them. Nothing in the
+   * writer is poisoned for good: cleanup is garbage collection, so a failure
+   * to remove a run never turns off reads of other runs.
+   */
+  private readonly removalRetry = new Set<string>();
   private readonly pins = new Map<string, number>();
   /**
    * Latest durable-import coverage per (owner, keyCheck, connector, ns, stream,
@@ -1849,7 +1857,38 @@ export class StreamSyncWriter {
       this.retainedStreams(host).length > 0
     )
       return;
-    await this.options.home.files.remove(`runs/${host.entry.runId}`);
+    const runId = host.entry.runId;
+    try {
+      await this.options.home.files.remove(`runs/${runId}`);
+      this.removalRetry.delete(runId);
+    } catch (error) {
+      this.removalRetry.add(runId);
+      this.reportCleanup(runId, error);
+    }
+  }
+
+  private reportCleanup(runId: string, error: unknown): void {
+    this.options.logger?.warn(
+      {
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      "stream-sync run cleanup failed; it will be retried",
+    );
+  }
+
+  /** Retry removals that failed earlier. Call inside the lifecycle queue. */
+  private async retryRemovals(): Promise<void> {
+    for (const runId of [...this.removalRetry]) {
+      this.removalRetry.delete(runId);
+      try {
+        const host = await this.readEntry(runId);
+        if (host) await this.reclaimLocked(host);
+      } catch (error) {
+        this.removalRetry.add(runId);
+        this.reportCleanup(runId, error);
+      }
+    }
   }
 
   /** Called only by the home-bound overlay adapter. Does no network I/O. */
@@ -1857,7 +1896,7 @@ export class StreamSyncWriter {
     await this.recover();
     const bound = await this.binding();
     return this.lifecycle(async () => {
-      if (this.lifecycleError) throw this.lifecycleError;
+      await this.retryRemovals();
       const runs: StreamSyncOverlayRun[] = [];
       const logs = new Map<
         StreamSyncOverlayRun,
@@ -1960,11 +1999,16 @@ export class StreamSyncWriter {
               else this.pins.set(run.runId, count);
             }
             for (const run of runs) {
-              const host = await this.readEntry(run.runId);
-              if (host?.phase === "done") await this.reclaimLocked(host);
+              try {
+                const host = await this.readEntry(run.runId);
+                if (host?.phase === "done") await this.reclaimLocked(host);
+              } catch (error) {
+                // Unreadable metadata fails the read of that run, not the writer.
+                this.removalRetry.add(run.runId);
+                this.reportCleanup(run.runId, error);
+              }
             }
-          }).catch((error) => {
-            this.lifecycleError = error;
+            await this.retryRemovals();
           });
         },
       );
@@ -1987,7 +2031,7 @@ export class StreamSyncWriter {
     await this.recover();
     const binding = await this.binding();
     await this.lifecycle(async () => {
-      if (this.lifecycleError) throw this.lifecycleError;
+      await this.retryRemovals();
       const key = coverageKey(
         binding,
         coverage.connector,

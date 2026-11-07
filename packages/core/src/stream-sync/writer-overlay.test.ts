@@ -17,7 +17,7 @@ import {
   type StreamSyncRegistry,
   type StreamSyncFaultPoint,
 } from "./ports.js";
-import { StreamSyncWriter } from "./writer.js";
+import { StreamSyncWriter, type StreamSyncWriterOptions } from "./writer.js";
 import { createWriterOverlaySource } from "./writer-overlay.js";
 
 const encoder = new TextEncoder();
@@ -95,8 +95,9 @@ async function fixture() {
     network: "test",
     open: () => files,
   });
-  const make = () =>
+  const make = (extra: Partial<StreamSyncWriterOptions> = {}) =>
     new StreamSyncWriter({
+      ...extra,
       ownerAddress,
       home,
       registry,
@@ -810,6 +811,37 @@ describe("writer coverage that arrives before the receipt", () => {
   ])("reclaims nothing for early coverage %j", async (change) => {
     const { f } = await earlyAck(change);
     expect(await f.files.size(log)).toBeGreaterThan(0);
+  });
+});
+
+describe("writer cleanup failure", () => {
+  it("retries a failed run removal without disabling later overlay reads", async () => {
+    const f = await fixture();
+    const warnings: Record<string, unknown>[] = [];
+    const w = f.make({ logger: { warn: (obj) => warnings.push(obj) } });
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    const source = createWriterOverlaySource(w);
+    const pin = await source.snapshot(connector);
+    const coverage = await coverageOf(f);
+    await source.acknowledge(coverage);
+    const remove = f.files.remove.bind(f.files);
+    let failures = 0;
+    f.files.remove = async (path) => {
+      if (failures++ === 0) throw new Error("transient cleanup I/O failure");
+      return remove(path);
+    };
+    pin.release();
+    const later = await source.snapshot(connector);
+    later.release();
+    await source.acknowledge(coverage);
+    (await source.snapshot(connector)).release();
+    expect(failures).toBe(2);
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ runId: "r1" });
+    expect(JSON.stringify(warnings)).not.toContain("one");
   });
 });
 
