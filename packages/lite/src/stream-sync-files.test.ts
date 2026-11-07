@@ -121,7 +121,8 @@ it("writes bounded chunks and removes stale chunks on overwrite", async () => {
     (_, i) => i % 251,
   );
   await files.write("large", bytes);
-  expect(await files.read("large")).toEqual(bytes);
+  // Buffer.compare: toEqual on a 1 MiB array is slow under the fake database.
+  expect(Buffer.compare((await files.read("large"))!, bytes)).toBe(0);
   const chunks: Uint8Array[] = [];
   for await (const chunk of files.readChunks("large")) chunks.push(chunk);
   expect(chunks.every((chunk) => chunk.length <= 1024 * 1024)).toBe(true);
@@ -133,7 +134,7 @@ it("writes bounded chunks and removes stale chunks on overwrite", async () => {
     combined.set(chunk, offset);
     offset += chunk.length;
   }
-  expect(combined).toEqual(bytes);
+  expect(Buffer.compare(combined, bytes)).toBe(0);
   await files.appendMany([{ path: "large", bytes: enc.encode("tail") }]);
   expect((await files.read("large"))?.slice(-4)).toEqual(enc.encode("tail"));
   await files.write("large", enc.encode("short"));
