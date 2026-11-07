@@ -11,6 +11,7 @@
  */
 
 import { InvalidArgumentError } from "./errors.js";
+import type { StreamRow } from "./head.js";
 import type { ControlHashes } from "./namespace.js";
 
 export type ControlState =
@@ -59,6 +60,23 @@ export function classifyControl(
     return { kind: "active", generation: read.version };
   }
   return { kind: "foreign", version: read.version };
+}
+
+/**
+ * The one rule for reading a stream row: a row is tombstoned when its
+ * `deleted_at` is set or when it carries the tombstone dataHash and
+ * metadataHash pair. Writers and readers both call this, so the two
+ * encodings cannot drift apart.
+ */
+export function classifyStreamRow(
+  read: ControlRead,
+  hashes: Pick<ControlHashes, "tombstoneData" | "tombstoneMetadata">,
+): StreamRow {
+  if (!read.found) return "absent";
+  const tombstone =
+    read.dataHash.toLowerCase() === hashes.tombstoneData &&
+    read.metadataHash.toLowerCase() === hashes.tombstoneMetadata;
+  return read.deleted || tombstone ? "tombstoned" : "present";
 }
 
 export function sameControl(a: ControlState, b: ControlState): boolean {

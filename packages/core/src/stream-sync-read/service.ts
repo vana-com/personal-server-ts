@@ -373,7 +373,7 @@ export class StreamSyncReadService {
           imported !== null &&
           isHeadLive(
             control,
-            row.deleted ? "tombstoned" : "present",
+            this.importer.streamRowKind(row),
             imported.head.generation,
           );
         streams[stream] = { live, complete: imported?.head.complete ?? false };
