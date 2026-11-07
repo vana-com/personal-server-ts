@@ -42,6 +42,19 @@ interface CurrentFile {
   readonly dataHash: string;
 }
 
+/** What an import may do while it holds the stream's lock. */
+export interface ImportTransaction {
+  hasPart(sha256: string): Promise<boolean>;
+  putPart(sha256: string, clear: Uint8Array): Promise<void>;
+  /** Make `version` current. Every part of `head` must be stored first. */
+  commit(
+    version: number,
+    dataHash: string,
+    headBytes: Uint8Array,
+    head: Head,
+  ): Promise<void>;
+}
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -82,8 +95,12 @@ export class ViewStore {
   /** id → versions on disk that are not current. */
   private readonly retained = new Map<string, Map<number, ImportedVersion>>();
   private readonly keys = new Map<string, ViewKey>();
-  /** id → parts an import is writing, kept until it commits or gives up. */
-  private readonly staged = new Map<string, Set<string>>();
+  /**
+   * id → tail of the stream's lock queue. Imports and collections of one
+   * stream run one at a time, so a collection never works from keep-sets
+   * that an import has since outdated.
+   */
+  private readonly locks = new Map<string, Promise<void>>();
 
   private constructor(private readonly files: StreamSyncReadFiles) {}
 
@@ -131,21 +148,45 @@ export class ViewStore {
     }));
   }
 
-  async hasPart(key: ViewKey, sha256: string): Promise<boolean> {
+  private async hasPart(key: ViewKey, sha256: string): Promise<boolean> {
     return (await this.files.read(`${dir(key)}/parts/${sha256}`)) !== null;
   }
 
-  /** Keep the parts of `head` while an import writes them. */
-  stage(key: ViewKey, head: Head): () => void {
+  /** Run `body` while holding the stream's lock. */
+  private exclusive<T>(key: ViewKey, body: () => Promise<T>): Promise<T> {
     const id = viewKeyId(key);
-    const hashes = new Set(head.parts.map((p) => p.hash));
-    this.staged.set(id, hashes);
-    return () => {
-      if (this.staged.get(id) === hashes) this.staged.delete(id);
-    };
+    const previous = this.locks.get(id) ?? Promise.resolve();
+    const run = previous.then(body);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.locks.set(id, tail);
+    void tail.then(() => {
+      if (this.locks.get(id) === tail) this.locks.delete(id);
+    });
+    return run;
   }
 
-  async putPart(
+  /**
+   * Import one version of a stream. The stream's lock is held from the first
+   * part to the commit, so no collection runs against a half-written import.
+   */
+  withImport<T>(
+    key: ViewKey,
+    body: (tx: ImportTransaction) => Promise<T>,
+  ): Promise<T> {
+    return this.exclusive(key, () =>
+      body({
+        hasPart: (sha256) => this.hasPart(key, sha256),
+        putPart: (sha256, clear) => this.putPart(key, sha256, clear),
+        commit: (version, dataHash, headBytes, head) =>
+          this.commit(key, version, dataHash, headBytes, head),
+      }),
+    );
+  }
+
+  private async putPart(
     key: ViewKey,
     sha256: string,
     clear: Uint8Array,
@@ -154,7 +195,7 @@ export class ViewStore {
   }
 
   /** Make `version` current. Every part of `head` must be stored first. */
-  async commit(
+  private async commit(
     key: ViewKey,
     version: number,
     dataHash: string,
@@ -177,7 +218,7 @@ export class ViewStore {
       if (!retained) this.retained.set(id, (retained = new Map()));
       retained.set(previous.version, previous);
     }
-    await this.collect(key);
+    await this.collectLocked(key);
   }
 
   /**
@@ -218,7 +259,12 @@ export class ViewStore {
   }
 
   /** Remove versions that are neither current nor leased, and unreferenced parts. */
-  private async collect(key: ViewKey): Promise<void> {
+  private collect(key: ViewKey): Promise<void> {
+    return this.exclusive(key, () => this.collectLocked(key));
+  }
+
+  /** The caller holds the stream's lock; keep-sets are read here, under it. */
+  private async collectLocked(key: ViewKey): Promise<void> {
     const id = viewKeyId(key);
     const base = dir(key);
     const current = this.current.get(id);
@@ -230,7 +276,7 @@ export class ViewStore {
     }
     const keep = new Set<number>(retained.keys());
     if (current) keep.add(current.version);
-    const referenced = new Set<string>(this.staged.get(id) ?? []);
+    const referenced = new Set<string>();
     for (const version of keep) {
       const imported =
         version === current?.version ? current : retained.get(version)!;

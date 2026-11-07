@@ -45,19 +45,15 @@ async function importVersion(
   part: string,
 ): Promise<void> {
   const head = headOf(part);
-  const unstage = store.stage(KEY, head);
-  try {
-    await store.putPart(KEY, part, enc.encode(`part ${part}\n`));
-    await store.commit(
-      KEY,
+  await store.withImport(KEY, async (tx) => {
+    await tx.putPart(part, enc.encode(`part ${part}\n`));
+    await tx.commit(
       version,
       `h${version}`,
       enc.encode(`head ${version}`),
       head,
     );
-  } finally {
-    unstage();
-  }
+  });
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 25));

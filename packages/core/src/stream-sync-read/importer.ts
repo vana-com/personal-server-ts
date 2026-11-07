@@ -217,10 +217,9 @@ export class StreamSyncImporter {
     const head = verified.head;
     // A head of another generation is not live (§2.4); nothing to import.
     if (head.generation !== generation) return;
-    const unstage = views.stage(key, head);
-    try {
+    await views.withImport(key, async (tx) => {
       for (const part of head.parts) {
-        if (await views.hasPart(key, part.hash)) continue;
+        if (await tx.hasPart(part.hash)) continue;
         const partCipher = await blobs.get(
           `${scope}/${partBlobName(head.generation, part.hash)}`,
         );
@@ -237,12 +236,10 @@ export class StreamSyncImporter {
         } catch (error) {
           throw new Problem("corrupt", `part: ${(error as Error).message}`);
         }
-        await views.putPart(key, part.hash, partClear);
+        await tx.putPart(part.hash, partClear);
       }
-      await views.commit(key, row.version, row.dataHash, clear, head);
-    } finally {
-      unstage();
-    }
+      await tx.commit(row.version, row.dataHash, clear, head);
+    });
   }
 }
 
