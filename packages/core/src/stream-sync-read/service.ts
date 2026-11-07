@@ -1146,10 +1146,8 @@ export class StreamSyncReadService {
         const plan = await planProjection({
           scope,
           binding: target.binding,
-          profileKey:
-            (baseOf(first)
-              ? baseOf(first)!.version.head.profile.key
-              : first.fold.merged.at(-1)!.stream.profile.key) ?? undefined,
+          // The head the writer leaves, not the base the runs built on.
+          profileKey: first.fold.shape?.profile.key ?? undefined,
           lines,
           streamBytes: (stream) =>
             (baseOf(byStream.get(stream)!)?.version.head.parts ?? []).reduce(
