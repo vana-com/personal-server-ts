@@ -190,9 +190,17 @@ afterEach(() => {
   }
 });
 
+// Each round is one fresh directory with a fresh race, and every round must
+// give the home to exactly one opener. The counts are kept low on purpose: a
+// process round starts four `tsx` children, and at 100 and 12 rounds this file
+// took about a minute on a CI runner and slowed the sizing tests that run
+// beside it in the same worker pool until one of them timed out.
+const IN_PROCESS_ROUNDS = 30;
+const PROCESS_ROUNDS = 5;
+
 describe("full-server stream-sync home: one kernel-held lock", () => {
   it("gives exactly one of many in-process openers the home, every time", async () => {
-    for (let round = 0; round < 100; round += 1) {
+    for (let round = 0; round < IN_PROCESS_ROUNDS; round += 1) {
       const dir = join(root, `in-process-${round}`);
       const opened = await Promise.all(
         Array.from({ length: 6 }, () =>
@@ -205,7 +213,7 @@ describe("full-server stream-sync home: one kernel-held lock", () => {
   }, 60_000);
 
   it("gives exactly one of several racing processes the home, every time", async () => {
-    for (let round = 0; round < 12; round += 1) {
+    for (let round = 0; round < PROCESS_ROUNDS; round += 1) {
       const dir = join(root, `race-${round}`);
       const racers = Array.from({ length: 4 }, () => startChild(dir));
       const results = await Promise.all(racers.map((r) => r.result));
