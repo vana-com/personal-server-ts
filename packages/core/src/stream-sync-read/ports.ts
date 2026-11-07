@@ -3,7 +3,7 @@
  * §2.10 reads). The pure rules come from
  * `@opendatalabs/personal-server-ts-stream-sync`; this module names the I/O a
  * host provides: durable files for the registry mirror and imported views,
- * encrypted blob reads, the owner key, and the local outbox overlay.
+ * encrypted blob reads, the owner key, and the local overlay.
  */
 
 import type {
@@ -44,29 +44,10 @@ export interface StreamSyncReadKeys {
   decrypt(scope: string, cipher: Uint8Array): Promise<Uint8Array>;
 }
 
-/**
- * A local outbox entry that has not committed (§2.9): its rows are a
- * read-time overlay over the imported view of `(connector, ns, stream)`,
- * merged by the package merge rule. An entry never blocks import.
- */
-export interface StreamSyncOverlayEntry {
-  readonly runId: string;
-  /** `null` while the run's identity is unknown: such rows are not attributable to a connection and are not overlaid. */
-  readonly ns: string | null;
-  readonly state: "pending" | "failed";
-  /** Shown for failed entries. */
-  readonly error?: string;
-  readonly streams: readonly string[];
-  /** Lines of one stream, in spool order. */
-  lines(stream: string): AsyncIterable<Line>;
-}
-
-export interface StreamSyncOverlaySource {
-  entries(connector: string): Promise<readonly StreamSyncOverlayEntry[]>;
-}
-
-// Own-writes overlay (pinned snapshots, publish receipts, reader acknowledgment).
-// Replaces StreamSyncOverlaySource once the read service is switched over.
+// Local overlay (pinned snapshots, publish receipts, reader acknowledgment).
+// A local run's rows are a read-time overlay over the imported view of
+// `(connector, ns, stream)`, merged by the package merge rule. A run never
+// blocks import.
 //
 // Binding: one source instance belongs to one immutable owner/network/key
 // home. Hosts build the reader and the source from that same home; an owner,

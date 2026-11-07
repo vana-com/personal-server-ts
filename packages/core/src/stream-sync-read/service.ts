@@ -30,25 +30,50 @@ import {
   type LegacyScopeBinding,
 } from "../legacy-projection/index.js";
 import { StreamSyncImporter, type ImportIssue } from "./importer.js";
-import { overlayWinners, viewLines, type OverlayWinners } from "./lines.js";
-import { RegistryMirror, type MirrorFeedRow } from "./mirror.js";
+import {
+  NO_OVERLAY,
+  overlayWinners,
+  viewLines,
+  type OverlayWinners,
+} from "./lines.js";
+import {
+  RegistryMirror,
+  type ConnectorRows,
+  type MirrorFeedRow,
+} from "./mirror.js";
 import type {
   StreamSyncBlobReader,
-  StreamSyncOverlaySource,
+  StreamSyncOverlayRun,
+  StreamSyncOverlaySnapshot,
+  StreamSyncOverlaySnapshotSource,
+  StreamSyncOverlayStream,
+  StreamSyncPublishReceipt,
   StreamSyncReadFiles,
   StreamSyncReadKeys,
   StreamSyncReadLogger,
 } from "./ports.js";
 import { planProjection } from "./projection.js";
 import { isPhysicalScope, logicalStreamScopeParts } from "./routing.js";
-import { ViewStore, type ViewKey, type ViewLease } from "./view-store.js";
+import {
+  ViewStore,
+  type ImportedVersion,
+  type ViewKey,
+  type ViewLease,
+} from "./view-store.js";
 
 export interface StreamSyncReadOptions {
   readonly files: StreamSyncReadFiles;
   readonly blobs: StreamSyncBlobReader;
   readonly keys: StreamSyncReadKeys;
   readonly logger: StreamSyncReadLogger;
-  readonly overlay?: StreamSyncOverlaySource;
+  /** Own-writes overlay: local runs whose rows the imported views may not hold yet. */
+  readonly overlay?: StreamSyncOverlaySnapshotSource;
+  /**
+   * The read files survive a restart. Only then does an import acknowledge
+   * its coverage to the overlay source, which may retire what it covers.
+   * Default false: a reader that cannot prove durability never acknowledges.
+   */
+  readonly durable?: boolean;
   /** Byte budget of a non-windowed legacy projection; above it `too_large`. */
   readonly arrayProjectionBudgetBytes?: number;
   readonly now?: () => Date;
@@ -62,6 +87,8 @@ export interface ResolveInput {
   readonly cursor: string | null;
   /** The existing path holds a legacy or raw body of `scope`. */
   readonly legacyFile: boolean;
+  /** The caller reads as the owner (`isOwnerView`), not as a grantee. */
+  readonly isOwnerView: boolean;
 }
 
 export type ReadDecision =
@@ -191,6 +218,21 @@ export function readTargets(scope: string): Target[] {
   return [...targets.values()];
 }
 
+/** Whether the imported view holds everything the published stream holds. */
+function covers(base: ImportedVersion, receipt: StreamSyncPublishReceipt): boolean {
+  if (base.head.generation !== receipt.generation) return false;
+  if (base.version > receipt.registryVersion) return true;
+  return (
+    base.version === receipt.registryVersion &&
+    normalizeHash(base.dataHash) === normalizeHash(receipt.dataHash)
+  );
+}
+
+function normalizeHash(hash: string): string {
+  const lower = hash.toLowerCase();
+  return lower.startsWith("0x") ? lower.slice(2) : lower;
+}
+
 function encodeCursor(cursor: Cursor): string {
   const json = JSON.stringify(cursor);
   let binary = "";
@@ -260,6 +302,15 @@ function toStream(
     },
   });
 }
+
+/** What a read sees when no overlay source is configured. */
+const NO_SNAPSHOT: StreamSyncOverlaySnapshot = {
+  runs: [],
+  lines: () => {
+    throw new Error("no overlay source");
+  },
+  release() {},
+};
 
 export class StreamSyncReadService {
   private spoolCounter = 0;
@@ -355,8 +406,46 @@ export class StreamSyncReadService {
     };
   }
 
+  /**
+   * The local runs whose rows `stream` of `(connector, ns)` shows on top of
+   * `base`. A run counts only under a verified active control state of this
+   * key and its own generation (never the one active at read time), and never
+   * over a tombstoned stream row. A published stream that `base` already
+   * covers adds nothing: its rows are in the view.
+   */
+  private contributions(
+    snapshot: StreamSyncOverlaySnapshot | undefined,
+    connector: string,
+    ns: string,
+    stream: string,
+    control: ControlState,
+    tombstoned: boolean,
+    base: ImportedVersion | null,
+  ): { run: StreamSyncOverlayRun; stream: StreamSyncOverlayStream }[] {
+    if (!snapshot || control.kind !== "active" || tombstoned) return [];
+    const out: { run: StreamSyncOverlayRun; stream: StreamSyncOverlayStream }[] =
+      [];
+    for (const run of snapshot.runs) {
+      if (
+        run.connector !== connector ||
+        run.ns !== ns ||
+        run.generation !== control.generation
+      ) {
+        continue;
+      }
+      const local = run.streams.find((s) => s.name === stream);
+      if (!local) continue;
+      if (local.receipt && base && covers(base, local.receipt)) continue;
+      out.push({ run, stream: local });
+    }
+    return out;
+  }
+
   /** §2.10 inputs for connector c: every connection this server knows. */
-  connectionViews(connector: string): ConnectionView[] {
+  connectionViews(
+    connector: string,
+    snapshot?: StreamSyncOverlaySnapshot,
+  ): ConnectionView[] {
     const rows = this.mirror.rowsFor(connector);
     const namespaces = new Set([
       ...rows.controls.keys(),
@@ -369,14 +458,25 @@ export class StreamSyncReadService {
       let latest: number | null = null;
       for (const [stream, row] of rows.streams.get(ns) ?? []) {
         const imported = this.views.get({ connector, ns, stream });
+        const kind = this.importer.streamRowKind(row);
         const live =
           imported !== null &&
-          isHeadLive(
-            control,
-            this.importer.streamRowKind(row),
-            imported.head.generation,
-          );
-        streams[stream] = { live, complete: imported?.head.complete ?? false };
+          isHeadLive(control, kind, imported.head.generation);
+        const local = this.contributions(
+          snapshot,
+          connector,
+          ns,
+          stream,
+          control,
+          kind === "tombstoned",
+          live ? imported : null,
+        );
+        streams[stream] = {
+          live: live || local.length > 0,
+          complete:
+            (imported?.head.complete ?? false) ||
+            local.some((c) => c.stream.complete),
+        };
         // Q6: the registry time of the connection's newest live stream head.
         if (live && row.addedAtMs !== null) {
           latest =
@@ -406,8 +506,37 @@ export class StreamSyncReadService {
         ? { kind: "unavailable", reason: "connection_not_found" }
         : { kind: "pass" };
     }
+    // One pinned snapshot per connector, taken BEFORE any imported view is
+    // leased: whatever an import retires after this point stays readable
+    // from the pin. The chosen view keeps its snapshot until the body ends.
+    const snapshots = new Map<string, StreamSyncOverlaySnapshot>();
+    try {
+      for (const target of targets) {
+        snapshots.set(target.connector, await this.snapshot(target.connector));
+      }
+      return await this.decide(input, cursor, targets, snapshots);
+    } finally {
+      for (const snapshot of snapshots.values()) snapshot.release();
+    }
+  }
+
+  private snapshot(connector: string): Promise<StreamSyncOverlaySnapshot> {
+    return this.options.overlay
+      ? this.options.overlay.snapshot(connector)
+      : Promise.resolve(NO_SNAPSHOT);
+  }
+
+  private async decide(
+    input: ResolveInput,
+    cursor: Cursor | null,
+    targets: readonly Target[],
+    snapshots: Map<string, StreamSyncOverlaySnapshot>,
+  ): Promise<ReadDecision> {
     const evaluated = targets.map((target) => {
-      const connections = this.connectionViews(target.connector);
+      const connections = this.connectionViews(
+        target.connector,
+        snapshots.get(target.connector),
+      );
       const eligibility: Eligibility = eligible({
         connections,
         target:
@@ -441,7 +570,16 @@ export class StreamSyncReadService {
       );
     if (views.length > 0) {
       const best = views[0]!;
-      return this.serveView(input.scope, best.target, best.ns, cursor);
+      // The view owns its snapshot from here: it releases it with the body.
+      const snapshot = snapshots.get(best.target.connector)!;
+      snapshots.delete(best.target.connector);
+      return this.serveView(
+        input.scope,
+        best.target,
+        best.ns,
+        cursor,
+        snapshot,
+      );
     }
     if (cursor) return { kind: "cursor_stale" };
     if (
@@ -485,42 +623,64 @@ export class StreamSyncReadService {
     target: Target,
     ns: string,
     cursor: Cursor | null,
+    snapshot: StreamSyncOverlaySnapshot,
   ): Promise<ReadDecision> {
-    if (cursor && (cursor.c !== target.connector || cursor.ns !== ns)) {
-      return { kind: "cursor_stale" };
-    }
     const leases: ViewLease[] = [];
+    // Snapshot and leases are released together, once, with the body.
+    let released = false;
     const releaseAll = () => {
+      if (released) return;
+      released = true;
       for (const lease of leases) lease.release();
+      snapshot.release();
     };
-    for (const stream of target.streams) {
-      const key: ViewKey = { connector: target.connector, ns, stream };
-      const at = cursor ? cursor.v[stream] : undefined;
-      if (cursor && at === undefined) {
-        releaseAll();
-        return { kind: "cursor_stale" };
-      }
-      const lease = this.views.lease(key, at);
-      if (!lease) {
-        releaseAll();
-        return { kind: "cursor_stale" };
-      }
-      leases.push(lease);
-    }
     try {
+      if (cursor && (cursor.c !== target.connector || cursor.ns !== ns)) {
+        releaseAll();
+        return { kind: "cursor_stale" };
+      }
+      for (const stream of target.streams) {
+        const key: ViewKey = { connector: target.connector, ns, stream };
+        const at = cursor ? cursor.v[stream] : undefined;
+        if (cursor && at === undefined) {
+          releaseAll();
+          return { kind: "cursor_stale" };
+        }
+        const lease = this.views.lease(key, at);
+        if (!lease) {
+          releaseAll();
+          return { kind: "cursor_stale" };
+        }
+        leases.push(lease);
+      }
+      const control = this.importer.controlState(
+        this.mirror.rowsFor(target.connector).controls.get(ns),
+      );
       const byStream = new Map(leases.map((l) => [l.key.stream, l]));
       const overlays = new Map<string, OverlayWinners>();
       let observedAt = 0;
       for (const lease of leases) {
-        const overlay = await overlayWinners(
-          this.options.overlay,
-          this.options.keys,
-          lease,
-        );
+        const head = lease.version.head;
+        const runs = this.contributions(
+          snapshot,
+          target.connector,
+          ns,
+          lease.key.stream,
+          control,
+          false,
+          lease.version,
+        ).map((c) => c.run);
+        const overlay = runs.length
+          ? await overlayWinners(snapshot, this.options.keys, {
+              runs,
+              stream: lease.key.stream,
+              primaryKey: head.primaryKey,
+            })
+          : NO_OVERLAY;
         overlays.set(lease.key.stream, overlay);
         observedAt = Math.max(
           observedAt,
-          lease.version.head.observedAt,
+          head.observedAt,
           overlay.newestObservedAt ?? 0,
         );
       }
@@ -530,6 +690,7 @@ export class StreamSyncReadService {
           this.options.keys,
           byStream.get(stream)!,
           overlays.get(stream)!,
+          byStream.get(stream)!.version.head.primaryKey,
         );
       const nextCursor = encodeCursor({
         c: target.connector,

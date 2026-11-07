@@ -2593,6 +2593,7 @@ export async function handlePersonalServerDataRequest(
           connection: latestRead ? url.searchParams.get("connection") : null,
           cursor: latestRead ? url.searchParams.get("cursor") : null,
           legacyFile: Boolean(selectedEntry) || latest?.kind === "canonical",
+          isOwnerView: isOwnerView(authResult),
         });
         if (decision.kind === "unavailable" && decision.reason === "deleted") {
           throw new DataDeletedError({ scope: scopeResult.scope });
