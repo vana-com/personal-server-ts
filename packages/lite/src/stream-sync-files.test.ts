@@ -74,3 +74,32 @@ describe("IndexedDB stream-sync files appendMany", () => {
     expect(transactions).toBe(1);
   });
 });
+
+describe("IndexedDB durability", () => {
+  it("requests strict durability for every mutation", async () => {
+    const factory = new IDBFactory();
+    const request = factory.open("durability");
+    const db = await new Promise<IDBDatabase>((resolve) => {
+      request.onsuccess = () => resolve(request.result);
+    });
+    const proto = Object.getPrototypeOf(db) as { transaction: IDBDatabase["transaction"] };
+    const original = proto.transaction;
+    const options: (IDBTransactionOptions | undefined)[] = [];
+    proto.transaction = function (this: IDBDatabase, ...args: Parameters<IDBDatabase["transaction"]>) {
+      if (args[1] === "readwrite") options.push(args[2]);
+      return original.apply(this, args);
+    } as IDBDatabase["transaction"];
+    try {
+      const files = createIndexedDbStreamSyncFiles({ dbName: "strict-test", factory, keyRange: IDBKeyRange });
+      await files.write("p", enc.encode("a"));
+      await files.appendMany([{ path: "p", bytes: enc.encode("b") }]);
+      await files.sync("p");
+      await files.remove("p");
+      expect(options).toHaveLength(3);
+      expect(options).toEqual(options.map(() => ({ durability: "strict" })));
+    } finally {
+      proto.transaction = original;
+      db.close();
+    }
+  });
+});

@@ -76,6 +76,7 @@ export function createIndexedDbStreamSyncFiles(
     return opened;
   };
 
+  // Engines without the durability option ignore it. The phone WebView engine is unknown.
   async function lastSeq(store: IDBObjectStore, path: string): Promise<number> {
     const cursor = await promisify(
       store.openKeyCursor(fileRange(path), "prev"),
@@ -90,7 +91,7 @@ export function createIndexedDbStreamSyncFiles(
       opened = null;
     },
     async write(path, bytes) {
-      const tx = (await db()).transaction(STORE, "readwrite");
+      const tx = (await db()).transaction(STORE, "readwrite", { durability: "strict" });
       const store = tx.objectStore(STORE);
       store.delete(fileRange(path));
       store.put({
@@ -119,7 +120,7 @@ export function createIndexedDbStreamSyncFiles(
       if (entries.length === 0) return;
       // One transaction for the whole batch: a spool flush touches up to 256
       // shard files, and a transaction per file would commit 256 times.
-      const tx = (await db()).transaction(STORE, "readwrite");
+      const tx = (await db()).transaction(STORE, "readwrite", { durability: "strict" });
       const store = tx.objectStore(STORE);
       const committed = done(tx);
       const next = new Map<string, number>();
@@ -166,7 +167,7 @@ export function createIndexedDbStreamSyncFiles(
       return [...new Set(keys.map(pathOf))].sort();
     },
     async remove(prefix) {
-      const tx = (await db()).transaction(STORE, "readwrite");
+      const tx = (await db()).transaction(STORE, "readwrite", { durability: "strict" });
       const store = tx.objectStore(STORE);
       store.delete(fileRange(prefix));
       store.delete(dirRange(prefix));
