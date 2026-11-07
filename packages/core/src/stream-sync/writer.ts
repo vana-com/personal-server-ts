@@ -343,6 +343,23 @@ export function compareConnectorVersions(a: string, b: string): VersionOrder {
   return "equal";
 }
 
+function coverageKey(
+  binding: { owner: string; keyCheck: string },
+  connector: string,
+  ns: string,
+  stream: string,
+  generation: number,
+): string {
+  return JSON.stringify([
+    binding.owner.toLowerCase(),
+    binding.keyCheck,
+    connector,
+    ns,
+    stream,
+    generation,
+  ]);
+}
+
 function json(value: unknown): Uint8Array {
   return encoder.encode(JSON.stringify(value));
 }
@@ -401,8 +418,14 @@ export class StreamSyncWriter {
   private lifecycleQueue: Promise<unknown> = Promise.resolve();
   private lifecycleError: unknown = null;
   private readonly pins = new Map<string, number>();
-  /** Coverage belongs to this reader/store lifetime; startup must reconcile it again. */
-  private readonly covered = new Map<string, Set<string>>();
+  /**
+   * Latest durable-import coverage per (owner, keyCheck, connector, ns, stream,
+   * generation), kept even when no receipt matches it yet: the reader can
+   * acknowledge before the writer stores its receipt, and a no-op run gets a
+   * receipt for a head the reader already imported. Memory only. It belongs to
+   * this reader/store lifetime, so startup must reconcile it again.
+   */
+  private readonly coverage = new Map<string, StreamSyncImportedCoverage>();
 
   constructor(private readonly options: StreamSyncWriterOptions) {
     if (
@@ -1774,14 +1797,44 @@ export class StreamSyncWriter {
     }
   }
 
-  /** Never treat a missing pre-upgrade receipt as proof of read coverage. */
+  /**
+   * A stream is covered only when its own receipt satisfies the latest
+   * coverage for the same binding, connector, namespace, stream and generation.
+   * Never treat a missing pre-upgrade receipt as proof of read coverage.
+   */
+  private isCovered(host: HostEntry, name: string): boolean {
+    const receipt = host.streams[name]?.receipt;
+    if (
+      !receipt ||
+      !host.binding ||
+      host.entry.ns === null ||
+      host.generation == null
+    )
+      return false;
+    const coverage = this.coverage.get(
+      coverageKey(
+        host.binding,
+        host.entry.connector,
+        host.entry.ns,
+        name,
+        host.generation,
+      ),
+    );
+    return (
+      coverage !== undefined &&
+      (coverage.registryVersion > receipt.registryVersion ||
+        (coverage.registryVersion === receipt.registryVersion &&
+          coverage.dataHash === receipt.dataHash))
+    );
+  }
+
   private retainedStreams(host: HostEntry): string[] {
     if (host.ready === false || host.outcome?.kind === "aborted") return [];
     return Object.keys(host.streams).filter(
       (name) =>
         !host.streams[name]!.seedOnly &&
         host.entry.streams[name]?.state !== "discarded" &&
-        !this.covered.get(host.entry.runId)?.has(name),
+        !this.isCovered(host, name),
     );
   }
 
@@ -1797,7 +1850,6 @@ export class StreamSyncWriter {
     )
       return;
     await this.options.home.files.remove(`runs/${host.entry.runId}`);
-    this.covered.delete(host.entry.runId);
   }
 
   /** Called only by the home-bound overlay adapter. Does no network I/O. */
@@ -1936,6 +1988,16 @@ export class StreamSyncWriter {
     const binding = await this.binding();
     await this.lifecycle(async () => {
       if (this.lifecycleError) throw this.lifecycleError;
+      const key = coverageKey(
+        binding,
+        coverage.connector,
+        coverage.ns,
+        coverage.stream,
+        coverage.generation,
+      );
+      const known = this.coverage.get(key);
+      if (!known || coverage.registryVersion >= known.registryVersion)
+        this.coverage.set(key, Object.freeze({ ...coverage }));
       for (const runId of await this.runIds()) {
         const host = await this.readEntry(runId);
         if (
@@ -1951,19 +2013,6 @@ export class StreamSyncWriter {
           host.binding.keyCheck !== binding.keyCheck
         )
           continue;
-        const receipt = host.streams[coverage.stream]?.receipt;
-        if (
-          !receipt ||
-          !(
-            coverage.registryVersion > receipt.registryVersion ||
-            (coverage.registryVersion === receipt.registryVersion &&
-              coverage.dataHash === receipt.dataHash)
-          )
-        )
-          continue;
-        const covered = this.covered.get(runId) ?? new Set<string>();
-        covered.add(coverage.stream);
-        this.covered.set(runId, covered);
         await this.reclaimLocked(host);
       }
     });

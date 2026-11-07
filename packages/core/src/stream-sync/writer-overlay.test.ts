@@ -37,6 +37,12 @@ async function fixture() {
   let ambiguous = false;
   let fault: StreamSyncFaultPoint | undefined;
   let onPoint: ((point: StreamSyncFaultPoint) => void) | undefined;
+  let afterInstalled:
+    | ((request: {
+        expectedVersion: bigint;
+        dataHash: string;
+      }) => Promise<void>)
+    | undefined;
   const mac = async (m: Uint8Array) =>
     hmac(sha256, new Uint8Array(32).fill(4), m);
   const hashes = await controlHashes(
@@ -76,6 +82,7 @@ async function fixture() {
         metadataHash: request.metadataHash,
         deleted: false,
       });
+      await afterInstalled?.(request);
       if (ambiguous) {
         ambiguous = false;
         throw new AmbiguousRegistryReplyError("reply lost");
@@ -150,6 +157,10 @@ async function fixture() {
     posts: () => posts,
     onPoint: (callback: (point: StreamSyncFaultPoint) => void) => {
       onPoint = callback;
+    },
+    /** Runs after the registry row is installed and before the POST replies. */
+    afterInstalled: (callback: NonNullable<typeof afterInstalled>) => {
+      afterInstalled = callback;
     },
   };
 }
@@ -730,6 +741,75 @@ describe("writer durable read acknowledgment", () => {
     );
     expect(reopened.runs[0]!.streams.map((s) => s.name)).toEqual(["s", "z"]);
     reopened.release();
+  });
+});
+
+describe("writer coverage that arrives before the receipt", () => {
+  const log = "runs/r1/spool/s0.log";
+  async function earlyAck(
+    change: Record<string, unknown> = {},
+    pinFirst = false,
+  ) {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    const source = createWriterOverlaySource(w);
+    const pin = pinFirst ? await source.snapshot(connector) : undefined;
+    f.afterInstalled(async (request) => {
+      await source.acknowledge({
+        connector,
+        ns: "",
+        stream: "s",
+        generation: (await f.read()).generation,
+        registryVersion: Number(request.expectedVersion),
+        dataHash: request.dataHash,
+        ...change,
+      });
+    });
+    await w.publishPending();
+    return { f, w, source, pin };
+  }
+  it("reclaims after the receipt lands and the last pin is released", async () => {
+    const { f, source, pin } = await earlyAck({}, true);
+    expect(await f.files.size(log)).toBeGreaterThan(0);
+    pin!.release();
+    (await source.snapshot(connector)).release();
+    expect(await f.files.size(log)).toBe(0);
+  });
+  it("reclaims at finish when nothing is pinned", async () => {
+    const { f } = await earlyAck();
+    expect(await f.files.size(log)).toBe(0);
+  });
+  it("reclaims a no-op against a head the reader already imported", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    // Older run stamps with the same row change nothing in the head.
+    await collect(w, "zz");
+    await w.publishPending();
+    const source = createWriterOverlaySource(w);
+    await source.acknowledge({
+      connector,
+      ns: "",
+      stream: "s",
+      ...(await f.read("zz")).streams.s.receipt,
+    });
+    const posts = f.posts();
+    await collect(w, "a1");
+    await w.publishPending();
+    expect(f.posts()).toBe(posts);
+    expect(await f.files.read("runs/a1/entry.json")).toBeNull();
+    expect(await f.files.size("runs/a1/spool/s0.log")).toBe(0);
+  });
+  it.each([
+    { generation: 5 },
+    { ns: "other" },
+    { stream: "other" },
+    { registryVersion: 0 },
+  ])("reclaims nothing for early coverage %j", async (change) => {
+    const { f } = await earlyAck(change);
+    expect(await f.files.size(log)).toBeGreaterThan(0);
   });
 });
 
