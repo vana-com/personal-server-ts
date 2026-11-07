@@ -38,7 +38,7 @@ import {
 } from "./lines.js";
 import {
   RegistryMirror,
-  type ConnectorRows,
+  type MirrorRow,
   type MirrorFeedRow,
 } from "./mirror.js";
 import type {
@@ -118,7 +118,10 @@ export type ReadDecision =
        * window's parent stream of a windowed legacy name, else the first
        * stream read. Physical name and registry version.
        */
-      readonly served: { readonly scope: string; readonly version: number };
+      readonly served: {
+        readonly scope: string;
+        readonly version: number;
+      } | null;
       readonly body: ReadableStream<Uint8Array>;
     };
 
@@ -174,10 +177,16 @@ interface Target {
   readonly binding?: LegacyScopeBinding;
 }
 
+/** What a cursor pins of one input stream. */
+interface CursorStream {
+  /** Imported registry version, or null: the stream had no imported head. */
+  readonly b: number | null;
+}
+
 interface Cursor {
   readonly c: string;
   readonly ns: string;
-  readonly v: Readonly<Record<string, number>>;
+  readonly s: Readonly<Record<string, CursorStream>>;
 }
 
 const NS = /^(?:[0-9a-f]{16})?$/;
@@ -247,19 +256,32 @@ function decodeCursor(text: string): Cursor | null {
   try {
     const binary = atob(text.replace(/-/g, "+").replace(/_/g, "/"));
     const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as Cursor;
-    if (
-      typeof parsed?.c !== "string" ||
-      typeof parsed.ns !== "string" ||
-      typeof parsed.v !== "object" ||
-      parsed.v === null
-    ) {
+    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as {
+      c?: unknown;
+      ns?: unknown;
+      v?: unknown;
+      s?: unknown;
+    };
+    if (typeof parsed?.c !== "string" || typeof parsed.ns !== "string") {
       return null;
     }
-    for (const version of Object.values(parsed.v)) {
-      if (!Number.isSafeInteger(version)) return null;
+    const streams: Record<string, CursorStream> = {};
+    if (typeof parsed.s === "object" && parsed.s !== null) {
+      for (const [name, pin] of Object.entries(parsed.s)) {
+        const b = (pin as { b?: unknown } | null)?.b;
+        if (b !== null && !Number.isSafeInteger(b)) return null;
+        streams[name] = { b: b as number | null };
+      }
+    } else if (typeof parsed.v === "object" && parsed.v !== null) {
+      // A cursor from before overlay pins: registry versions only.
+      for (const [name, version] of Object.entries(parsed.v)) {
+        if (!Number.isSafeInteger(version)) return null;
+        streams[name] = { b: version as number };
+      }
+    } else {
+      return null;
     }
-    return parsed;
+    return { c: parsed.c, ns: parsed.ns, s: streams };
   } catch {
     return null;
   }
@@ -438,7 +460,18 @@ export class StreamSyncReadService {
       if (local.receipt && base && covers(base, local.receipt)) continue;
       out.push({ run, stream: local });
     }
-    return out;
+    // Rows merge only under one primary key: the base's, else the newest
+    // run's. A run of an unrelated key shape is not hashed against it.
+    const reference =
+      base?.head.primaryKey ??
+      [...out].sort(
+        (a, b) =>
+          b.run.observedAt - a.run.observedAt ||
+          (a.run.runId < b.run.runId ? 1 : -1),
+      )[0]?.stream.primaryKey;
+    return out.filter(
+      (c) => JSON.stringify(c.stream.primaryKey) === JSON.stringify(reference),
+    );
   }
 
   /** §2.10 inputs for connector c: every connection this server knows. */
@@ -456,11 +489,19 @@ export class StreamSyncReadService {
       const control = this.importer.controlState(rows.controls.get(ns));
       const streams: Record<string, StreamHeadView> = {};
       let latest: number | null = null;
-      for (const [stream, row] of rows.streams.get(ns) ?? []) {
+      const mirrored = rows.streams.get(ns) ?? new Map<string, MirrorRow>();
+      const names = new Set(mirrored.keys());
+      for (const run of snapshot?.runs ?? []) {
+        if (run.ns !== ns) continue;
+        for (const s of run.streams) names.add(s.name);
+      }
+      for (const stream of [...names].sort()) {
+        const row = mirrored.get(stream);
         const imported = this.views.get({ connector, ns, stream });
-        const kind = this.importer.streamRowKind(row);
+        const kind = row ? this.importer.streamRowKind(row) : null;
         const live =
           imported !== null &&
+          kind !== null &&
           isHeadLive(control, kind, imported.head.generation);
         const local = this.contributions(
           snapshot,
@@ -478,7 +519,7 @@ export class StreamSyncReadService {
             local.some((c) => c.stream.complete),
         };
         // Q6: the registry time of the connection's newest live stream head.
-        if (live && row.addedAtMs !== null) {
+        if (live && row && row.addedAtMs !== null) {
           latest =
             latest === null ? row.addedAtMs : Math.max(latest, row.addedAtMs);
         }
@@ -639,64 +680,101 @@ export class StreamSyncReadService {
         releaseAll();
         return { kind: "cursor_stale" };
       }
+      const rows = this.mirror.rowsFor(target.connector);
+      const control = this.importer.controlState(rows.controls.get(ns));
+      const inputs: StreamInput[] = [];
       for (const stream of target.streams) {
         const key: ViewKey = { connector: target.connector, ns, stream };
-        const at = cursor ? cursor.v[stream] : undefined;
-        if (cursor && at === undefined) {
+        const pin = cursor ? cursor.s[stream] : undefined;
+        if (cursor && !pin) {
           releaseAll();
           return { kind: "cursor_stale" };
         }
-        const lease = this.views.lease(key, at);
-        if (!lease) {
-          releaseAll();
-          return { kind: "cursor_stale" };
+        const row = rows.streams.get(ns)?.get(stream);
+        const kind = row ? this.importer.streamRowKind(row) : null;
+        const current = this.views.get(key);
+        const currentLive =
+          current !== null &&
+          kind !== null &&
+          isHeadLive(control, kind, current.head.generation);
+        let lease: ViewLease | null = null;
+        if (cursor) {
+          if (pin!.b === null) {
+            // The cursor saw no imported head; one has appeared since.
+            if (currentLive) {
+              releaseAll();
+              return { kind: "cursor_stale" };
+            }
+          } else {
+            lease = this.views.lease(key, pin!.b);
+            if (!lease) {
+              releaseAll();
+              return { kind: "cursor_stale" };
+            }
+          }
+        } else if (currentLive) {
+          lease = this.views.lease(key);
         }
-        leases.push(lease);
-      }
-      const control = this.importer.controlState(
-        this.mirror.rowsFor(target.connector).controls.get(ns),
-      );
-      const byStream = new Map(leases.map((l) => [l.key.stream, l]));
-      const overlays = new Map<string, OverlayWinners>();
-      let observedAt = 0;
-      for (const lease of leases) {
-        const head = lease.version.head;
-        const runs = this.contributions(
+        if (lease) leases.push(lease);
+        const local = this.contributions(
           snapshot,
           target.connector,
           ns,
-          lease.key.stream,
+          stream,
           control,
-          false,
-          lease.version,
-        ).map((c) => c.run);
-        const overlay = runs.length
+          kind === "tombstoned",
+          lease?.version ?? null,
+        );
+        if (!lease && local.length === 0) {
+          // Not a view after all: nothing imported and nothing local.
+          releaseAll();
+          return { kind: "cursor_stale" };
+        }
+        inputs.push({ stream, lease, local });
+      }
+      const byStream = new Map(inputs.map((i) => [i.stream, i]));
+      const overlays = new Map<string, OverlayWinners>();
+      let observedAt = 0;
+      for (const input of inputs) {
+        const shape = input.lease
+          ? input.lease.version.head
+          : newestShape(input.local);
+        const overlay = input.local.length
           ? await overlayWinners(snapshot, this.options.keys, {
-              runs,
-              stream: lease.key.stream,
-              primaryKey: head.primaryKey,
+              runs: input.local.map((c) => c.run),
+              stream: input.stream,
+              primaryKey: shape.primaryKey,
             })
           : NO_OVERLAY;
-        overlays.set(lease.key.stream, overlay);
+        overlays.set(input.stream, overlay);
         observedAt = Math.max(
           observedAt,
-          head.observedAt,
+          input.lease?.version.head.observedAt ?? 0,
           overlay.newestObservedAt ?? 0,
+          ...input.local.map((c) => c.run.observedAt),
         );
       }
-      const lines = (stream: string): AsyncIterable<Line> =>
-        viewLines(
+      const lines = (stream: string): AsyncIterable<Line> => {
+        const input = byStream.get(stream)!;
+        return viewLines(
           this.views,
           this.options.keys,
-          byStream.get(stream)!,
+          input.lease,
           overlays.get(stream)!,
-          byStream.get(stream)!.version.head.primaryKey,
+          (input.lease
+            ? input.lease.version.head
+            : newestShape(input.local)
+          ).primaryKey,
         );
+      };
       const nextCursor = encodeCursor({
         c: target.connector,
         ns,
-        v: Object.fromEntries(
-          leases.map((l) => [l.key.stream, l.version.version]),
+        s: Object.fromEntries(
+          inputs.map((i) => [
+            i.stream,
+            { b: i.lease ? i.lease.version.version : null },
+          ]),
         ),
       });
       const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},"data":`;
@@ -704,15 +782,20 @@ export class StreamSyncReadService {
       if (!target.binding) {
         payload = recordsPayload(lines(target.streams[0]!));
       } else {
+        const first = inputs[0]!;
         const plan = await planProjection({
           scope,
           binding: target.binding,
-          profileKey: leases[0]!.version.head.profile.key ?? undefined,
+          profileKey:
+            (first.lease
+              ? first.lease.version.head.profile.key
+              : newestShape(first.local).profile.key) ?? undefined,
           lines,
           streamBytes: (stream) =>
-            byStream
-              .get(stream)!
-              .version.head.parts.reduce((sum, p) => sum + p.bytes, 0),
+            (byStream.get(stream)!.lease?.version.head.parts ?? []).reduce(
+              (sum, p) => sum + p.bytes,
+              0,
+            ),
           sha256: this.options.keys.hashes.sha256,
           spool: this.options.files,
           spoolId: `${Date.now().toString(36)}-${(this.spoolCounter++).toString(36)}`,
@@ -728,16 +811,22 @@ export class StreamSyncReadService {
       }
       const servedStream =
         target.binding?.window?.parentStream ?? target.streams[0]!;
+      const servedBase = byStream.get(servedStream)!.lease;
       const body = toStream(envelope(open, payload), releaseAll);
       return {
         kind: "view",
         connector: target.connector,
         ns,
         cursor: nextCursor,
-        served: {
-          scope: streamScope(target.connector, ns, servedStream),
-          version: byStream.get(servedStream)!.version.version,
-        },
+        // A view with an input that has no registered head has no registry
+        // entry to bind a paid read to.
+        served:
+          servedBase && inputs.every((i) => i.lease)
+            ? {
+                scope: streamScope(target.connector, ns, servedStream),
+                version: servedBase.version.version,
+              }
+            : null,
         body,
       };
     } catch (error) {
@@ -745,6 +834,26 @@ export class StreamSyncReadService {
       throw error;
     }
   }
+}
+
+interface StreamInput {
+  readonly stream: string;
+  /** The leased imported view, or null for an overlay-only stream. */
+  readonly lease: ViewLease | null;
+  readonly local: readonly {
+    run: StreamSyncOverlayRun;
+    stream: StreamSyncOverlayStream;
+  }[];
+}
+
+/** Primary key and profile of an overlay-only stream: its newest run's. */
+function newestShape(local: StreamInput["local"]): StreamSyncOverlayStream {
+  const newest = [...local].sort(
+    (a, b) =>
+      b.run.observedAt - a.run.observedAt ||
+      (a.run.runId < b.run.runId ? 1 : -1),
+  )[0]!;
+  return newest.stream;
 }
 
 /**
