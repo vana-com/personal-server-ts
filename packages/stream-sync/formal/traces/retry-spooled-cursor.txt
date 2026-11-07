@@ -1,0 +1,32 @@
+retry_pending saves the cursor of a stream that had records
+(RetryQuietOnly = FALSE): S7_CheckpointSafety violated.
+
+Config: cfg/C-retry-saves-spooled.cfg (profile "late": devices d1
+(Desktop) and d2, one account A, record keys x1 and x2, one stream s1,
+three runs, one delete, one retry_pending end).  TLC 2026.11.03,
+4 workers: violation at depth 10 after 41,356 distinct states.
+
+This is the run-intake v2 model delta (section 9) as written: a
+retry_pending end saves its candidate checkpoint and publishes nothing,
+and the candidate may hold any covered stream.
+
+State 3: d1 starts run 1.  No control row exists yet.
+State 5: d2 starts run 2.  The source ends it retry_pending.  It
+  emitted records x1 and x2 for s1 and holds a candidate cursor for s1
+  (cand = {s1}, emit = {s1}).  It has no covered streams.
+State 7: d1 creates the control row: A is active at generation 1.
+State 8: RetryPending(d2).  Control now reads active(1), so the save
+  is admitted at generation 1.  d2 saves the checkpoint A/g1 with
+  s1 = run 2 and drops its s1 records: retry_pending publishes nothing.
+
+S7 fails: the checkpoint names run 2 for s1, but no head of s1 holds a
+commit of run 2.  d2's next incremental run starts after x1 and x2, so
+those records never reach the stream.
+
+Fix (the model's default, RetryQuietOnly = TRUE): a retry_pending end
+keeps no candidate cursor for a stream that emitted records in the run.
+It can keep a cursor (a job token) only for a stream with no records.
+An equal fix: accept the retry checkpoint only with no record batches
+(lastBatch = -1).
+
+Rendered by hand from the TLC error trace.

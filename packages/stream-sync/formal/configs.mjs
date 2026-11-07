@@ -37,10 +37,14 @@ export const DESIGN = {
   NeedsFullForcesFull: "TRUE",
   PublishCoveredOnly: "TRUE",
   WriterIssuesStart: "TRUE",
-  // Proposed fix, not in run intake v2 as written (see README.md):
-  // retry_pending keeps no cursor of a stream with spooled records.
+  // F2's fix, adopted: retry_pending keeps no cursor of a stream with
+  // spooled records (traces/retry-spooled-cursor.txt).
   RetryQuietOnly: "TRUE",
   FullMerges: "TRUE",
+  // Proposed fix, not in the ruled contract, so FALSE here: a checkpoint
+  // that only retry_pending ends saved keeps the next run full
+  // (traces/retry-token-incremental.txt).  The Fix-* rows turn it on.
+  RetryCkptStaysFull: "FALSE",
 };
 
 /**
@@ -80,6 +84,8 @@ const base = {
   MaxOldDelete: 0,
   // Device imports feed only S12 (second key) and L2.
   Views: "FALSE",
+  // A bound, not a guard: FALSE makes every "ok" run cover every stream.
+  PartialCover: "TRUE",
 };
 
 export const PROFILES = {
@@ -235,6 +241,24 @@ export const PROFILES = {
   // Three reruns: under Q9 a device that stays may need a no-op rerun
   // (which sets needsFull) and then a full one, and the device that
   // leaves may spend one first.
+  // Liveness with two streams and partial coverage on one device: a full
+  // run that skips s1 saves a checkpoint, so only needsFull keeps the
+  // next run full (C12L).
+  "live-cover": {
+    ...base,
+    Devices: set(["d1"]),
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1"]),
+    Streams: set(["s1", "s2"]),
+    MaxRuns: 3,
+    MaxReruns: 2,
+    MaxDeletes: 0,
+    MaxRetry: 0,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+  },
   "live-leave": {
     ...base,
     Acct: set(["A"]),
@@ -254,12 +278,33 @@ export const PROFILES = {
   "slice-lag": { ...base, Acct: set(["A"]), Streams: set(["s1"]), MaxLost: 0, MaxSessions: 0, MaxFail: 0, Readers: set(["r1"]) },
   // Run intake v2: two streams, one declared incremental: false, partial
   // coverage, a retry_pending run and an aborted run, one delete.
+  // Run intake v2 on the identity-less name every connector uses (R23):
+  // partial coverage, a stream declared incremental: false, retry_pending
+  // and abort.  Two devices with two runs, then one device with four runs
+  // (checkpoint merges across runs).  Three runs on two devices do not
+  // finish within the hour.
   "slice-intake": {
     ...base,
     Acct: set(["A"]),
+    IdLess: "TRUE",
     PK: set(["x1"]),
     Streams: set(["s1", "s2"]),
     FullStreams: set(["s2"]),
+    MaxRuns: 2,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    MaxAbort: 1,
+  },
+  "slice-intake1": {
+    ...base,
+    Devices: set(["d1"]),
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1"]),
+    Streams: set(["s1", "s2"]),
+    FullStreams: set(["s2"]),
+    MaxRuns: 4,
     MaxLost: 0,
     MaxSessions: 0,
     MaxFail: 0,
@@ -311,6 +356,12 @@ export const LIVENESS = [
 
 /** Simulation bounds for the profiles that breadth-first search cannot finish. */
 const SIM = { traces: 200000, depth: 60, seed: 1 };
+// The cut for slices that do not finish within an hour with the intake
+// choices: every "ok" run covers every stream and no run ends
+// retry_pending.  Partial coverage and retry_pending are checked on
+// "split", "slice-key", "slice-q9", "slice-idless", "slice-intake" and in
+// the controls on "late".
+const CUT = { PartialCover: "FALSE", MaxRetry: 0 };
 
 /**
  * name, what it shows, profile, changed constants, expected result, kind,
@@ -327,16 +378,29 @@ export const CONFIGS = [
   ["Full", "the design, full profile", "full", {}, "pass", "safety", SIM],
   ["IdLess", "the design, an identity-less connector", "idless", {}, "pass", "safety", SIM],
   // Exhaustive slices of the small profile.
-  ["Slice-faults", "the design: lost replies, a restart and a failed entry", "slice-faults", {}, "pass"],
-  ["Slice-accounts", "the design: two accounts", "slice-accounts", {}, "pass"],
+  // slice-faults with every intake choice does not finish within the
+  // hour: lost replies, and a restart with a failed entry, are two slices.
+  ["Slice-faults", "the design: lost replies (cut)", "slice-faults", { ...CUT, MaxSessions: 0, MaxFail: 0 }, "pass"],
+  ["Slice-faults2", "the design: a restart and a failed entry (cut)", "slice-faults", { ...CUT, MaxLost: 0 }, "pass"],
+  ["Slice-accounts", "the design: two accounts", "slice-accounts", CUT, "pass"],
   ["Slice-key", "the design: a second owner key with imports", "slice-key", {}, "pass"],
   ["Slice-idless", "the design: an identity-less connector, two accounts", "slice-idless", {}, "pass"],
-  ["Slice-twice", "the design: two deletes and reconnects", "twice", {}, "pass"],
+  // Four runs with two deletes do not finish within the hour with the
+  // intake choices; three runs still allow run, delete, run, delete, run.
+  ["Slice-twice", "the design: two deletes and reconnects (cut, three runs)", "twice", { ...CUT, MaxRuns: 3 }, "pass"],
   ["Slice-q9", "the design: an old stream DELETE, a device that leaves, no-ops", "slice-q9", {}, "pass"],
-  ["Slice-intake", "the design: partial coverage, a stream declared incremental: false, retry_pending and abort", "slice-intake", {}, "pass"],
-  ["Live", "liveness of the design", "live", {}, "pass", "liveness"],
-  ["Live-fail", "liveness of the design with a failed entry", "live-fail", {}, "pass", "liveness"],
-  ["Live-leave", "liveness of the design with an old stream DELETE and a device that leaves", "live-leave", {}, "pass", "liveness"],
+  ["Slice-intake", "the design, identity-less: partial coverage, a stream declared incremental: false, retry_pending and abort; two devices", "slice-intake", {}, "pass"],
+  ["Slice-intake1", "the design, identity-less: the same on one device with four runs", "slice-intake1", {}, "pass"],
+  ["Live", "liveness of the design", "live", CUT, "pass", "liveness"],
+  ["Live-fail", "liveness of the design with a failed entry", "live-fail", CUT, "pass", "liveness"],
+  // One stream, so PartialCover only drops runs that cover nothing; one
+  // retry_pending end stays, the positive counterpart of C12L.
+  ["Live-leave", "liveness of the design with an old stream DELETE, a device that leaves and a retry_pending end", "live-leave", { PartialCover: "FALSE" }, "pass", "liveness"],
+  ["Live-cover", "liveness with two streams and partial coverage, one device, identity-less", "live-cover", {}, "pass", "liveness"],
+  // --- the proposed fix RetryCkptStaysFull (traces/retry-token-incremental.txt) ---
+  ["Fix-live-leave", "Live-leave with the proposed fix", "live-leave", { PartialCover: "FALSE", RetryCkptStaysFull: "TRUE" }, "pass", "liveness"],
+  ["Fix-idless", "the identity-less slice with the proposed fix", "slice-idless", { RetryCkptStaysFull: "TRUE" }, "pass"],
+  ["Fix-split", "two streams, partial coverage and retry_pending with the proposed fix", "split", { RetryCkptStaysFull: "TRUE" }, "pass"],
 
   // --- regression: the revision 4 counterexample (traces/split-run.txt) ---
   [
@@ -352,7 +416,7 @@ export const CONFIGS = [
     "CE-late-head",
     "an old-generation run resumes after a delete and reconnect elsewhere; the stream row has a newer generation",
     "late",
-    {},
+    CUT,
     "pass",
   ],
   [
@@ -381,6 +445,7 @@ export const CONFIGS = [
   ["C15-failed-row-replaceable", "a row that failed settlement can be replaced", "slice-settle", { AckImmutable: "FALSE" }, "S8_AckImmutable"],
   ["C16-readiness-live-only", "readiness uses live, reads use live and complete", "slice-q9", { ReadinessSame: "FALSE" }, "S10_ReadinessMatchesRead"],
   ["C19-no-q9", "a no-op onto a complete:false base sets no needsFull", "slice-q9", { NoOpNeedsFull: "FALSE" }, "IncompleteOwned"],
+  ["C12L-no-needsfull", "complete:false sets no needsFull; a full run that skips the stream then saves a checkpoint, so later runs are incremental", "live-cover", { NeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
   ["C19L-no-q9", "the same, against liveness L3", "live-leave", { NoOpNeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
   ["C20-null-base-noop", "an incremental run onto an empty base with an empty spool is a no-op", "slice-q9", { NullBasePublishes: "FALSE" }, "IncompleteOwned"],
   ["C21-needsfull-not-full", "a device with needsFull and a checkpoint runs incrementally", "slice-accounts4", { NeedsFullForcesFull: "FALSE" }, "NeedsFullRunIsFull"],

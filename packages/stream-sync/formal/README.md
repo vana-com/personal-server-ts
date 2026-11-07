@@ -20,8 +20,38 @@ Status: design revision 4.1 with these rulings and review fixes:
 - **A run's `full` flag follows `runMustBeFull`:** no checkpoint, or any
   `needsFull` of the connector, makes the run full.
 
-No counterexample to this design was found within the bounds below. Read
-"Results" for what was checked at which bounds and in which mode.
+The model also has the run intake contract v2 (its section 9), as the
+owner's decisions reduce it: no tombstones, no deletion by absence and
+no restricted streams. A START that limits fields or resources is
+rejected, so the model does not have one. The intake parts are:
+
+- **Covered streams.** A run declares the streams it covered. Only those
+  are published or checkpointed. An uncovered stream keeps its row. A
+  covered stream may have no records.
+- **The writer issues the START state.** A full run that the owner starts
+  gets the stored checkpoint with mode `full_refresh`. Only a full run
+  that the writer forces (`needsFull`, or no checkpoint) gets no state.
+  The model takes `full` from the issued mode, never from "no state".
+- **`retry_pending`.** The run publishes nothing and saves its checkpoint
+  candidate, with the same control check as a finished run.
+- **`abortRun`.** The run publishes and saves nothing.
+- **Checkpoint merge.** A save merges its streams' cursors into the
+  stored checkpoint when that has the same namespace and generation;
+  otherwise it replaces it.
+- **Per-stream full.** A stream declared `incremental: false` is full in
+  every run (`fullS(s) = full ∨ s ∈ FullStreams`). A full stream merges
+  into its base and never replaces it.
+- **The raw-file seed is gone.** The seed from the old raw file and its
+  account check (`RawSeedChecksId`, `C17`) are removed. The old raw
+  file stays as one of the legacy files that reads are checked against.
+
+The intake model found one defect in section 9 as written: a
+`retry_pending` end can save the cursor of a stream whose records it
+drops. Read "Counterexamples". The model's default (`RetryQuietOnly`)
+is the proposed fix.
+
+With that fix, no counterexample was found within the bounds below.
+Read "Results" for what was checked at which bounds and in which mode.
 
 Model: `StreamSync.tla`, sha256 `cb85b4f8c217ded154968be8e4b72b4596dd3fb5a11f614f18b3d0da57ed18b5`. TLC 2026.11.03
 (`tla2tools.jar`).
@@ -119,8 +149,20 @@ expected result.
 All guards are TRUE except the one a control turns off. Devices are `d1`
 (the Desktop) and `d2` in every profile except `slice-accounts4`. `MaxVer` is 6 (a state
 constraint on chain length) in every safety profile. Symmetry: accounts,
-record keys and streams other than `s1`. Liveness profiles have no
-symmetry and no state constraint.
+record keys, and streams other than `s1` (streams declared
+`incremental: false` permute only among themselves). Liveness profiles
+have no symmetry and no state constraint.
+
+Intake bounds: every profile allows one run that ends `retry_pending`
+(`MaxRetry` 1) and no abort (`MaxAbort` 0), and declares no stream
+`incremental: false` (`FullStreams` empty), except where the table says
+so. Rows marked "cut" in Results use `CUT` from `configs.mjs`:
+`PartialCover` FALSE, so every `ok` run covers every stream, and
+`MaxRetry` 0. Without the cut those slices do not finish within an
+hour. Partial coverage and `retry_pending` are checked on `split`,
+`slice-key`, `slice-q9`, `slice-idless`, `slice-intake` and
+`slice-intake1`, and in
+the controls on `late`.
 
 | Profile | Acct | PK | Streams | Runs (+ reruns) | Deletes | Lost / restarts / failed entries | Other |
 | ------- | ---- | -- | ------- | --------------- | ------- | -------------------------------- | ----- |
@@ -133,6 +175,8 @@ symmetry and no state constraint.
 | `slice-idless` | A, B | x1 | s1 | 3 | 1 | 0 / 0 / 0 | identity-less connector |
 | `twice` | A | x1 | s1 | 4 | 2 | 0 / 0 / 0 | |
 | `slice-q9` | A | x1 | s1 | 4 | 0 | 0 / 0 / 0 | 1 old stream DELETE (L11), 1 leave |
+| `slice-intake` | A, identity-less | x1 | s1, s2 | 2 | 1 | 0 / 0 / 0 | `s2` is `incremental: false`; 1 `retry_pending` and 1 abort |
+| `slice-intake1` | A, identity-less | x1 | s1, s2 | 4 | 1 | 0 / 0 / 0 | as `slice-intake`, `d1` only |
 | `slice-settle` | A | x1, x2 | s1 | 3 | 1 | 0 / 0 / 0 | 1 settlement failure |
 | `slice-lag` | A | x1, x2 | s1 | 3 | 1 | 0 / 0 / 0 | reader PS `r1` |
 | `lean` | A | x1 | s1, s2 | 3 | 1 | 1 / 1 / 1 | witnesses only |
@@ -201,6 +245,17 @@ profiles in two ways:
 
 ## Counterexamples kept as controls
 
+- [traces/retry-spooled-cursor.txt](traces/retry-spooled-cursor.txt):
+  run intake v2 section 9 as written. A `retry_pending` end saves its
+  checkpoint candidate and publishes nothing, and the candidate may hold
+  any covered stream. `d2`'s run emits records for `s1`, ends
+  `retry_pending` with a cursor for `s1`, and saves it at generation 1
+  after `d1` creates the control row. The records are dropped, and the
+  next incremental run starts after them (`C-retry-saves-spooled`, S7).
+  Proposed fix, the model's default `RetryQuietOnly`: a `retry_pending`
+  end keeps no cursor of a stream that had records in the run. It can
+  keep a cursor such as a job token only for a stream with no records.
+  An equal fix is to accept the candidate only with no record batches.
 - [traces/late-head.txt](traces/late-head.txt): the two-outcome base rule
   (revision 4.1 before F1). A run of generation 1 resumes after a delete
   and a reconnect elsewhere, and commits a generation-1 head over an
@@ -239,7 +294,8 @@ models:
   view. A device can leave for good (`Leave`); it loses its entry,
   `needsFull`, checkpoint and view.
 - **Desktop.** `seedTarget` and the seed receipts.
-- **Old raw file.** `rawF`, which can record an account identity.
+- **Old raw file.** It is one of the legacy files (`Legacies`) that
+  reads are checked against. Nothing seeds from it.
 - **Lost replies.** `inflight`, which can land late (`LateApply`).
 
 Each guard in section 4, and each ruling that adds a rule, is a
@@ -250,13 +306,32 @@ configs, checks that `cfg/` matches, and runs TLC (`--run`).
 Modelling choices the reader should check:
 
 - **Records.** A line is `<<pk, run, account, origin>>`. Run ids follow
-  run start order, so `(o, r)` order is run id order. Seed and raw-seed
-  lines have run 0 and rank below run lines.
-- **Runs.** Every run plans every stream of `c`. The source emits records
-  for a chosen subset of streams and a chosen non-empty subset of keys.
-  A stream outside that subset has an empty spool. A full run emits
-  records for every stream, with any non-empty subset of keys. A key the
-  run does not emit is a record the source no longer has.
+  run start order, so `(o, r)` order is run id order. Seed lines have
+  run 0 and rank below run lines.
+- **Runs.** A run chooses its end (`ok`, `retry_pending` or abort), the
+  streams with records `E`, a non-empty set of keys, the covered streams
+  `cov` and, for `retry_pending`, the streams of its checkpoint candidate
+  `cand`. A stream outside `E` has an empty spool. A key the run does not
+  emit is a record the source no longer has, or one outside the
+  increment. Choices with the same future are made canonical: an `ok`
+  run's records lie in `cov`, because the spool of an uncovered stream is
+  dropped unread. A run plans its covered streams, and the Desktop's seed
+  streams. An uncovered stream that only the seed plans publishes only
+  if seeded; otherwise the run skips it with its receipt.
+- **START.** The writer forces a full run when the device has no
+  checkpoint or holds a `needsFull`; it then issues no state. A run that
+  the owner starts (`userConnect`) may also ask for a full run while a
+  checkpoint exists; it gets that checkpoint with mode `full_refresh`.
+  A full run whose stored checkpoint has another namespace counts as an
+  account switch, so its heads are `complete:false`.
+- **Run ends.** Only an `ok` run publishes, and it saves its checkpoint
+  only if it covered at least one stream. A `retry_pending` end saves its
+  candidate under the same control check as `Finish`. On a connection
+  with no control row it saves nothing. It keeps no cursor of a stream
+  with records (`RetryQuietOnly`). An abort removes the entry.
+- **Checkpoint.** A checkpoint holds one cursor per stream. A save
+  merges into the stored checkpoint of the same namespace and generation,
+  else it starts empty.
 - **Delete.** A delete tombstones every active control row of the
   connector, as §2.11 says. It also purges the device's entry, checkpoint
   and view, and sets `stopped`.
@@ -319,13 +394,17 @@ How the properties read here:
 | Property | Reading in the model |
 | -------- | -------------------- |
 | S1 | For every acknowledged head of generation `g`, while control is `active(g)`: the current stream row is a head of generation `g`, and for each line of the acknowledged head it holds a line of the same key with an equal or greater `(o, r)`. Exempt: an L11 tombstone above the acknowledged head. |
-| S3 | Every run line in a head of generation `g` comes from a run that was bound to `g` while `decide(start, control)` gave `g`. Seed and raw lines appear only at generation 1. |
-| S7 | A saved checkpoint `(ns, g, run)`: control was `active(g)` at the save, and every stream of the run committed at `g`. |
+| S3 | Every run line in a head of generation `g` comes from a run that was bound to `g` while `decide(start, control)` gave `g`. Seed lines appear only at generation 1. |
+| S7 | A saved checkpoint `(ns, g)` with one cursor (a run) per stream: control was `active(g)` at the save, and each stream's cursor names a run that committed that stream at `g`, or a `retry_pending` save of a stream that had no records in that run (`quiet`). |
 | S11 | A seed receipt at generation 1: the stream is live and holds every key. Exempt: an L11 tombstone in the stream. |
 | IncompleteOwned | L3 and M3 as bounded safety. After a device that stays finishes a run at `(ns, T)`, a stream row it saw that is still current, and is live and `complete:false`, an L11 tombstone, or no row, is one it holds `needsFull` for. Its next run is then full. |
 | NeedsFullRunIsFull | A run for a connection the device holds `needsFull` for is full, unless the run itself published `complete:false`. |
 | NoHeadAboveControl, HeadGenMonotone | No head has a generation above the control chain; along a stream row chain the generation never goes down (tombstones aside). |
 | S2a, S4, S9, S10 | Checked as described under Reads. |
+| CoveredOnly | No head is published for a stream that its run did not cover, except a Desktop seed head. A head carries a ghost bit (`oc`) set when it is written for an uncovered stream that the seed does not fill. |
+| IssuedStart | Every run in an outbox used the START state the writer issued: the stored checkpoint, or no state when the writer forced the run full. |
+| NoFalseDelete | Every key of a head's base is a key of the head. The base is the row just below it, when that row has the same generation and is not a tombstone. Nothing deletes a record: no tombstones and no deletion by absence. |
+| LaterWriteSurvives | A base line written by a later run than the publishing one (a greater run id than the head's `at`) is still in the head. This is the plain no-lost-write check of the merge. |
 | L3 | A live `complete:false` stream becomes live `complete:true`, or control moves, under the fairness above. |
 
 ## Earlier work

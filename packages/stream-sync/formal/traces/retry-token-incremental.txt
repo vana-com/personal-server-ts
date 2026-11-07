@@ -1,0 +1,49 @@
+A checkpoint that only a retry_pending end saved makes the next run
+incremental: L3_NoStuckIncomplete violated.
+
+Config: cfg/Live-leave.cfg (profile "live-leave": devices d1 (Desktop)
+and d2, one account A, record key x1, one stream s1, three runs and
+three scheduler reruns, one retry_pending end, one old stream DELETE
+(limitation L11), one device may leave; every "ok" run covers s1).
+Model: the ruled contract (RetryQuietOnly on, RetryCkptStaysFull off).
+TLC 2026.11.03, 4 workers: violation at depth 17 after 358,958 distinct
+states, 325 seconds.
+
+States 2-5: d1 starts run 1 and creates the control row: A is active at
+  generation 1.
+State 7: d1 leaves for good.  Its run is lost.
+State 8: d2 starts run 2.  It has no checkpoint, so the writer forces a
+  full run and issues no state.  The source ends the run retry_pending
+  with a cursor (a job token) for s1 and no records.
+State 9: RetryPending(d2).  Control reads active(1), and s1 had no
+  records, so the token is kept: d2's checkpoint is A/g1, s1 = run 2.
+  No head of s1 exists.
+State 10: d2 starts run 3.  It holds a checkpoint and no needsFull, so
+  the run is incremental, with the token as its state.  It emits x1.
+States 11-13: the base is empty (no row), so the run publishes
+  (M3) a complete:false head of x1 at generation 1.  d2 holds needsFull
+  for s1, and its checkpoint is cleared.
+State 14: Finish(d2).  The run published complete:false, so no
+  checkpoint is saved.
+State 15: an old app's DELETE tombstones s1 (L11) before the scheduler's
+  rerun.
+Then nothing more is required to happen.  The rerun is fair only while
+s1 is live and complete:false, and s1 is now a tombstone.  L3 fails:
+s1 was live and complete:false at generation 1, and it never becomes
+live and complete:true, although control stays active(1).
+
+Without retry_pending a device's first run of a generation is full, so
+its first head is complete:true, and this path does not exist.  Here
+the job token made the device's first published run incremental.
+
+Proposed contract fix (RetryCkptStaysFull): a checkpoint that only
+retry_pending ends saved at this (namespace, generation) is issued as
+the START state, but the run is full (mode full_refresh).  The first
+published run of a generation stays full, as before run intake v2.
+Config Fix-live-leave checks it.
+
+Required build test: with no stored checkpoint, a retry_pending end that
+keeps a job token for s1, then begin: the issued mode is full_refresh,
+the state is the token, and the published s1 head is complete:true.
+
+Rendered by hand from the TLC error trace.

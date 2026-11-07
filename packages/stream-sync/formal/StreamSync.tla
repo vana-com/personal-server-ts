@@ -68,6 +68,7 @@ CONSTANTS
   MaxLeave,        \* devices that may leave (stop forever, local state lost)
   MaxOldDelete,    \* old non-exclusive stream DELETEs (limitation L11)
   Views,           \* model device imports (key and liveness profiles)
+  PartialCover,    \* a bound, not a guard: FALSE makes every "ok" run cover every stream
   \* --- guards, all TRUE in the design; each control turns one off ---
   GenInNames,        \* part names carry the generation (2.1)
   ClearOnGenChange,  \* checkpoints and entries cleared on a generation change (2.4)
@@ -93,6 +94,9 @@ CONSTANTS
   PublishCoveredOnly,\* only covered streams are declared and published (v2 3.5)
   WriterIssuesStart, \* START state is the writer's issue, not the producer's (v2 2.1, R16)
   RetryQuietOnly,    \* retry_pending saves no cursor of a stream with spooled records
+  RetryCkptStaysFull,\* proposed, FALSE in the ruled contract: a checkpoint that only
+                     \* retry_pending ends saved keeps the next run full (state issued,
+                     \* mode full_refresh)
   FullMerges         \* a stream-full run merges into its base; it never replaces it
 
 ASSUME Desktop \in Devices /\ LegacyFrom \in Streams /\ OtherKey \subseteq Devices
@@ -108,7 +112,8 @@ VARIABLES
   known,     \* known[d][n]: control length the sync loop last saw (persisted)
   stopped,   \* stopped[d][n]: 0, or the tombstone version d stopped at
   needsFull, \* needsFull[d]: set of <<n, s>>
-  ckpt,      \* ckpt[d]: [n, g, cur, ctlOk] or NoCk; cur[s] is the run whose cursor is saved
+  ckpt,      \* ckpt[d]: [n, g, cur, ctlOk, byRun] or NoCk; cur[s] is the run whose cursor
+             \* is saved; byRun: a finished run saved into it at this (n, g)
   ob,        \* ob[d]: the outbox entry (one run at a time), or NoEntry
   view,      \* view[d][n][s]: imported head version, 0 = none
   psv,       \* psv[p][n]: [c |-> control length, h |-> [s |-> head length]]
@@ -146,7 +151,7 @@ FileOf(a, origin, id) ==
 NoHead == [g |-> 0, lines |-> {}, complete |-> FALSE, key |-> "", at |-> 0, oc |-> FALSE]
 NoReq == [ver |-> 0, h |-> NoHead]
 NoCur == [s \in Streams |-> 0]
-NoCk == [n |-> "none", g |-> 0, cur |-> NoCur, ctlOk |-> FALSE]
+NoCk == [n |-> "none", g |-> 0, cur |-> NoCur, ctlOk |-> FALSE, byRun |-> FALSE]
 \* An entry.  full: the issued collection mode is full_refresh (never read
 \* from the state).  sw: the issued state belongs to another namespace.
 \* stOk: the START state the connector used is the writer's issue.  cov:
@@ -436,17 +441,20 @@ PlanPublish(d, s) ==
 \* Save cursors for the streams S of run rid into d's checkpoint, tagged
 \* (n, g) (v2 3.6): value = {...prev, ...candidate}, where prev is the
 \* stored value when the stored (n, g) equals the run's, else empty.
-SaveCk(d, n, g, S, rid, ok) ==
-  LET prev == IF ckpt[d] # NoCk /\ ckpt[d].n = n /\ ckpt[d].g = g THEN ckpt[d].cur ELSE NoCur
+SaveCk(d, n, g, S, rid, ok, byRun) ==
+  LET same == ckpt[d] # NoCk /\ ckpt[d].n = n /\ ckpt[d].g = g
+      prev == IF same THEN ckpt[d].cur ELSE NoCur
   IN [n |-> n, g |-> g, cur |-> [s \in Streams |-> IF s \in S THEN rid ELSE prev[s]],
-      ctlOk |-> ok]
+      \* byRun is tracked only under the proposed fix, so with it off the
+      \* state space is the ruled contract's.
+      ctlOk |-> ok, byRun |-> RetryCkptStaysFull /\ (byRun \/ (same /\ ckpt[d].byRun))]
 
 \* Without CheckpointAfterAll the checkpoint is saved at the first commit.
 EarlyCkpt(d) ==
   IF CheckpointAfterAll THEN ckpt
   ELSE [ckpt EXCEPT ![d] = SaveCk(d, ob[d].n, ob[d].T,
                                   {s \in ob[d].cov : ob[d].st[s] # "none"}, ob[d].rid,
-                                  CtlNow(ob[d].n, Key(d)) = [k |-> "active", g |-> ob[d].T])]
+                                  CtlNow(ob[d].n, Key(d)) = [k |-> "active", g |-> ob[d].T], TRUE)]
 
 Post(d, s) ==
   LET e == ob[d]
@@ -508,7 +516,7 @@ Finish(d) ==
   IN /\ e # NoEntry /\ ~e.dead /\ e.out = "ok"
      /\ \A s \in Streams : e.st[s] \in {"none", "done"}
      /\ ob' = [ob EXCEPT ![d] = NoEntry]
-     /\ ckpt' = IF save THEN [ckpt EXCEPT ![d] = SaveCk(d, e.n, e.T, e.cov, e.rid, ctlOk)]
+     /\ ckpt' = IF save THEN [ckpt EXCEPT ![d] = SaveCk(d, e.n, e.T, e.cov, e.rid, ctlOk, TRUE)]
                 ELSE ckpt
      /\ fin' = [fin EXCEPT ![d] = [n |-> e.n, T |-> e.T, seen |-> e.seen, cov |-> e.cov]]
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
@@ -535,7 +543,7 @@ RetryPending(d) ==
   IN /\ e # NoEntry /\ ~e.dead /\ e.out = "retry"
      /\ t # -1
      /\ ob' = [ob EXCEPT ![d] = NoEntry]
-     /\ ckpt' = IF save THEN [ckpt EXCEPT ![d] = SaveCk(d, e.n, t, keep, e.rid, TRUE)]
+     /\ ckpt' = IF save THEN [ckpt EXCEPT ![d] = SaveCk(d, e.n, t, keep, e.rid, TRUE, FALSE)]
                 ELSE IF t = 0 /\ ClearOnGenChange /\ S.k = "active" /\ ckpt[d].n = e.n
                 THEN [ckpt EXCEPT ![d] = NoCk]
                 ELSE ckpt
@@ -591,6 +599,9 @@ StartRunFor(d, a, uc, out, allCov) ==
   LET n == NSOf(a)
       forced == ckpt[d] = NoCk \/ (NeedsFullForcesFull /\ needsFull[d] # {})
       iss == IF forced THEN NoCk ELSE ckpt[d]
+      \* Proposed fix: a checkpoint that holds only retry_pending job
+      \* tokens is issued, but the run stays full.
+      tokOnly == RetryCkptStaysFull /\ ckpt[d] # NoCk /\ ~ckpt[d].byRun
       rid == clock + 1
       tgt == IF d = Desktop /\ seedTarget = "none" THEN n ELSE seedTarget
       seedS == IF d = Desktop /\ n = tgt THEN {s \in Streams : <<n, s>> \notin rcpt} ELSE {}
@@ -600,7 +611,7 @@ StartRunFor(d, a, uc, out, allCov) ==
      \* run the writer already forces full; records of a stream whose
      \* spool is dropped unread (an uncovered stream of an "ok" run, a
      \* stream outside a retry candidate); keys of an empty spool.
-     /\ \E wf \in IF uc /\ out = "ok" /\ ~forced THEN BOOLEAN ELSE {FALSE},
+     /\ \E wf \in IF uc /\ out = "ok" /\ ~forced /\ ~tokOnly THEN BOOLEAN ELSE {FALSE},
            st \in IF WriterIssuesStart THEN {iss} ELSE {NoCk, ckpt[d]},
            E \in SUBSET Streams, P \in (SUBSET PK) \ {{}},
            cov \in SUBSET Streams, cand \in SUBSET Streams :
@@ -611,9 +622,10 @@ StartRunFor(d, a, uc, out, allCov) ==
           /\ out = "retry" /\ RetryQuietOnly => E \subseteq cand
           /\ out = "abort" => E = {}
           /\ allCov => E = Streams /\ cov = Streams
+          /\ out = "ok" /\ ~PartialCover => cov = Streams
           /\ LET e == [NoEntry EXCEPT
                       !.rid = rid, !.a = a, !.n = n, !.start = listing[d], !.uc = uc,
-                      !.full = forced \/ wf, !.sw = (st # NoCk /\ st.n # n),
+                      !.full = forced \/ tokOnly \/ wf, !.sw = (st # NoCk /\ st.n # n),
                       !.stOk = (st = iss), !.pks = P, !.emit = E,
                       !.cov = cov, !.cand = cand, !.out = out]
                  planned == IF out = "ok" THEN PubCov(e) \cup seedS ELSE {}
