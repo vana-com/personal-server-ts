@@ -139,12 +139,15 @@ interface WriterState {
   needsFull: NeedsFull;
   checkpoints: Record<string, StreamSyncCheckpoint>;
   /**
-   * Per connector, how many times control observation invalidated its saved
-   * checkpoint. It only grows and outlives the checkpoint it deletes, so a
-   * save can tell that an invalidation came after the run's control read. A
-   * state file without it reads as 0.
+   * Per connector, how many times its checkpoint was invalidated: a control
+   * change seen, or a deliberate clear. It only grows and outlives the
+   * checkpoint, so a save can tell that an invalidation came after the run's
+   * control read, even when no checkpoint was stored. A state file without it
+   * reads as 0.
    */
   invalidations?: Record<string, number>;
+  /** Per connector, the last control state seen, as `<ns>|<state>`. */
+  observedControl?: Record<string, string>;
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
   receipts: Record<string, SeedReceipt>;
@@ -1118,17 +1121,21 @@ export class StreamSyncWriter {
     current: ControlState,
   ): Promise<void> {
     await this.withState((state) => {
+      // A change from the last control state seen invalidates a pending save
+      // even when no checkpoint is stored for it to replace.
+      const marks = (state.observedControl ??= {});
+      const mark = `${ns}|${describe(current)}`;
+      const moved = marks[connector] !== undefined && marks[connector] !== mark;
+      marks[connector] = mark;
       const checkpoint = state.checkpoints[connector];
-      if (!checkpoint || checkpoint.ns !== ns) return;
-      if (
-        current.kind === "active" &&
-        current.generation === checkpoint.generation
-      ) {
-        return;
-      }
-      delete state.checkpoints[connector];
-      const epochs = (state.invalidations ??= {});
-      epochs[connector] = (epochs[connector] ?? 0) + 1;
+      const stale =
+        checkpoint !== undefined &&
+        checkpoint.ns === ns &&
+        !(
+          current.kind === "active" &&
+          current.generation === checkpoint.generation
+        );
+      if (stale || moved) invalidateCheckpoint(state, connector, stale);
     });
   }
 
@@ -1531,7 +1538,9 @@ export class StreamSyncWriter {
         runFull: entry.full || stream.fullStream,
       });
       state.needsFull = effect.needsFull;
-      if (effect.clearCheckpoint) delete state.checkpoints[entry.connector];
+      if (effect.clearCheckpoint) {
+        invalidateCheckpoint(state, entry.connector, true);
+      }
       if (stream.seedApplies && this.options.seed) {
         state.receipts[
           `${this.options.seed.installId}|${entry.connector}|${entry.ns}|${name}`
@@ -1632,9 +1641,11 @@ export class StreamSyncWriter {
     const { decision } = error;
     if (decision.clearCheckpoints) {
       await this.withState((state) => {
-        if (state.checkpoints[entry.connector]?.ns === entry.ns) {
-          delete state.checkpoints[entry.connector];
-        }
+        invalidateCheckpoint(
+          state,
+          entry.connector,
+          state.checkpoints[entry.connector]?.ns === entry.ns,
+        );
       });
     }
     for (const [name, stream] of Object.entries(entry.streams)) {
@@ -1990,6 +2001,22 @@ function streamRowKind(read: ControlRead, hashes: ControlHashes): StreamRow {
 
 function parseHeadKey(request: SignedRegistryPost): string {
   return `${request.scope}/h-${request.dataHash.slice(2).toLowerCase()}`;
+}
+
+/**
+ * The one place a checkpoint is invalidated: advance the connector's
+ * invalidation count in the same state mutation as the clear, so a save that
+ * read control earlier cannot restore what was cleared. The count advances
+ * even when `clear` is false or the slot is already empty.
+ */
+function invalidateCheckpoint(
+  state: WriterState,
+  connector: string,
+  clear: boolean,
+): void {
+  if (clear) delete state.checkpoints[connector];
+  const epochs = (state.invalidations ??= {});
+  epochs[connector] = (epochs[connector] ?? 0) + 1;
 }
 
 function describe(state: ControlState): string {
