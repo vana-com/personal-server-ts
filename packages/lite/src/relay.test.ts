@@ -983,3 +983,24 @@ describe("whenDrained + drain-gated read fulfillment", () => {
     client.close();
   });
 });
+
+describe("buildHttpResponse framing", () => {
+  // The relay sends the whole body it buffered, framed by content-length.
+  // Transfer-Encoding belongs to the hop between the runtime and the relay:
+  // copied onward, it would make the client parse the body as chunks.
+  it("drops an upstream transfer-encoding", () => {
+    const json = '{"records":[]}';
+    const wire = buildHttpResponse({
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "Transfer-Encoding": "chunked",
+      },
+      body: Buffer.from(json).toString("base64"),
+    });
+    const head = wire.slice(0, wire.indexOf("\r\n\r\n")).toLowerCase();
+    expect(head).not.toContain("transfer-encoding");
+    expect(head).toContain(`content-length: ${json.length}`);
+    expect(wire.slice(wire.indexOf("\r\n\r\n") + 4)).toBe(json);
+  });
+});

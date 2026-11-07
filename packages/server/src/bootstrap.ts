@@ -99,6 +99,12 @@ import {
   resolveReplication,
 } from "./pdpp/records-bootstrap.js";
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
+import {
+  createStorageBlobReader,
+  createStreamSyncReadKeys,
+  StreamSyncReadService,
+} from "@opendatalabs/personal-server-ts-core/stream-sync-read";
+import { createFsStreamSyncReadFiles } from "./stream-sync-read/fs-files.js";
 import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import {
   createNodeReplication,
@@ -120,6 +126,21 @@ import {
   reindexLegacyDataFiles,
 } from "./storage/node-data-storage.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
+import {
+  StreamSyncWriter,
+  createStreamSyncIntake,
+  type StreamSyncIntake,
+  createGatewayStreamSyncRegistry,
+  manifestArtifactResolver,
+  createStorageStreamSyncBlobs,
+  createStreamSyncKeyPorts,
+  streamSyncNetwork,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { openFsStreamSyncHome } from "./stream-sync/fs-home.js";
+import {
+  createSeedStaging,
+  type SeedStaging,
+} from "./stream-sync/seed-staging.js";
 import {
   computeQuestion,
   createOpenAiCompatibleInferenceProvider,
@@ -144,6 +165,8 @@ export interface ServerContext {
   serverAccount?: ServerAccount;
   serverSigner?: ServerSigner;
   syncManager: SyncManager | null;
+  /** Whole-file stream sync writer; `null` unless `streamSync.write` is on. */
+  streamSyncWriter: StreamSyncWriter | null;
   tunnelManager?: TunnelManager;
   tunnelUrl?: string;
   isServerRegistered: () => boolean;
@@ -617,6 +640,13 @@ export async function createServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
+  let streamSyncWriter: StreamSyncWriter | null = null;
+  let releaseStreamSyncHome: (() => Promise<void>) | null = null;
+  let streamSyncRead: StreamSyncReadService | undefined;
+  let streamSyncSeed: {
+    writer: StreamSyncWriter;
+    staging: SeedStaging;
+  } | null = null;
   /**
    * Late-bound PDPP importer.
    *
@@ -811,7 +841,19 @@ export async function createServer(
       scopeDeletions,
     };
 
+    if (config.streamSync.read) {
+      streamSyncRead = await StreamSyncReadService.open({
+        files: createFsStreamSyncReadFiles(
+          join(storageRoot, "stream-sync-read"),
+        ),
+        blobs: createStorageBlobReader(storageAdapter),
+        keys: await createStreamSyncReadKeys(masterKey),
+        logger,
+      });
+    }
+
     const downloadDeps = {
+      streamSync: streamSyncRead,
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -879,7 +921,53 @@ export async function createServer(
       );
     }
 
+    // Whole-file stream sync publishes beside the legacy upload, only when
+    // `streamSync.write` is on. Legacy uploads run unchanged either way.
+    if (config.streamSync.write && !isEnclave) {
+      let writerForSeed: StreamSyncWriter | null = null;
+      const streamSyncHome = await openFsStreamSyncHome({
+        root: storageRoot,
+        ownerAddress: serverOwner,
+        network: streamSyncNetwork(config.gateway),
+      });
+      if (!streamSyncHome) {
+        logger.warn(
+          "Stream sync is off in this process: another process holds this owner's stream-sync storage",
+        );
+      } else {
+        releaseStreamSyncHome = () => streamSyncHome.close();
+        // Desktop seed intake (§2.9): retained rows staged by the seed route,
+        // kept in this owner's home so another owner never merges them.
+        // The receipts lookup binds late because the writer owns the receipts.
+        const seedStaging = createSeedStaging(streamSyncHome.seedFiles);
+        const seedSource = seedStaging.source(
+          await seedStaging.installId(),
+          async (connector) =>
+            writerForSeed
+              ? (await writerForSeed.seedStatus(connector)).receipts
+              : {},
+        );
+        streamSyncWriter = new StreamSyncWriter({
+          ownerAddress: serverOwner,
+          registry: createGatewayStreamSyncRegistry({
+            gatewayUrl: config.gateway.url,
+            ownerAddress: serverOwner,
+          }),
+          blobs: createStorageStreamSyncBlobs(storageAdapter),
+          home: streamSyncHome.home,
+          keys: createStreamSyncKeyPorts(masterKeySignature),
+          signer: serverSigner,
+          seed: seedSource,
+        });
+        writerForSeed = streamSyncWriter;
+        streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
+      }
+    }
+
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
+      streamSync: streamSyncWriter
+        ? { write: true, publisher: streamSyncWriter }
+        : null,
       deleteData,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
@@ -1140,6 +1228,19 @@ export async function createServer(
         })
       : undefined;
 
+  // Run intake (V2 §2): mounted only with `streamSync.write`. An artifact
+  // digest resolves only to a pinned connector manifest whose bytes this boot
+  // verified (§6); an unknown digest answers `unknown_artifact`.
+  const streamSyncIntake: StreamSyncIntake | undefined =
+    streamSyncWriter && !isEnclave
+      ? createStreamSyncIntake({
+          writer: streamSyncWriter,
+          resolveArtifact: manifestArtifactResolver(
+            pdppAuth?.retainedManifests ?? [],
+          ),
+        })
+      : undefined;
+
   const app = createApp({
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
@@ -1180,6 +1281,7 @@ export async function createServer(
     gateway: gatewayClient,
     gatewayConfig: config.gateway,
     paymentEnabled: config.payment.enabled,
+    ownAppAccountUrl: config.payment.ownAppAccountUrl,
     gatewayUrl: config.gateway.url,
     lineageGateway,
     derivativeCompute,
@@ -1189,6 +1291,7 @@ export async function createServer(
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
     additions,
+    streamSyncRead,
     // Latest legacy reads of connector scopes the owner collects into the
     // record store come from its rows: the same store and the same
     // configured methods the RS enforces. Composed with or without the RS,
@@ -1233,6 +1336,10 @@ export async function createServer(
     tokenStore,
     configPath,
     syncManager,
+    streamSyncSeed,
+    streamSyncIntake,
+    // Shutdown stops stream-sync requests first; the home then drains.
+    streamSyncAdmitting: () => !backgroundClosed,
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
@@ -1262,6 +1369,10 @@ export async function createServer(
     if (syncManager) {
       await syncManager.stop();
     }
+    // Closes the home's lock only after every file operation of the home has
+    // finished (new ones are refused). `backgroundClosed` (set above) already
+    // stops the stream-sync routes from admitting new requests.
+    await releaseStreamSyncHome?.();
     indexManager.close();
   };
 
@@ -1276,6 +1387,7 @@ export async function createServer(
     serverAccount,
     serverSigner,
     syncManager,
+    streamSyncWriter,
     tunnelManager,
     tunnelUrl: undefined,
     isServerRegistered: () => Boolean(identity?.serverId),

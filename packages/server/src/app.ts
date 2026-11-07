@@ -1,4 +1,9 @@
 import { ouraRoutes } from "./routes/oura.js";
+import {
+  streamSyncSeedRoutes,
+  type StreamSyncSeedRouteDeps,
+} from "./routes/stream-sync-seed.js";
+import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -6,6 +11,10 @@ import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-c
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import {
+  StreamSyncHomeClosedError,
+  type StreamSyncIntake,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type {
@@ -15,7 +24,10 @@ import type {
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
-import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
+import type {
+  PersonalServerReadFulfillmentReporter,
+  StreamSyncReadPort,
+} from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import {
@@ -147,6 +159,15 @@ export interface AppDeps {
   accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
+  /** Desktop seed intake (§2.9); null or absent when stream sync writing is off. */
+  streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
+  /** Run intake (V2 §2); absent when stream sync writing is off. */
+  streamSyncIntake?: StreamSyncIntake;
+  /**
+   * False once the host is shutting down: stream-sync requests then answer
+   * 503 before they start a file operation, so the home can close and drain.
+   */
+  streamSyncAdmitting?: () => boolean;
   /** Read-side tombstone memory; reads of a deleted scope answer 410. */
   scopeDeletions?: ScopeDeletionTracker;
   serverSigner?: ServerSigner;
@@ -155,6 +176,8 @@ export interface AppDeps {
   dataStorage?: DataStoragePort;
   /** Canonical latest bodies for GET /v1/data; absent = file reads only. */
   legacyScopeView?: LegacyScopeViewPort;
+  /** Stream-sync reads (`streamSync.read`); absent = reads as before. */
+  streamSyncRead?: StreamSyncReadPort;
   /**
    * Gateway base URL — wired into the data route so the GET handler can
    * forward validated X-PAYMENTs to POST /v1/escrow/pay via direct fetch.
@@ -165,6 +188,7 @@ export interface AppDeps {
    * Off-by-default to keep dev / test setups frictionless.
    */
   paymentEnabled?: boolean;
+  ownAppAccountUrl?: string;
   /**
    * Lifetime in seconds of grants the server signs itself for MCP
    * connections (OAuth approve, scope-request approve with no live grant).
@@ -291,6 +315,14 @@ function isMcpPath(path: string): boolean {
     path === MCP_PATH ||
     path.startsWith(`${MCP_PATH}/`) ||
     MCP_WELL_KNOWN_PATHS.has(path)
+  );
+}
+
+function streamSyncClosing(): ProtocolError {
+  return new ProtocolError(
+    503,
+    "STREAM_SYNC_CLOSING",
+    "Stream sync is shutting down on this server",
   );
 }
 
@@ -498,6 +530,41 @@ export function createApp(deps: AppDeps): Hono {
 
   app.route("/v1/import/oura-browser", ouraRoutes(deps));
 
+  app.use("/v1/stream-sync/*", async (_c, next) => {
+    if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
+      throw streamSyncClosing();
+    }
+    await next();
+  });
+
+  app.route(
+    "/v1/stream-sync/seed",
+    streamSyncSeedRoutes({
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      streamSyncSeed: deps.streamSyncSeed ?? null,
+    }),
+  );
+
+  if (deps.streamSyncIntake) {
+    app.route(
+      "/v1/stream-sync/runs",
+      streamSyncRunsRoutes({
+        serverOrigin: deps.serverOrigin,
+        serverOwner: deps.serverOwner,
+        gateway: deps.gateway,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
+        tokenStore: deps.tokenStore,
+        intake: deps.streamSyncIntake,
+      }),
+    );
+  }
+
   // Mount data routes (ingest + read + delete)
   app.route(
     "/v1/data",
@@ -519,6 +586,7 @@ export function createApp(deps: AppDeps): Hono {
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
       legacyScopeView,
+      streamSyncRead: deps.streamSyncRead,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,
@@ -530,6 +598,7 @@ export function createApp(deps: AppDeps): Hono {
       gatewayUrl:
         deps.gatewayUrl ?? deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       paymentEnabled: deps.paymentEnabled,
+      ownAppAccountUrl: deps.ownAppAccountUrl,
       lineageGateway: deps.lineageGateway,
       writeSessionStore,
       writeProofReplayStore,
@@ -667,6 +736,7 @@ export function createApp(deps: AppDeps): Hono {
     gateway: deps.gateway,
     gatewayConfig: deps.gatewayConfig,
     paymentEnabled: deps.paymentEnabled,
+    ownAppAccountUrl: deps.ownAppAccountUrl,
     mcpGrantTtlSeconds: deps.mcpGrantTtlSeconds,
     devToken: deps.devToken,
     accessToken: deps.accessToken,
@@ -842,6 +912,8 @@ export function createApp(deps: AppDeps): Hono {
 
   // Global error handler
   app.onError((err, c) => {
+    // A request admitted just before shutdown can meet the closed home.
+    if (err instanceof StreamSyncHomeClosedError) err = streamSyncClosing();
     if (err instanceof ProtocolError) {
       deps.logger.warn({ err }, err.message);
       return c.json(err.toJSON(), err.code as 401 | 403 | 413 | 503);

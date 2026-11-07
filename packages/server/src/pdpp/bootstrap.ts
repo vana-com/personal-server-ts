@@ -20,6 +20,7 @@ import type { Logger } from "pino";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { manifestArtifact } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   AuthorizationSessionStore,
   declaredSourceId,
@@ -74,6 +75,13 @@ export type PdppAuthBootResult = PdppAuthRouteDeps & {
    * are those original bytes, carried forward from boot.
    */
   retainedDocuments: Map<string, string>;
+  /**
+   * The connector manifest documents behind the active configured methods:
+   * each was read from its pinned path, matched its pinned sha256, and
+   * carries a `connector_key` equal to its method id. The run intake resolves
+   * artifact digests to these bytes and to nothing else.
+   */
+  retainedManifests: string[];
   /** Configured artifact methods resolved through their retained declaration paths. */
   configuredMethods: { sourceId: string; methodId: string }[];
   /** Connection methods remain available when canonical record declarations are off. */
@@ -143,6 +151,11 @@ export async function createPdppAuthDeps(
     }
     return [{ sourceId, methodId: method.method_id }];
   });
+  const retainedManifests = await readMethodManifests(
+    config.pdpp.enabled ? config.pdpp.methods : [],
+    new Set(declarationSourceByPath.keys()),
+    logger,
+  );
   const connectionMethods = new Map<string, string[]>();
   for (const method of config.pdpp.connectionMethods ?? []) {
     const methods = connectionMethods.get(method.source_id) ?? [];
@@ -239,6 +252,7 @@ export async function createPdppAuthDeps(
     sessions,
     retainedDeclarations: registry.retained,
     retainedDocuments: registry.retainedDocuments,
+    retainedManifests,
     configuredMethods: activeConfiguredMethods,
     connectionMethods,
     resolveConnectionSourceId: (requested) =>
@@ -337,6 +351,66 @@ export async function createPdppAuthDeps(
     // grants use so a token minted here resolves sessions created above.
     ownerSubjectId: () => subjectId,
   };
+}
+
+/**
+ * Read the connector manifest each configured method pins.
+ *
+ * A manifest is kept only when its method references a retained declaration,
+ * its bytes match the pinned sha256, and its own `connector_key` equals the
+ * method id. A method that fails any check is logged with a reason class and
+ * left out, so its runs resolve to nothing and stay legacy-only. The key is
+ * never guessed from anything else.
+ */
+export async function readMethodManifests(
+  methods: ServerConfig["pdpp"]["methods"],
+  retainedDeclarationPaths: ReadonlySet<string>,
+  logger: Logger,
+): Promise<string[]> {
+  const out: string[] = [];
+  for (const method of methods) {
+    const methodId = method.method_id;
+    if (!retainedDeclarationPaths.has(resolve(method.declaration_path))) {
+      continue;
+    }
+    if (
+      method.manifest_path === undefined ||
+      method.manifest_sha256 === undefined
+    ) {
+      logger.warn(
+        { methodId, reason: "manifest_missing" },
+        "PDPP method has no pinned manifest — its runs stay legacy-only",
+      );
+      continue;
+    }
+    let document: string;
+    try {
+      document = await readFile(method.manifest_path, "utf-8");
+    } catch {
+      logger.warn(
+        { methodId, reason: "manifest_unreadable" },
+        "PDPP method manifest could not be read — its runs stay legacy-only",
+      );
+      continue;
+    }
+    const actual = createHash("sha256").update(document, "utf8").digest("hex");
+    if (actual !== method.manifest_sha256) {
+      logger.warn(
+        { methodId, reason: "manifest_digest_mismatch" },
+        "PDPP method manifest does not match its pinned digest — its runs stay legacy-only",
+      );
+      continue;
+    }
+    if (manifestArtifact(document)?.declarations.connector !== methodId) {
+      logger.warn(
+        { methodId, reason: "manifest_key_mismatch" },
+        "PDPP method manifest names a different connector key — its runs stay legacy-only",
+      );
+      continue;
+    }
+    out.push(document);
+  }
+  return out;
 }
 
 /**

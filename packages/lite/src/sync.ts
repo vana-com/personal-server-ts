@@ -1,8 +1,29 @@
 import {
+  StreamSyncWriter,
+  createStreamSyncIntake,
+  type ResolveArtifact,
+  type RunIntake,
+  createGatewayStreamSyncRegistry,
+  createStorageStreamSyncBlobs,
+  createStreamSyncKeyPorts,
+  bindStreamSyncHome,
+  streamSyncNetwork,
+  type StreamSyncFiles,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { openIndexedDbStreamSyncHome } from "./stream-sync-files.js";
+import {
   createVersionInventoryClient,
   type DurableAdditionsService,
 } from "@opendatalabs/personal-server-ts-core/additions";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  createMemoryStreamSyncReadFiles,
+  createStorageBlobReader,
+  createStreamSyncReadKeys,
+  StreamSyncReadService,
+  type StreamSyncOverlaySource,
+  type StreamSyncReadFiles,
+} from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import {
@@ -88,6 +109,20 @@ export interface PsLiteOwnerSyncSigner
 
 export interface PsLiteSyncOptions {
   config: ServerConfig;
+  /**
+   * Durable files for whole-file stream sync, used only when
+   * `config.streamSync.write` is on. Given the home id of the (owner,
+   * network), it returns files stored at a location derived from that id. The
+   * host then owns "one live writer per home". Defaults to IndexedDB named by
+   * the home id, held under an exclusive Web Lock.
+   */
+  streamSyncFiles?: (homeId: string) => StreamSyncFiles;
+  /**
+   * Resolves a run's `artifactDigest` to declarations the host verified
+   * (run-intake contract v2 §6). Without it every run answers
+   * `unknown_artifact`.
+   */
+  streamSyncDeclarations?: ResolveArtifact;
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;
@@ -123,6 +158,16 @@ export interface PsLiteSyncOptions {
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   /** Post-index download hook (marks derivative questions stale). */
   onDataPointIndexed?: DownloadWorkerDeps["onDataPointIndexed"];
+  /**
+   * Stream-sync reads (`streamSync.read`). Present = on: the sync loop
+   * imports stream heads, and the returned `streamSyncRead` answers reads.
+   * Without `files`, state is in memory and rebuilt by a full listing on
+   * each start.
+   */
+  streamSyncRead?: {
+    readonly files?: StreamSyncReadFiles;
+    readonly overlay?: StreamSyncOverlaySource;
+  };
 }
 
 function createBrowserLogger(logger?: Logger): Logger {
@@ -261,6 +306,17 @@ export async function createPsLiteSyncManager(
   serverOwner: `0x${string}`;
   dataPointFeed: DataPointFeedPort;
   scopeDeletions: ScopeDeletionTracker;
+  /**
+   * Null when writing is off, or when another instance holds this owner's
+   * stream-sync home (or the runtime has no `navigator.locks`): stream sync
+   * does not run here; legacy sync does.
+   */
+  streamSyncWriter: StreamSyncWriter | null;
+  /** Releases the stream-sync home's lock and database. */
+  closeStreamSync(): Promise<void>;
+  /** In-process run intake for the host's own connector runs; null when writing is off. */
+  streamSyncIntake: RunIntake | null;
+  streamSyncRead?: StreamSyncReadService;
 }> {
   const additionsTimeBudgetMs = options.additionsTimeBudgetMs ?? 10_000;
   const additionsByteBudget = options.additionsByteBudget ?? 8 * 1024 * 1024;
@@ -397,9 +453,64 @@ export async function createPsLiteSyncManager(
       },
     }),
   );
+  const streamSyncRead = options.streamSyncRead
+    ? await StreamSyncReadService.open({
+        files:
+          options.streamSyncRead.files ?? createMemoryStreamSyncReadFiles(),
+        blobs: createStorageBlobReader(storageAdapter),
+        keys: await createStreamSyncReadKeys(masterKey),
+        logger: logger as never,
+        ...(options.streamSyncRead.overlay
+          ? { overlay: options.streamSyncRead.overlay }
+          : {}),
+      })
+    : undefined;
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
+  // Whole-file stream sync publishes beside the legacy upload, only when
+  // `streamSync.write` is on. Legacy uploads run unchanged either way.
+  const streamSyncNet = streamSyncNetwork(options.config.gateway);
+  const streamSyncHome = options.config.streamSync?.write
+    ? options.streamSyncFiles
+      ? {
+          home: bindStreamSyncHome({
+            ownerAddress: serverOwner,
+            network: streamSyncNet,
+            open: options.streamSyncFiles,
+          }),
+          close: async () => {},
+        }
+      : await openIndexedDbStreamSyncHome({
+          ownerAddress: serverOwner,
+          network: streamSyncNet,
+        })
+    : null;
+  if (options.config.streamSync?.write && !streamSyncHome) {
+    logger.info(
+      {},
+      "Stream sync is off in this instance: its storage is held by another instance, or Web Locks are unavailable",
+    );
+  }
+  const streamSyncWriter = streamSyncHome
+    ? new StreamSyncWriter({
+        ownerAddress: serverOwner,
+        registry: createGatewayStreamSyncRegistry({
+          gatewayUrl: options.config.gateway.url,
+          ownerAddress: serverOwner,
+        }),
+        blobs: createStorageStreamSyncBlobs(storageAdapter),
+        home: streamSyncHome.home,
+        keys: createStreamSyncKeyPorts(options.ownerSignature),
+        signer,
+      })
+    : null;
+  const streamSyncIntake = streamSyncWriter
+    ? createStreamSyncIntake({
+        writer: streamSyncWriter,
+        resolveArtifact: options.streamSyncDeclarations ?? (() => null),
+      })
+    : null;
   const syncManager = createSyncManager(
     {
       additions,
@@ -426,8 +537,12 @@ export async function createPsLiteSyncManager(
       dataPointFeed,
       scopeDeletions,
       onDataPointIndexed: options.onDataPointIndexed,
+      streamSync: streamSyncRead,
     },
     {
+      streamSync: streamSyncWriter
+        ? { write: true, publisher: streamSyncWriter }
+        : null,
       deleteData,
       pendingBlobDeletions,
       tombstoneFinality,
@@ -458,5 +573,17 @@ export async function createPsLiteSyncManager(
     },
   );
   if (options.autoStartSync !== false) syncManager.start();
-  return { syncManager, additions, serverOwner, dataPointFeed, scopeDeletions };
+  return {
+    syncManager,
+    additions,
+    serverOwner,
+    dataPointFeed,
+    scopeDeletions,
+    streamSyncWriter,
+    closeStreamSync: async () => {
+      await streamSyncHome?.close();
+    },
+    streamSyncIntake,
+    streamSyncRead,
+  };
 }

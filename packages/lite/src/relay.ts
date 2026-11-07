@@ -775,8 +775,11 @@ export function buildHttpResponse(
   // bridge lowercases it, so without this the head would carry two conflicting
   // content-length values and clients reject that (the same mismatch class this
   // change fixes). Match case-insensitively in case the name wasn't normalized.
+  // Transfer-Encoding framed the hop from the runtime, whose body is now
+  // buffered whole; copied onward it would override content-length.
   for (const key of Object.keys(responseHeaders)) {
-    if (key.toLowerCase() === "content-length") {
+    const name = key.toLowerCase();
+    if (name === "content-length" || name === "transfer-encoding") {
       delete responseHeaders[key];
     }
   }

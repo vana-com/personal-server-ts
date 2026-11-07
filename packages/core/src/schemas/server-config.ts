@@ -51,6 +51,15 @@ export const DEFAULTS = {
     enabled: false,
     lastProcessedTimestamp: null,
   },
+  streamSync: {
+    // Whole-file stream sync publish. Off by default; legacy uploads are
+    // unchanged either way.
+    write: false,
+    // Off by default. When true, this server imports stream-sync heads and
+    // serves logical reads from complete stream views (§2.10). When false,
+    // reads are exactly as before.
+    read: false,
+  },
   replication: {
     // Off by default. When false, no replica code runs and no replica
     // schema is created. When true, the record store is built with the
@@ -92,7 +101,18 @@ export const DEFAULTS = {
     declarationPaths: [] as Array<string | { path: string; sha256: string }>,
     // At most one acquisition method may write each retained source. The
     // declaration path ties an artifact method id to the source it produces.
-    methods: [] as Array<{ method_id: string; declaration_path: string }>,
+    //
+    // A method may also pin the connector's signed manifest document
+    // (`manifest_path` plus the sha256 of its exact bytes). The stream-sync
+    // run intake resolves a run's artifact digest only to a manifest pinned
+    // this way, and takes the connector key from the manifest's own
+    // `connector_key`, which must equal `method_id` (the signed pin id).
+    methods: [] as Array<{
+      method_id: string;
+      declaration_path: string;
+      manifest_path?: string;
+      manifest_sha256?: string;
+    }>,
     optInMethods: [] as string[],
     // Per-source connection methods are independent of canonical record
     // declarations. They let Desktop manage account handles while canonical
@@ -203,6 +223,7 @@ export const ServerConfigSchema = z.object({
   payment: z
     .object({
       enabled: z.boolean().default(DEFAULTS.payment.enabled),
+      ownAppAccountUrl: z.url().optional(),
     })
     .default(DEFAULTS.payment),
   sync: z
@@ -215,6 +236,12 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.sync.lastProcessedTimestamp),
     })
     .default(DEFAULTS.sync),
+  streamSync: z
+    .object({
+      write: z.boolean().default(DEFAULTS.streamSync.write),
+      read: z.boolean().default(DEFAULTS.streamSync.read),
+    })
+    .default(DEFAULTS.streamSync),
   replication: z
     .object({
       enabled: z.boolean().default(DEFAULTS.replication.enabled),
@@ -286,6 +313,11 @@ export const ServerConfigSchema = z.object({
           z.object({
             method_id: z.string().min(1),
             declaration_path: z.string().min(1),
+            manifest_path: z.string().min(1).optional(),
+            manifest_sha256: z
+              .string()
+              .regex(/^[0-9a-f]{64}$/, "lowercase hex sha256")
+              .optional(),
           }),
         )
         .default(DEFAULTS.pdpp.methods),

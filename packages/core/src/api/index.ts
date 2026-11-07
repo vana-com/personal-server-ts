@@ -1,3 +1,4 @@
+import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
@@ -43,6 +44,7 @@ import {
   listAccessLogsContract,
   listDataScopesContract,
   listDataVersionsContract,
+  parseDataReadScopeContract,
   parseDataScopeContract,
   parseJsonObjectBody,
   readDataContract,
@@ -94,6 +96,10 @@ import {
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
+import type {
+  ReadDecision,
+  ResolveInput,
+} from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
   deletionHistoryOf,
@@ -316,6 +322,11 @@ export interface PersonalServerIngestSyncManager {
   deleteScope?(scope: string): Promise<DeleteScopeResult>;
 }
 
+/** The read side of stream sync, as the data API uses it. */
+export interface StreamSyncReadPort {
+  resolve(input: ResolveInput): Promise<ReadDecision>;
+}
+
 export interface PersonalServerDataApiDeps {
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
@@ -325,6 +336,13 @@ export interface PersonalServerDataApiDeps {
    * Explicit versions (`fileId`, `at`) always read from `storage`.
    */
   legacyScopeView?: LegacyScopeViewPort;
+  /**
+   * Stream-sync reads (`streamSync.read`). Absent = every read takes the
+   * existing path, unchanged. Present: a latest read of a name a stream view
+   * can serve is answered from the view (§2.10); a deleted connector's
+   * names are refused at every version.
+   */
+  streamSyncRead?: StreamSyncReadPort;
   auth: PersonalServerApiAuthPort;
   accessLogWriter: AccessLogWriter;
   syncManager?: PersonalServerIngestSyncManager | null;
@@ -386,6 +404,8 @@ export interface PersonalServerDataApiDeps {
    * serve. When false (default), reads bypass payment entirely.
    */
   paymentEnabled?: boolean;
+  /** Operator-selected Account authority. Never taken from a read request. */
+  ownAppAccountUrl?: string;
   /**
    * Test seam for the gateway forwarding fetch. Defaults to the global
    * `fetch`; tests inject a mock that returns specific gateway statuses.
@@ -617,6 +637,121 @@ function errorResponse(
   );
 }
 
+/** The response for a stream-sync decision that serves nothing; `null` otherwise. */
+function streamSyncRefusal(decision: ReadDecision): Response | null {
+  switch (decision.kind) {
+    case "unavailable":
+      return decision.reason === "connection_not_found"
+        ? errorResponse(
+            404,
+            "CONNECTION_NOT_FOUND",
+            "No connection of this name's connector matches the connection parameter",
+          )
+        : null;
+    case "key_mismatch":
+      return errorResponse(
+        503,
+        "KEY_MISMATCH",
+        "This data was written with another owner key and cannot be read here",
+      );
+    case "cursor_stale":
+      return errorResponse(
+        409,
+        "CURSOR_STALE",
+        "The cursor names a version this server no longer holds; read again without it",
+      );
+    case "invalid_cursor":
+      return errorResponse(400, "INVALID_CURSOR", "cursor is not valid");
+    case "invalid_connection":
+      return errorResponse(
+        400,
+        "INVALID_CONNECTION",
+        "connection must be empty or 16 lowercase hex characters",
+      );
+    case "too_large":
+      return errorResponse(
+        503,
+        "TOO_LARGE",
+        "This legacy view is larger than this server can build; read its streams instead",
+      );
+    default:
+      return null;
+  }
+}
+
+/**
+ * Serve a stream view: the envelope streams part by part. A charged read
+ * has already paid (`paymentResponseHeader`).
+ */
+async function serveStreamSyncView(
+  deps: PersonalServerDataApiDeps,
+  request: Request,
+  input: {
+    scope: string;
+    grantId: string | undefined;
+    authResult: Awaited<
+      ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+    >;
+    decision: Extract<ReadDecision, { kind: "view" }>;
+    paymentResponseHeader: string | undefined;
+  },
+): Promise<Response> {
+  const { authResult, decision } = input;
+  const logId = deps.createLogId?.() ?? crypto.randomUUID();
+  const timestamp = (deps.now ?? (() => new Date()))().toISOString();
+  const ipAddress =
+    request.headers.get("x-forwarded-for") ??
+    request.headers.get("x-real-ip") ??
+    "unknown";
+  const userAgent = request.headers.get("user-agent") ?? "unknown";
+  try {
+    await deps.accessLogWriter.write({
+      logId,
+      grantId: authResult?.grantId ?? input.grantId ?? "unknown",
+      builder: authResult?.builder ?? "unknown",
+      action: "read",
+      scope: input.scope,
+      timestamp,
+      ipAddress,
+      userAgent,
+    });
+  } catch (error) {
+    await decision.body.cancel();
+    throw error;
+  }
+  if (authResult?.grantId && authResult.builder) {
+    reportPersonalServerReadFulfillment(deps, {
+      builder: authResult.builder,
+      fileId: undefined,
+      grantId: authResult.grantId,
+      ipAddress,
+      logId,
+      outcome: "served",
+      scope: input.scope,
+      servedAt: timestamp,
+      source: "api",
+      userAgent,
+    });
+  }
+  // A projection can fail after the 200 status. The client must then see
+  // the connection abort, never a complete shorter body. Chunked framing
+  // also keeps @hono/node-server from reading the body ahead of the status:
+  // a failure in that read-ahead would end the response with a
+  // content-length of the bytes read so far, as if it were whole.
+  return new Response(decision.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "X-Vana-Data-Source": "stream-sync",
+      "X-Stream-Sync-Cursor": decision.cursor,
+      ...(input.paymentResponseHeader
+        ? { "X-PAYMENT-RESPONSE": input.paymentResponseHeader }
+        : {}),
+    },
+  });
+}
+
 function methodNotAllowed(): Response {
   return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
 }
@@ -792,12 +927,200 @@ function listAuthCovers(
   );
 }
 
+/**
+ * Whether the app reading is the data owner's own app, which is exempt from
+ * the read fee. `false` when no Account authority is configured or the read
+ * is owner-signalled; a `Response` (503) when eligibility cannot be
+ * verified, so a read is never served free on missing evidence.
+ */
+async function ownAppReadStatus(
+  deps: PersonalServerDataApiDeps,
+  authResult: Awaited<
+    ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+  >,
+): Promise<boolean | Response> {
+  const isOwnerSignal =
+    authResult?.grantId === "owner" || authResult?.grantId === "policy-bypass";
+  const builder = authResult?.builder;
+  if (
+    !deps.paymentEnabled ||
+    isOwnerSignal ||
+    !authResult?.grantId ||
+    !builder ||
+    !deps.ownAppAccountUrl
+  ) {
+    return false;
+  }
+  const unavailable = () =>
+    errorResponse(
+      503,
+      "OWN_APP_ELIGIBILITY_UNAVAILABLE",
+      "Own-app fee eligibility could not be verified",
+    );
+  if (!deps.serverOwner || !deps.gatewayConfig) return unavailable();
+  try {
+    return await isOwnAppRead({
+      accountUrl: deps.ownAppAccountUrl,
+      appAddress: builder,
+      dataOwner: deps.serverOwner,
+      chainId: deps.gatewayConfig.chainId,
+    });
+  } catch {
+    return unavailable();
+  }
+}
+
+/** What a charged builder read pays with; see `readCharge`. */
+interface ReadCharge {
+  grantId: string;
+  builder: `0x${string}`;
+  gateway: Pick<GatewayClient, "getGrant">;
+  gatewayConfig: DataPortabilityGatewayConfig;
+  gatewayUrl: string;
+}
+
+/**
+ * Whether a read is charged, and with what. Owner-exempt reads (the grantId
+ * sentinels "owner" / "policy-bypass") are never charged: there is no
+ * payable op to attach the payment to. The grantId paid against is the one
+ * verifyDataReadPolicy resolved from the Web3Signed payload (authoritative
+ * source), not the URL / header hint, which may be absent when the payload
+ * carries it. `null` = served free.
+ */
+function readCharge(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+  authResult: Awaited<
+    ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+  >,
+  ownAppRead: boolean,
+): ReadCharge | null {
+  const isOwnerSignal =
+    authResult?.grantId === "owner" || authResult?.grantId === "policy-bypass";
+  const builder = authResult?.builder;
+  const resolvedGrantId =
+    !isOwnerSignal && authResult?.grantId ? authResult.grantId : undefined;
+  const willCharge = Boolean(
+    deps.paymentEnabled &&
+    !isOwnerSignal &&
+    !ownAppRead &&
+    typeof builder === "string" &&
+    builder.startsWith("0x") &&
+    resolvedGrantId &&
+    deps.gateway &&
+    deps.gatewayConfig &&
+    deps.gatewayUrl,
+  );
+  // Diagnostic: makes it explicit why a read is/isn't charged. x402 has
+  // many "served free" branches (owner read, payment disabled, missing
+  // gateway deps); this surfaces the deciding inputs.
+  //
+  // Routing: when a logger is wired (the Node server always provides one),
+  // log the full detail through it at debug level so the operator's level
+  // controls + redaction apply and access metadata (scope/grantId/builder)
+  // doesn't unconditionally hit stdout. The browser PS-Lite runtime wires
+  // no logger; there we fall back to console but log ONLY the non-identifying
+  // decision booleans — never scope/grantId/builder.
+  if (deps.logger?.debug) {
+    deps.logger.debug(
+      {
+        scope,
+        grantId: authResult?.grantId,
+        isOwnerSignal,
+        builder,
+        resolvedGrantId,
+        paymentEnabled: Boolean(deps.paymentEnabled),
+        hasGateway: Boolean(deps.gateway),
+        hasGatewayConfig: Boolean(deps.gatewayConfig),
+        hasGatewayUrl: Boolean(deps.gatewayUrl),
+        willCharge,
+      },
+      "[x402-gate] read",
+    );
+  } else {
+    console.info("[x402-gate] read", {
+      isOwnerSignal,
+      paymentEnabled: Boolean(deps.paymentEnabled),
+      hasGateway: Boolean(deps.gateway),
+      hasGatewayConfig: Boolean(deps.gatewayConfig),
+      hasGatewayUrl: Boolean(deps.gatewayUrl),
+      willCharge,
+    });
+  }
+  if (
+    !willCharge ||
+    !resolvedGrantId ||
+    !deps.gateway ||
+    !deps.gatewayConfig ||
+    !deps.gatewayUrl
+  ) {
+    return null;
+  }
+  return {
+    grantId: resolvedGrantId,
+    builder: builder as `0x${string}`,
+    gateway: deps.gateway,
+    gatewayConfig: deps.gatewayConfig,
+    gatewayUrl: deps.gatewayUrl,
+  };
+}
+
+/**
+ * The X402 step of a charged read: a response to return instead of the
+ * body (a fresh 402 challenge, or the gateway's error relayed verbatim so
+ * the builder can dispatch on it), or the X-PAYMENT-RESPONSE value to send
+ * with the body once the gateway accepted the payment.
+ */
+async function payForRead(
+  deps: PersonalServerDataApiDeps,
+  request: Request,
+  charge: ReadCharge,
+  read: Pick<
+    X402CycleInput,
+    "scope" | "fileIdParam" | "atParam" | "servedEntry"
+  >,
+): Promise<
+  | { kind: "refused"; response: Response }
+  | { kind: "paid"; paymentResponseHeader: string | undefined }
+> {
+  const x402Result = await handleX402Cycle({
+    deps,
+    request,
+    ...read,
+    ...charge,
+  });
+  if (x402Result.kind === "challenge") {
+    return {
+      kind: "refused",
+      response: jsonResponse(x402Result.body, { status: 402 }),
+    };
+  }
+  if (x402Result.kind === "gateway-error") {
+    return {
+      kind: "refused",
+      response: jsonResponse(x402Result.body, { status: x402Result.status }),
+    };
+  }
+  // The gateway's success body goes back to the builder in
+  // X-PAYMENT-RESPONSE (canonical X402 convention) so callers can see
+  // breakdown / paidAt / paymentNonce without a second gateway round-trip.
+  return {
+    kind: "paid",
+    paymentResponseHeader: encodePaymentResponseHeader(x402Result.payResponse),
+  };
+}
+
 export interface X402CycleInput {
   deps: PersonalServerDataApiDeps;
   request: Request;
   scope: string;
   fileIdParam?: string;
   atParam?: string;
+  /**
+   * The registered data point version the served body comes from, when it
+   * is not the stored entry of `scope`: a stream view serves a stream head.
+   */
+  servedEntry?: { scope: string; version: number };
   grantId: string;
   builder: `0x${string}`;
   gateway: Pick<GatewayClient, "getGrant">;
@@ -850,19 +1173,30 @@ export async function handleX402Cycle(
   }
 
   // Bind the accessRecord to the entry being served, if it exists and has
-  // been registered with DPv2 yet.
-  const entryRow = deps.storage.findEntry({
-    scope,
-    fileId: input.fileIdParam,
-    at: input.atParam,
-  });
-  const entryForChallenge = entryRow
-    ? {
-        dataPointId: entryRow.dataPointId as `0x${string}` | null,
+  // been registered with DPv2 yet. A served stream head is registered: it
+  // was listed from the registry.
+  const entryRow = input.servedEntry
+    ? undefined
+    : deps.storage.findEntry({
         scope,
-        version: entryRow.version,
+        fileId: input.fileIdParam,
+        at: input.atParam,
+      });
+  const entryForChallenge = input.servedEntry
+    ? {
+        dataPointId: deps.serverOwner
+          ? computeDataPointId(deps.serverOwner, input.servedEntry.scope)
+          : null,
+        scope: input.servedEntry.scope,
+        version: input.servedEntry.version,
       }
-    : undefined;
+    : entryRow
+      ? {
+          dataPointId: entryRow.dataPointId as `0x${string}` | null,
+          scope,
+          version: entryRow.version,
+        }
+      : undefined;
 
   // `grant` is narrowed to non-null above, but that narrowing is not carried
   // into this closure (vana-sdk 3.14.0 made getGrant return `... | null`), so
@@ -2199,7 +2533,11 @@ export async function handlePersonalServerDataRequest(
     logContext.route = `${request.method} ${options.basePath ?? "/v1/data"}/:scope`;
 
     if (request.method === "GET") {
-      const scopeResult = parseDataScopeContract(scopeParam);
+      // Stream names are read names only while stream-sync reads are on; with
+      // the flag off every read answers as before.
+      const scopeResult = deps.streamSyncRead
+        ? parseDataReadScopeContract(scopeParam)
+        : parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       logContext.detail = { scope: scopeResult.scope };
       // An empty `fileId=` or `at=` selects no version: it is the latest
@@ -2241,6 +2579,68 @@ export async function handlePersonalServerDataRequest(
         fileIdParam === undefined && atParam === undefined && view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
+      // Stream-sync (§2.10): the one eligibility rule decides between the
+      // stream view, the existing body and a refusal. Explicit versions stay
+      // legacy history, but a deleted connector serves nothing at all.
+      const latestRead =
+        fileIdParam === undefined && atParam === undefined && view === null;
+      if (deps.streamSyncRead) {
+        const decision = await deps.streamSyncRead.resolve({
+          scope: scopeResult.scope,
+          connection: latestRead ? url.searchParams.get("connection") : null,
+          cursor: latestRead ? url.searchParams.get("cursor") : null,
+          legacyFile: Boolean(selectedEntry) || latest?.kind === "canonical",
+        });
+        if (decision.kind === "unavailable" && decision.reason === "deleted") {
+          throw new DataDeletedError({ scope: scopeResult.scope });
+        }
+        if (latestRead) {
+          const refusal = streamSyncRefusal(decision);
+          if (refusal) return refusal;
+          if (decision.kind === "view") {
+            notifyDataRead(deps, { scope: scopeResult.scope });
+            // The same charge as a file read; the access record binds the
+            // stream head the view serves.
+            let paymentResponseHeader: string | undefined;
+            const ownApp = await ownAppReadStatus(deps, authResult);
+            if (ownApp instanceof Response) {
+              await decision.body.cancel();
+              return ownApp;
+            }
+            const charge = readCharge(
+              deps,
+              scopeResult.scope,
+              authResult,
+              ownApp,
+            );
+            if (charge) {
+              let paid: Awaited<ReturnType<typeof payForRead>>;
+              try {
+                paid = await payForRead(deps, request, charge, {
+                  scope: scopeResult.scope,
+                  servedEntry: decision.served,
+                });
+              } catch (error) {
+                await decision.body.cancel();
+                throw error;
+              }
+              if (paid.kind === "refused") {
+                await decision.body.cancel();
+                return paid.response;
+              }
+              paymentResponseHeader = paid.paymentResponseHeader;
+            }
+            return serveStreamSyncView(deps, request, {
+              scope: scopeResult.scope,
+              grantId,
+              authResult,
+              decision,
+              paymentResponseHeader,
+            });
+          }
+        }
+      }
+
       // The deletion history comes with the body the view chose, never from
       // a later ownership query a concurrent write could change.
       const canonicalOwned =
@@ -2282,113 +2682,28 @@ export async function handlePersonalServerDataRequest(
         return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
       }
 
-      // X402 payment dance for builder reads. Owner-exempt reads (the
-      // grantId sentinels "owner" / "policy-bypass") skip payment entirely
-      // since there's no payable op to attach the payment to.
-      //
-      // The grantId we pay against is the one verifyDataReadPolicy resolved
-      // from the Web3Signed payload (authoritative source) — not the URL /
-      // header hint, which may be absent when the payload carries it.
-      const isOwnerSignal =
-        authResult?.grantId === "owner" ||
-        authResult?.grantId === "policy-bypass";
-      const builder = authResult?.builder;
-      const resolvedGrantId =
-        !isOwnerSignal && authResult?.grantId ? authResult.grantId : undefined;
-      const willCharge = Boolean(
-        deps.paymentEnabled &&
-        !isOwnerSignal &&
-        typeof builder === "string" &&
-        builder.startsWith("0x") &&
-        resolvedGrantId &&
-        deps.gateway &&
-        deps.gatewayConfig &&
-        deps.gatewayUrl,
-      );
-      // Diagnostic: makes it explicit why a read is/isn't charged. x402 has
-      // many "served free" branches (owner read, payment disabled, missing
-      // gateway deps); this surfaces the deciding inputs.
-      //
-      // Routing: when a logger is wired (the Node server always provides one),
-      // log the full detail through it at debug level so the operator's level
-      // controls + redaction apply and access metadata (scope/grantId/builder)
-      // doesn't unconditionally hit stdout. The browser PS-Lite runtime wires
-      // no logger; there we fall back to console but log ONLY the non-identifying
-      // decision booleans — never scope/grantId/builder.
-      if (deps.logger?.debug) {
-        deps.logger.debug(
-          {
-            scope: scopeResult.scope,
-            grantId: authResult?.grantId,
-            isOwnerSignal,
-            builder,
-            resolvedGrantId,
-            paymentEnabled: Boolean(deps.paymentEnabled),
-            hasGateway: Boolean(deps.gateway),
-            hasGatewayConfig: Boolean(deps.gatewayConfig),
-            hasGatewayUrl: Boolean(deps.gatewayUrl),
-            willCharge,
-          },
-          "[x402-gate] read",
-        );
-      } else {
-        console.info("[x402-gate] read", {
-          isOwnerSignal,
-          paymentEnabled: Boolean(deps.paymentEnabled),
-          hasGateway: Boolean(deps.gateway),
-          hasGatewayConfig: Boolean(deps.gatewayConfig),
-          hasGatewayUrl: Boolean(deps.gatewayUrl),
-          willCharge,
-        });
-      }
-      if (willCharge && latest?.kind === "canonical") {
+      // X402 payment dance for builder reads (see `readCharge`).
+      const ownApp = await ownAppReadStatus(deps, authResult);
+      if (ownApp instanceof Response) return ownApp;
+      const charge = readCharge(deps, scopeResult.scope, authResult, ownApp);
+      if (charge && latest?.kind === "canonical") {
         return legacyViewRefusalResponse(scopeResult.scope, {
           status: "unavailable",
           reason: "paid_read_unsupported",
         });
       }
-      // Keep the full condition inline (not `if (willCharge)`) so TS narrows
-      // deps.gateway/gatewayConfig/gatewayUrl to non-undefined in the block.
-      if (
-        deps.paymentEnabled &&
-        !isOwnerSignal &&
-        typeof builder === "string" &&
-        builder.startsWith("0x") &&
-        resolvedGrantId &&
-        deps.gateway &&
-        deps.gatewayConfig &&
-        deps.gatewayUrl
-      ) {
-        const x402Result = await handleX402Cycle({
-          deps,
-          request,
+      if (charge) {
+        const paid = await payForRead(deps, request, charge, {
           scope: scopeResult.scope,
           fileIdParam,
           atParam,
-          grantId: resolvedGrantId,
-          builder: builder as `0x${string}`,
-          gateway: deps.gateway,
-          gatewayConfig: deps.gatewayConfig,
-          gatewayUrl: deps.gatewayUrl,
         });
-        if (x402Result.kind === "challenge") {
-          return jsonResponse(x402Result.body, { status: 402 });
-        }
-        if (x402Result.kind === "gateway-error") {
-          // Relay the gateway's structured body verbatim so the builder can
-          // dispatch on it (insufficient balance vs. replay vs. race etc.).
-          return jsonResponse(x402Result.body, { status: x402Result.status });
-        }
-        // x402Result.kind === "ok" — payment accepted, proceed to read.
-        // The gateway's success body is forwarded back to the builder via
-        // X-PAYMENT-RESPONSE (canonical X402 convention) so callers can see
-        // breakdown / paidAt / paymentNonce without a second gateway round-trip.
-        paymentResponseHeader = encodePaymentResponseHeader(
-          x402Result.payResponse,
-        );
+        if (paid.kind === "refused") return paid.response;
+        paymentResponseHeader = paid.paymentResponseHeader;
       }
 
       const headers: Record<string, string> = {};
+      if (ownApp) headers["X-Vana-Payment-Exemption"] = "own-app";
       headers["X-Vana-Data-Source"] =
         latest?.kind === "canonical" ? "canonical" : "legacy";
       let envelope: DataFileEnvelope;

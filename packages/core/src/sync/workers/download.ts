@@ -1,4 +1,5 @@
 import { isReplicaScope } from "../../replication/namespace.js";
+import { isPhysicalScope } from "../../stream-sync/scope-routing.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   DataFileEnvelopeSchema,
@@ -117,6 +118,25 @@ export interface DownloadWorkerDeps {
    * the newer one.
    */
   pdppImporter?: PdppImporter;
+  /**
+   * Stream-sync read side (`streamSync.read`). Physical stream-sync rows
+   * (`pdpp.<c>~<ns>…`) are never legacy data points: with or without this
+   * port they are routed away from every legacy step. With it, each listed
+   * page's physical rows are handed over before the cursor moves, and the
+   * import runs after the page; an import failure never blocks the cursor.
+   */
+  streamSync?: StreamSyncListingObserver;
+}
+
+export interface StreamSyncListingObserver {
+  /** The next listing must start at the registry's first page. */
+  wantsListingFromStart(): boolean;
+  /** Persist a listed page's physical rows. Throws if they were not persisted. */
+  observe(
+    rows: readonly DataPointFeedRecord[],
+    page: { readonly fromStart: boolean; readonly lastPage: boolean },
+  ): Promise<void>;
+  importPending(): Promise<void>;
 }
 
 export interface DeletionReconcileResult {
@@ -167,6 +187,7 @@ export async function downloadScopes(
   const results: DownloadResult[] = [];
 
   for (const scope of scopes) {
+    if (isPhysicalScope(scope)) continue;
     const dataPoint = await feed.getDataPoint({
       ownerAddress: deps.serverOwner,
       scope,
@@ -276,6 +297,9 @@ export async function downloadOne(
   record: DataPointRecord,
 ): Promise<DownloadResult | null> {
   if (isReplicaScope(record.scope)) return null;
+  // Ruling Q7: stream-sync rows are not legacy data points; their reads are
+  // routed by the stream-sync importer, never by the SDK scope helpers.
+  if (isPhysicalScope(record.scope)) return null;
   const { storage, storageAdapter, masterKey, logger, diagnostics } = deps;
   const ctx: RecordContext = { dataPointId: record.id, schemaId: null };
 
@@ -599,7 +623,9 @@ export async function downloadAll(
 
   // 1. Read cursor (opaque pagination cursor persisted across runs)
   const lastCursor =
-    options.fullReconcile || repairSummary.missingEnvelopeEntries > 0
+    options.fullReconcile ||
+    repairSummary.missingEnvelopeEntries > 0 ||
+    deps.streamSync?.wantsListingFromStart()
       ? null
       : await cursor.read();
   if (options.fullReconcile) {
@@ -627,11 +653,32 @@ export async function downloadAll(
   // deletion made on another replica must reach this one or its local copy
   // would be re-uploaded and resurrect the point.
   const feed = deps.dataPointFeed ?? feedFromGatewayClient(gateway);
-  const { dataPoints, cursor: nextCursor } = await feed.listDataPointsByOwner(
-    serverOwner,
-    lastCursor,
-    { includeDeleted: true },
+  const listed = await feed.listDataPointsByOwner(serverOwner, lastCursor, {
+    includeDeleted: true,
+  });
+  const nextCursor = listed.cursor;
+  // Stream-sync rows go to the stream-sync read side only; no legacy step
+  // (deletion memory, tombstone reconcile, download) can handle their names.
+  const dataPoints = listed.dataPoints.filter(
+    (dataPoint) => !isPhysicalScope(dataPoint.scope),
   );
+  let failed = false;
+  if (deps.streamSync) {
+    try {
+      await deps.streamSync.observe(
+        listed.dataPoints.filter((dataPoint) =>
+          isPhysicalScope(dataPoint.scope),
+        ),
+        { fromStart: lastCursor === null, lastPage: nextCursor === null },
+      );
+    } catch (err) {
+      logger.error(
+        { error: (err as Error).message },
+        "Failed to record stream-sync registry rows",
+      );
+      failed = true;
+    }
+  }
 
   // Feed the read-side deletion memory before any per-record work so a
   // tombstone is refused by reads even if its local reconcile below fails.
@@ -659,11 +706,11 @@ export async function downloadAll(
   }
 
   const results: DownloadResult[] = [];
-  let failed = false;
 
   // 3. Process each data point record
   for (const dataPoint of dataPoints) {
     if (isReplicaScope(dataPoint.scope)) continue;
+    if (isPhysicalScope(dataPoint.scope)) continue;
     const deletedAt = deletionTimestamp(dataPoint);
     if (deletedAt !== null) {
       // Tombstone: never download; drop what the deletion covers locally.
@@ -756,6 +803,17 @@ export async function downloadAll(
       { nextCursor },
       "Download cursor not advanced because one or more data points failed",
     );
+  }
+
+  if (deps.streamSync) {
+    try {
+      await deps.streamSync.importPending();
+    } catch (err) {
+      logger.warn(
+        { error: (err as Error).message },
+        "Stream-sync import did not complete; retried next cycle",
+      );
+    }
   }
 
   return results;

@@ -108,6 +108,67 @@ describe("SyncManager", () => {
     await manager.stop();
   });
 
+  describe("stream sync write flag", () => {
+    it("runs only the legacy upload when streamSync.write is off", async () => {
+      const publisher = { cycle: vi.fn(async () => ({ runs: [] })) };
+      const manager = createSyncManager(
+        makeMockUploadDeps(),
+        makeMockDownloadDeps(),
+        { pollInterval: 60_000, streamSync: { write: false, publisher } },
+      );
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(uploadAll).toHaveBeenCalledTimes(1);
+      expect(publisher.cycle).not.toHaveBeenCalled();
+      await manager.stop();
+    });
+
+    it("publishes after the legacy upload when streamSync.write is on", async () => {
+      const order: string[] = [];
+      (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        order.push("legacy");
+        return [];
+      });
+      const publisher = {
+        cycle: vi.fn(async () => {
+          order.push("stream-sync");
+          return { runs: [] };
+        }),
+      };
+      const manager = createSyncManager(
+        makeMockUploadDeps(),
+        makeMockDownloadDeps(),
+        { pollInterval: 60_000, streamSync: { write: true, publisher } },
+      );
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toEqual(["legacy", "stream-sync"]);
+      await manager.stop();
+    });
+
+    it("reports a failed stream-sync publish without failing the cycle", async () => {
+      const publisher = {
+        cycle: vi.fn(async () => {
+          throw new Error("registry down");
+        }),
+      };
+      const manager = createSyncManager(
+        makeMockUploadDeps(),
+        makeMockDownloadDeps(),
+        { pollInterval: 60_000, streamSync: { write: true, publisher } },
+      );
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(downloadAll).toHaveBeenCalledTimes(1);
+      expect(manager.getStatus().errors).toEqual([
+        expect.objectContaining({
+          message: "Stream sync publish failed: registry down",
+        }),
+      ]);
+      await manager.stop();
+    });
+  });
+
   it("publishes boot hydration before the full download cycle resolves", async () => {
     let releaseFullDownload!: () => void;
     const fullDownload = new Promise<never[]>((resolve) => {

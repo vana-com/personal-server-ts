@@ -20,9 +20,11 @@ export default tseslint.config(
       "packages/core/src/additions/**/*.ts",
       "packages/core/src/replication/**/*.ts",
       "packages/core/src/storage/pdpp-records/completion.ts",
+      "packages/stream-sync/src/**/*.ts",
     ],
     ignores: [
       "**/*.test.ts",
+      "**/test-support/**",
       "**/__fixtures__/**",
       "**/github-browser-parity-fixtures.ts",
     ],

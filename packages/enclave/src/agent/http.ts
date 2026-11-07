@@ -565,6 +565,12 @@ function prewarmRequestBody(value: unknown): PrewarmRequestBody {
   const body = record(value);
   const sealedEnvelope = record(body.sealedEnvelope);
   const wrappedContentKey = record(sealedEnvelope.wrappedContentKey);
+  // Ruling Q7: stream-sync names never reach the SDK ScopeSchema. Every
+  // stream-sync name holds `~` and no SDK scope can, and this agent stays
+  // free of Personal Server packages, so it checks the character itself.
+  if (typeof body.scope !== "string" || body.scope.includes("~")) {
+    throw new BadRequest();
+  }
   const scope = ScopeSchema.safeParse(body.scope);
   if (
     !isHex(body.userPsId, { strict: true }) ||
