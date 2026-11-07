@@ -92,7 +92,7 @@ CONSTANTS
   NeedsFullForcesFull,\* any needsFull of the connector makes a run full
   \* --- run intake v2 guards ---
   PublishCoveredOnly,\* only covered streams are declared and published (v2 3.5)
-  WriterIssuesStart, \* START state is the writer's issue, not the producer's (v2 2.1, R16)
+  WriterIssuesStart, \* START state is the writer's issue, not the producer's (v2 2.1)
   RetryQuietOnly,    \* retry_pending saves no cursor of a stream with spooled records
   RetryCkptStaysFull,\* proposed, FALSE in the ruled contract: a checkpoint that only
                      \* retry_pending ends saved keeps the next run full (state issued,
@@ -571,7 +571,7 @@ Progress(d) ==
 \* atomic here: the run's outcome, covered streams, spool and candidate
 \* are chosen at once, and the end's effects follow in Progress.
 \*
-\* begin (v2 2.1, R16): the run is full when the writer forces it
+\* begin (v2 2.1): the run is full when the writer forces it
 \* (runMustBeFull: no checkpoint, or any needsFull of the connector) or
 \* the owner started it with a full_refresh profile (wantFull; only an
 \* explicit connect, uc, is owner-started here).  The writer issues the
@@ -1047,7 +1047,7 @@ TypeOK ==
 \* run output.
 CoveredOnly == \A x \in inserted : ~x[4].oc
 
-\* Run intake v2 (2.1, R16): the START state the connector used is the
+\* Run intake v2 (2.1): the START state the connector used is the
 \* writer's issue: the stored checkpoint, or none when the writer forced
 \* the run full.
 IssuedStart == \A d \in Devices : ob[d] # NoEntry => ob[d].stOk

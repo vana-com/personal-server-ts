@@ -241,9 +241,10 @@ export const PROFILES = {
   // Three reruns: under Q9 a device that stays may need a no-op rerun
   // (which sets needsFull) and then a full one, and the device that
   // leaves may spend one first.
-  // Liveness with two streams and partial coverage on one device: a full
-  // run that skips s1 saves a checkpoint, so only needsFull keeps the
-  // next run full (C12L).
+  // Liveness with two streams and partial coverage on one device.  No
+  // complete:false head is reachable here (the state count is the same
+  // with NeedsFull off), so L3 is vacuous on this profile; it checks L1
+  // and L4 under partial coverage.
   "live-cover": {
     ...base,
     Devices: set(["d1"]),
@@ -278,7 +279,7 @@ export const PROFILES = {
   "slice-lag": { ...base, Acct: set(["A"]), Streams: set(["s1"]), MaxLost: 0, MaxSessions: 0, MaxFail: 0, Readers: set(["r1"]) },
   // Run intake v2: two streams, one declared incremental: false, partial
   // coverage, a retry_pending run and an aborted run, one delete.
-  // Run intake v2 on the identity-less name every connector uses (R23):
+  // Run intake v2 on the identity-less name every connector uses:
   // partial coverage, a stream declared incremental: false, retry_pending
   // and abort.  Two devices with two runs, then one device with four runs
   // (checkpoint merges across runs).  Three runs on two devices do not
@@ -359,8 +360,8 @@ const SIM = { traces: 200000, depth: 60, seed: 1 };
 // The cut for slices that do not finish within an hour with the intake
 // choices: every "ok" run covers every stream and no run ends
 // retry_pending.  Partial coverage and retry_pending are checked on
-// "split", "slice-key", "slice-q9", "slice-idless", "slice-intake" and in
-// the controls on "late".
+// "split", "slice-key", "slice-q9", "slice-idless", "slice-intake",
+// "slice-intake1" and in the controls on "late".
 const CUT = { PartialCover: "FALSE", MaxRetry: 0 };
 
 /**
@@ -392,9 +393,11 @@ export const CONFIGS = [
   ["Slice-intake", "the design, identity-less: partial coverage, a stream declared incremental: false, retry_pending and abort; two devices", "slice-intake", {}, "pass"],
   ["Slice-intake1", "the design, identity-less: the same on one device with four runs", "slice-intake1", {}, "pass"],
   ["Live", "liveness of the design", "live", CUT, "pass", "liveness"],
-  ["Live-fail", "liveness of the design with a failed entry", "live-fail", CUT, "pass", "liveness"],
+  // With the reader PS it does not finish within the hour; reader lag
+  // matters only to C18, and Live keeps the reader.
+  ["Live-fail", "liveness of the design with a failed entry (cut, no reader PS)", "live-fail", { ...CUT, Readers: "{}" }, "pass", "liveness"],
   // One stream, so PartialCover only drops runs that cover nothing; one
-  // retry_pending end stays, the positive counterpart of C12L.
+  // retry_pending end stays, the positive counterpart of C19L.
   ["Live-leave", "liveness of the design with an old stream DELETE, a device that leaves and a retry_pending end", "live-leave", { PartialCover: "FALSE" }, "pass", "liveness"],
   ["Live-cover", "liveness with two streams and partial coverage, one device, identity-less", "live-cover", {}, "pass", "liveness"],
   // --- the proposed fix RetryCkptStaysFull (traces/retry-token-incremental.txt) ---
@@ -429,7 +432,12 @@ export const CONFIGS = [
 
   // --- section 4 negative controls: each removes one guard ---
   ["C01-no-gen-in-names", "part names without the generation", "late", { GenInNames: "FALSE" }, "S5_CleanupSafety"],
-  ["C02-no-clear-on-gen-change", "checkpoints and entries kept on a generation change", "slice-faults", { ClearOnGenChange: "FALSE" }, "S3_CleanGeneration"],
+  // C02 is not a failing control.  With the guard off, every safety
+  // invariant still holds on three profiles with a generation change
+  // (README.md, "C02 and C12"); the rows record that.
+  ["C02-key", "checkpoints and entries kept on a generation change", "slice-key", { ClearOnGenChange: "FALSE" }, "pass"],
+  ["C02-split", "the same, two streams", "split", { ClearOnGenChange: "FALSE" }, "pass"],
+  ["C02-idless", "the same, identity-less", "slice-idless", { ClearOnGenChange: "FALSE" }, "pass"],
   ["C03-non-exclusive", "an occupied head version is replaced", "late", { ExclusiveHeads: "FALSE" }, "S1_NoLostCommit"],
   ["C04-reader-unions", "a plain-name read unions the connections", "slice-accounts", { OneConnectionRead: "FALSE" }, "S4_NoAccountMix"],
   ["C05-seed-any-gen", "the Desktop seeds at any generation", "late", { SeedOnlyGen1: "FALSE" }, "S3_CleanGeneration"],
@@ -445,7 +453,11 @@ export const CONFIGS = [
   ["C15-failed-row-replaceable", "a row that failed settlement can be replaced", "slice-settle", { AckImmutable: "FALSE" }, "S8_AckImmutable"],
   ["C16-readiness-live-only", "readiness uses live, reads use live and complete", "slice-q9", { ReadinessSame: "FALSE" }, "S10_ReadinessMatchesRead"],
   ["C19-no-q9", "a no-op onto a complete:false base sets no needsFull", "slice-q9", { NoOpNeedsFull: "FALSE" }, "IncompleteOwned"],
-  ["C12L-no-needsfull", "complete:false sets no needsFull; a full run that skips the stream then saves a checkpoint, so later runs are incremental", "live-cover", { NeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
+  // Is needsFull needed for liveness once RetryCkptStaysFull holds?  A
+  // complete:false publish also clears the checkpoint, so only a
+  // retry_pending save before the next run could make it incremental, and
+  // the fix keeps that run full.  Expected to pass (README.md, C02 and C12).
+  ["C12L-fix", "complete:false sets no needsFull, with the proposed fix", "live-leave", { PartialCover: "FALSE", RetryCkptStaysFull: "TRUE", NeedsFull: "FALSE" }, "pass", "liveness"],
   ["C19L-no-q9", "the same, against liveness L3", "live-leave", { NoOpNeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
   ["C20-null-base-noop", "an incremental run onto an empty base with an empty spool is a no-op", "slice-q9", { NullBasePublishes: "FALSE" }, "IncompleteOwned"],
   ["C21-needsfull-not-full", "a device with needsFull and a checkpoint runs incrementally", "slice-accounts4", { NeedsFullForcesFull: "FALSE" }, "NeedsFullRunIsFull"],

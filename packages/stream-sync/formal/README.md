@@ -45,15 +45,24 @@ rejected, so the model does not have one. The intake parts are:
   account check (`RawSeedChecksId`, `C17`) are removed. The old raw
   file stays as one of the legacy files that reads are checked against.
 
-The intake model found one defect in section 9 as written: a
-`retry_pending` end can save the cursor of a stream whose records it
-drops. Read "Counterexamples". The model's default (`RetryQuietOnly`)
-is the proposed fix.
+The intake model found two defects. Read "Counterexamples".
 
-With that fix, no counterexample was found within the bounds below.
-Read "Results" for what was checked at which bounds and in which mode.
+- **Safety (S7).** In section 9 as written, a `retry_pending` end can
+  save the cursor of a stream whose records it drops. The fix keeps a
+  `retry_pending` cursor only for a stream with no records in the run.
+  It is adopted, and it is the model's default (`RetryQuietOnly`).
+- **Liveness (L3).** With that fix, a job token that a `retry_pending`
+  end saved makes the device's next run incremental, before any head of
+  the generation exists. That run publishes `complete:false`. If an old
+  app's DELETE then tombstones the stream, no run is required to follow,
+  and L3 fails on `Live-leave`. The proposed fix, `RetryCkptStaysFull`,
+  is not in the ruled contract, so it is off by default. The `Fix-*`
+  rows check it.
 
-Model: `StreamSync.tla`, sha256 `cb85b4f8c217ded154968be8e4b72b4596dd3fb5a11f614f18b3d0da57ed18b5`. TLC 2026.11.03
+No other counterexample was found within the bounds below. Read
+"Results" for what was checked at which bounds and in which mode.
+
+Model: `StreamSync.tla`, sha256 `a14998644a6207f78d759175a196c12335c8e487fd6ee2c640f14d8faea2cf22`. TLC 2026.11.03
 (`tla2tools.jar`).
 
 ## Results
@@ -61,95 +70,165 @@ Model: `StreamSync.tla`, sha256 `cb85b4f8c217ded154968be8e4b72b4596dd3fb5a11f614
 Every run used 4 workers under `nice -n 19` on a shared, loaded host, so
 the times show that load. "Exhaustive" means breadth-first search
 finished: every reachable state within the bounds was checked. A control
-or witness passes when TLC stops at the expected violation.
+or witness passes when TLC stops at the expected violation. A row whose
+Observed column differs from its Expected column is a finding; the text
+after the table explains it.
 
 | Config | Slice | Expected | Observed | Distinct states | Depth | Mode | Seconds | Model |
 | ------ | ----- | -------- | -------- | --------------: | ----: | ---- | ------: | ----- |
-| `Small` | small | pass | pass | 20,501,352 generated |  | simulation | 1413 | `cb85b4f8c217` |
-| `Key` | key | pass | pass | 20,667,229 generated |  | simulation | 1659 | `cb85b4f8c217` |
-| `Full` | full | pass | pass | 21,221,242 generated |  | simulation | 1516 | `cb85b4f8c217` |
-| `IdLess` | idless | pass | pass | 20,274,382 generated |  | simulation | 1002 | `cb85b4f8c217` |
-| `Slice-faults` | slice-faults | pass | pass | 33,991,646 | 33 | exhaustive | 2472 | `1e95f2aee0b6` |
-| `Slice-accounts` | slice-accounts | pass | pass | 12,556,684 | 30 | exhaustive | 1635 | `1e95f2aee0b6` |
-| `Slice-key` | slice-key | pass | pass | 457,688 | 28 | exhaustive | 28 | `1e95f2aee0b6` |
-| `Slice-idless` | slice-idless | pass | pass | 2,860,536 | 28 | exhaustive | 173 | `1e95f2aee0b6` |
-| `Slice-twice` | twice | pass | pass | 15,112,596 | 37 | exhaustive | 927 | `1e95f2aee0b6` |
-| `Slice-q9` | slice-q9 | pass | pass | 2,400,482 | 37 | exhaustive | 197 | `1e95f2aee0b6` |
-| `Live` | live | pass | pass | 374,776 | 24 | exhaustive | 811 | `cb85b4f8c217` |
-| `Live-fail` | live-fail | pass | pass | 860,976 | 24 | exhaustive | 1945 | `cb85b4f8c217` |
-| `Live-leave` | live-leave | pass | pass | 1,019,113 | 47 | exhaustive | 1001 | `cb85b4f8c217` |
-| `CE-split-run` | split | pass | pass | 758,372 | 29 | exhaustive | 85 | `1e95f2aee0b6` |
-| `CE-late-head` | late | pass | pass | 8,642,702 | 31 | exhaustive | 903 | `1e95f2aee0b6` |
-| `C-late-head-old-rule` | late | S1_NoLostCommit | S1_NoLostCommit | 878,725 | 17 | breadth-first, stopped | 34 | `1e95f2aee0b6` |
-| `C01-no-gen-in-names` | late | S5_CleanupSafety | S5_CleanupSafety | 1,348,398 | 18 | breadth-first, stopped | 54 | `1e95f2aee0b6` |
-| `C02-no-clear-on-gen-change` | slice-faults | S3_CleanGeneration | pass | 44,121,686 | 33 | exhaustive | 1304 | `1e95f2aee0b6` |
-| `C03-non-exclusive` | late | S1_NoLostCommit | S1_NoLostCommit | 193,149 | 14 | breadth-first, stopped | 10 | `1e95f2aee0b6` |
-| `C04-reader-unions` | slice-accounts | S4_NoAccountMix | S4_NoAccountMix | 804,627 | 15 | breadth-first, stopped | 42 | `1e95f2aee0b6` |
-| `C05-seed-any-gen` | late | S3_CleanGeneration | S3_CleanGeneration | 189,552 | 14 | breadth-first, stopped | 8 | `1e95f2aee0b6` |
-| `C06-early-checkpoint` | split | S7_CheckpointSafety | S7_CheckpointSafety | 2,575 | 9 | breadth-first, stopped | 1 | `1e95f2aee0b6` |
-| `C07-no-reread-after-create` | late | S3_CleanGeneration | S3_CleanGeneration | 4,222 | 8 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
-| `C08-rebind-old-spool` | late | S3_CleanGeneration | S3_CleanGeneration | 13,235 | 9 | breadth-first, stopped | 3 | `1e95f2aee0b6` |
-| `C09-no-listing-needed` | slice-faults | S3_CleanGeneration | S3_CleanGeneration | 5,495 | 7 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
-| `C10-legacy-ignores-delete` | late | S2a_DeleteHolds | S2a_DeleteHolds | 2,587 | 8 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
-| `C11-collectedat-competition` | late | S9_OneWay | S9_OneWay | 7,129 | 9 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
-| `C12-no-needsfull` | slice-q9 | IncompleteOwned | not re-run with this config; last run on `live-leave` checked L3: pass | 1,040,621 | 47 | exhaustive | 720 | `cb85b4f8c217` |
-| `C13-pending-blocks-import` | live-fail | L2_Convergence | L2_Convergence | 524,920 | 19 | breadth-first, stopped | 64 | `cb85b4f8c217` |
-| `C14-seed-only-empty-base` | late | S11_SeedCoverage | S11_SeedCoverage | 104,796 | 14 | breadth-first, stopped | 5 | `1e95f2aee0b6` |
-| `C15-failed-row-replaceable` | slice-settle | S8_AckImmutable | S8_AckImmutable | 392,604 | 15 | breadth-first, stopped | 17 | `1e95f2aee0b6` |
-| `C16-readiness-live-only` | slice-q9 | S10_ReadinessMatchesRead | S10_ReadinessMatchesRead | 44,700 | 16 | breadth-first, stopped | 5 | `1e95f2aee0b6` |
-| `C17-raw-seed-ignores-id` | slice-accounts | S4_NoAccountMix | S4_NoAccountMix | 1,130,223 | 15 | breadth-first, stopped | 54 | `1e95f2aee0b6` |
-| `C19-no-q9` | slice-q9 | IncompleteOwned | IncompleteOwned | 1,137,988 | 24 | breadth-first, stopped | 34 | `1e95f2aee0b6` |
-| `C19L-no-q9` | live-leave | L3_NoStuckIncomplete | L3_NoStuckIncomplete | 801,745 | 32 | breadth-first, stopped | 481 | `cb85b4f8c217` |
-| `C20-null-base-noop` | slice-q9 | IncompleteOwned | IncompleteOwned | 46,475 | 15 | breadth-first, stopped | 4 | `1e95f2aee0b6` |
-| `C21-needsfull-not-full` | slice-accounts4 | NeedsFullRunIsFull | NeedsFullRunIsFull | 7,694 | 22 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
-| `C18-immediate-delete` | slice-lag | S2_Immediate | S2_Immediate | 2,705 | 7 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
-| `W-trace-a` | lean | NotTraceA | NotTraceA | 7,127 | 8 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
-| `W-trace-b` | lean | NotTraceB | NotTraceB | 1,069,431 | 13 | breadth-first, stopped | 23 | `1e95f2aee0b6` |
-| `W-offline-vs-5` | twice | NotOfflineVs5 | NotOfflineVs5 | 489,473 | 18 | breadth-first, stopped | 11 | `1e95f2aee0b6` |
-| `W-late-old-head` | lean | NotLateOldHead | NotLateOldHead | 52,080 | 10 | breadth-first, stopped | 3 | `1e95f2aee0b6` |
-| `W-twice` | twice | NotTwice | NotTwice | 178,354 | 16 | breadth-first, stopped | 5 | `1e95f2aee0b6` |
-| `W-first-write-in-delete` | lean | NotFirstWriteDuringDelete | NotFirstWriteDuringDelete | 57,511 | 10 | breadth-first, stopped | 3 | `1e95f2aee0b6` |
-| `W-phone-first-seed` | late | NotPhoneFirstThenSeed | NotPhoneFirstThenSeed | 194,875 | 15 | breadth-first, stopped | 7 | `1e95f2aee0b6` |
-| `W-zero-emission-seed` | slice-accounts | NotZeroEmissionSeed | NotZeroEmissionSeed | 1,938,868 | 17 | breadth-first, stopped | 43 | `1e95f2aee0b6` |
-| `W-settle-after-ack` | slice-settle | NotSettleAfterAck | NotSettleAfterAck | 14,332 | 11 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
-| `W-switch-reused-ckpt` | slice-accounts | NotSwitchReusedCkpt | NotSwitchReusedCkpt | 34,483 | 10 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
-| `W-needsfull-with-ckpt` | slice-accounts4 | NotNeedsFullWithCkpt | NotNeedsFullWithCkpt | 6,899 | 22 | breadth-first, stopped | 1 | `1e95f2aee0b6` |
-| `W-failed-entry` | lean | NotFailedEntryNewerHeads | NotFailedEntryNewerHeads | 91,265 | 10 | breadth-first, stopped | 2 | `1e95f2aee0b6` |
+| `Small` | small | pass | no violation, stopped by hand | 9,562,741 checked, 24,639 behaviours | | simulation | 932 | `f2c42e6d2504` |
+| `Key` | key | pass | no violation, stopped at 900 s | 8,945,417 checked, 23,066 behaviours | | simulation | 900 | `f2c42e6d2504` |
+| `Full` | full | pass | no violation, stopped at 900 s | 8,188,425 checked, 21,095 behaviours | | simulation | 901 | `f2c42e6d2504` |
+| `IdLess` | idless | pass | no violation, stopped at 900 s | 9,780,709 checked, 25,119 behaviours | | simulation | 900 | `f2c42e6d2504` |
+| `Slice-faults` | slice-faults (cut, lost replies only) | pass | pass | 9,222,368 | 31 | exhaustive | 962 | `23acd6410d61` |
+| `Slice-faults2` | slice-faults (cut, no lost replies) | pass | queued | | | | | |
+| `Slice-accounts` | slice-accounts (cut) | pass | pass | 23,627,834 | 30 | exhaustive | 3085 | `23acd6410d61` |
+| `Slice-key` | slice-key | pass | pass | 3,501,147 | 28 | exhaustive | 226 | `f2c42e6d2504` |
+| `Slice-idless` | slice-idless | pass | pass | 10,549,465 | 28 | exhaustive | 899 | `b48bf8a62957` |
+| `Slice-twice` | twice (cut, 3 runs) | pass | queued | | | | | |
+| `Slice-q9` | slice-q9 | pass | pass | 22,987,926 | 37 | exhaustive | 1841 | `b48bf8a62957` |
+| `Slice-intake` | slice-intake | pass | pass | 12,345,919 | 29 | exhaustive | 1269 | `f2c42e6d2504` |
+| `Slice-intake1` | slice-intake1 | pass | pass | 9,668,164 | 41 | exhaustive | 966 | `f2c42e6d2504` |
+| `Live` | live (cut) | pass | pass | 665,867 | 24 | exhaustive | 1299 | `23acd6410d61` |
+| `Live-fail` | live-fail (cut, no reader PS) | pass | pass | 366,930 | 23 | exhaustive | 522 | `f2c42e6d2504` |
+| `Live-leave` | live-leave (every run covers s1) | pass | L3_NoStuckIncomplete | 358,958 | 17 | breadth-first, stopped | 325 | `23acd6410d61` |
+| `Live-cover` | live-cover | pass | pass | 42,776 | 29 | exhaustive | 36 | `f2c42e6d2504` |
+| `Fix-live-leave` | live-leave | pass | pass | 2,435,418 | 47 | exhaustive | 3215 | `f2c42e6d2504` |
+| `Fix-idless` | slice-idless | pass | queued | | | | | |
+| `Fix-split` | split | pass | queued | | | | | |
+| `CE-split-run` | split | pass | pass | 12,176,674 | 29 | exhaustive | 1012 | `b48bf8a62957` |
+| `CE-late-head` | late (cut) | pass | pass | 6,998,289 | 30 | exhaustive | 728 | `23acd6410d61` |
+| `C-late-head-old-rule` | late | S1_NoLostCommit | S1_NoLostCommit | 2,662,050 | 17 | breadth-first, stopped | 60 | `b48bf8a62957` |
+| `C01-no-gen-in-names` | late | S5_CleanupSafety | S5_CleanupSafety | 3,723,528 | 18 | breadth-first, stopped | 83 | `b48bf8a62957` |
+| `C02-key` | slice-key | pass | pass | 4,505,291 | 28 | exhaustive | 341 | `f2c42e6d2504` |
+| `C02-split` | split | pass | pass | 16,238,496 | 29 | exhaustive | 2005 | `f2c42e6d2504` |
+| `C02-idless` | slice-idless | pass | pass | 13,483,670 | 29 | exhaustive | 939 | `f2c42e6d2504` |
+| `C03-non-exclusive` | late | S1_NoLostCommit | S1_NoLostCommit | 678,999 | 15 | breadth-first, stopped | 13 | `b48bf8a62957` |
+| `C04-reader-unions` | slice-accounts | S4_NoAccountMix | S4_NoAccountMix | 5,921,144 | 16 | breadth-first, stopped | 165 | `b48bf8a62957` |
+| `C05-seed-any-gen` | late | S3_CleanGeneration | S3_CleanGeneration | 609,722 | 15 | breadth-first, stopped | 12 | `b48bf8a62957` |
+| `C06-early-checkpoint` | split | S7_CheckpointSafety | S7_CheckpointSafety | 101,173 | 9 | breadth-first, stopped | 3 | `b48bf8a62957` |
+| `C07-no-reread-after-create` | late | S3_CleanGeneration | S3_CleanGeneration | 21,902 | 9 | breadth-first, stopped | 1 | `b48bf8a62957` |
+| `C08-rebind-old-spool` | late | S3_CleanGeneration | S3_CleanGeneration | 54,520 | 11 | breadth-first, stopped | 2 | `b48bf8a62957` |
+| `C09-no-listing-needed` | slice-faults | S3_CleanGeneration | S3_CleanGeneration | 36,746 | 8 | breadth-first, stopped | 2 | `b48bf8a62957` |
+| `C10-legacy-ignores-delete` | late | S2a_DeleteHolds | S2a_DeleteHolds | 13,414 | 9 | breadth-first, stopped | 1 | `b48bf8a62957` |
+| `C11-collectedat-competition` | late | S9_OneWay | S9_OneWay | 32,538 | 10 | breadth-first, stopped | 2 | `b48bf8a62957` |
+| `C12-no-needsfull` | slice-q9 | IncompleteOwned | IncompleteOwned | 370,739 | 15 | breadth-first, stopped | 6 | `b48bf8a62957` |
+| `C13-pending-blocks-import` | live-fail | L2_Convergence | L2_Convergence | 1,010,722 | 17 | breadth-first, stopped | 199 | `b48bf8a62957` |
+| `C14-seed-only-empty-base` | late | S11_SeedCoverage | S11_SeedCoverage | 387,003 | 15 | breadth-first, stopped | 9 | `b48bf8a62957` |
+| `C15-failed-row-replaceable` | slice-settle | S8_AckImmutable | S8_AckImmutable | 1,274,854 | 16 | breadth-first, stopped | 24 | `b48bf8a62957` |
+| `C16-readiness-live-only` | slice-q9 | S10_ReadinessMatchesRead | S10_ReadinessMatchesRead | 239,798 | 15 | breadth-first, stopped | 8 | `b48bf8a62957` |
+| `C19-no-q9` | slice-q9 | IncompleteOwned | IncompleteOwned | 5,855,555 | 21 | breadth-first, stopped | 101 | `b48bf8a62957` |
+| `C12L-fix` | live-leave | pass | queued | | | | | |
+| `C19L-no-q9` | live-leave | L3_NoStuckIncomplete | L3_NoStuckIncomplete | 591,731 | 17 | breadth-first, stopped | 589 | `b48bf8a62957` |
+| `C20-null-base-noop` | slice-q9 | IncompleteOwned | IncompleteOwned | 37,407 | 10 | breadth-first, stopped | 1 | `b48bf8a62957` |
+| `C21-needsfull-not-full` | slice-accounts4 | NeedsFullRunIsFull | NeedsFullRunIsFull | 35,830 | 22 | breadth-first, stopped | 2 | `b48bf8a62957` |
+| `C18-immediate-delete` | slice-lag | S2_Immediate | S2_Immediate | 13,117 | 9 | breadth-first, stopped | 1 | `b48bf8a62957` |
+| `C-publish-uncovered` | late | CoveredOnly | CoveredOnly | 50,684 | 10 | breadth-first, stopped | 3 | `b48bf8a62957` |
+| `C-producer-state` | late | IssuedStart | IssuedStart | 63,959 | 12 | breadth-first, stopped | 2 | `b48bf8a62957` |
+| `C-retry-saves-spooled` | late | S7_CheckpointSafety | S7_CheckpointSafety | 41,356 | 10 | breadth-first, stopped | 2 | `b48bf8a62957` |
+| `C-full-replaces` | late | NoFalseDelete | NoFalseDelete | 623,640 | 15 | breadth-first, stopped | 13 | `b48bf8a62957` |
+| `W-trace-a` | lean | NotTraceA | NotTraceA | 525,071 | 9 | breadth-first, stopped | 7 | `b48bf8a62957` |
+| `W-trace-b` | lean | NotTraceB | NotTraceB | 64,867,358 | 15 | breadth-first, stopped | 1008 | `b48bf8a62957` |
+| `W-offline-vs-5` | twice | NotOfflineVs5 | NotOfflineVs5 | 8,649,332 | 20 | breadth-first, stopped | 148 | `b48bf8a62957` |
+| `W-late-old-head` | lean | NotLateOldHead | NotLateOldHead | 3,352,083 | 11 | breadth-first, stopped | 34 | `b48bf8a62957` |
+| `W-twice` | twice | NotTwice | NotTwice | 2,743,602 | 17 | breadth-first, stopped | 41 | `b48bf8a62957` |
+| `W-first-write-in-delete` | lean | NotFirstWriteDuringDelete | NotFirstWriteDuringDelete | 3,379,581 | 11 | breadth-first, stopped | 40 | `b48bf8a62957` |
+| `W-phone-first-seed` | late | NotPhoneFirstThenSeed | NotPhoneFirstThenSeed | 679,159 | 16 | breadth-first, stopped | 14 | `b48bf8a62957` |
+| `W-zero-emission-seed` | slice-accounts | NotZeroEmissionSeed | NotZeroEmissionSeed | 75,590 | 9 | breadth-first, stopped | 3 | `b48bf8a62957` |
+| `W-settle-after-ack` | slice-settle | NotSettleAfterAck | NotSettleAfterAck | 54,122 | 11 | breadth-first, stopped | 3 | `b48bf8a62957` |
+| `W-switch-reused-ckpt` | slice-accounts | NotSwitchReusedCkpt | NotSwitchReusedCkpt | 130,758 | 10 | breadth-first, stopped | 4 | `b48bf8a62957` |
+| `W-needsfull-with-ckpt` | slice-accounts4 | NotNeedsFullWithCkpt | NotNeedsFullWithCkpt | 25,331 | 21 | breadth-first, stopped | 1 | `b48bf8a62957` |
+| `W-failed-entry` | lean | NotFailedEntryNewerHeads | NotFailedEntryNewerHeads | 3,344,717 | 11 | breadth-first, stopped | 38 | `b48bf8a62957` |
 
 The Model column is the first 12 hex digits of the sha256 of
-`StreamSync.tla` for that run. `1e95f2aee0b6` differs from the final
-model `cb85b4f8c217` only in `L4_Resume` and its comment: L4 moved
-"the device has not left" from the quantifier bound into the formula,
-because TLC cannot bound a quantifier by a state variable there. No
-safety config checks L4, so the `1e95f2aee0b6` safety rows hold for the
-final model.
+`StreamSync.tla` for that run. Four versions ran:
 
-`C02-no-clear-on-gen-change` with `ClearOnGenChange = FALSE` passes S3
-on `slice-faults`. A run of the same config against every safety
-invariant was stopped by hand at a deadline, not finished: no violation in
-42,337,267 distinct states to depth 28, with 1,822,042 states still
-queued, after 2971 seconds on `cb85b4f8c217`.
+- `b48bf8a62957`: the intake model.
+- `23acd6410d61`: adds the bound `PartialCover`. It is TRUE, so it
+  changes nothing, except in the rows marked "cut".
+- `f2c42e6d2504`: adds the proposed guard `RetryCkptStaysFull` and the
+  checkpoint field `byRun`. Both are inert while the guard is FALSE,
+  which is the default.
+- `a14998644a62`, the final model: differs from `f2c42e6d2504` only in
+  three comments.
 
-`C12-no-needsfull` moved from `live-leave` (L3) to `slice-q9`
-(IncompleteOwned) after its last run. It was not re-run with the new
-config.
+`Slice-key` reached the same 3,501,147 distinct states and 18,500,789
+states generated on all three versions. So the rows of the two earlier
+versions hold for the final model with its defaults.
+
+Findings and open rows:
+
+- `Live-leave` fails L3 with the ruled contract. Read
+  `traces/retry-token-incremental.txt`. `Fix-live-leave` passes with the
+  proposed fix on.
+- The four simulations found no violation. `Small` was stopped by hand
+  at 932 seconds; the others stopped at their 900-second cap. The table
+  gives states checked and random behaviours at the last progress
+  report.
+- Rows marked "queued" wait for host capacity. Earlier runs of two of
+  them found no violation before they stopped: `Fix-idless` was stopped
+  at 631 seconds by a host load limit, with 8,352,552 distinct states to
+  depth 21; `Slice-twice` with four runs and the cut timed out at 3600
+  seconds with 40,787,341 distinct states to depth 28.
+- These bounds timed out at 3600 seconds with no violation, and were
+  then cut to the bounds in the table: `slice-intake` with three runs
+  (33.7 million distinct states, depth 17) and with no delete
+  (30,378,089, depth 18); `live-fail` with the reader PS and the cut
+  (1,512,262, depth 23).
 
 Positive configs check every safety invariant: TypeOK, S1 to S12,
-NeverInconsistent, NoHeadAboveControl, HeadGenMonotone, IncompleteOwned
-and NeedsFullRunIsFull. Liveness configs check TypeOK and L1 to L4, except L2 on a profile
-without imports (`live-leave`). A control or
-witness checks TypeOK and its one expected property, so TLC's first
+NeverInconsistent, NoHeadAboveControl, HeadGenMonotone, IncompleteOwned,
+NeedsFullRunIsFull, CoveredOnly, IssuedStart, NoFalseDelete and
+LaterWriteSurvives. Liveness configs check TypeOK and L1 to L4, except
+L2 on a profile without imports (`live-leave`, `live-cover`). A control
+or witness checks TypeOK and its one expected property, so TLC's first
 violation is that one.
 
 `node formal/check.mjs --list` prints every config with its slice and
 expected result.
 
+### C02 and C12
+
+Each of these guards was a control that did not fail. Neither is removed
+from the package.
+
+**`C02`, `ClearOnGenChange`.** With the guard off, a device keeps its
+checkpoint and outbox entry when the generation changes. Every safety
+invariant still holds on `slice-key`, `split` and `slice-idless`, three
+profiles where a delete changes the generation (`C02-key`, `C02-split`,
+`C02-idless`). So the guard is redundant for safety in the model. A kept
+checkpoint is tagged with its namespace and generation, so a save at the
+new generation replaces it and never merges into it. A kept entry
+decides again at publish, against the current control row (S3). An
+incremental run at the new generation either merges into a head of that
+generation, which deletes nothing, or publishes `complete:false` onto an
+empty base (M3), which sets `needsFull`. The guard saves that one
+incomplete run. In the package the guard is `observeControl` in
+`writer.ts`, with the `clearCheckpoints` decision in `decide.ts`.
+
+**`C12`, `NeedsFull`.** With the guard off, a `complete:false` publish
+does not set `needsFull`. On `slice-q9`, `IncompleteOwned` fails
+(`C12-no-needsfull`). That is by definition, because the invariant says
+the device holds `needsFull`. The question is liveness (L3). A
+`complete:false` publish also clears the checkpoint, so the next run
+is full without `needsFull`, because the device has no checkpoint. The
+one exception is a `retry_pending` end between the publish and the next
+run that saves a job token: the next run is then incremental. In the
+ruled contract only `needsFull` keeps that run full. With the proposed
+fix (`RetryCkptStaysFull`) the run stays full anyway. `C12L-fix` checks
+that (queued). `live-cover` cannot decide it: no `complete:false` head is
+reachable there, because the state count is the same with `NeedsFull` on
+and off. In the package, `afterCommit` in `needs-full.ts` adds the key,
+and `runMustBeFull` and `runPlan` in `writer.ts` read it.
+
 ### Bounds
 
-All guards are TRUE except the one a control turns off. Devices are `d1`
-(the Desktop) and `d2` in every profile except `slice-accounts4`. `MaxVer` is 6 (a state
-constraint on chain length) in every safety profile. Symmetry: accounts,
-record keys, and streams other than `s1` (streams declared
+All guards are TRUE except the one a control turns off, and
+`RetryCkptStaysFull`, which only the `Fix-*` rows and `C12L-fix` turn
+on. Devices are `d1` (the Desktop) and `d2` in every profile except
+`slice-accounts4`, `slice-intake1` and `live-cover`. `MaxVer` is 6 (a
+state constraint on chain length) in every safety profile. Symmetry:
+accounts, record keys, and streams other than `s1` (streams declared
 `incremental: false` permute only among themselves). Liveness profiles
 have no symmetry and no state constraint.
 
@@ -161,8 +240,8 @@ so. Rows marked "cut" in Results use `CUT` from `configs.mjs`:
 `MaxRetry` 0. Without the cut those slices do not finish within an
 hour. Partial coverage and `retry_pending` are checked on `split`,
 `slice-key`, `slice-q9`, `slice-idless`, `slice-intake` and
-`slice-intake1`, and in
-the controls on `late`.
+`slice-intake1`, in the controls on `late`, and, for liveness, on
+`live-cover` (partial coverage) and `live-leave` (`retry_pending`).
 
 | Profile | Acct | PK | Streams | Runs (+ reruns) | Deletes | Lost / restarts / failed entries | Other |
 | ------- | ---- | -- | ------- | --------------- | ------- | -------------------------------- | ----- |
@@ -182,7 +261,8 @@ the controls on `late`.
 | `lean` | A | x1 | s1, s2 | 3 | 1 | 1 / 1 / 1 | witnesses only |
 | `live` | A | x1 | s1 | 2 (+2) | 1 | 0 / 0 / 0 | imports on, reader `r1` |
 | `live-fail` | A | x1 | s1 | 2 (+2) | 1 | 0 / 0 / 1 | imports on, reader `r1` |
-| `live-leave` | A | x1 | s1 | 3 (+3) | 0 | 0 / 0 / 0 | 1 old stream DELETE, 1 leave; no imports, so no L2 |
+| `live-leave` | A | x1 | s1 | 3 (+3) | 0 | 0 / 0 / 0 | 1 old stream DELETE, 1 leave, 1 `retry_pending`; no imports, so no L2 |
+| `live-cover` | identity-less | x1 | s1, s2 | 3 (+2) | 0 | 0 / 0 / 0 | `d1` only; partial coverage, no `retry_pending`; no imports, so no L2 |
 | `small` (§4) | A, B | x1, x2 | s1, s2, s3 | 3 | 1 | 1 / 1 / 1 | simulation only |
 | `key`, `full`, `idless` (§4) | as `small` | | | | `full`: 2 | `full`: 2 / 2 / 1 | simulation only |
 
@@ -190,61 +270,84 @@ the controls on `late`.
 
 The section 4 profiles do not finish on this host. Breadth-first search
 on `small` reached depth 11 with 37 million distinct states after
-30 minutes, with 25 million more queued. So this model checks those
-profiles in two ways:
+30 minutes, with 25 million more queued, before run intake v2 added its
+choices. So this model checks those profiles in two ways:
 
 - **Exhaustive slices.** Each slice keeps one dimension of `small` at
   full size and cuts the others: two accounts, faults, a second owner
   key, an identity-less connector, two deletes, two streams (`split`),
-  two record keys (`late`), and the Q9 events.
+  two record keys (`late`), the Q9 events, and the intake choices
+  (`slice-intake`, `slice-intake1`).
 - **Simulation.** `Small`, `Key`, `Full` and `IdLess` run TLC's random
-  simulation with seed 1 and depth 60 (`SIM` in `configs.mjs`).
-  `num=200000` is per worker, so each profile ran 800,000 random
-  behaviours. A simulation that finds no violation is evidence, not
-  proof. Most random behaviours end early: the mean length was 8 to 11
-  steps (standard deviation 7 to 9). The table gives states generated,
-  not distinct states, for these rows.
+  simulation with seed 1 and depth 60 (`SIM` in `configs.mjs`). Each
+  stops at 900 seconds. The intake choices make each step about 14 times
+  slower than before, because TLC enumerates every subset of streams a
+  run may cover, emit or keep. So each profile ran about 21,000 to
+  25,000 random behaviours, not the earlier 800,000. A simulation that
+  finds no violation is evidence, not proof. Most random behaviours end
+  early: the mean length was 7 steps (standard deviation 9 to 10).
 
 ## What is proven, simulated only, and unproven
 
 **Proven within the bounds of each row** (breadth-first search finished):
 
-- Every safety invariant holds on the exhaustive slices (`slice-faults`,
-  `slice-accounts`, `slice-key`, `slice-idless`, `twice`, `slice-q9`)
-  and on the two counterexample profiles (`late`, `split`).
-- L1 to L4 hold on `live` and `live-fail`; L1, L3 and L4 hold on
-  `live-leave`, under the fairness below. So L3 holds as liveness, not
-  only in its bounded safety form (`IncompleteOwned`), on these
-  profiles.
+- Every safety invariant, including the four intake properties, holds
+  on the exhaustive slices (`slice-key`, `slice-idless`, `slice-q9`,
+  `slice-intake`, `slice-intake1`), on the cut slices (`slice-faults`,
+  `slice-accounts`) and on the two counterexample profiles (`split`,
+  `late` with the cut).
+- The intake controls fail as expected. Publishing an uncovered stream
+  breaks `CoveredOnly`. A producer-chosen START state breaks
+  `IssuedStart`. Section 9's `retry_pending` save as written breaks S7.
+  A full run that replaces its base breaks `NoFalseDelete`.
+- L1 to L4 hold on `live` and `live-fail` (both cut). L1, L3 and L4 hold
+  on `live-cover` and, with the proposed fix, on `live-leave`.
+- L3 fails on `live-leave` with the ruled contract (see
+  "Counterexamples").
 - Q9 is needed. Without it L3 fails on `live-leave` (`C19L-no-q9`) and
   `IncompleteOwned` fails on `slice-q9` (`C19-no-q9`).
 - M3 is needed. Without it `IncompleteOwned` fails (`C20-null-base-noop`).
 - The `runMustBeFull` rule decides runs. A device can hold a checkpoint
   and a `needsFull` at once (`W-needsfull-with-ckpt`). Without the rule
   `NeedsFullRunIsFull` fails (`C21-needsfull-not-full`).
-- Every other control except `C02` and `C12` stops at its expected
-  property, and every witness is reached.
+- `ClearOnGenChange` is not needed for safety on three profiles (read
+  "C02 and C12").
+- Every other control stops at its expected property, and every witness
+  is reached.
 
 **Simulated only:** the section 4 profiles `small`, `key`, `full` and
-`idless`. Each ran 800,000 random behaviours with no violation.
+`idless`, about 21,000 to 25,000 random behaviours each, with no
+violation.
 
 **Unproven:**
 
 - The section 4 profiles, exhaustively.
-- Liveness with two streams, lost replies, restarts, or a failed entry
-  together with a leave. Profiles with these did not finish on this
-  host.
-- That `ClearOnGenChange` is needed. `C02` passes S3 on `slice-faults`
-  (see Results).
-- That `needsFull` is needed for liveness. The last `C12` run, with
-  `needsFull` off, passed L3 on `live-leave`. `C12` was not re-run with
-  its `slice-q9` safety config.
+- Partial coverage or `retry_pending` together with two accounts,
+  faults or four runs. Those slices finish only with the cut.
+- Liveness with two streams and a reachable `complete:false` head, lost
+  replies, restarts, or a failed entry together with a leave. Profiles
+  with these did not finish on this host.
+- Whether `needsFull` is needed for liveness: open until `C12L-fix`
+  runs (read "C02 and C12").
+- The rows marked "queued".
 - That the package matches the model. This directory checks the model
   only.
 - Everything under "Not modelled" below.
 
 ## Counterexamples kept as controls
 
+- [traces/retry-token-incremental.txt](traces/retry-token-incremental.txt):
+  the ruled contract, found by the positive config `Live-leave`. `d2`
+  has no checkpoint, so its run 2 is full. The run ends `retry_pending`
+  with a job token for `s1` and no records, and the token is saved. No
+  head of `s1` exists yet. Run 3 is incremental because `d2` holds a
+  checkpoint and no `needsFull`. Onto the empty base it publishes
+  `complete:false` (M3). An old app's DELETE then tombstones `s1`, and
+  the scheduler's rerun is fair only while the stream is live and
+  `complete:false`. So no run follows, and L3 fails. Proposed fix
+  (`RetryCkptStaysFull`, config `Fix-live-leave`): a checkpoint that
+  only `retry_pending` ends saved is issued as the START state, but the
+  run is full (`full_refresh`).
 - [traces/retry-spooled-cursor.txt](traces/retry-spooled-cursor.txt):
   run intake v2 section 9 as written. A `retry_pending` end saves its
   checkpoint candidate and publishes nothing, and the candidate may hold
