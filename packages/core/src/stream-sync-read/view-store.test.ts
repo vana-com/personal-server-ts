@@ -1,3 +1,4 @@
+import { sha256 } from "@noble/hashes/sha2";
 import { describe, expect, it } from "vitest";
 import type { Head } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
@@ -7,6 +8,16 @@ import { ViewStore, type ViewKey } from "./view-store.js";
 const KEY: ViewKey = { connector: "c", ns: "n", stream: "s" };
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+
+/** A part is stored under the SHA-256 of its clear bytes. */
+function partBytes(label: string): Uint8Array {
+  return enc.encode(`part ${label}\n`);
+}
+function partHash(label: string): string {
+  return Array.from(sha256(partBytes(label)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+}
 
 function headOf(...hashes: string[]): Head {
   return { parts: hashes.map((hash) => ({ hash })) } as unknown as Head;
@@ -42,11 +53,12 @@ function gated(files: StreamSyncReadFiles, suffix: string, count = 1) {
 async function importVersion(
   store: ViewStore,
   version: number,
-  part: string,
+  label: string,
 ): Promise<void> {
+  const part = partHash(label);
   const head = headOf(part);
   await store.withImport(KEY, async (tx) => {
-    await tx.putPart(part, enc.encode(`part ${part}\n`));
+    await tx.putPart(part, partBytes(label));
     await tx.commit(
       version,
       `h${version}`,
@@ -62,13 +74,15 @@ async function expectViewIntact(
   base: ReturnType<typeof createMemoryStreamSyncReadFiles>,
   store: ViewStore,
   version: number,
-  part: string,
+  label: string,
 ) {
   const lease = store.lease(KEY)!;
   expect(lease.version.version).toBe(version);
   const paths = await base.list("views");
   expect(paths.some((p) => p.endsWith(`/heads/${version}.json`))).toBe(true);
-  expect(dec.decode(await store.readPart(KEY, part))).toBe(`part ${part}\n`);
+  expect(dec.decode(await store.readPart(KEY, partHash(label)))).toBe(
+    `part ${label}\n`,
+  );
   lease.release();
 }
 

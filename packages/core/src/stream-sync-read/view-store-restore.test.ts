@@ -1,7 +1,8 @@
+import { sha256 } from "@noble/hashes/sha2";
 import { decodeHead } from "@opendatalabs/personal-server-ts-stream-sync";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
-import { ViewStore } from "./view-store.js";
+import { ViewStore, type ImportedVersion } from "./view-store.js";
 
 // Isolate restoration completeness from the head wire-format validator.
 vi.mock("@opendatalabs/personal-server-ts-stream-sync", () => ({
@@ -10,10 +11,14 @@ vi.mock("@opendatalabs/personal-server-ts-stream-sync", () => ({
 
 const key = { connector: "source", ns: "", stream: "records" };
 const base = "views/source/_/records";
-const hashes = ["a".repeat(64), "b".repeat(64)];
+const clear = [new Uint8Array([1]), new Uint8Array()];
+// A part is stored under the SHA-256 of its clear bytes.
+const hashes = clear.map((bytes) =>
+  Array.from(sha256(bytes), (b) => b.toString(16).padStart(2, "0")).join(""),
+);
 const head = {
-  parts: hashes.map((hash) => ({ hash })),
-} as unknown as Parameters<ViewStore["commit"]>[4];
+  parts: hashes.map((hash, i) => ({ hash, bytes: clear[i]!.length })),
+} as unknown as ImportedVersion["head"];
 const headBytes = new TextEncoder().encode("decoded by the fixture");
 const dataHash = "c".repeat(64);
 
@@ -22,12 +27,20 @@ describe("restored view completeness", () => {
     vi.mocked(decodeHead).mockReturnValue({ kind: "ok", head });
   });
 
+  /** Import version 7 the way the importer does: parts first, then commit. */
+  async function importSeven(store: ViewStore, only?: number) {
+    await store.withImport(key, async (tx) => {
+      for (const [i, hash] of hashes.entries()) {
+        if (only !== undefined && i !== only) continue;
+        if (!(await tx.hasPart(hash))) await tx.putPart(hash, clear[i]!);
+      }
+      await tx.commit(7, dataHash, headBytes, head);
+    });
+  }
+
   async function committed() {
     const files = createMemoryStreamSyncReadFiles();
-    const store = await ViewStore.open(files);
-    await store.putPart(key, hashes[0]!, new Uint8Array([1]));
-    await store.putPart(key, hashes[1]!, new Uint8Array([2]));
-    await store.commit(key, 7, dataHash, headBytes, head);
+    await importSeven(await ViewStore.open(files));
     return files;
   }
 
@@ -42,7 +55,7 @@ describe("restored view completeness", () => {
     expect(restored.views()).toEqual([]);
     expect(await files.read(`${base}/current.json`)).toBeNull();
     // Retain surviving parts so an unchanged registry row can reuse them.
-    expect(await restored.hasPart(key, hashes[0]!)).toBe(true);
+    expect(await files.read(`${base}/parts/${hashes[0]}`)).not.toBeNull();
   });
 
   it("allows reimport of the same registry version after an incomplete restore", async () => {
@@ -51,25 +64,22 @@ describe("restored view completeness", () => {
     const restored = await ViewStore.open(files);
     expect(restored.get(key)).toBeNull();
 
-    await restored.putPart(key, hashes[1]!, new Uint8Array([2]));
-    await restored.commit(key, 7, dataHash, headBytes, head);
+    await importSeven(restored);
 
     const reopened = await ViewStore.open(files);
     expect(reopened.get(key)?.version).toBe(7);
-    expect(await reopened.readPart(key, hashes[1]!)).toEqual(
-      new Uint8Array([2]),
-    );
+    expect(await reopened.readPart(key, hashes[1]!)).toEqual(clear[1]);
   });
 
   it("preserves a complete restored view, including an existing empty part", async () => {
     const files = await committed();
-    await files.write(`${base}/parts/${hashes[1]}`, new Uint8Array());
+    await files.write(`${base}/parts/${hashes[1]}`, clear[1]!);
 
     const restored = await ViewStore.open(files);
 
     expect(restored.get(key)?.version).toBe(7);
     expect(restored.views()).toHaveLength(1);
-    expect(await restored.readPart(key, hashes[1]!)).toEqual(new Uint8Array());
+    expect(await restored.readPart(key, hashes[1]!)).toEqual(clear[1]);
   });
 
   it("drops a pointer whose head is missing", async () => {

@@ -12,6 +12,7 @@
  * so an import fetches only the parts it does not hold yet.
  */
 
+import { sha256 as hashPart } from "@noble/hashes/sha2";
 import {
   decodeHead,
   type Head,
@@ -44,7 +45,11 @@ interface CurrentFile {
 
 /** What an import may do while it holds the stream's lock. */
 export interface ImportTransaction {
-  hasPart(sha256: string): Promise<boolean>;
+  /**
+   * Whether an intact copy of the part is stored. A stored copy that does not
+   * match its hash (or `expectedBytes`) is removed and reported as missing.
+   */
+  hasPart(sha256: string, expectedBytes?: number): Promise<boolean>;
   putPart(sha256: string, clear: Uint8Array): Promise<void>;
   /** Make `version` current. Every part of `head` must be stored first. */
   commit(
@@ -57,6 +62,21 @@ export interface ImportTransaction {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+/** Part names hash the clear bytes, not the encrypted storage blob. */
+function matchesPart(
+  bytes: Uint8Array,
+  sha256: string,
+  expectedBytes?: number,
+): boolean {
+  if (expectedBytes !== undefined && bytes.length !== expectedBytes) {
+    return false;
+  }
+  const hash = Array.from(hashPart(bytes), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+  return hash === sha256;
+}
 
 /** Safe as one path segment: no separators, no dot segments. */
 function segment(value: string): string {
@@ -131,7 +151,7 @@ export class ViewStore {
       // pointer so the stream imports again; surviving parts stay reusable.
       let complete = true;
       for (const part of decoded.head.parts) {
-        if (!(await store.hasPart(key, part.hash))) {
+        if (!(await store.partExists(key, part.hash))) {
           complete = false;
           break;
         }
@@ -164,8 +184,22 @@ export class ViewStore {
     }));
   }
 
-  private async hasPart(key: ViewKey, sha256: string): Promise<boolean> {
+  private async partExists(key: ViewKey, sha256: string): Promise<boolean> {
     return (await this.files.read(`${dir(key)}/parts/${sha256}`)) !== null;
+  }
+
+  private async hasPart(
+    key: ViewKey,
+    sha256: string,
+    expectedBytes?: number,
+  ): Promise<boolean> {
+    const path = `${dir(key)}/parts/${sha256}`;
+    const bytes = await this.files.read(path);
+    if (bytes === null) return false;
+    if (matchesPart(bytes, sha256, expectedBytes)) return true;
+    // Treat a damaged cache entry like a missing part so the import repairs it.
+    await this.files.remove(path);
+    return false;
   }
 
   /** Run `body` while holding the stream's lock. */
@@ -194,7 +228,8 @@ export class ViewStore {
   ): Promise<T> {
     return this.exclusive(key, () =>
       body({
-        hasPart: (sha256) => this.hasPart(key, sha256),
+        hasPart: (sha256, expectedBytes) =>
+          this.hasPart(key, sha256, expectedBytes),
         putPart: (sha256, clear) => this.putPart(key, sha256, clear),
         commit: (version, dataHash, headBytes, head) =>
           this.commit(key, version, dataHash, headBytes, head),
@@ -268,9 +303,16 @@ export class ViewStore {
   }
 
   /** Clear part bytes of a leased version. */
-  async readPart(key: ViewKey, sha256: string): Promise<Uint8Array> {
+  async readPart(
+    key: ViewKey,
+    sha256: string,
+    expectedBytes?: number,
+  ): Promise<Uint8Array> {
     const bytes = await this.files.read(`${dir(key)}/parts/${sha256}`);
     if (!bytes) throw new Error("imported part is missing");
+    if (!matchesPart(bytes, sha256, expectedBytes)) {
+      throw new Error("corrupt imported part: size or SHA-256 mismatch");
+    }
     return bytes;
   }
 

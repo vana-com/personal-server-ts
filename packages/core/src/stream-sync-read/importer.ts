@@ -219,7 +219,7 @@ export class StreamSyncImporter {
     if (head.generation !== generation) return;
     await views.withImport(key, async (tx) => {
       for (const part of head.parts) {
-        if (await tx.hasPart(part.hash)) continue;
+        if (await tx.hasPart(part.hash, part.bytes)) continue;
         const partCipher = await blobs.get(
           `${scope}/${partBlobName(head.generation, part.hash)}`,
         );
