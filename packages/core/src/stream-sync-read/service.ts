@@ -183,6 +183,11 @@ interface Target {
 interface CursorStream {
   /** Imported registry version, or null: the stream had no imported head. */
   readonly b: number | null;
+  /**
+   * The overlay members it served, `[runId, contentRevision]`. Absent in a
+   * cursor from before overlay pins: it pinned no member.
+   */
+  readonly m?: readonly (readonly [string, string])[];
 }
 
 interface Cursor {
@@ -270,9 +275,27 @@ function decodeCursor(text: string): Cursor | null {
     const streams: Record<string, CursorStream> = {};
     if (typeof parsed.s === "object" && parsed.s !== null) {
       for (const [name, pin] of Object.entries(parsed.s)) {
-        const b = (pin as { b?: unknown } | null)?.b;
+        const { b, m } = (pin ?? {}) as { b?: unknown; m?: unknown };
         if (b !== null && !Number.isSafeInteger(b)) return null;
-        streams[name] = { b: b as number | null };
+        if (
+          m !== undefined &&
+          !(
+            Array.isArray(m) &&
+            m.every(
+              (x) =>
+                Array.isArray(x) &&
+                x.length === 2 &&
+                typeof x[0] === "string" &&
+                typeof x[1] === "string",
+            )
+          )
+        ) {
+          return null;
+        }
+        streams[name] = {
+          b: b as number | null,
+          ...(m ? { m: m as [string, string][] } : {}),
+        };
       }
     } else if (typeof parsed.v === "object" && parsed.v !== null) {
       // A cursor from before overlay pins: registry versions only.
@@ -720,7 +743,7 @@ export class StreamSyncReadService {
           lease = this.views.lease(key);
         }
         if (lease) leases.push(lease);
-        const local = this.contributions(
+        let local = this.contributions(
           snapshot,
           target.connector,
           ns,
@@ -729,6 +752,21 @@ export class StreamSyncReadService {
           kind === "tombstoned",
           lease?.version ?? null,
         );
+        if (cursor) {
+          // Replay exactly the recorded members: a retired or changed one
+          // makes the cursor stale, and a new run does not join.
+          const wanted = pin!.m ?? [];
+          local = local.filter((c) =>
+            wanted.some(
+              ([runId, revision]) =>
+                runId === c.run.runId && revision === c.stream.contentRevision,
+            ),
+          );
+          if (local.length !== wanted.length) {
+            releaseAll();
+            return { kind: "cursor_stale" };
+          }
+        }
         if (!lease && local.length === 0) {
           // Not a view after all: nothing imported and nothing local.
           releaseAll();
@@ -784,7 +822,12 @@ export class StreamSyncReadService {
         s: Object.fromEntries(
           inputs.map((i) => [
             i.stream,
-            { b: i.lease ? i.lease.version.version : null },
+            {
+              b: i.lease ? i.lease.version.version : null,
+              m: i.local
+                .map((c) => [c.run.runId, c.stream.contentRevision] as const)
+                .sort(),
+            },
           ]),
         ),
       });
