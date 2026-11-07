@@ -752,6 +752,14 @@ async function serveStreamSyncView(
       ...(decision.kind === "local_pending"
         ? { "X-Stream-Sync-Origin": "local-pending" }
         : {}),
+      // Owner only: the service attaches this to no other audience.
+      ...(decision.withheld?.length
+        ? {
+            "X-Stream-Sync-Withheld": [
+              ...new Set(decision.withheld.map((w) => w.reason)),
+            ].join(","),
+          }
+        : {}),
       ...(input.paymentResponseHeader
         ? { "X-PAYMENT-RESPONSE": input.paymentResponseHeader }
         : {}),

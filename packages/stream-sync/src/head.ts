@@ -407,7 +407,7 @@ export type WriterCompatibility =
  * of the writer's connector version with `base.profile.version`.
  */
 export function writerCompatibility(
-  base: Head | null,
+  base: Pick<Head, "primaryKey"> | null,
   writerPrimaryKey: readonly string[],
   writerVersusBase: VersionOrder,
 ): WriterCompatibility {

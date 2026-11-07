@@ -29,6 +29,12 @@ import {
   LEGACY_SCOPE_BINDINGS,
   type LegacyScopeBinding,
 } from "../legacy-projection/index.js";
+import {
+  foldContributions,
+  type Contribution,
+  type Fold,
+  type FoldBase,
+} from "./fold.js";
 import { StreamSyncImporter, type ImportIssue } from "./importer.js";
 import {
   NO_OVERLAY,
@@ -44,10 +50,8 @@ import {
 import type {
   StreamSyncBlobReader,
   StreamSyncImportedCoverage,
-  StreamSyncOverlayRun,
   StreamSyncOverlaySnapshot,
   StreamSyncOverlaySnapshotSource,
-  StreamSyncOverlayStream,
   StreamSyncPublishReceipt,
   StreamSyncReadFiles,
   StreamSyncReadKeys,
@@ -92,6 +96,16 @@ export interface ResolveInput {
   readonly isOwnerView: boolean;
 }
 
+/**
+ * A local run whose rows the view does not show: the writer will not publish
+ * it until the connector is newer (§2.5). Carried to the owner only.
+ */
+export interface WithheldRun {
+  readonly runId: string;
+  readonly stream: string;
+  readonly reason: "connector_update_required";
+}
+
 export type ReadDecision =
   /** Not a stream-sync read: the existing path answers, unchanged. */
   | { readonly kind: "pass" }
@@ -119,6 +133,8 @@ export type ReadDecision =
       readonly connector: string;
       readonly ns: string;
       readonly cursor: string;
+      /** Owner only; absent when none. */
+      readonly withheld?: readonly WithheldRun[];
       readonly body: ReadableStream<Uint8Array>;
     }
   | {
@@ -138,6 +154,8 @@ export type ReadDecision =
         readonly scope: string;
         readonly version: number;
       } | null;
+      /** Owner only; absent when none. */
+      readonly withheld?: readonly WithheldRun[];
       readonly body: ReadableStream<Uint8Array>;
     };
 
@@ -367,6 +385,16 @@ function toStream(
   });
 }
 
+function toFoldBase(version: ImportedVersion | null): FoldBase | null {
+  return version === null
+    ? null
+    : {
+        primaryKey: version.head.primaryKey,
+        profile: version.head.profile,
+        complete: version.head.complete,
+      };
+}
+
 /** What a read sees when no overlay source is configured. */
 const NO_SNAPSHOT: StreamSyncOverlaySnapshot = {
   runs: [],
@@ -490,10 +518,18 @@ export class StreamSyncReadService {
 
   /**
    * The local runs whose rows `stream` of `(connector, ns)` shows on top of
-   * `base`. A run counts only under a verified active control state of this
-   * key and its own generation (never the one active at read time), and never
-   * over a tombstoned stream row. A published stream that `base` already
-   * covers adds nothing: its rows are in the view.
+   * `base`, folded as the writer will publish them (`foldContributions`). A
+   * run counts only under a verified active control state of this key and its
+   * own generation (never the one active at read time), and never over a
+   * tombstoned stream row. A published stream that `base` already covers adds
+   * nothing: its rows are in the view.
+   *
+   * `pending` reads this device's own rows that no verified activation of
+   * their generation covers. `foldBase` is the head the writer would meet
+   * (default `base`); a pending read passes the live imported head here
+   * without letting it cover or join the rows. `members`, from a cursor,
+   * replays exactly those runs; the withheld runs are still every run that is
+   * withheld now.
    */
   private contributions(
     snapshot: StreamSyncOverlaySnapshot | undefined,
@@ -503,9 +539,17 @@ export class StreamSyncReadService {
     control: ControlState,
     tombstoned: boolean,
     base: ImportedVersion | null,
-    pending = false,
-  ): { run: StreamSyncOverlayRun; stream: StreamSyncOverlayStream }[] {
-    if (!snapshot || tombstoned) return [];
+    options: {
+      readonly pending?: boolean;
+      readonly foldBase?: ImportedVersion | null;
+      readonly members?: readonly (readonly [string, string])[];
+    } = {},
+  ): Fold {
+    const { pending = false, members } = options;
+    const foldBase = toFoldBase(
+      options.foldBase === undefined ? base : options.foldBase,
+    );
+    if (!snapshot || tombstoned) return foldContributions(foldBase, []);
     // Pending: this device's own rows that no verified activation of their
     // generation covers. A verified control of another generation, a deleted
     // connection and a foreign key hide them.
@@ -514,12 +558,9 @@ export class StreamSyncReadService {
         ? !(control.kind === "absent" || control.kind === "active")
         : control.kind !== "active"
     ) {
-      return [];
+      return foldContributions(foldBase, []);
     }
-    const out: {
-      run: StreamSyncOverlayRun;
-      stream: StreamSyncOverlayStream;
-    }[] = [];
+    const candidates: Contribution[] = [];
     for (const run of snapshot.runs) {
       if (
         run.connector !== connector ||
@@ -535,20 +576,20 @@ export class StreamSyncReadService {
       const local = run.streams.find((s) => s.name === stream);
       if (!local) continue;
       if (local.receipt && base && covers(base, local.receipt)) continue;
-      out.push({ run, stream: local });
+      candidates.push({ run, stream: local });
     }
-    // Rows merge only under one primary key: the base's, else the newest
-    // run's. A run of an unrelated key shape is not hashed against it.
-    const reference =
-      base?.head.primaryKey ??
-      [...out].sort(
-        (a, b) =>
-          b.run.observedAt - a.run.observedAt ||
-          (a.run.runId < b.run.runId ? 1 : -1),
-      )[0]?.stream.primaryKey;
-    return out.filter(
-      (c) => JSON.stringify(c.stream.primaryKey) === JSON.stringify(reference),
+    const all = foldContributions(foldBase, candidates);
+    if (!members) return all;
+    const replay = foldContributions(
+      foldBase,
+      candidates.filter((c) =>
+        members.some(
+          ([runId, revision]) =>
+            runId === c.run.runId && revision === c.stream.contentRevision,
+        ),
+      ),
     );
+    return { ...replay, withheld: all.withheld };
   }
 
   /** §2.10 inputs for connector c: every connection this server knows. */
@@ -590,10 +631,8 @@ export class StreamSyncReadService {
           live ? imported : null,
         );
         streams[stream] = {
-          live: live || local.length > 0,
-          complete:
-            (imported?.head.complete ?? false) ||
-            local.some((c) => c.stream.complete),
+          live: live || local.merged.length > 0,
+          complete: local.complete,
         };
         // Q6: the registry time of the connection's newest live stream head.
         if (live && row && row.addedAtMs !== null) {
@@ -764,6 +803,23 @@ export class StreamSyncReadService {
     return { kind: "pass" };
   }
 
+  /** The imported view of a stream while its head is live, else null. */
+  private liveImported(
+    connector: string,
+    ns: string,
+    stream: string,
+    control: ControlState,
+    row: MirrorRow | undefined,
+  ): ImportedVersion | null {
+    const imported = this.views.get({ connector, ns, stream });
+    const kind = row ? this.importer.streamRowKind(row) : null;
+    return imported !== null &&
+      kind !== null &&
+      isHeadLive(control, kind, imported.head.generation)
+      ? imported
+      : null;
+  }
+
   /** The target and connection whose local runs every needed stream has. */
   private pendingChoice(
     input: ResolveInput,
@@ -797,10 +853,19 @@ export class StreamSyncReadService {
             row !== undefined &&
               this.importer.streamRowKind(row) === "tombstoned",
             null,
-            true,
+            {
+              pending: true,
+              foldBase: this.liveImported(
+                target.connector,
+                ns,
+                stream,
+                control,
+                row,
+              ),
+            },
           );
-          for (const c of local) at = Math.max(at, c.run.observedAt);
-          return local.length > 0;
+          for (const c of local.merged) at = Math.max(at, c.run.observedAt);
+          return local.merged.length > 0;
         });
         if (!complete) continue;
         if (
@@ -882,7 +947,10 @@ export class StreamSyncReadService {
           lease = this.views.lease(key);
         }
         if (lease) leases.push(lease);
-        let local = this.contributions(
+        // Replay exactly the recorded members of a cursor: a retired or
+        // changed one makes the cursor stale, and a new run does not join.
+        const members = cursor ? (pin!.m ?? []) : undefined;
+        const fold = this.contributions(
           snapshot,
           target.connector,
           ns,
@@ -890,29 +958,26 @@ export class StreamSyncReadService {
           control,
           kind === "tombstoned",
           lease?.version ?? null,
-          pending,
+          {
+            pending,
+            // A pending read leases no base, but the writer would meet the
+            // live head when it publishes these runs.
+            foldBase: pending
+              ? this.liveImported(target.connector, ns, stream, control, row)
+              : (lease?.version ?? null),
+            ...(members ? { members } : {}),
+          },
         );
-        if (cursor) {
-          // Replay exactly the recorded members: a retired or changed one
-          // makes the cursor stale, and a new run does not join.
-          const wanted = pin!.m ?? [];
-          local = local.filter((c) =>
-            wanted.some(
-              ([runId, revision]) =>
-                runId === c.run.runId && revision === c.stream.contentRevision,
-            ),
-          );
-          if (local.length !== wanted.length) {
-            releaseAll();
-            return { kind: "cursor_stale" };
-          }
+        if (members && fold.merged.length !== members.length) {
+          releaseAll();
+          return { kind: "cursor_stale" };
         }
-        if (!lease && local.length === 0) {
+        if (!lease && fold.merged.length === 0) {
           // Not a view after all: nothing imported and nothing local.
           releaseAll();
           return { kind: "cursor_stale" };
         }
-        inputs.push({ stream, lease, local });
+        inputs.push({ stream, lease, fold });
       }
       // A stream without an imported head has no registry entry: only the
       // owner reads it. Everyone else gets the existing path, with its own
@@ -929,22 +994,20 @@ export class StreamSyncReadService {
       const overlays = new Map<string, OverlayWinners>();
       let observedAt = 0;
       for (const input of inputs) {
-        const shape = input.lease
-          ? input.lease.version.head
-          : newestShape(input.local);
-        const overlay = input.local.length
+        const { fold } = input;
+        const overlay = fold.merged.length
           ? await overlayWinners(snapshot, this.options.keys, {
-              runs: input.local.map((c) => c.run),
+              runs: fold.merged.map((c) => c.run),
               stream: input.stream,
-              primaryKey: shape.primaryKey,
+              primaryKey: fold.shape!.primaryKey,
             })
           : NO_OVERLAY;
         overlays.set(input.stream, overlay);
         observedAt = Math.max(
           observedAt,
-          input.lease?.version.head.observedAt ?? 0,
+          baseOf(input)?.version.head.observedAt ?? 0,
           overlay.newestObservedAt ?? 0,
-          ...input.local.map((c) => c.run.observedAt),
+          ...fold.merged.map((c) => c.run.observedAt),
         );
       }
       const lines = (stream: string): AsyncIterable<Line> => {
@@ -952,10 +1015,9 @@ export class StreamSyncReadService {
         return viewLines(
           this.views,
           this.options.keys,
-          input.lease,
+          baseOf(input),
           overlays.get(stream)!,
-          (input.lease ? input.lease.version.head : newestShape(input.local))
-            .primaryKey,
+          input.fold.shape!.primaryKey,
         );
       };
       const nextCursor = encodeCursor({
@@ -966,14 +1028,40 @@ export class StreamSyncReadService {
             i.stream,
             {
               b: i.lease ? i.lease.version.version : null,
-              m: i.local
+              m: i.fold.merged
                 .map((c) => [c.run.runId, c.stream.contentRevision] as const)
                 .sort(),
             },
           ]),
         ),
       });
-      const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},${pending ? '"origin":"local-pending",' : ""}"data":`;
+      // Runs the writer will not publish are never shown and never dropped
+      // silently: the log gets a count, the owner gets the runs.
+      const withheldAll: WithheldRun[] = inputs
+        .flatMap((i) =>
+          i.fold.withheld.map((c): WithheldRun => ({
+            runId: c.run.runId,
+            stream: i.stream,
+            reason: "connector_update_required",
+          })),
+        )
+        .sort((a, b) =>
+          a.runId === b.runId
+            ? a.stream < b.stream
+              ? -1
+              : 1
+            : a.runId < b.runId
+              ? -1
+              : 1,
+        );
+      if (withheldAll.length > 0) {
+        this.options.logger.warn(
+          { connector: target.connector, withheld: withheldAll.length },
+          "stream-sync read: local runs withheld until the connector is newer",
+        );
+      }
+      const withheld = isOwnerView ? withheldAll : [];
+      const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},${pending ? '"origin":"local-pending",' : ""}${withheld.length > 0 ? `"withheld":${JSON.stringify(withheld)},` : ""}"data":`;
       let payload: AsyncIterable<string>;
       if (!target.binding) {
         payload = recordsPayload(lines(target.streams[0]!));
@@ -983,12 +1071,12 @@ export class StreamSyncReadService {
           scope,
           binding: target.binding,
           profileKey:
-            (first.lease
-              ? first.lease.version.head.profile.key
-              : newestShape(first.local).profile.key) ?? undefined,
+            (baseOf(first)
+              ? baseOf(first)!.version.head.profile.key
+              : first.fold.merged.at(-1)!.stream.profile.key) ?? undefined,
           lines,
           streamBytes: (stream) =>
-            (byStream.get(stream)!.lease?.version.head.parts ?? []).reduce(
+            (baseOf(byStream.get(stream)!)?.version.head.parts ?? []).reduce(
               (sum, p) => sum + p.bytes,
               0,
             ),
@@ -1015,6 +1103,7 @@ export class StreamSyncReadService {
           connector: target.connector,
           ns,
           cursor: nextCursor,
+          ...(withheld.length > 0 ? { withheld } : {}),
           body,
         };
       }
@@ -1032,6 +1121,7 @@ export class StreamSyncReadService {
                 version: servedBase.version.version,
               }
             : null,
+        ...(withheld.length > 0 ? { withheld } : {}),
         body,
       };
     } catch (error) {
@@ -1045,20 +1135,13 @@ interface StreamInput {
   readonly stream: string;
   /** The leased imported view, or null for an overlay-only stream. */
   readonly lease: ViewLease | null;
-  readonly local: readonly {
-    run: StreamSyncOverlayRun;
-    stream: StreamSyncOverlayStream;
-  }[];
+  /** The local runs the view shows, as the writer will publish them. */
+  readonly fold: Fold;
 }
 
-/** Primary key and profile of an overlay-only stream: its newest run's. */
-function newestShape(local: StreamInput["local"]): StreamSyncOverlayStream {
-  const newest = [...local].sort(
-    (a, b) =>
-      b.run.observedAt - a.run.observedAt ||
-      (a.run.runId < b.run.runId ? 1 : -1),
-  )[0]!;
-  return newest.stream;
+/** The imported view whose rows the stream shows: none once a run replaced it. */
+function baseOf(input: StreamInput): ViewLease | null {
+  return input.fold.baseDropped ? null : input.lease;
 }
 
 /**

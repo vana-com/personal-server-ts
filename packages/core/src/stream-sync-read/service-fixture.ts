@@ -91,6 +91,7 @@ export class Fixture {
     primaryKey?: string[];
     complete?: boolean;
     observedAt?: number;
+    profileVersion?: string;
     prefixes?: string[];
     key?: TestOwnerKey;
     encryptWith?: TestOwnerKey;
@@ -106,6 +107,7 @@ export class Fixture {
       records: input.records,
       observedAt: input.observedAt ?? this.clock,
       complete: input.complete,
+      ...(input.profileVersion ? { profileVersion: input.profileVersion } : {}),
       prefixes: input.prefixes,
       encryptWith: input.encryptWith,
     });
@@ -171,6 +173,10 @@ export interface FakeStream {
   readonly complete?: boolean;
   readonly contentRevision?: string;
   readonly receipt?: StreamSyncPublishReceipt;
+  /** Default `["id"]`. */
+  readonly primaryKey?: readonly string[];
+  /** The writing connector's version. Default `1.0.0`. */
+  readonly version?: string;
 }
 
 export interface FakeRun {
@@ -208,8 +214,8 @@ export class FakeOverlay implements StreamSyncOverlaySnapshotSource {
       observedAt: run.observedAt ?? Date.parse("2026-11-01T00:00:00.000Z"),
       streams: run.streams.map((s) => ({
         name: s.name,
-        primaryKey: ["id"],
-        profile: { key: null, version: "1.0.0" },
+        primaryKey: s.primaryKey ?? ["id"],
+        profile: { key: null, version: s.version ?? "1.0.0" },
         complete: s.complete ?? false,
         contentRevision: s.contentRevision ?? "r1",
         state: s.receipt
