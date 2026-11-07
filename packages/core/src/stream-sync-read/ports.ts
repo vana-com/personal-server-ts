@@ -8,6 +8,7 @@
 
 import type {
   HashPorts,
+  HeadProfile,
   Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 
@@ -77,7 +78,8 @@ export interface StreamSyncPublishReceipt {
 export interface StreamSyncOverlayStream {
   readonly name: string;
   readonly primaryKey: readonly string[];
-  readonly profile: string;
+  /** The writer's head profile: projector key and connector version. */
+  readonly profile: HeadProfile;
   /** True only when the run's full/fullStream provenance says so (writer.ts:1460-1466). */
   readonly complete: boolean;
   /** Changes whenever the stream's overlay rows could change; used in cursors. */
