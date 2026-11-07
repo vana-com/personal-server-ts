@@ -82,15 +82,24 @@ describe("IndexedDB durability", () => {
     const db = await new Promise<IDBDatabase>((resolve) => {
       request.onsuccess = () => resolve(request.result);
     });
-    const proto = Object.getPrototypeOf(db) as { transaction: IDBDatabase["transaction"] };
+    const proto = Object.getPrototypeOf(db) as {
+      transaction: IDBDatabase["transaction"];
+    };
     const original = proto.transaction;
     const options: (IDBTransactionOptions | undefined)[] = [];
-    proto.transaction = function (this: IDBDatabase, ...args: Parameters<IDBDatabase["transaction"]>) {
+    proto.transaction = function (
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase["transaction"]>
+    ) {
       if (args[1] === "readwrite") options.push(args[2]);
       return original.apply(this, args);
     } as IDBDatabase["transaction"];
     try {
-      const files = createIndexedDbStreamSyncFiles({ dbName: "strict-test", factory, keyRange: IDBKeyRange });
+      const files = createIndexedDbStreamSyncFiles({
+        dbName: "strict-test",
+        factory,
+        keyRange: IDBKeyRange,
+      });
       await files.write("p", enc.encode("a"));
       await files.appendMany([{ path: "p", bytes: enc.encode("b") }]);
       await files.sync("p");
@@ -102,4 +111,33 @@ describe("IndexedDB durability", () => {
       db.close();
     }
   });
+});
+
+it("writes bounded chunks and removes stale chunks on overwrite", async () => {
+  const files = open();
+  const bytes = Uint8Array.from(
+    { length: 1024 * 1024 + 17 },
+    (_, i) => i % 251,
+  );
+  await files.write("large", bytes);
+  expect(await files.read("large")).toEqual(bytes);
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of files.readChunks("large")) chunks.push(chunk);
+  expect(chunks.every((chunk) => chunk.length <= 1024 * 1024)).toBe(true);
+  const combined = new Uint8Array(
+    chunks.reduce((sum, chunk) => sum + chunk.length, 0),
+  );
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  expect(combined).toEqual(bytes);
+  await files.appendMany([{ path: "large", bytes: enc.encode("tail") }]);
+  expect((await files.read("large"))?.slice(-4)).toEqual(enc.encode("tail"));
+  await files.write("large", enc.encode("short"));
+  expect(dec.decode((await files.read("large"))!)).toBe("short");
+  const overwritten: Uint8Array[] = [];
+  for await (const chunk of files.readChunks("large")) overwritten.push(chunk);
+  expect(overwritten).toHaveLength(1);
 });

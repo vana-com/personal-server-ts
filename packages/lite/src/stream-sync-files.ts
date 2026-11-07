@@ -17,6 +17,8 @@ import {
 
 const STORE = "chunks";
 const SEP = "\u0001";
+// Bound each IndexedDB record to 1 MiB to limit memory used by a read step.
+const CHUNK_SIZE = 1024 * 1024;
 const SEQ_WIDTH = 10;
 
 interface Chunk {
@@ -91,13 +93,21 @@ export function createIndexedDbStreamSyncFiles(
       opened = null;
     },
     async write(path, bytes) {
-      const tx = (await db()).transaction(STORE, "readwrite", { durability: "strict" });
+      const tx = (await db()).transaction(STORE, "readwrite", {
+        durability: "strict",
+      });
       const store = tx.objectStore(STORE);
       store.delete(fileRange(path));
-      store.put({
-        key: chunkKey(path, 0),
-        bytes: bytes.slice(),
-      } satisfies Chunk);
+      for (
+        let offset = 0, seq = 0;
+        offset < bytes.length || seq === 0;
+        offset += CHUNK_SIZE, seq += 1
+      ) {
+        store.put({
+          key: chunkKey(path, seq),
+          bytes: bytes.slice(offset, offset + CHUNK_SIZE),
+        } satisfies Chunk);
+      }
       await done(tx);
     },
     async read(path) {
@@ -120,18 +130,27 @@ export function createIndexedDbStreamSyncFiles(
       if (entries.length === 0) return;
       // One transaction for the whole batch: a spool flush touches up to 256
       // shard files, and a transaction per file would commit 256 times.
-      const tx = (await db()).transaction(STORE, "readwrite", { durability: "strict" });
+      const tx = (await db()).transaction(STORE, "readwrite", {
+        durability: "strict",
+      });
       const store = tx.objectStore(STORE);
       const committed = done(tx);
       const next = new Map<string, number>();
       for (const { path, bytes } of entries) {
         let seq = next.get(path);
         if (seq === undefined) seq = (await lastSeq(store, path)) + 1;
-        next.set(path, seq + 1);
-        store.put({
-          key: chunkKey(path, seq),
-          bytes: bytes.slice(),
-        } satisfies Chunk);
+        for (
+          let offset = 0;
+          offset < bytes.length || offset === 0;
+          offset += CHUNK_SIZE
+        ) {
+          store.put({
+            key: chunkKey(path, seq),
+            bytes: bytes.slice(offset, offset + CHUNK_SIZE),
+          } satisfies Chunk);
+          seq += 1;
+        }
+        next.set(path, seq);
       }
       await committed;
     },
@@ -145,9 +164,9 @@ export function createIndexedDbStreamSyncFiles(
           after === null
             ? fileRange(path)
             : KeyRange.bound(after, `${path}${SEP}\uffff`, true);
-        const chunk = (await promisify(tx.objectStore(STORE).get(range))) as
-          Chunk | undefined;
-        if (!chunk) return;
+        const cursor = await promisify(tx.objectStore(STORE).openCursor(range));
+        if (!cursor) return;
+        const chunk = cursor.value as Chunk;
         after = chunk.key;
         yield chunk.bytes;
       }
@@ -167,7 +186,9 @@ export function createIndexedDbStreamSyncFiles(
       return [...new Set(keys.map(pathOf))].sort();
     },
     async remove(prefix) {
-      const tx = (await db()).transaction(STORE, "readwrite", { durability: "strict" });
+      const tx = (await db()).transaction(STORE, "readwrite", {
+        durability: "strict",
+      });
       const store = tx.objectStore(STORE);
       store.delete(fileRange(prefix));
       store.delete(dirRange(prefix));
