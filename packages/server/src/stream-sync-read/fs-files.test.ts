@@ -1,7 +1,7 @@
 import type * as FsPromises from "node:fs/promises";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, parse } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFsStreamSyncReadFiles } from "./fs-files.js";
 
@@ -51,10 +51,18 @@ describe("filesystem publication durability", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  /** Events, without syncs of directories above the temp root's parent. */
   function events(): string[] {
-    return trace.events.map((event) =>
-      event.replace(root, "<root>").replace(/\.tmp-\d+-\d+$/, ".tmp"),
-    );
+    const above = new Set<string>();
+    for (let dir = dirname(dirname(root)); ; dir = dirname(dir)) {
+      above.add(`sync:${dir}`);
+      if (dir === parse(dir).root) break;
+    }
+    return trace.events
+      .filter((event) => !above.has(event))
+      .map((event) =>
+        event.replace(root, "<root>").replace(/\.tmp-\d+-\d+$/, ".tmp"),
+      );
   }
 
   it("syncs the file before rename, then every directory deepest first through the root's parent", async () => {
@@ -88,6 +96,7 @@ describe("filesystem publication durability", () => {
       "sync:<root>/store/views",
       "sync:<root>/store",
       "sync:<root>",
+      `sync:${dirname(root)}`,
     ]);
   });
 
@@ -102,7 +111,33 @@ describe("filesystem publication durability", () => {
     await files.write("mirror.json", new Uint8Array([6]));
 
     expect(events()).toContain("sync:<root>");
-    expect(events().slice(-2)).toEqual(["sync:<root>/new-root", "sync:<root>"]);
+    expect(events().slice(-3)).toEqual([
+      "sync:<root>/new-root",
+      "sync:<root>",
+      `sync:${dirname(root)}`,
+    ]);
+  });
+
+  it("syncs every ancestor up to the filesystem root on the retry after a write that created several missing levels and failed", async () => {
+    const storeRoot = join(root, "a", "b", "store");
+    const files = createFsStreamSyncReadFiles(storeRoot);
+    trace.failNextRename = true;
+    await expect(
+      files.write("mirror.json", new Uint8Array([7])),
+    ).rejects.toThrow("rename failed");
+    trace.events.length = 0;
+
+    await files.write("mirror.json", new Uint8Array([7]));
+
+    const synced = trace.events
+      .filter((event) => event.startsWith("sync:"))
+      .map((event) => event.slice("sync:".length));
+    const ancestors: string[] = [];
+    for (let dir = storeRoot; ; dir = dirname(dir)) {
+      ancestors.push(dir);
+      if (dir === parse(storeRoot).root) break;
+    }
+    expect(synced.slice(-ancestors.length)).toEqual(ancestors);
   });
 
   it("makes a newly created root durable in its existing parent", async () => {
@@ -115,6 +150,7 @@ describe("filesystem publication durability", () => {
       "sync:<root>/new-root/heads",
       "sync:<root>/new-root",
       "sync:<root>",
+      `sync:${dirname(root)}`,
     ]);
   });
 

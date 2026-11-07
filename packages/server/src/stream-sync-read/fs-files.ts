@@ -6,7 +6,7 @@
 
 import { createReadStream } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, parse, relative, resolve, sep } from "node:path";
 import type { StreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 
 function inside(root: string, path: string): string {
@@ -27,29 +27,13 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-/**
- * The last directory whose entry a write syncs: the root's parent, or the
- * parent of the highest directory this write created when that lies at or
- * above the root.
- */
-function syncTop(root: string, created: string | undefined): string {
-  const rootPath = resolve(root);
-  if (created !== undefined) {
-    const rel = relative(resolve(created), rootPath);
-    if (rel !== ".." && !rel.startsWith(`..${sep}`)) {
-      return dirname(resolve(created));
-    }
-  }
-  return dirname(rootPath);
-}
-
 export function createFsStreamSyncReadFiles(root: string): StreamSyncReadFiles {
   let counter = 0;
   return {
     async write(path, bytes) {
       const target = inside(root, path);
       const parent = dirname(target);
-      const created = await mkdir(parent, { recursive: true });
+      await mkdir(parent, { recursive: true });
       const temp = `${target}.tmp-${process.pid}-${counter++}`;
       const handle = await open(temp, "w");
       try {
@@ -59,11 +43,12 @@ export function createFsStreamSyncReadFiles(root: string): StreamSyncReadFiles {
         await handle.close();
       }
       await rename(temp, target);
-      // Publish the file entry, then every directory entry above it through
-      // the root's parent. Existence of a directory is no proof that its
+      // Publish the file entry, then every directory entry above it up to
+      // the filesystem root. Existence of a directory is no proof that its
       // entry was synced: an earlier write may have created it and failed
-      // before syncing, or the process may have restarted since.
-      const top = syncTop(root, created);
+      // before syncing, or the process may have restarted since. Cost: one
+      // open, fsync and close per ancestor on every write.
+      const top = parse(resolve(parent)).root;
       for (let directory = resolve(parent); ; directory = dirname(directory)) {
         await syncDirectory(directory);
         if (directory === top) break;
