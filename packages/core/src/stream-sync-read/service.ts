@@ -680,7 +680,14 @@ export class StreamSyncReadService {
     const snapshots = new Map<string, StreamSyncOverlaySnapshot>();
     try {
       for (const target of [...targets, ...candidates]) {
-        snapshots.set(target.connector, await this.snapshot(target.connector));
+        snapshots.set(
+          target.connector,
+          // Only the owner view reads local runs. A grant is answered from
+          // the imported heads, as if no local run existed.
+          input.isOwnerView
+            ? await this.snapshot(target.connector)
+            : NO_SNAPSHOT,
+        );
       }
       return await this.decide(input, cursor, targets, candidates, snapshots);
     } finally {

@@ -138,11 +138,14 @@ describe("overlay fold under the writer's compatible-writer rule", () => {
       }),
     ];
     // The writer would publish complete:false over an empty base. The owner
-    // still sees the run's rows, marked pending; a grant gets the old path.
+    // still sees the run's rows, marked pending; a grant sees the registered
+    // base, as it would with no local run.
     const owner = await read(f);
     expect(owner.kind).toBe("local_pending");
     expect(owner.ids).toEqual(["u1"]);
-    expect((await read(f, { isOwnerView: false })).kind).toBe("pass");
+    const grant = await read(f, { isOwnerView: false });
+    expect(grant.kind).toBe("view");
+    expect(grant.ids).toEqual(["a", "b"]);
   });
 
   it.each(["1.0.0", "0.9.0"])(
