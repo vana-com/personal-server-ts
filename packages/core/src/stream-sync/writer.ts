@@ -109,6 +109,8 @@ import {
   shardPath,
 } from "./spool.js";
 
+import type { StreamSyncPublishReceipt } from "../stream-sync-read/ports.js";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -159,6 +161,8 @@ interface WriterState {
 }
 
 interface HostStream {
+  /** Persisted in the same atomic entry write as committed/noop. */
+  receipt?: StreamSyncPublishReceipt;
   index: number;
   primaryKey: string[];
   profile: HeadProfile;
@@ -1382,6 +1386,8 @@ export class StreamSyncWriter {
         outbox.generation!,
         outbox.complete!,
         "committed",
+        Number(request.expectedVersion),
+        request.dataHash,
       );
       return true;
     }
@@ -1466,7 +1472,16 @@ export class StreamSyncWriter {
 
     const built = await this.buildParts(host, name, scope, target, base);
     if (isNoop(base, built.parts, complete)) {
-      await this.committed(host, name, target, complete, "noop");
+      if (!row.found) throw new Error("no-op requires a registered base");
+      await this.committed(
+        host,
+        name,
+        target,
+        complete,
+        "noop",
+        row.version,
+        row.dataHash,
+      );
       return true;
     }
     const clear = encodeHead({
@@ -1516,7 +1531,15 @@ export class StreamSyncWriter {
     const result = await this.options.registry.post(request);
     this.fault("after_post_reply", runId, name);
     if (result.kind === "committed") {
-      await this.committed(host, name, target, complete, "committed");
+      await this.committed(
+        host,
+        name,
+        target,
+        complete,
+        "committed",
+        version,
+        request.dataHash,
+      );
       return true;
     }
     this.setStream(host, name, { state: "planned" });
@@ -1531,6 +1554,8 @@ export class StreamSyncWriter {
     generation: number,
     complete: boolean,
     kind: "committed" | "noop",
+    registryVersion: number,
+    dataHash: string,
   ): Promise<void> {
     const { entry } = host;
     const stream = host.streams[name]!;
@@ -1553,6 +1578,11 @@ export class StreamSyncWriter {
         ] = "merged";
       }
     });
+    stream.receipt = {
+      registryVersion,
+      dataHash: dataHash.toLowerCase(),
+      generation,
+    };
     this.setStream(host, name, {
       state: kind,
       generation,
