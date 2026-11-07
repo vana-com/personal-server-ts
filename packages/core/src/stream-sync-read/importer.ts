@@ -102,6 +102,19 @@ export class StreamSyncImporter {
     return classifyStreamRow(toControlRead(row), this.options.controlHashes);
   }
 
+  /**
+   * The imported view of a stream, unless it is at or below the stream's
+   * deletion floor: a later live row replaced the tombstone row, but the view
+   * still holds records the owner deleted. `row` is the stream's mirror row.
+   */
+  servableView(key: ViewKey, row: MirrorRow) {
+    const imported = this.options.views.get(key);
+    return imported &&
+      imported.version > this.options.mirror.deletionFloor(row.scope)
+      ? imported
+      : null;
+  }
+
   listIssues(): ImportIssue[] {
     return [...this.issues.values()];
   }
@@ -154,7 +167,7 @@ export class StreamSyncImporter {
           this.issues.delete(id);
           continue;
         }
-        const imported = this.options.views.get(key);
+        const imported = this.servableView(key, row);
         if (imported && imported.version >= row.version) {
           this.issues.delete(id);
           continue;

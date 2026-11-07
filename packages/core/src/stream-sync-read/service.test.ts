@@ -721,5 +721,59 @@ describe("stream-sync reads", () => {
         expect(await ids(await f.service())).toEqual(["c"]);
       });
     }
+
+    for (const encoding of encodings) {
+      it(`keeps the deleted version unavailable while a later live head is not yet downloadable (${encoding})`, async () => {
+        const { f, ns, first, service } = await importedLive(23);
+        await tombstone(f, first.scope, encoding);
+        await f.sync(service);
+        expect(await view(service)).not.toBe("view");
+
+        const later = await f.publish({
+          connector: "acme",
+          ns,
+          stream: "items",
+          generation: 1,
+          records: [{ id: "c" }],
+          withholdBlobs: true,
+        });
+        await f.sync(service);
+        expect(await view(service)).not.toBe("view");
+        expect(service.status().issues).toEqual([
+          expect.objectContaining({ problem: "blob_missing", version: 3 }),
+        ]);
+
+        const restarted = await f.service();
+        expect(await view(restarted)).not.toBe("view");
+        await restarted.importPending();
+        expect(await view(restarted)).not.toBe("view");
+
+        for (const [k, v] of later.blobs) f.blobs.set(k, v);
+        await restarted.importPending();
+        const ids = (
+          await body(await restarted.resolve(ask("pdpp.acme.items")))
+        ).data.records.map((r: any) => r.id);
+        expect(ids).toEqual(["c"]);
+      });
+    }
+
+    it("still serves the older view while a replacement is not downloadable and nothing was deleted", async () => {
+      const { f, ns, service } = await importedLive(24);
+      await f.publish({
+        connector: "acme",
+        ns,
+        stream: "items",
+        generation: 1,
+        records: [{ id: "c" }],
+        withholdBlobs: true,
+      });
+      await f.sync(service);
+      const ids = async (s: StreamSyncReadService) =>
+        (await body(await s.resolve(ask("pdpp.acme.items")))).data.records
+          .map((r: any) => r.id)
+          .sort();
+      expect(await ids(service)).toEqual(["a", "b"]);
+      expect(await ids(await f.service())).toEqual(["a", "b"]);
+    });
   });
 });

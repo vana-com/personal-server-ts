@@ -68,6 +68,7 @@ async function fixture() {
     deleted: false,
   };
   const mirror = {
+    deletionFloor: () => 0,
     rowsFor: () => ({
       controls: new Map([
         ["", { ...control.active, version: 1, deleted: false }],

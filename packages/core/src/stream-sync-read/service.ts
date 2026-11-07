@@ -13,6 +13,7 @@
  */
 
 import {
+  classifyStreamRow,
   controlHashes,
   eligible,
   isHeadLive,
@@ -31,7 +32,7 @@ import {
 } from "../legacy-projection/index.js";
 import { StreamSyncImporter, type ImportIssue } from "./importer.js";
 import { overlayWinners, viewLines, type OverlayWinners } from "./lines.js";
-import { RegistryMirror, type MirrorFeedRow } from "./mirror.js";
+import { RegistryMirror, toControlRead, type MirrorFeedRow } from "./mirror.js";
 import type {
   StreamSyncBlobReader,
   StreamSyncOverlaySource,
@@ -275,7 +276,14 @@ export class StreamSyncReadService {
   static async open(
     options: StreamSyncReadOptions,
   ): Promise<StreamSyncReadService> {
-    const mirror = await RegistryMirror.open(options.files);
+    const hashes = await controlHashes(
+      options.keys.hashes.keccak256,
+      options.keys.keyCheck,
+    );
+    const mirror = await RegistryMirror.open(
+      options.files,
+      (row) => classifyStreamRow(toControlRead(row), hashes) === "tombstoned",
+    );
     const views = await ViewStore.open(options.files);
     await options.files.remove("spool");
     const importer = new StreamSyncImporter({
@@ -283,10 +291,7 @@ export class StreamSyncReadService {
       views,
       blobs: options.blobs,
       keys: options.keys,
-      controlHashes: await controlHashes(
-        options.keys.hashes.keccak256,
-        options.keys.keyCheck,
-      ),
+      controlHashes: hashes,
       logger: options.logger,
     });
     // Import whatever the mirror holds that a crash left unimported.
@@ -327,13 +332,17 @@ export class StreamSyncReadService {
   status(): StreamSyncReadStatus {
     const connections: StreamSyncConnectionStatus[] = [];
     for (const connector of this.mirror.connectors()) {
+      const rows = this.mirror.rowsFor(connector);
       for (const view of this.connectionViews(connector)) {
         const streams: Record<
           string,
           StreamHeadView & { version: number | null; records: number | null }
         > = {};
         for (const [stream, head] of Object.entries(view.streams)) {
-          const imported = this.views.get({ connector, ns: view.ns, stream });
+          const imported = this.importer.servableView(
+            { connector, ns: view.ns, stream },
+            rows.streams.get(view.ns)!.get(stream)!,
+          );
           streams[stream] = {
             ...head,
             version: imported?.version ?? null,
@@ -368,7 +377,10 @@ export class StreamSyncReadService {
       const streams: Record<string, StreamHeadView> = {};
       let latest: number | null = null;
       for (const [stream, row] of rows.streams.get(ns) ?? []) {
-        const imported = this.views.get({ connector, ns, stream });
+        const imported = this.importer.servableView(
+          { connector, ns, stream },
+          row,
+        );
         const live =
           imported !== null &&
           isHeadLive(
