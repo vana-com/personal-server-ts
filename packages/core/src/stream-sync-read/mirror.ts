@@ -89,6 +89,8 @@ function replaces(next: MirrorRow, current: MirrorRow | undefined): boolean {
 }
 
 export class RegistryMirror {
+  private pending: Promise<void> = Promise.resolve();
+
   private constructor(
     private readonly files: StreamSyncReadFiles,
     private rows: Map<string, MirrorRow>,
@@ -130,20 +132,37 @@ export class RegistryMirror {
     rows: readonly MirrorFeedRow[],
     page: { readonly fromStart: boolean; readonly lastPage: boolean },
   ): Promise<string[]> {
-    if (page.fromStart) this.fullListingStarted = true;
+    const observation = this.pending.then(() => this.observePage(rows, page));
+    // A failed write rejects its caller without preventing the next replay.
+    this.pending = observation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return observation;
+  }
+
+  private async observePage(
+    rows: readonly MirrorFeedRow[],
+    page: { readonly fromStart: boolean; readonly lastPage: boolean },
+  ): Promise<string[]> {
+    const nextRows = new Map(this.rows);
+    const fullListingStarted = this.fullListingStarted || page.fromStart;
     const changed = new Set<string>();
     for (const feed of rows) {
       const parsed = parseScope(feed.scope);
       if (!parsed) continue;
       const row = rowFromFeed(feed);
       if (!row) continue;
-      if (!replaces(row, this.rows.get(feed.scope))) continue;
-      this.rows.set(feed.scope, row);
+      if (!replaces(row, nextRows.get(feed.scope))) continue;
+      nextRows.set(feed.scope, row);
       changed.add(parsed.connector);
     }
-    const nowListed = !this.listed && this.fullListingStarted && page.lastPage;
-    if (nowListed) this.listed = true;
-    if (changed.size > 0 || nowListed) await this.persist();
+    const nowListed = !this.listed && fullListingStarted && page.lastPage;
+    const listed = this.listed || nowListed;
+    if (changed.size > 0 || nowListed) await this.persist(nextRows, listed);
+    this.rows = nextRows;
+    this.fullListingStarted = fullListingStarted;
+    this.listed = listed;
     return [...changed];
   }
 
@@ -173,11 +192,14 @@ export class RegistryMirror {
     return { controls, streams };
   }
 
-  private async persist(): Promise<void> {
+  private async persist(
+    rows: Map<string, MirrorRow>,
+    listed: boolean,
+  ): Promise<void> {
     const file: MirrorFile = {
       format: 1,
-      listed: this.listed,
-      rows: Object.fromEntries(this.rows),
+      listed,
+      rows: Object.fromEntries(rows),
     };
     await this.files.write(PATH, encoder.encode(JSON.stringify(file)));
   }
