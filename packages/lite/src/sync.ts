@@ -21,7 +21,7 @@ import {
   createStorageBlobReader,
   createStreamSyncReadKeys,
   StreamSyncReadService,
-  type StreamSyncOverlaySource,
+  type StreamSyncOverlaySnapshotSource,
   type StreamSyncReadFiles,
 } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
@@ -166,7 +166,7 @@ export interface PsLiteSyncOptions {
    */
   streamSyncRead?: {
     readonly files?: StreamSyncReadFiles;
-    readonly overlay?: StreamSyncOverlaySource;
+    readonly overlay?: StreamSyncOverlaySnapshotSource;
   };
 }
 
