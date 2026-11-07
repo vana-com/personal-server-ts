@@ -774,4 +774,67 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
     );
     expect(await checkpointOf(w, c)).toBeUndefined();
   });
+
+  // Only the serialized watermark selection protects this case: the watermark
+  // advances after A's final read returned and without an invalidation count
+  // bump, as if another writer on the home recorded it. A's own read is still
+  // the fresh, equal row.
+  it("the save decides on the watermark as of its own mutation", async () => {
+    const c = freshConnector("ckpt-epoch-serialized");
+    const held = controlReadHooks(env.newRegistry());
+    const inner = await env.files("ckpt-epoch-serialized");
+    let armed = false;
+    let reachedWrite!: () => void;
+    const atWrite = new Promise<void>((resolve) => (reachedWrite = resolve));
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => (releaseWrite = resolve));
+    const files: StreamSyncFiles = {
+      ...inner,
+      async write(path, bytes) {
+        await inner.write(path, bytes);
+        if (armed && path === "state.json") {
+          armed = false;
+          reachedWrite();
+          await writeGate;
+        }
+      },
+    };
+    const w = await env.writer("ckpt-epoch-serialized", {
+      files,
+      registry: held.registry,
+    });
+    await w.refreshControls();
+    await collect(w, {
+      runId: "rA",
+      connector: c,
+      observedAt: T0,
+      streams: { s1: rows(["1"], "a") },
+      checkpoint: { s1: "T1" },
+    });
+    held.holdAfterStreamPost();
+    const publishing = w.publishPending();
+    try {
+      await held.atPost;
+      // The state write that records A's final control read is held.
+      held.script([{ action: async () => void (armed = true) }]);
+      held.releasePost();
+      await atWrite;
+      const state = JSON.parse(
+        new TextDecoder().decode((await inner.read("state.json"))!),
+      );
+      state.observedControl[c][NS] = { kind: "active", generation: 3 };
+      await inner.write(
+        "state.json",
+        new TextEncoder().encode(JSON.stringify(state)),
+      );
+    } finally {
+      releaseWrite();
+      held.releasePost();
+    }
+    await publishing;
+    expect(finishedOutcome(await w.status(), "rA")?.outcome.kind).toBe(
+      "no_checkpoint",
+    );
+    expect(await checkpointOf(w, c)).toBeUndefined();
+  });
 });
