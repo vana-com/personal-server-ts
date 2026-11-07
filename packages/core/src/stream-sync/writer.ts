@@ -67,7 +67,7 @@ import {
   type BucketResult,
   type CheckpointDecision,
   type ControlHashes,
-  type ControlRead,
+  classifyStreamRow,
   type ControlState,
   type Decision,
   type DecidePhase,
@@ -81,7 +81,6 @@ import {
   type OutboxProblem,
   type OutboxStream,
   type StartSnapshot,
-  type StreamRow,
   type VersionOrder,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { publicationMetadataHash } from "../publication/publish.js";
@@ -1408,7 +1407,7 @@ export class StreamSyncWriter {
     const { keyCheck } = await this.keys();
 
     const row = await this.options.registry.read(scope);
-    const rowKind = streamRowKind(row, this.control!);
+    const rowKind = classifyStreamRow(row, this.control!);
     let head: Head | null = null;
     if (rowKind === "present" && row.found) {
       head = await this.loadHead(scope, row.dataHash, {
@@ -1998,14 +1997,6 @@ function nextIndex(host: HostEntry): number {
     (n, v) => Math.max(n, v.index + 1),
     0,
   );
-}
-
-function streamRowKind(read: ControlRead, hashes: ControlHashes): StreamRow {
-  if (!read.found) return "absent";
-  const tombstone =
-    read.dataHash.toLowerCase() === hashes.tombstoneData &&
-    read.metadataHash.toLowerCase() === hashes.tombstoneMetadata;
-  return read.deleted || tombstone ? "tombstoned" : "present";
 }
 
 function parseHeadKey(request: SignedRegistryPost): string {

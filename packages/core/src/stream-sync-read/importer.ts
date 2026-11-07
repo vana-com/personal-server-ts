@@ -12,6 +12,7 @@
 
 import {
   classifyControl,
+  classifyStreamRow,
   decodePart,
   headBlobName,
   partBlobName,
@@ -19,6 +20,7 @@ import {
   verifyHead,
   type ControlHashes,
   type ControlState,
+  type StreamRow,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   toControlRead,
@@ -95,6 +97,11 @@ export class StreamSyncImporter {
     return classifyControl(toControlRead(row), this.options.controlHashes);
   }
 
+  /** Absent, present or tombstoned, by the rule the writer uses. */
+  streamRowKind(row: MirrorRow): StreamRow {
+    return classifyStreamRow(toControlRead(row), this.options.controlHashes);
+  }
+
   listIssues(): ImportIssue[] {
     return [...this.issues.values()];
   }
@@ -143,7 +150,7 @@ export class StreamSyncImporter {
       for (const [stream, row] of rows.streams.get(ns) ?? []) {
         const key: ViewKey = { connector, ns, stream };
         const id = issueId(connector, ns, stream);
-        if (row.deleted) {
+        if (this.streamRowKind(row) === "tombstoned") {
           this.issues.delete(id);
           continue;
         }
