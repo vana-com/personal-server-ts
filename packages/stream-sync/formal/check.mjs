@@ -85,7 +85,10 @@ if (args[0] === "--write") {
     );
     rmSync(meta, { recursive: true, force: true });
     const out = `${run.stdout}${run.stderr}`;
+    // TLC reports the always-state-predicate half of L5 under its own name.
+    const alias = { NoRestart: "L5_BudgetProgress" };
     const violated =
+      alias[out.match(/Invariant (\w+) is violated/)?.[1]] ??
       out.match(/Invariant (\w+) is violated/)?.[1] ??
       (out.includes("Temporal properties were violated") ? config.expect : undefined);
     const passed = out.includes("No error has been found");

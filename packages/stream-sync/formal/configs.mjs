@@ -37,14 +37,14 @@ export const DESIGN = {
   NeedsFullForcesFull: "TRUE",
   PublishCoveredOnly: "TRUE",
   WriterIssuesStart: "TRUE",
-  // F2's fix, adopted: retry_pending keeps no cursor of a stream with
-  // spooled records (traces/retry-spooled-cursor.txt).
-  RetryQuietOnly: "TRUE",
   FullMerges: "TRUE",
-  // Proposed fix, not in the ruled contract, so FALSE here: a checkpoint
-  // that only retry_pending ends saved keeps the next run full
-  // (traces/retry-token-incremental.txt).  The Fix-* rows turn it on.
-  RetryCkptStaysFull: "FALSE",
+  // R28 (retry-pending publishes progress), each guard a control:
+  RetryCkptAfterPublish: "TRUE",
+  RetryHeadIncomplete: "TRUE",
+  RetryMerges: "TRUE",
+  FullRefreshNoCursor: "TRUE",
+  KeepProvOnSuccess: "TRUE",
+  PerStreamRetryResume: "TRUE",
 };
 
 /**
@@ -65,6 +65,11 @@ const base = {
   LegacyFrom: "s1",
   // Streams declared incremental: false (run intake v2 3.0).
   FullStreams: "{}",
+  // R28: a budgeted connector (none in the base profiles): its streams
+  // need two pages, one page per run.
+  Budgeted: "{}",
+  Page1: "{}",
+  Page2: "{}",
   MaxRuns: 3,
   // One run of the bound may end retry_pending; failed or cancelled runs
   // (abortRun) only in the intake slice.
@@ -115,6 +120,11 @@ export const PROFILES = {
     MaxLost: 0,
     MaxSessions: 0,
     MaxFail: 0,
+    // F3 size cut: the delete-between-streams shape needs no retry end, no
+    // partial coverage and only a few record versions.
+    MaxRetry: 0,
+    PartialCover: "FALSE",
+    MaxVer: 3,
   },
   // One account, two record keys, one stream, three runs: a late
   // old-generation head under later runs of the current generation.
@@ -311,6 +321,82 @@ export const PROFILES = {
     MaxFail: 0,
     MaxAbort: 1,
   },
+  // R28 budgeted backfill, safety: one stream of two pages (page 1 = x1,
+  // page 2 = x2), one page per run, two devices, a delete and a restart.
+  bud: {
+    // No Desktop seed: the seed would publish every page at once.
+    ...base,
+    Desktop: "nodesk",
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1", "x2"]),
+    Streams: set(["s1"]),
+    Budgeted: set(["s1"]),
+    Page1: "{x1}",
+    Page2: "{x2}",
+    MaxRuns: 4,
+    MaxRetry: 4,
+    MaxLost: 0,
+    MaxFail: 0,
+  },
+  // The same on one device with a normal sibling stream s2: a covered
+  // sibling, a token-only sibling, a mixed run.
+  bud2: {
+    // No Desktop seed: the seed would publish every page at once.
+    ...base,
+    Desktop: "nodesk",
+    Devices: set(["d1"]),
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1", "x2"]),
+    Streams: set(["s1", "s2"]),
+    Budgeted: set(["s1"]),
+    Page1: "{x1}",
+    Page2: "{x2}",
+    MaxRuns: 4,
+    MaxRetry: 4,
+    MaxDeletes: 0,
+    MaxLost: 0,
+    MaxFail: 0,
+  },
+  // R28 liveness: one device, no delete, no leave, no explicit full
+  // request (the scheduler's runs only), no permanent failure.
+  "bud-live": {
+    // No Desktop seed: the seed would publish every page at once.
+    ...base,
+    Desktop: "nodesk",
+    Devices: set(["d1"]),
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1", "x2"]),
+    Streams: set(["s1"]),
+    Budgeted: set(["s1"]),
+    Page1: "{x1}",
+    Page2: "{x2}",
+    MaxRuns: 0,
+    MaxReruns: 4,
+    MaxRetry: 4,
+    MaxDeletes: 0,
+    MaxLost: 1,
+    MaxSessions: 1,
+    MaxFail: 0,
+  },
+  // Retry runs with records, token-only retries and needsFull debt on one
+  // device: two streams, four runs, up to three retry ends.
+  retry1: {
+    ...base,
+    Devices: set(["d1"]),
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1", "x2"]),
+    Streams: set(["s1", "s2"]),
+    MaxRuns: 4,
+    MaxRetry: 3,
+    MaxDeletes: 0,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+  },
   // The identity-less connector, two accounts.
   "slice-idless": {
     ...base,
@@ -342,6 +428,8 @@ export const SAFETY = [
   "HeadGenMonotone",
   "IncompleteOwned",
   "NeedsFullRunIsFull",
+  "R24_CursorImpliesIncremental",
+  "ProvenanceAtomic",
   "CoveredOnly",
   "IssuedStart",
   "NoFalseDelete",
@@ -354,6 +442,8 @@ export const LIVENESS = [
   "L3_NoStuckIncomplete",
   "L4_Resume",
 ];
+/** R28: the budgeted-backfill profiles check L5 only (their head stays complete:false by design). */
+export const LIVENESS_BUDGET = ["L5_BudgetProgress"];
 
 /** Simulation bounds for the profiles that breadth-first search cannot finish. */
 const SIM = { traces: 200000, depth: 60, seed: 1 };
@@ -392,6 +482,18 @@ export const CONFIGS = [
   ["Slice-q9", "the design: an old stream DELETE, a device that leaves, no-ops", "slice-q9", {}, "pass"],
   ["Slice-intake", "the design, identity-less: partial coverage, a stream declared incremental: false, retry_pending and abort; two devices", "slice-intake", {}, "pass"],
   ["Slice-intake1", "the design, identity-less: the same on one device with four runs", "slice-intake1", {}, "pass"],
+  // R28: budgeted backfill and retry-progress profiles.
+  // The full bud profile (a delete and a restart together) does not finish
+  // within the hour: a delete slice and a restart slice.
+  ["Bud-delete", "R28: a budgeted backfill (two pages), two devices, a delete", "bud", { MaxDeletes: 1, MaxSessions: 0 }, "pass"],
+  ["Bud-restart", "R28: a budgeted backfill (two pages), two devices, a restart after each publish step", "bud", { MaxDeletes: 0, MaxSessions: 1 }, "pass"],
+  // Four runs with a sibling stream do not finish within the hour; three
+  // runs allow retry, retry, succeed.
+  ["Bud2", "R28: a budgeted backfill with a normal sibling stream, one device (cut, three runs)", "bud2", { MaxRuns: 3 }, "pass"],
+  // Four runs do not finish within the hour; three runs allow retry with
+  // records, token-only retry, succeed.
+  ["Retry1", "R28: record-bearing and token-only retry ends with needsFull debt, one device (cut, three runs)", "retry1", { MaxRuns: 3 }, "pass"],
+  ["Bud-live", "R28 liveness: every page of a budgeted backfill is published and no run restarts at page 1", "bud-live", {}, "pass", "liveness"],
   ["Live", "liveness of the design", "live", CUT, "pass", "liveness"],
   // With the reader PS it does not finish within the hour; reader lag
   // matters only to C18, and Live keeps the reader.
@@ -400,11 +502,6 @@ export const CONFIGS = [
   // retry_pending end stays, the positive counterpart of C19L.
   ["Live-leave", "liveness of the design with an old stream DELETE, a device that leaves and a retry_pending end", "live-leave", { PartialCover: "FALSE" }, "pass", "liveness"],
   ["Live-cover", "liveness with two streams and partial coverage, one device, identity-less", "live-cover", {}, "pass", "liveness"],
-  // --- the proposed fix RetryCkptStaysFull (traces/retry-token-incremental.txt) ---
-  ["Fix-live-leave", "Live-leave with the proposed fix", "live-leave", { PartialCover: "FALSE", RetryCkptStaysFull: "TRUE" }, "pass", "liveness"],
-  ["Fix-idless", "the identity-less slice with the proposed fix", "slice-idless", { RetryCkptStaysFull: "TRUE" }, "pass"],
-  ["Fix-split", "two streams, partial coverage and retry_pending with the proposed fix", "split", { RetryCkptStaysFull: "TRUE" }, "pass"],
-
   // --- regression: the revision 4 counterexample (traces/split-run.txt) ---
   [
     "CE-split-run",
@@ -453,14 +550,6 @@ export const CONFIGS = [
   ["C15-failed-row-replaceable", "a row that failed settlement can be replaced", "slice-settle", { AckImmutable: "FALSE" }, "S8_AckImmutable"],
   ["C16-readiness-live-only", "readiness uses live, reads use live and complete", "slice-q9", { ReadinessSame: "FALSE" }, "S10_ReadinessMatchesRead"],
   ["C19-no-q9", "a no-op onto a complete:false base sets no needsFull", "slice-q9", { NoOpNeedsFull: "FALSE" }, "IncompleteOwned"],
-  // Is needsFull needed for liveness once RetryCkptStaysFull holds?  A
-  // complete:false publish also clears the checkpoint, so only a
-  // retry_pending save before the next run could make it incremental, and
-  // the fix keeps that run full.  Expected to pass (README.md, C02 and C12).
-  ["C12L-fix", "complete:false sets no needsFull, with the proposed fix", "live-leave", { PartialCover: "FALSE", RetryCkptStaysFull: "TRUE", NeedsFull: "FALSE" }, "pass", "liveness"],
-  // C12L-fix does not finish within an hour.  A cut to d1 only and no
-  // leave gives the same state count with NeedsFull on and off, so it
-  // cannot decide the question and is not kept (README.md, C02 and C12).
   ["C19L-no-q9", "the same, against liveness L3", "live-leave", { NoOpNeedsFull: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
   ["C20-null-base-noop", "an incremental run onto an empty base with an empty spool is a no-op", "slice-q9", { NullBasePublishes: "FALSE" }, "IncompleteOwned"],
   ["C21-needsfull-not-full", "a device with needsFull and a checkpoint runs incrementally", "slice-accounts4", { NeedsFullForcesFull: "FALSE" }, "NeedsFullRunIsFull"],
@@ -469,7 +558,13 @@ export const CONFIGS = [
   // --- run intake v2 negative controls ---
   ["C-publish-uncovered", "a stream the run did not cover is published", "late", { PublishCoveredOnly: "FALSE" }, "CoveredOnly"],
   ["C-producer-state", "START takes a state the producer chose", "late", { WriterIssuesStart: "FALSE" }, "IssuedStart"],
-  ["C-retry-saves-spooled", "retry_pending saves the cursor of a stream whose records it drops (v2 2.3 as written)", "late", { RetryQuietOnly: "FALSE" }, "S7_CheckpointSafety"],
+  // --- R28 negative controls ---
+  ["C-retry-checkpoint-before-publish", "a retry end saves its checkpoint at intake.end, before its records are published", "late", { RetryCkptAfterPublish: "FALSE" }, "S7_CheckpointSafety"],
+  ["C-retry-head-complete", "an uncovered retry head takes the ordinary completeness (full mode, old complete base)", "late", { RetryHeadIncomplete: "FALSE" }, "CoveredOnly"],
+  ["C-retry-replace", "a retry publish replaces its base instead of merging", "late", { RetryMerges: "FALSE" }, "NoFalseDelete"],
+  ["C-full-with-cursor", "an explicit full request is issued full_refresh with the saved cursor", "late", { FullRefreshNoCursor: "FALSE" }, "R24_CursorImpliesIncremental"],
+  ["C-drop-provenance-on-success", "a succeeded run drops retry provenance and the cursor", "bud-live", { KeepProvOnSuccess: "FALSE" }, "L5_BudgetProgress", "liveness"],
+  ["C-needsfull-hides-token", "any needsFull of the connector hides every cursor (today's rule)", "bud-live", { PerStreamRetryResume: "FALSE" }, "L5_BudgetProgress", "liveness"],
   ["C-full-replaces", "a stream-full run replaces its base instead of merging", "late", { FullMerges: "FALSE", FullStreams: "{s1}" }, "NoFalseDelete"],
 
   // --- section 4 scenarios: each must be reachable (NotX violated) ---
@@ -485,6 +580,10 @@ export const CONFIGS = [
   ["W-switch-reused-ckpt", "an account switch with a reused checkpoint", "slice-accounts", {}, "NotSwitchReusedCkpt", "witness"],
   ["W-needsfull-with-ckpt", "a device holds needsFull and a checkpoint at once", "slice-accounts4", {}, "NotNeedsFullWithCkpt", "witness"],
   ["W-failed-entry", "a failed entry while newer heads arrive", "lean", {}, "NotFailedEntryNewerHeads", "witness"],
+  ["W-budget-resume", "R28: a budgeted stream resumes at page 2 from its saved cursor", "bud", { MaxDeletes: 0, MaxSessions: 0 }, "NotBudgetResume", "witness"],
+  ["W-token-resume", "R28: a retry token is issued incremental under needsFull", "retry1", {}, "NotTokenResume", "witness"],
+  ["W-mixed-modes", "R28: a retrying stream resumes while a sibling with needsFull is issued nothing", "retry1", {}, "NotMixedModes", "witness"],
+  ["W-retry-merge", "R28: a record-bearing uncovered retry stream is published as a merge", "retry1", {}, "NotRetryMerge", "witness"],
 ].map(([name, why, profile, changes, expect, kind = "safety", simulate]) => ({
   name,
   why,
@@ -508,9 +607,10 @@ export function configText(config) {
       ? [
           "INVARIANT TypeOK",
           // L2 is about imports: a profile without views does not check it.
-          ...LIVENESS.filter((p) => constants.Views === "TRUE" || p !== "L2_Convergence").map(
-            (p) => `PROPERTY ${p}`,
-          ),
+          ...(constants.Budgeted !== "{}"
+            ? LIVENESS_BUDGET
+            : LIVENESS.filter((p) => constants.Views === "TRUE" || p !== "L2_Convergence")
+          ).map((p) => `PROPERTY ${p}`),
         ]
       : ["INVARIANT TypeOK", `PROPERTY ${config.expect}`]
     : config.expect === "pass"
