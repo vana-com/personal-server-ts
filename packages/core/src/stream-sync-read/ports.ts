@@ -67,11 +67,18 @@ export interface StreamSyncOverlaySource {
 
 // Own-writes overlay (pinned snapshots, publish receipts, reader acknowledgment).
 // Replaces StreamSyncOverlaySource once the read service is switched over.
+//
+// Binding: one source instance belongs to one immutable owner/network/key
+// home. Hosts build the reader and the source from that same home; an owner,
+// network or key change builds a new pair. Only that reader calls
+// `acknowledge`, and only when its files are durable.
 
 /** Durable proof that the writer published this stream version (writer.ts committed/noop). */
 export interface StreamSyncPublishReceipt {
   readonly registryVersion: number;
-  readonly dataHash: string;       // lowercase hex, as registered
+  /** Lowercase hex, as registered. */
+  readonly dataHash: string;
+  /** Always equal to the owning run's non-null `generation`; a mismatch is an integrity error. */
   readonly generation: number;
 }
 
@@ -82,36 +89,64 @@ export interface StreamSyncOverlayStream {
   readonly profile: HeadProfile;
   /** True only when the run's full/fullStream provenance says so (writer.ts:1460-1466). */
   readonly complete: boolean;
-  /** Changes whenever the stream's overlay rows could change; used in cursors. */
+  /**
+   * Identifies this stream's immutable rows and every descriptor field that
+   * affects a read (profile, primaryKey, complete, state, receipt). Never
+   * reused for different content, including across restart.
+   */
   readonly contentRevision: string;
-  /** Present once the stream is committed/noop and is waiting for the reader to import it. */
+  /**
+   * Per-stream publication state. `published` iff `receipt` is present.
+   * Terminally discarded streams are never listed (see snapshot membership).
+   */
+  readonly state: "pending" | "failed" | "published";
+  /** Present once the stream is committed/noop and waits for the reader to import it. */
   readonly receipt?: StreamSyncPublishReceipt;
 }
 
 export interface StreamSyncOverlayRun {
   readonly runId: string;
   readonly connector: string;
-  /** null = not attributable; never overlaid. */
+  /** null = not attributable; never overlaid. Never normalized to "". */
   readonly ns: string | null;
-  /** Generation the run is bound to; null when it was never admitted to one. */
+  /**
+   * The run's verified read-generation binding, from verified active-control
+   * provenance at start/ready or from successful admission. null only when
+   * genuinely unbound; never inferred from whichever control is active later.
+   */
   readonly generation: number | null;
+  /** Diagnostic aggregate only. Visibility and retirement use the per-stream fields. */
   readonly state: "pending" | "failed" | "published";
   readonly error?: string;
-  /** Run stamp used by compareStamp (not a registry time). */
-  readonly observedAt: string;
+  /** Run stamp in epoch milliseconds: the same value as Line.o for its rows. */
+  readonly observedAt: number;
+  /**
+   * Positive membership: only streams that are overlay candidates. The source
+   * omits terminally discarded streams, uncovered and seed-only streams, and
+   * whole runs that are collecting, aborted, checkpoint-only, owner/key
+   * mismatched or inconsistent (receipt/run generation mismatch). Omitting a
+   * discarded stream never removes another stream's receipt.
+   */
   readonly streams: readonly StreamSyncOverlayStream[];
 }
 
-/** One read's pinned view of the overlay. Logs it names cannot be removed until release(). */
+/**
+ * One read's pinned, immutable view of the overlay: metadata and bytes are
+ * frozen, and logs it names are not removed until release().
+ */
 export interface StreamSyncOverlaySnapshot {
-  readonly entries: readonly StreamSyncOverlayRun[];
-  /** Lines of one stream of one entry, in spool order, from the pinned log. Throws on a missing or corrupt nonempty log. */
-  lines(entry: StreamSyncOverlayRun, stream: string): AsyncIterable<Line>;
+  readonly runs: readonly StreamSyncOverlayRun[];
+  /**
+   * Lines of one stream of one run of THIS snapshot, in spool order. Rejects a
+   * run or stream not in this snapshot; throws on a missing or corrupt
+   * nonempty log.
+   */
+  lines(run: StreamSyncOverlayRun, stream: string): AsyncIterable<Line>;
   /** Idempotent. */
   release(): void;
 }
 
-/** What the reader has durably installed (after ViewStore commit). */
+/** What the reader has durably installed (after its ViewStore commit). */
 export interface StreamSyncImportedCoverage {
   readonly connector: string;
   readonly ns: string;
@@ -122,12 +157,22 @@ export interface StreamSyncImportedCoverage {
 }
 
 export interface StreamSyncOverlaySnapshotSource {
-  /** Pinned snapshot of all overlay entries of `connector`. Acquire BEFORE leasing imported views. */
+  /**
+   * Pinned snapshot of every overlay run of `connector`. Acquire it BEFORE
+   * leasing imported views, once per read, shared by all input streams.
+   * A cursor replays only the exact members (run, stream, contentRevision,
+   * base version) it recorded, or the read answers cursor_stale.
+   */
   snapshot(connector: string): Promise<StreamSyncOverlaySnapshot>;
   /**
-   * Called after a durable ViewStore commit, and for every durable current view at startup.
-   * Idempotent. The source retires a published stream only when coverage matches its receipt
-   * (same version and dataHash, or a later version in the same generation) and no snapshot pins it.
+   * Called after a durable ViewStore commit and for every durable current
+   * view at startup. Idempotent. A published stream retires only when
+   *   run.connector === c.connector && run.ns !== null && run.ns === c.ns &&
+   *   stream.name === c.stream && run.generation !== null &&
+   *   run.generation === receipt.generation && c.generation === receipt.generation &&
+   *   (c.registryVersion > receipt.registryVersion ||
+   *    (c.registryVersion === receipt.registryVersion && c.dataHash === receipt.dataHash))
+   * and no snapshot pins it. A different generation never covers a receipt.
    * A reader whose files are not durable never calls this.
    */
   acknowledge(coverage: StreamSyncImportedCoverage): Promise<void>;
