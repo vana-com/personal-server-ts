@@ -28,6 +28,7 @@ class Fixture {
   readonly blobs = new Map<string, Uint8Array>();
   readonly rows = new Map<string, MirrorFeedRow>();
   readonly files = createMemoryStreamSyncReadFiles();
+  readonly blobGets: string[] = [];
   overlay: StreamSyncOverlayEntry[] = [];
   private clock = Date.parse("2026-11-01T00:00:00Z");
 
@@ -113,7 +114,12 @@ class Fixture {
   async service(): Promise<StreamSyncReadService> {
     return StreamSyncReadService.open({
       files: this.files,
-      blobs: { get: async (k) => this.blobs.get(k) ?? null },
+      blobs: {
+        get: async (k) => {
+          this.blobGets.push(k);
+          return this.blobs.get(k) ?? null;
+        },
+      },
       keys: await createStreamSyncReadKeys(this.key.masterKey),
       logger: silent,
       overlay: { entries: async () => this.overlay },
@@ -622,5 +628,98 @@ describe("stream-sync reads", () => {
       ...array,
       conversations: [],
     });
+  });
+
+  describe("stream tombstones", () => {
+    const encodings = ["deletedAt only", "hash pair only"] as const;
+
+    async function importedLive(seed: number) {
+      const f = new Fixture(await testOwnerKey(masterKey(seed)));
+      const ns = await f.key.ns("acme", "account-1");
+      await f.activate("acme", ns);
+      const first = await f.publish({
+        connector: "acme",
+        ns,
+        stream: "items",
+        generation: 1,
+        records: [{ id: "a" }, { id: "b" }],
+      });
+      const service = await f.service();
+      await f.sync(service);
+      expect((await service.resolve(ask("pdpp.acme.items"))).kind).toBe("view");
+      return { f, ns, first, service };
+    }
+
+    async function tombstone(
+      f: Fixture,
+      scope: string,
+      encoding: (typeof encodings)[number],
+    ) {
+      const prev = f.rows.get(scope)!;
+      const { tombstone: t } = await f.key.control();
+      const next = String(Number(prev.expectedVersion) + 1);
+      f.rows.set(
+        scope,
+        encoding === "deletedAt only"
+          ? {
+              ...prev,
+              expectedVersion: next,
+              deletedAt: "2026-11-01T01:00:00.000Z",
+            }
+          : {
+              ...prev,
+              dataHash: t.dataHash,
+              metadataHash: t.metadataHash,
+              expectedVersion: next,
+              deletedAt: null,
+            },
+      );
+      return t.dataHash.slice(2).toLowerCase();
+    }
+
+    const view = (s: StreamSyncReadService) =>
+      s.resolve(ask("pdpp.acme.items")).then((d) => d.kind);
+
+    for (const encoding of encodings) {
+      it(`makes the old records unavailable (${encoding})`, async () => {
+        const { f, first, service } = await importedLive(21);
+        const tombHash = await tombstone(f, first.scope, encoding);
+        const feed = [...f.rows.values()];
+        f.blobGets.length = 0;
+
+        await service.observe(feed, { fromStart: true, lastPage: true });
+        expect(await view(service)).not.toBe("view");
+
+        await service.importPending();
+        expect(await view(service)).not.toBe("view");
+        expect(f.blobGets.filter((k) => k.includes(tombHash))).toEqual([]);
+
+        const restarted = await f.service();
+        expect(await view(restarted)).not.toBe("view");
+        await restarted.importPending();
+        expect(await view(restarted)).not.toBe("view");
+        expect(f.blobGets.filter((k) => k.includes(tombHash))).toEqual([]);
+      });
+
+      it(`imports a later live version without resurrecting the deleted one (${encoding})`, async () => {
+        const { f, ns, first, service } = await importedLive(22);
+        await tombstone(f, first.scope, encoding);
+        await f.sync(service);
+        await f.publish({
+          connector: "acme",
+          ns,
+          stream: "items",
+          generation: 1,
+          records: [{ id: "c" }],
+        });
+        await f.sync(service);
+        const ids = async (s: StreamSyncReadService) =>
+          (await body(await s.resolve(ask("pdpp.acme.items")))).data.records
+            .map((r: any) => r.id)
+            .sort();
+        expect(await ids(service)).toEqual(["c"]);
+        expect(await ids(await f.service())).toEqual(["c"]);
+      });
+    }
   });
 });
