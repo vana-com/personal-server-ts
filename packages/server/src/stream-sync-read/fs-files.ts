@@ -27,6 +27,22 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
+/**
+ * The last directory whose entry a write syncs: the root's parent, or the
+ * parent of the highest directory this write created when that lies at or
+ * above the root.
+ */
+function syncTop(root: string, created: string | undefined): string {
+  const rootPath = resolve(root);
+  if (created !== undefined) {
+    const rel = relative(resolve(created), rootPath);
+    if (rel !== ".." && !rel.startsWith(`..${sep}`)) {
+      return dirname(resolve(created));
+    }
+  }
+  return dirname(rootPath);
+}
+
 export function createFsStreamSyncReadFiles(root: string): StreamSyncReadFiles {
   let counter = 0;
   return {
@@ -43,13 +59,14 @@ export function createFsStreamSyncReadFiles(root: string): StreamSyncReadFiles {
         await handle.close();
       }
       await rename(temp, target);
-      // Publish the file entry, then each new directory entry up to the
-      // first existing ancestor. A later pointer write may rely on this.
-      const last =
-        created === undefined ? resolve(parent) : dirname(resolve(created));
+      // Publish the file entry, then every directory entry above it through
+      // the root's parent. Existence of a directory is no proof that its
+      // entry was synced: an earlier write may have created it and failed
+      // before syncing, or the process may have restarted since.
+      const top = syncTop(root, created);
       for (let directory = resolve(parent); ; directory = dirname(directory)) {
         await syncDirectory(directory);
-        if (directory === last) break;
+        if (directory === top) break;
       }
     },
     async read(path) {
