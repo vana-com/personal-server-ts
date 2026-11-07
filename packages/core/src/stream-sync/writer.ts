@@ -147,11 +147,11 @@ interface WriterState {
    */
   invalidations?: Record<string, number>;
   /**
-   * Per connector, the newest control state known: its namespace and the
-   * whole state. Only moves forward within a namespace. Every decision uses
-   * this, never a raw read.
+   * Per connector and namespace, the newest control state known: the whole
+   * state. Each entry only moves forward and another namespace never touches
+   * it. Every decision uses this, never a raw read.
    */
-  observedControl?: Record<string, { ns: string; state: ControlState }>;
+  observedControl?: Record<string, Record<string, ControlState>>;
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
   receipts: Record<string, SeedReceipt>;
@@ -1590,8 +1590,7 @@ export class StreamSyncWriter {
             undefined,
       );
       // Decide on the watermark as of this mutation, not on the read alone.
-      const known = state.observedControl?.[entry.connector];
-      const latest = known?.ns === ns ? known.state : control;
+      const latest = state.observedControl?.[entry.connector]?.[ns] ?? control;
       const decided = checkpointDecision({
         target: host.target!,
         streams,
@@ -2028,12 +2027,13 @@ function controlRank(state: ControlState): number {
 
 /**
  * Apply one control read to the state and return the newest control state
- * known. Ordering rule: within a namespace a read ranks by row version and
- * the watermark only moves forward. A read older than the watermark is a
+ * known. Ordering rule: within a (connector, namespace) a read ranks by row
+ * version and the watermark only moves forward; another namespace never
+ * changes it. A read older than the watermark is a
  * late response: it changes nothing and the stored newer state is returned,
  * so it can neither clear a checkpoint, overwrite a newer observation nor
- * authorize a decision. A newer read, or a read of another namespace, is an
- * invalidation: it advances the count whether or not a checkpoint is stored.
+ * authorize a decision. A newer read is an invalidation: it advances the
+ * count whether or not a checkpoint is stored.
  * A read that shows a stored checkpoint's generation is gone (a higher row,
  * or the same row no longer active) also clears that checkpoint (§2.4).
  */
@@ -2043,16 +2043,12 @@ function recordControl(
   ns: string,
   current: ControlState,
 ): ControlState {
-  const marks = (state.observedControl ??= {});
+  const marks = ((state.observedControl ??= {})[connector] ??= {});
   const rank = controlRank(current);
-  const prev = marks[connector];
-  const known =
-    typeof prev === "object" && prev !== null && prev.state !== undefined;
-  if (known && prev.ns === ns && rank < controlRank(prev.state)) {
-    return prev.state;
-  }
-  const moved = known && (prev.ns !== ns || rank > controlRank(prev.state));
-  marks[connector] = { ns, state: current };
+  const prev = marks[ns];
+  if (prev !== undefined && rank < controlRank(prev)) return prev;
+  const moved = prev !== undefined && rank > controlRank(prev);
+  marks[ns] = current;
   const checkpoint = state.checkpoints[connector];
   // A read ranked below the checkpoint's generation is a lagging response.
   const stale =
