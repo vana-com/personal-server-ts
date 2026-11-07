@@ -843,7 +843,7 @@ export async function createServer(
 
     if (config.streamSync.read) {
       streamSyncRead = await StreamSyncReadService.open({
-        files: createFsStreamSyncReadFiles(
+        files: await createFsStreamSyncReadFiles(
           join(storageRoot, "stream-sync-read"),
         ),
         blobs: createStorageBlobReader(storageAdapter),

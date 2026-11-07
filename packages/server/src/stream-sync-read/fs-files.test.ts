@@ -1,5 +1,5 @@
 import type * as FsPromises from "node:fs/promises";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, parse } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -65,8 +65,9 @@ describe("filesystem publication durability", () => {
       );
   }
 
-  it("syncs the file before rename, then every directory deepest first through the root's parent", async () => {
-    const files = createFsStreamSyncReadFiles(root);
+  it("syncs the file before rename, then every directory deepest first up to the root", async () => {
+    const files = await createFsStreamSyncReadFiles(root);
+    trace.events.length = 0;
     await files.write("views/stream/parts/chunk", new Uint8Array([1, 2]));
 
     expect(events()).toEqual([
@@ -76,16 +77,30 @@ describe("filesystem publication durability", () => {
       "sync:<root>/views/stream",
       "sync:<root>/views",
       "sync:<root>",
-      `sync:${dirname(root)}`,
     ]);
     expect(await readFile(join(root, "views/stream/parts/chunk"))).toEqual(
       Buffer.from([1, 2]),
     );
   });
 
-  it("syncs every ancestor through the root's parent even when the directories already exist", async () => {
+  it("syncs the root and its parent when opened, and no directory above the parent", async () => {
+    await createFsStreamSyncReadFiles(join(root, "store"));
+
+    expect(events()).toEqual(["sync:<root>/store", "sync:<root>"]);
+  });
+
+  it("makes a root created by an earlier process durable on the next open", async () => {
+    await mkdir(join(root, "store"));
+
+    await createFsStreamSyncReadFiles(join(root, "store"));
+
+    expect(events()).toEqual(["sync:<root>/store", "sync:<root>"]);
+  });
+
+  it("syncs every directory up to the root even when the directories already exist", async () => {
     await mkdir(join(root, "store/views/stream/parts"), { recursive: true });
-    const files = createFsStreamSyncReadFiles(join(root, "store"));
+    const files = await createFsStreamSyncReadFiles(join(root, "store"));
+    trace.events.length = 0;
     await files.write("views/stream/parts/chunk", new Uint8Array([3]));
 
     expect(events()).toEqual([
@@ -95,67 +110,48 @@ describe("filesystem publication durability", () => {
       "sync:<root>/store/views/stream",
       "sync:<root>/store/views",
       "sync:<root>/store",
-      "sync:<root>",
-      `sync:${dirname(root)}`,
     ]);
   });
 
-  it("completes the root's entry on a successful retry after a write that failed at rename", async () => {
-    const files = createFsStreamSyncReadFiles(join(root, "new-root"));
+  it("syncs the chain up to the root on the retry after a write that failed at rename", async () => {
+    const files = await createFsStreamSyncReadFiles(
+      join(root, "a", "b", "store"),
+    );
     trace.failNextRename = true;
     await expect(
-      files.write("mirror.json", new Uint8Array([6])),
+      files.write("deep/mirror.json", new Uint8Array([7])),
     ).rejects.toThrow("rename failed");
     trace.events.length = 0;
 
-    await files.write("mirror.json", new Uint8Array([6]));
+    await files.write("deep/mirror.json", new Uint8Array([7]));
 
-    expect(events()).toContain("sync:<root>");
     expect(events().slice(-3)).toEqual([
-      "sync:<root>/new-root",
-      "sync:<root>",
-      `sync:${dirname(root)}`,
+      "rename:<root>/a/b/store/deep/mirror.json",
+      "sync:<root>/a/b/store/deep",
+      "sync:<root>/a/b/store",
     ]);
   });
 
-  it("syncs every ancestor up to the filesystem root on the retry after a write that created several missing levels and failed", async () => {
-    const storeRoot = join(root, "a", "b", "store");
-    const files = createFsStreamSyncReadFiles(storeRoot);
-    trace.failNextRename = true;
-    await expect(
-      files.write("mirror.json", new Uint8Array([7])),
-    ).rejects.toThrow("rename failed");
-    trace.events.length = 0;
-
-    await files.write("mirror.json", new Uint8Array([7]));
-
-    const synced = trace.events
-      .filter((event) => event.startsWith("sync:"))
-      .map((event) => event.slice("sync:".length));
-    const ancestors: string[] = [];
-    for (let dir = storeRoot; ; dir = dirname(dir)) {
-      ancestors.push(dir);
-      if (dir === parse(storeRoot).root) break;
-    }
-    expect(synced.slice(-ancestors.length)).toEqual(ancestors);
-  });
-
-  it("makes a newly created root durable in its existing parent", async () => {
-    const files = createFsStreamSyncReadFiles(join(root, "new-root"));
-    await files.write("heads/1.json", new Uint8Array([4]));
-
-    expect(events()).toEqual([
-      "sync:<root>/new-root/heads/1.json.tmp",
-      "rename:<root>/new-root/heads/1.json",
-      "sync:<root>/new-root/heads",
-      "sync:<root>/new-root",
-      "sync:<root>",
-      `sync:${dirname(root)}`,
-    ]);
-  });
+  it.skipIf(process.getuid?.() === 0)(
+    "writes under a root whose ancestors above its parent are traverse-only",
+    async () => {
+      const blocked = join(root, "blocked");
+      await mkdir(join(blocked, "parent"), { recursive: true });
+      await chmod(blocked, 0o111);
+      try {
+        const files = await createFsStreamSyncReadFiles(
+          join(blocked, "parent", "store"),
+        );
+        await files.write("mirror.json", new Uint8Array([8]));
+        expect(await files.read("mirror.json")).toEqual(new Uint8Array([8]));
+      } finally {
+        await chmod(blocked, 0o755);
+      }
+    },
+  );
 
   it("syncs the parent after removing a published file", async () => {
-    const files = createFsStreamSyncReadFiles(root);
+    const files = await createFsStreamSyncReadFiles(root);
     await files.write("views/current.json", new Uint8Array([5]));
     trace.events.length = 0;
 
@@ -169,7 +165,7 @@ describe("filesystem publication durability", () => {
   });
 
   it("keeps removal idempotent when the parent does not exist", async () => {
-    const files = createFsStreamSyncReadFiles(root);
+    const files = await createFsStreamSyncReadFiles(root);
     await expect(files.remove("absent/current.json")).resolves.toBeUndefined();
   });
 });

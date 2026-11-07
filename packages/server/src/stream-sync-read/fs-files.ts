@@ -2,11 +2,18 @@
  * Filesystem {@link StreamSyncReadFiles} for the full server, under one root
  * directory. A write lands in a temporary file that is synced and renamed
  * over the target, so a reader or a crash never sees half a file.
+ *
+ * Durability by ownership: the adapter owns the root and everything below it.
+ * The root's parent and the directories above belong to whoever provisions
+ * the storage root. Opening makes the root exist and syncs the root and its
+ * parent; each write syncs every directory from the file's parent up to and
+ * including the root. The adapter never opens a directory above the root's
+ * parent.
  */
 
 import { createReadStream } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
-import { dirname, join, parse, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import type { StreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 
 function inside(root: string, path: string): string {
@@ -27,7 +34,15 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-export function createFsStreamSyncReadFiles(root: string): StreamSyncReadFiles {
+export async function createFsStreamSyncReadFiles(
+  root: string,
+): Promise<StreamSyncReadFiles> {
+  const base = resolve(root);
+  // Runs on every open, so a root created by an earlier process that crashed
+  // before syncing it becomes durable here.
+  await mkdir(base, { recursive: true });
+  await syncDirectory(base);
+  await syncDirectory(dirname(base));
   let counter = 0;
   return {
     async write(path, bytes) {
@@ -44,14 +59,12 @@ export function createFsStreamSyncReadFiles(root: string): StreamSyncReadFiles {
       }
       await rename(temp, target);
       // Publish the file entry, then every directory entry above it up to
-      // the filesystem root. Existence of a directory is no proof that its
-      // entry was synced: an earlier write may have created it and failed
-      // before syncing, or the process may have restarted since. Cost: one
-      // open, fsync and close per ancestor on every write.
-      const top = parse(resolve(parent)).root;
+      // and including the root. Existence of a directory is no proof that its
+      // entry was synced, so nothing is remembered between attempts. The
+      // root's parent was synced when the adapter opened.
       for (let directory = resolve(parent); ; directory = dirname(directory)) {
         await syncDirectory(directory);
-        if (directory === top) break;
+        if (directory === base) break;
       }
     },
     async read(path) {
