@@ -116,9 +116,12 @@ export function foldContributions(
       continue;
     }
     // `complete` is `full || base complete`, and an empty base is not complete.
+    // A run resumed from another namespace's checkpoint publishes an
+    // incomplete head even over a complete base (writer.ts:1465).
     const baseComplete =
       compat.kind === "use_base" && state !== null && state.complete;
-    const complete = c.stream.complete || baseComplete;
+    const complete =
+      !c.stream.incompleteOverBase && (c.stream.complete || baseComplete);
     const profile = nextProfile(
       compat.kind === "empty_base" ? null : state,
       c,

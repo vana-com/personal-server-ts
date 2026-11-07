@@ -78,6 +78,12 @@ export interface StreamSyncOverlayStream {
    */
   readonly recordCount?: number;
   /**
+   * The run resumed from a checkpoint of another namespace (writer.ts:1465):
+   * the head the writer publishes for it is incomplete even over a complete
+   * base. `complete` is then false as well.
+   */
+  readonly incompleteOverBase?: boolean;
+  /**
    * Identifies this stream's immutable rows and every descriptor field that
    * affects a read (profile, primaryKey, complete, state, receipt). Never
    * reused for different content, including across restart.

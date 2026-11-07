@@ -171,6 +171,8 @@ export interface FakeStream {
   readonly name: string;
   readonly rows: readonly Line[];
   readonly complete?: boolean;
+  /** See `StreamSyncOverlayStream.incompleteOverBase`. */
+  readonly incompleteOverBase?: boolean;
   readonly contentRevision?: string;
   readonly receipt?: StreamSyncPublishReceipt;
   /** Default `["id"]`. */
@@ -218,6 +220,7 @@ export class FakeOverlay implements StreamSyncOverlaySnapshotSource {
         profile: { key: null, version: s.version ?? "1.0.0" },
         complete: s.complete ?? false,
         recordCount: s.rows.length,
+        ...(s.incompleteOverBase ? { incompleteOverBase: true } : {}),
         contentRevision: s.contentRevision ?? "r1",
         state: s.receipt
           ? "published"
