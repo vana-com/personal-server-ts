@@ -62,10 +62,15 @@ async function* partLines(
   lease: ViewLease,
 ): AsyncGenerator<{ readonly text: string; readonly line: Line }> {
   for (const part of lease.version.head.parts) {
-    const text = decoder.decode(await views.readPart(lease.key, part.hash));
+    const text = decoder.decode(
+      await views.readPart(lease.key, part.hash, part.bytes),
+    );
     let start = 0;
     while (start < text.length) {
       const end = text.indexOf("\n", start);
+      if (end === -1) {
+        throw new Error("corrupt imported part: missing final newline");
+      }
       const lineText = text.slice(start, end);
       start = end + 1;
       // Verified at import (`decodePart`); parsed, not re-verified.

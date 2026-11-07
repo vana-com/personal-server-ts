@@ -12,6 +12,7 @@
  * so an import fetches only the parts it does not hold yet.
  */
 
+import { sha256 as hashPart } from "@noble/hashes/sha2";
 import {
   decodeHead,
   type Head,
@@ -42,8 +43,40 @@ interface CurrentFile {
   readonly dataHash: string;
 }
 
+/** What an import may do while it holds the stream's lock. */
+export interface ImportTransaction {
+  /**
+   * Whether an intact copy of the part is stored. A stored copy that does not
+   * match its hash (or `expectedBytes`) is removed and reported as missing.
+   */
+  hasPart(sha256: string, expectedBytes?: number): Promise<boolean>;
+  putPart(sha256: string, clear: Uint8Array): Promise<void>;
+  /** Make `version` current. Every part of `head` must be stored first. */
+  commit(
+    version: number,
+    dataHash: string,
+    headBytes: Uint8Array,
+    head: Head,
+  ): Promise<void>;
+}
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+/** Part names hash the clear bytes, not the encrypted storage blob. */
+function matchesPart(
+  bytes: Uint8Array,
+  sha256: string,
+  expectedBytes?: number,
+): boolean {
+  if (expectedBytes !== undefined && bytes.length !== expectedBytes) {
+    return false;
+  }
+  const hash = Array.from(hashPart(bytes), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+  return hash === sha256;
+}
 
 /** Safe as one path segment: no separators, no dot segments. */
 function segment(value: string): string {
@@ -82,8 +115,12 @@ export class ViewStore {
   /** id → versions on disk that are not current. */
   private readonly retained = new Map<string, Map<number, ImportedVersion>>();
   private readonly keys = new Map<string, ViewKey>();
-  /** id → parts an import is writing, kept until it commits or gives up. */
-  private readonly staged = new Map<string, Set<string>>();
+  /**
+   * id → tail of the stream's lock queue. Imports and collections of one
+   * stream run one at a time, so a collection never works from keep-sets
+   * that an import has since outdated.
+   */
+  private readonly locks = new Map<string, Promise<void>>();
 
   private constructor(private readonly files: StreamSyncReadFiles) {}
 
@@ -104,9 +141,25 @@ export class ViewStore {
       const headBytes = await files.read(
         `${dir(key)}/heads/${pointer.version}.json`,
       );
-      if (!headBytes) continue;
+      if (!headBytes) {
+        await files.remove(path);
+        continue;
+      }
       const decoded = decodeHead(headBytes);
       if (decoded.kind !== "ok") continue;
+      // A restore can bring back a pointer without all its parts. Drop the
+      // pointer so the stream imports again; surviving parts stay reusable.
+      let complete = true;
+      for (const part of decoded.head.parts) {
+        if (!(await store.partExists(key, part.hash))) {
+          complete = false;
+          break;
+        }
+      }
+      if (!complete) {
+        await files.remove(path);
+        continue;
+      }
       const id = viewKeyId(key);
       store.keys.set(id, key);
       store.current.set(id, {
@@ -131,21 +184,60 @@ export class ViewStore {
     }));
   }
 
-  async hasPart(key: ViewKey, sha256: string): Promise<boolean> {
+  private async partExists(key: ViewKey, sha256: string): Promise<boolean> {
     return (await this.files.read(`${dir(key)}/parts/${sha256}`)) !== null;
   }
 
-  /** Keep the parts of `head` while an import writes them. */
-  stage(key: ViewKey, head: Head): () => void {
-    const id = viewKeyId(key);
-    const hashes = new Set(head.parts.map((p) => p.hash));
-    this.staged.set(id, hashes);
-    return () => {
-      if (this.staged.get(id) === hashes) this.staged.delete(id);
-    };
+  private async hasPart(
+    key: ViewKey,
+    sha256: string,
+    expectedBytes?: number,
+  ): Promise<boolean> {
+    const path = `${dir(key)}/parts/${sha256}`;
+    const bytes = await this.files.read(path);
+    if (bytes === null) return false;
+    if (matchesPart(bytes, sha256, expectedBytes)) return true;
+    // Treat a damaged cache entry like a missing part so the import repairs it.
+    await this.files.remove(path);
+    return false;
   }
 
-  async putPart(
+  /** Run `body` while holding the stream's lock. */
+  private exclusive<T>(key: ViewKey, body: () => Promise<T>): Promise<T> {
+    const id = viewKeyId(key);
+    const previous = this.locks.get(id) ?? Promise.resolve();
+    const run = previous.then(body);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.locks.set(id, tail);
+    void tail.then(() => {
+      if (this.locks.get(id) === tail) this.locks.delete(id);
+    });
+    return run;
+  }
+
+  /**
+   * Import one version of a stream. The stream's lock is held from the first
+   * part to the commit, so no collection runs against a half-written import.
+   */
+  withImport<T>(
+    key: ViewKey,
+    body: (tx: ImportTransaction) => Promise<T>,
+  ): Promise<T> {
+    return this.exclusive(key, () =>
+      body({
+        hasPart: (sha256, expectedBytes) =>
+          this.hasPart(key, sha256, expectedBytes),
+        putPart: (sha256, clear) => this.putPart(key, sha256, clear),
+        commit: (version, dataHash, headBytes, head) =>
+          this.commit(key, version, dataHash, headBytes, head),
+      }),
+    );
+  }
+
+  private async putPart(
     key: ViewKey,
     sha256: string,
     clear: Uint8Array,
@@ -154,7 +246,7 @@ export class ViewStore {
   }
 
   /** Make `version` current. Every part of `head` must be stored first. */
-  async commit(
+  private async commit(
     key: ViewKey,
     version: number,
     dataHash: string,
@@ -177,7 +269,7 @@ export class ViewStore {
       if (!retained) this.retained.set(id, (retained = new Map()));
       retained.set(previous.version, previous);
     }
-    await this.collect(key);
+    await this.collectLocked(key);
   }
 
   /**
@@ -211,14 +303,26 @@ export class ViewStore {
   }
 
   /** Clear part bytes of a leased version. */
-  async readPart(key: ViewKey, sha256: string): Promise<Uint8Array> {
+  async readPart(
+    key: ViewKey,
+    sha256: string,
+    expectedBytes?: number,
+  ): Promise<Uint8Array> {
     const bytes = await this.files.read(`${dir(key)}/parts/${sha256}`);
     if (!bytes) throw new Error("imported part is missing");
+    if (!matchesPart(bytes, sha256, expectedBytes)) {
+      throw new Error("corrupt imported part: size or SHA-256 mismatch");
+    }
     return bytes;
   }
 
   /** Remove versions that are neither current nor leased, and unreferenced parts. */
-  private async collect(key: ViewKey): Promise<void> {
+  private collect(key: ViewKey): Promise<void> {
+    return this.exclusive(key, () => this.collectLocked(key));
+  }
+
+  /** The caller holds the stream's lock; keep-sets are read here, under it. */
+  private async collectLocked(key: ViewKey): Promise<void> {
     const id = viewKeyId(key);
     const base = dir(key);
     const current = this.current.get(id);
@@ -230,7 +334,7 @@ export class ViewStore {
     }
     const keep = new Set<number>(retained.keys());
     if (current) keep.add(current.version);
-    const referenced = new Set<string>(this.staged.get(id) ?? []);
+    const referenced = new Set<string>();
     for (const version of keep) {
       const imported =
         version === current?.version ? current : retained.get(version)!;

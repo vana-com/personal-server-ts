@@ -12,6 +12,7 @@
 
 import {
   classifyControl,
+  classifyStreamRow,
   decodePart,
   headBlobName,
   partBlobName,
@@ -19,6 +20,7 @@ import {
   verifyHead,
   type ControlHashes,
   type ControlState,
+  type StreamRow,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   toControlRead,
@@ -95,6 +97,24 @@ export class StreamSyncImporter {
     return classifyControl(toControlRead(row), this.options.controlHashes);
   }
 
+  /** Absent, present or tombstoned, by the rule the writer uses. */
+  streamRowKind(row: MirrorRow): StreamRow {
+    return classifyStreamRow(toControlRead(row), this.options.controlHashes);
+  }
+
+  /**
+   * The imported view of a stream, unless it is at or below the stream's
+   * deletion floor: a later live row replaced the tombstone row, but the view
+   * still holds records the owner deleted. `row` is the stream's mirror row.
+   */
+  servableView(key: ViewKey, row: MirrorRow) {
+    const imported = this.options.views.get(key);
+    return imported &&
+      imported.version > this.options.mirror.deletionFloor(row.scope)
+      ? imported
+      : null;
+  }
+
   listIssues(): ImportIssue[] {
     return [...this.issues.values()];
   }
@@ -143,11 +163,11 @@ export class StreamSyncImporter {
       for (const [stream, row] of rows.streams.get(ns) ?? []) {
         const key: ViewKey = { connector, ns, stream };
         const id = issueId(connector, ns, stream);
-        if (row.deleted) {
+        if (this.streamRowKind(row) === "tombstoned") {
           this.issues.delete(id);
           continue;
         }
-        const imported = this.options.views.get(key);
+        const imported = this.servableView(key, row);
         if (imported && imported.version >= row.version) {
           this.issues.delete(id);
           continue;
@@ -217,10 +237,9 @@ export class StreamSyncImporter {
     const head = verified.head;
     // A head of another generation is not live (§2.4); nothing to import.
     if (head.generation !== generation) return;
-    const unstage = views.stage(key, head);
-    try {
+    await views.withImport(key, async (tx) => {
       for (const part of head.parts) {
-        if (await views.hasPart(key, part.hash)) continue;
+        if (await tx.hasPart(part.hash, part.bytes)) continue;
         const partCipher = await blobs.get(
           `${scope}/${partBlobName(head.generation, part.hash)}`,
         );
@@ -237,12 +256,10 @@ export class StreamSyncImporter {
         } catch (error) {
           throw new Problem("corrupt", `part: ${(error as Error).message}`);
         }
-        await views.putPart(key, part.hash, partClear);
+        await tx.putPart(part.hash, partClear);
       }
-      await views.commit(key, row.version, row.dataHash, clear, head);
-    } finally {
-      unstage();
-    }
+      await tx.commit(row.version, row.dataHash, clear, head);
+    });
   }
 }
 
