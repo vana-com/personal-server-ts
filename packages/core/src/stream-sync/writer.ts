@@ -138,6 +138,13 @@ interface WriterState {
   version: 1;
   needsFull: NeedsFull;
   checkpoints: Record<string, StreamSyncCheckpoint>;
+  /**
+   * Per connector, how many times control observation invalidated its saved
+   * checkpoint. It only grows and outlives the checkpoint it deletes, so a
+   * save can tell that an invalidation came after the run's control read. A
+   * state file without it reads as 0.
+   */
+  invalidations?: Record<string, number>;
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
   receipts: Record<string, SeedReceipt>;
@@ -1120,6 +1127,8 @@ export class StreamSyncWriter {
         return;
       }
       delete state.checkpoints[connector];
+      const epochs = (state.invalidations ??= {});
+      epochs[connector] = (epochs[connector] ?? 0) + 1;
     });
   }
 
@@ -1544,12 +1553,20 @@ export class StreamSyncWriter {
   private async checkpoint(host: HostEntry): Promise<void> {
     const { entry } = host;
     const ns = entry.ns!;
+    // Snapshot before the control read: an invalidation that lands after it
+    // makes that read stale, and the save below refuses to use it.
+    const epoch =
+      (await this.readState()).invalidations?.[entry.connector] ?? 0;
     const control = await this.readControl(controlScope(entry.connector, ns));
     const seed = this.options.seed;
     const streams = Object.fromEntries(
       Object.entries(entry.streams).map(([k, v]) => [k, streamRunResult(v)]),
     );
     const decision = await this.withState((state) => {
+      if ((state.invalidations?.[entry.connector] ?? 0) !== epoch) {
+        // The records are already published; the next run reads them again.
+        return { kind: "stale" as const };
+      }
       const seedReceiptsPending = host.seedStreams.some(
         (s) =>
           seed !== undefined &&
@@ -1562,6 +1579,15 @@ export class StreamSyncWriter {
         control,
         seedReceiptsPending,
       });
+      const held = state.checkpoints[entry.connector];
+      if (
+        decided.kind === "save" &&
+        held?.ns === ns &&
+        held.generation > decided.generation
+      ) {
+        // Never replace a newer generation's checkpoint with an older one.
+        return { kind: "stale" as const };
+      }
       if (decided.kind === "save") {
         // §3.6: this run's cursors join the saved ones of the same namespace
         // and generation, so a stream the run did not cover keeps its own.
@@ -1578,6 +1604,14 @@ export class StreamSyncWriter {
       }
       return decided;
     });
+    if (decision.kind === "stale") {
+      await this.finish(host, {
+        kind: "no_checkpoint",
+        generation: host.target!,
+        reason: "control_changed",
+      });
+      return;
+    }
     if (decision.kind === "save") {
       this.fault("after_checkpoint_saved", entry.runId);
       await this.finish(host, {
