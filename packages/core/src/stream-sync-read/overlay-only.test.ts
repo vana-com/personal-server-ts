@@ -42,9 +42,7 @@ async function rows(f: Fixture, extra = {}) {
   const decision = await service.resolve(ask("pdpp.acme.items", extra));
   if (decision.kind !== "view") return decision.kind;
   const envelope = await body(decision);
-  return Object.fromEntries(
-    envelope.data.records.map((r: any) => [r.id, r.v]),
-  );
+  return Object.fromEntries(envelope.data.records.map((r: any) => [r.id, r.v]));
 }
 
 describe("overlay over an older imported view", () => {
@@ -55,10 +53,15 @@ describe("overlay over an older imported view", () => {
       ns,
       stream: "items",
       generation: 1,
-      records: [{ id: "a", v: 1 }, { id: "r", v: 1 }],
+      records: [
+        { id: "a", v: 1 },
+        { id: "r", v: 1 },
+      ],
       observedAt: T - 1000,
     });
-    f.overlay.runs = [run(ns, [row("r", 2), row("new", 1)], { complete: false })];
+    f.overlay.runs = [
+      run(ns, [row("r", 2), row("new", 1)], { complete: false }),
+    ];
     expect(await rows(f)).toEqual({ a: 1, r: 2, new: 1 });
   });
 
@@ -80,9 +83,13 @@ describe("overlay over an older imported view", () => {
     const { f, ns } = await setup(53);
     f.overlay.runs = [
       run(ns, [row("k", 3, T + 2, "b")], { runId: "b" }),
-      run(ns, [row("k", 1, T + 1, "a"), row("e", 1, T, "a"), row("e", 2, T, "a")], {
-        runId: "a",
-      }),
+      run(
+        ns,
+        [row("k", 1, T + 1, "a"), row("e", 1, T, "a"), row("e", 2, T, "a")],
+        {
+          runId: "a",
+        },
+      ),
       run(ns, [row("e", 3, T, "0")], { runId: "0" }),
     ];
     // k: newest stamp wins. e: equal stamps in run "a" (later line wins), and
@@ -204,12 +211,18 @@ describe("overlay-only views", () => {
     ];
     const service = await f.service();
     await f.sync(service);
-    expect((await service.resolve(ask("instagram.posts"))).kind).not.toBe("view");
+    expect((await service.resolve(ask("instagram.posts"))).kind).not.toBe(
+      "view",
+    );
   });
 
   it("serves the retained rows of a published stream until the imported view covers it", async () => {
     const { f, ns } = await setup(65);
-    const receipt = { registryVersion: 2, dataHash: "ab".repeat(32), generation: 1 };
+    const receipt = {
+      registryVersion: 2,
+      dataHash: "ab".repeat(32),
+      generation: 1,
+    };
     f.overlay.runs = [
       {
         runId: "r1",
@@ -217,7 +230,12 @@ describe("overlay-only views", () => {
         generation: 1,
         state: "published",
         streams: [
-          { name: "items", rows: [row("r", 2), row("new", 1)], complete: true, receipt },
+          {
+            name: "items",
+            rows: [row("r", 2), row("new", 1)],
+            complete: true,
+            receipt,
+          },
         ],
       },
     ];

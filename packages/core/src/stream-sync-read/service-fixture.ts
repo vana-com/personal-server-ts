@@ -18,7 +18,7 @@ import {
   type ReadDecision,
   type StreamSyncReadOptions,
 } from "./service.js";
-import { buildTestHead, testOwnerKey, type TestOwnerKey } from "./testing.js";
+import { buildTestHead, type TestOwnerKey } from "./testing.js";
 
 const META = `0x${"ab".repeat(32)}`;
 const silent = { info() {}, warn() {}, error() {} };
@@ -145,7 +145,9 @@ export class Fixture {
   }
 }
 
-export async function body(decision: ReadDecision): Promise<Record<string, any>> {
+export async function body(
+  decision: ReadDecision,
+): Promise<Record<string, any>> {
   if (decision.kind !== "view")
     throw new Error(`expected view, got ${decision.kind}`);
   return JSON.parse(await new Response(decision.body).text());
@@ -162,7 +164,6 @@ export const ask = (
   isOwnerView: true,
   ...extra,
 });
-
 
 export interface FakeStream {
   readonly name: string;
@@ -211,7 +212,11 @@ export class FakeOverlay implements StreamSyncOverlaySnapshotSource {
         profile: { key: null, version: "1.0.0" },
         complete: s.complete ?? false,
         contentRevision: s.contentRevision ?? "r1",
-        state: s.receipt ? "published" : (run.state ?? "pending") === "failed" ? "failed" : "pending",
+        state: s.receipt
+          ? "published"
+          : (run.state ?? "pending") === "failed"
+            ? "failed"
+            : "pending",
         ...(s.receipt ? { receipt: s.receipt } : {}),
       })),
     };
@@ -235,7 +240,10 @@ export class FakeOverlay implements StreamSyncOverlaySnapshotSource {
         .map((t) => t.described),
       lines: (entry, stream) => {
         this.beforeLines?.();
-        const found = this.runs.length === 0 ? undefined : taken.find((t) => t.run.runId === entry.runId);
+        const found =
+          this.runs.length === 0
+            ? undefined
+            : taken.find((t) => t.run.runId === entry.runId);
         const rows = found?.run.streams.find((s) => s.name === stream)?.rows;
         if (!rows) throw new Error("overlay log is missing");
         return (async function* () {

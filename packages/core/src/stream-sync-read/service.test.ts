@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { JsonObject } from "@opendatalabs/personal-server-ts-stream-sync";
 import { projectPdppRecordsToLegacyPayload } from "../legacy-projection/index.js";
+import type {
+  StreamSyncReadService} from "./service.js";
 import {
   liveStreamCounts,
-  readTargets,
-  StreamSyncReadService,
+  readTargets
 } from "./service.js";
 import { testOwnerKey } from "./testing.js";
 import { ask, body, Fixture, masterKey } from "./service-fixture.js";

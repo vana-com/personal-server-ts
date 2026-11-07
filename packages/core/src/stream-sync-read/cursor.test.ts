@@ -102,7 +102,9 @@ describe("cursor over the overlay", () => {
     const { f, ns, service } = await setup(84, false);
     f.overlay.runs = [fakeRun(ns, "r1", [line("one", 1, "r1")])];
     const cursor = await first(service);
-    expect(JSON.parse(atob(cursor.replace(/-/g, "+").replace(/_/g, "/")))).toMatchObject({
+    expect(
+      JSON.parse(atob(cursor.replace(/-/g, "+").replace(/_/g, "/"))),
+    ).toMatchObject({
       s: { items: { b: null } },
     });
     expect(await ids(service, cursor)).toEqual(["one"]);

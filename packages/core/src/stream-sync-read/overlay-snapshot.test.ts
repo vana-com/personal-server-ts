@@ -34,7 +34,9 @@ describe("overlay snapshot lifecycle", () => {
         runId: "r1",
         ns,
         generation: 1,
-        streams: [{ name: "items", rows: [{ o: 9e12, r: "r1", v: { id: "n" } }] }],
+        streams: [
+          { name: "items", rows: [{ o: 9e12, r: "r1", v: { id: "n" } }] },
+        ],
       },
     ];
     const order: string[] = [];
@@ -60,7 +62,9 @@ describe("overlay snapshot lifecycle", () => {
         runId: "r1",
         ns,
         generation: 1,
-        streams: [{ name: "items", rows: [{ o: 9e12, r: "r1", v: { id: "n" } }] }],
+        streams: [
+          { name: "items", rows: [{ o: 9e12, r: "r1", v: { id: "n" } }] },
+        ],
       },
     ];
     const decision = await service.resolve(ask("pdpp.acme.items"));
@@ -90,9 +94,7 @@ describe("overlay snapshot lifecycle", () => {
     const fresh = f.overlay.released;
     const decision = await service.resolve(
       ask("pdpp.acme.items", {
-        cursor: btoa(
-          JSON.stringify({ c: "other", ns: "", v: { items: 1 } }),
-        ),
+        cursor: btoa(JSON.stringify({ c: "other", ns: "", v: { items: 1 } })),
       }),
     );
     expect(decision.kind).toBe("cursor_stale");
@@ -143,7 +145,9 @@ describe("overlay snapshot lifecycle", () => {
         runId: "r1",
         ns,
         generation: 1,
-        streams: [{ name: "items", rows: [{ o: 9e12, r: "r1", v: { id: "n" } }] }],
+        streams: [
+          { name: "items", rows: [{ o: 9e12, r: "r1", v: { id: "n" } }] },
+        ],
       },
     ];
     // The log of a described stream vanishes before it is read.
@@ -159,9 +163,11 @@ describe("overlay snapshot lifecycle", () => {
 
   it("releases the snapshot when resolve throws", async () => {
     const { f, service } = await importedItems(47);
-    const lease = vi.spyOn(ViewStore.prototype, "lease").mockImplementation(() => {
-      throw new Error("lease failed");
-    });
+    const lease = vi
+      .spyOn(ViewStore.prototype, "lease")
+      .mockImplementation(() => {
+        throw new Error("lease failed");
+      });
     try {
       await expect(service.resolve(ask("pdpp.acme.items"))).rejects.toThrow(
         "lease failed",

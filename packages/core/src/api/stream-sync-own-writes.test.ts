@@ -2,10 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { handlePersonalServerDataRequest } from "./index.js";
 import type { PersonalServerDataApiDeps } from "./index.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
-import {
-  Fixture,
-  masterKey,
-} from "../stream-sync-read/service-fixture.js";
+import { Fixture, masterKey } from "../stream-sync-read/service-fixture.js";
 import { testOwnerKey } from "../stream-sync-read/testing.js";
 
 /**
@@ -54,10 +51,11 @@ async function setup(seed: number, activate = true) {
     sizeBytes: written.sizeBytes,
   } as never);
   const accessLog = vi.fn(async () => undefined);
-  const authorizeBuilderRead = vi.fn(async ({ request }: { request: Request }) =>
-    request.headers.get("x-test-builder")
-      ? { builder: BUILDER, grantId: "grant-1" }
-      : { builder: BUILDER, grantId: "owner" },
+  const authorizeBuilderRead = vi.fn(
+    async ({ request }: { request: Request }) =>
+      request.headers.get("x-test-builder")
+        ? { builder: BUILDER, grantId: "grant-1" }
+        : { builder: BUILDER, grantId: "owner" },
   );
   const deps: PersonalServerDataApiDeps = {
     storage,

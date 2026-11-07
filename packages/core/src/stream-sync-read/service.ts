@@ -236,7 +236,10 @@ export function readTargets(scope: string): Target[] {
 }
 
 /** Whether the imported view holds everything the published stream holds. */
-function covers(base: ImportedVersion, receipt: StreamSyncPublishReceipt): boolean {
+function covers(
+  base: ImportedVersion,
+  receipt: StreamSyncPublishReceipt,
+): boolean {
   if (base.head.generation !== receipt.generation) return false;
   if (base.version > receipt.registryVersion) return true;
   return (
@@ -489,8 +492,10 @@ export class StreamSyncReadService {
     base: ImportedVersion | null,
   ): { run: StreamSyncOverlayRun; stream: StreamSyncOverlayStream }[] {
     if (!snapshot || control.kind !== "active" || tombstoned) return [];
-    const out: { run: StreamSyncOverlayRun; stream: StreamSyncOverlayStream }[] =
-      [];
+    const out: {
+      run: StreamSyncOverlayRun;
+      stream: StreamSyncOverlayStream;
+    }[] = [];
     for (const run of snapshot.runs) {
       if (
         run.connector !== connector ||
@@ -829,10 +834,8 @@ export class StreamSyncReadService {
           this.options.keys,
           input.lease,
           overlays.get(stream)!,
-          (input.lease
-            ? input.lease.version.head
-            : newestShape(input.local)
-          ).primaryKey,
+          (input.lease ? input.lease.version.head : newestShape(input.local))
+            .primaryKey,
         );
       };
       const nextCursor = encodeCursor({

@@ -29,9 +29,7 @@ describe("reader acknowledgment", () => {
     const pointerAtAck: (number | null)[] = [];
     const original = f.overlay.acknowledge.bind(f.overlay);
     f.overlay.acknowledge = async (c) => {
-      const current = await f.files.read(
-        `views/acme/${ns}/items/current.json`,
-      );
+      const current = await f.files.read(`views/acme/${ns}/items/current.json`);
       pointerAtAck.push(
         current ? JSON.parse(new TextDecoder().decode(current)).version : null,
       );
