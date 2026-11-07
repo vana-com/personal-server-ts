@@ -112,15 +112,24 @@ export interface WithheldRun {
   readonly reason: "connector_update_required";
 }
 
+/**
+ * What only the owner is told of this device's local runs when the answer
+ * serves no stream view: the existing path or a refusal answers instead.
+ */
+export interface OwnerNotes {
+  /** Runs the writer will not publish; absent when none. */
+  readonly withheld?: readonly WithheldRun[];
+}
+
 export type ReadDecision =
   /** Not a stream-sync read: the existing path answers, unchanged. */
-  | { readonly kind: "pass" }
+  | ({ readonly kind: "pass" } & OwnerNotes)
   /** §2.10 step 3: serve the legacy or raw file through the existing path. */
-  | { readonly kind: "legacy" }
-  | {
+  | ({ readonly kind: "legacy" } & OwnerNotes)
+  | ({
       readonly kind: "unavailable";
       readonly reason: "deleted" | "no_data" | "connection_not_found";
-    }
+    } & OwnerNotes)
   /** The connector's only connections were written with another owner key. */
   | { readonly kind: "key_mismatch" }
   /** The cursor names a version this server no longer holds. */
@@ -776,32 +785,37 @@ export class StreamSyncReadService {
         e.eligibility.reason === "deleted",
     );
     // The owner's own unactivated rows, unless a deletion hides the
-    // connector. A legacy body answers instead, unless the pending rows were
-    // collected strictly after it: the owner reads the newer collection and
-    // the two are never merged.
+    // connector. A legacy body answers instead, as before own-writes.
+    let notes: OwnerNotes = {};
     if (input.isOwnerView && !deleted) {
-      const pending = this.pendingChoice(
+      const scan = this.pendingScan(
         input,
         [...targets, ...candidates],
         snapshots,
       );
       if (
-        pending &&
+        scan.best &&
         (!input.legacyFile ||
           (typeof input.legacyCollectedAt === "number" &&
-            pending.at > input.legacyCollectedAt))
+            scan.best.at > input.legacyCollectedAt))
       ) {
-        const snapshot = snapshots.get(pending.target.connector)!;
-        snapshots.delete(pending.target.connector);
+        const snapshot = snapshots.get(scan.best.target.connector)!;
+        snapshots.delete(scan.best.target.connector);
         return this.serveView(
           input.scope,
-          pending.target,
-          pending.ns,
+          scan.best.target,
+          scan.best.ns,
           cursor,
           snapshot,
           true,
           "pending",
         );
+      }
+      // No view is served: the runs the writer will not publish still reach
+      // the owner, with the answer that is.
+      if (scan.withheld.length > 0) {
+        this.logWithheld(scan.connectors, scan.withheld.length);
+        notes = { withheld: scan.withheld };
       }
     }
     if (cursor) return { kind: "cursor_stale" };
@@ -818,10 +832,10 @@ export class StreamSyncReadService {
       );
       return foreign
         ? { kind: "key_mismatch" }
-        : { kind: "unavailable", reason: "connection_not_found" };
+        : { kind: "unavailable", reason: "connection_not_found", ...notes };
     }
     if (evaluated.some((e) => e.eligibility.kind === "legacy")) {
-      return { kind: "legacy" };
+      return { kind: "legacy", ...notes };
     }
     if (
       evaluated.some(
@@ -832,7 +846,7 @@ export class StreamSyncReadService {
     ) {
       return { kind: "key_mismatch" };
     }
-    return { kind: "pass" };
+    return { kind: "pass", ...notes };
   }
 
   /** The imported view of a stream while its head is live, else null. */
@@ -854,14 +868,22 @@ export class StreamSyncReadService {
 
   /**
    * The target and connection whose local runs every needed stream has, with
-   * `at`, the newest observedAt among those runs.
+   * `at`, the newest observedAt among those runs; and every run the writer
+   * will not publish, among all the connections looked at, whether or not any
+   * of them can be served.
    */
-  private pendingChoice(
+  private pendingScan(
     input: ResolveInput,
     targets: readonly Target[],
     snapshots: ReadonlyMap<string, StreamSyncOverlaySnapshot>,
-  ): { target: Target; ns: string; at: number } | null {
+  ): {
+    best: { target: Target; ns: string; at: number } | null;
+    withheld: WithheldRun[];
+    connectors: string[];
+  } {
     let best: { target: Target; ns: string; at: number } | null = null;
+    const withheld: WithheldRun[] = [];
+    const connectors = new Set<string>();
     for (const target of targets) {
       const snapshot = snapshots.get(target.connector);
       if (!snapshot) continue;
@@ -899,6 +921,8 @@ export class StreamSyncReadService {
               ),
             },
           );
+          if (local.withheld.length > 0) connectors.add(target.connector);
+          withheld.push(...withheldRuns([{ stream, fold: local }]));
           for (const c of local.merged) at = Math.max(at, c.run.observedAt);
           return local.merged.length > 0;
         });
@@ -912,7 +936,19 @@ export class StreamSyncReadService {
         }
       }
     }
-    return best;
+    return {
+      best,
+      withheld: uniqueWithheld(withheld),
+      connectors: [...connectors],
+    };
+  }
+
+  /** One log line per read: a count, never a row. */
+  private logWithheld(connectors: readonly string[], count: number): void {
+    this.options.logger.warn(
+      { connector: connectors.join(","), withheld: count },
+      "stream-sync read: local runs withheld until the connector is newer",
+    );
   }
 
   private async serveView(
@@ -1077,28 +1113,9 @@ export class StreamSyncReadService {
       });
       // Runs the writer will not publish are never shown and never dropped
       // silently: the log gets a count, the owner gets the runs.
-      const withheldAll: WithheldRun[] = inputs
-        .flatMap((i) =>
-          i.fold.withheld.map((c): WithheldRun => ({
-            runId: c.run.runId,
-            stream: i.stream,
-            reason: "connector_update_required",
-          })),
-        )
-        .sort((a, b) =>
-          a.runId === b.runId
-            ? a.stream < b.stream
-              ? -1
-              : 1
-            : a.runId < b.runId
-              ? -1
-              : 1,
-        );
+      const withheldAll = uniqueWithheld(withheldRuns(inputs));
       if (withheldAll.length > 0) {
-        this.options.logger.warn(
-          { connector: target.connector, withheld: withheldAll.length },
-          "stream-sync read: local runs withheld until the connector is newer",
-        );
+        this.logWithheld([target.connector], withheldAll.length);
       }
       const withheld = isOwnerView ? withheldAll : [];
       const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},${pending ? '"origin":"local-pending",' : ""}${withheld.length > 0 ? `"withheld":${JSON.stringify(withheld)},` : ""}"data":`;
@@ -1177,6 +1194,41 @@ interface StreamInput {
   readonly lease: ViewLease | null;
   /** The local runs the view shows, as the writer will publish them. */
   readonly fold: Fold;
+}
+
+/** The runs the writer will not publish, one per run and stream. */
+function withheldRuns(
+  inputs: readonly { readonly stream: string; readonly fold: Fold }[],
+): WithheldRun[] {
+  return inputs.flatMap((i) =>
+    i.fold.withheld.map((c): WithheldRun => ({
+      runId: c.run.runId,
+      stream: i.stream,
+      reason: "connector_update_required",
+    })),
+  );
+}
+
+function uniqueWithheld(runs: readonly WithheldRun[]): WithheldRun[] {
+  const seen = new Set<string>();
+  return runs
+    .filter((w) => {
+      const key = `${w.runId}\0${w.stream}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) =>
+      a.runId === b.runId
+        ? a.stream < b.stream
+          ? -1
+          : a.stream > b.stream
+            ? 1
+            : 0
+        : a.runId < b.runId
+          ? -1
+          : 1,
+    );
 }
 
 const stepKey = (c: Contribution) =>

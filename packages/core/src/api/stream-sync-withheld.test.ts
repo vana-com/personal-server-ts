@@ -45,8 +45,15 @@ async function setup(seed: number) {
   ];
   const service = await f.service();
   await f.sync(service);
+  return setupDeps(service, createMemoryDataStorage());
+}
+
+async function setupDeps(
+  service: PersonalServerDataApiDeps["streamSyncRead"],
+  storage: PersonalServerDataApiDeps["storage"],
+) {
   const deps: PersonalServerDataApiDeps = {
-    storage: createMemoryDataStorage(),
+    storage,
     streamSyncRead: service,
     auth: {
       authorizeOwner: vi.fn(async () => undefined),
@@ -97,5 +104,79 @@ describe("data reads with a withheld local run", () => {
     expect(read.withheld).toBeNull();
     expect(read.body.withheld).toBeUndefined();
     expect(read.body.data.records).toEqual([{ id: "a", v: 1 }]);
+  });
+});
+
+describe("data reads whose answer is the existing body", () => {
+  /** An incomplete base and a withheld run: no view can be served. */
+  async function legacyOnly(seed: number) {
+    const f = new Fixture(await testOwnerKey(masterKey(seed)));
+    const ns = await f.key.ns("acme", "account-1");
+    await f.activate("acme", ns);
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      records: [{ id: "a", v: 1 }],
+      observedAt: T - 1000,
+      profileVersion: "2.0.0",
+      complete: false,
+    });
+    f.overlay.runs = [
+      {
+        runId: "r1",
+        ns,
+        generation: 1,
+        observedAt: T,
+        streams: [
+          {
+            name: "items",
+            complete: true,
+            primaryKey: ["uid"],
+            version: "1.0.0",
+            rows: [{ o: T, r: "r1", v: { uid: "u1" } }],
+          },
+        ],
+      },
+    ];
+    const service = await f.service();
+    await f.sync(service);
+    const storage = createMemoryDataStorage();
+    const envelope = {
+      version: "1.0" as const,
+      scope: "pdpp.acme.items",
+      collectedAt: "2026-10-01T00:00:00.000Z",
+      data: { records: [{ id: "stored" }] },
+    };
+    const written = await storage.writeEnvelope(envelope);
+    storage.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: written.sizeBytes,
+    } as never);
+    const deps = await setupDeps(service, storage);
+    return deps;
+  }
+
+  it("tells the owner of the withheld run in the header and the body", async () => {
+    const read = await get(await legacyOnly(323), false);
+    expect(read.status).toBe(200);
+    expect(read.source).toBe("legacy");
+    expect(read.withheld).toBe("connector_update_required");
+    expect(read.body.withheld).toEqual([
+      { runId: "r1", stream: "items", reason: "connector_update_required" },
+    ]);
+    expect(read.body.data.records).toEqual([{ id: "stored" }]);
+  });
+
+  it("tells a grantee nothing", async () => {
+    const read = await get(await legacyOnly(324), true);
+    expect(read.status).toBe(200);
+    expect(read.source).toBe("legacy");
+    expect(read.withheld).toBeNull();
+    expect(read.body.withheld).toBeUndefined();
   });
 });

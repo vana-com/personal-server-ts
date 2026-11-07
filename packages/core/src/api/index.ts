@@ -97,9 +97,11 @@ import {
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
 import type {
+  OwnerNotes,
   ReadDecision,
   ResolveInput,
   StreamSyncReadStatus,
+  WithheldRun,
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
@@ -754,17 +756,18 @@ async function serveStreamSyncView(
         : {}),
       // Owner only: the service attaches this to no other audience.
       ...(decision.withheld?.length
-        ? {
-            "X-Stream-Sync-Withheld": [
-              ...new Set(decision.withheld.map((w) => w.reason)),
-            ].join(","),
-          }
+        ? { "X-Stream-Sync-Withheld": withheldReasons(decision.withheld) }
         : {}),
       ...(input.paymentResponseHeader
         ? { "X-PAYMENT-RESPONSE": input.paymentResponseHeader }
         : {}),
     },
   });
+}
+
+/** The distinct reasons of the withheld runs, for the response header. */
+function withheldReasons(withheld: readonly WithheldRun[]): string {
+  return [...new Set(withheld.map((w) => w.reason))].join(",");
 }
 
 /** Epoch milliseconds of an ISO time, or null when absent or unparsable. */
@@ -2605,6 +2608,9 @@ export async function handlePersonalServerDataRequest(
       // legacy history, but a deleted connector serves nothing at all.
       const latestRead =
         fileIdParam === undefined && atParam === undefined && view === null;
+      // What only the owner is told when the existing path answers a stream
+      // read: local runs the writer will not publish.
+      let ownerNotes: OwnerNotes | undefined;
       if (deps.streamSyncRead) {
         const decision = await deps.streamSyncRead.resolve({
           scope: scopeResult.scope,
@@ -2624,6 +2630,13 @@ export async function handlePersonalServerDataRequest(
         if (latestRead) {
           const refusal = streamSyncRefusal(decision);
           if (refusal) return refusal;
+          if (
+            decision.kind === "pass" ||
+            decision.kind === "legacy" ||
+            decision.kind === "unavailable"
+          ) {
+            ownerNotes = decision;
+          }
           if (decision.kind === "local_pending") {
             // Owner-only and unregistered: nothing to bill and no version to
             // bind in an access record.
@@ -2747,6 +2760,11 @@ export async function handlePersonalServerDataRequest(
       }
 
       const headers: Record<string, string> = {};
+      if (ownerNotes?.withheld?.length) {
+        headers["X-Stream-Sync-Withheld"] = withheldReasons(
+          ownerNotes.withheld,
+        );
+      }
       if (ownApp) headers["X-Vana-Payment-Exemption"] = "own-app";
       headers["X-Vana-Data-Source"] =
         latest?.kind === "canonical" ? "canonical" : "legacy";
@@ -2852,7 +2870,12 @@ export async function handlePersonalServerDataRequest(
         });
         return response;
       }
-      const response = jsonResponse(servedEnvelope, { headers });
+      const response = jsonResponse(
+        ownerNotes?.withheld?.length
+          ? { ...servedEnvelope, withheld: ownerNotes.withheld }
+          : servedEnvelope,
+        { headers },
+      );
       reportReadFulfillment();
       return response;
     }
