@@ -1,5 +1,6 @@
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
+import { createStreamSyncReadCacheFiles } from "./stream-sync-read-cache-files.js";
 import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 
 const enc = new TextEncoder();
@@ -140,4 +141,12 @@ it("writes bounded chunks and removes stale chunks on overwrite", async () => {
   const overwritten: Uint8Array[] = [];
   for await (const chunk of files.readChunks("large")) overwritten.push(chunk);
   expect(overwritten).toHaveLength(1);
+});
+
+it("keeps read caches for different keys separate in one home", async () => {
+  const files = open();
+  const first = createStreamSyncReadCacheFiles(files, "key-one");
+  const second = createStreamSyncReadCacheFiles(files, "key-two");
+  await first.write("views/item", enc.encode("value"));
+  expect(await second.read("views/item")).toBeNull();
 });

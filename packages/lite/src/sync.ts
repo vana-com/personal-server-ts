@@ -1,3 +1,4 @@
+import { createStreamSyncReadCacheFiles } from "./stream-sync-read-cache-files.js";
 import {
   StreamSyncWriter,
   createStreamSyncIntake,
@@ -161,8 +162,8 @@ export interface PsLiteSyncOptions {
   /**
    * Stream-sync reads (`streamSync.read`). Present = on: the sync loop
    * imports stream heads, and the returned `streamSyncRead` answers reads.
-   * Without `files`, state is in memory and rebuilt by a full listing on
-   * each start.
+   * Without `files`, the reader uses the writer home when available;
+   * otherwise it uses memory and rebuilds on each start.
    */
   streamSyncRead?: {
     readonly files?: StreamSyncReadFiles;
@@ -453,18 +454,6 @@ export async function createPsLiteSyncManager(
       },
     }),
   );
-  const streamSyncRead = options.streamSyncRead
-    ? await StreamSyncReadService.open({
-        files:
-          options.streamSyncRead.files ?? createMemoryStreamSyncReadFiles(),
-        blobs: createStorageBlobReader(storageAdapter),
-        keys: await createStreamSyncReadKeys(masterKey),
-        logger: logger as never,
-        ...(options.streamSyncRead.overlay
-          ? { overlay: options.streamSyncRead.overlay }
-          : {}),
-      })
-    : undefined;
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
@@ -492,6 +481,27 @@ export async function createPsLiteSyncManager(
       "Stream sync is off in this instance: its storage is held by another instance, or Web Locks are unavailable",
     );
   }
+  const readKeys = options.streamSyncRead
+    ? await createStreamSyncReadKeys(masterKey)
+    : undefined;
+  const streamSyncRead = options.streamSyncRead
+    ? await StreamSyncReadService.open({
+        files:
+          options.streamSyncRead.files ??
+          (streamSyncHome
+            ? createStreamSyncReadCacheFiles(
+                streamSyncHome.home.files,
+                readKeys!.keyCheck,
+              )
+            : createMemoryStreamSyncReadFiles()),
+        blobs: createStorageBlobReader(storageAdapter),
+        keys: readKeys!,
+        logger: logger as never,
+        ...(options.streamSyncRead.overlay
+          ? { overlay: options.streamSyncRead.overlay }
+          : {}),
+      })
+    : undefined;
   const streamSyncWriter = streamSyncHome
     ? new StreamSyncWriter({
         ownerAddress: serverOwner,
