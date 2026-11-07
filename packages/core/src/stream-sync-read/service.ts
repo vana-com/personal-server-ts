@@ -116,7 +116,9 @@ export type ReadDecision =
       /**
        * The registered stream head a paid read's access record binds: the
        * window's parent stream of a windowed legacy name, else the first
-       * stream read. Physical name and registry version.
+       * stream read. Physical name and registry version. `null` for an
+       * owner-only view with an input stream that has no imported head: there
+       * is no registry entry to bind or charge.
        */
       readonly served: {
         readonly scope: string;
@@ -620,6 +622,7 @@ export class StreamSyncReadService {
         best.ns,
         cursor,
         snapshot,
+        input.isOwnerView,
       );
     }
     if (cursor) return { kind: "cursor_stale" };
@@ -665,6 +668,7 @@ export class StreamSyncReadService {
     ns: string,
     cursor: Cursor | null,
     snapshot: StreamSyncOverlaySnapshot,
+    isOwnerView: boolean,
   ): Promise<ReadDecision> {
     const leases: ViewLease[] = [];
     // Snapshot and leases are released together, once, with the body.
@@ -731,6 +735,13 @@ export class StreamSyncReadService {
           return { kind: "cursor_stale" };
         }
         inputs.push({ stream, lease, local });
+      }
+      // A stream without an imported head has no registry entry: only the
+      // owner reads it. Everyone else gets the existing path, with its own
+      // billing, grants and access record.
+      if (!isOwnerView && inputs.some((i) => !i.lease)) {
+        releaseAll();
+        return { kind: "pass" };
       }
       const byStream = new Map(inputs.map((i) => [i.stream, i]));
       const overlays = new Map<string, OverlayWinners>();

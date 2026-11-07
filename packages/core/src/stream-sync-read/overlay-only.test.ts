@@ -223,4 +223,26 @@ describe("overlay-only views", () => {
     ];
     expect(await rows(f)).toEqual({ r: 2, new: 1 });
   });
+
+  it("answers pass to a non-owner and releases the snapshot", async () => {
+    const { f, ns } = await setup(66);
+    f.overlay.runs = [run(ns, [row("x", 1)])];
+    expect(await rows(f, { isOwnerView: false })).toBe("pass");
+    expect(f.overlay.open).toBe(0);
+    expect(f.overlay.released).toBe(1);
+  });
+
+  it("still serves a non-owner a registered base merged with local rows", async () => {
+    const { f, ns } = await setup(67);
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      records: [{ id: "a", v: 1 }],
+      observedAt: T - 1000,
+    });
+    f.overlay.runs = [run(ns, [row("new", 1)], { complete: false })];
+    expect(await rows(f, { isOwnerView: false })).toEqual({ a: 1, new: 1 });
+  });
 });

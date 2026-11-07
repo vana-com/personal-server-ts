@@ -2606,33 +2606,38 @@ export async function handlePersonalServerDataRequest(
             // The same charge as a file read; the access record binds the
             // stream head the view serves.
             let paymentResponseHeader: string | undefined;
-            const ownApp = await ownAppReadStatus(deps, authResult);
-            if (ownApp instanceof Response) {
-              await decision.body.cancel();
-              return ownApp;
-            }
-            const charge = readCharge(
-              deps,
-              scopeResult.scope,
-              authResult,
-              ownApp,
-            );
-            if (charge) {
-              let paid: Awaited<ReturnType<typeof payForRead>>;
-              try {
-                paid = await payForRead(deps, request, charge, {
-                  scope: scopeResult.scope,
-                  servedEntry: decision.served,
-                });
-              } catch (error) {
+            // An owner-only view with no registered head has nothing to
+            // charge against: the service serves it to the owner alone.
+            if (decision.served !== null) {
+              const served = decision.served;
+              const ownApp = await ownAppReadStatus(deps, authResult);
+              if (ownApp instanceof Response) {
                 await decision.body.cancel();
-                throw error;
+                return ownApp;
               }
-              if (paid.kind === "refused") {
-                await decision.body.cancel();
-                return paid.response;
+              const charge = readCharge(
+                deps,
+                scopeResult.scope,
+                authResult,
+                ownApp,
+              );
+              if (charge) {
+                let paid: Awaited<ReturnType<typeof payForRead>>;
+                try {
+                  paid = await payForRead(deps, request, charge, {
+                    scope: scopeResult.scope,
+                    servedEntry: served,
+                  });
+                } catch (error) {
+                  await decision.body.cancel();
+                  throw error;
+                }
+                if (paid.kind === "refused") {
+                  await decision.body.cancel();
+                  return paid.response;
+                }
+                paymentResponseHeader = paid.paymentResponseHeader;
               }
-              paymentResponseHeader = paid.paymentResponseHeader;
             }
             return serveStreamSyncView(deps, request, {
               scope: scopeResult.scope,
