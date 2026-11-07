@@ -10,7 +10,10 @@ import type {
   StreamSyncFiles,
   StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  controlScope,
+  parseScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   activateControl,
   collect,
@@ -48,6 +51,8 @@ afterAll(async () => {
  *   but is delivered only after `release` (a save's final control read). With
  *   `afterStreamPost` it waits for a stream post first; `skip` lets that many
  *   control reads pass.
+ * - `holdAfterStreamPost`: the next stream post returns only after
+ *   `releasePost`, so a test can act between a run's commit and its checkpoint.
  * - `script`: the next control reads, in order, each optionally run an action
  *   first and optionally return a given result instead of the registry's.
  */
@@ -56,6 +61,11 @@ function controlReadHooks(inner: StreamSyncRegistry) {
   let held: { skip: number; afterStreamPost: boolean } | null = null;
   let postSeen = false;
   const steps: ControlScriptStep[] = [];
+  let postHeld = false;
+  let releasePost!: () => void;
+  const postGate = new Promise<void>((resolve) => (releasePost = resolve));
+  let postReached!: () => void;
+  const atPost = new Promise<void>((resolve) => (postReached = resolve));
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
   let reached!: () => void;
@@ -66,6 +76,11 @@ function controlReadHooks(inner: StreamSyncRegistry) {
       const result = await inner.post(request);
       if (held && parseScope(request.scope)?.kind === "stream") {
         postSeen = true;
+      }
+      if (postHeld && parseScope(request.scope)?.kind === "stream") {
+        postHeld = false;
+        postReached();
+        await postGate;
       }
       return result;
     },
@@ -93,6 +108,11 @@ function controlReadHooks(inner: StreamSyncRegistry) {
         afterStreamPost: options.afterStreamPost ?? false,
       };
     },
+    holdAfterStreamPost: () => {
+      postHeld = true;
+    },
+    atPost,
+    releasePost,
     script: (next: ControlScriptStep[]) => {
       steps.push(...next);
     },
@@ -122,6 +142,7 @@ async function guarded(
   try {
     await body();
   } finally {
+    held.releasePost();
     held.release();
   }
 }
@@ -562,6 +583,46 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
       const b = await w.saveCheckpointOnly("rB", { s1: "U2" });
       expect(b.outcome.kind).toBe("discarded");
       expect(await watermark(files, c)).toContain("3");
+    });
+    await publishing;
+    expect(finishedOutcome(await w.status(), "rA")?.outcome.kind).toBe(
+      "no_checkpoint",
+    );
+    expect(await checkpointOf(w, c)).toBeUndefined();
+    expect(await watermark(files, c)).toContain("3");
+  });
+
+  // The invalidation completes before A snapshots its epoch, so the epoch
+  // matches. A's final read then comes from a lagging replica as the old row.
+  // A decision must use the newest control the writer knows, not that read.
+  it("a lagging final read cannot authorize a save after the invalidation was recorded", async () => {
+    const c = freshConnector("ckpt-epoch-lag");
+    const held = controlReadHooks(env.newRegistry());
+    const files = await env.files("ckpt-epoch-lag");
+    const w = await env.writer("ckpt-epoch-lag", {
+      files,
+      registry: held.registry,
+    });
+    await w.refreshControls();
+    await collect(w, {
+      runId: "rA",
+      connector: c,
+      observedAt: T0,
+      streams: { s1: rows(["1"], "a") },
+      checkpoint: { s1: "T1" },
+    });
+    held.holdAfterStreamPost();
+    const publishing = w.publishPending();
+    await guarded(held, async () => {
+      await held.atPost;
+      const g1 = await env.registry.read(controlScope(c, NS));
+      await deleteConnection(env.registry, c, NS, ["s1"]);
+      await activateControl(env.registry, c, NS);
+      await w.refreshControls();
+      expect(await watermark(files, c)).toContain("3");
+      // A's final read is the old row.
+      held.script([{ result: g1 }]);
+      held.releasePost();
     });
     await publishing;
     expect(finishedOutcome(await w.status(), "rA")?.outcome.kind).toBe(
