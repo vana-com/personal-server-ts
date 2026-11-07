@@ -214,3 +214,81 @@ describe("writer publish receipts", () => {
     expect((await f.read("r2")).entry.streams.s.state).toBe("noop");
   });
 });
+
+describe("writer retained completed runs", () => {
+  it("keeps published intake through finish and offline recovery without reposting", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+    expect((await f.read()).phase).toBe("done");
+    const posts = f.posts();
+    const report = await f.make().publishPending();
+    expect(report.runs).toEqual([]);
+    expect(f.posts()).toBe(posts);
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+  });
+  it("retains a committed stream when another stream is discarded", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    f.fault("after_commit_recorded");
+    await expect(w.publishPending()).rejects.toThrow("crash");
+    await f.edit((e) => {
+      e.entry.streams.other = { state: "planned" };
+      e.streams.other = { ...e.streams.s, index: 1 };
+      delete e.streams.other.receipt;
+    });
+    const hashes = await controlHashes(
+      streamSyncHashes.keccak256,
+      await deriveKeyCheck(async (m) =>
+        hmac(sha256, new Uint8Array(32).fill(4), m),
+      ),
+    );
+    f.rows.set(controlScope(connector, ""), {
+      found: true,
+      version: 2,
+      dataHash: hashes.tombstoneData,
+      metadataHash: hashes.tombstoneMetadata,
+      deleted: false,
+    });
+    await f.make().publishPending();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+    expect((await f.read()).entry.streams.other.state).toBe("discarded");
+    expect((await f.read()).streams.s.receipt.registryVersion).toBe(1);
+  });
+  it("retains pre-upgrade done runs without receipts", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await f.edit((e) => {
+      e.phase = "done";
+      e.entry.streams.s = { state: "committed", generation: 1, complete: true };
+    });
+    await f.make().publishPending();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+  });
+  it("keeps a receipt and rows when checkpoint completion fails", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    f.fault("after_commit_recorded");
+    await expect(w.publishPending()).rejects.toThrow("crash");
+    f.rows.set(controlScope(connector, ""), {
+      found: true,
+      version: 3,
+      dataHash: `0x${"ab".repeat(32)}`,
+      metadataHash: `0x${"cd".repeat(32)}`,
+      deleted: false,
+    });
+    // A crash after commit cannot lose the intake even if the next control read refuses admission.
+    await f.make().publishPending();
+    expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
+    expect((await f.read()).streams.s.receipt.registryVersion).toBe(1);
+  });
+});

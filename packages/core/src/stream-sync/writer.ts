@@ -216,6 +216,8 @@ interface HostEntry {
   target: number | null;
   streams: Record<string, HostStream>;
   outcome: RunOutcome | null;
+  /** Intake crossed the durable ready barrier (absent on older entries). */
+  ready?: boolean;
   /** Seed streams this run must hold receipts for before its checkpoint. */
   seedStreams: string[];
   /** M5: who the run writes for; checked again before it publishes. */
@@ -856,6 +858,7 @@ export class StreamSyncWriter {
           checkpointCandidate: input.checkpointCandidate,
         };
         host.phase = "ready";
+        host.ready = true;
         await this.writeEntry(host);
       } finally {
         this.forget(runId);
@@ -1048,7 +1051,7 @@ export class StreamSyncWriter {
           why: "the process stopped before the run finished collecting",
         });
       } else if (host?.phase === "done") {
-        await this.options.home.files.remove(`runs/${runId}`);
+        await this.reclaim(host);
       }
     }
   }
@@ -1702,6 +1705,8 @@ export class StreamSyncWriter {
   }
 
   private async finish(host: HostEntry, outcome: RunOutcome): Promise<void> {
+    // Older ready entries have no explicit ready marker.
+    host.ready ??= host.phase === "ready";
     host.outcome = outcome;
     host.phase = "done";
     const runId = host.entry.runId;
@@ -1710,7 +1715,7 @@ export class StreamSyncWriter {
       `results/${runId}.json`,
       json(this.statusOf(host)),
     );
-    await this.options.home.files.remove(`runs/${runId}`);
+    await this.reclaim(host);
     if (!(outcome.kind === "aborted" && outcome.reason === "cancelled")) {
       const bad =
         outcome.kind === "failed" ||
@@ -1721,6 +1726,21 @@ export class StreamSyncWriter {
     for (const dir of [...this.derived.keys()]) {
       if (dir.startsWith(`runs/${runId}/`)) this.derived.delete(dir);
     }
+  }
+
+  /** Never treat a missing pre-upgrade receipt as proof of read coverage. */
+  private retainedStreams(host: HostEntry): string[] {
+    if (host.ready === false || host.outcome?.kind === "aborted") return [];
+    return Object.keys(host.streams).filter(
+      (name) =>
+        !host.streams[name]!.seedOnly &&
+        host.entry.streams[name]?.state !== "discarded",
+    );
+  }
+
+  private async reclaim(host: HostEntry): Promise<void> {
+    if (this.retainedStreams(host).length > 0) return;
+    await this.options.home.files.remove(`runs/${host.entry.runId}`);
   }
 
   // --------------------------------------------------------------- merge
