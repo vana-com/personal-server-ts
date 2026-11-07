@@ -135,7 +135,8 @@ describe("overlay-only views", () => {
   it("is not a view without a verified active control state (activation unknown)", async () => {
     const { f, ns } = await setup(57, false);
     f.overlay.runs = [run(ns, [row("x", 1)])];
-    expect(await rows(f)).toBe("pass");
+    // The owner gets the marked local-pending read instead (local-pending.test.ts).
+    expect(await rows(f, { isOwnerView: false })).toBe("pass");
     expect(await rows(f, { legacyFile: true })).toBe("pass");
   });
 
@@ -149,7 +150,7 @@ describe("overlay-only views", () => {
   it("is not a view for an unbound run", async () => {
     const { f, ns } = await setup(59);
     f.overlay.runs = [{ ...run(ns, [row("x", 1)]), generation: null }];
-    expect(await rows(f)).toBe("pass");
+    expect(await rows(f, { isOwnerView: false })).toBe("pass");
   });
 
   it("keeps a deleted connection deleted", async () => {

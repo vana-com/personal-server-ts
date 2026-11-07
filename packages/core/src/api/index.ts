@@ -695,7 +695,7 @@ async function serveStreamSyncView(
     authResult: Awaited<
       ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
     >;
-    decision: Extract<ReadDecision, { kind: "view" }>;
+    decision: Extract<ReadDecision, { kind: "view" | "local_pending" }>;
     paymentResponseHeader: string | undefined;
   },
 ): Promise<Response> {
@@ -748,6 +748,10 @@ async function serveStreamSyncView(
       "Transfer-Encoding": "chunked",
       "X-Vana-Data-Source": "stream-sync",
       "X-Stream-Sync-Cursor": decision.cursor,
+      // The rows are this device's own and not yet activated.
+      ...(decision.kind === "local_pending"
+        ? { "X-Stream-Sync-Origin": "local-pending" }
+        : {}),
       ...(input.paymentResponseHeader
         ? { "X-PAYMENT-RESPONSE": input.paymentResponseHeader }
         : {}),
@@ -2601,6 +2605,18 @@ export async function handlePersonalServerDataRequest(
         if (latestRead) {
           const refusal = streamSyncRefusal(decision);
           if (refusal) return refusal;
+          if (decision.kind === "local_pending") {
+            // Owner-only and unregistered: nothing to bill and no version to
+            // bind in an access record.
+            notifyDataRead(deps, { scope: scopeResult.scope });
+            return serveStreamSyncView(deps, request, {
+              scope: scopeResult.scope,
+              grantId,
+              authResult,
+              decision,
+              paymentResponseHeader: undefined,
+            });
+          }
           if (decision.kind === "view") {
             notifyDataRead(deps, { scope: scopeResult.scope });
             // The same charge as a file read; the access record binds the

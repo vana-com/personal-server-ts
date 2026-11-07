@@ -148,7 +148,7 @@ export class Fixture {
 export async function body(
   decision: ReadDecision,
 ): Promise<Record<string, any>> {
-  if (decision.kind !== "view")
+  if (decision.kind !== "view" && decision.kind !== "local_pending")
     throw new Error(`expected view, got ${decision.kind}`);
   return JSON.parse(await new Response(decision.body).text());
 }

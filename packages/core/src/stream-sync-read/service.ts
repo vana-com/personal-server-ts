@@ -108,6 +108,19 @@ export type ReadDecision =
   | { readonly kind: "invalid_cursor" }
   | { readonly kind: "invalid_connection" }
   | { readonly kind: "too_large"; readonly bytes: number }
+  /**
+   * The owner's own local rows that no verified activation covers yet (a
+   * first run made offline). Owner-only, this device only, no registry entry:
+   * nothing to bill and no version to bind. The body marks the data
+   * `"origin":"local-pending"`.
+   */
+  | {
+      readonly kind: "local_pending";
+      readonly connector: string;
+      readonly ns: string;
+      readonly cursor: string;
+      readonly body: ReadableStream<Uint8Array>;
+    }
   | {
       readonly kind: "view";
       readonly connector: string;
@@ -490,8 +503,19 @@ export class StreamSyncReadService {
     control: ControlState,
     tombstoned: boolean,
     base: ImportedVersion | null,
+    pending = false,
   ): { run: StreamSyncOverlayRun; stream: StreamSyncOverlayStream }[] {
-    if (!snapshot || control.kind !== "active" || tombstoned) return [];
+    if (!snapshot || tombstoned) return [];
+    // Pending: this device's own rows that no verified activation of their
+    // generation covers. A verified control of another generation, a deleted
+    // connection and a foreign key hide them.
+    if (
+      pending
+        ? !(control.kind === "absent" || control.kind === "active")
+        : control.kind !== "active"
+    ) {
+      return [];
+    }
     const out: {
       run: StreamSyncOverlayRun;
       stream: StreamSyncOverlayStream;
@@ -500,7 +524,11 @@ export class StreamSyncReadService {
       if (
         run.connector !== connector ||
         run.ns !== ns ||
-        run.generation !== control.generation
+        (pending
+          ? control.kind === "active" &&
+            run.generation !== null &&
+            run.generation !== control.generation
+          : run.generation !== (control as { generation?: number }).generation)
       ) {
         continue;
       }
@@ -588,10 +616,15 @@ export class StreamSyncReadService {
       if (!cursor) return { kind: "invalid_cursor" };
     }
     const known = new Set(this.mirror.connectors());
-    const targets = readTargets(input.scope).filter((t) =>
-      known.has(t.connector),
-    );
-    if (targets.length === 0) {
+    const all = readTargets(input.scope);
+    const targets = all.filter((t) => known.has(t.connector));
+    // A connector the registry mirror has never seen can still hold the
+    // owner's local runs (a first run made offline).
+    const candidates =
+      this.options.overlay && input.isOwnerView
+        ? all.filter((t) => !known.has(t.connector))
+        : [];
+    if (targets.length === 0 && candidates.length === 0) {
       return input.connection !== null
         ? { kind: "unavailable", reason: "connection_not_found" }
         : { kind: "pass" };
@@ -601,10 +634,10 @@ export class StreamSyncReadService {
     // from the pin. The chosen view keeps its snapshot until the body ends.
     const snapshots = new Map<string, StreamSyncOverlaySnapshot>();
     try {
-      for (const target of targets) {
+      for (const target of [...targets, ...candidates]) {
         snapshots.set(target.connector, await this.snapshot(target.connector));
       }
-      return await this.decide(input, cursor, targets, snapshots);
+      return await this.decide(input, cursor, targets, candidates, snapshots);
     } finally {
       for (const snapshot of snapshots.values()) snapshot.release();
     }
@@ -620,6 +653,7 @@ export class StreamSyncReadService {
     input: ResolveInput,
     cursor: Cursor | null,
     targets: readonly Target[],
+    candidates: readonly Target[],
     snapshots: Map<string, StreamSyncOverlaySnapshot>,
   ): Promise<ReadDecision> {
     const evaluated = targets.map((target) => {
@@ -672,14 +706,35 @@ export class StreamSyncReadService {
         input.isOwnerView,
       );
     }
+    const deleted = evaluated.some(
+      (e) =>
+        e.eligibility.kind === "unavailable" &&
+        e.eligibility.reason === "deleted",
+    );
+    // The owner's own unactivated rows, unless a body already answers or a
+    // deletion hides the connector.
+    if (input.isOwnerView && !input.legacyFile && !deleted) {
+      const pending = this.pendingChoice(
+        input,
+        [...targets, ...candidates],
+        snapshots,
+      );
+      if (pending) {
+        const snapshot = snapshots.get(pending.target.connector)!;
+        snapshots.delete(pending.target.connector);
+        return this.serveView(
+          input.scope,
+          pending.target,
+          pending.ns,
+          cursor,
+          snapshot,
+          true,
+          "pending",
+        );
+      }
+    }
     if (cursor) return { kind: "cursor_stale" };
-    if (
-      evaluated.some(
-        (e) =>
-          e.eligibility.kind === "unavailable" &&
-          e.eligibility.reason === "deleted",
-      )
-    ) {
+    if (deleted) {
       return { kind: "unavailable", reason: "deleted" };
     }
     // A named connection is served only from its own view: a legacy file
@@ -709,6 +764,57 @@ export class StreamSyncReadService {
     return { kind: "pass" };
   }
 
+  /** The target and connection whose local runs every needed stream has. */
+  private pendingChoice(
+    input: ResolveInput,
+    targets: readonly Target[],
+    snapshots: ReadonlyMap<string, StreamSyncOverlaySnapshot>,
+  ): { target: Target; ns: string } | null {
+    let best: { target: Target; ns: string; at: number } | null = null;
+    for (const target of targets) {
+      const snapshot = snapshots.get(target.connector);
+      if (!snapshot) continue;
+      const rows = this.mirror.rowsFor(target.connector);
+      const namespaces = new Set<string>([
+        ...rows.controls.keys(),
+        ...rows.streams.keys(),
+      ]);
+      for (const run of snapshot.runs)
+        if (run.ns !== null) namespaces.add(run.ns);
+      for (const ns of [...namespaces].sort()) {
+        if (input.connection !== null && input.connection !== ns) continue;
+        const control = this.importer.controlState(rows.controls.get(ns));
+        if (control.kind === "deleted" || control.kind === "foreign") continue;
+        let at = 0;
+        const complete = target.streams.every((stream) => {
+          const row = rows.streams.get(ns)?.get(stream);
+          const local = this.contributions(
+            snapshot,
+            target.connector,
+            ns,
+            stream,
+            control,
+            row !== undefined &&
+              this.importer.streamRowKind(row) === "tombstoned",
+            null,
+            true,
+          );
+          for (const c of local) at = Math.max(at, c.run.observedAt);
+          return local.length > 0;
+        });
+        if (!complete) continue;
+        if (
+          !best ||
+          at > best.at ||
+          (at === best.at && target.connector < best.target.connector)
+        ) {
+          best = { target, ns, at };
+        }
+      }
+    }
+    return best;
+  }
+
   private async serveView(
     scope: string,
     target: Target,
@@ -716,7 +822,9 @@ export class StreamSyncReadService {
     cursor: Cursor | null,
     snapshot: StreamSyncOverlaySnapshot,
     isOwnerView: boolean,
+    mode: "view" | "pending" = "view",
   ): Promise<ReadDecision> {
+    const pending = mode === "pending";
     const leases: ViewLease[] = [];
     // Snapshot and leases are released together, once, with the body.
     let released = false;
@@ -749,7 +857,14 @@ export class StreamSyncReadService {
           kind !== null &&
           isHeadLive(control, kind, current.head.generation);
         let lease: ViewLease | null = null;
-        if (cursor) {
+        if (pending) {
+          // An unactivated stream has no imported head to lease. A cursor
+          // that saw one (or none, pending) is replayed only as pending.
+          if (cursor && pin!.b !== null) {
+            releaseAll();
+            return { kind: "cursor_stale" };
+          }
+        } else if (cursor) {
           if (pin!.b === null) {
             // The cursor saw no imported head; one has appeared since.
             if (currentLive) {
@@ -775,6 +890,7 @@ export class StreamSyncReadService {
           control,
           kind === "tombstoned",
           lease?.version ?? null,
+          pending,
         );
         if (cursor) {
           // Replay exactly the recorded members: a retired or changed one
@@ -801,6 +917,10 @@ export class StreamSyncReadService {
       // A stream without an imported head has no registry entry: only the
       // owner reads it. Everyone else gets the existing path, with its own
       // billing, grants and access record.
+      if (pending && !isOwnerView) {
+        releaseAll();
+        return { kind: "pass" };
+      }
       if (!isOwnerView && inputs.some((i) => !i.lease)) {
         releaseAll();
         return { kind: "pass" };
@@ -853,7 +973,7 @@ export class StreamSyncReadService {
           ]),
         ),
       });
-      const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},"data":`;
+      const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},${pending ? '"origin":"local-pending",' : ""}"data":`;
       let payload: AsyncIterable<string>;
       if (!target.binding) {
         payload = recordsPayload(lines(target.streams[0]!));
@@ -889,6 +1009,15 @@ export class StreamSyncReadService {
         target.binding?.window?.parentStream ?? target.streams[0]!;
       const servedBase = byStream.get(servedStream)!.lease;
       const body = toStream(envelope(open, payload), releaseAll);
+      if (pending) {
+        return {
+          kind: "local_pending",
+          connector: target.connector,
+          ns,
+          cursor: nextCursor,
+          body,
+        };
+      }
       return {
         kind: "view",
         connector: target.connector,

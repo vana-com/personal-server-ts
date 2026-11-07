@@ -14,7 +14,7 @@ const BUILDER = "0x000000000000000000000000000000000000bEEF";
 const STORED = [{ id: "stored", v: 0 }];
 const T = Date.parse("2026-11-01T00:00:00Z");
 
-async function setup(seed: number, activate = true) {
+async function setup(seed: number, activate = true, stored = true) {
   const f = new Fixture(await testOwnerKey(masterKey(seed)));
   const ns = await f.key.ns("acme", "account-1");
   if (activate) await f.activate("acme", ns);
@@ -43,13 +43,14 @@ async function setup(seed: number, activate = true) {
     data: { records: STORED },
   };
   const written = await storage.writeEnvelope(envelope);
-  storage.insertEntry({
-    fileId: null,
-    path: written.relativePath,
-    scope: envelope.scope,
-    collectedAt: envelope.collectedAt,
-    sizeBytes: written.sizeBytes,
-  } as never);
+  if (stored)
+    storage.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: written.sizeBytes,
+    } as never);
   const accessLog = vi.fn(async () => undefined);
   const authorizeBuilderRead = vi.fn(
     async ({ request }: { request: Request }) =>
@@ -82,6 +83,7 @@ async function get(deps: PersonalServerDataApiDeps, builder: boolean) {
   return {
     status: response.status,
     source: response.headers.get("x-vana-data-source"),
+    origin: response.headers.get("x-stream-sync-origin"),
     body: await response.json().catch(() => null),
   };
 }
@@ -110,6 +112,26 @@ describe("data reads of a device's own rows", () => {
     const { deps } = await setup(73, false);
     const read = await get(deps, false);
     expect(read.source).toBe("legacy");
+    expect(read.body.data.records).toEqual(STORED);
+  });
+
+  it("marks the owner's unactivated rows as local and pending", async () => {
+    const { f, deps } = await setup(74, false, false);
+    f.overlay.runs = f.overlay.runs.map((r) => ({ ...r, generation: null }));
+    const read = await get(deps, false);
+    expect(read.status).toBe(200);
+    expect(read.source).toBe("stream-sync");
+    expect(read.origin).toBe("local-pending");
+    expect(read.body.origin).toBe("local-pending");
+    expect(read.body.data.records).toEqual([{ id: "local", v: 1 }]);
+  });
+
+  it("never serves unactivated rows to a grantee", async () => {
+    const { f, deps } = await setup(75, false);
+    f.overlay.runs = f.overlay.runs.map((r) => ({ ...r, generation: null }));
+    const read = await get(deps, true);
+    expect(read.source).toBe("legacy");
+    expect(read.origin).toBeNull();
     expect(read.body.data.records).toEqual(STORED);
   });
 });
