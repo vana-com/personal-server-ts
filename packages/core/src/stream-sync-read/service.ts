@@ -94,12 +94,6 @@ export interface ResolveInput {
   readonly legacyFile: boolean;
   /** The caller reads as the owner (`isOwnerView`), not as a grantee. */
   readonly isOwnerView: boolean;
-  /**
-   * When the legacy body was collected, in epoch milliseconds; absent or
-   * `null` when unknown. An owner's pending local run answers instead of the
-   * legacy body only when it is strictly newer than this.
-   */
-  readonly legacyCollectedAt?: number | null;
 }
 
 /**
@@ -119,6 +113,12 @@ export interface WithheldRun {
 export interface OwnerNotes {
   /** Runs the writer will not publish; absent when none. */
   readonly withheld?: readonly WithheldRun[];
+  /**
+   * A legacy body answers, and pending local runs hold records it does not
+   * supersede. The legacy body's own time is an ingest stamp, not comparable
+   * with a run's, so nothing decides which is newer: the owner is told.
+   */
+  readonly pending?: { readonly runs: number };
 }
 
 export type ReadDecision =
@@ -793,12 +793,7 @@ export class StreamSyncReadService {
         [...targets, ...candidates],
         snapshots,
       );
-      if (
-        scan.best &&
-        (!input.legacyFile ||
-          (typeof input.legacyCollectedAt === "number" &&
-            scan.best.at > input.legacyCollectedAt))
-      ) {
+      if (scan.best && !input.legacyFile) {
         const snapshot = snapshots.get(scan.best.target.connector)!;
         snapshots.delete(scan.best.target.connector);
         return this.serveView(
@@ -816,6 +811,15 @@ export class StreamSyncReadService {
       if (scan.withheld.length > 0) {
         this.logWithheld(scan.connectors, scan.withheld.length);
         notes = { withheld: scan.withheld };
+      }
+      // The legacy body answers, as before own-writes; pending runs with
+      // records are named, never compared by time.
+      if (input.legacyFile && scan.best && scan.best.runs > 0) {
+        this.options.logger.info(
+          { connector: scan.best.target.connector, pending: scan.best.runs },
+          "stream-sync read: legacy body served over pending local runs",
+        );
+        notes = { ...notes, pending: { runs: scan.best.runs } };
       }
     }
     if (cursor) return { kind: "cursor_stale" };
@@ -868,7 +872,8 @@ export class StreamSyncReadService {
 
   /**
    * The target and connection whose local runs every needed stream has, with
-   * `at`, the newest observedAt among those runs; and every run the writer
+   * `at`, the newest observedAt among those runs that hold records, and
+   * `runs`, how many of them there are; and every run the writer
    * will not publish, among all the connections looked at, whether or not any
    * of them can be served.
    */
@@ -877,11 +882,16 @@ export class StreamSyncReadService {
     targets: readonly Target[],
     snapshots: ReadonlyMap<string, StreamSyncOverlaySnapshot>,
   ): {
-    best: { target: Target; ns: string; at: number } | null;
+    best: { target: Target; ns: string; at: number; runs: number } | null;
     withheld: WithheldRun[];
     connectors: string[];
   } {
-    let best: { target: Target; ns: string; at: number } | null = null;
+    let best: {
+      target: Target;
+      ns: string;
+      at: number;
+      runs: number;
+    } | null = null;
     const withheld: WithheldRun[] = [];
     const connectors = new Set<string>();
     for (const target of targets) {
@@ -898,7 +908,11 @@ export class StreamSyncReadService {
         if (input.connection !== null && input.connection !== ns) continue;
         const control = this.importer.controlState(rows.controls.get(ns));
         if (control.kind === "deleted" || control.kind === "foreign") continue;
+        // Recency counts only runs that hold records: an empty run is newer
+        // than nothing it returns.
         let at = 0;
+        let atAny = 0;
+        const withRecords = new Set<string>();
         const complete = target.streams.every((stream) => {
           const row = rows.streams.get(ns)?.get(stream);
           const local = this.contributions(
@@ -923,7 +937,12 @@ export class StreamSyncReadService {
           );
           if (local.withheld.length > 0) connectors.add(target.connector);
           withheld.push(...withheldRuns([{ stream, fold: local }]));
-          for (const c of local.merged) at = Math.max(at, c.run.observedAt);
+          for (const c of local.merged) {
+            atAny = Math.max(atAny, c.run.observedAt);
+            if (c.stream.recordCount === 0) continue;
+            at = Math.max(at, c.run.observedAt);
+            withRecords.add(c.run.runId);
+          }
           return local.merged.length > 0;
         });
         if (!complete) continue;
@@ -932,7 +951,7 @@ export class StreamSyncReadService {
           at > best.at ||
           (at === best.at && target.connector < best.target.connector)
         ) {
-          best = { target, ns, at };
+          best = { target, ns, at: at || atAny, runs: withRecords.size };
         }
       }
     }

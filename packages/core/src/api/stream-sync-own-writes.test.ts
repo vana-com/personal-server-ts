@@ -84,6 +84,7 @@ async function get(deps: PersonalServerDataApiDeps, builder: boolean) {
     status: response.status,
     source: response.headers.get("x-vana-data-source"),
     origin: response.headers.get("x-stream-sync-origin"),
+    pending: response.headers.get("x-stream-sync-pending"),
     body: await response.json().catch(() => null),
   };
 }
@@ -142,23 +143,26 @@ describe("data reads of a device's own rows", () => {
 });
 
 describe("data reads of a device's own rows against a stored body", () => {
-  it("serves the owner the pending run when it is newer than the stored body", async () => {
+  it("serves the owner the stored body and marks the pending run", async () => {
     const { deps } = await setup(76, false);
-    // The stored body was collected 2026-10-01; the run, 2026-11-01.
+    // The stored body's time is an ingest stamp, not comparable with a run's:
+    // the stored body answers whichever is newer, and the pending run is named.
     const read = await get(deps, false);
-    expect(read.source).toBe("stream-sync");
-    expect(read.origin).toBe("local-pending");
-    expect(read.body.data.records).toEqual([{ id: "local", v: 1 }]);
+    expect(read.source).toBe("legacy");
+    expect(read.pending).toBe("1");
+    expect(read.body.data.records).toEqual(STORED);
   });
 
-  it("serves the stored body when it is newer than the pending run", async () => {
+  it("serves the stored body without a marker when the pending run is older", async () => {
     const { f, deps } = await setup(77, false);
     f.overlay.runs = f.overlay.runs.map((r) => ({
       ...r,
       observedAt: Date.parse("2026-09-01T00:00:00Z"),
+      streams: r.streams.map((s) => ({ ...s, rows: [] })),
     }));
     const read = await get(deps, false);
     expect(read.source).toBe("legacy");
+    expect(read.pending).toBeNull();
     expect(read.body.data.records).toEqual(STORED);
   });
 
@@ -167,6 +171,7 @@ describe("data reads of a device's own rows against a stored body", () => {
     const read = await get(deps, true);
     expect(read.source).toBe("legacy");
     expect(read.origin).toBeNull();
+    expect(read.pending).toBeNull();
     expect(read.body.data.records).toEqual(STORED);
   });
 });
