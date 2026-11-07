@@ -4,6 +4,7 @@ import {
   type StreamSyncSeedRouteDeps,
 } from "./routes/stream-sync-seed.js";
 import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
+import { streamSyncReadStatusRoutes } from "./routes/stream-sync-read-status.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -547,6 +548,19 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       streamSyncSeed: deps.streamSyncSeed ?? null,
+    }),
+  );
+
+  app.route(
+    "/v1/stream-sync/read-status",
+    streamSyncReadStatusRoutes({
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      streamSyncRead: deps.streamSyncRead,
     }),
   );
 
