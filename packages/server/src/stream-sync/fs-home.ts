@@ -29,6 +29,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import {
   bindStreamSyncHome,
+  createStreamSyncIoBarrier,
   type StreamSyncFiles,
   type StreamSyncHome,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
@@ -38,7 +39,11 @@ export interface FsStreamSyncHome {
   readonly home: StreamSyncHome;
   /** Staging area for this home's Desktop seed rows. */
   readonly seedFiles: StreamSyncFiles;
-  /** Release the lock. Safe to call twice. */
+  /**
+   * Release the lock once every file operation of the home (both ports,
+   * including open `readChunks` iterators) has finished. Operations that
+   * start after `close` begins reject. Safe to call twice.
+   */
   close(): Promise<void>;
 }
 
@@ -79,13 +84,19 @@ export async function openFsStreamSyncHome(input: {
   readonly root: string;
   readonly ownerAddress: `0x${string}`;
   readonly network: string;
+  /** Test seam: the file store for a directory. Defaults to the local file system. */
+  readonly createFiles?: (dir: string) => StreamSyncFiles;
 }): Promise<FsStreamSyncHome | null> {
+  const createFiles = input.createFiles ?? createFsStreamSyncFiles;
+  // Every file operation of this home, on either port, passes through this
+  // barrier, so none starts or ends outside the lock (see io-barrier.ts).
+  const barrier = createStreamSyncIoBarrier();
   const homes = join(input.root, "stream-sync-homes");
   await mkdir(homes, { recursive: true });
   const home = bindStreamSyncHome({
     ownerAddress: input.ownerAddress,
     network: input.network,
-    open: (id) => createFsStreamSyncFiles(join(homes, id)),
+    open: (id) => barrier.guard(createFiles(join(homes, id))),
   });
   const lockPath = join(homes, `${home.id}.lock.sqlite`);
   let lock: Database.Database | null = null;
@@ -99,8 +110,10 @@ export async function openFsStreamSyncHome(input: {
   const held = lock;
   return {
     home,
-    seedFiles: createFsStreamSyncFiles(join(homes, `${home.id}.seed`)),
+    seedFiles: barrier.guard(createFiles(join(homes, `${home.id}.seed`))),
     close: async () => {
+      // Drain first: the lock stays held while any file operation runs.
+      await barrier.shut();
       if (held.open) held.close();
     },
   };

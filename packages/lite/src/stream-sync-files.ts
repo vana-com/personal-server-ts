@@ -10,6 +10,7 @@
 
 import {
   bindStreamSyncHome,
+  createStreamSyncIoBarrier,
   type StreamSyncFiles,
   type StreamSyncHome,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
@@ -195,7 +196,11 @@ export interface IndexedDbStreamSyncHomeOptions {
 
 export interface IndexedDbStreamSyncHome {
   readonly home: StreamSyncHome;
-  /** Close the database and release the lock. */
+  /**
+   * Release the lock once every file operation of the home (including open
+   * `readChunks` iterators) has finished, then close the database.
+   * Operations that start after `close` begins reject. Safe to call twice.
+   */
   close(): Promise<void>;
 }
 
@@ -215,6 +220,9 @@ export async function openIndexedDbStreamSyncHome(
     (globalThis.navigator?.locks as StreamSyncLocks | undefined);
   if (!locks) return null;
   let files: (StreamSyncFiles & { close(): void }) | null = null;
+  // Every file operation of the home passes through this barrier, so none
+  // starts or ends after the lock is released (see core's io-barrier.ts).
+  const barrier = createStreamSyncIoBarrier();
   const home = bindStreamSyncHome({
     ownerAddress: options.ownerAddress,
     network: options.network,
@@ -224,7 +232,7 @@ export async function openIndexedDbStreamSyncHome(
         factory: options.factory,
         keyRange: options.keyRange,
       });
-      return files;
+      return barrier.guard(files);
     },
   });
   let release!: () => void;
@@ -250,6 +258,8 @@ export async function openIndexedDbStreamSyncHome(
   return {
     home,
     async close() {
+      // Drain first: the lock stays held while any file operation runs.
+      await barrier.shut();
       (files as { close(): void } | null)?.close();
       release();
     },

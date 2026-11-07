@@ -1338,6 +1338,8 @@ export async function createServer(
     syncManager,
     streamSyncSeed,
     streamSyncIntake,
+    // Shutdown stops stream-sync requests first; the home then drains.
+    streamSyncAdmitting: () => !backgroundClosed,
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
@@ -1367,6 +1369,9 @@ export async function createServer(
     if (syncManager) {
       await syncManager.stop();
     }
+    // Closes the home's lock only after every file operation of the home has
+    // finished (new ones are refused). `backgroundClosed` (set above) already
+    // stops the stream-sync routes from admitting new requests.
     await releaseStreamSyncHome?.();
     indexManager.close();
   };

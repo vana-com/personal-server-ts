@@ -4,7 +4,6 @@ import {
   type StreamSyncSeedRouteDeps,
 } from "./routes/stream-sync-seed.js";
 import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
-import type { StreamSyncIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -12,6 +11,10 @@ import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-c
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import {
+  StreamSyncHomeClosedError,
+  type StreamSyncIntake,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type {
@@ -160,6 +163,11 @@ export interface AppDeps {
   streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
   /** Run intake (V2 §2); absent when stream sync writing is off. */
   streamSyncIntake?: StreamSyncIntake;
+  /**
+   * False once the host is shutting down: stream-sync requests then answer
+   * 503 before they start a file operation, so the home can close and drain.
+   */
+  streamSyncAdmitting?: () => boolean;
   /** Read-side tombstone memory; reads of a deleted scope answer 410. */
   scopeDeletions?: ScopeDeletionTracker;
   serverSigner?: ServerSigner;
@@ -307,6 +315,14 @@ function isMcpPath(path: string): boolean {
     path === MCP_PATH ||
     path.startsWith(`${MCP_PATH}/`) ||
     MCP_WELL_KNOWN_PATHS.has(path)
+  );
+}
+
+function streamSyncClosing(): ProtocolError {
+  return new ProtocolError(
+    503,
+    "STREAM_SYNC_CLOSING",
+    "Stream sync is shutting down on this server",
   );
 }
 
@@ -513,6 +529,13 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   app.route("/v1/import/oura-browser", ouraRoutes(deps));
+
+  app.use("/v1/stream-sync/*", async (_c, next) => {
+    if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
+      throw streamSyncClosing();
+    }
+    await next();
+  });
 
   app.route(
     "/v1/stream-sync/seed",
@@ -889,6 +912,8 @@ export function createApp(deps: AppDeps): Hono {
 
   // Global error handler
   app.onError((err, c) => {
+    // A request admitted just before shutdown can meet the closed home.
+    if (err instanceof StreamSyncHomeClosedError) err = streamSyncClosing();
     if (err instanceof ProtocolError) {
       deps.logger.warn({ err }, err.message);
       return c.json(err.toJSON(), err.code as 401 | 403 | 413 | 503);
