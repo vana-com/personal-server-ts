@@ -339,7 +339,7 @@ async function makeHost(input: {
       signer: accountSigner(SERVER_KEY),
     });
     const reader = await StreamSyncReadService.open({
-      files: createFsStreamSyncReadFiles(join(input.root, "full-read")),
+      files: await createFsStreamSyncReadFiles(join(input.root, "full-read")),
       blobs,
       keys: await createStreamSyncReadKeys(
         streamMasterKeyFromSignature(OWNER_SIGNATURE),
