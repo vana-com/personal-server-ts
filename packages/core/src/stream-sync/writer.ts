@@ -138,6 +138,20 @@ interface WriterState {
   version: 1;
   needsFull: NeedsFull;
   checkpoints: Record<string, StreamSyncCheckpoint>;
+  /**
+   * Per connector, how many times its checkpoint was invalidated: a control
+   * change seen, or a deliberate clear. It only grows and outlives the
+   * checkpoint, so a save can tell that an invalidation came after the run's
+   * control read, even when no checkpoint was stored. A state file without it
+   * reads as 0.
+   */
+  invalidations?: Record<string, number>;
+  /**
+   * Per connector and namespace, the newest control state known: the whole
+   * state. Each entry only moves forward and another namespace never touches
+   * it. Every decision uses this, never a raw read.
+   */
+  observedControl?: Record<string, Record<string, ControlState>>;
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
   receipts: Record<string, SeedReceipt>;
@@ -460,14 +474,30 @@ export class StreamSyncWriter {
     return this.intake(async () => {
       const { control } = await this.keys();
       const rows = await this.options.registry.listControlRows();
-      const next = new Map<string, Record<string, ControlState>>();
+      const listed: { connector: string; ns: string; state: ControlState }[] =
+        [];
       for (const row of rows) {
         const parsed = parseScope(row.scope);
         if (parsed?.kind !== "control") continue;
-        const states = next.get(parsed.connector) ?? {};
-        states[parsed.ns] = classifyControl(row.read, control);
-        next.set(parsed.connector, states);
+        listed.push({
+          connector: parsed.connector,
+          ns: parsed.ns,
+          state: classifyControl(row.read, control),
+        });
       }
+      // A listing is a control read too: record it like every other, and
+      // keep the newest known state of each row, not the raw listing.
+      const newest = await this.withState((state) =>
+        listed.map((row) =>
+          recordControl(state, row.connector, row.ns, row.state),
+        ),
+      );
+      const next = new Map<string, Record<string, ControlState>>();
+      listed.forEach((row, i) => {
+        const states = next.get(row.connector) ?? {};
+        states[row.ns] = newest[i]!;
+        next.set(row.connector, states);
+      });
       this.controls = next;
     });
   }
@@ -1020,9 +1050,25 @@ export class StreamSyncWriter {
     }
   }
 
-  private async readControl(scope: string): Promise<ControlState> {
+  /**
+   * The only way the writer reads a control row. The read is recorded in the
+   * connector's control watermark and the watermark's state is returned
+   * (`recordControl`): a lagging read yields the newer state already known,
+   * so no decision can use a raw read. The network read is outside the state
+   * lock; the recording is one short mutation.
+   */
+  private async readControl(
+    connector: string,
+    ns: string,
+  ): Promise<ControlState> {
     const { control } = await this.keys();
-    return classifyControl(await this.options.registry.read(scope), control);
+    const current = classifyControl(
+      await this.options.registry.read(controlScope(connector, ns)),
+      control,
+    );
+    return this.withState((state) =>
+      recordControl(state, connector, ns, current),
+    );
   }
 
   /**
@@ -1035,8 +1081,7 @@ export class StreamSyncWriter {
     const ns = entry.ns!;
     const scope = controlScope(entry.connector, ns);
     const start = startState(entry.start, ns);
-    let current = await this.readControl(scope);
-    await this.observeControl(entry.connector, ns, current);
+    let current = await this.readControl(entry.connector, ns);
     let decision = decide({
       start,
       current,
@@ -1045,7 +1090,7 @@ export class StreamSyncWriter {
       phase,
     });
     if (decision.kind === "reread") {
-      current = await this.readControl(scope);
+      current = await this.readControl(entry.connector, ns);
       decision = decide({
         start,
         current,
@@ -1057,7 +1102,7 @@ export class StreamSyncWriter {
     if (decision.kind === "create" || decision.kind === "reconnect") {
       await this.writeControl(scope, decision.target);
       this.fault("after_control_write", entry.runId);
-      current = await this.readControl(scope);
+      current = await this.readControl(entry.connector, ns);
       decision = decide({
         start,
         current,
@@ -1099,28 +1144,6 @@ export class StreamSyncWriter {
     } catch (error) {
       if (!(error instanceof AmbiguousRegistryReplyError)) throw error;
     }
-  }
-
-  /**
-   * §2.4: a generation change seen by the sync loop clears the checkpoint of
-   * an older generation for (c, ns), so the next run is full.
-   */
-  private async observeControl(
-    connector: string,
-    ns: string,
-    current: ControlState,
-  ): Promise<void> {
-    await this.withState((state) => {
-      const checkpoint = state.checkpoints[connector];
-      if (!checkpoint || checkpoint.ns !== ns) return;
-      if (
-        current.kind === "active" &&
-        current.generation === checkpoint.generation
-      ) {
-        return;
-      }
-      delete state.checkpoints[connector];
-    });
   }
 
   private async sign(
@@ -1522,7 +1545,9 @@ export class StreamSyncWriter {
         runFull: entry.full || stream.fullStream,
       });
       state.needsFull = effect.needsFull;
-      if (effect.clearCheckpoint) delete state.checkpoints[entry.connector];
+      if (effect.clearCheckpoint) {
+        invalidateCheckpoint(state, entry.connector, true);
+      }
       if (stream.seedApplies && this.options.seed) {
         state.receipts[
           `${this.options.seed.installId}|${entry.connector}|${entry.ns}|${name}`
@@ -1544,24 +1569,43 @@ export class StreamSyncWriter {
   private async checkpoint(host: HostEntry): Promise<void> {
     const { entry } = host;
     const ns = entry.ns!;
-    const control = await this.readControl(controlScope(entry.connector, ns));
+    // Snapshot before the control read: an invalidation that lands after it
+    // makes that read stale, and the save below refuses to use it.
+    const epoch =
+      (await this.readState()).invalidations?.[entry.connector] ?? 0;
+    const control = await this.readControl(entry.connector, ns);
     const seed = this.options.seed;
     const streams = Object.fromEntries(
       Object.entries(entry.streams).map(([k, v]) => [k, streamRunResult(v)]),
     );
     const decision = await this.withState((state) => {
+      if ((state.invalidations?.[entry.connector] ?? 0) !== epoch) {
+        // The records are already published; the next run reads them again.
+        return { kind: "stale" as const };
+      }
       const seedReceiptsPending = host.seedStreams.some(
         (s) =>
           seed !== undefined &&
           state.receipts[`${seed.installId}|${entry.connector}|${ns}|${s}`] ===
             undefined,
       );
+      // Decide on the watermark as of this mutation, not on the read alone.
+      const latest = state.observedControl?.[entry.connector]?.[ns] ?? control;
       const decided = checkpointDecision({
         target: host.target!,
         streams,
-        control,
+        control: latest,
         seedReceiptsPending,
       });
+      const held = state.checkpoints[entry.connector];
+      if (
+        decided.kind === "save" &&
+        held?.ns === ns &&
+        held.generation > decided.generation
+      ) {
+        // Never replace a newer generation's checkpoint with an older one.
+        return { kind: "stale" as const };
+      }
       if (decided.kind === "save") {
         // §3.6: this run's cursors join the saved ones of the same namespace
         // and generation, so a stream the run did not cover keeps its own.
@@ -1578,6 +1622,14 @@ export class StreamSyncWriter {
       }
       return decided;
     });
+    if (decision.kind === "stale") {
+      await this.finish(host, {
+        kind: "no_checkpoint",
+        generation: host.target!,
+        reason: "control_changed",
+      });
+      return;
+    }
     if (decision.kind === "save") {
       this.fault("after_checkpoint_saved", entry.runId);
       await this.finish(host, {
@@ -1598,9 +1650,11 @@ export class StreamSyncWriter {
     const { decision } = error;
     if (decision.clearCheckpoints) {
       await this.withState((state) => {
-        if (state.checkpoints[entry.connector]?.ns === entry.ns) {
-          delete state.checkpoints[entry.connector];
-        }
+        invalidateCheckpoint(
+          state,
+          entry.connector,
+          state.checkpoints[entry.connector]?.ns === entry.ns,
+        );
       });
     }
     for (const [name, stream] of Object.entries(entry.streams)) {
@@ -1956,6 +2010,70 @@ function streamRowKind(read: ControlRead, hashes: ControlHashes): StreamRow {
 
 function parseHeadKey(request: SignedRegistryPost): string {
   return `${request.scope}/h-${request.dataHash.slice(2).toLowerCase()}`;
+}
+
+/** Control rows are ordered by registry version; an absent row ranks 0. */
+function controlRank(state: ControlState): number {
+  switch (state.kind) {
+    case "absent":
+      return 0;
+    case "active":
+      return state.generation;
+    case "deleted":
+    case "foreign":
+      return state.version;
+  }
+}
+
+/**
+ * Apply one control read to the state and return the newest control state
+ * known. Ordering rule: within a (connector, namespace) a read ranks by row
+ * version and the watermark only moves forward; another namespace never
+ * changes it. A read older than the watermark is a
+ * late response: it changes nothing and the stored newer state is returned,
+ * so it can neither clear a checkpoint, overwrite a newer observation nor
+ * authorize a decision. A newer read is an invalidation: it advances the
+ * count whether or not a checkpoint is stored.
+ * A read that shows a stored checkpoint's generation is gone (a higher row,
+ * or the same row no longer active) also clears that checkpoint (§2.4).
+ */
+function recordControl(
+  state: WriterState,
+  connector: string,
+  ns: string,
+  current: ControlState,
+): ControlState {
+  const marks = ((state.observedControl ??= {})[connector] ??= {});
+  const rank = controlRank(current);
+  const prev = marks[ns];
+  if (prev !== undefined && rank < controlRank(prev)) return prev;
+  const moved = prev !== undefined && rank > controlRank(prev);
+  marks[ns] = current;
+  const checkpoint = state.checkpoints[connector];
+  // A read ranked below the checkpoint's generation is a lagging response.
+  const stale =
+    checkpoint !== undefined &&
+    checkpoint.ns === ns &&
+    (rank > checkpoint.generation ||
+      (rank === checkpoint.generation && current.kind !== "active"));
+  if (stale || moved) invalidateCheckpoint(state, connector, stale);
+  return current;
+}
+
+/**
+ * The one place a checkpoint is invalidated: advance the connector's
+ * invalidation count in the same state mutation as the clear, so a save that
+ * read control earlier cannot restore what was cleared. The count advances
+ * even when `clear` is false or the slot is already empty.
+ */
+function invalidateCheckpoint(
+  state: WriterState,
+  connector: string,
+  clear: boolean,
+): void {
+  if (clear) delete state.checkpoints[connector];
+  const epochs = (state.invalidations ??= {});
+  epochs[connector] = (epochs[connector] ?? 0) + 1;
 }
 
 function describe(state: ControlState): string {
