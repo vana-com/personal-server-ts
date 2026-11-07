@@ -26,6 +26,7 @@ import {
 } from "./oracle.test-utils.js";
 
 const NS = "";
+const OTHER_NS = "a1b2c3d4e5f60718";
 const T0 = Date.UTC(2026, 10, 1);
 const rows = (ids: string[], tag: string) => ids.map((id) => ({ id, n: tag }));
 
@@ -56,11 +57,14 @@ afterAll(async () => {
  * - `script`: the next control reads, in order, each optionally run an action
  *   first and optionally return a given result instead of the registry's.
  */
+type ControlListing = { scope: string; read: ControlRead };
 type ControlScriptStep = { action?: () => Promise<void>; result?: ControlRead };
 function controlReadHooks(inner: StreamSyncRegistry) {
   let held: { skip: number; afterStreamPost: boolean } | null = null;
   let postSeen = false;
   const steps: ControlScriptStep[] = [];
+  const listings: ControlListing[][] = [];
+  let controlReads = 0;
   let postHeld = false;
   let releasePost!: () => void;
   const postGate = new Promise<void>((resolve) => (releasePost = resolve));
@@ -84,8 +88,12 @@ function controlReadHooks(inner: StreamSyncRegistry) {
       }
       return result;
     },
+    async listControlRows() {
+      return listings.shift() ?? inner.listControlRows();
+    },
     async read(scope) {
       const control = parseScope(scope)?.kind === "control";
+      if (control) controlReads += 1;
       const step = control ? steps.shift() : undefined;
       if (step?.action) await step.action();
       const result = step?.result ?? (await inner.read(scope));
@@ -113,6 +121,11 @@ function controlReadHooks(inner: StreamSyncRegistry) {
     },
     atPost,
     releasePost,
+    /** The next listings `refreshControls` gets, in order. */
+    listings: (next: ControlListing[][]) => {
+      listings.push(...next);
+    },
+    controlReads: () => controlReads,
     script: (next: ControlScriptStep[]) => {
       steps.push(...next);
     },
@@ -485,9 +498,10 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
     expect(await watermark(files, c)).toContain("3");
   });
 
-  // Admission's first read lags (absent) and the writer decides on the known
-  // active(1); the next read sees a newer foreign row and ends in keep_pending.
-  it("a reread observation stops a late save", async () => {
+  // B's admission read lags (absent) and the writer decides on the known
+  // active(1). B's final read sees a newer foreign row: it is recorded, B ends
+  // in keep_pending, and A's late save is stopped.
+  it("a foreign row seen at the final read stops a late save", async () => {
     const c = freshConnector("ckpt-epoch-reread");
     const held = controlReadHooks(env.newRegistry());
     const files = await env.files("ckpt-epoch-reread");
@@ -540,11 +554,10 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
     expect(await watermark(files, c)).toContain("3");
   });
 
-  // B starts from an absent snapshot and its admission read lags (absent). The
-  // writer decides on the newest state it knows, active(1), so B does not
-  // write control; the owner then deletes and reconnects, and B's next read
-  // records the change.
-  it("an after_write observation stops a late save", async () => {
+  // B's admission read lags (absent) and the writer decides on the known
+  // active(1). The owner deletes and reconnects before B's final read: B
+  // saves nothing and A's late save is stopped.
+  it("a reconnect seen at the final read stops a late save after a lagging admission read", async () => {
     const c = freshConnector("ckpt-epoch-afterwrite");
     const held = controlReadHooks(env.newRegistry());
     const files = await env.files("ckpt-epoch-afterwrite");
@@ -631,5 +644,134 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
     );
     expect(await checkpointOf(w, c)).toBeUndefined();
     expect(await watermark(files, c)).toContain("3");
+  });
+
+  // Branch coverage: with no stored watermark the raw read is the only input.
+  it("reread: with no watermark, a lagging absent read is read again", async () => {
+    const c = freshConnector("ckpt-epoch-reread-branch");
+    const held = controlReadHooks(env.newRegistry());
+    const files = await env.files("ckpt-epoch-reread-branch");
+    const w = await env.writer("ckpt-epoch-reread-branch", {
+      files,
+      registry: held.registry,
+    });
+    await w.refreshControls();
+    await collect(w, {
+      runId: "r0",
+      connector: c,
+      observedAt: T0,
+      streams: { s1: rows(["1"], "a") },
+      checkpoint: { s1: "T0" },
+    });
+    await w.publishPending();
+    await w.refreshControls();
+    // Forget the watermark so only the raw read decides.
+    const state = JSON.parse(
+      new TextDecoder().decode((await files.read("state.json"))!),
+    );
+    delete state.observedControl;
+    await files.write(
+      "state.json",
+      new TextEncoder().encode(JSON.stringify(state)),
+    );
+    await w.beginRun({
+      runId: "rB",
+      connector: c,
+      userConnect: false,
+      observedAt: T0 + 1000,
+      identity: "none",
+      checkpointUsed: null,
+    });
+    const before = held.controlReads();
+    held.script([{ result: { found: false } }]);
+    const b = await w.saveCheckpointOnly("rB", { s1: "T1" });
+    // Admission, the reread, then the final checkpoint read.
+    expect(held.controlReads() - before).toBe(3);
+    expect(b.outcome).toEqual({ kind: "checkpointed", generation: 1 });
+  });
+
+  // Branch coverage: a first read of an absent row is followed by a write and
+  // an after_write re-read; a change in between discards the run.
+  it("after_write: a change between the control write and its re-read discards the run", async () => {
+    const c = freshConnector("ckpt-epoch-afterwrite-branch");
+    const held = controlReadHooks(env.newRegistry());
+    const files = await env.files("ckpt-epoch-afterwrite-branch");
+    const w = await env.writer("ckpt-epoch-afterwrite-branch", {
+      files,
+      registry: held.registry,
+    });
+    await w.refreshControls();
+    await w.beginRun({
+      runId: "rB",
+      connector: c,
+      userConnect: false,
+      observedAt: T0,
+      identity: "none",
+      checkpointUsed: null,
+    });
+    const before = held.controlReads();
+    held.script([
+      {},
+      {
+        action: async () => {
+          await deleteConnection(env.registry, c, NS, []);
+          await activateControl(env.registry, c, NS);
+        },
+      },
+    ]);
+    const b = await w.saveCheckpointOnly("rB", { s1: "U" });
+    // Admission read, the after_write re-read; a discard has no final read.
+    expect(held.controlReads() - before).toBe(2);
+    expect(b.outcome.kind).toBe("discarded");
+    expect(await watermark(files, c)).toContain("3");
+  });
+
+  // The listing of another namespace must not erase or lower what the writer
+  // knows of this one: N is seen at g3, then M, then a lagging N at g1.
+  it("a listing of another namespace cannot lower this namespace's watermark", async () => {
+    const c = freshConnector("ckpt-epoch-ns");
+    const held = controlReadHooks(env.newRegistry());
+    const files = await env.files("ckpt-epoch-ns");
+    const w = await env.writer("ckpt-epoch-ns", {
+      files,
+      registry: held.registry,
+    });
+    await w.refreshControls();
+    await collect(w, {
+      runId: "rA",
+      connector: c,
+      observedAt: T0,
+      streams: { s1: rows(["1"], "a") },
+      checkpoint: { s1: "T1" },
+    });
+    held.holdAfterStreamPost();
+    const publishing = w.publishPending();
+    await guarded(held, async () => {
+      await held.atPost;
+      const n1 = await env.registry.read(controlScope(c, NS));
+      await activateControl(env.registry, c, OTHER_NS);
+      const m1 = await env.registry.read(controlScope(c, OTHER_NS));
+      await deleteConnection(env.registry, c, NS, ["s1"]);
+      await activateControl(env.registry, c, NS);
+      const n3 = await env.registry.read(controlScope(c, NS));
+      const row = (ns: string, read: ControlRead) => ({
+        scope: controlScope(c, ns),
+        read,
+      });
+      held.listings([
+        [row(NS, n3), row(OTHER_NS, m1)],
+        [row(OTHER_NS, m1), row(NS, n1)],
+      ]);
+      await w.refreshControls();
+      await w.refreshControls();
+      // A's final read is the old row of N.
+      held.script([{ result: n1 }]);
+      held.releasePost();
+    });
+    await publishing;
+    expect(finishedOutcome(await w.status(), "rA")?.outcome.kind).toBe(
+      "no_checkpoint",
+    );
+    expect(await checkpointOf(w, c)).toBeUndefined();
   });
 });
