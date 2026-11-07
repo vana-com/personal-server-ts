@@ -5,7 +5,11 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { StreamSyncRegistry } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type {
+  ControlRead,
+  StreamSyncFiles,
+  StreamSyncRegistry,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   activateControl,
@@ -44,12 +48,14 @@ afterAll(async () => {
  *   but is delivered only after `release` (a save's final control read). With
  *   `afterStreamPost` it waits for a stream post first; `skip` lets that many
  *   control reads pass.
- * - `beforeRead`: runs an action before the Nth control read after it is set.
+ * - `script`: the next control reads, in order, each optionally run an action
+ *   first and optionally return a given result instead of the registry's.
  */
+type ControlScriptStep = { action?: () => Promise<void>; result?: ControlRead };
 function controlReadHooks(inner: StreamSyncRegistry) {
   let held: { skip: number; afterStreamPost: boolean } | null = null;
   let postSeen = false;
-  let before: { skip: number; action: () => Promise<void> } | null = null;
+  const steps: ControlScriptStep[] = [];
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
   let reached!: () => void;
@@ -65,15 +71,9 @@ function controlReadHooks(inner: StreamSyncRegistry) {
     },
     async read(scope) {
       const control = parseScope(scope)?.kind === "control";
-      if (control && before) {
-        if (before.skip > 0) before.skip -= 1;
-        else {
-          const { action } = before;
-          before = null;
-          await action();
-        }
-      }
-      const result = await inner.read(scope);
+      const step = control ? steps.shift() : undefined;
+      if (step?.action) await step.action();
+      const result = step?.result ?? (await inner.read(scope));
       if (control && held && (!held.afterStreamPost || postSeen)) {
         if (held.skip > 0) held.skip -= 1;
         else {
@@ -93,8 +93,8 @@ function controlReadHooks(inner: StreamSyncRegistry) {
         afterStreamPost: options.afterStreamPost ?? false,
       };
     },
-    beforeRead: (skip: number, action: () => Promise<void>) => {
-      before = { skip, action };
+    script: (next: ControlScriptStep[]) => {
+      steps.push(...next);
     },
     atRead,
     release,
@@ -105,6 +105,14 @@ const checkpointOf = async (
   w: Awaited<ReturnType<OracleEnv["writer"]>>,
   c: string,
 ) => (await w.status()).checkpoints[c];
+
+/** The stored control watermark of `connector`, as raw JSON text. */
+async function watermark(files: StreamSyncFiles, connector: string) {
+  const state = JSON.parse(
+    new TextDecoder().decode((await files.read("state.json"))!),
+  );
+  return JSON.stringify(state.observedControl?.[connector] ?? null);
+}
 
 /** Run `body`, always releasing the held read so a failure cannot hang. */
 async function guarded(
@@ -224,9 +232,14 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
       });
       // B sees active(3) at admission, then the connection is deleted again
       // before its final read, so B saves nothing.
-      held.beforeRead(1, () =>
-        deleteConnection(env.registry, c, NS, []).then(() => undefined),
-      );
+      held.script([
+        {},
+        {
+          action: async () => {
+            await deleteConnection(env.registry, c, NS, []);
+          },
+        },
+      ]);
       const b = await w.saveCheckpointOnly("rB", { s1: "U2" });
       expect(b.outcome.kind).toBe("no_checkpoint");
       expect(await checkpointOf(w, c)).toBeUndefined();
@@ -396,5 +409,165 @@ describe("checkpoint save against an invalidation", { timeout: 30_000 }, () => {
     });
     await saving;
     expect(await checkpointOf(w, c)).toBeUndefined();
+  });
+
+  // The final read is the only observation that sees the change: B's
+  // admission read the same active(1) the run's mark already holds.
+  it("a changed final control read stops a late save when admission saw no change", async () => {
+    const c = freshConnector("ckpt-epoch-final");
+    const held = controlReadHooks(env.newRegistry());
+    const files = await env.files("ckpt-epoch-final");
+    const w = await env.writer("ckpt-epoch-final", {
+      registry: held.registry,
+      files,
+    });
+    await w.refreshControls();
+    held.arm({ afterStreamPost: true });
+    await collect(w, {
+      runId: "rA",
+      connector: c,
+      observedAt: T0,
+      streams: { s1: rows(["1"], "a") },
+      checkpoint: { s1: "T1" },
+    });
+    const publishing = w.publishPending();
+    await guarded(held, async () => {
+      await held.atRead;
+      await w.beginRun({
+        runId: "rB",
+        connector: c,
+        userConnect: false,
+        observedAt: T0 + 1000,
+        identity: "none",
+        checkpointUsed: null,
+      });
+      held.script([
+        {},
+        {
+          action: async () => {
+            await deleteConnection(env.registry, c, NS, ["s1"]);
+            await activateControl(env.registry, c, NS);
+          },
+        },
+      ]);
+      const b = await w.saveCheckpointOnly("rB", { s1: "U2" });
+      expect(b.outcome.kind).toBe("no_checkpoint");
+      expect(await checkpointOf(w, c)).toBeUndefined();
+      expect(await watermark(files, c)).toContain("3");
+    });
+    await publishing;
+    expect(finishedOutcome(await w.status(), "rA")?.outcome.kind).toBe(
+      "no_checkpoint",
+    );
+    expect(await checkpointOf(w, c)).toBeUndefined();
+    // A's late read of active(1) is older than what B saw: it moves nothing.
+    expect(await watermark(files, c)).toContain("3");
+  });
+
+  // Admission's first read lags (absent); the reread is the only read that
+  // sees a newer row, and it ends in keep_pending, not a discard.
+  it("a reread observation stops a late save", async () => {
+    const c = freshConnector("ckpt-epoch-reread");
+    const held = controlReadHooks(env.newRegistry());
+    const files = await env.files("ckpt-epoch-reread");
+    const w = await env.writer("ckpt-epoch-reread", {
+      files,
+      registry: held.registry,
+    });
+    await w.refreshControls();
+    held.arm({ afterStreamPost: true });
+    await collect(w, {
+      runId: "rA",
+      connector: c,
+      observedAt: T0,
+      streams: { s1: rows(["1"], "a") },
+      checkpoint: { s1: "T1" },
+    });
+    const publishing = w.publishPending();
+    await guarded(held, async () => {
+      await held.atRead;
+      await w.refreshControls();
+      await w.beginRun({
+        runId: "rB",
+        connector: c,
+        userConnect: false,
+        observedAt: T0 + 1000,
+        identity: "none",
+        checkpointUsed: null,
+      });
+      held.script([
+        { result: { found: false } },
+        {
+          result: {
+            found: true,
+            version: 3,
+            dataHash: `0x${"11".repeat(32)}`,
+            metadataHash: `0x${"22".repeat(32)}`,
+            deleted: false,
+          },
+        },
+      ]);
+      const b = await w.saveCheckpointOnly("rB", { s1: "U2" });
+      expect(b.outcome.kind).toBe("no_checkpoint");
+      expect(await watermark(files, c)).toContain("3");
+    });
+    await publishing;
+    expect(finishedOutcome(await w.status(), "rA")?.outcome.kind).toBe(
+      "no_checkpoint",
+    );
+    expect(await checkpointOf(w, c)).toBeUndefined();
+    expect(await watermark(files, c)).toContain("3");
+  });
+
+  // The after_write read is the only read that sees the change: B starts
+  // from an absent snapshot, its admission read lags, it writes control, and
+  // the owner deletes and reconnects before it reads again.
+  it("an after_write observation stops a late save", async () => {
+    const c = freshConnector("ckpt-epoch-afterwrite");
+    const held = controlReadHooks(env.newRegistry());
+    const files = await env.files("ckpt-epoch-afterwrite");
+    const w = await env.writer("ckpt-epoch-afterwrite", {
+      files,
+      registry: held.registry,
+    });
+    await w.refreshControls();
+    held.arm({ afterStreamPost: true });
+    await collect(w, {
+      runId: "rA",
+      connector: c,
+      observedAt: T0,
+      streams: { s1: rows(["1"], "a") },
+      checkpoint: { s1: "T1" },
+    });
+    const publishing = w.publishPending();
+    await guarded(held, async () => {
+      await held.atRead;
+      await w.beginRun({
+        runId: "rB",
+        connector: c,
+        userConnect: false,
+        observedAt: T0 + 1000,
+        identity: "none",
+        checkpointUsed: null,
+      });
+      held.script([
+        { result: { found: false } },
+        {
+          action: async () => {
+            await deleteConnection(env.registry, c, NS, ["s1"]);
+            await activateControl(env.registry, c, NS);
+          },
+        },
+      ]);
+      const b = await w.saveCheckpointOnly("rB", { s1: "U2" });
+      expect(b.outcome.kind).toBe("discarded");
+      expect(await watermark(files, c)).toContain("3");
+    });
+    await publishing;
+    expect(finishedOutcome(await w.status(), "rA")?.outcome.kind).toBe(
+      "no_checkpoint",
+    );
+    expect(await checkpointOf(w, c)).toBeUndefined();
+    expect(await watermark(files, c)).toContain("3");
   });
 });
