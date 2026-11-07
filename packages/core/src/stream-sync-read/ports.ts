@@ -71,6 +71,13 @@ export interface StreamSyncOverlayStream {
   /** True only when the run's full/fullStream provenance says so (writer.ts:1460-1466). */
   readonly complete: boolean;
   /**
+   * How many records the run holds for this stream. The reader needs to know
+   * only whether it is zero: a run with no record and no change of
+   * completeness is a no-op for the writer, which keeps the head's profile.
+   * Absent = unknown, and the reader takes the side that withholds more.
+   */
+  readonly recordCount?: number;
+  /**
    * Identifies this stream's immutable rows and every descriptor field that
    * affects a read (profile, primaryKey, complete, state, receipt). Never
    * reused for different content, including across restart.

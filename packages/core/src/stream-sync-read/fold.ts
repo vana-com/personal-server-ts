@@ -6,7 +6,8 @@
  * - runs fold onto the base in publish order, `observedAt` then `runId`;
  * - each step asks the writer's own rule (`writerCompatibility`) with the
  *   writer's own version comparison, against the key and profile that the
- *   previous step would have published;
+ *   previous step would have published; a step the writer skips as a no-op
+ *   publishes nothing, so it leaves the profile as it found it;
  * - the same key merges onto the base; a newer connector that changed the key
  *   starts from an empty base, so the view is complete only if that run is
  *   full; any other run is withheld: the writer will not publish it, so its
@@ -61,6 +62,35 @@ export function publishOrder(a: Contribution, b: Contribution): number {
   return a.run.runId < b.run.runId ? -1 : a.run.runId > b.run.runId ? 1 : 0;
 }
 
+/**
+ * The profile of the head the writer leaves after this step. It mirrors the
+ * writer's isNoop(base, parts, complete): over a base the writer skips the
+ * publish when the parts and completeness are unchanged, and the head then
+ * keeps the profile it had; otherwise it publishes the run's own profile.
+ *
+ * - no base (none, or replaced by `empty_base`): always published;
+ * - completeness changes: published;
+ * - the run holds no record: its parts equal the base's, so skipped;
+ * - the run holds records, or the count is unknown: its parts equal the base's
+ *   only when every row loses to a row the base already holds, which the
+ *   overlay cannot see. Take the side that withholds more: the higher version
+ *   of the two, so no later run is merged that the writer would refuse.
+ */
+function nextProfile(
+  base: FoldBase | null,
+  c: Contribution,
+  complete: boolean,
+): HeadProfile {
+  if (base === null || complete !== base.complete) return c.stream.profile;
+  if (c.stream.recordCount === 0) return base.profile;
+  return compareConnectorVersions(
+    c.stream.profile.version,
+    base.profile.version,
+  ) === "higher"
+    ? c.stream.profile
+    : base.profile;
+}
+
 export function foldContributions(
   base: FoldBase | null,
   candidates: readonly Contribution[],
@@ -85,21 +115,22 @@ export function foldContributions(
       withheld.push(c);
       continue;
     }
-    // The writer's head carries the run's own key and profile; `complete` is
-    // `full || base complete`, and an empty base is not complete.
+    // `complete` is `full || base complete`, and an empty base is not complete.
     const baseComplete =
       compat.kind === "use_base" && state !== null && state.complete;
+    const complete = c.stream.complete || baseComplete;
+    const profile = nextProfile(
+      compat.kind === "empty_base" ? null : state,
+      c,
+      complete,
+    );
     if (compat.kind === "empty_base") {
       baseDropped = true;
       merged = [];
     }
     chain.push(c);
     merged.push(c);
-    state = {
-      primaryKey: c.stream.primaryKey,
-      profile: c.stream.profile,
-      complete: c.stream.complete || baseComplete,
-    };
+    state = { primaryKey: c.stream.primaryKey, profile, complete };
   }
   return {
     chain,
