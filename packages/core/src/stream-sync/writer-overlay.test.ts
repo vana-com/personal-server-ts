@@ -557,7 +557,7 @@ describe("writer durable read acknowledgment", () => {
   it.each([
     { registryVersion: 0 },
     { registryVersion: 2, generation: 3 },
-    { dataHash: "wrong" },
+    { dataHash: `0x${"ab".repeat(32)}` },
     { connector: "other" },
     { ns: "other" },
     { stream: "other" },
@@ -587,7 +587,7 @@ describe("writer durable read acknowledgment", () => {
     await createWriterOverlaySource(w).acknowledge({
       ...(await coverageOf(f)),
       registryVersion: 2,
-      dataHash: "later",
+      dataHash: `0x${"cd".repeat(32)}`,
     });
     expect(await f.files.size("runs/r1/spool/s0.log")).toBe(0);
   });
@@ -643,7 +643,7 @@ describe("writer durable read acknowledgment", () => {
       stream: "s",
       generation: 1,
       registryVersion: 1,
-      dataHash: "unknown",
+      dataHash: `0x${"ee".repeat(32)}`,
     });
     const snap = await source.snapshot(connector);
     expect(snap.runs).toHaveLength(1);
@@ -657,7 +657,7 @@ describe("writer durable read acknowledgment", () => {
       stream: "s",
       generation: 1,
       registryVersion: 1,
-      dataHash: "unknown",
+      dataHash: `0x${"ee".repeat(32)}`,
     });
     expect(await f.files.size("runs/r1/spool/s0.log")).toBeGreaterThan(0);
   });
@@ -812,6 +812,57 @@ describe("writer coverage that arrives before the receipt", () => {
     const { f } = await earlyAck(change);
     expect(await f.files.size(log)).toBeGreaterThan(0);
   });
+});
+
+describe("writer coverage hash spelling", () => {
+  const log = "runs/r1/spool/s0.log";
+  async function published() {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w);
+    await w.publishPending();
+    const coverage = await coverageOf(f);
+    return { f, source: createWriterOverlaySource(w), coverage };
+  }
+  it.each([
+    ["lowercase 0x", (h: string) => h],
+    ["0x uppercase digits", (h: string) => `0x${h.slice(2).toUpperCase()}`],
+    ["0X uppercase digits", (h: string) => `0X${h.slice(2).toUpperCase()}`],
+    ["0X lowercase digits", (h: string) => `0X${h.slice(2)}`],
+    ["unprefixed", (h: string) => h.slice(2)],
+    ["unprefixed uppercase", (h: string) => h.slice(2).toUpperCase()],
+  ])("covers a receipt for the %s spelling", async (_name, spell) => {
+    const { f, source, coverage } = await published();
+    await source.acknowledge({
+      ...coverage,
+      dataHash: spell(coverage.dataHash),
+    });
+    expect(await f.files.size(log)).toBe(0);
+  });
+  it("does not cover a different digest", async () => {
+    const { f, source, coverage } = await published();
+    await source.acknowledge({ ...coverage, dataHash: `0x${"ab".repeat(32)}` });
+    expect(await f.files.size(log)).toBeGreaterThan(0);
+  });
+  it.each([
+    "wrong",
+    "0x",
+    "0x12",
+    `0x${"a".repeat(63)}`,
+    `0x${"g".repeat(64)}`,
+  ])(
+    "rejects malformed hash %j at the acknowledgement boundary",
+    async (dataHash) => {
+      const { f, source, coverage } = await published();
+      await expect(
+        source.acknowledge({ ...coverage, dataHash }),
+      ).rejects.toThrow();
+      expect(await f.files.size(log)).toBeGreaterThan(0);
+      await source.acknowledge(coverage);
+      expect(await f.files.size(log)).toBe(0);
+    },
+  );
 });
 
 describe("writer cleanup failure", () => {

@@ -82,6 +82,7 @@ import {
   type OutboxStream,
   type StartSnapshot,
   type VersionOrder,
+  canonicalBytes32,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { publicationMetadataHash } from "../publication/publish.js";
 import { streamSyncHashes } from "./crypto.js";
@@ -1660,7 +1661,7 @@ export class StreamSyncWriter {
     });
     stream.receipt = {
       registryVersion,
-      dataHash: dataHash.toLowerCase(),
+      dataHash: canonicalBytes32(dataHash),
       generation,
     };
     this.setStream(host, name, {
@@ -1828,12 +1829,14 @@ export class StreamSyncWriter {
         host.generation,
       ),
     );
-    return (
-      coverage !== undefined &&
-      (coverage.registryVersion > receipt.registryVersion ||
-        (coverage.registryVersion === receipt.registryVersion &&
-          coverage.dataHash === receipt.dataHash))
-    );
+    if (!coverage) return false;
+    if (coverage.registryVersion !== receipt.registryVersion)
+      return coverage.registryVersion > receipt.registryVersion;
+    try {
+      return coverage.dataHash === canonicalBytes32(receipt.dataHash);
+    } catch {
+      return false; // an unreadable stored hash never proves coverage
+    }
   }
 
   private retainedStreams(host: HostEntry): string[] {
@@ -2025,9 +2028,12 @@ export class StreamSyncWriter {
   }
 
   /** The caller has committed these bytes to its durable read store. */
-  async acknowledgeOverlay(
-    coverage: StreamSyncImportedCoverage,
-  ): Promise<void> {
+  async acknowledgeOverlay(offered: StreamSyncImportedCoverage): Promise<void> {
+    // Reject a malformed digest before it can be stored or reclaim anything.
+    const coverage = {
+      ...offered,
+      dataHash: canonicalBytes32(offered.dataHash),
+    };
     await this.recover();
     const binding = await this.binding();
     await this.lifecycle(async () => {
