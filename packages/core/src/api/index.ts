@@ -1,3 +1,4 @@
+import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
@@ -403,6 +404,8 @@ export interface PersonalServerDataApiDeps {
    * serve. When false (default), reads bypass payment entirely.
    */
   paymentEnabled?: boolean;
+  /** Operator-selected Account authority. Never taken from a read request. */
+  ownAppAccountUrl?: string;
   /**
    * Test seam for the gateway forwarding fetch. Defaults to the global
    * `fetch`; tests inject a mock that returns specific gateway statuses.
@@ -924,6 +927,49 @@ function listAuthCovers(
   );
 }
 
+/**
+ * Whether the app reading is the data owner's own app, which is exempt from
+ * the read fee. `false` when no Account authority is configured or the read
+ * is owner-signalled; a `Response` (503) when eligibility cannot be
+ * verified, so a read is never served free on missing evidence.
+ */
+async function ownAppReadStatus(
+  deps: PersonalServerDataApiDeps,
+  authResult: Awaited<
+    ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+  >,
+): Promise<boolean | Response> {
+  const isOwnerSignal =
+    authResult?.grantId === "owner" || authResult?.grantId === "policy-bypass";
+  const builder = authResult?.builder;
+  if (
+    !deps.paymentEnabled ||
+    isOwnerSignal ||
+    !authResult?.grantId ||
+    !builder ||
+    !deps.ownAppAccountUrl
+  ) {
+    return false;
+  }
+  const unavailable = () =>
+    errorResponse(
+      503,
+      "OWN_APP_ELIGIBILITY_UNAVAILABLE",
+      "Own-app fee eligibility could not be verified",
+    );
+  if (!deps.serverOwner || !deps.gatewayConfig) return unavailable();
+  try {
+    return await isOwnAppRead({
+      accountUrl: deps.ownAppAccountUrl,
+      appAddress: builder,
+      dataOwner: deps.serverOwner,
+      chainId: deps.gatewayConfig.chainId,
+    });
+  } catch {
+    return unavailable();
+  }
+}
+
 /** What a charged builder read pays with; see `readCharge`. */
 interface ReadCharge {
   grantId: string;
@@ -947,6 +993,7 @@ function readCharge(
   authResult: Awaited<
     ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
   >,
+  ownAppRead: boolean,
 ): ReadCharge | null {
   const isOwnerSignal =
     authResult?.grantId === "owner" || authResult?.grantId === "policy-bypass";
@@ -956,6 +1003,7 @@ function readCharge(
   const willCharge = Boolean(
     deps.paymentEnabled &&
     !isOwnerSignal &&
+    !ownAppRead &&
     typeof builder === "string" &&
     builder.startsWith("0x") &&
     resolvedGrantId &&
@@ -2554,7 +2602,17 @@ export async function handlePersonalServerDataRequest(
             // The same charge as a file read; the access record binds the
             // stream head the view serves.
             let paymentResponseHeader: string | undefined;
-            const charge = readCharge(deps, scopeResult.scope, authResult);
+            const ownApp = await ownAppReadStatus(deps, authResult);
+            if (ownApp instanceof Response) {
+              await decision.body.cancel();
+              return ownApp;
+            }
+            const charge = readCharge(
+              deps,
+              scopeResult.scope,
+              authResult,
+              ownApp,
+            );
             if (charge) {
               let paid: Awaited<ReturnType<typeof payForRead>>;
               try {
@@ -2625,7 +2683,9 @@ export async function handlePersonalServerDataRequest(
       }
 
       // X402 payment dance for builder reads (see `readCharge`).
-      const charge = readCharge(deps, scopeResult.scope, authResult);
+      const ownApp = await ownAppReadStatus(deps, authResult);
+      if (ownApp instanceof Response) return ownApp;
+      const charge = readCharge(deps, scopeResult.scope, authResult, ownApp);
       if (charge && latest?.kind === "canonical") {
         return legacyViewRefusalResponse(scopeResult.scope, {
           status: "unavailable",
@@ -2643,6 +2703,7 @@ export async function handlePersonalServerDataRequest(
       }
 
       const headers: Record<string, string> = {};
+      if (ownApp) headers["X-Vana-Payment-Exemption"] = "own-app";
       headers["X-Vana-Data-Source"] =
         latest?.kind === "canonical" ? "canonical" : "legacy";
       let envelope: DataFileEnvelope;
