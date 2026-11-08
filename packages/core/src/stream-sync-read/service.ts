@@ -632,6 +632,10 @@ export class StreamSyncReadService {
     ) {
       return none;
     }
+    // A receipt at or below the stream's deletion floor was published before
+    // the owner deleted the stream: the same rule servableView applies to
+    // imported views, on every overlay path (owner, pending and overlay-only).
+    const floor = this.mirror.deletionFloor(streamScope(connector, ns, stream));
     const candidates: Contribution[] = [];
     for (const run of snapshot.runs) {
       if (
@@ -647,6 +651,7 @@ export class StreamSyncReadService {
       }
       const local = run.streams.find((s) => s.name === stream);
       if (!local) continue;
+      if (local.receipt && local.receipt.registryVersion <= floor) continue;
       if (local.receipt && base && covers(base, local.receipt)) continue;
       candidates.push({ run, stream: local });
     }
