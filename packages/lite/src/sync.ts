@@ -1,3 +1,4 @@
+import { createStreamSyncReadCacheFiles } from "./stream-sync-read-cache-files.js";
 import {
   StreamSyncWriter,
   createStreamSyncIntake,
@@ -161,8 +162,8 @@ export interface PsLiteSyncOptions {
   /**
    * Stream-sync reads (`streamSync.read`). Present = on: the sync loop
    * imports stream heads, and the returned `streamSyncRead` answers reads.
-   * Without `files`, state is in memory and rebuilt by a full listing on
-   * each start.
+   * Without `files`, the reader uses the writer home when available;
+   * otherwise it uses memory and rebuilds on each start.
    */
   streamSyncRead?: {
     readonly files?: StreamSyncReadFiles;
@@ -453,18 +454,6 @@ export async function createPsLiteSyncManager(
       },
     }),
   );
-  const streamSyncRead = options.streamSyncRead
-    ? await StreamSyncReadService.open({
-        files:
-          options.streamSyncRead.files ?? createMemoryStreamSyncReadFiles(),
-        blobs: createStorageBlobReader(storageAdapter),
-        keys: await createStreamSyncReadKeys(masterKey),
-        logger: logger as never,
-        ...(options.streamSyncRead.overlay
-          ? { overlay: options.streamSyncRead.overlay }
-          : {}),
-      })
-    : undefined;
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
@@ -492,98 +481,140 @@ export async function createPsLiteSyncManager(
       "Stream sync is off in this instance: its storage is held by another instance, or Web Locks are unavailable",
     );
   }
-  const streamSyncWriter = streamSyncHome
-    ? new StreamSyncWriter({
-        ownerAddress: serverOwner,
-        registry: createGatewayStreamSyncRegistry({
-          gatewayUrl: options.config.gateway.url,
+  // The home (and its Web Lock) belongs to this function until the manager
+  // is returned. A failure before that must release it, or a retry in this
+  // browser context cannot acquire the home and writes stay off until reload.
+  let syncManager!: ReturnType<typeof createSyncManager>;
+  try {
+    const readKeys = options.streamSyncRead
+      ? await createStreamSyncReadKeys(masterKey)
+      : undefined;
+    const streamSyncRead = options.streamSyncRead
+      ? await StreamSyncReadService.open({
+          files:
+            options.streamSyncRead.files ??
+            (streamSyncHome
+              ? createStreamSyncReadCacheFiles(
+                  streamSyncHome.home.files,
+                  readKeys!.keyCheck,
+                )
+              : createMemoryStreamSyncReadFiles()),
+          blobs: createStorageBlobReader(storageAdapter),
+          keys: readKeys!,
+          logger: logger as never,
+          ...(options.streamSyncRead.overlay
+            ? { overlay: options.streamSyncRead.overlay }
+            : {}),
+        })
+      : undefined;
+    const streamSyncWriter = streamSyncHome
+      ? new StreamSyncWriter({
           ownerAddress: serverOwner,
-        }),
-        blobs: createStorageStreamSyncBlobs(storageAdapter),
-        home: streamSyncHome.home,
-        keys: createStreamSyncKeyPorts(options.ownerSignature),
+          registry: createGatewayStreamSyncRegistry({
+            gatewayUrl: options.config.gateway.url,
+            ownerAddress: serverOwner,
+          }),
+          blobs: createStorageStreamSyncBlobs(storageAdapter),
+          home: streamSyncHome.home,
+          keys: createStreamSyncKeyPorts(options.ownerSignature),
+          signer,
+        })
+      : null;
+    const streamSyncIntake = streamSyncWriter
+      ? createStreamSyncIntake({
+          writer: streamSyncWriter,
+          resolveArtifact: options.streamSyncDeclarations ?? (() => null),
+        })
+      : null;
+    syncManager = createSyncManager(
+      {
+        additions,
+        storage: options.storage,
+        storageAdapter,
+        gateway,
         signer,
-      })
-    : null;
-  const streamSyncIntake = streamSyncWriter
-    ? createStreamSyncIntake({
-        writer: streamSyncWriter,
-        resolveArtifact: options.streamSyncDeclarations ?? (() => null),
-      })
-    : null;
-  const syncManager = createSyncManager(
-    {
-      additions,
-      storage: options.storage,
-      storageAdapter,
-      gateway,
-      signer,
-      masterKey,
-      serverOwner,
-      logger: logger as never,
-      lineageGateway: options.lineageGateway,
-      dataPointFeed,
-      scopeDeletions,
-    },
-    {
-      storage: options.storage,
-      storageAdapter,
-      gateway,
-      cursor,
-      masterKey,
-      serverOwner,
-      logger: logger as never,
-      diagnostics: downloadDiagnostics,
-      dataPointFeed,
-      scopeDeletions,
-      onDataPointIndexed: options.onDataPointIndexed,
-      streamSync: streamSyncRead,
-    },
-    {
-      streamSync: streamSyncWriter
-        ? { write: true, publisher: streamSyncWriter }
-        : null,
-      deleteData,
-      pendingBlobDeletions,
-      tombstoneFinality,
-      async canSync() {
-        if (options.ownerSyncSigner) return { ok: true };
-        try {
-          const serverInfo = await gateway.getServer(
-            options.serverAccount.address,
-          );
-          if (serverInfo?.id) return { ok: true };
-          return {
-            ok: false,
-            reason: "unregistered",
-            message: "Register this Personal Server before syncing.",
-          };
-        } catch (err) {
-          logger.warn(
-            { error: err instanceof Error ? err.message : String(err) },
-            "Could not verify server registration for sync",
-          );
-          return {
-            ok: false,
-            reason: "registration_check_failed",
-            message: "Could not verify server registration before syncing.",
-          };
-        }
+        masterKey,
+        serverOwner,
+        logger: logger as never,
+        lineageGateway: options.lineageGateway,
+        dataPointFeed,
+        scopeDeletions,
       },
-    },
-  );
-  if (options.autoStartSync !== false) syncManager.start();
-  return {
-    syncManager,
-    additions,
-    serverOwner,
-    dataPointFeed,
-    scopeDeletions,
-    streamSyncWriter,
-    closeStreamSync: async () => {
+      {
+        storage: options.storage,
+        storageAdapter,
+        gateway,
+        cursor,
+        masterKey,
+        serverOwner,
+        logger: logger as never,
+        diagnostics: downloadDiagnostics,
+        dataPointFeed,
+        scopeDeletions,
+        onDataPointIndexed: options.onDataPointIndexed,
+        streamSync: streamSyncRead,
+      },
+      {
+        streamSync: streamSyncWriter
+          ? { write: true, publisher: streamSyncWriter }
+          : null,
+        deleteData,
+        pendingBlobDeletions,
+        tombstoneFinality,
+        async canSync() {
+          if (options.ownerSyncSigner) return { ok: true };
+          try {
+            const serverInfo = await gateway.getServer(
+              options.serverAccount.address,
+            );
+            if (serverInfo?.id) return { ok: true };
+            return {
+              ok: false,
+              reason: "unregistered",
+              message: "Register this Personal Server before syncing.",
+            };
+          } catch (err) {
+            logger.warn(
+              { error: err instanceof Error ? err.message : String(err) },
+              "Could not verify server registration for sync",
+            );
+            return {
+              ok: false,
+              reason: "registration_check_failed",
+              message: "Could not verify server registration before syncing.",
+            };
+          }
+        },
+      },
+    );
+    if (options.autoStartSync !== false) syncManager.start();
+    return {
+      syncManager,
+      additions,
+      serverOwner,
+      dataPointFeed,
+      scopeDeletions,
+      streamSyncWriter,
+      closeStreamSync: async () => {
+        await streamSyncHome?.close();
+      },
+      streamSyncIntake,
+      streamSyncRead,
+    };
+  } catch (error) {
+    try {
       await streamSyncHome?.close();
-    },
-    streamSyncIntake,
-    streamSyncRead,
-  };
+    } catch (closeError) {
+      logger.warn(
+        {
+          error:
+            closeError instanceof Error
+              ? closeError.message
+              : String(closeError),
+        },
+        "Could not release stream sync storage after a failed start",
+      );
+    }
+    throw error;
+  }
 }
