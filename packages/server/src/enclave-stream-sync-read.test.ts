@@ -579,6 +579,31 @@ describe("hosted enclave stream-sync reader", () => {
     expect(fixture.serverWrites).toEqual([]);
   });
 
+  it("does not project a legacy name from a head whose profile key is not its binding", async () => {
+    // Connector "chatgpt" under profile key "chatgpt-export": the chatgpt legacy
+    // binding is keyed by "chatgpt", so the projector must refuse this head.
+    await fixture.publish(
+      "chatgpt",
+      { conversations: [CONVERSATION], messages: [MESSAGE] },
+      "chatgpt-export",
+    );
+    await boot();
+    await importPublishedRows();
+    // A refused projection may fail mid-body; either way the title must not appear.
+    const served = await (async () => {
+      try {
+        const response = await request("/v1/data/chatgpt.conversations");
+        return response.status === 200
+          ? await response.text()
+          : `status ${response.status}`;
+      } catch {
+        return "projection error";
+      }
+    })();
+    expect(served).not.toContain(CONVERSATION.title);
+    expect(fixture.serverWrites).toEqual([]);
+  });
+
   // Coverage boundary: legacyFile: true above exercises real reader
   // eligibility, not a disk-backed fallback. A separate real-file test needs
   // a positive-control HTTP read of the fallback before tombstoning.
