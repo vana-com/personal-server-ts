@@ -822,7 +822,9 @@ describe(
       await h.intake.abort("r3", "cancelled");
     });
 
-    it("without a tombstone, an explicit full run keeps the retry cursor for the next begin", async () => {
+    // Control: green today and must stay green. Without a tombstone the
+    // retry cursor survives an explicit full run.
+    it("control: without a tombstone, an explicit full run keeps the retry cursor for the next begin", async () => {
       const c = freshConnector("r28-m2-twin");
       const h = await host();
       await run(h, "r1", c, {
@@ -847,7 +849,9 @@ describe(
       await h.intake.abort("r3", "cancelled");
     });
 
-    it("a covered whole-read stream in a mixed retry end restarts full/null, not from its saved cursor", async () => {
+    // Guard: green today, because no whole-read stream gets a cursor. The
+    // build that adds retry provenance must keep it green.
+    it("guard: a covered whole-read stream restarts full/null after a mixed retry end", async () => {
       const c = freshConnector("r28-m6a");
       const h = await host();
       await run(h, "r1", c, {
@@ -864,11 +868,30 @@ describe(
       expect(next.streams.find((s) => s.name === "snapshot")?.mode).toBe(
         "full_refresh",
       );
+      expect(next.start.state ?? {}).not.toHaveProperty("snapshot");
+      await h.intake.abort("r2", "cancelled");
+    });
+
+    it("an uncovered sibling resumes from its cursor after a mixed retry end", async () => {
+      const c = freshConnector("r28-m6a-items");
+      const h = await host();
+      await run(h, "r1", c, {
+        records: [
+          { stream: "items", data: row("a") },
+          { stream: "snapshot", data: row("s") },
+        ],
+        covered: ["snapshot"],
+        candidate: { items: "i1", snapshot: "s1" },
+        outcome: "retry_pending",
+      });
+      await publish(h, "r1");
+      const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
       expect(next.start.state).toEqual({ items: "i1" });
       await h.intake.abort("r2", "cancelled");
     });
 
-    it("a covered whole-read stream omitted from the saved candidate restarts full/null", async () => {
+    // Guard: green today, for the same reason as the guard above.
+    it("guard: a covered whole-read stream omitted from the saved candidate restarts full/null", async () => {
       const c = freshConnector("r28-m6b");
       const h = await host();
       await run(h, "r1", c, {
@@ -896,6 +919,35 @@ describe(
       expect(next.streams.find((s) => s.name === "snapshot")?.mode).toBe(
         "full_refresh",
       );
+      expect(next.start.state ?? {}).not.toHaveProperty("snapshot");
+      await h.intake.abort("r3", "cancelled");
+    });
+
+    it("an uncovered sibling keeps its cursor when a later retry omits a covered whole-read stream", async () => {
+      const c = freshConnector("r28-m6b-items");
+      const h = await host();
+      await run(h, "r1", c, {
+        records: [
+          { stream: "items", data: row("a") },
+          { stream: "snapshot", data: row("s") },
+        ],
+        covered: [],
+        candidate: { items: "i1", snapshot: "s1" },
+        outcome: "retry_pending",
+      });
+      await publish(h, "r1");
+      await run(h, "r2", c, {
+        records: [
+          { stream: "items", data: row("b") },
+          { stream: "snapshot", data: row("t") },
+        ],
+        covered: ["snapshot"],
+        candidate: { items: "i2" },
+        outcome: "retry_pending",
+        begin: { observedAt: T0 + 1 },
+      });
+      await publish(h, "r2");
+      const next = await h.intake.begin("r3", begin(c, { observedAt: T0 + 2 }));
       expect(next.start.state).toEqual({ items: "i2" });
       await h.intake.abort("r3", "cancelled");
     });
