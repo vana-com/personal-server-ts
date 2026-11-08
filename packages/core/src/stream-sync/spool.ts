@@ -18,11 +18,25 @@ import {
   BucketReducer,
   SHARD_COUNT,
   shardOf,
+  utf8Length,
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { StreamSyncFiles } from "./ports.js";
 
 const encoder = new TextEncoder();
+
+/**
+ * The UTF-8 bytes of `lines` in one buffer. Joining them first would hold the
+ * joined string and its encoding at once, twice the flush size.
+ */
+function encodeLines(lines: readonly string[]): Uint8Array {
+  let total = 0;
+  for (const line of lines) total += utf8Length(line);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const line of lines) at += encoder.encodeInto(line, out.subarray(at)).written;
+  return out;
+}
 /** Default spool flush threshold: buffered lines written per append batch. */
 export const FLUSH_BYTES = 8 * 1024 * 1024;
 
@@ -91,7 +105,7 @@ export class SpoolWriter {
       await this.files.appendMany(
         pending.map(([path, lines]) => ({
           path,
-          bytes: encoder.encode(lines.join("")),
+          bytes: encodeLines(lines),
         })),
       );
     } catch (error) {
@@ -120,7 +134,7 @@ export async function deriveShards(
     await files.appendMany(
       pending.map(([shard, lines]) => ({
         path: shardPath(dir, shard),
-        bytes: encoder.encode(lines.join("")),
+        bytes: encodeLines(lines),
       })),
     );
   };

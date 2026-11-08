@@ -97,6 +97,7 @@ function liveBytes(): number {
  * repeats until the reading stops falling.
  */
 function settledLive(): number {
+  if (!FORCE_GC) return liveBytes();
   const gc = (globalThis as { gc?: () => void }).gc;
   if (!gc) throw new Error("run with node --expose-gc");
   let prev = Infinity;
@@ -110,6 +111,8 @@ function settledLive(): number {
 }
 
 const GC_TRIGGER = 8 * 1024 * 1024;
+/** P3_NO_FORCED_GC=1 reads raw live bytes (the phone-like peak: GC runs when V8 decides). */
+const FORCE_GC = process.env.P3_NO_FORCED_GC !== "1";
 
 export class HeapSampler {
   private peak = 0;
@@ -343,6 +346,60 @@ export interface RunOptions {
   readonly dir: string;
 }
 
+/**
+ * Allocation totals by site from V8's sampling heap profiler. Collected objects are
+ * included, so this counts what was allocated, not what is live at the end.
+ */
+async function startAllocProfile(): Promise<{
+  stop(records: number): Promise<{ allocBytes: number; allocPerRecord: number; topAllocSites: { site: string; bytes: number; share: number }[] }>;
+}> {
+  const { Session } = await import("node:inspector/promises");
+  const session = new Session();
+  session.connect();
+  await session.post("HeapProfiler.enable");
+  await session.post("HeapProfiler.startSampling", {
+    samplingInterval: 4096,
+    includeObjectsCollectedByMajorGC: true,
+    includeObjectsCollectedByMinorGC: true,
+  });
+  return {
+    async stop(records: number) {
+      const { profile } = (await session.post("HeapProfiler.stopSampling")) as {
+        profile: { head: AllocNode };
+      };
+      session.disconnect();
+      const bySite = new Map<string, number>();
+      let total = 0;
+      // Native frames (Array.prototype.join, TypedArray ops) have no url; attribute their bytes to
+      // the nearest JS caller so the site names the code that asked for the allocation.
+      const walk = (node: AllocNode, jsCaller: string) => {
+        const f = node.callFrame;
+        const isJs = f.url !== "";
+        const site = isJs ? `${f.functionName || "(anonymous)"} ${f.url.split("/").slice(-2).join("/")}:${f.lineNumber + 1}` : jsCaller;
+        const native = isJs ? "" : ` [native ${f.functionName || "?"}]`;
+        if (node.selfSize > 0) {
+          const key = isJs ? site : `${site}${native}`;
+          bySite.set(key, (bySite.get(key) ?? 0) + node.selfSize);
+          total += node.selfSize;
+        }
+        for (const child of node.children) walk(child, isJs ? site : jsCaller);
+      };
+      walk(profile.head, "(root)");
+      const topAllocSites = [...bySite.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)
+        .map(([site, bytes]) => ({ site, bytes, share: total > 0 ? +(bytes / total).toFixed(3) : 0 }));
+      return { allocBytes: total, allocPerRecord: records > 0 ? Math.round(total / records) : 0, topAllocSites };
+    },
+  };
+}
+
+interface AllocNode {
+  callFrame: { functionName: string; url: string; lineNumber: number };
+  selfSize: number;
+  children: AllocNode[];
+}
+
 export interface RunReport {
   readonly spec: ScenarioSpec;
   readonly heap: HeapPeak;
@@ -356,6 +413,11 @@ export interface RunReport {
   readonly countOk: boolean;
   readonly tooLargeSpooled: number;
   readonly outcome: string;
+  /** Sampled allocation totals (inspector sampling heap profile, collected objects included). */
+  readonly allocBytes: number;
+  readonly allocPerRecord: number;
+  readonly topAllocSites: { site: string; bytes: number; share: number }[];
+  readonly forcedGc: boolean;
 }
 
 /**
@@ -410,6 +472,7 @@ export async function runScenario(
   const baseline = await settledHeap();
   sampler.startTimer();
   const started = Date.now();
+  const alloc = await startAllocProfile();
   await writer.refreshControls();
   await writer.beginRun({
     runId: RUN_ID,
@@ -434,6 +497,7 @@ export async function runScenario(
   await writer.finishRun(RUN_ID, { checkpointCandidate: null });
   sampler.sample("finishRun");
   const report = await writer.cycle();
+  const allocSummary = await alloc.stop(spec.records);
   const durationMs = Date.now() - started;
   // Sampling stops with the publish; verification reads below are not measured.
   sampler.active = false;
@@ -459,6 +523,8 @@ export async function runScenario(
     countOk: verified.outputCount === expected.count,
     tooLargeSpooled,
     outcome,
+    ...allocSummary,
+    forcedGc: FORCE_GC,
   };
 }
 

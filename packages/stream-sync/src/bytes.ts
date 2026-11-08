@@ -29,14 +29,35 @@ export function utf8(text: string): Uint8Array {
   return encoder.encode(text);
 }
 
+/**
+ * UTF-8 byte length of `text`, counted without encoding it. Lone surrogates
+ * count as the 3-byte replacement character, as TextEncoder writes them.
+ */
 export function utf8Length(text: string): number {
-  return encoder.encode(text).length;
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const unit = text.charCodeAt(i);
+    if (unit < 0x80) bytes += 1;
+    else if (unit < 0x800) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i += 1;
+      } else bytes += 3;
+    } else bytes += 3;
+  }
+  return bytes;
 }
+
+const HEX_PAIRS = Array.from({ length: 256 }, (_, byte) =>
+  byte.toString(16).padStart(2, "0"),
+);
 
 export function toHex(bytes: Uint8Array): string {
   let out = "";
   for (let i = 0; i < bytes.length; i += 1) {
-    out += bytes[i]!.toString(16).padStart(2, "0");
+    out += HEX_PAIRS[bytes[i]!];
   }
   return out;
 }

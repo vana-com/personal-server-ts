@@ -65,21 +65,29 @@ function write(value: unknown, depth: number): string {
   }
 }
 
+// Output is built by appending to one string, not by join at each nesting
+// level: join copies the whole subtree again at every depth.
 function writeArray(value: readonly unknown[], depth: number): string {
-  const parts: string[] = [];
+  let out = "[";
   for (let i = 0; i < value.length; i += 1) {
-    parts.push(write(value[i], depth + 1));
+    if (i > 0) out += ",";
+    out += write(value[i], depth + 1);
   }
-  return `[${parts.join(",")}]`;
+  return `${out}]`;
 }
 
 function writeObject(value: object, depth: number): string {
   if (!isPlainObject(value)) {
     throw new NonCanonicalValueError("only plain objects are allowed");
   }
-  const parts: string[] = [];
+  let out = "{";
+  let first = true;
   for (const key of Object.keys(value).sort()) {
-    parts.push(`${JSON.stringify(key)}:${write(value[key], depth + 1)}`);
+    if (!first) out += ",";
+    out += `${JSON.stringify(key)}:`;
+    out += write(value[key], depth + 1);
+    first = false;
   }
-  return `{${parts.join(",")}}`;
+  return `${out}}`;
 }
+
