@@ -2017,9 +2017,11 @@ export class StreamSyncWriter {
 
   private retainedStreams(host: HostEntry): string[] {
     if (host.ready === false || host.outcome?.kind === "aborted") return [];
+    // A stream only the seed fills stays until its receipt is covered: it
+    // publishes a head later runs of the stream meet, so the reader's plan
+    // needs its step. It holds no intake rows and exposes no seed rows.
     return Object.keys(host.streams).filter(
       (name) =>
-        !host.streams[name]!.seedOnly &&
         host.entry.streams[name]?.state !== "discarded" &&
         !this.isCovered(host, name),
     );
@@ -2150,6 +2152,8 @@ export class StreamSyncWriter {
           };
           plan.runs.push(Object.freeze(this.planRun(host, name, state)));
           plans.set(planKey, plan);
+          // A seed-only stream has no intake log: its rows are never read.
+          if (stream.seedOnly) continue;
           runLogs.set(name, {
             path: spoolLogPath(`runs/${runId}/spool/s${stream.index}`),
             bytes: stream.shardBytes.reduce((sum, n) => sum + n, 0),

@@ -78,6 +78,8 @@ interface Row {
   readonly published?: boolean;
   readonly expect: {
     readonly before: Read;
+    /** After one publish pass, before the reader imports anything. */
+    readonly published?: Read;
     /** After the writer publishes until stable and the reader imports. */
     readonly after: Read;
     /** What a grant reads, before and after. */
@@ -584,6 +586,33 @@ const ROWS: readonly Row[] = [
       grant: [null, [SEED]],
       pending: 0,
       head: { key: "id", version: "1.0.0", complete: true },
+    },
+  },
+  {
+    id: "E4",
+    title:
+      "a seed-only stream the first publish adds, then a run that changes its key at the seed's version",
+    base: [],
+    seed: { key: "uid", version: "3.0.0", rows: [{ uid: "s1" }] },
+    runs: [
+      run({ runId: "rA", stream: "other", version: "3.0.0", rows: [C] }),
+      run({
+        runId: "rB",
+        version: "3.0.0",
+        full: true,
+        rows: [D],
+      }),
+    ],
+    expect: {
+      before: read(null, null, ["rB:seed_unresolved"]),
+      // A's publish committed the seed on `items` (key uid, 3.0.0); the
+      // writer now refuses B. The reader has not imported that head: the
+      // seed rows are not shown, and neither is B.
+      published: read(null, null, ["rA:seed_pending", `rB:${CUR}`]),
+      after: read([{ uid: "s1" }], true, [`rB:${CUR}`]),
+      grant: [null, [{ uid: "s1" }]],
+      pending: 1,
+      head: { key: "uid", version: "3.0.0", complete: true },
     },
   },
   {
@@ -1134,6 +1163,12 @@ describe("own-writes state table", () => {
         expect(canon(before.grant)).toEqual(canon(want.grant[0]));
         expectOwnerCoversGrant(before);
 
+        if (want.published) {
+          await rig.publish();
+          const mid = await observe(rig, row);
+          expectRead(mid, want.published);
+          expectOwnerCoversGrant(mid);
+        }
         await publishUntilStable(rig, row);
         await rig.sync();
 

@@ -545,7 +545,7 @@ describe("writer snapshot provenance", () => {
     expect(snap.runs[0]!.generation).toBe(1);
     snap.release();
   });
-  it("omits seed-only streams and excluded oversized records", async () => {
+  it("lists a seed-only stream by metadata only and omits excluded oversized records", async () => {
     const f = await fixture();
     const w = f.make();
     await w.beginRun({ runId: "r1", connector, userConnect: false });
@@ -564,12 +564,16 @@ describe("writer snapshot provenance", () => {
       e.entry.streams.seed = { state: "planned" };
     });
     const snap = await createWriterOverlaySource(w).snapshot(connector);
-    expect(snap.runs[0]!.streams.map((s) => s.name)).toEqual(["s"]);
+    expect(snap.runs[0]!.streams.map((s) => s.name)).toEqual(["s", "seed"]);
     expect(
       (await Array.fromAsync(snap.lines(snap.runs[0]!, "s"))).map(
         (l) => l.v.id,
       ),
     ).toEqual(["kept"]);
+    // The seed-only stream exposes no rows.
+    await expect(
+      Array.fromAsync(snap.lines(snap.runs[0]!, "seed")),
+    ).rejects.toThrow();
     snap.release();
   });
 });
