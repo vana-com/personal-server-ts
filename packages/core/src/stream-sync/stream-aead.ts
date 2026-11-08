@@ -159,3 +159,40 @@ export async function* openStream(
     counter += 1;
   }
 }
+
+async function* once(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
+  yield bytes;
+}
+
+async function joined(source: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const pieces: Uint8Array[] = [];
+  let total = 0;
+  for await (const piece of source) {
+    pieces.push(piece);
+    total += piece.length;
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const piece of pieces) {
+    out.set(piece, at);
+    at += piece.length;
+  }
+  return out;
+}
+
+/** Seal one part (at most 16 MiB) as a single blob. */
+export function sealBytes(
+  key: Uint8Array,
+  clear: Uint8Array,
+  random: (n: number) => Uint8Array,
+): Promise<Uint8Array> {
+  return joined(sealStream(key, once(clear), random));
+}
+
+/** Open one blob made by {@link sealBytes}. */
+export function openBytes(
+  key: Uint8Array,
+  cipher: Uint8Array,
+): Promise<Uint8Array> {
+  return joined(openStream(key, once(cipher)));
+}
