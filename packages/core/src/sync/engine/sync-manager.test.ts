@@ -976,7 +976,9 @@ describe("sync manager upload attempt markers", () => {
       seen = deps;
       return [];
     });
-    await manager.trigger();
+    // start(), not trigger(): an owner trigger may lift the quarantine.
+    manager.start();
+    await vi.waitFor(() => expect(seen).toBeDefined());
     return seen!.uploadAttempts!;
   }
 
