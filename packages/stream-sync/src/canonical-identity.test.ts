@@ -14,7 +14,11 @@ import { toHex, utf8, utf8Length } from "./bytes.js";
 function legacyCanonical(value: unknown): string {
   return legacyWrite(value, 0);
 }
+// Contract checks copied from the pre-cut json.ts (MAX_DEPTH 256, finite
+// numbers, plain objects, JSON data model only). The cuts must keep these.
+const LEGACY_MAX_DEPTH = 256;
 function legacyWrite(value: unknown, depth: number): string {
+  if (depth > LEGACY_MAX_DEPTH) throw new Error("value nests too deeply");
   if (value === null) return "null";
   switch (typeof value) {
     case "boolean":
@@ -22,6 +26,7 @@ function legacyWrite(value: unknown, depth: number): string {
     case "string":
       return JSON.stringify(value);
     case "number":
+      if (!Number.isFinite(value)) throw new Error("non-finite number");
       return JSON.stringify(value);
     case "object":
       return Array.isArray(value)
@@ -31,6 +36,10 @@ function legacyWrite(value: unknown, depth: number): string {
       throw new Error("unsupported");
   }
 }
+function legacyIsPlainObject(value: object): boolean {
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
 function legacyArray(value: readonly unknown[], depth: number): string {
   const parts: string[] = [];
   for (let i = 0; i < value.length; i += 1)
@@ -38,6 +47,8 @@ function legacyArray(value: readonly unknown[], depth: number): string {
   return `[${parts.join(",")}]`;
 }
 function legacyObject(value: Record<string, unknown>, depth: number): string {
+  if (!legacyIsPlainObject(value))
+    throw new Error("only plain objects are allowed");
   const parts: string[] = [];
   for (const key of Object.keys(value).sort()) {
     parts.push(`${JSON.stringify(key)}:${legacyWrite(value[key], depth + 1)}`);
@@ -174,5 +185,119 @@ describe("pre-cut byte identity", () => {
     }
     const all = Uint8Array.from({ length: 256 }, (_, b) => b);
     expect(toHex(all)).toBe(legacyToHex(all));
+  });
+});
+
+// Both encoders must agree on bytes for every accepted value, and both must
+// reject every value the pre-cut encoder rejected.
+function expectSameOutcome(value: unknown, label: string): void {
+  let legacy: string | Error;
+  let current: string | Error;
+  try {
+    legacy = legacyCanonical(value);
+  } catch (err) {
+    legacy = err as Error;
+  }
+  try {
+    current = canonicalJson(value);
+  } catch (err) {
+    current = err as Error;
+  }
+  if (legacy instanceof Error) {
+    expect(current, `${label}: must reject`).toBeInstanceOf(Error);
+  } else {
+    expect(current, `${label}: bytes`).toBe(legacy);
+  }
+}
+
+function nestedArrays(levels: number): unknown {
+  let value: unknown = [];
+  for (let i = 1; i < levels; i += 1) value = [value];
+  return value;
+}
+
+describe("old-contract fixtures", () => {
+  it("U+2028 and U+2029 stay raw in strings and keys, as JSON.stringify leaves them", () => {
+    const value = { "a\u2029b": "x\u2028\u2029y", "\u2028": ["\u2029"] };
+    const out = canonicalJson(value);
+    expect(out).toBe('{"a\u2029b":"x\u2028\u2029y","\u2028":["\u2029"]}');
+    expect(out.includes("\\u2029")).toBe(false);
+    expectSameOutcome(value, "separators");
+  });
+
+  it("extreme and special numbers match the pre-cut bytes", () => {
+    expectSameOutcome(
+      [
+        Number.MAX_VALUE,
+        Number.MIN_VALUE,
+        -0,
+        0,
+        1e21,
+        1e-7,
+        0.1 + 0.2,
+        2 ** 53,
+        -(2 ** 53) - 1,
+        123456789.125,
+      ],
+      "numbers",
+    );
+  });
+
+  it("empty and mixed containers match the pre-cut bytes", () => {
+    expectSameOutcome([], "[]");
+    expectSameOutcome({}, "{}");
+    expectSameOutcome([[], {}, [{}]], "nested empties");
+    expectSameOutcome({ "": { "": [] } }, "empty key");
+  });
+
+  it("lone and paired surrogates at the boundaries match the pre-cut bytes", () => {
+    expectSameOutcome(
+      [
+        "\uD800",
+        "\uDBFF",
+        "\uDC00",
+        "\uDFFF",
+        "\uD800\uDC00",
+        "\uDBFF\uDFFF",
+        "\u{10000}",
+      ],
+      "surrogates",
+    );
+    expectSameOutcome({ "\uD800": "\uDC00" }, "surrogate key");
+  });
+
+  it("nesting depth 257 is accepted and 258 is rejected, as before", () => {
+    expectSameOutcome(nestedArrays(257), "depth 257");
+    expectSameOutcome(nestedArrays(258), "depth 258");
+    expect(() => canonicalJson(nestedArrays(258))).toThrow();
+    expect(canonicalJson(nestedArrays(257))).toBe(
+      legacyCanonical(nestedArrays(257)),
+    );
+  });
+
+  it("rejects non-finite numbers, non-plain objects and non-JSON values", () => {
+    for (const bad of [
+      NaN,
+      Infinity,
+      -Infinity,
+      new Date(0),
+      new Map(),
+      new (class Thing {})(),
+      undefined,
+      () => 1,
+      Symbol("s"),
+      BigInt(1),
+      [undefined],
+      { a: undefined },
+    ]) {
+      expectSameOutcome(bad, `reject ${String(bad)}`);
+    }
+  });
+
+  it("accepts a null-prototype plain object as the pre-cut encoder did", () => {
+    const obj = Object.create(null) as Record<string, unknown>;
+    obj.b = 1;
+    obj.a = [true];
+    expectSameOutcome(obj, "null prototype");
   });
 });
