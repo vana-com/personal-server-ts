@@ -21,8 +21,9 @@ import {
   type StreamSyncFiles,
   type StreamSyncRegistry,
   type StreamSyncSeedSource,
+  type StreamSyncWriterOptions,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import { createSeedStaging } from "./seed-staging.js";
+import { createSeedStaging, type SeedStaging } from "./seed-staging.js";
 
 // Extends the writer-overlay in-memory rig, without the oracle rig's HTTP store.
 // oracle.test.ts M7 already covers phone-first WITH new Desktop records. Here
@@ -31,13 +32,37 @@ import { createSeedStaging } from "./seed-staging.js";
 // Identity encryption and a dummy signer are intentional test ports; the real
 // writer, planner, head/part codecs and hash verification perform publication.
 const OWNER = `0x${"11".repeat(20)}` as const;
+const OTHER_OWNER = `0x${"22".repeat(20)}` as const;
 const C = "seed-scenarios";
 const SHAPE = { primaryKey: ["id"], profile: { key: null, version: "1.0.0" } };
+// A newer connector version that changes the primary key: an empty base.
+const V2_SHAPE = {
+  primaryKey: ["n"],
+  profile: { key: null, version: "2.0.0" },
+};
+type Shape = {
+  readonly primaryKey: readonly string[];
+  readonly profile: { readonly key: string | null; readonly version: string };
+  readonly incremental?: boolean;
+};
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const receipt = (install: string, stream: string) =>
   `${install}|${C}||${stream}`;
-type Row = { id: string };
+// Retained rows carry non-key data; the published values are compared whole.
+type Row = {
+  id: string;
+  text?: string;
+  n?: number;
+  nested?: { tags: string[] };
+};
+const rich = (id: string): Row => ({
+  id,
+  text: `${id} text`,
+  n: id.length,
+  nested: { tags: [id, "retained"] },
+});
+const byId = (a: Row, b: Row) => (a.id < b.id ? -1 : 1);
 
 function retained(installId: string, rows: Record<string, readonly Row[]>) {
   const reads: string[] = [];
@@ -118,19 +143,21 @@ async function fixture(generation = 1) {
   const device = (
     seed?: StreamSyncSeedSource,
     files: StreamSyncFiles = createMemoryStreamSyncFiles(7),
+    owner: typeof OWNER = OWNER,
   ) => {
     const home = bindStreamSyncHome({
-      ownerAddress: OWNER,
+      ownerAddress: owner,
       network: "test",
       open: () => files,
     });
-    const open = (source = seed) =>
+    const open = (source = seed, fault?: StreamSyncWriterOptions["fault"]) =>
       new StreamSyncWriter({
-        ownerAddress: OWNER,
+        ownerAddress: owner,
         home,
         registry,
         blobs,
         seed: source,
+        fault,
         now: () => 1000,
         keys: {
           namespaceHmac: mac,
@@ -170,10 +197,12 @@ async function fixture(generation = 1) {
           lines.push(line);
         }
       }
+      const values = lines.map((line) => line.v as Row).sort(byId);
       return {
         head: decoded.head,
         lines,
-        ids: lines.map((line) => (line.v as Row).id).sort(),
+        values,
+        ids: values.map((row) => row.id),
       };
     },
   });
@@ -192,6 +221,7 @@ async function collect(
   runId: string,
   streams: Record<string, readonly Row[]>,
   generation?: number,
+  shape: Shape = SHAPE,
 ) {
   await writer.refreshControls();
   await writer.beginRun({
@@ -203,10 +233,29 @@ async function collect(
     checkpointUsed: generation === undefined ? null : { ns: "", generation },
   });
   for (const [stream, records] of Object.entries(streams)) {
-    await writer.declareStream(runId, stream, SHAPE);
+    await writer.declareStream(runId, stream, shape);
     for (const record of records) await writer.append(runId, stream, record);
   }
   await writer.finishRun(runId, { checkpointCandidate: { cursor: runId } });
+}
+
+/** Stage one upload of `rows` as the sidecar's seed route does. */
+async function stageRows(
+  staging: SeedStaging,
+  connector: string,
+  stream: string,
+  rows: readonly Row[],
+) {
+  async function* body() {
+    yield encoder.encode(
+      [
+        JSON.stringify({ ...SHAPE, records: rows.length }),
+        ...rows.map((row) => JSON.stringify(row)),
+        "",
+      ].join("\n"),
+    );
+  }
+  await staging.stage(connector, stream, body());
 }
 
 // Checked at 5ad1d563: baseline passes; each A-E mutation below independently
@@ -221,16 +270,17 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     const phone = f.device().writer;
     await collect(phone, "phone-first", { s: [{ id: "p1" }] });
     await phone.publishPending();
-    const seed = retained("desktop", { s: [{ id: "d1" }] });
+    const seed = retained("desktop", { s: [rich("d1")] });
     const desktop = f.device(seed.source);
     await collect(desktop.writer, "empty-desktop", {});
     await desktop.writer.publishPending();
     const third = await f.reader().read("s");
     expect(third?.ids).toEqual(["d1", "p1"]);
+    expect(third?.values).toEqual([rich("d1"), { id: "p1" }]);
     expect(third?.head).toMatchObject({ generation: 1, complete: true });
     expect(
       third?.lines.find((line) => (line.v as Row).id === "d1"),
-    ).toMatchObject({ o: 0, r: "seed", v: { id: "d1" } });
+    ).toMatchObject({ o: 0, r: "seed", v: rich("d1") });
     expect(
       (await desktop.open().status()).receipts[receipt("desktop", "s")],
     ).toBe("merged");
@@ -241,8 +291,8 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     // Mutant B: prepareSeed skips retained streams absent from host.streams.
     const f = await fixture();
     const seed = retained("desktop", {
-      s1: [{ id: "d1" }],
-      s2: [{ id: "d2" }],
+      s1: [rich("d1")],
+      s2: [rich("d2")],
     });
     const files = createMemoryStreamSyncFiles(7);
     const writes: Pick<
@@ -269,7 +319,11 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     });
     await collect(desktop.writer, "zero-emission", { s1: [{ id: "n1" }] });
     await desktop.writer.publishPending();
-    expect((await f.reader().read("s2"))?.ids).toEqual(["d2"]);
+    expect((await f.reader().read("s2"))?.values).toEqual([rich("d2")]);
+    expect((await f.reader().read("s1"))?.values).toEqual([
+      rich("d1"),
+      { id: "n1" },
+    ]);
     expect(sawUnreceiptedS2).toBe(true);
     const durable = await desktop.open().status();
     expect(durable.receipts[receipt("desktop", "s2")]).toBe("merged");
@@ -288,11 +342,20 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
 
   it("c: Desktop-first survives later phone publication and a restarted Desktop never reseeds", async () => {
     // Mutant C: ignore the existing receipt in prepareSeed (records read twice).
+    // After the seed, the Desktop's retained row is edited. A receipt-respecting
+    // restart must keep the published seed value; a replayed seed would publish
+    // the edited value, because nothing else in this stream has a newer row for d1.
     const f = await fixture();
-    const seed = retained("desktop", { s: [{ id: "d1" }] });
+    const data: Record<string, readonly Row[]> = { s: [rich("d1")] };
+    const seed = retained("desktop", data);
     const desktop = f.device(seed.source);
     await collect(desktop.writer, "desktop-first", { s: [{ id: "n1" }] });
     await desktop.writer.publishPending();
+    expect((await f.reader().read("s"))?.values).toEqual([
+      rich("d1"),
+      { id: "n1" },
+    ]);
+    data.s = [{ ...rich("d1"), text: "d1 edited after seed" }];
     const phone = f.device().writer;
     await collect(phone, "phone-later", { s: [{ id: "p1" }] }, 1);
     await phone.publishPending();
@@ -303,7 +366,12 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     );
     await collect(restarted, "desktop-again", { s: [{ id: "n2" }] }, 1);
     await restarted.publishPending();
-    expect((await f.reader().read("s"))?.ids).toEqual(["d1", "n1", "n2", "p1"]);
+    expect((await f.reader().read("s"))?.values).toEqual([
+      rich("d1"),
+      { id: "n1" },
+      { id: "n2" },
+      { id: "p1" },
+    ]);
     expect(seed.reads).toEqual([`${C}/s`]);
   });
 
@@ -340,21 +408,11 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
       // The install-key mutant is checked by the collision half of this same case.
       const own = createSeedStaging(createMemoryStreamSyncFiles(7));
       const foreign = createSeedStaging(createMemoryStreamSyncFiles(7));
-      async function stage(target: typeof own, connector: string, id: string) {
-        async function* body() {
-          yield encoder.encode(
-            [
-              JSON.stringify({ ...SHAPE, records: 1 }),
-              JSON.stringify({ id }),
-              "",
-            ].join("\n"),
-          );
-        }
-        await target.stage(connector, "s", body());
-      }
-      await stage(own, C, "own");
-      await stage(own, "other-connector", "foreign-connector");
-      await stage(foreign, C, "foreign-install");
+      await stageRows(own, C, "s", [{ id: "own" }]);
+      await stageRows(own, "other-connector", "s", [
+        { id: "foreign-connector" },
+      ]);
+      await stageRows(foreign, C, "s", [{ id: "foreign-install" }]);
       const ownId = await own.installId();
       expect(await foreign.installId()).not.toBe(ownId);
       const f = await fixture();
@@ -383,5 +441,142 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     const receipts = (await device.open(b.source).status()).receipts;
     expect(receipts[receipt("install-a", "s")]).toBe("merged");
     expect(receipts[receipt("install-b", "s")]).toBe("merged");
+  });
+
+  it("f: a pending run from owner A restored into owner B's home never publishes under B", async () => {
+    // Mutant F: drop the `bound.owner !== now.owner` disjunct in publishEntry.
+    // The key check still matches (same key material), so only the owner guard
+    // separates A's pending data from B's publication.
+    const f = await fixture();
+    const aFiles = createMemoryStreamSyncFiles(7);
+    const a = f.device(undefined, aFiles, OWNER);
+    await collect(a.writer, "owner-a-run", { s: [{ id: "a-marker" }] });
+    // Owner A never publishes. Its durable pending run is copied into B's home.
+    const bFiles = createMemoryStreamSyncFiles(7);
+    for (const path of aFiles.paths()) {
+      await bFiles.write(path, (await aFiles.read(path))!);
+    }
+    const bSeed = retained("desktop-b", { s: [rich("b-seed")] });
+    const b = f.device(bSeed.source, bFiles, OTHER_OWNER);
+    await collect(b.writer, "owner-b-run", { s: [{ id: "b-live" }] });
+    await b.writer.publishPending();
+    const head = await f.reader().read("s");
+    expect(head?.ids).toEqual(["b-live", "b-seed"]);
+    expect(head?.values).not.toContainEqual({ id: "a-marker" });
+    expect(bSeed.reads).toEqual([`${C}/s`]);
+  });
+
+  it("g: retained rows staged on disk survive a sidecar reopen before their first publish", async () => {
+    // Mutant G: a startup cleanup in createSeedStaging's installId() (bootstrap
+    // calls it on every start) removes staged pointers and uploads that hold no
+    // receipt. The retained row is then the only copy and is lost.
+    const f = await fixture();
+    const stagingFiles = createMemoryStreamSyncFiles(7);
+    const before = createSeedStaging(stagingFiles);
+    await stageRows(before, C, "s", [rich("d1")]);
+    // Sidecar restarts over the same durable staging files.
+    const after = createSeedStaging(stagingFiles);
+    const installId = await after.installId();
+    const homeFiles = createMemoryStreamSyncFiles(7);
+    const desktop = f.device(
+      after.source(
+        installId,
+        async (connector) =>
+          (await desktop.writer.seedStatus(connector)).receipts,
+      ),
+      homeFiles,
+    );
+    const writer = desktop.writer;
+    await collect(writer, "desktop-reopened", {});
+    await writer.publishPending();
+    expect((await f.reader().read("s"))?.values).toEqual([rich("d1")]);
+    expect((await writer.status()).receipts[receipt(installId, "s")]).toBe(
+      "merged",
+    );
+  });
+
+  it("h: a crash after the POST and before the local receipt re-merges the staged rows exactly once", async () => {
+    // Crash point after_post_reply: the registry has accepted the head, but the
+    // writer has not persisted its receipt. Reopen both sides and retry.
+    const f = await fixture();
+    const stagingFiles = createMemoryStreamSyncFiles(7);
+    const homeFiles = createMemoryStreamSyncFiles(7);
+    const first = createSeedStaging(stagingFiles);
+    const installId = await first.installId();
+    await stageRows(first, C, "s", [rich("d1")]);
+
+    let writer: StreamSyncWriter | undefined;
+    let fired = false;
+    const sidecar = async (crash: boolean) => {
+      const staging = createSeedStaging(stagingFiles);
+      await staging.installId();
+      const source = staging.source(installId, async (connector) =>
+        writer ? (await writer.seedStatus(connector)).receipts : {},
+      );
+      const desktop = f.device(source, homeFiles);
+      writer = desktop.open(source, (point) => {
+        if (crash && point === "after_post_reply") {
+          fired = true;
+          throw new Error("injected crash after POST reply");
+        }
+      });
+      return writer;
+    };
+
+    const crashed = await sidecar(true);
+    await collect(crashed, "crash-run", {});
+    await crashed.publishPending().catch(() => undefined);
+    // The crash must have happened, or the retry below proves nothing.
+    expect(fired).toBe(true);
+
+    const restarted = await sidecar(false);
+    await restarted.publishPending();
+    expect((await f.reader().read("s"))?.values).toEqual([rich("d1")]);
+    expect((await restarted.status()).receipts[`${installId}|${C}||s`]).toBe(
+      "merged",
+    );
+  });
+
+  it("i: a newer connector key change empties the base; a restart must not reseed the removed row", async () => {
+    // Mutant I: ignore the seed receipt on restart (writer.ts prepareSeed).
+    // Same generation is not enough to keep rows: a v2 run whose primary key
+    // changed meets writerCompatibility's empty_base (head.ts), which replaces
+    // the head (publish-plan.ts replacesBase). The retained row is then gone,
+    // and a restart with the old retained source must not bring it back.
+    const f = await fixture();
+    const seed = retained("desktop", { s: [rich("d1")] });
+    const desktop = f.device(seed.source);
+    await collect(desktop.writer, "desktop-first", { s: [{ id: "n1" }] });
+    await desktop.writer.publishPending();
+    expect((await f.reader().read("s"))?.ids).toEqual(["d1", "n1"]);
+    const phone = f.device().writer;
+    await collect(
+      phone,
+      "phone-v2",
+      { s: [{ id: "v2a", n: 100 }] },
+      1,
+      V2_SHAPE,
+    );
+    await phone.publishPending();
+    const replaced = await f.reader().read("s");
+    expect(replaced?.head).toMatchObject({ generation: 1, primaryKey: ["n"] });
+    expect(replaced?.values).toEqual([{ id: "v2a", n: 100 }]);
+    const restarted = desktop.open();
+    expect((await restarted.status()).receipts[receipt("desktop", "s")]).toBe(
+      "merged",
+    );
+    await collect(
+      restarted,
+      "desktop-v2",
+      { s: [{ id: "desk-2", n: 200 }] },
+      1,
+      V2_SHAPE,
+    );
+    await restarted.publishPending();
+    expect((await f.reader().read("s"))?.values).toEqual([
+      { id: "desk-2", n: 200 },
+      { id: "v2a", n: 100 },
+    ]);
+    expect(seed.reads).toEqual([`${C}/s`]);
   });
 });
