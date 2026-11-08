@@ -18,9 +18,12 @@ import {
 } from "../stream-sync/index.js";
 import { createWriterOverlaySource } from "../stream-sync/writer.js";
 import {
+  decodeHead,
   parseScope,
   streamMasterKeyFromSignature,
+  streamScope,
   type ControlRead,
+  type Head,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createStreamSyncReadKeys } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
@@ -103,6 +106,8 @@ export interface RunSpec {
   readonly stream?: string;
   readonly key: string;
   readonly version: string;
+  /** The legacy projector's profile key; default null. */
+  readonly profileKey?: string | null;
   readonly rows: readonly Record<string, unknown>[];
   /** A full read; otherwise it resumes from a checkpoint. */
   readonly full: boolean;
@@ -247,7 +252,7 @@ export class Rig {
     const stream = spec.stream ?? "items";
     await this.writer.declareStream(spec.runId, stream, {
       primaryKey: [spec.key],
-      profile: { key: null, version: spec.version },
+      profile: { key: spec.profileKey ?? null, version: spec.version },
     });
     for (const row of spec.rows) {
       await this.writer.append(spec.runId, stream, { ...row });
@@ -255,6 +260,29 @@ export class Rig {
     await this.writer.finishRun(spec.runId, {
       checkpointCandidate: { cursor: spec.runId },
     });
+  }
+
+  /** The head the registry holds now for `stream`, decrypted; null when none. */
+  async registeredHead(stream = "items"): Promise<Head | null> {
+    const scope = streamScope(this.connector, this.ns, stream);
+    const row = await this.gateway.read(scope);
+    if (!row.found) return null;
+    const name = `h-${row.dataHash.toLowerCase().replace(/^0x/, "")}`;
+    const cipher = this.blobMap.get(`${scope}/${name}`);
+    if (!cipher) throw new Error(`head blob ${name} is missing`);
+    const decoded = decodeHead(
+      await createStreamSyncKeyPorts(SIGNATURE).decrypt(scope, cipher),
+    );
+    if (decoded.kind !== "ok") throw new Error(`head ${name}: ${decoded.kind}`);
+    return decoded.head;
+  }
+
+  /** The registry version of `stream`; 0 when none. */
+  async registeredVersion(stream = "items"): Promise<number> {
+    const row = await this.gateway.read(
+      streamScope(this.connector, this.ns, stream),
+    );
+    return row.found ? row.version : 0;
   }
 
   /** Publish every ready run and say what the writer did with each. */
