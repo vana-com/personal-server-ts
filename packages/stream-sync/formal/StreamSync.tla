@@ -116,6 +116,7 @@ CONSTANTS
   WitnessAtSave,         \* ... and before the save (R30.5)
   TailEndsWhenDone,      \* history_tail ends when a covered, non-budgeted incremental read ends (R30.4 gap)
   CoveredEndsAttempt,    \* a covered incremental:false stream in the saved candidate saves no active_attempt (R30.4)
+  CoveredEndsNoSave,     \* an end that saves no checkpoint still retires a covered snapshot stream's attempt (R30.4)
   CoveredEndsKept,       \* a covered incremental:false stream outside the candidate loses its kept active_attempt (R30.4)
   RetryNeedsReceipt,     \* a retry end saves a checkpoint only once the Desktop seed receipts are in (F3); FALSE waives it
   PerStreamClear,        \* an incomplete stream clears only its own checkpoint entry (R30.7)
@@ -190,10 +191,10 @@ NoCur == [s \in Streams |-> 0]
 NoPh == [s \in Streams |-> "n"]
 NoTw == [s \in Streams |-> FALSE]
 NoCk == [n |-> "none", g |-> 0, cur |-> NoCur, pg |-> NoCur, prov |-> NoCur,
-         ph |-> NoPh, wv |-> NoCur, tw |-> NoTw, cvd |-> NoTw, ctlOk |-> FALSE]
+         ph |-> NoPh, wv |-> NoCur, tw |-> NoTw, ctlOk |-> FALSE]
 \* R30.7: one stream's checkpoint entry is cleared alone.
 ClearS(ck, s) == [ck EXCEPT !.cur[s] = 0, !.pg[s] = 0, !.prov[s] = 0, !.ph[s] = "n",
-                            !.wv[s] = 0, !.tw[s] = FALSE, !.cvd[s] = FALSE]
+                            !.wv[s] = 0, !.tw[s] = FALSE]
 NormCk(ck) == IF \A s \in Streams : ck.cur[s] = 0 THEN NoCk ELSE ck
 \* An entry.  full: the issued collection mode is full_refresh (never read
 \* from the state).  sw: the issued state belongs to another namespace.
@@ -221,7 +222,10 @@ NoEntry == [rid |-> 0, a |-> "none", n |-> "none", start |-> Null, uc |-> FALSE,
             st |-> [s \in Streams |-> "none"], g |-> [s \in Streams |-> 0],
             req |-> [s \in Streams |-> NoReq], seeding |-> {},
             seen |-> [s \in Streams |-> 0]]
-NoFin == [n |-> "none", T |-> 0, seen |-> [s \in Streams |-> 0], cov |-> {}]
+\* cvs (ghost, round 3): the incremental:false streams an end has covered since
+\* a retry end last opened an attempt for them; written by Finish from the end
+\* alone, never by the save.
+NoFin == [n |-> "none", T |-> 0, seen |-> [s \in Streams |-> 0], cov |-> {}, cvs |-> {}]
 \* An old app's non-exclusive DELETE writes this row (limitation L11).
 TombHead == [g |-> 0, lines |-> {}, complete |-> FALSE, key |-> "old", at |-> 0, oc |-> FALSE,
              gr |-> FALSE, sr |-> FALSE]
@@ -457,6 +461,14 @@ RP(e, s) == e.out = "retry" \/ (KeepProvOnSuccess /\ s \in e.el)
 \* R30.8: a stream whose upserts were all oversized is excluded from the
 \* retained set, so its cursor never passes a dropped record.
 KeepSet(e) == IF e.out = "retry" THEN e.cand \ e.ovz ELSE e.cov
+\* R30.4: an end that saves nothing still ends the attempt of every
+\* incremental:false stream it covered (the old pair otherwise survives).
+RetireCovered(ck, e) ==
+  IF ~CoveredEndsNoSave \/ ck = NoCk \/ ck.n # e.n THEN ck
+  ELSE [ck EXCEPT !.ph = [s \in Streams |-> IF s \in FullStreams /\ s \in e.cov THEN "n" ELSE @[s]],
+                  !.prov = [s \in Streams |-> IF s \in FullStreams /\ s \in e.cov THEN 0 ELSE @[s]],
+                  !.wv = [s \in Streams |-> IF s \in FullStreams /\ s \in e.cov THEN 0 ELSE @[s]],
+                  !.tw = [s \in Streams |-> IF s \in FullStreams /\ s \in e.cov THEN FALSE ELSE @[s]]]
 \* R30.7: clearing an incomplete stream's entry.
 ClearFor(d, n, s) ==
   IF ckpt[d] # NoCk /\ ckpt[d].n = n /\ PerStreamClear
@@ -602,9 +614,6 @@ SaveCk(d, n, g, S, e, ok) ==
                                  ELSE (IF kph(s) # "n" THEN prev.wv[s] ELSE 0)],
       tw |-> [s \in Streams |-> IF s \in S THEN (phv(s) # "n" /\ TombAfter(n, s, e.wb[s]))
                                  ELSE (kph(s) # "n" /\ prev.tw[s])],
-      \* ghost: the end that last saved or kept this pair covered the stream
-      cvd |-> [s \in Streams |-> IF s \in S THEN s \in e.cov
-                                 ELSE (kph(s) # "n" /\ (prev.cvd[s] \/ s \in e.cov))],
       ctlOk |-> ok]
 
 \* Without CheckpointAfterAll the checkpoint is saved at the first commit.
@@ -677,9 +686,12 @@ Finish(d) ==
      /\ \A s \in Streams : e.st[s] \in {"none", "done"}
      /\ ob' = [ob EXCEPT ![d] = NoEntry]
      /\ ckpt' = IF save THEN [ckpt EXCEPT ![d] = SaveCk(d, e.n, e.T, keep, e, ctlOk)]
-                ELSE ckpt
+                ELSE [ckpt EXCEPT ![d] = RetireCovered(@, e)]
      /\ fin' = [fin EXCEPT ![d] = [n |-> e.n, T |-> e.T, seen |-> e.seen,
-                                   cov |-> IF e.out = "retry" THEN PubSet(e) ELSE e.cov]]
+                                   cov |-> IF e.out = "retry" THEN PubSet(e) ELSE e.cov,
+                                   cvs |-> (fin[d].cvs \cup (FullStreams \cap e.cov))
+                                           \ (IF save /\ e.out = "retry"
+                                              THEN {s \in FullStreams \cap keep : s \notin e.cov} ELSE {})]]
      /\ quiet' = IF save /\ e.out = "retry" THEN quiet \cup {<<e.rid, s>> : s \in keep \ e.emit}
                  ELSE quiet
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
@@ -709,9 +721,11 @@ RetryEmpty(d) ==
                 THEN [ckpt EXCEPT ![d] = NoCk]
                 ELSE ckpt
      /\ quiet' = IF save THEN quiet \cup {<<e.rid, s>> : s \in keep \ e.emit} ELSE quiet
+     \* a saved token-only retry opens an attempt for its uncovered snapshot streams
+     /\ fin' = [fin EXCEPT ![d].cvs = IF save THEN @ \ (FullStreams \cap keep) ELSE @]
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
                  stopped, needsFull, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, lateOld, left, fin, acked, selfConflict, sib, cnt>>
+                 admitted, inserted, lateOld, left, acked, selfConflict, sib, cnt>>
 
 \* Control only (RetryCkptAfterPublish = FALSE): the retry end saves its
 \* candidate at intake.end, before the records are published.
@@ -725,9 +739,10 @@ RetryEarly(d) ==
      /\ ckpt' = [ckpt EXCEPT ![d] = SaveCk(d, e.n, t, e.cand, e, TRUE)]
      /\ ob' = [ob EXCEPT ![d].early = TRUE]
      /\ quiet' = quiet \cup {<<e.rid, s>> : s \in e.cand \ e.emit}
+     /\ fin' = [fin EXCEPT ![d].cvs = @ \ (FullStreams \cap (e.cand \ e.cov))]
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
                  stopped, needsFull, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, lateOld, left, fin, acked, selfConflict, sib, cnt>>
+                 admitted, inserted, lateOld, left, acked, selfConflict, sib, cnt>>
 
 \* end{failed|cancelled} or abort (v2 3.7, abortRun): the entry is
 \* removed; no head, no checkpoint.
@@ -858,7 +873,7 @@ StartRunFor(d, a, uc, out, allCov) ==
                              ELSE {s \in Streams : K0 # NoCk /\ K0.n = n /\ K0.ph[s] # "n" /\ hi[s] # 0
                                                    /\ ~WitNow(n, s, K0.wv[s])},
                       !.cb = IF wf THEN {}
-                             ELSE {s \in FullStreams : K0 # NoCk /\ K0.n = n /\ K0.ph[s] = "A" /\ K0.cvd[s] /\ hi[s] # 0},
+                             ELSE {s \in FullStreams : K0 # NoCk /\ K0.n = n /\ K0.ph[s] = "A" /\ s \in fin[d].cvs /\ hi[s] # 0},
                       !.nf = {s \in Streams : nfd(s)},
                       !.pg = [s \in Streams |-> pgS(s)],
                       !.rs = \E s \in Budgeted :
@@ -1535,11 +1550,13 @@ NotCoveredSnapshotOmitted ==
   ~\E d \in Devices, s \in FullStreams :
      ob[d] # NoEntry /\ ob[d].out = "retry" /\ s \in ob[d].cov /\ s \notin ob[d].cand
      /\ ckpt[d] # NoCk /\ ckpt[d].n = ob[d].n /\ ckpt[d].ph[s] = "A"
-\* R30 waiver: the Desktop's checkpoint on the seed target is saved while a
-\* seed receipt is still missing (only a retry end can do this).
-NotRetrySaveNoReceipt ==
-  ~(ckpt[Desktop] # NoCk /\ ckpt[Desktop].n = seedTarget
-    /\ \E s \in Streams : <<seedTarget, s>> \notin rcpt)
+\* R30.4: a record-bearing retry end covers an incremental:false stream while
+\* its candidate is empty (so Finish saves no checkpoint) and the old pair holds
+\* an active_attempt for it.
+NotCoveredSnapshotEmptyCand ==
+  ~\E d \in Devices, s \in FullStreams :
+     ob[d] # NoEntry /\ ob[d].out = "retry" /\ s \in ob[d].cov /\ ob[d].cand = {}
+     /\ ckpt[d] # NoCk /\ ckpt[d].n = ob[d].n /\ ckpt[d].ph[s] = "A"
 \* A begin is full/null for a stream whose saved continuation a tombstone invalidated.
 NotTombInvalidates ==
   ~\E d \in Devices, s \in Streams :

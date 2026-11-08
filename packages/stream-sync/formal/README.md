@@ -53,7 +53,7 @@ model. Read "R28" below.
 No other counterexample was found within the bounds below. Read
 "Results" for what was checked at which bounds and in which mode.
 
-Model: `StreamSync.tla`, sha256 prefix `b983f1f13457` (round 2). TLC 2026.11.03
+Model: `StreamSync.tla`, sha256 prefix `a954884b6d5b` (round 3). TLC 2026.11.03
 (`tla2tools.jar`).
 
 
@@ -679,9 +679,11 @@ flight; used only by two liveness rows).
 New ghost state: head fields `gr` (grounded completeness) and `sr`
 (seed-only on a retry run); checkpoint fields `ph` (provenance state), `wv`
 (witness: the stream row length at save), `tw` (a tombstone was above the
-witness) and `cvd` (round 2: the end that saved or kept the pair covered the
-stream); entry fields `ovz`, `ep`, `wb`, `rb`, `cb` (round 2: streams issued
-an active_attempt cursor an earlier end had covered); variable `sib`.
+witness); entry fields `ovz`, `ep`, `wb`, `rb`, `cb` (streams issued an
+active_attempt cursor an earlier end had covered); the per-device `fin`
+record gains `cvs` (round 3: the incremental:false streams an end covered
+since a retry end last opened an attempt for them; written by the end
+actions from the end alone, never by the save); variable `sib`.
 
 New properties: `NoFalseComplete`, `RetryPubSetOnly`,
 `StreamKindEligibility`, `NoResumeAfterTombstone`,
@@ -781,21 +783,25 @@ A dot review of round 1 found a false pass against R30.4. A snapshot stream
 `StreamKindEligibility` checked only that an issued snapshot cursor had phase
 `A`, so it missed this.
 
-**Model fix.** At every end, a covered `incremental: false` stream loses
-`active_attempt`:
+**Model fix.** A covered `incremental: false` stream loses `active_attempt`
+at the end that covers it. Round 2 did this only where the end saves a
+checkpoint; round 3 found the no-save path (see Round 3 below).
 
 - `CoveredEndsAttempt`: in `rawPh` a retry end saves `n` (not `A`) for a
   covered snapshot stream in the saved candidate.
 - `CoveredEndsKept`: in `kph` a covered snapshot stream the candidate
   omits has its kept `A` pair retired. Round 1 kept it.
+- `CoveredEndsNoSave` (round 3): `Finish` retires the covered stream's pair
+  on the old checkpoint when it saves nothing (`RetireCovered`).
 
 The stored cursor may stay. The next begin issues no state for the stream
 (full/null), because the stream is not eligible.
 
 **New invariant.** `NoResumeAfterCoveredAttempt`: no begin issues an
 `active_attempt` cursor to an `incremental: false` stream that an earlier end
-covered. It is checked at the begin entry (ghost `cb`), fed by checkpoint
-ghost `cvd` (the end that saved or kept the pair covered the stream).
+covered. It is checked at the begin entry (ghost `cb`), fed by `fin[d].cvs`
+(round 3: the round 2 observer was a checkpoint ghost written only by the
+save, so it could not see an end that saved nothing).
 
 **Named mutants (controls).** Each reverts one half of the fix and must fail
 on `NoResumeAfterCoveredAttempt` alone. `check.mjs` compares the invariant
@@ -822,21 +828,33 @@ on the reverted model and passes on the fixed one by the pair control /
 `W-covered-snapshot-omitted` witnesses the omitted-candidate case.
 
 **Seed-receipt waiver.** The Lead adopted waiving the Desktop seed receipt at
-retry ends on one condition: all R29/R30 invariants, including the new one,
-still hold. `RetryNeedsReceipt` is now `FALSE` by default (a retry end saves
-its checkpoint without the receipts). Result: **every R29/R30 invariant
-holds with the receipt waived**; no invariant needs the receipt. The waived
-model is `b983f1f13457`. The rows that run a Desktop (`R30-pub`,
-`R30-prov-3r`) pass waived; `R30-pub-rcpt` and `R30-prov-rcpt` (receipt
-required, F3's behaviour) pass too, so the waiver does not change the
-outcome. `W-retry-save-no-receipt` shows the waiver is exercised: a retry
-end saves the Desktop's checkpoint before every seed receipt exists.
-`R30-wit`, `R30-sib` and `Snap-live` use `Desktop nodesk`, so the waiver is
-vacuous there; their passes do not count for it. `R30-prov` at four runs
-timed out (11.6 million distinct states, 2.7 million on the queue, 30 min, no
-violation); it is **inconclusive**, and `R30-prov-3r` is the exhaustive form.
+retry ends on one condition: the R29/R30 invariants must still hold.
+`RetryNeedsReceipt` is now `FALSE` by default. What was run, and what was
+not:
 
-Round 2 results (model `b983f1f134572441202e9818f538aad510bd7c86a1aaf5c6a55896a74655590d`).
+- Run: `R30-pub` and `R30-prov-3r` (Desktop on, receipt waived) and
+  `R30-pub-rcpt` and `R30-prov-rcpt` (receipt required) all pass every
+  safety invariant. Those profiles have `MaxOldDelete 0` and `MaxDeletes 0`:
+  **no head tombstone occurs in them.** They say nothing about the waiver
+  together with the R29/R30.5 tombstone rule.
+- Not run: a Desktop, a pending receipt and a tombstone together.
+  `R30-wit` has `Desktop nodesk`, so the receipt rule is irrelevant there.
+  No such profile was added (Lead ruling: no more model work). This
+  interaction is **unchecked**, not shown safe. The R28 build test for the
+  waiver should include a tombstone landing after a waived retry save.
+- No witness proves a record-bearing `Finish` saved while a receipt was
+  missing. Round 2's `W-retry-save-no-receipt` is removed: a token-only
+  retry (`RetryEmpty`) saves without consulting the receipt rule even with
+  `RetryNeedsReceipt TRUE`, so the witness did not tell the two rules
+  apart. The waiver rows pass, but this model does not show that they
+  exercised the changed `Finish` gate.
+- `R30-wit`, `R30-sib` and `Snap-live` use `Desktop nodesk`; the waiver is
+  vacuous there.
+- `R30-prov` at four runs timed out (11.6 million distinct states, 2.7
+  million on the queue, 30 min, no violation); it is **inconclusive**, and
+  `R30-prov-3r` is the exhaustive form.
+
+Round 2 results (model `b983f1f134572441202e9818f538aad510bd7c86a1aaf5c6a55896a74655590d`; superseded by round 3 where a row has the same name).
 Every row ran on this model, one at a time, 4 workers, under 30 minutes.
 Rows not listed here keep their round 1 result on an earlier hash; the
 round 2 edits touch only the provenance save and the retry receipt rule, and
@@ -867,10 +885,119 @@ these rows were not rerun.
 | `C-tail-forever-rr3` | L3 | violate | violates L3_NoStuckIncomplete | 200791 | 38 | 96 |
 | `W-covered-snapshot-in-cand` | witness | reached | reached | 242 | 6 | 1 |
 | `W-covered-snapshot-omitted` | witness | reached | reached | 25520 | 13 | 2 |
-| `W-retry-save-no-receipt` | witness | reached | reached | 16446 | 12 | 2 |
 
 The round 1 results tables below are on earlier hashes. Where a row appears
 in both, the round 2 row replaces it.
+
+### Round 3: an end that saves nothing (the last formal round)
+
+The dot recheck of `c2c2a5dc` found that round 2 retired a covered snapshot
+stream's `active_attempt` only inside the save. `Finish` saves nothing when
+the saved candidate is empty, so the old pair survived. The round 2 observer
+(`cvd`) was written by the same save, so it could not see this. The Lead
+ruled it a real bug.
+
+**Fix.** `RetireCovered`: when `Finish` saves nothing it retires the pair of
+every covered `incremental: false` stream on the old checkpoint
+(`CoveredEndsNoSave`). The observer is now `fin[d].cvs`, written by the end
+actions from the end alone: `Finish` adds the covered snapshot streams, and
+a retry end that saves an uncovered snapshot stream (`Finish`, `RetryEmpty`,
+`RetryEarly`) removes it, because that end opens a new attempt. A first
+version of the observer did not clear on `RetryEmpty`; its control then
+failed on a legitimate attempt. TLC showed it, and it is fixed.
+
+**Control and witness.** `C-covered-attempt-empty-cand`
+(`CoveredEndsNoSave FALSE`, three runs) fails
+`Error: Invariant NoResumeAfterCoveredAttempt is violated.` Its trace
+(TLC, 15 states, final model):
+
+1. Run 1 begins. It ends `retry_pending`: `emit = {s1}`, `cov = {}`,
+   `cand = {s2}`. `Finish` saves `s2` with cursor 2 and phase `A`.
+2. Run 2 begins and issues `s2` its cursor. It ends `retry_pending`:
+   `emit = {s2}`, `cov = {s2}`, `cand = {}`. `Finish` saves nothing; the
+   checkpoint keeps `ph[s2] = A`. `fin.cvs = {s2}`.
+3. Run 3 begins. It issues `s2` the `A` cursor: `ep[s2] = A`,
+   `cb = {s2}`. The invariant fails.
+
+The fixed model passes `R30-prov-3r` exhaustively with the invariant on.
+`W-covered-snapshot-empty-cand` witnesses the empty-candidate end.
+
+Round 3 results (model
+`a954884b6d5b6c18f41d69e76aa1a491e6f179444f9d9dc4fc7bd93846f11ee5`).
+Every row ran on this model, one at a time, 4 workers, under 30 minutes. No
+four-run rerun. These rows replace the round 2 rows of the same name.
+
+| Config | Property | Expected | Result | Distinct states | Depth | Seconds |
+|---|---|---|---|---|---|---|
+| `C-covered-attempt-empty-cand` | `NoResumeAfterCoveredAttempt` | violate | violates it | 298590 | 18 | 45 |
+| `W-covered-snapshot-empty-cand` | witness | reached | reached | 20459 | 13 | 7 |
+| `W-covered-snapshot-in-cand` | witness | reached | reached | 244 | 6 | 4 |
+| `W-covered-snapshot-omitted` | witness | reached | reached | 26603 | 13 | 9 |
+| `C-covered-attempt-kept-in-cand` | `NoResumeAfterCoveredAttempt` | violate | violates it | 25073 | 13 | 10 |
+| `C-covered-attempt-kept-omitted` | `NoResumeAfterCoveredAttempt` | violate | violates it | 233324 | 18 | 34 |
+| `C-retry-seed-only` | `RetryPubSetOnly` | violate | violates it | 15340 | 10 | 6 |
+| `C-retry-guard-uncovered-only` | `NoFalseComplete` | violate | violates it | 2047979 | 23 | 237 |
+| `C-decl-is-full` | `NoFalseComplete` | violate | violates it | 880495 | 20 | 108 |
+| `C-one-prov-bit` | `StreamKindEligibility` | violate | violates it | 2663751 | 23 | 215 |
+| `C-resume-after-tombstone` | `NoResumeAfterTombstone` | violate | violates it | 7886 | 14 | 2 |
+| `C-save-after-tombstone` | `NoResumeAfterTombstone` | violate | violates it | 3243 | 12 | 2 |
+| `C-whole-envelope-clear` | `SiblingContinuationKept` | violate | violates it | 14898 | 16 | 2 |
+| `C-oversized-token-only` | `S7_CheckpointSafety` | violate | violates it | 29785 | 14 | 3 |
+| `C-one-prov-bit-live` | L6 | violate | violates `L6_SnapshotReturns` | 554 | 20 | 1 |
+| `C-tail-forever-rr3` | L3 | violate | violates `L3_NoStuckIncomplete` | 199378 | 38 | 94 |
+| `R30-prov-3r` | all, incl. `NoResumeAfterCoveredAttempt` | pass | pass | 3498672 | 29 | 580 |
+| `R30-prov-rcpt` (3 runs, receipt required) | all | pass | pass | 3049046 | 29 | 424 |
+| `R30-sib` | all | pass | pass | 30840 | 25 | 6 |
+| `R30-wit` | all | pass | pass | 3188375 | 29 | 280 |
+| `R30-pub` (receipt waived) | all | pass | pass | 4418929 | 29 | 696 |
+| `R30-pub-rcpt` (receipt required) | all | pass | pass | 3811129 | 29 | 553 |
+| `Snap-live` | L6 | pass | pass | 554 | 20 | 1 |
+| `F3-live-retry-delete-rr3` | L1, L3, L4 | pass | pass | 176751 | 35 | 149 |
+
+Findings 2-4 of the recheck are README-only by Lead ruling: the waiver
+paragraph and the Vacuity section state what each config does and does not
+reach. `R30-pub` and `R30-pub-rcpt` have no tombstone and no witness that a
+record-bearing `Finish` used the waiver.
+
+### Build-test spec M7: a covered snapshot stream resumes through an end that saves nothing
+
+Found in round 3 (dot recheck of `c2c2a5dc`). Model evidence: control
+`C-covered-attempt-empty-cand` (`CoveredEndsNoSave FALSE`) fails
+`NoResumeAfterCoveredAttempt`; the fixed model (`RetireCovered`) passes
+`R30-prov-3r`. This test is red on an implementation that retires covered
+provenance only when it saves a checkpoint. It is the gate for the fix.
+
+Setup. One connector with two streams: `s1`, incremental-capable, and `s2`,
+declared `incremental: false`. One device, one account. No stored checkpoint.
+
+Actions.
+1. Run 1 begins, issued no state for either stream. It ends
+   `retry_pending`. It sends records for `s1` only. The saved candidate holds
+   `s2` as a token-only stream (no records), so the end saves a checkpoint:
+   `s2` gets a cursor and an `active_attempt` provenance; the end does not
+   cover `s2`.
+2. Run 2 begins. `s2` is eligible (active_attempt, valid witness), so it is
+   issued its cursor. Run 2 ends `retry_pending`. It sends records for `s2`
+   and covers `s2`. Its saved candidate is empty, so the end saves **no**
+   checkpoint (the old checkpoint stays as stored).
+3. Run 3 begins as an ordinary run (no `wantFull`, no tombstone, no
+   generation change).
+
+Expected next begin (run 3). `s2` is issued **no state** (a full read from
+null). The old `s2` cursor may still be stored, but the begin must not issue
+it: the attempt ended when run 2 covered `s2`, whether or not run 2 saved a
+checkpoint. `s1` follows its own rules. Assert on the begin plan (the issued
+state per stream), not only on the stored checkpoint.
+
+Model trace (TLC, `C-covered-attempt-empty-cand`, 15 states): run 1 retry,
+`emit={s1}`, `cov={}`, `cand={s2}`, Finish saves `s2` with phase `A`; run 2
+retry, `emit={s2}`, `cov={s2}`, `cand={}`, Finish saves nothing; run 3 begin
+issues `s2` with `ep = A`, `cb = {s2}`.
+
+Variant (same setup, same expected result): run 2 ends with a candidate that
+omits `s2` (covered by the earlier control `C-covered-attempt-kept-omitted`);
+and run 2 ends `succeeded` but saves nothing (control not run; the model's
+`RetireCovered` covers it, since `Finish` retires on every non-save end).
 
 ### Results (round 1)
 
@@ -1010,10 +1137,21 @@ their behavior is the same.
 
 ### Vacuity
 
-- The R30 profiles set `PartialCover TRUE` and `MaxRetry` 1 or more, so
-  `CoveredOnly`, `ProvenanceAtomic`, `NeedsFullRunIsFull`,
-  `IncompleteOwned` and `LaterWriteSurvives` are not vacuous there. Each
-  R30 witness shows its scenario is reached.
+- Every R30 profile has one device and `MaxLost 0`.
+  - `LaterWriteSurvives` needs a base line from a later run than the
+    publisher (`l[2] > x[4].at`). One device runs one entry at a time and
+    no write is late, so the antecedent cannot occur in any R30 profile:
+    **it is vacuous in all of them.** It is reachable only in the
+    two-device base profiles from earlier work, which this round did not
+    rerun.
+  - `r30-sib` has `MaxRetry 0`: no retry end occurs, so it does not
+    exercise `CoveredOnly` for an uncovered retry stream.
+  - `r30-pub` and `r30-prov` have `PartialCover TRUE`, two streams and
+    `MaxRetry` 1 or more, so uncovered retry streams occur there;
+    `CoveredOnly`, `ProvenanceAtomic`, `NeedsFullRunIsFull` and
+    `IncompleteOwned` can be reached in them. `r30-wit` has one stream and
+    `MaxRetry` 2. No witness was written per property; "can be reached"
+    comes from the profile bounds, not from a witness.
 - `F3-retry-split` and `F3-retry-lost-delete` keep F3's split profile with
   `PartialCover FALSE`. That bound constrains only `ok` runs, so these rows
   do test uncovered retry streams. They do **not** exercise `CoveredOnly`
@@ -1039,6 +1177,7 @@ their behavior is the same.
 | `StreamKindEligibility` | 7, 41, 42 | none |
 | `NoResumeAfterTombstone` | 47, 49 | **M2**: a tombstone lands during an explicit `wantFull` run, which issues no cursor and does not re-save the checkpoint. The next ordinary begin must be full/null for that stream (finding 1). **M3**: a tombstone lands while a run holds a cursor for the stream. The save must not renew the continuation (control `C-save-after-tombstone`). Test 38 checks generation, not a tombstone. |
 | `NoResumeAfterCoveredAttempt` (R30.4, round 2) | 28, 29, 42, 45 | **M6**: a retry_pending end covers an `incremental: false` stream and the next begin issues it full/null. Two cases: the stream is inside the saved candidate (`C-covered-attempt-kept-in-cand`), and the stream is outside it while an older `active_attempt` pair is kept (`C-covered-attempt-kept-omitted`). The stored cursor may stay, but the next begin must issue no state for that stream. |
+| `NoResumeAfterCoveredAttempt`, end that saves nothing (round 3) | 28, 29, 42, 45 | **M7**: see the build-test spec in Round 3. |
 | `SiblingContinuationKept` (R30.7) | 41, 45, 49 | none |
 | `S7_CheckpointSafety` with oversized-only (R30.8) | 1, 58 | **M4**: an oversized upsert plus one accepted upsert in the same retry run. "All empty" must then be false. Test 58 covers the oversized-only run. |
 | `L3_NoStuckIncomplete`, `L6_SnapshotReturns`, history_tail end | 6, 42, 43 | **M5**: a non-budgeted, incremental-capable stream with debt finishes a covered incremental continuation that ends with no further token. The next begin must be full/null, and a full covered read must clear the debt (finding 2). |
@@ -1059,8 +1198,9 @@ their behavior is the same.
    saves only its checkpoint, and an explicit `wantFull` issues no cursor.
 5. **Desktop seed receipt.** F3's `rcptOk` blocked the retry checkpoint on a
    first run that seeds. The Lead adopted waiving it on retry ends, on one
-   condition: every R29/R30 invariant must still hold. Round 2 checked
-   that (`RetryNeedsReceipt FALSE` is the default; see the round 2 table).
+   condition: the R29/R30 invariants must still hold. Round 2 and 3 checked
+   that on the Desktop slices without tombstones only; see the waiver
+   paragraph in Round 2. The tombstone interaction is unchecked.
 6. **Oversized upserts.** Modeled only on retry runs, on uncovered streams.
 7. **Budgeted streams under `TailEndsWhenDone`.** Exempt unconditionally
    (`s \in Budgeted` in `rawPh`). The model does not test whether the pages
