@@ -90,4 +90,3 @@ function writeObject(value: object, depth: number): string {
   }
   return `${out}}`;
 }
-

@@ -351,7 +351,11 @@ export interface RunOptions {
  * included, so this counts what was allocated, not what is live at the end.
  */
 async function startAllocProfile(): Promise<{
-  stop(records: number): Promise<{ allocBytes: number; allocPerRecord: number; topAllocSites: { site: string; bytes: number; share: number }[] }>;
+  stop(records: number): Promise<{
+    allocBytes: number;
+    allocPerRecord: number;
+    topAllocSites: { site: string; bytes: number; share: number }[];
+  }>;
 }> {
   const { Session } = await import("node:inspector/promises");
   const session = new Session();
@@ -375,7 +379,9 @@ async function startAllocProfile(): Promise<{
       const walk = (node: AllocNode, jsCaller: string) => {
         const f = node.callFrame;
         const isJs = f.url !== "";
-        const site = isJs ? `${f.functionName || "(anonymous)"} ${f.url.split("/").slice(-2).join("/")}:${f.lineNumber + 1}` : jsCaller;
+        const site = isJs
+          ? `${f.functionName || "(anonymous)"} ${f.url.split("/").slice(-2).join("/")}:${f.lineNumber + 1}`
+          : jsCaller;
         const native = isJs ? "" : ` [native ${f.functionName || "?"}]`;
         if (node.selfSize > 0) {
           const key = isJs ? site : `${site}${native}`;
@@ -388,8 +394,16 @@ async function startAllocProfile(): Promise<{
       const topAllocSites = [...bySite.entries()]
         .sort((a, b) => b[1] - a[1])
         .slice(0, 8)
-        .map(([site, bytes]) => ({ site, bytes, share: total > 0 ? +(bytes / total).toFixed(3) : 0 }));
-      return { allocBytes: total, allocPerRecord: records > 0 ? Math.round(total / records) : 0, topAllocSites };
+        .map(([site, bytes]) => ({
+          site,
+          bytes,
+          share: total > 0 ? +(bytes / total).toFixed(3) : 0,
+        }));
+      return {
+        allocBytes: total,
+        allocPerRecord: records > 0 ? Math.round(total / records) : 0,
+        topAllocSites,
+      };
     },
   };
 }

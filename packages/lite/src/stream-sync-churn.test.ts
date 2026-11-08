@@ -50,17 +50,29 @@ async function allocPerRecord(spec: ScenarioSpec): Promise<RunReport> {
 }
 
 describe("stream-sync writer allocation churn", () => {
-  it("uniform records allocate within budget", async () => {
-    const report = await allocPerRecord({ kind: "uniform", records: 2000 });
-    expect(report.outcome).toBe("committed");
-    expect(report.digestOk && report.countOk).toBe(true);
-    expect(report.allocPerRecord).toBeLessThanOrEqual(UNIFORM_BYTES_PER_RECORD_BUDGET);
-  }, 10 * 60 * 1000);
+  it(
+    "uniform records allocate within budget",
+    async () => {
+      const report = await allocPerRecord({ kind: "uniform", records: 2000 });
+      expect(report.outcome).toBe("committed");
+      expect(report.digestOk && report.countOk).toBe(true);
+      expect(report.allocPerRecord).toBeLessThanOrEqual(
+        UNIFORM_BYTES_PER_RECORD_BUDGET,
+      );
+    },
+    10 * 60 * 1000,
+  );
 
-  it("skewed records allocate within budget", async () => {
-    const report = await allocPerRecord({ kind: "skewed", records: 2000 });
-    expect(report.outcome).toBe("committed");
-    expect(report.digestOk && report.countOk).toBe(true);
-    expect(report.allocPerRecord).toBeLessThanOrEqual(SKEWED_BYTES_PER_RECORD_BUDGET);
-  }, 10 * 60 * 1000);
+  it(
+    "skewed records allocate within budget",
+    async () => {
+      const report = await allocPerRecord({ kind: "skewed", records: 2000 });
+      expect(report.outcome).toBe("committed");
+      expect(report.digestOk && report.countOk).toBe(true);
+      expect(report.allocPerRecord).toBeLessThanOrEqual(
+        SKEWED_BYTES_PER_RECORD_BUDGET,
+      );
+    },
+    10 * 60 * 1000,
+  );
 });

@@ -34,7 +34,8 @@ function encodeLines(lines: readonly string[]): Uint8Array {
   for (const line of lines) total += utf8Length(line);
   const out = new Uint8Array(total);
   let at = 0;
-  for (const line of lines) at += encoder.encodeInto(line, out.subarray(at)).written;
+  for (const line of lines)
+    at += encoder.encodeInto(line, out.subarray(at)).written;
   return out;
 }
 /** Default spool flush threshold: buffered lines written per append batch. */
