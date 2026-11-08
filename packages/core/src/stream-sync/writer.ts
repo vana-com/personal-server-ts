@@ -275,6 +275,24 @@ export class ConnectionStoppedError extends Error {
   }
 }
 
+/**
+ * A fresh connection delete whose tombstone did not land: the connection
+ * was reconnected or deleted again while the delete ran. The intent is
+ * dropped; nothing was tombstoned at a version the caller did not see.
+ */
+export class ConnectionDeleteSuperseded extends Error {
+  constructor(readonly connector: string) {
+    super(`delete of ${connector} was superseded before it landed`);
+    this.name = "ConnectionDeleteSuperseded";
+  }
+}
+
+/** A delete intent that could not be finished on this pass. */
+export interface PendingDelete {
+  readonly connector: string;
+  readonly why: string;
+}
+
 /** A run id that finished, or whose entry this process no longer drives. */
 export class RunGoneError extends Error {
   constructor(readonly runId: string) {
@@ -303,6 +321,8 @@ export interface StreamSyncRunStatus {
 
 export interface StreamSyncPublishReport {
   readonly runs: readonly StreamSyncRunStatus[];
+  /** Connectors whose delete intent is still open after this pass. */
+  readonly deletesPending: readonly PendingDelete[];
 }
 
 export interface StreamSyncWriterOptions {
@@ -533,22 +553,24 @@ export class StreamSyncWriter {
   // -------------------------------------------------------------- delete
 
   /**
-   * §2.11 connection delete. The intent (the live control rows of the
-   * connector, each at the version it was seen) is persisted first; then
-   * each pinned row is tombstoned at `version + 1`. A resumed delete writes
-   * only its pinned versions, so a reconnect that lands in between is never
-   * tombstoned. Other devices stop when their control read shows `deleted`.
+   * §2.11 connection delete. The intent (the pinned version of each live
+   * control row of the connector) is persisted first; then each pinned row is
+   * tombstoned at `version + 1`. A fresh delete pins the row as read now, not
+   * as listed: a stale listing would tombstone a version already gone. A
+   * resumed delete writes only its stored pins, so a reconnect that lands in
+   * between is never tombstoned. An earlier intent for the connector is
+   * finished first. Other devices stop when their control read shows `deleted`.
    */
   deleteConnection(connector: string): Promise<void> {
     return this.publish(async () => {
-      const { control } = await this.keys();
+      await this.finishDelete(connector);
       const pins: DeletePin[] = [];
       for (const row of await this.options.registry.listControlRows()) {
         const parsed = parseScope(row.scope);
         if (parsed?.kind !== "control" || parsed.connector !== connector) {
           continue;
         }
-        const state = classifyControl(row.read, control);
+        const state = await this.readControl(connector, parsed.ns);
         if (state.kind === "active" || state.kind === "foreign") {
           pins.push({
             ns: parsed.ns,
@@ -560,19 +582,21 @@ export class StreamSyncWriter {
       await this.withState((state) => {
         (state.deletes ??= {})[connector] = { pins };
       });
-      await this.runDelete(connector, pins);
+      await this.runDelete(connector, pins, true);
     });
   }
 
   /**
-   * Tombstone each pinned control row. A 409 means the row already moved on
-   * (deleted or reconnected elsewhere): that pin is resolved either way.
-   * Ambiguous and refused replies throw and leave the intent for the next
-   * boot.
+   * Tombstone each pinned control row. A fresh delete must end deleted; if a
+   * pin's tombstone did not land, the intent is dropped and the delete throws
+   * `ConnectionDeleteSuperseded`. A resumed delete ends with its intent
+   * cleared whatever the rows show (it never tombstones a reconnect). Errors
+   * from the registry leave the intent for a later pass.
    */
   private async runDelete(
     connector: string,
     pins: readonly DeletePin[],
+    fresh: boolean,
   ): Promise<void> {
     const { control } = await this.keys();
     for (const pin of pins) {
@@ -583,19 +607,53 @@ export class StreamSyncWriter {
         pin.version + 1,
       );
       await this.options.registry.post(request);
-      await this.readControl(connector, pin.ns);
+      const after = await this.readControl(connector, pin.ns);
+      if (fresh && after.kind !== "deleted") {
+        await this.withState((state) => {
+          delete state.deletes?.[connector];
+        });
+        throw new ConnectionDeleteSuperseded(connector);
+      }
     }
     await this.withState((state) => {
       delete state.deletes?.[connector];
     });
   }
 
-  /** Resume every delete a previous process left in progress. */
-  private async resumeDeletes(): Promise<void> {
-    const state = await this.readState();
-    for (const [connector, intent] of Object.entries(state.deletes ?? {})) {
-      await this.runDelete(connector, intent.pins);
+  /**
+   * §2.4 `stopped`, read from saved state alone (no registry call): an open
+   * delete, or this device's identity-less namespace last read `deleted`.
+   */
+  async isStopped(connector: string): Promise<boolean> {
+    return isStoppedState(await this.readState(), connector);
+  }
+
+  /** Finish the stored delete intent of `connector`, if one is open. */
+  private async finishDelete(connector: string): Promise<void> {
+    const intent = (await this.readState()).deletes?.[connector];
+    if (intent) await this.runDelete(connector, intent.pins, false);
+  }
+
+  /**
+   * Finish every open delete intent. Each connector stands alone: a failure
+   * is reported for that connector and does not stop the others. Runs every
+   * pass, so a failed delete is retried on the next pass.
+   */
+  private async resumeDeletes(): Promise<PendingDelete[]> {
+    const pending: PendingDelete[] = [];
+    for (const connector of Object.keys(
+      (await this.readState()).deletes ?? {},
+    )) {
+      try {
+        await this.finishDelete(connector);
+      } catch (error) {
+        pending.push({
+          connector,
+          why: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
+    return pending;
   }
 
   // -------------------------------------------------------------- intake
@@ -693,13 +751,14 @@ export class StreamSyncWriter {
         if (!this.active.has(input.runId)) throw new RunGoneError(input.runId);
         throw new Error(`run ${input.runId} already exists`);
       }
+      // P2-1: an explicit connect finishes an open delete of this connector
+      // first, so a later boot cannot tombstone what the connect creates.
+      if (input.userConnect) {
+        await this.publish(() => this.finishDelete(input.connector));
+      }
       const state = await this.readState();
-      // §2.4 `stopped`: the newest control state seen for any namespace of
-      // the connector is `deleted`. Only an explicit connect starts a run.
-      const observed = Object.values(
-        state.observedControl?.[input.connector] ?? {},
-      );
-      if (!input.userConnect && observed.some((s) => s.kind === "deleted")) {
+      // §2.4 `stopped`: only an explicit connect starts a stopped connection.
+      if (!input.userConnect && isStoppedState(state, input.connector)) {
         throw new ConnectionStoppedError(input.connector);
       }
       let checkpointUsed = input.checkpointUsed ?? null;
@@ -1103,11 +1162,16 @@ export class StreamSyncWriter {
   publishPending(): Promise<StreamSyncPublishReport> {
     return this.publish(async () => {
       await this.recover();
+      const deletesPending = await this.resumeDeletes();
+      const held = new Set(deletesPending.map((p) => p.connector));
       const runs: StreamSyncRunStatus[] = [];
       const hosts: HostEntry[] = [];
       for (const runId of await this.runIds()) {
         const host = await this.readEntry(runId);
-        if (host && host.phase === "ready") hosts.push(host);
+        // A connector whose delete is still open publishes nothing this pass.
+        if (host && host.phase === "ready" && !held.has(host.entry.connector)) {
+          hosts.push(host);
+        }
       }
       hosts.sort(
         (a, b) =>
@@ -1118,7 +1182,7 @@ export class StreamSyncWriter {
         await this.publishEntry(host);
         runs.push(this.statusOf(host));
       }
-      return { runs };
+      return { runs, deletesPending };
     });
   }
 
@@ -1147,7 +1211,6 @@ export class StreamSyncWriter {
         await this.options.home.files.remove(`runs/${runId}`);
       }
     }
-    await this.resumeDeletes();
   }
 
   /**
@@ -1166,9 +1229,19 @@ export class StreamSyncWriter {
       await this.options.registry.read(controlScope(connector, ns)),
       control,
     );
-    return this.withState((state) =>
+    const newest = await this.withState((state) =>
       recordControl(state, connector, ns, current),
     );
+    this.noteControl(connector, ns, newest);
+    return newest;
+  }
+
+  /** Keep the session `controls` in step with every control read (P3-2). */
+  private noteControl(connector: string, ns: string, state: ControlState) {
+    if (this.controls === null) return;
+    const states = this.controls.get(connector) ?? {};
+    states[ns] = state;
+    this.controls.set(connector, states);
   }
 
   /**
@@ -2115,6 +2188,14 @@ function controlRank(state: ControlState): number {
     case "foreign":
       return state.version;
   }
+}
+
+/** §2.4 `stopped` from saved state; see `StreamSyncWriter.isStopped`. */
+function isStoppedState(state: WriterState, connector: string): boolean {
+  return (
+    state.deletes?.[connector] !== undefined ||
+    state.observedControl?.[connector]?.[IDENTITYLESS_NS]?.kind === "deleted"
+  );
 }
 
 /**
