@@ -734,7 +734,11 @@ describe.each(matrix)(
       await activateControl(env.registry, c, NS); // active(2): the reconnect takes pin+1
 
       const booted = await env.writer("p4r2-conflict-a");
-      await expect(booted.publishPending()).resolves.toBeDefined();
+      // The conflicting tombstone post is not an error: the resume finishes
+      // without reporting the connector as a pending delete.
+      await expect(booted.publishPending()).resolves.toMatchObject({
+        deletesPending: [],
+      });
       expect(await env.registry.read(tombScope)).toMatchObject({
         found: true,
         version: 2,
