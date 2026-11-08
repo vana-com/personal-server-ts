@@ -28,6 +28,7 @@ import {
   type ControlRead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createStreamSyncReadKeys } from "./keys.js";
+import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
 import type { StreamSyncOverlaySnapshotSource } from "./ports.js";
@@ -37,6 +38,8 @@ const OWNER = `0x${"11".repeat(20)}` as const;
 // A fixed 65-byte signature: the master key both sides derive from.
 const SIGNATURE = `0x${"1f".repeat(32)}${"2a".repeat(32)}1b` as const;
 const CONNECTOR = "acme";
+// A 16-hex namespace other than the identity-less one every run uses.
+const OTHER_NS = "0123456789abcdef";
 const SHAPE = { primaryKey: ["id"], profile: { key: null, version: "1.0.0" } };
 const T0 = Date.UTC(2026, 10, 1);
 const silent = { info() {}, warn() {}, error() {} };
@@ -69,11 +72,16 @@ class Gateway implements StreamSyncRegistry {
     };
   }
 
-  /** The owner deletes `items`: a deletedAt tombstone as the next version. */
-  deleteStream(): void {
-    const scope = [...this.versions.keys()].find(
-      (s) => parseScope(s)?.kind === "stream",
+  /** The stream row of `stream` in this connector, by its name. */
+  private streamRow(stream: string): string {
+    return [...this.versions.keys()].find(
+      (s) => parseScope(s)?.kind === "stream" && s.endsWith(`.${stream}`),
     )!;
+  }
+
+  /** The owner deletes `stream`: a deletedAt tombstone as the next version. */
+  deleteStream(stream = "items"): void {
+    const scope = this.streamRow(stream);
     const rows = this.versions.get(scope)!;
     const head = rows[rows.length - 1]!;
     rows.push({
@@ -82,6 +90,36 @@ class Gateway implements StreamSyncRegistry {
       at: new Date(T0 + rows.length * 1000).toISOString(),
       deleted: true,
     });
+  }
+
+  /** The stream is live again: a new non-deleted version after the tombstone. */
+  reliveStream(stream = "items"): void {
+    const scope = this.streamRow(stream);
+    const rows = this.versions.get(scope)!;
+    const head = rows[rows.length - 1]!;
+    rows.push({
+      dataHash: head.dataHash,
+      metadataHash: head.metadataHash,
+      at: new Date(T0 + rows.length * 1000).toISOString(),
+    });
+  }
+
+  /** A stream row of another namespace, already tombstoned (v1 live, v2 deleted). */
+  seedDeletedStream(scope: string): void {
+    const at = (n: number) => new Date(T0 + n * 1000).toISOString();
+    this.versions.set(scope, [
+      {
+        dataHash: `0x${"aa".repeat(32)}`,
+        metadataHash: `0x${"bb".repeat(32)}`,
+        at: at(1),
+      },
+      {
+        dataHash: `0x${"aa".repeat(32)}`,
+        metadataHash: `0x${"bb".repeat(32)}`,
+        at: at(2),
+        deleted: true,
+      },
+    ]);
   }
 
   async post(request: SignedRegistryPost): Promise<RegistryPostResult> {
@@ -196,6 +234,13 @@ class Device {
 
   /** A finished run of `items`; its publish has not started. */
   async collect(rows: readonly { id: string; v: number }[]): Promise<string> {
+    return this.collectStreams({ items: rows });
+  }
+
+  /** A finished run with one stream per key; its publish has not started. */
+  async collectStreams(
+    streams: Readonly<Record<string, readonly { id: string; v: number }[]>>,
+  ): Promise<string> {
     const runId = `run-${(this.runs += 1)}`;
     await this.writer.refreshControls();
     await this.writer.beginRun({
@@ -206,8 +251,10 @@ class Device {
       identity: "none",
       checkpointUsed: null,
     });
-    await this.writer.declareStream(runId, "items", SHAPE);
-    for (const row of rows) await this.writer.append(runId, "items", row);
+    for (const [stream, rows] of Object.entries(streams)) {
+      await this.writer.declareStream(runId, stream, SHAPE);
+      for (const row of rows) await this.writer.append(runId, stream, row);
+    }
     await this.writer.finishRun(runId, {
       checkpointCandidate: { cursor: runId },
     });
@@ -247,9 +294,9 @@ class Device {
  * A latest read of `pdpp.acme.items`, as the shared handler asks. `view` and
  * `local_pending` both carry the rows; `origin` is the body's marker.
  */
-async function latest(service: StreamSyncReadService) {
+async function latest(service: StreamSyncReadService, stream = "items") {
   const decision = await service.resolve({
-    scope: `pdpp.${CONNECTOR}.items`,
+    scope: `pdpp.${CONNECTOR}.${stream}`,
     connection: null,
     cursor: null,
     legacyFile: false,
@@ -508,4 +555,65 @@ describe("own-write visibility (deletion floor)", () => {
       { runId: inFlight, stream: "items", reason: "publication_in_flight" },
     ]);
   });
+
+  // The floor of one stream must not hide another stream's run. A floor
+  // looked up under a fixed stream name hides `other` here and fails.
+  it("deleting one stream hides only that stream's run, not a sibling stream's", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    await d.collectStreams({
+      items: [{ id: "a", v: 1 }],
+      other: [{ id: "x", v: 1 }],
+    });
+    await d.publish();
+    d.gateway.deleteStream("items");
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await latest(service, "other")).toMatchObject({ rows: { x: 1 } });
+    expect((await latest(service, "items")).rows).not.toHaveProperty("a");
+  });
+
+  // A tombstone under another namespace must not hide this namespace's run. A
+  // floor looked up under the wrong ns hides it here and fails.
+  it("a deleted stream of another namespace does not hide this namespace's run", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    await d.collect([{ id: "a", v: 1 }]);
+    await d.publish();
+    d.gateway.seedDeletedStream(streamScope(CONNECTOR, OTHER_NS, "items"));
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await latest(service)).toMatchObject({ rows: { a: 1 } });
+  });
+
+  // Gate: #563 (feat/stream-sync-p4). Its stream-row predicate is not on that
+  // branch yet, so this stays `it.fails` until the predicate is used by
+  // contributions() for pending and in-flight runs. Remove `.fails` then.
+  it.fails(
+    "does not serve a run collected before a stream deletion, after a relive (gate: #563)",
+    async () => {
+      const d = new Device();
+      const service = await d.openReader();
+      await d.collect([{ id: "a", v: 1 }]);
+      await d.publish();
+      await d.collect([{ id: "b", v: 2 }]);
+      // The reader sees the tombstone (the floor), then the relive (not imported).
+      d.gateway.deleteStream("items");
+      await service.observe(d.gateway.feed(), {
+        fromStart: true,
+        lastPage: true,
+      });
+      d.gateway.reliveStream("items");
+      await service.observe(d.gateway.feed(), {
+        fromStart: true,
+        lastPage: true,
+      });
+      expect((await latest(service)).rows).not.toHaveProperty("a");
+      expect((await latest(service)).rows).not.toHaveProperty("b");
+    },
+  );
 });
