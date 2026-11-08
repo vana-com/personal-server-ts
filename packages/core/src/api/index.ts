@@ -531,6 +531,36 @@ export interface PersonalServerOauthTokenApiDeps {
 
 export interface PersonalServerApiDispatchOptions {
   basePath?: string;
+  /**
+   * In-process only, never set from an HTTP request. A same-process caller
+   * that answers a read for itself (the MCP read client) states how the
+   * handler treats that read. Absent, the handler behaves as it does for HTTP.
+   */
+  inProcess?: PersonalServerInProcessRead;
+}
+
+/** A read the handler served, in the terms a fulfilment report needs. */
+export interface PersonalServerServedRead {
+  scope: string;
+  builder: string;
+  grantId: string;
+  fileId?: string;
+  logId: string;
+  ipAddress: string;
+  servedAt: string;
+  userAgent: string;
+}
+
+export interface PersonalServerInProcessRead {
+  /** Ask the auth port for a metadata read: grant policy applies, nothing is charged. */
+  metadataOnly?: boolean;
+  /** Write the grant-gated access-log line. Defaults to true. */
+  logAccess?: boolean;
+  /**
+   * Receives the served read in place of the HTTP fulfilment report. The
+   * caller decides whether the read completes a scope.
+   */
+  onServed: (served: PersonalServerServedRead) => void;
 }
 
 type JsonStatus =
@@ -2644,6 +2674,7 @@ export async function handlePersonalServerDataRequest(
         grantId,
         fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
         at: atParam,
+        ...(options.inProcess?.metadataOnly ? { metadataOnly: true } : {}),
       });
 
       // Select the body after auth and before deletion or payment. A file's
@@ -2848,18 +2879,33 @@ export async function handlePersonalServerDataRequest(
       const userAgent = request.headers.get("user-agent") ?? "unknown";
       const loggedGrantId = authResult?.grantId ?? grantId ?? "unknown";
       const loggedBuilder = authResult?.builder ?? "unknown";
-      await deps.accessLogWriter.write({
-        logId,
-        grantId: loggedGrantId,
-        builder: loggedBuilder,
-        action: "read",
-        scope: scopeResult.scope,
-        timestamp,
-        ipAddress,
-        userAgent,
-      });
+      if (options.inProcess?.logAccess !== false) {
+        await deps.accessLogWriter.write({
+          logId,
+          grantId: loggedGrantId,
+          builder: loggedBuilder,
+          action: "read",
+          scope: scopeResult.scope,
+          timestamp,
+          ipAddress,
+          userAgent,
+        });
+      }
       const reportReadFulfillment = () => {
         if (!authResult?.grantId || !authResult.builder) return;
+        if (options.inProcess) {
+          options.inProcess.onServed({
+            scope: scopeResult.scope,
+            builder: authResult.builder,
+            grantId: authResult.grantId,
+            fileId: servedFileId,
+            logId,
+            ipAddress,
+            servedAt: timestamp,
+            userAgent,
+          });
+          return;
+        }
         reportPersonalServerReadFulfillment(deps, {
           builder: authResult.builder,
           fileId: servedFileId,
