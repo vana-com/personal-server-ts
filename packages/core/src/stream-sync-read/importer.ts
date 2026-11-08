@@ -11,6 +11,7 @@
  */
 
 import {
+  canonicalBytes32,
   classifyControl,
   classifyStreamRow,
   decodePart,
@@ -115,7 +116,7 @@ export class StreamSyncImporter {
         stream: key.stream,
         generation: installed.generation,
         registryVersion: installed.version,
-        dataHash: installed.dataHash.toLowerCase(),
+        dataHash: canonicalBytes32(installed.dataHash),
       });
     } catch (error) {
       this.options.logger.warn(

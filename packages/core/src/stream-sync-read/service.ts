@@ -13,6 +13,7 @@
  */
 
 import {
+  canonicalBytes32,
   classifyStreamRow,
   controlHashes,
   eligible,
@@ -336,13 +337,17 @@ function covers(
   if (base.version > receipt.registryVersion) return true;
   return (
     base.version === receipt.registryVersion &&
-    normalizeHash(base.dataHash) === normalizeHash(receipt.dataHash)
+    sameBytes32(base.dataHash, receipt.dataHash)
   );
 }
 
-function normalizeHash(hash: string): string {
-  const lower = hash.toLowerCase();
-  return lower.startsWith("0x") ? lower.slice(2) : lower;
+/** Digests compare in the one spelling the writer uses; a malformed one never matches. */
+function sameBytes32(a: string, b: string): boolean {
+  try {
+    return canonicalBytes32(a) === canonicalBytes32(b);
+  } catch {
+    return false;
+  }
 }
 
 function encodeCursor(cursor: Cursor): string {
