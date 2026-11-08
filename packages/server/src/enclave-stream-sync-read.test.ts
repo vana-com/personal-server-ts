@@ -41,12 +41,17 @@ const host = vi.hoisted(() => ({
 vi.mock("./bootstrap.js", async (importOriginal) => {
   const actual = await importOriginal<typeof Bootstrap>();
   host.createServer.mockImplementation(
-    (config: Bootstrap.ServerContext["config"], options: Bootstrap.CreateServerOptions) =>
+    (
+      config: Bootstrap.ServerContext["config"],
+      options: Bootstrap.CreateServerOptions,
+    ) =>
       actual.createServer(config, {
         ...options,
         gatewayClient: {
           getServer: host.getServer,
-        } as unknown as NonNullable<Bootstrap.CreateServerOptions["gatewayClient"]>,
+        } as unknown as NonNullable<
+          Bootstrap.CreateServerOptions["gatewayClient"]
+        >,
       }),
   );
   return { ...actual, createServer: host.createServer };
@@ -67,7 +72,9 @@ vi.mock(
 );
 
 const OWNER = privateKeyToAccount(`0x${"11".repeat(32)}`);
-const MASTER_SIGNATURE = await OWNER.signMessage({ message: MASTER_KEY_MESSAGE });
+const MASTER_SIGNATURE = await OWNER.signMessage({
+  message: MASTER_KEY_MESSAGE,
+});
 const SERVER = privateKeyToAccount(`0x${"22".repeat(32)}`);
 const TOKEN = "synthetic-hosted-reader-token";
 const ORIGIN = "http://127.0.0.1:18080";
@@ -128,8 +135,14 @@ class PublishedFixture {
         .map((scope) => ({ scope, read: this.controlRead(scope) })),
     post: async (request) => {
       const previous = this.rows.get(request.scope);
-      if (Number(request.expectedVersion) !== Number(previous?.expectedVersion ?? 0) + 1) {
-        return { kind: "conflict", latestVersion: previous?.expectedVersion ?? null };
+      if (
+        Number(request.expectedVersion) !==
+        Number(previous?.expectedVersion ?? 0) + 1
+      ) {
+        return {
+          kind: "conflict",
+          latestVersion: previous?.expectedVersion ?? null,
+        };
       }
       this.posts.push(request);
       this.rows.set(request.scope, {
@@ -197,7 +210,9 @@ class PublishedFixture {
         expect(await this.writer.append(runId, stream, record)).toBe("spooled");
       }
     }
-    await this.writer.finishRun(runId, { checkpointCandidate: { complete: true } });
+    await this.writer.finishRun(runId, {
+      checkpointCandidate: { complete: true },
+    });
     const report = await this.writer.cycle();
     expect(report.runs).toContainEqual(
       expect.objectContaining({
@@ -210,7 +225,8 @@ class PublishedFixture {
 
   /** The public storage-adapter boundary used by createServer, backed by writer bytes. */
   storageAdapter() {
-    const keyFromUrl = (url: string) => decodeURIComponent(new URL(url).pathname.slice(1));
+    const keyFromUrl = (url: string) =>
+      decodeURIComponent(new URL(url).pathname.slice(1));
     const refuseWrite = async (operation: string): Promise<never> => {
       this.serverWrites.push(operation);
       throw new Error(`Hosted reader attempted ${operation}`);
@@ -268,27 +284,34 @@ describe("hosted enclave stream-sync reader", () => {
     );
     host.getServer.mockResolvedValue(null);
     host.listenHttpServer.mockResolvedValue({ close: vi.fn() });
-    host.createStorageAdapter.mockImplementation(() => fixture.storageAdapter());
+    host.createStorageAdapter.mockImplementation(() =>
+      fixture.storageAdapter(),
+    );
     vi.spyOn(process, "on").mockImplementation(() => process);
     const open = StreamSyncReadService.open;
-    vi.spyOn(StreamSyncReadService, "open").mockImplementation(async (options) => {
-      service = await open.call(StreamSyncReadService, options);
-      return service;
-    });
+    vi.spyOn(StreamSyncReadService, "open").mockImplementation(
+      async (options) => {
+        service = await open.call(StreamSyncReadService, options);
+        return service;
+      },
+    );
     // Any unexpected outbound write is observable even when background code
     // catches the exception. Tombstone lookups outside the seeded stream feed
     // return absent. No request may leave this test process.
-    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      if (request.method !== "GET" && request.method !== "HEAD") {
-        fixture.serverWrites.push(`${request.method} ${request.url}`);
-        throw new Error("Unexpected hosted network write");
-      }
-      if (new URL(request.url).origin !== GATEWAY) {
-        throw new Error(`Unexpected hosted network read: ${request.url}`);
-      }
-      return new Response(null, { status: 404 });
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        if (request.method !== "GET" && request.method !== "HEAD") {
+          fixture.serverWrites.push(`${request.method} ${request.url}`);
+          throw new Error("Unexpected hosted network write");
+        }
+        if (new URL(request.url).origin !== GATEWAY) {
+          throw new Error(`Unexpected hosted network read: ${request.url}`);
+        }
+        return new Response(null, { status: 404 });
+      }),
+    );
     vi.stubEnv("VANA_OWNER_PRIVATE_KEY", undefined);
     vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", MASTER_SIGNATURE);
     vi.stubEnv("PS_ACCESS_TOKEN", TOKEN);
@@ -309,7 +332,8 @@ describe("hosted enclave stream-sync reader", () => {
       "DATA_PORTABILITY_SERVER_CONTRACT",
       "DATA_PORTABILITY_GRANTEES_CONTRACT",
       "DATA_PORTABILITY_PERMISSIONS_CONTRACT",
-    ]) vi.stubEnv(name, undefined);
+    ])
+      vi.stubEnv(name, undefined);
   });
 
   afterEach(async () => {
@@ -324,24 +348,38 @@ describe("hosted enclave stream-sync reader", () => {
   async function boot() {
     await runEnclaveMain();
     const result = host.createServer.mock.results.at(-1);
-    if (!result || result.type !== "return") throw new Error("createServer did not return");
-    context = await result.value as Bootstrap.ServerContext;
+    if (!result || result.type !== "return")
+      throw new Error("createServer did not return");
+    context = (await result.value) as Bootstrap.ServerContext;
     expect(host.createServer).toHaveBeenCalledWith(
-      expect.objectContaining({ streamSync: { read: Boolean(service), write: true } }),
-      expect.objectContaining({ profile: "enclave", ownerSignature: MASTER_SIGNATURE }),
+      expect.objectContaining({
+        streamSync: { read: Boolean(service), write: true },
+      }),
+      expect.objectContaining({
+        profile: "enclave",
+        ownerSignature: MASTER_SIGNATURE,
+      }),
     );
     expect(process.env.VANA_MASTER_KEY_SIGNATURE).toBeUndefined();
     expect(context.serverAccount?.address).toBe(SERVER.address);
     expect(context.streamSyncWriter).toBeNull();
-    expect(host.createStorageAdapter.mock.calls.every(([options]) => options.reads === "public")).toBe(true);
+    expect(
+      host.createStorageAdapter.mock.calls.every(
+        ([options]) => options.reads === "public",
+      ),
+    ).toBe(true);
     return context;
   }
 
   async function importPublishedRows() {
-    if (!service) throw new Error("Hosted entrypoint did not construct the reader");
+    if (!service)
+      throw new Error("Hosted entrypoint did not construct the reader");
     // This is the explicit feed boundary of this test. It does not claim to
     // cover the gateway pagination/cursor adapter or download worker.
-    await service.observe([...fixture.rows.values()], { fromStart: true, lastPage: true });
+    await service.observe([...fixture.rows.values()], {
+      fromStart: true,
+      lastPage: true,
+    });
     await service.importPending();
     expect(service.status().issues).toEqual([]);
   }
@@ -356,10 +394,14 @@ describe("hosted enclave stream-sync reader", () => {
 
   it("reads writer-generated heads and parts through the hosted signature path without a writer", async () => {
     await fixture.publish("acme", { items: ITEMS }, null);
-    await fixture.publish("chatgpt", {
-      conversations: [CONVERSATION],
-      messages: [MESSAGE],
-    }, "chatgpt");
+    await fixture.publish(
+      "chatgpt",
+      {
+        conversations: [CONVERSATION],
+        messages: [MESSAGE],
+      },
+      "chatgpt",
+    );
     const writerPosts = fixture.posts.length;
     const writerPuts = fixture.puts.length;
     expect(writerPosts).toBe(5); // Two control rows and three stream heads.
@@ -374,10 +416,21 @@ describe("hosted enclave stream-sync reader", () => {
     const logical = await request("/v1/data/pdpp.acme.items");
     expect(logical.status).toBe(200);
     const envelope = await logical.json();
-    expect(envelope).toMatchObject({ version: "1.0", scope: "pdpp.acme.items" });
-    expect(envelope.data.records.sort((a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id))).toEqual(ITEMS);
-    expect(fixture.downloads.some((key) => key.startsWith("pdpp.acme~.items/h-"))).toBe(true);
-    expect(fixture.downloads.some((key) => key.startsWith("pdpp.acme~.items/g1-p-"))).toBe(true);
+    expect(envelope).toMatchObject({
+      version: "1.0",
+      scope: "pdpp.acme.items",
+    });
+    expect(
+      envelope.data.records.sort((a: { id: string }, b: { id: string }) =>
+        a.id.localeCompare(b.id),
+      ),
+    ).toEqual(ITEMS);
+    expect(
+      fixture.downloads.some((key) => key.startsWith("pdpp.acme~.items/h-")),
+    ).toBe(true);
+    expect(
+      fixture.downloads.some((key) => key.startsWith("pdpp.acme~.items/g1-p-")),
+    ).toBe(true);
 
     const legacy = await request("/v1/data/chatgpt.conversations");
     expect(legacy.status).toBe(200);
@@ -397,12 +450,20 @@ describe("hosted enclave stream-sync reader", () => {
         { connector: "acme", ns: "", stream: "items", records: ITEMS.length },
       ]),
     });
-    const writeRoutes = server.app.routes.filter(({ path }) =>
-      /\/stream-sync(?:\/|$)/.test(path) && !path.includes("/read-status"),
+    const writeRoutes = server.app.routes.filter(
+      ({ path }) =>
+        /\/stream-sync(?:\/|$)/.test(path) &&
+        !path.includes("/read-status") &&
+        !path.startsWith("/v1/stream-sync/seed") &&
+        !path.endsWith("/*"),
     );
     expect(writeRoutes).toEqual([]);
     const localFiles = await readdir(root, { recursive: true });
-    expect(localFiles.some((path) => /(?:^|[/\\])(?:runs|outbox)(?:[/\\]|$)/.test(path))).toBe(false);
+    expect(
+      localFiles.some((path) =>
+        /(?:^|[/\\])(?:runs|outbox)(?:[/\\]|$)/.test(path),
+      ),
+    ).toBe(false);
     expect(fixture.posts).toHaveLength(writerPosts);
     expect(fixture.puts).toHaveLength(writerPuts);
     expect(fixture.serverWrites).toEqual([]);
@@ -426,31 +487,92 @@ describe("hosted enclave stream-sync reader", () => {
     const server = await boot();
     expect(server.config.streamSync.write).toBe(true);
     expect(server.streamSyncWriter).toBeNull();
-    expect(server.app.routes.filter(({ path }) =>
-      /\/stream-sync(?:\/|$)/.test(path) && !path.includes("/read-status"),
-    )).toEqual([]);
+    // The seed routes and the /v1/stream-sync/* admission middleware are mounted
+    // on every profile; they are checked by the probes below, not by route list.
+    expect(
+      server.app.routes.filter(
+        ({ path }) =>
+          /\/stream-sync(?:\/|$)/.test(path) &&
+          !path.includes("/read-status") &&
+          !path.startsWith("/v1/stream-sync/seed") &&
+          !path.endsWith("/*"),
+      ),
+    ).toEqual([]);
+    const before = await readdir(root, { recursive: true });
+    const seedBody =
+      [
+        JSON.stringify({
+          primaryKey: ["id"],
+          profile: { key: null, version: "1.0.0" },
+          records: 1,
+        }),
+        JSON.stringify({ id: "probe" }),
+      ].join("\n") + "\n";
+    // Probe the seed write route: the enclave has no seed port, so it answers 404.
+    const seedPut = await server.app.request(
+      `${ORIGIN}/v1/stream-sync/seed/acme/items`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/x-ndjson",
+        },
+        body: seedBody,
+      },
+    );
+    expect(seedPut.status).toBe(404);
+    expect(await seedPut.json()).toMatchObject({
+      error: { errorCode: "STREAM_SYNC_WRITE_OFF" },
+    });
+    // Probe an intake write route the route filter cannot see: it is absent here.
+    const runPut = await server.app.request(
+      `${ORIGIN}/v1/stream-sync/runs/hosted-probe`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      },
+    );
+    expect(runPut.ok).toBe(false);
+    // Nothing staged, written to the home, or sent to storage or the gateway.
+    expect(await readdir(root, { recursive: true })).toEqual(before);
     const localFiles = await readdir(root, { recursive: true });
-    expect(localFiles.some((path) => /(?:^|[/\\])(?:runs|outbox)(?:[/\\]|$)/.test(path))).toBe(false);
+    expect(
+      localFiles.some((path) =>
+        /(?:^|[/\\])(?:runs|outbox|seed)(?:[/\\]|$)/.test(path),
+      ),
+    ).toBe(false);
+    expect(fixture.puts).toEqual([]);
+    expect(fixture.posts).toEqual([]);
     expect(fixture.serverWrites).toEqual([]);
   });
 
   it("stops serving a writer-generated legacy projection after its connection is deleted", async () => {
-    await fixture.publish("chatgpt", {
-      conversations: [CONVERSATION],
-      messages: [MESSAGE],
-    }, "chatgpt");
+    await fixture.publish(
+      "chatgpt",
+      {
+        conversations: [CONVERSATION],
+        messages: [MESSAGE],
+      },
+      "chatgpt",
+    );
     await boot();
     await importPublishedRows();
     expect((await request("/v1/data/chatgpt.conversations")).status).toBe(200);
 
     fixture.deleteConnection("chatgpt");
     await importPublishedRows();
-    expect(await service!.resolve({
-      scope: "chatgpt.conversations",
-      connection: null,
-      cursor: null,
-      legacyFile: true,
-    })).toEqual({ kind: "unavailable", reason: "deleted" });
+    expect(
+      await service!.resolve({
+        scope: "chatgpt.conversations",
+        connection: null,
+        cursor: null,
+        legacyFile: true,
+      }),
+    ).toEqual({ kind: "unavailable", reason: "deleted" });
     const response = await request("/v1/data/chatgpt.conversations");
     expect(response.status).not.toBe(200);
     expect(await response.text()).not.toContain(CONVERSATION.title);
