@@ -407,7 +407,7 @@ export type WriterCompatibility =
  * of the writer's connector version with `base.profile.version`.
  */
 export function writerCompatibility(
-  base: Head | null,
+  base: Pick<Head, "primaryKey"> | null,
   writerPrimaryKey: readonly string[],
   writerVersusBase: VersionOrder,
 ): WriterCompatibility {
@@ -434,13 +434,30 @@ export function headComplete(input: {
   return input.full || input.baseComplete || input.seedMerged;
 }
 
-/** §2.6: every part and `complete` unchanged against the base → skip upload and POST. */
+/**
+ * §2.6: every part and `complete` unchanged against the base → skip upload and
+ * POST. With `next`, the next head's primary key and profile must also equal
+ * the base's: a re-projection is never a no-op.
+ */
 export function isNoop(
   base: Head | null,
   parts: readonly HeadPart[],
   complete: boolean,
+  next?: { primaryKey: readonly string[]; profile: HeadProfile },
 ): boolean {
   if (base === null || base.complete !== complete) return false;
+  // A changed key or projector profile is a re-projection: it publishes even
+  // when every part is unchanged.
+  if (next) {
+    if (
+      next.profile.key !== base.profile.key ||
+      next.profile.version !== base.profile.version ||
+      next.primaryKey.length !== base.primaryKey.length ||
+      next.primaryKey.some((field, i) => field !== base.primaryKey[i])
+    ) {
+      return false;
+    }
+  }
   if (base.parts.length !== parts.length) return false;
   return base.parts.every((p, i) => {
     const q = parts[i]!;

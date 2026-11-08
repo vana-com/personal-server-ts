@@ -130,6 +130,7 @@ import {
 import { createSqliteQuestionStore } from "./storage/question-store.js";
 import {
   StreamSyncWriter,
+  createWriterOverlaySource,
   createStreamSyncIntake,
   type StreamSyncIntake,
   createGatewayStreamSyncRegistry,
@@ -848,38 +849,6 @@ export async function createServer(
       scopeDeletions,
     };
 
-    if (config.streamSync.read) {
-      streamSyncRead = await StreamSyncReadService.open({
-        files: await createFsStreamSyncReadFiles(
-          join(storageRoot, "stream-sync-read"),
-        ),
-        blobs: createStorageBlobReader(storageAdapter),
-        keys: await createStreamSyncReadKeys(masterKey),
-        logger,
-      });
-    }
-
-    const downloadDeps = {
-      streamSync: streamSyncRead,
-      storage: rawDataStorage,
-      storageAdapter,
-      gateway: gatewayClient,
-      cursor,
-      masterKey,
-      serverOwner,
-      logger,
-      dataPointFeed,
-      scopeDeletions,
-      onDataPointIndexed: (event: {
-        scope: string;
-        lineageSources?: string[];
-      }) =>
-        derivativeScheduler.markSourceChanged(event.scope, {
-          lineageSources: event.lineageSources,
-        }),
-      pdppImporter,
-    };
-
     // Durable deletion: gateway tombstone signed with the same server
     // account + AddData signer uploads use, storage DELETE authorised with
     // the same Web3Signed signer the storage provider uploads with.
@@ -970,6 +939,44 @@ export async function createServer(
         streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
       }
     }
+
+    // The read service opens after the writer, so an owner's own publications
+    // can overlay its reads and the reader can acknowledge what it installed.
+    if (config.streamSync.read) {
+      streamSyncRead = await StreamSyncReadService.open({
+        files: await createFsStreamSyncReadFiles(
+          join(storageRoot, "stream-sync-read"),
+        ),
+        blobs: createStorageBlobReader(storageAdapter),
+        keys: await createStreamSyncReadKeys(masterKey),
+        logger,
+        durable: true,
+        ...(streamSyncWriter
+          ? { overlay: createWriterOverlaySource(streamSyncWriter) }
+          : {}),
+      });
+    }
+
+    const downloadDeps = {
+      streamSync: streamSyncRead,
+      storage: rawDataStorage,
+      storageAdapter,
+      gateway: gatewayClient,
+      cursor,
+      masterKey,
+      serverOwner,
+      logger,
+      dataPointFeed,
+      scopeDeletions,
+      onDataPointIndexed: (event: {
+        scope: string;
+        lineageSources?: string[];
+      }) =>
+        derivativeScheduler.markSourceChanged(event.scope, {
+          lineageSources: event.lineageSources,
+        }),
+      pdppImporter,
+    };
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
       streamSync: streamSyncWriter

@@ -90,3 +90,52 @@ export function sameControl(a: ControlState, b: ControlState): boolean {
       return a.version === (b as typeof a).version;
   }
 }
+
+/**
+ * The hide rule of §2.4, shared by publish admission and every reader: data
+ * collected under an active control row is hidden once that row reads
+ * deleted. `start` is the state the run began under (`unknown` when no
+ * snapshot was taken); `now` is the newest state known. Both are for the same
+ * connector and namespace. A reconnect (active at a higher generation) is not
+ * a deletion and does not match.
+ */
+export function deletedSinceStart(
+  start: ControlState | { readonly kind: "unknown" },
+  now: ControlState,
+): boolean {
+  if (start.kind !== "active") return false;
+  if (now.kind === "deleted") return true;
+  // A reconnect after a delete lands at a higher generation. That is still
+  // deleted since start: a generation can only rise through a delete.
+  return now.kind === "active" && now.generation > start.generation;
+}
+
+/**
+ * The one delete predicate for a run, shared by publish admission and any
+ * reader that hides pending runs. A run is deleted when its connection was
+ * active at start and deleted or reconnected since (control arm), or when its stream row
+ * was not a tombstone at start and is one now (stream arm). Each arm is
+ * skipped when its start or now state is not known.
+ *
+ * `streamTombstoned` is the stream row at start (`undefined` = not stamped).
+ * The stream arm cannot see a tombstone a later write overwrote before `now`
+ * was read; the registry returns only the latest row.
+ */
+export function runDeletedSince(
+  start: {
+    readonly control: ControlState | { readonly kind: "unknown" };
+    readonly streamTombstoned?: boolean;
+  },
+  now: {
+    readonly control?: ControlState;
+    readonly stream?: ControlRead;
+    readonly hashes: Pick<ControlHashes, "tombstoneData" | "tombstoneMetadata">;
+  },
+): boolean {
+  if (now.control && deletedSinceStart(start.control, now.control)) return true;
+  return (
+    start.streamTombstoned === false &&
+    now.stream !== undefined &&
+    classifyStreamRow(now.stream, now.hashes) === "tombstoned"
+  );
+}

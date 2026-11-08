@@ -1,9 +1,11 @@
 /**
- * The records of one leased stream view, part by part in pkHash order, with
- * the local outbox overlay merged by the package rule (§2.6, §2.9).
+ * The records of one stream view, part by part in pkHash order, with the
+ * local overlay merged by the package rule (§2.6, §2.9).
  *
- * Without overlay rows a read holds one part at a time. Overlay winners are
- * held in memory: they are the rows of local runs that have not committed.
+ * The base is the leased imported view, or nothing when the stream has no
+ * imported head (an overlay-only view). Without overlay rows a read holds one
+ * part at a time. Overlay winners are held in memory: they are the rows of
+ * local runs the imported view does not cover yet.
  */
 
 import {
@@ -11,7 +13,11 @@ import {
   pkHash,
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { StreamSyncOverlaySource, StreamSyncReadKeys } from "./ports.js";
+import type {
+  StreamSyncOverlayRun,
+  StreamSyncOverlaySnapshot,
+  StreamSyncReadKeys,
+} from "./ports.js";
 import type { ViewLease, ViewStore } from "./view-store.js";
 
 const decoder = new TextDecoder();
@@ -25,24 +31,33 @@ export interface OverlayWinners {
   readonly newestObservedAt: number | null;
 }
 
-/** Overlay winners of `(connector, ns, stream)`; rows of unattributed runs are not included. */
+export const NO_OVERLAY: OverlayWinners = {
+  winners: new Map(),
+  skipped: 0,
+  newestObservedAt: null,
+};
+
+/**
+ * Overlay winners of one stream: the lines of `runs` in the pinned
+ * `snapshot`. The caller has already decided which runs may contribute.
+ */
 export async function overlayWinners(
-  source: StreamSyncOverlaySource | undefined,
+  snapshot: StreamSyncOverlaySnapshot,
   keys: StreamSyncReadKeys,
-  lease: ViewLease,
+  input: {
+    readonly runs: readonly StreamSyncOverlayRun[];
+    readonly stream: string;
+    readonly primaryKey: readonly string[];
+  },
 ): Promise<OverlayWinners> {
   const winners = new Map<string, Line>();
   let skipped = 0;
   let newest: number | null = null;
-  if (!source) return { winners, skipped, newestObservedAt: newest };
-  const { connector, ns, stream } = lease.key;
-  const primaryKey = lease.version.head.primaryKey;
-  for (const entry of await source.entries(connector)) {
-    if (entry.ns !== ns || !entry.streams.includes(stream)) continue;
-    for await (const line of entry.lines(stream)) {
+  for (const run of input.runs) {
+    for await (const line of snapshot.lines(run, input.stream)) {
       let hash: string;
       try {
-        hash = await pkHash(keys.hashes.sha256, line.v, primaryKey);
+        hash = await pkHash(keys.hashes.sha256, line.v, input.primaryKey);
       } catch {
         skipped++;
         continue;
@@ -79,21 +94,31 @@ async function* partLines(
   }
 }
 
-/** Every record of the leased view merged with `overlay`, in pkHash order. */
+/**
+ * Every record of the stream merged with `overlay`, in pkHash order. `base`
+ * is the leased imported view, or null when the stream has none: then the
+ * sorted overlay winners are the whole answer.
+ */
 export async function* viewLines(
   views: ViewStore,
   keys: StreamSyncReadKeys,
-  lease: ViewLease,
+  base: ViewLease | null,
   overlay: OverlayWinners,
+  primaryKey: readonly string[],
 ): AsyncGenerator<Line> {
-  if (overlay.winners.size === 0) {
-    for await (const { line } of partLines(views, lease)) yield line;
+  if (!base) {
+    for (const hash of [...overlay.winners.keys()].sort()) {
+      yield overlay.winners.get(hash)!;
+    }
     return;
   }
-  const primaryKey = lease.version.head.primaryKey;
+  if (overlay.winners.size === 0) {
+    for await (const { line } of partLines(views, base)) yield line;
+    return;
+  }
   const pending = [...overlay.winners.keys()].sort();
   let next = 0;
-  for await (const { line } of partLines(views, lease)) {
+  for await (const { line } of partLines(views, base)) {
     const hash = await pkHash(keys.hashes.sha256, line.v, primaryKey);
     while (next < pending.length && pending[next]! < hash) {
       yield overlay.winners.get(pending[next++]!)!;

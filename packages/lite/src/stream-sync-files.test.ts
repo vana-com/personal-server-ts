@@ -1,5 +1,6 @@
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
+import { createStreamSyncReadCacheFiles } from "./stream-sync-read-cache-files.js";
 import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 
 const enc = new TextEncoder();
@@ -73,4 +74,80 @@ describe("IndexedDB stream-sync files appendMany", () => {
     }
     expect(transactions).toBe(1);
   });
+});
+
+describe("IndexedDB durability", () => {
+  it("requests strict durability for every mutation", async () => {
+    const factory = new IDBFactory();
+    const request = factory.open("durability");
+    const db = await new Promise<IDBDatabase>((resolve) => {
+      request.onsuccess = () => resolve(request.result);
+    });
+    const proto = Object.getPrototypeOf(db) as {
+      transaction: IDBDatabase["transaction"];
+    };
+    const original = proto.transaction;
+    const options: (IDBTransactionOptions | undefined)[] = [];
+    proto.transaction = function (
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase["transaction"]>
+    ) {
+      if (args[1] === "readwrite") options.push(args[2]);
+      return original.apply(this, args);
+    } as IDBDatabase["transaction"];
+    try {
+      const files = createIndexedDbStreamSyncFiles({
+        dbName: "strict-test",
+        factory,
+        keyRange: IDBKeyRange,
+      });
+      await files.write("p", enc.encode("a"));
+      await files.appendMany([{ path: "p", bytes: enc.encode("b") }]);
+      await files.sync("p");
+      await files.remove("p");
+      expect(options).toHaveLength(3);
+      expect(options).toEqual(options.map(() => ({ durability: "strict" })));
+    } finally {
+      proto.transaction = original;
+      db.close();
+    }
+  });
+});
+
+it("writes bounded chunks and removes stale chunks on overwrite", async () => {
+  const files = open();
+  const bytes = Uint8Array.from(
+    { length: 1024 * 1024 + 17 },
+    (_, i) => i % 251,
+  );
+  await files.write("large", bytes);
+  // Buffer.compare: toEqual on a 1 MiB array is slow under the fake database.
+  expect(Buffer.compare((await files.read("large"))!, bytes)).toBe(0);
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of files.readChunks("large")) chunks.push(chunk);
+  expect(chunks.every((chunk) => chunk.length <= 1024 * 1024)).toBe(true);
+  const combined = new Uint8Array(
+    chunks.reduce((sum, chunk) => sum + chunk.length, 0),
+  );
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  expect(Buffer.compare(combined, bytes)).toBe(0);
+  await files.appendMany([{ path: "large", bytes: enc.encode("tail") }]);
+  expect((await files.read("large"))?.slice(-4)).toEqual(enc.encode("tail"));
+  await files.write("large", enc.encode("short"));
+  expect(dec.decode((await files.read("large"))!)).toBe("short");
+  const overwritten: Uint8Array[] = [];
+  for await (const chunk of files.readChunks("large")) overwritten.push(chunk);
+  expect(overwritten).toHaveLength(1);
+});
+
+it("keeps read caches for different keys separate in one home", async () => {
+  const files = open();
+  const first = createStreamSyncReadCacheFiles(files, "key-one");
+  const second = createStreamSyncReadCacheFiles(files, "key-two");
+  await first.write("views/item", enc.encode("value"));
+  expect(await second.read("views/item")).toBeNull();
 });

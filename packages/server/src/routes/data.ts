@@ -1,3 +1,4 @@
+import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono, type Context } from "hono";
 import {
@@ -363,6 +364,20 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   // Durable owner imports are root JSON writes: same bound as a plain ingest.
   app.use("/:scope/imports/:operation", (c, next) =>
     c.req.method === "PUT" ? legacyWriteBodyLimit(c, next) : next(),
+  );
+  // A stream-sync control scope (pdpp.<c>~<ns>) is owned by the connection
+  // delete, not by a legacy data delete: refuse it before the scope grammar.
+  app.delete("/:scope", (c, next) =>
+    parseScope(c.req.param("scope"))?.kind === "control"
+      ? c.json(
+          {
+            error: "STREAM_SYNC_CONTROL_SCOPE",
+            message:
+              "a stream-sync connection is deleted through the stream-sync connection delete",
+          },
+          409,
+        )
+      : next(),
   );
   app.all("*", (c) =>
     handlePersonalServerDataRequest(

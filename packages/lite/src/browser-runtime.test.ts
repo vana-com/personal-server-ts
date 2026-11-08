@@ -302,6 +302,79 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
   });
 });
 
+describe("createIndexedDbPsLiteRuntime own-write reads", () => {
+  it("reads back a run this device collected, through the runtime's data route", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    // An empty registry: listings are empty, single reads are 404, and every
+    // POST commits. The run is then this device's own unpublished rows.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if ((init?.method ?? "GET") === "POST")
+          return new Response(null, { status: 201 });
+        if (String(input).includes("/v1/data?"))
+          return Response.json({
+            data: { dataPoints: [] },
+            pagination: { hasMore: false, nextCursor: null },
+          });
+        return new Response(null, { status: 404 });
+      }),
+    );
+    const dbName = `ps-lite-own-reads-${Math.random()}`;
+    const { runtime, streamSyncWriter } = await createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      dbName,
+      storageDbName: `${dbName}-storage`,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      streamSyncFiles: () =>
+        createIndexedDbStreamSyncFiles({
+          dbName: `${dbName}-streams`,
+          factory: new IDBFactory(),
+          keyRange: IDBKeyRange,
+        }),
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: true },
+        streamSync: { write: true, read: true },
+      },
+    });
+    const writer = streamSyncWriter!;
+    await writer.refreshControls();
+    await writer.beginRun({
+      runId: "run-1",
+      connector: "acme",
+      userConnect: false,
+      observedAt: Date.now(),
+      identity: "none",
+      checkpointUsed: null,
+    });
+    await writer.declareStream("run-1", "items", {
+      primaryKey: ["id"],
+      profile: { key: null, version: "1.0.0" },
+    });
+    await writer.append("run-1", "items", { id: "a", v: 1 });
+    await writer.finishRun("run-1", {
+      checkpointCandidate: { cursor: "run-1" },
+    });
+
+    const read = await runtime.fetch(
+      new Request("https://ps.local/v1/data/pdpp.acme.items", {
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
+    expect(read.status).toBe(200);
+    await expect(read.json()).resolves.toMatchObject({
+      data: { records: [{ id: "a", v: 1 }] },
+    });
+  });
+});
+
 describe("createIndexedDbPsLiteRuntime write sessions", () => {
   it("mounts the write-session handshake by default and skips it for a caller-owned auth adapter", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
