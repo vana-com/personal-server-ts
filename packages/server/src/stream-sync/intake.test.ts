@@ -72,7 +72,7 @@ interface Host {
 }
 
 async function host(
-  extra: Partial<StreamSyncWriterOptions> = {},
+  extra: Partial<StreamSyncWriterOptions> & { files?: StreamFiles } = {},
   intakeOptions: Partial<Parameters<typeof createStreamSyncIntake>[0]> = {},
   name = `intake-${(device += 1)}`,
 ): Promise<Host> {
@@ -817,6 +817,47 @@ async function withNeedsFull(
   return host({}, {}, h.name);
 }
 
+type StreamFiles = Awaited<ReturnType<OracleEnv["files"]>>;
+
+/**
+ * Wraps a device's files port and records each appended entry. A finished
+ * run removes its run directory, so the evidence is read from the append.
+ */
+function recordingFiles(
+  inner: StreamFiles,
+  appends: Map<string, string[]>,
+): StreamFiles {
+  return new Proxy(inner, {
+    get(target, key) {
+      if (key === "appendMany") {
+        return async (
+          entries: readonly { path: string; bytes: Uint8Array }[],
+        ) => {
+          for (const entry of entries) {
+            appends.set(entry.path, [
+              ...(appends.get(entry.path) ?? []),
+              new TextDecoder().decode(entry.bytes),
+            ]);
+          }
+          return target.appendMany(entries);
+        };
+      }
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/** The stream of each exclusion line the run appended. */
+function exclusionStreams(appends: Map<string, string[]>, runId: string) {
+  const text = (appends.get(`runs/${runId}/excluded.ndjson`) ?? []).join("");
+  return text
+    .trim()
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => (JSON.parse(line) as { stream?: string }).stream);
+}
+
 /** A record-bearing retry with a candidate; its head must commit the record. */
 async function recordRetry(h: Host, connector: string) {
   await run(h, "r1", connector, {
@@ -827,6 +868,22 @@ async function recordRetry(h: Host, connector: string) {
   });
   await publish(h, "r1");
   expect(await recordKeys(connector, "items")).toEqual(["a"]);
+  await expectIncompleteHead(h, connector);
+}
+
+/** The committed items head is incomplete, and its items debt is durable. */
+async function expectIncompleteHead(h: Host, connector: string) {
+  const view = await readStream(
+    env.registry,
+    env.blobs,
+    connector,
+    "",
+    "items",
+  );
+  expect(view).not.toBeNull();
+  expect(view).not.toBe("tombstoned");
+  expect((view as { head: { complete: boolean } }).head.complete).toBe(false);
+  expect(await debtOf(h, connector)).toEqual(["items"]);
 }
 
 describe(
@@ -1180,6 +1237,7 @@ describe(
         outcome: "retry_pending",
       });
       await publish(h, "r2");
+      await expectIncompleteHead(h, c);
       const next = await h.intake.begin("r3", begin(c, { observedAt: T0 + 2 }));
       expect(next.start).toEqual({
         collection_mode: "incremental",
@@ -1222,7 +1280,13 @@ describe(
 
     it("an oversized-only retry follows the ordinary exclusion path and is not an all-empty retry", async () => {
       const c = freshConnector("r28-m4-only");
-      const h = await host();
+      const name = `ev-${c}`;
+      const appends = new Map<string, string[]>();
+      const h = await host(
+        { files: recordingFiles(await env.files(name), appends) },
+        {},
+        name,
+      );
       const { batch, ended } = await run(h, "r1", c, {
         records: [
           {
@@ -1239,17 +1303,8 @@ describe(
       // The candidate is not saved before the run publishes.
       expect(JSON.stringify(await savedState(h))).not.toContain('"c1"');
       await publish(h, "r1");
-      // The exclusion evidence is written by the ordinary path.
-      const excluded = await (
-        await env.files(h.name)
-      ).read("runs/r1/excluded.ndjson");
-      expect(excluded).not.toBeNull();
-      const lines = new TextDecoder()
-        .decode(excluded!)
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as { stream?: string });
-      expect(lines.map((line) => line.stream)).toContain("items");
+      // The ordinary path appends the exclusion evidence for the excluded row.
+      expect(exclusionStreams(appends, "r1")).toContain("items");
       const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
       expect(next.start).toEqual({
         collection_mode: "incremental",
@@ -1260,7 +1315,13 @@ describe(
 
     it("an oversized upsert beside an accepted one is not an all-empty retry", async () => {
       const c = freshConnector("r28-m4");
-      const h = await host();
+      const name = `ev-${c}`;
+      const appends = new Map<string, string[]>();
+      const h = await host(
+        { files: recordingFiles(await env.files(name), appends) },
+        {},
+        name,
+      );
       const { batch, ended } = await run(h, "r1", c, {
         records: [
           { stream: "items", data: row("a") },
@@ -1276,14 +1337,9 @@ describe(
       expect(batch).toMatchObject({ accepted: 1, tooLarge: 1 });
       expect(ended.result).toBe("queued");
       await publish(h, "r1");
-      const items = await readStream(env.registry, env.blobs, c, "", "items");
-      expect(items).not.toBeNull();
       expect(await recordKeys(c, "items")).toEqual(["a"]);
-      // The exclusion evidence is written by the ordinary path.
-      const excluded = await (
-        await env.files(h.name)
-      ).read("runs/r1/excluded.ndjson");
-      expect(excluded).not.toBeNull();
+      // The ordinary path appends the exclusion evidence for the excluded row.
+      expect(exclusionStreams(appends, "r1")).toContain("items");
       const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
       expect(next.start).toEqual({
         collection_mode: "incremental",
