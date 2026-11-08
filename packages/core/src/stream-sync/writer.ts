@@ -133,10 +133,21 @@ export interface StreamSyncCheckpoint {
 
 export type SeedReceipt = "merged" | "skipped";
 
+/** A control row a delete pinned: tombstone it at `version + 1`, nothing else. */
+interface DeletePin {
+  readonly ns: string;
+  readonly version: number;
+}
+
 interface WriterState {
   version: 1;
   needsFull: NeedsFull;
   checkpoints: Record<string, StreamSyncCheckpoint>;
+  /**
+   * Connection deletes in progress (§2.11), per connector. Persisted before
+   * the first tombstone, so a crash resumes the same pins on the next boot.
+   */
+  deletes?: Record<string, { readonly pins: readonly DeletePin[] }>;
   /**
    * Per connector, how many times its checkpoint was invalidated: a control
    * change seen, or a deliberate clear. It only grows and outlives the
@@ -504,6 +515,74 @@ export class StreamSyncWriter {
   private startSnapshot(connector: string): StartSnapshot {
     if (this.controls === null) return null;
     return { ...(this.controls.get(connector) ?? {}) };
+  }
+
+  // -------------------------------------------------------------- delete
+
+  /**
+   * §2.11 connection delete. The intent (the live control rows of the
+   * connector, each at the version it was seen) is persisted first; then
+   * each pinned row is tombstoned at `version + 1`. A resumed delete writes
+   * only its pinned versions, so a reconnect that lands in between is never
+   * tombstoned. Other devices stop when their control read shows `deleted`.
+   */
+  deleteConnection(connector: string): Promise<void> {
+    return this.publish(async () => {
+      const { control } = await this.keys();
+      const pins: DeletePin[] = [];
+      for (const row of await this.options.registry.listControlRows()) {
+        const parsed = parseScope(row.scope);
+        if (parsed?.kind !== "control" || parsed.connector !== connector) {
+          continue;
+        }
+        const state = classifyControl(row.read, control);
+        if (state.kind === "active" || state.kind === "foreign") {
+          pins.push({
+            ns: parsed.ns,
+            version: state.kind === "active" ? state.generation : state.version,
+          });
+        }
+      }
+      if (pins.length === 0) return;
+      await this.withState((state) => {
+        (state.deletes ??= {})[connector] = { pins };
+      });
+      await this.runDelete(connector, pins);
+    });
+  }
+
+  /**
+   * Tombstone each pinned control row. A 409 means the row already moved on
+   * (deleted or reconnected elsewhere): that pin is resolved either way.
+   * Ambiguous and refused replies throw and leave the intent for the next
+   * boot.
+   */
+  private async runDelete(
+    connector: string,
+    pins: readonly DeletePin[],
+  ): Promise<void> {
+    const { control } = await this.keys();
+    for (const pin of pins) {
+      const request = await this.sign(
+        controlScope(connector, pin.ns),
+        control.tombstoneData,
+        control.tombstoneMetadata,
+        pin.version + 1,
+      );
+      await this.options.registry.post(request);
+      await this.readControl(connector, pin.ns);
+    }
+    await this.withState((state) => {
+      delete state.deletes?.[connector];
+    });
+  }
+
+  /** Resume every delete a previous process left in progress. */
+  private async resumeDeletes(): Promise<void> {
+    const state = await this.readState();
+    for (const [connector, intent] of Object.entries(state.deletes ?? {})) {
+      await this.runDelete(connector, intent.pins);
+    }
   }
 
   // -------------------------------------------------------------- intake
@@ -1047,6 +1126,7 @@ export class StreamSyncWriter {
         await this.options.home.files.remove(`runs/${runId}`);
       }
     }
+    await this.resumeDeletes();
   }
 
   /**
