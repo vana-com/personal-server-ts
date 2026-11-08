@@ -2490,7 +2490,9 @@ export class StreamSyncWriter {
           generation,
           // An entry written before the start snapshot existed has no `start`:
           // it decodes as unknown, the start decide discards and recollects.
-          start: startState(host.entry.start ?? null, host.entry.ns),
+          start: startState(host.entry.start, host.entry.ns),
+          userConnect: host.entry.userConnect,
+          full: host.entry.full,
           observedAt: host.entry.observedAt,
           state: streams.every((s) => s.state === "published")
             ? "published"

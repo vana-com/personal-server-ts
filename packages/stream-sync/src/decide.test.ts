@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { admitStart } from "./admission.js";
 import type { ControlState } from "./control.js";
 import {
   checkpointDecision,
@@ -92,6 +93,98 @@ describe("decide invariants (exhaustive over small states)", () => {
           : { kind: "reread" },
       );
     }
+  });
+
+  it("a deleted start: a full connect reconnects at a same delete, publishes at the next generation, and nothing else publishes", () => {
+    for (let v0 = 1; v0 <= 5; v0 += 1) {
+      const start: StartState = { kind: "deleted", version: v0 };
+      for (const current of CURRENTS) {
+        const got = decide({
+          start,
+          current,
+          userConnect: true,
+          full: true,
+          phase: "first",
+        });
+        if (current.kind === "foreign") {
+          expect(got).toEqual({ kind: "keep_pending", reason: "key_mismatch" });
+        } else if (current.kind === "deleted" && current.version === v0) {
+          expect(got).toEqual({ kind: "reconnect", target: v0 + 1 });
+        } else if (current.kind === "active" && current.generation === v0 + 1) {
+          expect(got).toEqual({ kind: "publish", target: v0 + 1 });
+        } else {
+          expect(got).toMatchObject({ kind: "discard", restartFull: false });
+        }
+      }
+    }
+  });
+
+  it("a deleted start that is not a full connect never writes or publishes, and restarts full only at its deletion or reconnect", () => {
+    for (let v0 = 1; v0 <= 5; v0 += 1) {
+      const start: StartState = { kind: "deleted", version: v0 };
+      for (const current of CURRENTS) {
+        if (current.kind === "foreign") continue;
+        const atDelete = current.kind === "deleted" && current.version === v0;
+        const atReconnect =
+          current.kind === "active" && current.generation === v0 + 1;
+        const notConnect = decide({
+          start,
+          current,
+          userConnect: false,
+          full: true,
+          phase: "first",
+        });
+        expect(notConnect).toMatchObject({
+          kind: "discard",
+          restartFull: false,
+        });
+        const notFull = decide({
+          start,
+          current,
+          userConnect: true,
+          full: false,
+          phase: "first",
+        });
+        expect(notFull).toMatchObject({
+          kind: "discard",
+          restartFull: atDelete || atReconnect,
+        });
+      }
+    }
+  });
+
+  it("the rule never admits an unknown or foreign start, and decide never writes or publishes one", () => {
+    const unadmitted: StartState[] = [
+      { kind: "unknown" },
+      { kind: "foreign", version: 1 },
+    ];
+    for (const start of unadmitted) {
+      for (const current of CURRENTS) {
+        for (const userConnect of [false, true]) {
+          for (const full of [false, true]) {
+            expect(admitStart(start, current, { userConnect, full })).toBe(
+              "discard",
+            );
+            const got = decide({
+              start,
+              current,
+              userConnect,
+              full,
+              phase: "first",
+            });
+            // A foreign current row holds every run pending, whatever its start.
+            expect(got.kind).toBe(
+              current.kind === "foreign" ? "keep_pending" : "discard",
+            );
+          }
+        }
+      }
+    }
+  });
+
+  it("decodes a missing start snapshot, null or absent, as unknown", () => {
+    expect(startState(null, "")).toEqual({ kind: "unknown" });
+    expect(startState(undefined, "")).toEqual({ kind: "unknown" });
   });
 
   it("reads the start snapshot by ns", () => {

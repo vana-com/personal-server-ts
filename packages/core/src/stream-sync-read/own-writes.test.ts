@@ -40,6 +40,7 @@ import { StreamSyncReadService } from "./service.js";
 const OWNER = `0x${"11".repeat(20)}` as const;
 // A fixed 65-byte signature: the master key both sides derive from.
 const SIGNATURE = `0x${"1f".repeat(32)}${"2a".repeat(32)}1b` as const;
+const OTHER_SIGNATURE = `0x${"3c".repeat(32)}${"4d".repeat(32)}1b` as const;
 const CONNECTOR = "acme";
 // A 16-hex namespace other than the identity-less one every run uses.
 const OTHER_NS = "0123456789abcdef";
@@ -202,7 +203,7 @@ class Device {
   readonly writer: StreamSyncWriter;
   private runs = 0;
 
-  constructor() {
+  constructor(signature: typeof SIGNATURE = SIGNATURE) {
     const blobs: StreamSyncBlobs = {
       put: async (key, bytes) => {
         if (this.storageDown) throw new Error("storage unreachable");
@@ -219,7 +220,7 @@ class Device {
         network: "test",
         open: () => this.files,
       }),
-      keys: createStreamSyncKeyPorts(SIGNATURE),
+      keys: createStreamSyncKeyPorts(signature),
       signer: { signAddData: async () => `0x${"22".repeat(65)}` },
       now: () => T0,
     });
@@ -278,16 +279,20 @@ class Device {
    */
   async begin(
     streams: Readonly<Record<string, readonly { id: string; v: number }[]>>,
+    options: {
+      readonly userConnect?: boolean;
+      readonly checkpointUsed?: { ns: string; generation: number } | null;
+    } = {},
   ): Promise<string> {
     const runId = `run-${(this.runs += 1)}`;
     await this.writer.refreshControls();
     await this.writer.beginRun({
       runId,
       connector: CONNECTOR,
-      userConnect: false,
+      userConnect: options.userConnect ?? false,
       observedAt: T0 + this.runs * 60_000,
       identity: "none",
-      checkpointUsed: null,
+      checkpointUsed: options.checkpointUsed ?? null,
     });
     for (const [stream, rows] of Object.entries(streams)) {
       await this.writer.declareStream(runId, stream, SHAPE);
@@ -875,7 +880,7 @@ describe("own-write visibility (deletion floor)", () => {
   // wait state (started at generation 3, connection now at generation 1) is
   // not published, so the grant's view over the imported base must not show
   // its rows. Under a mutant that publishes on wait, the grant would see them.
-  it("does not show a grant a run in the wait state on top of an imported view", async () => {
+  it("does not show a run waiting on an active start as published on the owner view", async () => {
     const d = new Device();
     const service = await d.openReader();
     const other = new Device();
@@ -885,33 +890,13 @@ describe("own-write visibility (deletion floor)", () => {
     await d.collect([{ id: "a", v: 1 }]);
     await d.publish();
     await d.syncReader(service);
-    const readAs = (isOwnerView: boolean) => async () => {
-      const decision = await service.resolve({
-        scope: `pdpp.${CONNECTOR}.items`,
-        connection: null,
-        cursor: null,
-        legacyFile: false,
-        isOwnerView,
-      });
-      if (decision.kind !== "view") return decision.kind;
-      const envelope = JSON.parse(await new Response(decision.body).text());
-      return Object.fromEntries(
-        envelope.data.records.map((r: { id: string; v: number }) => [
-          r.id,
-          r.v,
-        ]),
-      );
-    };
-    const grantRead = readAs(false);
-    const ownerRead = readAs(true);
-    // Precondition: the grant sees the imported base at generation 1.
-    expect(await grantRead()).toEqual({ a: 1 });
+    // Precondition: the imported base is served at generation 1.
+    expect(await latest(service)).toMatchObject({ rows: { a: 1 } });
     d.gateway.deleteControl();
     d.gateway.reviveControl();
     await d.writer.refreshControls();
     const runId = await d.begin({ items: [{ id: "b", v: 2 }] });
     await d.finish(runId);
-    await d.publish();
     // The connection drops to generation 1: the run starts at 3, so it waits.
     d.gateway.adoptControlFrom(other.gateway);
     await service.observe(d.gateway.feed(), {
@@ -923,8 +908,118 @@ describe("own-write visibility (deletion floor)", () => {
       version: 1,
       deleted: false,
     });
-    expect(await grantRead()).toEqual({ a: 1 });
-    // The owner's published fold reads local runs: the waiting run must not show.
-    expect(await ownerRead()).toEqual({ a: 1 });
+    expect(await latest(service)).toMatchObject({
+      kind: "view",
+      rows: { a: 1 },
+    });
+  });
+
+  // A deleted start: the first run after a reconnect. A full connect run
+  // will publish once the connection is back, so the owner sees it pending.
+  async function deletedConnect() {
+    const d = new Device();
+    const service = await d.openReader();
+    const other = new Device();
+    await other.collect([{ id: "z", v: 1 }]);
+    await other.publish();
+    d.gateway.adoptControlFrom(other.gateway);
+    d.gateway.deleteControl();
+    return { d, service };
+  }
+
+  it("shows a full connect run whose start is deleted, while the connection stays deleted", async () => {
+    const { d, service } = await deletedConnect();
+    const runId = await d.begin(
+      { items: [{ id: "b", v: 2 }] },
+      { userConnect: true },
+    );
+    await d.finish(runId);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+  });
+
+  it("shows a full connect run whose start is deleted, once the connection is back at the next generation", async () => {
+    const { d, service } = await deletedConnect();
+    const runId = await d.begin(
+      { items: [{ id: "b", v: 2 }] },
+      { userConnect: true },
+    );
+    await d.finish(runId);
+    d.gateway.reviveControl();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+  });
+
+  it("does not show a deleted-start run that resumed from a checkpoint, though it was a connect", async () => {
+    const { d, service } = await deletedConnect();
+    // A connect that resumes from a checkpoint is not a full run: decide
+    // discards it, so the owner must not see its rows.
+    const runId = await d.begin(
+      { items: [{ id: "b", v: 2 }] },
+      { userConnect: true, checkpointUsed: { ns: "", generation: 1 } },
+    );
+    await d.finish(runId);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
+
+  it("does not show a full connect run published before a second delete and reconnect", async () => {
+    const { d, service } = await deletedConnect();
+    const runId = await d.begin(
+      { items: [{ id: "b", v: 2 }] },
+      { userConnect: true },
+    );
+    await d.finish(runId);
+    // The writer reconnects at the next generation and publishes the run.
+    await d.publish();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    // Precondition: the run is served while its publish is the current one.
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+    d.gateway.deleteControl();
+    d.gateway.reviveControl();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
+
+  it("names the runs a foreign control key keeps pending, with reason key_mismatch", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    const other = new Device(OTHER_SIGNATURE);
+    await other.collect([{ id: "z", v: 1 }]);
+    await other.publish();
+    d.gateway.adoptControlFrom(other.gateway);
+    const runId = await d.collect([{ id: "b", v: 2 }]);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect((await latest(service)).rows).not.toHaveProperty("b");
+    // A foreign key answers key_mismatch, and the answer names the held run.
+    const decision = await service.resolve({
+      scope: `pdpp.${CONNECTOR}.items`,
+      connection: null,
+      cursor: null,
+      legacyFile: false,
+      isOwnerView: true,
+    });
+    expect(decision).toMatchObject({
+      kind: "key_mismatch",
+      withheld: [{ runId, stream: "items", reason: "key_mismatch" }],
+    });
   });
 });

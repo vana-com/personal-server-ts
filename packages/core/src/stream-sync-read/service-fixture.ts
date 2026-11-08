@@ -198,6 +198,8 @@ export interface FakeRun {
   readonly generation: number | null;
   /** The recorded start. Default: absent when `generation` is null, else active(generation). */
   readonly start?: StreamSyncOverlayRun["start"];
+  readonly userConnect?: boolean;
+  readonly full?: boolean;
   readonly state?: StreamSyncOverlayRun["state"];
   readonly observedAt?: number;
   readonly streams: readonly FakeStream[];
@@ -261,6 +263,8 @@ export class FakeOverlay implements StreamSyncOverlaySnapshotSource {
         (run.generation === null
           ? { kind: "absent" }
           : { kind: "active", generation: run.generation }),
+      userConnect: run.userConnect ?? false,
+      full: run.full ?? true,
       state: run.state ?? "pending",
       observedAt: run.observedAt ?? Date.parse("2026-11-01T00:00:00.000Z"),
       streams: run.streams.map((s) => ({

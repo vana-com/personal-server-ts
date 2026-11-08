@@ -13,6 +13,7 @@
  */
 
 import {
+  admitReceipt,
   admitStart,
   canonicalBytes32,
   classifyStreamRow,
@@ -37,6 +38,7 @@ import {
   planHeadOf,
   type Contribution,
   type Fold,
+  type WithheldContribution,
   type WithheldReason,
 } from "./fold.js";
 import { StreamSyncImporter, type ImportIssue } from "./importer.js";
@@ -154,7 +156,7 @@ export type ReadDecision =
       readonly reason: "deleted" | "no_data" | "connection_not_found";
     } & OwnerNotes)
   /** The connector's only connections were written with another owner key. */
-  | { readonly kind: "key_mismatch" }
+  | ({ readonly kind: "key_mismatch" } & OwnerNotes)
   /** The cursor names a version this server no longer holds. */
   | { readonly kind: "cursor_stale" }
   | { readonly kind: "invalid_cursor" }
@@ -623,16 +625,21 @@ export class StreamSyncReadService {
     const head = base && planHeadOf(base.head);
     const none = foldPlan(head, [], []);
     if (!snapshot || tombstoned) return none;
-    // Pending: this device's own rows that no verified activation of their
-    // generation covers. A verified control of another generation, a deleted
-    // connection and a foreign key hide them.
-    if (
-      pending
-        ? !(control.kind === "absent" || control.kind === "active")
-        : control.kind !== "active"
-    ) {
-      return none;
+    // A foreign key holds every local run pending, as the writer does: none is
+    // shown, and each is named withheld with the reason.
+    if (control.kind === "foreign") {
+      const held: WithheldContribution[] = [];
+      for (const run of snapshot.runs) {
+        if (run.connector !== connector || run.ns !== ns) continue;
+        const local = run.streams.find((s) => s.name === stream);
+        if (local) held.push({ run, stream: local, reason: "key_mismatch" });
+      }
+      return { ...none, withheld: held };
     }
+    // Published: only while the connection is active. Pending: each run is
+    // judged by the rule below, so a deleted connection shows only the full
+    // connect runs the writer will publish.
+    if (!pending && control.kind !== "active") return none;
     // A receipt at or below the stream's deletion floor was published before
     // the owner deleted the stream: the same rule servableView applies to
     // imported views, on every overlay path (owner, pending and overlay-only).
@@ -644,14 +651,12 @@ export class StreamSyncReadService {
       if (!local) continue;
       // The same rule decide() applies, on the run's recorded start: a pending
       // read shows publish and wait, a published read shows publish only. A
-      // deleted or foreign start is not decided here (decide keeps its own
-      // deleted cell): the run counts only once a receipt shows it published.
+      // published deleted-start run is judged by the generation it was
+      // published under, against the current control.
       const verdict =
-        run.start.kind === "deleted" || run.start.kind === "foreign"
-          ? local.receipt
-            ? "publish"
-            : "discard"
-          : admitStart(run.start, control);
+        run.start.kind === "deleted" && local.receipt
+          ? admitReceipt(local.receipt.generation, control)
+          : admitStart(run.start, control, run);
       if (verdict === "discard" || (verdict === "wait" && !pending)) continue;
       if (local.receipt && local.receipt.registryVersion <= floor) continue;
       if (local.receipt && base && covers(base, local.receipt)) continue;
@@ -888,11 +893,12 @@ export class StreamSyncReadService {
         e.eligibility.kind === "unavailable" &&
         e.eligibility.reason === "deleted",
     );
-    // The owner's partial view, unless a deletion hides the connector. The
-    // owner never reads fewer rows than a grant: when a grant would read the
-    // legacy body, the owner reads it too, with the notes.
+    // The owner's partial view. A deleted connection still gets the scan: the
+    // rule admits only a full connect the writer will publish, and nothing
+    // else is shown. The owner never reads fewer rows than a grant: when a
+    // grant would read the legacy body, the owner reads it too, with the notes.
     let notes: OwnerNotes = {};
-    if (input.isOwnerView && !deleted) {
+    if (input.isOwnerView) {
       const scan = this.pendingScan(
         input,
         [...targets, ...candidates],
@@ -967,7 +973,7 @@ export class StreamSyncReadService {
         ),
       );
       return foreign
-        ? { kind: "key_mismatch" }
+        ? { kind: "key_mismatch", ...notes }
         : { kind: "unavailable", reason: "connection_not_found", ...notes };
     }
     if (evaluated.some((e) => e.eligibility.kind === "legacy")) {
@@ -980,7 +986,7 @@ export class StreamSyncReadService {
           e.connections.some((c) => c.control.kind === "foreign"),
       )
     ) {
-      return { kind: "key_mismatch" };
+      return { kind: "key_mismatch", ...notes };
     }
     return { kind: "pass", ...notes };
   }
@@ -1071,7 +1077,6 @@ export class StreamSyncReadService {
       for (const ns of [...namespaces].sort()) {
         if (input.connection !== null && input.connection !== ns) continue;
         const control = this.importer.controlState(rows.controls.get(ns));
-        if (control.kind === "deleted" || control.kind === "foreign") continue;
         let at = 0;
         const shown: WithheldRun[] = [];
         // Every stream is scanned, whether or not an earlier one can be

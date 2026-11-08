@@ -107,6 +107,12 @@ export interface StreamSyncOverlayRun {
    * none. Required: the overlay is an in-process port, never serialized.
    */
   readonly start: StartState;
+  /**
+   * The run's connect and fullness, copied from its start (never rewritten):
+   * decide() reads both for a deleted start. Required, in-process only.
+   */
+  readonly userConnect: boolean;
+  readonly full: boolean;
   /** Diagnostic aggregate only. Visibility and retirement use the per-stream fields. */
   readonly state: "pending" | "failed" | "published";
   readonly error?: string;

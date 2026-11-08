@@ -41,7 +41,9 @@ export type WithheldReason =
   /** The run's publish merges seed rows the overlay does not hold. */
   | "seed_pending"
   /** The writer will publish the run, but the projector cannot project it to the requested name. */
-  | "projection_unavailable";
+  | "projection_unavailable"
+  /** A foreign control key holds the connection: the writer keeps the run pending. */
+  | "key_mismatch";
 
 export interface WithheldContribution extends Contribution {
   readonly reason: WithheldReason;
