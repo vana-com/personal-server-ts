@@ -19,7 +19,7 @@
  * row was written once.
  */
 
-import type { ControlState } from "./control.js";
+import { deletedSinceStart, type ControlState } from "./control.js";
 import { hasOwn } from "./json.js";
 
 export type StartSnapshot = Readonly<Record<string, ControlState>> | null;
@@ -103,6 +103,10 @@ function table(input: DecideInput): Decision {
           ? { kind: "keep_pending", reason: "registry_inconsistent" }
           : { kind: "reread" };
       }
+      // The shared hide rule (deletedSinceStart) and any other state an active
+      // start cannot publish under both discard.
+      if (deletedSinceStart(s, c))
+        return { ...DISCARD, clearCheckpoints: true };
       return { ...DISCARD, clearCheckpoints: true };
     }
     case "deleted": {

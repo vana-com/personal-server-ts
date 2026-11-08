@@ -607,6 +607,9 @@ export class StreamSyncWriter {
         pin.version + 1,
       );
       await this.options.registry.post(request);
+      // A conflict here means the row moved (a reconnect or another write took
+      // this version). It never throws: the read below decides what the pin
+      // means now (§2.11).
       const after = await this.readControl(connector, pin.ns);
       if (fresh && after.kind !== "deleted") {
         await this.withState((state) => {
@@ -615,8 +618,57 @@ export class StreamSyncWriter {
         throw new ConnectionDeleteSuperseded(connector);
       }
     }
+    await this.purgeConnector(connector, pins);
     await this.withState((state) => {
       delete state.deletes?.[connector];
+    });
+  }
+
+  /**
+   * Remove this device's local copies of the connector's data once its
+   * tombstones landed: the runs (in flight or finished) that started under a
+   * generation the delete ended, their results, and the connector's checkpoint
+   * and `needsFull` entries. A run that started after a reconnect (a higher
+   * generation than the pin) is kept. A run in flight that is removed is gone:
+   * its later calls are refused and nothing of it publishes.
+   */
+  private async purgeConnector(
+    connector: string,
+    pins: readonly DeletePin[],
+  ): Promise<void> {
+    const pinned = new Map(pins.map((pin) => [pin.ns, pin.version]));
+    for (const runId of await this.runIds()) {
+      const host = await this.readEntry(runId);
+      if (!host || host.entry.connector !== connector) continue;
+      const ns = host.entry.ns ?? IDENTITYLESS_NS;
+      const start = startState(host.entry.start, ns);
+      const pin = pinned.get(ns);
+      if (
+        start.kind === "active" &&
+        pin !== undefined &&
+        start.generation > pin
+      ) {
+        continue;
+      }
+      this.active.delete(runId);
+      for (const dir of [...this.derived.keys()]) {
+        if (dir.startsWith(`runs/${runId}/`)) this.derived.delete(dir);
+      }
+      await this.options.home.files.remove(`runs/${runId}`);
+    }
+    for (const path of await this.options.home.files.list("results")) {
+      const bytes = await this.options.home.files.read(path);
+      if (!bytes) continue;
+      const status = JSON.parse(decoder.decode(bytes)) as StreamSyncRunStatus;
+      if (status.connector === connector) {
+        await this.options.home.files.remove(path);
+      }
+    }
+    await this.withState((state) => {
+      delete state.checkpoints[connector];
+      state.needsFull = state.needsFull.filter(
+        (entry) => entry.connector !== connector,
+      );
     });
   }
 
@@ -885,7 +937,7 @@ export class StreamSyncWriter {
   private async collecting(runId: string): Promise<HostEntry> {
     const host = await this.readEntry(runId);
     if (!host || host.phase !== "collecting" || !this.active.has(runId)) {
-      throw new Error(`run ${runId} is not collecting in this process`);
+      throw new RunGoneError(runId);
     }
     return host;
   }
@@ -906,7 +958,7 @@ export class StreamSyncWriter {
     },
   ): Promise<"spooled" | "too_large"> {
     const run = this.active.get(runId);
-    if (!run) throw new Error(`run ${runId} is not collecting in this process`);
+    if (!run) throw new RunGoneError(runId);
     let info = this.streamCache.get(`${runId}\u0000${stream}`);
     if (!info) {
       if (shape) await this.declareStream(runId, stream, shape);

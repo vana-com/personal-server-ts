@@ -90,3 +90,18 @@ export function sameControl(a: ControlState, b: ControlState): boolean {
       return a.version === (b as typeof a).version;
   }
 }
+
+/**
+ * The hide rule of §2.4, shared by publish admission and every reader: data
+ * collected under an active control row is hidden once that row reads
+ * deleted. `start` is the state the run began under (`unknown` when no
+ * snapshot was taken); `now` is the newest state known. Both are for the same
+ * connector and namespace. A reconnect (active at a higher generation) is not
+ * a deletion and does not match.
+ */
+export function deletedSinceStart(
+  start: ControlState | { readonly kind: "unknown" },
+  now: ControlState,
+): boolean {
+  return start.kind === "active" && now.kind === "deleted";
+}
