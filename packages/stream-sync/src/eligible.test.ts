@@ -77,3 +77,102 @@ describe("eligible (property)", () => {
     ).toThrow(InvalidArgumentError);
   });
 });
+
+// Legacy fallback converse: a newer legacy file survives while any required
+// head is missing, incomplete or non-live, but never defeats a complete view.
+describe("eligible legacy fallback converse", () => {
+  const ns = "0000000000000001";
+  const active = { kind: "active" as const, generation: 1 };
+  const cases: {
+    label: string;
+    control: ControlState;
+    streams: ConnectionView["streams"];
+  }[] = [
+    { label: "absent head", control: active, streams: {} },
+    {
+      label: "live incomplete head",
+      control: active,
+      streams: { a: { live: true, complete: false } },
+    },
+    {
+      label: "complete non-live head",
+      control: active,
+      streams: { a: { live: false, complete: true } },
+    },
+    {
+      label: "foreign control",
+      control: { kind: "foreign" as const, version: 1 },
+      streams: { a: { live: true, complete: true } },
+    },
+  ];
+  it.each(cases)("falls back to legacy for $label", ({ control, streams }) => {
+    expect(
+      eligible({
+        connections: [{ ns, control, streams, latestHeadRegistration: 1 }],
+        target: { kind: "logical", streams: ["a"] },
+        legacyFile: true,
+      }),
+    ).toEqual({ kind: "legacy" });
+  });
+
+  it("keeps a deleted control unavailable rather than falling back", () => {
+    expect(
+      eligible({
+        connections: [
+          {
+            ns,
+            control: { kind: "deleted", version: 2 },
+            streams: { a: { live: true, complete: true } },
+            latestHeadRegistration: 1,
+          },
+        ],
+        target: { kind: "logical", streams: ["a"] },
+        legacyFile: true,
+      }),
+    ).toEqual({ kind: "unavailable", reason: "deleted" });
+  });
+
+  it("returns a view only if EVERY required head is live and complete", () => {
+    const heads = [
+      undefined,
+      { live: false, complete: false },
+      { live: false, complete: true },
+      { live: true, complete: false },
+      { live: true, complete: true },
+    ];
+    const controls: ControlState[] = [
+      active,
+      { kind: "foreign", version: 1 },
+      { kind: "deleted", version: 2 },
+    ];
+    for (const control of controls)
+      for (const a of heads)
+        for (const b of heads) {
+          const streams = { ...(a ? { a } : {}), ...(b ? { b } : {}) };
+          const result = eligible({
+            connections: [{ ns, control, streams, latestHeadRegistration: 1 }],
+            target: { kind: "logical", streams: ["a", "b"] },
+            legacyFile: true,
+          });
+          const allRequired =
+            control.kind === "active" &&
+            !!a?.live &&
+            !!a.complete &&
+            !!b?.live &&
+            !!b.complete;
+          expect(result).toEqual(
+            allRequired
+              ? { kind: "view", ns }
+              : control.kind === "deleted"
+                ? { kind: "unavailable", reason: "deleted" }
+                : { kind: "legacy" },
+          );
+          if (result.kind === "view") {
+            expect(control.kind).toBe("active");
+            expect([a, b].every((head) => head?.live && head.complete)).toBe(
+              true,
+            );
+          }
+        }
+  });
+});
