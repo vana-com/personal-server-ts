@@ -5,6 +5,7 @@ export * from "./registry.js";
 export * from "./blobs.js";
 export * from "./scope-routing.js";
 export * from "./writer.js";
+export * from "./writer-overlay.js";
 export {
   SpoolWriter,
   compactShard,
