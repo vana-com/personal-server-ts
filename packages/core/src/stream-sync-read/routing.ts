@@ -6,29 +6,16 @@
  * `isReplicaScope` is routed.
  */
 
-import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  logicalStreamScope,
+  parseLogicalStreamScope,
+  parseScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 
-/**
- * True for a physical stream-sync name, and for any other name with `~`: no
- * SDK scope can hold one, so it must not reach the SDK either.
- */
-export function isPhysicalScope(name: string): boolean {
-  return name.includes("~") || parseScope(name) !== null;
-}
-
-/**
- * A logical stream-sync read name: `pdpp.<c>.<s>`. `c` is the connector key
- * and may hold any character but `.` and `~` (a hyphen, for one); the SDK scope
- * rule (lowercase category) does not apply to it.
- */
-const LOGICAL_STREAM_SCOPE = /^pdpp\.([^.~]+)\.([^~]+)$/;
-
-export function logicalStreamScopeParts(
-  name: string,
-): { connector: string; stream: string } | null {
-  const match = LOGICAL_STREAM_SCOPE.exec(name);
-  return match ? { connector: match[1]!, stream: match[2]! } : null;
-}
+export {
+  isPhysicalScope,
+  parseLogicalStreamScope as logicalStreamScopeParts,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 
 /**
  * The logical read name a data route serves for `name`, or `null` when `name`
@@ -46,8 +33,11 @@ export function streamReadScope(name: string): string | null {
   const parsed = parseScope(name);
   if (parsed) {
     if (parsed.kind !== "stream" || parsed.ns !== "") return null;
-    const logical = `pdpp.${parsed.connector}.${parsed.stream}`;
-    return LOGICAL_STREAM_SCOPE.test(logical) ? logical : null;
+    try {
+      return logicalStreamScope(parsed.connector, parsed.stream);
+    } catch {
+      return null;
+    }
   }
-  return LOGICAL_STREAM_SCOPE.test(name) ? name : null;
+  return parseLogicalStreamScope(name) ? name : null;
 }

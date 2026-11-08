@@ -17,7 +17,7 @@ function word(random: () => number, min: number, allowTilde: boolean): string {
   const len = min + int(random, 12);
   while (out.length < len) {
     const c = pick(random, ALPHABET);
-    if (c === "~" && !allowTilde) continue;
+    if ((c === "~" || c === ".") && !allowTilde) continue;
     out += c;
   }
   return out;

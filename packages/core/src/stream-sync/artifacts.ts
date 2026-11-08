@@ -14,6 +14,10 @@
 
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
+import {
+  streamScope,
+  IDENTITYLESS_NS,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import type {
   IntakeDeclarations,
   IntakeStreamDeclaration,
@@ -97,7 +101,6 @@ export function manifestArtifact(document: string): VerifiedArtifact | null {
   if (
     typeof connector !== "string" ||
     connector === "" ||
-    connector.includes("~") ||
     typeof version !== "string" ||
     version === "" ||
     !Array.isArray(streams) ||
@@ -118,6 +121,11 @@ export function manifestArtifact(document: string): VerifiedArtifact | null {
         stream.semantics !== "mutable_state" &&
         stream.semantics !== "append_only")
     ) {
+      return null;
+    }
+    try {
+      streamScope(connector, IDENTITYLESS_NS, stream.name);
+    } catch {
       return null;
     }
     seen.add(stream.name);

@@ -6,12 +6,15 @@
  *   head blob:     h-<keccak-256 hex of the clear head>
  *   part blob:     g<generation>-p-<sha-256 hex of the clear part>
  *
- * `c` is the manifest connector key and never contains `~`. `ns` is 16
- * lowercase hex characters, or empty for identity-less connectors. Parse
- * takes `c` up to the first `~`, then `ns` = `([0-9a-f]{16})?`, then the end
- * (control scope) or `.` and a non-empty `s` (stream scope). A scope over 256
+ * `c` is the manifest connector key. The builders refuse a `c` that contains
+ * `.` or `~`; the physical parser takes `c` up to the first `~` (vectors/v1.json
+ * pins `pdpp.a.b~` as connector `a.b`), and a dotted physical name never maps to
+ * a logical read name. `ns` is 16 lowercase hex characters, or empty for
+ * identity-less connectors. After `c`, parse reads `ns` = `([0-9a-f]{16})?`,
+ * then the end (control scope) or `.` and a non-empty `s` (stream scope). A scope over 256
  * UTF-8 bytes is a permanent error. Old raw names `pdpp.<c>.<s>` have no `~`
- * and never parse as either kind.
+ * and never parse as either physical kind. Logical read names use a separate
+ * builder/parser below; the first dot after the prefix separates `c` from `s`.
  */
 
 import { HEX16, HEX64, NAME_LIMIT_BYTES, utf8Length } from "./bytes.js";
@@ -41,9 +44,9 @@ export type ParsedBlobName =
     };
 
 function checkConnector(connector: string): void {
-  if (connector === "" || connector.includes("~")) {
+  if (connector === "" || connector.includes("~") || connector.includes(".")) {
     throw new InvalidNameError(
-      `connector key must be non-empty and contain no "~": ${JSON.stringify(connector)}`,
+      `connector key must be non-empty and contain no "." or "~": ${JSON.stringify(connector)}`,
     );
   }
 }
@@ -100,6 +103,36 @@ export function parseScope(name: string): ParsedScope | null {
   if (tail === "") return { kind: "control", connector, ns };
   if (tail[0] !== "." || tail.length === 1) return null;
   return { kind: "stream", connector, ns, stream: tail.slice(1) };
+}
+
+/**
+ * Logical read names have no namespace: `pdpp.<c>.<s>`. A stream may contain
+ * dots, but a connector may not, so splitting at the first dot is lossless.
+ * Physical-only stream names containing `~` cannot be logical read names.
+ * Route-specific path/whitespace checks belong to the route, not this codec.
+ */
+const LOGICAL_STREAM_SCOPE = /^pdpp\.([^.~]+)\.([^~]+)$/;
+
+export function logicalStreamScope(connector: string, stream: string): string {
+  checkConnector(connector);
+  if (stream === "" || stream.includes("~")) {
+    throw new InvalidNameError(
+      "logical stream name must be non-empty and contain no '~'",
+    );
+  }
+  return `${SCOPE_PREFIX}${connector}.${stream}`;
+}
+
+export function parseLogicalStreamScope(
+  name: string,
+): { connector: string; stream: string } | null {
+  const match = LOGICAL_STREAM_SCOPE.exec(name);
+  return match ? { connector: match[1]!, stream: match[2]! } : null;
+}
+
+/** Also catches malformed names containing `~`, which must never reach the SDK. */
+export function isPhysicalScope(name: string): boolean {
+  return name.includes("~");
 }
 
 export function headBlobName(keccakHex: string): string {
