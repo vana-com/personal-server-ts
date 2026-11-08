@@ -19,6 +19,11 @@ import {
   type StreamSyncReadOptions,
 } from "./service.js";
 import { buildTestHead, type TestOwnerKey } from "./testing.js";
+import {
+  NO_FLOOR,
+  planStream,
+  type PlanRun,
+} from "../stream-sync/publish-plan.js";
 
 const META = `0x${"ab".repeat(32)}`;
 const silent = { info() {}, warn() {}, error() {} };
@@ -175,7 +180,7 @@ export interface FakeStream {
   readonly name: string;
   readonly rows: readonly Line[];
   readonly complete?: boolean;
-  /** See `StreamSyncOverlayStream.incompleteOverBase`. */
+  /** The run resumed from another namespace's checkpoint (the plan's `foreignCheckpoint`). */
   readonly incompleteOverBase?: boolean;
   readonly contentRevision?: string;
   readonly receipt?: StreamSyncPublishReceipt;
@@ -194,6 +199,37 @@ export interface FakeRun {
   readonly state?: StreamSyncOverlayRun["state"];
   readonly observedAt?: number;
   readonly streams: readonly FakeStream[];
+}
+
+/** The plan facts of a fake stream: the descriptor read as a writer run. */
+function fakePlanRun(run: StreamSyncOverlayRun, s: FakeStream): PlanRun {
+  const primaryKey = s.primaryKey ?? ["id"];
+  const profile = { key: s.profileKey ?? null, version: s.version ?? "1.0.0" };
+  return {
+    runId: run.runId,
+    observedAt: run.observedAt,
+    generation: run.generation,
+    primaryKey,
+    profile,
+    full: s.complete ?? false,
+    foreignCheckpoint: s.incompleteOverBase ?? false,
+    empty: s.rows.length === 0,
+    seed: "none",
+    ...(s.receipt
+      ? {
+          executed: {
+            kind: "publish" as const,
+            head: {
+              generation: s.receipt.generation,
+              primaryKey,
+              profile,
+              complete: s.complete ?? false,
+            },
+            replacesBase: false,
+          },
+        }
+      : {}),
+  };
 }
 
 /** A snapshot source that counts what the reader does with it. */
@@ -224,9 +260,7 @@ export class FakeOverlay implements StreamSyncOverlaySnapshotSource {
         name: s.name,
         primaryKey: s.primaryKey ?? ["id"],
         profile: { key: s.profileKey ?? null, version: s.version ?? "1.0.0" },
-        complete: s.complete ?? false,
-        recordCount: s.rows.length,
-        incompleteOverBase: s.incompleteOverBase ?? false,
+        complete: (s.complete ?? false) && !(s.incompleteOverBase ?? false),
         contentRevision: s.contentRevision ?? "r1",
         state: s.receipt
           ? "published"
@@ -254,6 +288,18 @@ export class FakeOverlay implements StreamSyncOverlaySnapshotSource {
       runs: taken
         .filter(() => connector === this.connector)
         .map((t) => t.described),
+      plan: (ns, stream, head, ids) =>
+        connector !== this.connector
+          ? []
+          : planStream(
+              head,
+              NO_FLOOR,
+              taken.flatMap(({ run, described }) => {
+                const s = run.streams.find((x) => x.name === stream);
+                if (run.ns !== ns || !s || !ids.includes(run.runId)) return [];
+                return [fakePlanRun(described, s)];
+              }),
+            ),
       lines: (entry, stream) => {
         this.beforeLines?.();
         const found =

@@ -1,8 +1,8 @@
 /**
  * The owner is told about every local run the writer will not publish, on
- * every path of the answer, including the paths that serve no view: a read
- * whose every pending run is withheld, with or without a legacy body and with
- * an explicit connection. A grant is told nothing.
+ * every path of the answer: the owner's partial view of an incomplete head
+ * (with or without an explicit connection) and the legacy body a grant would
+ * read too. A grant is told nothing.
  */
 
 import { describe, expect, it } from "vitest";
@@ -71,11 +71,12 @@ async function resolve(
   );
 }
 
-describe("withheld runs reach the owner on a read that serves no view", () => {
-  it("passes with the withheld run when no legacy body exists", async () => {
+describe("withheld runs reach the owner on a read that serves no complete view", () => {
+  it("serves the incomplete head with the withheld run when no legacy body exists", async () => {
     const warns: unknown[][] = [];
     const decision = await resolve(801, {}, warns);
-    expect(decision.kind).toBe("pass");
+    expect(decision.kind).toBe("local_pending");
+    expect((decision as { complete?: boolean }).complete).toBe(false);
     expect((decision as { withheld?: unknown }).withheld).toEqual(WITHHELD);
     const logs = warns.filter((c) => JSON.stringify(c).includes("withheld"));
     expect(logs).toHaveLength(1);
@@ -88,9 +89,9 @@ describe("withheld runs reach the owner on a read that serves no view", () => {
     expect((decision as { withheld?: unknown }).withheld).toEqual(WITHHELD);
   });
 
-  it("names the withheld run when an explicit connection finds no view", async () => {
+  it("names the withheld run on an explicit connection's partial view", async () => {
     const decision = await resolve(803, { connection: "ns" });
-    expect(decision.kind).toBe("unavailable");
+    expect(decision.kind).toBe("local_pending");
     expect((decision as { withheld?: unknown }).withheld).toEqual(WITHHELD);
   });
 

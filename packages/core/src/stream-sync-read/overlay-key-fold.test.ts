@@ -108,45 +108,35 @@ describe("overlay fold under the writer's compatible-writer rule", () => {
     expect((out.decision as any).withheld).toBeUndefined();
   });
 
-  it("starts from an empty base when a newer connector changed the key (full run: complete view)", async () => {
-    const { f, ns } = await setup(302);
-    await publishBase(f, ns);
-    f.overlay.runs = [
-      fakeRun(ns, {
-        runId: "r1",
-        rows: [{ uid: "u1" }],
-        primaryKey: ["uid"],
-        version: "2.0.0",
-        complete: true,
-      }),
-    ];
-    const out = await read(f);
-    expect(out.kind).toBe("view");
-    expect(out.ids).toEqual(["u1"]);
-  });
-
-  it("starts from an empty base when a newer connector changed the key (partial run: not a complete view)", async () => {
-    const { f, ns } = await setup(303);
-    await publishBase(f, ns);
-    f.overlay.runs = [
-      fakeRun(ns, {
-        runId: "r1",
-        rows: [{ uid: "u1" }],
-        primaryKey: ["uid"],
-        version: "2.0.0",
-        complete: false,
-      }),
-    ];
-    // The writer would publish complete:false over an empty base. The owner
-    // still sees the run's rows, marked pending; a grant sees the registered
-    // base, as it would with no local run.
-    const owner = await read(f);
-    expect(owner.kind).toBe("local_pending");
-    expect(owner.ids).toEqual(["u1"]);
-    const grant = await read(f, { isOwnerView: false });
-    expect(grant.kind).toBe("view");
-    expect(grant.ids).toEqual(["a", "b"]);
-  });
+  it.each([true, false])(
+    "keeps the base, marked incomplete, while a newer connector's key reset is pending (full run: %s)",
+    async (complete) => {
+      const { f, ns } = await setup(complete ? 302 : 303);
+      await publishBase(f, ns);
+      f.overlay.runs = [
+        fakeRun(ns, {
+          runId: "r1",
+          rows: [{ uid: "u1" }],
+          primaryKey: ["uid"],
+          version: "2.0.0",
+          complete,
+        }),
+      ];
+      // The writer will replace the base with the run's rows. A grant reads
+      // the base until the reset is imported, and the owner never reads
+      // fewer rows than a grant: the base stays, the reset is withheld.
+      const owner = await read(f);
+      expect(owner.kind).toBe("local_pending");
+      expect(owner.ids).toEqual(["a", "b"]);
+      expect(owner.envelope.complete).toBe(false);
+      expect((owner.decision as any).withheld).toEqual([
+        { runId: "r1", stream: "items", reason: "key_reset_pending" },
+      ]);
+      const grant = await read(f, { isOwnerView: false });
+      expect(grant.kind).toBe("view");
+      expect(grant.ids).toEqual(["a", "b"]);
+    },
+  );
 
   it.each(["1.0.0", "0.9.0"])(
     "keeps the base and reports the run withheld when connector %s changed the key (base 1.0.0)",
@@ -201,7 +191,7 @@ describe("overlay fold under the writer's compatible-writer rule", () => {
     expect(JSON.stringify(withheldLogs)).not.toContain("secret-row");
   });
 
-  it("folds two runs with a key change between them, in publish order", async () => {
+  it("shows the runs before a key reset and withholds the reset and every later run, in publish order", async () => {
     const { f, ns } = await setup(306);
     await publishBase(f, ns);
     const runs = [
@@ -233,11 +223,14 @@ describe("overlay fold under the writer's compatible-writer rule", () => {
     ]) {
       f.overlay.runs = order;
       const out = await read(f);
-      // a merges onto the base; b empties it; c merges onto b. Complete came
-      // from b's full run and survives c.
-      expect(out.kind).toBe("view");
-      expect(out.ids).toEqual(["u1", "u2"]);
-      expect((out.decision as any).withheld).toBeUndefined();
+      // a merges onto the base; b would empty it, so b and c (which builds
+      // on b) wait until they are imported.
+      expect(out.kind).toBe("local_pending");
+      expect(out.ids).toEqual(["a", "a2", "b"]);
+      expect((out.decision as any).withheld).toEqual([
+        { runId: "b", stream: "items", reason: "key_reset_pending" },
+        { runId: "c", stream: "items", reason: "earlier_run_pending" },
+      ]);
     }
   });
 
@@ -252,16 +245,18 @@ describe("overlay fold under the writer's compatible-writer rule", () => {
       version: "2.0.0",
       complete: true,
     });
-    // b publishes first (empty base, key uid); z then meets key uid with an
-    // older connector and is withheld.
+    // b publishes first (empty base, key uid), so it is withheld until it
+    // is imported; z then meets key uid with an older connector and is
+    // refused.
     for (const order of [
       [z, b],
       [b, z],
     ]) {
       f.overlay.runs = order;
       const out = await read(f);
-      expect(out.ids).toEqual(["u1"]);
+      expect(out.ids).toEqual(["a", "b"]);
       expect((out.decision as any).withheld).toEqual([
+        { runId: "b", stream: "items", reason: "key_reset_pending" },
         { runId: "z", stream: "items", reason: "connector_update_required" },
       ]);
     }

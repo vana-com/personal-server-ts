@@ -90,13 +90,25 @@ async function get(deps: PersonalServerDataApiDeps, builder: boolean) {
 }
 
 describe("data reads of a device's own rows", () => {
-  it("serves the owner an overlay-only view", async () => {
-    const { deps, accessLog } = await setup(71);
+  it("serves the owner an overlay-only view when no stored body exists", async () => {
+    const { deps, accessLog } = await setup(71, true, false);
     const read = await get(deps, false);
     expect(read.status).toBe(200);
     expect(read.source).toBe("stream-sync");
     expect(read.body.data.records).toEqual([{ id: "local", v: 1 }]);
     expect(accessLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers the owner with the stored body a grantee reads, and says a run is pending", async () => {
+    // A complete overlay-only view does not contain the stored body: the
+    // owner never reads fewer records than a grantee of the same stream.
+    const { deps } = await setup(71);
+    const owner = await get(deps, false);
+    const grant = await get(deps, true);
+    expect(grant.source).toBe("legacy");
+    expect(owner.source).toBe("legacy");
+    expect(owner.body.data.records).toEqual(STORED);
+    expect(owner.pending).toBe("1");
   });
 
   it("answers a grantee with today's stored body, not the overlay-only view", async () => {
@@ -153,7 +165,7 @@ describe("data reads of a device's own rows against a stored body", () => {
     expect(read.body.data.records).toEqual(STORED);
   });
 
-  it("serves the stored body without a marker when the pending run is older", async () => {
+  it("counts a pending run with no record, whatever its time", async () => {
     const { f, deps } = await setup(77, false);
     f.overlay.runs = f.overlay.runs.map((r) => ({
       ...r,
@@ -162,7 +174,8 @@ describe("data reads of a device's own rows against a stored body", () => {
     }));
     const read = await get(deps, false);
     expect(read.source).toBe("legacy");
-    expect(read.pending).toBeNull();
+    // Unpublished runs are counted, never compared by time.
+    expect(read.pending).toBe("1");
     expect(read.body.data.records).toEqual(STORED);
   });
 

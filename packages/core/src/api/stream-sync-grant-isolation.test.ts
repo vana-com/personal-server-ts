@@ -6,9 +6,11 @@ import { Fixture, masterKey } from "../stream-sync-read/service-fixture.js";
 import { testOwnerKey } from "../stream-sync-read/testing.js";
 
 /**
- * An owner's unpublished local rows are never served to a grant, even when a
- * full run under a replacement key would replace the registered view for the
- * owner. The grant is served the registered head, as if no local run existed.
+ * An owner's unpublished local rows are never served to a grant. A full run
+ * under a replacement key replaces the registered head once published; until
+ * the reader imports it, the owner reads the registered head too, with the
+ * run withheld. The grant is served the registered head, as if no local run
+ * existed.
  */
 
 const BUILDER = "0x000000000000000000000000000000000000bEEF";
@@ -101,9 +103,13 @@ describe("GET /v1/data/:scope with a full replacement-key local run", () => {
     expect(read.withheld).toBeNull();
   });
 
-  it("still serves the owner the local rows in place of the base", async () => {
+  it("serves the owner the base a grant reads, with the reset withheld until it is imported", async () => {
     const read = await get(await setup(332), false);
     expect(read.status).toBe(200);
-    expect(read.body.data.records).toEqual([{ uid: "local-private" }]);
+    expect(read.body.data.records).toEqual([
+      { id: "base-a", v: 1 },
+      { id: "base-b", v: 1 },
+    ]);
+    expect(read.withheld).toBe("key_reset_pending");
   });
 });

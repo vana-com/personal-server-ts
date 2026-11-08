@@ -1,14 +1,18 @@
 /**
  * Writer parity: the owner's read of a stream before its pending runs are
- * published equals the read after the real writer publishes them and the
- * reader imports the result: the same rows, the same completeness, the same
- * withheld runs. The writer here is the real `StreamSyncWriter`; the overlay
- * describes its pending runs the way an overlay source would.
+ * published, against the read after the real writer publishes them and the
+ * reader imports the result. The writer here is the real `StreamSyncWriter`;
+ * the reader reads the writer's own publish plan through its overlay source.
+ *
+ * Where the read shows every run, it equals the published read: the same rows,
+ * the same completeness. Where it withholds a run the writer will publish (a
+ * key reset over the base, or a step whose seed is not resolved), the owner
+ * keeps the base, marked incomplete. A run the writer refuses is withheld
+ * before and after, with the same reason.
  */
 
 import { describe, expect, it } from "vitest";
 import { ask } from "./service-fixture.js";
-import { foldContributions } from "./fold.js";
 import { liveStreamCounts } from "./service.js";
 import { CONNECTOR, Rig, type RunSpec, type SeedRows } from "./writer-rig.js";
 
@@ -37,6 +41,7 @@ interface Observed {
   /** The records themselves; null when an incomplete head is not a view. */
   readonly records: string[] | null;
   readonly complete: boolean | undefined;
+  /** `runId:reason`, sorted. */
   readonly withheld: string[];
 }
 
@@ -56,7 +61,7 @@ async function observe(rig: Rig): Promise<Observed> {
   snapshot.release();
   const withheld =
     decision.kind === "view" || decision.kind === "local_pending"
-      ? (decision.withheld ?? []).map((w) => w.runId).sort()
+      ? (decision.withheld ?? []).map((w) => `${w.runId}:${w.reason}`).sort()
       : [];
   // An incomplete imported head is not served as a view (§2.10): count what
   // it holds instead, which is what the owner read before it was published.
@@ -89,8 +94,13 @@ async function compare(input: {
   const statuses = await rig.publish();
   await rig.sync();
   const refused = statuses
-    .filter((s) => s.streams["items"]?.problem === "connector_update_required")
-    .map((s) => s.runId)
+    .flatMap((s) => {
+      const problem = s.streams["items"]?.problem;
+      return problem === "connector_update_required" ||
+        problem === "out_of_order"
+        ? [`${s.runId}:${problem}`]
+        : [];
+    })
     .sort();
   const after = await observe(rig);
   return { before, after, refused };
@@ -98,16 +108,23 @@ async function compare(input: {
 
 describe("the overlay read equals the read after the real writer publishes", () => {
   it.each<
-    [string, number, { base: RunSpec; runs: RunSpec[]; seed?: SeedRows }]
+    [
+      string,
+      number,
+      string[],
+      { base: RunSpec; runs: RunSpec[]; seed?: SeedRows },
+    ]
   >([
     [
       "the same key",
       3,
+      [],
       { base, runs: [run({ runId: "r1", rows: [{ id: "c", v: 1 }] })] },
     ],
     [
       "a newer connector with a changed key, full run",
       1,
+      ["r1:key_reset_pending"],
       {
         base,
         runs: [
@@ -124,6 +141,7 @@ describe("the overlay read equals the read after the real writer publishes", () 
     [
       "a newer connector with a changed key, partial run",
       1,
+      ["r1:key_reset_pending"],
       {
         base,
         runs: [
@@ -139,6 +157,7 @@ describe("the overlay read equals the read after the real writer publishes", () 
     [
       "an older connector with a changed key",
       2,
+      ["r1:connector_update_required"],
       {
         base: { ...base, version: "2.0.0" },
         runs: [
@@ -155,6 +174,7 @@ describe("the overlay read equals the read after the real writer publishes", () 
     [
       "a key change and back",
       1,
+      ["r1:key_reset_pending", "r2:earlier_run_pending"],
       {
         base,
         runs: [
@@ -176,8 +196,9 @@ describe("the overlay read equals the read after the real writer publishes", () 
       },
     ],
     [
-      "an older no-op run, then an older changed key",
+      "an older empty run, then an older changed key",
       2,
+      ["r1:connector_update_required", "r2:connector_update_required"],
       {
         base: { ...base, version: "2.0.0" },
         runs: [
@@ -193,8 +214,9 @@ describe("the overlay read equals the read after the real writer publishes", () 
       },
     ],
     [
-      "a newer no-op run, then a newer changed key",
-      1,
+      "a newer no-op run raises the floor above a later changed key",
+      2,
+      ["r2:connector_update_required"],
       {
         base: { ...base, version: "2.0.0" },
         runs: [
@@ -212,6 +234,7 @@ describe("the overlay read equals the read after the real writer publishes", () 
     [
       "a checkpoint from another namespace",
       3,
+      [],
       {
         base,
         runs: [
@@ -223,44 +246,62 @@ describe("the overlay read equals the read after the real writer publishes", () 
         ],
       },
     ],
-  ])("%s", async (_name, heads, input) => {
+    [
+      "an older run with a row is refused",
+      2,
+      ["r1:connector_update_required", "r2:connector_update_required"],
+      {
+        base: { ...base, version: "2.0.0" },
+        runs: [
+          run({ runId: "r1", version: "1.0.0", rows: [{ id: "c", v: 1 }] }),
+          run({
+            runId: "r2",
+            key: "uid",
+            version: "1.5.0",
+            full: true,
+            rows: [{ uid: "u1" }],
+          }),
+        ],
+      },
+    ],
+  ])("%s", async (_name, heads, withheldBefore, input) => {
     const { before, after, refused } = await compare(input);
     expect(before.records).not.toBeNull();
-    expect(before.complete).toBe(after.complete);
     expect(after.rows).toBe(heads);
-    if (before.complete) {
-      expect(before.rows).toBe(heads);
+    expect(before.withheld).toEqual(withheldBefore);
+    expect(after.withheld).toEqual(refused);
+    // Every run the writer refuses, the read withheld with the same reason.
+    expect(before.withheld).toEqual(expect.arrayContaining(refused));
+    if (before.withheld.every((w) => refused.includes(w))) {
+      expect(before.complete).toBe(after.complete);
       expect(before.records).toEqual(after.records);
     } else {
-      // An incomplete head is not a view: the owner reads this device's own
-      // rows, which the published head holds.
-      expect(before.rows).toBeLessThanOrEqual(heads);
+      // A run the writer publishes is withheld: the owner keeps the base.
+      expect(before.complete).toBe(false);
+      expect(before.rows).toBe(input.base.rows.length);
     }
-    expect(before.withheld).toEqual(refused);
-    expect(after.withheld).toEqual(refused);
   });
 });
 
 describe("a seeded first publish", () => {
-  it("is complete after, and never claimed complete before", async () => {
+  it("is withheld before admission resolves the seed, complete after", async () => {
     // The seed (a host's retained history) merges into the first publish, so
-    // the head is complete although the run resumed from a checkpoint. The
-    // overlay descriptor cannot say so: the seed is read at publish time. The
-    // reader takes the cautious side: incomplete before, complete after.
+    // the head is complete although the run resumed from a checkpoint. Before
+    // admission the plan cannot tell whether a seed merges, so it defers the
+    // run; the read withholds it.
     const rig = new Rig({
       key: "id",
       version: "1.0.0",
       rows: [{ id: "seed" }],
     });
     await rig.open();
-    const spec = run({ runId: "r1", rows: [{ id: "c", v: 1 }] });
-    await rig.collect(spec);
+    await rig.collect(run({ runId: "r1", rows: [{ id: "c", v: 1 }] }));
     const snapshot = await rig.overlay.snapshot(CONNECTOR);
-    const pending = snapshot.runs[0]!;
-    const folded = foldContributions(null, [
-      { run: pending, stream: pending.streams[0]! },
-    ]);
+    const steps = snapshot.plan(rig.ns, "items", null, ["r1"]);
     snapshot.release();
+    expect(steps.map((s) => s.decision)).toEqual([
+      { kind: "deferred", reason: "seed_unresolved" },
+    ]);
 
     await rig.publish();
     await rig.sync();
@@ -268,34 +309,9 @@ describe("a seeded first publish", () => {
       .connectionViews(CONNECTOR)
       .find((c) => c.ns === rig.ns)?.streams["items"];
     expect(head?.live).toBe(true);
-    expect(folded.complete).toBe(false);
     expect(head?.complete).toBe(true);
     const read = await observe(rig);
     expect(read.records).toContain(JSON.stringify({ id: "c", v: 1 }));
     expect(read.records).toContain(JSON.stringify({ id: "seed" }));
-  });
-});
-
-describe("where the overlay cannot tell, it withholds more than the writer", () => {
-  it("an older same-key run with a row may be skipped by the writer, so the profile stays high", async () => {
-    // The writer publishes r1 (its row is new), so the head's profile drops
-    // to 1.0.0 and it then publishes r2 (1.5.0 is newer). The overlay cannot
-    // see that r1's row wins, so it keeps 2.0.0 and withholds r2. It never
-    // does the reverse: it never shows a run the writer refuses.
-    const { before, refused } = await compare({
-      base: { ...base, version: "2.0.0" },
-      runs: [
-        run({ runId: "r1", version: "1.0.0", rows: [{ id: "c", v: 1 }] }),
-        run({
-          runId: "r2",
-          key: "uid",
-          version: "1.5.0",
-          full: true,
-          rows: [{ uid: "u1" }],
-        }),
-      ],
-    });
-    expect(refused).toEqual([]);
-    expect(before.withheld).toEqual(["r2"]);
   });
 });

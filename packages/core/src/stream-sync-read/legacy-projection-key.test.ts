@@ -1,7 +1,8 @@
 /**
  * A legacy-named read projects with the profile key of the head the writer
  * will leave (the fold's shape), not the key of the imported base the run
- * built on.
+ * built on. A key reset over the imported base is withheld until it is
+ * imported (fold.ts): the owner then reads what a grant reads.
  */
 
 import { describe, expect, it } from "vitest";
@@ -32,7 +33,7 @@ const activity = {
   exported_at: null,
 };
 
-async function scenario(seed: number, replaceKey: boolean) {
+async function scenario(seed: number, replaceKey: boolean, isOwnerView = true) {
   const f = new Fixture(await testOwnerKey(masterKey(seed)));
   f.overlay.connector = CONNECTOR;
   const ns = await f.key.ns(CONNECTOR, "account-1");
@@ -71,21 +72,33 @@ async function scenario(seed: number, replaceKey: boolean) {
   ];
   const service = await f.service();
   await f.sync(service);
-  return service.resolve(ask(SCOPE));
+  return service.resolve(ask(SCOPE, { isOwnerView }));
 }
 
 describe("legacy projection key", () => {
-  for (const [name, replaceKey] of [
-    ["over a retained base (use_base)", false],
-    ["after an empty_base fold", true],
-  ] as const) {
-    it(`projects with the published head's profile key ${name}`, async () => {
-      const decision = await scenario(replaceKey ? 702 : 701, replaceKey);
-      expect(decision.kind).toBe("view");
-      const envelope = await body(decision);
-      expect(envelope.data.activities.map((a: { id: string }) => a.id)).toEqual(
-        replaceKey ? [activity.id] : ["old", activity.id].sort(),
-      );
+  it("projects with the published head's profile key over a retained base (use_base)", async () => {
+    const decision = await scenario(701, false);
+    expect(decision.kind).toBe("view");
+    const envelope = await body(decision);
+    expect(envelope.data.activities.map((a: { id: string }) => a.id)).toEqual(
+      ["old", activity.id].sort(),
+    );
+  });
+
+  it("projects the imported base, as a grant does, while a key reset is withheld", async () => {
+    // The base's profile key maps to no binding: a grant's read fails the
+    // projection. The owner's partial view (the base, the reset withheld)
+    // fails it too, never with the reset run's key: no partial view serves,
+    // and the existing path answers with the withheld run.
+    await expect(scenario(703, true, false)).rejects.toThrow(
+      "unsupported_profile",
+    );
+    const owner = await scenario(702, true);
+    expect(owner).toEqual({
+      kind: "pass",
+      withheld: [
+        { runId: "r1", stream: "activities", reason: "key_reset_pending" },
+      ],
     });
-  }
+  });
 });

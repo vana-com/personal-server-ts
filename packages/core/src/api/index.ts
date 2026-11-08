@@ -638,6 +638,14 @@ function ownerNoteHeaders(
   if (notes?.pending) {
     headers["X-Stream-Sync-Pending"] = String(notes.pending.runs);
   }
+  if (notes?.awaitingImport) {
+    headers["X-Stream-Sync-Awaiting-Import"] = String(
+      notes.awaitingImport.runs,
+    );
+  }
+  if (notes?.notReflected) {
+    headers["X-Stream-Sync-Not-Reflected"] = String(notes.notReflected.streams);
+  }
   return headers;
 }
 
@@ -696,6 +704,20 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
         409,
         "CURSOR_STALE",
         "The cursor names a version this server no longer holds; read again without it",
+      );
+    case "busy":
+      return jsonResponse(
+        {
+          error: {
+            code: 503,
+            errorCode: "STREAM_SYNC_READ_BUSY",
+            message: "This data is changing; read again shortly",
+          },
+        },
+        {
+          status: 503,
+          headers: { "Retry-After": String(decision.retryAfterSeconds) },
+        },
       );
     case "invalid_cursor":
       return errorResponse(400, "INVALID_CURSOR", "cursor is not valid");
@@ -782,9 +804,12 @@ async function serveStreamSyncView(
       "Transfer-Encoding": "chunked",
       "X-Vana-Data-Source": "stream-sync",
       "X-Stream-Sync-Cursor": decision.cursor,
-      // The rows are this device's own and not yet activated.
+      // An owner-only view built on this device; it may be partial.
       ...(decision.kind === "local_pending"
-        ? { "X-Stream-Sync-Origin": "local-pending" }
+        ? {
+            "X-Stream-Sync-Origin": "local-pending",
+            "X-Stream-Sync-Complete": String(decision.complete),
+          }
         : {}),
       // Owner only: the service attaches this to no other audience.
       ...(decision.withheld?.length

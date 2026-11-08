@@ -1,10 +1,10 @@
 /**
  * A legacy body answers the owner as before own-writes. Its collectedAt is an
  * ingest stamp of some server, not a time comparable with a run's observedAt,
- * so no time decides between the two. When pending rows that the legacy body
- * does not supersede exist (a pending run with records), the owner is told:
- * a count of pending runs on the decision. A grant is told nothing. With no
- * legacy body the pending run is served as local_pending.
+ * so no time decides between the two. When local runs are not published yet,
+ * with or without records, the owner is told: the count of distinct
+ * unpublished runs on the decision. A grant is told nothing. With no legacy
+ * body the pending run is served as local_pending.
  */
 
 import { describe, expect, it } from "vitest";
@@ -86,20 +86,21 @@ describe.each([
       });
     });
 
-    it("keeps the legacy body without a marker when the pending run is empty", async () => {
+    it("keeps the legacy body and counts empty pending runs too", async () => {
       const { f, ns, generation } = await setup(seed + 3, activate);
       f.overlay.runs = [
         pendingRun(ns, generation, "r1", [], T + 100),
         pendingRun(ns, generation, "r2", [], T + 200),
       ];
-      expect(await read(f, { legacyFile: true })).toEqual({ kind: kept });
+      const want = { kind: kept, pending: { runs: 2 } };
+      expect(await read(f, { legacyFile: true })).toEqual(want);
       // A caller that still sends the legacy ingest stamp changes nothing: an
       // empty run newer than it must not select older rows over the body.
       const stamped = { legacyFile: true, legacyCollectedAt: T } as never;
-      expect(await read(f, stamped)).toEqual({ kind: kept });
+      expect(await read(f, stamped)).toEqual(want);
     });
 
-    it("counts only the pending runs that hold records", async () => {
+    it("counts every distinct unpublished run, with records or not", async () => {
       const { f, ns, generation } = await setup(seed + 4, activate);
       f.overlay.runs = [
         pendingRun(ns, generation, "r1", [line("x", "r1")]),
@@ -108,7 +109,7 @@ describe.each([
       ];
       expect(await read(f, { legacyFile: true })).toEqual({
         kind: kept,
-        pending: { runs: 2 },
+        pending: { runs: 3 },
       });
     });
 
