@@ -596,14 +596,17 @@ export class StreamSyncReadService {
 
   /**
    * The local runs whose rows `stream` of `(connector, ns)` shows on top of
-   * `base`, read from the writer's publish plan (`foldPlan`). A run counts
-   * only under a verified active control state of this key and its own
-   * generation (never the one active at read time), and never over a
-   * tombstoned stream row. A published stream that `base` already covers adds
-   * nothing: its rows are in the view.
+   * `base`, read from the writer's publish plan (`foldPlan`). Each run is
+   * judged by the start-to-current rule alone, `admitStart(run.start, control,
+   * run)`: a pending read shows the runs the rule publishes or waits on, and a
+   * published read shows only the runs it publishes. A foreign control
+   * withholds every run of the key with reason `key_mismatch`. A tombstoned
+   * stream row shows nothing. A run at or below the stream's deletion floor,
+   * or one that `base` already covers, adds nothing. Whether a connection
+   * serves a view at all is decided by `eligible()`, not here.
    *
-   * `pending` reads this device's own rows that no verified activation of
-   * their generation covers. `steps`, from a cursor, replays the plan of
+   * `pending` reads this device's own rows the rule does not yet publish, for
+   * the owner's pending view. `steps`, from a cursor, replays the plan of
    * exactly those runs; the withheld and unpublished runs are still every
    * such run now.
    */
