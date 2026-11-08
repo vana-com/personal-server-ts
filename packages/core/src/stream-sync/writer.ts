@@ -129,6 +129,12 @@ export interface StreamSyncCheckpoint {
   readonly ns: string;
   readonly generation: number;
   readonly value: JsonValue | null;
+  /**
+   * R28/R30: streams whose saved cursor came from a retry end and may
+   * resume while their history is incomplete. Cleared by a complete commit of
+   * the stream and by invalidation (which drops the whole checkpoint).
+   */
+  readonly prov?: readonly string[];
 }
 
 export type SeedReceipt = "merged" | "skipped";
@@ -172,6 +178,8 @@ interface HostStream {
   fullStream: boolean;
   /** The seed is merged into this stream's publish. */
   seedApplies: boolean;
+  /** R28: an uncovered stream of a retry end; its publish is never complete. */
+  retryProgress?: boolean;
   recordTooLarge: number;
   problem: StreamSyncHostProblem | null;
   detail: string | null;
@@ -216,6 +224,12 @@ interface HostEntry {
   seedStreams: string[];
   /** M5: who the run writes for; checked again before it publishes. */
   binding?: { owner: string; keyCheck: string; leaseId: string | null };
+  /** R28: set for a retry_pending end; `covered` is the producer's coverage. */
+  retry?: { covered: string[] } | null;
+  /** A stream head this run found tombstoned: its continuation is void. */
+  tombstoned?: boolean;
+  /** R28: the run's whole-read streams (`incremental: false`). */
+  wholeRead?: string[];
 }
 
 /** The START the writer issued to a run (V2 §2.1). */
@@ -223,6 +237,8 @@ export interface IssuedStart {
   readonly collectionMode: "full_refresh" | "incremental";
   readonly state: JsonValue | null;
   readonly keyCheck: string;
+  /** R28: streams whose stored cursor is a valid retry continuation. */
+  readonly provenance?: readonly string[];
 }
 
 export interface StreamSyncRunStart {
@@ -524,6 +540,20 @@ export class StreamSyncWriter {
     };
   }
 
+  /** The stored checkpoint and needsFull streams, before the R28 provenance rule. */
+  private async planState(connector: string): Promise<{
+    needsFull: readonly string[];
+    checkpoint: StreamSyncCheckpoint | null;
+  }> {
+    const state = await this.readState();
+    return {
+      needsFull: state.needsFull
+        .filter((k) => k.connector === connector)
+        .map((k) => k.stream),
+      checkpoint: state.checkpoints[connector] ?? null,
+    };
+  }
+
   /**
    * §2.9 seed state of `connector` on this install: whether the seed target
    * is known (set by the first identified run of the connector) and the
@@ -571,14 +601,46 @@ export class StreamSyncWriter {
     checkpoint: StreamSyncCheckpoint | null;
     full: boolean;
   }> {
-    const plan = await this.runPlan(connector);
-    const full = wantFull || plan.mustBeFull || plan.checkpoint === null;
+    let plan = await this.planState(connector);
+    if (!wantFull && plan.checkpoint) {
+      // R29/R30.5: a head tombstone of a held cursor voids the checkpoint,
+      // whether or not the cursor carries retry provenance.
+      const { control } = await this.keys();
+      const held = plan.checkpoint.value;
+      const names = new Set([
+        ...(plan.checkpoint.prov ?? []),
+        ...(isPlainObject(held) ? Object.keys(held) : []),
+      ]);
+      let voided = false;
+      for (const stream of names) {
+        const row = await this.options.registry.read(
+          streamScope(connector, IDENTITYLESS_NS, stream),
+        );
+        if (classifyStreamRow(row, control) === "tombstoned") voided = true;
+      }
+      if (voided) {
+        await this.withState((state) => {
+          invalidateCheckpoint(state, connector, true);
+        });
+        plan = await this.planState(connector);
+      }
+    }
+    // R28: a needsFull stream may resume only from a retry continuation.
+    const provenance = plan.checkpoint?.prov ?? [];
+    const resumable =
+      plan.checkpoint !== null &&
+      plan.needsFull.every((stream) => provenance.includes(stream));
+    const full =
+      wantFull ||
+      plan.checkpoint === null ||
+      (plan.needsFull.length > 0 && !resumable);
     const { keyCheck } = await this.keys();
     return {
       start: {
         collectionMode: full ? "full_refresh" : "incremental",
-        state: plan.checkpoint?.value ?? null,
+        state: full ? null : (plan.checkpoint?.value ?? null),
         keyCheck,
+        provenance: full ? [] : [...provenance],
       },
       checkpoint: plan.checkpoint,
       full,
@@ -631,7 +693,9 @@ export class StreamSyncWriter {
         observedAt: Math.min(input.observedAt ?? now, now + SKEW_MS),
         spoolRef: `runs/${input.runId}/spool`,
         checkpointCandidate: null,
-        needsFull: state.needsFull,
+        // A resumed run has no full-run requirement left: each needsFull
+        // stream resumes from its retry provenance (R28).
+        needsFull: issued && !full ? [] : state.needsFull,
       });
       const host: HostEntry = {
         version: 1,
@@ -670,6 +734,7 @@ export class StreamSyncWriter {
           collectionMode: full ? "full_refresh" : "incremental",
           state: null,
           keyCheck,
+          provenance: [],
         }
       );
     });
@@ -813,6 +878,13 @@ export class StreamSyncWriter {
     input: {
       readonly checkpointCandidate: JsonValue | null;
       readonly coveredStreams?: readonly string[];
+      /** R28: this run's `incremental: false` streams. */
+      readonly wholeRead?: readonly string[];
+      /**
+       * R28: a `retry_pending` end. Its record-bearing streams are published
+       * too, as merges that stay incomplete unless the stream is covered.
+       */
+      readonly retry?: boolean;
     },
   ): Promise<StreamSyncRunStatus> {
     return this.intake(async () => {
@@ -823,7 +895,20 @@ export class StreamSyncWriter {
       // run. It is forgotten on any failure and once it is `ready`.
       try {
         await run.spool.flush();
-        if (input.coveredStreams) this.keepCovered(host, input.coveredStreams);
+        if (input.retry) {
+          const covered = input.coveredStreams ?? [];
+          const withRecords = [...run.records.keys()].filter(
+            (name) => (run.records.get(name) ?? 0) > 0,
+          );
+          this.keepCovered(host, [...covered, ...withRecords]);
+          host.retry = { covered: [...covered] };
+          host.wholeRead = [...(input.wholeRead ?? [])];
+          for (const [name, stream] of Object.entries(host.streams)) {
+            stream.retryProgress = !covered.includes(name);
+          }
+        } else if (input.coveredStreams) {
+          this.keepCovered(host, input.coveredStreams);
+        }
         if (run.excluded.length > 0) {
           await this.options.home.files.appendMany([
             {
@@ -911,6 +996,7 @@ export class StreamSyncWriter {
   saveCheckpointOnly(
     runId: string,
     candidate: Readonly<Record<string, JsonValue>>,
+    wholeRead: readonly string[] = [],
   ): Promise<StreamSyncRunStatus> {
     return this.intake(async () => {
       const host = await this.collecting(runId);
@@ -923,6 +1009,8 @@ export class StreamSyncWriter {
       // Active until the run has ended, so recovery cannot end it first.
       try {
         this.keepCovered(host, []);
+        host.retry = { covered: [] };
+        host.wholeRead = [...wholeRead];
         const ns = IDENTITYLESS_NS;
         host.entry = {
           ...host.entry,
@@ -1272,6 +1360,8 @@ export class StreamSyncWriter {
     for (const s of seedStreams) {
       if (state.receipts[receiptKey(s.stream)] !== undefined) continue;
       let stream = host.streams[s.stream];
+      // R30.1: a retry run plans no seed-only stream; its receipt is deferred.
+      if (!stream && host.retry) continue;
       if (!stream) {
         stream = this.newStream(nextIndex(host), s);
         stream.shardBytes = emptyShardBytes();
@@ -1417,6 +1507,15 @@ export class StreamSyncWriter {
         keyCheck,
       });
     }
+    if (rowKind === "tombstoned" && !host.tombstoned) {
+      // R29: a continuation held for this stream was built on a history that
+      // is now tombstoned. Without a held cursor there is nothing to void.
+      const held = (await this.readState()).checkpoints[entry.connector]?.value;
+      if (isPlainObject(held) && Object.hasOwn(held, name)) {
+        host.tombstoned = true;
+        await this.writeEntry(host);
+      }
+    }
     const choice = chooseBase(rowKind, head, target);
     if (choice.kind === "stale_generation") {
       // F1: the stream holds a newer generation than this run's target.
@@ -1461,6 +1560,8 @@ export class StreamSyncWriter {
       baseComplete: base?.complete ?? false,
       seedMerged: stream.seedApplies,
     });
+    // R28/R30.2: an uncovered retry stream is never complete, even when read whole.
+    if (stream.retryProgress) complete = false;
     // §2.12: a run resumed from another namespace's checkpoint is incomplete.
     if (host.checkpointUsed && host.checkpointUsed.ns !== ns) complete = false;
 
@@ -1544,8 +1645,18 @@ export class StreamSyncWriter {
         runFull: entry.full || stream.fullStream,
       });
       state.needsFull = effect.needsFull;
-      if (effect.clearCheckpoint) {
+      // R28/R30.7: a retry-progress commit keeps the checkpoint; any other
+      // incomplete commit clears it as before.
+      if (effect.clearCheckpoint && !stream.retryProgress) {
         invalidateCheckpoint(state, entry.connector, true);
+      }
+      // A complete commit ends the stream's retry continuation.
+      const held = state.checkpoints[entry.connector];
+      if (complete && held?.prov?.includes(name)) {
+        state.checkpoints[entry.connector] = {
+          ...held,
+          prov: held.prov.filter((s) => s !== name),
+        };
       }
       if (stream.seedApplies && this.options.seed) {
         state.receipts[
@@ -1568,6 +1679,19 @@ export class StreamSyncWriter {
   private async checkpoint(host: HostEntry): Promise<void> {
     const { entry } = host;
     const ns = entry.ns!;
+    if (host.tombstoned) {
+      // R29: a tombstone seen by this run voids its continuation; nothing
+      // of this run is saved, so the next begin reads the history afresh.
+      await this.withState((state) => {
+        invalidateCheckpoint(state, entry.connector, true);
+      });
+      await this.finish(host, {
+        kind: "no_checkpoint",
+        generation: host.target!,
+        reason: "control_changed",
+      });
+      return;
+    }
     // Snapshot before the control read: an invalidation that lands after it
     // makes that read stale, and the save below refuses to use it.
     const epoch =
@@ -1575,7 +1699,17 @@ export class StreamSyncWriter {
     const control = await this.readControl(entry.connector, ns);
     const seed = this.options.seed;
     const streams = Object.fromEntries(
-      Object.entries(entry.streams).map(([k, v]) => [k, streamRunResult(v)]),
+      Object.entries(entry.streams).map(([k, v]) => {
+        const result = streamRunResult(v);
+        // R28: a retry-progress publish is incomplete by design; it does not
+        // block the checkpoint that saves its cursor (S7 holds by the barrier).
+        return [
+          k,
+          host.streams[k]?.retryProgress
+            ? { ...result, complete: true }
+            : result,
+        ];
+      }),
     );
     const decision = await this.withState((state) => {
       if ((state.invalidations?.[entry.connector] ?? 0) !== epoch) {
@@ -1610,6 +1744,28 @@ export class StreamSyncWriter {
         // and generation, so a stream the run did not cover keeps its own.
         const prev = state.checkpoints[entry.connector];
         const same = prev?.ns === ns && prev.generation === decided.generation;
+        // R28: a candidate cursor of an uncovered stream of a retry end is a
+        // continuation: it keeps its provenance until a complete commit. It
+        // matters only where the stream would otherwise read full: a stream
+        // with needsFull debt, or a whole-read stream (incremental: false),
+        // which resumes from its token only through provenance.
+        const debt = new Set(
+          state.needsFull
+            .filter((k) => k.connector === entry.connector && k.ns === ns)
+            .map((k) => k.stream),
+        );
+        const covered = host.retry?.covered ?? [];
+        const wholeRead = host.wholeRead ?? [];
+        const fresh = host.retry
+          ? Object.keys(entry.checkpointCandidate ?? {}).filter(
+              (name) => !covered.includes(name),
+            )
+          : [];
+        const prov = [
+          ...new Set([...(same ? (prev.prov ?? []) : []), ...fresh]),
+        ]
+          .filter((name) => debt.has(name) || wholeRead.includes(name))
+          .sort();
         state.checkpoints[entry.connector] = {
           ns,
           generation: decided.generation,
@@ -1617,6 +1773,7 @@ export class StreamSyncWriter {
             same ? prev.value : null,
             entry.checkpointCandidate,
           ),
+          ...(prov.length > 0 ? { prov } : {}),
         };
       }
       return decided;

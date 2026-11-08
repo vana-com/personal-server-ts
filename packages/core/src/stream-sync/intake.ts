@@ -210,6 +210,8 @@ interface Run {
   deletesSkipped: number;
   /** A stream with at least one record: its candidate cursor is not safe. */
   hadRecords: boolean;
+  /** Upserts received, accepted or too large (R28: "all empty" counts these). */
+  received: number;
 }
 
 function invalid(message: string): RunIntakeError {
@@ -355,11 +357,13 @@ export class StreamSyncIntake implements RunIntake {
     let collection: "full_refresh" | "incremental";
     let state: JsonValue | null;
     let keyCheck: string;
+    let provenance: readonly string[];
     if (willDiscard) {
       const issued = await writer.issueStart(connector, wantFull);
       collection = issued.start.collectionMode;
       state = issued.start.state;
       keyCheck = issued.start.keyCheck;
+      provenance = issued.start.provenance ?? [];
     } else {
       try {
         const issued = await writer.beginRun({
@@ -376,16 +380,19 @@ export class StreamSyncIntake implements RunIntake {
         collection = issued.collectionMode;
         state = issued.state;
         keyCheck = issued.keyCheck;
+        provenance = issued.provenance ?? [];
       } catch (error) {
         if (error instanceof RunGoneError) throw new RunIntakeError("gone");
         throw error;
       }
     }
     const runFull = collection === "full_refresh";
+    // R28: a snapshot stream resumes incrementally only from its retry
+    // continuation; every other stream of a resumed run is incremental.
     const modes = new Map(
       declarations.streams.map((d) => [
         d.name,
-        runFull || d.incremental === false
+        runFull || (d.incremental === false && !provenance.includes(d.name))
           ? ("full_refresh" as const)
           : ("incremental" as const),
       ]),
@@ -421,6 +428,7 @@ export class StreamSyncIntake implements RunIntake {
       lastBatch: -1,
       deletesSkipped: 0,
       hadRecords: false,
+      received: 0,
     });
     return response;
   }
@@ -496,6 +504,7 @@ export class StreamSyncIntake implements RunIntake {
       if (run.willDiscard) continue;
       const decl = run.decl.get(record.stream)!;
       const profile: HeadProfile = { key: null, version: run.version };
+      run.received += 1;
       const spooled = await this.options.writer.append(
         runId,
         record.stream,
@@ -538,6 +547,9 @@ export class StreamSyncIntake implements RunIntake {
       throw invalid("checkpointCandidate must be an object");
     }
     const keys = Object.keys(candidate ?? {});
+    const wholeRead = [...run.decl]
+      .filter(([, d]) => d.incremental === false)
+      .map(([name]) => name);
 
     switch (req.outcome) {
       case "failed":
@@ -571,10 +583,13 @@ export class StreamSyncIntake implements RunIntake {
       return { result: "discarded", stuck: await writer.stuck(run.connector) };
     }
 
-    if (req.outcome === "retry_pending") {
+    // R28: a retry that received records publishes them; only a retry with
+    // no upserts at all is checkpoint-only.
+    if (req.outcome === "retry_pending" && run.received === 0) {
       const status = await writer.saveCheckpointOnly(
         runId,
         (candidate ?? {}) as Record<string, JsonValue>,
+        wholeRead,
       );
       this.forget(runId);
       const kind = status.outcome?.kind;
@@ -589,7 +604,12 @@ export class StreamSyncIntake implements RunIntake {
       };
     }
 
-    if (covered.length === 0 && keys.length === 0 && !run.hadRecords) {
+    if (
+      req.outcome !== "retry_pending" &&
+      covered.length === 0 &&
+      keys.length === 0 &&
+      !run.hadRecords
+    ) {
       // Nothing to publish and nothing to remember.
       await this.finishWithout(runId, run, "cancelled");
       return {
@@ -608,6 +628,8 @@ export class StreamSyncIntake implements RunIntake {
     const status = await writer.finishRun(runId, {
       checkpointCandidate: keys.length > 0 ? (candidate as JsonValue) : null,
       coveredStreams: covered,
+      wholeRead,
+      retry: req.outcome === "retry_pending",
     });
     this.forget(runId);
     return {
