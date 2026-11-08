@@ -494,6 +494,7 @@ describe.each(matrix)(
       ["7.9 MiB", Math.floor(7.9 * MiB)],
       ["8 MiB + 1", 8 * MiB + 1],
       ["30 MiB", 30 * MiB],
+      ["100 MiB", 100 * MiB],
     ])(
       "keeps a record of %s byte-exact through publish and read",
       async (_name, bodyBytes) => {
@@ -522,6 +523,39 @@ describe.each(matrix)(
         for (const part of view.head.parts) {
           expect(part.bytes).toBeLessThanOrEqual(FRAME_PIECE_BYTES);
         }
+      },
+    );
+
+    it.each(["after_parts_upload", "after_head_upload"] as const)(
+      "crash at %s with a long record, then resume: it is published once, byte-exact",
+      async (point) => {
+        const c = freshConnector(`crash-long-${point.replaceAll("_", "-")}`);
+        const device = `crash-long-${point}`;
+        const crashing = await env.writer(device, {
+          fault: (p) => {
+            if (p === point) throw new Error(`crash at ${p}`);
+          },
+        });
+        await crashing.refreshControls();
+        const huge = recordOfBodyBytes("huge", 9 * MiB);
+        await collect(crashing, {
+          runId: "run-1",
+          connector: c,
+          observedAt: T0,
+          streams: { s: [{ id: "small", n: "x" }, huge] },
+        });
+        await expect(crashing.publishPending()).rejects.toThrow(
+          `crash at ${point}`,
+        );
+        const resumed = await env.writer(device);
+        await resumed.cycle();
+        expect((await resumed.status()).pending).toEqual([]);
+        const view = await readStream(env.registry, env.blobs, c, NS, "s");
+        if (!view || view === "tombstoned") throw new Error("stream missing");
+        expect(view.version).toBe(1);
+        expect(canonicalJson(view.records.get("huge"))).toBe(
+          canonicalJson(huge),
+        );
       },
     );
 
