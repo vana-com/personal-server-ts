@@ -7,6 +7,8 @@ import {
   CRASHED_UPLOAD_REASON,
   createMemoryUploadAttemptStore,
   createUploadAttemptLedger,
+  uploadAttemptKey,
+  type UploadAttemptRecord,
   type UploadAttemptStore,
 } from "../upload-attempts.js";
 import type { IndexEntry } from "../../storage/index/types.js";
@@ -80,6 +82,18 @@ function makeIndex(initial: IndexEntry[]) {
   return { rows, dies, reads, storage };
 }
 
+/**
+ * A restarted process holds no lock from its dead predecessor, so a boot may
+ * always take the store.
+ */
+function restartable(store: UploadAttemptStore): UploadAttemptStore {
+  return {
+    read: () => store.read(),
+    write: (envelope) => store.write(envelope),
+    acquire: async () => ({ release() {} }),
+  };
+}
+
 /** One process lifetime: fresh deps, tracker and (via `store`) ledger. */
 function boot(
   index: ReturnType<typeof makeIndex>,
@@ -114,11 +128,15 @@ function boot(
       debug: vi.fn(),
     } as unknown as Logger,
     uploadState,
-    uploadAttempts: createUploadAttemptLedger(store, OWNER),
+    uploadAttempts: createUploadAttemptLedger(restartable(store), OWNER),
     ...overrides,
   };
   return { deps, uploadState, registerDataPoint };
 }
+
+const records = async (store: UploadAttemptStore) =>
+  ((await store.read()) as { records: UploadAttemptRecord[] } | null)
+    ?.records ?? [];
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -172,13 +190,13 @@ describe("uploadAll — durable attempt markers", () => {
     const first = boot(index, store);
     first.registerDataPoint.mockRejectedValueOnce(new Error("503"));
     await uploadAll(first.deps);
-    expect(await store.read()).toEqual([]);
+    expect(await records(store)).toEqual([]);
 
     const second = boot(index, store);
     await uploadAll(second.deps, {
       now: () => new Date(Date.now() + 3_600_000),
     });
-    expect(await store.read()).toEqual([]);
+    expect(await records(store)).toEqual([]);
   });
 
   it("uploads normally when new data replaced the quarantined entry version", async () => {
@@ -300,14 +318,27 @@ describe("uploadAll — durable attempt markers", () => {
     await flush();
     index.dies.clear();
     await uploadAll(boot(index, store).deps);
-    expect(await store.read()).toEqual([]);
+    expect(await records(store)).toEqual([]);
   });
 
   describe("attempt deadline", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
 
-    it("aborts a never-settling upload at the deadline, records a caught failure and moves on", async () => {
+    /** A storage upload that stops only when its signal aborts. */
+    const cancellableStorage = () =>
+      ({
+        upload: vi.fn(
+          (_key: string, _data: Uint8Array, signal?: AbortSignal) =>
+            new Promise<string>((_resolve, reject) => {
+              signal?.addEventListener("abort", () => reject(signal.reason));
+            }),
+        ),
+        urlForKey: (key: string) => `https://storage.test/${key}`,
+        exists: vi.fn().mockResolvedValue(true),
+      }) as unknown as StorageAdapter;
+
+    it("keeps the marker of an attempt that has not stopped, skips it, and moves on", async () => {
       const a = makeEntry(1);
       const b = makeEntry(2);
       const index = makeIndex([a, b]);
@@ -315,8 +346,11 @@ describe("uploadAll — durable attempt markers", () => {
       const store = createMemoryUploadAttemptStore();
       const { deps, uploadState } = boot(index, store);
 
-      const run = uploadAll(deps, { attemptDeadlineMs: 5_000 });
-      await vi.advanceTimersByTimeAsync(5_000);
+      const run = uploadAll(deps, {
+        attemptDeadlineMs: 5_000,
+        abandonGraceMs: 100,
+      });
+      await vi.advanceTimersByTimeAsync(5_100);
       const results = await run;
 
       expect(results.map((r) => r.path)).toEqual([b.path]);
@@ -327,8 +361,64 @@ describe("uploadAll — durable attempt markers", () => {
           lastError: expect.stringMatching(/deadline/i),
         }),
       ]);
-      // A caught failure settles the marker: it is not a crash.
-      expect(await store.read()).toEqual([]);
+      // The work behind the deadline may still run: its marker stays.
+      expect(await records(store)).toEqual([
+        expect.objectContaining({ path: a.path, inFlight: true }),
+      ]);
+      // And no second attempt starts beside it, even when backoff is due.
+      const readsBefore = index.reads.length;
+      await vi.advanceTimersByTimeAsync(24 * 3_600_000);
+      await uploadAll(deps, { attemptDeadlineMs: 5_000, abandonGraceMs: 100 });
+      expect(index.reads.slice(readsBefore)).not.toContain(a.path);
+    });
+
+    it("clears the marker once the aborted attempt has stopped, as a caught failure", async () => {
+      const a = makeEntry(1);
+      const index = makeIndex([a]);
+      const store = createMemoryUploadAttemptStore();
+      const { deps, uploadState } = boot(index, store, {
+        storageAdapter: cancellableStorage(),
+      });
+
+      const run = uploadAll(deps, { attemptDeadlineMs: 5_000 });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await run;
+
+      expect(uploadState.snapshot().retrying).toHaveLength(1);
+      expect(await records(store)).toEqual([]);
+    });
+
+    it("counts crash, deadline, crash as two interruptions", async () => {
+      const a = makeEntry(1);
+      const b = makeEntry(2);
+      const index = makeIndex([a]);
+      const store = createMemoryUploadAttemptStore();
+
+      index.dies.add(a.path);
+      void uploadAll(boot(index, store).deps);
+      await vi.advanceTimersByTimeAsync(0);
+
+      index.dies.clear();
+      const timedOut = boot(index, store, {
+        storageAdapter: cancellableStorage(),
+      });
+      const run = uploadAll(timedOut.deps, { attemptDeadlineMs: 5_000 });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await run;
+      expect(timedOut.uploadState.snapshot().retrying).toHaveLength(1);
+
+      index.dies.add(a.path);
+      void uploadAll(boot(index, store).deps);
+      await vi.advanceTimersByTimeAsync(0);
+
+      index.dies.clear();
+      index.rows.push(b);
+      const host = boot(index, store);
+      const results = await uploadAll(host.deps);
+      expect(host.uploadState.snapshot().stopped).toEqual([
+        expect.objectContaining({ path: a.path }),
+      ]);
+      expect(results.map((r) => r.path)).toEqual([b.path]);
     });
   });
 });
@@ -339,12 +429,25 @@ describe("attempt ledger — paged scans", () => {
     const ledger = createUploadAttemptLedger(store, OWNER);
     const early = makeEntry(1);
     const late = makeEntry(9);
-    await ledger.begin(early);
-    await ledger.begin(late);
+    // Two interrupted attempts from an earlier process.
+    await store.write({
+      version: 1,
+      records: [early, late].map((e) => ({
+        key: uploadAttemptKey(OWNER, e),
+        owner: OWNER.toLowerCase(),
+        scope: e.scope,
+        path: e.path,
+        rowId: e.id,
+        interrupted: 1,
+        inFlight: false,
+        quarantined: false,
+      })),
+    });
+    await ledger.recover();
 
     // The scan covered ids 0..5 and listed neither row.
     await ledger.reconcile([], { afterId: 0, throughId: 5 });
 
-    expect((await store.read())?.map((r) => r.path)).toEqual([late.path]);
+    expect((await records(store)).map((r) => r.path)).toEqual([late.path]);
   });
 });

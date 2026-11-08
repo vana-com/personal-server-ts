@@ -463,6 +463,54 @@ describe("PS Lite read-side deletion memory", () => {
   });
 });
 
+describe("createPsLiteUploadAttemptStore ownership", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("holds an exclusive browser lock per store name until released", async () => {
+    const held = new Set<string>();
+    vi.stubGlobal("navigator", {
+      locks: {
+        request: async (
+          name: string,
+          _options: unknown,
+          callback: (lock: object | null) => Promise<void> | undefined,
+        ) => {
+          if (held.has(name)) return callback(null);
+          held.add(name);
+          try {
+            await callback({});
+          } finally {
+            held.delete(name);
+          }
+        },
+      },
+    });
+    const first = createPsLiteUploadAttemptStore(
+      createMemoryPsLiteStateStore(),
+    );
+    const second = createPsLiteUploadAttemptStore(
+      createMemoryPsLiteStateStore(),
+    );
+    const lease = await first.acquire!();
+    expect(lease).not.toBeNull();
+    expect(await second.acquire!()).toBeNull();
+    lease!.release();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(await second.acquire!()).not.toBeNull();
+  });
+
+  it("falls back to a lock in this realm without browser locks", async () => {
+    vi.stubGlobal("navigator", {});
+    const shared = createMemoryPsLiteStateStore();
+    const lease = await createPsLiteUploadAttemptStore(shared).acquire!();
+    expect(await createPsLiteUploadAttemptStore(shared).acquire!()).toBeNull();
+    lease!.release();
+    expect(
+      await createPsLiteUploadAttemptStore(shared).acquire!(),
+    ).not.toBeNull();
+  });
+});
+
 describe("createPsLiteUploadAttemptStore", () => {
   const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
   const entry = {
@@ -484,6 +532,7 @@ describe("createPsLiteUploadAttemptStore", () => {
       await ledger.recover();
       expect(ledger.quarantined()).toEqual([]);
       await ledger.begin(entry); // the WebView dies here, never settles
+      await ledger.close(); // and its lock goes with it
     }
     const ledger = createUploadAttemptLedger(
       createPsLiteUploadAttemptStore(stateStore),

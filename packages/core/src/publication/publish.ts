@@ -287,6 +287,8 @@ export async function publishPreparedVersion(
         }),
       };
     }
+    // Signing awaited: the caller may have given up while it ran.
+    checkpoint();
     let id: string | undefined;
     if (fencedPublication) {
       const previous = requireFence("registration/adoption");
@@ -356,6 +358,7 @@ export async function publishPreparedVersion(
           throw new Error(
             "Missing committed blob cannot be healed: metadata commitment mismatch",
           );
+        checkpoint();
         try {
           await storageAdapter.upload(`${scope}/${version}`, encrypted, ...sig);
         } catch (error) {

@@ -463,6 +463,8 @@ export function createSyncManager(
       if (cycleInFlight) {
         await cycleInFlight;
       }
+      // Hand the upload markers to the next manager over this store.
+      await uploadAttempts.close();
     },
 
     async trigger() {
@@ -512,7 +514,7 @@ export function createSyncManager(
     },
 
     async retryQuarantinedUploads(scope) {
-      await uploadAttempts.recover();
+      if (!(await uploadAttempts.recover())) return;
       for (const path of await uploadAttempts.release(scope))
         uploadState.clear(path);
     },

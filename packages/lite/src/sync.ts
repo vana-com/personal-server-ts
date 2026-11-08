@@ -19,7 +19,6 @@ import {
   normalizePendingBlobDeletions,
   type PendingBlobDeletionPlanned,
   type ScopeDeletionTracker,
-  type UploadAttemptRecord,
   type UploadAttemptStore,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
@@ -44,6 +43,7 @@ import {
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import {
+  acquireProcessLock,
   withCancellableRegistration,
   type DownloadDiagnosticsHook,
   type DownloadWorkerDeps,
@@ -164,22 +164,56 @@ export function createPsLiteSyncCursor(
   };
 }
 
+const realmIds = new WeakMap<object, number>();
+let realmCount = 0;
+/** Distinguishes state stores for the lock used where browser locks are absent. */
+function realmId(stateStore: PsLiteStateStore): number {
+  let id = realmIds.get(stateStore);
+  if (id === undefined) {
+    id = ++realmCount;
+    realmIds.set(stateStore, id);
+  }
+  return id;
+}
+
 /**
  * Upload-attempt markers in the same durable state store as the sync cursor,
- * so a WebView or manager rebuild keeps the interrupted-attempt count.
+ * so a WebView or manager rebuild keeps the interrupted-attempt count. One
+ * manager per store holds an exclusive browser lock (shared by every tab on
+ * the origin) for as long as it owns the markers; a runtime without browser
+ * locks falls back to a lock inside this realm.
  */
 export function createPsLiteUploadAttemptStore(
   stateStore: PsLiteStateStore,
+  options: { lockName?: string } = {},
 ): UploadAttemptStore {
+  const lockName = options.lockName ?? `ps-lite:${UPLOAD_ATTEMPTS_KEY}`;
   return {
-    async read() {
-      const state = await stateStore.get<{ records?: UploadAttemptRecord[] }>(
-        UPLOAD_ATTEMPTS_KEY,
-      );
-      return Array.isArray(state?.records) ? state.records : null;
+    read() {
+      return stateStore.get<unknown>(UPLOAD_ATTEMPTS_KEY);
     },
-    async write(records) {
-      await stateStore.set(UPLOAD_ATTEMPTS_KEY, { records });
+    async write(envelope) {
+      await stateStore.set(UPLOAD_ATTEMPTS_KEY, envelope);
+    },
+    async acquire() {
+      const locks =
+        typeof navigator === "undefined" ? undefined : navigator.locks;
+      if (!locks)
+        return acquireProcessLock(`${lockName}:${realmId(stateStore)}`);
+      return new Promise((resolve, reject) => {
+        // The lock is held by a callback that stays pending until released.
+        locks
+          .request(lockName, { ifAvailable: true }, (lock) => {
+            if (!lock) {
+              resolve(null);
+              return undefined;
+            }
+            return new Promise<void>((release) =>
+              resolve({ release: () => release() }),
+            );
+          })
+          .catch(reject);
+      });
     },
   };
 }

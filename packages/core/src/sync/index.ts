@@ -72,11 +72,17 @@ export {
   CRASHED_UPLOAD_REASON,
   MAX_INTERRUPTED_UPLOAD_ATTEMPTS,
   createMemoryUploadAttemptStore,
+  UPLOAD_ATTEMPTS_ENVELOPE_VERSION,
+  UploadAttemptStoreInvalidError,
+  acquireProcessLock,
   createUploadAttemptLedger,
+  parseUploadAttemptsEnvelope,
   uploadAttemptKey,
+  type UploadAttemptLease,
   type UploadAttemptLedger,
   type UploadAttemptRecord,
   type UploadAttemptStore,
+  type UploadAttemptsEnvelope,
 } from "./upload-attempts.js";
 export { computeDataPointId } from "./data-point-id.js";
 export {
