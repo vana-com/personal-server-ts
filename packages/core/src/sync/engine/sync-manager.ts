@@ -441,6 +441,10 @@ export function createSyncManager(
     },
 
     async trigger() {
+      // An owner "sync now" gives stopped uploads a fresh failure budget.
+      // Too-large entries stay (their size decides) and entries waiting in
+      // backoff keep waiting: the owner asked to retry what gave up.
+      uploadState.releaseAllStopped();
       // Clear existing timers, run immediately, restart interval
       clearIntervalTimer();
       clearNotifyTimer();

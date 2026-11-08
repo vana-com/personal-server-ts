@@ -178,6 +178,8 @@ export interface UploadStateTracker {
   setScanFence(throughId: number | null): void;
   /** New data arrived for `scope`: stopped entries there try again. */
   releaseStopped(scope: string): void;
+  /** Owner retry: every stopped entry tries again with a fresh budget. */
+  releaseAllStopped(): void;
   /** The entry synced or was removed: forget it. */
   clear(path: string): void;
   /** Forget every entry of `scope` (owner retry, scope deletion). */
@@ -296,6 +298,11 @@ export function createUploadStateTracker(
       for (const [path, state] of states) {
         if (state.scope === scope && state.stoppedAtMs !== null)
           states.delete(path);
+      }
+    },
+    releaseAllStopped() {
+      for (const [path, state] of states) {
+        if (state.stoppedAtMs !== null) states.delete(path);
       }
     },
     clearScope(scope) {
