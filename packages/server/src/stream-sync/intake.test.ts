@@ -4,7 +4,10 @@
  * and the in-memory exclusive-version registry.
  */
 
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { RECORD_LINE_LIMIT_BYTES } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   RunIntakeError,
@@ -886,6 +889,144 @@ describe(
           covered: ["events"],
         }),
       ).toEqual(["a", "b"]);
+    });
+  },
+);
+
+/**
+ * Conformance with the desktop producer. `replace-conformance.cases.json` is
+ * the same table the producer's own test reads, byte for byte; the hash fails
+ * the build when either copy changes alone. Each case feeds intake what it can
+ * see and checks the decision against the table. `producer` is what the
+ * desktop producer does with the same run, so a case where the two differ is
+ * listed, not hidden.
+ */
+const CASES_SHA256 =
+  "72013bbe9bf13c6bcf3238257f9e72e491ff605f16f96df6d571e070746f90f8";
+
+interface ConformanceCase {
+  readonly id: string;
+  readonly outcome: "succeeded" | "partial" | "retry_pending";
+  readonly collection: "full_refresh" | "incremental";
+  readonly timeRange: boolean;
+  readonly semantics: "mutable_state" | "append_only";
+  readonly records: number;
+  readonly skippedDelete: boolean;
+  readonly oversize: boolean;
+  readonly covered: boolean;
+  readonly producer: "replace" | "merge";
+  readonly intake: "replace" | "merge";
+  readonly producerOnly: boolean;
+  readonly safe: boolean;
+}
+
+const casesBytes = readFileSync(
+  new URL("./replace-conformance.cases.json", import.meta.url),
+);
+const CASES = (
+  JSON.parse(casesBytes.toString("utf8")) as {
+    cases: readonly ConformanceCase[];
+  }
+).cases;
+
+describe(
+  "run intake: replace decision against the desktop producer's table",
+  { timeout: 60_000 },
+  () => {
+    it("reads the table the producer's test reads", () => {
+      expect(createHash("sha256").update(casesBytes).digest("hex")).toBe(
+        CASES_SHA256,
+      );
+      expect(CASES).toHaveLength(16);
+      expect(new Set(CASES.map((c) => c.id)).size).toBe(CASES.length);
+    });
+
+    async function decide(c: ConformanceCase): Promise<"replace" | "merge"> {
+      const stream = c.semantics === "append_only" ? "events" : "items";
+      const connector = freshConnector(`conform-${c.id}`.slice(0, 40));
+      const h = await host({}, { coveredReplace: true });
+      await run(h, "r1", connector, {
+        records: ["a", "b", "z"].map((id) => ({ stream, data: row(id) })),
+        covered: [stream],
+        candidate: { [stream]: "c1" },
+      });
+      await publish(h, "r1");
+      const records: { stream: string; op?: string; data: unknown }[] = [
+        "a",
+        "b",
+      ]
+        .slice(0, c.records)
+        .map((id) => ({ stream, data: row(id) }));
+      if (c.skippedDelete) {
+        records.push({ stream, op: "delete", data: { id: "z" } });
+      }
+      if (c.oversize) {
+        records.push({
+          stream,
+          data: { id: "big", pad: "x".repeat(RECORD_LINE_LIMIT_BYTES + 1) },
+        });
+      }
+      await run(h, "r2", connector, {
+        records,
+        covered: c.covered ? [stream] : [],
+        outcome: c.outcome,
+        begin: {
+          observedAt: T0 + 10,
+          wantFull: c.collection === "full_refresh",
+          ...(c.timeRange
+            ? {
+                streams: [
+                  { name: stream, time_range: { since: "2026-01-01" } },
+                ],
+              }
+            : {}),
+        },
+      });
+      await publish(h, "r2");
+      const view = (await readStream(
+        env.registry,
+        env.blobs,
+        connector,
+        "",
+        stream,
+      )) as { records: Map<string, unknown> };
+      return view.records.has("z") ? "merge" : "replace";
+    }
+
+    for (const c of CASES) {
+      it(`${c.id}: intake ${c.intake}`, async () => {
+        expect(await decide(c)).toBe(c.intake);
+      });
+    }
+
+    it("a producer-only case never has intake replace where the producer merges, unless listed unsafe", () => {
+      const unsafe = CASES.filter(
+        (c) => c.intake === "replace" && c.producer === "merge",
+      );
+      expect(unsafe.map((c) => c.id)).toEqual([
+        "no-completion-proof",
+        "proof-does-not-match-records",
+      ]);
+      for (const c of unsafe) {
+        expect(c.producerOnly).toBe(true);
+        expect(c.safe).toBe(false);
+      }
+      for (const c of CASES.filter((x) => !unsafe.includes(x))) {
+        expect(c.safe).toBe(true);
+      }
+    });
+
+    it("lists every case where the two sides differ", () => {
+      expect(
+        CASES.filter((c) => c.producer !== c.intake).map((c) => c.id),
+      ).toEqual([
+        "partial-outcome-other-stream-uncovered",
+        "certified-failed-done",
+        "retry-pending",
+        "oversize-record",
+        "no-completion-proof",
+        "proof-does-not-match-records",
+      ]);
     });
   },
 );
