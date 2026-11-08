@@ -761,3 +761,131 @@ describe("run intake: no account derivation (R23)", { timeout: 30_000 }, () => {
     ).not.toBeNull();
   });
 });
+
+describe(
+  "run intake: covered full refresh replaces",
+  { timeout: 30_000 },
+  () => {
+    /** A base of a and b, then one more run; the keys the registry holds after. */
+    async function afterSecondRun(
+      label: string,
+      second: {
+        records: { stream: string; op?: string; data: unknown }[];
+        covered: string[];
+        outcome?: "succeeded" | "partial";
+        begin?: Partial<BeginRequest>;
+        stream?: string;
+      },
+      flag = true,
+    ): Promise<string[]> {
+      const c = freshConnector(label);
+      const h = await host({}, flag ? { coveredReplace: true } : {});
+      const stream = second.stream ?? "items";
+      await run(h, "r1", c, {
+        records: [
+          { stream, data: row("a") },
+          { stream, data: row("b") },
+        ],
+        covered: [stream],
+        candidate: { [stream]: "c1" },
+      });
+      await publish(h, "r1");
+      await run(h, "r2", c, {
+        ...second,
+        begin: { wantFull: true, observedAt: T0 + 10, ...second.begin },
+      });
+      await publish(h, "r2");
+      const view = (await readStream(
+        env.registry,
+        env.blobs,
+        c,
+        "",
+        stream,
+      )) as {
+        records: Map<string, unknown>;
+      };
+      return [...view.records.keys()].sort();
+    }
+
+    const refresh = [{ stream: "items", data: row("a") }];
+
+    it("drops the records a succeeded, covered, whole-stream run omits", async () => {
+      expect(
+        await afterSecondRun("rep-covered", {
+          records: refresh,
+          covered: ["items"],
+        }),
+      ).toEqual(["a"]);
+    });
+
+    it("keeps them when the setting is off", async () => {
+      expect(
+        await afterSecondRun(
+          "rep-off",
+          { records: refresh, covered: ["items"] },
+          false,
+        ),
+      ).toEqual(["a", "b"]);
+    });
+
+    it("keeps them for a partial outcome", async () => {
+      expect(
+        await afterSecondRun("rep-partial", {
+          records: refresh,
+          covered: ["items"],
+          outcome: "partial",
+        }),
+      ).toEqual(["a", "b"]);
+    });
+
+    it("keeps them for an incremental run", async () => {
+      expect(
+        await afterSecondRun("rep-incr", {
+          records: refresh,
+          covered: ["items"],
+          begin: { wantFull: false },
+        }),
+      ).toEqual(["a", "b"]);
+    });
+
+    it("keeps them when the stream was read through a time range", async () => {
+      expect(
+        await afterSecondRun("rep-range", {
+          records: refresh,
+          covered: ["items"],
+          begin: {
+            streams: [{ name: "items", time_range: { since: "2026-01-01" } }],
+          },
+        }),
+      ).toEqual(["a", "b"]);
+    });
+
+    it("keeps them when the run skipped a delete in the stream", async () => {
+      expect(
+        await afterSecondRun("rep-delete", {
+          records: [
+            ...refresh,
+            { stream: "items", op: "delete", data: { id: "b" } },
+          ],
+          covered: ["items"],
+        }),
+      ).toEqual(["a", "b"]);
+    });
+
+    it("keeps them when the covered stream has no record", async () => {
+      expect(
+        await afterSecondRun("rep-empty", { records: [], covered: ["items"] }),
+      ).toEqual(["a", "b"]);
+    });
+
+    it("never replaces an append-only stream", async () => {
+      expect(
+        await afterSecondRun("rep-append", {
+          stream: "events",
+          records: [{ stream: "events", data: row("a") }],
+          covered: ["events"],
+        }),
+      ).toEqual(["a", "b"]);
+    });
+  },
+);

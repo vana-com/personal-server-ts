@@ -36,7 +36,7 @@ export interface Contribution {
 export type WithheldReason =
   | RefusedReason
   | DeferredReason
-  /** The run replaces the imported base, which grants still read. */
+  /** The run replaces the imported base (a key reset or a covered full refresh), which grants still read. */
   | "key_reset_pending"
   /** The run's publish merges seed rows the overlay does not hold. */
   | "seed_pending"

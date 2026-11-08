@@ -87,6 +87,7 @@ import {
   compareConnectorVersions,
   planStreamStep,
   stampBefore,
+  type CommitStamp,
   type ExecutedStep,
   type PlanHead,
   type PlanRun,
@@ -210,6 +211,11 @@ interface HostStream {
   seedOnly: boolean;
   /** Declared `incremental: false`: every run of it is a full read (§3.0). */
   fullStream: boolean;
+  /**
+   * Intake validated this stream as a covered full refresh (set once, when
+   * the run finishes; absent on older entries, which merge).
+   */
+  replace?: boolean;
   /** The seed is merged into this stream's publish. */
   seedApplies: boolean;
   recordTooLarge: number;
@@ -924,6 +930,8 @@ export class StreamSyncWriter {
     input: {
       readonly checkpointCandidate: JsonValue | null;
       readonly coveredStreams?: readonly string[];
+      /** Covered streams that replace what the head holds; every other stream merges. */
+      readonly replaceStreams?: readonly string[];
     },
   ): Promise<StreamSyncRunStatus> {
     return this.intake(async () => {
@@ -935,6 +943,10 @@ export class StreamSyncWriter {
       try {
         await run.spool.flush();
         if (input.coveredStreams) this.keepCovered(host, input.coveredStreams);
+        for (const name of input.replaceStreams ?? []) {
+          const stream = host.streams[name];
+          if (stream) stream.replace = true;
+        }
         if (run.excluded.length > 0) {
           await this.options.home.files.appendMany([
             {
@@ -1672,14 +1684,24 @@ export class StreamSyncWriter {
     }
     const base =
       choice.kind === "base" &&
-      (decision.kind === "noop" || !decision.replacesBase)
+      (decision.kind === "noop" ||
+        !decision.replacesBase ||
+        decision.dropsBefore !== undefined)
         ? choice.head
         : null;
-    if (stream.seedApplies) await this.spoolSeed(host, name);
+    // A covered refresh sets the seed aside too: its omitted rows stay gone.
+    if (stream.seedApplies && !stream.replace) await this.spoolSeed(host, name);
     const next = decision.head;
     const complete = next.complete;
 
-    const built = await this.buildParts(host, name, scope, target, base);
+    const built = await this.buildParts(
+      host,
+      name,
+      scope,
+      target,
+      base,
+      decision.kind === "publish" ? (decision.dropsBefore ?? null) : null,
+    );
     // A step whose parts, completeness, key and profile all equal the base's
     // changes nothing a reader sees: record a no-op of the same head.
     if (
@@ -1822,6 +1844,7 @@ export class StreamSyncWriter {
       foreignCheckpoint:
         host.checkpointUsed !== null && host.checkpointUsed.ns !== entry.ns,
       empty: (stream.shardBytes ?? []).every((bytes) => bytes === 0),
+      ...(stream.replace ? { replace: true } : {}),
       seed: stream.seedApplies ? "merged" : seedOpen ? "unresolved" : "none",
       ...(executed ? { executed } : {}),
       // Selected by a running pass, or signed and persisted: either way the
@@ -2372,6 +2395,7 @@ export class StreamSyncWriter {
     scope: string,
     target: number,
     base: Head | null,
+    dropsBefore: CommitStamp | null,
   ): Promise<{ parts: HeadPart[] }> {
     const stream = host.streams[name]!;
     const runDir = `runs/${host.entry.runId}/spool/s${stream.index}`;
@@ -2448,6 +2472,7 @@ export class StreamSyncWriter {
         target,
         baseParts,
         [runDir, seedDir],
+        dropsBefore,
       );
       for (const result of results) {
         if (result.kind === "split") {
@@ -2486,6 +2511,7 @@ export class StreamSyncWriter {
     target: number,
     baseParts: readonly HeadPart[],
     dirs: readonly string[],
+    dropsBefore: CommitStamp | null,
   ): Promise<BucketResult[]> {
     const reducers = new Map(prefixes.map((p) => [p, new BucketReducer(p)]));
     const single = prefixes.length === 1 ? reducers.get(prefixes[0]!)! : null;
@@ -2515,6 +2541,12 @@ export class StreamSyncWriter {
         primaryKey,
       );
       for (const { line, text } of lines) {
+        if (
+          dropsBefore &&
+          stampBefore({ observedAt: line.o, runId: line.r }, dropsBefore)
+        ) {
+          continue;
+        }
         const hash = await pkHash(this.hashes.sha256, line.v, primaryKey);
         route(hash)?.add(hash, line, text);
       }

@@ -144,6 +144,8 @@ export interface RunSpec extends StreamSpec {
   readonly at?: number;
   /** Collect and publish on a second device of the same owner. */
   readonly otherDevice?: boolean;
+  /** Intake validated a covered full refresh: the run replaces what its streams hold. */
+  readonly replace?: boolean;
 }
 
 export interface SeedRows {
@@ -317,6 +319,13 @@ export class Rig {
     }
     await writer.finishRun(spec.runId, {
       checkpointCandidate: { cursor: spec.runId },
+      ...(spec.replace
+        ? {
+            replaceStreams: [spec, ...(spec.also ?? [])].map(
+              (stream) => stream.stream ?? "items",
+            ),
+          }
+        : {}),
     });
     if (spec.otherDevice) await writer.publishPending();
   }

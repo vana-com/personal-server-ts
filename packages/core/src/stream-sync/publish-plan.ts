@@ -114,6 +114,11 @@ export interface PlanRun extends CommitStamp {
   readonly foreignCheckpoint: boolean;
   /** The run holds no intake record for the stream (exact). */
   readonly empty: boolean;
+  /**
+   * Intake validated this stream as a covered full refresh: the run replaces
+   * what the head holds. Absent means merge, always.
+   */
+  readonly replace?: boolean;
   readonly seed: PlanSeed;
   /** Present once the writer committed or recorded a no-op for this stream. */
   readonly executed?: ExecutedStep;
@@ -155,6 +160,12 @@ export type StepDecision =
       readonly kind: "publish";
       readonly head: PlanHead;
       readonly replacesBase: boolean;
+      /**
+       * A covered full refresh over a usable base: the writer reads the base
+       * and drops the lines older than this stamp (the refresh omitted them),
+       * and keeps the newer ones (written after the refresh was collected).
+       */
+      readonly dropsBefore?: CommitStamp;
       readonly seed: boolean;
       readonly floor: string;
     }
@@ -212,7 +223,10 @@ export function planStreamStep(state: PlanState, run: PlanRun): StepDecision {
   if (compat.kind === "connector_update_required") {
     return { kind: "refused", reason: "connector_update_required" };
   }
-  const used = compat.kind === "empty_base" ? null : base;
+  const usable = compat.kind === "empty_base" ? null : base;
+  // A covered full refresh sets the stream aside: its rows are the stream.
+  const replaced = run.replace === true && usable !== null;
+  const used = replaced ? null : usable;
   const seedMerged = run.seed === "merged";
   // §2.5 complete = full || base complete || seed merged; §2.12 a run resumed
   // from another namespace's checkpoint is incomplete even over a complete base.
@@ -233,6 +247,9 @@ export function planStreamStep(state: PlanState, run: PlanRun): StepDecision {
     kind: "publish",
     head: next,
     replacesBase: head !== null && used === null,
+    ...(replaced
+      ? { dropsBefore: { observedAt: run.observedAt, runId: run.runId } }
+      : {}),
     seed: seedMerged,
     floor: nextFloor,
   };

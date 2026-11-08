@@ -21,7 +21,8 @@ the test change together.
    back every later run of its stream (`earlier_run_pending`).
 3. **The owner never reads fewer records than a grant of the same stream.**
    Every key a grant reads, the owner reads; its payload may be newer. So a
-   run that replaces the imported base (a key reset) is withheld
+   run that replaces the imported base (a key reset, or a covered full
+   refresh; see `covered-replace.test.ts`) is withheld
    (`key_reset_pending`) until the reader imports it, and the owner keeps the
    base, marked incomplete. A run whose publish merges seed rows the overlay
    does not hold is withheld too (`seed_pending`, or `seed_unresolved` while

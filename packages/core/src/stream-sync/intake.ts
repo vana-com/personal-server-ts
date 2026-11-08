@@ -190,6 +190,22 @@ export interface StreamSyncIntakeOptions {
    * whose owner can change under a running run supplies it.
    */
   readonly currentBinding?: () => Promise<{ owner: string; keyCheck: string }>;
+  /**
+   * Let a covered full refresh replace what a stream holds on the owner's
+   * other devices. Off by default: every run then merges by key.
+   *
+   * A stream replaces only when the run `succeeded`, covers the stream, was
+   * issued `full_refresh` for it, read it without a time range, the stream is
+   * `mutable_state` with at least one record, and the run skipped no delete
+   * and dropped no oversize record in it. Anything else merges.
+   *
+   * The desktop producer sends its replace call when a completion proof covers
+   * the stream's output and the run had no detail gap
+   * (`replace_streams`, apps/desktop/src-tauri/src/commands/pdpp_runtime.rs).
+   * This request does not carry that proof, so the setting stays off until a
+   * producer states per-stream full-source coverage.
+   */
+  readonly coveredReplace?: boolean;
 }
 
 const RUN_ID = /^[A-Za-z0-9._-]{1,128}$/;
@@ -210,6 +226,12 @@ interface Run {
   deletesSkipped: number;
   /** A stream with at least one record: its candidate cursor is not safe. */
   hadRecords: boolean;
+  /** Streams issued `full_refresh` whose scope names no time range. */
+  readonly wholeStreams: Set<string>;
+  /** Streams with an accepted record. */
+  readonly recorded: Set<string>;
+  /** Streams that lost a record: a skipped delete or an oversize record. */
+  readonly lossy: Set<string>;
 }
 
 function invalid(message: string): RunIntakeError {
@@ -390,6 +412,11 @@ export class StreamSyncIntake implements RunIntake {
           : ("incremental" as const),
       ]),
     );
+    const ranged = new Set(
+      (req.streams ?? [])
+        .filter((e) => e.time_range !== undefined && e.time_range !== null)
+        .map((e) => e.name),
+    );
     const response: BeginResponse = {
       runId,
       status: willDiscard ? "will_discard" : "collecting",
@@ -421,6 +448,15 @@ export class StreamSyncIntake implements RunIntake {
       lastBatch: -1,
       deletesSkipped: 0,
       hadRecords: false,
+      wholeStreams: new Set(
+        [...modes]
+          .filter(
+            ([name, mode]) => mode === "full_refresh" && !ranged.has(name),
+          )
+          .map(([name]) => name),
+      ),
+      recorded: new Set(),
+      lossy: new Set(),
     });
     return response;
   }
@@ -491,6 +527,7 @@ export class StreamSyncIntake implements RunIntake {
       if (record.delete) {
         response.deletesSkipped += 1;
         run.deletesSkipped += 1;
+        run.lossy.add(record.stream);
         continue;
       }
       if (run.willDiscard) continue;
@@ -507,8 +544,13 @@ export class StreamSyncIntake implements RunIntake {
         },
       );
       run.hadRecords = true;
-      if (spooled === "too_large") response.tooLarge += 1;
-      else response.accepted += 1;
+      if (spooled === "too_large") {
+        response.tooLarge += 1;
+        run.lossy.add(record.stream);
+      } else {
+        response.accepted += 1;
+        run.recorded.add(record.stream);
+      }
     }
     run.lastBatch = req.batch;
     return response;
@@ -608,6 +650,16 @@ export class StreamSyncIntake implements RunIntake {
     const status = await writer.finishRun(runId, {
       checkpointCandidate: keys.length > 0 ? (candidate as JsonValue) : null,
       coveredStreams: covered,
+      replaceStreams: this.options.coveredReplace
+        ? covered.filter(
+            (name) =>
+              req.outcome === "succeeded" &&
+              run.decl.get(name)!.semantics === "mutable_state" &&
+              run.wholeStreams.has(name) &&
+              run.recorded.has(name) &&
+              !run.lossy.has(name),
+          )
+        : [],
     });
     this.forget(runId);
     return {
