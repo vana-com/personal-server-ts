@@ -460,9 +460,11 @@ describe.each(matrix)(
       });
       await a.deleteConnection(c); // deleted(2)
       // The in-flight run finishes after the delete, then a publish cycle runs.
-      await a.finishRun("p4r2-purge-inflight", {
-        checkpointCandidate: { cursor: "x" },
-      });
+      await expect(
+        a.finishRun("p4r2-purge-inflight", {
+          checkpointCandidate: { cursor: "x" },
+        }),
+      ).rejects.toThrow(/gone/);
       await a.publishPending();
       await a.publishPending();
 
@@ -515,9 +517,12 @@ describe.each(matrix)(
       await a.declareStream("p4r2-collecting", "s", SHAPE);
       await a.append("p4r2-collecting", "s", { id: "1", n: "early" });
       await a.deleteConnection(c); // deleted(2)
-      await a.finishRun("p4r2-collecting", {
-        checkpointCandidate: { cursor: "x" },
-      });
+      // The delete purged the run: it is gone and cannot finish.
+      await expect(
+        a.finishRun("p4r2-collecting", {
+          checkpointCandidate: { cursor: "x" },
+        }),
+      ).rejects.toThrow(/gone/);
       await a.publishPending();
       const view = await readStream(env.registry, env.blobs, c, NS, "s");
       expect(view === null || view === "tombstoned").toBe(true);
