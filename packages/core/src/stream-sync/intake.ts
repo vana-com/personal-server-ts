@@ -200,10 +200,10 @@ export interface StreamSyncIntakeOptions {
    * and dropped no oversize record in it. Anything else merges.
    *
    * The desktop producer sends its replace call when a completion proof covers
-   * the stream's output and the run had no detail gap
-   * (`replace_streams`, apps/desktop/src-tauri/src/commands/pdpp_runtime.rs).
-   * This request does not carry that proof, so the setting stays off until a
-   * producer states per-stream full-source coverage.
+   * the stream's output and the run had no detail gap. This request does not
+   * carry that proof, so the setting stays off until a producer states
+   * per-stream full-source coverage. `replace-conformance.cases.json` (server
+   * package) lists, case by case, where intake and that producer differ.
    */
   readonly coveredReplace?: boolean;
 }
