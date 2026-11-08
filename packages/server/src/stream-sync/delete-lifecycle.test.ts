@@ -568,6 +568,30 @@ describe.each(matrix)(
       ).not.toMatchObject({ kind: "checkpointed" });
     });
 
+    // S1-stream, no relive: a stream row tombstoned after collect and not
+    // written again. The old run must not publish over the tombstone.
+    it("collect, tombstone stream row, publish: nothing from the old run is readable or published", async () => {
+      const c = freshConnector("p4r2-stream-tomb-only");
+      await activateControl(env.registry, c, NS); // control active(1)
+      const scope = streamScope(c, NS, "s");
+      const a = await env.writer("p4r2-stream-tomb-only-a");
+      await a.refreshControls();
+      await collect(a, {
+        runId: "p4r2-stream-tomb-only-old",
+        connector: c,
+        observedAt: T0,
+        streams: { s: rows(["1"], "old") },
+      });
+      await oldDelete(env, scope); // the stream row is tombstoned
+      await a.publishPending();
+
+      const view = await readStream(env.registry, env.blobs, c, NS, "s");
+      expect(view === null || view === "tombstoned").toBe(true);
+      expect(
+        finishedOutcome(await a.status(), "p4r2-stream-tomb-only-old")?.outcome,
+      ).not.toMatchObject({ kind: "checkpointed" });
+    });
+
     // S1-stream, in-flight: the tombstone and relive land between the old
     // run's read and its POST, so the publish takes the conflict-retry path.
     it("in-flight publish conflicts with a stream tombstone and relive: the retry discards the old run", async () => {
@@ -613,6 +637,43 @@ describe.each(matrix)(
       expect(
         finishedOutcome(await a.status(), "p4r2-stream-inflight-old")?.outcome,
       ).not.toMatchObject({ kind: "checkpointed" });
+    });
+
+    // Guard for the stream-row stamp: a second run of the same connector,
+    // collected before the first publishes, is an ordinary overlay and not a
+    // delete. Both runs publish and neither is lost.
+    it("two runs of one connector collected before either publishes: both publish, neither is lost", async () => {
+      const c = freshConnector("p4r2-two-runs");
+      await activateControl(env.registry, c, NS); // control active(1)
+      const a = await env.writer("p4r2-two-runs-a");
+      await a.refreshControls();
+      await collect(a, {
+        runId: "p4r2-two-first",
+        connector: c,
+        observedAt: T0,
+        streams: { s: rows(["1"], "first") },
+      });
+      await collect(a, {
+        runId: "p4r2-two-second",
+        connector: c,
+        observedAt: T0 + 1000,
+        streams: { s: rows(["2"], "second") },
+      });
+      await a.publishPending();
+      await a.publishPending();
+
+      const view = await readStream(env.registry, env.blobs, c, NS, "s");
+      expect(view).not.toBeNull();
+      expect(view).not.toBe("tombstoned");
+      expect([...(view as StreamView).records.keys()].sort()).toEqual([
+        "1",
+        "2",
+      ]);
+      for (const runId of ["p4r2-two-first", "p4r2-two-second"]) {
+        expect(finishedOutcome(await a.status(), runId)?.outcome).toMatchObject(
+          { kind: "checkpointed" },
+        );
+      }
     });
 
     // R8 (item 1): after a delete and a pass, no file of the scope remains.
