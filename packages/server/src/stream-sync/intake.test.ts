@@ -893,26 +893,24 @@ async function withNeedsFull(
 type StreamFiles = Awaited<ReturnType<OracleEnv["files"]>>;
 
 /**
- * Wraps a device's files port and records each appended entry. A finished
- * run removes its run directory, so the evidence is read from the append.
+ * Wraps a device's files port and keeps the exclusion evidence as it stands
+ * just before finish removes the run directory. Any write path (one write,
+ * appends, truncation) is observed through the bytes it leaves behind.
  */
-function recordingFiles(
+function observedFiles(
   inner: StreamFiles,
-  appends: Map<string, string[]>,
+  evidence: Map<string, string>,
 ): StreamFiles {
   return new Proxy(inner, {
     get(target, key) {
-      if (key === "appendMany") {
-        return async (
-          entries: readonly { path: string; bytes: Uint8Array }[],
-        ) => {
-          for (const entry of entries) {
-            appends.set(entry.path, [
-              ...(appends.get(entry.path) ?? []),
-              new TextDecoder().decode(entry.bytes),
-            ]);
+      if (key === "remove") {
+        return async (prefix: string) => {
+          if (/^runs\/[^/]+$/.test(prefix)) {
+            const path = `${prefix}/excluded.ndjson`;
+            const bytes = await target.read(path);
+            if (bytes) evidence.set(path, new TextDecoder().decode(bytes));
           }
-          return target.appendMany(entries);
+          return target.remove(prefix);
         };
       }
       const value = Reflect.get(target, key, target);
@@ -921,10 +919,24 @@ function recordingFiles(
   });
 }
 
-/** The stream of each exclusion line the run appended. */
-function exclusionStreams(appends: Map<string, string[]>, runId: string) {
-  const text = (appends.get(`runs/${runId}/excluded.ndjson`) ?? []).join("");
-  return text
+/**
+ * The run's exclusion evidence: the bytes captured before cleanup, or the
+ * file as it stands when cleanup never ran.
+ */
+async function exclusionEvidence(
+  h: Host,
+  evidence: Map<string, string>,
+  runId: string,
+): Promise<string | null> {
+  const path = `runs/${runId}/excluded.ndjson`;
+  if (evidence.has(path)) return evidence.get(path)!;
+  const bytes = await (await env.files(h.name)).read(path);
+  return bytes ? new TextDecoder().decode(bytes) : null;
+}
+
+/** The stream of each exclusion line in the evidence bytes. */
+function exclusionStreams(text: string | null) {
+  return (text ?? "")
     .trim()
     .split("\n")
     .filter((line) => line !== "")
@@ -1354,9 +1366,9 @@ describe(
     it("an oversized-only retry follows the ordinary exclusion path and is not an all-empty retry", async () => {
       const c = freshConnector("r28-m4-only");
       const name = `ev-${c}`;
-      const appends = new Map<string, string[]>();
+      const evidence = new Map<string, string>();
       const h = await host(
-        { files: recordingFiles(await env.files(name), appends) },
+        { files: observedFiles(await env.files(name), evidence) },
         {},
         name,
       );
@@ -1376,8 +1388,10 @@ describe(
       // The candidate is not saved before the run publishes.
       expect(JSON.stringify(await savedState(h))).not.toContain('"c1"');
       await publish(h, "r1");
-      // The ordinary path appends the exclusion evidence for the excluded row.
-      expect(exclusionStreams(appends, "r1")).toContain("items");
+      // The ordinary path writes the exclusion evidence for the excluded row.
+      expect(
+        exclusionStreams(await exclusionEvidence(h, evidence, "r1")),
+      ).toEqual(["items"]);
       const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
       expect(next.start).toEqual({
         collection_mode: "incremental",
@@ -1389,9 +1403,9 @@ describe(
     it("an oversized upsert beside an accepted one is not an all-empty retry", async () => {
       const c = freshConnector("r28-m4");
       const name = `ev-${c}`;
-      const appends = new Map<string, string[]>();
+      const evidence = new Map<string, string>();
       const h = await host(
-        { files: recordingFiles(await env.files(name), appends) },
+        { files: observedFiles(await env.files(name), evidence) },
         {},
         name,
       );
@@ -1411,8 +1425,10 @@ describe(
       expect(ended.result).toBe("queued");
       await publish(h, "r1");
       expect(await recordKeys(c, "items")).toEqual(["a"]);
-      // The ordinary path appends the exclusion evidence for the excluded row.
-      expect(exclusionStreams(appends, "r1")).toContain("items");
+      // The ordinary path writes the exclusion evidence for the excluded row.
+      expect(
+        exclusionStreams(await exclusionEvidence(h, evidence, "r1")),
+      ).toEqual(["items"]);
       const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
       expect(next.start).toEqual({
         collection_mode: "incremental",
