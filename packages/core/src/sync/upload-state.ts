@@ -170,6 +170,12 @@ export interface UploadStateTracker {
   /** Where the next paged scan of the unsynced rows resumes (row id, 0 = start). */
   scanCursor(): number;
   setScanCursor(afterId: number): void;
+  /**
+   * Highest row id the current sweep may scan, fixed when the sweep starts
+   * (`null` between sweeps). Rows above it join the next sweep.
+   */
+  scanFence(): number | null;
+  setScanFence(throughId: number | null): void;
   /** New data arrived for `scope`: stopped entries there try again. */
   releaseStopped(scope: string): void;
   /** The entry synced or was removed: forget it. */
@@ -194,6 +200,7 @@ export function createUploadStateTracker(
   const maxFailures = options.maxFailures ?? MAX_UPLOAD_FAILURES;
   const states = new Map<string, Tracked>();
   let scanAfterId = 0;
+  let scanFenceId: number | null = null;
   const iso = (ms: number) => new Date(ms).toISOString();
 
   return {
@@ -278,6 +285,12 @@ export function createUploadStateTracker(
     },
     setScanCursor(afterId) {
       scanAfterId = afterId;
+    },
+    scanFence() {
+      return scanFenceId;
+    },
+    setScanFence(throughId) {
+      scanFenceId = throughId;
     },
     releaseStopped(scope) {
       for (const [path, state] of states) {

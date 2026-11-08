@@ -538,10 +538,27 @@ export async function uploadAll(
   const paged = deps.storage.findUnsyncedPage;
   const scanBudget = options?.scanBudget ?? UPLOAD_SCAN_BUDGET;
   const scanAfter = paged ? state.scanCursor() : 0;
-  const entries = paged
+  // A sweep covers the rows present when it began: its upper id is fixed at
+  // the start. Rows that arrive above it wait for the next sweep, so a tail
+  // that keeps growing cannot stop the sweep from wrapping back to earlier
+  // rows (a failed upload that is due again would never be revisited). A
+  // host without `maxUnsyncedId` is swept without a fence.
+  if (paged && scanAfter === 0 && state.scanFence() === null) {
+    state.setScanFence(
+      deps.storage.maxUnsyncedId?.() ?? Number.POSITIVE_INFINITY,
+    );
+  }
+  const scanFence = paged ? (state.scanFence() ?? Number.POSITIVE_INFINITY) : 0;
+  const listed = paged
     ? paged.call(deps.storage, { afterId: scanAfter, limit: scanBudget })
     : deps.storage.findUnsynced();
-  const windowFull = paged !== undefined && entries.length >= scanBudget;
+  const entries = paged ? listed.filter((e) => e.id <= scanFence) : listed;
+  // The window is full only if it filled the budget and stayed inside the
+  // fence; otherwise the sweep has listed everything up to its fence.
+  const windowFull =
+    paged !== undefined &&
+    listed.length >= scanBudget &&
+    entries.length === listed.length;
   // Tracked state is dropped for rows that are gone or were rewritten. After a
   // partial window only the id range actually listed counts, so backoff of
   // rows beyond it survives; a window that reached the end covers the rest.
@@ -552,7 +569,7 @@ export async function uploadAll(
           afterId: scanAfter,
           throughId: windowFull
             ? Number(entries[entries.length - 1]?.id)
-            : Number.POSITIVE_INFINITY,
+            : scanFence,
         }
       : undefined,
   );
@@ -602,8 +619,11 @@ export async function uploadAll(
 
   if (paged) {
     // Stopped early: resume right after the last row looked at. Looked at all
-    // of a full window: continue past it. Reached the end: start over.
-    state.setScanCursor(selectionStopped || windowFull ? lastLookedAt : 0);
+    // of a full window: continue past it. Reached the end of the sweep's
+    // fence: start over with a new fence.
+    const resumes = selectionStopped || windowFull;
+    state.setScanCursor(resumes ? lastLookedAt : 0);
+    if (!resumes) state.setScanFence(null);
   }
 
   for (const { entry, plan } of batch) {

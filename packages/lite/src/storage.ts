@@ -771,6 +771,14 @@ export async function createPersistentPsLiteStorage(
       return page.sort((a, b) => a.id - b.id).slice(0, limit);
     },
 
+    maxUnsyncedId() {
+      let max = 0;
+      for (const entry of state.entries) {
+        if (entry.dataPointId === null && entry.id > max) max = entry.id;
+      }
+      return max;
+    },
+
     async readEnvelope(scope, collectedAt) {
       const path = envelopePath(scope, collectedAt);
       const envelope =

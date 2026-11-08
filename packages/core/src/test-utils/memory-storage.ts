@@ -113,6 +113,13 @@ export function createMemoryDataStorage(): MemoryDataStorage {
         .sort((a, b) => a.id - b.id)
         .slice(0, limit);
     },
+    maxUnsyncedId() {
+      return entries.reduce(
+        (max, entry) =>
+          entry.dataPointId === null ? Math.max(max, entry.id) : max,
+        0,
+      );
+    },
     async readEnvelope(scope, collectedAt) {
       const envelope = envelopes.get(key(scope, collectedAt));
       if (!envelope)

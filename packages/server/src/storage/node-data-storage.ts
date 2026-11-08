@@ -197,6 +197,9 @@ export function createNodeDataStorage(
     findUnsyncedPage(options: { afterId: number; limit: number }) {
       return deps.indexManager.findUnsyncedPage(options);
     },
+    maxUnsyncedId() {
+      return deps.indexManager.maxUnsyncedId();
+    },
     readEnvelope(scope: string, collectedAt: string) {
       return readDataFile(deps.hierarchyOptions, scope, collectedAt);
     },

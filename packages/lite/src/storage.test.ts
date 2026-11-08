@@ -1604,4 +1604,29 @@ describe("findUnsyncedPage", () => {
     expect(second.map((e) => e.id)).toEqual([rows[3].id, rows[4].id]);
     expect(done).toEqual([]);
   });
+
+  it("maxUnsyncedId is the highest unsynced id, 0 when none", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore("custom"),
+    );
+    expect(storage.maxUnsyncedId!()).toBe(0);
+    const rows = [];
+    for (let i = 0; i < 3; i++) {
+      const collectedAt = `2026-11-07T12:00:0${i}.000Z`;
+      rows.push(
+        await storage.writeEnvelopeAndIndex!(
+          createDataFileEnvelope(`notes.m${i}`, collectedAt, { value: i }),
+          {
+            fileId: null,
+            scope: `notes.m${i}`,
+            collectedAt,
+            dataPointId: i === 2 ? "0xdp" : null,
+          },
+        ),
+      );
+    }
+    expect(storage.maxUnsyncedId!()).toBe(rows[1].id);
+  });
 });

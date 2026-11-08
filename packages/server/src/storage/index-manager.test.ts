@@ -491,6 +491,22 @@ describe("IndexManager", () => {
     expect(done).toEqual([]);
   });
 
+  it("maxUnsyncedId is the highest unsynced id, 0 when none", () => {
+    expect(manager.maxUnsyncedId()).toBe(0);
+    const rows = [0, 1, 2].map((i) =>
+      manager.insert({
+        fileId: null,
+        path: `m/${i}.json`,
+        scope: `m.${i}`,
+        collectedAt: `2026-01-21T10:00:0${i}Z`,
+        sizeBytes: 10,
+      }),
+    );
+    expect(manager.maxUnsyncedId()).toBe(rows[2].id);
+    manager.updateDataPointId(rows[2].path, "0xdp");
+    expect(manager.maxUnsyncedId()).toBe(rows[1].id);
+  });
+
   // --- findUnsynced ---
 
   it("findUnsynced returns entries with fileId === null", () => {
