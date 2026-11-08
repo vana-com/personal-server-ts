@@ -584,7 +584,10 @@ export class StreamSyncIntake implements RunIntake {
     }
 
     // R28: a retry that received records publishes them; only a retry with
-    // no upserts at all is checkpoint-only.
+    // no upserts at all is checkpoint-only. This is the model's RetryEmpty
+    // ("an end with no records at all is checkpoint-only"): coverage is not
+    // retired here. The old continuation stays until a later succeeded end
+    // covers the stream (retry-followups.test.ts, RetryEmpty).
     if (req.outcome === "retry_pending" && run.received === 0) {
       const status = await writer.saveCheckpointOnly(
         runId,

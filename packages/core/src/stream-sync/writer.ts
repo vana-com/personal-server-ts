@@ -230,6 +230,11 @@ interface HostEntry {
   tombstoned?: boolean;
   /** R28: the run's whole-read streams (`incremental: false`). */
   wholeRead?: string[];
+  /**
+   * R28 follow-up: streams whose records were all too large, dropped from
+   * publication. Their exclusion count stays in the run's result.
+   */
+  excludedOnly?: Record<string, number>;
 }
 
 /** The START the writer issued to a run (V2 §2.1). */
@@ -909,6 +914,11 @@ export class StreamSyncWriter {
         } else if (input.coveredStreams) {
           this.keepCovered(host, input.coveredStreams);
         }
+        // Per-record evidence of each too-large exclusion, kept until finish
+        // removes the run directory. Nothing in production reads it; the
+        // intake tests assert its bytes before cleanup (intake.test.ts
+        // exclusion evidence). The durable count is the result file's
+        // recordTooLarge. Removing this write means changing those tests.
         if (run.excluded.length > 0) {
           await this.options.home.files.appendMany([
             {
@@ -922,6 +932,12 @@ export class StreamSyncWriter {
         for (const [name, stream] of Object.entries(host.streams)) {
           stream.shardBytes = run.shardBytes.get(name) ?? emptyShardBytes();
           stream.recordTooLarge = run.recordTooLarge.get(name) ?? 0;
+        }
+        for (const [name, count] of run.recordTooLarge) {
+          // A stream kept out of publication still reports what it skipped.
+          if (!host.streams[name] && count > 0) {
+            host.excludedOnly = { ...host.excludedOnly, [name]: count };
+          }
         }
         if (this.options.seed) {
           await this.withState((state) => {
@@ -1653,9 +1669,18 @@ export class StreamSyncWriter {
       // A complete commit ends the stream's retry continuation.
       const held = state.checkpoints[entry.connector];
       if (complete && held?.prov?.includes(name)) {
+        // The completed attempt's cursor goes with its provenance, so an
+        // artifact that later makes the stream incremental cannot reissue it.
+        const rest = isPlainObject(held.value)
+          ? Object.fromEntries(
+              Object.entries(held.value).filter(([key]) => key !== name),
+            )
+          : held.value;
         state.checkpoints[entry.connector] = {
           ...held,
           prov: held.prov.filter((s) => s !== name),
+          value:
+            isPlainObject(rest) && Object.keys(rest).length === 0 ? null : rest,
         };
       }
       if (stream.seedApplies && this.options.seed) {
@@ -2095,6 +2120,15 @@ export class StreamSyncWriter {
         problem: info?.problem ?? null,
         detail: info?.detail ?? null,
         recordTooLarge: info?.recordTooLarge ?? 0,
+      };
+    }
+    for (const [name, count] of Object.entries(host.excludedOnly ?? {})) {
+      if (streams[name]) continue;
+      streams[name] = {
+        state: "discarded",
+        problem: null,
+        detail: null,
+        recordTooLarge: count,
       };
     }
     return {
