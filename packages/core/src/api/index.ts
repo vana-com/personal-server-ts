@@ -105,6 +105,10 @@ import type {
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
+  refuseLegacyWrite,
+  type LegacyWriteSwitch,
+} from "./legacy-write-gate.js";
+import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
   type LegacyScopeViewPort,
@@ -333,6 +337,11 @@ export interface StreamSyncReadPort {
 }
 
 export interface PersonalServerDataApiDeps {
+  /**
+   * Whether an undeclared legacy write is refused (see
+   * `legacy-write-gate.ts`). Absent = never refuse.
+   */
+  legacyWritesRefused?: LegacyWriteSwitch;
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
   /**
@@ -2939,6 +2948,12 @@ export async function handlePersonalServerDataRequest(
           undefined;
       } else {
         await deps.auth.authorizeOwner(request);
+      }
+      // `writeAuth` exists only after the builder's session and write
+      // signature verified, so only a verified builder skips the refusal.
+      if (!writeAuth) {
+        const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+        if (refusal) return refusal;
       }
       // `?supersede=legacy`: once this write commits, delete the scope's
       // older legacy-form versions (see supersedeLegacyVersions). It deletes

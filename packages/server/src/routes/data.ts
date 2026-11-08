@@ -187,8 +187,10 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   });
 
   // Refuse before any body is read, so an old client sees `update_required`
-  // and not a size or parse error. A builder's delegated write carries a
-  // write proof and is left to the data handler, which knows its auth.
+  // and not a size or parse error. A request that carries a write signature
+  // might be a builder's delegated write. This layer cannot verify the
+  // signature (it signs the body), so the data handler decides once it has:
+  // `refuseLegacyWrite` runs again after `authorizeWrite` returns no builder.
   const refuseLegacy: MiddlewareHandler = async (c, next) => {
     if (c.req.header(WRITE_SIGNATURE_HEADER) === undefined) {
       const refusal = refuseLegacyWrite(c.req.raw, deps.legacyWritesRefused);
@@ -408,6 +410,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       c.req.raw,
       {
         additions: deps.additions,
+        legacyWritesRefused: deps.legacyWritesRefused,
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
         streamSyncRead: deps.streamSyncRead,

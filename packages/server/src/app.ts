@@ -603,7 +603,10 @@ export function createApp(deps: AppDeps): Hono {
       streamSyncRead: deps.streamSyncRead,
       // The account's stream-sync switch as this server holds it: its host
       // sets `streamSync.write` from the Account setting before launch.
-      legacyWritesRefused: () => deps.config?.streamSync.write === true,
+      // Enforcement is its own flag and ships off.
+      legacyWritesRefused: () =>
+        deps.config?.streamSync.write === true &&
+        deps.config.streamSync.refuseLegacyWrites === true,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,

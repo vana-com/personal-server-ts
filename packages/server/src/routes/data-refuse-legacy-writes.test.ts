@@ -184,17 +184,18 @@ describe("refuse legacy writes after the stream-sync switch", () => {
     expect(del.status).not.toBe(426);
   });
 
-  it("does not refuse a builder's delegated write at the gate", async () => {
+  it("refuses an owner write that only carries a forged write signature", async () => {
     switchedOn = true;
     const response = await app.request(`/${scope}`, {
       method: "POST",
       headers: {
-        Authorization: "Bearer vana_write_x",
-        "X-Vana-Write-Signature": "0x00",
+        ...bearer,
+        "X-Vana-Write-Signature": "forged",
         "Content-Type": "application/json",
       },
-      body: "{}",
+      body: JSON.stringify({ v: 1 }),
     });
-    expect(response.status).not.toBe(426);
+    expect(response.status).toBe(426);
+    expect(index.countByScope(scope)).toBe(0);
   });
 });

@@ -35,7 +35,10 @@ describe("createApp legacy-write refusal", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  function makeApp(streamSyncWrite: boolean) {
+  function makeApp(streamSync: {
+    write?: boolean;
+    refuseLegacyWrites?: boolean;
+  }) {
     return createApp({
       logger: pino({ level: "silent" }),
       version: "0.0.1",
@@ -48,7 +51,7 @@ describe("createApp legacy-write refusal", () => {
       accessLogWriter: { write: async () => undefined },
       devToken: token,
       config: ServerConfigSchema.parse({
-        streamSync: { write: streamSyncWrite },
+        streamSync,
       }),
     });
   }
@@ -65,20 +68,29 @@ describe("createApp legacy-write refusal", () => {
     });
   }
 
-  it("refuses an old client's write when streamSync.write is on", async () => {
-    const response = await post(makeApp(true));
+  it("accepts an old client's write by default, even with streamSync.write on", async () => {
+    expect((await post(makeApp({ write: true }))).status).toBe(201);
+  });
+
+  it("refuses an old client's write only when both flags are on", async () => {
+    const response = await post(
+      makeApp({ write: true, refuseLegacyWrites: true }),
+    );
     expect(response.status).toBe(426);
     expect((await response.json()).errorCode).toBe("update_required");
   });
 
-  it("accepts a declaring client's write when streamSync.write is on", async () => {
-    const response = await post(makeApp(true), {
-      [STREAM_SYNC_CLIENT_HEADER]: "1",
-    });
+  it("accepts a declaring client's write when both flags are on", async () => {
+    const response = await post(
+      makeApp({ write: true, refuseLegacyWrites: true }),
+      { [STREAM_SYNC_CLIENT_HEADER]: "1" },
+    );
     expect(response.status).toBe(201);
   });
 
   it("accepts an old client's write when streamSync.write is off", async () => {
-    expect((await post(makeApp(false))).status).toBe(201);
+    expect(
+      (await post(makeApp({ write: false, refuseLegacyWrites: true }))).status,
+    ).toBe(201);
   });
 });
