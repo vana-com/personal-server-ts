@@ -4,7 +4,10 @@ import { keccak256 } from "viem";
 
 import type { UploadWorkerDeps } from "./upload.js";
 import { uploadOne, uploadAll, computeDataPointId } from "./upload.js";
-import { createUploadStateTracker } from "../upload-state.js";
+import {
+  createUploadStateTracker,
+  type UploadStateTracker,
+} from "../upload-state.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type {
@@ -1948,6 +1951,57 @@ describe("uploadAll — paged scan of a large backlog", () => {
       "p/9.json",
     );
   });
+  describe("tracked state above a new sweep's maximum", () => {
+    const track = (uploadState: UploadStateTracker, id: number) =>
+      uploadState.recordFailure(
+        {
+          scope: `p.${id}`,
+          path: `p/${id}.json`,
+          identity: { id, sizeBytes: 1024 },
+        },
+        "boom",
+        T0,
+      );
+
+    it("prunes the state of a deleted tracked maximum while lower rows remain", async () => {
+      const { deps, uploadState } = setup([row(1), row(2), row(3)]);
+      track(uploadState, 10);
+      await uploadAll(deps, { now: () => new Date(T0 + 1000) });
+      expect(uploadState.has("p/10.json")).toBe(false);
+    });
+
+    it("prunes the state of the last deleted row", async () => {
+      const { deps, uploadState } = setup([]);
+      track(uploadState, 10);
+      await uploadAll(deps, { now: () => new Date(T0 + 1000) });
+      expect(uploadState.has("p/10.json")).toBe(false);
+    });
+
+    it("keeps live backoff above an older active fence", async () => {
+      const { deps, uploadState } = setup([row(1), row(2), row(3), row(10)]);
+      track(uploadState, 10);
+      uploadState.setScanFence(3);
+      uploadState.setScanCursor(1);
+      await uploadAll(deps, {
+        batchSize: 1,
+        now: () => new Date(T0 + 1000),
+      });
+      expect(uploadState.has("p/10.json")).toBe(true);
+    });
+
+    it("does not bring the moving-tail starvation back on a host with a page method but no maximum", async () => {
+      const { rows } = await runWithArrivals({
+        initial: 100,
+        arrivals: 50,
+        cycles: 30,
+        failScope: "p.1",
+        failTimes: 1,
+        withoutMax: true,
+      });
+      expect(rows.find((r) => r.id === 1)?.dataPointId).not.toBeNull();
+    });
+  });
+
   /** Rows arrive at the tail every cycle while the scan keeps working. */
   async function runWithArrivals(options: {
     initial: number;
@@ -1957,10 +2011,18 @@ describe("uploadAll — paged scan of a large backlog", () => {
     cycles: number;
     failScope: string;
     failTimes: number;
+    withoutMax?: boolean;
     onCycle?: (cycle: number, rows: IndexEntry[]) => void;
   }) {
     const rows = Array.from({ length: options.initial }, (_, i) => row(i + 1));
     const ctx = setup(rows);
+    if (options.withoutMax) {
+      // A host with the page method but no maximum is scanned whole.
+      ctx.deps.storage.maxUnsyncedId = undefined;
+      ctx.deps.storage.findUnsynced = vi.fn(() =>
+        rows.filter((r) => r.dataPointId === null),
+      );
+    }
     let failuresLeft = options.failTimes;
     (ctx.deps.storage.readEnvelope as ReturnType<typeof vi.fn>)
       .mockReset()
