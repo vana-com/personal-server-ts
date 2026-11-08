@@ -72,7 +72,7 @@ interface Host {
 }
 
 async function host(
-  extra: Partial<StreamSyncWriterOptions> & { files?: StreamFiles } = {},
+  extra: Partial<StreamSyncWriterOptions> = {},
   intakeOptions: Partial<Parameters<typeof createStreamSyncIntake>[0]> = {},
   name = `intake-${(device += 1)}`,
 ): Promise<Host> {
@@ -890,57 +890,18 @@ async function withNeedsFull(
   return host({}, {}, h.name);
 }
 
-type StreamFiles = Awaited<ReturnType<OracleEnv["files"]>>;
-
 /**
- * Wraps a device's files port and keeps the exclusion evidence as it stands
- * just before finish removes the run directory. Any write path (one write,
- * appends, truncation) is observed through the bytes it leaves behind.
+ * The streams a finished run excluded for size (§2.2). The durable result of
+ * the run names them: `recordTooLarge` is carried by the stream status that
+ * finish writes to results/<runId>.json, which status().finished reads.
  */
-function observedFiles(
-  inner: StreamFiles,
-  evidence: Map<string, string>,
-): StreamFiles {
-  return new Proxy(inner, {
-    get(target, key) {
-      if (key === "remove") {
-        return async (prefix: string) => {
-          if (/^runs\/[^/]+$/.test(prefix)) {
-            const path = `${prefix}/excluded.ndjson`;
-            const bytes = await target.read(path);
-            if (bytes) evidence.set(path, new TextDecoder().decode(bytes));
-          }
-          return target.remove(prefix);
-        };
-      }
-      const value = Reflect.get(target, key, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-}
-
-/**
- * The run's exclusion evidence: the bytes captured before cleanup, or the
- * file as it stands when cleanup never ran.
- */
-async function exclusionEvidence(
-  h: Host,
-  evidence: Map<string, string>,
-  runId: string,
-): Promise<string | null> {
-  const path = `runs/${runId}/excluded.ndjson`;
-  if (evidence.has(path)) return evidence.get(path)!;
-  const bytes = await (await env.files(h.name)).read(path);
-  return bytes ? new TextDecoder().decode(bytes) : null;
-}
-
-/** The stream of each exclusion line in the evidence bytes. */
-function exclusionStreams(text: string | null) {
-  return (text ?? "")
-    .trim()
-    .split("\n")
-    .filter((line) => line !== "")
-    .map((line) => (JSON.parse(line) as { stream?: string }).stream);
+function excludedStreams(
+  finished: { streams: Record<string, { recordTooLarge: number }> } | null,
+): string[] {
+  return Object.entries(finished?.streams ?? {})
+    .filter(([, stream]) => stream.recordTooLarge > 0)
+    .map(([name]) => name)
+    .sort();
 }
 
 /** A record-bearing retry with a candidate; its head must commit the record. */
@@ -1365,13 +1326,7 @@ describe(
 
     it("an oversized-only retry follows the ordinary exclusion path and is not an all-empty retry", async () => {
       const c = freshConnector("r28-m4-only");
-      const name = `ev-${c}`;
-      const evidence = new Map<string, string>();
-      const h = await host(
-        { files: observedFiles(await env.files(name), evidence) },
-        {},
-        name,
-      );
+      const h = await host();
       const { batch, ended } = await run(h, "r1", c, {
         records: [
           {
@@ -1387,11 +1342,9 @@ describe(
       expect(ended.result).toBe("queued");
       // The candidate is not saved before the run publishes.
       expect(JSON.stringify(await savedState(h))).not.toContain('"c1"');
-      await publish(h, "r1");
-      // The ordinary path writes the exclusion evidence for the excluded row.
-      expect(
-        exclusionStreams(await exclusionEvidence(h, evidence, "r1")),
-      ).toEqual(["items"]);
+      const { finished } = await publish(h, "r1");
+      // The durable result of the run names the excluded stream.
+      expect(excludedStreams(finished)).toEqual(["items"]);
       const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
       expect(next.start).toEqual({
         collection_mode: "incremental",
@@ -1402,13 +1355,7 @@ describe(
 
     it("an oversized upsert beside an accepted one is not an all-empty retry", async () => {
       const c = freshConnector("r28-m4");
-      const name = `ev-${c}`;
-      const evidence = new Map<string, string>();
-      const h = await host(
-        { files: observedFiles(await env.files(name), evidence) },
-        {},
-        name,
-      );
+      const h = await host();
       const { batch, ended } = await run(h, "r1", c, {
         records: [
           { stream: "items", data: row("a") },
@@ -1423,12 +1370,10 @@ describe(
       });
       expect(batch).toMatchObject({ accepted: 1, tooLarge: 1 });
       expect(ended.result).toBe("queued");
-      await publish(h, "r1");
+      const { finished } = await publish(h, "r1");
       expect(await recordKeys(c, "items")).toEqual(["a"]);
-      // The ordinary path writes the exclusion evidence for the excluded row.
-      expect(
-        exclusionStreams(await exclusionEvidence(h, evidence, "r1")),
-      ).toEqual(["items"]);
+      // The durable result of the run names the excluded stream.
+      expect(excludedStreams(finished)).toEqual(["items"]);
       const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
       expect(next.start).toEqual({
         collection_mode: "incremental",
