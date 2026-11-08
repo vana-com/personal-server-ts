@@ -1524,3 +1524,45 @@ describe("deleteVersionIfEnvelopeMissing", () => {
     );
   });
 });
+
+describe("same-path replacement of an unsynced row", () => {
+  const scope = "notes.entries";
+  const collectedAt = "2026-11-07T12:00:00.000Z";
+
+  // The upload worker keys its held and backoff state by path and tells a
+  // replaced row apart by its id and size. This pins what a replacement at an
+  // existing scope and collectedAt looks like to `findUnsynced`.
+  it("lists one unsynced row, with a fresh id and the new size", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore("custom"),
+    );
+    const large = await storage.writeEnvelopeAndIndex!(
+      createDataFileEnvelope(scope, collectedAt, { value: 1 }),
+      {
+        fileId: null,
+        scope,
+        collectedAt,
+        dataPointId: null,
+        sizeBytes: 337 * 1024 * 1024,
+      },
+    );
+
+    const small = await storage.writeEnvelopeAndIndex!(
+      createDataFileEnvelope(scope, collectedAt, { value: 2 }),
+      { fileId: null, scope, collectedAt, dataPointId: null },
+    );
+
+    expect(small.path).toBe(large.path);
+    expect(small.id).not.toBe(large.id);
+    expect(small.sizeBytes).toBeLessThan(1024);
+    const unsynced = storage.findUnsynced();
+    expect(unsynced).toHaveLength(1);
+    expect(unsynced[0]).toMatchObject({
+      id: small.id,
+      path: large.path,
+      sizeBytes: small.sizeBytes,
+    });
+  });
+});

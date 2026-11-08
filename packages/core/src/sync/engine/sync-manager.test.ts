@@ -31,6 +31,7 @@ import { uploadAll } from "../workers/upload.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { createSyncManager } from "./sync-manager.js";
+import { createUploadStateTracker } from "../upload-state.js";
 
 function makeMockLogger(): Logger {
   return {
@@ -588,6 +589,99 @@ describe("SyncManager", () => {
       expect(result.steps.gateway).toEqual({
         status: "skipped",
         reason: "sync-disabled",
+      });
+    });
+
+    describe("upload state across a delete", () => {
+      const row = (n: number, scope = "instagram.profile") => ({
+        id: n,
+        path: `${scope}/${n}.json`,
+        scope,
+        collectedAt: `2026-08-0${n}T00:00:00.000Z`,
+        version: n,
+        sizeBytes: 1024,
+        dataPointId: null,
+        afterTombstoneVersion: null,
+      });
+
+      /** Three held entries of the scope (+ one of another), all still unsynced. */
+      function heldState(rows: ReturnType<typeof row>[]) {
+        const state = createUploadStateTracker();
+        const [tooLarge, retrying, stopped, other] = rows;
+        state.markTooLarge(
+          { scope: tooLarge.scope, path: tooLarge.path },
+          337 * 1024 * 1024,
+        );
+        state.recordFailure(
+          { scope: retrying.scope, path: retrying.path },
+          "boom",
+          Date.parse("2026-11-07T12:00:00Z"),
+        );
+        for (let i = 0; i < 8; i++)
+          state.recordFailure(
+            { scope: stopped.scope, path: stopped.path },
+            "boom",
+            Date.parse("2026-11-07T12:00:00Z"),
+          );
+        state.recordFailure(
+          { scope: other.scope, path: other.path },
+          "boom",
+          Date.parse("2026-11-07T12:00:00Z"),
+        );
+        return state;
+      }
+
+      it("keeps retrying, stopped and too-large state when the gateway tombstone fails", async () => {
+        const rows = [row(1), row(2), row(3), row(4, "notes.entries")];
+        const uploadDeps = makeMockUploadDeps();
+        const uploadState = heldState(rows);
+        uploadDeps.uploadState = uploadState;
+        uploadDeps.storage.findUnsynced = vi.fn(() => rows);
+        uploadDeps.storage.listVersions = vi.fn(() => rows);
+        uploadDeps.storage.deleteVersion = vi.fn(async () => true);
+        const deleteData = makeDeleteData();
+        deleteData.tombstone.mockRejectedValue(new Error("gateway down"));
+        const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+          deleteData,
+          pendingBlobDeletions: makePending(),
+        });
+
+        const result = await manager.deleteScope("instagram.profile");
+
+        expect(result.steps.gateway.status).toBe("failed");
+        expect(uploadDeps.storage.deleteVersion).not.toHaveBeenCalled();
+        const held = uploadState.snapshot();
+        expect(held.tooLarge).toHaveLength(1);
+        expect(held.retrying).toHaveLength(2);
+        expect(held.stopped).toHaveLength(1);
+        // The retrying entry is not due early because a delete failed.
+        const failedAt = Date.parse("2026-11-07T12:00:00Z");
+        expect(uploadState.shouldAttempt(rows[1].path, failedAt + 1000)).toBe(
+          false,
+        );
+      });
+
+      it("clears upload state for exactly the entries the delete removed", async () => {
+        const rows = [row(1), row(2), row(3), row(4, "notes.entries")];
+        const uploadDeps = makeMockUploadDeps();
+        const uploadState = heldState(rows);
+        uploadDeps.uploadState = uploadState;
+        uploadDeps.storage.findUnsynced = vi.fn(() => [...rows]);
+        uploadDeps.storage.listVersions = vi.fn(() => []);
+        // The local delete removes entries 1 and 2 and leaves entry 3 behind.
+        uploadDeps.storage.deleteScope = vi.fn(async () => {
+          rows.splice(0, 2);
+          return 2;
+        });
+        const manager = createSyncManager(uploadDeps, makeMockDownloadDeps());
+
+        await manager.deleteScope("instagram.profile");
+
+        const paths = (list: { path: string }[]) => list.map((e) => e.path);
+        const held = uploadState.snapshot();
+        expect(paths(held.tooLarge)).toEqual([]);
+        expect(paths(held.retrying)).toEqual(["notes.entries/4.json"]);
+        expect(paths(held.stopped)).toEqual(["instagram.profile/3.json"]);
       });
     });
 

@@ -1657,3 +1657,162 @@ describe("uploadAll — terminal entries, failure clock and removals", () => {
     },
   );
 });
+
+describe("uploadAll — planning cost over a large backlog", () => {
+  const T0 = Date.parse("2026-11-07T12:00:00Z");
+
+  /** Elements read through the array iterator (spread, for-of) while `fn` runs. */
+  async function countIteratedElements(fn: () => Promise<void>) {
+    const proto = Array.prototype as unknown as Record<symbol, unknown>;
+    const original = proto[Symbol.iterator] as () => IterableIterator<unknown>;
+    let count = 0;
+    proto[Symbol.iterator] = function (this: unknown[]) {
+      count += this.length;
+      return original.call(this);
+    };
+    try {
+      await fn();
+    } finally {
+      proto[Symbol.iterator] = original;
+    }
+    return count;
+  }
+
+  it("plans one coalesced scope in a single pass, without copying its growing version list", async () => {
+    const N = 2000;
+    const deps = makeMockDeps();
+    const rows = Array.from({ length: N }, (_, i) =>
+      makeEntry({
+        id: i + 1,
+        path: `memory.claude/${i}.json`,
+        scope: "memory.claude",
+        collectedAt: new Date(T0 + i * 10).toISOString(),
+        sizeBytes: 1024,
+      }),
+    );
+    (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue(
+      rows,
+    );
+
+    // The newest snapshot is inside the quiet window, so nothing uploads: the
+    // whole cost measured here is selection and planning.
+    const iterated = await countIteratedElements(async () => {
+      await uploadAll(deps, { now: () => new Date(T0 + N * 10 + 1000) });
+    });
+
+    expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+    // One pass is a few passes over N rows; the quadratic accumulator reads
+    // about N^2 / 2 (2,000,000 here).
+    expect(iterated).toBeLessThan(20 * N);
+  });
+});
+
+describe("uploadAll — terminal state follows the row, not the path", () => {
+  const SCOPE_KEY = new Uint8Array(32).fill(0xbb);
+  const MIB = 1024 * 1024;
+  const T0 = Date.parse("2026-11-07T12:00:00Z");
+  const MINUTE = 60_000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
+    (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    );
+  });
+
+  function setup(initial: IndexEntry) {
+    const deps = makeMockDeps();
+    const uploadState = createUploadStateTracker();
+    deps.uploadState = uploadState;
+    const index = { row: initial };
+    deps.storage.findUnsynced = vi.fn(() =>
+      index.row.dataPointId === null ? [index.row] : [],
+    );
+    deps.storage.updateDataPointId = vi.fn(
+      (_path: string, id: string | null) => {
+        index.row = { ...index.row, dataPointId: id };
+        return true;
+      },
+    );
+    const cycle = (n: number) =>
+      uploadAll(deps, { now: () => new Date(T0 + n * 61 * MINUTE) });
+    return { deps, uploadState, index, cycle };
+  }
+
+  it("uploads a small row written at the path of a held too-large row", async () => {
+    const big = makeEntry({ id: 1, path: "s/1.json", sizeBytes: 337 * MIB });
+    const { deps, uploadState, index, cycle } = setup(big);
+    await cycle(0);
+    expect(uploadState.snapshot().tooLarge).toHaveLength(1);
+
+    // Same scope and collectedAt, so the same path; a fresh id and a 1 KiB body.
+    index.row = { ...big, id: 2, sizeBytes: 1024 };
+    const results = await cycle(1);
+
+    expect(results.map((r) => r.path)).toEqual(["s/1.json"]);
+    expect(deps.storage.readEnvelope).toHaveBeenCalledTimes(1);
+    expect(uploadState.snapshot().tooLarge).toEqual([]);
+  });
+
+  it("uploads a row whose missing size was repaired in place", async () => {
+    const bad = makeEntry({ id: 1, path: "s/1.json", sizeBytes: 0 });
+    const { uploadState, index, cycle } = setup(bad);
+    await cycle(0);
+    expect(uploadState.snapshot().unsizable).toHaveLength(1);
+
+    index.row = { ...bad, sizeBytes: 1024 };
+    const results = await cycle(1);
+
+    expect(results.map((r) => r.path)).toEqual(["s/1.json"]);
+    expect(uploadState.snapshot().unsizable).toEqual([]);
+  });
+
+  it("uploads a valid row written at the path of an unsizable one", async () => {
+    const bad = makeEntry({ id: 1, path: "s/1.json", sizeBytes: Number.NaN });
+    const { uploadState, index, cycle } = setup(bad);
+    await cycle(0);
+    expect(uploadState.snapshot().unsizable).toHaveLength(1);
+
+    index.row = { ...bad, id: 2, sizeBytes: 1024 };
+    const results = await cycle(1);
+
+    expect(results.map((r) => r.path)).toEqual(["s/1.json"]);
+  });
+
+  it("retries a stopped path at once when a new row replaces it", async () => {
+    const row = makeEntry({ id: 1, path: "s/1.json", sizeBytes: 1024 });
+    const { deps, uploadState, index, cycle } = setup(row);
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("boom"),
+    );
+    for (let i = 0; i < 8; i++) await cycle(i);
+    expect(uploadState.snapshot().stopped).toHaveLength(1);
+
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockResolvedValue(
+      `https://storage.vana.com/v1/blobs/${OWNER}/s/1`,
+    );
+    index.row = { ...row, id: 2 };
+    const results = await cycle(8);
+
+    expect(results.map((r) => r.path)).toEqual(["s/1.json"]);
+  });
+
+  it("keeps an unchanged held row held and an unchanged backoff in force", async () => {
+    const big = makeEntry({ id: 1, path: "s/1.json", sizeBytes: 337 * MIB });
+    const { deps, uploadState, cycle } = setup(big);
+    for (let i = 0; i < 4; i++) await cycle(i);
+    expect(uploadState.snapshot().tooLarge).toHaveLength(1);
+    expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+
+    const failing = makeEntry({ id: 2, path: "s/2.json", sizeBytes: 1024 });
+    const second = setup(failing);
+    (
+      second.deps.storageAdapter.upload as ReturnType<typeof vi.fn>
+    ).mockRejectedValue(new Error("boom"));
+    await uploadAll(second.deps, { now: () => new Date(T0) });
+    await uploadAll(second.deps, { now: () => new Date(T0 + 1000) });
+    expect(second.deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+    expect(second.uploadState.snapshot().retrying).toHaveLength(1);
+  });
+});
