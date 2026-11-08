@@ -393,8 +393,8 @@ describe("run intake", { timeout: 30_000 }, () => {
     });
   });
 
-  it("retry_pending keeps no cursor for a stream that emitted records (R19)", async () => {
-    const c = freshConnector("r19");
+  it("a retry_pending run that emitted records publishes them incomplete and keeps its cursors (R28)", async () => {
+    const c = freshConnector("r28-records");
     const h = await host();
     const { ended } = await run(h, "r1", c, {
       records: [{ stream: "items", data: row("a") }],
@@ -402,13 +402,86 @@ describe("run intake", { timeout: 30_000 }, () => {
       candidate: { items: "after-a", export: "tok" },
       outcome: "retry_pending",
     });
-    expect(ended.result).toBe("checkpoint_only");
+    expect(ended.result).toBe("queued");
+    await publish(h, "r1");
+    expect(await recordKeys(c, "items")).toEqual(["a"]);
+    const view = await readStream(env.registry, env.blobs, c, "", "items");
+    expect((view as { head: { complete: boolean } }).head.complete).toBe(false);
     const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
-    // The records of run 1 were never published: items must be read again.
-    expect(next.start.state).toEqual({ export: "tok" });
+    expect(next.start.state).toEqual({ items: "after-a", export: "tok" });
+    await h.intake.abort("r2", "cancelled");
+  });
+
+  it("a retry_pending run with no records takes the cursor path and publishes nothing", async () => {
+    const c = freshConnector("r19-cursor-path");
+    const h = await host();
+    const { ended } = await run(h, "r1", c, {
+      records: [],
+      covered: [],
+      candidate: { items: "c1", export: "tok" },
+      outcome: "retry_pending",
+    });
+    expect(ended.result).toBe("checkpoint_only");
     expect(
       await readStream(env.registry, env.blobs, c, "", "items"),
     ).toBeNull();
+    const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
+    expect(next.start).toEqual({
+      collection_mode: "incremental",
+      state: { items: "c1", export: "tok" },
+    });
+    await h.intake.abort("r2", "cancelled");
+  });
+
+  it("a retry commit whose candidate omits a sibling keeps the sibling's cursor", async () => {
+    const c = freshConnector("r28-sibling");
+    const h = await host();
+    await run(h, "r1", c, {
+      records: [{ stream: "items", data: row("a") }],
+      covered: [],
+      candidate: { items: "i1", export: "tok1" },
+      outcome: "retry_pending",
+    });
+    await publish(h, "r1");
+    await run(h, "r2", c, {
+      records: [{ stream: "items", data: row("b") }],
+      covered: [],
+      candidate: { items: "i2" },
+      outcome: "retry_pending",
+      begin: { observedAt: T0 + 1 },
+    });
+    await publish(h, "r2");
+    // r2's candidate omits export, so export keeps the cursor saved by r1.
+    const next = await h.intake.begin("r3", begin(c, { observedAt: T0 + 2 }));
+    expect(next.start).toEqual({
+      collection_mode: "incremental",
+      state: { items: "i2", export: "tok1" },
+    });
+    await h.intake.abort("r3", "cancelled");
+  });
+
+  it("an oversized-only retry publishes and saves its candidate", async () => {
+    const c = freshConnector("r28-oversized-only");
+    const h = await host();
+    const { ended } = await run(h, "r1", c, {
+      records: [
+        {
+          stream: "items",
+          data: { id: "big", n: "x".repeat(8 * 1024 * 1024) },
+        },
+      ],
+      covered: [],
+      candidate: { items: "c1" },
+      outcome: "retry_pending",
+    });
+    expect(ended.result).toBe("queued");
+    await publish(h, "r1");
+    const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
+    expect(next.start).toEqual({
+      collection_mode: "incremental",
+      state: { items: "c1" },
+    });
+    await h.intake.abort("r2", "cancelled");
   });
 
   it("begin and end of one run finish while another run's publish waits on an upload", async () => {
