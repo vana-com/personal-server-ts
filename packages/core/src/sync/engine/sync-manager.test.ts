@@ -953,4 +953,34 @@ describe("sync manager upload state", () => {
       expect.objectContaining({ scope: "s.big", path: "s/1.json" }),
     ]);
   });
+
+  it("trigger() releases stopped uploads before the cycle, and keeps too-large and backing-off ones", async () => {
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      { pollInterval: 60_000 },
+    );
+    let afterFirst: ReturnType<typeof manager.getStatus>["uploads"];
+    (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async (deps) => {
+      const state = deps.uploadState!;
+      const e = (n: string) => ({ scope: `s.${n}`, path: `s/${n}.json` });
+      if (!state.has("s/big.json")) {
+        state.markTooLarge(e("big"), 9);
+        state.recordFailure(e("wait"), "boom", Date.now());
+        for (let i = 0; i < 8; i++) state.recordFailure(e("stop"), "boom", 0);
+      }
+      afterFirst = state.snapshot();
+      return [];
+    });
+
+    await manager.trigger();
+    expect(afterFirst?.stopped).toHaveLength(1);
+
+    await manager.trigger();
+    await manager.stop();
+
+    expect(afterFirst?.stopped).toEqual([]);
+    expect(afterFirst?.tooLarge).toHaveLength(1);
+    expect(afterFirst?.retrying).toHaveLength(1);
+  });
 });

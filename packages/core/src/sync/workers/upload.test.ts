@@ -1462,6 +1462,78 @@ describe("uploadAll — upload size cap and bounded retry", () => {
     expect(results.map((r) => r.path)).toEqual(["s/2.json"]);
     expect(uploadState.snapshot().stopped).toEqual([]);
   });
+  describe("owner retry (releaseAllStopped)", () => {
+    async function stopEntry(
+      deps: UploadWorkerDeps,
+      upload: ReturnType<typeof vi.fn>,
+    ) {
+      upload.mockRejectedValue(new Error("boom"));
+      for (let i = 0; i < 8; i++) await cycle(deps, i * 61 * MINUTE);
+      expect(upload).toHaveBeenCalledTimes(8);
+    }
+
+    it("attempts a stopped entry again on the next cycle and empties stopped after a success", async () => {
+      const entry = makeEntry();
+      const { deps, uploadState } = setup([entry]);
+      const upload = deps.storageAdapter.upload as ReturnType<typeof vi.fn>;
+      await stopEntry(deps, upload);
+      expect(uploadState.snapshot().stopped).toHaveLength(1);
+
+      uploadState.releaseAllStopped();
+      upload.mockResolvedValue(STORAGE_URL);
+      const results = await cycle(deps, 9 * 61 * MINUTE);
+
+      expect(upload).toHaveBeenCalledTimes(9);
+      expect(results.map((r) => r.path)).toEqual([entry.path]);
+      expect(uploadState.snapshot().stopped).toEqual([]);
+    });
+
+    it("gives a released entry a fresh failure budget", async () => {
+      const entry = makeEntry();
+      const { deps, uploadState } = setup([entry]);
+      const upload = deps.storageAdapter.upload as ReturnType<typeof vi.fn>;
+      await stopEntry(deps, upload);
+
+      uploadState.releaseAllStopped();
+      await cycle(deps, 9 * 61 * MINUTE);
+
+      expect(uploadState.snapshot().stopped).toEqual([]);
+      expect(uploadState.snapshot().retrying).toEqual([
+        expect.objectContaining({ path: entry.path, failures: 1 }),
+      ]);
+    });
+
+    it("keeps a too-large entry too large and never reads it", async () => {
+      const huge = makeEntry({ sizeBytes: 337 * MIB });
+      const { deps, uploadState } = setup([huge]);
+      await cycle(deps, 0);
+
+      uploadState.releaseAllStopped();
+      await cycle(deps, MINUTE);
+
+      expect(uploadState.snapshot().tooLarge).toEqual([
+        expect.objectContaining({ path: huge.path }),
+      ]);
+      expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+      expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+    });
+
+    it("leaves an entry that is only waiting in backoff waiting", async () => {
+      const entry = makeEntry();
+      const { deps, uploadState } = setup([entry]);
+      const upload = deps.storageAdapter.upload as ReturnType<typeof vi.fn>;
+      upload.mockRejectedValue(new Error("boom"));
+      await cycle(deps, 0);
+
+      uploadState.releaseAllStopped();
+      await cycle(deps, 30_000);
+
+      expect(upload).toHaveBeenCalledTimes(1);
+      expect(uploadState.snapshot().retrying).toEqual([
+        expect.objectContaining({ path: entry.path, failures: 1 }),
+      ]);
+    });
+  });
 });
 
 describe("uploadAll — terminal entries, failure clock and removals", () => {
