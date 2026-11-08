@@ -14,7 +14,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   OWNER,
+  activateControl,
   createOracleEnv,
+  deleteConnection,
   finishedOutcome,
   artifactFor,
   freshConnector,
@@ -195,6 +197,17 @@ describe("stream-sync run intake route", () => {
     );
     expect(mismatch.status).toBe(409);
     expect(await mismatch.json()).toMatchObject({ error: "owner_mismatch" });
+  });
+
+  it("answers a scheduled begin of a deleted connection 409 connection_stopped over HTTP (review P2-3)", async () => {
+    const { call } = await build("route-stopped");
+    const body = beginBody();
+    const connector = body.connector;
+    await activateControl(env.registry, connector, "");
+    await deleteConnection(env.registry, connector, "", []);
+    const res = await call("PUT", "stopped-1", body);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "connection_stopped" });
   });
 
   it("refuses a body over the batch cap", async () => {
