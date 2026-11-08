@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
-import {
-  recoverServerOwner,
-  createGatewayClient,
-} from "@opendatalabs/vana-sdk/node";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { CreateServerOptions } from "./bootstrap.js";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import { createPublicOnlyAccount } from "@opendatalabs/personal-server-ts-core/keys";
+import {
+  createPublicOnlyAccount,
+  recoverOwnerAddress,
+} from "@opendatalabs/personal-server-ts-core/keys";
 import {
   isAddress,
   isHex,
@@ -243,7 +243,7 @@ export async function createEnclaveAdditionsPorts(
 ): Promise<
   Pick<CreateServerOptions, "additionsInventorySigner" | "additionsWriter">
 > {
-  const ownerAddress = await recoverServerOwner(env.ownerSignature);
+  const ownerAddress = await recoverOwnerAddress(env.ownerSignature);
   const sources = new Map<string, string>();
   const sourceFor = (scope: string) =>
     scope.startsWith("vana.system.additions.")

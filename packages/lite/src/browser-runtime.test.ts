@@ -8,7 +8,7 @@
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
-import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
+import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
 import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 import { startPersonalServer } from "./client.js";
@@ -41,9 +41,7 @@ afterEach(() => {
 beforeAll(async () => {
   const account = privateKeyToAccount(`0x${"11".repeat(32)}`);
   ownerAddress = account.address;
-  ownerSignature = await account.signMessage({
-    message: buildPersonalServerLiteOwnerBindingMessage(account.address),
-  });
+  ownerSignature = await signOwnerMasterKey(account);
 });
 
 function memoryBundle(): PsLitePersistenceBundle {
