@@ -36,10 +36,10 @@ import {
   type PdppRecord,
 } from "../legacy-projection/index.js";
 import {
-  READ_BUDGET,
+  READ_THRESHOLDS,
   retainedBytes,
   textCharge,
-  type ReadBudget,
+  type ReadMemoryEstimator,
 } from "./budget.js";
 import type { StreamSyncReadFiles } from "./ports.js";
 
@@ -57,7 +57,7 @@ export interface ProjectionInput {
   readonly budgetBytes: number;
   readonly now: string;
   /** Live accounting of this projection. Measurement only; see budget.ts. */
-  readonly budget?: ReadBudget;
+  readonly budget?: ReadMemoryEstimator;
 }
 
 export type ProjectionPlan =
@@ -67,7 +67,7 @@ export type ProjectionPlan =
 export class ProjectionFailedError extends Error {}
 
 const SHARDS = 256;
-const SPOOL_FLUSH_BYTES = READ_BUDGET.spoolFlushBytes;
+const SPOOL_FLUSH_BYTES = READ_THRESHOLDS.spoolFlushBytes;
 
 function options(input: ProjectionInput) {
   return {
@@ -332,7 +332,7 @@ interface ProjectedShards {
 async function* spoolLines(
   spool: StreamSyncReadFiles,
   paths: readonly string[],
-  budget?: ReadBudget,
+  budget?: ReadMemoryEstimator,
 ): AsyncGenerator<string> {
   let held = 0;
   try {

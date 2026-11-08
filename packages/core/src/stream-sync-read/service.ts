@@ -30,7 +30,7 @@ import {
   LEGACY_SCOPE_BINDINGS,
   type LegacyScopeBinding,
 } from "../legacy-projection/index.js";
-import { ReadBudget } from "./budget.js";
+import { ReadMemoryEstimator } from "./budget.js";
 import { StreamSyncImporter, type ImportIssue } from "./importer.js";
 import { overlayWinners, viewLines, type OverlayWinners } from "./lines.js";
 import { RegistryMirror, toControlRead, type MirrorFeedRow } from "./mirror.js";
@@ -58,7 +58,7 @@ export interface StreamSyncReadOptions {
    * Default off. When true, each read and the import keep live budget
    * accounting (budget.ts). Output is unchanged either way.
    */
-  readonly measureBudgets?: boolean;
+  readonly estimateReadMemory?: boolean;
 }
 
 export interface ResolveInput {
@@ -101,10 +101,10 @@ export type ReadDecision =
       readonly served: { readonly scope: string; readonly version: number };
       readonly body: ReadableStream<Uint8Array>;
       /**
-       * Live accounting of this read. Present only with `measureBudgets`.
+       * Live accounting of this read. Present only with `estimateReadMemory`.
        * Read it after the body ends: every charge is released by then.
        */
-      readonly budget?: ReadBudget;
+      readonly budget?: ReadMemoryEstimator;
     };
 
 export interface StreamSyncConnectionStatus {
@@ -238,7 +238,7 @@ function decodeCursor(text: string): Cursor | null {
 function toStream(
   chunks: AsyncIterable<string>,
   done: () => void,
-  budget?: ReadBudget,
+  budget?: ReadMemoryEstimator,
 ): ReadableStream<Uint8Array> {
   const iterator = chunks[Symbol.asyncIterator]();
   let finished = false;
@@ -298,7 +298,7 @@ export class StreamSyncReadService {
     private readonly views: ViewStore,
     private readonly importer: StreamSyncImporter,
     private changed: Set<string>,
-    private readonly importBudgetAccount: ReadBudget | null,
+    private readonly importEstimatorAccount: ReadMemoryEstimator | null,
   ) {}
 
   static async open(
@@ -314,7 +314,9 @@ export class StreamSyncReadService {
     );
     const views = await ViewStore.open(options.files);
     await options.files.remove("spool");
-    const importBudget = options.measureBudgets ? new ReadBudget() : null;
+    const importEstimator = options.estimateReadMemory
+      ? new ReadMemoryEstimator()
+      : null;
     const importer = new StreamSyncImporter({
       mirror,
       views,
@@ -322,7 +324,7 @@ export class StreamSyncReadService {
       keys: options.keys,
       controlHashes: hashes,
       logger: options.logger,
-      budget: importBudget ?? undefined,
+      budget: importEstimator ?? undefined,
     });
     // Import whatever the mirror holds that a crash left unimported.
     return new StreamSyncReadService(
@@ -331,13 +333,13 @@ export class StreamSyncReadService {
       views,
       importer,
       new Set(mirror.connectors()),
-      importBudget,
+      importEstimator,
     );
   }
 
-  /** Live accounting of imports, or `null` unless `measureBudgets` is set. */
-  importBudget(): ReadBudget | null {
-    return this.importBudgetAccount;
+  /** Live accounting of imports, or `null` unless `estimateReadMemory` is set. */
+  importEstimator(): ReadMemoryEstimator | null {
+    return this.importEstimatorAccount;
   }
 
   /** True when the next listing must start from the registry's first page. */
@@ -539,7 +541,9 @@ export class StreamSyncReadService {
     }
     const leases: ViewLease[] = [];
     const overlays = new Map<string, OverlayWinners>();
-    const budget = this.options.measureBudgets ? new ReadBudget() : undefined;
+    const budget = this.options.estimateReadMemory
+      ? new ReadMemoryEstimator()
+      : undefined;
     const releaseAll = () => {
       for (const lease of leases) lease.release();
       for (const overlay of overlays.values()) overlay.release();

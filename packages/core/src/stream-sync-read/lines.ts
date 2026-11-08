@@ -16,10 +16,11 @@ import {
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
-  READ_BUDGET,
+  READ_THRESHOLDS,
   retainedBytes,
   textCharge,
-  type ReadBudget,
+  utf8Bytes,
+  type ReadMemoryEstimator,
 } from "./budget.js";
 import type { StreamSyncOverlaySource, StreamSyncReadKeys } from "./ports.js";
 import type { ViewLease, ViewStore } from "./view-store.js";
@@ -42,7 +43,7 @@ export async function overlayWinners(
   source: StreamSyncOverlaySource | undefined,
   keys: StreamSyncReadKeys,
   lease: ViewLease,
-  budget?: ReadBudget,
+  budget?: ReadMemoryEstimator,
 ): Promise<OverlayWinners> {
   const winners = new Map<string, Line>();
   // Measured mode only: the serialized charge of each winner, to subtract on replacement.
@@ -99,7 +100,7 @@ export async function overlayWinners(
 async function* partLines(
   views: ViewStore,
   lease: ViewLease,
-  budget?: ReadBudget,
+  budget?: ReadMemoryEstimator,
 ): AsyncGenerator<{ readonly text: string; readonly line: Line }> {
   for (const part of lease.version.head.parts) {
     const bytes = await views.readPart(lease.key, part.hash, part.bytes);
@@ -117,7 +118,10 @@ async function* partLines(
         }
         const lineText = text.slice(start, end);
         start = end + 1;
-        if (budget && textCharge(lineText) > READ_BUDGET.ordinaryRecordBytes) {
+        if (
+          budget &&
+          utf8Bytes(lineText) > READ_THRESHOLDS.ordinaryRecordBytes
+        ) {
           budget.noteOversizeRecord();
         }
         // Verified at import (`decodePart`); parsed, not re-verified.
@@ -136,7 +140,7 @@ export async function* viewLines(
   keys: StreamSyncReadKeys,
   lease: ViewLease,
   overlay: OverlayWinners,
-  budget?: ReadBudget,
+  budget?: ReadMemoryEstimator,
 ): AsyncGenerator<Line> {
   if (overlay.winners.size === 0) {
     for await (const { line } of partLines(views, lease, budget)) yield line;

@@ -22,7 +22,7 @@ import {
   type ControlState,
   type StreamRow,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { retainedBytes, type ReadBudget } from "./budget.js";
+import { retainedBytes, type ReadMemoryEstimator } from "./budget.js";
 import {
   toControlRead,
   type MirrorRow,
@@ -92,7 +92,7 @@ export class StreamSyncImporter {
       readonly controlHashes: ControlHashes;
       readonly logger: StreamSyncReadLogger;
       /** Live accounting of imports. Measurement only; see budget.ts. */
-      readonly budget?: ReadBudget;
+      readonly budget?: ReadMemoryEstimator;
     },
   ) {}
 

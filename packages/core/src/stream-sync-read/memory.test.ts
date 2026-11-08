@@ -1,6 +1,6 @@
 /**
  * Step 1 of the stream-sync memory plan: measurement and red acceptance gates
- * for the read side. Counters come from budget.ts (`measureBudgets: true`).
+ * for the read side. Counters come from budget.ts (`estimateReadMemory: true`).
  *
  * Conventions:
  * - Plain `it` tests are green on the current code and must stay green.
@@ -13,17 +13,23 @@
 
 import { sha256 } from "@noble/hashes/sha2";
 import { describe, expect, it } from "vitest";
+import v8 from "node:v8";
+import vm from "node:vm";
 import type {
   JsonObject,
   Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { LEGACY_SCOPE_BINDINGS } from "../legacy-projection/index.js";
-import { READ_BUDGET, ReadBudget, type ReadBudgetSnapshot } from "./budget.js";
+import {
+  READ_THRESHOLDS,
+  ReadMemoryEstimator,
+  type ReadMemoryEstimate,
+} from "./budget.js";
 import { streamSyncReadHashes } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
-import type { StreamSyncOverlayEntry } from "./ports.js";
+import type { StreamSyncOverlayEntry, StreamSyncReadFiles } from "./ports.js";
 import { planProjection, type ProjectionInput } from "./projection.js";
 import {
   StreamSyncReadService,
@@ -203,13 +209,13 @@ async function drain(
   };
 }
 
-function expectQuiet(s: ReadBudgetSnapshot): void {
+function expectQuiet(s: ReadMemoryEstimate): void {
   for (const [name, c] of Object.entries(s.categories)) {
-    expect(c.current, name).toBe(0);
-    expect(c.exceedances, name).toBe(0);
+    expect(c.estimatedCurrent, name).toBe(0);
+    expect(c.thresholdExceedances, name).toBe(0);
   }
-  expect(s.totalBytesCurrent).toBe(0);
-  expect(s.oversizeRecords).toBe(0);
+  expect(s.estimatedBytesCurrent).toBe(0);
+  expect(s.oversizeRecordCount).toBe(0);
 }
 
 async function plainRead(n: number, measure: boolean) {
@@ -225,7 +231,7 @@ async function plainRead(n: number, measure: boolean) {
     records: recordsOf(n),
     prefixes: prefixesFor(bitsFor(n)),
   });
-  const service = await f.service({ measureBudgets: measure });
+  const service = await f.service({ estimateReadMemory: measure });
   await f.sync(service);
   const decision = await service.resolve(ask("pdpp.acme.items"));
   const result = await drain(decision);
@@ -245,27 +251,33 @@ describe("stream-sync read memory: step 1 measurement", () => {
       ] as const) {
         expect(run.result.records, label).toBe(n);
         const s = run.budget!;
-        expect(s.categories.importedPart.peak, label).toBeLessThanOrEqual(
-          FIXTURE_PART_BYTES,
-        );
-        expect(s.categories.decodedPart.peak, label).toBeLessThanOrEqual(
-          2 * FIXTURE_PART_BYTES,
-        );
-        expect(s.totalBytesPeak, label).toBeLessThanOrEqual(2 * MiB);
+        expect(
+          s.categories.importedPart.estimatedPeak,
+          label,
+        ).toBeLessThanOrEqual(FIXTURE_PART_BYTES);
+        expect(
+          s.categories.decodedPart.estimatedPeak,
+          label,
+        ).toBeLessThanOrEqual(2 * FIXTURE_PART_BYTES);
+        expect(s.estimatedBytesPeak, label).toBeLessThanOrEqual(2 * MiB);
         // No overlay, no projection: those peaks are zero for a plain read.
-        expect(s.categories.overlayWinners.peak, label).toBe(0);
-        expect(s.categories.overlayPayload.peak, label).toBe(0);
-        expect(s.categories.spoolBuffer.peak, label).toBe(0);
-        expect(s.categories.shardPayload.peak, label).toBe(0);
-        expect(s.categories.otherRows.peak, label).toBe(0);
+        expect(s.categories.overlayWinners.estimatedPeak, label).toBe(0);
+        expect(s.categories.overlayPayload.estimatedPeak, label).toBe(0);
+        expect(s.categories.spoolBuffer.estimatedPeak, label).toBe(0);
+        expect(s.categories.shardPayload.estimatedPeak, label).toBe(0);
+        expect(s.categories.otherRows.estimatedPeak, label).toBe(0);
         expectQuiet(s);
       }
       // The workload really grows: the part count rises fourfold.
-      expect(large.budget!.categories.importedPart.allocations).toBeGreaterThan(
-        3.9 * small.budget!.categories.importedPart.allocations,
+      expect(
+        large.budget!.categories.importedPart.acquisitions,
+      ).toBeGreaterThan(
+        3.9 * small.budget!.categories.importedPart.acquisitions,
       );
       // Each read holds one part at a time, not the stream.
-      expect(large.budget!.totalBytesPeak).toBeLessThan(large.result.bytes / 4);
+      expect(large.budget!.estimatedBytesPeak).toBeLessThan(
+        large.result.bytes / 4,
+      );
     }, 120_000);
 
     it("stats on and stats off produce the same output", async () => {
@@ -278,7 +290,7 @@ describe("stream-sync read memory: step 1 measurement", () => {
 
   describe("overlay log with a bounded distinct-key working set", () => {
     it("repeated_overlay_rows_do_not_accumulate_losing_versions", async () => {
-      const results: ReadBudgetSnapshot[] = [];
+      const results: ReadMemoryEstimate[] = [];
       for (const n of [8_192, 32_768]) {
         const owner = await testOwnerKey(masterKey(42));
         const f = new Fixture(owner);
@@ -344,7 +356,7 @@ describe("stream-sync read memory: step 1 measurement", () => {
             },
           },
         ];
-        const service = await f.service({ measureBudgets: true });
+        const service = await f.service({ estimateReadMemory: true });
         await f.sync(service);
         const decision = await service.resolve(ask("pdpp.acme.items"));
         if (decision.kind !== "view") throw new Error(decision.kind);
@@ -364,18 +376,18 @@ describe("stream-sync read memory: step 1 measurement", () => {
         results.push(decision.budget!.snapshot());
       }
       const [small, large] = results as [
-        ReadBudgetSnapshot,
-        ReadBudgetSnapshot,
+        ReadMemoryEstimate,
+        ReadMemoryEstimate,
       ];
-      expect(small.categories.overlayWinners.peak).toBe(64);
-      expect(small.categories.overlayPendingKeys.peak).toBe(64);
-      expect(large.categories.overlayWinners.peak).toBe(64);
-      expect(large.categories.overlayPendingKeys.peak).toBe(64);
-      expect(small.categories.overlayPayload.peak).toBeLessThanOrEqual(
+      expect(small.categories.overlayWinners.estimatedPeak).toBe(64);
+      expect(small.categories.overlayPendingKeys.estimatedPeak).toBe(64);
+      expect(large.categories.overlayWinners.estimatedPeak).toBe(64);
+      expect(large.categories.overlayPendingKeys.estimatedPeak).toBe(64);
+      expect(small.categories.overlayPayload.estimatedPeak).toBeLessThanOrEqual(
         128 * KiB,
       );
-      expect(large.categories.overlayPayload.peak).toBeLessThanOrEqual(
-        small.categories.overlayPayload.peak + KiB,
+      expect(large.categories.overlayPayload.estimatedPeak).toBeLessThanOrEqual(
+        small.categories.overlayPayload.estimatedPeak + KiB,
       );
       expectQuiet(small);
       expectQuiet(large);
@@ -414,7 +426,7 @@ describe("stream-sync read memory: step 1 measurement", () => {
           },
         },
       ];
-      const service = await f.service({ measureBudgets: true });
+      const service = await f.service({ estimateReadMemory: true });
       await f.sync(service);
       const decision = await service.resolve(ask("pdpp.acme.items"));
       const drained = await drain(decision);
@@ -429,8 +441,8 @@ describe("stream-sync read memory: step 1 measurement", () => {
           decision.kind === "view" ? decision.budget!.snapshot() : null;
         // Current code retains every distinct winner. This pins that, so the
         // counters are shown to be honest before any reader change.
-        expect(snap!.categories.overlayWinners.peak).toBe(n);
-        expect(snap!.categories.overlayPendingKeys.peak).toBe(n);
+        expect(snap!.categories.overlayWinners.estimatedPeak).toBe(n);
+        expect(snap!.categories.overlayPendingKeys.estimatedPeak).toBe(n);
       }
     });
 
@@ -441,12 +453,12 @@ describe("stream-sync read memory: step 1 measurement", () => {
           const { decision } = await distinct(n);
           const snap =
             decision.kind === "view" ? decision.budget!.snapshot() : null;
-          expect(snap!.categories.overlayWinners.peak).toBeLessThanOrEqual(
-            1024,
-          );
-          expect(snap!.categories.overlayPendingKeys.peak).toBeLessThanOrEqual(
-            1024,
-          );
+          expect(
+            snap!.categories.overlayWinners.estimatedPeak,
+          ).toBeLessThanOrEqual(1024);
+          expect(
+            snap!.categories.overlayPendingKeys.estimatedPeak,
+          ).toBeLessThanOrEqual(1024);
         }
       },
     );
@@ -488,7 +500,7 @@ describe("stream-sync read memory: step 1 measurement", () => {
     /** Run planProjection on the chatgpt binding; `skewed` puts every join key in one shard. */
     async function project(n: number, skewed: boolean) {
       const { conversations, messages } = chatgpt(n);
-      const budget = new ReadBudget();
+      const budget = new ReadMemoryEstimator();
       const hashes = streamSyncReadHashes.sha256;
       const input: ProjectionInput = {
         scope: "chatgpt.conversations",
@@ -533,12 +545,14 @@ describe("stream-sync read memory: step 1 measurement", () => {
       for (const n of [256, 1_024]) {
         for (const skewed of [false, true]) {
           const { snap } = await project(n, skewed);
-          expect(snap.categories.spoolBuffer.peak).toBeLessThanOrEqual(
-            READ_BUDGET.spoolBufferBytes,
+          expect(snap.categories.spoolBuffer.estimatedPeak).toBeLessThanOrEqual(
+            READ_THRESHOLDS.spoolBufferBytes,
           );
-          expect(snap.categories.mergeCursors.peak).toBeLessThanOrEqual(256);
-          expect(snap.categories.mergeChunk.peak).toBeLessThanOrEqual(
-            READ_BUDGET.mergeChunkBytes,
+          expect(
+            snap.categories.mergeCursors.estimatedPeak,
+          ).toBeLessThanOrEqual(256);
+          expect(snap.categories.mergeChunk.estimatedPeak).toBeLessThanOrEqual(
+            READ_THRESHOLDS.mergeChunkBytes,
           );
           expectQuiet(snap);
         }
@@ -549,8 +563,8 @@ describe("stream-sync read memory: step 1 measurement", () => {
       const normal = await project(256, false);
       const skewed = await project(256, true);
       const rows = 256 + 512;
-      expect(skewed.snap.categories.shardRows.peak).toBe(rows);
-      expect(normal.snap.categories.shardRows.peak).toBeLessThan(rows);
+      expect(skewed.snap.categories.shardRows.estimatedPeak).toBe(rows);
+      expect(normal.snap.categories.shardRows.estimatedPeak).toBeLessThan(rows);
     });
 
     it.fails(
@@ -559,22 +573,94 @@ describe("stream-sync read memory: step 1 measurement", () => {
         const small = await project(256, true);
         const large = await project(1_024, true);
         // A flat bound: the hot shard does not grow fourfold with the input.
-        expect(large.snap.categories.shardPayload.peak).toBeLessThanOrEqual(
-          1.25 * small.snap.categories.shardPayload.peak + 64 * KiB,
+        expect(
+          large.snap.categories.shardPayload.estimatedPeak,
+        ).toBeLessThanOrEqual(
+          1.25 * small.snap.categories.shardPayload.estimatedPeak + 64 * KiB,
         );
       },
     );
   });
 
-  describe("durable storage: the step-2 requirement is pinned, not met", () => {
+  describe("durable read store: the step-2 requirement, against the store production selects", () => {
+    // The store production selects for the stream-sync read side. Lite
+    // (packages/lite/src/sync.ts) uses `createMemoryStreamSyncReadFiles()`
+    // unless a host injects its own `StreamSyncReadFiles`. A reopen is a new
+    // call with the same root: a durable store reads back what the last
+    // instance wrote. Step 2 changes this selector to the durable store. The
+    // predicates below are about that store, not about the memory adapter.
+    const openProductionReadFiles = (_root: string): StreamSyncReadFiles =>
+      createMemoryStreamSyncReadFiles();
+
+    const PAYLOAD_FILES = 8;
+    const payloadPath = (i: number) => `views/a/_/s/parts/p${i}`;
+    const payloadBytes = (i: number) => new Uint8Array(MiB).fill(i + 1);
+
+    it("green setup: the selected store writes, reads and lists one file", async () => {
+      const store = openProductionReadFiles("setup-root");
+      await store.write("views/a/_/s/parts/one", new Uint8Array([1, 2, 3]));
+      expect(await store.read("views/a/_/s/parts/one")).toEqual(
+        new Uint8Array([1, 2, 3]),
+      );
+      expect(await store.list("views/a/_/s")).toEqual([
+        "views/a/_/s/parts/one",
+      ]);
+    });
+
     it.fails(
-      "step 2+: the read store does not retain file payload in a JS Map (red: the memory adapter is the only adapter in core)",
+      "step 2: the read store is durable and keeps payload out of process memory: after 8 MiB is written, resident payload grows by under 1 MiB, and a reopen reads the same bytes (red: the production selector is memory)",
       async () => {
-        const files = createMemoryStreamSyncReadFiles();
-        await files.write("views/a/_/s/parts/x", new Uint8Array(4 * MiB));
-        let retained = 0;
-        for (const bytes of files.files.values()) retained += bytes.byteLength;
-        expect(retained).toBe(0);
+        const root = "durable-root";
+        const forceGc = (): void => {
+          const g = (globalThis as { gc?: () => void }).gc;
+          if (g) {
+            g();
+            g();
+            return;
+          }
+          // Runtime fallback for `--expose-gc`, which vitest does not pass.
+          v8.setFlagsFromString("--expose-gc");
+          (vm.runInNewContext("gc") as () => void)();
+          (vm.runInNewContext("gc") as () => void)();
+        };
+        const residentPayload = (): number => {
+          forceGc();
+          const m = process.memoryUsage();
+          return m.heapUsed + m.arrayBuffers;
+        };
+
+        const store = openProductionReadFiles(root);
+        const before = residentPayload();
+        for (let i = 0; i < PAYLOAD_FILES; i++) {
+          await store.write(payloadPath(i), payloadBytes(i));
+        }
+        const growth = residentPayload() - before;
+        expect(growth).toBeLessThan(MiB);
+
+        const reopened = openProductionReadFiles(root);
+        for (let i = 0; i < PAYLOAD_FILES; i++) {
+          const got = await reopened.read(payloadPath(i));
+          expect(got, payloadPath(i)).not.toBeNull();
+          expect(got!.byteLength).toBe(MiB);
+        }
+      },
+    );
+  });
+
+  describe("retained parsed lines: a reader that keeps every line", () => {
+    // Gate, not yet runnable. The estimator counts bookkeeping calls, so a
+    // reader that collects every parsed line into an array (viewLines, no
+    // overlay) keeps the whole stream while the estimate reports one part.
+    // The independent instrument is the shared child-process high-water
+    // helper in PS #565 (test/stream-sync-p1-bounded). It is not yet
+    // importable, so this body throws. Replace it with the helper's
+    // assertion when the helper lands; do not copy the helper's sampler here.
+    it.fails(
+      "step 2+: a reader that retains every parsed line across a read is caught by the shared high-water helper (gate: PS #565, not yet shared)",
+      () => {
+        throw new Error(
+          "gate: needs the shared child-process high-water helper from PS #565 (test/stream-sync-p1-bounded); not yet importable",
+        );
       },
     );
   });
@@ -593,14 +679,14 @@ describe("stream-sync read memory: step 1 measurement", () => {
         records: recordsOf(2_048),
         prefixes: prefixesFor(bitsFor(2_048)),
       });
-      const first = await f.service({ measureBudgets: true });
+      const first = await f.service({ estimateReadMemory: true });
       await f.sync(first);
       const before = await drain(await first.resolve(ask("pdpp.acme.items")));
 
       let gets = 0;
       const restarted = await StreamSyncReadService.open(
         f.options({
-          measureBudgets: true,
+          estimateReadMemory: true,
           blobs: {
             get: async () => {
               gets++;
@@ -615,7 +701,9 @@ describe("stream-sync read memory: step 1 measurement", () => {
       );
       expect(after).toEqual(before);
       expect(gets).toBe(0);
-      expect(restarted.importBudget()!.snapshot().totalBytesPeak).toBe(0);
+      expect(restarted.importEstimator()!.snapshot().estimatedBytesPeak).toBe(
+        0,
+      );
     });
 
     it("import charges one part at a time and releases every charge", async () => {
@@ -631,19 +719,41 @@ describe("stream-sync read memory: step 1 measurement", () => {
         records: recordsOf(8_192),
         prefixes: prefixesFor(bitsFor(8_192)),
       });
-      const service = await f.service({ measureBudgets: true });
+      const service = await f.service({ estimateReadMemory: true });
       await f.sync(service);
-      const snap = service.importBudget()!.snapshot();
-      expect(snap.categories.importPart.allocations).toBe(64);
-      expect(snap.categories.importPart.peak).toBeLessThanOrEqual(
+      const snap = service.importEstimator()!.snapshot();
+      expect(snap.categories.importPart.acquisitions).toBe(64);
+      expect(snap.categories.importPart.estimatedPeak).toBeLessThanOrEqual(
         2 * FIXTURE_PART_BYTES,
       );
-      expect(snap.categories.importPart.exceedances).toBe(0);
-      expect(snap.totalBytesCurrent).toBe(0);
+      expect(snap.categories.importPart.thresholdExceedances).toBe(0);
+      expect(snap.estimatedBytesCurrent).toBe(0);
     });
   });
 
   describe("ordinary-record budget vs the 8 MiB record limit", () => {
+    it("a 200 KiB ASCII record is not counted oversize: its canonical UTF-8 size is under the threshold, though its UTF-16 memory charge is over it", async () => {
+      const owner = await testOwnerKey(masterKey(50));
+      const f = new Fixture(owner);
+      const ns = await owner.ns(CONNECTOR, "account-1");
+      await f.activate(CONNECTOR, ns);
+      await f.publish({
+        connector: CONNECTOR,
+        ns,
+        stream: "items",
+        generation: 1,
+        records: [{ id: "medium", body: "x".repeat(200 * KiB) }],
+      });
+      const service = await f.service({ estimateReadMemory: true });
+      await f.sync(service);
+      const decision = await service.resolve(ask("pdpp.acme.items"));
+      const result = await drain(decision);
+      expect(result.records).toBe(1);
+      const snap =
+        decision.kind === "view" ? decision.budget!.snapshot() : null;
+      expect(snap!.oversizeRecordCount).toBe(0);
+    });
+
     it.fails(
       "step 2 must not enforce budgets until the ordinary-record budget agrees with the 8 MiB record limit: a legal 1 MiB record is not counted as oversize or as an exceedance (red today: the 256 KiB budget counts it)",
       async () => {
@@ -658,16 +768,16 @@ describe("stream-sync read memory: step 1 measurement", () => {
           generation: 1,
           records: [{ id: "big", body: "x".repeat(MiB) }],
         });
-        const service = await f.service({ measureBudgets: true });
+        const service = await f.service({ estimateReadMemory: true });
         await f.sync(service);
         const decision = await service.resolve(ask("pdpp.acme.items"));
         const result = await drain(decision);
         expect(result.records).toBe(1);
         const snap =
           decision.kind === "view" ? decision.budget!.snapshot() : null;
-        expect(snap!.oversizeRecords).toBe(0);
+        expect(snap!.oversizeRecordCount).toBe(0);
         for (const [name, c] of Object.entries(snap!.categories)) {
-          expect(c.exceedances, name).toBe(0);
+          expect(c.thresholdExceedances, name).toBe(0);
         }
       },
     );
@@ -687,7 +797,7 @@ describe("stream-sync read memory: step 1 measurement", () => {
         records: recordsOf(2_048),
         prefixes: prefixesFor(bitsFor(2_048)),
       });
-      const service = await f.service({ measureBudgets: true });
+      const service = await f.service({ estimateReadMemory: true });
       await f.sync(service);
       const decision = await service.resolve(ask("pdpp.acme.items"));
       if (decision.kind !== "view") throw new Error(decision.kind);
@@ -710,7 +820,7 @@ describe("stream-sync read memory: step 1 measurement", () => {
         records: recordsOf(2_048),
         prefixes: prefixesFor(bitsFor(2_048)),
       });
-      const service = await f.service({ measureBudgets: true });
+      const service = await f.service({ estimateReadMemory: true });
       await f.sync(service);
       // Remove one imported part: the read reaches it after bytes were sent.
       const parts = [...f.files.files.keys()].filter((p) =>
@@ -736,7 +846,7 @@ describe("stream-sync read memory: step 1 measurement", () => {
         records: recordsOf(2_048),
         prefixes: prefixesFor(bitsFor(2_048)),
       });
-      const service = await f.service({ measureBudgets: true });
+      const service = await f.service({ estimateReadMemory: true });
       await f.sync(service);
       const peaks: number[] = [];
       for (let attempt = 0; attempt < 20; attempt++) {
@@ -745,7 +855,7 @@ describe("stream-sync read memory: step 1 measurement", () => {
         const snap =
           decision.kind === "view" ? decision.budget!.snapshot() : null;
         expectQuiet(snap!);
-        peaks.push(snap!.totalBytesPeak);
+        peaks.push(snap!.estimatedBytesPeak);
       }
       expect(peaks[19]!).toBeLessThanOrEqual(peaks[0]! + 64 * KiB);
     });
