@@ -847,6 +847,7 @@ describe("sync manager upload state", () => {
 
     expect(manager.getStatus().uploads).toEqual({
       tooLarge: [],
+      unsizable: [],
       retrying: [],
       stopped: [],
     });

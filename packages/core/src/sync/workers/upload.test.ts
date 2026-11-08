@@ -359,9 +359,6 @@ describe("upload worker", () => {
 
       const results = await uploadAll(deps);
 
-      expect(deps.storage.findUnsynced).toHaveBeenCalledWith({
-        limit: 50,
-      });
       expect(results).toHaveLength(3);
       expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(3);
     });
@@ -1428,6 +1425,7 @@ describe("uploadAll — upload size cap and bounded retry", () => {
     await cycle(deps, 2 * MINUTE);
     expect(uploadState.snapshot()).toEqual({
       tooLarge: [],
+      unsizable: [],
       retrying: [],
       stopped: [],
     });
@@ -1505,11 +1503,13 @@ describe("uploadAll — terminal entries, failure clock and removals", () => {
         ? unsynced
         : unsynced.slice(0, options.limit);
     });
-    deps.storage.updateDataPointId = vi.fn((path: string, id: string | null) => {
-      const row = index.rows.find((r) => r.path === path);
-      if (row) row.dataPointId = id;
-      return true;
-    });
+    deps.storage.updateDataPointId = vi.fn(
+      (path: string, id: string | null) => {
+        const row = index.rows.find((r) => r.path === path);
+        if (row) row.dataPointId = id;
+        return true;
+      },
+    );
     return { deps, uploadState, index };
   }
 
@@ -1536,7 +1536,12 @@ describe("uploadAll — terminal entries, failure clock and removals", () => {
   });
 
   it("lets a fresh entry release a stopped scope even when terminal entries fill the page", async () => {
-    const stale = makeEntry({ id: 3, path: "s/1.json", scope: "s", version: 1 });
+    const stale = makeEntry({
+      id: 3,
+      path: "s/1.json",
+      scope: "s",
+      version: 1,
+    });
     const fresh = makeEntry({
       id: 4,
       path: "s/2.json",
@@ -1600,12 +1605,12 @@ describe("uploadAll — terminal entries, failure clock and removals", () => {
     );
 
     for (let i = 0; i < 6; i++) {
+      // Another path (a download tombstone) removes the oldest oversized row.
+      index.rows.splice(1, 1);
       await uploadAll(deps, {
         batchSize: 3,
         now: () => new Date(T0 + i * 1000),
       });
-      // Another path (a download tombstone) removes the oldest oversized row.
-      index.rows.splice(1, 1);
       const live = new Set(index.rows.map((r) => r.path));
       const tracked = [
         ...uploadState.snapshot().tooLarge,
@@ -1630,22 +1635,25 @@ describe("uploadAll — terminal entries, failure clock and removals", () => {
     ["zero", 0],
     ["negative", -5],
     ["infinite", Number.POSITIVE_INFINITY],
-  ])("never reads the body of an entry whose size is %s", async (_name, size) => {
-    const entry = healthy(1, { sizeBytes: size as unknown as number });
-    const { deps, uploadState } = setup([entry]);
+  ])(
+    "never reads the body of an entry whose size is %s",
+    async (_name, size) => {
+      const entry = healthy(1, { sizeBytes: size as unknown as number });
+      const { deps, uploadState } = setup([entry]);
 
-    for (let i = 0; i < 3; i++)
-      await uploadAll(deps, { now: () => new Date(T0 + i * MINUTE) });
+      for (let i = 0; i < 3; i++)
+        await uploadAll(deps, { now: () => new Date(T0 + i * MINUTE) });
 
-    expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
-    expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
-    expect(uploadState.snapshot().unsizable).toEqual([
-      expect.objectContaining({ scope: entry.scope, path: entry.path }),
-    ]);
-    expect(uploadState.snapshot().tooLarge).toEqual([]);
-    const logs = (deps.logger.warn as ReturnType<typeof vi.fn>).mock.calls
-      .map(([, message]) => String(message))
-      .filter((message) => /size/i.test(message));
-    expect(logs).toHaveLength(1);
-  });
+      expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+      expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+      expect(uploadState.snapshot().unsizable).toEqual([
+        expect.objectContaining({ scope: entry.scope, path: entry.path }),
+      ]);
+      expect(uploadState.snapshot().tooLarge).toEqual([]);
+      const logs = (deps.logger.warn as ReturnType<typeof vi.fn>).mock.calls
+        .map(([, message]) => String(message))
+        .filter((message) => /size/i.test(message));
+      expect(logs).toHaveLength(1);
+    },
+  );
 });

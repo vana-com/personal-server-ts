@@ -30,6 +30,7 @@ import {
   MAX_UPLOAD_BODY_BYTES,
   createUploadStateTracker,
   exceedsUploadCap,
+  isUsableUploadSize,
   type UploadStateTracker,
 } from "../upload-state.js";
 
@@ -144,6 +145,21 @@ export class UploadTooLargeError extends Error {
 }
 
 /**
+ * Thrown before anything is read when an unsynced entry's stored size is
+ * missing or not a positive finite number. The cap cannot be checked, so the
+ * entry is held back (fail closed) and stays local.
+ */
+export class UploadUnsizableError extends Error {
+  constructor(
+    readonly path: string,
+    readonly sizeBytes: unknown,
+  ) {
+    super(`No usable stored size for ${path}: ${String(sizeBytes)}`);
+    this.name = "UploadUnsizableError";
+  }
+}
+
+/**
  * Drop an unsynced entry the gateway tombstone covers and signal it as a
  * self-heal. Returns without effect when the entry was ingested with
  * knowledge of the tombstone (`afterTombstoneVersion`): a legitimate re-add.
@@ -214,8 +230,12 @@ export async function uploadOne(
 
   // Decide from the stored size alone, before anything is read, parsed or
   // encrypted: a body over the request limit can never be accepted.
-  if (!entry.dataPointId && exceedsUploadCap(entry.sizeBytes))
-    throw new UploadTooLargeError(entry.path, entry.sizeBytes);
+  if (!entry.dataPointId) {
+    if (!isUsableUploadSize(entry.sizeBytes))
+      throw new UploadUnsizableError(entry.path, entry.sizeBytes);
+    if (exceedsUploadCap(entry.sizeBytes))
+      throw new UploadTooLargeError(entry.path, entry.sizeBytes);
+  }
 
   // 1. Read local data file
   let envelope;
@@ -430,6 +450,40 @@ async function eraseSuperseded(
 }
 
 /**
+ * Note an entry whose stored size means it can never be uploaded (too large,
+ * or no usable size), log it once, and say so. Reads nothing but the row.
+ */
+function holdBackTerminal(
+  deps: UploadWorkerDeps,
+  state: UploadStateTracker,
+  target: IndexEntry,
+): boolean {
+  if (target.dataPointId !== null) return false;
+  const at = { scope: target.scope, path: target.path };
+  if (!isUsableUploadSize(target.sizeBytes)) {
+    if (state.markUnsizable(at)) {
+      deps.logger.warn(
+        { ...at, sizeBytes: String(target.sizeBytes) },
+        "Entry has no usable size; it stays local and is not uploaded",
+      );
+    }
+    return true;
+  }
+  if (!exceedsUploadCap(target.sizeBytes)) return false;
+  if (state.markTooLarge(at, target.sizeBytes)) {
+    deps.logger.warn(
+      {
+        ...at,
+        sizeBytes: target.sizeBytes,
+        maxBodyBytes: MAX_UPLOAD_BODY_BYTES,
+      },
+      "Entry is too large to sync; it stays local and is not uploaded",
+    );
+  }
+  return true;
+}
+
+/**
  * Process all unsynced entries (dataPointId === null).
  * Processes sequentially to avoid overwhelming storage backend.
  * Returns array of results (skips failures, logs errors).
@@ -443,13 +497,16 @@ export async function uploadAll(
   options?: UploadAllOptions,
 ): Promise<UploadResult[]> {
   const batchSize = options?.batchSize ?? 50;
-  const entries = deps.storage.findUnsynced({ limit: batchSize });
-  const nowMs = (options?.now ?? (() => new Date()))().getTime();
-  const plans = coalescePlan(deps, entries, nowMs);
+  const clock = () => (options?.now ?? (() => new Date()))().getTime();
+  // The whole unsynced set (index rows only, no bodies), not a limited page:
+  // entries that cannot be attempted now must not occupy the batch, or they
+  // hide every entry behind them. The batch is chosen below.
+  const entries = deps.storage.findUnsynced();
   const state = deps.uploadState ?? createUploadStateTracker();
-  // A short page is the whole unsynced set: forget rows that are gone.
-  if (entries.length < batchSize) state.retainOnly(entries.map((e) => e.path));
-  const handled = new Set<string>();
+  // Every unsynced row is listed, so a tracked path missing here is gone
+  // (deleted, replaced or synced elsewhere): forget it on every cycle.
+  state.retainOnly(entries.map((e) => e.path));
+  const plans = coalescePlan(deps, entries, clock());
   const results: UploadResult[] = [];
 
   /** Erase superseded snapshots and forget their upload state. */
@@ -459,21 +516,43 @@ export async function uploadAll(
     for (const entry of older) state.clear(entry.path);
   };
 
+  // Choose the batch: the first `batchSize` entries that can be worked on
+  // now. Too-large, unsizable, stopped and backing-off entries are skipped
+  // here and stay in the index untouched.
+  interface Work {
+    entry: IndexEntry;
+    plan: CoalescedScope | undefined;
+  }
+  const batch: Work[] = [];
+  const planned = new Set<string>();
+  const selectedAt = clock();
   for (const entry of entries) {
+    if (batch.length >= batchSize) break;
     const plan = plans.get(entry.scope);
     if (plan) {
-      if (handled.has(entry.scope)) continue;
-      handled.add(entry.scope);
+      if (planned.has(entry.scope)) continue;
+      planned.add(entry.scope);
       if (plan.deferred) continue;
-      if (plan.head.dataPointId !== null) {
-        // The latest version is already published: older unpublished
-        // snapshots are superseded, never published.
-        await supersede(plan.head);
-        continue;
+      if (plan.head.dataPointId === null) {
+        if (!state.shouldAttempt(plan.head.path, selectedAt)) continue;
       }
+    } else if (!state.shouldAttempt(entry.path, selectedAt)) continue;
+    // Entries that can never upload are classified here, from the index row
+    // alone, so they cost no batch slot even the first time they are seen.
+    if (holdBackTerminal(deps, state, plan ? plan.head : entry)) continue;
+    batch.push({ entry, plan });
+  }
+
+  for (const { entry, plan } of batch) {
+    if (plan && plan.head.dataPointId !== null) {
+      // The latest version is already published: older unpublished
+      // snapshots are superseded, never published.
+      await supersede(plan.head);
+      continue;
     }
     const target = plan ? plan.head : entry;
-    if (!state.shouldAttempt(target.path, nowMs)) continue;
+    // Earlier entries may have taken minutes: judge this one at its own time.
+    if (!state.shouldAttempt(target.path, clock())) continue;
     // A first attempt at an entry is new data: it releases the scope's
     // stopped entries to try again.
     if (!state.has(target.path)) state.releaseStopped(target.scope);
@@ -494,33 +573,11 @@ export async function uploadAll(
         state.clear(target.path);
         continue;
       }
-      // Too large to ever upload: not a failure to retry. Note it for the
-      // owner and log it once. The older snapshots of a coalesced scope are
-      // kept, since the head they would be superseded by never publishes.
-      if (err instanceof UploadTooLargeError) {
-        if (
-          state.markTooLarge(
-            { scope: target.scope, path: target.path },
-            target.sizeBytes,
-          )
-        ) {
-          deps.logger.warn(
-            {
-              path: target.path,
-              scope: target.scope,
-              sizeBytes: target.sizeBytes,
-              maxBodyBytes: MAX_UPLOAD_BODY_BYTES,
-            },
-            "Entry is too large to sync; it stays local and is not uploaded",
-          );
-        }
-        continue;
-      }
       const error = err as Error;
       state.recordFailure(
         { scope: target.scope, path: target.path },
         error.message,
-        nowMs,
+        clock(),
       );
       options?.onError?.(entry, error);
       deps.logger.error(

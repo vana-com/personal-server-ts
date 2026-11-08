@@ -14,6 +14,10 @@
  *    "too large to sync": it is never read, encoded, encrypted or sent. It
  *    stays local and readable. The decision uses the stored size only, so it
  *    needs no memory to stay correct.
+ *  - An entry with no usable stored size (missing, NaN, zero, negative) is
+ *    "unsizable": it cannot be shown to fit, so it is treated the same way
+ *    and reported under its own reason. No storage port offers an exact size
+ *    without reading the body, so the check fails closed instead.
  *  - Any other failure backs off: attempt n waits `BASE * 2^(n-1)` (capped),
  *    and after `MAX_UPLOAD_FAILURES` failures the entry is "stopped" until new
  *    data arrives for its scope or the owner retries.
@@ -48,8 +52,28 @@ export function estimateUploadBodyBytes(storedBytes: number): number {
   );
 }
 
-/** Whether an entry of `storedBytes` could exceed the upload body cap. */
+/**
+ * Whether the stored size is a usable measurement: a finite, positive number.
+ * A stored envelope is never empty, so a missing, NaN, zero or negative size
+ * is bad metadata, not a small file.
+ */
+export function isUsableUploadSize(
+  storedBytes: unknown,
+): storedBytes is number {
+  return (
+    typeof storedBytes === "number" &&
+    Number.isFinite(storedBytes) &&
+    storedBytes > 0
+  );
+}
+
+/**
+ * Whether an entry of `storedBytes` could exceed the upload body cap. Fails
+ * closed: a size that is not usable cannot be shown to fit, so it counts as
+ * over the cap.
+ */
 export function exceedsUploadCap(storedBytes: number): boolean {
+  if (!isUsableUploadSize(storedBytes)) return true;
   return estimateUploadBodyBytes(storedBytes) > MAX_UPLOAD_BODY_BYTES;
 }
 
@@ -70,6 +94,9 @@ export interface TooLargeUpload extends UploadStateEntry {
   maxBodyBytes: number;
 }
 
+/** Stored size was missing or not a positive finite number. */
+export type UnsizableUpload = UploadStateEntry;
+
 export interface RetryingUpload extends UploadStateEntry {
   failures: number;
   lastError: string;
@@ -87,6 +114,8 @@ export interface StoppedUpload extends UploadStateEntry {
 export interface UploadStateSnapshot {
   /** Local entries that can never fit one upload; kept locally, not synced. */
   tooLarge: TooLargeUpload[];
+  /** Local entries with no usable stored size; never read, kept locally. */
+  unsizable: UnsizableUpload[];
   /** Failed entries waiting for their next attempt. */
   retrying: RetryingUpload[];
   /** Entries that used every attempt; new data or an owner retry resets. */
@@ -96,6 +125,8 @@ export interface UploadStateSnapshot {
 export interface UploadStateTracker {
   /** Record an entry as too large; true the first time (log once). */
   markTooLarge(entry: UploadStateEntry, sizeBytes: number): boolean;
+  /** Record an entry as having no usable size; true the first time. */
+  markUnsizable(entry: UploadStateEntry): boolean;
   /** Whether the entry may be attempted now (not backing off, not stopped). */
   shouldAttempt(path: string, nowMs: number): boolean;
   /** Count one failed attempt. */
@@ -115,6 +146,7 @@ export interface UploadStateTracker {
 
 interface Tracked extends UploadStateEntry {
   tooLargeBytes?: number;
+  unsizable?: true;
   failures: number;
   lastError: string;
   nextAttemptMs: number;
@@ -142,10 +174,22 @@ export function createUploadStateTracker(
       });
       return true;
     },
+    markUnsizable(entry) {
+      if (states.get(entry.path)?.unsizable) return false;
+      states.set(entry.path, {
+        ...entry,
+        unsizable: true,
+        failures: 0,
+        lastError: "",
+        nextAttemptMs: 0,
+        stoppedAtMs: null,
+      });
+      return true;
+    },
     shouldAttempt(path, nowMs) {
       const state = states.get(path);
       if (!state) return true;
-      if (state.tooLargeBytes !== undefined) return false;
+      if (state.tooLargeBytes !== undefined || state.unsizable) return false;
       if (state.stoppedAtMs !== null) return false;
       return nowMs >= state.nextAttemptMs;
     },
@@ -188,6 +232,7 @@ export function createUploadStateTracker(
     snapshot() {
       const snapshot: UploadStateSnapshot = {
         tooLarge: [],
+        unsizable: [],
         retrying: [],
         stopped: [],
       };
@@ -199,6 +244,8 @@ export function createUploadStateTracker(
             sizeBytes: state.tooLargeBytes,
             maxBodyBytes: MAX_UPLOAD_BODY_BYTES,
           });
+        } else if (state.unsizable) {
+          snapshot.unsizable.push(base);
         } else if (state.stoppedAtMs !== null) {
           snapshot.stopped.push({
             ...base,
