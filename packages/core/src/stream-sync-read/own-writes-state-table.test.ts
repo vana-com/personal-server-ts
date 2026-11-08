@@ -514,6 +514,19 @@ const ROWS: readonly Row[] = [
     },
   },
   {
+    id: "N1",
+    title: "no imported base, a full run",
+    base: [],
+    runs: [run({ runId: "r1", full: true, rows: [C] })],
+    expect: {
+      before: read([C], true),
+      after: read([C], true),
+      grant: [null, [C]],
+      pending: 1,
+      head: { key: "id", version: "1.0.0", complete: true },
+    },
+  },
+  {
     id: "D6",
     title: "a run whose every row loses to a newer head from another device",
     base: [baseRun({ otherDevice: true, at: 5000 })],
@@ -1168,10 +1181,10 @@ describe("own-writes state table", () => {
             partial ? String(want.before.complete) : plain.complete,
           );
         }
-        if (grantView || want.before.complete === true) {
+        if (grantView) {
           // A grant reads the published view, not the stored body, so the
           // owner does too, whatever is pending (no legacy body over a
-          // pending key reset). A complete owner view also wins (D5).
+          // pending key reset).
           expect(filed.source).toBe("stream-sync");
           expect(canon(filed.records)).toEqual(canon(want.before.rows));
           expect(filed.pending).toBeNull();
@@ -1202,6 +1215,64 @@ describe("own-writes state table", () => {
           }
         }
       });
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Every HTTP response, at every phase: before the writer publishes, after one
+// publish pass the reader has not imported, and after it imports the result.
+
+/** The keys of a response's records; empty when it carries none. */
+const keysOf = (read: Api): Set<string> =>
+  new Set((read.records ?? []).map(keyOf));
+
+async function expectHttp(rig: Rig, row: Row, phase: string): Promise<void> {
+  const seen = await observe(rig, row);
+  const header = reasonsHeader(seen.read.withheld);
+  const label = `${row.id} ${phase}`;
+  for (const file of [false, true]) {
+    for (const connection of [false, true]) {
+      const where = `${label} file=${file} connection=${connection}`;
+      const owner = await api(rig, row, { builder: false, file, connection });
+      const grant = await api(rig, row, { builder: true, file, connection });
+      // A grant carries no marker on any path.
+      expect(grant.withheld, where).toBeNull();
+      expect(grant.bodyWithheld, where).toBeNull();
+      expect(grant.pending, where).toBeNull();
+      expect(grant.complete, where).toBeNull();
+      // The owner never reads fewer records than a grant of the same stream.
+      for (const key of keysOf(grant)) {
+        expect(
+          keysOf(owner),
+          `${where} owner covers grant key ${key}`,
+        ).toContain(key);
+      }
+      // The owner is told what the writer will not publish, on every path.
+      if (owner.status === 200 && owner.source === "stream-sync") {
+        expect(canon(owner.records), where).toEqual(canon(seen.read.rows));
+      }
+      if (header !== null && owner.source !== "legacy") {
+        expect(sortedHeader(owner.withheld), where).toBe(header);
+      }
+    }
+  }
+  // A stored body answers the owner wherever it answers a grant.
+  const grantFiled = await api(rig, row, { builder: true, file: true });
+  const ownerFiled = await api(rig, row, { builder: false, file: true });
+  expect(ownerFiled.source, `${label} source`).toBe(grantFiled.source);
+}
+
+describe("owner and grant over HTTP, with a stored body that shares no key", () => {
+  for (const row of ROWS) {
+    it(`${row.id}: before publication, after one pass, after import`, async () => {
+      const rig = await open(row);
+      await expectHttp(rig, row, "before");
+      await rig.publish();
+      await expectHttp(rig, row, "published");
+      await publishUntilStable(rig, row);
+      await rig.sync();
+      await expectHttp(rig, row, "imported");
     });
   }
 });

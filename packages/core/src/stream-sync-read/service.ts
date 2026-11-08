@@ -754,8 +754,25 @@ export class StreamSyncReadService {
       return { target, connections, eligibility };
     });
 
+    // The owner never reads fewer records than a grant. When the stored body
+    // answers a grant (no published view of the imported heads), it answers
+    // the owner too, whatever the owner's own overlay would show: a complete
+    // overlay does not contain a different stored body.
+    const grantReadsFile =
+      input.isOwnerView &&
+      input.legacyFile &&
+      input.connection === null &&
+      !targets.some(
+        (target) =>
+          this.eligibility(
+            input,
+            target,
+            this.connectionViews(target.connector),
+          ).kind === "view",
+      );
+
     const views = evaluated
-      .filter((e) => e.eligibility.kind === "view")
+      .filter((e) => !grantReadsFile && e.eligibility.kind === "view")
       .map((e) => {
         const ns = (e.eligibility as { ns: string }).ns;
         const selected = e.connections.find((c) => c.ns === ns)!;
@@ -799,17 +816,6 @@ export class StreamSyncReadService {
         [...targets, ...candidates],
         snapshots,
       );
-      const grantReadsFile =
-        input.legacyFile &&
-        input.connection === null &&
-        !targets.some(
-          (target) =>
-            this.eligibility(
-              input,
-              target,
-              this.connectionViews(target.connector),
-            ).kind === "view",
-        );
       if (scan.best && !grantReadsFile) {
         const snapshot = snapshots.get(scan.best.target.connector)!;
         snapshots.delete(scan.best.target.connector);

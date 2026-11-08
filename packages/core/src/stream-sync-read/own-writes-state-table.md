@@ -37,11 +37,14 @@ the test change together.
    body field) on a served view, the legacy body, the missing-body contract
    error and the named-connection refusal. A grant reads only published data
    and gets no marker on any path.
-6. **A stored body answers the owner only where it answers a grant.** If a
+6. **A stored body answers the owner exactly where it answers a grant.** If a
    grant reads a published view, so does the owner, whatever is pending: no
-   legacy body over a pending key reset. A complete owner view also wins over
-   the stored body. Otherwise the stored body answers both, and the owner is
-   told `X-Stream-Sync-Pending`: U.
+   legacy body over a pending key reset. Otherwise the stored body answers
+   both, and the owner is told `X-Stream-Sync-Pending`: U. This holds even
+   when the owner's own view is complete (D5, N1): a predicted head does not
+   contain a different stored body. The test checks it over HTTP with a stored
+   record that shares no key with the rows, before the writer publishes, after
+   one pass the reader has not imported, and after the import.
 7. **U counts distinct unpublished runs**: runs with a requested stream that
    has no publish receipt, with or without records, shown or withheld. A run
    counts once across streams; a run with receipts on every requested stream
@@ -102,6 +105,7 @@ obsolete.
 | D3  | empty, newer `uid 2.0.0`, full                                                              | publishes an empty head, complete                 | `a b`        | no       | `rX:key_reset_pending`                                        | ∅           | yes            | none                                                          | `a b`        | ∅           | 1   |
 | D4  | base `2.0.0`; empty, older `uid 1.0.0`, full                                                | refuses                                           | `a b`        | yes      | `rX:connector_update_required`                                | `a b`       | yes            | `rX:connector_update_required`                                | `a b`        | `a b`       | 1   |
 | D5  | incomplete base; empty full run                                                             | publishes complete                                | `a b`        | yes      | none                                                          | `a b`       | yes            | none                                                          | —            | `a b`       | 1   |
+| N1  | no imported base; full run, row `c`                                                         | publishes `c`, complete                           | `c`          | yes      | none                                                          | `c`         | yes            | none                                                          | —            | `c`         | 1   |
 | D6  | another device's newer head `a b`; older local row `a` v0                                   | no-op (every row loses)                           | `a b`        | yes      | none                                                          | `a b`       | yes            | none                                                          | `a b`        | `a b`       | 1   |
 | P2  | another device's incomplete head; empty run, published, not imported                        | no-op                                             | `a b`        | no       | none                                                          | `a b`       | no             | none                                                          | —            | —           | 0   |
 | E2  | no base; seed; empty run                                                                    | publishes the seed, complete                      | —            | —        | `rE:seed_unresolved`                                          | `seed`      | yes            | none                                                          | —            | `seed`      | 1   |
