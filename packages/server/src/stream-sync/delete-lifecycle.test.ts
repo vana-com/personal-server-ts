@@ -400,6 +400,72 @@ describe.each(matrix)(
       await expect(scheduled(second, c, "sched-b2")).resolves.toBeDefined();
     });
 
+    // R7 (owinteg #567 gap): a run collected before a deletion must neither
+    // stay readable nor publish after it, whether it is still in flight or
+    // already finished locally.
+    it("a run collected before a scope delete: nothing deleted is readable or published by the next publish cycle", async () => {
+      const c = freshConnector("p4r2-purge-pending");
+      await activateControl(env.registry, c, NS); // active(1)
+      const a = await env.writer("p4r2-purge-a");
+      await a.refreshControls();
+      // In flight: begun and appended, never finished.
+      await a.beginRun({
+        runId: "p4r2-purge-inflight",
+        connector: c,
+        userConnect: false,
+        observedAt: T0,
+        identity: "none",
+        checkpointUsed: null,
+      });
+      await a.declareStream("p4r2-purge-inflight", "s", SHAPE);
+      await a.append("p4r2-purge-inflight", "s", { id: "1", n: "inflight" });
+      // Finished locally, not yet published.
+      await collect(a, {
+        runId: "p4r2-purge-finished",
+        connector: c,
+        observedAt: T0 + 1000,
+        streams: { s: rows(["2"], "finished") },
+      });
+      await a.deleteConnection(c); // deleted(2)
+      // The in-flight run finishes after the delete, then a publish cycle runs.
+      await a.finishRun("p4r2-purge-inflight", {
+        checkpointCandidate: { cursor: "x" },
+      });
+      await a.publishPending();
+      await a.publishPending();
+
+      const view = await readStream(env.registry, env.blobs, c, NS, "s");
+      expect(view === null || view === "tombstoned").toBe(true);
+      expect(
+        finishedOutcome(await a.status(), "p4r2-purge-finished")?.outcome,
+      ).not.toMatchObject({ kind: "checkpointed" });
+      expect(
+        finishedOutcome(await a.status(), "p4r2-purge-inflight")?.outcome,
+      ).not.toMatchObject({ kind: "checkpointed" });
+    });
+
+    // R6 (review P2-2): a fresh delete overtaken by a reconnect fails typed, not silently.
+    it("a fresh delete overtaken by a reconnect before it reads back fails with ConnectionDeleteSuperseded", async () => {
+      const c = freshConnector("p4r2-superseded");
+      await activateControl(env.registry, c, NS); // active(1)
+      const tombScope = controlScope(c, NS);
+      let overtaken = false;
+      const a = await env.writer("p4r2-superseded-a", {
+        registry: interpose(env.newRegistry(), {
+          async afterPost(request) {
+            if (overtaken || request.scope !== tombScope) return;
+            overtaken = true;
+            await activateControl(env.registry, c, NS); // active(3) lands first
+          },
+        }),
+      });
+      await a.refreshControls();
+      await expect(a.deleteConnection(c)).rejects.toMatchObject({
+        name: "ConnectionDeleteSuperseded",
+      });
+      expect(overtaken).toBe(true);
+    });
+
     // S6: a run collected before the delete publishes nothing after it.
     it("a run collected before the delete publishes nothing once the delete has landed", async () => {
       const c = freshConnector("p4r2-collecting-run");
