@@ -416,7 +416,11 @@ describe("U3 real browser write path (host verification required)", () => {
         }),
       );
       expect(read.status).toBe(200);
-      expect(JSON.stringify(await read.json())).toContain("alpha-1");
+      // Exact data payload, not a substring: a dropped row or changed value must fail.
+      // collectedAt is a wall-clock stamp, so the envelope is checked by fields.
+      const body = await read.json();
+      expect(body.scope).toBe("legacy.items");
+      expect(body.data).toEqual({ items: ROWS.alpha });
       expect(net.uploads).toEqual([]);
       expect(net.commits).toEqual([]);
     },
@@ -582,7 +586,73 @@ describe("U3 real browser write path (host verification required)", () => {
           { headers: ownerHeaders },
         ),
       );
-      expect(response.ok).toBe(false);
+      // Exact refusal: deletion is 410 DATA_DELETED; a vanished connection is 404.
+      expect(response.status).toBe(kind === "deleted" ? 410 : 404);
     },
   );
+
+  // Mutant f2: a named view already served by this reader is replayed from a
+  // cache after its control is deleted, without rechecking the control. The
+  // same reader must see the deletion, refuse, and return no old row bodies.
+  it("stops serving an already-imported named view when its control is deleted", async () => {
+    const net = await network();
+    const writer = await boot(net, browser("warm-seed"), true);
+    await collect(writer.built, "warm-seed-run");
+    await writer.built.streamSyncWriter!.publishPending();
+    const control = [...net.rows.values()].find(
+      (r) => parseScope(r.scope)?.kind === "control",
+    )!;
+    const ns = parseScope(control.scope)!.ns;
+    const query = {
+      scope: logical("alpha"),
+      connection: ns,
+      cursor: null,
+      legacyFile: true,
+      isOwnerView: true,
+    };
+    const reader = await boot(net, browser("warm-reader"), false);
+    const legacy = await reader.built.runtime.fetch(
+      new Request(`https://ps.local/v1/data/${logical("alpha")}`, {
+        method: "POST",
+        headers: { ...ownerHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ stale: true }),
+      }),
+    );
+    expect(legacy.status).toBe(201);
+    await imported(net, reader.reader);
+
+    // Serve the live rows on this reader first, so a cached view can exist.
+    const live = await reader.reader.resolve(query);
+    expect(live.kind).toBe("view");
+    if (live.kind !== "view") throw new Error(`live read was ${live.kind}`);
+    const envelope = await new Response(live.body).json();
+    expect(
+      envelope.data.records.sort((a: { id: string }, b: { id: string }) =>
+        a.id.localeCompare(b.id),
+      ),
+    ).toEqual(ROWS.alpha);
+
+    // The deletion reaches the SAME reader that already served those rows.
+    net.rows.set(control.scope, {
+      ...control,
+      deletedAt: new Date(1_800_000_001_000).toISOString(),
+      expectedVersion: "2",
+    });
+    await imported(net, reader.reader);
+    expect(await reader.reader.resolve(query)).toEqual({
+      kind: "unavailable",
+      reason: "deleted",
+    });
+    const response = await reader.built.runtime.fetch(
+      new Request(
+        `https://ps.local/v1/data/${logical("alpha")}?connection=${ns}`,
+        { headers: ownerHeaders },
+      ),
+    );
+    expect(response.status).toBe(410);
+    const text = await response.text();
+    expect(text).toContain("DATA_DELETED");
+    expect(text).not.toContain("alpha-1");
+    expect(text).not.toContain("alpha-2");
+  });
 });
