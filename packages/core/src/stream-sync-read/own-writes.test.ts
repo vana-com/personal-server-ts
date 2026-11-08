@@ -982,6 +982,50 @@ describe("own-write visibility (deletion floor)", () => {
     ).rejects.toMatchObject({ name: "ConnectionStoppedError" });
   });
 
+  // beginRun checks the connection's state, then takes its start. A delete
+  // that the publish queue records between those two steps must not give a
+  // scheduled run a deleted start: the check and the start read one state.
+  it("does not give a scheduled run a deleted start when a delete lands during begin", async () => {
+    const d = new Device();
+    await d.collect([{ id: "z", v: 1 }]);
+    await d.publish();
+    // Device.begin reads control first; the race is inside beginRun, so read
+    // control here and call beginRun directly with the same arguments.
+    await d.writer.refreshControls();
+    // The publish queue records a control read through readControl, which
+    // does not take the intake lock beginRun holds. Inject it at beginRun's
+    // next keys() call: that is after its stopped check.
+    const writer = d.writer as unknown as {
+      keys: () => Promise<unknown>;
+      readControl: (connector: string, ns: string) => Promise<unknown>;
+    };
+    const keys = writer.keys.bind(d.writer);
+    writer.keys = async () => {
+      writer.keys = keys;
+      d.gateway.deleteControl();
+      await writer.readControl(CONNECTOR, "");
+      return keys();
+    };
+    const runId = "race-run";
+    await d.writer.beginRun({
+      runId,
+      connector: CONNECTOR,
+      userConnect: false,
+      observedAt: T0 + 60_000,
+      identity: "none",
+      checkpointUsed: null,
+    });
+    await d.writer.declareStream(runId, "items", SHAPE);
+    await d.writer.append(runId, "items", { id: "b", v: 2 });
+    await d.finish(runId);
+    const snapshot = await createWriterOverlaySource(d.writer).snapshot(
+      CONNECTOR,
+    );
+    const run = snapshot.runs.find((r) => r.runId === runId);
+    expect(run).toBeDefined();
+    expect(run!.start.kind).not.toBe("deleted");
+  });
+
   it("does not show a full connect run published before a second delete and reconnect", async () => {
     const { d, service } = await deletedConnect();
     const runId = await d.begin(
