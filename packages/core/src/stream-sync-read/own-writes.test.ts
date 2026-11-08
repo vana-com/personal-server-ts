@@ -45,7 +45,7 @@ const silent = { info() {}, warn() {}, error() {} };
 class Gateway implements StreamSyncRegistry {
   private readonly versions = new Map<
     string,
-    { dataHash: string; metadataHash: string; at: string }[]
+    { dataHash: string; metadataHash: string; at: string; deleted?: boolean }[]
   >();
   down = false;
   /** `refuse`: post throws an ambiguous reply (publish fails, entry stays). */
@@ -65,8 +65,23 @@ class Gateway implements StreamSyncRegistry {
       version: rows.length,
       dataHash: head.dataHash,
       metadataHash: head.metadataHash,
-      deleted: false,
+      deleted: head.deleted ?? false,
     };
+  }
+
+  /** The owner deletes `items`: a deletedAt tombstone as the next version. */
+  deleteStream(): void {
+    const scope = [...this.versions.keys()].find(
+      (s) => parseScope(s)?.kind === "stream",
+    )!;
+    const rows = this.versions.get(scope)!;
+    const head = rows[rows.length - 1]!;
+    rows.push({
+      dataHash: head.dataHash,
+      metadataHash: head.metadataHash,
+      at: new Date(T0 + rows.length * 1000).toISOString(),
+      deleted: true,
+    });
   }
 
   async post(request: SignedRegistryPost): Promise<RegistryPostResult> {
@@ -106,7 +121,7 @@ class Gateway implements StreamSyncRegistry {
         metadataHash: head.metadataHash,
         expectedVersion: String(rows.length),
         addedAt: head.at,
-        deletedAt: null,
+        deletedAt: head.deleted ? head.at : null,
       };
     });
   }
@@ -251,6 +266,20 @@ async function latest(service: StreamSyncReadService) {
     rows,
     ...(envelope.origin ? { origin: envelope.origin as string } : {}),
   };
+}
+
+/** The withheld runs the owner's latest read names (`[]` when none). */
+async function withheldOf(service: StreamSyncReadService) {
+  const decision = await service.resolve({
+    scope: `pdpp.${CONNECTOR}.items`,
+    connection: null,
+    cursor: null,
+    legacyFile: false,
+    isOwnerView: true,
+  });
+  if (decision.kind !== "view" && decision.kind !== "local_pending") return [];
+  const envelope = JSON.parse(await new Response(decision.body).text());
+  return envelope.withheld ?? [];
 }
 
 const H1 = [
@@ -429,5 +458,54 @@ describe("own-write visibility (G4: restart and acknowledgment)", () => {
     await d.syncReader(service);
     expect(d.streamVersion()).toBe(1);
     expect(d.runFiles(runId)).toBe(0);
+  });
+});
+
+describe("own-write visibility (deletion floor)", () => {
+  // Stream v1 holds run-1 (published). The owner deletes it (v2, observed and
+  // imported: the floor is 2). A live row (v3) then replaces the tombstone and
+  // the reader has not imported it yet, so no imported view covers run-1.
+  async function deletedThenRelive(d: Device, service: StreamSyncReadService) {
+    await d.collect([{ id: "a", v: 1 }]);
+    await d.publish();
+    d.gateway.deleteStream();
+    await d.syncReader(service);
+  }
+
+  it("does not serve a run published before the deletion (overlay-only)", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    await deletedThenRelive(d, service);
+    await d.collect([{ id: "b", v: 2 }]);
+    await d.publish();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(d.streamVersion()).toBe(3);
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+    expect((await latest(service)).rows).not.toHaveProperty("a");
+  });
+
+  it("does not serve a run published before the deletion, beside an in-flight run", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    await deletedThenRelive(d, service);
+    await d.collect([{ id: "b", v: 2 }]);
+    await d.publish();
+    d.gateway.failPosts = true;
+    const inFlight = await d.collect([{ id: "c", v: 3 }]);
+    await d.publish();
+    d.gateway.failPosts = false;
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    // The in-flight run's rows stay withheld (publication_in_flight), by design.
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+    expect((await latest(service)).rows).not.toHaveProperty("a");
+    expect(await withheldOf(service)).toEqual([
+      { runId: inFlight, stream: "items", reason: "publication_in_flight" },
+    ]);
   });
 });
