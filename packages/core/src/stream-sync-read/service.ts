@@ -604,7 +604,14 @@ export class StreamSyncReadService {
     } = {},
   ): Fold {
     const { pending = false, steps } = options;
-    const head = base && planHeadOf(base.head);
+    const head = base && {
+      ...planHeadOf(base.head),
+      identity: {
+        generation: base.head.generation,
+        registryVersion: base.version,
+        dataHash: base.dataHash.toLowerCase(),
+      },
+    };
     const none = foldPlan(head, [], []);
     if (!snapshot || tombstoned) return none;
     // Pending: this device's own rows that no verified activation of their

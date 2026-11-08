@@ -144,11 +144,15 @@ describe("covered full refresh", () => {
     await rig.collect(
       run({ runId: "mine", full: true, replace: true, rows: [A2], at: 5000 }),
     );
+    let crashed = false;
     rig.gateway.afterPost = async () => {
+      crashed = true;
       rig.gateway.afterPost = undefined;
       throw new Error("crash after the registry committed");
     };
     await rig.publish().catch(() => undefined);
+    // The hook must have fired, or the restart below proves nothing.
+    expect(crashed).toBe(true);
     await rig.restart();
     await rig.publish();
     await rig.sync();
@@ -159,6 +163,72 @@ describe("covered full refresh", () => {
     await rig.restart();
     await rig.publish();
     expect(await rig.registeredVersion()).toBe(version);
+  });
+
+  // The skew trace: this device queues a covered refresh stamped 5000 and
+  // holds it; another device, whose clock is slower, publishes a newer
+  // covered refresh stamped 4000 that keeps c. The queued refresh started
+  // before c existed, so it must not delete c.
+  const skew =
+    (queued: string, other: string, queuedAt: number, otherAt: number) =>
+    async (merge: boolean) => {
+      const rig = await baseRig();
+      await rig.collect(
+        run({
+          runId: queued,
+          full: true,
+          ...(merge ? {} : { replace: true }),
+          rows: [A2],
+          at: queuedAt,
+        }),
+      );
+      await rig.collect(
+        run({
+          runId: other,
+          otherDevice: true,
+          full: true,
+          replace: true,
+          rows: [A2, C],
+          at: otherAt,
+        }),
+      );
+      await rig.sync();
+      expect((await read(rig, false)).ids).toEqual(["a", "c"]);
+      await rig.publish();
+      await rig.sync();
+      return {
+        owner: (await read(rig, true)).ids,
+        grant: (await read(rig, false)).ids,
+      };
+    };
+
+  it("keeps a record another device published after this device's queued refresh began (skewed clocks)", async () => {
+    const result = await skew("mine", "other", 5000, 4000)(false);
+    expect(result.owner).toEqual(["a", "c"]);
+    expect(result.grant).toEqual(["a", "c"]);
+  });
+
+  it("keeps the record when observedAt ties and run ids sort against the queued refresh", async () => {
+    const result = await skew("z-refresh", "a-new", 5000, 5000)(false);
+    expect(result.owner).toEqual(["a", "c"]);
+    expect(result.grant).toEqual(["a", "c"]);
+  });
+
+  it("merges the same skewed trace when the queued run carries no replace marker", async () => {
+    const result = await skew("mine", "other", 5000, 4000)(true);
+    expect(result.owner).toEqual(["a", "c"]);
+    expect(result.grant).toEqual(["a", "c"]);
+  });
+
+  it("replaces when no other device published since the refresh began", async () => {
+    const rig = await baseRig();
+    await rig.collect(
+      run({ runId: "mine", full: true, replace: true, rows: [A2], at: 5000 }),
+    );
+    await rig.publish();
+    await rig.sync();
+    expect((await read(rig, true)).ids).toEqual(["a"]);
+    expect((await read(rig, false)).ids).toEqual(["a"]);
   });
 
   it("does not bring back a seed row the refresh omits", async () => {

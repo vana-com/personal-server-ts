@@ -306,6 +306,13 @@ export class Rig {
             generation: 1,
           },
     });
+    if (spec.replace) {
+      // What intake does at begin: the starting head of each stream the run may replace.
+      await writer.recordBasis(
+        spec.runId,
+        [spec, ...(spec.also ?? [])].map((stream) => stream.stream ?? "items"),
+      );
+    }
     for (const stream of [spec, ...(spec.also ?? [])]) {
       const name = stream.stream ?? "items";
       await writer.declareStream(spec.runId, name, {

@@ -89,6 +89,7 @@ import {
   stampBefore,
   type CommitStamp,
   type ExecutedStep,
+  type HeadIdentity,
   type PlanHead,
   type PlanRun,
   type StreamFloor,
@@ -268,6 +269,12 @@ interface HostEntry {
   seedStreams: string[];
   /** M5: who the run writes for; checked again before it publishes. */
   binding?: { owner: string; keyCheck: string; leaseId: string | null };
+  /**
+   * The registered head each stream held when the run started, recorded once
+   * by `recordBasis` and never refreshed: a replay or a retry keeps it. `null`
+   * means no trustworthy head. Absent on runs that record none.
+   */
+  basis?: Record<string, HeadIdentity | null>;
 }
 
 /** The START the writer issued to a run (V2 §2.1). */
@@ -915,6 +922,54 @@ export class StreamSyncWriter {
     string,
     { index: number; primaryKey: string[]; observedAt: number }
   >();
+
+  /**
+   * Record the starting head of each stream that may be replaced by this run.
+   * Call once, at the run's start, before any source read. A stream already
+   * recorded keeps its basis. A stream with no trustworthy head records `null`.
+   */
+  recordBasis(runId: string, streams: readonly string[]): Promise<void> {
+    return this.intake(async () => {
+      const host = await this.collecting(runId);
+      const basis = { ...(host.basis ?? {}) };
+      for (const name of streams) {
+        if (name in basis) continue;
+        basis[name] = await this.startingBasis(host.entry.connector, name);
+      }
+      host.basis = basis;
+      await this.writeEntry(host);
+    });
+  }
+
+  /** The registered head of one stream, verified; null when none can be trusted. */
+  private async startingBasis(
+    connector: string,
+    name: string,
+  ): Promise<HeadIdentity | null> {
+    if (!this.control) return null;
+    try {
+      const scope = streamScope(connector, IDENTITYLESS_NS, name);
+      const { keyCheck } = await this.keys();
+      const row = await this.options.registry.read(scope);
+      if (!row.found || classifyStreamRow(row, this.control) !== "present") {
+        return null;
+      }
+      const head = await this.loadHead(scope, row.dataHash, {
+        connector,
+        ns: IDENTITYLESS_NS,
+        stream: name,
+        keyCheck,
+      });
+      return {
+        generation: head.generation,
+        registryVersion: row.version,
+        dataHash: row.dataHash.toLowerCase(),
+      };
+    } catch {
+      // No trustworthy starting head: the run merges this stream.
+      return null;
+    }
+  }
 
   /**
    * End intake. The run becomes publishable.
@@ -1661,9 +1716,17 @@ export class StreamSyncWriter {
     }
     // The publish plan decides this step (publish-plan.ts); this method only
     // executes it: the parts, the head upload and the POST.
+    const identity: HeadIdentity | undefined =
+      head && row.found
+        ? {
+            generation: head.generation,
+            registryVersion: row.version,
+            dataHash: row.dataHash.toLowerCase(),
+          }
+        : undefined;
     const decision = planStreamStep(
       {
-        head: head && planHeadOf(head),
+        head: head && { ...planHeadOf(head), identity },
         floor: floorOf(await this.readState(), entry.connector, ns, name),
       },
       this.planRun(host, name, await this.readState(), true),
@@ -1690,7 +1753,10 @@ export class StreamSyncWriter {
         ? choice.head
         : null;
     // A covered refresh sets the seed aside too: its omitted rows stay gone.
-    if (stream.seedApplies && !stream.replace) await this.spoolSeed(host, name);
+    // Only a refresh that replaces the head does; any other merges the seed.
+    const replacing =
+      decision.kind === "publish" && decision.replacesStream === true;
+    if (stream.seedApplies && !replacing) await this.spoolSeed(host, name);
     const next = decision.head;
     const complete = next.complete;
 
@@ -1845,6 +1911,9 @@ export class StreamSyncWriter {
         host.checkpointUsed !== null && host.checkpointUsed.ns !== entry.ns,
       empty: (stream.shardBytes ?? []).every((bytes) => bytes === 0),
       ...(stream.replace ? { replace: true } : {}),
+      ...(stream.replace && host.basis?.[name] !== undefined
+        ? { basis: host.basis[name] }
+        : {}),
       seed: stream.seedApplies ? "merged" : seedOpen ? "unresolved" : "none",
       ...(executed ? { executed } : {}),
       // Selected by a running pass, or signed and persisted: either way the
@@ -1914,7 +1983,14 @@ export class StreamSyncWriter {
     };
     stream.executed = {
       kind: step.kind,
-      head: step.head,
+      head: {
+        ...step.head,
+        identity: {
+          generation,
+          registryVersion,
+          dataHash: dataHash.toLowerCase(),
+        },
+      },
       replacesBase: step.replacesBase,
     };
     delete stream.planned;

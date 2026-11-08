@@ -54,6 +54,25 @@ function higherVersion(a: string | null, b: string | null): string | null {
   return compareConnectorVersions(b, a) === "higher" ? b : a;
 }
 
+/**
+ * Which registered head a stream holds: its generation, registry version and
+ * data hash. Two heads are the same only when all three match.
+ */
+export interface HeadIdentity {
+  readonly generation: number;
+  readonly registryVersion: number;
+  /** Lowercase hex. */
+  readonly dataHash: string;
+}
+
+export function sameHeadIdentity(a: HeadIdentity, b: HeadIdentity): boolean {
+  return (
+    a.generation === b.generation &&
+    a.registryVersion === b.registryVersion &&
+    a.dataHash.toLowerCase() === b.dataHash.toLowerCase()
+  );
+}
+
 /** What the plan reads of a head. */
 export interface PlanHead {
   /** null only in a prediction: a first run whose generation admission has not bound yet. */
@@ -61,12 +80,33 @@ export interface PlanHead {
   readonly primaryKey: readonly string[];
   readonly profile: HeadProfile;
   readonly complete: boolean;
+  /**
+   * The registered head this is, when it is one. Absent on a prediction: the
+   * plan cannot tell which registered head a predicted one will become.
+   */
+  readonly identity?: HeadIdentity;
 }
 
 /** The order commits follow on a stream. */
 export interface CommitStamp {
   readonly observedAt: number;
   readonly runId: string;
+}
+
+/**
+ * Whether a covered refresh recorded on `basis` still applies to `head`. Both
+ * "no head" is a match (a refresh over nothing), and a recorded head must be
+ * the registered head the plan meets. A prediction without an identity does
+ * not match.
+ */
+function basisHolds(
+  basis: HeadIdentity | null | undefined,
+  head: PlanHead | null,
+): boolean {
+  if (basis === undefined) return false;
+  if (head === null) return basis === null;
+  if (basis === null || head.identity === undefined) return false;
+  return sameHeadIdentity(basis, head.identity);
 }
 
 export function stampBefore(a: CommitStamp, b: CommitStamp): boolean {
@@ -97,6 +137,7 @@ export type PlanSeed = "none" | "merged" | "unresolved";
 /** A step the writer already executed for this run's stream. */
 export interface ExecutedStep {
   readonly kind: "publish" | "noop";
+  /** The head the step left, with the registry identity the writer committed. */
   readonly head: PlanHead;
   /** The head's earlier rows are not in the result. */
   readonly replacesBase: boolean;
@@ -119,6 +160,12 @@ export interface PlanRun extends CommitStamp {
    * what the head holds. Absent means merge, always.
    */
   readonly replace?: boolean;
+  /**
+   * The registered head this stream held when the run started (null: none
+   * trustworthy). A replace applies only when the head the plan meets is this
+   * one; any other head, or no recorded basis, merges. Absent: not recorded.
+   */
+  readonly basis?: HeadIdentity | null;
   readonly seed: PlanSeed;
   /** Present once the writer committed or recorded a no-op for this stream. */
   readonly executed?: ExecutedStep;
@@ -148,6 +195,11 @@ export type DeferredReason =
   /** An earlier run of the stream is not resolved; commits stay in order. */
   | "earlier_run_pending"
   /**
+   * A covered refresh holds a recorded basis, but the head is a prediction
+   * whose registry identity is not known, so the replace cannot be decided.
+   */
+  | "basis_unknown"
+  /**
    * The writer sent a signed request for this run, or a later run, and the
    * registry's answer is not recorded. The request may have committed: until
    * it is reconciled, no run it would supersede or reorder has a known fate.
@@ -166,6 +218,11 @@ export type StepDecision =
        * and keeps the newer ones (written after the refresh was collected).
        */
       readonly dropsBefore?: CommitStamp;
+      /**
+       * The stream is set aside: the writer does not merge the seed (its rows
+       * are the stream). Absent on a merge, and on a step the writer executed.
+       */
+      readonly replacesStream?: boolean;
       readonly seed: boolean;
       readonly floor: string;
     }
@@ -207,6 +264,14 @@ export function planStreamStep(state: PlanState, run: PlanRun): StepDecision {
   if (run.seed === "unresolved") {
     return { kind: "deferred", reason: "seed_unresolved" };
   }
+  if (
+    run.replace === true &&
+    run.basis != null &&
+    head !== null &&
+    head.identity === undefined
+  ) {
+    return { kind: "deferred", reason: "basis_unknown" };
+  }
   // chooseBase: a head of an older generation is no base (§2.7).
   const base = head && head.generation === run.generation ? head : null;
   const against = higherVersion(floor.version, base?.profile.version ?? null);
@@ -224,8 +289,10 @@ export function planStreamStep(state: PlanState, run: PlanRun): StepDecision {
     return { kind: "refused", reason: "connector_update_required" };
   }
   const usable = compat.kind === "empty_base" ? null : base;
-  // A covered full refresh sets the stream aside: its rows are the stream.
-  const replaced = run.replace === true && usable !== null;
+  // A covered full refresh sets the stream aside: its rows are the stream, but
+  // only over the head it started on. Any other head merges.
+  const setAside = run.replace === true && basisHolds(run.basis, head);
+  const replaced = setAside && usable !== null;
   const used = replaced ? null : usable;
   const seedMerged = run.seed === "merged";
   // §2.5 complete = full || base complete || seed merged; §2.12 a run resumed
@@ -247,6 +314,7 @@ export function planStreamStep(state: PlanState, run: PlanRun): StepDecision {
     kind: "publish",
     head: next,
     replacesBase: head !== null && used === null,
+    ...(setAside ? { replacesStream: true } : {}),
     ...(replaced
       ? { dropsBefore: { observedAt: run.observedAt, runId: run.runId } }
       : {}),

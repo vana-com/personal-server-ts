@@ -993,10 +993,20 @@ function expectRead(seen: Observed, want: Read): void {
   expect(seen.read.withheld).toEqual([...want.withheld].sort());
 }
 
-const sameAs = (predicted: PlanHead, registered: PlanHead): PlanHead =>
-  predicted.generation === null
-    ? { ...predicted, generation: registered.generation }
-    : predicted;
+// The head's fields only: a head may carry the registry identity the writer
+// committed, which a predicted head or a registered head read here does not.
+const headFields = (h: PlanHead): PlanHead => ({
+  generation: h.generation,
+  primaryKey: h.primaryKey,
+  profile: h.profile,
+  complete: h.complete,
+});
+const sameAs = (predicted: PlanHead, registered: PlanHead): PlanHead => {
+  const fields = headFields(predicted);
+  return fields.generation === null
+    ? { ...fields, generation: registered.generation }
+    : fields;
+};
 
 async function plans(
   rig: Rig,
@@ -1335,7 +1345,10 @@ async function checkedPass(
           const head = sameAs(step.head!, now ?? step.head!);
           if (done) {
             expect(done.executed, `${label} ${step.runId} executed`).toBe(true);
-            expect(done.head, `${label} ${step.runId} head`).toEqual(head);
+            expect(
+              done.head && headFields(done.head),
+              `${label} ${step.runId} head`,
+            ).toEqual(head);
           } else {
             // Reclaimed at once: only a no-op leaves nothing to import.
             expect(statuses.find((s) => s.runId === step.runId)?.phase).toBe(

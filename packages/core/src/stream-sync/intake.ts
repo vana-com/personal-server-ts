@@ -199,11 +199,21 @@ export interface StreamSyncIntakeOptions {
    * `mutable_state` with at least one record, and the run skipped no delete
    * and dropped no oversize record in it. Anything else merges.
    *
-   * The desktop producer sends its replace call when a completion proof covers
-   * the stream's output and the run had no detail gap. This request does not
-   * carry that proof, so the setting stays off until a producer states
-   * per-stream full-source coverage. `replace-conformance.cases.json` (server
-   * package) lists, case by case, where intake and that producer differ.
+   * The head a stream holds is recorded when its run begins. At publish the
+   * stream replaces only if the registry still holds that same head; if
+   * another device published since, the stream merges. So a refresh cannot
+   * delete a record another device wrote after the refresh started, whatever
+   * the device clocks say.
+   *
+   * Before this can default on, the producer must state per-stream full-source
+   * coverage on the end request: the source read every page and detail the
+   * stream needs. This request carries no such proof yet. The desktop producer
+   * sends its replace call when a completion proof covers the stream's output
+   * and the run had no detail gap (`replace_streams`, apps/desktop/src-tauri/
+   * src/commands/pdpp_runtime.rs). `replace-conformance.cases.json` (server
+   * package) lists, case by case, where intake and that producer differ. The
+   * cases that must hold first are `no-completion-proof` and
+   * `proof-does-not-match-records`: a proof-less or mismatched end must merge.
    */
   readonly coveredReplace?: boolean;
 }
@@ -417,6 +427,21 @@ export class StreamSyncIntake implements RunIntake {
         .filter((e) => e.time_range !== undefined && e.time_range !== null)
         .map((e) => e.name),
     );
+    if (this.options.coveredReplace && !willDiscard) {
+      // A stream that may be replaced at finish records its starting head now,
+      // before any record is read, so a publish can tell whether the head moved.
+      await writer.recordBasis(
+        runId,
+        declarations.streams
+          .filter(
+            (d) =>
+              d.semantics === "mutable_state" &&
+              modes.get(d.name) === "full_refresh" &&
+              !ranged.has(d.name),
+          )
+          .map((d) => d.name),
+      );
+    }
     const response: BeginResponse = {
       runId,
       status: willDiscard ? "will_discard" : "collecting",
