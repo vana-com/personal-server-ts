@@ -13,6 +13,7 @@
  */
 
 import {
+  admitsCurrent,
   canonicalBytes32,
   classifyStreamRow,
   controlHashes,
@@ -20,6 +21,7 @@ import {
   isHeadLive,
   selectConnection,
   streamScope,
+  type AdmissionStart,
   type ConnectionView,
   type ControlState,
   type Eligibility,
@@ -638,15 +640,17 @@ export class StreamSyncReadService {
     const floor = this.mirror.deletionFloor(streamScope(connector, ns, stream));
     const candidates: Contribution[] = [];
     for (const run of snapshot.runs) {
-      if (
-        run.connector !== connector ||
-        run.ns !== ns ||
-        (pending
-          ? control.kind === "active" &&
-            run.generation !== null &&
-            run.generation !== control.generation
-          : run.generation !== (control as { generation?: number }).generation)
-      ) {
+      // The writer's admission rule, shared with decide(): a run bound to no
+      // generation started while the connection was absent. A pending read
+      // with the connection absent still shows an active-start run: decide()
+      // keeps it pending (reread) and does not discard it until it publishes.
+      const start: AdmissionStart =
+        run.generation === null
+          ? { kind: "absent" }
+          : { kind: "active", generation: run.generation };
+      const admitted =
+        (pending && control.kind === "absent") || admitsCurrent(start, control);
+      if (run.connector !== connector || run.ns !== ns || !admitted) {
         continue;
       }
       const local = run.streams.find((s) => s.name === stream);

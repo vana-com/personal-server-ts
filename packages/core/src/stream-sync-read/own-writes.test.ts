@@ -28,7 +28,10 @@ import {
   type ControlRead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createStreamSyncReadKeys } from "./keys.js";
-import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  controlScope,
+  streamScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
 import type { StreamSyncOverlaySnapshotSource } from "./ports.js";
@@ -106,6 +109,20 @@ class Gateway implements StreamSyncRegistry {
   /** The owner deletes the connection: its control row is tombstoned. */
   deleteControl(): void {
     this.append(this.controlRow(), true);
+  }
+
+  /**
+   * The connection is connected by another device of this owner: its control
+   * row (same key-bound hashes) appears here, with no publish on this device.
+   */
+  adoptControlFrom(other: Gateway): void {
+    const scope = [...other.versions.keys()].find(
+      (s) => parseScope(s)?.kind === "control",
+    )!;
+    this.versions.set(
+      scope,
+      other.versions.get(scope)!.map((row) => ({ ...row })),
+    );
   }
 
   /** The connection is reconnected: its control row is live at a new version. */
@@ -250,6 +267,18 @@ class Device {
   async collectStreams(
     streams: Readonly<Record<string, readonly { id: string; v: number }[]>>,
   ): Promise<string> {
+    const runId = await this.begin(streams);
+    await this.finish(runId);
+    return runId;
+  }
+
+  /**
+   * A run started with its rows appended but not finished, so it is not ready
+   * and no publish takes it. Its start state is read now.
+   */
+  async begin(
+    streams: Readonly<Record<string, readonly { id: string; v: number }[]>>,
+  ): Promise<string> {
     const runId = `run-${(this.runs += 1)}`;
     await this.writer.refreshControls();
     await this.writer.beginRun({
@@ -264,10 +293,14 @@ class Device {
       await this.writer.declareStream(runId, stream, SHAPE);
       for (const row of rows) await this.writer.append(runId, stream, row);
     }
+    return runId;
+  }
+
+  /** Finish a run started by `begin`: it becomes ready, not published. */
+  async finish(runId: string): Promise<void> {
     await this.writer.finishRun(runId, {
       checkpointCandidate: { cursor: runId },
     });
-    return runId;
   }
 
   /** Registry version of the stream row; 0 when none. */
@@ -662,5 +695,71 @@ describe("own-write visibility (deletion floor)", () => {
     });
     expect(await withheldOf(service)).toEqual([]);
     expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
+
+  // A run finished while the connection was absent has generation null (the
+  // start state is "absent", which admits only generation 1: decide.ts, the
+  // absent cell). The connection is then connected by another device, without
+  // publishing this run. Served at generation 1, it must not be served after a
+  // delete and reconnect to generation 3.
+  it("does not serve a run finished before the first connect, once the connection is at generation 3", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    await d.collectStreams({ items: [{ id: "b", v: 2 }] });
+    const other = new Device();
+    await other.collect([{ id: "z", v: 1 }]);
+    await other.publish();
+    d.gateway.adoptControlFrom(other.gateway);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    // Precondition: absent then active at generation 1 admits the run.
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+    d.gateway.deleteControl();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    d.gateway.reviveControl();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    // The connection is back at generation 3, not the run's absent start.
+    expect(await d.gateway.read(controlScope(CONNECTOR, ""))).toMatchObject({
+      found: true,
+      version: 3,
+      deleted: false,
+    });
+    expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
+
+  // Twin: the connection stays absent, so the run is admitted and must serve.
+  it("serves a run that finished while the connection was absent and is still absent", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    await d.collect([{ id: "b", v: 2 }]);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+  });
+
+  // Twin: absent, then the first connect at generation 1. Admitted, must serve.
+  it("serves a run that finished before the first connect, when the connection is at generation 1", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    await d.collectStreams({ items: [{ id: "b", v: 2 }] });
+    const other = new Device();
+    await other.collect([{ id: "z", v: 1 }]);
+    await other.publish();
+    d.gateway.adoptControlFrom(other.gateway);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
   });
 });

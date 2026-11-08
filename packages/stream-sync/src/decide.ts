@@ -20,6 +20,7 @@
  */
 
 import type { ControlState } from "./control.js";
+import { admitsCurrent } from "./admission.js";
 import { hasOwn } from "./json.js";
 
 export type StartSnapshot = Readonly<Record<string, ControlState>> | null;
@@ -88,16 +89,12 @@ function table(input: DecideInput): Decision {
     case "unknown":
       return { ...DISCARD, recollect: true };
     case "absent":
+      if (!admitsCurrent({ kind: "absent" }, c)) return DISCARD;
       if (c.kind === "absent") return { kind: "create", target: 1 };
-      if (c.kind === "active" && c.generation === 1) {
-        return { kind: "publish", target: 1 };
-      }
-      return DISCARD;
+      return { kind: "publish", target: 1 };
     case "active": {
       const g0 = s.generation;
-      if (c.kind === "active" && c.generation === g0) {
-        return { kind: "publish", target: g0 };
-      }
+      if (admitsCurrent(s, c)) return { kind: "publish", target: g0 };
       if (c.kind === "absent" || (c.kind === "active" && c.generation < g0)) {
         return phase === "reread"
           ? { kind: "keep_pending", reason: "registry_inconsistent" }
