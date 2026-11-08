@@ -8,6 +8,17 @@ import { InvalidArgumentError } from "./errors.js";
 /** SHA-256 of the exact bytes, as the 32-byte digest. */
 export type Sha256 = (data: Uint8Array) => Promise<Uint8Array>;
 
+/**
+ * Incremental SHA-256: feed pieces with `update`, then read the 32-byte
+ * digest once. Needed for bodies that are never held as one buffer (WebCrypto
+ * has no incremental digest, so hosts supply a JavaScript implementation).
+ */
+export interface Sha256Stream {
+  update(data: Uint8Array): void;
+  digest(): Uint8Array;
+}
+export type Sha256StreamFactory = () => Sha256Stream;
+
 /** Keccak-256 (Ethereum, not SHA3-256) of the exact bytes, as the 32-byte digest. */
 export type Keccak256 = (data: Uint8Array) => Promise<Uint8Array>;
 
