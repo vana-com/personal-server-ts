@@ -30,10 +30,11 @@ import {
   type LegacyScopeBinding,
 } from "../legacy-projection/index.js";
 import {
-  foldContributions,
+  foldPlan,
+  planHeadOf,
   type Contribution,
   type Fold,
-  type FoldBase,
+  type WithheldReason,
 } from "./fold.js";
 import { StreamSyncImporter, type ImportIssue } from "./importer.js";
 import {
@@ -57,7 +58,7 @@ import type {
   StreamSyncReadKeys,
   StreamSyncReadLogger,
 } from "./ports.js";
-import { planProjection } from "./projection.js";
+import { planProjection, ProjectionFailedError } from "./projection.js";
 import { isPhysicalScope, logicalStreamScopeParts } from "./routing.js";
 import {
   ViewStore,
@@ -97,13 +98,14 @@ export interface ResolveInput {
 }
 
 /**
- * A local run whose rows the view does not show: the writer will not publish
- * it until the connector is newer (§2.5). Carried to the owner only.
+ * A local run whose rows the view does not show, and why (fold.ts): the
+ * writer's publish plan refuses or defers it, or the read does not show it
+ * before it is imported. Carried to the owner only.
  */
 export interface WithheldRun {
   readonly runId: string;
   readonly stream: string;
-  readonly reason: "connector_update_required";
+  readonly reason: WithheldReason;
 }
 
 /**
@@ -114,9 +116,11 @@ export interface OwnerNotes {
   /** Runs the writer will not publish; absent when none. */
   readonly withheld?: readonly WithheldRun[];
   /**
-   * A legacy body answers, and pending local runs hold records it does not
-   * supersede. The legacy body's own time is an ingest stamp, not comparable
-   * with a run's, so nothing decides which is newer: the owner is told.
+   * A legacy body answers while local runs are not published: `runs` counts
+   * distinct runs with a requested stream that has no publish receipt, with
+   * or without records, shown or withheld. The legacy body's own time is an
+   * ingest stamp, not comparable with a run's, so nothing decides which is
+   * newer: the owner is told.
    */
   readonly pending?: { readonly runs: number };
 }
@@ -138,16 +142,20 @@ export type ReadDecision =
   | { readonly kind: "invalid_connection" }
   | { readonly kind: "too_large"; readonly bytes: number }
   /**
-   * The owner's own local rows that no verified activation covers yet (a
-   * first run made offline). Owner-only, this device only, no registry entry:
-   * nothing to bill and no version to bind. The body marks the data
-   * `"origin":"local-pending"`.
+   * The owner's partial view, built on this device: the live imported heads,
+   * complete or not, and the local runs the writer will publish on them, when
+   * no complete view serves (a first run made offline, an incomplete head, a
+   * pending key reset). Owner-only, no registry entry to bind: nothing to
+   * bill. The body marks the data `"origin":"local-pending"` and says whether
+   * it is `"complete"`.
    */
   | {
       readonly kind: "local_pending";
       readonly connector: string;
       readonly ns: string;
       readonly cursor: string;
+      /** The view holds everything the writer will publish, and that is complete. */
+      readonly complete: boolean;
       /** Owner only; absent when none. */
       readonly withheld?: readonly WithheldRun[];
       readonly body: ReadableStream<Uint8Array>;
@@ -241,8 +249,16 @@ interface CursorStream {
    * later key change replaced. Absent in a cursor from before fold pins.
    */
   readonly p?: readonly (readonly [string, string])[];
-  /** The fold replaced the imported base. Pinned with `p`. */
+  /**
+   * A cursor from before the plan: the fold replaced the imported base. Such
+   * a cursor replays only when this is false.
+   */
   readonly d?: boolean;
+  /**
+   * The key, profile and completeness of the head the response showed (the
+   * projection's input). Absent in a cursor from before shape pins.
+   */
+  readonly h?: string;
 }
 
 interface Cursor {
@@ -333,11 +349,12 @@ function decodeCursor(text: string): Cursor | null {
     const streams: Record<string, CursorStream> = {};
     if (typeof parsed.s === "object" && parsed.s !== null) {
       for (const [name, pin] of Object.entries(parsed.s)) {
-        const { b, m, p, d } = (pin ?? {}) as {
+        const { b, m, p, d, h } = (pin ?? {}) as {
           b?: unknown;
           m?: unknown;
           p?: unknown;
           d?: unknown;
+          h?: unknown;
         };
         if (b !== null && !Number.isSafeInteger(b)) return null;
         const pairs = (x: unknown) =>
@@ -352,11 +369,13 @@ function decodeCursor(text: string): Cursor | null {
         if (m !== undefined && !pairs(m)) return null;
         if (p !== undefined && !pairs(p)) return null;
         if (d !== undefined && typeof d !== "boolean") return null;
+        if (h !== undefined && typeof h !== "string") return null;
         streams[name] = {
           b: b as number | null,
           ...(m ? { m: m as [string, string][] } : {}),
           ...(p ? { p: p as [string, string][] } : {}),
           ...(d !== undefined ? { d } : {}),
+          ...(h !== undefined ? { h } : {}),
         };
       }
     } else if (typeof parsed.v === "object" && parsed.v !== null) {
@@ -412,19 +431,10 @@ function toStream(
   });
 }
 
-function toFoldBase(version: ImportedVersion | null): FoldBase | null {
-  return version === null
-    ? null
-    : {
-        primaryKey: version.head.primaryKey,
-        profile: version.head.profile,
-        complete: version.head.complete,
-      };
-}
-
 /** What a read sees when no overlay source is configured. */
 const NO_SNAPSHOT: StreamSyncOverlaySnapshot = {
   runs: [],
+  plan: () => [],
   lines: () => {
     throw new Error("no overlay source");
   },
@@ -545,18 +555,16 @@ export class StreamSyncReadService {
 
   /**
    * The local runs whose rows `stream` of `(connector, ns)` shows on top of
-   * `base`, folded as the writer will publish them (`foldContributions`). A
-   * run counts only under a verified active control state of this key and its
-   * own generation (never the one active at read time), and never over a
+   * `base`, read from the writer's publish plan (`foldPlan`). A run counts
+   * only under a verified active control state of this key and its own
+   * generation (never the one active at read time), and never over a
    * tombstoned stream row. A published stream that `base` already covers adds
    * nothing: its rows are in the view.
    *
    * `pending` reads this device's own rows that no verified activation of
-   * their generation covers. `foldBase` is the head the writer would meet
-   * (default `base`); a pending read passes the live imported head here
-   * without letting it cover or join the rows. `steps`, from a cursor,
-   * replays the fold of exactly those runs; the withheld runs are still every
-   * run that is withheld now.
+   * their generation covers. `steps`, from a cursor, replays the plan of
+   * exactly those runs; the withheld and unpublished runs are still every
+   * such run now.
    */
   private contributions(
     snapshot: StreamSyncOverlaySnapshot | undefined,
@@ -568,15 +576,13 @@ export class StreamSyncReadService {
     base: ImportedVersion | null,
     options: {
       readonly pending?: boolean;
-      readonly foldBase?: ImportedVersion | null;
       readonly steps?: readonly (readonly [string, string])[];
     } = {},
   ): Fold {
     const { pending = false, steps } = options;
-    const foldBase = toFoldBase(
-      options.foldBase === undefined ? base : options.foldBase,
-    );
-    if (!snapshot || tombstoned) return foldContributions(foldBase, []);
+    const head = base && planHeadOf(base.head);
+    const none = foldPlan(head, [], []);
+    if (!snapshot || tombstoned) return none;
     // Pending: this device's own rows that no verified activation of their
     // generation covers. A verified control of another generation, a deleted
     // connection and a foreign key hide them.
@@ -585,7 +591,7 @@ export class StreamSyncReadService {
         ? !(control.kind === "absent" || control.kind === "active")
         : control.kind !== "active"
     ) {
-      return foldContributions(foldBase, []);
+      return none;
     }
     const candidates: Contribution[] = [];
     for (const run of snapshot.runs) {
@@ -605,10 +611,20 @@ export class StreamSyncReadService {
       if (local.receipt && base && covers(base, local.receipt)) continue;
       candidates.push({ run, stream: local });
     }
-    const all = foldContributions(foldBase, candidates);
+    const fold = (runs: readonly Contribution[]) =>
+      foldPlan(
+        head,
+        runs,
+        snapshot.plan(
+          ns,
+          stream,
+          head,
+          runs.map((c) => c.run.runId),
+        ),
+      );
+    const all = fold(candidates);
     if (!steps) return all;
-    const replay = foldContributions(
-      foldBase,
+    const replay = fold(
       candidates.filter((c) =>
         steps.some(
           ([runId, revision]) =>
@@ -616,7 +632,7 @@ export class StreamSyncReadService {
         ),
       ),
     );
-    return { ...replay, withheld: all.withheld };
+    return { ...replay, withheld: all.withheld, unpublished: all.unpublished };
   }
 
   /** §2.10 inputs for connector c: every connection this server knows. */
@@ -734,18 +750,7 @@ export class StreamSyncReadService {
         target.connector,
         snapshots.get(target.connector),
       );
-      const eligibility: Eligibility = eligible({
-        connections,
-        target:
-          input.connection !== null
-            ? {
-                kind: "physical",
-                ns: input.connection,
-                streams: target.streams,
-              }
-            : { kind: "logical", streams: target.streams },
-        legacyFile: input.legacyFile,
-      });
+      const eligibility = this.eligibility(input, target, connections);
       return { target, connections, eligibility };
     });
 
@@ -784,8 +789,9 @@ export class StreamSyncReadService {
         e.eligibility.kind === "unavailable" &&
         e.eligibility.reason === "deleted",
     );
-    // The owner's own unactivated rows, unless a deletion hides the
-    // connector. A legacy body answers instead, as before own-writes.
+    // The owner's partial view, unless a deletion hides the connector. The
+    // owner never reads fewer rows than a grant: when a grant would read the
+    // legacy body, the owner reads it too, with the notes.
     let notes: OwnerNotes = {};
     if (input.isOwnerView && !deleted) {
       const scan = this.pendingScan(
@@ -793,18 +799,40 @@ export class StreamSyncReadService {
         [...targets, ...candidates],
         snapshots,
       );
-      if (scan.best && !input.legacyFile) {
+      const grantReadsFile =
+        input.legacyFile &&
+        input.connection === null &&
+        !targets.some(
+          (target) =>
+            this.eligibility(
+              input,
+              target,
+              this.connectionViews(target.connector),
+            ).kind === "view",
+        );
+      if (scan.best && !grantReadsFile) {
         const snapshot = snapshots.get(scan.best.target.connector)!;
         snapshots.delete(scan.best.target.connector);
-        return this.serveView(
-          input.scope,
-          scan.best.target,
-          scan.best.ns,
-          cursor,
-          snapshot,
-          true,
-          "pending",
-        );
+        try {
+          return await this.serveView(
+            input.scope,
+            scan.best.target,
+            scan.best.ns,
+            cursor,
+            snapshot,
+            true,
+            "pending",
+          );
+        } catch (error) {
+          // The projector refuses the partial input (a legacy name whose
+          // rows are not all there yet). No partial view serves; the answer
+          // below does, with the notes. serveView released the snapshot.
+          if (!(error instanceof ProjectionFailedError)) throw error;
+          this.options.logger.info(
+            { connector: scan.best.target.connector },
+            "stream-sync read: the partial view cannot be projected",
+          );
+        }
       }
       // No view is served: the runs the writer will not publish still reach
       // the owner, with the answer that is.
@@ -812,14 +840,14 @@ export class StreamSyncReadService {
         this.logWithheld(scan.connectors, scan.withheld.length);
         notes = { withheld: scan.withheld };
       }
-      // The legacy body answers, as before own-writes; pending runs with
-      // records are named, never compared by time.
-      if (input.legacyFile && scan.best && scan.best.runs > 0) {
+      // The legacy body answers, as before own-writes; unpublished runs are
+      // counted, never compared by time.
+      if (input.legacyFile && scan.unpublished > 0) {
         this.options.logger.info(
-          { connector: scan.best.target.connector, pending: scan.best.runs },
+          { connector: scan.connectors.join(","), pending: scan.unpublished },
           "stream-sync read: legacy body served over pending local runs",
         );
-        notes = { ...notes, pending: { runs: scan.best.runs } };
+        notes = { ...notes, pending: { runs: scan.unpublished } };
       }
     }
     if (cursor) return { kind: "cursor_stale" };
@@ -853,6 +881,26 @@ export class StreamSyncReadService {
     return { kind: "pass", ...notes };
   }
 
+  /** §2.10 for one target over `connections`. */
+  private eligibility(
+    input: ResolveInput,
+    target: Target,
+    connections: readonly ConnectionView[],
+  ): Eligibility {
+    return eligible({
+      connections: [...connections],
+      target:
+        input.connection !== null
+          ? {
+              kind: "physical",
+              ns: input.connection,
+              streams: target.streams,
+            }
+          : { kind: "logical", streams: target.streams },
+      legacyFile: input.legacyFile,
+    });
+  }
+
   /** The imported view of a stream while its head is live, else null. */
   private liveImported(
     connector: string,
@@ -871,28 +919,25 @@ export class StreamSyncReadService {
   }
 
   /**
-   * The target and connection whose local runs every needed stream has, with
-   * `at`, the newest observedAt among those runs that hold records, and
-   * `runs`, how many of them there are; and every run the writer
-   * will not publish, among all the connections looked at, whether or not any
-   * of them can be served.
+   * The target and connection the owner's partial view serves: every needed
+   * stream has a live imported head (complete or not) or local runs the
+   * writer will publish; `at` is the newest stamp among them. Also every run
+   * withheld, and the distinct runs not published yet, among all the
+   * connections looked at, whether or not any of them can be served.
    */
   private pendingScan(
     input: ResolveInput,
     targets: readonly Target[],
     snapshots: ReadonlyMap<string, StreamSyncOverlaySnapshot>,
   ): {
-    best: { target: Target; ns: string; at: number; runs: number } | null;
+    best: { target: Target; ns: string; at: number } | null;
     withheld: WithheldRun[];
+    unpublished: number;
     connectors: string[];
   } {
-    let best: {
-      target: Target;
-      ns: string;
-      at: number;
-      runs: number;
-    } | null = null;
+    let best: { target: Target; ns: string; at: number } | null = null;
     const withheld: WithheldRun[] = [];
+    const unpublished = new Set<string>();
     const connectors = new Set<string>();
     for (const target of targets) {
       const snapshot = snapshots.get(target.connector);
@@ -908,15 +953,18 @@ export class StreamSyncReadService {
         if (input.connection !== null && input.connection !== ns) continue;
         const control = this.importer.controlState(rows.controls.get(ns));
         if (control.kind === "deleted" || control.kind === "foreign") continue;
-        // Recency counts only runs that hold records: an empty run is newer
-        // than nothing it returns.
         let at = 0;
-        let atAny = 0;
-        const withRecords = new Set<string>();
-        // Every stream is scanned, whether or not an earlier one has a local
-        // run: a run the writer will not publish is reported either way.
+        // Every stream is scanned, whether or not an earlier one can be
+        // served: a withheld or unpublished run is reported either way.
         const covered = target.streams.map((stream) => {
           const row = rows.streams.get(ns)?.get(stream);
+          const live = this.liveImported(
+            target.connector,
+            ns,
+            stream,
+            control,
+            row,
+          );
           const local = this.contributions(
             snapshot,
             target.connector,
@@ -925,27 +973,22 @@ export class StreamSyncReadService {
             control,
             row !== undefined &&
               this.importer.streamRowKind(row) === "tombstoned",
-            null,
-            {
-              pending: true,
-              foldBase: this.liveImported(
-                target.connector,
-                ns,
-                stream,
-                control,
-                row,
-              ),
-            },
+            live,
+            { pending: true },
           );
-          if (local.withheld.length > 0) connectors.add(target.connector);
-          withheld.push(...withheldRuns([{ stream, fold: local }]));
-          for (const c of local.merged) {
-            atAny = Math.max(atAny, c.run.observedAt);
-            if (c.stream.recordCount === 0) continue;
-            at = Math.max(at, c.run.observedAt);
-            withRecords.add(c.run.runId);
+          if (local.withheld.length > 0 || local.unpublished.length > 0) {
+            connectors.add(target.connector);
           }
-          return local.merged.length > 0;
+          withheld.push(...withheldRuns([{ stream, fold: local }]));
+          for (const runId of local.unpublished) {
+            unpublished.add(JSON.stringify([target.connector, ns, runId]));
+          }
+          at = Math.max(
+            at,
+            live?.head.observedAt ?? 0,
+            ...local.merged.map((c) => c.run.observedAt),
+          );
+          return live !== null || local.merged.length > 0;
         });
         if (!covered.every(Boolean)) continue;
         if (
@@ -953,13 +996,14 @@ export class StreamSyncReadService {
           at > best.at ||
           (at === best.at && target.connector < best.target.connector)
         ) {
-          best = { target, ns, at: at || atAny, runs: withRecords.size };
+          best = { target, ns, at };
         }
       }
     }
     return {
       best,
       withheld: uniqueWithheld(withheld),
+      unpublished: unpublished.size,
       connectors: [...connectors],
     };
   }
@@ -968,7 +1012,7 @@ export class StreamSyncReadService {
   private logWithheld(connectors: readonly string[], count: number): void {
     this.options.logger.warn(
       { connector: connectors.join(","), withheld: count },
-      "stream-sync read: local runs withheld until the connector is newer",
+      "stream-sync read: local runs withheld from the view",
     );
   }
 
@@ -1013,15 +1057,10 @@ export class StreamSyncReadService {
           current !== null &&
           kind !== null &&
           isHeadLive(control, kind, current.head.generation);
+        // A partial view leases the live head too, complete or not: the
+        // owner's rows stay readable after the run that wrote them retires.
         let lease: ViewLease | null = null;
-        if (pending) {
-          // An unactivated stream has no imported head to lease. A cursor
-          // that saw one (or none, pending) is replayed only as pending.
-          if (cursor && pin!.b !== null) {
-            releaseAll();
-            return { kind: "cursor_stale" };
-          }
-        } else if (cursor) {
+        if (cursor) {
           if (pin!.b === null) {
             // The cursor saw no imported head; one has appeared since.
             if (currentLive) {
@@ -1039,7 +1078,7 @@ export class StreamSyncReadService {
           lease = this.views.lease(key);
         }
         if (lease) leases.push(lease);
-        // Replay the fold a cursor recorded: a retired or changed run makes
+        // Replay the plan a cursor recorded: a retired or changed run makes
         // the cursor stale, and a new run does not join. A cursor from before
         // fold pins recorded the shown members alone.
         const steps = cursor ? (pin!.p ?? pin!.m ?? []) : undefined;
@@ -1051,15 +1090,7 @@ export class StreamSyncReadService {
           control,
           kind === "tombstoned",
           lease?.version ?? null,
-          {
-            pending,
-            // A pending read leases no base, but the writer would meet the
-            // live head when it publishes these runs.
-            foldBase: pending
-              ? this.liveImported(target.connector, ns, stream, control, row)
-              : (lease?.version ?? null),
-            ...(steps ? { steps } : {}),
-          },
+          { pending, ...(steps ? { steps } : {}) },
         );
         if (cursor && !replaysPin(fold, pin!)) {
           releaseAll();
@@ -1098,7 +1129,7 @@ export class StreamSyncReadService {
         overlays.set(input.stream, overlay);
         observedAt = Math.max(
           observedAt,
-          baseOf(input)?.version.head.observedAt ?? 0,
+          input.lease?.version.head.observedAt ?? 0,
           overlay.newestObservedAt ?? 0,
           ...fold.merged.map((c) => c.run.observedAt),
         );
@@ -1108,7 +1139,7 @@ export class StreamSyncReadService {
         return viewLines(
           this.views,
           this.options.keys,
-          baseOf(input),
+          input.lease,
           overlays.get(stream)!,
           input.fold.shape!.primaryKey,
         );
@@ -1127,7 +1158,7 @@ export class StreamSyncReadService {
               p: i.fold.chain.map(
                 (c) => [c.run.runId, c.stream.contentRevision] as const,
               ),
-              d: i.fold.baseDropped,
+              h: shapePin(i.fold),
             },
           ]),
         ),
@@ -1139,7 +1170,8 @@ export class StreamSyncReadService {
         this.logWithheld([target.connector], withheldAll.length);
       }
       const withheld = isOwnerView ? withheldAll : [];
-      const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},${pending ? '"origin":"local-pending",' : ""}${withheld.length > 0 ? `"withheld":${JSON.stringify(withheld)},` : ""}"data":`;
+      const complete = inputs.every((i) => i.fold.complete);
+      const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},${pending ? `"origin":"local-pending","complete":${complete},` : ""}${withheld.length > 0 ? `"withheld":${JSON.stringify(withheld)},` : ""}"data":`;
       let payload: AsyncIterable<string>;
       if (!target.binding) {
         payload = recordsPayload(lines(target.streams[0]!));
@@ -1152,7 +1184,7 @@ export class StreamSyncReadService {
           profileKey: first.fold.shape?.profile.key ?? undefined,
           lines,
           streamBytes: (stream) =>
-            (baseOf(byStream.get(stream)!)?.version.head.parts ?? []).reduce(
+            (byStream.get(stream)!.lease?.version.head.parts ?? []).reduce(
               (sum, p) => sum + p.bytes,
               0,
             ),
@@ -1179,6 +1211,7 @@ export class StreamSyncReadService {
           connector: target.connector,
           ns,
           cursor: nextCursor,
+          complete,
           ...(withheld.length > 0 ? { withheld } : {}),
           body,
         };
@@ -1215,7 +1248,7 @@ interface StreamInput {
   readonly fold: Fold;
 }
 
-/** The runs the writer will not publish, one per run and stream. */
+/** The runs the view does not show, one per run and stream. */
 function withheldRuns(
   inputs: readonly { readonly stream: string; readonly fold: Fold }[],
 ): WithheldRun[] {
@@ -1223,9 +1256,19 @@ function withheldRuns(
     i.fold.withheld.map((c): WithheldRun => ({
       runId: c.run.runId,
       stream: i.stream,
-      reason: "connector_update_required",
+      reason: c.reason,
     })),
   );
+}
+
+/** The projection input a cursor pins: the shown head's key, profile and completeness. */
+function shapePin(fold: Fold): string {
+  return JSON.stringify([
+    fold.shape?.primaryKey ?? null,
+    fold.shape?.profile.key ?? null,
+    fold.shape?.profile.version ?? null,
+    fold.complete,
+  ]);
 }
 
 function uniqueWithheld(runs: readonly WithheldRun[]): WithheldRun[] {
@@ -1257,10 +1300,13 @@ const pairKey = ([runId, revision]: readonly [string, string]) =>
 
 /**
  * The replayed fold is the one the cursor recorded: the same published runs
- * in the same order, the same shown members, the same base decision.
- * Otherwise a replay would mix rows the first response had replaced.
+ * in the same order, the same shown members, the same head shape. Otherwise
+ * a replay would mix rows the first response had replaced, or project them
+ * under another profile.
  */
 function replaysPin(fold: Fold, pin: CursorStream): boolean {
+  if (pin.d === true) return false;
+  if (pin.h !== undefined && pin.h !== shapePin(fold)) return false;
   const members = (pin.m ?? []).map(pairKey).sort();
   const shown = fold.merged.map(stepKey).sort();
   if (
@@ -1278,12 +1324,7 @@ function replaysPin(fold: Fold, pin: CursorStream): boolean {
       return false;
     }
   }
-  return pin.d === undefined || pin.d === fold.baseDropped;
-}
-
-/** The imported view whose rows the stream shows: none once a run replaced it. */
-function baseOf(input: StreamInput): ViewLease | null {
-  return input.fold.baseDropped ? null : input.lease;
+  return true;
 }
 
 /**

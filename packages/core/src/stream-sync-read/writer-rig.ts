@@ -1,8 +1,8 @@
 /**
  * Test rig for the writer-parity tests: the real `StreamSyncWriter` publishes
  * to a registry fake, and the real `StreamSyncReadService` reads through the
- * writer's own overlay source, so every descriptor the reader folds is the one
- * the production producer emits.
+ * writer's own overlay source, so every plan the reader reads is the one the
+ * production producer emits.
  */
 
 import {
@@ -29,11 +29,7 @@ import { createStreamSyncReadKeys } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
 import { StreamSyncReadService } from "./service.js";
-import type {
-  StreamSyncOverlaySnapshot,
-  StreamSyncOverlaySnapshotSource,
-  StreamSyncOverlayStream,
-} from "./ports.js";
+import type { StreamSyncOverlaySnapshotSource } from "./ports.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
 const SIGNATURE = `0x${"1f".repeat(32)}${"2a".repeat(32)}1b` as const;
@@ -99,26 +95,37 @@ class Gateway implements StreamSyncRegistry {
   }
 }
 
-/** One run of one stream (default `items`), as a connector would deliver it. */
-export interface RunSpec {
-  readonly runId: string;
-  /** The stream the run delivers; default `items`. */
+/** One stream of a run. */
+export interface StreamSpec {
+  /** Default `items`. */
   readonly stream?: string;
   readonly key: string;
   readonly version: string;
   /** The legacy projector's profile key; default null. */
   readonly profileKey?: string | null;
   readonly rows: readonly Record<string, unknown>[];
+  /** The stream is not incremental: the run reads it whole. */
+  readonly fullStream?: boolean;
+}
+
+/** One run, as a connector would deliver it. */
+export interface RunSpec extends StreamSpec {
+  readonly runId: string;
   /** A full read; otherwise it resumes from a checkpoint. */
   readonly full: boolean;
   /** Resume from a checkpoint of another namespace (writer.ts:1465). */
   readonly otherNamespace?: boolean;
+  /** More streams the same run delivers. */
+  readonly also?: readonly StreamSpec[];
+  /** observedAt, in ms after T0; default: collection order, 1 s apart. */
+  readonly at?: number;
+  /** Collect and publish on a second device of the same owner. */
+  readonly otherDevice?: boolean;
 }
 
-/** Descriptor fields a producer may leave out. */
-export type OptionalDescriptorField = "recordCount" | "incompleteOverBase";
-
 export interface SeedRows {
+  /** Default `items`. */
+  readonly stream?: string;
   readonly key: string;
   readonly version: string;
   readonly rows: readonly Record<string, unknown>[];
@@ -129,11 +136,8 @@ export class Rig {
   readonly blobMap = new Map<string, Uint8Array>();
   readonly files = createMemoryStreamSyncFiles();
   readonly writer: StreamSyncWriter;
-  /**
-   * Descriptor fields the overlay leaves out: a producer that does not emit
-   * them. Empty = the writer's own descriptors, unchanged.
-   */
-  readonly omit = new Set<OptionalDescriptorField>();
+  /** A second device: its own home, the same owner, registry and blobs. */
+  readonly other: StreamSyncWriter;
   readonly overlay: StreamSyncOverlaySnapshotSource;
   service!: StreamSyncReadService;
   /** Every run is identity-less: one namespace, the empty one. */
@@ -144,18 +148,27 @@ export class Rig {
     seed?: SeedRows,
     readonly connector: string = CONNECTOR,
   ) {
+    this.writer = this.device(this.files, seed);
+    this.other = this.device(createMemoryStreamSyncFiles());
+    this.overlay = createWriterOverlaySource(this.writer);
+  }
+
+  private device(
+    files: ReturnType<typeof createMemoryStreamSyncFiles>,
+    seed?: SeedRows,
+  ): StreamSyncWriter {
     const blobs: StreamSyncBlobs = {
       put: async (key, bytes) => void this.blobMap.set(key, bytes.slice()),
       get: async (key) => this.blobMap.get(key) ?? null,
     };
-    this.writer = new StreamSyncWriter({
+    return new StreamSyncWriter({
       ownerAddress: OWNER,
       registry: this.gateway,
       blobs,
       home: bindStreamSyncHome({
         ownerAddress: OWNER,
         network: "test",
-        open: () => this.files,
+        open: () => files,
       }),
       keys: createStreamSyncKeyPorts(SIGNATURE),
       signer: { signAddData: async () => `0x${"22".repeat(65)}` },
@@ -166,7 +179,7 @@ export class Rig {
               installId: "install-1",
               streams: async () => [
                 {
-                  stream: "items",
+                  stream: seed.stream ?? "items",
                   primaryKey: [seed.key],
                   profile: { key: null, version: seed.version },
                 },
@@ -178,36 +191,6 @@ export class Rig {
           }
         : {}),
     });
-    const source = createWriterOverlaySource(this.writer);
-    this.overlay = {
-      snapshot: async (connector) =>
-        this.withoutOmitted(await source.snapshot(connector)),
-      acknowledge: (coverage) => source.acknowledge(coverage),
-    };
-  }
-
-  private withoutOmitted(
-    snapshot: StreamSyncOverlaySnapshot,
-  ): StreamSyncOverlaySnapshot {
-    if (this.omit.size === 0) return snapshot;
-    const original = new Map<object, (typeof snapshot.runs)[number]>();
-    const runs = snapshot.runs.map((run) => {
-      const stripped = Object.freeze({
-        ...run,
-        streams: run.streams.map((stream) => {
-          const copy: Partial<StreamSyncOverlayStream> = { ...stream };
-          for (const field of this.omit) delete copy[field];
-          return Object.freeze(copy as StreamSyncOverlayStream);
-        }),
-      });
-      original.set(stripped, run);
-      return stripped;
-    });
-    return {
-      runs,
-      lines: (run, stream) => snapshot.lines(original.get(run)!, stream),
-      release: () => snapshot.release(),
-    };
   }
 
   async open(): Promise<void> {
@@ -232,11 +215,13 @@ export class Rig {
     await this.service.importPending();
   }
 
-  /** A finished run of `items` whose publish has not started. */
+  /** A finished run whose publish has not started; a second device's run is published at once. */
   async collect(spec: RunSpec): Promise<void> {
-    const observedAt = T0 + (this.order += 1) * 1000;
-    await this.writer.refreshControls();
-    await this.writer.beginRun({
+    const writer = spec.otherDevice ? this.other : this.writer;
+    this.order += 1;
+    const observedAt = T0 + (spec.at ?? this.order * 1000);
+    await writer.refreshControls();
+    await writer.beginRun({
       runId: spec.runId,
       connector: this.connector,
       userConnect: false,
@@ -249,17 +234,21 @@ export class Rig {
             generation: 1,
           },
     });
-    const stream = spec.stream ?? "items";
-    await this.writer.declareStream(spec.runId, stream, {
-      primaryKey: [spec.key],
-      profile: { key: spec.profileKey ?? null, version: spec.version },
-    });
-    for (const row of spec.rows) {
-      await this.writer.append(spec.runId, stream, { ...row });
+    for (const stream of [spec, ...(spec.also ?? [])]) {
+      const name = stream.stream ?? "items";
+      await writer.declareStream(spec.runId, name, {
+        primaryKey: [stream.key],
+        profile: { key: stream.profileKey ?? null, version: stream.version },
+        ...(stream.fullStream ? { incremental: false } : {}),
+      });
+      for (const row of stream.rows) {
+        await writer.append(spec.runId, name, { ...row });
+      }
     }
-    await this.writer.finishRun(spec.runId, {
+    await writer.finishRun(spec.runId, {
       checkpointCandidate: { cursor: spec.runId },
     });
+    if (spec.otherDevice) await writer.publishPending();
   }
 
   /** The head the registry holds now for `stream`, decrypted; null when none. */

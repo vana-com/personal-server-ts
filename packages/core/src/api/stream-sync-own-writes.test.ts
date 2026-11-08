@@ -153,7 +153,7 @@ describe("data reads of a device's own rows against a stored body", () => {
     expect(read.body.data.records).toEqual(STORED);
   });
 
-  it("serves the stored body without a marker when the pending run is older", async () => {
+  it("counts a pending run with no record, whatever its time", async () => {
     const { f, deps } = await setup(77, false);
     f.overlay.runs = f.overlay.runs.map((r) => ({
       ...r,
@@ -162,7 +162,8 @@ describe("data reads of a device's own rows against a stored body", () => {
     }));
     const read = await get(deps, false);
     expect(read.source).toBe("legacy");
-    expect(read.pending).toBeNull();
+    // Unpublished runs are counted, never compared by time.
+    expect(read.pending).toBe("1");
     expect(read.body.data.records).toEqual(STORED);
   });
 

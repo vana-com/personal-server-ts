@@ -782,9 +782,12 @@ async function serveStreamSyncView(
       "Transfer-Encoding": "chunked",
       "X-Vana-Data-Source": "stream-sync",
       "X-Stream-Sync-Cursor": decision.cursor,
-      // The rows are this device's own and not yet activated.
+      // An owner-only view built on this device; it may be partial.
       ...(decision.kind === "local_pending"
-        ? { "X-Stream-Sync-Origin": "local-pending" }
+        ? {
+            "X-Stream-Sync-Origin": "local-pending",
+            "X-Stream-Sync-Complete": String(decision.complete),
+          }
         : {}),
       // Owner only: the service attaches this to no other audience.
       ...(decision.withheld?.length

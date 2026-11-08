@@ -313,7 +313,7 @@ describe("writer retained completed runs", () => {
 });
 
 describe("writer overlay snapshots", () => {
-  it("says when a run holds no record and when it resumed from another namespace", async () => {
+  it("plans an empty run as a no-op and a run resumed from another namespace as incomplete", async () => {
     const f = await fixture();
     const w = f.make();
     await w.refreshControls();
@@ -330,16 +330,27 @@ describe("writer overlay snapshots", () => {
     await w.append("other", "s", { id: "two" });
     await w.finishRun("other", { checkpointCandidate: null });
     const snapshot = await createWriterOverlaySource(w).snapshot(connector);
-    const byId = new Map(snapshot.runs.map((r) => [r.runId, r.streams[0]!]));
-    expect(byId.get("empty")).toMatchObject({
-      recordCount: 0,
-      incompleteOverBase: false,
+    const byId = new Map(snapshot.runs.map((r) => [r.runId, r]));
+    expect(byId.get("other")!.streams[0]).toMatchObject({ complete: false });
+    // Over a complete head of the runs' generation and shape.
+    const head = {
+      generation: byId.get("empty")!.generation!,
+      primaryKey: shape.primaryKey,
+      profile: shape.profile,
+      complete: true,
+    };
+    const steps = snapshot.plan("", "s", head, ["empty", "other"]);
+    expect(steps.map((s) => [s.runId, s.decision.kind])).toEqual([
+      ["empty", "noop"],
+      ["other", "publish"],
+    ]);
+    expect(steps[0]!.head).toEqual(head);
+    expect(steps[1]!.head).toEqual({ ...head, complete: false });
+    expect(steps[1]!.rows).toEqual({
+      fromHead: true,
+      runs: ["other"],
+      seed: false,
     });
-    expect(byId.get("other")).toMatchObject({
-      complete: false,
-      incompleteOverBase: true,
-    });
-    expect(byId.get("other")).not.toHaveProperty("recordCount");
     snapshot.release();
   });
   it("lists ready offline rows including an unactivated null-generation run", async () => {
@@ -815,18 +826,19 @@ describe("writer coverage that arrives before the receipt", () => {
     const f = await fixture();
     const w = f.make();
     await w.refreshControls();
-    // Older run stamps with the same row change nothing in the head.
-    await collect(w, "zz");
+    // A newer empty run changes nothing in the head. (An older run is
+    // refused out of order; writer-policies.test.ts covers that.)
+    await collect(w, "a0");
     await w.publishPending();
     const source = createWriterOverlaySource(w);
     await source.acknowledge({
       connector,
       ns: "",
       stream: "s",
-      ...(await f.read("zz")).streams.s.receipt,
+      ...(await f.read("a0")).streams.s.receipt,
     });
     const posts = f.posts();
-    await collect(w, "a1");
+    await collect(w, "a1", []);
     await w.publishPending();
     expect(f.posts()).toBe(posts);
     expect(await f.files.read("runs/a1/entry.json")).toBeNull();

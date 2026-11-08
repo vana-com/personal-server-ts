@@ -1,9 +1,9 @@
 /**
- * The fold advances the effective key and profile only on a step where the
- * writer publishes a new head. The writer skips a run whose parts and
- * completeness equal the base's (isNoop), so its head keeps the profile it
- * had; a run that adds no row and changes no completeness must not move the
- * profile the next run is judged against.
+ * A key change is judged against the stream's version floor: the highest
+ * connector version that registered on it, not the profile of the last head.
+ * A run the writer skips (isNoop) or one from an older connector that
+ * publishes cannot lower the floor, so neither can let a later older key
+ * change through. The read shows what the writer's plan publishes.
  */
 
 import { describe, expect, it } from "vitest";
@@ -77,7 +77,7 @@ async function read(
     ids: envelope.data.records
       .map((r: any) => r.id ?? r.uid)
       .sort() as string[],
-    withheld: (decision.withheld ?? []).map((w) => w.runId),
+    withheld: (decision.withheld ?? []).map((w) => `${w.runId}:${w.reason}`),
   };
 }
 
@@ -100,54 +100,62 @@ const keyChange = (version: string): Spec => ({
   rows: [{ uid: "local-b" }],
 });
 
-describe("a run the writer would skip does not move the fold's profile", () => {
+describe("the version floor judges a key change", () => {
   it("an older no-op run does not make a later older key change look newer", async () => {
-    // Base 2.0.0 (key id). Run a: key id, 1.0.0, no rows, not full: the
-    // writer skips it and the head stays 2.0.0. Run b: key uid, 1.5.0 is older
-    // than that head, so the writer will not publish it.
+    // Base 2.0.0 (key id). Run a: key id, 1.0.0, no rows, not full: a no-op.
+    // Run b: key uid, 1.5.0 is below the floor 2.0.0: refused.
     const out = await read(701, { version: "2.0.0", complete: true }, () => [
       noRows("1.0.0"),
       keyChange("1.5.0"),
     ]);
     expect(out.kind).toBe("view");
     expect(out.ids).toEqual(["base-a", "base-b"]);
-    expect(out.withheld).toEqual(["b"]);
+    expect(out.withheld).toEqual(["b:connector_update_required"]);
   });
 
-  it("a newer no-op run does not make a later newer key change look older", async () => {
-    // Base 2.0.0. Run a: key id, 3.0.0, no rows: skipped, head stays 2.0.0.
-    // Run b: key uid, 2.5.0 is newer than that head: the writer publishes it
-    // over an empty base.
+  it("a newer no-op run raises the floor above a later key change", async () => {
+    // Base 2.0.0. Run a: key id, 3.0.0, no rows: a no-op, but a 3.0.0
+    // connector ran on the stream, so the floor is 3.0.0. Run b: key uid,
+    // 2.5.0 is below it: refused. (Conservative: the floor counts a no-op.)
     const out = await read(702, { version: "2.0.0", complete: true }, () => [
       noRows("3.0.0"),
       keyChange("2.5.0"),
     ]);
     expect(out.kind).toBe("view");
-    expect(out.ids).toEqual(["local-b"]);
-    expect(out.withheld).toEqual([]);
+    expect(out.ids).toEqual(["base-a", "base-b"]);
+    expect(out.withheld).toEqual(["b:connector_update_required"]);
   });
 
-  it("a run that completes an incomplete base is published, and moves the profile", async () => {
+  it("a newer key change above the floor publishes", async () => {
+    // Base 2.0.0. Run b: key uid, 2.5.0 is above the floor. It replaces the
+    // base, which a grant reads until it is imported: the owner keeps the
+    // base, marked incomplete, and is told b is pending.
+    const out = await read(705, { version: "2.0.0", complete: true }, () => [
+      keyChange("2.5.0"),
+    ]);
+    expect(out.kind).toBe("local_pending");
+    expect(out.ids).toEqual(["base-a", "base-b"]);
+    expect(out.withheld).toEqual(["b:key_reset_pending"]);
+  });
+
+  it("an older run that completes an incomplete base publishes, and does not lower the floor", async () => {
     // Base 2.0.0, incomplete. Run a: older connector, no rows, but full: the
-    // head's completeness changes, so the writer publishes it with 1.0.0.
+    // head's completeness changes, so the writer publishes it. The floor
+    // stays 2.0.0, so run b (1.5.0, key uid) is refused.
     const out = await read(703, { version: "2.0.0", complete: false }, () => [
       noRows("1.0.0", { complete: true }),
       keyChange("1.5.0"),
     ]);
-    expect(out.kind).toBe("view");
-    expect(out.ids).toEqual(["local-b"]);
-    expect(out.withheld).toEqual([]);
+    expect(out.ids).toEqual(["base-a", "base-b"]);
+    expect(out.withheld).toEqual(["b:connector_update_required"]);
   });
 
-  it("a run with rows may be skipped too, so the profile stays at the higher of the two", async () => {
-    // Base 2.0.0. Run a: key id, 1.0.0, one row, not full. If its row loses
-    // to the base's, the writer skips it and the head stays 2.0.0; the
-    // overlay cannot tell, and takes the side that withholds more.
+  it("an older run with rows does not lower the floor", async () => {
     const out = await read(704, { version: "2.0.0", complete: true }, () => [
       noRows("1.0.0", { rows: [{ id: "base-a", v: 0 }] }),
       keyChange("1.5.0"),
     ]);
     expect(out.ids).toEqual(["base-a", "base-b"]);
-    expect(out.withheld).toEqual(["b"]);
+    expect(out.withheld).toEqual(["b:connector_update_required"]);
   });
 });

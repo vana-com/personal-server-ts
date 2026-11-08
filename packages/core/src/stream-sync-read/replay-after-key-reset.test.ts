@@ -1,9 +1,12 @@
 /**
  * A cursor replays exactly the rows of its first response or answers
  * cursor_stale; it never mixes in rows the first response had already
- * replaced. The first response's fold had two steps that changed the shape:
- * a key change away from the base key and one back to it. The cursor must
- * remember the whole fold, not only its last members.
+ * replaced. The first response's plan had two steps that changed the shape:
+ * a key change away from the first run's key and one back to it. The cursor
+ * must remember the whole plan, not only its last members.
+ *
+ * The stream has no imported head: a key reset over an imported head is
+ * withheld until it is imported (fold.ts), so only local runs reset here.
  */
 
 import { describe, expect, it } from "vitest";
@@ -47,24 +50,19 @@ async function setup(seed: number) {
   const f = new Fixture(await testOwnerKey(masterKey(seed)));
   const ns = await f.key.ns("acme", "account-1");
   await f.activate("acme", ns);
-  await f.publish({
-    connector: "acme",
-    ns,
-    stream: "items",
-    generation: 1,
-    records: [
-      { id: "base-a", v: 1 },
-      { id: "base-b", v: 1 },
-    ],
-    observedAt: T - 1000,
-    profileVersion: "1.0.0",
-  });
   const service = await f.service();
   await f.sync(service);
   return { f, ns, service };
 }
 
 const runs = (ns: string, revisionOfA = "a1") => [
+  fakeRun(ns, {
+    runId: "0",
+    observedAt: T - 1,
+    key: "id",
+    version: "1.0.0",
+    row: { id: "local-0" },
+  }),
   fakeRun(ns, {
     runId: "a",
     observedAt: T,

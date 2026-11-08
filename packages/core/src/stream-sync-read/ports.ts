@@ -6,6 +6,7 @@
  * encrypted blob reads, the owner key, and the local overlay.
  */
 
+import type { PlanHead, PlanStep } from "../stream-sync/publish-plan.js";
 import type {
   HashPorts,
   HeadProfile,
@@ -68,22 +69,11 @@ export interface StreamSyncOverlayStream {
   readonly primaryKey: readonly string[];
   /** The writer's head profile: projector key and connector version. */
   readonly profile: HeadProfile;
-  /** True only when the run's full/fullStream provenance says so (writer.ts:1460-1466). */
+  /**
+   * The run read the stream whole, from no other namespace's checkpoint.
+   * Diagnostic only: what the head becomes is the snapshot's `plan`.
+   */
   readonly complete: boolean;
-  /**
-   * How many records the run holds for this stream. The reader needs to know
-   * only whether it is zero: a run with no record and no change of
-   * completeness is a no-op for the writer, which keeps the head's profile.
-   * Absent = unknown, and the reader takes the side that withholds more.
-   */
-  readonly recordCount?: number;
-  /**
-   * The run resumed from a checkpoint of another namespace (writer.ts:1465):
-   * the head the writer publishes for it is incomplete even over a complete
-   * base. `complete` is then false as well. Absent = unknown: the reader takes
-   * the incomplete side and counts the head complete only by `complete`.
-   */
-  readonly incompleteOverBase?: boolean;
   /**
    * Identifies this stream's immutable rows and every descriptor field that
    * affects a read (profile, primaryKey, complete, state, receipt). Never
@@ -131,6 +121,19 @@ export interface StreamSyncOverlayRun {
  */
 export interface StreamSyncOverlaySnapshot {
   readonly runs: readonly StreamSyncOverlayRun[];
+  /**
+   * The writer's publish plan for one stream of this snapshot, starting from
+   * `head` (the head the reader imported; null = none): one step for each of
+   * `runs` (run ids of this snapshot that list the stream; others are
+   * ignored), in commit order, decided by the same step the writer executes
+   * when it publishes (publish-plan.ts).
+   */
+  plan(
+    ns: string,
+    stream: string,
+    head: PlanHead | null,
+    runs: readonly string[],
+  ): readonly PlanStep[];
   /**
    * Lines of one stream of one run of THIS snapshot, in spool order. Rejects a
    * run or stream not in this snapshot; throws on a missing or corrupt
