@@ -13,7 +13,6 @@
  */
 
 import {
-  admitReceipt,
   admitStart,
   canonicalBytes32,
   classifyStreamRow,
@@ -649,14 +648,11 @@ export class StreamSyncReadService {
       if (run.connector !== connector || run.ns !== ns) continue;
       const local = run.streams.find((s) => s.name === stream);
       if (!local) continue;
-      // The same rule decide() applies, on the run's recorded start: a pending
-      // read shows publish and wait, a published read shows publish only. A
-      // published deleted-start run is judged by the generation it was
-      // published under, against the current control.
-      const verdict =
-        run.start.kind === "deleted" && local.receipt
-          ? admitReceipt(local.receipt.generation, control)
-          : admitStart(run.start, control, run);
+      // The same rule decide() applies, on the run's recorded start and flags:
+      // a pending read shows publish and wait, a published read shows publish
+      // only. The rule holds for a published run too, including the window
+      // where this mirror still reads the deleted control the writer left.
+      const verdict = admitStart(run.start, control, run);
       if (verdict === "discard" || (verdict === "wait" && !pending)) continue;
       if (local.receipt && local.receipt.registryVersion <= floor) continue;
       if (local.receipt && base && covers(base, local.receipt)) continue;

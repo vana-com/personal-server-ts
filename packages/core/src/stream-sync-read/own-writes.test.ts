@@ -972,6 +972,16 @@ describe("own-write visibility (deletion floor)", () => {
     expect((await latest(service)).rows).not.toHaveProperty("b");
   });
 
+  // Why a deleted start is always a connect: the writer refuses a scheduled
+  // run on a stopped connection, so no overlay run carries a deleted start
+  // with userConnect false. The writer's overlay flag depends on this.
+  it("refuses a scheduled run on a deleted connection, so a deleted start is always a connect", async () => {
+    const { d } = await deletedConnect();
+    await expect(
+      d.begin({ items: [{ id: "b", v: 2 }] }, { userConnect: false }),
+    ).rejects.toMatchObject({ name: "ConnectionStoppedError" });
+  });
+
   it("does not show a full connect run published before a second delete and reconnect", async () => {
     const { d, service } = await deletedConnect();
     const runId = await d.begin(
@@ -994,6 +1004,28 @@ describe("own-write visibility (deletion floor)", () => {
       lastPage: true,
     });
     expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
+
+  // The writer reconnects and publishes, but the reader's control mirror
+  // still reads deleted(v0) until the download worker's feed catches up. The
+  // owner view must not drop the run in that window: the rule decides a
+  // published deleted-start run from its start, as it does before the publish.
+  it("keeps showing a published deleted-start run while the reader's mirror still reads deleted", async () => {
+    const { d, service } = await deletedConnect();
+    const runId = await d.begin(
+      { items: [{ id: "b", v: 2 }] },
+      { userConnect: true },
+    );
+    await d.finish(runId);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    // Precondition: the run is pending and shown under the deleted control.
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+    // The writer reconnects and publishes; the mirror is not observed again.
+    await d.publish();
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
   });
 
   it("names the runs a foreign control key keeps pending, with reason key_mismatch", async () => {

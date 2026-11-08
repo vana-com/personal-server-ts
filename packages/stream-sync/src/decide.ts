@@ -87,6 +87,16 @@ const DISCARD = {
   restartFull: false,
 } as const;
 
+/** The starts a publish cell can take: `unknown` and `foreign` never publish. */
+type PublishStart = Extract<
+  StartState,
+  { readonly kind: "absent" | "active" | "deleted" }
+>;
+
+function publishable(s: StartState): s is PublishStart {
+  return s.kind === "absent" || s.kind === "active" || s.kind === "deleted";
+}
+
 function table(input: DecideInput): Decision {
   const { start: s, current: c } = input;
   // `any | foreign` overrides the `other` cells (see DESIGN-QUESTIONS.md Q1).
@@ -94,7 +104,7 @@ function table(input: DecideInput): Decision {
     return { kind: "keep_pending", reason: "key_mismatch" };
   // The one mapping: the rule's verdict decides the cell's decision.
   const admission = admitStart(s, c, input);
-  if (admission === "publish") return publishing(s, c);
+  if (admission === "publish" && publishable(s)) return publishing(s, c);
   if (admission === "wait") {
     return input.phase === "reread"
       ? { kind: "keep_pending", reason: "registry_inconsistent" }
@@ -106,9 +116,12 @@ function table(input: DecideInput): Decision {
 /**
  * The writer takes the run's target. A connection that must be created or
  * reconnected is written first, then decide runs again with `after_write`.
- * `unknown` and `foreign` starts are never admitted, so they have no publish.
+ * The parameter type leaves out `unknown` and `foreign`, so this switch has no
+ * case for them. A publish verdict for either falls through to `discarding`,
+ * which keeps `recollect` for `unknown`; the rule-level decide test catches
+ * such a change, since `Admission` is not typed by start kind.
  */
-function publishing(s: StartState, c: ControlState): Decision {
+function publishing(s: PublishStart, c: ControlState): Decision {
   switch (s.kind) {
     case "absent":
       return c.kind === "absent"
@@ -120,9 +133,6 @@ function publishing(s: StartState, c: ControlState): Decision {
       return c.kind === "deleted"
         ? { kind: "reconnect", target: s.version + 1 }
         : { kind: "publish", target: s.version + 1 };
-    case "unknown":
-    case "foreign":
-      return DISCARD;
   }
 }
 

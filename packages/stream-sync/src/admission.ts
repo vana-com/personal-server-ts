@@ -86,17 +86,3 @@ export function admitStart(
       return "discard";
   }
 }
-
-/**
- * A run that already has a publish receipt: it is served only while the
- * connection is active at the generation it was published under. A later
- * delete and reconnect moves the connection past that generation.
- */
-export function admitReceipt(
-  receiptGeneration: number,
-  current: ControlState,
-): "publish" | "discard" {
-  return current.kind === "active" && current.generation === receiptGeneration
-    ? "publish"
-    : "discard";
-}
