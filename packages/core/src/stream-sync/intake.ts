@@ -29,7 +29,11 @@ import {
   type JsonObject,
   type JsonValue,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { RunGoneError, type StreamSyncWriter } from "./writer.js";
+import {
+  ConnectionStoppedError,
+  RunGoneError,
+  type StreamSyncWriter,
+} from "./writer.js";
 
 /** What `end` can answer (V2 §2.3). */
 export type EndResult =
@@ -40,6 +44,7 @@ export type RunIntakeErrorName =
   | "owner_mismatch"
   | "lease_lost"
   | "connection_busy"
+  | "connection_stopped"
   | "gone"
   | "run_conflict"
   | "unknown_artifact"
@@ -51,6 +56,7 @@ const STATUS: Record<RunIntakeErrorName, number> = {
   owner_mismatch: 409,
   lease_lost: 409,
   connection_busy: 409,
+  connection_stopped: 409,
   gone: 410,
   run_conflict: 409,
   unknown_artifact: 422,
@@ -104,8 +110,13 @@ export interface BeginRequest {
   readonly connector: string;
   readonly artifactDigest: string;
   readonly owner: { readonly address: string; readonly leaseId: string | null };
-  /** True only for an owner-started run whose profile mode is full. */
+  /** True when the run asks for a full collection (a profile mode, not an action). */
   readonly wantFull?: boolean;
+  /**
+   * True only for an explicit connect action by the owner. The only thing that
+   * starts a connection the device saw deleted (§2.4 `stopped`).
+   */
+  readonly connect?: boolean;
   readonly observedAt?: number;
   /**
    * The scope the producer will put in START, per stream. Used only to
@@ -290,6 +301,9 @@ export class StreamSyncIntake implements RunIntake {
     if (req.wantFull !== undefined && typeof req.wantFull !== "boolean") {
       throw invalid("wantFull must be a boolean");
     }
+    if (req.connect !== undefined && typeof req.connect !== "boolean") {
+      throw invalid("connect must be a boolean");
+    }
     if (
       req.observedAt !== undefined &&
       !(typeof req.observedAt === "number" && Number.isFinite(req.observedAt))
@@ -352,9 +366,14 @@ export class StreamSyncIntake implements RunIntake {
     }
 
     const wantFull = req.wantFull === true;
+    const connect = req.connect === true;
     let collection: "full_refresh" | "incremental";
     let state: JsonValue | null;
     let keyCheck: string;
+    // The offline path skips the writer's gate, so it applies the same refusal.
+    if (willDiscard && !connect && (await writer.isStopped(connector))) {
+      throw new RunIntakeError("connection_stopped");
+    }
     if (willDiscard) {
       const issued = await writer.issueStart(connector, wantFull);
       collection = issued.start.collectionMode;
@@ -365,7 +384,7 @@ export class StreamSyncIntake implements RunIntake {
         const issued = await writer.beginRun({
           runId,
           connector,
-          userConnect: wantFull,
+          userConnect: connect,
           ...(req.observedAt !== undefined
             ? { observedAt: req.observedAt }
             : {}),
@@ -378,6 +397,9 @@ export class StreamSyncIntake implements RunIntake {
         keyCheck = issued.keyCheck;
       } catch (error) {
         if (error instanceof RunGoneError) throw new RunIntakeError("gone");
+        if (error instanceof ConnectionStoppedError) {
+          throw new RunIntakeError("connection_stopped");
+        }
         throw error;
       }
     }
