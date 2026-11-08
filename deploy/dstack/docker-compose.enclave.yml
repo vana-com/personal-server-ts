@@ -50,6 +50,7 @@ services:
       - WORK_DELAY_MS
       - SANDBOX_SYNC
       - JOB_RESULT_MAX_BYTES
+      - PS_STREAM_SYNC_READ
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
     depends_on:
