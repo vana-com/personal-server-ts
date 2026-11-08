@@ -783,9 +783,10 @@ async function serveStreamSyncView(
     >;
     decision: Extract<ReadDecision, { kind: "view" | "local_pending" }>;
     paymentResponseHeader: string | undefined;
+    inProcess: PersonalServerInProcessRead | undefined;
   },
 ): Promise<Response> {
-  const { authResult, decision } = input;
+  const { authResult, decision, inProcess } = input;
   const logId = deps.createLogId?.() ?? crypto.randomUUID();
   const timestamp = (deps.now ?? (() => new Date()))().toISOString();
   const ipAddress =
@@ -793,34 +794,51 @@ async function serveStreamSyncView(
     request.headers.get("x-real-ip") ??
     "unknown";
   const userAgent = request.headers.get("user-agent") ?? "unknown";
-  try {
-    await deps.accessLogWriter.write({
-      logId,
-      grantId: authResult?.grantId ?? input.grantId ?? "unknown",
-      builder: authResult?.builder ?? "unknown",
-      action: "read",
-      scope: input.scope,
-      timestamp,
-      ipAddress,
-      userAgent,
-    });
-  } catch (error) {
-    await decision.body.cancel();
-    throw error;
+  if (inProcess?.logAccess !== false) {
+    try {
+      await deps.accessLogWriter.write({
+        logId,
+        grantId: authResult?.grantId ?? input.grantId ?? "unknown",
+        builder: authResult?.builder ?? "unknown",
+        action: "read",
+        scope: input.scope,
+        timestamp,
+        ipAddress,
+        userAgent,
+      });
+    } catch (error) {
+      await decision.body.cancel();
+      throw error;
+    }
   }
   if (authResult?.grantId && authResult.builder) {
-    reportPersonalServerReadFulfillment(deps, {
+    const served = {
       builder: authResult.builder,
       fileId: undefined,
       grantId: authResult.grantId,
       ipAddress,
       logId,
-      outcome: "served",
+      outcome: "served" as const,
       scope: input.scope,
       servedAt: timestamp,
-      source: "api",
+      source: "api" as const,
       userAgent,
-    });
+    };
+    // An in-process caller decides completion itself, after any paging.
+    if (inProcess) {
+      inProcess.onServed({
+        scope: input.scope,
+        builder: authResult.builder,
+        grantId: authResult.grantId,
+        fileId: undefined,
+        logId,
+        ipAddress,
+        servedAt: timestamp,
+        userAgent,
+      });
+    } else {
+      reportPersonalServerReadFulfillment(deps, served);
+    }
   }
   // A projection can fail after the 200 status. The client must then see
   // the connection abort, never a complete shorter body. Chunked framing
@@ -2668,14 +2686,28 @@ export async function handlePersonalServerDataRequest(
       // X402 succeeds — emitted on the final read response as X-PAYMENT-RESPONSE.
       let paymentResponseHeader: string | undefined;
       const grantId = selectedGrantId(request, url);
-      const authResult = await deps.auth.authorizeBuilderRead({
+      const wantsRawContent = url.searchParams.get("content") === "raw";
+      const inProcess = options.inProcess;
+      // An in-process paid read settles last. Auth checks the grant without
+      // charging here; `settle` runs the charging auth once the read is known
+      // to be served, after every refusal. HTTP never takes this path.
+      const settleLast = inProcess !== undefined && !inProcess.metadataOnly;
+      const authInput = {
         request,
         scope: scopeResult.scope,
         grantId,
         fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
         at: atParam,
-        ...(options.inProcess?.metadataOnly ? { metadataOnly: true } : {}),
+      };
+      const authResult = await deps.auth.authorizeBuilderRead({
+        ...authInput,
+        ...(inProcess?.metadataOnly || settleLast
+          ? { metadataOnly: true }
+          : {}),
       });
+      const settle = async (): Promise<void> => {
+        if (settleLast) await deps.auth.authorizeBuilderRead(authInput);
+      };
 
       // Select the body after auth and before deletion or payment. A file's
       // version and re-add marker authorize that file, not canonical rows.
@@ -2714,9 +2746,27 @@ export async function handlePersonalServerDataRequest(
           }
           const refusal = streamSyncRefusal(decision);
           if (refusal) return refusal;
+          if (
+            inProcess &&
+            wantsRawContent &&
+            (decision.kind === "view" || decision.kind === "local_pending")
+          ) {
+            // A view has no raw bytes. Refused before any charge, log or
+            // fulfilment, so a caller never pays for a read it cannot use.
+            await decision.body.cancel();
+            return jsonResponse(
+              {
+                error: "STREAM_VIEW_NOT_RAW",
+                message: `Scope "${scopeResult.scope}" is served from its stream view, which has no raw binary content.`,
+                scope: scopeResult.scope,
+              },
+              { status: 409 },
+            );
+          }
           if (decision.kind === "local_pending") {
             // Owner-only and unregistered: nothing to bill and no version to
             // bind in an access record.
+            await settle();
             notifyDataRead(deps, { scope: scopeResult.scope });
             return serveStreamSyncView(deps, request, {
               scope: scopeResult.scope,
@@ -2724,6 +2774,7 @@ export async function handlePersonalServerDataRequest(
               authResult,
               decision,
               paymentResponseHeader: undefined,
+              inProcess,
             });
           }
           if (decision.kind === "view") {
@@ -2764,12 +2815,14 @@ export async function handlePersonalServerDataRequest(
                 paymentResponseHeader = paid.paymentResponseHeader;
               }
             }
+            await settle();
             return serveStreamSyncView(deps, request, {
               scope: scopeResult.scope,
               grantId,
               authResult,
               decision,
               paymentResponseHeader,
+              inProcess,
             });
           }
         }
@@ -2866,6 +2919,9 @@ export async function handlePersonalServerDataRequest(
         servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
       }
 
+      // Every refusal above has run; only a read that will be served pays.
+      await settle();
+
       const servedEnvelope = isOwnerView(authResult)
         ? envelope
         : redactEnvelopeForGrantee(envelope);
@@ -2923,8 +2979,6 @@ export async function handlePersonalServerDataRequest(
       if (paymentResponseHeader) {
         headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
       }
-
-      const wantsRawContent = url.searchParams.get("content") === "raw";
 
       // `?content=raw` streams the decoded bytes of a binary envelope with its
       // original media type, so a builder can download the file directly. The

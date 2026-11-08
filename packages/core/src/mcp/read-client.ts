@@ -1137,26 +1137,19 @@ export function createMcpDataReadClient(
         },
       });
 
+      // A raw read is never fulfilment, so the served-read callback is inert.
+      // The handler refuses a view-served name (409 STREAM_VIEW_NOT_RAW)
+      // before it charges, logs or serves anything.
       const response = await handlePersonalServerDataRequest(
         request,
         options.dataApiDeps,
-        { basePath },
+        { basePath, inProcess: { onServed: () => {} } },
       );
       if (!response.ok) {
         throw new McpDataReadError(
           response.status,
           await parseJsonOrText(response),
         );
-      }
-      if (
-        streamSync &&
-        response.headers.get(STREAM_SYNC_SOURCE_HEADER) === STREAM_SYNC_SOURCE
-      ) {
-        throw new McpDataReadError(409, {
-          error: "STREAM_VIEW_NOT_RAW",
-          message: `Scope "${scope}" is served from its stream view, which has no raw binary content.`,
-          scope,
-        });
       }
 
       const mimeType =
