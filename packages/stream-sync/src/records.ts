@@ -7,14 +7,7 @@
  * Canonical JSON sorts keys, so a line always reads `{"o":...,"r":...,"v":...}`.
  */
 
-import {
-  HEX64,
-  RECORD_LINE_LIMIT_BYTES,
-  sha256Hex,
-  utf8,
-  utf8Length,
-  type Sha256,
-} from "./bytes.js";
+import { HEX64, sha256Hex, utf8, type Sha256 } from "./bytes.js";
 import {
   InvalidArgumentError,
   InvalidLineError,
@@ -147,24 +140,4 @@ export function inPrefix(hash: string, prefix: string): boolean {
     throw new InvalidArgumentError("prefix must be a string of 0 and 1");
   }
   return pkHashBits(hash, prefix.length) === prefix;
-}
-
-export type LineSize =
-  | { readonly fits: true; readonly bytes: number }
-  | {
-      readonly fits: false;
-      readonly bytes: number;
-      readonly reason: "record_too_large";
-    };
-
-/**
- * §2.2 single-record limit on canonical line bytes (no terminator). A line
- * that does not fit is not published; the host counts it, keeps its key
- * digest and size locally, and the run continues.
- */
-export function lineSize(text: string): LineSize {
-  const bytes = utf8Length(text);
-  return bytes > RECORD_LINE_LIMIT_BYTES
-    ? { fits: false, bytes, reason: "record_too_large" }
-    : { fits: true, bytes };
 }

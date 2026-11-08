@@ -7,7 +7,7 @@
  *     line 1: {"primaryKey": [...], "profile": {"key", "version"}, "records": N}
  *     lines 2..N+1: one retained record object per line
  *     -> 200 {state: "merged" | "skipped"}  a receipt exists; body not read
- *     -> 202 {state: "staged", records, invalid, tooLarge}
+ *     -> 202 {state: "staged", records, invalid}
  *
  * Only the owner may call it; Desktop uses the sidecar access token it
  * already sends. The body is streamed to disk, so memory stays bounded by one
@@ -108,7 +108,6 @@ export function streamSyncSeedRoutes(deps: StreamSyncSeedRouteDeps): Hono {
         state: "staged",
         records: staged.records,
         invalid: staged.invalid,
-        tooLarge: staged.tooLarge,
       };
     }
     for (const [stream, receipt] of Object.entries(status.receipts)) {
@@ -142,7 +141,6 @@ export function streamSyncSeedRoutes(deps: StreamSyncSeedRouteDeps): Hono {
           state: "staged",
           records: staged.records,
           invalid: staged.invalid,
-          tooLarge: staged.tooLarge,
         },
         202,
       );

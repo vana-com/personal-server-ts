@@ -74,8 +74,6 @@ export const REGISTRY_HASH = /^0x[0-9a-f]{64}$/;
 
 const MiB = 1024 * 1024;
 
-/** §2.2: a record whose canonical line exceeds this is not published. */
-export const RECORD_LINE_LIMIT_BYTES = 8 * MiB;
 /** §2.2: default writer target per part. Hosts with less memory pass a smaller target. */
 export const DEFAULT_PART_TARGET_BYTES = 4 * MiB;
 /** §2.2: decoder limit for a clear head. */

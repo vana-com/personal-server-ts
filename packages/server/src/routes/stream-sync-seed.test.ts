@@ -214,7 +214,6 @@ describe("stream-sync seed route", () => {
       state: "staged",
       records: 1,
       invalid: 3,
-      tooLarge: 0,
     });
   });
 
@@ -268,7 +267,7 @@ describe("stream-sync seed route", () => {
     );
     expect(await (await get(routes, "c")).json()).toEqual({
       targetKnown: false,
-      streams: { s: { state: "staged", records: 2, invalid: 0, tooLarge: 0 } },
+      streams: { s: { state: "staged", records: 2, invalid: 0 } },
     });
     const rowsRead = [];
     const source = staging.source("x", async () => ({}));

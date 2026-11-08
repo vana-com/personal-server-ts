@@ -25,7 +25,6 @@
  */
 
 import {
-  RECORD_LINE_LIMIT_BYTES,
   isPlainObject,
   pkHash,
   streamScope,
@@ -62,8 +61,6 @@ export interface StagedSeed {
   readonly records: number;
   /** Lines that were not a JSON object with every primary-key field. */
   readonly invalid: number;
-  /** Lines over the record limit (§2.2); never staged. */
-  readonly tooLarge: number;
 }
 
 export class SeedUploadError extends Error {
@@ -339,7 +336,6 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
         let seen = 0;
         let records = 0;
         let invalid = 0;
-        let tooLarge = 0;
         let batch: string[] = [];
         let batchBytes = 0;
         const flush = async () => {
@@ -350,7 +346,7 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
           batch = [];
           batchBytes = 0;
         };
-        for await (const line of lines(body, RECORD_LINE_LIMIT_BYTES)) {
+        for await (const line of lines(body, Number.MAX_SAFE_INTEGER)) {
           if (descriptor === null) {
             if (line === null) {
               throw new SeedUploadError(
@@ -363,10 +359,6 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
           }
           if (line !== null && line.length === 0) continue;
           seen += 1;
-          if (line === null) {
-            tooLarge += 1;
-            continue;
-          }
           const text = decoder.decode(line);
           let value: unknown;
           try {
@@ -404,7 +396,6 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
           profile: descriptor.profile,
           records,
           invalid,
-          tooLarge,
         };
         await files.write(
           pointerPath(connector, stream),

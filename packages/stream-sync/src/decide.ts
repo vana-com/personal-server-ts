@@ -214,8 +214,7 @@ export type CheckpointDecision =
  * §2.4 checkpoint save: after every stream of the run is committed or no-op
  * at T, re-read control. Save tagged (ns, T) only if it is `active(T)` and
  * no stream was published `complete:false` or left a `complete:false` head
- * unchanged (no-op, ruling Q9). A `record_too_large` exclusion
- * does not block; a `bucket_too_large` stream is not committed and does. §2.9:
+ * unchanged (no-op, ruling Q9). A `bucket_too_large` stream is not committed and does. §2.9:
  * the checkpoint also waits for every seed receipt of the run (a host merging its retained history).
  */
 export function checkpointDecision(input: {

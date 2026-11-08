@@ -518,23 +518,97 @@
         "text": "not json",
         "why": "not JSON"
       }
-    ],
-    "size": {
-      "description": "Line = {\"o\":0,\"r\":\"r\",\"v\":{\"x\":<count × 'a'>}}. Limit is on canonical line bytes without the terminator.",
-      "limitBytes": 8388608,
-      "cases": [
-        {
-          "count": 8388580,
-          "bytes": 8388608,
-          "fits": true
+    ]
+  },
+  "frames": {
+    "description": "Format 2 frame = envelope LF body LF. Envelope = canonical JSON {h: sha256(body) hex, k: pkHash, n: body bytes, o, r}; body = canonical JSON of the record. A part is frames sorted strictly by k (or the pieces of one long frame). No record size limit.",
+    "cases": [
+      {
+        "name": "unicode",
+        "primaryKey": ["id"],
+        "record": {
+          "id": "é",
+          "t": "日本語"
         },
-        {
-          "count": 8388581,
-          "bytes": 8388609,
-          "fits": false
-        }
-      ]
-    }
+        "o": 5,
+        "r": "r",
+        "bodyBytes": 27,
+        "envelope": "{\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}",
+        "frame": "{\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n"
+      },
+      {
+        "name": "small",
+        "primaryKey": ["id"],
+        "record": {
+          "id": "a",
+          "body": 1
+        },
+        "o": 1700000000000,
+        "r": "run-1",
+        "bodyBytes": 19,
+        "envelope": "{\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}",
+        "frame": "{\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n"
+      },
+      {
+        "name": "composite key",
+        "primaryKey": ["a", "b"],
+        "record": {
+          "b": 2,
+          "a": "x",
+          "c": true
+        },
+        "o": 0,
+        "r": "run-2",
+        "bodyBytes": 24,
+        "envelope": "{\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}",
+        "frame": "{\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n"
+      }
+    ],
+    "part": {
+      "prefix": "",
+      "frames": ["unicode", "small", "composite key"],
+      "text": "{\"h\":\"709e86674171c242f279aa714a62d71346d6c785505b108149cb548405c1e435\",\"k\":\"0b657be394b1d432f8d1942406ed09c213604cbcd87b299641cf994bcaf84b11\",\"n\":27,\"o\":5,\"r\":\"r\"}\n{\"id\":\"é\",\"t\":\"日本語\"}\n{\"h\":\"6511b6213cd8003d68b52a49f42a68900679578cc248952fc936cfe83717f778\",\"k\":\"0eb5b8d6f81bc677da8a08567cc4fa9a06a57e9ec8da85ed73a7f62727996002\",\"n\":19,\"o\":1700000000000,\"r\":\"run-1\"}\n{\"body\":1,\"id\":\"a\"}\n{\"h\":\"2e6c6b7e3652ea85c432e0cfcff6dc1409948f6efe93177553c1899c7d0772a7\",\"k\":\"9ca894e6afeeab81977088382cb4b4657275cb44206d9105a5c5f0c135b81eb3\",\"n\":24,\"o\":0,\"r\":\"run-2\"}\n{\"a\":\"x\",\"b\":2,\"c\":true}\n",
+      "bytes": 588,
+      "count": 3,
+      "hash": "34e00c608df055c13f9d0853910d51c9e70af302cd4fe5cacd1258049854dae6"
+    },
+    "long": {
+      "description": "Record {\"id\":\"big\",\"x\":<count x \"a\">} as a frame; only digests are listed.",
+      "primaryKey": ["id"],
+      "count": 1048581,
+      "o": 9,
+      "r": "run-long",
+      "bodyBytes": 1048600,
+      "bodyHash": "6a76dd4d65eb5356eeb09a5ea54f6b4daaafc822051ac7ad46c635c01eebe4d5",
+      "k": "8ce95d9409fd5d37ac975b5c82daebe4244657aa9e1397b5db2304253f6873d5",
+      "envelope": "{\"h\":\"6a76dd4d65eb5356eeb09a5ea54f6b4daaafc822051ac7ad46c635c01eebe4d5\",\"k\":\"8ce95d9409fd5d37ac975b5c82daebe4244657aa9e1397b5db2304253f6873d5\",\"n\":1048600,\"o\":9,\"r\":\"run-long\"}"
+    },
+    "envelopeErrors": [
+      {
+        "text": "{\"h\":\"x\",\"k\":\"y\",\"n\":1,\"o\":1,\"r\":\"r\"}",
+        "why": "hash not hex64"
+      },
+      {
+        "text": "{\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":-1,\"o\":1,\"r\":\"r\"}",
+        "why": "negative n"
+      },
+      {
+        "text": "{\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"r\"}",
+        "why": "not canonical order"
+      },
+      {
+        "text": "{\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"\"}",
+        "why": "empty r"
+      },
+      {
+        "text": "{\"h\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"k\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"n\":1,\"o\":1,\"r\":\"r\",\"z\":1}",
+        "why": "extra field"
+      },
+      {
+        "text": "not json",
+        "why": "not JSON"
+      }
+    ]
   },
   "merge": [
     {

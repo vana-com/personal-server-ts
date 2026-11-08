@@ -40,12 +40,13 @@ import {
 import { controlHashes, deriveKeyCheck, deriveNs } from "./namespace.js";
 import { streamMasterKeyFromSignature } from "./master-key.js";
 import { afterCommit, runMustBeFull, type NeedsFull } from "./needs-full.js";
+import { decodeEnvelope, encodeEnvelope, frameOfBody } from "./frames.js";
+import { encodeFramePart } from "./part-frames.js";
 import { decodePart, encodePart } from "./parts.js";
 import { planBuckets } from "./planner.js";
 import {
   decodeLine,
   encodeLine,
-  lineSize,
   pkHash,
   pkHashBits,
   shardOf,
@@ -202,14 +203,75 @@ export async function runVectors(
   for (const c of vectors.lines.decodeErrors) {
     await throws(`decodeLine ${c.why}`, () => decodeLine(c.text));
   }
-  for (const c of vectors.lines.size.cases) {
-    const text = encodeLine({ o: 0, r: "r", v: { x: "a".repeat(c.count) } });
-    const size = lineSize(text);
+
+  // frames (format 2)
+  for (const c of vectors.frames.cases) {
+    const body = utf8(canonicalJson(c.record));
+    const key = await pkHash(ports.sha256, c.record, c.primaryKey);
+    const envelope = {
+      h: toHex(await ports.sha256(body)),
+      k: key,
+      n: body.length,
+      o: c.o,
+      r: c.r,
+    };
     eq(
-      `lineSize ${c.count}`,
-      { bytes: size.bytes, fits: size.fits },
-      { bytes: c.bytes, fits: c.fits },
+      `envelope ${c.name}`,
+      new TextDecoder().decode(encodeEnvelope(envelope)),
+      c.envelope,
     );
+    eq(`decodeEnvelope ${c.name}`, decodeEnvelope(utf8(c.envelope)), envelope);
+    eq(
+      `frame ${c.name}`,
+      new TextDecoder().decode(frameOfBody(envelope, body)),
+      c.frame,
+    );
+  }
+  {
+    const part = vectors.frames.part;
+    const framed = vectors.frames.cases.map((c: any) => ({
+      k: JSON.parse(c.envelope).k as string,
+      bytes: utf8(c.frame),
+    }));
+    const encoded = await encodeFramePart(ports.sha256, part.prefix, framed);
+    eq(
+      "frame part",
+      encoded && new TextDecoder().decode(encoded.data),
+      part.text,
+    );
+    eq("frame part entry", encoded?.entry, {
+      bytes: part.bytes,
+      count: part.count,
+      hash: part.hash,
+      prefix: part.prefix,
+    });
+  }
+  {
+    const long = vectors.frames.long;
+    const body = utf8(canonicalJson({ id: "big", x: "a".repeat(long.count) }));
+    eq("long body bytes", body.length, long.bodyBytes);
+    eq("long body hash", toHex(await ports.sha256(body)), long.bodyHash);
+    eq(
+      "long key",
+      await pkHash(ports.sha256, { id: "big" }, long.primaryKey),
+      long.k,
+    );
+    eq(
+      "long envelope",
+      new TextDecoder().decode(
+        encodeEnvelope({
+          h: long.bodyHash,
+          k: long.k,
+          n: long.bodyBytes,
+          o: long.o,
+          r: long.r,
+        }),
+      ),
+      long.envelope,
+    );
+  }
+  for (const c of vectors.frames.envelopeErrors) {
+    await throws(`decodeEnvelope ${c.why}`, () => decodeEnvelope(utf8(c.text)));
   }
 
   // merge and parts

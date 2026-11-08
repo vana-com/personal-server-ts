@@ -19,7 +19,7 @@ workflows.
 | Master key    | `streamMasterKeyFromSignature(signature)` returns the 65-byte owner signature as r, low s and v = 27/28. Every stream-sync key (`K_ns`, head and part keys) derives from it, so every encoding of one signature gives one `ns` and `keyCheck`. Legacy scope keys keep the raw signature. |
 | Namespace     | `ns = hex(first 8 bytes of HMAC-SHA256(K_ns, canonicalJson([c, accountId])))`, `keyCheck = hex(first 8 bytes of HMAC-SHA256(K_ns, "key-check"))`. The host derives `K_ns` with label `pdpp-stream-sync/namespace/v1` and passes an HMAC port bound to it.                                |
 | Control row   | `ACTIVE_DATA = keccak256("pdpp.stream-sync.connection.active.v1:" + keyCheck)`. A read classifies as `absent`, `active(g)`, `deleted(v)` or `foreign` (another key's row).                                                                                                               |
-| Lines, parts  | `pkHash = sha256(canonicalJson([pk values]))`. A part is NDJSON lines `{"o":<run start ms>,"r":"<runId>","v":<record>}` sorted by `pkHash`. A line over 8 MiB is `record_too_large`. Parts ≤ 16 MiB, heads ≤ 1 MiB.                                                                      |
+| Lines, parts  | `pkHash = sha256(canonicalJson([pk values]))`. A part is NDJSON lines `{"o":<run start ms>,"r":"<runId>","v":<record>}` sorted by `pkHash`. Format 2 stores each record as a frame (envelope plus body) and has no record size limit; see SPANS.md. Parts ≤ 16 MiB, heads ≤ 1 MiB.       |
 | Merge         | Greatest `(o, r)` wins per key; on equal `(o, r)` the later line wins. Feed base lines, then run lines. Seed lines have `o = 0`, `r = "seed"`. The reducer keeps one line per key.                                                                                                       |
 | Planner       | 256 spool shards by first `pkHash` byte. Split a bucket over the target by the next bit, never deeper than 16 bits. Deeper than 8 bits, the host makes one counting pass per shard when asked (`needs_counts`).                                                                          |
 | Head format 1 | Canonical JSON with `complete`, `connector`, `format`, `generation` (decimal string), `keyCheck`, `ns`, `observedAt`, `parts`, `primaryKey`, `profile {key, version}`, `recordCount`, `stream`. Readers check the hash, format, names and `keyCheck`.                                    |
@@ -33,25 +33,25 @@ in [DESIGN-QUESTIONS.md](DESIGN-QUESTIONS.md).
 
 ## API
 
-| Export                                                                                | Purpose                                                               |
-| ------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `Sha256`, `Keccak256`, `NamespaceHmac`, `HashPorts`                                   | Port types the host implements.                                       |
-| `canonicalJson`                                                                       | The one serialization behind every byte and hash.                     |
-| `streamScope`, `controlScope`, `parseScope`                                           | Build and parse registry scopes.                                      |
-| `headBlobName`, `partBlobName`, `parseBlobName`                                       | Build and parse blob names.                                           |
-| `deriveNs`, `deriveKeyCheck`, `controlHashes`                                         | Namespace, key check and control-row hashes.                          |
-| `encodeLine`, `decodeLine`, `pkHash`, `shardOf`, `pkHashBits`, `inPrefix`, `lineSize` | Line codec, key hash, shard and prefix helpers, the 8 MiB line limit. |
-| `compareStamp`, `BucketReducer`, `mergeLines`                                         | Merge rule and winner-only reduce.                                    |
-| `encodePart`, `encodeWinners`, `decodePart`                                           | Part codec with fail-closed verification.                             |
-| `planBuckets`, `basePartsFor`                                                         | Bucket planner and base-part routing.                                 |
-| `encodeHead`, `decodeHead`, `digestHead`, `verifyHead`                                | Head format 1.                                                        |
-| `isHeadLive`, `chooseBase`, `writerCompatibility`, `headComplete`, `isNoop`           | Head rules.                                                           |
-| `classifyControl`, `sameControl`                                                      | Control-row states.                                                   |
-| `startState`, `decide`, `targetFor`, `checkpointDecision`                             | Admission, generation and checkpoint rules.                           |
-| `afterCommit`, `runMustBeFull`                                                        | `needsFull` rules.                                                    |
-| `selectConnection`, `eligible`, `isReady`                                             | The eligibility predicate.                                            |
-| `createOutboxEntry`, `streamRunResult`, `OutboxEntry`                                 | Outbox entry type.                                                    |
-| `runVectors`                                                                          | Run `vectors/v1.json` against a host's ports.                         |
+| Export                                                                      | Purpose                                           |
+| --------------------------------------------------------------------------- | ------------------------------------------------- |
+| `Sha256`, `Keccak256`, `NamespaceHmac`, `HashPorts`                         | Port types the host implements.                   |
+| `canonicalJson`                                                             | The one serialization behind every byte and hash. |
+| `streamScope`, `controlScope`, `parseScope`                                 | Build and parse registry scopes.                  |
+| `headBlobName`, `partBlobName`, `parseBlobName`                             | Build and parse blob names.                       |
+| `deriveNs`, `deriveKeyCheck`, `controlHashes`                               | Namespace, key check and control-row hashes.      |
+| `encodeLine`, `decodeLine`, `pkHash`, `shardOf`, `pkHashBits`, `inPrefix`   | Line codec, key hash, shard and prefix helpers.   |
+| `compareStamp`, `BucketReducer`, `mergeLines`                               | Merge rule and winner-only reduce.                |
+| `encodePart`, `encodeWinners`, `decodePart`                                 | Part codec with fail-closed verification.         |
+| `planBuckets`, `basePartsFor`                                               | Bucket planner and base-part routing.             |
+| `encodeHead`, `decodeHead`, `digestHead`, `verifyHead`                      | Head format 1.                                    |
+| `isHeadLive`, `chooseBase`, `writerCompatibility`, `headComplete`, `isNoop` | Head rules.                                       |
+| `classifyControl`, `sameControl`                                            | Control-row states.                               |
+| `startState`, `decide`, `targetFor`, `checkpointDecision`                   | Admission, generation and checkpoint rules.       |
+| `afterCommit`, `runMustBeFull`                                              | `needsFull` rules.                                |
+| `selectConnection`, `eligible`, `isReady`                                   | The eligibility predicate.                        |
+| `createOutboxEntry`, `streamRunResult`, `OutboxEntry`                       | Outbox entry type.                                |
+| `runVectors`                                                                | Run `vectors/v1.json` against a host's ports.     |
 
 ## Vectors
 

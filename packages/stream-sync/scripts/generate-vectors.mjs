@@ -301,8 +301,6 @@ const pkCases = [
   };
 });
 
-const LINE_SHELL = lineText({ o: 0, r: "r", v: { x: "" } }).length;
-const MiB8 = 8 * 1024 * 1024;
 const lines = {
   encode: [
     { line: { o: 1700000000000, r: "run-1", v: { id: "a", n: 1 } } },
@@ -320,16 +318,95 @@ const lines = {
     { text: '{"o":1,"r":"x"}', why: "missing v" },
     { text: "not json", why: "not JSON" },
   ],
-  size: {
+};
+
+// ---------- frames (format 2) ----------
+
+const shaBytes = (text) => sha(text);
+const frameCase = (name, primaryKey, record, o, r) => {
+  const body = cj(record);
+  const k = sha(cj(primaryKey.map((f) => record[f])));
+  const envelope = cj({
+    h: shaBytes(body),
+    k,
+    n: Buffer.byteLength(body),
+    o,
+    r,
+  });
+  return {
+    name,
+    primaryKey,
+    record,
+    o,
+    r,
+    bodyBytes: Buffer.byteLength(body),
+    envelope,
+    frame: `${envelope}\n${body}\n`,
+  };
+};
+const frameCases = [
+  frameCase("small", ["id"], { id: "a", body: 1 }, 1700000000000, "run-1"),
+  frameCase("unicode", ["id"], { id: "é", t: "日本語" }, 5, "r"),
+  frameCase("composite key", ["a", "b"], { b: 2, a: "x", c: true }, 0, "run-2"),
+].sort((x, y) =>
+  JSON.parse(x.envelope).k < JSON.parse(y.envelope).k ? -1 : 1,
+);
+const longCount = 1024 * 1024 + 5;
+const longBody = cj({ id: "big", x: "a".repeat(longCount) });
+const longK = sha(cj(["big"]));
+const frames = {
+  description:
+    "Format 2 frame = envelope LF body LF. Envelope = canonical JSON {h: sha256(body) hex, k: pkHash, n: body bytes, o, r}; body = canonical JSON of the record. A part is frames sorted strictly by k (or the pieces of one long frame). No record size limit.",
+  cases: frameCases,
+  part: (() => {
+    const text = frameCases.map((c) => c.frame).join("");
+    return {
+      prefix: "",
+      frames: frameCases.map((c) => c.name),
+      text,
+      bytes: Buffer.byteLength(text),
+      count: frameCases.length,
+      hash: sha(text),
+    };
+  })(),
+  long: {
     description:
-      'Line = {"o":0,"r":"r","v":{"x":<count × \'a\'>}}. Limit is on canonical line bytes without the terminator.',
-    limitBytes: MiB8,
-    cases: [MiB8 - LINE_SHELL, MiB8 - LINE_SHELL + 1].map((count) => ({
-      count,
-      bytes: LINE_SHELL + count,
-      fits: LINE_SHELL + count <= MiB8,
-    })),
+      'Record {"id":"big","x":<count x "a">} as a frame; only digests are listed.',
+    primaryKey: ["id"],
+    count: longCount,
+    o: 9,
+    r: "run-long",
+    bodyBytes: Buffer.byteLength(longBody),
+    bodyHash: sha(longBody),
+    k: longK,
+    envelope: cj({
+      h: sha(longBody),
+      k: longK,
+      n: Buffer.byteLength(longBody),
+      o: 9,
+      r: "run-long",
+    }),
   },
+  envelopeErrors: [
+    { text: '{"h":"x","k":"y","n":1,"o":1,"r":"r"}', why: "hash not hex64" },
+    {
+      text: `{"h":"${"0".repeat(64)}","k":"${"0".repeat(64)}","n":-1,"o":1,"r":"r"}`,
+      why: "negative n",
+    },
+    {
+      text: `{"k":"${"0".repeat(64)}","h":"${"0".repeat(64)}","n":1,"o":1,"r":"r"}`,
+      why: "not canonical order",
+    },
+    {
+      text: `{"h":"${"0".repeat(64)}","k":"${"0".repeat(64)}","n":1,"o":1,"r":""}`,
+      why: "empty r",
+    },
+    {
+      text: `{"h":"${"0".repeat(64)}","k":"${"0".repeat(64)}","n":1,"o":1,"r":"r","z":1}`,
+      why: "extra field",
+    },
+    { text: "not json", why: "not JSON" },
+  ],
 };
 
 // ---------- merge ----------
@@ -1909,6 +1986,7 @@ const vectors = {
   scopes,
   pkHash: pkCases,
   lines,
+  frames,
   merge,
   planner,
   heads: {
