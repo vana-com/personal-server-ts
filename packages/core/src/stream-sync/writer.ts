@@ -1554,6 +1554,12 @@ export class StreamSyncWriter {
             why: "the process stopped before the run finished collecting",
           });
         } else if (host?.phase === "done") {
+          // A finish interrupted after its entry was saved "done" has no result
+          // yet, and the checkpoint already advanced: rebuild it before the run
+          // directory (the only other copy of the exclusion counts) goes.
+          if (!(await this.options.home.files.read(`results/${runId}.json`))) {
+            await this.writeResult(host);
+          }
           await this.reclaim(host);
         }
       }
@@ -2480,6 +2486,14 @@ export class StreamSyncWriter {
     if (decision.restartFull) this.options.onRestartFull?.(entry.connector);
   }
 
+  /** The one write of a finished run's result; durable when it resolves. */
+  private writeResult(host: HostEntry): Promise<void> {
+    return this.options.home.files.write(
+      `results/${host.entry.runId}.json`,
+      json(this.statusOf(host)),
+    );
+  }
+
   private async finish(host: HostEntry, outcome: RunOutcome): Promise<void> {
     // Older ready entries have no explicit ready marker.
     host.ready ??= host.phase === "ready";
@@ -2487,10 +2501,7 @@ export class StreamSyncWriter {
     host.phase = "done";
     const runId = host.entry.runId;
     await this.writeEntry(host);
-    await this.options.home.files.write(
-      `results/${runId}.json`,
-      json(this.statusOf(host)),
-    );
+    await this.writeResult(host);
     await this.reclaim(host);
     if (!(outcome.kind === "aborted" && outcome.reason === "cancelled")) {
       const bad =

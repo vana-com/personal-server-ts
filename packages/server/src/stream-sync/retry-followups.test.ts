@@ -6,7 +6,10 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type {
+  StreamSyncFiles,
+  StreamSyncWriter,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   createStreamSyncIntake,
   type BeginRequest,
@@ -241,5 +244,55 @@ describe("retry follow-ups", { timeout: 30_000 }, () => {
     const restarted = await env.writer("f-oversize-durable-device");
     const after = finishedOutcome(await restarted.status(), "r1");
     expect(after?.streams.items?.recordTooLarge).toBe(1);
+  });
+
+  it("an oversized-only retry keeps its exclusion result when the result write is interrupted", async () => {
+    const c = freshConnector("f-oversize-interrupted");
+    const device = "f-oversize-interrupted-device";
+    const base = await env.files(device);
+    let tripped = false;
+    const faulty: StreamSyncFiles = {
+      ...base,
+      write: async (path, bytes) => {
+        // The run entry is already "done" when its result write fails.
+        if (path === "results/r1.json" && !tripped) {
+          tripped = true;
+          throw new Error("injected: result write interrupted");
+        }
+        return base.write(path, bytes);
+      },
+    };
+    const writer = await env.writer(device, { files: faulty });
+    const intake = createStreamSyncIntake({
+      writer,
+      resolveArtifact: resolveTestArtifact,
+    });
+    await run({ name: device, writer, intake }, "r1", c, {
+      records: [
+        {
+          stream: "items",
+          data: { id: "big", n: "x".repeat(8 * 1024 * 1024) },
+        },
+      ],
+      covered: [],
+      candidate: { items: "c1" },
+      outcome: "retry_pending",
+    });
+    await expect(writer.cycle()).rejects.toThrow(
+      "injected: result write interrupted",
+    );
+    expect(tripped).toBe(true);
+    // Reopen the same home without the fault: the next cycle must rebuild r1.
+    const reopened = await env.writer(device);
+    await reopened.cycle();
+    const restarted = createStreamSyncIntake({
+      writer: reopened,
+      resolveArtifact: resolveTestArtifact,
+    });
+    const next = await restarted.begin("r2", begin(c, { observedAt: T0 + 1 }));
+    expect(next.start.state).toEqual({ items: "c1" });
+    await restarted.abort("r2", "cancelled");
+    const result = finishedOutcome(await reopened.status(), "r1");
+    expect(result?.streams.items?.recordTooLarge).toBe(1);
   });
 });
