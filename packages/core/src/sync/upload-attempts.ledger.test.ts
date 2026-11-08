@@ -5,6 +5,7 @@ import {
   createUploadAttemptLedger,
   UPLOAD_ATTEMPTS_RESET_NOTICE,
   UploadAttemptStoreInvalidError,
+  UploadAttemptWriteUncertainError,
   uploadAttemptKey,
   type UploadAttemptStore,
 } from "./upload-attempts.js";
@@ -285,5 +286,118 @@ describe("attempt tokens", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/** A store whose writes can be held, or made to fail, by the test. */
+function controlledStore() {
+  const inner = createMemoryUploadAttemptStore();
+  const control = {
+    hold: null as Promise<void> | null,
+    started: 0,
+    rejectNext: null as Error | null,
+  };
+  const store: UploadAttemptStore = {
+    namespace: inner.namespace,
+    read: () => inner.read(),
+    async write(envelope) {
+      control.started += 1;
+      if (control.rejectNext) {
+        const error = control.rejectNext;
+        control.rejectNext = null;
+        throw error;
+      }
+      if (control.hold) await control.hold;
+      await inner.write(envelope);
+    },
+    preserveCorrupt: () => inner.preserveCorrupt(),
+  };
+  return { store, control, inner };
+}
+
+describe("release against reactivation", () => {
+  it("keeps ownership when a manager takes the store back and begins an attempt while a pending close is writing", async () => {
+    const { store, control, inner } = controlledStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A);
+    await ledger.recover();
+    const a = await ledger.begin(entry(1));
+    await ledger.close(0); // grace passes: A stays live, the close is pending
+    expect(ledger.isLive(a.key)).toBe(true);
+
+    let resume!: () => void;
+    control.hold = new Promise<void>((r) => (resume = r));
+    const before = control.started;
+    const settling = ledger.settle(a, "success"); // marker write is held
+    await vi.waitFor(() => expect(control.started).toBeGreaterThan(before));
+
+    // The same manager is reactivated and begins B for the same entry.
+    expect(await ledger.recover()).toBe(true);
+    const begunB = ledger.begin(entry(1));
+    resume();
+    await settling;
+    const b = await begunB;
+
+    expect(ledger.isLive(b.key)).toBe(true);
+    expect(await createUploadAttemptLedger(inner, OWNER_A).recover()).toBe(
+      false,
+    );
+
+    await ledger.settle(b, "failure"); // a clean settle
+    const later = createUploadAttemptLedger(inner, OWNER_A);
+    await ledger.close(0);
+    expect(await later.recover()).toBe(true);
+    expect(later.quarantined()).toEqual([]);
+    expect(
+      ((await inner.read()) as { records: Array<{ interrupted: number }> })
+        .records,
+    ).toEqual([]);
+  });
+});
+
+describe("a begin whose write was rejected", () => {
+  it("is not persisted later as an attempt that ran", async () => {
+    const { store, control, inner } = controlledStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A, {
+      maxInterrupted: 1,
+    });
+    await ledger.recover();
+    control.rejectNext = new Error("disk full");
+    await expect(ledger.begin(entry(1))).rejects.toThrow("disk full");
+    expect(ledger.isLive(uploadAttemptKey(OWNER_A, entry(1)))).toBe(false);
+
+    const b = await ledger.begin(entry(2));
+    await ledger.settle(b, "success");
+    await ledger.close();
+
+    for (let boot = 0; boot < 2; boot++) {
+      const next = createUploadAttemptLedger(processOver(inner), OWNER_A, {
+        maxInterrupted: 1,
+      });
+      await next.recover();
+      expect(next.quarantined()).toEqual([]);
+      expect(next.isQuarantined(uploadAttemptKey(OWNER_A, entry(1)))).toBe(
+        false,
+      );
+      await next.close();
+    }
+    expect(((await inner.read()) as { records: unknown[] }).records).toEqual(
+      [],
+    );
+  });
+
+  it("keeps the marker when the write's outcome is unknown", async () => {
+    const { store, control, inner } = controlledStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A, {
+      maxInterrupted: 1,
+    });
+    await ledger.recover();
+    control.rejectNext = new UploadAttemptWriteUncertainError("sync failed");
+    await expect(ledger.begin(entry(1))).rejects.toThrow(/unknown/);
+    const b = await ledger.begin(entry(2));
+    await ledger.settle(b, "success");
+    expect(
+      ((await inner.read()) as { records: Array<{ inFlight: boolean }> })
+        .records,
+    ).toEqual([expect.objectContaining({ inFlight: true })]);
   });
 });

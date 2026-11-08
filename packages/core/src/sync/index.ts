@@ -74,6 +74,7 @@ export {
   createMemoryUploadAttemptStore,
   UPLOAD_ATTEMPTS_ENVELOPE_VERSION,
   UploadAttemptStoreInvalidError,
+  UploadAttemptWriteUncertainError,
   UPLOAD_ATTEMPTS_RESET_NOTICE,
   createUploadAttemptLedger,
   parseUploadAttemptsEnvelope,

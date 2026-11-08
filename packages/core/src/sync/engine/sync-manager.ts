@@ -137,6 +137,8 @@ export function createSyncManager(
   const dataPointFeed = downloadDeps.dataPointFeed ?? uploadDeps.dataPointFeed;
   const scopeDeletions =
     uploadDeps.scopeDeletions ?? downloadDeps.scopeDeletions;
+  const namelessAttempts =
+    !uploadDeps.uploadAttempts && !options?.uploadAttemptStore;
   // The upload worker queues guarded cleanup for ciphertext it had to
   // abandon mid-race; it shares the manager's marker store.
   const uploadAttempts =
@@ -474,7 +476,10 @@ export function createSyncManager(
       }
       // Hand the upload markers to the next manager over this store, once no
       // attempt is still running (a running one keeps its entry excluded).
-      await uploadAttempts.close();
+      // Without a stable store namespace a rebuilt manager gets a fresh,
+      // unrelated lock, so only a fully drained stop keeps two managers over
+      // the same persistence from overlapping.
+      await uploadAttempts.close(namelessAttempts ? Infinity : undefined);
     },
 
     async trigger() {

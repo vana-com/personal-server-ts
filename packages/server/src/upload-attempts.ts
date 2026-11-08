@@ -1,6 +1,9 @@
 import { mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
-import type { UploadAttemptStore } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  UploadAttemptWriteUncertainError,
+  type UploadAttemptStore,
+} from "@opendatalabs/personal-server-ts-core/sync";
 
 let tempCounter = 0;
 const MAX_CORRUPT_COPIES = 3;
@@ -18,11 +21,18 @@ async function writeDurably(path: string, text: string): Promise<void> {
     await file.close();
   }
   await rename(tmpPath, path);
-  const dir = await open(directory, "r");
+  // Past the rename the new value may already be what a reader sees.
   try {
-    await dir.sync();
-  } finally {
-    await dir.close();
+    const dir = await open(directory, "r");
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+  } catch (error) {
+    throw new UploadAttemptWriteUncertainError(
+      error instanceof Error ? error.message : String(error),
+    );
   }
 }
 

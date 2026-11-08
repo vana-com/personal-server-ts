@@ -60,7 +60,7 @@ function processOver(store: UploadAttemptStore, boot: number) {
   } satisfies UploadAttemptStore;
 }
 
-function buildManager(store: UploadAttemptStore) {
+function buildManager(store?: UploadAttemptStore) {
   /** Each attempt's body read: settles only when the test says so. */
   const bodies: Array<{ fail(): void }> = [];
   const storage = {
@@ -100,7 +100,7 @@ function buildManager(store: UploadAttemptStore) {
   } as unknown as DownloadWorkerDeps;
   const manager = createSyncManager(uploadDeps, downloadDeps, {
     pollInterval: 365 * 24 * HOUR,
-    uploadAttemptStore: store,
+    ...(store ? { uploadAttemptStore: store } : {}),
   });
   return { manager, bodies, storage };
 }
@@ -150,5 +150,39 @@ describe("upload attempts across manager stop and start", () => {
     expect(await recordsOf(store)).toEqual([
       expect.objectContaining({ interrupted: 1 }),
     ]);
+  });
+
+  it("with no store namespace, stop waits for live work, so a rebuilt manager cannot overlap it", async () => {
+    const first = buildManager(); // the in-memory fallback names no store
+    first.manager.start();
+    await vi.advanceTimersByTimeAsync(10 * 60_000 + 5_000);
+    expect(first.bodies).toHaveLength(1);
+
+    let stopped = false;
+    const stopping = first.manager.stop().then(() => {
+      stopped = true;
+    });
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(stopped).toBe(false); // the read is still live
+
+    first.bodies[0]!.fail();
+    await vi.advanceTimersByTimeAsync(0);
+    await stopping;
+    expect(stopped).toBe(true);
+  });
+
+  it("with a stable namespace, stop is bounded and a rebuilt manager over the same store is excluded", async () => {
+    const store = createMemoryUploadAttemptStore();
+    const first = buildManager(store);
+    first.manager.start();
+    await vi.advanceTimersByTimeAsync(10 * 60_000 + 5_000);
+    const stopping = first.manager.stop();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await stopping; // resolved although the read is still live
+
+    const second = buildManager(store);
+    second.manager.start();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(second.storage.readEnvelope).not.toHaveBeenCalled();
   });
 });

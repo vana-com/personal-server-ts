@@ -454,7 +454,8 @@ export function createIndexedDbPsLiteStateStore(
   return {
     ...bounded,
     bounded,
-    namespace: `indexeddb:${resolved.dbName}/${resolved.storeName}`,
+    // Injective: "a/b" + "c" and "a" + "b/c" must not name one store.
+    namespace: `indexeddb:${JSON.stringify([resolved.dbName, resolved.storeName])}`,
   };
 }
 

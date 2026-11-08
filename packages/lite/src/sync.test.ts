@@ -557,8 +557,31 @@ describe("createPsLiteUploadAttemptStore ownership", () => {
     expect(
       createIndexedDbPsLiteStateStore({ dbName: "a", storeName: "s" })
         .namespace,
-    ).toBe("indexeddb:a/s");
+    ).toBe('indexeddb:["a","s"]');
   });
+
+  it.each([
+    ["without browser locks", () => vi.stubGlobal("navigator", {})],
+    ["with browser locks", stubBrowserLocks],
+  ])(
+    "does not merge database/store names that concatenate alike (%s)",
+    async (_name, setup) => {
+      setup();
+      const first = createIndexedDbPsLiteStateStore({
+        dbName: "tenant/a",
+        storeName: "state",
+      });
+      const second = createIndexedDbPsLiteStateStore({
+        dbName: "tenant",
+        storeName: "a/state",
+      });
+      expect(first.namespace).not.toBe(second.namespace);
+      const a = ledgerOver(stateAt(first.namespace!));
+      const b = ledgerOver(stateAt(second.namespace!));
+      expect(await a.recover()).toBe(true);
+      expect(await b.recover()).toBe(true);
+    },
+  );
 
   it("refuses to guess a lock identity when the host names no store", () => {
     expect(() =>

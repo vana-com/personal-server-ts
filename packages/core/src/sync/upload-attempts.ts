@@ -75,6 +75,17 @@ export class UploadAttemptStoreInvalidError extends Error {
   }
 }
 
+/**
+ * A store `write` may throw this when it cannot tell whether the value reached
+ * storage. Any other rejection means nothing was stored.
+ */
+export class UploadAttemptWriteUncertainError extends Error {
+  constructor(reason: string) {
+    super(`Upload attempt write outcome is unknown: ${reason}`);
+    this.name = "UploadAttemptWriteUncertainError";
+  }
+}
+
 /** Status text recorded when a malformed ledger was preserved and reset. */
 export const UPLOAD_ATTEMPTS_RESET_NOTICE =
   "Upload crash protection was reset; earlier interruption counts were lost";
@@ -303,7 +314,9 @@ export interface UploadAttemptLedger {
    * settle, then gives up the store's owner lock. An attempt that has not
    * settled keeps its entry excluded and the store owned (a reactivated
    * manager shares this ledger and cannot start a second body for it); the
-   * lock is given up when it settles.
+   * lock is given up when it settles. A manager that takes the store back
+   * (`recover`) during the wait cancels the release. `Infinity` waits for
+   * the attempts however long they take.
    */
   close(graceMs?: number): Promise<void>;
 }
@@ -331,6 +344,11 @@ export function createUploadAttemptLedger(
   /** Set once a malformed value was replaced: it is not replaced twice. */
   let resetOnce = false;
   let closeWhenIdle = false;
+  /**
+   * Bumped whenever a manager takes the store back (`recover` on a held
+   * lease). A release that began earlier sees the change and stands down.
+   */
+  let reactivations = 0;
   const idleWaiters: Array<() => void> = [];
   const keyOf = (entry: IndexEntry) => uploadAttemptKey(owner, entry);
   const mine = (record: UploadAttemptRecord) => record.owner === owner;
@@ -342,7 +360,7 @@ export function createUploadAttemptLedger(
   }
 
   /** Serialised, whole-value persist of the current records. */
-  function persist(): Promise<void> {
+  function persist(onRejected?: (error: unknown) => void): Promise<void> {
     assertOwned();
     const run = writes.then(() =>
       store.write({
@@ -350,13 +368,20 @@ export function createUploadAttemptLedger(
         records: [...records.values()],
       }),
     );
-    writes = run.catch(() => undefined);
+    // The rollback runs before the next queued write reads `records`.
+    writes = run.catch((error) => onRejected?.(error));
     return run;
   }
 
-  async function giveUp() {
+  /**
+   * Give up the store. `since` is the `reactivations` count when the release
+   * was decided; the checks after the wait are the ones that count, because a
+   * manager may have taken the store back, and begun an attempt, meanwhile.
+   */
+  async function giveUp(since: number) {
     await writes;
-    lease?.release();
+    if (reactivations !== since || live.size > 0 || !lease) return;
+    lease.release();
     lease = null;
     recovering = null;
     closeWhenIdle = false;
@@ -417,6 +442,7 @@ export function createUploadAttemptLedger(
     recover() {
       if (lease && recovering) {
         closeWhenIdle = false;
+        reactivations += 1;
         return recovering;
       }
       recovering ??= load();
@@ -456,10 +482,20 @@ export function createUploadAttemptLedger(
         quarantined: false,
       });
       live.set(key, token);
+      // A write that failed before storing anything must not leave this
+      // attempt in memory, or a later whole-ledger write would persist an
+      // attempt that never ran. A write of unknown outcome keeps the marker:
+      // it may be on disk, and counting a start that did not run is safer than
+      // missing one that did.
+      const rollback = (error: unknown) => {
+        if (error instanceof UploadAttemptWriteUncertainError) return;
+        if (known) records.set(key, known);
+        else records.delete(key);
+      };
       try {
-        await persist();
+        await persist(rollback);
       } catch (error) {
-        live.delete(key);
+        if (live.get(key) === token) live.delete(key);
         throw error;
       }
       return token;
@@ -485,8 +521,9 @@ export function createUploadAttemptLedger(
       if (live.size === 0) {
         for (const wake of idleWaiters.splice(0)) wake();
         if (closeWhenIdle) {
+          const since = reactivations;
           await done.catch(() => undefined);
-          await giveUp();
+          await giveUp(since);
           return;
         }
       }
@@ -526,21 +563,24 @@ export function createUploadAttemptLedger(
       );
     },
     async close(graceMs = DEFAULT_ABANDON_GRACE_MS) {
+      const since = reactivations;
       if (live.size > 0) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([
           new Promise<void>((wake) => idleWaiters.push(wake)),
+          // An infinite grace waits for the attempts, however long.
           new Promise<void>((wake) => {
-            timer = setTimeout(wake, graceMs);
+            if (Number.isFinite(graceMs)) timer = setTimeout(wake, graceMs);
           }),
         ]);
         clearTimeout(timer);
       }
+      if (reactivations !== since) return;
       if (live.size > 0) {
         closeWhenIdle = true;
         return;
       }
-      await giveUp();
+      await giveUp(since);
     },
   };
 }
