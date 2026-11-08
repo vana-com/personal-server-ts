@@ -76,13 +76,18 @@ export class SpoolWriter {
     text: string,
     bytes: number,
   ): Promise<void> {
+    await this.addLine(logPath, `${pkHash} ${text}`, bytes + 65);
+  }
+
+  /** Queue a text line without a key prefix. `bytes` excludes its terminator. */
+  async addLine(logPath: string, text: string, bytes: number): Promise<void> {
     let buffer = this.buffers.get(logPath);
     if (!buffer) {
       buffer = [];
       this.buffers.set(logPath, buffer);
     }
-    buffer.push(`${pkHash} ${text}\n`);
-    this.buffered += bytes + 66;
+    buffer.push(`${text}\n`);
+    this.buffered += bytes + 1;
     if (this.buffered >= this.flushBytes) await this.flush();
   }
 
@@ -147,7 +152,7 @@ export async function deriveShards(
       buffers.set(shard, buffer);
     }
     buffer.push(`${line.pkHash} ${line.text}\n`);
-    buffered += line.text.length + 66;
+    buffered += utf8Length(line.text) + 66;
     if (buffered >= flushBytes) await flush();
   }
   await flush();
@@ -238,6 +243,7 @@ export async function compactShard(
   path: string,
   shard: number,
   budgetBytes: number,
+  flushBytes: number = DEFAULT_SPOOL_FLUSH_BYTES,
 ): Promise<number | null> {
   const prefix = shard.toString(2).padStart(8, "0");
   const reducer = new BucketReducer(prefix);
@@ -253,12 +259,14 @@ export async function compactShard(
   const result = reducer.finish(Number.MAX_SAFE_INTEGER);
   if (result.kind !== "ok") return null;
   if (result.winners.length === seenLines) return null;
-  const text = result.winners.map((w) => `${w.pkHash} ${w.text}\n`).join("");
   // Replace the shard without a durable write per file: the run is still
   // collecting, and its one `sync` follows the last compaction (§2.6). A stop
   // between the two calls fails the run, as any stop while collecting does.
   await files.remove(path);
-  await files.appendMany([{ path, bytes: encoder.encode(text) }]);
+  const writer = new SpoolWriter(files, flushBytes);
+  for (const winner of result.winners)
+    await writer.add(path, winner.pkHash, winner.text, utf8Length(winner.text));
+  await writer.flush();
   return result.bytes;
 }
 
@@ -271,7 +279,7 @@ export async function countShard(
   for (const path of paths) {
     for await (const line of readSpool(files, path)) {
       const second = parseInt(line.pkHash.slice(2, 4), 16);
-      counts[second]! += encoder.encode(line.text).length + 1;
+      counts[second]! += utf8Length(line.text) + 1;
     }
   }
   return counts;
