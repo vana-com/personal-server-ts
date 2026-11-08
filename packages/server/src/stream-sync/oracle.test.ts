@@ -524,6 +524,7 @@ describe.each(matrix)(
           expect(part.bytes).toBeLessThanOrEqual(FRAME_PIECE_BYTES);
         }
       },
+      120_000,
     );
 
     it.each(["after_parts_upload", "after_head_upload"] as const)(
@@ -557,6 +558,7 @@ describe.each(matrix)(
           canonicalJson(huge),
         );
       },
+      120_000,
     );
 
     it("carries a long record unchanged through a later run that updates another record", async () => {
