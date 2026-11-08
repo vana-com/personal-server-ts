@@ -149,12 +149,16 @@ export async function* readSpool(
   files: StreamSyncFiles,
   path: string,
 ): AsyncGenerator<SpoolLine> {
-  const decoder = new TextDecoder("utf-8", { fatal: true });
+  // ignoreBOM keeps a U+FEFF in the decoded text. A decoder strips a BOM at the
+  // start of every decode call, so a per-line decode would strip one from every
+  // line. The whole-file decoder strips only the file's first BOM; match that.
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   // Split on the newline byte, then decode each line on its own. Decoding the
   // whole chunk and slicing lines out of it would make every line a view that
   // pins its 1 MiB chunk for as long as any caller keeps the line's text.
   // 0x0a cannot occur inside a multi-byte UTF-8 sequence, so the split is safe.
   let rest = new Uint8Array(0);
+  let firstLine = true;
   for await (const chunk of files.readChunks(path)) {
     const bytes = new Uint8Array(rest.length + chunk.length);
     bytes.set(rest);
@@ -162,13 +166,24 @@ export async function* readSpool(
     let start = 0;
     let newline = bytes.indexOf(0x0a, start);
     while (newline !== -1) {
-      yield parseSpoolLine(decoder.decode(bytes.subarray(start, newline)));
+      let raw = decoder.decode(bytes.subarray(start, newline));
+      if (firstLine && raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+      firstLine = false;
+      yield parseSpoolLine(raw);
       start = newline + 1;
       newline = bytes.indexOf(0x0a, start);
     }
     rest = bytes.slice(start);
   }
   if (rest.length !== 0) {
+    // A file that holds only a BOM has no lines, as the whole-file decoder gives.
+    const bomOnly =
+      firstLine &&
+      rest.length === 3 &&
+      rest[0] === 0xef &&
+      rest[1] === 0xbb &&
+      rest[2] === 0xbf;
+    if (bomOnly) return;
     throw new Error(`spool file ${path} ends mid-line`);
   }
 }
