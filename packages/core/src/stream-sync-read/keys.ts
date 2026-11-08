@@ -14,6 +14,7 @@ import {
 import {
   deriveKeyCheck,
   NAMESPACE_KEY_LABEL,
+  streamMasterKeyFromSignature,
   type HashPorts,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { StorageAdapter } from "../storage/adapters/interface.js";
@@ -33,8 +34,9 @@ function hex(bytes: Uint8Array): string {
  * physical names are safe here.
  */
 export async function createStreamSyncReadKeys(
-  masterKey: Uint8Array,
+  ownerSignature: Uint8Array,
 ): Promise<StreamSyncReadKeys> {
+  const masterKey = streamMasterKeyFromSignature(ownerSignature);
   const kNs = deriveScopeKey(masterKey, NAMESPACE_KEY_LABEL);
   const keyCheck = await deriveKeyCheck(async (message) =>
     hmac(nobleSha256, kNs, message),

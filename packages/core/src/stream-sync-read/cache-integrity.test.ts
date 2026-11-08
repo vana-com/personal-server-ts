@@ -7,6 +7,7 @@ import {
 import { StreamSyncImporter } from "./importer.js";
 import { streamSyncReadHashes } from "./keys.js";
 import { viewLines } from "./lines.js";
+import { masterKey } from "./service-fixture.js";
 import { buildTestHead, testOwnerKey } from "./testing.js";
 import { ViewStore, type ViewKey } from "./view-store.js";
 
@@ -42,7 +43,7 @@ class MemoryFiles implements Files {
 }
 
 async function fixture() {
-  const owner = await testOwnerKey(new Uint8Array(32).fill(7));
+  const owner = await testOwnerKey(masterKey(7));
   // Keep the real publisher/codec, but use identity encryption for this cache test.
   const publisher = {
     ...owner,
