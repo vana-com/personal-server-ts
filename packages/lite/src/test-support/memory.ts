@@ -601,6 +601,8 @@ function pageBlock(
   };
 }
 
+let memoryStateStores = 0;
+
 export function createMemoryPsLiteStateStore(
   seed?: Partial<Record<PsLiteStateKey, unknown>>,
 ): PsLiteStateStore {
@@ -608,6 +610,7 @@ export function createMemoryPsLiteStateStore(
     Object.entries(seed ?? {}) as Array<[PsLiteStateKey, unknown]>,
   );
   return {
+    namespace: `memory:${++memoryStateStores}`,
     async get<T>(key: PsLiteStateKey) {
       return values.has(key) ? clone(values.get(key) as T) : null;
     },

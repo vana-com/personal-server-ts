@@ -72,6 +72,24 @@ export {
   type PendingBlobDeletionPlanned,
   type PendingBlobDeletionState,
 } from "./pending-blob-deletions.js";
+export {
+  CRASHED_UPLOAD_REASON,
+  MAX_INTERRUPTED_UPLOAD_ATTEMPTS,
+  createMemoryUploadAttemptStore,
+  UPLOAD_ATTEMPTS_ENVELOPE_VERSION,
+  UploadAttemptStoreInvalidError,
+  UploadAttemptWriteUncertainError,
+  UPLOAD_ATTEMPTS_RESET_NOTICE,
+  createUploadAttemptLedger,
+  parseUploadAttemptsEnvelope,
+  uploadAttemptKey,
+  type UploadAttemptLease,
+  type UploadAttemptLedger,
+  type UploadAttemptRecord,
+  type UploadAttemptToken,
+  type UploadAttemptStore,
+  type UploadAttemptsEnvelope,
+} from "./upload-attempts.js";
 export { computeDataPointId } from "./data-point-id.js";
 export {
   createScopeDeletionTracker,
@@ -100,3 +118,8 @@ export {
   type PublicationFence,
   type PublicationRecord,
 } from "../publication/publish.js";
+
+export {
+  withCancellableRegistration,
+  type CancellableRegistration,
+} from "./cancellable-gateway.js";

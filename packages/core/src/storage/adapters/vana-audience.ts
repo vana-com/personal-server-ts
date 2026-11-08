@@ -52,6 +52,7 @@ export function createAudienceVanaAdapter(
     url: string,
     method: "PUT" | "GET" | "DELETE",
     body?: Uint8Array,
+    signal?: AbortSignal,
   ) {
     const parsed = validate(url);
     const authorization = await sign(method, url, body);
@@ -63,6 +64,7 @@ export function createAudienceVanaAdapter(
       },
       body: body ? Uint8Array.from(body) : undefined,
       redirect: "error",
+      ...(signal ? { signal } : {}),
     });
     if (!response.ok && response.status !== 404) {
       await response.body?.cancel();
@@ -74,15 +76,15 @@ export function createAudienceVanaAdapter(
   }
   return {
     urlForKey,
-    async upload(key, bytes) {
+    async upload(key, bytes, signal) {
       const url = urlForKey(key);
-      const response = await request(url, "PUT", bytes);
+      const response = await request(url, "PUT", bytes, signal);
       await response.body?.cancel();
       if (!response.ok) throw new Error("Storage upload not found");
       return url;
     },
-    async download(url) {
-      const response = await request(url, "GET");
+    async download(url, signal) {
+      const response = await request(url, "GET", undefined, signal);
       if (!response.ok) {
         await response.body?.cancel();
         throw new Error("Storage blob not found");
@@ -94,9 +96,13 @@ export function createAudienceVanaAdapter(
       await response.body?.cancel();
       return response.ok;
     },
-    async exists(url) {
+    async exists(url, signal) {
       validate(url);
-      const response = await fetch(url, { method: "HEAD", redirect: "error" });
+      const response = await fetch(url, {
+        method: "HEAD",
+        redirect: "error",
+        ...(signal ? { signal } : {}),
+      });
       await response.body?.cancel();
       if (response.status === 404) return false;
       if (!response.ok)

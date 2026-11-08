@@ -2,7 +2,10 @@ import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-cor
 import { resolveLiteReplication } from "./replication-door.js";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
-import { createGatewayDataPointFeed } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  createGatewayDataPointFeed,
+  withCancellableRegistration,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import type { StreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type {
   RunIntake,
@@ -232,7 +235,12 @@ export async function createIndexedDbPsLiteRuntime(
       }),
       options.dataFileStore,
     ));
-  const gateway = options.gateway ?? createGatewayClient(config.gateway.url);
+  const gateway =
+    options.gateway ??
+    withCancellableRegistration(
+      createGatewayClient(config.gateway.url),
+      config.gateway.url,
+    );
   const serverOwner = await resolvePsLiteOwner({
     ownerAddress: options.ownerAddress,
     ownerSignature: options.ownerSignature,
