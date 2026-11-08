@@ -1,11 +1,14 @@
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
-import { Hono, type Context } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
+import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerApiDispatchOptions,
   type PersonalServerReadFulfillmentReporter,
   type StreamSyncReadPort,
+  refuseLegacyWrite,
+  type LegacyWriteSwitch,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -149,6 +152,8 @@ export interface DataRouteDeps {
    */
   pdppImporter?: PdppImporter;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
+  /** The account's stream-sync switch; true refuses undeclared legacy writes. */
+  legacyWritesRefused?: LegacyWriteSwitch;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
@@ -180,6 +185,25 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     writeProofReplayStore: deps.writeProofReplayStore,
     pdppOwnerBearer: deps.pdppOwnerBearer,
   });
+
+  // Refuse before any body is read, so an old client sees `update_required`
+  // and not a size or parse error. A builder's delegated write carries a
+  // write proof and is left to the data handler, which knows its auth.
+  const refuseLegacy: MiddlewareHandler = async (c, next) => {
+    if (c.req.header(WRITE_SIGNATURE_HEADER) === undefined) {
+      const refusal = refuseLegacyWrite(c.req.raw, deps.legacyWritesRefused);
+      if (refusal) return refusal;
+    }
+    await next();
+  };
+  app.post("/:scope", refuseLegacy);
+  app.post("/:scope/imports", refuseLegacy);
+  app.put("/:scope/imports/:id/chunks/:index", refuseLegacy);
+  app.post("/:scope/imports/:id/finalize", refuseLegacy);
+  app.put("/:scope/imports/:operation", refuseLegacy);
+  app.post("/:scope/uploads", refuseLegacy);
+  app.put("/:scope/uploads/:id/batches/:index", refuseLegacy);
+  app.post("/:scope/uploads/:id/commit", refuseLegacy);
 
   const importDeps: ScopeImportDeps = {
     hierarchyOptions: deps.hierarchyOptions,

@@ -1,0 +1,71 @@
+# Refusing legacy writes after the stream-sync switch
+
+Once an account has moved to stream sync, a legacy-format write from an app
+version built before stream sync is refused with an update-your-app error. The
+old app keeps its local records. This note lists every legacy write path in this
+repository and says which ones the server can refuse.
+
+## The check
+
+- **Switch state.** The account owns the switch. A host reads it from the
+  Account setting (`GET /api/v1/me/stream-sync`) before it launches the server
+  and passes it as `streamSync.write`. The server reads only that local value,
+  at the moment of each write (`packages/server/src/app.ts`, `legacyWritesRefused`).
+  The server never calls the Account.
+- **Who is refused.** A legacy write that does not send
+  `Vana-Stream-Sync-Client: 1`. A client built for stream sync sends it on every
+  legacy write it still makes. An old client cannot send it. The header chooses
+  the message, never what a caller may read.
+- **One check.** `refuseLegacyWrite` (`packages/core/src/api/legacy-write-gate.ts`)
+  is the only place that decides. `dataRoutes` (`packages/server/src/routes/data.ts`)
+  calls it first on each write route, before any body is read.
+- **Error.** HTTP `426 Upgrade Required`, code `update_required`, header
+  `Upgrade: vana-stream-sync`:
+
+  ```json
+  {
+    "error": { "code": 426, "errorCode": "update_required", "message": "…" },
+    "errorCode": "update_required",
+    "message": "This account has moved to stream sync. Update the Vana app to keep syncing. The data already on this device is untouched."
+  }
+  ```
+
+  Why 426: it says "this client is too old" and nothing else. 409 is already
+  used here for import conflicts and stream-sync control scopes, and an old
+  client may retry or merge on it. 5xx invites a retry. 401 and 403 invite a
+  sign-in loop. The body has the message under both error shapes this API
+  uses, so an old client shows it from the field it already reads.
+
+## Census (this repository)
+
+| Path                                                                     | Where                                                                                 | Old clients that use it                                                                | Can the check see the switch?  | Result                                                                                                                                                                              |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/data/:scope`                                                   | gate `server/src/routes/data.ts:199`; handler `core/src/api/index.ts:2930`            | Desktop (renderer ingest, projection import), Web via a hosted server, a hosted server | Yes: `config.streamSync.write` | Refused                                                                                                                                                                             |
+| `PUT /v1/data/:scope/imports/:operation`                                 | gate `data.ts:203`; handler `core/src/api/index.ts:2395`                              | Desktop saved-export delivery and retained-import                                      | Yes                            | Refused                                                                                                                                                                             |
+| `POST /v1/data/:scope/imports` (chunked begin)                           | gate `data.ts:200`; handler `data.ts:272`                                             | Chunked importers                                                                      | Yes                            | Refused                                                                                                                                                                             |
+| `PUT /v1/data/:scope/imports/:id/chunks/:index`                          | gate `data.ts:201`; handler `data.ts:299`                                             | Chunked importers                                                                      | Yes                            | Refused                                                                                                                                                                             |
+| `POST /v1/data/:scope/imports/:id/finalize`                              | gate `data.ts:202`; handler `data.ts:329`                                             | Chunked importers                                                                      | Yes                            | Refused                                                                                                                                                                             |
+| `POST /v1/data/:scope/uploads`                                           | gate `data.ts:204`; handler `core/src/api/index.ts:2392` (`handleScopeUploadRequest`) | Scope-version streaming uploads                                                        | Yes                            | Refused                                                                                                                                                                             |
+| `PUT /v1/data/:scope/uploads/:id/batches/:index`                         | gate `data.ts:205`; same handler                                                      | Same                                                                                   | Yes                            | Refused                                                                                                                                                                             |
+| `POST /v1/data/:scope/uploads/:id/commit`                                | gate `data.ts:206`; same handler                                                      | Same                                                                                   | Yes                            | Refused                                                                                                                                                                             |
+| `DELETE /v1/data/:scope`, `DELETE …/imports/:id`, `DELETE …/uploads/:id` | `core/src/api/index.ts:3223`, `data.ts:342`                                           | Any                                                                                    | Yes                            | **Allowed on purpose.** A delete writes a tombstone, but refusing it would stop a person from deleting data from the old app. The switch deletes the account's legacy files anyway. |
+| `POST /v1/data/:scope` with a builder write session                      | `core/src/api/index.ts:2930` (`authorizeWrite`)                                       | Third-party builders, not Vana apps                                                    | Yes                            | **Exempt.** A request with `X-Vana-Write-Signature` passes the gate; the data handler authenticates it. Builder writes are not an "old app version".                                |
+| `POST /v1/sync/trigger`, `/v1/sync/file/:id`                             | `core/src/api/index.ts:3341`                                                          | Any                                                                                    | n/a                            | Not a client write. The server's own sync engine decides what to upload.                                                                                                            |
+| `/v1/stream-sync/*`                                                      | `server/src/app.ts:535`                                                               | Stream-sync clients                                                                    | n/a                            | New routes. Never gated.                                                                                                                                                            |
+| `/v1/records/*`, `/v1/blobs/ingest` (PDPP record store)                  | `server/src/routes/pdpp-records.ts:1274,1431,1614,1826`                               | Record-store clients                                                                   | n/a                            | Not legacy files. Not gated.                                                                                                                                                        |
+| `POST /v1/import/oura-browser`                                           | `server/src/routes/oura.ts`, in-process write `core/src/oura/index.ts:384`            | Desktop connector host                                                                 | n/a                            | The server writes in-process with no HTTP request to gate. Same version as its host. Not gated.                                                                                     |
+| Phone in-process runtime `/v1/data`                                      | `lite/src/runtime.ts:1267`                                                            | The phone app that bundles it                                                          | n/a                            | Bundled with its own app shell, so the caller is never older than the server. Not gated.                                                                                            |
+| Server → storage upload of local legacy files                            | `core/src/sync/workers/upload.ts:266`                                                 | Every server version                                                                   | n/a                            | An **old server version** uploads straight to storage. See below.                                                                                                                   |
+
+## What this repository cannot refuse
+
+An old app version carries an old server inside it (Desktop sidecar, phone
+runtime). That server uploads legacy files straight to the storage service
+with the owner's own signature. No server of ours is in the loop, so no code
+here can refuse it. The narrowest enforcement point is the storage service's
+write authorization: it refuses a legacy-format upload for an account that has
+switched, with the same `426 update_required` body. The Account already holds
+the switch state, so the storage service reads it from there. This change
+does not touch the storage service or the gateway.
+
+Web is covered at the Account's signing step, not here (companion change).

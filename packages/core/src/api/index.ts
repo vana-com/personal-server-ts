@@ -2109,6 +2109,15 @@ export function redactEnvelopeForGrantee(
 }
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
+export {
+  STREAM_SYNC_CLIENT_HEADER,
+  UPDATE_REQUIRED_CODE,
+  UPDATE_REQUIRED_MESSAGE,
+  UPDATE_REQUIRED_STATUS,
+  declaresStreamSyncClient,
+  refuseLegacyWrite,
+  type LegacyWriteSwitch,
+} from "./legacy-write-gate.js";
 
 /**
  * `/v1/data/:scope/uploads...`: an owner writes one new version of a scope as
