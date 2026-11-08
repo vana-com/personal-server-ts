@@ -24,6 +24,7 @@ import * as AdditionsModule from "@opendatalabs/personal-server-ts-core/addition
 import * as HostPortsModule from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import * as ReplicationHostModule from "./storage/pdpp-replication-host.js";
 import * as LocalMcpStateModule from "./mcp/local-state.js";
+import * as SyncModule from "@opendatalabs/personal-server-ts-core/sync";
 import { createServer, type ServerContext } from "./bootstrap.js";
 
 vi.mock(
@@ -57,6 +58,17 @@ vi.mock("./storage/pdpp-replication-host.js", async (importOriginal) => {
     createNodeReplication: vi.fn(actual.createNodeReplication),
   };
 });
+
+vi.mock(
+  "@opendatalabs/personal-server-ts-core/sync",
+  async (importOriginal) => {
+    const actual = await importOriginal<typeof SyncModule>();
+    return {
+      ...actual,
+      createSyncManager: vi.fn(actual.createSyncManager),
+    };
+  },
+);
 
 vi.mock("./mcp/local-state.js", async (importOriginal) => {
   const actual = await importOriginal<typeof LocalMcpStateModule>();
@@ -117,7 +129,10 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-async function boot(replication: boolean): Promise<ServerContext> {
+async function boot(
+  replication: boolean,
+  sync = false,
+): Promise<ServerContext> {
   const dir = join(tempDir, "declarations");
   await mkdir(dir, { recursive: true });
   const path = join(dir, "claude.json");
@@ -126,7 +141,7 @@ async function boot(replication: boolean): Promise<ServerContext> {
     ServerConfigSchema.parse({
       gateway: { url: gatewayUrl },
       tunnel: { enabled: false },
-      sync: { enabled: false },
+      sync: { enabled: sync },
       logging: { level: "fatal", pretty: false },
       replication: { enabled: replication },
       pdpp: {
@@ -163,4 +178,13 @@ it("opens the local MCP state with the legacy master key", async () => {
   const calls = vi.mocked(LocalMcpStateModule.openLocalMcpState).mock.calls;
   expect(calls.length).toBe(1);
   expect(bytesToHex(calls[0]![0].masterKey)).toBe(SDK_LEGACY_KEY);
+});
+
+it("gives the sync manager the legacy master key for upload and download", async () => {
+  await boot(false, true);
+  const calls = vi.mocked(SyncModule.createSyncManager).mock.calls;
+  expect(calls.length).toBeGreaterThan(0);
+  const [uploadDeps, downloadDeps] = calls.at(-1)!;
+  expect(bytesToHex(uploadDeps.masterKey)).toBe(SDK_LEGACY_KEY);
+  expect(bytesToHex(downloadDeps.masterKey)).toBe(SDK_LEGACY_KEY);
 });
