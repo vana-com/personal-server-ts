@@ -64,9 +64,13 @@ export interface SyncManagerOptions {
   /** Exact owner scopes to hydrate before the first full download cycle. */
   hydrateScopes?: string[];
   /**
-   * Whole-file stream sync (`streamSync.write`, default off). When `write`
-   * is true, each upload cycle runs the stream-sync publisher after the
-   * legacy upload. When it is false or absent, nothing changes.
+   * Whole-file stream sync (`streamSync.write`, default off). While `write`
+   * is true the account has switched: each upload cycle publishes through the
+   * stream-sync publisher and does NOT upload or register new legacy files
+   * (legacy is read-only history; downloads, reads and deletes stay). Hosts
+   * pass `write` as a getter over their config so a switch-off mid-run is
+   * seen on the next cycle and legacy uploads resume. When it is false or
+   * absent, nothing changes.
    */
   streamSync?: {
     readonly write: boolean;
@@ -258,6 +262,8 @@ export function createSyncManager(
         // DELETE did not. Cheap when nothing is pending; never blocks sync.
         if (transferMode === "upload-download") {
           if (
+            // Requeueing re-registers legacy files with the gateway.
+            !options?.streamSync?.write &&
             lostDataPointAttempts < MAX_LOST_DATA_POINT_ATTEMPTS &&
             // null: no full pass has completed yet (first cycle, or it threw).
             (lostDataPointRetryScopes === null ||
@@ -422,6 +428,13 @@ export function createSyncManager(
       );
     }
 
+    // Switched account: legacy is read-only history, so nothing new is
+    // uploaded to storage or registered with the gateway. The collected file
+    // stays local and is published by the stream-sync writer below.
+    if (options?.streamSync?.write === true) {
+      await publishStreamSync();
+      return;
+    }
     try {
       const uploadResults = await uploadAll(workerUploadDeps, {
         batchSize: uploadBatchSize,
@@ -452,6 +465,10 @@ export function createSyncManager(
       );
     }
 
+    await publishStreamSync();
+  }
+
+  async function publishStreamSync(): Promise<void> {
     if (options?.streamSync?.write) {
       try {
         await options.streamSync.publisher.cycle();

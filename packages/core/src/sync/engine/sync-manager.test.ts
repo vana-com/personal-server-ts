@@ -130,7 +130,7 @@ describe("SyncManager", () => {
       await manager.stop();
     });
 
-    it("publishes after the legacy upload when streamSync.write is on", async () => {
+    it("publishes instead of uploading legacy files when streamSync.write is on", async () => {
       const order: string[] = [];
       (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async () => {
         order.push("legacy");
@@ -149,7 +149,8 @@ describe("SyncManager", () => {
       );
       manager.start();
       await vi.advanceTimersByTimeAsync(0);
-      expect(order).toEqual(["legacy", "stream-sync"]);
+      // Legacy is read-only history once the writer is on: no legacy upload.
+      expect(order).toEqual(["stream-sync"]);
       await manager.stop();
     });
 

@@ -531,8 +531,9 @@ export async function createPsLiteSyncManager(
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
-  // Whole-file stream sync publishes beside the legacy upload, only when
-  // `streamSync.write` is on. Legacy uploads run unchanged either way.
+  // Whole-file stream sync publishes only when `streamSync.write` is on.
+  // While it is on, the sync manager stops uploading and registering new
+  // legacy files (read-only history); it reads the switch live each cycle.
   const streamSyncNet = streamSyncNetwork(options.config.gateway);
   const streamSyncHome = options.config.streamSync?.write
     ? options.streamSyncFiles
@@ -645,7 +646,13 @@ export async function createPsLiteSyncManager(
       },
       {
         streamSync: streamSyncWriter
-          ? { write: true, publisher: streamSyncWriter }
+          ? {
+              // Live: switching off mid-run resumes legacy uploads next cycle.
+              get write() {
+                return options.config.streamSync?.write === true;
+              },
+              publisher: streamSyncWriter,
+            }
           : null,
         deleteData,
         // Writer on = the account has switched. Read from config each cycle.

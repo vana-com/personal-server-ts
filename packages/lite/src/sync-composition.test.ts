@@ -135,12 +135,16 @@ async function openLite(opts: {
     cursor: string | null;
   };
   readFiles?: ReturnType<typeof createMemoryStreamSyncReadFiles>;
+  /** Override the parsed config; the host reads it live each cycle. */
+  config?: ReturnType<typeof ServerConfigSchema.parse>;
 }) {
   return createPsLiteSyncManager({
-    config: ServerConfigSchema.parse({
-      sync: { enabled: true },
-      streamSync: { read: true, write: true },
-    }),
+    config:
+      opts.config ??
+      ServerConfigSchema.parse({
+        sync: { enabled: true },
+        streamSync: { read: true, write: true },
+      }),
     stateStore: opts.stateStore,
     storage: opts.storage,
     ownerSignature: OWNER_SIGNATURE,
@@ -257,14 +261,23 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
     const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const shared = namedState("indexeddb:composition-b/state");
     const first = await fixture(shared, owner);
+    const holderConfig = ServerConfigSchema.parse({
+      sync: { enabled: true },
+      streamSync: { read: true, write: true },
+    });
     const holder = await openLite({
       stateStore: shared,
       storage: (await legacyStorage()).storage,
       identity: first.identity,
       gateway: first.gateway,
+      config: holderConfig,
     });
     expect(holder.streamSyncWriter).not.toBeNull();
-    await holder.syncManager.trigger(); // the holder recovers and owns its store
+    // Legacy uploads own the attempt store, and they pause while the writer
+    // switch is on. Read live: switch off so the holder uploads, recovers and
+    // owns its store (the writer, and so the stream home, stays held).
+    holderConfig.streamSync.write = false;
+    await holder.syncManager.trigger();
 
     try {
       // Same namespace, another wrapper object: the attempt store is excluded.
@@ -338,8 +351,23 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
     vi.stubGlobal("fetch", uploadFetch(owner));
     const { storage } = await legacyStorage();
     const { identity, gateway } = await fixture(stateStore, owner);
-    const lite = await openLite({ stateStore, storage, identity, gateway });
+    const config = ServerConfigSchema.parse({
+      sync: { enabled: true },
+      streamSync: { read: true, write: true },
+    });
+    const lite = await openLite({
+      stateStore,
+      storage,
+      identity,
+      gateway,
+      config,
+    });
     const writer = lite.streamSyncWriter!;
+    // Writer-on cycles pause legacy uploads, so the unsettled attempt comes
+    // from a cycle run with the switch off (the writer exists regardless).
+    config.streamSync.write = false;
+    await lite.syncManager.trigger();
+    config.streamSync.write = true;
     const realCycle = writer.cycle.bind(writer);
     let enteredWriter = false;
     let writerDone = false;
@@ -439,5 +467,90 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
       await lite.syncManager.stop();
       await lite.closeStreamSync();
     }
+  });
+});
+
+describe("PS Lite: legacy is read-only history while the stream writer is on", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  async function run(
+    ns: string,
+    write: boolean,
+    cycles: Array<
+      (config: ReturnType<typeof ServerConfigSchema.parse>) => void
+    >,
+  ) {
+    stubBrowserLocks();
+    const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
+    const stateStore = namedState(`indexeddb:${ns}/state`);
+    const { storage } = await legacyStorage();
+    const fetchMock = uploadFetch(owner);
+    vi.stubGlobal("fetch", fetchMock);
+    const { identity, gateway } = await fixture(stateStore, owner);
+    const config = ServerConfigSchema.parse({
+      sync: { enabled: true },
+      streamSync: { read: true, write },
+    });
+    const lite = await openLite({
+      stateStore,
+      storage,
+      identity,
+      gateway,
+      config,
+    });
+    const publish = lite.streamSyncWriter
+      ? vi.spyOn(lite.streamSyncWriter, "cycle")
+      : null;
+    const puts = () =>
+      fetchMock.mock.calls.filter(
+        (call) =>
+          (call[1] as { method?: string } | undefined)?.method === "PUT",
+      ).length;
+    const seen: Array<{ puts: number; registered: number; published: number }> =
+      [];
+    try {
+      for (const before of cycles) {
+        before(config);
+        await lite.syncManager.trigger();
+        seen.push({
+          puts: puts(),
+          registered: gateway.registerDataPoint.mock.calls.length,
+          published: publish?.mock.calls.length ?? 0,
+        });
+      }
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+    return seen;
+  }
+
+  it("writer on: no legacy upload and no gateway register, and the stream publish still runs", async () => {
+    const [cycle] = await run("gate-on", true, [() => {}]);
+    expect(cycle).toEqual({ puts: 0, registered: 0, published: 1 });
+  });
+
+  it("writer off: the legacy row uploads and registers as before", async () => {
+    const [cycle] = await run("gate-off", false, [() => {}]);
+    expect(cycle!.puts).toBeGreaterThan(0);
+    expect(cycle!.registered).toBeGreaterThan(0);
+    expect(cycle!.published).toBe(0);
+  });
+
+  it("switched off mid-run: legacy uploads resume on the next cycle", async () => {
+    const [first, second] = await run("gate-toggle", true, [
+      () => {},
+      (config) => {
+        config.streamSync.write = false;
+      },
+    ]);
+    expect(first).toEqual({ puts: 0, registered: 0, published: 1 });
+    expect(second!.puts).toBeGreaterThan(0);
+    expect(second!.registered).toBeGreaterThan(0);
+    // The publisher does not run once the switch is off.
+    expect(second!.published).toBe(1);
   });
 });

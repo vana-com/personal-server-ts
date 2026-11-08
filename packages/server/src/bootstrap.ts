@@ -898,8 +898,9 @@ export async function createServer(
       );
     }
 
-    // Whole-file stream sync publishes beside the legacy upload, only when
-    // `streamSync.write` is on. Legacy uploads run unchanged either way.
+    // Whole-file stream sync publishes only when `streamSync.write` is on.
+    // While it is on, the sync manager stops uploading and registering new
+    // legacy files (read-only history); it reads the switch live each cycle.
     if (config.streamSync.write && !isEnclave) {
       let writerForSeed: StreamSyncWriter | null = null;
       const streamSyncHome = await openFsStreamSyncHome({
@@ -981,7 +982,13 @@ export async function createServer(
 
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
       streamSync: streamSyncWriter
-        ? { write: true, publisher: streamSyncWriter }
+        ? {
+            // Live: switching off mid-run resumes legacy uploads next cycle.
+            get write() {
+              return config.streamSync.write;
+            },
+            publisher: streamSyncWriter,
+          }
         : null,
       deleteData,
       // Legacy files of scopes the stream views replace are retired while
