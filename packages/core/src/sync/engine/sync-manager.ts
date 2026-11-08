@@ -2,6 +2,7 @@ import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
+import { createUploadStateTracker } from "../upload-state.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
 import {
@@ -113,6 +114,8 @@ export function createSyncManager(
   const downloadRetryMemory = createDownloadRetryMemory();
   // Re-submissions of deletes whose tombstone failed (bounded per boot).
   const tombstoneResubmits = createTombstoneResubmitTracker();
+  // Entries too large to upload and failing uploads that back off (per boot).
+  const uploadState = uploadDeps.uploadState ?? createUploadStateTracker();
   const dataPointFeed = downloadDeps.dataPointFeed ?? uploadDeps.dataPointFeed;
   const scopeDeletions =
     uploadDeps.scopeDeletions ?? downloadDeps.scopeDeletions;
@@ -120,6 +123,7 @@ export function createSyncManager(
   // abandon mid-race; it shares the manager's marker store.
   const workerUploadDeps: UploadWorkerDeps = {
     ...uploadDeps,
+    uploadState,
     pendingBlobDeletions:
       uploadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
   };
@@ -460,6 +464,7 @@ export function createSyncManager(
         hydratedScopes: [...hydratedScopes],
         errors: [...errors],
         deletions: tombstoneResubmits.snapshot(),
+        uploads: uploadState.snapshot(),
       };
     },
 
@@ -485,6 +490,7 @@ export function createSyncManager(
       const result = await exclusive(() => {
         // A delete the user asks for starts a fresh set of re-submissions.
         tombstoneResubmits.reset(scope);
+        uploadState.clearScope(scope);
         return deleteScope(deleteScopeDeps(), scope);
       });
       if (result.durable && uploadDeps.additions)

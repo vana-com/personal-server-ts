@@ -100,10 +100,14 @@ export interface UploadStateTracker {
   shouldAttempt(path: string, nowMs: number): boolean;
   /** Count one failed attempt. */
   recordFailure(entry: UploadStateEntry, error: string, nowMs: number): void;
+  /** Whether any state is held for the entry. */
+  has(path: string): boolean;
+  /** Forget every entry whose path is not in `paths` (the rows are gone). */
+  retainOnly(paths: readonly string[]): void;
+  /** New data arrived for `scope`: stopped entries there try again. */
+  releaseStopped(scope: string): void;
   /** The entry synced or was removed: forget it. */
   clear(path: string): void;
-  /** New data arrived for `scope`: forget its other entries' state. */
-  clearScopeExcept(scope: string, keepPath: string): void;
   /** Forget every entry of `scope` (owner retry, scope deletion). */
   clearScope(scope: string): void;
   snapshot(): UploadStateSnapshot;
@@ -162,9 +166,18 @@ export function createUploadStateTracker(
     clear(path) {
       states.delete(path);
     },
-    clearScopeExcept(scope, keepPath) {
+    has(path) {
+      return states.has(path);
+    },
+    retainOnly(paths) {
+      const keep = new Set(paths);
+      for (const path of states.keys())
+        if (!keep.has(path)) states.delete(path);
+    },
+    releaseStopped(scope) {
       for (const [path, state] of states) {
-        if (state.scope === scope && path !== keepPath) states.delete(path);
+        if (state.scope === scope && state.stoppedAtMs !== null)
+          states.delete(path);
       }
     },
     clearScope(scope) {

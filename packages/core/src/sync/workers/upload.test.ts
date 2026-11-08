@@ -1388,15 +1388,18 @@ describe("uploadAll — upload size cap and bounded retry", () => {
     await cycle(deps, 30_000);
     expect(upload).toHaveBeenCalledTimes(1);
 
-    // Backoff doubles: 1, 2, 4, 8, 16, 32, 60 minutes.
-    let now = 61_000;
-    for (const wait of [1, 2, 4, 8, 16, 32, 60]) {
-      await cycle(deps, now - 1_000);
+    // After failure n the wait is 2^(n-1) minutes, capped at 60.
+    let last = 0;
+    for (const waitMinutes of [1, 2, 4, 8, 16, 32, 60]) {
+      const due = last + waitMinutes * MINUTE;
       const before = upload.mock.calls.length;
-      await cycle(deps, now);
+      await cycle(deps, due - 1_000);
+      expect(upload.mock.calls.length).toBe(before);
+      await cycle(deps, due);
       expect(upload.mock.calls.length).toBe(before + 1);
-      now += (wait * 2 > 60 ? 60 : wait * 2) * MINUTE + 1_000;
+      last = due;
     }
+    const now = last;
 
     expect(upload).toHaveBeenCalledTimes(8);
     expect(uploadState.snapshot().retrying).toEqual([]);

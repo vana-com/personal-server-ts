@@ -26,6 +26,12 @@ import {
   type ScopeDeletionTracker,
 } from "../scope-deletions.js";
 import type { LineageGatewayPort } from "../../lineage/gateway.js";
+import {
+  MAX_UPLOAD_BODY_BYTES,
+  createUploadStateTracker,
+  exceedsUploadCap,
+  type UploadStateTracker,
+} from "../upload-state.js";
 
 export { computeDataPointId } from "../data-point-id.js";
 export { isEntryCoveredByTombstone } from "../scope-deletions.js";
@@ -66,6 +72,13 @@ export interface UploadWorkerDeps {
    * version key; exact-key cleanup belongs to the durable deletion worker.
    */
   pendingBlobDeletions?: PendingBlobDeletionStore;
+  /**
+   * Owner-visible record of entries that are too large to upload and of
+   * failing uploads that back off. The sync manager owns one and reports it
+   * in its status. Without it, `uploadAll` keeps no memory across calls: the
+   * size cap still applies, but failures are retried on every call.
+   */
+  uploadState?: UploadStateTracker;
 }
 
 export interface UploadResult {
@@ -110,6 +123,23 @@ export class DeletedScopeEntryError extends Error {
   constructor(path: string, deletedAt: string) {
     super(`Dropped local entry for a scope deleted at ${deletedAt}: ${path}`);
     this.name = "DeletedScopeEntryError";
+  }
+}
+
+/**
+ * Thrown before anything is read when an unsynced entry's upload body would
+ * pass `MAX_UPLOAD_BODY_BYTES`. The entry stays local and readable; it can
+ * never sync, so retrying it is wasted work.
+ */
+export class UploadTooLargeError extends Error {
+  constructor(
+    readonly path: string,
+    readonly sizeBytes: number,
+  ) {
+    super(
+      `Too large to sync: ${path} is ${sizeBytes} bytes and an upload body is limited to ${MAX_UPLOAD_BODY_BYTES} bytes`,
+    );
+    this.name = "UploadTooLargeError";
   }
 }
 
@@ -181,6 +211,11 @@ export async function uploadOne(
     serverOwner,
     logger,
   } = deps;
+
+  // Decide from the stored size alone, before anything is read, parsed or
+  // encrypted: a body over the request limit can never be accepted.
+  if (!entry.dataPointId && exceedsUploadCap(entry.sizeBytes))
+    throw new UploadTooLargeError(entry.path, entry.sizeBytes);
 
   // 1. Read local data file
   let envelope;
@@ -411,8 +446,18 @@ export async function uploadAll(
   const entries = deps.storage.findUnsynced({ limit: batchSize });
   const nowMs = (options?.now ?? (() => new Date()))().getTime();
   const plans = coalescePlan(deps, entries, nowMs);
+  const state = deps.uploadState ?? createUploadStateTracker();
+  // A short page is the whole unsynced set: forget rows that are gone.
+  if (entries.length < batchSize) state.retainOnly(entries.map((e) => e.path));
   const handled = new Set<string>();
   const results: UploadResult[] = [];
+
+  /** Erase superseded snapshots and forget their upload state. */
+  const supersede = async (head: IndexEntry) => {
+    const older = olderUnsynced(deps, head);
+    await eraseSuperseded(deps, older);
+    for (const entry of older) state.clear(entry.path);
+  };
 
   for (const entry of entries) {
     const plan = plans.get(entry.scope);
@@ -423,15 +468,20 @@ export async function uploadAll(
       if (plan.head.dataPointId !== null) {
         // The latest version is already published: older unpublished
         // snapshots are superseded, never published.
-        await eraseSuperseded(deps, olderUnsynced(deps, plan.head));
+        await supersede(plan.head);
         continue;
       }
     }
     const target = plan ? plan.head : entry;
+    if (!state.shouldAttempt(target.path, nowMs)) continue;
+    // A first attempt at an entry is new data: it releases the scope's
+    // stopped entries to try again.
+    if (!state.has(target.path)) state.releaseStopped(target.scope);
     try {
       const result = await uploadOne(deps, target);
       results.push(result);
-      if (plan) await eraseSuperseded(deps, olderUnsynced(deps, plan.head));
+      state.clear(target.path);
+      if (plan) await supersede(plan.head);
     } catch (err) {
       // A dropped orphan is a self-heal, not a failure: the row is already
       // gone, there is nothing to retry, and surfacing it would keep the
@@ -441,14 +491,48 @@ export async function uploadAll(
         err instanceof OrphanedEntryError ||
         err instanceof DeletedScopeEntryError
       ) {
+        state.clear(target.path);
+        continue;
+      }
+      // Too large to ever upload: not a failure to retry. Note it for the
+      // owner and log it once. The older snapshots of a coalesced scope are
+      // kept, since the head they would be superseded by never publishes.
+      if (err instanceof UploadTooLargeError) {
+        if (
+          state.markTooLarge(
+            { scope: target.scope, path: target.path },
+            target.sizeBytes,
+          )
+        ) {
+          deps.logger.warn(
+            {
+              path: target.path,
+              scope: target.scope,
+              sizeBytes: target.sizeBytes,
+              maxBodyBytes: MAX_UPLOAD_BODY_BYTES,
+            },
+            "Entry is too large to sync; it stays local and is not uploaded",
+          );
+        }
         continue;
       }
       const error = err as Error;
+      state.recordFailure(
+        { scope: target.scope, path: target.path },
+        error.message,
+        nowMs,
+      );
       options?.onError?.(entry, error);
       deps.logger.error(
         { path: entry.path, scope: entry.scope, error: error.message },
         "Failed to upload entry",
       );
+      if (!state.shouldAttempt(target.path, Number.MAX_SAFE_INTEGER)) {
+        deps.logger.warn(
+          { path: target.path, scope: target.scope },
+          "Stopped retrying the upload of an entry after repeated failures",
+        );
+      }
     }
   }
 
