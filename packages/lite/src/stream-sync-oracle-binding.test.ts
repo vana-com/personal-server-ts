@@ -41,9 +41,15 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+/**
+ * Verdicts, not sampled memory, are under test, so no forced GC is needed. The
+ * tamper closures run in-process and cannot move to the --expose-gc child that
+ * the bounded test uses.
+ */
 function run(tag: string, tamper?: RunOptions["tamper"]) {
   return runScenario(SPEC, {
     dir: join(root, tag),
+    forcedGc: false,
     ...(tamper ? { tamper } : {}),
   });
 }
@@ -140,6 +146,48 @@ describe("heap oracle is bound to the published registry head", () => {
         await ctx.blobs.put(partKey, await ctx.keys.encrypt(ctx.scope, clear));
       }),
     ).rejects.toThrow(/SHA-256/);
+  }, 120_000);
+
+  it("rejects a head of a later generation that the control row does not name", async () => {
+    // Control stays at generation 1. The head and its parts are re-encoded and
+    // re-hashed as generation 99, and the stream row is repointed to them, so
+    // every blob and hash check passes. Only the liveness rule can reject it.
+    await expect(
+      run("stale-generation", async (ctx) => {
+        const row = await currentRow(ctx);
+        const cipher = await ctx.blobs.get(
+          `${ctx.scope}/${headNameOf(row.dataHash)}`,
+        );
+        const decoded = decodeHead(await ctx.keys.decrypt(ctx.scope, cipher!));
+        if (decoded.kind !== "ok") throw new Error("tamper: head not ok");
+        const head = decoded.head;
+        const GENERATION = 99;
+        for (const part of head.parts) {
+          const from = await ctx.blobs.get(
+            `${ctx.scope}/${partBlobName(head.generation, part.hash)}`,
+          );
+          await ctx.blobs.put(
+            `${ctx.scope}/${partBlobName(GENERATION, part.hash)}`,
+            from!,
+          );
+        }
+        const bytes = encodeHead({ ...head, generation: GENERATION });
+        const hex = toHex(await streamSyncHashes.keccak256(bytes));
+        await ctx.blobs.put(
+          `${ctx.scope}/h-${hex}`,
+          await ctx.keys.encrypt(ctx.scope, bytes),
+        );
+        await repointRegistry(ctx, `0x${hex}`);
+      }),
+    ).rejects.toThrow(/not live/);
+  }, 120_000);
+
+  it("rejects a head whose stream row is deleted", async () => {
+    await expect(
+      run("stream-row-deleted", async (ctx) => {
+        ctx.setDeleted(ctx.scope);
+      }),
+    ).rejects.toThrow(/not live/);
   }, 120_000);
 });
 

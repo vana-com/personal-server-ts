@@ -42,8 +42,13 @@ import {
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
+  classifyControl,
+  classifyStreamRow,
+  controlHashes,
+  controlScope,
   decodePart,
   deriveKeyCheck,
+  isHeadLive,
   partBlobName,
   streamScope,
   verifyHead,
@@ -98,8 +103,8 @@ function liveBytes(): number {
  * (measured: 96 MiB raw -> 96 MiB after one gc -> 40 MiB after three). So GC
  * repeats until the reading stops falling.
  */
-function settledLive(): number {
-  if (!FORCE_GC) return liveBytes();
+function settledLive(forced: boolean): number {
+  if (!forced) return liveBytes();
   const gc = (globalThis as { gc?: () => void }).gc;
   if (!gc) throw new Error("run with node --expose-gc");
   let prev = Infinity;
@@ -117,6 +122,7 @@ const GC_TRIGGER = 8 * 1024 * 1024;
 const FORCE_GC = process.env.P3_NO_FORCED_GC !== "1";
 
 export class HeapSampler {
+  constructor(private readonly forced: boolean = FORCE_GC) {}
   private peak = 0;
   private peakAt = "";
   private peakUpper = 0;
@@ -137,7 +143,7 @@ export class HeapSampler {
     if (!this.active) return;
     const collect = options.collect ?? true;
     if (collect) {
-      const used = settledLive();
+      const used = settledLive(this.forced);
       this.samples += 1;
       if (used > (this.byLabel[label] ?? 0)) this.byLabel[label] = used;
       if (used > this.peak) {
@@ -162,12 +168,12 @@ export class HeapSampler {
    * reading below the trigger can overstate live bytes by at most GC_TRIGGER.
    */
   startTimer(): void {
-    this.lastLive = settledLive();
+    this.lastLive = settledLive(this.forced);
     this.timer = setInterval(() => {
       if (!this.active) return;
       const raw = liveBytes();
       if (raw - this.lastLive > GC_TRIGGER) {
-        this.lastLive = settledLive();
+        this.lastLive = settledLive(this.forced);
         if (this.lastLive > this.peak) {
           this.peak = this.lastLive;
           this.peakAt = "timer";
@@ -294,10 +300,19 @@ export function bridgeBlobs(
   };
 }
 
-/** Exclusive-version registry: POST at version+1 writes, identical replays. */
-function fakeRegistry(): StreamSyncRegistry {
+/**
+ * Exclusive-version registry: POST at version+1 writes, identical replays.
+ * `setDeleted` marks a scope's latest row deleted, as a registry delete does.
+ */
+function fakeRegistry(): StreamSyncRegistry & {
+  setDeleted(scope: string): void;
+} {
   const rows = new Map<string, { dataHash: string; metadataHash: string }[]>();
+  const deleted = new Set<string>();
   return {
+    setDeleted(scope) {
+      deleted.add(scope);
+    },
     async read(scope): Promise<ControlRead> {
       const versions = rows.get(scope);
       if (!versions || versions.length === 0) return { found: false };
@@ -307,7 +322,7 @@ function fakeRegistry(): StreamSyncRegistry {
         version: versions.length,
         dataHash: head.dataHash as `0x${string}`,
         metadataHash: head.metadataHash as `0x${string}`,
-        deleted: false,
+        deleted: deleted.has(scope),
       } as ControlRead;
     },
     async post(request) {
@@ -338,6 +353,12 @@ function fakeRegistry(): StreamSyncRegistry {
 }
 
 export interface RunOptions {
+  /**
+   * Force a settled GC at each sample (default: on, unless P3_NO_FORCED_GC=1).
+   * Forcing needs `node --expose-gc`. A run that checks only outputs and
+   * verdicts, not sampled memory, passes `false` so it does not need the flag.
+   */
+  readonly forcedGc?: boolean;
   /** Writer target per part (bytes). Omit for the writer default. */
   readonly partTargetBytes?: number;
   /** Reduce budget per group (bytes). Omit for the writer default. */
@@ -359,6 +380,8 @@ export interface TamperContext {
   readonly registry: StreamSyncRegistry;
   readonly blobs: StreamSyncBlobs & { keys(): string[] };
   readonly keys: StreamSyncKeyPorts;
+  /** Mark a scope's latest registry row deleted (`deleted: true` on read). */
+  readonly setDeleted: (scope: string) => void;
 }
 
 /**
@@ -457,7 +480,8 @@ export async function runScenario(
   spec: ScenarioSpec,
   options: RunOptions,
 ): Promise<RunReport> {
-  const sampler = new HeapSampler();
+  const forced = options.forcedGc ?? FORCE_GC;
+  const sampler = new HeapSampler(forced);
   const files = diskFiles(join(options.dir, "files"), sampler);
   const blobs = bridgeBlobs(join(options.dir, "blobs"), sampler);
   const baseKeys = createStreamSyncKeyPorts(OWNER_SIGNATURE);
@@ -498,7 +522,7 @@ export async function runScenario(
     spoolFlushBytes: options.spoolFlushBytes,
   });
 
-  const baseline = await settledHeap();
+  const baseline = settledLive(forced);
   sampler.startTimer();
   const started = Date.now();
   const alloc = await startAllocProfile();
@@ -537,10 +561,16 @@ export async function runScenario(
     "missing";
   const scope = streamScope(CONNECTOR, NS, STREAM);
   if (options.tamper) {
-    await options.tamper({ scope, registry, blobs, keys: baseKeys });
+    await options.tamper({
+      scope,
+      registry,
+      blobs,
+      keys: baseKeys,
+      setDeleted: (target) => registry.setDeleted(target),
+    });
   }
   const row = await registry.read(scope);
-  const verified = await verify(scope, row, blobs, baseKeys);
+  const verified = await verify(scope, row, blobs, baseKeys, registry);
   const expected = expectedDigest(spec);
   return {
     spec,
@@ -556,22 +586,25 @@ export async function runScenario(
     tooLargeSpooled,
     outcome,
     ...allocSummary,
-    forcedGc: FORCE_GC,
+    forcedGc: forced,
   };
 }
 
 /**
  * Verify the published stream the way a real reader does: the head is the one
- * the registry's dataHash names, checked by verifyHead; every part is checked
- * by decodePart (SHA-256, byte length, line count, primary-key placement); and
- * the verified line total must equal the head's recordCount. Any failure throws,
- * so a wrong published state fails the run instead of reporting expected totals.
+ * the registry's dataHash names, checked by verifyHead; the head is live (the
+ * control row is active at the head's generation and the stream row is not
+ * tombstoned, by isHeadLive); every part is checked by decodePart (SHA-256,
+ * byte length, line count, primary-key placement); and the verified line total
+ * must equal the head's recordCount. Any failure throws, so a wrong published
+ * state fails the run instead of reporting expected totals.
  */
 async function verify(
   scope: string,
   row: ControlRead,
   blobs: StreamSyncBlobs & { keys(): string[] },
   keys: StreamSyncKeyPorts,
+  registry: StreamSyncRegistry,
 ): Promise<{
   digest: string;
   parts: number;
@@ -598,6 +631,17 @@ async function verify(
     throw new Error(`oracle: head rejected (${verified.kind})`);
   }
   const head = verified.head;
+  const hashes = await controlHashes(streamSyncHashes.keccak256, keyCheck);
+  const control = classifyControl(
+    await registry.read(controlScope(CONNECTOR, NS)),
+    hashes,
+  );
+  const streamRow = classifyStreamRow(row, hashes);
+  if (!isHeadLive(control, streamRow, head.generation)) {
+    throw new Error(
+      `oracle: head of generation ${head.generation} is not live (control ${control.kind}, stream row ${streamRow})`,
+    );
+  }
   const digest = new SetDigest();
   let parts = 0;
   let partBytesMax = 0;
@@ -626,8 +670,4 @@ async function verify(
     );
   }
   return { digest: digest.hex(), parts, partBytesMax, outputCount };
-}
-
-async function settledHeap(): Promise<number> {
-  return settledLive();
 }

@@ -65,12 +65,17 @@ async function runChild(spec: ScenarioSpec, tag: string): Promise<RunReport> {
   return JSON.parse(line) as RunReport;
 }
 
-function assertBounded(report: RunReport, budget: number): void {
+/** Output checks that must pass before any memory number means anything. */
+function assertCorrect(report: RunReport): void {
   expect(report.outcome).toBe("committed");
   expect(report.tooLargeSpooled).toBe(report.spec.kind === "big8" ? 1 : 0);
   expect(report.countOk).toBe(true);
   expect(report.digestOk).toBe(true);
   expect(report.outputCount).toBe(expectedCount(report.spec));
+}
+
+function assertBounded(report: RunReport, budget: number): void {
+  assertCorrect(report);
   const above = report.heap.peakBytes - report.baselineBytes;
   expect(
     above,
@@ -105,6 +110,9 @@ describe("stream-sync bounded writer (small twin, always)", () => {
       { kind: "uniform", records: 20_000 },
       "flat-l",
     );
+    // Correct output first: a run that drops or changes records can look flat.
+    assertCorrect(small);
+    assertCorrect(large);
     const delta = Math.abs(
       small.heap.peakBytes -
         small.baselineBytes -
