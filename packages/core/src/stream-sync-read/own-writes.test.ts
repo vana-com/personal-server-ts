@@ -79,29 +79,38 @@ class Gateway implements StreamSyncRegistry {
     )!;
   }
 
-  /** The owner deletes `stream`: a deletedAt tombstone as the next version. */
-  deleteStream(stream = "items"): void {
-    const scope = this.streamRow(stream);
+  /** The control row of this connector. */
+  private controlRow(): string {
+    return [...this.versions.keys()].find(
+      (s) => parseScope(s)?.kind === "control",
+    )!;
+  }
+
+  /** The next version of `scope`: the head's hashes, deleted or live. */
+  private append(scope: string, deleted: boolean): void {
     const rows = this.versions.get(scope)!;
     const head = rows[rows.length - 1]!;
     rows.push({
       dataHash: head.dataHash,
       metadataHash: head.metadataHash,
       at: new Date(T0 + rows.length * 1000).toISOString(),
-      deleted: true,
+      ...(deleted ? { deleted: true } : {}),
     });
   }
 
-  /** The stream is live again: a new non-deleted version after the tombstone. */
-  reliveStream(stream = "items"): void {
-    const scope = this.streamRow(stream);
-    const rows = this.versions.get(scope)!;
-    const head = rows[rows.length - 1]!;
-    rows.push({
-      dataHash: head.dataHash,
-      metadataHash: head.metadataHash,
-      at: new Date(T0 + rows.length * 1000).toISOString(),
-    });
+  /** The owner deletes `stream`: a deletedAt tombstone as the next version. */
+  deleteStream(stream = "items"): void {
+    this.append(this.streamRow(stream), true);
+  }
+
+  /** The owner deletes the connection: its control row is tombstoned. */
+  deleteControl(): void {
+    this.append(this.controlRow(), true);
+  }
+
+  /** The connection is reconnected: its control row is live at a new version. */
+  reviveControl(): void {
+    this.append(this.controlRow(), false);
   }
 
   /** A stream row of another namespace, already tombstoned (v1 live, v2 deleted). */
@@ -590,30 +599,68 @@ describe("own-write visibility (deletion floor)", () => {
     expect(await latest(service)).toMatchObject({ rows: { a: 1 } });
   });
 
-  // Gate: #563 (feat/stream-sync-p4). Its stream-row predicate is not on that
-  // branch yet, so this stays `it.fails` until the predicate is used by
-  // contributions() for pending and in-flight runs. Remove `.fails` then.
-  it.fails(
-    "does not serve a run collected before a stream deletion, after a relive (gate: #563)",
-    async () => {
-      const d = new Device();
-      const service = await d.openReader();
-      await d.collect([{ id: "a", v: 1 }]);
-      await d.publish();
-      await d.collect([{ id: "b", v: 2 }]);
-      // The reader sees the tombstone (the floor), then the relive (not imported).
-      d.gateway.deleteStream("items");
-      await service.observe(d.gateway.feed(), {
-        fromStart: true,
-        lastPage: true,
-      });
-      d.gateway.reliveStream("items");
-      await service.observe(d.gateway.feed(), {
-        fromStart: true,
-        lastPage: true,
-      });
-      expect((await latest(service)).rows).not.toHaveProperty("a");
-      expect((await latest(service)).rows).not.toHaveProperty("b");
-    },
-  );
+  // A run collected under connection generation g stays pending when the
+  // connection is deleted and reconnected: the reconnect is a new control
+  // version, so the run's generation no longer matches and the reader hides it
+  // (contributions(), service.ts:644-648). Guard test: it passes without the
+  // delete predicate #563 adds (runDeletedSince).
+  it("does not serve a run collected before a connection delete, after a reconnect", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    await d.collect([{ id: "a", v: 1 }]);
+    await d.publish();
+    await d.collect([{ id: "b", v: 2 }]);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    // Precondition: the pending run is served while the connection is active.
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+    d.gateway.deleteControl();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    d.gateway.reviveControl();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    // The precondition above shows `b` is served while active, so this absence
+    // is the hiding, not an empty read.
+    expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
+
+  // The same rule for a run whose publish is in flight: its rows are never
+  // served, so the check is on the withheld list the owner read names.
+  it("does not name an in-flight run collected before a connection delete, after a reconnect", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    await d.collect([{ id: "a", v: 1 }]);
+    await d.publish();
+    d.gateway.failPosts = true;
+    const inFlight = await d.collect([{ id: "b", v: 2 }]);
+    await d.publish();
+    d.gateway.failPosts = false;
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    // Precondition: the run is in flight under the active connection.
+    expect(await withheldOf(service)).toEqual([
+      { runId: inFlight, stream: "items", reason: "publication_in_flight" },
+    ]);
+    d.gateway.deleteControl();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    d.gateway.reviveControl();
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await withheldOf(service)).toEqual([]);
+    expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
 });
