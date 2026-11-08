@@ -1,9 +1,8 @@
 {
-  "version": 1,
-  "about": "Run outcomes for one mutable or append-only stream after a base of three records (a, b, z). decision is what each side does to the stream's other-device copy: replace (drop what the run omits) or merge (same-key merge only). Intake sees: outcome, collection, timeRange, semantics, records, skippedDelete, oversize, covered. The desktop producer sees: mode, detailGap, proof, records, semantics. A detail gap reaches intake as covered=false. The completion proof, and a record too large for the writer, reach only one side. producerOnly marks a case where the two sides cannot see the same input. safe=false marks a case where intake replaces and the producer merges.",
+  "version": 2,
+  "about": "Run outcomes for one mutable or append-only stream after a base of three records (a, b, z). producer and intake are what each side does to the stream's other-device copy: replace (drop what the run omits) or merge (same-key merge only). Intake sees: outcome, collection, timeRange, semantics, records, skippedDelete, oversize, covered, retainedState (incremental runs: whether a cursor was saved). The desktop producer sees: mode, collection, timeRange, retainedState, semantics, records, skippedDelete, detailGap, proof. proof says what the producer's completion proof is built from: matching (the run's own records), mismatched (other records), none (no reviewed completion contract). The completion proof, and a record too large for the writer, reach only one side. producerOnly marks a case where the two sides cannot see the same input. safe=false marks a case where intake replaces and the producer merges. Both sides' decisions are asserted by their tests; a change to any value must change the hash in both tests.",
   "cases": [
     {
-      "id": "covered-full-refresh",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -15,13 +14,14 @@
       "covered": true,
       "detailGap": false,
       "proof": "matching",
+      "retainedState": true,
       "producer": "replace",
       "intake": "replace",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "covered-full-refresh"
     },
     {
-      "id": "partial-outcome-other-stream-uncovered",
       "outcome": "partial",
       "mode": "completed",
       "collection": "full_refresh",
@@ -33,13 +33,14 @@
       "covered": true,
       "detailGap": false,
       "proof": "matching",
+      "retainedState": true,
       "producer": "replace",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "partial-outcome-other-stream-uncovered"
     },
     {
-      "id": "certified-failed-done",
       "outcome": "partial",
       "mode": "certified_failed_done",
       "collection": "full_refresh",
@@ -51,13 +52,14 @@
       "covered": true,
       "detailGap": false,
       "proof": "matching",
+      "retainedState": true,
       "producer": "replace",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "certified-failed-done"
     },
     {
-      "id": "failed-done-upsert-only",
       "outcome": "partial",
       "mode": "failed_done_upsert_only",
       "collection": "full_refresh",
@@ -69,13 +71,14 @@
       "covered": false,
       "detailGap": false,
       "proof": "matching",
+      "retainedState": true,
       "producer": "merge",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "failed-done-upsert-only"
     },
     {
-      "id": "retry-pending",
       "outcome": "retry_pending",
       "mode": "completed",
       "collection": "full_refresh",
@@ -87,13 +90,14 @@
       "covered": false,
       "detailGap": false,
       "proof": "matching",
+      "retainedState": true,
       "producer": "replace",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "retry-pending"
     },
     {
-      "id": "incremental-run",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "incremental",
@@ -104,14 +108,34 @@
       "oversize": false,
       "covered": true,
       "detailGap": false,
-      "proof": "none",
+      "proof": "matching",
+      "retainedState": true,
       "producer": "merge",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "incremental-with-retained-state"
     },
     {
-      "id": "time-range",
+      "outcome": "succeeded",
+      "mode": "completed",
+      "collection": "incremental",
+      "timeRange": false,
+      "semantics": "mutable_state",
+      "records": 2,
+      "skippedDelete": false,
+      "oversize": false,
+      "covered": true,
+      "detailGap": false,
+      "proof": "matching",
+      "retainedState": false,
+      "producer": "replace",
+      "intake": "merge",
+      "producerOnly": false,
+      "safe": true,
+      "id": "incremental-without-state"
+    },
+    {
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -122,14 +146,15 @@
       "oversize": false,
       "covered": true,
       "detailGap": false,
-      "proof": "none",
+      "proof": "matching",
+      "retainedState": true,
       "producer": "merge",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "time-range"
     },
     {
-      "id": "skipped-delete",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -140,14 +165,15 @@
       "oversize": false,
       "covered": true,
       "detailGap": false,
-      "proof": "none",
+      "proof": "matching",
+      "retainedState": true,
       "producer": "merge",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "skipped-delete"
     },
     {
-      "id": "oversize-record",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -159,13 +185,14 @@
       "covered": true,
       "detailGap": false,
       "proof": "matching",
+      "retainedState": true,
       "producer": "replace",
       "intake": "merge",
       "producerOnly": true,
-      "safe": true
+      "safe": true,
+      "id": "oversize-record"
     },
     {
-      "id": "zero-records",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -177,13 +204,33 @@
       "covered": true,
       "detailGap": false,
       "proof": "matching",
+      "retainedState": true,
+      "producer": "replace",
+      "intake": "merge",
+      "producerOnly": true,
+      "safe": true,
+      "id": "covered-empty-proven"
+    },
+    {
+      "outcome": "succeeded",
+      "mode": "completed",
+      "collection": "full_refresh",
+      "timeRange": false,
+      "semantics": "mutable_state",
+      "records": 0,
+      "skippedDelete": false,
+      "oversize": false,
+      "covered": true,
+      "detailGap": false,
+      "proof": "none",
+      "retainedState": true,
       "producer": "merge",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "unproven-empty"
     },
     {
-      "id": "append-only-stream",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -194,14 +241,15 @@
       "oversize": false,
       "covered": true,
       "detailGap": false,
-      "proof": "none",
+      "proof": "matching",
+      "retainedState": true,
       "producer": "merge",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "append-only-stream"
     },
     {
-      "id": "detail-gap-no-proof",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -213,13 +261,14 @@
       "covered": false,
       "detailGap": true,
       "proof": "none",
+      "retainedState": true,
       "producer": "merge",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "detail-gap-no-proof"
     },
     {
-      "id": "detail-gap-with-proof",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -231,13 +280,14 @@
       "covered": false,
       "detailGap": true,
       "proof": "matching",
+      "retainedState": true,
       "producer": "merge",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "detail-gap-with-proof"
     },
     {
-      "id": "stream-not-covered",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -249,13 +299,14 @@
       "covered": false,
       "detailGap": false,
       "proof": "none",
+      "retainedState": true,
       "producer": "merge",
       "intake": "merge",
       "producerOnly": false,
-      "safe": true
+      "safe": true,
+      "id": "stream-not-covered"
     },
     {
-      "id": "no-completion-proof",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -267,13 +318,14 @@
       "covered": true,
       "detailGap": false,
       "proof": "none",
+      "retainedState": true,
       "producer": "merge",
       "intake": "replace",
       "producerOnly": true,
-      "safe": false
+      "safe": false,
+      "id": "no-completion-proof"
     },
     {
-      "id": "proof-does-not-match-records",
       "outcome": "succeeded",
       "mode": "completed",
       "collection": "full_refresh",
@@ -285,10 +337,12 @@
       "covered": true,
       "detailGap": false,
       "proof": "mismatched",
+      "retainedState": true,
       "producer": "merge",
       "intake": "replace",
       "producerOnly": true,
-      "safe": false
+      "safe": false,
+      "id": "proof-does-not-match-records"
     }
   ]
 }

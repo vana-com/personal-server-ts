@@ -902,7 +902,7 @@ describe(
  * listed, not hidden.
  */
 const CASES_SHA256 =
-  "72013bbe9bf13c6bcf3238257f9e72e491ff605f16f96df6d571e070746f90f8";
+  "497d62c3490cb197641bcf3488bafeaaabb5f31ac1edb8a1432c40c832a86fc2";
 
 interface ConformanceCase {
   readonly id: string;
@@ -914,6 +914,7 @@ interface ConformanceCase {
   readonly skippedDelete: boolean;
   readonly oversize: boolean;
   readonly covered: boolean;
+  readonly retainedState: boolean;
   readonly producer: "replace" | "merge";
   readonly intake: "replace" | "merge";
   readonly producerOnly: boolean;
@@ -937,7 +938,7 @@ describe(
       expect(createHash("sha256").update(casesBytes).digest("hex")).toBe(
         CASES_SHA256,
       );
-      expect(CASES).toHaveLength(16);
+      expect(CASES).toHaveLength(18);
       expect(new Set(CASES.map((c) => c.id)).size).toBe(CASES.length);
     });
 
@@ -948,7 +949,7 @@ describe(
       await run(h, "r1", connector, {
         records: ["a", "b", "z"].map((id) => ({ stream, data: row(id) })),
         covered: [stream],
-        candidate: { [stream]: "c1" },
+        candidate: c.retainedState ? { [stream]: "c1" } : undefined,
       });
       await publish(h, "r1");
       const records: { stream: string; op?: string; data: unknown }[] = [
@@ -1023,7 +1024,9 @@ describe(
         "partial-outcome-other-stream-uncovered",
         "certified-failed-done",
         "retry-pending",
+        "incremental-without-state",
         "oversize-record",
+        "covered-empty-proven",
         "no-completion-proof",
         "proof-does-not-match-records",
       ]);
