@@ -27,6 +27,7 @@ import {
   type Sha256,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
+  legacyScopeToPdppSelection,
   projectPdppRecordsToLegacyPayload,
   type LegacyScopeBinding,
   type PdppRecord,
@@ -50,7 +51,8 @@ export interface ProjectionInput {
 
 export type ProjectionPlan =
   | { readonly kind: "ok"; readonly payload: AsyncIterable<string> }
-  | { readonly kind: "too_large"; readonly bytes: number };
+  | { readonly kind: "too_large"; readonly bytes: number }
+  | { readonly kind: "unsupported_profile" };
 
 export class ProjectionFailedError extends Error {}
 
@@ -81,6 +83,17 @@ function project(input: ProjectionInput, records: PdppRecord[]) {
 export async function planProjection(
   input: ProjectionInput,
 ): Promise<ProjectionPlan> {
+  // Profile support is decided from the scope and profile key alone, before
+  // any row is read or spooled. The explicit lookup is the same binding check
+  // the projector runs first, so a refusal here means the body would fail.
+  if (input.profileKey) {
+    const lookup = legacyScopeToPdppSelection(input.scope, {
+      profileKey: input.profileKey,
+    });
+    if (!lookup.ok && lookup.error.kind === "unsupported_profile") {
+      return { kind: "unsupported_profile" };
+    }
+  }
   if (input.binding.window) {
     const spooled = await spoolShards(input);
     if (spooled) return { kind: "ok", payload: windowed(input, spooled) };

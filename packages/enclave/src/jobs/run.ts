@@ -97,6 +97,7 @@ type SandboxSpecDeps = Pick<
   | "image"
   | "gatewayUrl"
   | "storageApiUrl"
+  | "streamSyncRead"
   | "agentUrl"
   | "chainId"
   | "contracts"
@@ -115,6 +116,8 @@ export interface RunJobDeps {
   image: string;
   gatewayUrl: string;
   storageApiUrl?: string;
+  /** Raw deploy setting; undefined keeps the sandbox variable absent. */
+  streamSyncRead?: string;
   agentUrl: string;
   chainId: number;
   contracts: SandboxContracts;
@@ -136,6 +139,7 @@ export type PrewarmDeps = Pick<
   | "image"
   | "gatewayUrl"
   | "storageApiUrl"
+  | "streamSyncRead"
   | "agentUrl"
   | "chainId"
   | "contracts"
@@ -974,6 +978,9 @@ export function sandboxSpec(
       PS_SERVER_PUBLIC_KEY: identity.enclavePublicKey,
       PS_HYDRATE_SCOPES: requestedScope,
       SYNC_ENABLED: deps.sync === "enabled" ? SYNC_ENABLED : SYNC_DISABLED,
+      ...(deps.streamSyncRead !== undefined
+        ? { PS_STREAM_SYNC_READ: deps.streamSyncRead }
+        : {}),
       GATEWAY_URL: deps.gatewayUrl,
       ENCLAVE_AGENT_URL: deps.agentUrl,
       JOB_RESULT_MAX_BYTES: String(deps.jobResultMaxBytes),

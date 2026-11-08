@@ -1330,6 +1330,14 @@ export class StreamSyncReadService {
             this.options.arrayProjectionBudgetBytes ?? DEFAULT_ARRAY_BUDGET,
           now: (this.options.now?.() ?? new Date()).toISOString(),
         });
+        if (plan.kind === "unsupported_profile") {
+          // Fails before toStream can commit a response. The outer catch
+          // releases every lease. Pending views fall back to the answer with
+          // owner notes in decide; complete views reject as before.
+          throw new ProjectionFailedError(
+            "projection failed: unsupported_profile",
+          );
+        }
         if (plan.kind === "too_large") {
           releaseAll();
           return plan;

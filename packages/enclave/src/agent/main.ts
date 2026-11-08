@@ -137,6 +137,9 @@ async function startJobs(
     sync: config.sync,
     logger,
     jobResultMaxBytes: config.jobResultMaxBytes,
+    ...(env.PS_STREAM_SYNC_READ !== undefined
+      ? { streamSyncRead: env.PS_STREAM_SYNC_READ }
+      : {}),
   } satisfies PrewarmDeps;
   const mcp = await startMcpIngress(
     sandboxDeps,
