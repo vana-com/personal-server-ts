@@ -3,6 +3,11 @@ import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
 import { createUploadStateTracker } from "../upload-state.js";
+import {
+  createMemoryUploadAttemptStore,
+  createUploadAttemptLedger,
+  type UploadAttemptStore,
+} from "../upload-attempts.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
 import {
@@ -32,6 +37,13 @@ export interface SyncManagerOptions {
    * `deleteScope` is local-only and reports `durable: false`.
    */
   deleteData?: DeleteDataPort | null;
+  /**
+   * Durable host storage for upload-attempt markers. With it, an upload that
+   * kills the process is counted across restarts and host rebuilds, and the
+   * entry is quarantined after repeated crashes. Without it the markers live
+   * in memory and protect nothing across a restart.
+   */
+  uploadAttemptStore?: UploadAttemptStore;
   /** Durable retry marker for blob deletions that failed after the tombstone. */
   pendingBlobDeletions?: PendingBlobDeletionStore;
   /**
@@ -63,6 +75,12 @@ export interface SyncManager {
 
   /** Download exact owner scopes without advancing the registry cursor. */
   hydrateScopes(scopes: string[]): Promise<void>;
+
+  /**
+   * Owner retry: lift the quarantine of uploads that crashed the process, for
+   * one scope or all. The next cycle attempts them again.
+   */
+  retryQuarantinedUploads(scope?: string): Promise<void>;
 
   /** Signal that new data has been ingested (next cycle picks it up) */
   notifyNewData(): void;
@@ -119,11 +137,29 @@ export function createSyncManager(
   const dataPointFeed = downloadDeps.dataPointFeed ?? uploadDeps.dataPointFeed;
   const scopeDeletions =
     uploadDeps.scopeDeletions ?? downloadDeps.scopeDeletions;
+  const namelessAttempts =
+    !uploadDeps.uploadAttempts && !options?.uploadAttemptStore;
   // The upload worker queues guarded cleanup for ciphertext it had to
   // abandon mid-race; it shares the manager's marker store.
+  const uploadAttempts =
+    uploadDeps.uploadAttempts ??
+    createUploadAttemptLedger(
+      options?.uploadAttemptStore ?? createMemoryUploadAttemptStore(),
+      uploadDeps.serverOwner,
+      {
+        onDegraded: (message) =>
+          pushError({
+            fileId: null,
+            scope: null,
+            message,
+            timestamp: new Date().toISOString(),
+          }),
+      },
+    );
   const workerUploadDeps: UploadWorkerDeps = {
     ...uploadDeps,
     uploadState,
+    uploadAttempts,
     pendingBlobDeletions:
       uploadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
   };
@@ -430,6 +466,11 @@ export function createSyncManager(
     },
 
     async stop() {
+      // Opens the stop's repair window before anything awaits, so a stop that
+      // nothing awaits still holds its repair duty.
+      const closing = uploadAttempts
+        .close(namelessAttempts ? Infinity : undefined)
+        .catch((err: unknown) => err);
       clearIntervalTimer();
       clearNotifyTimer();
       isRunning = false;
@@ -437,6 +478,25 @@ export function createSyncManager(
       // Wait for any in-flight cycle to complete
       if (cycleInFlight) {
         await cycleInFlight;
+      }
+      // Hand the upload markers to the next manager over this store, once no
+      // attempt is still running (a running one keeps its entry excluded).
+      // Without a stable store namespace a rebuilt manager gets a fresh,
+      // unrelated lock, so only a fully drained stop keeps two managers over
+      // the same persistence from overlapping.
+      const err = await closing;
+      if (err !== undefined) {
+        // The ledger keeps the store and retries the repair itself; say so.
+        pushError({
+          fileId: null,
+          scope: null,
+          message: `Upload crash protection could not be saved on stop: ${(err as Error).message}`,
+          timestamp: new Date().toISOString(),
+        });
+        uploadDeps.logger.error(
+          { error: (err as Error).message },
+          "Upload attempt store could not be repaired on stop",
+        );
       }
     },
 
@@ -484,6 +544,12 @@ export function createSyncManager(
     notifyNewData() {
       uploadDeps.logger.debug("New data notification received");
       scheduleNotifiedCycle();
+    },
+
+    async retryQuarantinedUploads(scope) {
+      if (!(await uploadAttempts.recover())) return;
+      for (const path of await uploadAttempts.release(scope))
+        uploadState.clear(path);
     },
 
     async deleteScope(scope: string) {

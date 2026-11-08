@@ -11,6 +11,12 @@ import type {
   DataStoragePort,
   PendingBlobDeletion,
 } from "../../ports/index.js";
+import {
+  createMemoryUploadAttemptStore,
+  UPLOAD_ATTEMPTS_RESET_NOTICE,
+  uploadAttemptKey,
+  type UploadAttemptStore,
+} from "../upload-attempts.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 
 // Mock workers so we control their behavior
@@ -952,5 +958,91 @@ describe("sync manager upload state", () => {
     expect(manager.getStatus().uploads?.tooLarge).toEqual([
       expect.objectContaining({ scope: "s.big", path: "s/1.json" }),
     ]);
+  });
+});
+
+describe("sync manager upload attempt markers", () => {
+  const entry = {
+    id: 1,
+    scope: "s.crashy",
+    path: "s/1.json",
+    collectedAt: "2026-11-07T10:00:00Z",
+    version: 1,
+    sizeBytes: 10,
+  } as never;
+
+  /** The ledger the manager hands the upload worker on its next cycle. */
+  async function ledgerOf(manager: ReturnType<typeof createSyncManager>) {
+    let seen: UploadWorkerDeps | undefined;
+    (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async (deps) => {
+      seen = deps;
+      return [];
+    });
+    // start(), not trigger(): an owner trigger may lift the quarantine.
+    manager.start();
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    return seen!.uploadAttempts!;
+  }
+
+  /** A later process over the same bytes: it holds no dead predecessor's lock. */
+  let boots = 0;
+  const processOver = (store: UploadAttemptStore): UploadAttemptStore => ({
+    namespace: `${store.namespace}#boot-${++boots}`,
+    read: () => store.read(),
+    write: (envelope) => store.write(envelope),
+    preserveCorrupt: (value, stamp) => store.preserveCorrupt(value, stamp),
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("keeps the count and the quarantine when the manager is rebuilt over the same store", async () => {
+    const store = createMemoryUploadAttemptStore();
+    const build = () =>
+      createSyncManager(makeMockUploadDeps(), makeMockDownloadDeps(), {
+        uploadAttemptStore: processOver(store),
+      });
+
+    for (let boot = 0; boot < 2; boot++) {
+      const manager = build();
+      const ledger = await ledgerOf(manager);
+      await ledger.recover();
+      await ledger.begin(entry); // the process dies without settling
+    }
+    const rebuilt = build();
+    const ledger = await ledgerOf(rebuilt);
+    await ledger.recover();
+    expect(
+      ledger.isQuarantined(
+        uploadAttemptKey(makeMockUploadDeps().serverOwner, entry),
+      ),
+    ).toBe(true);
+
+    await rebuilt.retryQuarantinedUploads();
+    expect(ledger.quarantined()).toEqual([]);
+    await rebuilt.stop();
+  });
+
+  it("tells the owner, in the status errors, when a malformed ledger was reset", async () => {
+    const store = createMemoryUploadAttemptStore();
+    await store.write({ version: 9, records: [] } as never);
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      { uploadAttemptStore: store },
+    );
+    const ledger = await ledgerOf(manager);
+
+    expect(await ledger.recover()).toBe(true);
+
+    expect(manager.getStatus().errors).toEqual([
+      expect.objectContaining({
+        message: UPLOAD_ATTEMPTS_RESET_NOTICE,
+      }),
+    ]);
+    await manager.stop();
   });
 });

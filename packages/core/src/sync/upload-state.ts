@@ -22,12 +22,17 @@
  *    and after `MAX_UPLOAD_FAILURES` failures the entry is "stopped" until new
  *    data arrives for its scope or the owner retries.
  *
+ * An attempt that kills the process is invisible to the counters here; those
+ * are counted by the durable markers in `upload-attempts.ts`.
+ *
  * The index has no column for failure counts, and changing it is a storage
  * change in every host, so the counters live in memory per sync manager (as
  * the other retry trackers here do). A restart gives a stopped entry a fresh
  * budget of `MAX_UPLOAD_FAILURES` attempts spread over the backoff schedule,
  * not one attempt per cycle.
  */
+
+import { CRASHED_UPLOAD_REASON } from "./upload-attempts.js";
 
 /**
  * Cloudflare rejects request bodies over 100 MB. Stay under it with margin.
@@ -148,6 +153,16 @@ export interface UploadStateTracker {
   markUnsizable(entry: UploadStateEntry): boolean;
   /** Whether the entry may be attempted now (not backing off, not stopped). */
   shouldAttempt(path: string, nowMs: number): boolean;
+  /**
+   * Record an entry as quarantined after attempts that killed the process
+   * (see `upload-attempts.ts`). Not released by new data for its scope: the
+   * attempt ledger decides. Safe to call every cycle.
+   */
+  markCrashed(
+    entry: UploadStateEntry,
+    interrupted: number,
+    nowMs: number,
+  ): void;
   /** Count one failed attempt. */
   recordFailure(entry: UploadStateEntry, error: string, nowMs: number): void;
   /** Whether any state is held for the entry. */
@@ -188,6 +203,7 @@ export interface UploadStateTracker {
 interface Tracked extends UploadStateEntry {
   tooLargeBytes?: number;
   unsizable?: true;
+  crashed?: true;
   failures: number;
   lastError: string;
   nextAttemptMs: number;
@@ -228,6 +244,17 @@ export function createUploadStateTracker(
         stoppedAtMs: null,
       });
       return true;
+    },
+    markCrashed(entry, interrupted, nowMs) {
+      if (states.get(entry.path)?.crashed) return;
+      states.set(entry.path, {
+        ...entry,
+        crashed: true,
+        failures: interrupted,
+        lastError: CRASHED_UPLOAD_REASON,
+        nextAttemptMs: 0,
+        stoppedAtMs: nowMs,
+      });
     },
     shouldAttempt(path, nowMs) {
       const state = states.get(path);
@@ -294,7 +321,11 @@ export function createUploadStateTracker(
     },
     releaseStopped(scope) {
       for (const [path, state] of states) {
-        if (state.scope === scope && state.stoppedAtMs !== null)
+        if (
+          state.scope === scope &&
+          state.stoppedAtMs !== null &&
+          !state.crashed
+        )
           states.delete(path);
       }
     },

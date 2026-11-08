@@ -19,6 +19,13 @@ export interface SdkStorageAdapterOptions {
    * test backends that treat the key itself as the URL keep working.
    */
   urlForKey?: (key: string) => string;
+  /**
+   * The SDK provider takes no per-call signal, so a cancellable call needs a
+   * provider whose transport carries that signal. Without it the adapter can
+   * only refuse to start an aborted call; a request already sent is not
+   * cancelled.
+   */
+  providerFor?: (signal: AbortSignal) => SdkStorageProvider;
 }
 
 export function createSdkStorageAdapter(
@@ -36,10 +43,17 @@ export function createSdkStorageAdapter(
     return providerOrFactory;
   }
 
+  const providerWith = (signal?: AbortSignal): SdkStorageProvider => {
+    signal?.throwIfAborted();
+    return signal && options?.providerFor
+      ? options.providerFor(signal)
+      : provider();
+  };
+
   return {
-    async upload(key, data) {
+    async upload(key, data, signal) {
       try {
-        const result = await provider().upload(
+        const result = await providerWith(signal).upload(
           new Blob([copyBytes(data)], { type: "application/octet-stream" }),
           key,
         );
@@ -52,8 +66,8 @@ export function createSdkStorageAdapter(
 
     urlForKey,
 
-    async download(storageUrl) {
-      const blob = await provider().download(storageUrl);
+    async download(storageUrl, signal) {
+      const blob = await providerWith(signal).download(storageUrl);
       return new Uint8Array(await blob.arrayBuffer());
     },
 
@@ -61,7 +75,7 @@ export function createSdkStorageAdapter(
       return provider().delete(storageUrl);
     },
 
-    async exists(storageUrl) {
+    async exists(storageUrl, signal) {
       // The SDK provider interface has no HEAD/metadata call, so existence is
       // probed with a full download (follow-up: add a HEAD to the vana
       // provider). Only a definitive not-found may report "absent" — a
@@ -70,7 +84,7 @@ export function createSdkStorageAdapter(
       // (e.g. the upload worker's blob heal overwriting a blob that is
       // actually there).
       try {
-        await provider().download(storageUrl);
+        await providerWith(signal).download(storageUrl);
         return true;
       } catch (err) {
         if (isDefinitiveNotFound(err)) {
