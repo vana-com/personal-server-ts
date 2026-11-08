@@ -86,11 +86,13 @@ function makeIndex(initial: IndexEntry[]) {
  * A restarted process holds no lock from its dead predecessor, so a boot may
  * always take the store.
  */
+let boots = 0;
 function restartable(store: UploadAttemptStore): UploadAttemptStore {
   return {
+    namespace: `${store.namespace}#boot-${++boots}`,
     read: () => store.read(),
     write: (envelope) => store.write(envelope),
-    acquire: async () => ({ release() {} }),
+    preserveCorrupt: (value, stamp) => store.preserveCorrupt(value, stamp),
   };
 }
 

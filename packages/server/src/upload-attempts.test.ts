@@ -11,7 +11,6 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
-  UploadAttemptStoreInvalidError,
   createUploadAttemptLedger,
   uploadAttemptKey,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -29,6 +28,13 @@ const entry = {
   sizeBytes: 4096,
 } as IndexEntry;
 
+/** The file as seen by a later process: its own lock, the same bytes. */
+let boots = 0;
+const processOver = (path: string) => {
+  const store = createFileUploadAttemptStore(path);
+  return { ...store, namespace: `${store.namespace}#boot-${++boots}` };
+};
+
 describe("createFileUploadAttemptStore", () => {
   let dir: string;
   beforeEach(async () => {
@@ -43,19 +49,12 @@ describe("createFileUploadAttemptStore", () => {
   it("keeps an unsettled attempt across process restarts and quarantines at the second", async () => {
     const path = join(dir, "nested", "upload-attempts.json");
     for (let boot = 0; boot < 2; boot++) {
-      const ledger = createUploadAttemptLedger(
-        createFileUploadAttemptStore(path),
-        OWNER,
-      );
+      const ledger = createUploadAttemptLedger(processOver(path), OWNER);
       await ledger.recover();
       expect(ledger.quarantined()).toEqual([]);
       await ledger.begin(entry); // the process dies here, never settles
-      await ledger.close(); // a dead process holds no lock
     }
-    const ledger = createUploadAttemptLedger(
-      createFileUploadAttemptStore(path),
-      OWNER,
-    );
+    const ledger = createUploadAttemptLedger(processOver(path), OWNER);
     await ledger.recover();
     expect(ledger.isQuarantined(uploadAttemptKey(OWNER, entry))).toBe(true);
   });
@@ -66,32 +65,53 @@ describe("createFileUploadAttemptStore", () => {
     expect(await store.read()).toBeNull();
     const ledger = createUploadAttemptLedger(store, OWNER);
     await ledger.recover();
-    await ledger.begin(entry);
-    await ledger.settle(entry, "success");
+    await ledger.settle(await ledger.begin(entry), "success");
     expect(await store.read()).toEqual({ version: 1, records: [] });
   });
 
-  it("keeps a value that is not a ledger and refuses to upload over it", async () => {
+  it("preserves a value that is not a ledger beside it, then starts an empty one", async () => {
     const path = join(dir, "upload-attempts.json");
     const bad = '{"version":1,"records":{}}\n';
     await writeFile(path, bad);
-    const ledger = createUploadAttemptLedger(
-      createFileUploadAttemptStore(path),
-      OWNER,
+    const ledger = createUploadAttemptLedger(processOver(path), OWNER);
+    expect(await ledger.recover()).toBe(true);
+    const copies = (await readdir(dir)).filter((f) =>
+      f.startsWith("upload-attempts.json.corrupt-"),
     );
-    await expect(ledger.recover()).rejects.toBeInstanceOf(
-      UploadAttemptStoreInvalidError,
+    expect(copies).toHaveLength(1);
+    expect(JSON.parse(await readFile(join(dir, copies[0]!), "utf8"))).toEqual(
+      JSON.parse(bad),
     );
-    await expect(ledger.begin(entry)).rejects.toThrow();
-    expect(await readFile(path, "utf8")).toBe(bad);
-    // Unparseable text is kept as well.
-    await writeFile(path, "{not json");
-    const broken = createUploadAttemptLedger(
-      createFileUploadAttemptStore(path),
-      OWNER,
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({
+      version: 1,
+      records: [],
+    });
+  });
+
+  it("keeps unparseable text as well, and only a few copies", async () => {
+    const path = join(dir, "upload-attempts.json");
+    for (let i = 0; i < 5; i++) {
+      await writeFile(path, `{not json ${i}`);
+      // A new ledger object per round: each is the first corruption it sees.
+      const ledger = createUploadAttemptLedger(processOver(path), OWNER);
+      expect(await ledger.recover()).toBe(true);
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    const copies = (await readdir(dir))
+      .filter((f) => f.startsWith("upload-attempts.json.corrupt-"))
+      .sort();
+    expect(copies).toHaveLength(3);
+    expect(await readFile(join(dir, copies[2]!), "utf8")).toBe("{not json 4");
+  });
+
+  it("fails visibly, keeping the file, when it cannot be read", async () => {
+    const path = join(dir, "upload-attempts.json");
+    await mkdir(path); // a directory where the file should be
+    const ledger = createUploadAttemptLedger(processOver(path), OWNER);
+    await expect(ledger.recover()).rejects.toThrow();
+    expect((await readdir(dir)).filter((f) => f.includes("corrupt"))).toEqual(
+      [],
     );
-    await expect(broken.recover()).rejects.toThrow();
-    expect(await readFile(path, "utf8")).toBe("{not json");
   });
 
   it("lets one manager at a time own the file", async () => {
@@ -105,11 +125,11 @@ describe("createFileUploadAttemptStore", () => {
       OWNER,
     );
     expect(await first.recover()).toBe(true);
-    await first.begin(entry);
+    const token = await first.begin(entry);
     expect(await second.recover()).toBe(false);
+    await first.settle(token, "success");
     await first.close();
     expect(await second.recover()).toBe(true);
-    // The live attempt was counted once, by the manager that took over.
     expect(second.quarantined()).toEqual([]);
   });
 

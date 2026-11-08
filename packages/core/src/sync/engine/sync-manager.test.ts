@@ -13,7 +13,9 @@ import type {
 } from "../../ports/index.js";
 import {
   createMemoryUploadAttemptStore,
+  UPLOAD_ATTEMPTS_RESET_NOTICE,
   uploadAttemptKey,
+  type UploadAttemptStore,
 } from "../upload-attempts.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 
@@ -982,19 +984,33 @@ describe("sync manager upload attempt markers", () => {
     return seen!.uploadAttempts!;
   }
 
+  /** A later process over the same bytes: it holds no dead predecessor's lock. */
+  let boots = 0;
+  const processOver = (store: UploadAttemptStore): UploadAttemptStore => ({
+    namespace: `${store.namespace}#boot-${++boots}`,
+    read: () => store.read(),
+    write: (envelope) => store.write(envelope),
+    preserveCorrupt: (value, stamp) => store.preserveCorrupt(value, stamp),
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
   it("keeps the count and the quarantine when the manager is rebuilt over the same store", async () => {
     const store = createMemoryUploadAttemptStore();
     const build = () =>
       createSyncManager(makeMockUploadDeps(), makeMockDownloadDeps(), {
-        uploadAttemptStore: store,
+        uploadAttemptStore: processOver(store),
       });
 
     for (let boot = 0; boot < 2; boot++) {
       const manager = build();
       const ledger = await ledgerOf(manager);
       await ledger.recover();
-      await ledger.begin(entry); // dies without settling
-      await manager.stop();
+      await ledger.begin(entry); // the process dies without settling
     }
     const rebuilt = build();
     const ledger = await ledgerOf(rebuilt);
@@ -1008,5 +1024,25 @@ describe("sync manager upload attempt markers", () => {
     await rebuilt.retryQuarantinedUploads();
     expect(ledger.quarantined()).toEqual([]);
     await rebuilt.stop();
+  });
+
+  it("tells the owner, in the status errors, when a malformed ledger was reset", async () => {
+    const store = createMemoryUploadAttemptStore();
+    await store.write({ version: 9, records: [] } as never);
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      { uploadAttemptStore: store },
+    );
+    const ledger = await ledgerOf(manager);
+
+    expect(await ledger.recover()).toBe(true);
+
+    expect(manager.getStatus().errors).toEqual([
+      expect.objectContaining({
+        message: UPLOAD_ATTEMPTS_RESET_NOTICE,
+      }),
+    ]);
+    await manager.stop();
   });
 });

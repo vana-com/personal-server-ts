@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   createMemoryUploadAttemptStore,
   createUploadAttemptLedger,
+  UPLOAD_ATTEMPTS_RESET_NOTICE,
   UploadAttemptStoreInvalidError,
   uploadAttemptKey,
   type UploadAttemptStore,
@@ -29,20 +30,41 @@ function entry(n: number): IndexEntry {
 }
 
 /** A store whose persisted value is whatever the test says it is. */
-function storeHolding(
-  value: unknown,
-): UploadAttemptStore & { written: unknown[] } {
+let stores = 0;
+function storeHolding(value: unknown): UploadAttemptStore & {
+  written: unknown[];
+  preserved: unknown[];
+  failPreserve?: boolean;
+} {
   const written: unknown[] = [];
-  return {
+  const preserved: unknown[] = [];
+  const store = {
+    namespace: `holding:${++stores}`,
     written,
+    preserved,
+    failPreserve: false,
     async read() {
-      return value;
+      return written.length ? written[written.length - 1] : value;
     },
-    async write(envelope) {
+    async write(envelope: unknown) {
       written.push(envelope);
     },
+    async preserveCorrupt(bad: unknown) {
+      if (store.failPreserve) throw new Error("side write failed");
+      preserved.push(bad);
+    },
   };
+  return store as never;
 }
+
+/** The store as a later process sees it: its own lock, the same bytes. */
+let processes = 0;
+const processOver = (store: UploadAttemptStore): UploadAttemptStore => ({
+  namespace: `${store.namespace}#process-${++processes}`,
+  read: () => store.read(),
+  write: (envelope) => store.write(envelope),
+  preserveCorrupt: (value, stamp) => store.preserveCorrupt(value, stamp),
+});
 
 const record = (over: Record<string, unknown> = {}) => ({
   key: "k",
@@ -59,26 +81,29 @@ const record = (over: Record<string, unknown> = {}) => ({
 describe("owner isolation", () => {
   it("keeps another owner's quarantine through recover, reconcile and release", async () => {
     const store = createMemoryUploadAttemptStore();
-    const a = createUploadAttemptLedger(store, OWNER_A, { maxInterrupted: 1 });
+    const a = createUploadAttemptLedger(processOver(store), OWNER_A, {
+      maxInterrupted: 1,
+    });
     await a.recover();
     await a.begin(entry(1)); // owner A dies mid-upload
-    await a.close();
 
-    const again = createUploadAttemptLedger(store, OWNER_A, {
+    const again = createUploadAttemptLedger(processOver(store), OWNER_A, {
       maxInterrupted: 1,
     });
     await again.recover();
     expect(again.quarantined()).toHaveLength(1);
     await again.close();
 
-    const b = createUploadAttemptLedger(store, OWNER_B, { maxInterrupted: 1 });
+    const b = createUploadAttemptLedger(processOver(store), OWNER_B, {
+      maxInterrupted: 1,
+    });
     await b.recover();
     await b.reconcile([], { afterId: 0, throughId: 5 });
     expect(await b.release()).toEqual([]);
     expect(b.quarantined()).toEqual([]);
     await b.close();
 
-    const back = createUploadAttemptLedger(store, OWNER_A, {
+    const back = createUploadAttemptLedger(processOver(store), OWNER_A, {
       maxInterrupted: 1,
     });
     await back.recover();
@@ -101,14 +126,56 @@ describe("an invalid persisted ledger", () => {
     ],
     ["a bad flag", { version: 1, records: [record({ inFlight: "yes" })] }],
     ["a bad row id", { version: 1, records: [record({ rowId: 1.5 })] }],
-  ])("fails closed on %s and writes nothing", async (_name, value) => {
-    const store = storeHolding(value);
+  ])(
+    "preserves %s, starts an empty ledger and says so",
+    async (_name, value) => {
+      const store = storeHolding(value);
+      const degraded: string[] = [];
+      const ledger = createUploadAttemptLedger(store, OWNER_A, {
+        onDegraded: (message) => degraded.push(message),
+      });
+      await expect(ledger.recover()).resolves.toBe(true);
+      expect(store.preserved).toEqual([value]);
+      expect(store.written).toEqual([{ version: 1, records: [] }]);
+      expect(degraded).toEqual([UPLOAD_ATTEMPTS_RESET_NOTICE]);
+      await expect(ledger.begin(entry(1))).resolves.toBeDefined();
+    },
+  );
+
+  it("does not reset the same corruption twice in one ledger lifetime", async () => {
+    const bad = { version: 2, records: [] };
+    const store = storeHolding(bad);
     const ledger = createUploadAttemptLedger(store, OWNER_A);
+    await ledger.recover();
+    await ledger.close();
+    // The same corruption appears again.
+    store.written.push(bad);
     await expect(ledger.recover()).rejects.toBeInstanceOf(
       UploadAttemptStoreInvalidError,
     );
-    // Nothing may begin or rewrite the bad value as an empty ledger.
-    await expect(ledger.begin(entry(1))).rejects.toThrow();
+    expect(store.preserved).toEqual([bad]);
+    expect(store.written).toHaveLength(2);
+  });
+
+  it("continues only after the copy is kept: a failed copy fails the pass and replaces nothing", async () => {
+    const store = storeHolding({ version: 2, records: [] });
+    store.failPreserve = true;
+    const ledger = createUploadAttemptLedger(store, OWNER_A);
+    await expect(ledger.recover()).rejects.toThrow("side write failed");
+    expect(store.written).toEqual([]);
+    // Once storage works again the next pass resets.
+    store.failPreserve = false;
+    await expect(ledger.recover()).resolves.toBe(true);
+  });
+
+  it("fails visibly, resetting nothing, when the store cannot be read", async () => {
+    const store = storeHolding(null);
+    store.read = async () => {
+      throw new Error("storage unreadable");
+    };
+    const ledger = createUploadAttemptLedger(store, OWNER_A);
+    await expect(ledger.recover()).rejects.toThrow("storage unreadable");
+    expect(store.preserved).toEqual([]);
     expect(store.written).toEqual([]);
   });
 
@@ -123,13 +190,13 @@ describe("one active ledger per store", () => {
     const store = createMemoryUploadAttemptStore();
     const first = createUploadAttemptLedger(store, OWNER_A);
     expect(await first.recover()).toBe(true);
-    await first.begin(entry(1)); // live: the upload is still running
+    const token = await first.begin(entry(1)); // live: the upload is still running
 
     const second = createUploadAttemptLedger(store, OWNER_A);
     expect(await second.recover()).toBe(false);
     await expect(second.begin(entry(2))).rejects.toThrow();
 
-    await first.settle(entry(1), "success");
+    await first.settle(token, "success");
     // The live attempt was never counted as an interruption.
     expect(await store.read()).toEqual({ version: 1, records: [] });
   });
@@ -138,9 +205,85 @@ describe("one active ledger per store", () => {
     const store = createMemoryUploadAttemptStore();
     const first = createUploadAttemptLedger(store, OWNER_A);
     await first.recover();
-    await first.begin(entry(1));
+    await first.settle(await first.begin(entry(1)), "failure");
     await first.close();
     const second = createUploadAttemptLedger(store, OWNER_A);
     expect(await second.recover()).toBe(true);
+  });
+});
+
+describe("attempt tokens", () => {
+  it("lets only the token that owns an entry settle it", async () => {
+    const store = createMemoryUploadAttemptStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A);
+    await ledger.recover();
+    const token = await ledger.begin(entry(1));
+    // The same entry cannot be begun again while it is live.
+    await expect(ledger.begin(entry(1))).rejects.toThrow(/still running/);
+
+    await ledger.settle({ ...token, seq: token.seq + 1 }, "success");
+    await ledger.settle(
+      { ...token, generation: token.generation + 1 },
+      "success",
+    );
+    expect(ledger.isLive(token.key)).toBe(true);
+    expect(await store.read()).toEqual({
+      version: 1,
+      records: [expect.objectContaining({ inFlight: true })],
+    });
+
+    await ledger.settle(token, "success");
+    await ledger.settle(token, "success"); // a second settle changes nothing
+    expect(ledger.isLive(token.key)).toBe(false);
+  });
+
+  it("keeps a running attempt excluded and the store owned across close, until it settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = createMemoryUploadAttemptStore();
+      const ledger = createUploadAttemptLedger(store, OWNER_A);
+      await ledger.recover();
+      const token = await ledger.begin(entry(1));
+
+      const closing = ledger.close(50);
+      await vi.advanceTimersByTimeAsync(50);
+      await closing;
+      expect(ledger.isLive(token.key)).toBe(true);
+      // Another ledger still cannot take the store.
+      expect(await createUploadAttemptLedger(store, OWNER_A).recover()).toBe(
+        false,
+      );
+      // The same ledger, reactivated, keeps the entry excluded.
+      expect(await ledger.recover()).toBe(true);
+      expect(ledger.isLive(token.key)).toBe(true);
+
+      await ledger.settle(token, "failure");
+      await ledger.close(50);
+      expect(await createUploadAttemptLedger(store, OWNER_A).recover()).toBe(
+        true,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives up the store when the last running attempt settles after a close", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = createMemoryUploadAttemptStore();
+      const ledger = createUploadAttemptLedger(store, OWNER_A);
+      await ledger.recover();
+      const token = await ledger.begin(entry(1));
+      const closing = ledger.close(10);
+      await vi.advanceTimersByTimeAsync(10);
+      await closing;
+
+      await ledger.settle(token, "success");
+      expect(await createUploadAttemptLedger(store, OWNER_A).recover()).toBe(
+        true,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
