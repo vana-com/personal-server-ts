@@ -87,6 +87,11 @@ function table(input: DecideInput): Decision {
     return { kind: "keep_pending", reason: "key_mismatch" };
   switch (s.kind) {
     case "unknown":
+      // The shared rule owns the verdict: an unknown start is discarded, and
+      // decide only adds the recollect. Any other verdict is a rule breach.
+      if (admitStart(s, c) !== "discard") {
+        throw new Error("admitStart admits an unknown start");
+      }
       return { ...DISCARD, recollect: true };
     case "absent":
       if (admitStart(s, c) !== "publish") return DISCARD;

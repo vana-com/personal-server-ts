@@ -871,4 +871,60 @@ describe("own-write visibility (deletion floor)", () => {
     });
     expect((await latest(service)).rows).not.toHaveProperty("b");
   });
+  // Round 7. A grant (not the owner) takes only published runs. A run in the
+  // wait state (started at generation 3, connection now at generation 1) is
+  // not published, so the grant's view over the imported base must not show
+  // its rows. Under a mutant that publishes on wait, the grant would see them.
+  it("does not show a grant a run in the wait state on top of an imported view", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    const other = new Device();
+    await other.collect([{ id: "z", v: 1 }]);
+    await other.publish();
+    d.gateway.adoptControlFrom(other.gateway);
+    await d.collect([{ id: "a", v: 1 }]);
+    await d.publish();
+    await d.syncReader(service);
+    const readAs = (isOwnerView: boolean) => async () => {
+      const decision = await service.resolve({
+        scope: `pdpp.${CONNECTOR}.items`,
+        connection: null,
+        cursor: null,
+        legacyFile: false,
+        isOwnerView,
+      });
+      if (decision.kind !== "view") return decision.kind;
+      const envelope = JSON.parse(await new Response(decision.body).text());
+      return Object.fromEntries(
+        envelope.data.records.map((r: { id: string; v: number }) => [
+          r.id,
+          r.v,
+        ]),
+      );
+    };
+    const grantRead = readAs(false);
+    const ownerRead = readAs(true);
+    // Precondition: the grant sees the imported base at generation 1.
+    expect(await grantRead()).toEqual({ a: 1 });
+    d.gateway.deleteControl();
+    d.gateway.reviveControl();
+    await d.writer.refreshControls();
+    const runId = await d.begin({ items: [{ id: "b", v: 2 }] });
+    await d.finish(runId);
+    await d.publish();
+    // The connection drops to generation 1: the run starts at 3, so it waits.
+    d.gateway.adoptControlFrom(other.gateway);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await d.gateway.read(controlScope(CONNECTOR, ""))).toMatchObject({
+      found: true,
+      version: 1,
+      deleted: false,
+    });
+    expect(await grantRead()).toEqual({ a: 1 });
+    // The owner's published fold reads local runs: the waiting run must not show.
+    expect(await ownerRead()).toEqual({ a: 1 });
+  });
 });
