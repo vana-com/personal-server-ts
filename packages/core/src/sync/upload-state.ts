@@ -82,9 +82,22 @@ export const UPLOAD_BACKOFF_MAX_MS = 60 * 60_000;
 /** Failures allowed before an entry stops retrying (1m, 2m, 4m ... 1h). */
 export const MAX_UPLOAD_FAILURES = 8;
 
+/**
+ * What makes a row the same row: a path can be rewritten with a new id (a
+ * replacement) or a repaired size. State held for the old row must not apply
+ * to the new one.
+ */
+export interface RowIdentity {
+  id: string | number;
+  /** Compared with `Object.is`, so NaN equals NaN. */
+  sizeBytes: unknown;
+}
+
 export interface UploadStateEntry {
   scope: string;
   path: string;
+  /** The row this state was recorded for; absent for path-only callers. */
+  identity?: RowIdentity;
 }
 
 export interface TooLargeUpload extends UploadStateEntry {
@@ -133,8 +146,13 @@ export interface UploadStateTracker {
   recordFailure(entry: UploadStateEntry, error: string, nowMs: number): void;
   /** Whether any state is held for the entry. */
   has(path: string): boolean;
-  /** Forget every entry whose path is not in `paths` (the rows are gone). */
-  retainOnly(paths: readonly string[]): void;
+  /**
+   * Forget the state of every entry that is no longer one of `rows`: its path
+   * is absent (the row is gone) or its row identity or size changed (the path
+   * was rewritten). State recorded without an identity is kept while the path
+   * exists.
+   */
+  reconcile(rows: readonly (RowIdentity & { path: string })[]): void;
   /** New data arrived for `scope`: stopped entries there try again. */
   releaseStopped(scope: string): void;
   /** The entry synced or was removed: forget it. */
@@ -213,10 +231,19 @@ export function createUploadStateTracker(
     has(path) {
       return states.has(path);
     },
-    retainOnly(paths) {
-      const keep = new Set(paths);
-      for (const path of states.keys())
-        if (!keep.has(path)) states.delete(path);
+    reconcile(rows) {
+      const current = new Map<string, RowIdentity>();
+      for (const row of rows) current.set(row.path, row);
+      for (const [path, state] of states) {
+        const row = current.get(path);
+        if (
+          !row ||
+          (state.identity &&
+            (state.identity.id !== row.id ||
+              !Object.is(state.identity.sizeBytes, row.sizeBytes)))
+        )
+          states.delete(path);
+      }
     },
     releaseStopped(scope) {
       for (const [path, state] of states) {

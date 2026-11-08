@@ -31,6 +31,7 @@ import {
   createUploadStateTracker,
   exceedsUploadCap,
   isUsableUploadSize,
+  type RowIdentity,
   type UploadStateTracker,
 } from "../upload-state.js";
 
@@ -365,6 +366,10 @@ interface CoalescedScope {
 }
 
 const at = (entry: IndexEntry) => Date.parse(entry.collectedAt);
+const identityOf = (entry: IndexEntry): RowIdentity => ({
+  id: entry.id,
+  sizeBytes: entry.sizeBytes,
+});
 const VERSION_PAGE = 200;
 
 /**
@@ -379,17 +384,28 @@ function coalescePlan(
   entries: readonly IndexEntry[],
   nowMs: number,
 ): Map<string, CoalescedScope> {
-  const byScope = new Map<string, IndexEntry[]>();
+  // One pass, one small aggregate per scope: the batch's newest row and the
+  // oldest time. Nothing is copied per row, so the cost is linear in the
+  // entries however many versions one scope holds.
+  const aggregates = new Map<
+    string,
+    { batchHead: IndexEntry; oldestMs: number }
+  >();
   for (const entry of entries) {
     if (!isCoalescedScope(entry.scope)) continue;
-    byScope.set(entry.scope, [...(byScope.get(entry.scope) ?? []), entry]);
+    const known = aggregates.get(entry.scope);
+    if (!known) {
+      aggregates.set(entry.scope, { batchHead: entry, oldestMs: at(entry) });
+      continue;
+    }
+    if (at(entry) > at(known.batchHead)) known.batchHead = entry;
+    if (at(entry) < known.oldestMs) known.oldestMs = at(entry);
   }
   const plans = new Map<string, CoalescedScope>();
-  for (const [scope, inBatch] of byScope) {
-    const batchHead = inBatch.reduce((a, b) => (at(b) > at(a) ? b : a));
+  for (const [scope, { batchHead, oldestMs }] of aggregates) {
     const latest = deps.storage.findEntry?.({ scope });
     const head = latest && at(latest) >= at(batchHead) ? latest : batchHead;
-    const oldest = Math.min(...inBatch.map(at), at(head));
+    const oldest = Math.min(oldestMs, at(head));
     const deferred =
       head.dataPointId === null &&
       nowMs - at(head) < COALESCE_QUIET_MS &&
@@ -459,7 +475,11 @@ function holdBackTerminal(
   target: IndexEntry,
 ): boolean {
   if (target.dataPointId !== null) return false;
-  const at = { scope: target.scope, path: target.path };
+  const at = {
+    scope: target.scope,
+    path: target.path,
+    identity: identityOf(target),
+  };
   if (!isUsableUploadSize(target.sizeBytes)) {
     if (state.markUnsizable(at)) {
       deps.logger.warn(
@@ -504,8 +524,10 @@ export async function uploadAll(
   const entries = deps.storage.findUnsynced();
   const state = deps.uploadState ?? createUploadStateTracker();
   // Every unsynced row is listed, so a tracked path missing here is gone
-  // (deleted, replaced or synced elsewhere): forget it on every cycle.
-  state.retainOnly(entries.map((e) => e.path));
+  // (deleted or synced elsewhere), and one whose row id or size changed was
+  // rewritten (replaced or repaired): forget both on every cycle, so state
+  // held for an old row never applies to a new one.
+  state.reconcile(entries);
   const plans = coalescePlan(deps, entries, clock());
   const results: UploadResult[] = [];
 
@@ -575,7 +597,11 @@ export async function uploadAll(
       }
       const error = err as Error;
       state.recordFailure(
-        { scope: target.scope, path: target.path },
+        {
+          scope: target.scope,
+          path: target.path,
+          identity: identityOf(target),
+        },
         error.message,
         clock(),
       );

@@ -487,11 +487,15 @@ export function createSyncManager(
     },
 
     async deleteScope(scope: string) {
-      const result = await exclusive(() => {
+      const result = await exclusive(async () => {
         // A delete the user asks for starts a fresh set of re-submissions.
         tombstoneResubmits.reset(scope);
-        uploadState.clearScope(scope);
-        return deleteScope(deleteScopeDeps(), scope);
+        const outcome = await deleteScope(deleteScopeDeps(), scope);
+        // Upload state follows the rows. A failed delete removed nothing, so
+        // its entries keep their budget and status; entries the delete did
+        // remove are forgotten by comparing with what is still unsynced.
+        uploadState.reconcile(uploadDeps.storage.findUnsynced());
+        return outcome;
       });
       if (result.durable && uploadDeps.additions)
         await uploadDeps.additions.deleteScope(scope);
