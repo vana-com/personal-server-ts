@@ -11,7 +11,8 @@
  * - what a grant reads at the same two points: published data only, no
  *   marker; the owner never reads fewer records than a grant;
  * - the plan's predicted head after each step equals the head the writer
- *   registers, pass after pass, until no pass changes anything;
+ *   registers, pass after pass, until no pass changes anything, and every
+ *   registry publication holds the lines the plan predicted for its step;
  * - every API path carries the owner's markers, and none of a grant's does.
  */
 
@@ -19,6 +20,12 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { handlePersonalServerDataRequest } from "../api/index.js";
 import type { PersonalServerDataApiDeps } from "../api/index.js";
+import {
+  compareStamp,
+  SEED_OBSERVED_AT,
+  SEED_RUN_ID,
+  type Line,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import type { PlanHead, PlanStep } from "../stream-sync/publish-plan.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import { planHeadOf } from "./fold.js";
@@ -876,6 +883,9 @@ function rowStreams(row: Row): string[] {
   return [...names].sort();
 }
 
+/** How many registry publications existed when the case started. */
+const initialPublications = new WeakMap<Rig, number>();
+
 async function open(row: Row): Promise<Rig> {
   const rig = new Rig(row.seed, row.connector);
   await rig.open();
@@ -884,6 +894,7 @@ async function open(row: Row): Promise<Rig> {
     await rig.publish();
     await rig.sync();
   }
+  initialPublications.set(rig, rig.gateway.log.length);
   for (const spec of row.runs) await rig.collect(spec);
   if (row.published) await rig.publish();
   return rig;
@@ -1005,6 +1016,128 @@ async function registered(rig: Rig, stream: string): Promise<PlanHead | null> {
   return head && planHeadOf(head);
 }
 
+// ---------------------------------------------------------------------------
+// The differential oracle: what the registry holds after every publication,
+// predicted from the plan and the collected rows alone.
+
+/** Every stream the case touches: the runs' and the seed's. */
+function modelStreams(row: Row): string[] {
+  return [
+    ...new Set([
+      ...rowStreams(row),
+      ...(row.seed ? [row.seed.stream ?? "items"] : []),
+    ]),
+  ].sort();
+}
+
+const sameLines = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((x, i) => x === b[i]);
+
+const lineKey = (l: Line): string => JSON.stringify([l.o, l.r, l.v]);
+const canonLines = (lines: readonly Line[]): string[] =>
+  lines.map(lineKey).sort();
+
+/** The greatest (o, r) per primary key wins; the later line wins a tie. */
+function reduceLines(
+  lines: readonly Line[],
+  primaryKey: readonly string[],
+): Line[] {
+  const winners = new Map<string, Line>();
+  for (const line of lines) {
+    const key = JSON.stringify(primaryKey.map((f) => line.v[f]));
+    const held = winners.get(key);
+    if (!held || compareStamp(line, held) >= 0) winners.set(key, line);
+  }
+  return [...winners.values()];
+}
+
+/** The lines the newest publication of `stream` holds in the first `count` posts. */
+async function publishedLines(
+  rig: Rig,
+  stream: string,
+  count = Infinity,
+): Promise<Line[]> {
+  const pubs = (await rig.publications()).slice(0, count);
+  return pubs.filter((p) => p.stream === stream).at(-1)?.lines ?? [];
+}
+
+/** The collected rows of `runId` on `stream`, stamped as the writer stamps them. */
+function runLines(rig: Rig, row: Row, runId: string, stream: string): Line[] {
+  const spec = [...row.base, ...row.runs].find((r) => r.runId === runId);
+  if (!spec) return [];
+  const streams = [spec, ...(spec.also ?? [])] as StreamSpec[];
+  return streams
+    .filter((s) => (s.stream ?? "items") === stream)
+    .flatMap((s) =>
+      s.rows.map((v) => ({ o: rig.observedAt(runId), r: runId, v }) as Line),
+    );
+}
+
+/**
+ * The lines a plan step leaves: the head the plan started from (when it
+ * keeps it), the seed (when a publish merged it) and each run's rows.
+ */
+function modelLines(
+  rig: Rig,
+  row: Row,
+  stream: string,
+  step: PlanStep,
+  start: readonly Line[],
+): Line[] {
+  const lines: Line[] = [];
+  if (step.rows.fromHead) lines.push(...start);
+  if (step.rows.seed && row.seed && (row.seed.stream ?? "items") === stream) {
+    for (const v of row.seed.rows) {
+      lines.push({ o: SEED_OBSERVED_AT, r: SEED_RUN_ID, v } as Line);
+    }
+  }
+  for (const runId of step.rows.runs) {
+    lines.push(...runLines(rig, row, runId, stream));
+  }
+  return reduceLines(lines, step.head!.primaryKey);
+}
+
+/**
+ * Once the writer is stable, the newest publication of every stream holds
+ * exactly the lines the plan, from the head the case started with, predicts:
+ * the streams the runs name, the streams only the seed fills, and the runs
+ * published before the case began.
+ */
+async function expectRegistryMatchesPlan(rig: Rig, row: Row): Promise<void> {
+  const initial = initialPublications.get(rig) ?? 0;
+  const snapshot = await rig.overlay.snapshot(row.connector ?? CONNECTOR);
+  try {
+    for (const stream of modelStreams(row)) {
+      const label = `${row.id} ${stream} registry`;
+      const start = await publishedLines(rig, stream, initial);
+      const startHead =
+        (await rig.publications())
+          .slice(0, initial)
+          .filter((p) => p.stream === stream)
+          .at(-1)?.head ?? null;
+      const ids = snapshot.runs
+        .filter((r) => r.streams.some((s) => s.name === stream))
+        .map((r) => r.runId);
+      const steps = snapshot.plan(
+        rig.ns,
+        stream,
+        startHead && planHeadOf(startHead),
+        ids,
+      );
+      const last = steps
+        .filter(
+          (s) => s.decision.kind === "publish" || s.decision.kind === "noop",
+        )
+        .at(-1);
+      const want = last ? modelLines(rig, row, stream, last, start) : start;
+      const got = await publishedLines(rig, stream);
+      expect(canonLines(got), label).toEqual(canonLines(want));
+    }
+  } finally {
+    snapshot.release();
+  }
+}
+
 /**
  * Publish pass after pass until a pass executes nothing. Before each pass the
  * plan predicts every step from the registered head. After it, every step the
@@ -1020,6 +1153,11 @@ async function publishUntilStable(rig: Rig, row: Row): Promise<number> {
       heads.set(stream, await registered(rig, stream));
     }
     const predicted = await plans(rig, row, heads);
+    const starts = new Map<string, Line[]>();
+    for (const stream of rowStreams(row)) {
+      starts.set(stream, await publishedLines(rig, stream));
+    }
+    const pubsBefore = (await rig.publications()).length;
     const statuses = await rig.publish();
     const executed = await plans(rig, row, heads);
     let progressed = false;
@@ -1064,8 +1202,36 @@ async function publishUntilStable(rig: Rig, row: Row): Promise<number> {
         if (last) want = last.head;
       }
       expect(now, `${label} registered head`).toEqual(want);
+      if (!unpredicted) {
+        // Each publication this pass holds the lines the plan predicted for
+        // one of its steps, in order, and the last one holds the final lines.
+        const states = predicted
+          .get(stream)!
+          .filter((st) => !st.executed && st.decision.kind === "publish")
+          .map((st) =>
+            canonLines(modelLines(rig, row, stream, st, starts.get(stream)!)),
+          );
+        const posted = (await rig.publications())
+          .slice(pubsBefore)
+          .filter((p) => p.stream === stream)
+          .map((p) => canonLines(p.lines));
+        let from = 0;
+        for (const lines of posted) {
+          const at = states.findIndex(
+            (st, i) => i >= from && sameLines(st, lines),
+          );
+          expect(
+            at,
+            `${label} a publication matches no predicted step`,
+          ).toBeGreaterThanOrEqual(0);
+          from = at + 1;
+        }
+      }
     }
-    if (!progressed) return pass;
+    if (!progressed) {
+      await expectRegistryMatchesPlan(rig, row);
+      return pass;
+    }
   }
   throw new Error(`${row.id}: the writer did not reach a stable state`);
 }
@@ -1270,8 +1436,14 @@ describe("own-writes state table", () => {
 const keysOf = (read: Api): Set<string> =>
   new Set((read.records ?? []).map(keyOf));
 
-async function expectHttp(rig: Rig, row: Row, phase: string): Promise<void> {
+async function expectHttp(
+  rig: Rig,
+  row: Row,
+  phase: string,
+  want?: Read,
+): Promise<void> {
   const seen = await observe(rig, row);
+  if (want) expectRead(seen, want);
   const header = reasonsHeader(seen.read.withheld);
   const label = `${row.id} ${phase}`;
   for (const file of [false, true]) {
@@ -1310,12 +1482,12 @@ describe("owner and grant over HTTP, with a stored body that shares no key", () 
   for (const row of ROWS) {
     it(`${row.id}: before publication, after one pass, after import`, async () => {
       const rig = await open(row);
-      await expectHttp(rig, row, "before");
+      await expectHttp(rig, row, "before", row.expect.before);
       await rig.publish();
       await expectHttp(rig, row, "published");
       await publishUntilStable(rig, row);
       await rig.sync();
-      await expectHttp(rig, row, "imported");
+      await expectHttp(rig, row, "imported", row.expect.after);
     });
   }
 });

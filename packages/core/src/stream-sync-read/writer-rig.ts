@@ -16,14 +16,19 @@ import {
   type StreamSyncRegistry,
   type StreamSyncRunStatus,
 } from "../stream-sync/index.js";
+import { streamSyncHashes } from "../stream-sync/crypto.js";
 import { createWriterOverlaySource } from "../stream-sync/writer.js";
 import {
   decodeHead,
+  decodePart,
+  headBlobName,
+  partBlobName,
   parseScope,
   streamMasterKeyFromSignature,
   streamScope,
   type ControlRead,
   type Head,
+  type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createStreamSyncReadKeys } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
@@ -38,6 +43,8 @@ export const T0 = Date.UTC(2026, 10, 1);
 const silent = { info() {}, warn() {}, error() {} };
 
 class Gateway implements StreamSyncRegistry {
+  /** Every committed registry post, in order. */
+  readonly log: { scope: string; version: number; dataHash: string }[] = [];
   private readonly versions = new Map<
     string,
     { dataHash: string; metadataHash: string; at: string }[]
@@ -71,6 +78,11 @@ class Gateway implements StreamSyncRegistry {
       at: new Date(T0 + rows.length * 1000).toISOString(),
     });
     this.versions.set(request.scope, rows);
+    this.log.push({
+      scope: request.scope,
+      version: rows.length,
+      dataHash: request.dataHash,
+    });
     return { kind: "committed" };
   }
 
@@ -147,6 +159,14 @@ export class Rig {
   /** Every run is identity-less: one namespace, the empty one. */
   readonly ns = "";
   private order = 0;
+  private readonly observed = new Map<string, number>();
+
+  /** The observedAt a collected run carries. */
+  observedAt(runId: string): number {
+    const at = this.observed.get(runId);
+    if (at === undefined) throw new Error(`run ${runId} was not collected`);
+    return at;
+  }
 
   constructor(
     seed?: SeedRows,
@@ -237,6 +257,7 @@ export class Rig {
     const writer = spec.otherDevice ? this.other : this.writer;
     this.order += 1;
     const observedAt = T0 + (spec.at ?? this.order * 1000);
+    this.observed.set(spec.runId, observedAt);
     await writer.refreshControls();
     await writer.beginRun({
       runId: spec.runId,
@@ -281,6 +302,57 @@ export class Rig {
     );
     if (decoded.kind !== "ok") throw new Error(`head ${name}: ${decoded.kind}`);
     return decoded.head;
+  }
+
+  /**
+   * Every registry publication of the connector's streams, oldest first, with
+   * the head and the decoded lines it holds.
+   */
+  async publications(): Promise<
+    { stream: string; version: number; head: Head; lines: Line[] }[]
+  > {
+    const ports = createStreamSyncKeyPorts(SIGNATURE);
+    const out: {
+      stream: string;
+      version: number;
+      head: Head;
+      lines: Line[];
+    }[] = [];
+    for (const entry of this.gateway.log) {
+      const parsed = parseScope(entry.scope);
+      if (parsed?.kind !== "stream" || parsed.connector !== this.connector) {
+        continue;
+      }
+      const cipher = this.blobMap.get(
+        `${entry.scope}/${headBlobName(entry.dataHash)}`,
+      );
+      if (!cipher) throw new Error("head blob is missing");
+      const decoded = decodeHead(await ports.decrypt(entry.scope, cipher));
+      if (decoded.kind !== "ok") throw new Error(`head: ${decoded.kind}`);
+      const { head } = decoded;
+      const lines: Line[] = [];
+      for (const part of head.parts) {
+        const blob = this.blobMap.get(
+          `${entry.scope}/${partBlobName(head.generation, part.hash)}`,
+        );
+        if (!blob) throw new Error("part blob is missing");
+        const clear = await ports.decrypt(entry.scope, blob);
+        const decodedPart = await decodePart(
+          streamSyncHashes.sha256,
+          clear,
+          part,
+          head.primaryKey,
+        );
+        lines.push(...decodedPart.map((d) => d.line));
+      }
+      out.push({
+        stream: parsed.stream,
+        version: entry.version,
+        head,
+        lines,
+      });
+    }
+    return out;
   }
 
   /** The registry version of `stream`; 0 when none. */

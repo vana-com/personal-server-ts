@@ -62,6 +62,19 @@ the test change together.
    commit the snapshot does not know (`snapshot-coherence.test.ts`). An
    older, consistent snapshot is fine; a mixture is not.
 
+## The oracle every row runs
+
+For every row, the test captures each registry publication of the stream with
+its head and decoded lines (`Rig.publications`). Before each publish pass it
+predicts, from the plan and the collected rows alone, the lines every
+publishing step leaves, and each publication of the pass must match one of
+them in order. When the writer is stable, the newest publication of every
+stream, including a stream only the seed fills and runs published before the
+case began, equals the lines the plan predicts from the head the case started
+with. The HTTP matrix (plain, stored body, named connection, owner and grant)
+and the owner/grant containment check run before the writer publishes, after
+one publish pass, and after the reader imports.
+
 ## Writer policies the rows exercise
 
 - **Version floor** (V1, S6, S7, S9, S10, A2, A3, B2): a run from a connector
@@ -75,7 +88,19 @@ the test change together.
 - **Re-projection** (R1, S10): a step that changes the primary key or the
   projector profile publishes even when no row changes.
 - **Full runs merge** (F1): a same-key full run keeps base rows it does not
-  deliver, as the legacy path does.
+  deliver. This is how the stream-sync writer behaved before this table; it is
+  not a claim about what the legacy storage paths do. Those paths differ:
+  - ordinary canonical ingest upserts and tombstones only on an explicit
+    `delete` (a row the run omits stays);
+  - an explicit complete-set replacement (`replaceStream` over a covered full
+    refresh) tombstones live keys the supplied set omits;
+  - a whole-file write stores the supplied envelope as the newest version, and
+    a plain read selects that one envelope: rows it omits leave the latest
+    body, while older versions keep them as history.
+
+  Which of these a full stream-sync run should preserve is an open product
+  decision. The table records only what the writer does today (it merges); no
+  deletion semantics are added here.
 
 ## Rows
 
