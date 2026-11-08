@@ -2,7 +2,7 @@
  * Lane P1 workload: a real StreamSyncWriter (fs spool, disk-backed blobs)
  * publishes a repeated-key NDJSON source. Two halves:
  *
- * - `publishWorkload` runs in a fresh child (see memory-oracle.ts). It does the
+ * - `publishWorkload` runs in a fresh child (see packages/core/src/test-support/memory-oracle.ts). It does the
  *   publish and nothing else, so its kernel peak is the publish's peak.
  * - `verifyPublished` runs in the test process after the child exits. It reads
  *   the published head, then every part one at a time, and checks that every

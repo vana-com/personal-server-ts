@@ -3,7 +3,7 @@
  * publishes a repeated-key stream within a stated memory budget, and the
  * published data is checked part by part.
  *
- * Memory: each publish runs in a fresh child (memory-oracle.ts). The peak is
+ * Memory: each publish runs in a fresh child (packages/core/src/test-support/memory-oracle.ts). The peak is
  * the child's kernel high-water mark (VmHWM) minus the empty child's, so a
  * synchronous materialize-then-free still shows. Measured peaks include the
  * allocator and V8 slack, so budgets are in process-RSS terms.
@@ -31,7 +31,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { run } from "./memory-oracle.js";
+import { run } from "../../../core/src/test-support/memory-oracle.js";
 import {
   P,
   type PublishArgs,
@@ -64,12 +64,31 @@ const RECORD_4K = 4096;
 const FULL_BUDGET = 6 * P + RECORD_4K;
 
 // 79,872 × 4 KiB = 312 MiB. Winners (32,768 × 4 KiB = 128 MiB) exceed P.
+// Budget from the fitted bound, timer GC mode (round 3 sweep, fixed reader,
+// 14 runs, host load ~15-20): peak = C + K*keys + B*inputBytes with
+// C = 80.0 MiB, K = 226 bytes/key, B = 0.1035 MiB per input MiB, residual sd 10.4 MiB.
+// The 312 MiB case predicts 119.4 MiB; budget = prediction + 3 sd, rounded up
+// to 8 MiB. Measured clean runs of this case were 135 and 141 MiB, so the fit
+// underpredicts this shape; see the PR body.
+const FIT = {
+  constantMiB: 80.0,
+  bytesPerKey: 226,
+  mibPerInputMiB: 0.1035,
+  sdMiB: 10.4,
+};
+function fittedBudgetBytes(keys: number, inputMiB: number): number {
+  const predictedMiB =
+    FIT.constantMiB +
+    (FIT.bytesPerKey * keys) / MiB +
+    FIT.mibPerInputMiB * inputMiB;
+  return Math.ceil((predictedMiB + 3 * FIT.sdMiB) / 8) * 8 * MiB;
+}
 const REPEATED_BIG: Case = {
   name: "repeated keys, 312 MiB",
   recordBytes: RECORD_4K,
   records: 79_872,
   distinct: 32_768,
-  budgetBytes: FULL_BUDGET,
+  budgetBytes: fittedBudgetBytes(32_768, (79_872 * RECORD_4K) / MiB),
 };
 // Functional, not a memory gate: 10,240 × 4 KiB = 40 MiB, 5,120 keys. The
 // peak is reported only. Short runs read ±25 MiB under host load, which is

@@ -17,13 +17,13 @@
  *   ceiling), rejects `run` with the child's stderr tail.
  * - Linux only: reads `VmHWM` from `/proc/self/status`.
  * - Garbage lag: Buffer churn is reclaimed only after a GC, and V8 lets external
- *   memory grow to about 64 MiB before it forces one. The child therefore runs
- *   `gc()` every 25 ms for the whole workload, the same for the baseline. A GC
+ *   memory grow to about 64 MiB before it forces one. `gc: "timer25ms"` (the
+ *   default) runs `gc()` every 25 ms for the whole workload, in the baseline too.
+ *   It gives the floor the writer can reach. `gc: "none"` runs no forced GC and
+ *   gives the peak a phone would see, where WebView garbage stays resident. A GC
  *   cannot lower HWM and cannot free live data, so a retained or synchronously
- *   materialized peak still shows in full. In a probe with no periodic GC, the
- *   312 MiB case ended at about 414 MiB HWM; the timer is what keeps that down.
- *   Under host load the timer fires late, so readings move by tens of MiB
- *   between runs; budgets must leave that margin.
+ *   materialized peak shows in full in both modes. Under host load the timer
+ *   fires late, so timer-mode readings move by tens of MiB between runs.
  */
 
 import { spawn } from "node:child_process";
@@ -37,6 +37,20 @@ export interface Workload {
   readonly args?: unknown;
   /** Heap ceiling for the child, in MiB. Default 2048. */
   readonly heapLimitMiB?: number;
+}
+
+/**
+ * How the child collects garbage while the workload runs.
+ * - "timer25ms" (default): `gc()` every 25 ms. Matches a server with an idle
+ *   collector; readings are the lowest the writer can reach.
+ * - "none": no forced GC. Garbage stays resident until V8 decides to collect.
+ *   This is the phone-like peak: the P3 Pixel run showed WebView garbage
+ *   staying resident, up to 5.4 GB.
+ */
+export type GcMode = "timer25ms" | "none";
+
+export interface RunOptions {
+  readonly gc?: GcMode;
 }
 
 export interface MemoryRun<R = unknown> {
@@ -59,7 +73,7 @@ interface ChildReport {
   readonly result: unknown;
 }
 
-function spawnChild(workload: Workload): Promise<ChildReport> {
+function spawnChild(workload: Workload, gc: GcMode): Promise<ChildReport> {
   const heap = workload.heapLimitMiB ?? 2048;
   const args = [
     "--import",
@@ -70,6 +84,7 @@ function spawnChild(workload: Workload): Promise<ChildReport> {
     workload.module,
     workload.exportName,
     JSON.stringify(workload.args ?? null),
+    gc,
   ];
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, {
@@ -105,13 +120,18 @@ function spawnChild(workload: Workload): Promise<ChildReport> {
   });
 }
 
-/** Run one workload in a fresh child; baseline runs alongside it. */
+/**
+ * Run one workload in a fresh child; the empty baseline runs alongside it, in
+ * the same GC mode.
+ */
 export async function run<R = unknown>(
   workload: Workload,
+  opts: RunOptions = {},
 ): Promise<MemoryRun<R>> {
+  const gc = opts.gc ?? "timer25ms";
   const [base, measured] = await Promise.all([
-    spawnChild({ ...workload, exportName: "", args: null }),
-    spawnChild(workload),
+    spawnChild({ ...workload, exportName: "", args: null }, gc),
+    spawnChild(workload, gc),
   ]);
   return {
     peakBytes: Math.max(0, measured.hwmBytes - base.hwmBytes),

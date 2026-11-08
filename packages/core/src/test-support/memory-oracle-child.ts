@@ -1,6 +1,6 @@
 /**
  * Child entry for `memory-oracle.ts`. Usage:
- *   node --import tsx --max-old-space-size=N memory-oracle-child.ts <module> <export> <argsJson>
+ *   node --import tsx --max-old-space-size=N memory-oracle-child.ts <module> <export> <argsJson> <gcMode>
  * An empty export name loads the module and calls nothing (the baseline).
  */
 
@@ -23,13 +23,16 @@ const mod = (await import(pathToFileURL(modulePath).href)) as Record<
   string,
   (args: unknown) => unknown
 >;
-// Periodic GC keeps Buffer churn from piling up across the whole workload,
-// including the reduce phase that runs after intake. Unref'd so it never keeps
-// the child alive. See memory-oracle.ts for why this is a timer.
-const GC_INTERVAL_MS = 25;
+const gcMode = process.argv[5] ?? "timer25ms";
+if (gcMode !== "timer25ms" && gcMode !== "none") {
+  throw new Error(`unknown gc mode ${gcMode}`);
+}
 const gc = (globalThis as { gc?: () => void }).gc;
 if (!gc) throw new Error("memory-oracle child requires --expose-gc");
-setInterval(gc, GC_INTERVAL_MS).unref();
+// Periodic GC keeps Buffer churn from piling up across the whole workload,
+// including the reduce phase that runs after intake. Unref'd so it never keeps
+// the child alive. Skipped in "none" mode. See memory-oracle.ts.
+if (gcMode === "timer25ms") setInterval(gc, 25).unref();
 
 let result: unknown = null;
 if (exportName !== "") {
