@@ -106,3 +106,8 @@ export function canonicalBytes32(value: string): `0x${string}` {
   }
   return `0x${match[1]!.toLowerCase()}`;
 }
+
+/** Frames at most this large are held whole in memory by a reducer; larger ones are located, not held. */
+export const FRAME_SMALL_BYTES = 1 * MiB;
+/** Piece size for a frame longer than {@link FRAME_SMALL_BYTES}: each piece is its own part. */
+export const FRAME_PIECE_BYTES = DEFAULT_PART_TARGET_BYTES;

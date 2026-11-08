@@ -143,7 +143,7 @@ export interface Frame {
 
 /** A pull reader over a byte stream that never joins pieces beyond one line. */
 class ByteSource {
-  private piece = new Uint8Array(0);
+  private piece: Uint8Array = new Uint8Array(0);
   private at = 0;
   private readonly iterator: AsyncIterator<Uint8Array>;
   constructor(source: AsyncIterable<Uint8Array>) {

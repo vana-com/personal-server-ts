@@ -627,8 +627,8 @@ const mutate = (patch) => cj({ ...baseHead, ...patch });
 const headDecode = [
   { name: "valid", text: cj(baseHead), expected: "ok" },
   {
-    name: "format 2",
-    text: mutate({ format: 2 }),
+    name: "format 3",
+    text: mutate({ format: 3 }),
     expected: "unsupported_format",
   },
   {
@@ -761,10 +761,10 @@ const headVerify = [
   },
   {
     name: "unsupported format is reported before name and key",
-    text: mutate({ format: 2 }),
+    text: mutate({ format: 3 }),
     expect: {
       ...verifyExpect,
-      dataHash: keccak(mutate({ format: 2 })),
+      dataHash: keccak(mutate({ format: 3 })),
       keyCheck: otherKeyCheck,
     },
     result: "unsupported_format",

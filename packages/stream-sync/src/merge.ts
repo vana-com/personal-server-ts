@@ -10,7 +10,12 @@
  * distinct keys of the bucket, not with the versions fed to it.
  */
 
-import { PART_LIMIT_BYTES, PLANNER_DEPTH_CAP, utf8Length } from "./bytes.js";
+import {
+  FRAME_SMALL_BYTES,
+  PART_LIMIT_BYTES,
+  PLANNER_DEPTH_CAP,
+  utf8Length,
+} from "./bytes.js";
 import { InvalidArgumentError } from "./errors.js";
 import { encodeLine, inPrefix, type Line } from "./records.js";
 
@@ -130,4 +135,87 @@ export function mergeLines(
   const reducer = new BucketReducer(prefix);
   for (const entry of entries) reducer.add(entry.pkHash, entry.line);
   return reducer.finish(limitBytes);
+}
+
+/**
+ * A frame that won its key, with where its bytes are. The reducer never
+ * reads `ref`: the host decides what it points at (frame bytes held in
+ * memory, a run of base parts, a spool body file).
+ */
+export interface FrameWinner<Ref> {
+  readonly k: string;
+  readonly o: number;
+  readonly r: string;
+  /** Frame size: envelope, LF, body, LF. */
+  readonly size: number;
+  readonly ref: Ref;
+}
+
+export type FrameBucketResult<Ref> =
+  | {
+      readonly kind: "ok";
+      readonly prefix: string;
+      /** Winners sorted by key hash. */
+      readonly winners: readonly FrameWinner<Ref>[];
+      /** Bytes of the small winners, which a writer holds in memory. */
+      readonly smallBytes: number;
+    }
+  | {
+      readonly kind: "split";
+      readonly prefix: string;
+      readonly smallBytes: number;
+    }
+  | {
+      readonly kind: "bucket_too_large";
+      readonly prefix: string;
+      readonly smallBytes: number;
+    };
+
+/**
+ * The §2.6 merge over envelopes. Per key the greatest `(o, r)` wins and, on
+ * equal stamps, the later `add` wins. It reads no body. A bucket splits when
+ * its small winners (frames up to `FRAME_SMALL_BYTES`, which the host keeps
+ * in memory) pass the limit; long frames are located, not held, so they do
+ * not count.
+ */
+export class FrameReducer<Ref> {
+  readonly prefix: string;
+  private readonly winners = new Map<string, FrameWinner<Ref>>();
+
+  constructor(prefix: string) {
+    if (!/^[01]*$/.test(prefix)) {
+      throw new InvalidArgumentError("prefix must be a string of 0 and 1");
+    }
+    this.prefix = prefix;
+  }
+
+  add(winner: FrameWinner<Ref>): void {
+    if (!inPrefix(winner.k, this.prefix)) {
+      throw new InvalidArgumentError(
+        `key ${winner.k} is outside bucket "${this.prefix}"`,
+      );
+    }
+    const current = this.winners.get(winner.k);
+    if (current && compareStamp(winner, current) < 0) return;
+    this.winners.set(winner.k, winner);
+  }
+
+  get size(): number {
+    return this.winners.size;
+  }
+
+  finish(limitBytes: number = PART_LIMIT_BYTES): FrameBucketResult<Ref> {
+    const winners = [...this.winners.values()].sort((a, b) =>
+      a.k < b.k ? -1 : a.k > b.k ? 1 : 0,
+    );
+    let smallBytes = 0;
+    for (const w of winners)
+      if (w.size <= FRAME_SMALL_BYTES) smallBytes += w.size;
+    if (smallBytes > limitBytes) {
+      return this.prefix.length < PLANNER_DEPTH_CAP
+        ? { kind: "split", prefix: this.prefix, smallBytes }
+        : { kind: "bucket_too_large", prefix: this.prefix, smallBytes };
+    }
+    return { kind: "ok", prefix: this.prefix, winners, smallBytes };
+  }
 }

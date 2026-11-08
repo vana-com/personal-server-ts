@@ -17,3 +17,4 @@ export * from "./eligible.js";
 export * from "./outbox.js";
 export * from "./vectors.js";
 export * from "./frames.js";
+export * from "./part-frames.js";
