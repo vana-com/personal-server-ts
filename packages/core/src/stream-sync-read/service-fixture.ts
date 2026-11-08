@@ -5,6 +5,7 @@ import type {
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { hexToBytes, keccak256, parseSignature, toBytes, toHex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { OWNER_MASTER_KEY_MESSAGE } from "../keys/owner-master-key.js";
 import { createStreamSyncReadKeys } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
@@ -41,7 +42,9 @@ export async function masterKey(seed: number): Promise<Uint8Array> {
     keccak256(toBytes(`pdpp-test-owner-key:${seed}`)),
   );
   const sig = parseSignature(
-    await account.sign({ hash: keccak256(toBytes("vana-master-key-v1")) }),
+    await account.sign({
+      hash: keccak256(toBytes(OWNER_MASTER_KEY_MESSAGE)),
+    }),
   );
   const out = new Uint8Array(65);
   out.set(hexToBytes(toHex(BigInt(sig.r), { size: 32 })), 0);
