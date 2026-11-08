@@ -6,6 +6,8 @@ import type { UploadWorkerDeps } from "./upload.js";
 import { uploadOne, uploadAll, computeDataPointId } from "./upload.js";
 import {
   createUploadStateTracker,
+  estimateUploadBodyBytes,
+  MAX_UPLOAD_BODY_BYTES,
   type UploadStateTracker,
 } from "../upload-state.js";
 import type { IndexEntry } from "../../storage/index/types.js";
@@ -1261,6 +1263,18 @@ describe("uploadOne — derivative registration (lineage)", () => {
   });
 });
 
+/** Largest stored size whose upload estimate fits `cap`. The estimate is monotonic. */
+function largestStoredSizeWithin(cap: number): number {
+  let lo = 1;
+  let hi = cap;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (estimateUploadBodyBytes(mid) <= cap) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
 describe("uploadAll — upload size cap and bounded retry", () => {
   const SCOPE_KEY = new Uint8Array(32).fill(0xbb);
   const MIB = 1024 * 1024;
@@ -1321,6 +1335,44 @@ describe("uploadAll — upload size cap and bounded retry", () => {
     expect(results.map((r) => r.path)).toEqual(["b/2.json"]);
     expect(uploadState.snapshot().tooLarge.map((e) => e.path)).toEqual([
       "a/1.json",
+    ]);
+  });
+
+  it("uploads the largest stored size within the cap, and never reads the next byte", async () => {
+    // The estimate is ceil(stored * 1.02) + 65,536, and the cap is 95,000,000.
+    // 93,073,003 * 1.02 = 94,934,463.06, so ceil = 94,934,464, plus 65,536
+    // gives exactly 95,000,000 (fits). 93,073,004 * 1.02 = 94,934,464.08,
+    // so ceil = 94,934,465, plus 65,536 gives 95,000,001 (too large).
+    const LARGEST = largestStoredSizeWithin(MAX_UPLOAD_BODY_BYTES);
+    expect(LARGEST).toBe(93_073_003);
+    expect(estimateUploadBodyBytes(LARGEST)).toBe(MAX_UPLOAD_BODY_BYTES);
+    expect(estimateUploadBodyBytes(LARGEST + 1)).toBe(
+      MAX_UPLOAD_BODY_BYTES + 1,
+    );
+
+    const fits = makeEntry({
+      id: 1,
+      scope: "a",
+      path: "a/1.json",
+      sizeBytes: LARGEST,
+    });
+    const over = makeEntry({
+      id: 2,
+      scope: "b",
+      path: "b/2.json",
+      sizeBytes: LARGEST + 1,
+    });
+    const { deps, uploadState } = setup([fits, over]);
+
+    const results = await cycle(deps, 0);
+
+    expect(results.map((r) => r.path)).toEqual(["a/1.json"]);
+    expect(deps.storage.readEnvelope).toHaveBeenCalledTimes(1);
+    expect(deps.storage.readEnvelope).toHaveBeenCalledWith("a", COLLECTED_AT);
+    expect(encryptWithPassword).toHaveBeenCalledTimes(1);
+    expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+    expect(uploadState.snapshot().tooLarge.map((e) => e.path)).toEqual([
+      "b/2.json",
     ]);
   });
 

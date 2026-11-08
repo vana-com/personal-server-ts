@@ -272,6 +272,27 @@ describe("sync manager — owner retry with real uploadAll", () => {
         nextAttemptAt: new Date(T0 + MINUTE + 2 * MINUTE).toISOString(),
       }),
     ]);
+
+    // Owner triggers inside the second backoff (T0+60 s .. T0+180 s) leave
+    // the tracker exactly as the second failure recorded it.
+    const afterSecond = f.uploadState.snapshot();
+    for (const early of [90 * SECOND, 3 * MINUTE - 1]) {
+      f.at(early);
+      await f.manager.trigger();
+    }
+    expect(f.put).toHaveBeenCalledTimes(2);
+    expect(f.uploadState.snapshot()).toEqual(afterSecond);
+
+    // At T0+180 s the second deadline is due: one attempt, failure 3.
+    f.at(3 * MINUTE);
+    await f.manager.trigger();
+    expect(f.put).toHaveBeenCalledTimes(3);
+    expect(f.uploadState.snapshot().retrying).toEqual([
+      expect.objectContaining({
+        failures: 3,
+        nextAttemptAt: new Date(T0 + 3 * MINUTE + 4 * MINUTE).toISOString(),
+      }),
+    ]);
   });
 
   it("never reads, encrypts or sends a too-large entry, however often the owner triggers", async () => {
@@ -292,5 +313,62 @@ describe("sync manager — owner retry with real uploadAll", () => {
     expect(encryptWithPassword).not.toHaveBeenCalled();
     expect(f.put).not.toHaveBeenCalled();
     expect(f.registerDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("gives every stopped entry one attempt on one trigger(), and leaves a backing-off and a too-large entry alone", async () => {
+    const stoppedA = row(1, "owner.stopped-a", 256);
+    const stoppedB = row(2, "owner.stopped-b", 256);
+    const huge = row(4, "owner.huge", 319 * MIB);
+    const waiting = row(3, "owner.waiting", 256);
+    const rows = [stoppedA, stoppedB, huge];
+    const f = makeFixture(rows);
+
+    // Eight real cycles stop A and B; the huge entry is too large throughout.
+    for (const minutes of BUDGET_OFFSETS_MIN) {
+      f.at(minutes * MINUTE);
+      await uploadAll(f.uploadDeps);
+    }
+    expect(f.uploadState.snapshot().stopped.map((e) => e.path)).toEqual([
+      stoppedA.path,
+      stoppedB.path,
+    ]);
+
+    // A third scope appears and fails once, so it is backing off until +60 s.
+    const t = 200 * MINUTE;
+    rows.push(waiting);
+    f.at(t);
+    await uploadAll(f.uploadDeps);
+    expect(f.put).toHaveBeenCalledTimes(17);
+    const waitingBefore = f.uploadState.snapshot().retrying;
+    expect(waitingBefore).toEqual([
+      expect.objectContaining({ path: waiting.path, failures: 1 }),
+    ]);
+    const tooLargeBefore = f.uploadState.snapshot().tooLarge;
+
+    // One owner trigger, 30 s later: each stopped entry runs exactly once.
+    const readsBefore = f.readEnvelope.mock.calls.length;
+    f.at(t + 30 * SECOND);
+    await f.manager.trigger();
+    expect(f.put).toHaveBeenCalledTimes(19);
+    expect(
+      f.readEnvelope.mock.calls.slice(readsBefore).map(([scope]) => scope),
+    ).toEqual([stoppedA.scope, stoppedB.scope]);
+
+    const snapshot = f.uploadState.snapshot();
+    expect(snapshot.stopped).toEqual([]);
+    const retrying = (path: string) =>
+      snapshot.retrying.find((e) => e.path === path);
+    for (const entry of [stoppedA, stoppedB]) {
+      expect(retrying(entry.path)).toEqual(
+        expect.objectContaining({
+          failures: 1,
+          nextAttemptAt: new Date(T0 + t + 30 * SECOND + MINUTE).toISOString(),
+        }),
+      );
+    }
+    // The backing-off entry keeps its first failure and deadline.
+    expect(retrying(waiting.path)).toEqual(waitingBefore[0]);
+    expect(snapshot.retrying).toHaveLength(3);
+    expect(snapshot.tooLarge).toEqual(tooLargeBefore);
   });
 });
