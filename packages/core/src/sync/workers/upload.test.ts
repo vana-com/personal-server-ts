@@ -1858,6 +1858,11 @@ describe("uploadAll — paged scan of a large backlog", () => {
           .slice(0, limit);
       },
     );
+    deps.storage.maxUnsyncedId = vi.fn(() =>
+      rows
+        .filter((r) => r.dataPointId === null)
+        .reduce((max, r) => Math.max(max, r.id), 0),
+    );
     deps.storage.updateDataPointId = vi.fn(
       (path: string, id: string | null) => {
         const found = rows.find((r) => r.path === path);
@@ -1942,5 +1947,84 @@ describe("uploadAll — paged scan of a large backlog", () => {
     expect(uploadState.snapshot().retrying.map((e) => e.path)).not.toContain(
       "p/9.json",
     );
+  });
+  /** Rows arrive at the tail every cycle while the scan keeps working. */
+  async function runWithArrivals(options: {
+    initial: number;
+    arrivals: number;
+    batchSize?: number;
+    scanBudget?: number;
+    cycles: number;
+    failScope: string;
+    failTimes: number;
+    onCycle?: (cycle: number, rows: IndexEntry[]) => void;
+  }) {
+    const rows = Array.from({ length: options.initial }, (_, i) => row(i + 1));
+    const ctx = setup(rows);
+    let failuresLeft = options.failTimes;
+    (ctx.deps.storage.readEnvelope as ReturnType<typeof vi.fn>)
+      .mockReset()
+      .mockImplementation(async (scope: string) => {
+        if (scope === options.failScope && failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw new Error("transient");
+        }
+        return makeEnvelope();
+      });
+    let nextId = options.initial + 1;
+    for (let cycle = 0; cycle < options.cycles; cycle++) {
+      if (cycle > 0) {
+        for (let i = 0; i < options.arrivals; i++) rows.push(row(nextId++));
+      }
+      options.onCycle?.(cycle, rows);
+      await uploadAll(ctx.deps, {
+        batchSize: options.batchSize,
+        scanBudget: options.scanBudget,
+        now: () => new Date(T0 + cycle * MINUTE),
+      });
+    }
+    return ctx;
+  }
+
+  it("retries an earlier failed row while arrivals keep extending the tail (default sizes)", async () => {
+    const { rows } = await runWithArrivals({
+      initial: 100,
+      arrivals: 50,
+      cycles: 30,
+      failScope: "p.1",
+      failTimes: 1,
+    });
+    expect(rows.find((r) => r.id === 1)?.dataPointId).not.toBeNull();
+  });
+
+  it("retries an earlier failed row while arrivals keep extending the tail (small sizes)", async () => {
+    const { rows } = await runWithArrivals({
+      initial: 6,
+      arrivals: 2,
+      batchSize: 2,
+      scanBudget: 5,
+      cycles: 30,
+      failScope: "p.1",
+      failTimes: 1,
+    });
+    expect(rows.find((r) => r.id === 1)?.dataPointId).not.toBeNull();
+  });
+
+  it("prunes a tracked row deleted behind the cursor while arrivals continue", async () => {
+    const ctx = await runWithArrivals({
+      initial: 100,
+      arrivals: 50,
+      cycles: 40,
+      failScope: "p.5",
+      failTimes: Number.POSITIVE_INFINITY,
+      onCycle: (cycle, rows) => {
+        if (cycle !== 5) return;
+        const at = rows.findIndex((r) => r.id === 5);
+        if (at >= 0) rows.splice(at, 1);
+      },
+    });
+    expect(
+      ctx.uploadState.snapshot().retrying.map((e) => e.path),
+    ).not.toContain("p/5.json");
   });
 });
