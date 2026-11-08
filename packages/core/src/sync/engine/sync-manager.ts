@@ -10,6 +10,7 @@ import {
 } from "../upload-attempts.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
+import { retireLegacyScopes } from "../workers/retire-legacy.js";
 import {
   deleteScope,
   retryPendingBlobDeletions,
@@ -64,6 +65,18 @@ export interface SyncManagerOptions {
     readonly write: boolean;
     readonly publisher: { cycle(): Promise<unknown> };
   } | null;
+  /** See `RetireLegacyOption`. Absent or null: legacy files are never retired. */
+  retireLegacy?: RetireLegacyOption | null;
+}
+
+/**
+ * Present only once the account has switched to stream sync (the host sets it
+ * from the same setting that turns stream-sync write and read on). Each cycle
+ * then deletes the legacy files of scopes whose stream view is complete.
+ * Needs `deleteData`: a local-only delete would be undone by the next sync.
+ */
+export interface RetireLegacyOption {
+  viewIsComplete(scope: string): boolean;
 }
 
 export type SyncCanRunResult =
@@ -289,6 +302,8 @@ export function createSyncManager(
           );
         }
 
+        await retireLegacyAfterDownload();
+
         // Update cached cursor value
         try {
           lastProcessedTimestamp = await downloadDeps.cursor.read();
@@ -430,6 +445,30 @@ export function createSyncManager(
           "Stream sync publish failed",
         );
       }
+    }
+  }
+
+  /** Inside a cycle, after the import: the view state is as fresh as it gets. */
+  async function retireLegacyAfterDownload(): Promise<void> {
+    const retire = options?.retireLegacy;
+    if (!retire || !options?.deleteData) return;
+    try {
+      await retireLegacyScopes({
+        storage: uploadDeps.storage,
+        viewIsComplete: (scope) => retire.viewIsComplete(scope),
+        async deleteScope(scope) {
+          const outcome = await deleteScope(deleteScopeDeps(), scope);
+          uploadState.reconcile(uploadDeps.storage.findUnsynced());
+          if (outcome.durable) deleteAdditionsAfter(scope);
+          return outcome;
+        },
+        logger: uploadDeps.logger,
+      });
+    } catch (err) {
+      uploadDeps.logger.warn(
+        { error: (err as Error).message },
+        "Retiring legacy scopes failed; retried next cycle",
+      );
     }
   }
 

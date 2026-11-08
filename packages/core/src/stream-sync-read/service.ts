@@ -686,6 +686,26 @@ export class StreamSyncReadService {
     };
   }
 
+  /**
+   * The read path would serve a stream view of `scope`, not its legacy file:
+   * some target's streams are all live and `complete` (§2.10, the same
+   * `eligible()` call a read makes). Imported heads only; this device's
+   * unpublished local runs are not counted.
+   */
+  viewServes(scope: string): boolean {
+    const known = new Set(this.mirror.connectors());
+    return readTargets(scope)
+      .filter((target) => known.has(target.connector))
+      .some(
+        (target) =>
+          eligible({
+            connections: this.connectionViews(target.connector),
+            target: { kind: "logical", streams: target.streams },
+            legacyFile: true,
+          }).kind === "view",
+      );
+  }
+
   /** §2.10 inputs for connector c: every connection this server knows. */
   connectionViews(
     connector: string,

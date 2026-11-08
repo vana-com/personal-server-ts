@@ -54,6 +54,12 @@ export {
   type RetryPendingBlobDeletionsResult,
 } from "./workers/delete.js";
 export {
+  RETIRE_LEGACY_SCOPES_PER_CYCLE,
+  retireLegacyScopes,
+  type RetireLegacyDeps,
+  type RetireLegacyResult,
+} from "./workers/retire-legacy.js";
+export {
   createGatewayDataPointFeed,
   feedFromGatewayClient,
   type GatewayDataPointFeedOptions,
