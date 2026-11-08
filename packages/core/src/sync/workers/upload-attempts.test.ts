@@ -275,3 +275,19 @@ describe("uploadAll — durable attempt markers", () => {
     });
   });
 });
+
+describe("attempt ledger — paged scans", () => {
+  it("keeps markers for rows a partial scan did not reach, and drops those it covered", async () => {
+    const store = createMemoryUploadAttemptStore();
+    const ledger = createUploadAttemptLedger(store, OWNER);
+    const early = makeEntry(1);
+    const late = makeEntry(9);
+    await ledger.begin(early);
+    await ledger.begin(late);
+
+    // The scan covered ids 0..5 and listed neither row.
+    await ledger.reconcile([], { afterId: 0, throughId: 5 });
+
+    expect((await store.read())?.map((r) => r.path)).toEqual([late.path]);
+  });
+});
