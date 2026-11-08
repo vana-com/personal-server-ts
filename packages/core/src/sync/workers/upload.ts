@@ -535,18 +535,31 @@ export async function uploadAll(
   // a bounded amount per cycle and is still swept in full. Any other host is
   // listed whole.
   const state = deps.uploadState ?? createUploadStateTracker();
-  const paged = deps.storage.findUnsyncedPage;
+  // Paging needs both methods: the page method alone has no fence, so a
+  // growing tail could keep the sweep from ever wrapping. Such a host is
+  // listed whole.
+  const paged = deps.storage.maxUnsyncedId
+    ? deps.storage.findUnsyncedPage
+    : undefined;
   const scanBudget = options?.scanBudget ?? UPLOAD_SCAN_BUDGET;
   const scanAfter = paged ? state.scanCursor() : 0;
   // A sweep covers the rows present when it began: its upper id is fixed at
   // the start. Rows that arrive above it wait for the next sweep, so a tail
   // that keeps growing cannot stop the sweep from wrapping back to earlier
-  // rows (a failed upload that is due again would never be revisited). A
-  // host without `maxUnsyncedId` is swept without a fence.
+  // rows (a failed upload that is due again would never be revisited).
   if (paged && scanAfter === 0 && state.scanFence() === null) {
-    state.setScanFence(
-      deps.storage.maxUnsyncedId?.() ?? Number.POSITIVE_INFINITY,
-    );
+    const max = deps.storage.maxUnsyncedId?.() ?? Number.POSITIVE_INFINITY;
+    state.setScanFence(max);
+    // No unsynced row is above the fresh maximum, so state recorded for ids
+    // beyond it belongs to rows that are gone (a remote deletion removes rows
+    // without the sync manager). Only a new sweep may say this: an older
+    // sweep's fence can sit below live state.
+    if (Number.isFinite(max)) {
+      state.reconcile([], {
+        afterId: max,
+        throughId: Number.POSITIVE_INFINITY,
+      });
+    }
   }
   const scanFence = paged ? (state.scanFence() ?? Number.POSITIVE_INFINITY) : 0;
   const listed = paged
