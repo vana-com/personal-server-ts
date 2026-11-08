@@ -13,7 +13,7 @@
  */
 
 import {
-  admitsCurrent,
+  admitStart,
   canonicalBytes32,
   classifyStreamRow,
   controlHashes,
@@ -21,7 +21,6 @@ import {
   isHeadLive,
   selectConnection,
   streamScope,
-  type AdmissionStart,
   type ConnectionView,
   type ControlState,
   type Eligibility,
@@ -640,21 +639,20 @@ export class StreamSyncReadService {
     const floor = this.mirror.deletionFloor(streamScope(connector, ns, stream));
     const candidates: Contribution[] = [];
     for (const run of snapshot.runs) {
-      // The writer's admission rule, shared with decide(): a run bound to no
-      // generation started while the connection was absent. A pending read
-      // with the connection absent still shows an active-start run: decide()
-      // keeps it pending (reread) and does not discard it until it publishes.
-      const start: AdmissionStart =
-        run.generation === null
-          ? { kind: "absent" }
-          : { kind: "active", generation: run.generation };
-      const admitted =
-        (pending && control.kind === "absent") || admitsCurrent(start, control);
-      if (run.connector !== connector || run.ns !== ns || !admitted) {
-        continue;
-      }
+      if (run.connector !== connector || run.ns !== ns) continue;
       const local = run.streams.find((s) => s.name === stream);
       if (!local) continue;
+      // The same rule decide() applies, on the run's recorded start: a pending
+      // read shows publish and wait, a published read shows publish only. A
+      // deleted or foreign start is not decided here (decide keeps its own
+      // deleted cell): the run counts only once a receipt shows it published.
+      const verdict =
+        run.start.kind === "deleted" || run.start.kind === "foreign"
+          ? local.receipt
+            ? "publish"
+            : "discard"
+          : admitStart(run.start, control);
+      if (verdict === "discard" || (verdict === "wait" && !pending)) continue;
       if (local.receipt && local.receipt.registryVersion <= floor) continue;
       if (local.receipt && base && covers(base, local.receipt)) continue;
       candidates.push({ run, stream: local });

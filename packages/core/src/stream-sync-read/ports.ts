@@ -11,6 +11,7 @@ import type {
   HashPorts,
   HeadProfile,
   Line,
+  StartState,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 
 /**
@@ -100,6 +101,12 @@ export interface StreamSyncOverlayRun {
    * genuinely unbound; never inferred from whichever control is active later.
    */
   readonly generation: number | null;
+  /**
+   * The run's recorded start state, as decide() reads it at publish: the
+   * writer's `startState(entry.start, ns)`. `unknown` is a run that recorded
+   * none. Required: the overlay is an in-process port, never serialized.
+   */
+  readonly start: StartState;
   /** Diagnostic aggregate only. Visibility and retirement use the per-stream fields. */
   readonly state: "pending" | "failed" | "published";
   readonly error?: string;

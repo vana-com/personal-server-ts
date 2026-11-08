@@ -78,6 +78,22 @@ describe("decide invariants (exhaustive over small states)", () => {
     }
   });
 
+  it("waits on an active start whose connection is absent or at a lower generation", () => {
+    for (const input of everyInput()) {
+      const { start, current, phase } = input;
+      if (start.kind !== "active" || phase === "after_write") continue;
+      const lower =
+        current.kind === "absent" ||
+        (current.kind === "active" && current.generation < start.generation);
+      if (!lower) continue;
+      expect(decide(input)).toEqual(
+        phase === "reread"
+          ? { kind: "keep_pending", reason: "registry_inconsistent" }
+          : { kind: "reread" },
+      );
+    }
+  });
+
   it("reads the start snapshot by ns", () => {
     expect(startState(null, "x")).toEqual({ kind: "unknown" });
     expect(startState({}, "x")).toEqual({ kind: "absent" });

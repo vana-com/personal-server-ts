@@ -762,4 +762,113 @@ describe("own-write visibility (deletion floor)", () => {
     });
     expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
   });
+  // Round 6 (i). The run starts at generation 1 (control connected when it
+  // began). The connection is deleted and reconnected before the run finishes.
+  // The writer judges the run by its start (decide.ts, active cell: a later
+  // generation discards it), so the reader must not serve its rows, even
+  // though the run is bound to no generation at finish.
+  it("does not serve a run begun at generation 1, finished after a delete and reconnect", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    const other = new Device();
+    await other.collect([{ id: "z", v: 1 }]);
+    await other.publish();
+    d.gateway.adoptControlFrom(other.gateway);
+    const runId = await d.begin({ items: [{ id: "b", v: 2 }] });
+    d.gateway.deleteControl();
+    d.gateway.reviveControl();
+    await d.finish(runId);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
+
+  // Round 6 (ii). The run starts at generation 3. The connection is then at a
+  // lower active generation (1). The writer waits (decide.ts, active cell:
+  // reread or keep_pending) and does not discard, so the reader must still
+  // serve the pending run.
+  it("serves a pending run started at generation 3 when the connection is now at generation 1", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    const other = new Device();
+    await other.collect([{ id: "z", v: 1 }]);
+    await other.publish();
+    d.gateway.adoptControlFrom(other.gateway);
+    d.gateway.deleteControl();
+    d.gateway.reviveControl();
+    const runId = await d.begin({ items: [{ id: "b", v: 2 }] });
+    await d.finish(runId);
+    d.gateway.adoptControlFrom(other.gateway);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await d.gateway.read(controlScope(CONNECTOR, ""))).toMatchObject({
+      found: true,
+      version: 1,
+      deleted: false,
+    });
+    expect(await latest(service)).toMatchObject({ rows: { b: 2 } });
+  });
+
+  // Round 6 (iii). A run that records no start state (pre-upgrade: the control
+  // state was never read when it began). decide.ts discards an `unknown` start
+  // and recollects it, so the reader must not serve its rows, even though the
+  // connection is at generation 1.
+  it("does not serve a run that recorded no start state, while the connection is at generation 1", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    const other = new Device();
+    await other.collect([{ id: "z", v: 1 }]);
+    await other.publish();
+    d.gateway.adoptControlFrom(other.gateway);
+    // beginRun without refreshControls: the writer holds no control state.
+    await d.writer.beginRun({
+      runId: "run-unknown",
+      connector: CONNECTOR,
+      userConnect: false,
+      observedAt: T0,
+      identity: "none",
+      checkpointUsed: null,
+    });
+    await d.writer.declareStream("run-unknown", "items", SHAPE);
+    await d.writer.append("run-unknown", "items", { id: "b", v: 2 });
+    await d.finish("run-unknown");
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
+  // Round 6 (iv). The run begins while the connection is absent (start absent,
+  // no generation bound at begin). The connection is then connected at
+  // generation 3 before the run finishes. The writer's start is absent, so it
+  // discards at generation 3 (decide.ts, absent cell). The reader binds the
+  // generation at finish (3) and serves the rows unless it judges by start.
+  it("does not serve a run begun while the connection was absent, finished after the connection reached generation 3", async () => {
+    const d = new Device();
+    const service = await d.openReader();
+    const runId = await d.begin({ items: [{ id: "b", v: 2 }] });
+    const other = new Device();
+    await other.collect([{ id: "z", v: 1 }]);
+    await other.publish();
+    d.gateway.adoptControlFrom(other.gateway);
+    d.gateway.deleteControl();
+    d.gateway.reviveControl();
+    // The writer observes the reconnect before the run finishes.
+    await d.writer.refreshControls();
+    await d.finish(runId);
+    await service.observe(d.gateway.feed(), {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await d.gateway.read(controlScope(CONNECTOR, ""))).toMatchObject({
+      found: true,
+      version: 3,
+      deleted: false,
+    });
+    expect((await latest(service)).rows).not.toHaveProperty("b");
+  });
 });
