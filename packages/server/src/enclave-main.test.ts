@@ -140,6 +140,35 @@ describe("readEnclaveEnv", () => {
     );
   });
 
+  it.each([
+    ["true", true],
+    ["false", false],
+    [undefined, false],
+    ["1", false],
+    ["TRUE", false],
+  ])(
+    "sets hosted stream reading from PS_STREAM_SYNC_READ=%s",
+    async (value, expected) => {
+      const config = prepareEnclaveRun();
+      // The switch owns reading only; enclave bootstrap excludes writers.
+      config.streamSync.read = !expected;
+      config.streamSync.write = true;
+      vi.stubEnv("PS_STREAM_SYNC_READ", value);
+
+      await runEnclaveMain();
+
+      expect(config.streamSync.read).toBe(expected);
+      expect(config.streamSync.write).toBe(true);
+      expect(serviceMocks.createServer).toHaveBeenCalledWith(
+        config,
+        expect.objectContaining({
+          profile: "enclave",
+          ownerSignature: MASTER_SIGNATURE,
+        }),
+      );
+    },
+  );
+
   it("uses the sandbox gateway and adds preview bypass only for its origin", async () => {
     const config = ServerConfigSchema.parse({});
     const context = {

@@ -133,6 +133,8 @@ export async function runEnclaveMain(): Promise<void> {
     );
   }
   config.sync.enabled = process.env.SYNC_ENABLED !== SYNC_DISABLED;
+  // Hosted readers opt in independently of writers; the default stays off.
+  config.streamSync.read = process.env.PS_STREAM_SYNC_READ === "true";
   config.devUi.enabled = false;
   config.tunnel.enabled = false;
 
