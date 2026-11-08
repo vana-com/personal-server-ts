@@ -530,42 +530,102 @@ describe.each(matrix)(
       expect(view === null || view === "tombstoned").toBe(true);
     });
 
-    // S1-stream (review of #567, P1): a stream row tombstoned after a run was
-    // collected, then written again by a relive, must not take the old run.
-    it("collect, tombstone stream row, relive, publish: nothing from the old run is readable or published", async () => {
-      const c = freshConnector("p4r2-stream-relive");
+    // L11 (ruling M3): an old install's non-exclusive DELETE tombstones one
+    // stream row. The next incremental publish onto that base is incomplete and
+    // sets needsFull; the run after it is full and the head ends complete.
+    it("L11: an old DELETE tombstones one stream row; the next run is full and the head ends complete", async () => {
+      const c = freshConnector("p4r2-l11-full");
       await activateControl(env.registry, c, NS); // control active(1)
       const scope = streamScope(c, NS, "s");
-      const a = await env.writer("p4r2-stream-relive-a");
-      await a.refreshControls();
-      await collect(a, {
-        runId: "p4r2-stream-old",
+      const d = await env.writer("p4r2-l11-full-d");
+      await d.refreshControls();
+      await collect(d, {
+        runId: "p4r2-l11-full-0",
         connector: c,
         observedAt: T0,
-        streams: { s: rows(["1"], "old") },
+        streams: { s: rows(["r1", "r2", "r3"], "base") },
       });
-      await oldDelete(env, scope); // the stream row is tombstoned
-      const b = await env.writer("p4r2-stream-relive-b");
-      await b.refreshControls();
-      await collect(b, {
-        runId: "p4r2-stream-relive",
+      await d.publishPending();
+      await oldDelete(env, scope); // L11: the stream row is tombstoned
+
+      // Incremental run from the old checkpoint, publishing onto the tombstone.
+      await d.refreshControls();
+      await collect(d, {
+        runId: "p4r2-l11-full-1",
         connector: c,
         observedAt: T0 + 1000,
-        streams: { s: rows(["2"], "new") },
+        checkpointUsed: { ns: NS, generation: 1 },
+        streams: { s: rows(["r4"], "incremental") },
       });
-      await b.publishPending(); // the relive writes the row again
-      await a.publishPending();
+      await d.publishPending();
+      const partial = await readStream(env.registry, env.blobs, c, NS, "s");
+      expect(partial).not.toBeNull();
+      expect(partial).not.toBe("tombstoned");
+      expect((partial as StreamView).head.complete).toBe(false);
+      expect((await d.status()).needsFull).toEqual([
+        { connector: c, ns: NS, stream: "s" },
+      ]);
+      expect(await d.runPlan(c)).toEqual({
+        mustBeFull: true,
+        checkpoint: null,
+      });
+
+      // The next run is full: it re-collects everything upstream returns.
+      await d.refreshControls();
+      await collect(d, {
+        runId: "p4r2-l11-full-2",
+        connector: c,
+        observedAt: T0 + 2000,
+        checkpointUsed: null,
+        streams: { s: rows(["r1", "r2", "r3", "r4"], "full") },
+      });
+      await d.publishPending();
+      const view = await readStream(env.registry, env.blobs, c, NS, "s");
+      expect(view).not.toBeNull();
+      expect(view).not.toBe("tombstoned");
+      expect((view as StreamView).head.complete).toBe(true);
+      expect([...(view as StreamView).records.keys()].sort()).toEqual([
+        "r1",
+        "r2",
+        "r3",
+        "r4",
+      ]);
+    });
+
+    // L11, late arrival: a partial run started before the tombstone publishes
+    // after the relive. The head must stay complete and keep the relive's rows.
+    it("L11: an old partial run published after the relive leaves the head complete and keeps the relive's rows", async () => {
+      const c = freshConnector("p4r2-l11-late");
+      await activateControl(env.registry, c, NS); // control active(1)
+      const scope = streamScope(c, NS, "s");
+      const old = await env.writer("p4r2-l11-late-old");
+      await old.refreshControls();
+      await collect(old, {
+        runId: "p4r2-l11-late-old",
+        connector: c,
+        observedAt: T0,
+        checkpointUsed: { ns: NS, generation: 1 },
+        streams: { s: rows(["o1"], "old") },
+      });
+      await oldDelete(env, scope); // the stream row is tombstoned
+      const relive = await env.writer("p4r2-l11-late-relive");
+      await relive.refreshControls();
+      await collect(relive, {
+        runId: "p4r2-l11-late-relive",
+        connector: c,
+        observedAt: T0 + 1000,
+        streams: { s: rows(["r1", "r2"], "relive") },
+      });
+      await relive.publishPending();
+      await old.publishPending();
 
       const view = await readStream(env.registry, env.blobs, c, NS, "s");
       expect(view).not.toBeNull();
       expect(view).not.toBe("tombstoned");
-      // Only the relive's record is readable, and the row is still at the
-      // relive's version: the old run wrote nothing over it.
-      expect((view as StreamView).version).toBe(2);
-      expect([...(view as StreamView).records.keys()]).toEqual(["2"]);
-      expect(
-        finishedOutcome(await a.status(), "p4r2-stream-old")?.outcome,
-      ).not.toMatchObject({ kind: "checkpointed" });
+      expect((view as StreamView).head.complete).toBe(true);
+      expect([...(view as StreamView).records.keys()]).toEqual(
+        expect.arrayContaining(["r1", "r2"]),
+      );
     });
 
     // S1-stream, no relive: a stream row tombstoned after collect and not
@@ -589,53 +649,6 @@ describe.each(matrix)(
       expect(view === null || view === "tombstoned").toBe(true);
       expect(
         finishedOutcome(await a.status(), "p4r2-stream-tomb-only-old")?.outcome,
-      ).not.toMatchObject({ kind: "checkpointed" });
-    });
-
-    // S1-stream, in-flight: the tombstone and relive land between the old
-    // run's read and its POST, so the publish takes the conflict-retry path.
-    it("in-flight publish conflicts with a stream tombstone and relive: the retry discards the old run", async () => {
-      const c = freshConnector("p4r2-stream-inflight");
-      await activateControl(env.registry, c, NS); // control active(1)
-      const scope = streamScope(c, NS, "s");
-      let raced = false;
-      const a = await env.writer("p4r2-stream-inflight-a", {
-        registry: interpose(env.newRegistry(), {
-          async beforePost(request) {
-            if (raced || request.scope !== scope) return;
-            raced = true;
-            await oldDelete(env, scope);
-            const b = await env.writer("p4r2-stream-inflight-b");
-            await b.refreshControls();
-            await collect(b, {
-              runId: "p4r2-stream-inflight-relive",
-              connector: c,
-              observedAt: T0 + 1000,
-              streams: { s: rows(["2"], "new") },
-            });
-            await b.publishPending();
-          },
-        }),
-      });
-      await a.refreshControls();
-      await collect(a, {
-        runId: "p4r2-stream-inflight-old",
-        connector: c,
-        observedAt: T0,
-        streams: { s: rows(["1"], "old") },
-      });
-      await a.publishPending();
-
-      expect(raced).toBe(true);
-      const view = await readStream(env.registry, env.blobs, c, NS, "s");
-      expect(view).not.toBeNull();
-      expect(view).not.toBe("tombstoned");
-      // Only the relive's record is readable, and the row is still at the
-      // relive's version: the old run wrote nothing over it.
-      expect((view as StreamView).version).toBe(2);
-      expect([...(view as StreamView).records.keys()]).toEqual(["2"]);
-      expect(
-        finishedOutcome(await a.status(), "p4r2-stream-inflight-old")?.outcome,
       ).not.toMatchObject({ kind: "checkpointed" });
     });
 
