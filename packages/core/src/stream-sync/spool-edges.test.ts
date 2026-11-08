@@ -1,12 +1,37 @@
 import { describe, expect, it } from "vitest";
 import { createMemoryStreamSyncFiles } from "./memory-files.js";
 import type { StreamSyncFiles } from "./ports.js";
-import { readSpool, type SpoolLine } from "./spool.js";
+import { inlineSpoolLine, readSpool, type SpoolEntry } from "./spool.js";
 
 // Same size as the filesystem adapter's read chunk (fs-files.ts CHUNK_BYTES).
 const CHUNK = 1024 * 1024;
 const encoder = new TextEncoder();
 const hashOf = (n: number) => n.toString(16).padStart(64, "0");
+
+/** One spool line (no terminator) for a body held on the line. */
+function mk(k: string, body: string): string {
+  return inlineSpoolLine(
+    { h: "0".repeat(64), k, n: encoder.encode(body).length, o: 0, r: "r" },
+    body,
+  );
+}
+
+/** A line of exactly `bytes` UTF-8 bytes: the body is `prefix`, filler `a`, then `suffix`. */
+function exact(k: string, bytes: number, prefix = "", suffix = ""): string {
+  const size = (pad: number) =>
+    encoder.encode(mk(k, `${prefix}${"a".repeat(pad)}${suffix}`)).length;
+  let pad = 0;
+  // The size grows one byte per filler byte, plus one when the body length
+  // gains a digit, so a few corrections reach the target.
+  for (let i = 0; i < 4; i += 1) pad = Math.max(0, pad + bytes - size(pad));
+  if (size(pad) !== bytes) throw new Error("line cannot be that size");
+  return mk(k, `${prefix}${"a".repeat(pad)}${suffix}`);
+}
+
+interface RefLine {
+  readonly k: string;
+  readonly body: string;
+}
 
 /**
  * Reference split: decode the whole file at once, split on "\n", parse each
@@ -18,12 +43,21 @@ function reference(bytes: Uint8Array) {
     .decode(bytes)
     .split("\n");
   const unterminated = parts.pop() !== "";
-  const lines: SpoolLine[] = parts.map((raw) => {
-    if (raw[64] !== " ") throw new Error("reference: malformed line");
-    return { pkHash: raw.slice(0, 64), text: raw.slice(65) };
+  const lines: RefLine[] = parts.map((raw) => {
+    const fields = raw.split("\t");
+    if (fields.length !== 3 || fields[0]!.length !== 64) {
+      throw new Error("reference: malformed line");
+    }
+    return { k: fields[0]!, body: fields[2]! };
   });
   return { lines, unterminated };
 }
+
+const view = (entries: readonly SpoolEntry[]): RefLine[] =>
+  entries.map((e) => ({
+    k: e.envelope.k,
+    body: e.body.kind === "inline" ? e.body.text : `@${e.body.path}`,
+  }));
 
 /** Stores the file as one chunk; the adapter then yields exact CHUNK-byte reads. */
 async function fileOf(bytes: Uint8Array, chunk = CHUNK) {
@@ -44,7 +78,7 @@ async function fileOf(bytes: Uint8Array, chunk = CHUNK) {
 }
 
 async function readAll(files: StreamSyncFiles, path: string) {
-  const lines: SpoolLine[] = [];
+  const lines: SpoolEntry[] = [];
   try {
     for await (const line of readSpool(files, path)) lines.push(line);
   } catch (error) {
@@ -61,7 +95,7 @@ async function expectMatchesReference(bytes: Uint8Array, chunk = CHUNK) {
 
   expect(sizes[0]).toBe(Math.min(chunk, bytes.length));
   expect(sizes.reduce((n, s) => n + s, 0)).toBe(bytes.length);
-  expect(got.lines).toEqual(ref.lines);
+  expect(view(got.lines)).toEqual(ref.lines);
   if (ref.unterminated) {
     expect(got.error?.message).toContain("ends mid-line");
   } else {
@@ -76,9 +110,13 @@ async function expectMatchesReference(bytes: Uint8Array, chunk = CHUNK) {
  * the rest in chunk 2.
  */
 function straddleFile(ch: string, split: number) {
-  // Line 1 is 65 + k bytes plus "\n"; line 2's header is 65 bytes.
-  const k = CHUNK - split - 131;
-  return `${hashOf(1)} ${"a".repeat(k)}\n${hashOf(2)} ${ch}tail\n${hashOf(3)} after 😀€ end\n`;
+  // The character starts at byte CHUNK - split: line 1, its "\n" and line
+  // 2's key and envelope fill the gap.
+  const body = `${ch}tail`;
+  const header =
+    encoder.encode(mk(hashOf(2), body)).length - encoder.encode(body).length;
+  const first = exact(hashOf(1), CHUNK - split - 1 - header);
+  return `${first}\n${mk(hashOf(2), body)}\n${mk(hashOf(3), "after 😀€ end")}\n`;
 }
 
 describe("readSpool at 1 MiB chunk edges", () => {
@@ -96,7 +134,7 @@ describe("readSpool at 1 MiB chunk edges", () => {
       encoder.encode(ch),
     );
     const { ref } = await expectMatchesReference(bytes);
-    expect(ref.lines[1]?.text).toContain(ch);
+    expect(ref.lines[1]?.body).toContain(ch);
   });
 
   // (b) one line is longer than two chunks and crosses two boundaries.
@@ -104,11 +142,11 @@ describe("readSpool at 1 MiB chunk edges", () => {
     const unit = "é€😀"; // 2 + 3 + 4 bytes
     const long = unit.repeat(Math.ceil((2.5 * CHUNK) / 9));
     const bytes = encoder.encode(
-      `${hashOf(1)} short\n${hashOf(2)} ${long}\n${hashOf(3)} after\n`,
+      `${mk(hashOf(1), "short")}\n${mk(hashOf(2), long)}\n${mk(hashOf(3), "after")}\n`,
     );
     expect(encoder.encode(long).length).toBeGreaterThan(2 * CHUNK);
     const { ref } = await expectMatchesReference(bytes);
-    expect(ref.lines[1]?.text).toBe(long);
+    expect(ref.lines[1]?.body).toBe(long);
   });
 
   // (c) a line ends exactly at a boundary, in two positions.
@@ -116,10 +154,8 @@ describe("readSpool at 1 MiB chunk edges", () => {
     ["newline is the last byte of chunk 1", CHUNK - 1],
     ["last content byte is the last byte of chunk 1", CHUNK],
   ])("(c) a line ends at the boundary: %s", async (_name, newlineAt) => {
-    // Line 1 is ASCII: its header is 65 bytes, then k content bytes, then "\n".
-    const k = newlineAt - 65;
     const bytes = encoder.encode(
-      `${hashOf(1)} ${"a".repeat(k)}\n${hashOf(2)} 😀 tail\n${hashOf(3)} last\n`,
+      `${exact(hashOf(1), newlineAt)}\n${mk(hashOf(2), "😀 tail")}\n${mk(hashOf(3), "last")}\n`,
     );
     expect(bytes[newlineAt]).toBe(0x0a);
     await expectMatchesReference(bytes);
@@ -128,7 +164,7 @@ describe("readSpool at 1 MiB chunk edges", () => {
   // (d) the last line has no "\n": complete lines are yielded, then the error.
   it("(d) the file has no trailing newline", async () => {
     const bytes = encoder.encode(
-      `${hashOf(1)} ${"x".repeat(CHUNK + 100)}\n${hashOf(2)} tail 😀`,
+      `${mk(hashOf(1), "x".repeat(CHUNK + 100))}\n${mk(hashOf(2), "tail 😀")}`,
     );
     const { ref } = await expectMatchesReference(bytes);
     expect(ref.unterminated).toBe(true);
@@ -142,29 +178,33 @@ const BOM = "\uFEFF";
 
 /** Line 1 is ASCII and ends so that line 2 starts at `start` with a BOM. */
 function lineStartBomFile(start: number) {
-  // Line 1 is 66 + k bytes including its "\n".
-  const k = start - 66;
-  return `${hashOf(1)} ${"a".repeat(k)}\n${BOM}${hashOf(2)} two\n`;
+  return `${exact(hashOf(1), start - 1)}\n${BOM}${mk(hashOf(2), "two")}\n`;
 }
 
 describe("readSpool and the byte order mark", () => {
   it("strips a BOM at the start of the file", async () => {
     await expectMatchesReference(
-      encoder.encode(`${BOM}${hashOf(1)} one\n${hashOf(2)} two\n`),
+      encoder.encode(
+        `${BOM}${mk(hashOf(1), "one")}\n${mk(hashOf(2), "two")}\n`,
+      ),
     );
   });
 
   it("strips a BOM at the start of the file across 1-byte reads", async () => {
     await expectMatchesReference(
-      encoder.encode(`${BOM}${hashOf(1)} one\n${hashOf(2)} two\n`),
+      encoder.encode(
+        `${BOM}${mk(hashOf(1), "one")}\n${mk(hashOf(2), "two")}\n`,
+      ),
       1,
     );
   });
 
   it("keeps a U+FEFF inside a line", async () => {
-    const bytes = encoder.encode(`${hashOf(1)} a${BOM}b\n${hashOf(2)} two\n`);
+    const bytes = encoder.encode(
+      `${mk(hashOf(1), `a${BOM}b`)}\n${mk(hashOf(2), "two")}\n`,
+    );
     const { ref } = await expectMatchesReference(bytes);
-    expect(ref.lines[0]?.text).toBe(`a${BOM}b`);
+    expect(ref.lines[0]?.body).toBe(`a${BOM}b`);
   });
 
   it.each([1, 2])(
@@ -174,21 +214,24 @@ describe("readSpool and the byte order mark", () => {
       const at = CHUNK - split;
       expect(bytes.subarray(at, at + 3)).toEqual(encoder.encode(BOM));
       const { ref } = await expectMatchesReference(bytes);
-      expect(ref.lines[1]?.text).toContain(BOM);
+      expect(ref.lines[1]?.body).toContain(BOM);
     },
   );
 
   // Red on the per-line decode: each line used to lose a leading U+FEFF.
   it.each([
-    ["a small file", 100],
+    ["a small file", 300],
     ["a line that starts at the 1 MiB boundary", CHUNK - 1],
   ])("does not strip a U+FEFF at a line start: %s", async (_name, start) => {
     const bytes = encoder.encode(lineStartBomFile(start));
     expect(bytes[start]).toBe(0xef);
     const { files, path } = await fileOf(bytes);
     const got = await readAll(files, path);
-    expect(got.lines).toEqual([
-      { pkHash: hashOf(1), text: "a".repeat(start - 66) },
+    expect(view(got.lines)).toEqual([
+      {
+        k: hashOf(1),
+        body: expect.stringMatching(/^a*$/) as unknown as string,
+      },
     ]);
     expect(got.error?.message).toBe("malformed spool line");
   });
@@ -206,7 +249,7 @@ describe("readSpool and the byte order mark", () => {
 
   it("reads a file with no BOM unchanged", async () => {
     await expectMatchesReference(
-      encoder.encode(`${hashOf(1)} one\n${hashOf(2)} two\n`),
+      encoder.encode(`${mk(hashOf(1), "one")}\n${mk(hashOf(2), "two")}\n`),
     );
   });
 });

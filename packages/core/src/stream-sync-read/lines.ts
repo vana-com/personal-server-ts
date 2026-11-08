@@ -10,6 +10,7 @@
 
 import {
   compareStamp,
+  linesOfParts,
   pkHash,
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -74,12 +75,23 @@ export async function overlayWinners(
 
 async function* partLines(
   views: ViewStore,
+  keys: StreamSyncReadKeys,
   lease: ViewLease,
-): AsyncGenerator<{ readonly text: string; readonly line: Line }> {
-  for (const part of lease.version.head.parts) {
-    const text = decoder.decode(
-      await views.readPart(lease.key, part.hash, part.bytes),
-    );
+): AsyncGenerator<{ readonly line: Line }> {
+  const head = lease.version.head;
+  const read = (part: { hash: string; bytes: number }) =>
+    views.readPart(lease.key, part.hash, part.bytes);
+  if (head.format === 2) {
+    // The store verified each part; frame structure is checked as it is read.
+    for await (const line of linesOfParts(keys.hashes.sha256, head, read, {
+      verify: false,
+    })) {
+      yield { line };
+    }
+    return;
+  }
+  for (const part of head.parts) {
+    const text = decoder.decode(await read(part));
     let start = 0;
     while (start < text.length) {
       const end = text.indexOf("\n", start);
@@ -89,7 +101,7 @@ async function* partLines(
       const lineText = text.slice(start, end);
       start = end + 1;
       // Verified at import (`decodePart`); parsed, not re-verified.
-      yield { text: lineText, line: JSON.parse(lineText) as Line };
+      yield { line: JSON.parse(lineText) as Line };
     }
   }
 }
@@ -113,12 +125,12 @@ export async function* viewLines(
     return;
   }
   if (overlay.winners.size === 0) {
-    for await (const { line } of partLines(views, base)) yield line;
+    for await (const { line } of partLines(views, keys, base)) yield line;
     return;
   }
   const pending = [...overlay.winners.keys()].sort();
   let next = 0;
-  for await (const { line } of partLines(views, base)) {
+  for await (const { line } of partLines(views, keys, base)) {
     const hash = await pkHash(keys.hashes.sha256, line.v, primaryKey);
     while (next < pending.length && pending[next]! < hash) {
       yield overlay.winners.get(pending[next++]!)!;

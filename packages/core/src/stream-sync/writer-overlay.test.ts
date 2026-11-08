@@ -114,6 +114,9 @@ async function fixture() {
         async encrypt(_s, b) {
           return b;
         },
+        async encryptPart(_s, b) {
+          return b;
+        },
         async decrypt(_s, b) {
           return b;
         },
@@ -545,18 +548,16 @@ describe("writer snapshot provenance", () => {
     expect(snap.runs[0]!.generation).toBe(1);
     snap.release();
   });
-  it("lists a seed-only stream by metadata only and omits excluded oversized records", async () => {
+  it("lists a seed-only stream by metadata only and keeps oversized records", async () => {
     const f = await fixture();
     const w = f.make();
     await w.beginRun({ runId: "r1", connector, userConnect: false });
-    expect(
-      await w.append(
-        "r1",
-        "s",
-        { id: "huge", value: "x".repeat(8 * 1024 * 1024) },
-        shape,
-      ),
-    ).toBe("too_large");
+    await w.append(
+      "r1",
+      "s",
+      { id: "huge", value: "x".repeat(8 * 1024 * 1024) },
+      shape,
+    );
     await w.append("r1", "s", { id: "kept" }, shape);
     await w.finishRun("r1", { checkpointCandidate: null });
     await f.edit((e) => {
@@ -569,7 +570,7 @@ describe("writer snapshot provenance", () => {
       (await Array.fromAsync(snap.lines(snap.runs[0]!, "s"))).map(
         (l) => l.v.id,
       ),
-    ).toEqual(["kept"]);
+    ).toEqual(["huge", "kept"].sort());
     // The seed-only stream exposes no rows.
     await expect(
       Array.fromAsync(snap.lines(snap.runs[0]!, "seed")),

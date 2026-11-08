@@ -22,7 +22,7 @@ import {
   controlHashes,
   controlScope,
   decodeHead,
-  decodePart,
+  linesOfParts,
   deriveKeyCheck,
   keccakHex,
   parseScope,
@@ -556,22 +556,20 @@ export async function readStream(
     throw new Error(`head of ${scope}: ${decoded.kind}`);
   const head = decoded.head;
   const records = new Map<string, JsonValue>();
-  for (const part of head.parts) {
-    const partCipher = await blobs.get(
-      `${scope}/${partBlobName(head.generation, part.hash)}`,
-    );
-    if (!partCipher)
-      throw new Error(`part ${part.hash} of ${scope} is missing`);
-    const lines = await decodePart(
-      streamSyncHashes.sha256,
-      await keys.decrypt(scope, partCipher),
-      part,
-      head.primaryKey,
-    );
-    for (const { line } of lines) {
-      const value = line.v as { id: string };
-      records.set(value.id, line.v);
-    }
+  for await (const line of linesOfParts(
+    streamSyncHashes.sha256,
+    head,
+    async (part) => {
+      const partCipher = await blobs.get(
+        `${scope}/${partBlobName(head.generation, part.hash)}`,
+      );
+      if (!partCipher)
+        throw new Error(`part ${part.hash} of ${scope} is missing`);
+      return keys.decrypt(scope, partCipher);
+    },
+  )) {
+    const value = line.v as { id: string };
+    records.set(value.id, line.v);
   }
   return { version: row.version, head, records };
 }

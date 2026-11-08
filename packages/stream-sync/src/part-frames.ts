@@ -11,15 +11,16 @@
  * A reader needs at most one part in memory at a time.
  */
 
-import { PART_LIMIT_BYTES, sha256Hex, type Sha256 } from "./bytes.js";
+import { PART_LIMIT_BYTES, sha256Hex, utf8, type Sha256 } from "./bytes.js";
 import { InvalidArgumentError, InvalidPartError } from "./errors.js";
 import {
   decodeEnvelope,
   ENVELOPE_LIMIT_BYTES,
+  frameOfBody,
   type Envelope,
 } from "./frames.js";
-import type { EncodedPart, HeadPart } from "./parts.js";
-import { inPrefix } from "./records.js";
+import { decodePart, type EncodedPart, type HeadPart } from "./parts.js";
+import { decodeLine, inPrefix, type Line } from "./records.js";
 
 const LF = 0x0a;
 
@@ -111,6 +112,25 @@ export async function* cutPieces(
   if (used > 0) yield fill.slice(0, used);
 }
 
+/** Check a clear part against its head entry: size limit, byte count and SHA-256. */
+export async function checkPartBytes(
+  sha256: Sha256,
+  data: Uint8Array,
+  entry: HeadPart,
+): Promise<void> {
+  if (data.length > PART_LIMIT_BYTES) {
+    throw new InvalidPartError("part exceeds the 16 MiB decoder limit");
+  }
+  if (data.length !== entry.bytes) {
+    throw new InvalidPartError(
+      `part has ${data.length} bytes, head says ${entry.bytes}`,
+    );
+  }
+  if ((await sha256Hex(sha256, data)) !== entry.hash) {
+    throw new InvalidPartError("part SHA-256 does not match the head");
+  }
+}
+
 export interface PartFrame {
   readonly envelope: Envelope;
   /** Frame size in bytes: envelope, LF, body, LF. */
@@ -136,6 +156,7 @@ export async function* framesOfParts(
   sha256: Sha256,
   parts: readonly HeadPart[],
   load: (part: HeadPart, index: number) => Promise<Uint8Array>,
+  options: { readonly verify?: boolean } = {},
 ): AsyncGenerator<PartFrame> {
   let previousKey: string | null = null;
   const checkKey = (envelope: Envelope, part: HeadPart) => {
@@ -149,17 +170,8 @@ export async function* framesOfParts(
   };
   const verified = async (part: HeadPart, index: number) => {
     const data = await load(part, index);
-    if (data.length > PART_LIMIT_BYTES) {
-      throw new InvalidPartError("part exceeds the 16 MiB decoder limit");
-    }
-    if (data.length !== part.bytes) {
-      throw new InvalidPartError(
-        `part has ${data.length} bytes, head says ${part.bytes}`,
-      );
-    }
-    if ((await sha256Hex(sha256, data)) !== part.hash) {
-      throw new InvalidPartError("part SHA-256 does not match the head");
-    }
+    // A caller whose store already verified the bytes may skip the second hash.
+    if (options.verify !== false) await checkPartBytes(sha256, data, part);
     return data;
   };
 
@@ -248,5 +260,78 @@ export async function* framesOfParts(
       );
     }
     index += 1;
+  }
+}
+
+/**
+ * A format-1 line as a format-2 frame. The line is canonical
+ * `{"o":..,"r":..,"v":BODY}`, so the body is the text after `"v":` and is
+ * already canonical. `k` is the line's key hash, which the caller computed.
+ */
+export async function frameOfLine(
+  sha256: Sha256,
+  k: string,
+  text: string,
+): Promise<{ readonly envelope: Envelope; readonly bytes: Uint8Array }> {
+  const line = decodeLine(text);
+  // `r` is a JSON string, so a raw quote before `,"v":` cannot occur in it.
+  const at = text.indexOf(',"v":');
+  const body = utf8(text.slice(at + 5, -1));
+  const envelope: Envelope = {
+    h: await sha256Hex(sha256, body),
+    k,
+    n: body.length,
+    o: line.o,
+    r: line.r,
+  };
+  return { envelope, bytes: frameOfBody(envelope, body) };
+}
+
+const textDecoder = new TextDecoder();
+
+/**
+ * Every record of a head's parts as `{o, r, v}`, in key order, for a
+ * consumer that needs objects (it holds one parsed record at a time). Reads
+ * format 1 (NDJSON) and format 2 (frames) alike.
+ */
+export async function* linesOfParts(
+  sha256: Sha256,
+  head: {
+    readonly format: 1 | 2;
+    readonly parts: readonly HeadPart[];
+    readonly primaryKey: readonly string[];
+  },
+  load: (part: HeadPart, index: number) => Promise<Uint8Array>,
+  options: { readonly verify?: boolean } = {},
+): AsyncGenerator<Line> {
+  if (head.format === 1) {
+    for (let i = 0; i < head.parts.length; i += 1) {
+      const part = head.parts[i]!;
+      for (const { line } of await decodePart(
+        sha256,
+        await load(part, i),
+        part,
+        head.primaryKey,
+      )) {
+        yield line;
+      }
+    }
+    return;
+  }
+  for await (const frame of framesOfParts(sha256, head.parts, load, options)) {
+    const pieces: Uint8Array[] = [];
+    let total = 0;
+    for await (const piece of frame.body()) {
+      pieces.push(piece);
+      total += piece.length;
+    }
+    const bytes = new Uint8Array(total);
+    let at = 0;
+    for (const piece of pieces) {
+      bytes.set(piece, at);
+      at += piece.length;
+    }
+    const { o, r } = frame.envelope;
+    yield { o, r, v: JSON.parse(textDecoder.decode(bytes)) };
   }
 }

@@ -17,6 +17,7 @@ import {
   NAMESPACE_KEY_LABEL,
   streamMasterKeyFromSignature,
   type HashPorts,
+  type Sha256StreamFactory,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { StreamSyncKeyPorts } from "./ports.js";
 import { isStreamAead, openBytes, sealBytes } from "./stream-aead.js";
@@ -24,6 +25,15 @@ import { isStreamAead, openBytes, sealBytes } from "./stream-aead.js";
 export const streamSyncHashes: HashPorts = {
   sha256: async (data) => nobleSha256(data),
   keccak256: async (data) => keccak_256(data),
+};
+
+/** Incremental SHA-256 for bodies that are never held whole. */
+export const streamSyncSha256Stream: Sha256StreamFactory = () => {
+  const hash = nobleSha256.create();
+  return {
+    update: (data) => void hash.update(data),
+    digest: () => hash.digest(),
+  };
 };
 
 function hex(bytes: Uint8Array): string {

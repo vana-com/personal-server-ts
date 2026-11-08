@@ -4,7 +4,7 @@
  * reducer keeps its winners. What the kept texts pin is what the peak measures.
  */
 
-import { stat, writeFile, open } from "node:fs/promises";
+import { stat, open } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import { readSpool } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createFsStreamSyncFiles } from "./fs-files.js";
@@ -17,7 +17,7 @@ export interface RetainArgs {
   readonly keepEvery: number;
 }
 
-/** Spool-format file of `mib` MiB: `<64-hex pkHash> <canonical line>\n`. */
+/** Spool-format file of `mib` MiB: `<64-hex key>\t<envelope>\t<body>\n`. */
 async function ensureSpool(path: string, mib: number): Promise<void> {
   const expected = ((mib * 1024 * 1024) / LINE_BYTES) * LINE_BYTES;
   try {
@@ -30,12 +30,18 @@ async function ensureSpool(path: string, mib: number): Promise<void> {
   try {
     for (let i = 0; i < lines; i += 1) {
       const hash = (i % 4096).toString(16).padStart(64, "0");
-      const head = `{"o":${i},"r":"r","v":{"id":"k${String(i % 4096).padStart(8, "0")}","pad":"`;
-      const tail = `"}}`;
-      const pad = "p".repeat(
-        LINE_BYTES - 1 - head.length - tail.length - hash.length - 1,
-      );
-      await handle.write(`${hash} ${head}${pad}${tail}\n`);
+      const idText = `k${String(i % 4096).padStart(8, "0")}`;
+      const bodyHead = `{"id":"${idText}","pad":"`;
+      const bodyTail = `"}`;
+      // The envelope's length field has a fixed width for these sizes.
+      const fixed = (n: number) =>
+        `${hash}\t{"h":"${"0".repeat(64)}","k":"${hash}","n":${n},"o":${i},"r":"r"}\t`;
+      const bodyBytes = (n: number) => LINE_BYTES - 1 - fixed(n).length;
+      let n = bodyBytes(1000);
+      n = bodyBytes(n);
+      const pad = "p".repeat(n - bodyHead.length - bodyTail.length);
+      const body = `${bodyHead}${pad}${bodyTail}`;
+      await handle.write(`${fixed(body.length)}${body}\n`);
     }
   } finally {
     await handle.close();
@@ -52,7 +58,7 @@ export async function retainWinners(
   const kept: string[] = [];
   let lines = 0;
   for await (const line of readSpool(files, basename(a.path))) {
-    if (lines % a.keepEvery === 0) kept.push(line.text);
+    if (lines % a.keepEvery === 0) kept.push(line.line);
     lines += 1;
   }
   return { lines, kept: kept.length };

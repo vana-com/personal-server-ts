@@ -1,7 +1,8 @@
 /** Pinned intake logs from the existing, exclusively owned writer home. */
 import {
-  decodeLine,
   pkHash,
+  type JsonObject,
+  type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type {
   StreamSyncOverlayRun,
@@ -16,7 +17,7 @@ import {
   type StreamFloor,
 } from "./publish-plan.js";
 import type { StreamSyncFiles } from "./ports.js";
-import { readSpool } from "./spool.js";
+import { readSpool, type SpoolEntry } from "./spool.js";
 import type { StreamSyncWriter } from "./writer.js";
 
 export function createWriterOverlaySource(
@@ -78,18 +79,22 @@ export function pinnedWriterSnapshot(
       if (released || !log)
         throw new Error("stream is not in this live overlay snapshot");
       let bytes = 0;
-      for await (const raw of readSpool(files, log.path)) {
+      for await (const entry of readSpool(files, log.path)) {
         if (released) throw new Error("overlay snapshot was released");
-        const line = decodeLine(raw.text);
+        const { envelope } = entry;
+        // This consumer needs an object, so it is the one place that holds
+        // a whole body: the parsed record, once.
+        const v = await parseBody(files, entry);
+        const line: Line = { o: envelope.o, r: envelope.r, v };
         if (
           line.o !== run.observedAt ||
           line.r !== run.runId ||
           (await pkHash(streamSyncHashes.sha256, line.v, log.primaryKey)) !==
-            raw.pkHash
+            envelope.k
         ) {
           throw new Error("overlay spool integrity mismatch");
         }
-        bytes += new TextEncoder().encode(raw.text).length + 1;
+        bytes += entry.size;
         yield line;
       }
       if (bytes !== log.bytes)
@@ -101,4 +106,32 @@ export function pinnedWriterSnapshot(
       unpin();
     },
   });
+}
+
+async function parseBody(
+  files: StreamSyncFiles,
+  entry: SpoolEntry,
+): Promise<JsonObject> {
+  if (entry.body.kind === "inline") {
+    return JSON.parse(entry.body.text) as JsonObject;
+  }
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of files.readChunks(entry.body.path)) {
+    chunks.push(chunk);
+  }
+  return JSON.parse(
+    new TextDecoder().decode(await joinChunks(chunks)),
+  ) as JsonObject;
+}
+
+async function joinChunks(chunks: readonly Uint8Array[]): Promise<Uint8Array> {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
 }

@@ -94,6 +94,22 @@ export function frameBytes(envelope: Envelope): number {
   return encodeEnvelope(envelope).length + 1 + envelope.n + 1;
 }
 
+/** The whole frame as one buffer, for a body small enough to hold. */
+export function frameOfBody(envelope: Envelope, body: Uint8Array): Uint8Array {
+  if (body.length !== envelope.n) {
+    throw new InvalidPartError(
+      `body has ${body.length} bytes, envelope says ${envelope.n}`,
+    );
+  }
+  const head = encodeEnvelope(envelope);
+  const out = new Uint8Array(head.length + 1 + body.length + 1);
+  out.set(head);
+  out[head.length] = LF;
+  out.set(body, head.length + 1);
+  out[out.length - 1] = LF;
+  return out;
+}
+
 /** Frame bytes as pieces: the envelope line, then the body pieces, then LF. */
 export async function* frameChunks(
   envelope: Envelope,

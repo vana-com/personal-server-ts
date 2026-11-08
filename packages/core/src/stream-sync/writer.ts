@@ -14,9 +14,9 @@
  *   runs/<runId>/entry.json            the outbox entry and per-stream host data
  *   runs/<runId>/spool/s<i>.log        intake log of stream i (durable)
  *   runs/<runId>/spool/s<i>/<shard>    shards of that log (derived, never synced)
+ *   runs/<runId>/spool/s<i>.bodies/<n> bodies too long for a log line
  *   runs/<runId>/seed/s<i>.log         seed log of stream i (durable)
  *   runs/<runId>/seed/s<i>/<shard>     shards of that log (derived, never synced)
- *   runs/<runId>/excluded.ndjson       record_too_large: stream, key digest, bytes
  *   runs/<runId>/request-s<i>.json     persisted signed request of stream i
  *   runs/<runId>/head-s<i>.bin         persisted head ciphertext of stream i
  *   results/<runId>.json               the final outcome of a finished run
@@ -41,16 +41,27 @@ import {
   controlScope,
   createOutboxEntry,
   decide,
+  cutPieces,
   decodePart,
+  encodeFramePart,
+  encodePiece,
+  FRAME_PIECE_BYTES,
+  frameChunks,
+  frameOfBody,
+  frameOfLine,
+  framesOfParts,
+  FrameReducer,
+  HEAD_FORMAT,
+  type EncodedPart,
+  type Envelope,
+  type FrameBucketResult,
+  type FrameBytes,
   deriveKeyCheck,
   digestHead,
   encodeHead,
-  encodeLine,
-  encodePart,
   inPrefix,
   isNoop,
   isPlainObject,
-  lineSize,
   parseScope,
   partBlobName,
   pkHash,
@@ -62,8 +73,6 @@ import {
   streamRunResult,
   streamScope,
   verifyHead,
-  BucketReducer,
-  type BucketResult,
   type CheckpointDecision,
   type ControlHashes,
   classifyStreamRow,
@@ -93,7 +102,7 @@ import {
   type PlanRun,
   type StreamFloor,
 } from "./publish-plan.js";
-import { streamSyncHashes } from "./crypto.js";
+import { streamSyncHashes, streamSyncSha256Stream } from "./crypto.js";
 import type { StreamSyncHome } from "./home.js";
 import {
   AmbiguousRegistryReplyError,
@@ -114,10 +123,11 @@ import {
   compactShard,
   countShard,
   emptyShardBytes,
-  lineStamp,
   readSpool,
   shardPath,
+  spoolBodyDir,
 } from "./spool.js";
+import { spoolRecord } from "./record-intake.js";
 
 import {
   pinnedWriterSnapshot,
@@ -232,7 +242,6 @@ interface HostStream {
    * before this field existed, which skip the check.
    */
   rowAtStart?: { readonly tombstoned: boolean };
-  recordTooLarge: number;
   problem: StreamSyncHostProblem | null;
   detail: string | null;
 }
@@ -361,7 +370,6 @@ export interface StreamSyncStreamStatus {
   readonly complete?: boolean;
   readonly problem: StreamSyncHostProblem | null;
   readonly detail: string | null;
-  readonly recordTooLarge: number;
 }
 
 export interface StreamSyncRunStatus {
@@ -487,13 +495,30 @@ class Discard extends Error {
   }
 }
 
+/** Where the bytes of a winning frame are, for the part encoder. */
+type FrameRef =
+  /** The whole frame, held in memory. */
+  | { readonly kind: "held"; readonly bytes: Uint8Array }
+  /** A long frame in the base: its parts are kept as they are. */
+  | { readonly kind: "run"; readonly parts: readonly HeadPart[] }
+  /** A long frame from this run: its body is in a spool body file. */
+  | {
+      readonly kind: "file";
+      readonly path: string;
+      readonly envelope: Envelope;
+    };
+
+function frameOfInline(envelope: Envelope, bodyText: string): Uint8Array {
+  return frameOfBody(envelope, new TextEncoder().encode(bodyText));
+}
+
 interface ActiveRun {
   readonly spool: SpoolWriter;
   readonly shardBytes: Map<string, number[]>;
-  recordTooLarge: Map<string, number>;
   /** Records appended per stream (R19: a retry-pending cursor needs none). */
   readonly records: Map<string, number>;
-  excluded: string[];
+  /** Next body file number per stream. */
+  readonly bodySeq: Map<string, number>;
 }
 
 export class StreamSyncWriter {
@@ -998,9 +1023,8 @@ export class StreamSyncWriter {
       this.active.set(input.runId, {
         spool: new SpoolWriter(this.options.home.files, this.spoolFlushBytes),
         shardBytes: new Map(),
-        recordTooLarge: new Map(),
         records: new Map(),
-        excluded: [],
+        bodySeq: new Map(),
       });
       try {
         await this.writeEntry(host);
@@ -1070,7 +1094,6 @@ export class StreamSyncWriter {
       seedOnly: false,
       fullStream: shape.incremental === false,
       seedApplies: false,
-      recordTooLarge: 0,
       problem: null,
       detail: null,
     };
@@ -1085,9 +1108,9 @@ export class StreamSyncWriter {
   }
 
   /**
-   * Add one record. A record whose canonical line is over 8 MiB is not
-   * spooled; the stream counts it as `record_too_large` and keeps its key
-   * digest and size locally (§2.2).
+   * Add one record. Any size is kept: the body is serialized in pieces into
+   * the spool, so the cost of a large record is the object the caller holds
+   * plus one piece, not a copy of the record (see `record-intake.ts`).
    */
   async append(
     runId: string,
@@ -1098,7 +1121,7 @@ export class StreamSyncWriter {
       readonly profile: HeadProfile;
       readonly incremental?: boolean;
     },
-  ): Promise<"spooled" | "too_large"> {
+  ): Promise<void> {
     const run = this.active.get(runId);
     if (!run) throw new RunGoneError(runId);
     let info = this.streamCache.get(`${runId}\u0000${stream}`);
@@ -1118,30 +1141,27 @@ export class StreamSyncWriter {
       throw new Error("a record must be a JSON object");
     const value = record as JsonObject;
     const hash = await pkHash(this.hashes.sha256, value, info.primaryKey);
-    const text = encodeLine({ o: info.observedAt, r: runId, v: value });
-    const size = lineSize(text);
-    if (!size.fits) {
-      run.recordTooLarge.set(stream, (run.recordTooLarge.get(stream) ?? 0) + 1);
-      run.excluded.push(
-        JSON.stringify({ stream, pkHash: hash, bytes: size.bytes }),
-      );
-      return "too_large";
-    }
-    const shard = shardOf(hash);
+    const dir = `runs/${runId}/spool/s${info.index}`;
+    const seq = run.bodySeq.get(stream) ?? 0;
+    run.bodySeq.set(stream, seq + 1);
+    const spooled = await spoolRecord(
+      {
+        files: this.options.home.files,
+        spool: run.spool,
+        makeSha256: streamSyncSha256Stream,
+      },
+      spoolLogPath(dir),
+      () => `${spoolBodyDir(dir)}/${seq}`,
+      { k: hash, o: info.observedAt, r: runId },
+      value,
+    );
     let bytes = run.shardBytes.get(stream);
     if (!bytes) {
       bytes = emptyShardBytes();
       run.shardBytes.set(stream, bytes);
     }
-    bytes[shard]! += size.bytes + 1;
+    bytes[shardOf(hash)]! += spooled.size;
     run.records.set(stream, (run.records.get(stream) ?? 0) + 1);
-    await run.spool.add(
-      spoolLogPath(`runs/${runId}/spool/s${info.index}`),
-      hash,
-      text,
-      size.bytes,
-    );
-    return "spooled";
   }
 
   /** Spool directories whose shards were derived by this process, with bytes. */
@@ -1177,19 +1197,10 @@ export class StreamSyncWriter {
       try {
         await run.spool.flush();
         if (input.coveredStreams) this.keepCovered(host, input.coveredStreams);
-        if (run.excluded.length > 0) {
-          await this.options.home.files.appendMany([
-            {
-              path: `runs/${runId}/excluded.ndjson`,
-              bytes: encoder.encode(run.excluded.map((l) => `${l}\n`).join("")),
-            },
-          ]);
-        }
         const connector = host.entry.connector;
         const ns = IDENTITYLESS_NS;
         for (const [name, stream] of Object.entries(host.streams)) {
           stream.shardBytes = run.shardBytes.get(name) ?? emptyShardBytes();
-          stream.recordTooLarge = run.recordTooLarge.get(name) ?? 0;
         }
         if (this.options.seed) {
           await this.withState((state) => {
@@ -1745,32 +1756,36 @@ export class StreamSyncWriter {
     const dir = `runs/${host.entry.runId}/seed/s${stream.index}`;
     await this.options.home.files.remove(dir);
     await this.options.home.files.remove(spoolLogPath(dir));
+    await this.options.home.files.remove(spoolBodyDir(dir));
     this.derived.delete(dir);
     const writer = new SpoolWriter(
       this.options.home.files,
       this.spoolFlushBytes,
     );
     const bytes = emptyShardBytes();
+    let seq = 0;
     for await (const record of seed.records(host.entry.connector, name)) {
       if (!isPlainObject(record)) continue;
       const value = record as JsonObject;
       const hash = await pkHash(this.hashes.sha256, value, stream.primaryKey);
-      const text = encodeLine({
-        o: SEED_OBSERVED_AT,
-        r: SEED_RUN_ID,
-        v: value,
-      });
-      const size = lineSize(text);
-      if (!size.fits) {
-        stream.recordTooLarge += 1;
-        continue;
-      }
-      const shard = shardOf(hash);
-      bytes[shard]! += size.bytes + 1;
-      await writer.add(spoolLogPath(dir), hash, text, size.bytes);
+      const n = seq;
+      seq += 1;
+      const spooled = await spoolRecord(
+        {
+          files: this.options.home.files,
+          spool: writer,
+          makeSha256: streamSyncSha256Stream,
+        },
+        spoolLogPath(dir),
+        () => `${spoolBodyDir(dir)}/${n}`,
+        { k: hash, o: SEED_OBSERVED_AT, r: SEED_RUN_ID },
+        value,
+      );
+      bytes[shardOf(hash)]! += spooled.size;
     }
     await writer.flush();
     await this.options.home.files.sync(spoolLogPath(dir));
+    await this.options.home.files.sync(spoolBodyDir(dir));
     stream.seedShardBytes = bytes;
     await this.writeEntry(host);
   }
@@ -1998,7 +2013,7 @@ export class StreamSyncWriter {
     const clear = encodeHead({
       complete,
       connector: entry.connector,
-      format: 1,
+      format: HEAD_FORMAT,
       generation: target,
       keyCheck,
       ns,
@@ -2182,9 +2197,6 @@ export class StreamSyncWriter {
       state: kind,
       generation,
       complete,
-      ...(stream.recordTooLarge > 0
-        ? { recordTooLarge: stream.recordTooLarge }
-        : {}),
     });
     await this.writeEntry(host);
     this.fault("after_commit_recorded", entry.runId, name);
@@ -2725,8 +2737,21 @@ export class StreamSyncWriter {
     }
     if (group.length > 0) groups.push(group);
 
-    const baseByHash = new Set(baseParts.map((p) => `${p.prefix}:${p.hash}`));
+    // Part blobs are named by generation and content hash, so a base part's
+    // blob already exists under the target generation wherever its prefix
+    // moves to.
+    const baseHashes = new Set(baseParts.map((p) => p.hash));
     const parts: HeadPart[] = [];
+    const store = async (encoded: EncodedPart): Promise<void> => {
+      if (!baseHashes.has(encoded.entry.hash)) {
+        const cipher = await this.options.keys.encryptPart(scope, encoded.data);
+        await this.options.blobs.put(
+          `${scope}/${partBlobName(target, encoded.entry.hash)}`,
+          cipher,
+        );
+      }
+      parts.push(encoded.entry);
+    };
     while (groups.length > 0) {
       const prefixes = groups.shift()!;
       const results = await this.reduceGroup(
@@ -2734,7 +2759,7 @@ export class StreamSyncWriter {
         stream.primaryKey,
         scope,
         target,
-        baseParts,
+        base,
         [runDir, seedDir],
       );
       for (const result of results) {
@@ -2745,22 +2770,57 @@ export class StreamSyncWriter {
         if (result.kind === "bucket_too_large") {
           throw new PendingStream(
             "bucket_too_large",
-            `bucket ${result.prefix} holds ${result.bytes} bytes of winners`,
+            `bucket ${result.prefix} holds ${result.smallBytes} bytes of winners`,
           );
         }
-        const encoded = await encodePart(this.hashes.sha256, result);
-        if (!encoded) continue;
-        if (!baseByHash.has(`${encoded.entry.prefix}:${encoded.entry.hash}`)) {
-          const cipher = await this.options.keys.encrypt(scope, encoded.data);
-          await this.options.blobs.put(
-            `${scope}/${partBlobName(target, encoded.entry.hash)}`,
-            cipher,
+        // Held frames share parts; a long frame is alone in its own parts,
+        // cut into pieces, so its bytes pass through one piece at a time.
+        let segment: FrameBytes[] = [];
+        const flush = async () => {
+          const encoded = await encodeFramePart(
+            this.hashes.sha256,
+            result.prefix,
+            segment,
           );
+          segment = [];
+          if (encoded) await store(encoded);
+        };
+        for (const winner of result.winners) {
+          const ref = winner.ref;
+          if (ref.kind === "held") {
+            segment.push({ k: winner.k, bytes: ref.bytes });
+            continue;
+          }
+          await flush();
+          if (ref.kind === "run") {
+            // Unchanged long frame: keep its parts, under the bucket prefix.
+            for (const entry of ref.parts) {
+              parts.push({ ...entry, prefix: result.prefix });
+            }
+            continue;
+          }
+          let first = true;
+          const frame = frameChunks(
+            ref.envelope,
+            this.options.home.files.readChunks(ref.path),
+          );
+          for await (const piece of cutPieces(frame, FRAME_PIECE_BYTES)) {
+            await store(
+              await encodePiece(
+                this.hashes.sha256,
+                result.prefix,
+                piece,
+                first,
+              ),
+            );
+            first = false;
+          }
         }
-        parts.push(encoded.entry);
+        await flush();
       }
     }
     this.fault("after_parts_upload", host.entry.runId, name);
+    // Array.prototype.sort is stable: parts of one prefix keep their order.
     parts.sort((a, b) =>
       a.prefix < b.prefix ? -1 : a.prefix > b.prefix ? 1 : 0,
     );
@@ -2772,12 +2832,14 @@ export class StreamSyncWriter {
     primaryKey: readonly string[],
     scope: string,
     target: number,
-    baseParts: readonly HeadPart[],
+    base: Head | null,
     dirs: readonly string[],
-  ): Promise<BucketResult[]> {
-    const reducers = new Map(prefixes.map((p) => [p, new BucketReducer(p)]));
+  ): Promise<FrameBucketResult<FrameRef>[]> {
+    const reducers = new Map(
+      prefixes.map((p) => [p, new FrameReducer<FrameRef>(p)]),
+    );
     const single = prefixes.length === 1 ? reducers.get(prefixes[0]!)! : null;
-    const route = (hash: string): BucketReducer | null => {
+    const route = (hash: string): FrameReducer<FrameRef> | null => {
       if (single) return inPrefix(hash, single.prefix) ? single : null;
       const bits = pkHashBits(hash, 16);
       for (const p of prefixes) {
@@ -2786,25 +2848,67 @@ export class StreamSyncWriter {
       return null;
     };
 
-    const parts = new Map<string, HeadPart>();
+    const wanted: HeadPart[] = [];
+    const seen = new Set<HeadPart>();
     for (const p of prefixes) {
-      for (const part of basePartsFor(p, baseParts)) parts.set(part.hash, part);
+      for (const part of basePartsFor(p, base?.parts ?? [])) {
+        if (!seen.has(part)) {
+          seen.add(part);
+          wanted.push(part);
+        }
+      }
     }
-    for (const part of parts.values()) {
+    // `wanted` keeps head order, so the parts of one prefix stay together.
+    const load = async (part: HeadPart): Promise<Uint8Array> => {
       const key = `${scope}/${partBlobName(target, part.hash)}`;
       const cipher = await this.options.blobs.get(key);
       if (!cipher)
         throw new PendingStream("base_unreadable", `part ${key} is missing`);
-      const clear = await this.options.keys.decrypt(scope, cipher);
-      const lines = await decodePart(
+      return this.options.keys.decrypt(scope, cipher);
+    };
+    if (base?.format === 1) {
+      for (const part of wanted) {
+        const clear = await load(part);
+        const lines = await decodePart(
+          this.hashes.sha256,
+          clear,
+          part,
+          primaryKey,
+        );
+        for (const { line, text } of lines) {
+          const k = await pkHash(this.hashes.sha256, line.v, primaryKey);
+          if (route(k) === null) continue;
+          const frame = await frameOfLine(this.hashes.sha256, k, text);
+          route(k)!.add({
+            k,
+            o: line.o,
+            r: line.r,
+            size: frame.bytes.length,
+            held: true,
+            ref: { kind: "held", bytes: frame.bytes },
+          });
+        }
+      }
+    } else if (wanted.length > 0) {
+      for await (const frame of framesOfParts(
         this.hashes.sha256,
-        clear,
-        part,
-        primaryKey,
-      );
-      for (const { line, text } of lines) {
-        const hash = await pkHash(this.hashes.sha256, line.v, primaryKey);
-        route(hash)?.add(hash, line, text);
+        wanted,
+        load,
+      )) {
+        const { k, o, r } = frame.envelope;
+        const reducer = route(k);
+        if (reducer === null) continue;
+        reducer.add({
+          k,
+          o,
+          r,
+          size: frame.size,
+          held: frame.raw !== null,
+          ref:
+            frame.raw !== null
+              ? { kind: "held", bytes: frame.raw.slice() }
+              : { kind: "run", parts: frame.parts },
+        });
       }
     }
 
@@ -2820,11 +2924,35 @@ export class StreamSyncWriter {
     // Seed lines before run lines: on equal stamps the later line wins.
     for (const dir of [...dirs].reverse()) {
       for (const shard of [...shards].sort((a, b) => a - b)) {
-        for await (const line of readSpool(
+        for await (const entry of readSpool(
           this.options.home.files,
           shardPath(dir, shard),
         )) {
-          route(line.pkHash)?.add(line.pkHash, lineStamp(line.text), line.text);
+          const { k, o, r } = entry.envelope;
+          const reducer = route(k);
+          if (reducer === null) continue;
+          reducer.add({
+            k,
+            o,
+            r,
+            size: entry.size,
+            ...(entry.body.kind === "inline"
+              ? {
+                  held: true,
+                  ref: {
+                    kind: "held" as const,
+                    bytes: frameOfInline(entry.envelope, entry.body.text),
+                  },
+                }
+              : {
+                  held: false,
+                  ref: {
+                    kind: "file" as const,
+                    path: entry.body.path,
+                    envelope: entry.envelope,
+                  },
+                }),
+          });
         }
       }
     }
@@ -2845,7 +2973,6 @@ export class StreamSyncWriter {
         ...(outbox.complete !== undefined ? { complete: outbox.complete } : {}),
         problem: info?.problem ?? null,
         detail: info?.detail ?? null,
-        recordTooLarge: info?.recordTooLarge ?? 0,
       };
     }
     return {

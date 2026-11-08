@@ -163,7 +163,6 @@ export interface BatchResponse {
   readonly applied: boolean;
   readonly accepted: number;
   readonly deletesSkipped: number;
-  readonly tooLarge: number;
 }
 
 export interface EndRequest {
@@ -460,7 +459,7 @@ export class StreamSyncIntake implements RunIntake {
       throw invalid("batch and records are required");
     }
     if (req.batch <= run.lastBatch) {
-      return { applied: false, accepted: 0, deletesSkipped: 0, tooLarge: 0 };
+      return { applied: false, accepted: 0, deletesSkipped: 0 };
     }
     if (req.batch > run.lastBatch + 1) {
       throw new RunIntakeError("batch_gap", "batch_gap", run.lastBatch + 1);
@@ -506,7 +505,6 @@ export class StreamSyncIntake implements RunIntake {
       applied: true,
       accepted: 0,
       deletesSkipped: 0,
-      tooLarge: 0,
     };
     for (const record of checked) {
       // R17: a delete is skipped and counted, never stored.
@@ -518,19 +516,13 @@ export class StreamSyncIntake implements RunIntake {
       if (run.willDiscard) continue;
       const decl = run.decl.get(record.stream)!;
       const profile: HeadProfile = { key: null, version: run.version };
-      const spooled = await this.options.writer.append(
-        runId,
-        record.stream,
-        record.data,
-        {
-          primaryKey: decl.primaryKey,
-          profile,
-          incremental: decl.incremental !== false,
-        },
-      );
+      await this.options.writer.append(runId, record.stream, record.data, {
+        primaryKey: decl.primaryKey,
+        profile,
+        incremental: decl.incremental !== false,
+      });
       run.hadRecords = true;
-      if (spooled === "too_large") response.tooLarge += 1;
-      else response.accepted += 1;
+      response.accepted += 1;
     }
     run.lastBatch = req.batch;
     return response;

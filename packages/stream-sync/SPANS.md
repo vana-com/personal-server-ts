@@ -62,15 +62,16 @@ in the part, so a continuation piece has `count: 0`. Several parts may share a
 prefix (the head today forbids it). The head stays the only authority on which
 parts form a version, and each part hash commits to its bytes.
 
-The reducer keeps, for each winner, a small body in memory (bounded by the
-bucket, at most one part) and a large body (over 1 MiB) by locator: a spool
-body file or a base piece run. A winning base piece run is carried into the
+The reducer (`FrameReducer`, envelopes only) keeps, for each winner, a _held_
+frame in memory (a frame of at most 1 MiB; bounded by the bucket, at most one
+part) and a long frame by locator: a spool body file or a run of base parts.
+Only held bytes count toward the bucket split. A winning base piece run is carried into the
 next head unchanged: no piece is read, decrypted or uploaded again. Reading
 only the first piece of a run gives the stamp.
 
 ### 4. Streaming authenticated encryption
 
-Blobs of format 2 use the **STREAM** construction as specified for the age
+Part blobs of format 2 use the **STREAM** construction as specified for the age
 file format (age-encryption.org/v1, payload): ChaCha20-Poly1305, 64 KiB
 chunks, a 12-byte nonce made of an 11-byte big-endian chunk counter and a
 final-chunk flag byte, a fresh 16-byte random header nonce, and a payload key
@@ -79,7 +80,10 @@ from HKDF-SHA-256(key = the per-scope key, salt = header nonce, info =
 not invent a mode. The primitives come from `@noble/ciphers` and
 `@noble/hashes`, which already run in Node, browsers and WebViews. The blob is
 `magic || header nonce || chunks`; the magic distinguishes it from an OpenPGP
-SEIPD blob, which readers keep decrypting.
+SEIPD blob, which readers keep decrypting. **Heads stay OpenPGP** (at most
+1 MiB, one object). A format-1 reader then decrypts a format-2 head, reads
+`format: 2` and refuses with `unsupported_format`. It never reaches a STREAM
+blob, so it cannot report a misleading `key_mismatch`.
 
 ### 5. Streaming reads
 

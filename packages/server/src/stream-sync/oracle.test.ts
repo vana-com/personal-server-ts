@@ -15,7 +15,9 @@ import {
   type StreamSyncFaultPoint,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
+  canonicalJson,
   controlScope,
+  FRAME_PIECE_BYTES,
   streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
@@ -49,6 +51,18 @@ const matrix = backends.flatMap((backend) =>
 const report: Record<string, unknown> = {};
 
 const rows = (ids: string[], tag: string) => ids.map((id) => ({ id, n: tag }));
+
+const MiB = 1024 * 1024;
+
+/** A record whose canonical JSON body is exactly `bodyBytes` bytes long. */
+function recordOfBodyBytes(
+  id: string,
+  bodyBytes: number,
+  filler = "a",
+): { id: string; pad: string } {
+  const shell = canonicalJson({ id, pad: "" }).length;
+  return { id, pad: filler.repeat(bodyBytes - shell) };
+}
 
 describe.each(matrix)(
   "stream-sync oracle: $surface on $backend",
@@ -476,32 +490,144 @@ describe.each(matrix)(
       });
     });
 
-    it("a 9 MiB record is counted as record_too_large and the checkpoint still saves", async () => {
-      const c = freshConnector("big-record");
-      const w = await env.writer("big-record");
+    it.each([
+      ["7.9 MiB", Math.floor(7.9 * MiB)],
+      ["8 MiB + 1", 8 * MiB + 1],
+      ["30 MiB", 30 * MiB],
+    ])(
+      "keeps a record of %s byte-exact through publish and read",
+      async (_name, bodyBytes) => {
+        const c = freshConnector(`big-${bodyBytes}`);
+        const w = await env.writer(`big-${bodyBytes}`);
+        await w.refreshControls();
+        const huge = recordOfBodyBytes("huge", bodyBytes);
+        await collect(w, {
+          runId: "run-1",
+          connector: c,
+          observedAt: T0,
+          streams: { s: [{ id: "small", n: "x" }, huge] },
+        });
+        await w.publishPending();
+        const run = finishedOutcome(await w.status(), "run-1")!;
+        expect(run.outcome).toEqual({ kind: "checkpointed", generation: 1 });
+        const view = await readStream(env.registry, env.blobs, c, NS, "s");
+        if (!view || view === "tombstoned") throw new Error("stream missing");
+        expect([...view.records.keys()].sort()).toEqual(["huge", "small"]);
+        expect(canonicalJson(view.records.get("huge"))).toBe(
+          canonicalJson(huge),
+        );
+        expect(view.head.format).toBe(2);
+        expect(view.head.recordCount).toBe(2);
+        // The long record is alone in parts of at most the piece size.
+        for (const part of view.head.parts) {
+          expect(part.bytes).toBeLessThanOrEqual(FRAME_PIECE_BYTES);
+        }
+      },
+    );
+
+    it("carries a long record unchanged through a later run that updates another record", async () => {
+      const c = freshConnector("big-carry");
+      const w = await env.writer("big-carry");
+      await w.refreshControls();
+      const huge = recordOfBodyBytes("huge", 9 * MiB);
+      await collect(w, {
+        runId: "run-1",
+        connector: c,
+        observedAt: T0,
+        streams: { s: [{ id: "small", n: "x" }, huge] },
+      });
+      await w.publishPending();
+      const first = (await readStream(env.registry, env.blobs, c, NS, "s"))!;
+      if (first === "tombstoned") throw new Error("tombstoned");
+      await collect(w, {
+        runId: "run-2",
+        connector: c,
+        observedAt: T0 + 1000,
+        checkpointUsed: { ns: NS, generation: 1 },
+        streams: { s: [{ id: "small", n: "y" }] },
+      });
+      await w.publishPending();
+      const second = (await readStream(env.registry, env.blobs, c, NS, "s"))!;
+      if (second === "tombstoned") throw new Error("tombstoned");
+      expect(second.version).toBe(first.version + 1);
+      expect(second.records.get("small")).toEqual({ id: "small", n: "y" });
+      expect(canonicalJson(second.records.get("huge"))).toBe(
+        canonicalJson(huge),
+      );
+      // The long record's pieces are the same blobs: nothing was re-encoded.
+      const longHashes = (head: typeof first.head) =>
+        head.parts
+          .filter((p) => p.bytes === FRAME_PIECE_BYTES)
+          .map((p) => p.hash);
+      expect(longHashes(second.head)).toEqual(longHashes(first.head));
+      expect(longHashes(first.head).length).toBeGreaterThan(0);
+    });
+
+    it("replaces a long record when a later run updates it, to a long or a small one", async () => {
+      const c = freshConnector("big-update");
+      const w = await env.writer("big-update");
       await w.refreshControls();
       await collect(w, {
         runId: "run-1",
         connector: c,
         observedAt: T0,
-        streams: {
-          s: [
-            { id: "small", n: "x" },
-            { id: "huge", n: "y".repeat(9 * 1024 * 1024) },
-          ],
-        },
+        streams: { s: [recordOfBodyBytes("huge", 9 * MiB)] },
       });
       await w.publishPending();
-      const run = finishedOutcome(await w.status(), "run-1")!;
-      expect(run.outcome).toEqual({ kind: "checkpointed", generation: 1 });
-      expect(run.streams.s).toMatchObject({
-        state: "committed",
-        recordTooLarge: 1,
+      const longer = recordOfBodyBytes("huge", 10 * MiB, "b");
+      await collect(w, {
+        runId: "run-2",
+        connector: c,
+        observedAt: T0 + 1000,
+        checkpointUsed: { ns: NS, generation: 1 },
+        streams: { s: [longer] },
       });
-      const view = await readStream(env.registry, env.blobs, c, NS, "s");
-      if (!view || view === "tombstoned") throw new Error("stream missing");
-      expect([...view.records.keys()]).toEqual(["small"]);
-      note("record-too-large", { recordTooLarge: 1, outcome: run.outcome });
+      await w.publishPending();
+      let view = (await readStream(env.registry, env.blobs, c, NS, "s"))!;
+      if (view === "tombstoned") throw new Error("tombstoned");
+      expect(canonicalJson(view.records.get("huge"))).toBe(
+        canonicalJson(longer),
+      );
+      await collect(w, {
+        runId: "run-3",
+        connector: c,
+        observedAt: T0 + 2000,
+        checkpointUsed: { ns: NS, generation: 1 },
+        streams: { s: [{ id: "huge", n: "now small" }] },
+      });
+      await w.publishPending();
+      view = (await readStream(env.registry, env.blobs, c, NS, "s"))!;
+      if (view === "tombstoned") throw new Error("tombstoned");
+      expect(view.records.get("huge")).toEqual({ id: "huge", n: "now small" });
+      expect(view.head.parts).toHaveLength(1);
+    });
+
+    it("drops a long record when the stream is deleted and published again", async () => {
+      const c = freshConnector("big-delete");
+      const w = await env.writer("big-delete");
+      await w.refreshControls();
+      await collect(w, {
+        runId: "run-1",
+        connector: c,
+        observedAt: T0,
+        streams: { s: [recordOfBodyBytes("huge", 9 * MiB)] },
+      });
+      await w.publishPending();
+      await oldDelete(env, streamScope(c, NS, "s"));
+      expect(await readStream(env.registry, env.blobs, c, NS, "s")).toBe(
+        "tombstoned",
+      );
+      await w.refreshControls();
+      await collect(w, {
+        runId: "run-2",
+        connector: c,
+        observedAt: T0 + 1000,
+        streams: { s: [{ id: "after", n: "z" }] },
+      });
+      await w.publishPending();
+      const view = (await readStream(env.registry, env.blobs, c, NS, "s"))!;
+      if (view === "tombstoned") throw new Error("tombstoned");
+      expect([...view.records.keys()]).toEqual(["after"]);
     });
 
     it("Q9: a no-op onto a complete:false base keeps needsFull and blocks the checkpoint", async () => {
