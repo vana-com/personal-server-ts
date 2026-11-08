@@ -13,7 +13,7 @@ const WORKLOADS = fileURLToPath(
   new URL("./memory-oracle.calibration.ts", import.meta.url),
 );
 const MiB = 1024 * 1024;
-const HELD_MiB = 64;
+const HELD_MiB = 256;
 
 describe("memory-oracle calibration", () => {
   // The bounded case churns the same total through short-lived buffers, paced.

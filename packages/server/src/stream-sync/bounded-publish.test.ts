@@ -61,7 +61,6 @@ interface Case extends SourceCase {
 }
 
 const RECORD_4K = 4096;
-const FULL_BUDGET = 6 * P + RECORD_4K;
 
 // 79,872 × 4 KiB = 312 MiB. Winners (32,768 × 4 KiB = 128 MiB) exceed P.
 // Budget from the fitted bound, timer GC mode (round 3 sweep, fixed reader,
