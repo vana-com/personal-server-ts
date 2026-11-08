@@ -72,6 +72,8 @@ function rank(a: ConnectionView, b: ConnectionView): number {
 export function selectConnection(
   connections: readonly ConnectionView[],
 ): ConnectionView | null {
+  // Selection admits active connections only. Head liveness is checked
+  // separately by isHeadLive (head.ts).
   const live = connections.filter((c) => c.control.kind === "active");
   return live.length === 0 ? null : [...live].sort(rank)[0]!;
 }
@@ -83,7 +85,9 @@ export function eligible(input: EligibilityInput): Eligibility {
   }
   const selected =
     target.kind === "physical"
-      ? (connections.find(
+      ? // Selection admits active connections only; head liveness is checked
+        // separately by isHeadLive (head.ts).
+        (connections.find(
           (c) => c.ns === target.ns && c.control.kind === "active",
         ) ?? null)
       : selectConnection(connections);
