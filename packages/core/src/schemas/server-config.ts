@@ -240,6 +240,10 @@ export const ServerConfigSchema = z.object({
     .object({
       write: z.boolean().default(DEFAULTS.streamSync.write),
       read: z.boolean().default(DEFAULTS.streamSync.read),
+      // ISO time the Account switch was last turned on. Legacy files written
+      // at or after it come from old app builds and are never retired. Absent
+      // or unparsable: no legacy file is retired.
+      switchedAt: z.string().optional(),
     })
     .default(DEFAULTS.streamSync),
   replication: z

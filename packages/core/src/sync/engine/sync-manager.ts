@@ -12,8 +12,12 @@ import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
 import {
   countsOnlyLogger,
+  errorClass,
   retireLegacyScopes,
+  type RetireLegacyOption,
 } from "../workers/retire-legacy.js";
+
+export type { RetireLegacyOption };
 import {
   deleteScope,
   retryPendingBlobDeletions,
@@ -68,18 +72,14 @@ export interface SyncManagerOptions {
     readonly write: boolean;
     readonly publisher: { cycle(): Promise<unknown> };
   } | null;
-  /** See `RetireLegacyOption`. Absent or null: legacy files are never retired. */
-  retireLegacy?: RetireLegacyOption | null;
-}
-
-/**
- * Present only once the account has switched to stream sync (the host sets it
- * from the same setting that turns stream-sync write and read on). Each cycle
- * then deletes the legacy files of scopes whose stream view is complete.
- * Needs `deleteData`: a local-only delete would be undone by the next sync.
- */
-export interface RetireLegacyOption {
-  viewIsComplete(scope: string): boolean;
+  /**
+   * Called at the end of every cycle. Returns the retire inputs while the
+   * account is switched to stream sync (the host reads its current config), or
+   * null while it is not. Absent: legacy files are never retired. Needs
+   * `deleteData`: a local-only delete would be undone by the next sync. Its
+   * presence also makes every delete-path log counts only.
+   */
+  retireLegacy?: (() => RetireLegacyOption | null) | null;
 }
 
 export type SyncCanRunResult =
@@ -190,6 +190,10 @@ export function createSyncManager(
   };
   const workerDownloadDeps: DownloadWorkerDeps = {
     ...downloadDeps,
+    onCycleOutcome(outcome) {
+      downloadComplete = outcome.complete;
+      downloadDeps.onCycleOutcome?.(outcome);
+    },
     pendingBlobDeletions:
       downloadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
   };
@@ -279,6 +283,8 @@ export function createSyncManager(
           await runUploadCycle();
         }
 
+        // Only a pass that reports itself complete may let a retire run.
+        downloadComplete = false;
         try {
           // Download new remote files
           const fullReconcile = needsFullReconcile;
@@ -325,6 +331,14 @@ export function createSyncManager(
     }
   }
 
+  // A host that can retire legacy scopes logs counts only on every delete
+  // path (delete, blob retry, re-submission), so no scope name reaches a log.
+  const deletionLogger = options?.retireLegacy
+    ? countsOnlyLogger(uploadDeps.logger)
+    : uploadDeps.logger;
+  let downloadComplete = false;
+  let legacyWritesAfterSwitch = 0;
+
   function deleteScopeDeps() {
     return {
       storage: uploadDeps.storage,
@@ -334,7 +348,7 @@ export function createSyncManager(
       tombstoneFinality: options?.tombstoneFinality,
       scopeDeletions,
       dataPointFeed,
-      logger: uploadDeps.logger,
+      logger: deletionLogger,
     };
   }
 
@@ -368,7 +382,7 @@ export function createSyncManager(
         dataPointFeed,
         serverOwner: uploadDeps.serverOwner,
         storage: uploadDeps.storage,
-        logger: uploadDeps.logger,
+        logger: deletionLogger,
         ...(options?.tombstoneFinality && options.deleteData
           ? {
               tombstoneResubmits,
@@ -398,7 +412,12 @@ export function createSyncManager(
       });
     } catch (err) {
       uploadDeps.logger.warn(
-        { error: (err as Error).message },
+        // With retiring on, the message could name a scope: class only.
+        {
+          error: options?.retireLegacy
+            ? errorClass(err)
+            : (err as Error).message,
+        },
         "Pending blob deletion retry failed",
       );
     }
@@ -451,31 +470,39 @@ export function createSyncManager(
     }
   }
 
-  /** Inside a cycle, after the import: the view state is as fresh as it gets. */
+  /**
+   * Inside a cycle, after the import. Reads the host's switch state now, and
+   * runs only when this cycle's download pass completed: a failed or partial
+   * pass leaves the mirror stale, and a stale mirror must never delete.
+   */
   async function retireLegacyAfterDownload(): Promise<void> {
-    const retire = options?.retireLegacy;
-    if (!retire || !options?.deleteData) return;
+    if (!options?.retireLegacy || !options.deleteData) return;
+    const retire = options.retireLegacy();
+    if (!retire || !downloadComplete) return;
     try {
-      await retireLegacyScopes({
+      const outcome = await retireLegacyScopes({
         storage: uploadDeps.storage,
-        viewIsComplete: (scope) => retire.viewIsComplete(scope),
-        async deleteScope(scope) {
-          const outcome = await deleteScope(
-            {
-              ...deleteScopeDeps(),
-              logger: countsOnlyLogger(uploadDeps.logger),
-            },
+        switchedAt: retire.switchedAt,
+        coverage: (scope) => retire.coverage(scope),
+        async registeredAt(scope) {
+          const row = await dataPointFeed?.getDataPoint({
+            ownerAddress: uploadDeps.serverOwner,
             scope,
-          );
-          uploadState.reconcile(uploadDeps.storage.findUnsynced());
-          if (outcome.durable) deleteAdditionsAfter(scope);
-          return outcome;
+          });
+          return row?.addedAt ?? null;
         },
-        logger: uploadDeps.logger,
+        async deleteScope(scope) {
+          const result = await deleteScope(deleteScopeDeps(), scope);
+          uploadState.reconcile(uploadDeps.storage.findUnsynced());
+          if (result.durable) deleteAdditionsAfter(scope);
+          return result;
+        },
+        logger: deletionLogger,
       });
+      legacyWritesAfterSwitch = outcome.legacyWritesAfterSwitch;
     } catch (err) {
-      uploadDeps.logger.warn(
-        { error: (err as Error).message },
+      deletionLogger.warn(
+        { error: errorClass(err) },
         "Retiring legacy scopes failed; retried next cycle",
       );
     }
@@ -599,6 +626,7 @@ export function createSyncManager(
         errors: [...errors],
         deletions: tombstoneResubmits.snapshot(),
         uploads: uploadState.snapshot(),
+        streamSync: { legacyWritesAfterSwitch },
       };
     },
 

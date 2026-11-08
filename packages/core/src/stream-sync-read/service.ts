@@ -207,6 +207,11 @@ export type ReadDecision =
       readonly body: ReadableStream<Uint8Array>;
     };
 
+/** See `StreamSyncReadService.viewCoverage`. */
+export type ViewCoverage =
+  | { readonly kind: "covered"; readonly throughMs: number }
+  | { readonly kind: "skip"; readonly reason: "incomplete" | "ambiguous" };
+
 export interface StreamSyncConnectionStatus {
   readonly connector: string;
   readonly ns: string;
@@ -687,23 +692,53 @@ export class StreamSyncReadService {
   }
 
   /**
-   * The read path would serve a stream view of `scope`, not its legacy file:
-   * some target's streams are all live and `complete` (§2.10, the same
-   * `eligible()` call a read makes). Imported heads only; this device's
-   * unpublished local runs are not counted.
+   * Whether the stream views cover the legacy scope `scope`: the question a
+   * legacy delete asks. `covered` only when EVERY target of the scope (its
+   * `pdpp.<c>.<s>` name, its legacy binding and each alternate binding) has
+   * all its streams live and `complete` in the one active connection of its
+   * connector (§2.10, the same `eligible()` call a read makes) and the mirror
+   * holds the whole registry listing. `throughMs` is the oldest `observedAt`
+   * of the heads used: a legacy row collected after it may hold data the views
+   * lack. Imported heads only; this device's unpublished runs are not counted.
+   * More than one active connection of a connector is `ambiguous`: the legacy
+   * scope may hold data from either.
    */
-  viewServes(scope: string): boolean {
+  viewCoverage(scope: string): ViewCoverage {
+    const targets = readTargets(scope);
+    if (targets.length === 0 || this.mirror.needsFullListing()) {
+      return { kind: "skip", reason: "incomplete" };
+    }
     const known = new Set(this.mirror.connectors());
-    return readTargets(scope)
-      .filter((target) => known.has(target.connector))
-      .some(
-        (target) =>
-          eligible({
-            connections: this.connectionViews(target.connector),
-            target: { kind: "logical", streams: target.streams },
-            legacyFile: true,
-          }).kind === "view",
-      );
+    let throughMs = Infinity;
+    for (const target of targets) {
+      if (!known.has(target.connector)) {
+        return { kind: "skip", reason: "incomplete" };
+      }
+      const connections = this.connectionViews(target.connector);
+      if (connections.filter((c) => c.control.kind === "active").length > 1) {
+        return { kind: "skip", reason: "ambiguous" };
+      }
+      const eligibility = eligible({
+        connections,
+        target: { kind: "logical", streams: target.streams },
+        legacyFile: true,
+      });
+      if (eligibility.kind !== "view") {
+        return { kind: "skip", reason: "incomplete" };
+      }
+      for (const stream of target.streams) {
+        const imported = this.importer.servableView({
+          connector: target.connector,
+          ns: eligibility.ns,
+          stream,
+        });
+        if (!imported) return { kind: "skip", reason: "incomplete" };
+        throughMs = Math.min(throughMs, imported.head.observedAt);
+      }
+    }
+    return Number.isFinite(throughMs)
+      ? { kind: "covered", throughMs }
+      : { kind: "skip", reason: "incomplete" };
   }
 
   /** §2.10 inputs for connector c: every connection this server knows. */

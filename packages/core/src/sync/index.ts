@@ -55,7 +55,12 @@ export {
 } from "./workers/delete.js";
 export {
   RETIRE_LEGACY_SCOPES_PER_CYCLE,
+  countsOnlyLogger,
+  errorClass,
+  liveRetireLegacy,
   retireLegacyScopes,
+  type RetireCoverage,
+  type RetireLegacyOption,
   type RetireLegacyDeps,
   type RetireLegacyResult,
 } from "./workers/retire-legacy.js";

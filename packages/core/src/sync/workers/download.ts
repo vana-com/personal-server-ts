@@ -62,6 +62,13 @@ export interface DownloadDiagnosticsHook {
 }
 
 export interface DownloadWorkerDeps {
+  /**
+   * Called once at the end of `downloadAll` that did not throw: `complete` is
+   * false when any registry row, stream-sync row, data point or stream-sync
+   * import failed in that pass. Anything that acts on the mirror (deleting
+   * legacy scopes) must wait for a complete pass.
+   */
+  onCycleOutcome?: (outcome: { complete: boolean }) => void;
   storage: DataStoragePort;
   storageAdapter: StorageAdapter;
   gateway: GatewayClient;
@@ -805,10 +812,12 @@ export async function downloadAll(
     );
   }
 
+  let importFailed = false;
   if (deps.streamSync) {
     try {
       await deps.streamSync.importPending();
     } catch (err) {
+      importFailed = true;
       logger.warn(
         { error: (err as Error).message },
         "Stream-sync import did not complete; retried next cycle",
@@ -816,6 +825,7 @@ export async function downloadAll(
     }
   }
 
+  deps.onCycleOutcome?.({ complete: !failed && !importFailed });
   return results;
 }
 

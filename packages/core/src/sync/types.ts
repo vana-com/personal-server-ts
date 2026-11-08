@@ -28,6 +28,13 @@ export interface SyncStatus {
    * empty when nothing is owed.
    */
   uploads?: UploadStateSnapshot;
+  /**
+   * Stream-sync switch report. `legacyWritesAfterSwitch`: legacy files written
+   * at or after `streamSync.switchedAt` (old-app writes, in no stream), as
+   * counted by the last retire pass; 0 before the first pass or when the
+   * switch time is unknown. A number only: no scope, no file name.
+   */
+  streamSync?: { legacyWritesAfterSwitch: number };
 }
 
 export interface SyncBlockedReason {

@@ -38,6 +38,7 @@ import {
   createInventoryTombstoneFinality,
   createPendingBlobDeletionStore,
   createScopeDeletionTracker,
+  liveRetireLegacy,
   normalizePendingBlobDeletionPlanned,
   normalizePendingBlobDeletions,
   type PendingBlobDeletionPlanned,
@@ -647,11 +648,12 @@ export async function createPsLiteSyncManager(
           ? { write: true, publisher: streamSyncWriter }
           : null,
         deleteData,
-        // Writer on = the account has switched. The reader judges the view.
-        retireLegacy:
-          streamSyncWriter && streamSyncRead
-            ? { viewIsComplete: (scope) => streamSyncRead.viewServes(scope) }
-            : null,
+        // Writer on = the account has switched. Read from config each cycle.
+        retireLegacy: liveRetireLegacy({
+          config: options.config,
+          writer: streamSyncWriter,
+          reader: streamSyncRead,
+        }),
         pendingBlobDeletions,
         uploadAttemptStore: uploadAttemptNamespace
           ? createPsLiteUploadAttemptStore(options.stateStore, {

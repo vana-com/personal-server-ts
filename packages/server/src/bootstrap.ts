@@ -76,6 +76,7 @@ import {
   createInventoryTombstoneFinality,
   createScopeDeletionTracker,
   createSyncManager,
+  liveRetireLegacy,
   withCancellableRegistration,
   type PdppImporter,
   type SyncManager,
@@ -983,12 +984,13 @@ export async function createServer(
         ? { write: true, publisher: streamSyncWriter }
         : null,
       deleteData,
-      // The account has switched to stream sync (write and read both on):
-      // legacy files of scopes with a complete view are deleted.
-      retireLegacy:
-        streamSyncWriter && streamSyncRead
-          ? { viewIsComplete: (scope) => streamSyncRead!.viewServes(scope) }
-          : null,
+      // Legacy files of scopes the stream views replace are retired while
+      // the account is switched; the condition is read from config each cycle.
+      retireLegacy: liveRetireLegacy({
+        config,
+        writer: streamSyncWriter,
+        reader: streamSyncRead,
+      }),
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
       uploadAttemptStore: createFileUploadAttemptStore(uploadAttemptsPath),
