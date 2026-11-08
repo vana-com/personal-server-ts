@@ -2424,14 +2424,24 @@ export class StreamSyncWriter {
         ]
           .filter((name) => debt.has(name) || wholeRead.includes(name))
           .sort();
+        // R28 rule 4: a whole-read stream's attempt ends when the stream is
+        // covered. Its cursor is neither kept nor merged, with or without
+        // provenance, so no begin that makes the stream incremental resumes it.
+        const ended = new Set(
+          Object.entries(host.streams)
+            .filter(([, s]) => s.fullStream && !s.retryProgress)
+            .map(([name]) => name),
+        );
+        const kept = withoutKeys(
+          mergeCursors(same ? prev.value : null, entry.checkpointCandidate),
+          ended,
+        );
+        const keptProv = prov.filter((name) => !ended.has(name));
         state.checkpoints[entry.connector] = {
           ns,
           generation: decided.generation,
-          value: mergeCursors(
-            same ? prev.value : null,
-            entry.checkpointCandidate,
-          ),
-          ...(prov.length > 0 ? { prov } : {}),
+          value: kept,
+          ...(keptProv.length > 0 ? { prov: keptProv } : {}),
         };
       }
       return decided;
@@ -3091,6 +3101,18 @@ export class StreamSyncWriter {
       receipts: state.receipts,
     };
   }
+}
+
+/** The cursor object without `names`; null when nothing is left. */
+function withoutKeys(
+  value: JsonValue | null,
+  names: ReadonlySet<string>,
+): JsonValue | null {
+  if (!isPlainObject(value)) return value;
+  const rest = Object.fromEntries(
+    Object.entries(value).filter(([key]) => !names.has(key)),
+  );
+  return Object.keys(rest).length === 0 ? null : rest;
 }
 
 function mergeCursors(

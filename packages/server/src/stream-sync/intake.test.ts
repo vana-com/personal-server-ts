@@ -1651,17 +1651,21 @@ describe(
       await h.intake.abort("r2", "cancelled");
     });
 
-    it("spooled but unemitted rows do not turn an empty retry into publication (M5)", async () => {
+    it("a row the collecting run receives but never stores does not turn an empty retry into publication (M5)", async () => {
       const c = freshConnector("m5-unemitted");
       const h = await host({
         seed: fixedSeed("desktop-install", { items: [row("seed-i")] }),
       });
-      const { ended } = await run(h, "r1", c, {
-        records: [],
+      // A skipped delete is the one batch record the run does not spool
+      // (R17): it is counted, never stored, and leaves the run empty.
+      const { batch, ended } = await run(h, "r1", c, {
+        records: [{ stream: "items", op: "delete", data: row("gone") }],
         covered: [],
         candidate: { export: "tok" },
         outcome: "retry_pending",
       });
+      expect(batch.deletesSkipped).toBe(1);
+      expect(batch.accepted).toBe(0);
       expect(ended.result).toBe("checkpoint_only");
       await publish(h, "r1");
       expect(

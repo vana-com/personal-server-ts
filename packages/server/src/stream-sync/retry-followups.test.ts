@@ -184,6 +184,52 @@ describe("retry follow-ups", { timeout: 30_000 }, () => {
     await h.intake.abort("r3", "cancelled");
   });
 
+  it("a completed snapshot continuation with a supplied snapshot candidate is not reissued after the artifact makes it incremental, before and after reopening", async () => {
+    const c = freshConnector("f-m7-changed-supplied");
+    const h = await snapshotCompleted(c, { items: "i2", snapshot: "s-final" });
+    // r2 was published inside snapshotCompleted.
+    const next = await h.intake.begin(
+      "r3",
+      begin(c, { observedAt: T0 + 2 }, CHANGED),
+    );
+    expect(next.start.state).not.toHaveProperty("snapshot");
+    expect(next.start.state).toEqual({ items: "i2" });
+    await h.intake.abort("r3", "cancelled");
+    // Reopen the same home: the answer must survive a restart.
+    const reopened = createStreamSyncIntake({
+      writer: await env.writer(h.name),
+      resolveArtifact: resolveTestArtifact,
+    });
+    const again = await reopened.begin(
+      "r4",
+      begin(c, { observedAt: T0 + 3 }, CHANGED),
+    );
+    expect(again.start.state).not.toHaveProperty("snapshot");
+    expect(again.start.state).toEqual({ items: "i2" });
+    await reopened.abort("r4", "cancelled");
+  });
+
+  it("a whole-read success with a snapshot candidate and no prior retry is not reissued after the artifact makes it incremental", async () => {
+    const c = freshConnector("f-m7-whole-read-candidate");
+    const h = await host();
+    await run(h, "r1", c, {
+      records: [
+        { stream: "items", data: row("a") },
+        { stream: "snapshot", data: row("b") },
+      ],
+      covered: ["items", "snapshot"],
+      candidate: { items: "i1", snapshot: "s-tok" },
+      outcome: "succeeded",
+    });
+    await publish(h, "r1");
+    const next = await h.intake.begin(
+      "r2",
+      begin(c, { observedAt: T0 + 1 }, CHANGED),
+    );
+    expect(next.start.state).not.toHaveProperty("snapshot");
+    await h.intake.abort("r2", "cancelled");
+  });
+
   it("RetryEmpty: a zero-upsert covered retry writes no head, keeps the old token, and a later success retires it", async () => {
     const c = freshConnector("f-retry-empty");
     const h = await host();
