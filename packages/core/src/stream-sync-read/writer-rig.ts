@@ -56,7 +56,11 @@ class Gateway implements StreamSyncRegistry {
     };
   }
 
+  /** A test holds a registry POST here, before it commits. */
+  beforePost?: (request: SignedRegistryPost) => Promise<void>;
+
   async post(request: SignedRegistryPost): Promise<RegistryPostResult> {
+    await this.beforePost?.(request);
     const rows = this.versions.get(request.scope) ?? [];
     if (Number(request.expectedVersion) !== rows.length + 1) {
       return { kind: "conflict", latestVersion: String(rows.length) };
@@ -150,8 +154,21 @@ export class Rig {
   ) {
     this.writer = this.device(this.files, seed);
     this.other = this.device(createMemoryStreamSyncFiles());
-    this.overlay = createWriterOverlaySource(this.writer);
+    const source = createWriterOverlaySource(this.writer);
+    this.overlay = {
+      snapshot: async (connector) => {
+        const snapshot = await source.snapshot(connector);
+        const hook = this.afterSnapshot;
+        this.afterSnapshot = undefined;
+        await hook?.();
+        return snapshot;
+      },
+      acknowledge: (coverage) => source.acknowledge(coverage),
+    };
   }
+
+  /** Runs once, after the next owner snapshot is taken and before the read leases anything. */
+  afterSnapshot?: () => Promise<void>;
 
   private device(
     files: ReturnType<typeof createMemoryStreamSyncFiles>,

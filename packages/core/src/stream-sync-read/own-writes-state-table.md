@@ -56,6 +56,11 @@ the test change together.
    `projection_unavailable`. Its rows stay in the raw `pdpp.<connector>.<stream>`
    stream. A stored body answers without projecting, so it carries no such
    marker (the pending count tells the owner).
+9. **One read pairs one base with one plan.** The writer's snapshot is taken
+   before any imported head is leased. If an import lands before the read has
+   decided, the read starts over, so the plan never meets a head that holds a
+   commit the snapshot does not know (`snapshot-coherence.test.ts`). An
+   older, consistent snapshot is fine; a mixture is not.
 
 ## Writer policies the rows exercise
 

@@ -110,6 +110,8 @@ export function isUsableViewKey(key: ViewKey): boolean {
 
 export class ViewStore {
   private readonly current = new Map<string, ImportedVersion>();
+  /** Counts the imports that changed a current version; a read compares it before and after it pairs a base with a plan. */
+  private importEpoch = 0;
   /** id → version → lease count. */
   private readonly leases = new Map<string, Map<number, number>>();
   /** id → versions on disk that are not current. */
@@ -171,6 +173,10 @@ export class ViewStore {
       await store.collect(key);
     }
     return store;
+  }
+
+  get epoch(): number {
+    return this.importEpoch;
   }
 
   get(key: ViewKey): ImportedVersion | null {
@@ -264,6 +270,7 @@ export class ViewStore {
     const previous = this.current.get(id);
     this.keys.set(id, key);
     this.current.set(id, { version, dataHash, head });
+    this.importEpoch += 1;
     if (previous && previous.version !== version) {
       let retained = this.retained.get(id);
       if (!retained) this.retained.set(id, (retained = new Map()));

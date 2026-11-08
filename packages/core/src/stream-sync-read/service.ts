@@ -441,6 +441,9 @@ const NO_SNAPSHOT: StreamSyncOverlaySnapshot = {
   release() {},
 };
 
+/** Reads start over this many times when an import lands under them. */
+const MAX_COHERENCE_ATTEMPTS = 8;
+
 export class StreamSyncReadService {
   private spoolCounter = 0;
 
@@ -714,21 +717,43 @@ export class StreamSyncReadService {
     // One pinned snapshot per connector, taken BEFORE any imported view is
     // leased: whatever an import retires after this point stays readable
     // from the pin. The chosen view keeps its snapshot until the body ends.
-    const snapshots = new Map<string, StreamSyncOverlaySnapshot>();
-    try {
-      for (const target of [...targets, ...candidates]) {
-        snapshots.set(
-          target.connector,
-          // Only the owner view reads local runs. A grant is answered from
-          // the imported heads, as if no local run existed.
-          input.isOwnerView
-            ? await this.snapshot(target.connector)
-            : NO_SNAPSHOT,
+    //
+    // The snapshot's plan knows the writer's commits up to the snapshot. An
+    // import that lands after it carries commits the plan does not know, so
+    // pairing that base with this plan could show a run the writer refuses.
+    // The read starts over when an import lands before the decision is made.
+    for (let attempt = 1; ; attempt += 1) {
+      const epoch = this.views.epoch;
+      const snapshots = new Map<string, StreamSyncOverlaySnapshot>();
+      let decision: ReadDecision;
+      try {
+        for (const target of [...targets, ...candidates]) {
+          snapshots.set(
+            target.connector,
+            // Only the owner view reads local runs. A grant is answered from
+            // the imported heads, as if no local run existed.
+            input.isOwnerView
+              ? await this.snapshot(target.connector)
+              : NO_SNAPSHOT,
+          );
+        }
+        decision = await this.decide(
+          input,
+          cursor,
+          targets,
+          candidates,
+          snapshots,
+        );
+      } finally {
+        for (const snapshot of snapshots.values()) snapshot.release();
+      }
+      if (this.views.epoch === epoch) return decision;
+      if ("body" in decision) await decision.body.cancel();
+      if (attempt >= MAX_COHERENCE_ATTEMPTS) {
+        throw new Error(
+          "stream-sync read: imports kept changing the base under the read",
         );
       }
-      return await this.decide(input, cursor, targets, candidates, snapshots);
-    } finally {
-      for (const snapshot of snapshots.values()) snapshot.release();
     }
   }
 
