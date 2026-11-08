@@ -4,6 +4,7 @@ import { keccak256 } from "viem";
 
 import type { UploadWorkerDeps } from "./upload.js";
 import { uploadOne, uploadAll, computeDataPointId } from "./upload.js";
+import { createUploadStateTracker } from "../upload-state.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type {
@@ -1257,5 +1258,204 @@ describe("uploadOne — derivative registration (lineage)", () => {
     await uploadOne(deps, makeEntry());
     expect(deps.gateway.registerDataPoint).toHaveBeenCalled();
     expect(deps.lineageGateway.registerDataPoint).not.toHaveBeenCalled();
+  });
+});
+
+describe("uploadAll — upload size cap and bounded retry", () => {
+  const SCOPE_KEY = new Uint8Array(32).fill(0xbb);
+  const MIB = 1024 * 1024;
+  const T0 = Date.parse("2026-11-07T12:00:00Z");
+  const MINUTE = 60_000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
+    (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    );
+  });
+
+  function setup(entries: IndexEntry[]) {
+    const deps = makeMockDeps();
+    const uploadState = createUploadStateTracker();
+    deps.uploadState = uploadState;
+    (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue(
+      entries,
+    );
+    return { deps, uploadState };
+  }
+  const cycle = (deps: UploadWorkerDeps, offsetMs: number) =>
+    uploadAll(deps, { now: () => new Date(T0 + offsetMs) });
+
+  it("never reads, encrypts or sends a 337 MiB entry and reports it too large", async () => {
+    const huge = makeEntry({ sizeBytes: 337 * MIB });
+    const { deps, uploadState } = setup([huge]);
+
+    const results = await cycle(deps, 0);
+
+    expect(results).toEqual([]);
+    expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+    expect(encryptWithPassword).not.toHaveBeenCalled();
+    expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+    expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+    expect(uploadState.snapshot().tooLarge).toEqual([
+      expect.objectContaining({
+        scope: huge.scope,
+        path: huge.path,
+        sizeBytes: 337 * MIB,
+      }),
+    ]);
+  });
+
+  it("treats an entry whose encrypted body would pass the cap as too large, and one safely under it as uploadable", async () => {
+    const nearCap = makeEntry({
+      id: 1,
+      path: "a/1.json",
+      sizeBytes: 94_000_000,
+    });
+    const safe = makeEntry({ id: 2, path: "b/2.json", sizeBytes: 80_000_000 });
+    const { deps, uploadState } = setup([nearCap, safe]);
+
+    const results = await cycle(deps, 0);
+
+    expect(results.map((r) => r.path)).toEqual(["b/2.json"]);
+    expect(uploadState.snapshot().tooLarge.map((e) => e.path)).toEqual([
+      "a/1.json",
+    ]);
+  });
+
+  it("logs a too-large entry once across several cycles", async () => {
+    const { deps } = setup([makeEntry({ sizeBytes: 337 * MIB })]);
+
+    for (let i = 0; i < 5; i++) await cycle(deps, i * 4 * MINUTE);
+
+    const tooLargeLogs = [
+      ...(deps.logger.warn as ReturnType<typeof vi.fn>).mock.calls,
+      ...(deps.logger.info as ReturnType<typeof vi.fn>).mock.calls,
+      ...(deps.logger.error as ReturnType<typeof vi.fn>).mock.calls,
+    ].filter(([, message]) => /too large/i.test(String(message)));
+    expect(tooLargeLogs).toHaveLength(1);
+    expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("does not erase older snapshots when the coalesced head is too large", async () => {
+    const deps = makeMockDeps();
+    deps.uploadState = createUploadStateTracker();
+    deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+    const older = makeEntry({
+      id: 11,
+      path: "memory.claude/1.json",
+      scope: "memory.claude",
+      collectedAt: "2026-10-27T10:00:00.000Z",
+      version: 1,
+    });
+    const head = makeEntry({
+      id: 12,
+      path: "memory.claude/2.json",
+      scope: "memory.claude",
+      collectedAt: "2026-10-27T10:00:05.000Z",
+      version: 2,
+      sizeBytes: 337 * MIB,
+    });
+    (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+      older,
+      head,
+    ]);
+    withVersions(deps, [older, head]);
+
+    await cycle(deps, 0);
+
+    expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
+    expect(deps.storage.readEnvelope).not.toHaveBeenCalled();
+    expect(deps.uploadState?.snapshot().tooLarge).toHaveLength(1);
+  });
+
+  it("backs off a failing entry and stops after the failure cap", async () => {
+    const entry = makeEntry();
+    const { deps, uploadState } = setup([entry]);
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("Failed to fetch"),
+    );
+    const upload = deps.storageAdapter.upload as ReturnType<typeof vi.fn>;
+
+    await cycle(deps, 0);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(uploadState.snapshot().retrying).toEqual([
+      expect.objectContaining({ path: entry.path, failures: 1 }),
+    ]);
+
+    // Inside the 1 minute backoff: no attempt.
+    await cycle(deps, 30_000);
+    expect(upload).toHaveBeenCalledTimes(1);
+
+    // Backoff doubles: 1, 2, 4, 8, 16, 32, 60 minutes.
+    let now = 61_000;
+    for (const wait of [1, 2, 4, 8, 16, 32, 60]) {
+      await cycle(deps, now - 1_000);
+      const before = upload.mock.calls.length;
+      await cycle(deps, now);
+      expect(upload.mock.calls.length).toBe(before + 1);
+      now += (wait * 2 > 60 ? 60 : wait * 2) * MINUTE + 1_000;
+    }
+
+    expect(upload).toHaveBeenCalledTimes(8);
+    expect(uploadState.snapshot().retrying).toEqual([]);
+    expect(uploadState.snapshot().stopped).toEqual([
+      expect.objectContaining({
+        path: entry.path,
+        failures: 8,
+        lastError: "Failed to fetch",
+      }),
+    ]);
+
+    // Stopped: a day of cycles makes no further attempt.
+    for (let i = 1; i <= 20; i++) await cycle(deps, now + i * 60 * MINUTE);
+    expect(upload).toHaveBeenCalledTimes(8);
+  });
+
+  it("clears the state after a later successful upload", async () => {
+    const entry = makeEntry();
+    const { deps, uploadState } = setup([entry]);
+    const upload = deps.storageAdapter.upload as ReturnType<typeof vi.fn>;
+    upload.mockRejectedValueOnce(new Error("boom"));
+
+    await cycle(deps, 0);
+    expect(uploadState.snapshot().retrying).toHaveLength(1);
+
+    await cycle(deps, 2 * MINUTE);
+    expect(uploadState.snapshot()).toEqual({
+      tooLarge: [],
+      retrying: [],
+      stopped: [],
+    });
+  });
+
+  it("clears a stopped scope when new data arrives for it", async () => {
+    const stale = makeEntry({ id: 1, path: "s/1.json", version: 1 });
+    const { deps, uploadState } = setup([stale]);
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("boom"),
+    );
+    for (let i = 0; i < 8; i++) await cycle(deps, i * 61 * MINUTE);
+    expect(uploadState.snapshot().stopped).toHaveLength(1);
+
+    const fresh = makeEntry({
+      id: 2,
+      path: "s/2.json",
+      version: 2,
+      collectedAt: "2026-01-22T10:00:00Z",
+    });
+    (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+      stale,
+      fresh,
+    ]);
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockResolvedValue(
+      STORAGE_URL,
+    );
+
+    const results = await cycle(deps, 10 * 61 * MINUTE);
+
+    expect(results.map((r) => r.path)).toEqual(["s/2.json"]);
+    expect(uploadState.snapshot().stopped).toEqual([]);
   });
 });

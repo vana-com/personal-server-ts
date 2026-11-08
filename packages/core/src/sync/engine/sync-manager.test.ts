@@ -831,3 +831,31 @@ describe("SyncManager", () => {
     });
   });
 });
+
+describe("sync manager upload state", () => {
+  it("shares one upload state with the upload worker and reports it in the status", async () => {
+    const uploadDeps = makeMockUploadDeps();
+    const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+      pollInterval: 60_000,
+    });
+    let seen: UploadWorkerDeps | undefined;
+    (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async (deps) => {
+      seen = deps;
+      deps.uploadState?.markTooLarge({ scope: "s.big", path: "s/1.json" }, 9);
+      return [];
+    });
+
+    expect(manager.getStatus().uploads).toEqual({
+      tooLarge: [],
+      retrying: [],
+      stopped: [],
+    });
+    await manager.trigger();
+    await manager.stop();
+
+    expect(seen?.uploadState).toBeDefined();
+    expect(manager.getStatus().uploads?.tooLarge).toEqual([
+      expect.objectContaining({ scope: "s.big", path: "s/1.json" }),
+    ]);
+  });
+});
