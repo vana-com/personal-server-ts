@@ -26,6 +26,9 @@ import type {
 } from "../storage/blocks/types.js";
 import type { SearchHit } from "./search/index.js";
 import { decodeDataBlockCursor } from "../storage/blocks/index.js";
+import { buildDataBlocksAsync } from "../storage/blocks/build.js";
+import { readBuiltScopeBlocks } from "../storage/blocks/page.js";
+import { DataBlockStorageError } from "../storage/blocks/errors.js";
 import {
   bytesToBase64,
   isBinaryEnvelope,
@@ -339,7 +342,10 @@ export interface McpDataReadClient {
    * to populate sizeBytes/sizeClass/recommendedAccess without reading data.
    * Returns null when the scope has no local index entry.
    */
-  getScopeMetadata(scope: string): Promise<McpScopeMetadata | null>;
+  getScopeMetadata(
+    scope: string,
+    grantId?: string,
+  ): Promise<McpScopeMetadata | null>;
 
   /**
    * Perform a grant-gated bounded block read for MCP. This is the path used by
@@ -487,10 +493,126 @@ type BuilderReadAuthorization = Awaited<
   >
 >;
 
+/**
+ * Set by `/v1/data/:scope` when a stream view, not a legacy file, answered.
+ * Its value is the only signal MCP reads use to tell the two apart.
+ */
+const STREAM_SYNC_SOURCE_HEADER = "x-vana-data-source";
+const STREAM_SYNC_SOURCE = "stream-sync";
+/** Binds block cursors minted from a stream view; a legacy cursor is refused there. */
+const STREAM_VIEW_CURSOR_VIEW = "stream-sync";
+
+interface WholeScopeRead {
+  scope: string;
+  collectedAt: string;
+  /** The body as `/v1/data/:scope` served it, already grantee-redacted. */
+  body: unknown;
+  sizeBytes: number;
+  fromStreamView: boolean;
+}
+
+/** UTF-8 byte length without a second copy of the text. */
+function countUtf8Bytes(text: string): number {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4;
+      i += 1;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
 export function createMcpDataReadClient(
   options: CreateMcpDataReadClientOptions,
 ): McpDataReadClient {
   const basePath = options.basePath ?? "/v1/data";
+
+  /**
+   * One signed grantee request for `scope` through the `/v1/data` handler, the
+   * same entry `listScopes` uses. The handler owns the stream-sync decision,
+   * grant checks, x402 settlement and access logs; nothing here repeats them.
+   */
+  async function signedScopeRequest(params: {
+    scope: string;
+    grantId: string;
+    query?: URLSearchParams;
+    payment?: string;
+  }): Promise<Response> {
+    const signingUri = `${basePath}/${encodeURIComponent(params.scope)}`;
+    const authorization = await signMcpGranteeRequest({
+      account: options.granteeAccount,
+      aud: options.serverOrigin,
+      method: "GET",
+      uri: signingUri,
+      grantId: params.grantId,
+    });
+    const search = params.query?.toString();
+    const url = new URL(
+      search ? `${signingUri}?${search}` : signingUri,
+      options.serverOrigin,
+    ).toString();
+    const request = new Request(url, {
+      method: "GET",
+      headers: {
+        Authorization: authorization,
+        ...(params.payment ? { "X-PAYMENT": params.payment } : {}),
+      },
+    });
+    return handlePersonalServerDataRequest(request, options.dataApiDeps, {
+      basePath,
+    });
+  }
+
+  /**
+   * The whole latest body the handler serves for `scope`, as an HTTP read
+   * would return it. Refusals, unavailable answers and payment challenges
+   * surface as the handler's status and body.
+   */
+  async function readWholeScope(params: {
+    scope: string;
+    grantId: string;
+    payment?: string;
+  }): Promise<WholeScopeRead> {
+    const response = await signedScopeRequest(params);
+    if (!response.ok) {
+      throw new McpDataReadError(
+        response.status,
+        await parseJsonOrText(response),
+      );
+    }
+    const fromStreamView =
+      response.headers.get(STREAM_SYNC_SOURCE_HEADER) === STREAM_SYNC_SOURCE;
+    const text = await response.text();
+    const sizeBytes = countUtf8Bytes(text);
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw new McpDataReadError(422, {
+        error: "NOT_BLOCK_READABLE",
+        message: `Scope "${params.scope}" has no JSON body to read as blocks.`,
+        scope: params.scope,
+      });
+    }
+    if (!isPlainObject(body) || typeof body.collectedAt !== "string") {
+      throw new McpDataReadError(502, {
+        error: "BOUNDED_DATA_UNAVAILABLE",
+        message: `Scope "${params.scope}" was served without a collection time.`,
+        scope: params.scope,
+      });
+    }
+    return {
+      scope: params.scope,
+      collectedAt: body.collectedAt,
+      body,
+      sizeBytes,
+      fromStreamView,
+    };
+  }
 
   /**
    * Same deletion gate as GET /v1/data/:scope, surfaced as the MCP error
@@ -644,7 +766,32 @@ export function createMcpDataReadClient(
       return { status: response.status, ...normalizeListScopesPayload(body) };
     },
 
-    async getScopeMetadata(scope: string): Promise<McpScopeMetadata | null> {
+    async getScopeMetadata(
+      scope: string,
+      grantId?: string,
+    ): Promise<McpScopeMetadata | null> {
+      if (options.dataApiDeps.streamSyncRead) {
+        // Same response a read serves: size and version come from the body
+        // the handler decided on, never from the legacy index.
+        if (!grantId) return null;
+        try {
+          const read = await readWholeScope({ scope, grantId });
+          return {
+            scope,
+            collectedAt: read.collectedAt,
+            sizeBytes: read.sizeBytes,
+            hasBlocks: true,
+          };
+        } catch (err) {
+          if (
+            err instanceof McpDataReadError &&
+            (err.status === 404 || err.status === 410)
+          ) {
+            return null;
+          }
+          throw err;
+        }
+      }
       const storage = options.dataApiDeps.storage;
       const entry = storage.findEntry({ scope });
       if (!entry) return null;
@@ -674,6 +821,42 @@ export function createMcpDataReadClient(
       blockIds,
       tool,
     }) {
+      if (options.dataApiDeps.streamSyncRead) {
+        // The handler answers the read (decision, grant, charge, access log);
+        // blocks are paged from the body it served, so a view never pages
+        // legacy bytes. Cursors are not pinned to a version: a cursor from an
+        // older version fails validation here instead of reading history.
+        const read = await readWholeScope({ scope, grantId, payment });
+        const built = await buildDataBlocksAsync({
+          scope,
+          collectedAt: read.collectedAt,
+          content: read.body,
+        });
+        try {
+          const result = await readBuiltScopeBlocks(built, {
+            cursor,
+            maxBytes: maxBytes ?? 16_384,
+            ...(blockIds?.length ? { blockIds } : {}),
+            cursorView: read.fromStreamView
+              ? STREAM_VIEW_CURSOR_VIEW
+              : undefined,
+          });
+          return { status: 200, ...result };
+        } catch (err) {
+          if (
+            err instanceof DataBlockStorageError &&
+            err.code === "cursor_invalid"
+          ) {
+            throw new McpDataReadError(400, {
+              error: "INVALID_CURSOR",
+              message: "The bounded read cursor is invalid for this scope.",
+              scope,
+              reason: err.code,
+            });
+          }
+          throw err;
+        }
+      }
       const storage = options.dataApiDeps.storage;
       if (!storage.readScopeBlocks) {
         throw new McpDataReadError(503, {
@@ -785,6 +968,21 @@ export function createMcpDataReadClient(
     },
 
     async readBlockManifest({ scope, grantId }) {
+      if (options.dataApiDeps.streamSyncRead) {
+        try {
+          const read = await readWholeScope({ scope, grantId });
+          const built = await buildDataBlocksAsync({
+            scope,
+            collectedAt: read.collectedAt,
+            content: read.body,
+          });
+          return built.manifest;
+        } catch (err) {
+          if (err instanceof McpDataReadError && err.status === 404)
+            return null;
+          throw err;
+        }
+      }
       const storage = options.dataApiDeps.storage;
       if (!storage.readBlockManifest) return null;
 
@@ -836,17 +1034,20 @@ export function createMcpDataReadClient(
     },
 
     async readRawScopeFile({ scope, grantId, at, fileId, payment }) {
-      const storage = options.dataApiDeps.storage;
-      const selectedEntry = storage.findEntry({
-        scope,
-        ...(fileId ? { fileId } : {}),
-        ...(at ? { at } : {}),
-      });
-      if (!selectedEntry) {
-        throw new McpDataReadError(404, {
-          error: "NOT_FOUND",
-          message: `No data found for scope "${scope}"`,
+      const streamSync = Boolean(options.dataApiDeps.streamSyncRead);
+      if (!streamSync) {
+        const storage = options.dataApiDeps.storage;
+        const selectedEntry = storage.findEntry({
+          scope,
+          ...(fileId ? { fileId } : {}),
+          ...(at ? { at } : {}),
         });
+        if (!selectedEntry) {
+          throw new McpDataReadError(404, {
+            error: "NOT_FOUND",
+            message: `No data found for scope "${scope}"`,
+          });
+        }
       }
 
       const safeScope = encodeURIComponent(scope);
@@ -886,6 +1087,16 @@ export function createMcpDataReadClient(
           await parseJsonOrText(response),
         );
       }
+      if (
+        streamSync &&
+        response.headers.get(STREAM_SYNC_SOURCE_HEADER) === STREAM_SYNC_SOURCE
+      ) {
+        throw new McpDataReadError(409, {
+          error: "STREAM_VIEW_NOT_RAW",
+          message: `Scope "${scope}" is served from its stream view, which has no raw binary content.`,
+          scope,
+        });
+      }
 
       const mimeType =
         response.headers.get("content-type") ?? "application/octet-stream";
@@ -899,11 +1110,18 @@ export function createMcpDataReadClient(
       const bytes = new Uint8Array(await response.arrayBuffer());
       const contentDisposition = response.headers.get("content-disposition");
       const metadataHeader = response.headers.get("x-vana-metadata");
+      // The legacy file the handler just served: the same entry the
+      // non-reader path gated on.
+      const servedEntry = options.dataApiDeps.storage.findEntry({
+        scope,
+        ...(fileId ? { fileId } : {}),
+        ...(at ? { at } : {}),
+      });
       return {
         status: response.status,
         scope,
-        collectedAt: selectedEntry.collectedAt,
-        fileId: selectedEntry.fileId ?? undefined,
+        collectedAt: servedEntry?.collectedAt ?? "",
+        fileId: servedEntry?.fileId ?? undefined,
         mimeType,
         filename: filenameFromContentDisposition(contentDisposition),
         sizeBytes: bytes.byteLength,

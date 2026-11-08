@@ -760,6 +760,7 @@ export function createApp(deps: AppDeps): Hono {
     indexManager: deps.indexManager,
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,
+    streamSyncRead: deps.streamSyncRead,
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,

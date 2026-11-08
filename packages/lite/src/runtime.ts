@@ -1478,6 +1478,7 @@ export function createPsLiteRuntime(
             scopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
             auth,
             dataStorage,
+            streamSyncRead: options.streamSyncRead,
             accessLogWriter,
             readFulfillmentReporter: options.readFulfillmentReporter,
             now,
@@ -1520,6 +1521,7 @@ async function handleMcpRoute(input: {
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
+  streamSyncRead?: StreamSyncReadPort;
   accessLogWriter: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   now: () => Date;
@@ -2113,6 +2115,7 @@ async function handleMcpRoute(input: {
       granteeAccount,
       dataApiDeps: {
         storage: input.dataStorage,
+        streamSyncRead: input.streamSyncRead,
         auth: input.auth,
         accessLogWriter: input.accessLogWriter,
         readFulfillmentReporter: input.readFulfillmentReporter,
