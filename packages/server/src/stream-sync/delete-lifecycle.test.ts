@@ -8,6 +8,9 @@
  * pins on the next boot.
  */
 
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   controlScope,
@@ -20,6 +23,7 @@ import {
   createOracleEnv,
   deleteConnection,
   finishedOutcome,
+  foreignControl,
   freshConnector,
   interpose,
   readStream,
@@ -29,6 +33,7 @@ import {
   type OracleEnv,
   type Surface,
 } from "./oracle.test-utils.js";
+import { createFsStreamSyncFiles } from "./fs-files.js";
 
 const GATEWAY_URL = process.env.STREAM_SYNC_ORACLE_GATEWAY_URL;
 const NS = "";
@@ -42,6 +47,33 @@ const matrix = backends.flatMap((backend) =>
 );
 
 const rows = (ids: string[], tag: string) => ids.map((id) => ({ id, n: tag }));
+
+/**
+ * Every file under `dir` whose path or bytes contain a needle. Bytes are read
+ * as latin1 so a binary file is searched as well as a text one.
+ */
+async function leftoverFiles(
+  dir: string,
+  needles: string[],
+): Promise<string[]> {
+  const found: string[] = [];
+  const walk = async (current: string): Promise<void> => {
+    for (const entry of await readdir(current, { withFileTypes: true })) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(path);
+        continue;
+      }
+      const rel = relative(dir, path);
+      const text = (await readFile(path)).toString("latin1");
+      if (needles.some((n) => rel.includes(n) || text.includes(n))) {
+        found.push(rel);
+      }
+    }
+  };
+  await walk(dir);
+  return found;
+}
 
 /** A scheduled (not user-initiated) run start, for the `stopped` gate. */
 function scheduled(
@@ -488,6 +520,220 @@ describe.each(matrix)(
       });
       await a.publishPending();
       const view = await readStream(env.registry, env.blobs, c, NS, "s");
+      expect(view === null || view === "tombstoned").toBe(true);
+    });
+
+    // R8 (item 1): after a delete and a pass, no file of the scope remains.
+    it("collect, delete, run a pass: no file of that scope remains under the home", async () => {
+      const c = freshConnector("p4r2-purge-files");
+      await activateControl(env.registry, c, NS); // active(1)
+      const root = await mkdtemp(join(homedir(), ".tmp", "p4r2-purge-"));
+      try {
+        const a = await env.writer("p4r2-purge-device", {
+          files: createFsStreamSyncFiles(join(root, "home")),
+        });
+        await a.refreshControls();
+        await collect(a, {
+          runId: "purge-done",
+          connector: c,
+          observedAt: T0,
+          streams: { s: rows(["PURGE-DONE-MARKER"], "done") },
+        });
+        await a.beginRun({
+          runId: "purge-inflight",
+          connector: c,
+          userConnect: false,
+          observedAt: T0 + 1000,
+          identity: "none",
+          checkpointUsed: null,
+        });
+        await a.declareStream("purge-inflight", "s", SHAPE);
+        await a.append("purge-inflight", "s", { id: "PURGE-INFLIGHT-MARKER" });
+        await a.deleteConnection(c); // deleted(2)
+        await a.publishPending();
+        expect(
+          await leftoverFiles(join(root, "home"), [
+            "purge-done",
+            "purge-inflight",
+            "PURGE-DONE-MARKER",
+            "PURGE-INFLIGHT-MARKER",
+          ]),
+        ).toEqual([]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    // R9 (m6): a resumed delete whose tombstone version a reconnect took resolves without throwing.
+    it("a resumed delete whose tombstone version a reconnect took resolves without throwing, and the reconnect stays active", async () => {
+      const c = freshConnector("p4r2-conflict");
+      await activateControl(env.registry, c, NS); // active(1)
+      const tombScope = controlScope(c, NS);
+      const crashing = await env.writer("p4r2-conflict-a", {
+        registry: interpose(env.newRegistry(), {
+          async beforePost(request) {
+            if (request.scope === tombScope) throw new Error("crash first");
+          },
+        }),
+      });
+      await crashing.refreshControls();
+      await expect(crashing.deleteConnection(c)).rejects.toThrow("crash first");
+      await activateControl(env.registry, c, NS); // active(2): the reconnect takes pin+1
+
+      const booted = await env.writer("p4r2-conflict-a");
+      await expect(booted.publishPending()).resolves.toBeDefined();
+      expect(await env.registry.read(tombScope)).toMatchObject({
+        found: true,
+        version: 2,
+        deleted: false,
+      });
+      await expect(booted.publishPending()).resolves.toBeDefined();
+    });
+
+    // R10 (m3): two namespaces; the resume finishes every pin, not only the first.
+    it("a delete of two namespaces that fails after the first pin is finished for both by the resume", async () => {
+      const c = freshConnector("p4r2-multi-pin");
+      await activateControl(env.registry, c, NS);
+      await activateControl(env.registry, c, NS_OTHER);
+      let crashed = false;
+      const a = await env.writer("p4r2-multi-a", {
+        registry: interpose(env.newRegistry(), {
+          async afterPost(request) {
+            if (crashed || !request.scope.startsWith(controlScope(c, "")))
+              return;
+            crashed = true;
+            throw new Error("crash after one pin");
+          },
+        }),
+      });
+      await a.refreshControls();
+      await expect(a.deleteConnection(c)).rejects.toThrow(
+        "crash after one pin",
+      );
+
+      const booted = await env.writer("p4r2-multi-a");
+      await booted.publishPending();
+      expect(await env.registry.read(controlScope(c, NS))).toMatchObject({
+        deleted: true,
+      });
+      expect(await env.registry.read(controlScope(c, NS_OTHER))).toMatchObject({
+        deleted: true,
+      });
+    });
+
+    // R11 (m4): a foreign control row of the connector is pinned and tombstoned with the rest.
+    it("a foreign control row of the connector is tombstoned with the connector's other rows", async () => {
+      const c = freshConnector("p4r2-foreign-pin");
+      await activateControl(env.registry, c, NS); // active(1)
+      await foreignControl(env.registry, c, NS_OTHER); // foreign(1)
+      const a = await env.writer("p4r2-foreign-a");
+      await a.refreshControls();
+      await a.deleteConnection(c);
+      expect(await env.registry.read(controlScope(c, NS))).toMatchObject({
+        version: 2,
+        deleted: true,
+      });
+      expect(await env.registry.read(controlScope(c, NS_OTHER))).toMatchObject({
+        version: 2,
+        deleted: true,
+      });
+    });
+
+    // R12 (m5): two connectors with open deletes; a resume that still fails for one does not hold the other.
+    it("two connectors with open deletes: the one still failing is reported and does not hold the other", async () => {
+      const one = freshConnector("p4r2-two-a");
+      const two = freshConnector("p4r2-two-b");
+      await activateControl(env.registry, one, NS);
+      await activateControl(env.registry, two, NS);
+      let blockOne = true;
+      let blockTwo = true;
+      const a = await env.writer("p4r2-two-device", {
+        registry: interpose(env.newRegistry(), {
+          async beforePost(request) {
+            if (blockOne && request.scope === controlScope(one, NS)) {
+              throw new Error("one down");
+            }
+            if (blockTwo && request.scope === controlScope(two, NS)) {
+              throw new Error("two down");
+            }
+          },
+        }),
+      });
+      await a.refreshControls();
+      await expect(a.deleteConnection(one)).rejects.toThrow("one down");
+      await expect(a.deleteConnection(two)).rejects.toThrow("two down");
+
+      blockOne = false;
+      const report = await a.publishPending();
+      expect(report.deletesPending.map((p) => p.connector)).toEqual([two]);
+      expect(await env.registry.read(controlScope(one, NS))).toMatchObject({
+        deleted: true,
+      });
+      expect(await env.registry.read(controlScope(two, NS))).toMatchObject({
+        deleted: false,
+      });
+
+      blockTwo = false;
+      await a.publishPending();
+      expect(await env.registry.read(controlScope(two, NS))).toMatchObject({
+        deleted: true,
+      });
+    });
+
+    // R13: delete, reconnect, delete, reconnect: each lands at its own version; only the last generation's records show.
+    it("delete, reconnect, delete, reconnect: each lands at its own version and only the last generation's records are visible", async () => {
+      const c = freshConnector("p4r2-twice");
+      await activateControl(env.registry, c, NS); // active(1)
+      const a = await env.writer("p4r2-twice-a");
+      await a.refreshControls();
+      await a.deleteConnection(c); // deleted(2)
+      await activateControl(env.registry, c, NS); // active(3)
+      await a.refreshControls();
+      await collect(a, {
+        runId: "twice-1",
+        connector: c,
+        observedAt: T0,
+        userConnect: true,
+        streams: { s: rows(["old"], "gen3") },
+      });
+      await a.publishPending();
+
+      await a.deleteConnection(c); // deleted(4)
+      await activateControl(env.registry, c, NS); // active(5)
+      await a.refreshControls();
+      await collect(a, {
+        runId: "twice-2",
+        connector: c,
+        observedAt: T0 + 10000,
+        userConnect: true,
+        streams: { s: rows(["new"], "gen5") },
+      });
+      await a.publishPending();
+
+      expect(await env.registry.read(controlScope(c, NS))).toMatchObject({
+        version: 5,
+        deleted: false,
+      });
+      const view = await readStream(env.registry, env.blobs, c, NS, "s");
+      if (!view || view === "tombstoned") throw new Error("stream missing");
+      expect([...view.records.keys()]).toEqual(["new"]);
+    });
+
+    // R14: a stream first written by a run collected before the delete never appears.
+    it("a stream first written by a run collected before the delete never appears after it", async () => {
+      const c = freshConnector("p4r2-first-stream");
+      await activateControl(env.registry, c, NS); // active(1)
+      const a = await env.writer("p4r2-first-a");
+      await a.refreshControls();
+      await collect(a, {
+        runId: "first-stream",
+        connector: c,
+        observedAt: T0,
+        streams: { brandnew: rows(["1"], "new") },
+      });
+      await a.deleteConnection(c); // deleted(2)
+      await a.publishPending();
+      const view = await readStream(env.registry, env.blobs, c, NS, "brandnew");
       expect(view === null || view === "tombstoned").toBe(true);
     });
 

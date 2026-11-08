@@ -440,6 +440,24 @@ export async function activateControl(
   );
 }
 
+/**
+ * A control row whose hashes are neither the active nor the tombstone pair:
+ * a foreign row (§2.4). Posted at the next version like any other write.
+ */
+export async function foreignControl(
+  registry: StreamSyncRegistry,
+  connector: string,
+  ns: string,
+): Promise<number> {
+  const hash = (byte: string) => `0x${byte.repeat(32)}` as `0x${string}`;
+  return postNext(
+    registry,
+    controlScope(connector, ns),
+    hash("ab"),
+    hash("cd"),
+  );
+}
+
 /** Owner-signed connection delete: tombstone the control row and the given streams. */
 export async function deleteConnection(
   registry: StreamSyncRegistry,
