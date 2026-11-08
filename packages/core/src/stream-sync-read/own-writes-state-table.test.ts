@@ -198,18 +198,18 @@ const ROWS: readonly Row[] = [
   },
   {
     id: "S7",
-    title: "A lowers the profile, B changes the key below the floor, C merges",
+    title: "A merges, B changes the key at the floor, C merges",
     base: [baseRun({ version: "2.0.0" })],
     runs: [
-      run({ runId: "rA", version: "1.0.0", rows: [X] }),
+      run({ runId: "rA", version: "2.0.0", rows: [X] }),
       run({
         runId: "rB",
         key: "uid",
-        version: "1.5.0",
+        version: "2.0.0",
         full: true,
         rows: [U1],
       }),
-      run({ runId: "rC", version: "1.4.0", full: true, rows: [Z] }),
+      run({ runId: "rC", version: "2.0.0", full: true, rows: [Z] }),
     ],
     expect: {
       // The floor stays 2.0.0, so B is refused; once C commits, B is older
@@ -218,7 +218,7 @@ const ROWS: readonly Row[] = [
       after: read([A, B, X, Z], true, ["rB:out_of_order"]),
       grant: [AB, [A, B, X, Z]],
       pending: 3,
-      head: { key: "id", version: "1.4.0", complete: true },
+      head: { key: "id", version: "2.0.0", complete: true },
     },
   },
   {
@@ -248,7 +248,7 @@ const ROWS: readonly Row[] = [
   },
   {
     id: "S9",
-    title: "an older empty run re-projects, then an older changed key",
+    title: "an older empty run is refused, then an older changed key",
     base: [baseRun({ version: "2.0.0" })],
     runs: [
       run({ runId: "r1", version: "1.0.0" }),
@@ -261,11 +261,11 @@ const ROWS: readonly Row[] = [
       }),
     ],
     expect: {
-      before: read(AB, true, [`r2:${CUR}`]),
-      after: read(AB, true, [`r2:${CUR}`]),
+      before: read(AB, true, [`r1:${CUR}`, `r2:${CUR}`]),
+      after: read(AB, true, [`r1:${CUR}`, `r2:${CUR}`]),
       grant: [AB, AB],
       pending: 2,
-      head: { key: "id", version: "1.0.0", complete: true },
+      head: { key: "id", version: "2.0.0", complete: true },
     },
   },
   {
@@ -375,26 +375,25 @@ const ROWS: readonly Row[] = [
   },
   {
     id: "A2",
-    title:
-      "A empty below the floor, B changes the key below it, C merges a row",
+    title: "A empty at the floor, B changes the key at it, C merges a row",
     base: [baseRun({ version: "2.0.0" })],
     runs: [
-      run({ runId: "rA", version: "1.0.0" }),
+      run({ runId: "rA", version: "2.0.0" }),
       run({
         runId: "rB",
         key: "uid",
-        version: "1.5.0",
+        version: "2.0.0",
         full: true,
         rows: [U1],
       }),
-      run({ runId: "rC", version: "1.4.0", full: true, rows: [Z] }),
+      run({ runId: "rC", version: "2.0.0", full: true, rows: [Z] }),
     ],
     expect: {
       before: read([A, B, Z], true, [`rB:${CUR}`]),
       after: read([A, B, Z], true, ["rB:out_of_order"]),
       grant: [AB, [A, B, Z]],
       pending: 3,
-      head: { key: "id", version: "1.4.0", complete: true },
+      head: { key: "id", version: "2.0.0", complete: true },
     },
   },
   {
@@ -402,22 +401,22 @@ const ROWS: readonly Row[] = [
     title: "as A2, C empty too",
     base: [baseRun({ version: "2.0.0" })],
     runs: [
-      run({ runId: "rA", version: "1.0.0" }),
+      run({ runId: "rA", version: "2.0.0" }),
       run({
         runId: "rB",
         key: "uid",
-        version: "1.5.0",
+        version: "2.0.0",
         full: true,
         rows: [U1],
       }),
-      run({ runId: "rC", version: "1.4.0", full: true }),
+      run({ runId: "rC", version: "2.0.0", full: true }),
     ],
     expect: {
       before: read(AB, true, [`rB:${CUR}`]),
       after: read(AB, true, ["rB:out_of_order"]),
       grant: [AB, AB],
       pending: 3,
-      head: { key: "id", version: "1.4.0", complete: true },
+      head: { key: "id", version: "2.0.0", complete: true },
     },
   },
   {
@@ -603,11 +602,12 @@ const ROWS: readonly Row[] = [
       }),
     ],
     expect: {
-      before: read([A, B, C, D], true, [`r3:${CUR}`]),
-      after: read([A, B, C, D], true, [`r3:${CUR}`]),
-      grant: [AB, [A, B, C, D]],
+      // r2 is older than the floor 3.0.0 r1 raised: refused, its row unpublished.
+      before: read([A, B, C], true, [`r2:${CUR}`, `r3:${CUR}`]),
+      after: read([A, B, C], true, [`r2:${CUR}`, `r3:${CUR}`]),
+      grant: [AB, [A, B, C]],
       pending: 3,
-      head: { key: "id", version: "2.0.0", complete: true },
+      head: { key: "id", version: "3.0.0", complete: true },
     },
   },
   {
@@ -1225,7 +1225,7 @@ describe("a pending view's cursor pins the head it was built on", () => {
       }),
     );
     await rig.sync();
-    await rig.collect(run({ runId: "r1", rows: [C] }));
+    await rig.collect(run({ runId: "r1", version: "2.0.0", rows: [C] }));
     const first = await resolve(rig, row, { owner: true });
     expect(first.kind).toBe("local_pending");
     const cursor = (first as { cursor: string }).cursor;
@@ -1249,7 +1249,7 @@ describe("a pending view's cursor pins the head it was built on", () => {
     const replay = await resolve(rig, row, { owner: true, cursor });
     expect(replay.kind).toBe("cursor_stale");
     const fresh = await resolve(rig, row, { owner: true });
-    expect(canon(await records(fresh))).toEqual(canon([A, B, C, D]));
+    expect(canon(await records(fresh))).toEqual(canon([A, B, D]));
   });
 });
 

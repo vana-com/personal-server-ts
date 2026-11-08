@@ -1,9 +1,9 @@
 /**
- * A key change is judged against the stream's version floor: the highest
- * connector version that registered on it, not the profile of the last head.
- * A run the writer skips (isNoop) or one from an older connector that
- * publishes cannot lower the floor, so neither can let a later older key
- * change through. The read shows what the writer's plan publishes.
+ * A run is judged against the stream's version floor: the highest connector
+ * version that registered on it, not the profile of the last head. A run from
+ * an older connector is refused whatever it changes, so it cannot lower the
+ * floor or the published profile. A run the writer skips (isNoop) still
+ * counts toward the floor. The read shows what the writer's plan publishes.
  */
 
 import { describe, expect, it } from "vitest";
@@ -101,16 +101,19 @@ const keyChange = (version: string): Spec => ({
 });
 
 describe("the version floor judges a key change", () => {
-  it("an older no-op run does not make a later older key change look newer", async () => {
-    // Base 2.0.0 (key id). Run a: key id, 1.0.0, no rows, not full: a no-op.
-    // Run b: key uid, 1.5.0 is below the floor 2.0.0: refused.
+  it("an older empty run is refused, and so is a later older key change", async () => {
+    // Base 2.0.0 (key id). Run a: key id, 1.0.0, no rows, not full: below the
+    // floor, so refused. Run b: key uid, 1.5.0 is below the floor 2.0.0: refused.
     const out = await read(701, { version: "2.0.0", complete: true }, () => [
       noRows("1.0.0"),
       keyChange("1.5.0"),
     ]);
     expect(out.kind).toBe("view");
     expect(out.ids).toEqual(["base-a", "base-b"]);
-    expect(out.withheld).toEqual(["b:connector_update_required"]);
+    expect(out.withheld).toEqual([
+      "a:connector_update_required",
+      "b:connector_update_required",
+    ]);
   });
 
   it("a newer no-op run raises the floor above a later key change", async () => {
@@ -138,24 +141,30 @@ describe("the version floor judges a key change", () => {
     expect(out.withheld).toEqual(["b:key_reset_pending"]);
   });
 
-  it("an older run that completes an incomplete base publishes, and does not lower the floor", async () => {
-    // Base 2.0.0, incomplete. Run a: older connector, no rows, but full: the
-    // head's completeness changes, so the writer publishes it. The floor
-    // stays 2.0.0, so run b (1.5.0, key uid) is refused.
+  it("an older run that would complete an incomplete base is refused", async () => {
+    // Base 2.0.0, incomplete. Run a: older connector, no rows, but full:
+    // refused, so the base stays incomplete and run b (1.5.0, key uid) is
+    // refused too.
     const out = await read(703, { version: "2.0.0", complete: false }, () => [
       noRows("1.0.0", { complete: true }),
       keyChange("1.5.0"),
     ]);
     expect(out.ids).toEqual(["base-a", "base-b"]);
-    expect(out.withheld).toEqual(["b:connector_update_required"]);
+    expect(out.withheld).toEqual([
+      "a:connector_update_required",
+      "b:connector_update_required",
+    ]);
   });
 
-  it("an older run with rows does not lower the floor", async () => {
+  it("an older run with rows is refused", async () => {
     const out = await read(704, { version: "2.0.0", complete: true }, () => [
       noRows("1.0.0", { rows: [{ id: "base-a", v: 0 }] }),
       keyChange("1.5.0"),
     ]);
     expect(out.ids).toEqual(["base-a", "base-b"]);
-    expect(out.withheld).toEqual(["b:connector_update_required"]);
+    expect(out.withheld).toEqual([
+      "a:connector_update_required",
+      "b:connector_update_required",
+    ]);
   });
 });

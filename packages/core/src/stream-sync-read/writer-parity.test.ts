@@ -196,9 +196,9 @@ describe("the overlay read equals the read after the real writer publishes", () 
       },
     ],
     [
-      "an older no-op run, then an older changed key",
+      "an older empty run, then an older changed key",
       2,
-      ["r2:connector_update_required"],
+      ["r1:connector_update_required", "r2:connector_update_required"],
       {
         base: { ...base, version: "2.0.0" },
         runs: [
@@ -247,9 +247,9 @@ describe("the overlay read equals the read after the real writer publishes", () 
       },
     ],
     [
-      "an older run with a row does not lower the floor",
-      3,
-      ["r2:connector_update_required"],
+      "an older run with a row is refused",
+      2,
+      ["r1:connector_update_required", "r2:connector_update_required"],
       {
         base: { ...base, version: "2.0.0" },
         runs: [

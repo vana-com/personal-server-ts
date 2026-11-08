@@ -12,9 +12,11 @@
  *
  * Policies the step enforces:
  *
- * - **Version floor.** A changed primary key is accepted only from a connector
- *   newer than every version that registered on the stream, not only newer
- *   than the last writer. The floor never goes down.
+ * - **Version floor.** A run from a connector older than every version that
+ *   registered on the stream is refused, whatever it changes (rows, key or
+ *   profile, or nothing). A changed primary key is accepted only from a
+ *   connector newer than that floor, not only newer than the last writer. The
+ *   floor never goes down, and the published profile never goes back.
  * - **Commit order.** Runs commit in (observedAt, runId) order. A run older
  *   than the newest commit on the stream never commits; an unresolved run
  *   holds back every later run of the stream.
@@ -189,13 +191,16 @@ export function planStreamStep(state: PlanState, run: PlanRun): StepDecision {
   // chooseBase: a head of an older generation is no base (§2.7).
   const base = head && head.generation === run.generation ? head : null;
   const against = higherVersion(floor.version, base?.profile.version ?? null);
-  const compat = writerCompatibility(
-    base,
-    run.primaryKey,
+  const versus: VersionOrder =
     against === null
       ? "equal"
-      : compareConnectorVersions(run.profile.version, against),
-  );
+      : compareConnectorVersions(run.profile.version, against);
+  // Policy B: a run below the stream's floor is refused whatever it changes,
+  // so the published profile never goes back to an older version.
+  if (versus === "lower") {
+    return { kind: "refused", reason: "connector_update_required" };
+  }
+  const compat = writerCompatibility(base, run.primaryKey, versus);
   if (compat.kind === "connector_update_required") {
     return { kind: "refused", reason: "connector_update_required" };
   }

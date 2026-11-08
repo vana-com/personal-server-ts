@@ -14,6 +14,8 @@
 import { describe, expect, it } from "vitest";
 import { Rig, type RunSpec } from "../stream-sync-read/writer-rig.js";
 
+const C = { id: "c", v: 1 };
+
 const run = (spec: Partial<RunSpec> & { runId: string }): RunSpec => ({
   key: "id",
   version: "1.0.0",
@@ -69,6 +71,51 @@ describe("writer policy: version floor", () => {
     expect(problemOf(statuses, "rB")).toBe("connector_update_required");
     const head = await rig.registeredHead();
     expect(head?.primaryKey).toEqual(["id"]);
+  });
+});
+
+describe("writer policy: below the floor", () => {
+  it("refuses a same-key run older than the floor and publishes nothing from it", async () => {
+    const rig = await rigWithBase("3.0.0");
+    const version = await rig.registeredVersion();
+    await rig.collect(run({ runId: "old", version: "2.0.0", rows: [C] }));
+    const statuses = await rig.publish();
+    expect(problemOf(statuses, "old")).toBe("connector_update_required");
+    expect(await rig.registeredVersion()).toBe(version);
+    const head = await rig.registeredHead();
+    expect(head?.profile.version).toBe("3.0.0");
+    expect(head?.recordCount).toBe(2);
+    // The refusal is retained, not dropped: the next pass refuses it again.
+    const again = await rig.publish();
+    expect(problemOf(again, "old")).toBe("connector_update_required");
+    expect(await rig.registeredVersion()).toBe(version);
+  });
+
+  it("refuses an empty re-projection from an older connector", async () => {
+    const rig = await rigWithBase("3.0.0");
+    const version = await rig.registeredVersion();
+    await rig.collect(
+      run({ runId: "old", version: "2.0.0", profileKey: "projector-2" }),
+    );
+    const statuses = await rig.publish();
+    expect(problemOf(statuses, "old")).toBe("connector_update_required");
+    expect(await rig.registeredVersion()).toBe(version);
+    expect((await rig.registeredHead())?.profile).toEqual({
+      key: null,
+      version: "3.0.0",
+    });
+  });
+
+  it("keeps a floor that a no-op established", async () => {
+    const rig = await rigWithBase("3.0.0");
+    await rig.collect(run({ runId: "same", version: "3.0.0" }));
+    await rig.publish();
+    const version = await rig.registeredVersion();
+    await rig.collect(run({ runId: "old", version: "2.9.0", rows: [C] }));
+    const statuses = await rig.publish();
+    expect(problemOf(statuses, "old")).toBe("connector_update_required");
+    expect(await rig.registeredVersion()).toBe(version);
+    expect((await rig.registeredHead())?.recordCount).toBe(2);
   });
 });
 
