@@ -9,6 +9,15 @@
  * Budgets are absolute: peak heap above the child's idle baseline, measured
  * with forced GC at part encrypt, blob put/get and flush boundaries, and
  * including the cipher copy and one simulated bridge copy per blob.
+ *
+ * LIMIT (what this oracle does NOT prove): `peakBytes` is sampled live
+ * retention at settled boundaries and timer samples. It does not bound a
+ * transient allocation that is created and released between two samples, and
+ * it does not bound the process RSS, renderer PSS or any phone maximum. The
+ * uniform 2k/20k flatness test is the multi-part retention detector; a
+ * per-scenario single peak bound does not separate a retained-all writer from
+ * a correct one at these sizes. The phone and emulator maxima are measured
+ * outside this file and are disclosed in the PR body.
  */
 import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync } from "node:fs";
