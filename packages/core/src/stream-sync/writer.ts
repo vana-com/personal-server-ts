@@ -1121,21 +1121,30 @@ export class StreamSyncWriter {
     return this.publish(async () => {
       await this.recover();
       const runs: StreamSyncRunStatus[] = [];
-      const hosts: HostEntry[] = [];
-      for (const runId of await this.runIds()) {
-        const host = await this.readEntry(runId);
-        if (host && host.phase === "ready") hosts.push(host);
-      }
-      hosts.sort(
-        (a, b) =>
-          a.entry.observedAt - b.entry.observedAt ||
-          (a.entry.runId < b.entry.runId ? -1 : 1),
-      );
-      // Selection and reservation are one synchronous step: no await sits
-      // between the last read of the enumeration and this loop, and snapshots
-      // read `selected` inside the lifecycle queue, so a snapshot that sees a
-      // selected run's stream also sees that it is reserved.
-      const reserved = new Map(hosts.map((h) => [h, this.reserve(h)]));
+      // Selection is one critical section of the lifecycle queue, the lock
+      // ready-entry writes and snapshots also take: the run list, the entry
+      // reads, the sort and the reservation. A snapshot sees no selection or
+      // the whole reserved one, and a run that turns ready meanwhile is either
+      // in the list or written after it. The section holds only local reads
+      // (one list and one entry read per run); every network step (build,
+      // sign, upload, registry) runs after it. The reserve map is in `reserved`
+      // before the section ends, so the `finally` below always releases it.
+      const { hosts, reserved } = await this.lifecycle(async () => {
+        const hosts: HostEntry[] = [];
+        for (const runId of await this.runIds()) {
+          const host = await this.readEntry(runId);
+          if (host && host.phase === "ready") hosts.push(host);
+        }
+        hosts.sort(
+          (a, b) =>
+            a.entry.observedAt - b.entry.observedAt ||
+            (a.entry.runId < b.entry.runId ? -1 : 1),
+        );
+        return {
+          hosts,
+          reserved: new Map(hosts.map((h) => [h, this.reserve(h)])),
+        };
+      });
       try {
         // Commit order: a stream an earlier run did not resolve in this pass
         // holds back every later run of that stream until the next pass.

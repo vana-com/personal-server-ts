@@ -180,6 +180,74 @@ describe("a selected publication holds back the runs it would reorder", () => {
     expect(settled.withheld).toEqual(["rB:out_of_order"]);
   });
 
+  /** Holds one file operation of the publisher until released. */
+  function holdFiles(
+    rig: Rig,
+    op: "read" | "list",
+    target: string,
+  ): { release: () => void; arrived: Promise<void> } {
+    let release!: () => void;
+    let reached!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const arrived = new Promise<void>((resolve) => (reached = resolve));
+    const files = rig.files as unknown as Record<
+      string,
+      (arg: string) => Promise<unknown>
+    >;
+    const original = files[op]!.bind(files);
+    files[op] = async (arg: string) => {
+      if (arg !== target) return original(arg);
+      files[op] = original;
+      const result = await original(arg);
+      reached();
+      await held;
+      return result;
+    };
+    return { release, arrived };
+  }
+
+  async function expectNoUnreservedSelection(
+    rig: Rig,
+    publishing: Promise<unknown>,
+    hold: { release: () => void },
+  ) {
+    // B's intake write and the owner read may wait for the selection to end,
+    // so neither is awaited before the held read is released.
+    const finishing = rig.collect(
+      run({ runId: "rB", at: 10_000, rows: [{ id: "b2" }] }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const reading = finishing.then(() => ownerRead(rig));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    hold.release();
+    const owner = await reading;
+    await publishing;
+    // Never a prediction that holds C's row and B's row with no run withheld.
+    expect(owner.ids).not.toEqual(["a", "b", "b2", "c"]);
+    expect(owner.withheld.length).toBeGreaterThan(0);
+  }
+
+  it("barrier e: an entry read of the enumeration is held, B finishes intake, an owner read completes", async () => {
+    const rig = await baseRig();
+    await rig.collect(run({ runId: "rC", at: 20_000, rows: [{ id: "c" }] }));
+    await rig.collect(
+      run({ runId: "rD", at: 30_000, stream: "other", rows: [{ id: "d" }] }),
+    );
+    const hold = holdFiles(rig, "read", "runs/rD/entry.json");
+    const publishing = rig.publish();
+    await hold.arrived;
+    await expectNoUnreservedSelection(rig, publishing, hold);
+  });
+
+  it("barrier f: the run list is held after it was captured without B", async () => {
+    const rig = await baseRig();
+    await rig.collect(run({ runId: "rC", at: 20_000, rows: [{ id: "c" }] }));
+    const hold = holdFiles(rig, "list", "runs");
+    const publishing = rig.publish();
+    await hold.arrived;
+    await expectNoUnreservedSelection(rig, publishing, hold);
+  });
+
   it("the reservation is gone once the pass fails", async () => {
     const rig = await baseRig();
     await rig.collect(run({ runId: "rC", at: 20_000, rows: [{ id: "c" }] }));
