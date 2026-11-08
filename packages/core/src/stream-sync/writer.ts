@@ -262,6 +262,19 @@ export interface StreamSyncRunStart {
   readonly leaseId?: string | null;
 }
 
+/**
+ * A scheduled run of a connector this device has seen deleted (§2.4
+ * `stopped`). Cleared by an explicit connect, or by observing a reconnect.
+ */
+export class ConnectionStoppedError extends Error {
+  constructor(readonly connector: string) {
+    super(
+      `connection of ${connector} is stopped: deleted, not reconnected; an explicit connect is required`,
+    );
+    this.name = "ConnectionStoppedError";
+  }
+}
+
 /** A run id that finished, or whose entry this process no longer drives. */
 export class RunGoneError extends Error {
   constructor(readonly runId: string) {
@@ -681,6 +694,14 @@ export class StreamSyncWriter {
         throw new Error(`run ${input.runId} already exists`);
       }
       const state = await this.readState();
+      // §2.4 `stopped`: the newest control state seen for any namespace of
+      // the connector is `deleted`. Only an explicit connect starts a run.
+      const observed = Object.values(
+        state.observedControl?.[input.connector] ?? {},
+      );
+      if (!input.userConnect && observed.some((s) => s.kind === "deleted")) {
+        throw new ConnectionStoppedError(input.connector);
+      }
       let checkpointUsed = input.checkpointUsed ?? null;
       let full = checkpointUsed === null;
       let issued: IssuedStart | null = null;
