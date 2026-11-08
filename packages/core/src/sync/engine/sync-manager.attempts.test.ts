@@ -13,6 +13,7 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import {
   createMemoryUploadAttemptStore,
+  STOP_REPAIR_WINDOW_MS,
   type UploadAttemptRecord,
   type UploadAttemptStore,
 } from "../upload-attempts.js";
@@ -207,7 +208,10 @@ describe("upload attempts across manager stop and start", () => {
     failWrites = true;
     first.bodies[0]!.fail();
     await vi.advanceTimersByTimeAsync(0);
-    await first.manager.stop(); // does not reject
+    // The stop retries the refused repair for the whole window, then resolves.
+    const stopping = first.manager.stop();
+    await vi.advanceTimersByTimeAsync(STOP_REPAIR_WINDOW_MS + 1_000);
+    await stopping; // does not reject
 
     const errors = first.manager.getStatus().errors.map((e) => e.message);
     expect(errors.join("\n")).toMatch(/could not be saved on stop/);
