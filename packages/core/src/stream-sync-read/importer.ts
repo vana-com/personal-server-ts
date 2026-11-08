@@ -22,6 +22,7 @@ import {
   type ControlState,
   type StreamRow,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { retainedBytes, type ReadBudget } from "./budget.js";
 import {
   toControlRead,
   type MirrorRow,
@@ -90,6 +91,8 @@ export class StreamSyncImporter {
       readonly keys: StreamSyncReadKeys;
       readonly controlHashes: ControlHashes;
       readonly logger: StreamSyncReadLogger;
+      /** Live accounting of imports. Measurement only; see budget.ts. */
+      readonly budget?: ReadBudget;
     },
   ) {}
 
@@ -246,17 +249,24 @@ export class StreamSyncImporter {
         if (!partCipher)
           throw new Problem("blob_missing", "part blob not found");
         const partClear = await decrypt(keys, scope, partCipher);
+        // One part at a time: its ciphertext and clear bytes are live until stored.
+        const charge = retainedBytes(partCipher) + retainedBytes(partClear);
+        this.options.budget?.acquire("importPart", charge);
         try {
-          await decodePart(
-            keys.hashes.sha256,
-            partClear,
-            part,
-            head.primaryKey,
-          );
-        } catch (error) {
-          throw new Problem("corrupt", `part: ${(error as Error).message}`);
+          try {
+            await decodePart(
+              keys.hashes.sha256,
+              partClear,
+              part,
+              head.primaryKey,
+            );
+          } catch (error) {
+            throw new Problem("corrupt", `part: ${(error as Error).message}`);
+          }
+          await tx.putPart(part.hash, partClear);
+        } finally {
+          this.options.budget?.release("importPart", charge);
         }
-        await tx.putPart(part.hash, partClear);
       }
       await tx.commit(row.version, row.dataHash, clear, head);
     });

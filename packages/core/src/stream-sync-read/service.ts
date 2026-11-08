@@ -30,6 +30,7 @@ import {
   LEGACY_SCOPE_BINDINGS,
   type LegacyScopeBinding,
 } from "../legacy-projection/index.js";
+import { ReadBudget } from "./budget.js";
 import { StreamSyncImporter, type ImportIssue } from "./importer.js";
 import { overlayWinners, viewLines, type OverlayWinners } from "./lines.js";
 import { RegistryMirror, toControlRead, type MirrorFeedRow } from "./mirror.js";
@@ -53,6 +54,11 @@ export interface StreamSyncReadOptions {
   /** Byte budget of a non-windowed legacy projection; above it `too_large`. */
   readonly arrayProjectionBudgetBytes?: number;
   readonly now?: () => Date;
+  /**
+   * Default off. When true, each read and the import keep live budget
+   * accounting (budget.ts). Output is unchanged either way.
+   */
+  readonly measureBudgets?: boolean;
 }
 
 export interface ResolveInput {
@@ -94,6 +100,11 @@ export type ReadDecision =
        */
       readonly served: { readonly scope: string; readonly version: number };
       readonly body: ReadableStream<Uint8Array>;
+      /**
+       * Live accounting of this read. Present only with `measureBudgets`.
+       * Read it after the body ends: every charge is released by then.
+       */
+      readonly budget?: ReadBudget;
     };
 
 export interface StreamSyncConnectionStatus {
@@ -227,29 +238,45 @@ function decodeCursor(text: string): Cursor | null {
 function toStream(
   chunks: AsyncIterable<string>,
   done: () => void,
+  budget?: ReadBudget,
 ): ReadableStream<Uint8Array> {
   const iterator = chunks[Symbol.asyncIterator]();
   let finished = false;
+  // Bytes of the last chunk handed to the stream, charged while it is staged here.
+  let staged = 0;
+  const unstage = () => {
+    budget?.release("outputStaging", staged);
+    staged = 0;
+  };
+  const stage = (bytes: Uint8Array): Uint8Array => {
+    unstage();
+    staged = bytes.byteLength;
+    budget?.acquire("outputStaging", staged);
+    return bytes;
+  };
   const finish = () => {
     if (finished) return;
     finished = true;
+    unstage();
     done();
   };
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
+        // The consumer asked for more: the previous chunk is no longer staged here.
+        unstage();
         let buffer = "";
         while (buffer.length < 64 * 1024) {
           const next = await iterator.next();
           if (next.done) {
-            if (buffer) controller.enqueue(encoder.encode(buffer));
+            if (buffer) controller.enqueue(stage(encoder.encode(buffer)));
             controller.close();
             finish();
             return;
           }
           buffer += next.value;
         }
-        controller.enqueue(encoder.encode(buffer));
+        controller.enqueue(stage(encoder.encode(buffer)));
       } catch (error) {
         finish();
         controller.error(error);
@@ -271,6 +298,7 @@ export class StreamSyncReadService {
     private readonly views: ViewStore,
     private readonly importer: StreamSyncImporter,
     private changed: Set<string>,
+    private readonly importBudgetAccount: ReadBudget | null,
   ) {}
 
   static async open(
@@ -286,6 +314,7 @@ export class StreamSyncReadService {
     );
     const views = await ViewStore.open(options.files);
     await options.files.remove("spool");
+    const importBudget = options.measureBudgets ? new ReadBudget() : null;
     const importer = new StreamSyncImporter({
       mirror,
       views,
@@ -293,6 +322,7 @@ export class StreamSyncReadService {
       keys: options.keys,
       controlHashes: hashes,
       logger: options.logger,
+      budget: importBudget ?? undefined,
     });
     // Import whatever the mirror holds that a crash left unimported.
     return new StreamSyncReadService(
@@ -301,7 +331,13 @@ export class StreamSyncReadService {
       views,
       importer,
       new Set(mirror.connectors()),
+      importBudget,
     );
+  }
+
+  /** Live accounting of imports, or `null` unless `measureBudgets` is set. */
+  importBudget(): ReadBudget | null {
+    return this.importBudgetAccount;
   }
 
   /** True when the next listing must start from the registry's first page. */
@@ -502,8 +538,11 @@ export class StreamSyncReadService {
       return { kind: "cursor_stale" };
     }
     const leases: ViewLease[] = [];
+    const overlays = new Map<string, OverlayWinners>();
+    const budget = this.options.measureBudgets ? new ReadBudget() : undefined;
     const releaseAll = () => {
       for (const lease of leases) lease.release();
+      for (const overlay of overlays.values()) overlay.release();
     };
     for (const stream of target.streams) {
       const key: ViewKey = { connector: target.connector, ns, stream };
@@ -521,13 +560,13 @@ export class StreamSyncReadService {
     }
     try {
       const byStream = new Map(leases.map((l) => [l.key.stream, l]));
-      const overlays = new Map<string, OverlayWinners>();
       let observedAt = 0;
       for (const lease of leases) {
         const overlay = await overlayWinners(
           this.options.overlay,
           this.options.keys,
           lease,
+          budget,
         );
         overlays.set(lease.key.stream, overlay);
         observedAt = Math.max(
@@ -542,6 +581,7 @@ export class StreamSyncReadService {
           this.options.keys,
           byStream.get(stream)!,
           overlays.get(stream)!,
+          budget,
         );
       const nextCursor = encodeCursor({
         c: target.connector,
@@ -570,6 +610,7 @@ export class StreamSyncReadService {
           budgetBytes:
             this.options.arrayProjectionBudgetBytes ?? DEFAULT_ARRAY_BUDGET,
           now: (this.options.now?.() ?? new Date()).toISOString(),
+          budget,
         });
         if (plan.kind === "too_large") {
           releaseAll();
@@ -579,7 +620,7 @@ export class StreamSyncReadService {
       }
       const servedStream =
         target.binding?.window?.parentStream ?? target.streams[0]!;
-      const body = toStream(envelope(open, payload), releaseAll);
+      const body = toStream(envelope(open, payload), releaseAll, budget);
       return {
         kind: "view",
         connector: target.connector,
@@ -590,6 +631,7 @@ export class StreamSyncReadService {
           version: byStream.get(servedStream)!.version.version,
         },
         body,
+        ...(budget ? { budget } : {}),
       };
     } catch (error) {
       releaseAll();

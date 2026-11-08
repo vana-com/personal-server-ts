@@ -16,6 +16,10 @@
  *
  * Other bindings use the array projector over the whole input, refused with
  * `too_large` above the byte budget.
+ *
+ * Accounting (`input.budget`, optional): spool buffers, shard reads, merge
+ * cursors and their chunks, and the held other-stream rows are charged while
+ * owned and released on every exit path. Nothing is refused because of them.
  */
 
 import {
@@ -31,6 +35,12 @@ import {
   type LegacyScopeBinding,
   type PdppRecord,
 } from "../legacy-projection/index.js";
+import {
+  READ_BUDGET,
+  retainedBytes,
+  textCharge,
+  type ReadBudget,
+} from "./budget.js";
 import type { StreamSyncReadFiles } from "./ports.js";
 
 export interface ProjectionInput {
@@ -46,6 +56,8 @@ export interface ProjectionInput {
   readonly spoolId: string;
   readonly budgetBytes: number;
   readonly now: string;
+  /** Live accounting of this projection. Measurement only; see budget.ts. */
+  readonly budget?: ReadBudget;
 }
 
 export type ProjectionPlan =
@@ -55,7 +67,7 @@ export type ProjectionPlan =
 export class ProjectionFailedError extends Error {}
 
 const SHARDS = 256;
-const SPOOL_FLUSH_BYTES = 4 * 1024 * 1024;
+const SPOOL_FLUSH_BYTES = READ_BUDGET.spoolFlushBytes;
 
 function options(input: ProjectionInput) {
   return {
@@ -98,8 +110,13 @@ export async function planProjection(
       records.push({ stream, data: line.v as Record<string, unknown> });
     }
   }
-  const payload = project(input, records);
-  return { kind: "ok", payload: single(JSON.stringify(payload)) };
+  input.budget?.acquire("otherRows", records.length);
+  try {
+    const payload = project(input, records);
+    return { kind: "ok", payload: single(JSON.stringify(payload)) };
+  } finally {
+    input.budget?.release("otherRows", records.length);
+  }
 }
 
 async function* single(text: string): AsyncGenerator<string> {
@@ -129,6 +146,7 @@ async function spoolShards(input: ProjectionInput): Promise<Spooled | null> {
     c: Array.from({ length: SHARDS }, () => [] as string[]),
   };
   let buffered = 0;
+  let charged = 0;
   let flushes = 0;
   const flush = async () => {
     for (const kind of ["p", "c"] as const) {
@@ -143,8 +161,11 @@ async function spoolShards(input: ProjectionInput): Promise<Spooled | null> {
     }
     flushes++;
     buffered = 0;
+    input.budget?.release("spoolBuffer", charged);
+    charged = 0;
   };
   const others: PdppRecord[] = [];
+  let handedOff = false;
   try {
     for (const stream of input.binding.pdppStreams) {
       const kind =
@@ -157,6 +178,7 @@ async function spoolShards(input: ProjectionInput): Promise<Spooled | null> {
         const record = line.v as JsonObject;
         if (kind === null) {
           others.push({ stream, data: record as Record<string, unknown> });
+          input.budget?.acquire("otherRows", 1);
           continue;
         }
         const join = kind === "p" ? record[parentKey] : record[window.childKey];
@@ -170,31 +192,49 @@ async function spoolShards(input: ProjectionInput): Promise<Spooled | null> {
         const text = JSON.stringify(record);
         buffers[kind][shard]!.push(text);
         buffered += text.length;
+        const cost = textCharge(text);
+        input.budget?.acquire("spoolBuffer", cost);
+        charged += cost;
         if (buffered >= SPOOL_FLUSH_BYTES) await flush();
       }
     }
     await flush();
+    handedOff = true;
   } catch (error) {
     await input.spool.remove(`spool/${input.spoolId}`);
     throw error;
+  } finally {
+    if (!handedOff) {
+      // Rows not handed to the window are not held by anyone any more.
+      input.budget?.release("spoolBuffer", charged);
+      input.budget?.release("otherRows", others.length);
+    }
   }
   return { parents, children, others };
+}
+
+interface ReadRows {
+  readonly rows: Record<string, unknown>[];
+  /** Retained bytes of the spool files read. */
+  readonly bytes: number;
 }
 
 async function readRows(
   spool: StreamSyncReadFiles,
   paths: readonly string[],
-): Promise<Record<string, unknown>[]> {
-  const out: Record<string, unknown>[] = [];
+): Promise<ReadRows> {
+  const rows: Record<string, unknown>[] = [];
+  let bytes = 0;
   const decoder = new TextDecoder();
   for (const path of paths) {
-    const bytes = await spool.read(path);
-    if (!bytes) throw new Error("spool file is missing");
-    for (const text of decoder.decode(bytes).split("\n")) {
-      out.push(JSON.parse(text) as Record<string, unknown>);
+    const file = await spool.read(path);
+    if (!file) throw new Error("spool file is missing");
+    bytes += retainedBytes(file);
+    for (const text of decoder.decode(file).split("\n")) {
+      rows.push(JSON.parse(text) as Record<string, unknown>);
     }
   }
-  return out;
+  return { rows, bytes };
 }
 
 /**
@@ -216,48 +256,66 @@ async function projectShards(
   let template: Record<string, unknown> | null = null;
   for (let shard = 0; shard < SHARDS; shard++) {
     if (spooled.parents[shard]!.length === 0) continue;
-    const parents = await readRows(input.spool, spooled.parents[shard]!);
-    const children = new Map<string, Record<string, unknown>[]>();
-    for (const child of await readRows(input.spool, spooled.children[shard]!)) {
-      const join = canonicalJson([child[window.childKey] as JsonObject]);
-      const list = children.get(join);
-      if (list) list.push(child);
-      else children.set(join, [child]);
-    }
-    parents.sort(window.parentOrder);
-    const paths: string[] = [];
-    let buffer: string[] = [];
-    let buffered = 0;
-    const flush = async () => {
-      if (buffer.length === 0) return;
-      const path = `spool/${input.spoolId}/o${shard}-${paths.length}`;
-      await input.spool.write(path, utf8(buffer.join("\n") + "\n"));
-      paths.push(path);
-      buffer = [];
-      buffered = 0;
-    };
-    for (const parent of parents) {
-      const join = canonicalJson([(parent[parentKey] ?? null) as JsonObject]);
-      const payload = project(input, [
-        { stream: window.parentStream, data: parent },
-        ...(children.get(join) ?? []).map((data) => ({
-          stream: window.childStream,
-          data,
-        })),
-        ...spooled.others,
-      ]);
-      template ??= payload;
-      for (const key of window.sumKeys) sums[key]! += payload[key] as number;
-      const parentText = JSON.stringify(parent);
-      for (const item of payload[window.arrayKey] as unknown[]) {
-        const itemText = JSON.stringify(item);
-        buffer.push(parentText, itemText);
-        buffered += parentText.length + itemText.length;
+    const parentRead = await readRows(input.spool, spooled.parents[shard]!);
+    const childRead = await readRows(input.spool, spooled.children[shard]!);
+    const shardBytes = parentRead.bytes + childRead.bytes;
+    const shardRows = parentRead.rows.length + childRead.rows.length;
+    input.budget?.acquire("shardPayload", shardBytes);
+    input.budget?.acquire("shardRows", shardRows);
+    let outputCharge = 0;
+    try {
+      const parents = parentRead.rows;
+      const children = new Map<string, Record<string, unknown>[]>();
+      for (const child of childRead.rows) {
+        const join = canonicalJson([child[window.childKey] as JsonObject]);
+        const list = children.get(join);
+        if (list) list.push(child);
+        else children.set(join, [child]);
       }
-      if (buffered >= SPOOL_FLUSH_BYTES) await flush();
+      parents.sort(window.parentOrder);
+      const paths: string[] = [];
+      let buffer: string[] = [];
+      let buffered = 0;
+      const flush = async () => {
+        if (buffer.length === 0) return;
+        const path = `spool/${input.spoolId}/o${shard}-${paths.length}`;
+        await input.spool.write(path, utf8(buffer.join("\n") + "\n"));
+        paths.push(path);
+        buffer = [];
+        buffered = 0;
+        input.budget?.release("spoolBuffer", outputCharge);
+        outputCharge = 0;
+      };
+      for (const parent of parents) {
+        const join = canonicalJson([(parent[parentKey] ?? null) as JsonObject]);
+        const payload = project(input, [
+          { stream: window.parentStream, data: parent },
+          ...(children.get(join) ?? []).map((data) => ({
+            stream: window.childStream,
+            data,
+          })),
+          ...spooled.others,
+        ]);
+        template ??= payload;
+        for (const key of window.sumKeys) sums[key]! += payload[key] as number;
+        const parentText = JSON.stringify(parent);
+        for (const item of payload[window.arrayKey] as unknown[]) {
+          const itemText = JSON.stringify(item);
+          buffer.push(parentText, itemText);
+          buffered += parentText.length + itemText.length;
+          const cost = textCharge(parentText) + textCharge(itemText);
+          input.budget?.acquire("spoolBuffer", cost);
+          outputCharge += cost;
+        }
+        if (buffered >= SPOOL_FLUSH_BYTES) await flush();
+      }
+      await flush();
+      outputs.push(paths);
+    } finally {
+      input.budget?.release("spoolBuffer", outputCharge);
+      input.budget?.release("shardPayload", shardBytes);
+      input.budget?.release("shardRows", shardRows);
     }
-    await flush();
-    outputs.push(paths);
   }
   return { outputs, template, sums };
 }
@@ -274,21 +332,31 @@ interface ProjectedShards {
 async function* spoolLines(
   spool: StreamSyncReadFiles,
   paths: readonly string[],
+  budget?: ReadBudget,
 ): AsyncGenerator<string> {
-  for (const path of paths) {
-    const decoder = new TextDecoder();
-    let rest = "";
-    for await (const chunk of spool.readChunks(path)) {
-      rest += decoder.decode(chunk, { stream: true });
-      let end = rest.indexOf("\n");
-      while (end !== -1) {
-        yield rest.slice(0, end);
-        rest = rest.slice(end + 1);
-        end = rest.indexOf("\n");
+  let held = 0;
+  try {
+    for (const path of paths) {
+      const decoder = new TextDecoder();
+      let rest = "";
+      for await (const chunk of spool.readChunks(path)) {
+        budget?.release("mergeChunk", held);
+        held = retainedBytes(chunk);
+        budget?.acquire("mergeChunk", held);
+        rest += decoder.decode(chunk, { stream: true });
+        let end = rest.indexOf("\n");
+        while (end !== -1) {
+          yield rest.slice(0, end);
+          rest = rest.slice(end + 1);
+          end = rest.indexOf("\n");
+        }
       }
+      rest += decoder.decode();
+      if (rest !== "") throw new Error("spool file ends mid-line");
     }
-    rest += decoder.decode();
-    if (rest !== "") throw new Error("spool file ends mid-line");
+  } finally {
+    budget?.release("mergeChunk", held);
+    held = 0;
   }
 }
 
@@ -354,18 +422,39 @@ async function* mergeShards(
     }
     return top;
   };
-  for (let shard = 0; shard < outputs.length; shard++) {
-    const first = await advance({
-      shard,
-      lines: spoolLines(input.spool, outputs[shard]!),
-    });
-    if (first) push(first);
-  }
-  while (heap.length > 0) {
-    const top = pop();
-    yield top.item;
-    const next = await advance(top);
-    if (next) push(next);
+  // Every cursor is counted from creation until it is exhausted or closed.
+  const budget = input.budget;
+  // A cursor that is being advanced, or is out of the heap while its item is
+  // yielded. A consumer that stops early must not leave it open.
+  let out: { readonly lines: AsyncGenerator<string> } | null = null;
+  try {
+    for (let shard = 0; shard < outputs.length; shard++) {
+      const probe = {
+        shard,
+        lines: spoolLines(input.spool, outputs[shard]!, budget),
+      };
+      budget?.acquire("mergeCursors", 1);
+      out = probe;
+      const first = await advance(probe);
+      out = null;
+      if (first) push(first);
+      else budget?.release("mergeCursors", 1);
+    }
+    while (heap.length > 0) {
+      const top = pop();
+      out = top;
+      yield top.item;
+      const next = await advance(top);
+      out = null;
+      if (next) push(next);
+      else budget?.release("mergeCursors", 1);
+    }
+  } finally {
+    const open = out ? [out, ...heap] : heap;
+    for (const cursor of open) {
+      await cursor.lines.return(undefined);
+      budget?.release("mergeCursors", 1);
+    }
   }
 }
 
@@ -404,6 +493,7 @@ async function* windowed(
     }
     yield `${text}}`;
   } finally {
+    input.budget?.release("otherRows", spooled.others.length);
     await input.spool.remove(`spool/${input.spoolId}`);
   }
 }
