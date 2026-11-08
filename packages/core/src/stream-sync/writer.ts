@@ -56,6 +56,7 @@ import {
   pkHash,
   pkHashBits,
   planBuckets,
+  runDeletedSince,
   shardOf,
   startState,
   streamRunResult,
@@ -158,10 +159,21 @@ export interface StreamSyncCheckpoint {
 
 export type SeedReceipt = "merged" | "skipped";
 
+/** A control row a delete pinned: tombstone it at `version + 1`, nothing else. */
+interface DeletePin {
+  readonly ns: string;
+  readonly version: number;
+}
+
 interface WriterState {
   version: 1;
   needsFull: NeedsFull;
   checkpoints: Record<string, StreamSyncCheckpoint>;
+  /**
+   * Connection deletes in progress (§2.11), per connector. Persisted before
+   * the first tombstone, so a crash resumes the same pins on the next boot.
+   */
+  deletes?: Record<string, { readonly pins: readonly DeletePin[] }>;
   /**
    * Per connector, how many times its checkpoint was invalidated: a control
    * change seen, or a deliberate clear. It only grows and outlives the
@@ -212,6 +224,13 @@ interface HostStream {
   fullStream: boolean;
   /** The seed is merged into this stream's publish. */
   seedApplies: boolean;
+  /**
+   * The stream row as the run declared the stream: whether it was already a
+   * tombstone. A publish that finds it tombstoned when it was not is a delete
+   * that came after collection, so the run discards. Absent on runs begun
+   * before this field existed, which skip the check.
+   */
+  rowAtStart?: { readonly tombstoned: boolean };
   recordTooLarge: number;
   problem: StreamSyncHostProblem | null;
   detail: string | null;
@@ -297,6 +316,37 @@ export interface StreamSyncRunStart {
   readonly leaseId?: string | null;
 }
 
+/**
+ * A scheduled run of a connector this device has seen deleted (§2.4
+ * `stopped`). Cleared by an explicit connect, or by observing a reconnect.
+ */
+export class ConnectionStoppedError extends Error {
+  constructor(readonly connector: string) {
+    super(
+      `connection of ${connector} is stopped: deleted, not reconnected; an explicit connect is required`,
+    );
+    this.name = "ConnectionStoppedError";
+  }
+}
+
+/**
+ * A fresh connection delete whose tombstone did not land: the connection
+ * was reconnected or deleted again while the delete ran. The intent is
+ * dropped; nothing was tombstoned at a version the caller did not see.
+ */
+export class ConnectionDeleteSuperseded extends Error {
+  constructor(readonly connector: string) {
+    super(`delete of ${connector} was superseded before it landed`);
+    this.name = "ConnectionDeleteSuperseded";
+  }
+}
+
+/** A delete intent that could not be finished on this pass. */
+export interface PendingDelete {
+  readonly connector: string;
+  readonly why: string;
+}
+
 /** A run id that finished, or whose entry this process no longer drives. */
 export class RunGoneError extends Error {
   constructor(readonly runId: string) {
@@ -325,6 +375,8 @@ export interface StreamSyncRunStatus {
 
 export interface StreamSyncPublishReport {
   readonly runs: readonly StreamSyncRunStatus[];
+  /** Connectors whose delete intent is still open after this pass. */
+  readonly deletesPending: readonly PendingDelete[];
 }
 
 export interface StreamSyncWriterOptions {
@@ -615,6 +667,164 @@ export class StreamSyncWriter {
     return { ...(this.controls.get(connector) ?? {}) };
   }
 
+  // -------------------------------------------------------------- delete
+
+  /**
+   * §2.11 connection delete. The intent (the pinned version of each live
+   * control row of the connector) is persisted first; then each pinned row is
+   * tombstoned at `version + 1`. A fresh delete pins the row as read now, not
+   * as listed: a stale listing would tombstone a version already gone. A
+   * resumed delete writes only its stored pins, so a reconnect that lands in
+   * between is never tombstoned. An earlier intent for the connector is
+   * finished first. Other devices stop when their control read shows `deleted`.
+   */
+  deleteConnection(connector: string): Promise<void> {
+    return this.publish(async () => {
+      await this.finishDelete(connector);
+      const pins: DeletePin[] = [];
+      for (const row of await this.options.registry.listControlRows()) {
+        const parsed = parseScope(row.scope);
+        if (parsed?.kind !== "control" || parsed.connector !== connector) {
+          continue;
+        }
+        const state = await this.readControl(connector, parsed.ns);
+        if (state.kind === "active" || state.kind === "foreign") {
+          pins.push({
+            ns: parsed.ns,
+            version: state.kind === "active" ? state.generation : state.version,
+          });
+        }
+      }
+      if (pins.length === 0) return;
+      await this.withState((state) => {
+        (state.deletes ??= {})[connector] = { pins };
+      });
+      await this.runDelete(connector, pins, true);
+    });
+  }
+
+  /**
+   * Tombstone each pinned control row. A fresh delete must end deleted; if a
+   * pin's tombstone did not land, the intent is dropped and the delete throws
+   * `ConnectionDeleteSuperseded`. A resumed delete ends with its intent
+   * cleared whatever the rows show (it never tombstones a reconnect). Errors
+   * from the registry leave the intent for a later pass.
+   */
+  private async runDelete(
+    connector: string,
+    pins: readonly DeletePin[],
+    fresh: boolean,
+  ): Promise<void> {
+    const { control } = await this.keys();
+    for (const pin of pins) {
+      const request = await this.sign(
+        controlScope(connector, pin.ns),
+        control.tombstoneData,
+        control.tombstoneMetadata,
+        pin.version + 1,
+      );
+      await this.options.registry.post(request);
+      // A conflict here means the row moved (a reconnect or another write took
+      // this version). It never throws: the read below decides what the pin
+      // means now (§2.11).
+      const after = await this.readControl(connector, pin.ns);
+      if (fresh && after.kind !== "deleted") {
+        await this.withState((state) => {
+          delete state.deletes?.[connector];
+        });
+        throw new ConnectionDeleteSuperseded(connector);
+      }
+    }
+    await this.purgeConnector(connector, pins);
+    await this.withState((state) => {
+      delete state.deletes?.[connector];
+    });
+  }
+
+  /**
+   * Remove this device's local copies of the connector's data once its
+   * tombstones landed: the runs (in flight or finished) that started under a
+   * generation the delete ended, their results, and the connector's checkpoint
+   * and `needsFull` entries. A run that started after a reconnect (a higher
+   * generation than the pin) is kept. A run in flight that is removed is gone:
+   * its later calls are refused and nothing of it publishes.
+   */
+  private async purgeConnector(
+    connector: string,
+    pins: readonly DeletePin[],
+  ): Promise<void> {
+    const pinned = new Map(pins.map((pin) => [pin.ns, pin.version]));
+    for (const runId of await this.runIds()) {
+      const host = await this.readEntry(runId);
+      if (!host || host.entry.connector !== connector) continue;
+      const ns = host.entry.ns ?? IDENTITYLESS_NS;
+      const start = startState(host.entry.start, ns);
+      const pin = pinned.get(ns);
+      if (
+        start.kind === "active" &&
+        pin !== undefined &&
+        start.generation > pin
+      ) {
+        continue;
+      }
+      this.active.delete(runId);
+      for (const dir of [...this.derived.keys()]) {
+        if (dir.startsWith(`runs/${runId}/`)) this.derived.delete(dir);
+      }
+      await this.options.home.files.remove(`runs/${runId}`);
+    }
+    for (const path of await this.options.home.files.list("results")) {
+      const bytes = await this.options.home.files.read(path);
+      if (!bytes) continue;
+      const status = JSON.parse(decoder.decode(bytes)) as StreamSyncRunStatus;
+      if (status.connector === connector) {
+        await this.options.home.files.remove(path);
+      }
+    }
+    await this.withState((state) => {
+      delete state.checkpoints[connector];
+      state.needsFull = state.needsFull.filter(
+        (entry) => entry.connector !== connector,
+      );
+    });
+  }
+
+  /**
+   * §2.4 `stopped`, read from saved state alone (no registry call): an open
+   * delete, or this device's identity-less namespace last read `deleted`.
+   */
+  async isStopped(connector: string): Promise<boolean> {
+    return isStoppedState(await this.readState(), connector);
+  }
+
+  /** Finish the stored delete intent of `connector`, if one is open. */
+  private async finishDelete(connector: string): Promise<void> {
+    const intent = (await this.readState()).deletes?.[connector];
+    if (intent) await this.runDelete(connector, intent.pins, false);
+  }
+
+  /**
+   * Finish every open delete intent. Each connector stands alone: a failure
+   * is reported for that connector and does not stop the others. Runs every
+   * pass, so a failed delete is retried on the next pass.
+   */
+  private async resumeDeletes(): Promise<PendingDelete[]> {
+    const pending: PendingDelete[] = [];
+    for (const connector of Object.keys(
+      (await this.readState()).deletes ?? {},
+    )) {
+      try {
+        await this.finishDelete(connector);
+      } catch (error) {
+        pending.push({
+          connector,
+          why: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return pending;
+  }
+
   // -------------------------------------------------------------- intake
 
   /**
@@ -710,7 +920,16 @@ export class StreamSyncWriter {
         if (!this.active.has(input.runId)) throw new RunGoneError(input.runId);
         throw new Error(`run ${input.runId} already exists`);
       }
+      // P2-1: an explicit connect finishes an open delete of this connector
+      // first, so a later boot cannot tombstone what the connect creates.
+      if (input.userConnect) {
+        await this.publish(() => this.finishDelete(input.connector));
+      }
       const state = await this.readState();
+      // §2.4 `stopped`: only an explicit connect starts a stopped connection.
+      if (!input.userConnect && isStoppedState(state, input.connector)) {
+        throw new ConnectionStoppedError(input.connector);
+      }
       let checkpointUsed = input.checkpointUsed ?? null;
       let full = checkpointUsed === null;
       let issued: IssuedStart | null = null;
@@ -800,6 +1019,16 @@ export class StreamSyncWriter {
       const host = await this.collecting(runId);
       if (host.streams[stream]) return;
       host.streams[stream] = this.newStream(nextIndex(host), shape);
+      // Every run publishes under the identity-less name (R23), so the scope
+      // is known at collection even though `entry.ns` is set at finish.
+      const { control } = await this.keys();
+      const row = await this.options.registry.read(
+        streamScope(host.entry.connector, IDENTITYLESS_NS, stream),
+      );
+      host.streams[stream]!.rowAtStart = {
+        tombstoned:
+          row.found && classifyStreamRow(row, control) === "tombstoned",
+      };
       host.entry = {
         ...host.entry,
         streams: { ...host.entry.streams, [stream]: { state: "planned" } },
@@ -837,7 +1066,7 @@ export class StreamSyncWriter {
   private async collecting(runId: string): Promise<HostEntry> {
     const host = await this.readEntry(runId);
     if (!host || host.phase !== "collecting" || !this.active.has(runId)) {
-      throw new Error(`run ${runId} is not collecting in this process`);
+      throw new RunGoneError(runId);
     }
     return host;
   }
@@ -858,7 +1087,7 @@ export class StreamSyncWriter {
     },
   ): Promise<"spooled" | "too_large"> {
     const run = this.active.get(runId);
-    if (!run) throw new Error(`run ${runId} is not collecting in this process`);
+    if (!run) throw new RunGoneError(runId);
     let info = this.streamCache.get(`${runId}\u0000${stream}`);
     if (!info) {
       if (shape) await this.declareStream(runId, stream, shape);
@@ -1120,6 +1349,8 @@ export class StreamSyncWriter {
   publishPending(): Promise<StreamSyncPublishReport> {
     return this.publish(async () => {
       await this.recover();
+      const deletesPending = await this.resumeDeletes();
+      const held = new Set(deletesPending.map((p) => p.connector));
       const runs: StreamSyncRunStatus[] = [];
       // Selection is one critical section of the lifecycle queue, the lock
       // ready-entry writes and snapshots also take: the run list, the entry
@@ -1133,7 +1364,9 @@ export class StreamSyncWriter {
         const hosts: HostEntry[] = [];
         for (const runId of await this.runIds()) {
           const host = await this.readEntry(runId);
-          if (host && host.phase === "ready") hosts.push(host);
+          // A connector whose delete is still open publishes nothing this pass.
+          if (host && host.phase === "ready" && !held.has(host.entry.connector))
+            hosts.push(host);
         }
         hosts.sort(
           (a, b) =>
@@ -1148,10 +1381,10 @@ export class StreamSyncWriter {
       try {
         // Commit order: a stream an earlier run did not resolve in this pass
         // holds back every later run of that stream until the next pass.
-        const held = new Set<string>();
+        const heldStreams = new Set<string>();
         for (const host of hosts) {
           try {
-            await this.publishEntry(host, held);
+            await this.publishEntry(host, heldStreams);
           } finally {
             for (const key of reserved.get(host)!) this.selected.delete(key);
           }
@@ -1170,14 +1403,16 @@ export class StreamSyncWriter {
               problem === "out_of_order"
             )
               continue;
-            held.add(floorKey(host.entry.connector, host.entry.ns, name));
+            heldStreams.add(
+              floorKey(host.entry.connector, host.entry.ns, name),
+            );
           }
         }
       } finally {
         for (const keys of reserved.values())
           for (const key of keys) this.selected.delete(key);
       }
-      return { runs };
+      return { runs, deletesPending };
     });
   }
 
@@ -1228,9 +1463,19 @@ export class StreamSyncWriter {
       await this.options.registry.read(controlScope(connector, ns)),
       control,
     );
-    return this.withState((state) =>
+    const newest = await this.withState((state) =>
       recordControl(state, connector, ns, current),
     );
+    this.noteControl(connector, ns, newest);
+    return newest;
+  }
+
+  /** Keep the session `controls` in step with every control read (P3-2). */
+  private noteControl(connector: string, ns: string, state: ControlState) {
+    if (this.controls === null) return;
+    const states = this.controls.get(connector) ?? {};
+    states[ns] = state;
+    this.controls.set(connector, states);
   }
 
   /**
@@ -1616,6 +1861,28 @@ export class StreamSyncWriter {
 
     const row = await this.options.registry.read(scope);
     const rowKind = classifyStreamRow(row, this.control!);
+    // The delete predicate a reader shares (runDeletedSince): a stream row
+    // tombstoned after this run was collected discards it. A row already a
+    // tombstone at collection predates the run, so a reconnect keeps it.
+    if (
+      runDeletedSince(
+        {
+          control: { kind: "unknown" },
+          streamTombstoned: stream.rowAtStart?.tombstoned,
+        },
+        { stream: row, hashes: this.control! },
+      )
+    ) {
+      throw new Discard(
+        {
+          kind: "discard",
+          recollect: false,
+          clearCheckpoints: false,
+          restartFull: false,
+        },
+        "stream row tombstoned after this run was collected",
+      );
+    }
     let head: Head | null = null;
     if (rowKind === "present" && row.found) {
       head = await this.loadHead(scope, row.dataHash, {
@@ -2634,6 +2901,14 @@ function controlRank(state: ControlState): number {
     case "foreign":
       return state.version;
   }
+}
+
+/** §2.4 `stopped` from saved state; see `StreamSyncWriter.isStopped`. */
+function isStoppedState(state: WriterState, connector: string): boolean {
+  return (
+    state.deletes?.[connector] !== undefined ||
+    state.observedControl?.[connector]?.[IDENTITYLESS_NS]?.kind === "deleted"
+  );
 }
 
 /**
