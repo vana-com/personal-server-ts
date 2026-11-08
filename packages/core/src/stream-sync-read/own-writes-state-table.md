@@ -48,7 +48,12 @@ the test change together.
 7. **U counts distinct unpublished runs**: runs with a requested stream that
    has no publish receipt, with or without records, shown or withheld. A run
    counts once across streams; a run with receipts on every requested stream
-   counts zero.
+   counts zero. **Pending means "not reflected in this response."** A run the
+   writer published is no longer unpublished, but the stored body still does
+   not show it until the reader imports it. The owner is told that separately:
+   `X-Stream-Sync-Awaiting-Import`: the distinct runs with a published stream
+   the reader has not imported (D5, N1, P2, M2). Import coverage clears it, not
+   the POST receipt. The count of U keeps its meaning.
 8. **Every stream of a legacy name is scanned.** A run withheld on one stream
    is reported even when another stream has no local run. When the projector
    refuses a partial input, no partial view serves and the answer that does
@@ -60,20 +65,42 @@ the test change together.
    before any imported head is leased. If an import lands before the read has
    decided, the read starts over, so the plan never meets a head that holds a
    commit the snapshot does not know (`snapshot-coherence.test.ts`). An
-   older, consistent snapshot is fine; a mixture is not.
+   older, consistent snapshot is fine; a mixture is not. The read's basis is
+   the import revision of each stream it touches, not a global counter: an
+   import into an unrelated stream never restarts it. If relevant imports
+   keep landing past the retry limit, the read answers busy (503 with
+   `Retry-After`), never a generic 500.
+10. **A publication in flight holds back what it would reorder.** Once the
+    writer has persisted a signed request for a stream and not recorded the
+    registry's answer, the request may or may not have committed. The plan
+    defers that run and every older unexecuted run of the stream with
+    `publication_in_flight`, and later runs wait. This covers both windows:
+    the POST has not completed, and the registry committed (and the reader
+    imported) before the writer recorded the receipt. A signed request is
+    never taken as proof of success (`owner-read-basis.test.ts`).
 
 ## The oracle every row runs
 
 For every row, the test captures each registry publication of the stream with
 its head and decoded lines (`Rig.publications`). Before each publish pass it
-predicts, from the plan and the collected rows alone, the lines every
-publishing step leaves, and each publication of the pass must match one of
-them in order. When the writer is stable, the newest publication of every
+predicts, from the plan and the collected rows alone, the head and the lines
+every publishing step leaves, and each publication of the pass must match one
+of them in order, head fields and decoded rows alike. The first pass of a case
+that publishes before the owner reads is predicted too. A seed admission is
+predicted from the seed's own input (key, version, rows), stated before the
+POST, not read from the plan the writer holds after it executes. The baseline
+is the count of stream publications (control posts excluded). When the writer
+is stable, the newest publication of every stream, including streams only the
+seed fills or only the base published, the newest publication of every
 stream, including a stream only the seed fills and runs published before the
 case began, equals the lines the plan predicts from the head the case started
-with. The HTTP matrix (plain, stored body, named connection, owner and grant)
-and the owner/grant containment check run before the writer publishes, after
-one publish pass, and after the reader imports.
+with, and its head fields match. The HTTP matrix (plain, stored body, named
+connection, owner and grant) and the owner/grant containment check run before
+the writer publishes, after one publish pass, and after the reader imports; at
+every phase it asserts the owner's status, completeness, withheld fields and
+the pending and awaiting-import counts, counted from the writer's own
+snapshot. A deliberately broken model (a lost prepublished, seed or base-only
+line) must fail the case.
 
 ## Writer policies the rows exercise
 
@@ -99,8 +126,11 @@ one publish pass, and after the reader imports.
     body, while older versions keep them as history.
 
   Which of these a full stream-sync run should preserve is an open product
-  decision. The table records only what the writer does today (it merges); no
-  deletion semantics are added here.
+  decision. **Interim contract:** the stream-sync writer merges. A record
+  deleted at the source stays visible on other surfaces until the
+  covered-full-refresh replacement lands, and the legacy `replaceStream`
+  omission-tombstone semantics are not mirrored yet. The table records only
+  what the writer does today; no deletion semantics are added here.
 
 ## Rows
 

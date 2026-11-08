@@ -888,13 +888,14 @@ interface Options {
   readonly distort?: (
     kind: "prepublished" | "seed" | "base-only",
     lines: Line[],
+    stream: string,
   ) => Line[];
 }
 
-/** How many registry publications existed when the case started. */
+/** How many registry stream publications existed when the case started. */
 const initialPublications = new WeakMap<Rig, number>();
 
-async function open(row: Row, _options: Options = {}): Promise<Rig> {
+async function open(row: Row, options: Options = {}): Promise<Rig> {
   const rig = new Rig(row.seed, row.connector);
   await rig.open();
   if (row.base.length > 0) {
@@ -902,9 +903,10 @@ async function open(row: Row, _options: Options = {}): Promise<Rig> {
     await rig.publish();
     await rig.sync();
   }
-  initialPublications.set(rig, rig.gateway.log.length);
+  // The publications of the connector's streams only: control posts are not.
+  initialPublications.set(rig, (await rig.publications()).length);
   for (const spec of row.runs) await rig.collect(spec);
-  if (row.published) await rig.publish();
+  if (row.published) await checkedPass(rig, row, options, "prepublished");
   return rig;
 }
 
@@ -1004,7 +1006,7 @@ async function plans(
   const snapshot = await rig.overlay.snapshot(row.connector ?? CONNECTOR);
   try {
     const out = new Map<string, PlanStep[]>();
-    for (const stream of rowStreams(row)) {
+    for (const stream of modelStreams(row)) {
       const ids = snapshot.runs
         .filter((r) => r.streams.some((s) => s.name === stream))
         .map((r) => r.runId);
@@ -1028,11 +1030,17 @@ async function registered(rig: Rig, stream: string): Promise<PlanHead | null> {
 // The differential oracle: what the registry holds after every publication,
 // predicted from the plan and the collected rows alone.
 
-/** Every stream the case touches: the runs' and the seed's. */
+/** Every stream the case touches: the runs', the base's and the seed's. */
 function modelStreams(row: Row): string[] {
+  const base = row.base.flatMap((spec) =>
+    ([spec, ...(spec.also ?? [])] as StreamSpec[]).map(
+      (s) => s.stream ?? "items",
+    ),
+  );
   return [
     ...new Set([
       ...rowStreams(row),
+      ...base,
       ...(row.seed ? [row.seed.stream ?? "items"] : []),
     ]),
   ].sort();
@@ -1105,24 +1113,123 @@ function modelLines(
   return reduceLines(lines, step.head!.primaryKey);
 }
 
+/** One publication the oracle predicts: its head and the lines it holds. */
+interface Expected {
+  readonly head: PlanHead;
+  readonly lines: string[];
+}
+
+const distorted = (
+  options: Options,
+  kind: "prepublished" | "seed" | "base-only",
+  lines: Line[],
+  stream: string,
+): Line[] => options.distort?.(kind, lines, stream) ?? lines;
+
+const sameHeadFields = (a: PlanHead, b: PlanHead): boolean =>
+  a.generation === b.generation &&
+  a.complete === b.complete &&
+  a.profile.key === b.profile.key &&
+  a.profile.version === b.profile.version &&
+  a.primaryKey.join("\n") === b.primaryKey.join("\n");
+
+/** The run and stream spec a collected run's stream came from. */
+function specOf(
+  row: Row,
+  runId: string,
+  stream: string,
+): { run: RunSpec; s: StreamSpec } | undefined {
+  const run = [...row.base, ...row.runs].find((r) => r.runId === runId);
+  const s = run
+    ? ([run, ...(run.also ?? [])] as StreamSpec[]).find(
+        (x) => (x.stream ?? "items") === stream,
+      )
+    : undefined;
+  return run && s ? { run, s } : undefined;
+}
+
+/**
+ * The explicit seed-admission input (§2.9): the first publish of a stream
+ * the seed fills, with no head, holds the seed's rows and the rows of the
+ * runs that share its key and version, under the seed's own head. It is a
+ * model input, stated before the POST; it is not read from the plan the
+ * writer holds after it executes.
+ */
+function seedAdmission(
+  rig: Rig,
+  row: Row,
+  stream: string,
+  runIds: readonly string[],
+): { head: Omit<PlanHead, "generation">; lines: Line[] } | null {
+  const seed = row.seed;
+  if (!seed || (seed.stream ?? "items") !== stream) return null;
+  const lines: Line[] = seed.rows.map(
+    (v) => ({ o: SEED_OBSERVED_AT, r: SEED_RUN_ID, v }) as Line,
+  );
+  for (const runId of runIds) {
+    const spec = specOf(row, runId, stream);
+    if (spec && spec.s.key === seed.key && spec.s.version === seed.version) {
+      lines.push(...runLines(rig, row, runId, stream));
+    }
+  }
+  return {
+    head: {
+      primaryKey: [seed.key],
+      profile: { key: null, version: seed.version },
+      complete: true,
+    },
+    lines: reduceLines(lines, [seed.key]),
+  };
+}
+
+/**
+ * A run whose seed is unresolved on a stream the seed does not fill is
+ * admitted with no seed: over no head it publishes its own head and rows.
+ */
+function plainAdmission(
+  rig: Rig,
+  row: Row,
+  stream: string,
+  runId: string,
+  generation: number | null,
+): Expected | null {
+  const spec = specOf(row, runId, stream);
+  if (!spec) return null;
+  return {
+    head: {
+      generation,
+      primaryKey: [spec.s.key],
+      profile: { key: spec.s.profileKey ?? null, version: spec.s.version },
+      complete: spec.run.full && !spec.run.otherNamespace,
+    },
+    lines: canonLines(
+      reduceLines(runLines(rig, row, runId, stream), [spec.s.key]),
+    ),
+  };
+}
+
 /**
  * Once the writer is stable, the newest publication of every stream holds
  * exactly the lines the plan, from the head the case started with, predicts:
- * the streams the runs name, the streams only the seed fills, and the runs
- * published before the case began.
+ * the streams the runs name, the streams only the seed fills, the streams
+ * only the base published, and the runs published before the case began.
  */
-async function expectRegistryMatchesPlan(rig: Rig, row: Row): Promise<void> {
+async function expectRegistryMatchesPlan(
+  rig: Rig,
+  row: Row,
+  options: Options,
+): Promise<void> {
   const initial = initialPublications.get(rig) ?? 0;
   const snapshot = await rig.overlay.snapshot(row.connector ?? CONNECTOR);
   try {
+    const publications = await rig.publications();
     for (const stream of modelStreams(row)) {
       const label = `${row.id} ${stream} registry`;
-      const start = await publishedLines(rig, stream, initial);
-      const startHead =
-        (await rig.publications())
-          .slice(0, initial)
-          .filter((p) => p.stream === stream)
-          .at(-1)?.head ?? null;
+      const before = publications
+        .slice(0, initial)
+        .filter((p) => p.stream === stream);
+      const start = before.at(-1)?.lines ?? [];
+      const startHead = before.at(-1)?.head ?? null;
       const ids = snapshot.runs
         .filter((r) => r.streams.some((s) => s.name === stream))
         .map((r) => r.runId);
@@ -1137,9 +1244,18 @@ async function expectRegistryMatchesPlan(rig: Rig, row: Row): Promise<void> {
           (s) => s.decision.kind === "publish" || s.decision.kind === "noop",
         )
         .at(-1);
-      const want = last ? modelLines(rig, row, stream, last, start) : start;
+      const want = last
+        ? modelLines(rig, row, stream, last, start)
+        : distorted(options, "base-only", start, stream);
       const got = await publishedLines(rig, stream);
       expect(canonLines(got), label).toEqual(canonLines(want));
+      // The head the registry holds is the last step's, or the base's.
+      const held = await registered(rig, stream);
+      const wantHead = last ? last.head : startHead && planHeadOf(startHead);
+      expect(
+        held && wantHead && sameAs(wantHead, held),
+        `${label} head`,
+      ).toEqual(held);
     }
   } finally {
     snapshot.release();
@@ -1147,40 +1263,72 @@ async function expectRegistryMatchesPlan(rig: Rig, row: Row): Promise<void> {
 }
 
 /**
- * Publish pass after pass until a pass executes nothing. Before each pass the
- * plan predicts every step from the registered head. After it, every step the
- * plan said publishes or is a no-op has run: it is executed with the
- * predicted head, or (a no-op) its run is reclaimed. Every refused step
- * carries the writer's problem, and the registry holds the head of the last
- * step the plan predicted.
+ * One publish pass, checked. Before it, the plan predicts every step from the
+ * registered head, and a seed admission is predicted from its explicit input.
+ * After it, every step the plan said publishes or is a no-op has run: it is
+ * executed with the predicted head, or (a no-op) its run is reclaimed. Every
+ * refused step carries the writer's problem. Every publication the pass
+ * posted holds the head fields and the lines of one predicted step, in order,
+ * and the registry holds the head of the last one. Returns whether the pass
+ * changed anything.
  */
-async function publishUntilStable(
+async function checkedPass(
   rig: Rig,
   row: Row,
-  _options: Options = {},
-): Promise<number> {
-  for (let pass = 1; pass <= 6; pass += 1) {
-    const heads = new Map<string, PlanHead | null>();
-    for (const stream of rowStreams(row)) {
-      heads.set(stream, await registered(rig, stream));
-    }
-    const predicted = await plans(rig, row, heads);
-    const starts = new Map<string, Line[]>();
-    for (const stream of rowStreams(row)) {
-      starts.set(stream, await publishedLines(rig, stream));
-    }
-    const pubsBefore = (await rig.publications()).length;
-    const statuses = await rig.publish();
-    const executed = await plans(rig, row, heads);
-    let progressed = false;
-    for (const stream of rowStreams(row)) {
-      const label = `${row.id} pass ${pass} ${stream}`;
-      const after = executed.get(stream)!;
-      const now = await registered(rig, stream);
-      let want: PlanHead | null = heads.get(stream) ?? null;
-      let unpredicted = false;
-      for (const step of predicted.get(stream)!) {
-        if (step.executed) continue;
+  options: Options,
+  phase: "prepublished" | "pass" = "pass",
+  pass = 1,
+): Promise<boolean> {
+  const streams = modelStreams(row);
+  const heads = new Map<string, PlanHead | null>();
+  const starts = new Map<string, Line[]>();
+  for (const stream of streams) {
+    heads.set(stream, await registered(rig, stream));
+    starts.set(stream, await publishedLines(rig, stream));
+  }
+  const predicted = await plans(rig, row, heads);
+  const pubsBefore = (await rig.publications()).length;
+  const statuses = await rig.publish();
+  const executed = await plans(rig, row, heads);
+  const posted = (await rig.publications()).slice(pubsBefore);
+  let progressed = false;
+  for (const stream of streams) {
+    const label = `${row.id} ${phase} ${pass} ${stream}`;
+    const after = executed.get(stream)!;
+    const now = await registered(rig, stream);
+    const steps = predicted.get(stream)!.filter((st) => !st.executed);
+    const expected: Expected[] = [];
+    let want: PlanHead | null = heads.get(stream) ?? null;
+    const unresolved = steps.some(
+      (st) =>
+        st.decision.kind === "deferred" &&
+        st.decision.reason === "seed_unresolved",
+    );
+    // The seed fills a stream no run names (E3) at the first admission.
+    const admitting =
+      steps.length === 0 &&
+      [...predicted.values()].some((all) => all.some((st) => !st.executed));
+    const seeded =
+      want === null && (unresolved || admitting)
+        ? seedAdmission(
+            rig,
+            row,
+            stream,
+            steps.map((st) => st.runId),
+          )
+        : null;
+    if (seeded) {
+      // The writer resolves the seed at admission: one publication holds it
+      // and every later step is planned again from that head.
+      const head = { ...seeded.head, generation: now?.generation ?? null };
+      expected.push({
+        head,
+        lines: canonLines(distorted(options, "seed", seeded.lines, stream)),
+      });
+      want = head;
+      progressed = true;
+    } else {
+      for (const step of steps) {
         const done = after.find((s) => s.runId === step.runId);
         const { decision } = step;
         if (decision.kind === "publish" || decision.kind === "noop") {
@@ -1194,6 +1342,23 @@ async function publishUntilStable(
               "done",
             );
           }
+          if (decision.kind === "publish") {
+            const lines = modelLines(
+              rig,
+              row,
+              stream,
+              step,
+              starts.get(stream)!,
+            );
+            expected.push({
+              head,
+              lines: canonLines(
+                phase === "prepublished"
+                  ? distorted(options, "prepublished", lines, stream)
+                  : lines,
+              ),
+            });
+          }
           want = head;
           progressed = true;
         } else if (decision.kind === "refused") {
@@ -1202,46 +1367,60 @@ async function publishUntilStable(
             status?.streams[stream]?.problem,
             `${label} ${step.runId} refused`,
           ).toBe(decision.reason);
-        } else if (done?.executed || !done) {
-          // A deferred step the writer resolved in this pass (admission
-          // decides the seed); the next pass's plan carries it.
-          unpredicted = true;
+        } else if (
+          decision.reason === "seed_unresolved" &&
+          want === null &&
+          plainAdmission(rig, row, stream, step.runId, now?.generation ?? null)
+        ) {
+          const plain = plainAdmission(
+            rig,
+            row,
+            stream,
+            step.runId,
+            now?.generation ?? null,
+          )!;
+          expected.push(plain);
+          want = plain.head;
           progressed = true;
-        }
-      }
-      if (unpredicted) {
-        const last = after.filter((s) => s.executed).at(-1);
-        if (last) want = last.head;
-      }
-      expect(now, `${label} registered head`).toEqual(want);
-      if (!unpredicted) {
-        // Each publication this pass holds the lines the plan predicted for
-        // one of its steps, in order, and the last one holds the final lines.
-        const states = predicted
-          .get(stream)!
-          .filter((st) => !st.executed && st.decision.kind === "publish")
-          .map((st) =>
-            canonLines(modelLines(rig, row, stream, st, starts.get(stream)!)),
+        } else {
+          throw new Error(
+            `${label} ${step.runId} is deferred (${decision.reason}) and no model input says how it resolves`,
           );
-        const posted = (await rig.publications())
-          .slice(pubsBefore)
-          .filter((p) => p.stream === stream)
-          .map((p) => canonLines(p.lines));
-        let from = 0;
-        for (const lines of posted) {
-          const at = states.findIndex(
-            (st, i) => i >= from && sameLines(st, lines),
-          );
-          expect(
-            at,
-            `${label} a publication matches no predicted step`,
-          ).toBeGreaterThanOrEqual(0);
-          from = at + 1;
         }
       }
     }
-    if (!progressed) {
-      await expectRegistryMatchesPlan(rig, row);
+    expect(now, `${label} registered head`).toEqual(want);
+    // Each publication this pass posted holds one predicted step's head
+    // fields and lines, in order. A step may become a no-op and post nothing.
+    let from = 0;
+    for (const p of posted.filter((q) => q.stream === stream)) {
+      const lines = canonLines(p.lines);
+      const head = planHeadOf(p.head);
+      const at = expected.findIndex(
+        (e, i) =>
+          i >= from &&
+          sameLines(e.lines, lines) &&
+          sameHeadFields(e.head, head),
+      );
+      expect(
+        at,
+        `${label} a publication matches no predicted step (lines or head fields)`,
+      ).toBeGreaterThanOrEqual(0);
+      from = at + 1;
+    }
+  }
+  return progressed;
+}
+
+/** Publish pass after pass until a pass executes nothing. */
+async function publishUntilStable(
+  rig: Rig,
+  row: Row,
+  options: Options = {},
+): Promise<number> {
+  for (let pass = 1; pass <= 6; pass += 1) {
+    if (!(await checkedPass(rig, row, options, "pass", pass))) {
+      await expectRegistryMatchesPlan(rig, row, options);
       return pass;
     }
   }
@@ -1344,7 +1523,7 @@ describe("own-writes state table", () => {
         expectOwnerCoversGrant(before);
 
         if (want.published) {
-          await rig.publish();
+          await checkedPass(rig, row, {});
           const mid = await observe(rig, row);
           expectRead(mid, want.published);
           expectOwnerCoversGrant(mid);
@@ -1450,6 +1629,35 @@ describe("own-writes state table", () => {
 const keysOf = (read: Api): Set<string> =>
   new Set((read.records ?? []).map(keyOf));
 
+/**
+ * What the writer holds that the stored body cannot show: the runs with a
+ * stream it has not published, and the runs with a stream it published and
+ * the reader has not imported. Counted from the writer's own snapshot.
+ */
+async function localCounts(
+  rig: Rig,
+  row: Row,
+): Promise<{ unpublished: number; awaiting: number }> {
+  const snapshot = await rig.overlay.snapshot(row.connector ?? CONNECTOR);
+  try {
+    // The streams the scope reads: instagram.posts reads two legacy streams.
+    const read = row.scope ? ["posts", "post_likes"] : ["items"];
+    const states = snapshot.runs.map((r) =>
+      r.streams.filter((s) => read.includes(s.name)).map((s) => s.state),
+    );
+    return {
+      unpublished: states.filter((all) => all.some((x) => x !== "published"))
+        .length,
+      awaiting: states.filter((all) => all.some((x) => x === "published"))
+        .length,
+    };
+  } finally {
+    snapshot.release();
+  }
+}
+
+const count = (n: number): string | null => (n > 0 ? String(n) : null);
+
 async function expectHttp(
   rig: Rig,
   row: Row,
@@ -1470,6 +1678,7 @@ async function expectHttp(
       expect(grant.bodyWithheld, where).toBeNull();
       expect(grant.pending, where).toBeNull();
       expect(grant.complete, where).toBeNull();
+      expect(grant.awaitingImport, where).toBeNull();
       // The owner never reads fewer records than a grant of the same stream.
       for (const key of keysOf(grant)) {
         expect(
@@ -1484,6 +1693,35 @@ async function expectHttp(
       if (header !== null && owner.source !== "legacy") {
         expect(sortedHeader(owner.withheld), where).toBe(header);
       }
+      const counts = await localCounts(rig, row);
+      if (file && owner.source !== "stream-sync") {
+        // The stored body shows no local run: every run it does not reflect
+        // is counted, unpublished apart from published and awaiting import.
+        expect(owner.pending, `${where} pending`).toBe(
+          count(counts.unpublished),
+        );
+        expect(owner.awaitingImport, `${where} awaiting import`).toBe(
+          count(counts.awaiting),
+        );
+      } else {
+        expect(owner.pending, where).toBeNull();
+        expect(owner.awaitingImport, where).toBeNull();
+      }
+      if (!file && !connection) {
+        expect(owner.status, `${where} status`).toBe(
+          seen.read.rows !== null ? 200 : 404,
+        );
+        if (seen.read.rows !== null) {
+          expect(owner.complete, `${where} complete`).toBe(
+            seen.kind === "local_pending" ? String(seen.read.complete) : null,
+          );
+        }
+        expect(owner.bodyWithheld, `${where} withheld in the body`).toEqual(
+          seen.read.withheld.length === 0
+            ? null
+            : [...seen.read.withheld].sort(),
+        );
+      }
     }
   }
   // A stored body answers the owner wherever it answers a grant.
@@ -1497,7 +1735,7 @@ describe("owner and grant over HTTP, with a stored body that shares no key", () 
     it(`${row.id}: before publication, after one pass, after import`, async () => {
       const rig = await open(row);
       await expectHttp(rig, row, "before", row.expect.before);
-      await rig.publish();
+      await checkedPass(rig, row, {});
       await expectHttp(rig, row, "published");
       await publishUntilStable(rig, row);
       await rig.sync();
@@ -1519,7 +1757,7 @@ describe("a stored body over local runs the response does not reflect", () => {
       expect(before.pending).toBe("1");
       expect(before.awaitingImport).toBeNull();
 
-      await rig.publish();
+      await checkedPass(rig, row, {});
       const published = await api(rig, row, { builder: false, file: true });
       expect(published.source).toBe("legacy");
       expect(published.records).toEqual([{ id: "stored" }]);
@@ -1538,24 +1776,24 @@ describe("a stored body over local runs the response does not reflect", () => {
 describe("the oracle catches a deliberately broken model", () => {
   type Distort = NonNullable<Options["distort"]>;
   const dropFirst =
-    (only: Parameters<Distort>[0]): Distort =>
-    (kind, lines) =>
-      kind === only ? lines.slice(1) : lines;
+    (only: Parameters<Distort>[0], stream: string): Distort =>
+    (kind, lines, name) =>
+      kind === only && name === stream ? lines.slice(1) : lines;
 
-  for (const [id, kind] of [
-    ["M2", "prepublished"],
-    ["E2", "seed"],
-    ["S16", "base-only"],
+  for (const [id, kind, stream, failure] of [
+    ["M2", "prepublished", "posts", /prepublished 1 posts a publication/],
+    ["E2", "seed", "items", /pass 1 items a publication matches no/],
+    ["S16", "base-only", "posts", /S16 posts registry/],
   ] as const) {
     it(`${id}: a model that loses a ${kind} line fails the case`, async () => {
       const row = ROWS.find((r) => r.id === id)!;
-      const distort = dropFirst(kind);
+      const distort = dropFirst(kind, stream);
       await expect(
         (async () => {
           const rig = await open(row, { distort });
           await publishUntilStable(rig, row, { distort });
         })(),
-      ).rejects.toThrow();
+      ).rejects.toThrow(failure);
     });
   }
 });
