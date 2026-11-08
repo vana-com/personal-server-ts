@@ -883,10 +883,18 @@ function rowStreams(row: Row): string[] {
   return [...names].sort();
 }
 
+/** A model to break on purpose: it rewrites the lines the oracle predicts. */
+interface Options {
+  readonly distort?: (
+    kind: "prepublished" | "seed" | "base-only",
+    lines: Line[],
+  ) => Line[];
+}
+
 /** How many registry publications existed when the case started. */
 const initialPublications = new WeakMap<Rig, number>();
 
-async function open(row: Row): Promise<Rig> {
+async function open(row: Row, _options: Options = {}): Promise<Rig> {
   const rig = new Rig(row.seed, row.connector);
   await rig.open();
   if (row.base.length > 0) {
@@ -1146,7 +1154,11 @@ async function expectRegistryMatchesPlan(rig: Rig, row: Row): Promise<void> {
  * carries the writer's problem, and the registry holds the head of the last
  * step the plan predicted.
  */
-async function publishUntilStable(rig: Rig, row: Row): Promise<number> {
+async function publishUntilStable(
+  rig: Rig,
+  row: Row,
+  _options: Options = {},
+): Promise<number> {
   for (let pass = 1; pass <= 6; pass += 1) {
     const heads = new Map<string, PlanHead | null>();
     for (const stream of rowStreams(row)) {
@@ -1242,6 +1254,7 @@ interface Api {
   readonly withheld: string | null;
   readonly complete: string | null;
   readonly pending: string | null;
+  readonly awaitingImport: string | null;
   readonly bodyWithheld: string[] | null;
   readonly records: Rec[] | null;
 }
@@ -1301,6 +1314,7 @@ async function api(
     withheld: response.headers.get("x-stream-sync-withheld"),
     complete: response.headers.get("x-stream-sync-complete"),
     pending: response.headers.get("x-stream-sync-pending"),
+    awaitingImport: response.headers.get("x-stream-sync-awaiting-import"),
     bodyWithheld: body?.withheld
       ? body.withheld.map((w) => `${w.runId}:${w.reason}`).sort()
       : null,
@@ -1494,6 +1508,57 @@ describe("owner and grant over HTTP, with a stored body that shares no key", () 
 
 // ---------------------------------------------------------------------------
 // Cases that need more than one read.
+
+describe("a stored body over local runs the response does not reflect", () => {
+  for (const id of ["D5", "N1"]) {
+    it(`${id}: after the publish and before the import, the owner is told the run awaits import`, async () => {
+      const row = ROWS.find((r) => r.id === id)!;
+      const rig = await open(row);
+      const before = await api(rig, row, { builder: false, file: true });
+      expect(before.source).toBe("legacy");
+      expect(before.pending).toBe("1");
+      expect(before.awaitingImport).toBeNull();
+
+      await rig.publish();
+      const published = await api(rig, row, { builder: false, file: true });
+      expect(published.source).toBe("legacy");
+      expect(published.records).toEqual([{ id: "stored" }]);
+      expect(published.pending).toBeNull();
+      expect(published.awaitingImport).toBe("1");
+
+      await publishUntilStable(rig, row);
+      await rig.sync();
+      const imported = await api(rig, row, { builder: false, file: true });
+      expect(imported.pending).toBeNull();
+      expect(imported.awaitingImport).toBeNull();
+    });
+  }
+});
+
+describe("the oracle catches a deliberately broken model", () => {
+  type Distort = NonNullable<Options["distort"]>;
+  const dropFirst =
+    (only: Parameters<Distort>[0]): Distort =>
+    (kind, lines) =>
+      kind === only ? lines.slice(1) : lines;
+
+  for (const [id, kind] of [
+    ["M2", "prepublished"],
+    ["E2", "seed"],
+    ["S16", "base-only"],
+  ] as const) {
+    it(`${id}: a model that loses a ${kind} line fails the case`, async () => {
+      const row = ROWS.find((r) => r.id === id)!;
+      const distort = dropFirst(kind);
+      await expect(
+        (async () => {
+          const rig = await open(row, { distort });
+          await publishUntilStable(rig, row, { distort });
+        })(),
+      ).rejects.toThrow();
+    });
+  }
+});
 
 describe("a pending view's cursor pins the head it was built on", () => {
   it("is stale once another device's incomplete head with a new profile is imported", async () => {

@@ -65,6 +65,8 @@ class Gateway implements StreamSyncRegistry {
 
   /** A test holds a registry POST here, before it commits. */
   beforePost?: (request: SignedRegistryPost) => Promise<void>;
+  /** A test holds the writer here: the registry committed, the writer has not heard. */
+  afterPost?: (request: SignedRegistryPost) => Promise<void>;
 
   async post(request: SignedRegistryPost): Promise<RegistryPostResult> {
     await this.beforePost?.(request);
@@ -83,6 +85,7 @@ class Gateway implements StreamSyncRegistry {
       version: rows.length,
       dataHash: request.dataHash,
     });
+    await this.afterPost?.(request);
     return { kind: "committed" };
   }
 
@@ -181,6 +184,7 @@ export class Rig {
         const hook = this.afterSnapshot;
         this.afterSnapshot = undefined;
         await hook?.();
+        await this.onSnapshot?.();
         return snapshot;
       },
       acknowledge: (coverage) => source.acknowledge(coverage),
@@ -189,6 +193,8 @@ export class Rig {
 
   /** Runs once, after the next owner snapshot is taken and before the read leases anything. */
   afterSnapshot?: () => Promise<void>;
+  /** Runs after every owner snapshot, until cleared. */
+  onSnapshot?: () => Promise<void>;
 
   private device(
     files: ReturnType<typeof createMemoryStreamSyncFiles>,
