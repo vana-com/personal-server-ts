@@ -838,6 +838,12 @@ export class StreamSyncReadService {
             { connector: scan.best.target.connector },
             "stream-sync read: the partial view cannot be projected",
           );
+          // The writer will publish these runs, but the requested name cannot
+          // show them: the owner is told, whatever answer follows.
+          scan.withheld = uniqueWithheld([
+            ...scan.withheld,
+            ...scan.best.shown,
+          ]);
         }
       }
       // No view is served: the runs the writer will not publish still reach
@@ -936,12 +942,23 @@ export class StreamSyncReadService {
     targets: readonly Target[],
     snapshots: ReadonlyMap<string, StreamSyncOverlaySnapshot>,
   ): {
-    best: { target: Target; ns: string; at: number } | null;
+    best: {
+      target: Target;
+      ns: string;
+      at: number;
+      /** The runs whose rows its view shows, per stream. */
+      shown: WithheldRun[];
+    } | null;
     withheld: WithheldRun[];
     unpublished: number;
     connectors: string[];
   } {
-    let best: { target: Target; ns: string; at: number } | null = null;
+    let best: {
+      target: Target;
+      ns: string;
+      at: number;
+      shown: WithheldRun[];
+    } | null = null;
     const withheld: WithheldRun[] = [];
     const unpublished = new Set<string>();
     const connectors = new Set<string>();
@@ -960,6 +977,7 @@ export class StreamSyncReadService {
         const control = this.importer.controlState(rows.controls.get(ns));
         if (control.kind === "deleted" || control.kind === "foreign") continue;
         let at = 0;
+        const shown: WithheldRun[] = [];
         // Every stream is scanned, whether or not an earlier one can be
         // served: a withheld or unpublished run is reported either way.
         const covered = target.streams.map((stream) => {
@@ -986,6 +1004,13 @@ export class StreamSyncReadService {
             connectors.add(target.connector);
           }
           withheld.push(...withheldRuns([{ stream, fold: local }]));
+          for (const c of local.merged) {
+            shown.push({
+              runId: c.run.runId,
+              stream,
+              reason: "projection_unavailable",
+            });
+          }
           for (const runId of local.unpublished) {
             unpublished.add(JSON.stringify([target.connector, ns, runId]));
           }
@@ -1002,7 +1027,7 @@ export class StreamSyncReadService {
           at > best.at ||
           (at === best.at && target.connector < best.target.connector)
         ) {
-          best = { target, ns, at };
+          best = { target, ns, at, shown };
         }
       }
     }

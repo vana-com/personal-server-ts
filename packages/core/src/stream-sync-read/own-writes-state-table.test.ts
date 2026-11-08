@@ -849,7 +849,7 @@ const ROWS: readonly Row[] = [
     ],
     published: true,
     expect: {
-      before: read(null, null, [`r1:${CUR}`]),
+      before: read(null, null, [`r1:${CUR}`, "r1:projection_unavailable"]),
       after: read(null, null, [`r1:${CUR}`]),
       grant: [null, null],
       pending: 1,
@@ -1189,7 +1189,6 @@ describe("own-writes state table", () => {
       it("every owner response carries the markers; a grant's carries none", async () => {
         const rig = await open(row);
         const grantView = want.grant[0] !== null;
-        const header = reasonsHeader(want.before.withheld);
         const plain = await api(rig, row, { builder: false, file: false });
         const filed = await api(rig, row, { builder: false, file: true });
         const named = await api(rig, row, {
@@ -1197,10 +1196,19 @@ describe("own-writes state table", () => {
           file: false,
           connection: true,
         });
-        for (const read of [plain, filed, named]) {
-          expect(sortedHeader(read.withheld)).toBe(header);
+        // The stored body answers without projecting: it carries no
+        // projection marker, only what the plan withholds.
+        const unfiled = want.before.withheld.filter(
+          (w) => !w.endsWith(":projection_unavailable"),
+        );
+        for (const [read, withheld] of [
+          [plain, want.before.withheld],
+          [filed, unfiled],
+          [named, want.before.withheld],
+        ] as const) {
+          expect(sortedHeader(read.withheld)).toBe(reasonsHeader(withheld));
           expect(read.bodyWithheld).toEqual(
-            header === null ? null : [...want.before.withheld].sort(),
+            withheld.length === 0 ? null : [...withheld].sort(),
           );
         }
         if (want.before.rows === null) {

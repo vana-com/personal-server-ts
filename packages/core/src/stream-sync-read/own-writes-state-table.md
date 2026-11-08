@@ -52,7 +52,10 @@ the test change together.
 8. **Every stream of a legacy name is scanned.** A run withheld on one stream
    is reported even when another stream has no local run. When the projector
    refuses a partial input, no partial view serves and the answer that does
-   carries the markers.
+   carries the markers, and every run the view would have shown is withheld
+   `projection_unavailable`. Its rows stay in the raw `pdpp.<connector>.<stream>`
+   stream. A stored body answers without projecting, so it carries no such
+   marker (the pending count tells the owner).
 
 ## Writer policies the rows exercise
 
@@ -118,7 +121,7 @@ obsolete.
 | S16 | legacy name over `posts` + `post_likes`, both bases incomplete; refused run on `post_likes`                                  | refuses                                                  | —            | —        | `r1:connector_update_required`                                | —           | —              | `r1:connector_update_required`                                | —            | —           | 1   |
 | S17 | as S16, a refused run on each stream                                                                                         | refuses both                                             | —            | —        | `r1:connector_update_required` `r2:connector_update_required` | —           | —              | `r1:connector_update_required` `r2:connector_update_required` | —            | —           | 2   |
 | M1  | as S16, one run refused on both streams                                                                                      | refuses both streams of the run                          | —            | —        | `r1:connector_update_required` `r1:connector_update_required` | —           | —              | `r1:connector_update_required` `r1:connector_update_required` | —            | —           | 1   |
-| M2  | as S16, one run: `posts` publishes, `post_likes` refused; published, not imported                                            | publishes one stream, refuses the other                  | —            | —        | `r1:connector_update_required`                                | —           | —              | `r1:connector_update_required`                                | —            | —           | 1   |
+| M2  | as S16, one run: `posts` publishes, `post_likes` refused; published, not imported                                            | publishes one stream, refuses the other                  | —            | —        | `r1:connector_update_required` `r1:projection_unavailable`    | —           | —              | `r1:connector_update_required`                                | —            | —           | 1   |
 
 Oracle cases this table covers: A2, A3, B2, C3, D2 to D6, P2, E2, E3, F1, one
 run across two streams (M1) and a mixed-state run (M2). Where the oracle's

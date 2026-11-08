@@ -39,7 +39,9 @@ export type WithheldReason =
   /** The run replaces the imported base, which grants still read. */
   | "key_reset_pending"
   /** The run's publish merges seed rows the overlay does not hold. */
-  | "seed_pending";
+  | "seed_pending"
+  /** The writer will publish the run, but the projector cannot project it to the requested name. */
+  | "projection_unavailable";
 
 export interface WithheldContribution extends Contribution {
   readonly reason: WithheldReason;
