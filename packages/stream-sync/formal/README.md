@@ -62,7 +62,7 @@ The intake model found two defects. Read "Counterexamples".
 No other counterexample was found within the bounds below. Read
 "Results" for what was checked at which bounds and in which mode.
 
-Model: `StreamSync.tla`, sha256 `a14998644a6207f78d759175a196c12335c8e487fd6ee2c640f14d8faea2cf22`. TLC 2026.11.03
+Model: `StreamSync.tla`, sha256 `8be6f1cb42a18a5d34bc4c9f4fbe6bd3fc997da508ab13f65eb8d75d8befe399`. TLC 2026.11.03
 (`tla2tools.jar`).
 
 ## Results
@@ -524,6 +524,300 @@ How the properties read here:
 | NoFalseDelete | Every key of a head's base is a key of the head. The base is the row just below it, when that row has the same generation and is not a tombstone. Nothing deletes a record: no tombstones and no deletion by absence. |
 | LaterWriteSurvives | A base line written by a later run than the publishing one (a greater run id than the head's `at`) is still in the head. This is the plain no-lost-write check of the merge. |
 | L3 | A live `complete:false` stream becomes live `complete:true`, or control moves, under the fairness above. |
+
+## R30 amendments to the R28 retry-progress design (F3b)
+
+This section extends the model with the R28 amendments of ruling R30,
+items 1-5, 7 and 8. Item 6 (the invalidation epoch for stale finalizers) is
+not modeled. The model sha256 is `8be6f1cb42a18a5d34bc4c9f4fbe6bd3fc997da508ab13f65eb8d75d8befe399`.
+
+### What was added
+
+Each rule is a switchable constant (default TRUE). A negative control turns
+one rule off and must fail with a named property.
+
+| Constant | R30 item | The rule |
+|---|---|---|
+| `RetrySeedDeferred` | 1 | A retry run plans no seed-only stream. The seed enriches only a stream the run publishes anyway. Its receipt is deferred. |
+| `RetryGuardFull` | 2 | A retry head is complete only if the stream was covered **and** actually read full. |
+| `EffFullFact` | 3 | "Actually read full" is the mode issued per stream (`iss[s] = 0`), not the `incremental: false` declaration. |
+| `TwoProvStates` | 4 | Provenance is `active_attempt` or `history_tail`. An `incremental: false` stream has only `active_attempt`, which ends when the attempt is covered. |
+| `WitnessAtBegin`, `WitnessAtSave` | 5 | A head tombstone above the continuation's witness invalidates it. Checked at begin (no cursor issued) and at save (the save does not renew it). |
+| `PerStreamClear` | 7 | An incomplete stream clears only its own checkpoint entry. |
+| `ReceivedCount` | 8 | "All empty" counts received upserts, not spooled rows. An oversized-only retry follows the ordinary exclusion path. |
+| `TailEndsWhenDone` | 4 (gap, finding 2) | `history_tail` ends when a covered, non-budgeted incremental read ends. Budgeted streams keep it while pages remain. |
+
+Bounds, not guards: `Oversized` (a retry run may receive oversized
+upserts), `Periodic` (scheduled covering reruns for the snapshot liveness
+property), `SerialRuns` (no run starts while another device's run is in
+flight; used only by two liveness rows).
+
+New ghost state: head fields `gr` (grounded completeness) and `sr`
+(seed-only on a retry run); checkpoint fields `ph` (provenance state), `wv`
+(witness: the stream row length at save) and `tw` (a tombstone was above the
+witness); entry fields `ovz`, `ep`, `wb`, `rb`; variable `sib`.
+
+New properties: `NoFalseComplete`, `RetryPubSetOnly`,
+`StreamKindEligibility`, `NoResumeAfterTombstone`,
+`SiblingContinuationKept`, and the extended `ProvenanceAtomic`. New
+liveness: `L6_SnapshotReturns` (an `incremental: false` stream returns to
+full/null after its attempt ends). All earlier properties stay.
+
+`NoFalseDelete` is split in two. The key-subset check stays as it was. With
+`FullMerges` every publish is a merge, so "a retry deletes a row" shows up as
+"a retry head is complete without a covered full read". `NoFalseComplete`
+checks that.
+
+### Findings
+
+Two positive configs found model or contract gaps. A third failure was a
+bound artifact.
+
+1. **A stale checkpoint resumes after a tombstone (`R30-wit`).**
+   Steps: (1) a run covers stream `s1` and completes its head. (2) A retry
+   run saves a cursor and provenance for `s1`, witness anchored at row 1.
+   (3) A later explicit `wantFull` run issues no cursor, so it never
+   re-saves the checkpoint. (4) During that run an old app's DELETE
+   tombstones `s1`. (5) The run ends. The stored cursor and provenance are
+   untouched. (6) The next ordinary run begins and START issues the stored
+   cursor for `s1`, although the history under it is tombstoned.
+   Rule broken: R29, R30.5; property `NoResumeAfterTombstone`.
+   Smallest contract fix: evaluate the history witness for **every**
+   stream that holds stored provenance at **every** begin, and issue no
+   cursor to a stream whose witness is broken. Eligibility alone is not
+   enough, because a stream can hold a plain incremental cursor. The model
+   now does this (`WitnessAtBegin` in `issue`). Required build test: the
+   scenario above (missing from the R28 test plan, see the map below).
+2. **`history_tail` never ends for a non-budgeted stream
+   (`F3-live-retry-delete`, control `C-tail-forever-rr3`).**
+   Steps: (1) a retry run leaves needsFull debt and an active attempt on an
+   incremental-capable, non-budgeted stream. (2) A scheduled run resumes the
+   cursor incrementally and covers the stream. The read is not full, so the
+   head stays `complete:false` (R30.2, correct). (3) The succeeded end keeps
+   `history_tail` because debt remains. (4) The next run resumes
+   incrementally again. Every scheduled run repeats step 2. No run is full
+   unless the owner asks. `L3_NoStuckIncomplete` fails.
+   Rule broken: R30.4 says `history_tail` survives incremental pages but gives
+   no end for a stream with no pages. Smallest contract fix: a succeeded
+   end that covers a non-budgeted stream consumes its provenance. The debt
+   stays, so the next begin is full/null and clears it. A budgeted stream
+   keeps `history_tail` while pages remain. Required build test: missing
+   from the R28 test plan (M5 below).
+3. **Not a finding: rerun budget.** The first `F3-live-retry-delete`
+   (`MaxReruns 2`) failed again after finding 2 was fixed. The retry run,
+   its continuation and the full repair need three scheduled reruns. With
+   `MaxReruns 3` the row passes whether runs overlap (`-overlap`) or not
+   (`-rr3`). The same artifact hit `L6_SnapshotReturns` (reruns spent
+   before the retry that opened the attempt). That property now needs one
+   rerun left in the bound. A scheduled rerun now also starts from a current
+   listing (`FreshListing`), because a rerun on a stale listing is
+   discarded and wastes the bounded supply.
+
+Inherited, not changed: `Live-leave` fails `L3_NoStuckIncomplete` on the
+ruled R28 contract (the F2 finding; the proposed fix `RetryCkptStaysFull` is
+not in the contract). R30 does not repair it. An old app's DELETE can
+tombstone a stream that holds an incomplete retry head, after which no
+scheduled run is owed.
+
+One control went vacuous and was repaired. After finding 2, the end rule
+also ended the one-bit provenance of an `incremental: false` stream, so
+`C-one-prov-bit` passed. It now exempts `FullStreams`, and the control fails
+with `StreamKindEligibility` again.
+
+### Results
+
+Every row ran one at a time under the TLC cap (4 workers, `nice -n 19`,
+`-cleanup`), each under 30 minutes. The last column says which bound or cut
+applies. A `TIMEOUT` is **not** a pass. Where a row timed out, a smaller copy
+(`-1s` one stream, `-1d` one device, `-rN` fewer runs) is listed under its
+own name with the cut stated. The model hash differs between row groups
+because the model changed while the queue ran. After the last model edit the
+rule rows, the controls, the R30 positives and the R30 witnesses were run
+again on the final hash (`8be6f1cb42a18a5d34bc4c9f4fbe6bd3fc997da508ab13f65eb8d75d8befe399` starts `8be6f1cb42a1`). The other
+rows ran on `6603b3e819d3` or `99f19700ca3d`. Those two differ from the final
+model by a constant that defaults to FALSE (`SerialRuns`) and by comments, so
+their behavior is the same.
+
+| Config | Profile | Expected | Result | Distinct states | Depth | Seconds | Bounds / note |
+|---|---|---|---|---|---|---|---|
+| **R30 rules: positives (exhaustive)** | | | | | | | |
+| `R30-sib` | r30-sib | pass | pass | 30840 | 25 | 6 |  |
+| `R30-wit` | r30-wit | pass | pass | 3188375 | 29 | 264 |  |
+| `R30-pub` | r30-pub | pass | pass | 3811129 | 29 | 586 |  |
+| `R30-prov-3r` | r30-prov | pass | pass | 2886578 | 29 | 465 | MaxRuns 3 (R30-prov at 4 timed out) |
+| `Snap-live` | snap-live | pass | pass | 560 | 20 | 2 | liveness, L6 |
+| `F3-live-retry-delete-rr3` | live | pass | pass | 176751 | 35 | 178 | MaxReruns 3, runs never overlap |
+| `F3-live-retry-delete-overlap` | live | pass | pass | 1101960 | 43 | 1659 | MaxReruns 3, runs may overlap |
+| **R30 rules: the seven required controls and extras (each fails with its named property)** | | | | | | | |
+| `C-retry-seed-only` | r30-pub | violate RetryPubSetOnly | violates RetryPubSetOnly | 14867 | 10 | 2 |  |
+| `C-retry-guard-uncovered-only` | r30-pub | violate NoFalseComplete | violates NoFalseComplete | 1616132 | 23 | 60 | covered incremental sibling, empty base |
+| `C-decl-is-full` | r30-prov | violate NoFalseComplete | violates NoFalseComplete | 1561826 | 23 | 69 |  |
+| `C-one-prov-bit` | r30-prov | violate StreamKindEligibility | violates StreamKindEligibility | 1927169 | 24 | 87 |  |
+| `C-one-prov-bit-live` | snap-live | violate L6_SnapshotReturns | violates L6_SnapshotReturns | 560 | 20 | 1 | liveness control for L6 |
+| `C-resume-after-tombstone` | r30-wit | violate NoResumeAfterTombstone | violates NoResumeAfterTombstone | 6843 | 14 | 2 |  |
+| `C-save-after-tombstone` | r30-wit | violate NoResumeAfterTombstone | violates NoResumeAfterTombstone | 3289 | 14 | 2 |  |
+| `C-whole-envelope-clear` | r30-sib | violate SiblingContinuationKept | violates SiblingContinuationKept | 14889 | 16 | 3 |  |
+| `C-oversized-token-only` | r30-pub | violate S7_CheckpointSafety | violates S7_CheckpointSafety | 24425 | 13 | 3 |  |
+| `C-tail-forever-rr3` | live | violate L3_NoStuckIncomplete | violates L3_NoStuckIncomplete | 199378 | 38 | 124 | control for the history_tail end rule (finding 2) |
+| **R30 witnesses (each scenario is reachable)** | | | | | | | |
+| `W-snapshot-resume` | r30-prov | violate NotSnapshotResume | violates NotSnapshotResume | 40905 | 15 | 4 |  |
+| `W-tomb-invalidates` | r30-wit | violate NotTombInvalidates | violates NotTombInvalidates | 5920 | 13 | 3 |  |
+| `W-oversized-only` | r30-pub | violate NotOversizedOnly | violates NotOversizedOnly | 66 | 6 | 2 |  |
+| `W-retry-seed-deferred` | r30-pub | violate NotRetrySeedDeferred | violates NotRetrySeedDeferred | 58 | 6 | 1 |  |
+| `W-sibling-cursor` | r30-sib | violate NotSiblingCursor | violates NotSiblingCursor | 14834 | 16 | 2 |  |
+| **F3 shrunk-constants rows, section 3 of the review (retry and delete)** | | | | | | | |
+| `F3-retry-split` | split | pass | pass | 122207 | 16 | 12 |  |
+| `F3-retry-lost-delete` | split | pass | pass | 14060 | 15 | 2 |  |
+| `F3-retry-merge-delete-1s` | split | pass | pass | 812430 | 22 | 124 | one stream, two keys |
+| `F3-retry-chain-delete-1s` | split | pass | pass | 435480 | 22 | 38 | one stream |
+| `F3-token-middle-delete-1s` | split | pass | pass | 11990673 | 29 | 1088 | one stream |
+| `F3-provenance-delete-1s` | split | pass | pass | 4697805 | 29 | 539 | one stream |
+| `F3-provenance-sibling-delete-1d` | split | pass | pass | 1740997 | 29 | 241 | one device: the delete is the device's own, not a remote mid-run delete |
+| `F3-provenance-sibling-delete-2r` | split | pass | TIMEOUT (inconclusive) | 14398274 |  | 1800 | two runs, not three |
+| `F3-live-retry-delete` | live | pass | violates L3_NoStuckIncomplete | 617430 | 27 | 789 | MaxReruns 2: bound artifact, see Findings |
+| **Rows F3 did not run, on this model: simulations** | | | | | | | |
+| `Small` | small | pass | no violation (simulation, timed stop) |  |  | 900 | simulate num=200000 depth 60 seed 1, stopped at 900 s: 2.9k behaviours |
+| `Key` | key | pass | no violation (simulation, timed stop) |  |  | 901 | same bounds, 900 s |
+| `Full` | full | pass | no violation (simulation, timed stop) |  |  | 900 | same bounds, 900 s |
+| `IdLess` | idless | pass | no violation (simulation, timed stop) |  |  | 900 | same bounds, 900 s |
+| **Rows F3 did not run, on this model: exhaustive and liveness** | | | | | | | |
+| `C02-key` | slice-key | pass | pass | 15939362 | 28 | 1518 |  |
+| `C02-split` | split | pass | pass | 8574905 | 29 | 1528 |  |
+| `Slice-key` | slice-key | pass | pass | 11879562 | 28 | 1758 |  |
+| `Slice-faults` | slice-faults | pass | pass | 11312280 | 31 | 1149 |  |
+| `Slice-twice` | twice | pass | pass | 4364693 | 30 | 370 |  |
+| `Bud-live` | bud-live | pass | pass | 2827 | 26 | 2 |  |
+| `Live-cover` | live-cover | pass | pass | 42776 | 29 | 66 |  |
+| `Live-fail` | live-fail | pass | pass | 413570 | 23 | 1129 |  |
+| `Live-leave` | live-leave | pass | violates L3_NoStuckIncomplete | 226799 | 15 | 324 | inherited violation, ruled contract (F2 finding); R30 does not change it |
+| `Retry1-r2` | retry1 | pass | pass | 527192 | 21 | 178 | MaxRuns 2 (3) |
+| `Bud2-r2` | bud2 | pass | pass | 293082 | 22 | 85 | MaxRuns 2 (3) |
+| `Bud-delete-r3` | bud | pass | pass | 2431415 | 28 | 224 | MaxRuns 3, MaxRetry 3 (4, 4) |
+| `Bud-restart-r3` | bud | pass | pass | 1799632 | 25 | 190 | MaxRuns 3, MaxRetry 3 (4, 4) |
+| `Live-rr1` | live | pass | pass | 741571 | 24 | 1744 | MaxReruns 1 (2) |
+| `Slice-accounts-r2` | slice-accounts | pass | pass | 367485 | 22 | 35 | MaxRuns 2 (3) |
+| `Slice-faults2-r2` | slice-faults | pass | pass | 632664 | 23 | 42 | MaxRuns 2 (3) |
+| `Slice-idless-r2` | slice-idless | pass | pass | 919880 | 22 | 68 | MaxRuns 2 (3) |
+| `C02-idless-r2` | slice-idless | pass | pass | 1125226 | 22 | 78 | MaxRuns 2 (3) |
+| `Slice-intake1-r3` | slice-intake1 | pass | pass | 6437256 | 34 | 754 | MaxRuns 3 (4) |
+| `Slice-q9-r3` | slice-q9 | pass | pass | 10118989 | 30 | 1015 | MaxRuns 3 (4) |
+| **Rows F3 did not run: first bounds timed out at 30 min (inconclusive, not a pass)** | | | | | | | |
+| `Retry1` | retry1 | pass | TIMEOUT (inconclusive) | 7348580 |  | 1800 |  |
+| `Bud-delete` | bud | pass | TIMEOUT (inconclusive) | 13669664 |  | 1800 |  |
+| `Bud-restart` | bud | pass | TIMEOUT (inconclusive) | 14282149 |  | 1800 |  |
+| `Bud2` | bud2 | pass | TIMEOUT (inconclusive) | 6751073 |  | 1800 |  |
+| `Live` | live | pass | TIMEOUT (inconclusive) | 612611 |  | 1800 |  |
+| `C02-idless` | slice-idless | pass | TIMEOUT (inconclusive) | 20394029 |  | 1802 |  |
+| `Slice-accounts` | slice-accounts | pass | TIMEOUT (inconclusive) | 14014438 |  | 1800 |  |
+| `Slice-faults2` | slice-faults | pass | TIMEOUT (inconclusive) | 17931903 |  | 1800 |  |
+| `Slice-idless` | slice-idless | pass | TIMEOUT (inconclusive) | 16588089 |  | 1801 |  |
+| `Slice-intake` | slice-intake | pass | TIMEOUT (inconclusive) | 18264784 |  | 1800 |  |
+| `Slice-intake1` | slice-intake1 | pass | TIMEOUT (inconclusive) | 14139266 |  | 1801 |  |
+| `Slice-q9` | slice-q9 | pass | TIMEOUT (inconclusive) | 15963020 |  | 1801 |  |
+| `Slice-intake-a0` | slice-intake | pass | TIMEOUT (inconclusive) | 19205642 |  | 1800 | also cut: no abort; still timed out |
+| `R30-prov` | r30-prov | pass | TIMEOUT (inconclusive) | 8144614 |  | 1801 |  |
+| `F3-retry-merge-delete` | split | pass | TIMEOUT (inconclusive) | 18807936 |  | 1800 |  |
+| `F3-retry-chain-delete` | split | pass | TIMEOUT (inconclusive) | 21876228 |  | 1801 |  |
+| `F3-token-middle-delete` | split | pass | TIMEOUT (inconclusive) | 28764747 |  | 1800 |  |
+| `F3-provenance-delete` | split | pass | TIMEOUT (inconclusive) | 18845998 |  | 1800 |  |
+| `F3-provenance-sibling-delete` | split | pass | TIMEOUT (inconclusive) | 26006315 |  | 1800 |  |
+| `C02-idless-v3` | slice-idless | pass | TIMEOUT (inconclusive) | 27269238 |  | 1801 | MaxVer 3: no help |
+| `Retry1-v3` | retry1 | pass | TIMEOUT (inconclusive) | 9034972 |  | 1801 | MaxVer 3: no help |
+| `Bud-delete-v3` | bud | pass | TIMEOUT (inconclusive) | 14967000 |  | 1801 | MaxVer 3: no help |
+| `Bud-restart-v3` | bud | pass | TIMEOUT (inconclusive) | 15771612 |  | 1800 | MaxVer 3: no help |
+| **Witnesses from W-trace-a onward (F3 never ran them)** | | | | | | | |
+| `W-trace-a` | lean | violate NotTraceA | violates NotTraceA | 2287817 | 10 | 52 |  |
+| `W-trace-b` | lean | violate NotTraceB | violates NotTraceB |  |  | 12 | breadth-first timed out at 30 min; reached by -simulate (num=200000 depth 80 seed 1) in 12 s |
+| `W-twice` | twice | violate NotTwice | violates NotTwice | 5495516 | 17 | 120 |  |
+| `W-switch-reused-ckpt` | slice-accounts | violate NotSwitchReusedCkpt | violates NotSwitchReusedCkpt | 252599 | 10 | 8 |  |
+| `W-phone-first-seed` | late | violate NotPhoneFirstThenSeed | violates NotPhoneFirstThenSeed | 2220096 | 16 | 59 |  |
+| `W-zero-emission-seed` | slice-accounts | violate NotZeroEmissionSeed | violates NotZeroEmissionSeed | 136684 | 10 | 5 |  |
+| `W-settle-after-ack` | slice-settle | violate NotSettleAfterAck | violates NotSettleAfterAck | 147668 | 11 | 5 |  |
+| `W-retry-merge` | retry1 | violate NotRetryMerge | violates NotRetryMerge | 126408 | 16 | 5 |  |
+| `W-mixed-modes` | retry1 | violate NotMixedModes | violates NotMixedModes | 18049511 | 23 | 586 |  |
+| `W-needsfull-with-ckpt` | slice-accounts4 | violate NotNeedsFullWithCkpt | violates NotNeedsFullWithCkpt | 1960 | 12 | 1 |  |
+| `W-offline-vs-5` | twice | violate NotOfflineVs5 | violates NotOfflineVs5 | 19422616 | 20 | 521 |  |
+| `W-late-old-head` | lean | violate NotLateOldHead | violates NotLateOldHead | 17611441 | 11 | 345 |  |
+| `W-first-write-in-delete` | lean | violate NotFirstWriteDuringDelete | violates NotFirstWriteDuringDelete | 15196811 | 11 | 334 |  |
+| `W-failed-entry` | lean | violate NotFailedEntryNewerHeads | violates NotFailedEntryNewerHeads | 16113570 | 11 | 308 |  |
+| `W-budget-resume` | bud | violate NotBudgetResume | violates NotBudgetResume | 22475 | 13 | 2 |  |
+| `W-token-resume` | retry1 | violate NotTokenResume | violates NotTokenResume | 2612037 | 20 | 69 |  |
+| `W-trace-b-l0` | lean | violate NotTraceB | TIMEOUT (inconclusive) | 57263685 |  | 1800 | MaxLost 0: breadth-first timed out |
+
+### What each F3 section 2 gap needs
+
+| Gap in the review | Status |
+|---|---|
+| Retry run, two uncovered streams, delete between them | **Closed** by `F3-retry-split` (exhaustive pass). |
+| Token-only retry meets a delete | **Closed**, one stream, by `F3-token-middle-delete-1s`. The two-stream form timed out; open. |
+| Retry, provenance-preserving success, continuation and delete | **Half closed**: `F3-provenance-delete-1s` passes with one stream. The two-stream, two-device form timed out. |
+| Partial success omits a sibling and a remote delete splits the rest | **Open.** `F3-provenance-sibling-delete-1d` passes, but with one device the delete is the device's own and clears its outbox. It is not a remote mid-run delete. The two-device rows timed out with no violation in 14-26 million states. |
+| Two-key merge, delete splits a two-stream run | **Half closed**: `F3-retry-merge-delete-1s` passes with one stream, two keys. Two streams timed out. |
+| Retry chain (record retry, token-only retry, continuation) and delete | **Half closed**: `F3-retry-chain-delete-1s`. Two streams timed out. |
+| Budgeted stream with a sibling and a delete | **Open.** The `F3-budget-*` rows test R28 budget behavior, not an R30 rule, so they were not added. `Bud-delete-r3` passes with one stream. |
+| Budgeted retry with a restart and a delete | **Open**, same reason. `Bud-restart-r3` has no delete. |
+| Retry head reply lost across a delete | **Closed** by `F3-retry-lost-delete` (exhaustive pass, one stream). |
+| Liveness with retry debt and UserDelete | **Closed** by `F3-live-retry-delete-rr3` and `-overlap` (pass, MaxReruns 3). Finding 2 is the contract gap it exposed. |
+| `Slice-intake` (two devices, two streams, abort, partial cover) | **Open.** Both bounds timed out. `Slice-intake1-r3` passes with one device. |
+
+### Vacuity
+
+- The R30 profiles set `PartialCover TRUE` and `MaxRetry` 1 or more, so
+  `CoveredOnly`, `ProvenanceAtomic`, `NeedsFullRunIsFull`,
+  `IncompleteOwned` and `LaterWriteSurvives` are not vacuous there. Each
+  R30 witness shows its scenario is reached.
+- `F3-retry-split` and `F3-retry-lost-delete` keep F3's split profile with
+  `PartialCover FALSE`. They test retry plus delete, **not** `CoveredOnly`
+  or partial coverage. Do not count them as coverage of those properties.
+  `F3-provenance-sibling-delete-1d` has `PartialCover TRUE`.
+- `Live-rr1` has one scheduled rerun. It passes, but it checks less than
+  `Live` would. `Live` itself timed out.
+- The four simulations sampled about 2.8-3.4 thousand behaviours each in
+  900 s, far fewer than F3's. They found no violation. They do not prove
+  anything.
+
+### Property to test map (R28 test plan)
+
+| Property | Plan tests | Missing test |
+|---|---|---|
+| `NoFalseComplete` (R30.2, R30.3: retry NoFalseDelete with a covered incremental sibling; declaration is not proof) | 4, 5, 10, 11, 12, 42 | none |
+| `RetryPubSetOnly` (R30.1) | 3, 12 | **M1**: a retry run with a seed receipt pending for a stream the run does not publish plans no seed-only head and leaves the receipt deferred. Test 12 restricts the seed to `items` and so skips this case. |
+| `CoveredOnly` | 3, 42, 50, 51 | none |
+| R24 (no cursor with `full_refresh`) | 6, 10, 40, 42 | none |
+| `ProvenanceAtomic`, `active_attempt` | 28, 29, 42, 45, 46 | none |
+| `ProvenanceAtomic`, `history_tail` | 6, 27, 43, 49 | none |
+| `StreamKindEligibility` | 7, 41, 42 | none |
+| `NoResumeAfterTombstone` | 47, 49 | **M2**: a tombstone lands during an explicit `wantFull` run, which issues no cursor and does not re-save the checkpoint. The next ordinary begin must be full/null for that stream (finding 1). **M3**: a tombstone lands while a run holds a cursor for the stream. The save must not renew the continuation (control `C-save-after-tombstone`). Test 38 checks generation, not a tombstone. |
+| `SiblingContinuationKept` (R30.7) | 41, 45, 49 | none |
+| `S7_CheckpointSafety` with oversized-only (R30.8) | 1, 58 | **M4**: an oversized upsert plus one accepted upsert in the same retry run. "All empty" must then be false. Test 58 covers the oversized-only run. |
+| `L3_NoStuckIncomplete`, `L6_SnapshotReturns`, history_tail end | 6, 42, 43 | **M5**: a non-budgeted, incremental-capable stream with debt finishes a covered incremental continuation that ends with no further token. The next begin must be full/null, and a full covered read must clear the debt (finding 2). |
+
+### R30 ambiguities and how they were resolved
+
+1. **Where `history_tail` ends for a stream with no pages.** R30.4 does not
+   say. Resolved by `TailEndsWhenDone` (finding 2). This is a contract
+   addition. Recommended: adopt it.
+2. **Incompatible replacement.** Modeled as a tombstone. Transient
+   unreadability is not a separate model state: every read succeeds, so
+   "pending, never empty-base authority" has no control here. Unit tests 13
+   and 14 own it.
+3. **The selected-stream set (item 1).** Not modeled. The model has the
+   covered set and the set of streams with received upserts.
+4. **Effective-full fact (item 3).** Taken as "no cursor issued at begin".
+   F3's choices stand: the status is per stream, a record-free retry end
+   saves only its checkpoint, and an explicit `wantFull` issues no cursor.
+5. **Desktop seed receipt.** F3's `rcptOk` stays: a seed receipt blocks the
+   retry checkpoint on a first run that seeds. Recommended: waive it on
+   retry ends, so a seeded retry run still saves progress. Flagged, not
+   changed.
+6. **Oversized upserts.** Modeled only on retry runs, on uncovered streams.
+7. **Budgeted streams under `TailEndsWhenDone`.** Exempt, because pages
+   remain. A debt tail on an incremental-capable stream that has no budget
+   reaches a full read only through the rule above.
+
+Not modeled: R30 item 6 (the invalidation epoch for stale finalizers).
+`F3-live-retry-delete-overlap` shows that, in the bounds checked, overlapping
+runs do not by themselves stop repair. That is not a claim about item 6.
 
 ## Earlier work
 

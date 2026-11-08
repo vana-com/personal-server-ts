@@ -44,7 +44,17 @@ export const DESIGN = {
   RetryMerges: "TRUE",
   FullRefreshNoCursor: "TRUE",
   KeepProvOnSuccess: "TRUE",
+  TailEndsWhenDone: "TRUE",
   PerStreamRetryResume: "TRUE",
+  // R30 (amendments to R28), each guard a control:
+  RetrySeedDeferred: "TRUE",
+  RetryGuardFull: "TRUE",
+  EffFullFact: "TRUE",
+  TwoProvStates: "TRUE",
+  WitnessAtBegin: "TRUE",
+  WitnessAtSave: "TRUE",
+  PerStreamClear: "TRUE",
+  ReceivedCount: "TRUE",
 };
 
 /**
@@ -91,6 +101,11 @@ const base = {
   Views: "FALSE",
   // A bound, not a guard: FALSE makes every "ok" run cover every stream.
   PartialCover: "TRUE",
+  // R30.8: a retry run may receive oversized upserts (a bound, not a guard).
+  Oversized: "FALSE",
+  // L6: scheduled covering reruns (a bound, not a guard).
+  Periodic: "FALSE",
+  SerialRuns: "FALSE",
 };
 
 export const PROFILES = {
@@ -397,6 +412,98 @@ export const PROFILES = {
     MaxSessions: 0,
     MaxFail: 0,
   },
+  // R30 profiles.  One device, identity-less, one account: R30 adds no
+  // dimension the earlier slices cut.
+  // r30-pub: items 1, 2, 3, 8 (publication set, guard, effective-full fact,
+  // oversized-only retry).  Two streams, the Desktop seeds, up to two retry ends.
+  "r30-pub": {
+    ...base,
+    Devices: set(["d1"]),
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1"]),
+    Streams: set(["s1", "s2"]),
+    MaxRuns: 3,
+    MaxRetry: 2,
+    MaxDeletes: 0,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    Oversized: "TRUE",
+  },
+  // r30-prov: items 4 and 7 (two provenance states, per-stream clearing): s2
+  // is declared incremental: false, s1 is incremental-capable.
+  "r30-prov": {
+    ...base,
+    Devices: set(["d1"]),
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1"]),
+    Streams: set(["s1", "s2"]),
+    FullStreams: set(["s2"]),
+    MaxRuns: 4,
+    MaxRetry: 2,
+    MaxDeletes: 0,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+  },
+  // r30-wit: item 5 (the history witness): one incremental-capable stream,
+  // two record keys, an old-client stream DELETE.
+  "r30-wit": {
+    ...base,
+    Devices: set(["d1"]),
+    Desktop: "nodesk",
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1", "x2"]),
+    Streams: set(["s1"]),
+    MaxRuns: 4,
+    MaxRetry: 2,
+    MaxDeletes: 0,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    MaxOldDelete: 1,
+  },
+  // r30-sib: item 7 (per-stream clearing): s2's head goes incomplete after an
+  // old-client DELETE while s1 holds a saved cursor.
+  "r30-sib": {
+    ...base,
+    Devices: set(["d1"]),
+    Desktop: "nodesk",
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1"]),
+    Streams: set(["s1", "s2"]),
+    MaxRuns: 2,
+    MaxRetry: 0,
+    MaxDeletes: 0,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    MaxOldDelete: 1,
+  },
+  // snap-live: L6.  One incremental:false stream, one retry end then
+  // scheduled covering reruns.
+  "snap-live": {
+    ...base,
+    Devices: set(["d1"]),
+    Desktop: "nodesk",
+    Acct: set(["A"]),
+    IdLess: "TRUE",
+    PK: set(["x1"]),
+    Streams: set(["s1"]),
+    FullStreams: set(["s1"]),
+    MaxRuns: 1,
+    MaxReruns: 2,
+    MaxRetry: 1,
+    MaxDeletes: 0,
+    MaxLost: 0,
+    MaxSessions: 0,
+    MaxFail: 0,
+    Periodic: "TRUE",
+  },
   // The identity-less connector, two accounts.
   "slice-idless": {
     ...base,
@@ -434,6 +541,11 @@ export const SAFETY = [
   "IssuedStart",
   "NoFalseDelete",
   "LaterWriteSurvives",
+  "NoFalseComplete",
+  "RetryPubSetOnly",
+  "StreamKindEligibility",
+  "NoResumeAfterTombstone",
+  "SiblingContinuationKept",
 ];
 
 export const LIVENESS = [
@@ -444,6 +556,8 @@ export const LIVENESS = [
 ];
 /** R28: the budgeted-backfill profiles check L5 only (their head stays complete:false by design). */
 export const LIVENESS_BUDGET = ["L5_BudgetProgress"];
+/** R30: the snapshot-return profile checks L6 only. */
+export const LIVENESS_SNAP = ["L6_SnapshotReturns"];
 
 /** Simulation bounds for the profiles that breadth-first search cannot finish. */
 const SIM = { traces: 200000, depth: 60, seed: 1 };
@@ -567,6 +681,68 @@ export const CONFIGS = [
   ["C-needsfull-hides-token", "any needsFull of the connector hides every cursor (today's rule)", "bud-live", { PerStreamRetryResume: "FALSE" }, "L5_BudgetProgress", "liveness"],
   ["C-full-replaces", "a stream-full run replaces its base instead of merging", "late", { FullMerges: "FALSE", FullStreams: "{s1}" }, "NoFalseDelete"],
 
+  // --- R30 positives (amendments to R28) ---
+  ["R30-pub", "R30.1-3, 8: retry publication set, completeness guard, issued-mode fact, oversized-only retry; the Desktop seeds", "r30-pub", {}, "pass"],
+  ["R30-prov", "R30.4, 7: active_attempt and history_tail, an incremental:false sibling, per-stream clearing", "r30-prov", {}, "pass"],
+  ["R30-wit", "R30.5: the history witness; an old-client stream DELETE", "r30-wit", {}, "pass"],
+  ["R30-sib", "R30.7: an incomplete stream never clears a sibling's checkpoint entry", "r30-sib", {}, "pass"],
+  ["Snap-live", "R30 liveness: an incremental:false stream returns to full/null after its attempt ends", "snap-live", {}, "pass", "liveness"],
+
+  // --- R30 negative controls ---
+  ["C-retry-seed-only", "a retry run plans a seed-only stream", "r30-pub", { RetrySeedDeferred: "FALSE" }, "RetryPubSetOnly"],
+  ["C-retry-guard-uncovered-only", "a retry head is complete when covered, whatever mode it was read in (covered incremental sibling on an empty base)", "r30-pub", { RetryGuardFull: "FALSE" }, "NoFalseComplete"],
+  ["C-decl-is-full", "the incremental:false declaration is taken as a full read", "r30-prov", { EffFullFact: "FALSE" }, "NoFalseComplete"],
+  ["C-one-prov-bit", "one eligibility bit for both stream kinds (no active attempt that ends)", "r30-prov", { TwoProvStates: "FALSE" }, "StreamKindEligibility"],
+  ["C-one-prov-bit-live", "the same, against liveness L6", "snap-live", { TwoProvStates: "FALSE" }, "L6_SnapshotReturns", "liveness"],
+  ["C-resume-after-tombstone", "START ignores a head tombstone above the continuation's witness", "r30-wit", { WitnessAtBegin: "FALSE" }, "NoResumeAfterTombstone"],
+  ["C-save-after-tombstone", "the save renews a continuation over a head tombstone that landed during the run", "r30-wit", { WitnessAtSave: "FALSE" }, "NoResumeAfterTombstone"],
+  ["C-whole-envelope-clear", "an incomplete stream clears the whole checkpoint, siblings included", "r30-sib", { PerStreamClear: "FALSE" }, "SiblingContinuationKept"],
+  ["C-oversized-token-only", "an oversized-only retry is treated as a token-only retry (spooled rows, not received upserts, decide all-empty)", "r30-pub", { ReceivedCount: "FALSE" }, "S7_CheckpointSafety"],
+
+  // --- F3 shrunk-constants review, section 3 (the rows relevant to R30) ---
+  ["F3-retry-split", "one retry run split by a remote delete", "split", { Desktop: "nodesk", MaxRuns: 1, MaxRetry: 1, MaxVer: 2 }, "pass"],
+  ["F3-retry-chain-delete", "a second retry run split by a remote delete", "split", { Desktop: "nodesk", MaxRuns: 2, MaxRetry: 2, MaxVer: 2 }, "pass"],
+  ["F3-token-middle-delete", "record retry, token-only retry, continuation and delete", "split", { Desktop: "nodesk", MaxRuns: 3, MaxRetry: 2, MaxVer: 2 }, "pass"],
+  ["F3-provenance-delete", "retry, success preserves provenance, next continuation and delete", "split", { Desktop: "nodesk", MaxRuns: 3, MaxRetry: 1, PartialCover: "FALSE", MaxVer: 2 }, "pass"],
+  ["F3-provenance-sibling-delete", "partial success keeps an omitted sibling's provenance", "split", { Desktop: "nodesk", MaxRuns: 3, MaxRetry: 1, PartialCover: "TRUE", MaxVer: 2 }, "pass"],
+  ["F3-retry-merge-delete", "two-key retry merge split by a remote delete", "split", { Desktop: "nodesk", PK: "{x1, x2}", MaxRuns: 2, MaxRetry: 1, MaxVer: 2 }, "pass"],
+  // Shrunk copies of the rows whose first bounds timed out at 30 min (one
+  // stream, or one run fewer): each states its cut in its name.
+  ["F3-retry-merge-delete-1s", "two-key retry merge split by a remote delete (one stream)", "split", { Desktop: "nodesk", Streams: "{s1}", PK: "{x1, x2}", MaxRuns: 2, MaxRetry: 1, MaxVer: 2 }, "pass"],
+  ["F3-retry-chain-delete-1s", "a second retry run split by a remote delete (one stream)", "split", { Desktop: "nodesk", Streams: "{s1}", MaxRuns: 2, MaxRetry: 2, MaxVer: 2 }, "pass"],
+  ["F3-token-middle-delete-1s", "record retry, token-only retry, continuation and delete (one stream)", "split", { Desktop: "nodesk", Streams: "{s1}", MaxRuns: 3, MaxRetry: 2, MaxVer: 2 }, "pass"],
+  ["F3-provenance-delete-1s", "retry, success preserves provenance, next continuation and delete (one stream)", "split", { Desktop: "nodesk", Streams: "{s1}", MaxRuns: 3, MaxRetry: 1, PartialCover: "FALSE", MaxVer: 2 }, "pass"],
+  ["R30-prov-3r", "R30.4, 7 with three runs (not four)", "r30-prov", { MaxRuns: 3 }, "pass"],
+  ["F3-provenance-sibling-delete-2r", "partial success keeps an omitted sibling's provenance (two runs, not three)", "split", { Desktop: "nodesk", MaxRuns: 2, MaxRetry: 1, PartialCover: "TRUE", MaxVer: 2 }, "pass"],
+  ["C-tail-forever", "history_tail lasts through every covered incremental read of a non-budgeted stream: the head never completes", "live", { MaxRetry: 1, PartialCover: "FALSE", Readers: "{}", Views: "FALSE", TailEndsWhenDone: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
+  // Shrunk copies of F3 rows whose first bounds timed out at 30 min: record versions cut from 6 to 3.
+  ["Bud-delete-v3", "R28: a budgeted backfill (two pages), two devices, a delete (MaxVer 3, not 6)", "bud", { MaxDeletes: 1, MaxSessions: 0, MaxVer: 3 }, "pass"],
+  ["Bud-restart-v3", "R28: a budgeted backfill (two pages), two devices, a restart after each publish step (MaxVer 3, not 6)", "bud", { MaxDeletes: 0, MaxSessions: 1, MaxVer: 3 }, "pass"],
+  ["Retry1-v3", "R28: record-bearing and token-only retry ends with needsFull debt, one device (cut, three runs) (MaxVer 3, not 6)", "retry1", { MaxRuns: 3, MaxVer: 3 }, "pass"],
+  ["C02-idless-v3", "the same, identity-less (MaxVer 3, not 6)", "slice-idless", { ClearOnGenChange: "FALSE", MaxVer: 3 }, "pass"],
+  ["F3-provenance-sibling-delete-1d", "partial success keeps an omitted sibling's provenance (one device, three runs)", "split", { Desktop: "nodesk", Devices: "{d1}", MaxRuns: 3, MaxRetry: 1, PartialCover: "TRUE", MaxVer: 2 }, "pass"],
+  ["F3-live-retry-delete-serial", "non-budget retry debt under delete and fair repair, runs never overlap", "live", { MaxRetry: 1, PartialCover: "FALSE", Readers: "{}", Views: "FALSE", SerialRuns: "TRUE" }, "pass", "liveness"],
+  ["C-tail-forever-serial", "history_tail lasts through every covered incremental read of a non-budgeted stream (runs never overlap)", "live", { MaxRetry: 1, PartialCover: "FALSE", Readers: "{}", Views: "FALSE", SerialRuns: "TRUE", TailEndsWhenDone: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
+  // Real size cuts for the F3 rows that still timed out at MaxVer 3: one run, retry or fault fewer.
+  ["C02-idless-r2", "the same, identity-less (two runs, not three)", "slice-idless", { ClearOnGenChange: "FALSE", MaxRuns: 2 }, "pass"],
+  ["Retry1-r2", "R28 retry debt, one device (two runs, three retries)", "retry1", { MaxRuns: 2 }, "pass"],
+  ["Bud-delete-r3", "a budgeted backfill, two devices, a delete (three runs, three retries)", "bud", { MaxDeletes: 1, MaxSessions: 0, MaxRuns: 3, MaxRetry: 3 }, "pass"],
+  ["Bud-restart-r3", "a budgeted backfill, two devices, a restart (three runs, three retries)", "bud", { MaxDeletes: 0, MaxSessions: 1, MaxRuns: 3, MaxRetry: 3 }, "pass"],
+  ["Bud2-r2", "a budgeted backfill with a sibling, one device (two runs)", "bud2", { MaxRuns: 2 }, "pass"],
+  ["Live-rr1", "liveness of the design (one scheduled rerun)", "live", { ...CUT, MaxReruns: 1 }, "pass", "liveness"],
+  ["Slice-accounts-r2", "the design: two accounts (two runs)", "slice-accounts", { ...CUT, MaxRuns: 2 }, "pass"],
+  ["Slice-faults2-r2", "the design: a restart and a failed entry (two runs)", "slice-faults", { ...CUT, MaxLost: 0, MaxRuns: 2 }, "pass"],
+  ["Slice-idless-r2", "the design: an identity-less connector, two accounts (two runs)", "slice-idless", { MaxRuns: 2 }, "pass"],
+  ["Slice-intake-a0", "identity-less intake, two devices (no abort)", "slice-intake", { MaxAbort: 0 }, "pass"],
+  ["Slice-intake1-r3", "identity-less intake, one device (three runs, not four)", "slice-intake1", { MaxRuns: 3 }, "pass"],
+  ["Slice-q9-r3", "an old stream DELETE, a device that leaves (three runs, not four)", "slice-q9", { MaxRuns: 3 }, "pass"],
+  ["W-trace-b-l0", "trace B with no lost reply", "lean", { MaxLost: 0 }, "NotTraceB", "witness"],
+  ["F3-live-retry-delete-rr3", "non-budget retry debt under delete and fair repair; runs never overlap; three scheduled reruns (the retry run, its continuation, the full repair)", "live", { MaxRetry: 1, PartialCover: "FALSE", Readers: "{}", Views: "FALSE", SerialRuns: "TRUE", MaxReruns: 3 }, "pass", "liveness"],
+  ["C-tail-forever-rr3", "history_tail lasts through every covered incremental read of a non-budgeted stream (three reruns, runs never overlap)", "live", { MaxRetry: 1, PartialCover: "FALSE", Readers: "{}", Views: "FALSE", SerialRuns: "TRUE", MaxReruns: 3, TailEndsWhenDone: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
+  ["F3-live-retry-delete-overlap", "the same as -rr3 with overlapping runs allowed", "live", { MaxRetry: 1, PartialCover: "FALSE", Readers: "{}", Views: "FALSE", MaxReruns: 3 }, "pass", "liveness"],
+  ["F3-retry-lost-delete", "retry head reply lost across a remote delete", "split", { Desktop: "nodesk", Streams: "{s1}", MaxRuns: 1, MaxRetry: 1, MaxLost: 1, MaxVer: 2 }, "pass"],
+  ["F3-live-retry-delete", "non-budget retry debt under delete and fair repair", "live", { MaxRetry: 1, PartialCover: "FALSE", Readers: "{}", Views: "FALSE" }, "pass", "liveness"],
+
   // --- section 4 scenarios: each must be reachable (NotX violated) ---
   ["W-trace-a", "trace A: a lost create lands and is deleted before its resend", "lean", {}, "NotTraceA", "witness"],
   ["W-trace-b", "trace B: a userConnect entry meets a delete and reconnect", "lean", {}, "NotTraceB", "witness"],
@@ -583,6 +759,11 @@ export const CONFIGS = [
   ["W-budget-resume", "R28: a budgeted stream resumes at page 2 from its saved cursor", "bud", { MaxDeletes: 0, MaxSessions: 0 }, "NotBudgetResume", "witness"],
   ["W-token-resume", "R28: a retry token is issued incremental under needsFull", "retry1", {}, "NotTokenResume", "witness"],
   ["W-mixed-modes", "R28: a retrying stream resumes while a sibling with needsFull is issued nothing", "retry1", {}, "NotMixedModes", "witness"],
+  ["W-snapshot-resume", "R30.4: an incremental:false stream is issued its cursor from an active attempt", "r30-prov", {}, "NotSnapshotResume", "witness"],
+  ["W-tomb-invalidates", "R29/R30.5: a begin is full/null for a stream whose continuation a tombstone invalidated", "r30-wit", {}, "NotTombInvalidates", "witness"],
+  ["W-oversized-only", "R30.8: a retry run whose received upserts were all oversized", "r30-pub", {}, "NotOversizedOnly", "witness"],
+  ["W-retry-seed-deferred", "R30.1: a retry run on the seeding Desktop leaves a seed receipt pending", "r30-pub", {}, "NotRetrySeedDeferred", "witness"],
+  ["W-sibling-cursor", "R30.7: an incomplete head is published while a sibling holds a saved cursor", "r30-sib", {}, "NotSiblingCursor", "witness"],
   ["W-retry-merge", "R28: a record-bearing uncovered retry stream is published as a merge", "retry1", {}, "NotRetryMerge", "witness"],
 ].map(([name, why, profile, changes, expect, kind = "safety", simulate]) => ({
   name,
@@ -607,7 +788,9 @@ export function configText(config) {
       ? [
           "INVARIANT TypeOK",
           // L2 is about imports: a profile without views does not check it.
-          ...(constants.Budgeted !== "{}"
+          ...(constants.Periodic === "TRUE"
+            ? LIVENESS_SNAP
+            : constants.Budgeted !== "{}"
             ? LIVENESS_BUDGET
             : LIVENESS.filter((p) => constants.Views === "TRUE" || p !== "L2_Convergence")
           ).map((p) => `PROPERTY ${p}`),

@@ -106,7 +106,20 @@ CONSTANTS
   RetryMerges,           \* a retry publish merges into its base
   FullRefreshNoCursor,   \* a stream issued full_refresh has no cursor (R24)
   KeepProvOnSuccess,     \* retry provenance survives a later succeeded run
-  PerStreamRetryResume   \* an eligible retry cursor is issued under needsFull
+  PerStreamRetryResume,  \* an eligible retry cursor is issued under needsFull
+  \* --- R30 (amendments to R28) guards ---
+  RetrySeedDeferred,     \* a retry run plans no seed-only stream; its receipt is deferred (R30.1)
+  RetryGuardFull,        \* retry completeness needs covered AND actually read full (R30.2)
+  EffFullFact,           \* completeness and debt clearing read the mode issued per stream (R30.3)
+  TwoProvStates,         \* active_attempt and history_tail are separate states (R30.4)
+  WitnessAtBegin,        \* a head tombstone invalidates a continuation before START (R30.5, R29)
+  WitnessAtSave,         \* ... and before the save (R30.5)
+  TailEndsWhenDone,      \* history_tail ends when a covered, non-budgeted incremental read ends (R30.4 gap)
+  PerStreamClear,        \* an incomplete stream clears only its own checkpoint entry (R30.7)
+  ReceivedCount,         \* "all empty" counts received upserts, not spooled rows (R30.8)
+  Oversized,             \* a bound, not a guard: a retry run may receive oversized upserts
+  SerialRuns,            \* a bound, not a guard: no run starts while another device's run is in flight
+  Periodic               \* a bound, not a guard: scheduled covering reruns (snapshot liveness)
 
 \* Desktop may be a model value outside Devices (profiles with no seeding device).
 ASSUME LegacyFrom \in Streams /\ OtherKey \subseteq Devices
@@ -140,11 +153,12 @@ VARIABLES
   acked,     \* ghost: <<n, s, version, head>> for every head commit acknowledged
   selfConflict, \* ghost: a request was refused because of its own row
   quiet,     \* ghost: <<rid, s>> when a retry_pending save kept a cursor of a stream with no records
+  sib,       \* ghost (R30.7): an incomplete stream's publish cleared a sibling stream's checkpoint entry
   cnt
 
 vars == <<ctl, hd, failed, store, login, listing, known,
           stopped, needsFull, ckpt, ob, view, psv, inflight, seedTarget, rcpt, clock,
-          commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, cnt>>
+          commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, sib, cnt>>
 
 ----------------------------------------------------------------------------
 Null == [x \in {} |-> 0]  \* no listing this session (a function, so it compares with listings)
@@ -158,13 +172,26 @@ FileOf(a, origin, id) ==
   [present |-> TRUE, at |-> 0, lines |-> {<<p, 0, a, origin>> : p \in PK}, id |-> id]
 \* A head.  oc (ghost): a run published it for a stream it did not cover,
 \* and not as the Desktop seed (only controls set it).
-NoHead == [g |-> 0, lines |-> {}, complete |-> FALSE, key |-> "", at |-> 0, oc |-> FALSE]
+NoHead == [g |-> 0, lines |-> {}, complete |-> FALSE, key |-> "", at |-> 0, oc |-> FALSE,
+           gr |-> FALSE, sr |-> FALSE]
 NoReq == [ver |-> 0, h |-> NoHead]
 NoCur == [s \in Streams |-> 0]
 \* A checkpoint: cur[s] is the run whose cursor is saved, pg[s] the page it
 \* names (budgeted streams), prov[s] the run whose cursor carries retry
 \* provenance (R28; 0 = none), all tagged (n, g).
-NoCk == [n |-> "none", g |-> 0, cur |-> NoCur, pg |-> NoCur, prov |-> NoCur, ctlOk |-> FALSE]
+\* R30.4: ph[s] is the provenance state of the cursor: "n" none, "A" active_attempt
+\* (an unfinished export attempt), "H" history_tail (incomplete history that
+\* later incremental pages keep).  wv[s] is the history witness (stream row
+\* length at save, R30.5); tw[s] (ghost) records a tombstone above the
+\* run's anchor at save time.
+NoPh == [s \in Streams |-> "n"]
+NoTw == [s \in Streams |-> FALSE]
+NoCk == [n |-> "none", g |-> 0, cur |-> NoCur, pg |-> NoCur, prov |-> NoCur,
+         ph |-> NoPh, wv |-> NoCur, tw |-> NoTw, ctlOk |-> FALSE]
+\* R30.7: one stream's checkpoint entry is cleared alone.
+ClearS(ck, s) == [ck EXCEPT !.cur[s] = 0, !.pg[s] = 0, !.prov[s] = 0, !.ph[s] = "n",
+                            !.wv[s] = 0, !.tw[s] = FALSE]
+NormCk(ck) == IF \A s \in Streams : ck.cur[s] = 0 THEN NoCk ELSE ck
 \* An entry.  full: the issued collection mode is full_refresh (never read
 \* from the state).  sw: the issued state belongs to another namespace.
 \* stOk: the START state the connector used is the writer's issue.  cov:
@@ -182,13 +209,27 @@ NoEntry == [rid |-> 0, a |-> "none", n |-> "none", start |-> Null, uc |-> FALSE,
             \* a budgeted stream read; rs, a budgeted stream restarted from
             \* page 1 though its device has published it; early (control).
             iss |-> NoCur, el |-> {}, nf |-> {}, pg |-> NoCur, rs |-> FALSE, early |-> FALSE,
+            \* R30: ovz, streams whose received upserts were all oversized
+            \* (excluded, never spooled); ep, the provenance state each
+            \* stream was issued from; wb, the witness anchor of each
+            \* stream's continuation; rb (ghost), streams issued a cursor
+            \* whose witness was already broken.
+            ovz |-> {}, ep |-> NoPh, wb |-> NoCur, rb |-> {},
             st |-> [s \in Streams |-> "none"], g |-> [s \in Streams |-> 0],
             req |-> [s \in Streams |-> NoReq], seeding |-> {},
             seen |-> [s \in Streams |-> 0]]
 NoFin == [n |-> "none", T |-> 0, seen |-> [s \in Streams |-> 0], cov |-> {}]
 \* An old app's non-exclusive DELETE writes this row (limitation L11).
-TombHead == [g |-> 0, lines |-> {}, complete |-> FALSE, key |-> "old", at |-> 0, oc |-> FALSE]
+TombHead == [g |-> 0, lines |-> {}, complete |-> FALSE, key |-> "old", at |-> 0, oc |-> FALSE,
+             gr |-> FALSE, sr |-> FALSE]
 IsTomb(h) == h.key = "old"
+\* An L11 tombstone above version v (an accepted limitation).
+TombAfter(n, s, v) == \E i \in v + 1..Len(hd[n][s]) : IsTomb(hd[n][s][i])
+\* R30.5: the history witness of a continuation saved when the stream row had v
+\* versions: no tombstone (or incompatible replacement, modelled as one) above
+\* it, and the row at v is not one.  v = 0 is a pre-head absence witness: it
+\* holds only while the stream has never been tombstoned.
+WitNow(n, s, v) == ~TombAfter(n, s, v) /\ (v = 0 \/ ~IsTomb(hd[n][s][v]))
 
 Max(a, b) == IF a > b THEN a ELSE b
 Min(a, b) == IF a < b THEN a ELSE b
@@ -291,7 +332,7 @@ Decide(d, s) ==
                       /\ UNCHANGED <<admitted, known>>
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, stopped,
                  needsFull, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 inserted, lateOld, left, fin, acked, selfConflict, quiet, cnt>>
+                 inserted, lateOld, left, fin, acked, selfConflict, quiet, sib, cnt>>
 
 \* Create or reconnect POST (2.3): exclusive, identical bytes, exact resend
 \* after a lost reply.  A success or replay is followed by a re-read: the
@@ -328,7 +369,7 @@ CtlPost(d, s) ==
            /\ UNCHANGED <<ctl, ob, admitted, known>>
   /\ UNCHANGED <<hd, failed, store, login, listing, stopped,
                  needsFull, ckpt, view, psv, seedTarget, rcpt, clock, commits, inserted, lateOld, left, fin,
-                 acked, selfConflict, quiet>>
+                 acked, selfConflict, quiet, sib>>
 
 ----------------------------------------------------------------------------
 \* The head row version to write after (2.3).  The design: the latest row,
@@ -377,7 +418,7 @@ PlanStale(d, s) ==
   /\ UNCHANGED <<store, needsFull, ckpt, commits, rcpt>>
   /\ UNCHANGED <<ctl, hd, failed, login, listing, known, stopped,
                  view, psv, inflight, seedTarget, clock, admitted, inserted, lateOld, left, fin, acked,
-                 selfConflict, quiet, cnt>>
+                 selfConflict, quiet, sib, cnt>>
 
 \* The publish half: the row's generation is at most T.
 \*
@@ -393,18 +434,35 @@ PlanStale(d, s) ==
 \* (control) every stream is published, covered or not.
 \* R28: a retry_pending end that received records also publishes its
 \* record-bearing uncovered streams (as merges, complete:false).
+\* R30.1: the retry publication set is the covered streams plus the streams
+\* with accepted upserts (an oversized upsert is received, not accepted).
 PubSet(e) == IF ~PublishCoveredOnly THEN Streams
-             ELSE IF e.out = "retry" THEN e.cov \cup e.emit ELSE e.cov
+             ELSE IF e.out = "retry" THEN e.cov \cup (e.emit \ e.ovz) ELSE e.cov
+\* R30.8: "all empty" is the received-upsert count, not the spooled rows.
+AllEmpty(e) == IF ReceivedCount THEN e.emit = {} ELSE (e.emit \ e.ovz) = {}
 \* The stream's actual coverage result (the producer's coveredStreams).
 CovD(e, s) == s \in e.cov \/ ~PublishCoveredOnly \/ (e.out = "retry" /\ ~RetryHeadIncomplete)
 \* "Full" per stream (R28, v2 3.0): the run's issued mode is full_refresh, the
 \* stream was issued no state (a null state is a full read of it), or the
 \* stream is declared incremental: false.
-FullS(e, s) == e.full \/ e.iss[s] = 0 \/ s \in FullStreams
+\* R30.3: the mode actually issued for the stream, never the declaration.
+FullS(e, s) == IF EffFullFact THEN e.iss[s] = 0
+               ELSE e.full \/ e.iss[s] = 0 \/ s \in FullStreams
 \* A retry-progress stream: its incomplete history keeps its cursor (R28).
 RP(e, s) == e.out = "retry" \/ (KeepProvOnSuccess /\ s \in e.el)
 \* The streams whose cursors the run saves.
-KeepSet(e) == IF e.out = "retry" THEN e.cand ELSE e.cov
+\* R30.8: a stream whose upserts were all oversized is excluded from the
+\* retained set, so its cursor never passes a dropped record.
+KeepSet(e) == IF e.out = "retry" THEN e.cand \ e.ovz ELSE e.cov
+\* R30.7: clearing an incomplete stream's entry.
+ClearFor(d, n, s) ==
+  IF ckpt[d] # NoCk /\ ckpt[d].n = n /\ PerStreamClear
+  THEN NormCk(ClearS(ckpt[d], s)) ELSE NoCk
+SibLoss(d, n, s) ==
+  /\ ckpt[d] # NoCk /\ ckpt[d].n = n
+  /\ \E t \in Streams \ {s} :
+       /\ ckpt[d].cur[t] # 0
+       /\ LET c == ClearFor(d, n, s) IN c = NoCk \/ c.cur[t] = 0
 
 PlanPublish(d, s) ==
   LET e == ob[d]
@@ -431,9 +489,16 @@ PlanPublish(d, s) ==
       lines == Merge(kept \cup seedLines \cup runLines)
       \* Covered is necessary, not sufficient (R28).  An uncovered retry
       \* head is never complete:true, whatever its base or mode.
-      complete == ~e.sw /\ (seeded \/ (covd /\ (fullS \/ base.complete)))
+      \* R30.2: on the retry path a head is complete only if covered AND
+      \* actually read full (or onto a complete base); "uncovered" alone is
+      \* not the guard.
+      complete == ~e.sw /\ (seeded \/ (covd /\ (fullS \/ base.complete
+                                              \/ (~RetryGuardFull /\ e.out = "retry"))))
+      \* Ghost: what the head may honestly claim.
+      grounded == seeded \/ (s \in e.cov /\ (e.iss[s] = 0 \/ base.complete))
       h == [g |-> T, lines |-> lines, complete |-> complete, key |-> Key(d),
-            at |-> e.rid, oc |-> (s \notin e.cov /\ ~seeded)]
+            at |-> e.rid, oc |-> (s \notin e.cov /\ ~seeded),
+            gr |-> grounded, sr |-> (seeded /\ e.out = "retry" /\ ~pub)]
       seeding == IF first THEN e.seeding \cup {s} ELSE e.seeding
       \* Q9: a no-op onto a complete:false base of generation T
       q9 == NoOpNeedsFull /\ base # NoHead /\ ~base.complete
@@ -445,7 +510,7 @@ PlanPublish(d, s) ==
              /\ ob' = [ob EXCEPT ![d].st[s] = "done", ![d].g[s] = 0,
                                  ![d].seeding = seeding, ![d].seen[s] = N]
              /\ rcpt' = IF first THEN rcpt \cup {<<n, s>>} ELSE rcpt
-             /\ UNCHANGED <<store, commits, needsFull, ckpt>>
+             /\ UNCHANGED <<store, commits, needsFull, ckpt, sib>>
         \* No-op (2.6): a base of generation T, and every part and
         \* `complete` unchanged, or an empty spool with no seed (generation
         \* > 1: the receipt records "skipped", 2.9).  No upload and no
@@ -465,7 +530,8 @@ PlanPublish(d, s) ==
              /\ rcpt' = IF first THEN rcpt \cup {<<n, s>>} ELSE rcpt
              /\ needsFull' = IF q9 THEN [needsFull EXCEPT ![d] = @ \cup {<<n, s>>}]
                              ELSE needsFull
-             /\ ckpt' = IF q9 /\ ~rp THEN [ckpt EXCEPT ![d] = NoCk] ELSE ckpt
+             /\ ckpt' = IF q9 /\ ~rp THEN [ckpt EXCEPT ![d] = ClearFor(d, n, s)] ELSE ckpt
+             /\ sib' = (sib \/ (q9 /\ ~rp /\ SibLoss(d, n, s)))
              /\ UNCHANGED store
         ELSE /\ store' = store \cup Objects(n, s, h)
              /\ ob' = [ob EXCEPT ![d].st[s] = "posted", ![d].seeding = seeding,
@@ -476,7 +542,8 @@ PlanPublish(d, s) ==
                              ELSE needsFull
              \* R28: the debt (needsFull) stays visible, but a retry-progress
              \* stream keeps its safe cursor and provenance.
-             /\ ckpt' = IF ~complete /\ ~rp THEN [ckpt EXCEPT ![d] = NoCk] ELSE ckpt
+             /\ ckpt' = IF ~complete /\ ~rp THEN [ckpt EXCEPT ![d] = ClearFor(d, n, s)] ELSE ckpt
+             /\ sib' = (sib \/ (~complete /\ ~rp /\ SibLoss(d, n, s)))
              /\ UNCHANGED <<commits, rcpt>>
   /\ UNCHANGED <<ctl, hd, failed, login, listing, known, stopped,
                  view, psv, inflight, seedTarget, clock, admitted, inserted, lateOld, left, fin, acked,
@@ -493,14 +560,41 @@ SaveCk(d, n, g, S, e, ok) ==
   LET same == ckpt[d] # NoCk /\ ckpt[d].n = n /\ ckpt[d].g = g
       prev == IF same THEN ckpt[d] ELSE NoCk
       debt(s) == <<n, s>> \in needsFull[d]
-      pv(s) == IF s \in S
-               THEN (IF debt(s) /\ (e.out = "retry" \/ (KeepProvOnSuccess /\ s \in e.el))
-                     THEN e.rid ELSE 0)
-               ELSE (IF debt(s) THEN prev.prov[s] ELSE 0)
+      \* R30.4: the provenance state a stream's new cursor carries.  A retry
+      \* end opens an active attempt: an incremental:false stream always, an
+      \* incremental-capable stream while it holds debt.  A later succeeded
+      \* run that resumed it ends the attempt of an incremental:false stream
+      \* (the next begin is full/null) and turns an incremental-capable
+      \* stream's into history_tail while the debt remains.  Without
+      \* TwoProvStates (control) there is one bit and no attempt ever ends.
+      rawPh(s) ==
+        IF e.out = "retry"
+        THEN (IF s \in FullStreams \/ debt(s) THEN "A" ELSE "n")
+        ELSE IF s \in e.el /\ KeepProvOnSuccess
+             THEN (IF s \in FullStreams /\ TwoProvStates THEN "n"
+                   ELSE IF debt(s) /\ (~TailEndsWhenDone \/ s \in Budgeted \/ s \notin e.cov \/ s \in FullStreams)
+                        THEN "H" ELSE "n")
+             ELSE "n"
+      carry(s) == rawPh(s) # "n" \/ s \in e.el
+      \* R30.5: a tombstone above the run's anchor (checked at save).
+      broken(s) == carry(s) /\ TombAfter(n, s, e.wb[s])
+      wok(s) == ~WitnessAtSave \/ ~broken(s)
+      Sv == {s \in S : wok(s)}
+      phv(s) == IF s \in Sv THEN rawPh(s) ELSE "n"
+      \* Streams not saved by this run keep their pair while it stays eligible.
+      kph(s) == IF prev.ph[s] = "n" THEN "n"
+                ELSE IF debt(s) \/ s \in FullStreams THEN prev.ph[s] ELSE "n"
   IN [n |-> n, g |-> g,
-      cur |-> [s \in Streams |-> IF s \in S THEN e.rid ELSE prev.cur[s]],
-      pg |-> [s \in Streams |-> IF s \in S THEN e.pg[s] ELSE prev.pg[s]],
-      prov |-> [s \in Streams |-> pv(s)], ctlOk |-> ok]
+      cur |-> [s \in Streams |-> IF s \in Sv THEN e.rid ELSE IF s \in S THEN 0 ELSE prev.cur[s]],
+      pg |-> [s \in Streams |-> IF s \in Sv THEN e.pg[s] ELSE IF s \in S THEN 0 ELSE prev.pg[s]],
+      prov |-> [s \in Streams |-> IF s \in S THEN (IF phv(s) # "n" THEN e.rid ELSE 0)
+                                  ELSE (IF kph(s) # "n" THEN prev.prov[s] ELSE 0)],
+      ph |-> [s \in Streams |-> IF s \in S THEN phv(s) ELSE kph(s)],
+      wv |-> [s \in Streams |-> IF s \in S THEN (IF phv(s) # "n" THEN Len(hd[n][s]) ELSE 0)
+                                 ELSE (IF kph(s) # "n" THEN prev.wv[s] ELSE 0)],
+      tw |-> [s \in Streams |-> IF s \in S THEN (phv(s) # "n" /\ TombAfter(n, s, e.wb[s]))
+                                 ELSE (kph(s) # "n" /\ prev.tw[s])],
+      ctlOk |-> ok]
 
 \* Without CheckpointAfterAll the checkpoint is saved at the first commit.
 EarlyCkpt(d) ==
@@ -540,7 +634,7 @@ Post(d, s) ==
            /\ UNCHANGED <<hd, commits, inserted, lateOld, failed, ob, ckpt, acked, rcpt, needsFull,
                           selfConflict>>
   /\ UNCHANGED <<ctl, store, login, listing, known, stopped,
-                 view, psv, seedTarget, clock, admitted, left, fin, quiet>>
+                 view, psv, seedTarget, clock, admitted, left, fin, quiet, sib>>
 
 LateApply ==
   \E x \in inflight :
@@ -553,7 +647,7 @@ LateApply ==
             /\ UNCHANGED ctl
     /\ UNCHANGED <<store, login, listing, known, stopped, needsFull,
                    ckpt, ob, view, psv, seedTarget, rcpt, clock, admitted, left, fin, acked,
-                   selfConflict, quiet, cnt>>
+                   selfConflict, quiet, sib, cnt>>
 
 \* end{succeeded|partial}, or end{retry_pending} that received records (R28):
 \* every planned stream committed, no-op or skipped.  Re-read control; save
@@ -568,18 +662,18 @@ Finish(d) ==
       rcptOk == (d = Desktop /\ e.n = seedTarget) => \A s \in Streams : <<e.n, s>> \in rcpt
       keep == KeepSet(e)
       save == CheckpointAfterAll /\ ctlOk /\ ~e.incomp /\ rcptOk /\ keep # {}
-  IN /\ e # NoEntry /\ ~e.dead /\ (e.out = "ok" \/ (e.out = "retry" /\ e.emit # {}))
+  IN /\ e # NoEntry /\ ~e.dead /\ (e.out = "ok" \/ (e.out = "retry" /\ ~AllEmpty(e)))
      /\ \A s \in Streams : e.st[s] \in {"none", "done"}
      /\ ob' = [ob EXCEPT ![d] = NoEntry]
      /\ ckpt' = IF save THEN [ckpt EXCEPT ![d] = SaveCk(d, e.n, e.T, keep, e, ctlOk)]
                 ELSE ckpt
      /\ fin' = [fin EXCEPT ![d] = [n |-> e.n, T |-> e.T, seen |-> e.seen,
-                                   cov |-> IF e.out = "retry" THEN e.cov \cup e.emit ELSE e.cov]]
+                                   cov |-> IF e.out = "retry" THEN PubSet(e) ELSE e.cov]]
      /\ quiet' = IF save /\ e.out = "retry" THEN quiet \cup {<<e.rid, s>> : s \in keep \ e.emit}
                  ELSE quiet
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
                  stopped, needsFull, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, lateOld, left, acked, selfConflict, cnt>>
+                 admitted, inserted, lateOld, left, acked, selfConflict, sib, cnt>>
 
 \* end{retry_pending} with no record (R28, saveCheckpointOnly): the same
 \* admission as a normal end, then a checkpoint-only save of the candidate
@@ -596,17 +690,17 @@ RetryEmpty(d) ==
       ctlOk == t > 0 /\ CtlNow(e.n, Key(d)) = [k |-> "active", g |-> t]
       keep == e.cand
       save == ctlOk /\ keep # {}
-  IN /\ e # NoEntry /\ ~e.dead /\ e.out = "retry" /\ e.emit = {}
+  IN /\ e # NoEntry /\ ~e.dead /\ e.out = "retry" /\ AllEmpty(e)
      /\ t # -1
      /\ ob' = [ob EXCEPT ![d] = NoEntry]
      /\ ckpt' = IF save THEN [ckpt EXCEPT ![d] = SaveCk(d, e.n, t, keep, e, TRUE)]
                 ELSE IF t = 0 /\ ClearOnGenChange /\ S.k = "active" /\ ckpt[d].n = e.n
                 THEN [ckpt EXCEPT ![d] = NoCk]
                 ELSE ckpt
-     /\ quiet' = IF save THEN quiet \cup {<<e.rid, s>> : s \in keep} ELSE quiet
+     /\ quiet' = IF save THEN quiet \cup {<<e.rid, s>> : s \in keep \ e.emit} ELSE quiet
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
                  stopped, needsFull, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, lateOld, left, fin, acked, selfConflict, cnt>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict, sib, cnt>>
 
 \* Control only (RetryCkptAfterPublish = FALSE): the retry end saves its
 \* candidate at intake.end, before the records are published.
@@ -615,14 +709,14 @@ RetryEarly(d) ==
       t == EffTable(d, e)
       ctlOk == t > 0 /\ CtlNow(e.n, Key(d)) = [k |-> "active", g |-> t]
   IN /\ ~RetryCkptAfterPublish
-     /\ e # NoEntry /\ ~e.dead /\ e.out = "retry" /\ e.emit # {} /\ ~e.early
+     /\ e # NoEntry /\ ~e.dead /\ e.out = "retry" /\ ~AllEmpty(e) /\ ~e.early
      /\ ctlOk /\ e.cand # {}
      /\ ckpt' = [ckpt EXCEPT ![d] = SaveCk(d, e.n, t, e.cand, e, TRUE)]
      /\ ob' = [ob EXCEPT ![d].early = TRUE]
      /\ quiet' = quiet \cup {<<e.rid, s>> : s \in e.cand \ e.emit}
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
                  stopped, needsFull, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, lateOld, left, fin, acked, selfConflict, cnt>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict, sib, cnt>>
 
 \* end{failed|cancelled} or abort (v2 3.7, abortRun): the entry is
 \* removed; no head, no checkpoint.
@@ -631,7 +725,7 @@ Abort(d) ==
   /\ ob' = [ob EXCEPT ![d] = NoEntry]
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known, stopped, needsFull, ckpt,
                  view, psv, inflight, seedTarget, rcpt, clock, commits, admitted, inserted,
-                 lateOld, left, fin, acked, selfConflict, quiet, cnt>>
+                 lateOld, left, fin, acked, selfConflict, quiet, sib, cnt>>
 
 Progress(d) ==
   \/ \E s \in Streams : Decide(d, s) \/ CtlPost(d, s) \/ PlanStale(d, s) \/ PlanPublish(d, s)
@@ -674,7 +768,12 @@ StartRunFor(d, a, uc, out, allCov) ==
       \* A stream is eligible when its stored cursor carries retry
       \* provenance of the same namespace (the generation is checked at
       \* publish, as in the F2 model).
-      elig(s) == K0 # NoCk /\ K0.n = n /\ K0.prov[s] # 0
+      \* R30.4/5: a stream is eligible when its stored cursor carries a
+      \* provenance state of the same namespace whose history witness still
+      \* holds; an incremental:false stream resumes only an active attempt.
+      elig(s) == /\ K0 # NoCk /\ K0.n = n /\ K0.ph[s] # "n"
+                 /\ (~WitnessAtBegin \/ WitNow(n, s, K0.wv[s]))
+                 /\ (~TwoProvStates \/ s \notin FullStreams \/ K0.ph[s] = "A")
       nfd(s) == <<n, s>> \in needsFull[d]
       \* The host's issued state for stream s (R28 runPlan): explicit
       \* wantFull wins and issues nothing; a needsFull stream is issued
@@ -684,6 +783,12 @@ StartRunFor(d, a, uc, out, allCov) ==
       issue(w, s) ==
         IF cur0(s) = 0 THEN 0
         ELSE IF w /\ FullRefreshNoCursor THEN 0
+        \* R29/R30.5: a head tombstone above the continuation's witness
+        \* invalidates it; the stream begins full/null.
+        ELSE IF WitnessAtBegin /\ K0.ph[s] # "n" /\ ~WitNow(n, s, K0.wv[s]) THEN 0
+        \* intake issues no state to an incremental:false stream, unless
+        \* it continues an active attempt (R30.4)
+        ELSE IF s \in FullStreams /\ ~elig(s) THEN 0
         ELSE IF ~NeedsFullForcesFull THEN cur0(s)
         ELSE IF PerStreamRetryResume
              THEN (IF nfd(s) /\ ~elig(s) THEN 0 ELSE cur0(s))
@@ -693,6 +798,7 @@ StartRunFor(d, a, uc, out, allCov) ==
       tgt == IF d = Desktop /\ seedTarget = "none" THEN n ELSE seedTarget
       seedS == IF d = Desktop /\ n = tgt THEN {s \in Streams : <<n, s>> \notin rcpt} ELSE {}
   IN /\ d \notin left /\ ob[d] = NoEntry
+     /\ (~SerialRuns \/ \A x \in Devices : ob[x] = NoEntry)
      /\ uc \/ stopped[d][n] = 0
      \* Choices with identical futures are made canonical: wantFull on a
      \* run that resumes no cursor anyway; records of a stream whose spool
@@ -703,6 +809,7 @@ StartRunFor(d, a, uc, out, allCov) ==
                    ELSE {NoCur, [s \in Streams |-> cur0(s)]} :
         \E E \in SUBSET Streams, P \in (SUBSET PK) \ {{}},
            cov \in SUBSET Streams, cand \in SUBSET Streams :
+        \E O \in IF Oversized /\ out = "retry" THEN SUBSET E ELSE {{}} :
           LET hi == [s \in Streams |-> issue(wf, s)]
               \* the page a budgeted stream reads: the one after its used cursor
               pgS(s) == IF s \in Budgeted
@@ -714,6 +821,9 @@ StartRunFor(d, a, uc, out, allCov) ==
           /\ out # "retry" => cand = {}
           /\ out = "ok" /\ PublishCoveredOnly => E \subseteq cov
           /\ out = "abort" => E = {}
+          \* R30.8: oversized upserts are received and excluded; their stream
+          \* is not covered (the client fails a session that skips one).
+          /\ O \cap cov = {}
           /\ allCov => E = Streams /\ cov = Streams
           /\ out = "ok" /\ ~PartialCover => cov = Streams
           \* A budgeted stream reads its next page and emits it; before its
@@ -728,15 +838,24 @@ StartRunFor(d, a, uc, out, allCov) ==
                       !.sw = (K0 # NoCk /\ K0.n # n /\ \E s \in Streams : use[s] # 0),
                       !.stOk = (use = hi), !.pks = P, !.emit = E,
                       !.cov = cov, !.cand = cand, !.out = out,
-                      !.iss = hi,
+                      !.iss = hi, !.ovz = O,
                       !.el = IF wf THEN {} ELSE {s \in Streams : elig(s) /\ hi[s] # 0},
+                      !.ep = [s \in Streams |-> IF ~wf /\ elig(s) /\ hi[s] # 0 THEN K0.ph[s] ELSE "n"],
+                      !.wb = [s \in Streams |-> IF ~wf /\ elig(s) /\ hi[s] # 0 THEN K0.wv[s]
+                                                ELSE Len(hd[n][s])],
+                      !.rb = IF wf THEN {}
+                             ELSE {s \in Streams : K0 # NoCk /\ K0.n = n /\ K0.ph[s] # "n" /\ hi[s] # 0
+                                                   /\ ~WitNow(n, s, K0.wv[s])},
                       !.nf = {s \in Streams : nfd(s)},
                       !.pg = [s \in Streams |-> pgS(s)],
                       !.rs = \E s \in Budgeted :
                                /\ hi[s] = 0 /\ ~wf /\ Live(n, s)
                                /\ Latest(n, s).key = Key(d) /\ Latest(n, s).lines # {}]
-                 planned == IF out = "abort" \/ (out = "retry" /\ E = {}) THEN {}
-                            ELSE PubSet(e) \cup seedS
+                 \* R30.1: a retry run plans no seed-only stream (its
+                 \* receipt is deferred); the seed enriches only streams
+                 \* the run publishes anyway.
+                 planned == IF out = "abort" \/ (out = "retry" /\ AllEmpty(e)) THEN {}
+                            ELSE PubSet(e) \cup (IF out = "retry" /\ RetrySeedDeferred THEN {} ELSE seedS)
              IN /\ ob' = [ob EXCEPT ![d] = [e EXCEPT
                             !.st = [s \in Streams |-> IF s \in planned THEN "planned" ELSE "none"]]]
      /\ login' = [login EXCEPT ![d] = a]
@@ -745,7 +864,21 @@ StartRunFor(d, a, uc, out, allCov) ==
      /\ clock' = rid
   /\ UNCHANGED <<ctl, hd, failed, store, listing, known, needsFull,
                  ckpt, view, psv, inflight, rcpt, commits, admitted, inserted, lateOld, left, fin, acked,
-                 selfConflict, quiet>>
+                 selfConflict, quiet, sib>>
+
+\* A scheduled rerun starts from a current listing (the scheduler lists, then
+\* runs); a rerun on a stale listing is discarded and wastes the bounded
+\* supply of reruns, which the liveness assumption takes as unbounded.
+FreshListing(d) == listing[d] # Null /\ listing[d] = [n \in NS |-> CtlLen(n)]
+
+\* The scheduler's next covering run of a connector with incremental: false
+\* streams (liveness configs: Periodic).  It ends succeeded and covers every
+\* stream: the assumption of L6, that the connector eventually completes the
+\* attempt it keeps resuming.
+SnapRerun(d, a) ==
+  /\ Periodic /\ cnt.reruns < MaxReruns /\ FreshListing(d)
+  /\ StartRunFor(d, a, FALSE, "ok", TRUE)
+  /\ cnt' = [cnt EXCEPT !.reruns = @ + 1]
 
 StartRun(d, a, uc) ==
   /\ cnt.runs < MaxRuns
@@ -761,7 +894,7 @@ StartRun(d, a, uc) ==
 \* (liveness configs only: MaxReruns > 0).  It covers every stream.
 Rerun(d, a) ==
   /\ cnt.reruns < MaxReruns
-  /\ listing[d] # Null
+  /\ FreshListing(d)
   /\ \E s \in Streams : Live(NSOf(a), s) /\ ~Latest(NSOf(a), s).complete
   /\ StartRunFor(d, a, FALSE, "ok", TRUE)
   /\ cnt' = [cnt EXCEPT !.reruns = @ + 1]
@@ -772,7 +905,7 @@ Rerun(d, a) ==
 \* page is published, so a restart at page 1 is observable.
 PagesPub(n, s) == Live(n, s) /\ AllPageKeys \subseteq PKsOf(Latest(n, s).lines)
 BudgetRerun(d, a) ==
-  /\ Budgeted # {} /\ cnt.reruns < MaxReruns /\ listing[d] # Null
+  /\ Budgeted # {} /\ cnt.reruns < MaxReruns /\ FreshListing(d)
   /\ \E out \in {"ok", "retry"} :
        StartRunFor(d, a, FALSE, out, FALSE) /\ cnt' = [cnt EXCEPT !.reruns = @ + 1]
 
@@ -798,7 +931,7 @@ List(d) ==
      /\ stopped' = [stopped EXCEPT ![d] = [n \in NS |-> StopNext(d, n)]]
   /\ UNCHANGED <<ctl, hd, failed, store, login, needsFull, view,
                  psv, inflight, seedTarget, rcpt, clock, commits, admitted, inserted, lateOld, left, fin, acked,
-                 selfConflict, quiet, cnt>>
+                 selfConflict, quiet, sib, cnt>>
 
 \* App restart or crash: no listing this session; decisions in memory are
 \* lost; persisted requests stay.
@@ -812,7 +945,7 @@ NewSession(d) ==
   /\ cnt' = [cnt EXCEPT !.sessions = @ + 1]
   /\ UNCHANGED <<ctl, hd, failed, store, login, known, stopped,
                  needsFull, ckpt, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, sib>>
 
 \* A permanent failure of the entry: it stays, never publishes, and its
 \* local rows stay a read-time overlay (2.9).
@@ -822,7 +955,7 @@ FailEntry(d) ==
   /\ cnt' = [cnt EXCEPT !.fails = @ + 1]
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
                  stopped, needsFull, ckpt, view, psv, inflight, seedTarget, rcpt, clock,
-                 commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet>>
+                 commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, sib>>
 
 \* Import (2.9): one pass of the sync loop.  Every stream's local rows
 \* become the live verified head (own key), or are purged.  Without
@@ -839,7 +972,7 @@ Import(d) ==
                  IF Blocked(d, n, s) THEN view[d][n][s] ELSE Want(d, n, s)]]]
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
                  stopped, needsFull, ckpt, ob, psv, inflight, seedTarget, rcpt, clock,
-                 commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, cnt>>
+                 commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, sib, cnt>>
 
 \* Delete the connector (2.11): tombstone every active control row of c,
 \* foreign ones too; purge local rows, entries and the checkpoint; stop.
@@ -856,7 +989,7 @@ UserDelete(d) ==
   /\ known' = [known EXCEPT ![d] = [n \in NS |-> IF n \in on THEN CtlLen(n) + 1 ELSE known[d][n]]]
   /\ cnt' = [cnt EXCEPT !.deletes = @ + 1]
   /\ UNCHANGED <<hd, failed, store, login, listing, needsFull, psv, inflight,
-                 seedTarget, rcpt, clock, commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet>>
+                 seedTarget, rcpt, clock, commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, sib>>
 
 \* A device stops forever (uninstall, cleared browser storage): its
 \* outbox entry, needsFull and checkpoint are gone.
@@ -871,7 +1004,7 @@ Leave(d) ==
   /\ cnt' = [cnt EXCEPT !.leaves = @ + 1]
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known, stopped,
                  psv, inflight, seedTarget, rcpt, clock, commits, admitted, inserted,
-                 lateOld, acked, selfConflict, quiet>>
+                 lateOld, acked, selfConflict, quiet, sib>>
 
 \* Limitation L11: an old app's non-exclusive DELETE writes a tombstone at
 \* the next stream version; earlier versions stay.
@@ -882,7 +1015,7 @@ OldDelete(n, s) ==
   /\ cnt' = [cnt EXCEPT !.olddel = @ + 1]
   /\ UNCHANGED <<ctl, failed, store, login, listing, known, stopped,
                  needsFull, ckpt, ob, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, sib>>
 
 \* Best-effort cleanup (2.11): the objects of every head of generation
 \* <= a deleted D, all streams of n in one step.
@@ -894,7 +1027,7 @@ Cleanup(n, D) ==
         /\ store' = store \ gone
   /\ UNCHANGED <<ctl, hd, failed, login, listing, known, stopped,
                  needsFull, ckpt, ob, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, cnt>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, sib, cnt>>
 
 SettleFail(n, s, i) ==
   /\ cnt.settle < MaxSettleFail
@@ -903,7 +1036,7 @@ SettleFail(n, s, i) ==
   /\ cnt' = [cnt EXCEPT !.settle = @ + 1]
   /\ UNCHANGED <<ctl, hd, store, login, listing, known, stopped,
                  needsFull, ckpt, ob, view, psv, inflight, seedTarget, rcpt, clock, commits,
-                 admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet>>
+                 admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, sib>>
 
 Lens == [n \in NS |-> [c |-> CtlLen(n), h |-> [s \in Streams |-> Len(hd[n][s])]]]
 PsSync(p) ==
@@ -911,7 +1044,7 @@ PsSync(p) ==
   /\ psv' = [psv EXCEPT ![p] = Lens]
   /\ UNCHANGED <<ctl, hd, failed, store, login, listing, known,
                  stopped, needsFull, ckpt, ob, view, inflight, seedTarget, rcpt, clock,
-                 commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, cnt>>
+                 commits, admitted, inserted, lateOld, left, fin, acked, selfConflict, quiet, sib, cnt>>
 
 ----------------------------------------------------------------------------
 Init ==
@@ -941,12 +1074,13 @@ Init ==
   /\ acked = {}
   /\ selfConflict = FALSE
   /\ quiet = {}
+  /\ sib = FALSE
   /\ cnt = [runs |-> 0, reruns |-> 0, deletes |-> 0, lost |-> 0, sessions |-> 0,
             settle |-> 0, fails |-> 0, leaves |-> 0, olddel |-> 0, retries |-> 0, aborts |-> 0]
 
 Next ==
   \/ \E d \in Devices, a \in Acct, uc \in BOOLEAN : StartRun(d, a, uc)
-  \/ \E d \in Devices, a \in Acct : Rerun(d, a) \/ BudgetRerun(d, a)
+  \/ \E d \in Devices, a \in Acct : Rerun(d, a) \/ BudgetRerun(d, a) \/ SnapRerun(d, a)
   \/ \E d \in Devices : Progress(d) \/ List(d) \/ NewSession(d) \/ FailEntry(d)
   \/ LateApply
   \/ \E d \in Devices : Import(d)
@@ -960,6 +1094,7 @@ Next ==
 Fairness ==
   /\ \A d \in Devices : WF_vars(Progress(d)) /\ WF_vars(List(d))
   /\ \A d \in Devices, a \in Acct : WF_vars(Rerun(d, a)) /\ WF_vars(BudgetRerun(d, a))
+                                    /\ WF_vars(SnapRerun(d, a))
   /\ \A d \in Devices : WF_vars(Import(d))
   /\ \A p \in Readers : WF_vars(PsSync(p))
   /\ WF_vars(LateApply)
@@ -1031,9 +1166,6 @@ ReadinessR(r, F) ==
 ----------------------------------------------------------------------------
 \* Safety properties (README.md gives the reading of each).
 AcctLine(l) == l[4] \in {"run", "legacy"}
-
-\* An L11 tombstone above version v (an accepted limitation).
-TombAfter(n, s, v) == \E i \in v + 1..Len(hd[n][s]) : IsTomb(hd[n][s][i])
 
 \* S1 against the current stream row: while control is active(g), every
 \* acknowledged head of generation g is covered by the current row, which
@@ -1158,7 +1290,8 @@ TypeOK ==
        ob[d].st[s] \in {"none", "planned", "creating", "reconnecting", "decided", "posted", "done"}
   /\ \A d \in Devices : ob[d].out \in Outs
   /\ \A d \in Devices : ckpt[d] # NoCk =>
-       \A s \in Streams : ckpt[d].pg[s] \in 0..(KP + 1) /\ ckpt[d].prov[s] \in 0..clock
+       \A s \in Streams : /\ ckpt[d].pg[s] \in 0..(KP + 1) /\ ckpt[d].prov[s] \in 0..clock
+                          /\ ckpt[d].ph[s] \in {"n", "A", "H"} /\ ckpt[d].wv[s] \in 0..MaxVer
   /\ \A n \in NS : \A i \in 1..CtlLen(n) : ctl[n][i].k \in {"A", "T"}
 
 \* R28: a head committed for a stream the run did not cover (a record-bearing
@@ -1180,10 +1313,40 @@ R24_CursorImpliesIncremental ==
 
 \* The provenance of a stream is the run of its saved cursor, saved with it
 \* under the checkpoint's (n, g) and a re-checked control.
+\* R30.4: both provenance states.  A stream has a provenance state exactly
+\* when it has a provenance run, and that run is the run of its saved cursor,
+\* saved under a re-checked control.
 ProvenanceAtomic ==
   \A d \in Devices : ckpt[d] # NoCk =>
-    \A s \in Streams : ckpt[d].prov[s] # 0 =>
-      /\ ckpt[d].prov[s] = ckpt[d].cur[s] /\ ckpt[d].ctlOk
+    \A s \in Streams :
+      /\ (ckpt[d].ph[s] = "n") <=> (ckpt[d].prov[s] = 0)
+      /\ ckpt[d].ph[s] # "n" =>
+           (ckpt[d].prov[s] = ckpt[d].cur[s] /\ ckpt[d].ctlOk /\ ckpt[d].cur[s] # 0)
+
+\* R30.2 + R30.3: a complete head is grounded: seeded, or covered and actually
+\* read full (the stream was issued no state), or merged onto a complete base.
+\* A false complete:true is a false delete of every row the head lacks.
+NoFalseComplete == \A x \in inserted : x[4].complete => x[4].gr
+
+\* R30.1: a retry run publishes no seed-only stream.
+RetryPubSetOnly == \A x \in inserted : ~x[4].sr
+
+\* R30.4: an incremental:false stream is issued a state only from an active
+\* attempt, and never holds history_tail provenance.
+StreamKindEligibility ==
+  \A d \in Devices :
+    /\ ob[d] # NoEntry => \A s \in FullStreams : ob[d].iss[s] # 0 => ob[d].ep[s] = "A"
+    /\ ckpt[d] # NoCk => \A s \in FullStreams : ckpt[d].ph[s] # "H"
+
+\* R29 + R30.5: no stream resumes a cursor whose published history was
+\* tombstoned, at START or at save.
+NoResumeAfterTombstone ==
+  \A d \in Devices :
+    /\ ob[d] # NoEntry => ob[d].rb = {}
+    /\ ckpt[d] # NoCk => \A s \in Streams : ~ckpt[d].tw[s]
+
+\* R30.7: an incomplete stream's publish never clears a sibling's entry.
+SiblingContinuationKept == ~sib
 
 \* The row a head was written over: the row just below it, when it has the
 \* head's generation (an older generation or an L11 tombstone is an empty
@@ -1236,6 +1399,17 @@ L3_NoStuckIncomplete ==
 \* (profile bud-live: one device, no delete, no leave, no explicit full
 \* request, no permanent failure, a bounded number of scheduled runs).
 L5_BudgetProgress == []NoRestart /\ <>(\A n \in NS, s \in Budgeted : PagesPub(n, s))
+
+\* L6, conditional liveness for an incremental:false stream: once its
+\* attempt is covered by a succeeded run, its next begin is full/null, so it
+\* holds no provenance (profile snap-live: one device, no delete, no leave,
+\* no explicit full request, no permanent failure; scheduled covering reruns).
+L6_SnapshotReturns ==
+  \A d \in Devices, s \in FullStreams :
+    \* the antecedent needs one scheduled rerun left in the bound: the
+    \* assumption is an unbounded supply of covering reruns
+    (ckpt[d] # NoCk /\ ckpt[d].ph[s] # "n" /\ cnt.reruns < MaxReruns)
+      ~> (ckpt[d] = NoCk \/ ckpt[d].ph[s] = "n")
 
 L4_Resume ==
   \A d \in Devices, n \in NS :
@@ -1324,6 +1498,28 @@ NotMixedModes ==
 \* A record-bearing uncovered retry stream is published as a merge.
 NotRetryMerge ==
   ~\E x \in inserted : x[4].oc /\ x[4].lines # {}
+
+\* R30 witnesses.
+\* An incremental:false stream is issued its cursor from an active attempt.
+NotSnapshotResume ==
+  ~\E d \in Devices, s \in FullStreams : ob[d] # NoEntry /\ ob[d].iss[s] # 0
+\* A begin is full/null for a stream whose saved continuation a tombstone invalidated.
+NotTombInvalidates ==
+  ~\E d \in Devices, s \in Streams :
+     ob[d] # NoEntry /\ ckpt[d] # NoCk /\ ckpt[d].n = ob[d].n /\ ckpt[d].ph[s] # "n"
+     /\ ob[d].iss[s] = 0 /\ TombAfter(ob[d].n, s, ckpt[d].wv[s])
+\* A retry run whose received upserts were all oversized.
+NotOversizedOnly == ~\E d \in Devices : ob[d] # NoEntry /\ ob[d].ovz # {}
+\* A retry run on the seeding Desktop leaves a stream's seed receipt pending.
+NotRetrySeedDeferred ==
+  ~\E d \in Devices :
+     ob[d] # NoEntry /\ ob[d].out = "retry" /\ d = Desktop /\ ob[d].n = seedTarget
+     /\ \E s \in Streams : ob[d].st[s] = "none" /\ <<ob[d].n, s>> \notin rcpt
+\* A stream's incomplete head is published while a sibling holds a saved cursor.
+NotSiblingCursor ==
+  ~\E d \in Devices, s, t \in Streams :
+     s # t /\ ckpt[d] # NoCk /\ ckpt[d].cur[t] # 0 /\ ob[d] # NoEntry /\ ob[d].incomp
+     /\ ob[d].n = ckpt[d].n
 
 \* A permanently failed entry while newer heads arrive.
 NotFailedEntryNewerHeads ==
