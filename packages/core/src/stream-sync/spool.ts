@@ -150,20 +150,27 @@ export async function* readSpool(
   path: string,
 ): AsyncGenerator<SpoolLine> {
   const decoder = new TextDecoder("utf-8", { fatal: true });
-  let rest = "";
+  // Split on the newline byte, then decode each line on its own. Decoding the
+  // whole chunk and slicing lines out of it would make every line a view that
+  // pins its 1 MiB chunk for as long as any caller keeps the line's text.
+  // 0x0a cannot occur inside a multi-byte UTF-8 sequence, so the split is safe.
+  let rest = new Uint8Array(0);
   for await (const chunk of files.readChunks(path)) {
-    rest += decoder.decode(chunk, { stream: true });
-    let newline = rest.indexOf("\n");
+    const bytes = new Uint8Array(rest.length + chunk.length);
+    bytes.set(rest);
+    bytes.set(chunk, rest.length);
     let start = 0;
+    let newline = bytes.indexOf(0x0a, start);
     while (newline !== -1) {
-      yield parseSpoolLine(rest.slice(start, newline));
+      yield parseSpoolLine(decoder.decode(bytes.subarray(start, newline)));
       start = newline + 1;
-      newline = rest.indexOf("\n", start);
+      newline = bytes.indexOf(0x0a, start);
     }
-    rest = rest.slice(start);
+    rest = bytes.slice(start);
   }
-  rest += decoder.decode();
-  if (rest !== "") throw new Error(`spool file ${path} ends mid-line`);
+  if (rest.length !== 0) {
+    throw new Error(`spool file ${path} ends mid-line`);
+  }
 }
 
 function parseSpoolLine(raw: string): SpoolLine {
