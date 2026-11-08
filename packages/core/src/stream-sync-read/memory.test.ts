@@ -643,6 +643,36 @@ describe("stream-sync read memory: step 1 measurement", () => {
     });
   });
 
+  describe("ordinary-record budget vs the 8 MiB record limit", () => {
+    it.fails(
+      "step 2 must not enforce budgets until the ordinary-record budget agrees with the 8 MiB record limit: a legal 1 MiB record is not counted as oversize or as an exceedance (red today: the 256 KiB budget counts it)",
+      async () => {
+        const owner = await testOwnerKey(masterKey(49));
+        const f = new Fixture(owner);
+        const ns = await owner.ns(CONNECTOR, "account-1");
+        await f.activate(CONNECTOR, ns);
+        await f.publish({
+          connector: CONNECTOR,
+          ns,
+          stream: "items",
+          generation: 1,
+          records: [{ id: "big", body: "x".repeat(MiB) }],
+        });
+        const service = await f.service({ measureBudgets: true });
+        await f.sync(service);
+        const decision = await service.resolve(ask("pdpp.acme.items"));
+        const result = await drain(decision);
+        expect(result.records).toBe(1);
+        const snap =
+          decision.kind === "view" ? decision.budget!.snapshot() : null;
+        expect(snap!.oversizeRecords).toBe(0);
+        for (const [name, c] of Object.entries(snap!.categories)) {
+          expect(c.exceedances, name).toBe(0);
+        }
+      },
+    );
+  });
+
   describe("cancel, error and repeat: every charge is released", () => {
     it("a body cancelled after its first chunk releases every charge", async () => {
       const owner = await testOwnerKey(masterKey(46));
