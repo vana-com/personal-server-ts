@@ -23,7 +23,8 @@ import {
 import type { StreamSyncFiles } from "./ports.js";
 
 const encoder = new TextEncoder();
-const FLUSH_BYTES = 8 * 1024 * 1024;
+/** Default spool flush threshold: buffered lines written per append batch. */
+export const FLUSH_BYTES = 8 * 1024 * 1024;
 
 export function shardName(shard: number): string {
   return shard.toString(16).padStart(2, "0");
@@ -48,7 +49,10 @@ export class SpoolWriter {
   private buffered = 0;
   private failure: unknown = null;
 
-  constructor(private readonly files: StreamSyncFiles) {}
+  constructor(
+    private readonly files: StreamSyncFiles,
+    private readonly flushBytes: number = FLUSH_BYTES,
+  ) {}
 
   /** Queue one line. `bytes` is the canonical line's UTF-8 length. */
   async add(
@@ -64,7 +68,7 @@ export class SpoolWriter {
     }
     buffer.push(`${pkHash} ${text}\n`);
     this.buffered += bytes + 66;
-    if (this.buffered >= FLUSH_BYTES) await this.flush();
+    if (this.buffered >= this.flushBytes) await this.flush();
   }
 
   /** Drop every buffered line without writing it. */
@@ -104,6 +108,7 @@ export class SpoolWriter {
 export async function deriveShards(
   files: StreamSyncFiles,
   dir: string,
+  flushBytes: number = FLUSH_BYTES,
 ): Promise<void> {
   await files.remove(dir);
   const buffers = new Map<number, string[]>();
@@ -128,7 +133,7 @@ export async function deriveShards(
     }
     buffer.push(`${line.pkHash} ${line.text}\n`);
     buffered += line.text.length + 66;
-    if (buffered >= FLUSH_BYTES) await flush();
+    if (buffered >= flushBytes) await flush();
   }
   await flush();
 }
