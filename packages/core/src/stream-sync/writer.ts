@@ -455,6 +455,13 @@ export class StreamSyncWriter {
   private publishQueue: Promise<unknown> = Promise.resolve();
   private stateQueue: Promise<unknown> = Promise.resolve();
   private recovery: Promise<void> | null = null;
+  /**
+   * Streams of a run the publish pass has selected and not yet resolved, as
+   * `runId|stream`. Memory only: it tells a snapshot that an execution order is
+   * about to be taken, before the request exists. It is never proof of a
+   * publication; `request_persisted` stays the durable form.
+   */
+  private readonly selected = new Set<string>();
   private lifecycleQueue: Promise<unknown> = Promise.resolve();
   /**
    * Runs whose removal failed. They stay on disk, already covered and hidden
@@ -1124,28 +1131,42 @@ export class StreamSyncWriter {
           a.entry.observedAt - b.entry.observedAt ||
           (a.entry.runId < b.entry.runId ? -1 : 1),
       );
-      // Commit order: a stream an earlier run did not resolve in this pass
-      // holds back every later run of that stream until the next pass.
-      const held = new Set<string>();
-      for (const host of hosts) {
-        await this.publishEntry(host, held);
-        runs.push(this.statusOf(host));
-        if (host.phase === "done" || host.entry.ns === null) continue;
-        for (const [name, outbox] of Object.entries(host.entry.streams)) {
-          if (
-            outbox.state === "committed" ||
-            outbox.state === "noop" ||
-            outbox.state === "discarded"
-          )
-            continue;
-          const problem = host.streams[name]?.problem;
-          if (
-            problem === "connector_update_required" ||
-            problem === "out_of_order"
-          )
-            continue;
-          held.add(floorKey(host.entry.connector, host.entry.ns, name));
+      // Selection and reservation are one synchronous step: no await sits
+      // between the last read of the enumeration and this loop, and snapshots
+      // read `selected` inside the lifecycle queue, so a snapshot that sees a
+      // selected run's stream also sees that it is reserved.
+      const reserved = new Map(hosts.map((h) => [h, this.reserve(h)]));
+      try {
+        // Commit order: a stream an earlier run did not resolve in this pass
+        // holds back every later run of that stream until the next pass.
+        const held = new Set<string>();
+        for (const host of hosts) {
+          try {
+            await this.publishEntry(host, held);
+          } finally {
+            for (const key of reserved.get(host)!) this.selected.delete(key);
+          }
+          runs.push(this.statusOf(host));
+          if (host.phase === "done" || host.entry.ns === null) continue;
+          for (const [name, outbox] of Object.entries(host.entry.streams)) {
+            if (
+              outbox.state === "committed" ||
+              outbox.state === "noop" ||
+              outbox.state === "discarded"
+            )
+              continue;
+            const problem = host.streams[name]?.problem;
+            if (
+              problem === "connector_update_required" ||
+              problem === "out_of_order"
+            )
+              continue;
+            held.add(floorKey(host.entry.connector, host.entry.ns, name));
+          }
         }
+      } finally {
+        for (const keys of reserved.values())
+          for (const key of keys) this.selected.delete(key);
       }
       return { runs };
     });
@@ -1307,6 +1328,18 @@ export class StreamSyncWriter {
       expectedVersion: String(version),
       signature,
     };
+  }
+
+  /** Mark every unresolved stream of `host` as selected; returns the keys. */
+  private reserve(host: HostEntry): string[] {
+    const keys: string[] = [];
+    for (const [name, outbox] of Object.entries(host.entry.streams)) {
+      if (outbox.state === "committed" || outbox.state === "noop") continue;
+      const key = `${host.entry.runId}|${name}`;
+      this.selected.add(key);
+      keys.push(key);
+    }
+    return keys;
   }
 
   private async publishEntry(
@@ -1612,7 +1645,7 @@ export class StreamSyncWriter {
         head: head && planHeadOf(head),
         floor: floorOf(await this.readState(), entry.connector, ns, name),
       },
-      this.planRun(host, name, await this.readState()),
+      this.planRun(host, name, await this.readState(), true),
     );
     if (decision.kind === "refused") {
       throw new PendingStream(
@@ -1736,7 +1769,12 @@ export class StreamSyncWriter {
   }
 
   /** What the publish plan reads of one run's stream. */
-  private planRun(host: HostEntry, name: string, state: WriterState): PlanRun {
+  private planRun(
+    host: HostEntry,
+    name: string,
+    state: WriterState,
+    executing = false,
+  ): PlanRun {
     const { entry } = host;
     const stream = host.streams[name]!;
     const seed = this.options.seed;
@@ -1777,8 +1815,12 @@ export class StreamSyncWriter {
       empty: (stream.shardBytes ?? []).every((bytes) => bytes === 0),
       seed: stream.seedApplies ? "merged" : seedOpen ? "unresolved" : "none",
       ...(executed ? { executed } : {}),
-      // The request is signed and persisted; the registry's answer is not.
-      ...(!executed && outbox?.state === "request_persisted"
+      // Selected by a running pass, or signed and persisted: either way the
+      // registry's answer is not recorded yet.
+      ...(!executed &&
+      (outbox?.state === "request_persisted" ||
+        // The executing pass plans its own step: it is not its own barrier.
+        (!executing && this.selected.has(`${entry.runId}|${name}`)))
         ? { inFlight: true }
         : {}),
     };

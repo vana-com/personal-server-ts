@@ -54,6 +54,12 @@ the test change together.
    `X-Stream-Sync-Awaiting-Import`: the distinct runs with a published stream
    the reader has not imported (D5, N1, P2, M2). Import coverage clears it, not
    the POST receipt. The count of U keeps its meaning.
+   A stored body that answers while the reader holds a live imported head for a
+   requested stream (an incomplete head: a complete one serves its own view) does
+   not reflect that head. The owner is told with `X-Stream-Sync-Not-Reflected`
+   (the stream count), derived from the response and the head, not from runs. It
+   outlives import, run retirement and restart; only a view that reflects the
+   head ends it. Awaiting import keeps meaning "published, not yet imported".
 8. **Every stream of a legacy name is scanned.** A run withheld on one stream
    is reported even when another stream has no local run. When the projector
    refuses a partial input, no partial view serves and the answer that does

@@ -643,6 +643,9 @@ function ownerNoteHeaders(
       notes.awaitingImport.runs,
     );
   }
+  if (notes?.notReflected) {
+    headers["X-Stream-Sync-Not-Reflected"] = String(notes.notReflected.streams);
+  }
   return headers;
 }
 

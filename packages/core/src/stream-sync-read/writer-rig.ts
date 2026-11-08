@@ -50,7 +50,11 @@ class Gateway implements StreamSyncRegistry {
     { dataHash: string; metadataHash: string; at: string }[]
   >();
 
+  /** Runs inside every registry row read. */
+  beforeRead?: (scope: string) => Promise<void>;
+
   async read(scope: string): Promise<ControlRead> {
+    await this.beforeRead?.(scope);
     const rows = this.versions.get(scope);
     if (!rows?.length) return { found: false };
     const head = rows[rows.length - 1]!;
@@ -154,10 +158,11 @@ export class Rig {
   readonly gateway = new Gateway();
   readonly blobMap = new Map<string, Uint8Array>();
   readonly files = createMemoryStreamSyncFiles();
-  readonly writer: StreamSyncWriter;
+  writer: StreamSyncWriter;
   /** A second device: its own home, the same owner, registry and blobs. */
   readonly other: StreamSyncWriter;
-  readonly overlay: StreamSyncOverlaySnapshotSource;
+  overlay!: StreamSyncOverlaySnapshotSource;
+  private readonly readFiles = createMemoryStreamSyncReadFiles();
   service!: StreamSyncReadService;
   /** Every run is identity-less: one namespace, the empty one. */
   readonly ns = "";
@@ -175,8 +180,15 @@ export class Rig {
     seed?: SeedRows,
     readonly connector: string = CONNECTOR,
   ) {
+    this.seed = seed;
     this.writer = this.device(this.files, seed);
     this.other = this.device(createMemoryStreamSyncFiles());
+    this.bindOverlay();
+  }
+
+  private readonly seed: SeedRows | undefined;
+
+  private bindOverlay(): void {
     const source = createWriterOverlaySource(this.writer);
     this.overlay = {
       snapshot: async (connector) => {
@@ -193,6 +205,8 @@ export class Rig {
 
   /** Runs once, after the next owner snapshot is taken and before the read leases anything. */
   afterSnapshot?: () => Promise<void>;
+  /** Runs inside every signing call, before the signature returns. */
+  beforeSign?: () => Promise<void>;
   /** Runs after every owner snapshot, until cleared. */
   onSnapshot?: () => Promise<void>;
 
@@ -214,7 +228,12 @@ export class Rig {
         open: () => files,
       }),
       keys: createStreamSyncKeyPorts(SIGNATURE),
-      signer: { signAddData: async () => `0x${"22".repeat(65)}` },
+      signer: {
+        signAddData: async () => {
+          await this.beforeSign?.();
+          return `0x${"22".repeat(65)}`;
+        },
+      },
       now: () => T0 + 3_600_000,
       ...(seed
         ? {
@@ -236,9 +255,16 @@ export class Rig {
     });
   }
 
+  /** A process restart: a new writer and a new reader over the same files. */
+  async restart(): Promise<void> {
+    this.writer = this.device(this.files, this.seed);
+    this.bindOverlay();
+    await this.open();
+  }
+
   async open(): Promise<void> {
     this.service = await StreamSyncReadService.open({
-      files: createMemoryStreamSyncReadFiles(),
+      files: this.readFiles,
       blobs: { get: async (key) => this.blobMap.get(key) ?? null },
       keys: await createStreamSyncReadKeys(
         streamMasterKeyFromSignature(SIGNATURE),

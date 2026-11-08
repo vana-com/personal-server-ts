@@ -1434,6 +1434,7 @@ interface Api {
   readonly complete: string | null;
   readonly pending: string | null;
   readonly awaitingImport: string | null;
+  readonly notReflected: string | null;
   readonly bodyWithheld: string[] | null;
   readonly records: Rec[] | null;
 }
@@ -1494,6 +1495,7 @@ async function api(
     complete: response.headers.get("x-stream-sync-complete"),
     pending: response.headers.get("x-stream-sync-pending"),
     awaitingImport: response.headers.get("x-stream-sync-awaiting-import"),
+    notReflected: response.headers.get("x-stream-sync-not-reflected"),
     bodyWithheld: body?.withheld
       ? body.withheld.map((w) => `${w.runId}:${w.reason}`).sort()
       : null,
@@ -1771,6 +1773,65 @@ describe("a stored body over local runs the response does not reflect", () => {
       expect(imported.awaitingImport).toBeNull();
     });
   }
+});
+
+describe("a stored body over a published head it does not reflect", () => {
+  const S4 = () => ROWS.find((r) => r.id === "S4")!;
+
+  async function settled(): Promise<{ rig: Rig; row: Row }> {
+    const row = S4();
+    const rig = await open(row);
+    await publishUntilStable(rig, row);
+    await rig.sync();
+    return { rig, row };
+  }
+
+  async function expectNoted(rig: Rig, row: Row): Promise<void> {
+    const owner = await api(rig, row, { builder: false, file: true });
+    expect(owner.source).toBe("legacy");
+    expect(owner.records).toEqual([{ id: "stored" }]);
+    expect(owner.notReflected).toBe("1");
+    expect(owner.awaitingImport).toBeNull();
+    const grant = await api(rig, row, { builder: true, file: true });
+    expect(grant.notReflected).toBeNull();
+  }
+
+  it("S4: the note is present after import", async () => {
+    const { rig, row } = await settled();
+    await expectNoted(rig, row);
+  });
+
+  it("S4: the note is present after the run is retired", async () => {
+    const { rig, row } = await settled();
+    const snapshot = await rig.overlay.snapshot(CONNECTOR);
+    expect(snapshot.runs).toEqual([]);
+    snapshot.release();
+    await expectNoted(rig, row);
+  });
+
+  it("S4: the note is present after a restart", async () => {
+    const { rig, row } = await settled();
+    await rig.restart();
+    await rig.sync();
+    await expectNoted(rig, row);
+  });
+
+  it("control: a stored body over no published head carries no note", async () => {
+    const row = S4();
+    const rig = new Rig(row.seed, row.connector);
+    await rig.open();
+    const owner = await api(rig, row, { builder: false, file: true });
+    expect(owner.source).toBe("legacy");
+    expect(owner.notReflected).toBeNull();
+  });
+
+  it("control: a complete head serves its own view, so the stored body carries no note", async () => {
+    const row = S4();
+    const rig = await open(row);
+    const owner = await api(rig, row, { builder: false, file: true });
+    expect(owner.source).toBe("stream-sync");
+    expect(owner.notReflected).toBeNull();
+  });
 });
 
 describe("the oracle catches a deliberately broken model", () => {

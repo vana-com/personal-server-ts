@@ -112,6 +112,90 @@ describe("a publication in flight holds back the runs it would reorder", () => {
   });
 });
 
+describe("a selected publication holds back the runs it would reorder", () => {
+  it("barrier c: C is selected and its signer is held before the request exists, then B finishes intake", async () => {
+    const rig = await baseRig();
+    await rig.collect(run({ runId: "rC", at: 20_000, rows: [{ id: "c" }] }));
+    let release!: () => void;
+    let reached!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const arrived = new Promise<void>((resolve) => (reached = resolve));
+    rig.beforeSign = async () => {
+      rig.beforeSign = undefined;
+      reached();
+      await held;
+    };
+    const publishing = rig.publish();
+    await arrived;
+    await rig.collect(run({ runId: "rB", at: 10_000, rows: [{ id: "b2" }] }));
+
+    const owner = await ownerRead(rig);
+    expect(owner.ids).toEqual(["a", "b"]);
+    expect(owner.withheld).toContain("rB:publication_in_flight");
+    expect(owner.withheld).toEqual([
+      "rB:publication_in_flight",
+      "rC:earlier_run_pending",
+    ]);
+
+    release();
+    await publishing;
+    await rig.sync();
+    const settled = await ownerRead(rig);
+    expect(settled.ids).toEqual(["a", "b", "c"]);
+    expect(settled.withheld).toEqual(["rB:out_of_order"]);
+  });
+
+  it("barrier d: C is a no-op of the base, held at its registry read, then B finishes intake", async () => {
+    const rig = await baseRig();
+    await rig.collect(
+      run({
+        runId: "rC",
+        at: 20_000,
+        full: true,
+        rows: [{ id: "a" }, { id: "b" }],
+      }),
+    );
+    let release!: () => void;
+    let reached!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const arrived = new Promise<void>((resolve) => (reached = resolve));
+    rig.gateway.beforeRead = async (scope) => {
+      if (scope !== "pdpp.acme~.items") return;
+      rig.gateway.beforeRead = undefined;
+      reached();
+      await held;
+    };
+    const publishing = rig.publish();
+    await arrived;
+    await rig.collect(run({ runId: "rB", at: 10_000, rows: [{ id: "b2" }] }));
+
+    const owner = await ownerRead(rig);
+    expect(owner.withheld).toContain("rB:publication_in_flight");
+
+    release();
+    await publishing;
+    await rig.sync();
+    const settled = await ownerRead(rig);
+    expect(settled.ids).toEqual(["a", "b"]);
+    expect(settled.withheld).toEqual(["rB:out_of_order"]);
+  });
+
+  it("the reservation is gone once the pass fails", async () => {
+    const rig = await baseRig();
+    await rig.collect(run({ runId: "rC", at: 20_000, rows: [{ id: "c" }] }));
+    rig.beforeSign = async () => {
+      rig.beforeSign = undefined;
+      throw new Error("signer down");
+    };
+    await rig.publish().catch(() => undefined);
+    await rig.collect(run({ runId: "rB", at: 10_000, rows: [{ id: "b2" }] }));
+    const owner = await ownerRead(rig);
+    expect(
+      owner.withheld.filter((w) => w.endsWith("publication_in_flight")),
+    ).toEqual([]);
+  });
+});
+
 describe("a read is invalidated only by the streams it read", () => {
   let rig: Rig;
   afterEach(() => {

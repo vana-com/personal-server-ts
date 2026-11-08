@@ -130,6 +130,14 @@ export interface OwnerNotes {
    * coverage, not by the publish receipt.
    */
   readonly awaitingImport?: { readonly runs: number };
+  /**
+   * A stored body answers while the reader holds a live imported head for a
+   * requested stream: a complete head would have served its own view, so the
+   * body does not reflect this one (an incomplete head). Derived from the
+   * response and the stream's head, not from runs: it outlives import and run
+   * retirement. `streams` counts distinct streams.
+   */
+  readonly notReflected?: { readonly streams: number };
 }
 
 export type ReadDecision =
@@ -918,6 +926,11 @@ export class StreamSyncReadService {
       if (input.legacyFile && scan.awaiting > 0) {
         notes = { ...notes, awaitingImport: { runs: scan.awaiting } };
       }
+      // A live imported head the stored body does not reflect, whatever the
+      // runs say: import and retirement do not end this note, reflection does.
+      if (input.legacyFile && scan.notReflected > 0) {
+        notes = { ...notes, notReflected: { streams: scan.notReflected } };
+      }
     }
     if (cursor) return { kind: "cursor_stale" };
     if (deleted) {
@@ -1009,6 +1022,7 @@ export class StreamSyncReadService {
     withheld: WithheldRun[];
     unpublished: number;
     awaiting: number;
+    notReflected: number;
     connectors: string[];
   } {
     let best: {
@@ -1020,6 +1034,7 @@ export class StreamSyncReadService {
     const withheld: WithheldRun[] = [];
     const unpublished = new Set<string>();
     const awaiting = new Set<string>();
+    const notReflected = new Set<string>();
     const connectors = new Set<string>();
     for (const target of targets) {
       const snapshot = snapshots.get(target.connector);
@@ -1048,6 +1063,9 @@ export class StreamSyncReadService {
             control,
             row,
           );
+          if (live !== null) {
+            notReflected.add(JSON.stringify([target.connector, ns, stream]));
+          }
           const local = this.contributions(
             snapshot,
             target.connector,
@@ -1098,6 +1116,7 @@ export class StreamSyncReadService {
       withheld: uniqueWithheld(withheld),
       unpublished: unpublished.size,
       awaiting: awaiting.size,
+      notReflected: notReflected.size,
       connectors: [...connectors],
     };
   }
