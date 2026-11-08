@@ -11,16 +11,29 @@
  *   kept. Encryption is not what these tests measure.
  */
 
+import { rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { sha256 } from "@noble/hashes/sha2";
 import { describe, expect, it } from "vitest";
-import v8 from "node:v8";
-import vm from "node:vm";
 import type {
   JsonObject,
   Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { LEGACY_SCOPE_BINDINGS } from "../legacy-projection/index.js";
+import { run } from "../test-support/memory-oracle.js";
+import {
+  ask,
+  bitsFor,
+  CONNECTOR,
+  Fixture,
+  KiB,
+  masterKey,
+  MiB,
+  prefixesFor,
+  recordsOf,
+} from "../test-support/read-fixture.js";
 import {
   READ_THRESHOLDS,
   ReadMemoryEstimator,
@@ -28,154 +41,17 @@ import {
 } from "./budget.js";
 import { streamSyncReadHashes } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
-import type { MirrorFeedRow } from "./mirror.js";
-import type { StreamSyncOverlayEntry, StreamSyncReadFiles } from "./ports.js";
 import { planProjection, type ProjectionInput } from "./projection.js";
 import {
   StreamSyncReadService,
   type ReadDecision,
   type StreamSyncReadOptions,
 } from "./service.js";
-import { buildTestHead, testOwnerKey, type TestOwnerKey } from "./testing.js";
+import { testOwnerKey } from "./testing.js";
 
-const KiB = 1024;
-const MiB = 1024 * KiB;
-/** Fixture bound on one clear part. A fixture constant, not a production limit (production target is 4 MiB). */
 const FIXTURE_PART_BYTES = 128 * KiB;
-const META = `0x${"ab".repeat(32)}`;
 /** Overlay stamps sit above any imported `observedAt`, as in service.test.ts, so local rows win. */
 const OVERLAY_STAMP = 5_000_000_000_000;
-const silent = { info() {}, warn() {}, error() {} };
-const CONNECTOR = "acme";
-const ask = (scope: string) => ({
-  scope,
-  connection: null,
-  cursor: null,
-  legacyFile: false,
-});
-
-function masterKey(seed: number): Uint8Array {
-  return Uint8Array.from({ length: 32 }, (_, i) => (seed * 31 + i) & 0xff);
-}
-
-/** Bit prefixes of length `bits`: every head part is one of these, so parts stay small. */
-function prefixesFor(bits: number): string[] {
-  return Array.from({ length: 2 ** bits }, (_, i) =>
-    i.toString(2).padStart(bits, "0"),
-  );
-}
-
-/** Prefix length that keeps parts near FIXTURE_PART_BYTES for `n` records. */
-function bitsFor(n: number): number {
-  return Math.log2(n / 128);
-}
-
-/** Fixed-width IDs and a padded value: encoded lines of 384 to 768 bytes. */
-function recordsOf(n: number): JsonObject[] {
-  return Array.from({ length: n }, (_, i) => ({
-    id: `r${String(i).padStart(8, "0")}`,
-    seq: i,
-    body: "x".repeat(300 + (i % 300)),
-  }));
-}
-
-class Fixture {
-  readonly blobs = new Map<string, Uint8Array>();
-  readonly rows = new Map<string, MirrorFeedRow>();
-  readonly files = createMemoryStreamSyncReadFiles();
-  overlay: StreamSyncOverlayEntry[] = [];
-  private clock = Date.parse("2026-11-01T00:00:00Z");
-  /** Publishes with identity encryption. */
-  readonly identity: TestOwnerKey;
-
-  constructor(readonly owner: TestOwnerKey) {
-    this.identity = {
-      ...owner,
-      encrypt: async (_scope, clear) => clear.slice(),
-    };
-  }
-
-  private row(scope: string, dataHash: string, metadataHash: string) {
-    const previous = this.rows.get(scope);
-    const version = previous ? Number(previous.expectedVersion) + 1 : 1;
-    this.clock += 1000;
-    this.rows.set(scope, {
-      scope,
-      dataHash,
-      metadataHash,
-      expectedVersion: String(version),
-      addedAt: new Date(this.clock).toISOString(),
-      deletedAt: null,
-    });
-    return version;
-  }
-
-  async activate(connector: string, ns: string): Promise<void> {
-    const { active } = await this.owner.control();
-    this.row(controlScope(connector, ns), active.dataHash, active.metadataHash);
-  }
-
-  async publish(input: {
-    connector: string;
-    ns: string;
-    stream: string;
-    generation: number;
-    records: JsonObject[];
-    prefixes?: string[];
-    observedAt?: number;
-  }): Promise<void> {
-    const built = await buildTestHead({
-      key: this.identity,
-      connector: input.connector,
-      ns: input.ns,
-      stream: input.stream,
-      generation: input.generation,
-      primaryKey: ["id"],
-      records: input.records,
-      observedAt: input.observedAt ?? this.clock,
-      prefixes: input.prefixes,
-    });
-    for (const [k, v] of built.blobs) this.blobs.set(k, v);
-    this.row(built.scope, built.dataHash, META);
-  }
-
-  options(
-    overrides: Partial<StreamSyncReadOptions> = {},
-  ): Partial<StreamSyncReadOptions> {
-    return {
-      files: this.files,
-      blobs: {
-        get: async (k) => this.blobs.get(k)?.slice() ?? null,
-      },
-      // Identity decryption, matching the identity publisher above.
-      keys: {
-        hashes: streamSyncReadHashes,
-        keyCheck: this.owner.keyCheck,
-        decrypt: async (_scope, cipher) => cipher.slice(),
-      },
-      logger: silent,
-      overlay: { entries: async () => this.overlay },
-      now: () => new Date("2026-11-02T00:00:00Z"),
-      ...overrides,
-    };
-  }
-
-  async service(
-    overrides: Partial<StreamSyncReadOptions> = {},
-  ): Promise<StreamSyncReadService> {
-    return StreamSyncReadService.open(
-      this.options(overrides) as StreamSyncReadOptions,
-    );
-  }
-
-  async sync(service: StreamSyncReadService): Promise<void> {
-    await service.observe([...this.rows.values()], {
-      fromStart: true,
-      lastPage: true,
-    });
-    await service.importPending();
-  }
-}
 
 /** Drain a view body chunk by chunk: a digest, a byte count, and the records' count. */
 async function drain(
@@ -583,85 +459,45 @@ describe("stream-sync read memory: step 1 measurement", () => {
   });
 
   describe("durable read store: the step-2 requirement, against the store production selects", () => {
-    // The store production selects for the stream-sync read side. Lite
-    // (packages/lite/src/sync.ts) uses `createMemoryStreamSyncReadFiles()`
-    // unless a host injects its own `StreamSyncReadFiles`. A reopen is a new
-    // call with the same root: a durable store reads back what the last
-    // instance wrote. Step 2 changes this selector to the durable store. The
-    // predicates below are about that store, not about the memory adapter.
-    const openProductionReadFiles = (_root: string): StreamSyncReadFiles =>
-      createMemoryStreamSyncReadFiles();
-
-    const PAYLOAD_FILES = 8;
-    const payloadPath = (i: number) => `views/a/_/s/parts/p${i}`;
-    const payloadBytes = (i: number) => new Uint8Array(MiB).fill(i + 1);
-
-    it("green setup: the selected store writes, reads and lists one file", async () => {
-      const store = openProductionReadFiles("setup-root");
-      await store.write("views/a/_/s/parts/one", new Uint8Array([1, 2, 3]));
-      expect(await store.read("views/a/_/s/parts/one")).toEqual(
-        new Uint8Array([1, 2, 3]),
-      );
-      expect(await store.list("views/a/_/s")).toEqual([
-        "views/a/_/s/parts/one",
-      ]);
-    });
-
-    it.fails(
-      "step 2: the read store is durable and keeps payload out of process memory: after 8 MiB is written, resident payload grows by under 1 MiB, and a reopen reads the same bytes (red: the production selector is memory)",
-      async () => {
-        const root = "durable-root";
-        const forceGc = (): void => {
-          const g = (globalThis as { gc?: () => void }).gc;
-          if (g) {
-            g();
-            g();
-            return;
-          }
-          // Runtime fallback for `--expose-gc`, which vitest does not pass.
-          v8.setFlagsFromString("--expose-gc");
-          (vm.runInNewContext("gc") as () => void)();
-          (vm.runInNewContext("gc") as () => void)();
-        };
-        const residentPayload = (): number => {
-          forceGc();
-          const m = process.memoryUsage();
-          return m.heapUsed + m.arrayBuffers;
-        };
-
-        const store = openProductionReadFiles(root);
-        const before = residentPayload();
-        for (let i = 0; i < PAYLOAD_FILES; i++) {
-          await store.write(payloadPath(i), payloadBytes(i));
-        }
-        const growth = residentPayload() - before;
-        expect(growth).toBeLessThan(MiB);
-
-        const reopened = openProductionReadFiles(root);
-        for (let i = 0; i < PAYLOAD_FILES; i++) {
-          const got = await reopened.read(payloadPath(i));
-          expect(got, payloadPath(i)).not.toBeNull();
-          expect(got!.byteLength).toBe(MiB);
-        }
-      },
+    // Measured in a fresh child by the shared memory oracle (default GC timer).
+    // The store production selects is `productionReadFiles` in
+    // test-support/read-workloads.ts. Step 2 replaces that selector; the
+    // predicates below stay the same.
+    const PROBE = fileURLToPath(
+      new URL("../test-support/read-workloads.ts", import.meta.url),
     );
-  });
 
-  describe("retained parsed lines: a reader that keeps every line", () => {
-    // Gate, not yet runnable. The estimator counts bookkeeping calls, so a
-    // reader that collects every parsed line into an array (viewLines, no
-    // overlay) keeps the whole stream while the estimate reports one part.
-    // The independent instrument is the shared child-process high-water
-    // helper in PS #565 (test/stream-sync-p1-bounded). It is not yet
-    // importable, so this body throws. Replace it with the helper's
-    // assertion when the helper lands; do not copy the helper's sampler here.
+    /** A disk store survives the reopen: this proves the probe itself works before the red gate runs. */
+    const SETUP_ROOT = join(homedir(), ".tmp", "memstep1-durable-setup");
+    it("green setup: a surviving store writes and reads back one file in a child", async () => {
+      const r = await run<{ reopenedFiles: number }>({
+        module: PROBE,
+        exportName: "durableStoreProbe",
+        args: { root: SETUP_ROOT, store: "disk", files: 1, fileBytes: 1024 },
+      });
+      await rm(SETUP_ROOT, { recursive: true, force: true });
+      expect(r.result.reopenedFiles).toBe(1);
+    }, 60_000);
+
     it.fails(
-      "step 2+: a reader that retains every parsed line across a read is caught by the shared high-water helper (gate: PS #565, not yet shared)",
-      () => {
-        throw new Error(
-          "gate: needs the shared child-process high-water helper from PS #565 (test/stream-sync-p1-bounded); not yet importable",
+      "step 2: the read store is durable and keeps payload out of process memory: 8 files of 8 MiB, resident growth under 32 MiB, and every file reads back after a reopen (red: the production selector is memory)",
+      async () => {
+        const r = await run<{ reopenedFiles: number }>({
+          module: PROBE,
+          exportName: "durableStoreProbe",
+          args: {
+            root: "durable-root",
+            store: "production",
+            files: 8,
+            fileBytes: 8 * MiB,
+          },
+        });
+        expect(r.peakBytes, "resident payload growth, bytes").toBeLessThan(
+          32 * MiB,
         );
+        expect(r.result.reopenedFiles).toBe(8);
       },
+      120_000,
     );
   });
 
