@@ -26,6 +26,7 @@ export type PsLiteStateKey =
   | "sync-cursor-v1"
   | "pending-blob-deletions-v1"
   | "upload-attempts-v1"
+  | `upload-attempts-v1.corrupt-${string}`
   | `additions-publication-v1:${string}`
   | `additions-deletion-v1:${string}`
   | "derivative-questions-v1"
@@ -39,6 +40,13 @@ export interface PsLiteBoundedStateStore {
 }
 
 export interface PsLiteStateStore {
+  /**
+   * Stable name of the backing store (IndexedDB: database and object store).
+   * The same store has the same name whatever wrapper object holds it, and
+   * different stores differ. Upload crash protection is keyed by it; without
+   * one, it stays in memory.
+   */
+  readonly namespace?: string;
   bounded?: PsLiteBoundedStateStore;
   get<T>(key: PsLiteStateKey): Promise<T | null>;
   set<T>(key: PsLiteStateKey, value: T): Promise<void>;
@@ -443,7 +451,11 @@ export function createIndexedDbPsLiteStateStore(
       );
     },
   };
-  return { ...bounded, bounded };
+  return {
+    ...bounded,
+    bounded,
+    namespace: `indexeddb:${resolved.dbName}/${resolved.storeName}`,
+  };
 }
 
 export function createIndexedDbPsLiteTokenStore(

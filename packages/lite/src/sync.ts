@@ -43,7 +43,6 @@ import {
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import {
-  acquireProcessLock,
   withCancellableRegistration,
   type DownloadDiagnosticsHook,
   type DownloadWorkerDeps,
@@ -110,7 +109,20 @@ export interface PsLiteSyncOptions {
   autoStartSync?: boolean;
   /** Storage authentication origin, independent of its routing endpoint. */
   storageAudience?: string;
+  /**
+   * Gateway client. The default SDK client is wrapped so the upload deadline
+   * closes its in-flight registry write. A client supplied here is used as
+   * given: it is cancellable only if it declares so (see
+   * `withCancellableRegistration`); otherwise a hung registry write runs on
+   * past the deadline and its entry waits for it.
+   */
   gateway?: GatewayClient;
+  /**
+   * Names the backing store of `stateStore` for upload crash protection when
+   * the store does not name itself. Without either, that protection is kept
+   * in memory and does not survive a restart.
+   */
+  uploadAttemptNamespace?: string;
   /**
    * Deletion-aware gateway feed. Defaults to a REST feed on the configured
    * gateway URL; inject alongside a mock `gateway` in tests.
@@ -164,56 +176,45 @@ export function createPsLiteSyncCursor(
   };
 }
 
-const realmIds = new WeakMap<object, number>();
-let realmCount = 0;
-/** Distinguishes state stores for the lock used where browser locks are absent. */
-function realmId(stateStore: PsLiteStateStore): number {
-  let id = realmIds.get(stateStore);
-  if (id === undefined) {
-    id = ++realmCount;
-    realmIds.set(stateStore, id);
-  }
-  return id;
-}
+const MAX_CORRUPT_COPIES = 3;
+const CORRUPT_INDEX_KEY = "upload-attempts-v1.corrupt-index";
 
 /**
  * Upload-attempt markers in the same durable state store as the sync cursor,
- * so a WebView or manager rebuild keeps the interrupted-attempt count. One
- * manager per store holds an exclusive browser lock (shared by every tab on
- * the origin) for as long as it owns the markers; a runtime without browser
- * locks falls back to a lock inside this realm.
+ * so a WebView or manager rebuild keeps the interrupted-attempt count. The
+ * single-owner lock is named by the backing store (`namespace`, from the
+ * store or the host), never by the wrapper object: managers over the same
+ * store exclude each other, managers over different stores do not. Browser
+ * locks are shared by every tab of the origin; a runtime without them
+ * excludes only within this JS realm.
  */
 export function createPsLiteUploadAttemptStore(
   stateStore: PsLiteStateStore,
-  options: { lockName?: string } = {},
+  options: { namespace?: string } = {},
 ): UploadAttemptStore {
-  const lockName = options.lockName ?? `ps-lite:${UPLOAD_ATTEMPTS_KEY}`;
+  const namespace = options.namespace ?? stateStore.namespace;
+  if (!namespace)
+    throw new Error(
+      "Upload attempt markers need a namespace: the host must name the backing store",
+    );
   return {
+    namespace: `${namespace}/${UPLOAD_ATTEMPTS_KEY}`,
+    crossRealmLock: true,
     read() {
       return stateStore.get<unknown>(UPLOAD_ATTEMPTS_KEY);
     },
     async write(envelope) {
       await stateStore.set(UPLOAD_ATTEMPTS_KEY, envelope);
     },
-    async acquire() {
-      const locks =
-        typeof navigator === "undefined" ? undefined : navigator.locks;
-      if (!locks)
-        return acquireProcessLock(`${lockName}:${realmId(stateStore)}`);
-      return new Promise((resolve, reject) => {
-        // The lock is held by a callback that stays pending until released.
-        locks
-          .request(lockName, { ifAvailable: true }, (lock) => {
-            if (!lock) {
-              resolve(null);
-              return undefined;
-            }
-            return new Promise<void>((release) =>
-              resolve({ release: () => release() }),
-            );
-          })
-          .catch(reject);
-      });
+    async preserveCorrupt(value, stamp) {
+      const kept = [
+        ...((await stateStore.get<string[]>(CORRUPT_INDEX_KEY)) ?? []),
+        stamp,
+      ];
+      await stateStore.set(`${UPLOAD_ATTEMPTS_KEY}.corrupt-${stamp}`, value);
+      await stateStore.set(CORRUPT_INDEX_KEY, kept.slice(-MAX_CORRUPT_COPIES));
+      for (const old of kept.slice(0, -MAX_CORRUPT_COPIES))
+        await stateStore.delete(`${UPLOAD_ATTEMPTS_KEY}.corrupt-${old}`);
     },
   };
 }
@@ -351,7 +352,13 @@ export async function createPsLiteSyncManager(
   }
   const masterKey = deriveMasterKey(options.ownerSignature);
   const gateway =
-    options.gateway ?? createGatewayClient(options.config.gateway.url);
+    options.gateway ??
+    withCancellableRegistration(
+      createGatewayClient(options.config.gateway.url),
+      options.config.gateway.url,
+    );
+  const uploadAttemptNamespace =
+    options.uploadAttemptNamespace ?? options.stateStore.namespace;
   const storageAdapter = createVanaSyncStorageAdapter({
     config: options.config,
     serverOwner,
@@ -413,6 +420,11 @@ export async function createPsLiteSyncManager(
       : undefined;
   const cursor = createPsLiteSyncCursor(options.stateStore);
   const logger = createBrowserLogger(options.logger);
+  if (!uploadAttemptNamespace)
+    logger.warn(
+      {},
+      "State store names no backing store; upload crash protection is kept in memory",
+    );
   const dataPointFeed =
     options.dataPointFeed ??
     createGatewayDataPointFeed({
@@ -463,10 +475,7 @@ export async function createPsLiteSyncManager(
       additions,
       storage: options.storage,
       storageAdapter,
-      // Only the default SDK client needs wrapping to take the attempt signal.
-      gateway: options.gateway
-        ? gateway
-        : withCancellableRegistration(gateway, options.config.gateway.url),
+      gateway,
       signer,
       masterKey,
       serverOwner,
@@ -491,7 +500,11 @@ export async function createPsLiteSyncManager(
     {
       deleteData,
       pendingBlobDeletions,
-      uploadAttemptStore: createPsLiteUploadAttemptStore(options.stateStore),
+      uploadAttemptStore: uploadAttemptNamespace
+        ? createPsLiteUploadAttemptStore(options.stateStore, {
+            namespace: uploadAttemptNamespace,
+          })
+        : undefined,
       tombstoneFinality,
       async canSync() {
         if (options.ownerSyncSigner) return { ok: true };

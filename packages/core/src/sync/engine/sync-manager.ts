@@ -144,6 +144,15 @@ export function createSyncManager(
     createUploadAttemptLedger(
       options?.uploadAttemptStore ?? createMemoryUploadAttemptStore(),
       uploadDeps.serverOwner,
+      {
+        onDegraded: (message) =>
+          pushError({
+            fileId: null,
+            scope: null,
+            message,
+            timestamp: new Date().toISOString(),
+          }),
+      },
     );
   const workerUploadDeps: UploadWorkerDeps = {
     ...uploadDeps,
@@ -463,7 +472,8 @@ export function createSyncManager(
       if (cycleInFlight) {
         await cycleInFlight;
       }
-      // Hand the upload markers to the next manager over this store.
+      // Hand the upload markers to the next manager over this store, once no
+      // attempt is still running (a running one keeps its entry excluded).
       await uploadAttempts.close();
     },
 

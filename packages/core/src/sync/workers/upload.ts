@@ -36,6 +36,7 @@ import {
   type UploadStateTracker,
 } from "../upload-state.js";
 import {
+  DEFAULT_ABANDON_GRACE_MS,
   uploadAttemptKey,
   type UploadAttemptLedger,
 } from "../upload-attempts.js";
@@ -123,8 +124,6 @@ export interface UploadResult {
    */
   dataPointId: string;
 }
-
-const DEFAULT_ABANDON_GRACE_MS = 5_000;
 
 /** Default most unsynced rows read per cycle (index rows only, no bodies). */
 export const UPLOAD_SCAN_BUDGET = 2000;
@@ -775,7 +774,7 @@ export async function uploadAll(
     try {
       // Durable before any body is built: if this attempt kills the process,
       // the next boot finds the marker and counts it.
-      await attempts?.begin(target);
+      const token = attempts ? await attempts.begin(target) : undefined;
       const deadlineMs =
         options?.attemptDeadlineMs ?? DEFAULT_UPLOAD_ATTEMPT_DEADLINE_MS;
       const running = startAttempt(deadlineMs, (signal) =>
@@ -787,7 +786,7 @@ export async function uploadAll(
       markerCleared = running.stopped
         .then((error) =>
           attempts?.settle(
-            target,
+            token!,
             error === undefined ||
               error instanceof OrphanedEntryError ||
               error instanceof DeletedScopeEntryError

@@ -1,56 +1,73 @@
-import { mkdir, open, readFile, rename } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import {
-  acquireProcessLock,
-  type UploadAttemptStore,
-} from "@opendatalabs/personal-server-ts-core/sync";
+import { mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
+import type { UploadAttemptStore } from "@opendatalabs/personal-server-ts-core/sync";
 
 let tempCounter = 0;
+const MAX_CORRUPT_COPIES = 3;
+
+/** Write `text` so it is on disk when this resolves: temp file, flush, rename, flush the directory. */
+async function writeDurably(path: string, text: string): Promise<void> {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true });
+  const tmpPath = `${path}.${process.pid}.${++tempCounter}.tmp`;
+  const file = await open(tmpPath, "w");
+  try {
+    await file.writeFile(text);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  await rename(tmpPath, path);
+  const dir = await open(directory, "r");
+  try {
+    await dir.sync();
+  } finally {
+    await dir.close();
+  }
+}
 
 /**
  * File-backed upload-attempt markers (see core `upload-attempts.ts`), next to
- * `pending-blob-deletions.json` under the server root. Each write goes to a
- * unique temp file, is flushed, renamed over the ledger, and the directory is
- * flushed, so the marker is on disk before an upload body is built. One
- * manager per file per process holds the owner lock.
+ * `pending-blob-deletions.json` under the server root. Every write is on disk
+ * before an upload body is built. The resolved file path names the store, so
+ * one manager per file per process holds the owner lock; another process on
+ * the same file is not excluded.
  */
 export function createFileUploadAttemptStore(
   filePath: string,
 ): UploadAttemptStore {
-  const lockName = `upload-attempts:${resolve(filePath)}`;
+  const path = resolve(filePath);
   return {
+    namespace: path,
     async read() {
       let text: string;
       try {
-        text = await readFile(filePath, "utf8");
+        text = await readFile(path, "utf8");
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw err;
       }
-      // Unparseable text throws: the file is kept for recovery, not replaced.
-      return JSON.parse(text) as unknown;
-    },
-    async write(envelope) {
-      const directory = dirname(filePath);
-      await mkdir(directory, { recursive: true });
-      const tmpPath = `${filePath}.${process.pid}.${++tempCounter}.tmp`;
-      const file = await open(tmpPath, "w");
       try {
-        await file.writeFile(`${JSON.stringify(envelope, null, 2)}\n`);
-        await file.sync();
-      } finally {
-        await file.close();
-      }
-      await rename(tmpPath, filePath);
-      const dir = await open(directory, "r");
-      try {
-        await dir.sync();
-      } finally {
-        await dir.close();
+        return JSON.parse(text) as unknown;
+      } catch {
+        // Readable but not JSON: hand the text on as a value that is not a
+        // ledger, so it is preserved rather than lost.
+        return text;
       }
     },
-    async acquire() {
-      return acquireProcessLock(lockName);
+    write: (envelope) =>
+      writeDurably(path, `${JSON.stringify(envelope, null, 2)}\n`),
+    async preserveCorrupt(value, stamp) {
+      const name = `${basename(path)}.corrupt-${stamp.replace(/[^0-9A-Za-z]/g, "-")}`;
+      await writeDurably(
+        resolve(dirname(path), name),
+        typeof value === "string" ? value : JSON.stringify(value, null, 2),
+      );
+      const copies = (await readdir(dirname(path)))
+        .filter((file) => file.startsWith(`${basename(path)}.corrupt-`))
+        .sort();
+      for (const old of copies.slice(0, -MAX_CORRUPT_COPIES))
+        await rm(resolve(dirname(path), old), { force: true });
     },
   };
 }
