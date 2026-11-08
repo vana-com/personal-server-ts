@@ -183,6 +183,13 @@ interface HostStream {
   fullStream: boolean;
   /** The seed is merged into this stream's publish. */
   seedApplies: boolean;
+  /**
+   * The stream row as the run declared the stream: whether it was already a
+   * tombstone. A publish that finds it tombstoned when it was not is a delete
+   * that came after collection, so the run discards. Absent on runs begun
+   * before this field existed, which skip the check.
+   */
+  rowAtStart?: { readonly tombstoned: boolean };
   recordTooLarge: number;
   problem: StreamSyncHostProblem | null;
   detail: string | null;
@@ -900,6 +907,16 @@ export class StreamSyncWriter {
       const host = await this.collecting(runId);
       if (host.streams[stream]) return;
       host.streams[stream] = this.newStream(nextIndex(host), shape);
+      // Every run publishes under the identity-less name (R23), so the scope
+      // is known at collection even though `entry.ns` is set at finish.
+      const { control } = await this.keys();
+      const row = await this.options.registry.read(
+        streamScope(host.entry.connector, IDENTITYLESS_NS, stream),
+      );
+      host.streams[stream]!.rowAtStart = {
+        tombstoned:
+          row.found && classifyStreamRow(row, control) === "tombstoned",
+      };
       host.entry = {
         ...host.entry,
         streams: { ...host.entry.streams, [stream]: { state: "planned" } },
@@ -1634,6 +1651,23 @@ export class StreamSyncWriter {
 
     const row = await this.options.registry.read(scope);
     const rowKind = classifyStreamRow(row, this.control!);
+    // A stream row tombstoned after this run was collected: discard. A row
+    // already a tombstone at collection predates the run, so a reconnect keeps it.
+    if (
+      stream.rowAtStart !== undefined &&
+      rowKind === "tombstoned" &&
+      !stream.rowAtStart.tombstoned
+    ) {
+      throw new Discard(
+        {
+          kind: "discard",
+          recollect: false,
+          clearCheckpoints: false,
+          restartFull: false,
+        },
+        "stream row tombstoned after this run was collected",
+      );
+    }
     let head: Head | null = null;
     if (rowKind === "present" && row.found) {
       head = await this.loadHead(scope, row.dataHash, {
