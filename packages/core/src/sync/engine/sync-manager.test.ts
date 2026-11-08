@@ -11,6 +11,10 @@ import type {
   DataStoragePort,
   PendingBlobDeletion,
 } from "../../ports/index.js";
+import {
+  createMemoryUploadAttemptStore,
+  uploadAttemptKey,
+} from "../upload-attempts.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 
 // Mock workers so we control their behavior
@@ -952,5 +956,55 @@ describe("sync manager upload state", () => {
     expect(manager.getStatus().uploads?.tooLarge).toEqual([
       expect.objectContaining({ scope: "s.big", path: "s/1.json" }),
     ]);
+  });
+});
+
+describe("sync manager upload attempt markers", () => {
+  const entry = {
+    id: 1,
+    scope: "s.crashy",
+    path: "s/1.json",
+    collectedAt: "2026-11-07T10:00:00Z",
+    version: 1,
+    sizeBytes: 10,
+  } as never;
+
+  /** The ledger the manager hands the upload worker on its next cycle. */
+  async function ledgerOf(manager: ReturnType<typeof createSyncManager>) {
+    let seen: UploadWorkerDeps | undefined;
+    (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async (deps) => {
+      seen = deps;
+      return [];
+    });
+    await manager.trigger();
+    return seen!.uploadAttempts!;
+  }
+
+  it("keeps the count and the quarantine when the manager is rebuilt over the same store", async () => {
+    const store = createMemoryUploadAttemptStore();
+    const build = () =>
+      createSyncManager(makeMockUploadDeps(), makeMockDownloadDeps(), {
+        uploadAttemptStore: store,
+      });
+
+    for (let boot = 0; boot < 2; boot++) {
+      const manager = build();
+      const ledger = await ledgerOf(manager);
+      await ledger.recover();
+      await ledger.begin(entry); // dies without settling
+      await manager.stop();
+    }
+    const rebuilt = build();
+    const ledger = await ledgerOf(rebuilt);
+    await ledger.recover();
+    expect(
+      ledger.isQuarantined(
+        uploadAttemptKey(makeMockUploadDeps().serverOwner, entry),
+      ),
+    ).toBe(true);
+
+    await rebuilt.retryQuarantinedUploads();
+    expect(ledger.quarantined()).toEqual([]);
+    await rebuilt.stop();
   });
 });

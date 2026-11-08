@@ -20,9 +20,15 @@ import {
   createMemoryPsLiteStateStore,
   createMemoryPsLiteStorage,
 } from "./test-support/memory.js";
+import {
+  createUploadAttemptLedger,
+  uploadAttemptKey,
+} from "@opendatalabs/personal-server-ts-core/sync";
+import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index/types";
 import { loadOrCreatePsLiteServerIdentity } from "./state.js";
 import {
   createPsLitePendingBlobDeletionStore,
+  createPsLiteUploadAttemptStore,
   createPsLiteSyncManager,
 } from "./sync.js";
 
@@ -452,5 +458,36 @@ describe("PS Lite read-side deletion memory", () => {
       deleted: true,
       deletedAt: "2026-05-09T00:00:00.000Z",
     });
+  });
+});
+
+describe("createPsLiteUploadAttemptStore", () => {
+  const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
+  const entry = {
+    id: 1,
+    scope: "chatgpt.conversations",
+    path: "chatgpt.conversations/2026-11-07T10:00:00Z.json",
+    collectedAt: "2026-11-07T10:00:00Z",
+    version: 1,
+    sizeBytes: 4096,
+  } as IndexEntry;
+
+  it("keeps an unsettled attempt in the durable state store across rebuilds and quarantines at the second", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+    for (let boot = 0; boot < 2; boot++) {
+      const ledger = createUploadAttemptLedger(
+        createPsLiteUploadAttemptStore(stateStore),
+        OWNER,
+      );
+      await ledger.recover();
+      expect(ledger.quarantined()).toEqual([]);
+      await ledger.begin(entry); // the WebView dies here, never settles
+    }
+    const ledger = createUploadAttemptLedger(
+      createPsLiteUploadAttemptStore(stateStore),
+      OWNER,
+    );
+    await ledger.recover();
+    expect(ledger.isQuarantined(uploadAttemptKey(OWNER, entry))).toBe(true);
   });
 });

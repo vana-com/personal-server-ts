@@ -85,6 +85,7 @@ import {
   resolveVanaStorageEndpoint,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
+import { createFileUploadAttemptStore } from "./upload-attempts.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
@@ -283,6 +284,7 @@ export async function createServer(
     storageRoot,
     "pending-blob-deletions.json",
   );
+  const uploadAttemptsPath = join(storageRoot, "upload-attempts.json");
   const tokensPath = join(storageRoot, "tokens.json");
   const revisionJournalDir = join(storageRoot, "cas-revisions");
   const metadataSentinelPath = join(storageRoot, "cas-metadata-initialized");
@@ -883,6 +885,7 @@ export async function createServer(
       deleteData,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
+      uploadAttemptStore: createFileUploadAttemptStore(uploadAttemptsPath),
       tombstoneFinality,
       transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {

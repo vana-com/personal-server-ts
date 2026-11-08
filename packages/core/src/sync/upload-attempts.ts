@@ -34,6 +34,8 @@ export interface UploadAttemptRecord {
   key: string;
   scope: string;
   path: string;
+  /** Index row id of the entry version; scopes pruning to a scanned window. */
+  rowId: number;
   /** Attempts that never settled, counted at startup. */
   interrupted: number;
   /** An attempt started and has not settled. Only meaningful at startup. */
@@ -94,8 +96,16 @@ export interface UploadAttemptLedger {
   begin(entry: IndexEntry): Promise<void>;
   /** The attempt settled (success or caught failure): drop its marker. */
   settle(entry: IndexEntry): Promise<void>;
-  /** Drop records of entry versions that are no longer unsynced rows. */
-  retainOnly(entries: readonly IndexEntry[]): Promise<void>;
+  /**
+   * Drop records of entry versions that are no longer among `entries`. After
+   * a partial (paged) scan pass the scanned row-id range: only records whose
+   * row id lies inside it are judged, so rows the scan did not reach keep
+   * their markers.
+   */
+  reconcile(
+    entries: readonly IndexEntry[],
+    scanned?: { afterId: number; throughId: number },
+  ): Promise<void>;
   /**
    * Owner retry: lift quarantine (and the interrupted count) for `scope`, or
    * for every scope. Returns the paths released.
@@ -160,6 +170,7 @@ export function createUploadAttemptLedger(
         key,
         scope: entry.scope,
         path: entry.path,
+        rowId: entry.id,
         interrupted: known?.interrupted ?? 0,
         inFlight: true,
         quarantined: false,
@@ -169,11 +180,14 @@ export function createUploadAttemptLedger(
     async settle(entry) {
       if (records.delete(keyOf(entry))) await persist();
     },
-    async retainOnly(entries) {
+    async reconcile(entries, scanned) {
       const keep = new Set(entries.map(keyOf));
       let changed = false;
-      for (const key of [...records.keys()]) {
-        if (!keep.has(key)) {
+      for (const [key, record] of [...records]) {
+        const covered =
+          !scanned ||
+          (record.rowId > scanned.afterId && record.rowId <= scanned.throughId);
+        if (covered && !keep.has(key)) {
           records.delete(key);
           changed = true;
         }

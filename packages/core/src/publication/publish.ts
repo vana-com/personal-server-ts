@@ -94,6 +94,11 @@ export interface PublishOptions {
    * resume, or bytes to heal still need the fence.
    */
   deletionAcknowledgedAtIngest?: boolean;
+  /**
+   * Checked before each remote effect. Once aborted, publication stops at the
+   * next step instead of continuing after the caller gave up on it.
+   */
+  signal?: AbortSignal;
 }
 
 const sameHash = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
@@ -186,6 +191,8 @@ export async function publishPreparedVersion(
   options: PreparedPublishOptions,
 ): Promise<PublicationResult> {
   const { scope, storageAdapter, fencedPublication, signer } = options;
+  const checkpoint = () => options.signal?.throwIfAborted();
+  checkpoint();
   const isDeleted = (row: PublicationRecord) =>
     Boolean(row.deletedAt) || isTombstoneRecord(row);
   let fence = await fencedPublication?.read({
@@ -210,6 +217,7 @@ export async function publishPreparedVersion(
   }
   checkDeletion();
   const { encrypted, wanted, verifyStored } = await options.prepare();
+  checkpoint();
   const wantedHash = wanted.dataHash;
   const keyUrl = (version: bigint) =>
     storageAdapter.urlForKey(`${scope}/${version}`);
@@ -222,6 +230,7 @@ export async function publishPreparedVersion(
     value: PublicationCandidate,
     mode: "register" | "adopt",
   ) {
+    checkpoint();
     const request = {
       ownerAddress: options.ownerAddress,
       scope,
@@ -314,6 +323,7 @@ export async function publishPreparedVersion(
       : BigInt(head?.expectedVersion ?? "0") + 1n;
   let rebased = false;
   for (let step = 0; step < 4; step++) {
+    checkpoint();
     checkDeletion();
     if (head && !isDeleted(head) && sameHash(head.dataHash, wantedHash)) {
       version = BigInt(head.expectedVersion);

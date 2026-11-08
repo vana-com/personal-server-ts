@@ -68,6 +68,16 @@ export {
   type PendingBlobDeletionPlanned,
   type PendingBlobDeletionState,
 } from "./pending-blob-deletions.js";
+export {
+  CRASHED_UPLOAD_REASON,
+  MAX_INTERRUPTED_UPLOAD_ATTEMPTS,
+  createMemoryUploadAttemptStore,
+  createUploadAttemptLedger,
+  uploadAttemptKey,
+  type UploadAttemptLedger,
+  type UploadAttemptRecord,
+  type UploadAttemptStore,
+} from "./upload-attempts.js";
 export { computeDataPointId } from "./data-point-id.js";
 export {
   createScopeDeletionTracker,

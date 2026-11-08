@@ -3,6 +3,11 @@ import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
 import { createUploadStateTracker } from "../upload-state.js";
+import {
+  createMemoryUploadAttemptStore,
+  createUploadAttemptLedger,
+  type UploadAttemptStore,
+} from "../upload-attempts.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
 import {
@@ -32,6 +37,13 @@ export interface SyncManagerOptions {
    * `deleteScope` is local-only and reports `durable: false`.
    */
   deleteData?: DeleteDataPort | null;
+  /**
+   * Durable host storage for upload-attempt markers. With it, an upload that
+   * kills the process is counted across restarts and host rebuilds, and the
+   * entry is quarantined after repeated crashes. Without it the markers live
+   * in memory and protect nothing across a restart.
+   */
+  uploadAttemptStore?: UploadAttemptStore;
   /** Durable retry marker for blob deletions that failed after the tombstone. */
   pendingBlobDeletions?: PendingBlobDeletionStore;
   /**
@@ -63,6 +75,12 @@ export interface SyncManager {
 
   /** Download exact owner scopes without advancing the registry cursor. */
   hydrateScopes(scopes: string[]): Promise<void>;
+
+  /**
+   * Owner retry: lift the quarantine of uploads that crashed the process, for
+   * one scope or all. The next cycle attempts them again.
+   */
+  retryQuarantinedUploads(scope?: string): Promise<void>;
 
   /** Signal that new data has been ingested (next cycle picks it up) */
   notifyNewData(): void;
@@ -121,9 +139,16 @@ export function createSyncManager(
     uploadDeps.scopeDeletions ?? downloadDeps.scopeDeletions;
   // The upload worker queues guarded cleanup for ciphertext it had to
   // abandon mid-race; it shares the manager's marker store.
+  const uploadAttempts =
+    uploadDeps.uploadAttempts ??
+    createUploadAttemptLedger(
+      options?.uploadAttemptStore ?? createMemoryUploadAttemptStore(),
+      uploadDeps.serverOwner,
+    );
   const workerUploadDeps: UploadWorkerDeps = {
     ...uploadDeps,
     uploadState,
+    uploadAttempts,
     pendingBlobDeletions:
       uploadDeps.pendingBlobDeletions ?? options?.pendingBlobDeletions,
   };
@@ -484,6 +509,12 @@ export function createSyncManager(
     notifyNewData() {
       uploadDeps.logger.debug("New data notification received");
       scheduleNotifiedCycle();
+    },
+
+    async retryQuarantinedUploads(scope) {
+      await uploadAttempts.recover();
+      for (const path of await uploadAttempts.release(scope))
+        uploadState.clear(path);
     },
 
     async deleteScope(scope: string) {

@@ -19,6 +19,8 @@ import {
   normalizePendingBlobDeletions,
   type PendingBlobDeletionPlanned,
   type ScopeDeletionTracker,
+  type UploadAttemptRecord,
+  type UploadAttemptStore,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   DataPointFeedPort,
@@ -60,6 +62,7 @@ import type { DiagnosticsRecorder } from "./diagnostics.js";
 
 const SYNC_CURSOR_KEY = "sync-cursor-v1";
 const PENDING_BLOB_DELETIONS_KEY = "pending-blob-deletions-v1";
+const UPLOAD_ATTEMPTS_KEY = "upload-attempts-v1";
 
 interface PsLitePendingBlobDeletionsState {
   /** Exact (scope, version) keys; `scopes` is the pre-key format. */
@@ -156,6 +159,26 @@ export function createPsLiteSyncCursor(
       await stateStore.set<PsLiteSyncCursorState>(SYNC_CURSOR_KEY, {
         lastProcessedTimestamp: timestamp,
       });
+    },
+  };
+}
+
+/**
+ * Upload-attempt markers in the same durable state store as the sync cursor,
+ * so a WebView or manager rebuild keeps the interrupted-attempt count.
+ */
+export function createPsLiteUploadAttemptStore(
+  stateStore: PsLiteStateStore,
+): UploadAttemptStore {
+  return {
+    async read() {
+      const state = await stateStore.get<{ records?: UploadAttemptRecord[] }>(
+        UPLOAD_ATTEMPTS_KEY,
+      );
+      return Array.isArray(state?.records) ? state.records : null;
+    },
+    async write(records) {
+      await stateStore.set(UPLOAD_ATTEMPTS_KEY, { records });
     },
   };
 }
@@ -430,6 +453,7 @@ export async function createPsLiteSyncManager(
     {
       deleteData,
       pendingBlobDeletions,
+      uploadAttemptStore: createPsLiteUploadAttemptStore(options.stateStore),
       tombstoneFinality,
       async canSync() {
         if (options.ownerSyncSigner) return { ok: true };

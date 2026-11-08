@@ -34,6 +34,10 @@ import {
   type RowIdentity,
   type UploadStateTracker,
 } from "../upload-state.js";
+import {
+  uploadAttemptKey,
+  type UploadAttemptLedger,
+} from "../upload-attempts.js";
 
 export { computeDataPointId } from "../data-point-id.js";
 export { isEntryCoveredByTombstone } from "../scope-deletions.js";
@@ -81,7 +85,26 @@ export interface UploadWorkerDeps {
    * size cap still applies, but failures are retried on every call.
    */
   uploadState?: UploadStateTracker;
+  /**
+   * Durable markers for attempts in flight. Without it an attempt that kills
+   * the process leaves no trace, and the same entry is picked again after
+   * every restart. The sync manager builds one from the host's store.
+   */
+  uploadAttempts?: UploadAttemptLedger;
 }
+
+/** An upload attempt that ran past its deadline and was aborted. */
+export class UploadDeadlineError extends Error {
+  constructor(readonly deadlineMs: number) {
+    super(
+      `Upload attempt passed its ${deadlineMs} ms deadline and was aborted`,
+    );
+    this.name = "UploadDeadlineError";
+  }
+}
+
+/** One attempt's budget. Long enough for a slow link, short of forever. */
+export const DEFAULT_UPLOAD_ATTEMPT_DEADLINE_MS = 10 * 60_000;
 
 export interface UploadResult {
   path: string;
@@ -109,6 +132,11 @@ export interface UploadAllOptions {
   onError?: (entry: IndexEntry, error: Error) => void;
   /** Clock for the coalesced-scope quiet window. Defaults to the wall clock. */
   now?: () => Date;
+  /**
+   * Deadline for one entry's attempt. Past it the attempt is aborted, counted
+   * as a caught failure and the next entry proceeds.
+   */
+  attemptDeadlineMs?: number;
 }
 
 /**
@@ -225,7 +253,9 @@ function isMissingPayloadError(err: unknown): boolean {
 export async function uploadOne(
   deps: UploadWorkerDeps,
   entry: IndexEntry,
+  options?: { signal?: AbortSignal },
 ): Promise<UploadResult> {
+  const signal = options?.signal;
   if (isReplicaScope(entry.scope))
     throw new Error("replica scopes require immutable transport");
   const {
@@ -270,6 +300,7 @@ export async function uploadOne(
     }
     throw err;
   }
+  signal?.throwIfAborted();
 
   const readHead = async (): Promise<PublicationRecord | null> =>
     deps.dataPointFeed
@@ -307,6 +338,7 @@ export async function uploadOne(
         signer,
         lineageGateway: deps.lineageGateway,
         fencedPublication: deps.fencedPublication,
+        signal,
         head: initialHead,
         readHead,
         checkHead,
@@ -513,6 +545,32 @@ function holdBackTerminal(
 }
 
 /**
+ * Run `attempt` with an AbortSignal that fires at the deadline. The result is
+ * a rejection with `UploadDeadlineError` at the deadline even when `attempt`
+ * never settles, so the worker can move on; the signal lets the work stop at
+ * its next step instead of publishing late.
+ */
+async function withDeadline<T>(
+  deadlineMs: number,
+  attempt: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new UploadDeadlineError(deadlineMs);
+      controller.abort(error);
+      reject(error);
+    }, deadlineMs);
+  });
+  try {
+    return await Promise.race([attempt(controller.signal), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Process all unsynced entries (dataPointId === null).
  * Processes sequentially to avoid overwhelming storage backend.
  * Returns array of results (skips failures, logs errors).
@@ -535,6 +593,10 @@ export async function uploadAll(
   // a bounded amount per cycle and is still swept in full. Any other host is
   // listed whole.
   const state = deps.uploadState ?? createUploadStateTracker();
+  const attempts = deps.uploadAttempts;
+  // Leftover markers are attempts that never settled; count them before
+  // choosing what to upload.
+  await attempts?.recover();
   // Paging needs both methods: the page method alone has no fence, so a
   // growing tail could keep the sweep from ever wrapping. Such a host is
   // listed whole.
@@ -575,17 +637,17 @@ export async function uploadAll(
   // Tracked state is dropped for rows that are gone or were rewritten. After a
   // partial window only the id range actually listed counts, so backoff of
   // rows beyond it survives; a window that reached the end covers the rest.
-  state.reconcile(
-    entries,
-    paged
-      ? {
-          afterId: scanAfter,
-          throughId: windowFull
-            ? Number(entries[entries.length - 1]?.id)
-            : scanFence,
-        }
-      : undefined,
-  );
+  const scanned = paged
+    ? {
+        afterId: scanAfter,
+        throughId: windowFull
+          ? Number(entries[entries.length - 1]?.id)
+          : scanFence,
+      }
+    : undefined;
+  state.reconcile(entries, scanned);
+  // Markers of rows that are gone or rewritten go the same way.
+  await attempts?.reconcile(entries, scanned);
   const plans = coalescePlan(deps, entries, clock());
   const results: UploadResult[] = [];
 
@@ -627,6 +689,27 @@ export async function uploadAll(
     // Entries that can never upload are classified here, from the index row
     // alone, so they cost no batch slot even the first time they are seen.
     if (holdBackTerminal(deps, state, plan ? plan.head : entry)) continue;
+    // An entry whose attempts killed the process is skipped, not retried: it
+    // would starve every entry behind it after each restart.
+    const candidate = plan ? plan.head : entry;
+    const crashed = attempts
+      ?.quarantined()
+      .find(
+        (record) =>
+          record.key === uploadAttemptKey(deps.serverOwner, candidate),
+      );
+    if (crashed) {
+      state.markCrashed(
+        {
+          scope: crashed.scope,
+          path: crashed.path,
+          identity: identityOf(candidate),
+        },
+        crashed.interrupted,
+        selectedAt,
+      );
+      continue;
+    }
     batch.push({ entry, plan });
   }
 
@@ -653,7 +736,13 @@ export async function uploadAll(
     // stopped entries to try again.
     if (!state.has(target.path)) state.releaseStopped(target.scope);
     try {
-      const result = await uploadOne(deps, target);
+      // Durable before any body is built: if this attempt kills the process,
+      // the next boot finds the marker and counts it.
+      await attempts?.begin(target);
+      const result = await withDeadline(
+        options?.attemptDeadlineMs ?? DEFAULT_UPLOAD_ATTEMPT_DEADLINE_MS,
+        (signal) => uploadOne(deps, target, { signal }),
+      );
       results.push(result);
       state.clear(target.path);
       if (plan) await supersede(plan.head);
@@ -690,6 +779,17 @@ export async function uploadAll(
           "Stopped retrying the upload of an entry after repeated failures",
         );
       }
+    } finally {
+      // Settled (success, or a failure caught above): not a crash.
+      await attempts?.settle(target).catch((err: unknown) => {
+        deps.logger.warn(
+          {
+            path: target.path,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          "Could not clear an upload attempt marker",
+        );
+      });
     }
   }
 

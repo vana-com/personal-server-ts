@@ -25,6 +25,7 @@ export type PsLiteStateKey =
   | "relay-v1"
   | "sync-cursor-v1"
   | "pending-blob-deletions-v1"
+  | "upload-attempts-v1"
   | `additions-publication-v1:${string}`
   | `additions-deletion-v1:${string}`
   | "derivative-questions-v1"
