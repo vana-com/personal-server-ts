@@ -1816,3 +1816,131 @@ describe("uploadAll — terminal state follows the row, not the path", () => {
     expect(second.uploadState.snapshot().retrying).toHaveLength(1);
   });
 });
+
+describe("uploadAll — paged scan of a large backlog", () => {
+  const SCOPE_KEY = new Uint8Array(32).fill(0xbb);
+  const MIB = 1024 * 1024;
+  const T0 = Date.parse("2026-11-07T12:00:00Z");
+  const MINUTE = 60_000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (deriveScopeKey as ReturnType<typeof vi.fn>).mockReturnValue(SCOPE_KEY);
+    (encryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    );
+  });
+
+  const row = (id: number, overrides?: Partial<IndexEntry>) =>
+    makeEntry({
+      id,
+      path: `p/${id}.json`,
+      scope: `p.${id}`,
+      sizeBytes: 1024,
+      ...overrides,
+    });
+
+  /** A host with the keyset page method: rows after `afterId`, id order. */
+  function setup(rows: IndexEntry[]) {
+    const deps = makeMockDeps();
+    const uploadState = createUploadStateTracker();
+    deps.uploadState = uploadState;
+    const pageLimits: number[] = [];
+    deps.storage.findUnsynced = vi.fn(() => {
+      throw new Error("a paged host is never asked for the whole set");
+    });
+    deps.storage.findUnsyncedPage = vi.fn(
+      ({ afterId, limit }: { afterId: number; limit: number }) => {
+        pageLimits.push(limit);
+        return rows
+          .filter((r) => r.dataPointId === null && r.id > afterId)
+          .sort((a, b) => a.id - b.id)
+          .slice(0, limit);
+      },
+    );
+    deps.storage.updateDataPointId = vi.fn(
+      (path: string, id: string | null) => {
+        const found = rows.find((r) => r.path === path);
+        if (found) found.dataPointId = id;
+        return true;
+      },
+    );
+    return { deps, uploadState, rows, pageLimits };
+  }
+
+  it("reads at most the scan budget per cycle and still reaches rows behind a terminal prefix", async () => {
+    const rows = [
+      ...Array.from({ length: 25 }, (_, i) =>
+        row(i + 1, { sizeBytes: 337 * MIB }),
+      ),
+      row(26),
+    ];
+    const { deps, pageLimits } = setup(rows);
+    const uploaded: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const results = await uploadAll(deps, {
+        batchSize: 2,
+        scanBudget: 10,
+        now: () => new Date(T0 + i * 60 * MINUTE),
+      });
+      uploaded.push(...results.map((r) => r.path));
+    }
+    expect(uploaded).toEqual(["p/26.json"]);
+    expect(Math.max(...pageLimits)).toBeLessThanOrEqual(10);
+  });
+
+  it("does not forget backoff of rows outside the window it scanned", async () => {
+    const rows = Array.from({ length: 30 }, (_, i) => row(i + 1));
+    const { deps, uploadState } = setup(rows);
+    // A row far beyond the first window has a failure on record.
+    uploadState.recordFailure(
+      {
+        scope: "p.30",
+        path: "p/30.json",
+        identity: { id: 30, sizeBytes: 1024 },
+      },
+      "boom",
+      T0,
+    );
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("boom"),
+    );
+
+    await uploadAll(deps, {
+      batchSize: 1,
+      scanBudget: 10,
+      now: () => new Date(T0 + 1000),
+    });
+
+    expect(uploadState.snapshot().retrying.map((e) => e.path)).toContain(
+      "p/30.json",
+    );
+  });
+
+  it("forgets a row that vanished from the range it scanned", async () => {
+    const rows = Array.from({ length: 5 }, (_, i) => row(i + 1));
+    const { deps, uploadState } = setup(rows);
+    uploadState.recordFailure(
+      {
+        scope: "p.9",
+        path: "p/9.json",
+        identity: { id: 3.5, sizeBytes: 1024 },
+      },
+      "boom",
+      T0,
+    );
+    (deps.storageAdapter.upload as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("boom"),
+    );
+
+    await uploadAll(deps, {
+      batchSize: 50,
+      scanBudget: 10,
+      now: () => new Date(T0 + 1000),
+    });
+
+    expect(uploadState.snapshot().retrying.map((e) => e.path)).not.toContain(
+      "p/9.json",
+    );
+  });
+});
