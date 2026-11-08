@@ -20,13 +20,12 @@ const hex = (bytes: Uint8Array): string =>
  * Read a view from a directory written by a fixture, as a restarted server
  * would: no blob reads, no import. The child holds only the body it reads.
  */
-export async function readRetention(args: {
-  dir: string;
-  seed: number;
-  scope: string;
-}): Promise<{ bytes: number; digest: string }> {
+type RestartArgs = { dir: string; seed: number; scope: string };
+
+/** Open a view from a directory written by a fixture, as a restarted server: no blob reads, no import. */
+async function openRestart(args: RestartArgs): Promise<StreamSyncReadService> {
   const owner = await testOwnerKey(masterKey(args.seed));
-  const service = await StreamSyncReadService.open({
+  return StreamSyncReadService.open({
     files: createDiskStreamSyncReadFiles(args.dir),
     blobs: {
       get: async () => {
@@ -38,10 +37,19 @@ export async function readRetention(args: {
     overlay: { entries: async () => [] },
     now: () => new Date("2026-11-02T00:00:00Z"),
   } as StreamSyncReadOptions);
-  const decision = await service.resolve(ask(args.scope));
+}
+
+/** Resolve the view, call `onStart`, then drain it, calling `onChunk` after each chunk. */
+async function drainRestart(
+  service: StreamSyncReadService,
+  scope: string,
+  hooks: { onStart?: () => void; onChunk?: () => void } = {},
+): Promise<{ bytes: number; digest: string }> {
+  const decision = await service.resolve(ask(scope));
   if (decision.kind !== "view") {
     throw new Error(`expected a view, got ${decision.kind}`);
   }
+  hooks.onStart?.();
   const reader = decision.body.getReader();
   const hash = sha256.create();
   let bytes = 0;
@@ -50,8 +58,59 @@ export async function readRetention(args: {
     if (next.done) break;
     hash.update(next.value);
     bytes += next.value.byteLength;
+    hooks.onChunk?.();
   }
   return { bytes, digest: hex(hash.digest()) };
+}
+
+/**
+ * Read a view from a directory written by a fixture, as a restarted server
+ * would: no blob reads, no import. The child holds only the body it reads.
+ */
+export async function readRetention(
+  args: RestartArgs,
+): Promise<{ bytes: number; digest: string }> {
+  return drainRestart(await openRestart(args), args.scope);
+}
+
+/**
+ * The same restart read, measuring live memory with forced full GC instead of
+ * the RSS high-water mark. Deterministic: no timer, and the live set after a
+ * full GC is a function of the code, not of allocation timing. Live memory is
+ * the V8 heap plus ArrayBuffer backing stores, where the part bytes live.
+ * `retained` is the largest live amount seen during the drain above the
+ * amount live when the body starts. Absolute values include the module graph;
+ * the growth gate compares sizes.
+ */
+export async function readLiveRetention(
+  args: RestartArgs & { sampleEvery: number },
+): Promise<{ bytes: number; digest: string; retained: number }> {
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (!gc) throw new Error("readLiveRetention requires --expose-gc");
+  const live = (): number => {
+    gc();
+    const m = process.memoryUsage();
+    return m.heapUsed + m.arrayBuffers;
+  };
+  let start = 0;
+  let max = 0;
+  let chunks = 0;
+  const { bytes, digest } = await drainRestart(
+    await openRestart(args),
+    args.scope,
+    {
+      onStart: () => {
+        start = live();
+        max = start;
+      },
+      onChunk: () => {
+        chunks += 1;
+        if (chunks % args.sampleEvery === 0) max = Math.max(max, live());
+      },
+    },
+  );
+  max = Math.max(max, live());
+  return { bytes, digest, retained: max - start };
 }
 
 /**
