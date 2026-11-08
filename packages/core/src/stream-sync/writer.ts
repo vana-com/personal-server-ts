@@ -662,9 +662,13 @@ export class StreamSyncWriter {
     });
   }
 
-  private startSnapshot(connector: string): StartSnapshot {
+  /**
+   * The start snapshot of `connector`, from one state read. `null` until a
+   * control listing has completed in this session: the run's start is unknown.
+   */
+  private startFrom(state: WriterState, connector: string): StartSnapshot {
     if (this.controls === null) return null;
-    return { ...(this.controls.get(connector) ?? {}) };
+    return { ...(state.observedControl?.[connector] ?? {}) };
   }
 
   // -------------------------------------------------------------- delete
@@ -930,6 +934,10 @@ export class StreamSyncWriter {
       if (!input.userConnect && isStoppedState(state, input.connector)) {
         throw new ConnectionStoppedError(input.connector);
       }
+      // The start is read from the same state as the check, with no await
+      // between them: a delete the publish queue records later cannot give
+      // this run a start the check did not see.
+      const start = this.startFrom(state, input.connector);
       let checkpointUsed = input.checkpointUsed ?? null;
       let full = checkpointUsed === null;
       let issued: IssuedStart | null = null;
@@ -952,7 +960,7 @@ export class StreamSyncWriter {
       const entry = createOutboxEntry({
         runId: input.runId,
         connector: input.connector,
-        start: this.startSnapshot(input.connector),
+        start,
         userConnect: input.userConnect,
         full,
         // m1: a producer clock cannot place lines more than 5 min ahead.
