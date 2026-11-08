@@ -103,13 +103,17 @@ export function deletedSinceStart(
   start: ControlState | { readonly kind: "unknown" },
   now: ControlState,
 ): boolean {
-  return start.kind === "active" && now.kind === "deleted";
+  if (start.kind !== "active") return false;
+  if (now.kind === "deleted") return true;
+  // A reconnect after a delete lands at a higher generation. That is still
+  // deleted since start: a generation can only rise through a delete.
+  return now.kind === "active" && now.generation !== start.generation;
 }
 
 /**
  * The one delete predicate for a run, shared by publish admission and any
  * reader that hides pending runs. A run is deleted when its connection was
- * active at start and is deleted now (control arm), or when its stream row
+ * active at start and deleted or reconnected since (control arm), or when its stream row
  * was not a tombstone at start and is one now (stream arm). Each arm is
  * skipped when its start or now state is not known.
  *

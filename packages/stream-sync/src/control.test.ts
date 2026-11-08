@@ -29,6 +29,24 @@ describe("runDeletedSince", async () => {
     ).toBe(true);
   });
 
+  it("control arm: a connection deleted then reconnected since start is deleted (reader hides the run)", () => {
+    expect(
+      runDeletedSince(
+        { control: active },
+        { control: { kind: "active", generation: 3 }, hashes },
+      ),
+    ).toBe(true);
+  });
+
+  it("control arm: an unchanged active connection is not deleted", () => {
+    expect(
+      runDeletedSince(
+        { control: active },
+        { control: { kind: "active", generation: 1 }, hashes },
+      ),
+    ).toBe(false);
+  });
+
   it("control arm: a run that started with the connection absent or unknown is not deleted", () => {
     expect(
       runDeletedSince(
