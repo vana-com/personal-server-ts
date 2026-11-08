@@ -18,10 +18,12 @@ import {
   activateControl,
   collect,
   createOracleEnv,
+  deleteConnection,
   finishedOutcome,
   freshConnector,
   interpose,
   readStream,
+  SHAPE,
   startLocalStorage,
   type Backend,
   type OracleEnv,
@@ -30,6 +32,7 @@ import {
 
 const GATEWAY_URL = process.env.STREAM_SYNC_ORACLE_GATEWAY_URL;
 const NS = "";
+const NS_OTHER = "0123456789abcdef";
 const T0 = Date.UTC(2026, 10, 1);
 
 const backends: Backend[] = GATEWAY_URL ? ["fake", "gateway"] : ["fake"];
@@ -227,6 +230,199 @@ describe.each(matrix)(
       await activateControl(env.registry, c, NS);
       await again.refreshControls();
       await expect(scheduled(again, c, "sched-3")).resolves.toBeDefined();
+    });
+
+    // R1 (review P1, Q2): a resume that fails holds only its own connector.
+    it("a failed resume holds only its connector: another connector still publishes, and the resume is retried on the next pass", async () => {
+      const c = freshConnector("p4r2-resume-fail");
+      const other = freshConnector("p4r2-resume-other");
+      await activateControl(env.registry, c, NS);
+      await activateControl(env.registry, other, NS);
+      const tombScope = controlScope(c, NS);
+      const crashing = await env.writer("p4r2-resume-a", {
+        registry: interpose(env.newRegistry(), {
+          async beforePost(request) {
+            if (request.scope === tombScope) throw new Error("crash first");
+          },
+        }),
+      });
+      await crashing.refreshControls();
+      await expect(crashing.deleteConnection(c)).rejects.toThrow("crash first");
+
+      let down = true;
+      const booted = await env.writer("p4r2-resume-a", {
+        registry: interpose(env.newRegistry(), {
+          async beforePost(request) {
+            if (down && request.scope === tombScope) {
+              throw new Error("still down");
+            }
+          },
+        }),
+      });
+      await booted.refreshControls();
+      await collect(booted, {
+        runId: "p4r2-other",
+        connector: other,
+        observedAt: T0,
+        streams: { s: rows(["1"], "other") },
+      });
+      await expect(booted.publishPending()).resolves.toBeDefined();
+      const otherView = await readStream(
+        env.registry,
+        env.blobs,
+        other,
+        NS,
+        "s",
+      );
+      if (!otherView || otherView === "tombstoned") {
+        throw new Error("the other connector did not publish");
+      }
+      expect([...otherView.records.keys()]).toEqual(["1"]);
+
+      down = false;
+      await booted.publishPending();
+      expect(await env.registry.read(tombScope)).toMatchObject({
+        found: true,
+        version: 2,
+        deleted: true,
+      });
+    });
+
+    // R2 (review P2-1): an explicit connect finishes a pending delete first.
+    it("an explicit connect with a pending delete finishes the delete, then reconnects; a later boot does not delete the new connection", async () => {
+      const c = freshConnector("p4r2-connect-pending");
+      await activateControl(env.registry, c, NS); // active(1)
+      const tombScope = controlScope(c, NS);
+      let down = true;
+      const a = await env.writer("p4r2-connect-a", {
+        registry: interpose(env.newRegistry(), {
+          async beforePost(request) {
+            if (down && request.scope === tombScope) throw new Error("offline");
+          },
+        }),
+      });
+      await a.refreshControls();
+      await expect(a.deleteConnection(c)).rejects.toThrow("offline");
+
+      down = false;
+      await collect(a, {
+        runId: "p4r2-connect",
+        connector: c,
+        observedAt: T0,
+        userConnect: true,
+        streams: { s: rows(["9"], "new") },
+      });
+      await a.publishPending();
+
+      const boot = await env.writer("p4r2-connect-a");
+      await boot.publishPending();
+      expect(await env.registry.read(tombScope)).toMatchObject({
+        found: true,
+        version: 3,
+        deleted: false,
+      });
+    });
+
+    // R3 (review P2-2): a delete decided from a stale listing must not be a silent no-op.
+    it("a delete decided from a stale listing lands on the current row: the connection is deleted, not left active", async () => {
+      const c = freshConnector("p4r2-stale-listing");
+      await activateControl(env.registry, c, NS); // active(1)
+      const stale = await env.registry.listControlRows();
+      await deleteConnection(env.registry, c, NS, []); // deleted(2)
+      await activateControl(env.registry, c, NS); // active(3), reconnected elsewhere
+      const a = await env.writer("p4r2-stale-a", {
+        registry: { ...env.newRegistry(), listControlRows: async () => stale },
+      });
+      await a.deleteConnection(c);
+      expect(await env.registry.read(controlScope(c, NS))).toMatchObject({
+        found: true,
+        version: 4,
+        deleted: true,
+      });
+    });
+
+    // R4 (review P3-1): a deleted namespace does not stop the active one.
+    it("a deleted row in another namespace does not stop scheduled runs of the identity-less namespace", async () => {
+      const c = freshConnector("p4r2-ns-isolation");
+      await activateControl(env.registry, c, NS);
+      await activateControl(env.registry, c, NS_OTHER);
+      await deleteConnection(env.registry, c, NS_OTHER, []);
+      const a = await env.writer("p4r2-ns-a");
+      await a.refreshControls();
+      await expect(scheduled(a, c, "sched-ns")).resolves.toBeDefined();
+    });
+
+    // R5 (review P3-2): an explicit connect right after the device's own delete.
+    it("an explicit connect right after this device's own delete is accepted, without a listing in between", async () => {
+      const c = freshConnector("p4r2-connect-after-delete");
+      await activateControl(env.registry, c, NS); // active(1)
+      const a = await env.writer("p4r2-after-a");
+      await a.refreshControls();
+      await a.deleteConnection(c); // deleted(2)
+      await collect(a, {
+        runId: "p4r2-after-connect",
+        connector: c,
+        observedAt: T0,
+        userConnect: true,
+        streams: { s: rows(["1"], "n") },
+      });
+      await a.publishPending();
+      expect(await env.registry.read(controlScope(c, NS))).toMatchObject({
+        found: true,
+        version: 3,
+        deleted: false,
+      });
+    });
+
+    // S4b (review m8): a user connect on a stopped connector reconnects; a second device that saw the delete is stopped until then.
+    it("a second device stays stopped until the explicit connect reconnects, then runs again", async () => {
+      const c = freshConnector("p4r2-second-device");
+      await activateControl(env.registry, c, NS); // active(1)
+      const first = await env.writer("p4r2-second-a");
+      await first.refreshControls();
+      await first.deleteConnection(c); // deleted(2)
+
+      const second = await env.writer("p4r2-second-b");
+      await second.refreshControls();
+      await expect(scheduled(second, c, "sched-b1")).rejects.toThrow(/stopped/);
+
+      await first.refreshControls();
+      await collect(first, {
+        runId: "p4r2-second-connect",
+        connector: c,
+        observedAt: T0,
+        userConnect: true,
+        streams: { s: rows(["5"], "again") },
+      });
+      await first.publishPending();
+
+      await second.refreshControls();
+      await expect(scheduled(second, c, "sched-b2")).resolves.toBeDefined();
+    });
+
+    // S6: a run collected before the delete publishes nothing after it.
+    it("a run collected before the delete publishes nothing once the delete has landed", async () => {
+      const c = freshConnector("p4r2-collecting-run");
+      await activateControl(env.registry, c, NS); // active(1)
+      const a = await env.writer("p4r2-collecting-a");
+      await a.refreshControls();
+      await a.beginRun({
+        runId: "p4r2-collecting",
+        connector: c,
+        userConnect: false,
+        observedAt: T0,
+        identity: "none",
+        checkpointUsed: null,
+      });
+      await a.declareStream("p4r2-collecting", "s", SHAPE);
+      await a.append("p4r2-collecting", "s", { id: "1", n: "early" });
+      await a.deleteConnection(c); // deleted(2)
+      await a.finishRun("p4r2-collecting", {
+        checkpointCandidate: { cursor: "x" },
+      });
+      await a.publishPending();
+      const view = await readStream(env.registry, env.blobs, c, NS, "s");
+      expect(view === null || view === "tombstoned").toBe(true);
     });
 
     // S5
