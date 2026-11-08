@@ -301,7 +301,8 @@ describe("spool allocation chunks", () => {
         open: () => files,
       }),
       registry: {
-        read: unexpected,
+        // declareStream reads the stream's control row (not a publication).
+        read: async () => ({ found: false }),
         post: unexpected,
         listControlRows: unexpected,
       },

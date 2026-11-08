@@ -177,26 +177,52 @@ export async function* readSpool(
   // whole chunk and slicing lines out of it would make every line a view that
   // pins its 1 MiB chunk for as long as any caller keeps the line's text.
   // 0x0a cannot occur inside a multi-byte UTF-8 sequence, so the split is safe.
-  let rest = new Uint8Array(0);
+  // Bytes of the line still open at the end of the last chunk, as pieces. A
+  // long line is copied once, when its newline arrives, not once per chunk.
+  // The line's bytes are not referenced while the parsed line is yielded, so
+  // a caller that holds the line holds one copy of its text, not its bytes too.
+  let open: Uint8Array[] = [];
+  let openBytes = 0;
   let firstLine = true;
   for await (const chunk of files.readChunks(path)) {
-    const bytes = new Uint8Array(rest.length + chunk.length);
-    bytes.set(rest);
-    bytes.set(chunk, rest.length);
     let start = 0;
-    let newline = bytes.indexOf(0x0a, start);
+    let newline = chunk.indexOf(0x0a, start);
     while (newline !== -1) {
-      let raw = decoder.decode(bytes.subarray(start, newline));
+      let raw: string;
+      if (open.length === 0) {
+        raw = decoder.decode(chunk.subarray(start, newline));
+      } else {
+        const line = new Uint8Array(openBytes + (newline - start));
+        let at = 0;
+        for (const piece of open) {
+          line.set(piece, at);
+          at += piece.length;
+        }
+        line.set(chunk.subarray(start, newline), at);
+        raw = decoder.decode(line);
+        open = [];
+        openBytes = 0;
+      }
       if (firstLine && raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
       firstLine = false;
       yield parseSpoolLine(raw);
       start = newline + 1;
-      newline = bytes.indexOf(0x0a, start);
+      newline = chunk.indexOf(0x0a, start);
     }
-    rest = bytes.slice(start);
+    if (start < chunk.length) {
+      const tail = chunk.slice(start);
+      open.push(tail);
+      openBytes += tail.length;
+    }
   }
-  if (rest.length !== 0) {
+  if (openBytes !== 0) {
     // A file that holds only a BOM has no lines, as the whole-file decoder gives.
+    const rest = new Uint8Array(openBytes);
+    let at = 0;
+    for (const piece of open) {
+      rest.set(piece, at);
+      at += piece.length;
+    }
     const bomOnly =
       firstLine &&
       rest.length === 3 &&
@@ -243,7 +269,7 @@ export async function compactShard(
   path: string,
   shard: number,
   budgetBytes: number,
-  flushBytes: number = DEFAULT_SPOOL_FLUSH_BYTES,
+  flushBytes: number = FLUSH_BYTES,
 ): Promise<number | null> {
   const prefix = shard.toString(2).padStart(8, "0");
   const reducer = new BucketReducer(prefix);
