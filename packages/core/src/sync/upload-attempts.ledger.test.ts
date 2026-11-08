@@ -374,7 +374,7 @@ describe("serialized operations", () => {
     }
   });
 
-  it("keeps the store and the corrected ledger when a failed repair meets an immediate stop, and hands it over by itself once storage heals", async () => {
+  it("retries a failed repair during a stop, so the stop hands the store over once storage heals", async () => {
     const { store, control, inner } = controlledStore();
     const ledger = createUploadAttemptLedger(store, OWNER_A, {
       maxInterrupted: 1,
@@ -387,23 +387,17 @@ describe("serialized operations", () => {
       UploadAttemptStorageFailedError,
     );
 
-    // Stop at once: the repair is retried, fails, and the lease stays.
+    // The stop's first repair fails; its retry is referenced and succeeds.
     control.rejectNext = new Error("still down");
-    await expect(ledger.close()).rejects.toBeInstanceOf(
-      UploadAttemptStorageFailedError,
+    await ledger.close();
+    expect(((await inner.read()) as { records: unknown[] }).records).toEqual(
+      [],
     );
     const rebuilt = createUploadAttemptLedger(store, OWNER_A, {
       maxInterrupted: 1,
     });
-    expect(await rebuilt.recover()).toBe(false);
-    await expect(ledger.begin(entry(2))).rejects.toThrow(/stopping/);
-
-    // Storage heals. No command goes to the old ledger: it repairs itself.
-    await vi.waitFor(async () => expect(await rebuilt.recover()).toBe(true));
+    expect(await rebuilt.recover()).toBe(true);
     expect(rebuilt.quarantined()).toEqual([]);
-    expect(((await inner.read()) as { records: unknown[] }).records).toEqual(
-      [],
-    );
   });
 
   it("keeps a settlement whose write failed, so a stop cannot hand over a marker for a body that stopped", async () => {

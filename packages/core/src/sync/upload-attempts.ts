@@ -118,6 +118,15 @@ export const UPLOAD_ATTEMPTS_RESET_NOTICE =
 /** Waiting for a running attempt to settle when a manager stops. */
 export const DEFAULT_ABANDON_GRACE_MS = 5_000;
 
+/**
+ * How long a stop keeps retrying a repair that storage refused before it
+ * resolves with that error. The retries are referenced timers, so the process
+ * stays up for them. After the window a failed repair falls back to an
+ * unreferenced timer: the marker may survive the exit and is counted once on
+ * the next boot.
+ */
+export const STOP_REPAIR_WINDOW_MS = 10_000;
+
 /** Held by one ledger at a time; released when its manager stops. */
 export interface UploadAttemptLease {
   release(): void;
@@ -341,7 +350,9 @@ export interface UploadAttemptLedger {
    * manager shares this ledger and cannot start a second body for it); the
    * lock is given up when it settles. A manager that takes the store back
    * (`recover`) during the wait cancels the release. `Infinity` waits for
-   * the attempts however long they take.
+   * the attempts however long they take. A repair that storage refuses is
+   * retried, with referenced timers, for up to `STOP_REPAIR_WINDOW_MS`; the
+   * call rejects only after that window.
    */
   close(graceMs?: number): Promise<void>;
 }
@@ -452,8 +463,9 @@ export function createUploadAttemptLedger(
    * Give up the store, if still due: `since` is the `reactivations` count when
    * the release was decided; a manager may have taken the store back, and
    * begun an attempt, since. Storage must hold the committed state first.
+   * `stopDeadline` (a stop is waiting) keeps the retries referenced until it.
    */
-  async function giveUp(since: number) {
+  async function giveUp(since: number, stopDeadline?: number): Promise<void> {
     if (reactivations !== since || live.size > 0 || !lease) return;
     try {
       await repair();
@@ -464,6 +476,11 @@ export function createUploadAttemptLedger(
       closeWhenIdle = true; // the stop is still owed, whatever else happens
       const delay = retryDelay;
       retryDelay = Math.min(retryDelay * 2, 30 * baseRetryMs);
+      if (stopDeadline !== undefined && Date.now() + delay <= stopDeadline) {
+        // A referenced wait: the process cannot exit while the stop retries.
+        await new Promise<void>((wake) => setTimeout(wake, delay));
+        return giveUp(since, stopDeadline);
+      }
       const timer = setTimeout(
         () => void enqueue(() => giveUp(since)).catch(() => undefined),
         delay,
@@ -691,7 +708,7 @@ export function createUploadAttemptLedger(
           closeWhenIdle = true;
           return;
         }
-        await giveUp(since);
+        await giveUp(since, Date.now() + STOP_REPAIR_WINDOW_MS);
       });
     },
   };
