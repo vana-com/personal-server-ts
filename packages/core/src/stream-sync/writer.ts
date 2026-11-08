@@ -57,6 +57,7 @@ import {
   pkHash,
   pkHashBits,
   planBuckets,
+  runDeletedSince,
   shardOf,
   startState,
   streamRunResult,
@@ -1651,12 +1652,17 @@ export class StreamSyncWriter {
 
     const row = await this.options.registry.read(scope);
     const rowKind = classifyStreamRow(row, this.control!);
-    // A stream row tombstoned after this run was collected: discard. A row
-    // already a tombstone at collection predates the run, so a reconnect keeps it.
+    // The delete predicate a reader shares (runDeletedSince): a stream row
+    // tombstoned after this run was collected discards it. A row already a
+    // tombstone at collection predates the run, so a reconnect keeps it.
     if (
-      stream.rowAtStart !== undefined &&
-      rowKind === "tombstoned" &&
-      !stream.rowAtStart.tombstoned
+      runDeletedSince(
+        {
+          control: { kind: "unknown" },
+          streamTombstoned: stream.rowAtStart?.tombstoned,
+        },
+        { stream: row, hashes: this.control! },
+      )
     ) {
       throw new Discard(
         {

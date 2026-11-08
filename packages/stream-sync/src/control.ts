@@ -105,3 +105,33 @@ export function deletedSinceStart(
 ): boolean {
   return start.kind === "active" && now.kind === "deleted";
 }
+
+/**
+ * The one delete predicate for a run, shared by publish admission and any
+ * reader that hides pending runs. A run is deleted when its connection was
+ * active at start and is deleted now (control arm), or when its stream row
+ * was not a tombstone at start and is one now (stream arm). Each arm is
+ * skipped when its start or now state is not known.
+ *
+ * `streamTombstoned` is the stream row at start (`undefined` = not stamped).
+ * The stream arm cannot see a tombstone a later write overwrote before `now`
+ * was read; the registry returns only the latest row.
+ */
+export function runDeletedSince(
+  start: {
+    readonly control: ControlState | { readonly kind: "unknown" };
+    readonly streamTombstoned?: boolean;
+  },
+  now: {
+    readonly control?: ControlState;
+    readonly stream?: ControlRead;
+    readonly hashes: Pick<ControlHashes, "tombstoneData" | "tombstoneMetadata">;
+  },
+): boolean {
+  if (now.control && deletedSinceStart(start.control, now.control)) return true;
+  return (
+    start.streamTombstoned === false &&
+    now.stream !== undefined &&
+    classifyStreamRow(now.stream, now.hashes) === "tombstoned"
+  );
+}
