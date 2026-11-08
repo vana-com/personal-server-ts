@@ -91,6 +91,177 @@ interface Report {
   quarantined: number;
 }
 
+/**
+ * Scenario children. `refused`: entry 1 stays live, entry 2's admission is
+ * refused with its rollback failing, storage heals, then a default stop
+ * returns and the process ends. `crash`: one admission never settles and the
+ * process ends. `late`: a default stop returns with entry 1 live; the body
+ * then ends and its terminal write and immediate repair fail before storage
+ * heals.
+ */
+const SCENARIO_CHILD = `
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
+const {
+  createUploadAttemptLedger,
+  UploadAttemptWriteUncertainError,
+} = await import(process.env.LEDGER_URL);
+const FILE = process.env.STORE_FILE;
+const OWNER = process.env.OWNER;
+const plan = JSON.parse(process.env.PLAN ?? "[]");
+const after = process.env.AFTER ?? "ok";
+const entryOf = (id) => ({
+  id, fileId: null, schemaId: null, path: "scope." + id + "/p.json",
+  scope: "scope." + id, collectedAt: "2026-11-07T10:0" + id + ":00Z",
+  createdAt: "2026-11-07T10:0" + id + ":00Z", sizeBytes: 1024, version: 1,
+  dataPointId: null,
+});
+let writes = 0;
+const store = {
+  namespace: "file:" + FILE,
+  async read() {
+    return existsSync(FILE) ? JSON.parse(readFileSync(FILE, "utf8")) : null;
+  },
+  async write(envelope) {
+    writes += 1;
+    const step = writes <= plan.length ? plan[writes - 1] : after;
+    if (step === "fail") throw new Error("disk down");
+    writeFileSync(FILE, JSON.stringify(envelope));
+    if (step === "commit-uncertain")
+      throw new UploadAttemptWriteUncertainError("stored");
+  },
+  async preserveCorrupt() {
+    throw new Error("not expected");
+  },
+};
+const ledger = createUploadAttemptLedger(store, OWNER);
+const report = {};
+await ledger.recover();
+const mode = process.env.MODE;
+if (mode === "refused") {
+  const token = await ledger.begin(entryOf(1));
+  report.a = "begun";
+  try {
+    await ledger.begin(entryOf(2));
+    report.b = "ok";
+  } catch (error) {
+    report.b = error.name;
+  }
+  await ledger.close();
+  report.stop = "ok";
+} else if (mode === "crash") {
+  await ledger.begin(entryOf(1));
+} else if (mode === "late") {
+  const token = await ledger.begin(entryOf(1));
+  await ledger.close();
+  report.stop = "ok";
+  await new Promise((wake) => setTimeout(wake, 100));
+  try {
+    await ledger.settle(token, "failure");
+    report.settle = "ok";
+  } catch (error) {
+    report.settle = error.name;
+  }
+} else if (mode === "f3") {
+  // A and C begin; the stop gives up on both at once (grace 0); then A
+  // settles while C is still live.
+  const a = await ledger.begin(entryOf(1));
+  await ledger.begin(entryOf(2));
+  await ledger.close(0);
+  report.stop = "ok";
+  try {
+    await ledger.settle(a, "success");
+    report.settle = "ok";
+  } catch (error) {
+    report.settle = error.name;
+  }
+} else if (mode === "f4") {
+  // A begins; a default stop starts; another manager takes the store back
+  // before A settles, and A's settlement write is refused.
+  const a = await ledger.begin(entryOf(1));
+  const closing = ledger.close();
+  await ledger.recover();
+  try {
+    await ledger.settle(a, "success");
+    report.settle = "ok";
+  } catch (error) {
+    report.settle = error.name;
+  }
+  await closing;
+  report.stop = "ok";
+} else if (mode === "f6") {
+  // A begins and never settles; B's admission is refused with an uncertain
+  // marker that cannot be rolled back; then the stop is void (not awaited).
+  await ledger.begin(entryOf(1));
+  try {
+    await ledger.begin(entryOf(2));
+    report.b = "ok";
+  } catch (error) {
+    report.b = error.name;
+  }
+  void ledger.close(Infinity);
+  report.stop = "void";
+}
+const mine = (JSON.parse(existsSync(FILE) ? readFileSync(FILE, "utf8") : "{\\"records\\":[]}").records ?? [])
+  .filter((r) => r.owner === OWNER.toLowerCase());
+report.records = mine.map((r) => ({ rowId: r.rowId, interrupted: r.interrupted, inFlight: r.inFlight, quarantined: r.quarantined }));
+console.log("REPORT " + JSON.stringify(report));
+`;
+
+interface ScenarioReport {
+  stop?: string;
+  records: Array<{
+    rowId: number;
+    interrupted: number;
+    inFlight: boolean;
+    quarantined: boolean;
+  }>;
+}
+
+/** Run one scenario child to its natural end, with the same plan rules. */
+function runScenario(
+  file: string,
+  mode: "refused" | "crash" | "late" | "f3" | "f4" | "f6" | "recover",
+  plan: string[] = [],
+) {
+  return new Promise<{ report: ScenarioReport; code: number | null }>(
+    (resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "-e", SCENARIO_CHILD],
+        {
+          env: {
+            ...process.env,
+            LEDGER_URL,
+            STORE_FILE: file,
+            OWNER,
+            PLAN: JSON.stringify(plan),
+            AFTER: "ok",
+            MODE: mode,
+          },
+          cwd: fileURLToPath(new URL(".", import.meta.url)),
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (chunk) => (out += chunk));
+      child.stderr.on("data", (chunk) => (err += chunk));
+      child.on("error", reject);
+      child.on("close", (code) => {
+        const line = out.split("\n").find((l) => l.startsWith("REPORT "));
+        if (!line) {
+          reject(new Error(`child printed no report (exit ${code}): ${err}`));
+          return;
+        }
+        resolve({
+          report: JSON.parse(line.slice("REPORT ".length)) as ScenarioReport,
+          code,
+        });
+      });
+    },
+  );
+}
+
 /** Run one child to its natural end; resolve with its report and wall time. */
 function runChild(
   file: string,
@@ -201,6 +372,118 @@ describe("a stop that meets a failed repair, across real process exits", () => {
         { interrupted: 1, inFlight: false, quarantined: false },
       ]);
       expect(readFileSync(file, "utf8")).toContain('"interrupted":1');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it("keeps a refused admission out of the count when storage heals before a stop with a live body", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "upload-attempts-"));
+    try {
+      const file = join(dir, "upload-attempts.json");
+      // Writes per process: 1 entry 1's marker; 2 entry 2's marker, stored but
+      // reported uncertain; 3 its rollback, which fails. From write 4 storage
+      // is healthy, before the stop.
+      const plan = ["ok", "commit-uncertain", "fail"];
+      for (let run = 1; run <= 2; run++) {
+        const stop = await runScenario(file, "refused", plan);
+        expect(stop.code).toBe(0);
+        expect(stop.report.stop).toBe("ok");
+        const boot = await runScenario(file, "recover");
+        expect(boot.code).toBe(0);
+        const refused = boot.report.records.find((r) => r.rowId === 2);
+        expect(refused?.interrupted ?? 0).toBe(0);
+        expect(refused?.quarantined ?? false).toBe(false);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it("does not quarantine an entry whose body ends after a clean stop when its terminal repair fails first", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "upload-attempts-"));
+    try {
+      const file = join(dir, "upload-attempts.json");
+      // One earlier interruption, counted at the next boot.
+      expect((await runScenario(file, "crash")).code).toBe(0);
+      expect((await runScenario(file, "recover")).report.records).toEqual([
+        expect.objectContaining({ rowId: 1, interrupted: 1, inFlight: false }),
+      ]);
+      // Writes: 1 the marker; 2 the body's terminal write, failing; 3 its
+      // immediate repair, failing; from 4 storage is healthy.
+      const late = await runScenario(file, "late", ["ok", "fail", "fail"]);
+      expect(late.code).toBe(0);
+      expect(late.report.stop).toBe("ok");
+      for (const boot of [
+        await runScenario(file, "recover"),
+        await runScenario(file, "recover"),
+      ]) {
+        expect(boot.code).toBe(0);
+        expect(boot.report.records).toEqual([
+          expect.objectContaining({
+            rowId: 1,
+            interrupted: 1,
+            inFlight: false,
+            quarantined: false,
+          }),
+        ]);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it("repairs a late failed settlement under a stop even while another attempt is still live", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "upload-attempts-"));
+    try {
+      const file = join(dir, "upload-attempts.json");
+      // Writes: 1 A's marker; 2 C's marker; 3 A's settlement, refused. From 4
+      // storage is healthy. C never settles, so only A's marker may be gone.
+      const run = await runScenario(file, "f3", ["ok", "ok", "fail"]);
+      expect(run.code).toBe(0);
+      expect(run.report.stop).toBe("ok");
+      const boot = await runScenario(file, "recover");
+      expect(boot.code).toBe(0);
+      expect(boot.report.records.find((r) => r.rowId === 1)).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it("repairs a settlement refused after a default stop has been handed back to another manager", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "upload-attempts-"));
+    try {
+      const file = join(dir, "upload-attempts.json");
+      // Writes: 1 A's marker; 2 A's settlement, refused. From 3 storage heals.
+      const run = await runScenario(file, "f4", ["ok", "fail"]);
+      expect(run.code).toBe(0);
+      expect(run.report.stop).toBe("ok");
+      const boot = await runScenario(file, "recover");
+      expect(boot.code).toBe(0);
+      expect(
+        boot.report.records.find((r) => r.rowId === 1)?.interrupted ?? 0,
+      ).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it("repairs a refused, uncertain admission before a void stop waits on a body that never ends", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "upload-attempts-"));
+    try {
+      const file = join(dir, "upload-attempts.json");
+      // Writes: 1 A's marker; 2 B's marker, stored but reported uncertain; 3
+      // B's rollback, refused. From 4 storage is healthy, before the stop.
+      const run = await runScenario(file, "f6", [
+        "ok",
+        "commit-uncertain",
+        "fail",
+      ]);
+      expect(run.code).toBe(0);
+      expect(run.report.b).toBe("UploadAttemptStorageFailedError");
+      const boot = await runScenario(file, "recover");
+      expect(boot.code).toBe(0);
+      expect(boot.report.records.find((r) => r.rowId === 2)).toBeUndefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

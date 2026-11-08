@@ -42,7 +42,6 @@ import { describe, expect, it } from "vitest";
 import {
   acquireProcessLock,
   createUploadAttemptLedger,
-  STOP_REPAIR_WINDOW_MS,
   UploadAttemptWriteUncertainError,
   uploadAttemptKey,
   type UploadAttemptLedger,
@@ -56,6 +55,9 @@ const FOREIGN = "0x3333333333333333333333333333333333333333";
 const KEYS = [1, 2, 3];
 const SEEDS = Number(process.env.UPLOAD_ATTEMPT_SEEDS ?? 2000);
 const FIRST = Number(process.env.UPLOAD_ATTEMPT_FIRST_SEED ?? 1);
+/** Retry base and stop window the explored ledgers use (real time). */
+const RETRY_MS = 1;
+const STOP_WINDOW = 40;
 
 function entry(n: number): IndexEntry {
   const collectedAt = `2026-11-07T10:0${n}:00Z`;
@@ -166,6 +168,8 @@ async function runSeed(seed: number, maxSteps = Infinity) {
 
   // Some seeds use a threshold a schedule can reach; the rest never quarantine.
   const threshold = rng() < 0.35 ? 2 : 1_000;
+  // Some seeds refuse nearly every write while faults last, so a stop gives up.
+  const stormy = rng() < 0.4;
   // Initial storage.
   const start = rng();
   const malformed = { version: 99, records: "?" };
@@ -269,17 +273,21 @@ async function runSeed(seed: number, maxSteps = Infinity) {
         };
         const roll = faults ? rng() : 0;
         const kind =
-          roll < 0.5
-            ? "ok"
-            : roll < 0.6
+          faults && stormy && rng() < 0.9
+            ? rng() < 0.5
               ? "fail"
-              : roll < 0.68
-                ? "uncertain-stored"
-                : roll < 0.75
-                  ? "uncertain-lost"
-                  : roll < 0.88
-                    ? "hold-before"
-                    : "hold-after";
+              : "uncertain-stored"
+            : roll < 0.5
+              ? "ok"
+              : roll < 0.6
+                ? "fail"
+                : roll < 0.68
+                  ? "uncertain-stored"
+                  : roll < 0.75
+                    ? "uncertain-lost"
+                    : roll < 0.88
+                      ? "hold-before"
+                      : "hold-after";
         covered(`write ${kind}`);
         events.push(
           `m${id} write ${kind} ${JSON.stringify(recordsOf(snapshot).map((r) => `${r.rowId}${r.inFlight ? "F" : "-"}${r.interrupted}`))}`,
@@ -319,7 +327,8 @@ async function runSeed(seed: number, maxSteps = Infinity) {
     };
     manager.ledger = createUploadAttemptLedger(store, OWNER, {
       maxInterrupted: threshold,
-      repairRetryMs: 1,
+      repairRetryMs: RETRY_MS,
+      stopRepairWindowMs: STOP_WINDOW,
     });
     alive.push(manager);
     everyManager.push(manager);
@@ -360,10 +369,40 @@ async function runSeed(seed: number, maxSteps = Infinity) {
     bodies.some(
       (b) => b.entry === n && !b.counted && b.settle !== "ok" && !b.cleared,
     );
-  /** The stop gave up (rejected) only after the window had passed. */
-  const stopGaveUp = (started: number, rejected: boolean) => {
-    if (rejected && Date.now() - started < STOP_REPAIR_WINDOW_MS)
-      flag("6", "a stop gave up before its repair window had passed");
+  /**
+   * Where the retry schedule gives up: sleeps double from the base while the
+   * next one still ends inside the window. A repair starts at `start` (0, or
+   * the grace when attempts were live).
+   */
+  const giveUpAt = (start: number) => {
+    let t = start;
+    let delay = RETRY_MS;
+    while (t + delay <= STOP_WINDOW) {
+      t += delay;
+      delay *= 2;
+    }
+    return t;
+  };
+  /**
+   * A stop rejects only at the schedule's last step inside the window, so no
+   * earlier than the earliest such step (repair started at 0 or after grace),
+   * and not after the window.
+   */
+  const stopGaveUp = (started: number, rejected: boolean, grace: number) => {
+    if (!rejected) return;
+    const elapsed = Date.now() - started;
+    const earliest = Math.min(giveUpAt(0), giveUpAt(grace));
+    if (elapsed + 2 < earliest)
+      flag(
+        "6",
+        `a stop gave up at ${elapsed} ms, before its window's last retry`,
+      );
+    if (elapsed > STOP_WINDOW + 500)
+      flag(
+        "6",
+        `a stop gave up at ${elapsed} ms, after its ${STOP_WINDOW} ms window`,
+      );
+    covered("stop gave up");
   };
 
   function checkStable(label: string) {
@@ -519,6 +558,9 @@ async function runSeed(seed: number, maxSteps = Infinity) {
         if (manager.closeCalls === closes && lockFree(manager.ns))
           flag("2", `m${manager.id} owns the store but its lock is free`);
         manager.owned = true;
+        // The lock was free, so every earlier holder of this store has let go.
+        for (const other of alive)
+          if (other !== manager && other.ns === manager.ns) other.owned = false;
         leftover.clear();
         for (const body of bodies) if (body.counted) body.cleared = true;
       }
@@ -610,7 +652,7 @@ async function runSeed(seed: number, maxSteps = Infinity) {
       void track(manager, manager.ledger.close(grace), grace === Infinity).then(
         (result) => {
           covered(`close ${result.ok ? "ok" : errorName(result.error)}`);
-          stopGaveUp(started, !result.ok);
+          stopGaveUp(started, !result.ok, grace);
           if (manager.recoverCalls !== reactivated) return;
           if (result.ok) manager.closed = true;
           else manager.stopFailed = true;
@@ -662,13 +704,38 @@ async function runSeed(seed: number, maxSteps = Infinity) {
       manager.closeCalls += 1;
       const reactivated = manager.recoverCalls;
       const started = Date.now();
+      // Some stops run on healed storage: every write they make succeeds.
+      const healed = rng() < 0.4;
+      if (healed) faults = false;
+      let refused: number[] = [];
       void track(manager, manager.ledger.close(0)).then((result) => {
+        if (healed) faults = true;
+        // Admissions this stop refused and no live body of its own holds. Only
+        // when no operation is pending anywhere: an admission in flight may
+        // still land as a marker for its own (ended) realm.
+        if (
+          healed &&
+          result.ok &&
+          manager.owned &&
+          alive.every((m) => m.pending === 0)
+        )
+          refused = KEYS.filter(
+            (n) =>
+              (manager.suspect.get(n) ?? 0) > 0 &&
+              !bodies.some(
+                (b) =>
+                  b.entry === n &&
+                  b.manager === manager &&
+                  b.settle !== "ok" &&
+                  !b.counted,
+              ),
+          );
         covered(`shutdown ${result.ok ? "clean" : "stop refused"}`);
         events.push(
           `m${manager.id} shutdown -> ${result.ok ? "ok" : errorName(result.error)}`,
         );
         if (manager.dead || manager.recoverCalls !== reactivated) return;
-        stopGaveUp(started, !result.ok);
+        stopGaveUp(started, !result.ok, 0);
         // Handed over: the stop resolved and no attempt is still live. Only
         // then does a refused admission's marker count as gone.
         const handedOver =
@@ -678,13 +745,26 @@ async function runSeed(seed: number, maxSteps = Infinity) {
         if (handedOver) cleanStops.add(manager.ns);
         else if (!result.ok) manager.stopFailed = true;
         // The realm is the process: once this stop has resolved, every
-        // manager in it ends. Admissions count unless this stop handed over.
+        // manager in it ends. A manager that never stopped ended abruptly, so
+        // its admissions may count. The stopping manager's refused admissions
+        // count only where its stop exhausted the repair window (it rejected).
         for (const old of [...alive])
-          endRealm(old, old !== manager || !handedOver);
+          endRealm(old, old !== manager || !result.ok);
       });
       events.push("stable");
       await stable("mid-run");
       checkStable(`after step ${step}`);
+      // A clean stop on healthy storage leaves no marker for a refused admission.
+      for (const n of refused)
+        if (
+          !bodies.some(
+            (b) => b.entry === n && b.settle !== "ok" && !b.cleared,
+          ) &&
+          recordsOf(durable).some(
+            (r) => r.owner === OWNER && r.rowId === n && r.inFlight,
+          )
+        )
+          fail("2", `healthy clean stop left a marker for refused entry ${n}`);
     }
     if (rng() < 0.75) await tick();
   }
@@ -845,6 +925,7 @@ describe("upload attempt ledger: seeded schedule exploration", () => {
         "recover refused",
         "recover failed",
         "crash",
+        "stop gave up",
         "preserve kept",
       ])
         expect(

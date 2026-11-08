@@ -119,11 +119,12 @@ export const UPLOAD_ATTEMPTS_RESET_NOTICE =
 export const DEFAULT_ABANDON_GRACE_MS = 5_000;
 
 /**
- * How long a stop keeps retrying a repair that storage refused before it
- * resolves with that error. The retries are referenced timers, so the process
- * stays up for them. After the window a failed repair falls back to an
- * unreferenced timer: the marker may survive the exit and is counted once on
- * the next boot.
+ * How long a stop keeps retrying a repair that storage refused, counted from
+ * the moment the stop is called. Every repair that runs during a stop is
+ * bounded by this one deadline, whichever operation runs it, and its retries
+ * are referenced timers, so the process stays up for them. After the window a
+ * failed repair falls back to an unreferenced timer: the marker may survive
+ * the exit and is counted once on the next boot.
  */
 export const STOP_REPAIR_WINDOW_MS = 10_000;
 
@@ -350,9 +351,11 @@ export interface UploadAttemptLedger {
    * manager shares this ledger and cannot start a second body for it); the
    * lock is given up when it settles. A manager that takes the store back
    * (`recover`) during the wait cancels the release. `Infinity` waits for
-   * the attempts however long they take. A repair that storage refuses is
-   * retried, with referenced timers, for up to `STOP_REPAIR_WINDOW_MS`; the
-   * call rejects only after that window.
+   * the attempts however long they take. The committed state is repaired
+   * before the stop decides anything, and a live attempt does not hold that
+   * repair back. A repair that storage refuses is retried, with referenced
+   * timers, until `STOP_REPAIR_WINDOW_MS` after the call; the call rejects
+   * only after that window.
    */
   close(graceMs?: number): Promise<void>;
 }
@@ -366,6 +369,8 @@ export function createUploadAttemptLedger(
     onDegraded?: (message: string) => void;
     /** First wait before a stop that could not repair storage is retried. */
     repairRetryMs?: number;
+    /** Window a stop retries a refused repair in; tests shorten it. */
+    stopRepairWindowMs?: number;
   } = {},
 ): UploadAttemptLedger {
   const maxInterrupted =
@@ -396,6 +401,15 @@ export function createUploadAttemptLedger(
    */
   let reactivations = 0;
   const baseRetryMs = options.repairRetryMs ?? 1_000;
+  const stopWindowMs = options.stopRepairWindowMs ?? STOP_REPAIR_WINDOW_MS;
+  /**
+   * Set when a stop begins: the one deadline every repair under that stop is
+   * bounded by, whichever operation starts it. Cleared only when the store is
+   * released; a repair a stop owes stays owed when another manager takes the
+   * store back (`recover`).
+   */
+  let stopDeadline: number | undefined;
+  /** Backoff for the unreferenced fallback retry after a stop's window. */
   let retryDelay = baseRetryMs;
   const idleWaiters: Array<() => void> = [];
   const keyOf = (entry: IndexEntry) => uploadAttemptKey(owner, entry);
@@ -430,14 +444,25 @@ export function createUploadAttemptLedger(
       throw new Error("Upload attempt ledger is not recovered");
   }
 
-  /** Write the committed state again; fail closed if storage still refuses. */
+  /**
+   * Write the committed state again; fail closed if storage still refuses.
+   * Outside a stop a refusal fails at once. Inside one (`stopDeadline` set),
+   * whichever operation runs the repair retries it with referenced timers,
+   * and rejects only once the next retry would pass the stop's deadline.
+   */
   async function repair() {
-    if (!dirty) return;
-    try {
-      await write(records);
-      dirty = false;
-    } catch (error) {
-      throw new UploadAttemptStorageFailedError(error);
+    let delay = baseRetryMs;
+    while (dirty) {
+      try {
+        await write(records);
+        dirty = false;
+      } catch (error) {
+        if (stopDeadline === undefined || Date.now() + delay > stopDeadline)
+          throw new UploadAttemptStorageFailedError(error);
+        // Referenced: the process cannot exit while a stop is still repairing.
+        await new Promise<void>((wake) => setTimeout(wake, delay));
+        delay *= 2;
+      }
     }
   }
 
@@ -461,26 +486,20 @@ export function createUploadAttemptLedger(
 
   /**
    * Give up the store, if still due: `since` is the `reactivations` count when
-   * the release was decided; a manager may have taken the store back, and
-   * begun an attempt, since. Storage must hold the committed state first.
-   * `stopDeadline` (a stop is waiting) keeps the retries referenced until it.
+   * the release was decided; a manager may have taken the store back since.
+   * Storage must hold the committed state first, whether or not a body is
+   * still live: a live body keeps the lease, not the repair.
    */
-  async function giveUp(since: number, stopDeadline?: number): Promise<void> {
-    if (reactivations !== since || live.size > 0 || !lease) return;
+  async function giveUp(since: number): Promise<void> {
+    if (!lease) return;
     try {
       await repair();
     } catch (error) {
       // The stop could not hand the store over. This ledger keeps the lease
       // and the repair duty: it retries on its own until storage heals, so a
       // discarded manager does not leave the store owned for good.
-      closeWhenIdle = true; // the stop is still owed, whatever else happens
       const delay = retryDelay;
       retryDelay = Math.min(retryDelay * 2, 30 * baseRetryMs);
-      if (stopDeadline !== undefined && Date.now() + delay <= stopDeadline) {
-        // A referenced wait: the process cannot exit while the stop retries.
-        await new Promise<void>((wake) => setTimeout(wake, delay));
-        return giveUp(since, stopDeadline);
-      }
       const timer = setTimeout(
         () => void enqueue(() => giveUp(since)).catch(() => undefined),
         delay,
@@ -488,11 +507,12 @@ export function createUploadAttemptLedger(
       (timer as { unref?: () => void }).unref?.();
       throw error;
     }
-    if (reactivations !== since || live.size > 0 || !lease) return;
+    if (!closeWhenIdle || reactivations !== since || live.size > 0) return;
     lease.release();
     lease = null;
     recovering = null;
     closeWhenIdle = false;
+    stopDeadline = undefined;
     retryDelay = baseRetryMs;
     records = new Map();
   }
@@ -601,12 +621,13 @@ export function createUploadAttemptLedger(
     }
     if (live.size === 0) {
       for (const wake of idleWaiters.splice(0)) wake();
-      if (closeWhenIdle) {
-        try {
-          await giveUp(since);
-        } catch (error) {
-          failure ??= error;
-        }
+    }
+    // A stop owes the store its repair even while other bodies are live.
+    if (stopDeadline !== undefined) {
+      try {
+        await giveUp(since);
+      } catch (error) {
+        failure ??= error;
       }
     }
     if (failure !== undefined) throw failure;
@@ -691,6 +712,12 @@ export function createUploadAttemptLedger(
     },
     async close(graceMs = DEFAULT_ABANDON_GRACE_MS) {
       const since = reactivations;
+      stopDeadline = Date.now() + stopWindowMs;
+      closeWhenIdle = true;
+      // Repair first: a live attempt does not hold it back, and the wait below
+      // may be infinite.
+      const repaired = enqueue(() => giveUp(since));
+      repaired.catch(() => undefined);
       if (live.size > 0) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([
@@ -702,14 +729,7 @@ export function createUploadAttemptLedger(
         ]);
         clearTimeout(timer);
       }
-      await enqueue(async () => {
-        if (reactivations !== since) return;
-        if (live.size > 0) {
-          closeWhenIdle = true;
-          return;
-        }
-        await giveUp(since, Date.now() + STOP_REPAIR_WINDOW_MS);
-      });
+      await repaired;
     },
   };
 }

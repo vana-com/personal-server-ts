@@ -466,6 +466,11 @@ export function createSyncManager(
     },
 
     async stop() {
+      // Opens the stop's repair window before anything awaits, so a stop that
+      // nothing awaits still holds its repair duty.
+      const closing = uploadAttempts
+        .close(namelessAttempts ? Infinity : undefined)
+        .catch((err: unknown) => err);
       clearIntervalTimer();
       clearNotifyTimer();
       isRunning = false;
@@ -479,9 +484,8 @@ export function createSyncManager(
       // Without a stable store namespace a rebuilt manager gets a fresh,
       // unrelated lock, so only a fully drained stop keeps two managers over
       // the same persistence from overlapping.
-      try {
-        await uploadAttempts.close(namelessAttempts ? Infinity : undefined);
-      } catch (err) {
+      const err = await closing;
+      if (err !== undefined) {
         // The ledger keeps the store and retries the repair itself; say so.
         pushError({
           fileId: null,

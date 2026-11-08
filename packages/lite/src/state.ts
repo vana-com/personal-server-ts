@@ -49,6 +49,7 @@ export interface PsLiteStateStore {
   readonly namespace?: string;
   bounded?: PsLiteBoundedStateStore;
   get<T>(key: PsLiteStateKey): Promise<T | null>;
+  /** A rejection after storing must be an UploadAttemptWriteUncertainError. */
   set<T>(key: PsLiteStateKey, value: T): Promise<void>;
   delete(key: PsLiteStateKey): Promise<void>;
 }

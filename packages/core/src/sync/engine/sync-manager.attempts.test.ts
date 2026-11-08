@@ -13,7 +13,9 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import {
   createMemoryUploadAttemptStore,
+  createUploadAttemptLedger,
   STOP_REPAIR_WINDOW_MS,
+  type UploadAttemptLedger,
   type UploadAttemptRecord,
   type UploadAttemptStore,
 } from "../upload-attempts.js";
@@ -61,7 +63,10 @@ function processOver(store: UploadAttemptStore, boot: number) {
   } satisfies UploadAttemptStore;
 }
 
-function buildManager(store?: UploadAttemptStore) {
+function buildManager(
+  store?: UploadAttemptStore,
+  uploadAttempts?: UploadAttemptLedger,
+) {
   /** Each attempt's body read: settles only when the test says so. */
   const bodies: Array<{ fail(): void }> = [];
   const storage = {
@@ -89,6 +94,7 @@ function buildManager(store?: UploadAttemptStore) {
     masterKey: new Uint8Array(65).fill(0xaa),
     serverOwner: OWNER,
     logger,
+    ...(uploadAttempts ? { uploadAttempts } : {}),
   };
   const downloadDeps = {
     storage: {},
@@ -225,5 +231,19 @@ describe("upload attempts across manager stop and start", () => {
     expect(second.storage.readEnvelope).toHaveBeenCalledTimes(1);
     const [stored] = await recordsOf(store);
     expect(stored).toEqual(expect.objectContaining({ interrupted: 0 }));
+  });
+
+  it("opens the stop's repair window in the same call that stops the manager, not after its running cycle", async () => {
+    const store = createMemoryUploadAttemptStore();
+    const inner = createUploadAttemptLedger(store, OWNER);
+    const close = vi.fn((graceMs?: number) => inner.close(graceMs));
+    const first = buildManager(undefined, { ...inner, close });
+    first.manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(first.bodies).toHaveLength(1); // a cycle is running, its body hangs
+
+    // A void stop (nothing awaits it): the window must already be open.
+    void first.manager.stop();
+    expect(close).toHaveBeenCalledTimes(1);
   });
 });
