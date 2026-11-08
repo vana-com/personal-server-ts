@@ -56,7 +56,7 @@ describe("createFileUploadAttemptStore", () => {
     expect(await store.read()).toBeNull();
     const ledger = createUploadAttemptLedger(store, OWNER);
     await ledger.begin(entry);
-    await ledger.settle(entry);
+    await ledger.settle(entry, "success");
     expect(await store.read()).toEqual([]);
   });
 });

@@ -76,6 +76,7 @@ import {
   createInventoryTombstoneFinality,
   createScopeDeletionTracker,
   createSyncManager,
+  withCancellableRegistration,
   type PdppImporter,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -803,7 +804,11 @@ export async function createServer(
       additions,
       storage: rawDataStorage,
       storageAdapter,
-      gateway: gatewayClient,
+      // An injected client is a test double or a host's own; only the default
+      // SDK client needs wrapping to take the attempt signal.
+      gateway: options?.gatewayClient
+        ? gatewayClient
+        : withCancellableRegistration(gatewayClient, config.gateway.url),
       signer: serverSigner,
       masterKey,
       serverOwner,

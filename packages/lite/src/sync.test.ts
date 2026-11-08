@@ -299,6 +299,8 @@ describe("PS Lite sync", () => {
         scope: "instagram.profile",
         expectedVersion: "1",
       }),
+      // The attempt's signal reaches the registry write.
+      { signal: expect.any(AbortSignal) },
     );
   });
 

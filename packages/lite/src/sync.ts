@@ -43,9 +43,10 @@ import {
   deriveMasterKey,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
-import type {
-  DownloadDiagnosticsHook,
-  DownloadWorkerDeps,
+import {
+  withCancellableRegistration,
+  type DownloadDiagnosticsHook,
+  type DownloadWorkerDeps,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type { PsLiteStateStore } from "./state.js";
@@ -428,7 +429,10 @@ export async function createPsLiteSyncManager(
       additions,
       storage: options.storage,
       storageAdapter,
-      gateway,
+      // Only the default SDK client needs wrapping to take the attempt signal.
+      gateway: options.gateway
+        ? gateway
+        : withCancellableRegistration(gateway, options.config.gateway.url),
       signer,
       masterKey,
       serverOwner,

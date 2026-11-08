@@ -7,12 +7,16 @@
  * picks the same entry first and dies again, starving every later scope.
  *
  * Fix, kept to the smallest form: before an attempt builds its body, one
- * marker for that entry version is written durably. The marker is removed when
- * the attempt settles (success, or a failure that was caught). A marker found
- * at startup therefore means the last attempt never settled: it counts as one
- * interrupted attempt. After `MAX_INTERRUPTED_UPLOAD_ATTEMPTS` of them the
+ * marker for that entry version is written durably. The marker is cleared when
+ * the attempt settles. A marker found at startup therefore means the last
+ * attempt never settled: it counts as one interrupted attempt. After `MAX_INTERRUPTED_UPLOAD_ATTEMPTS` of them the
  * entry is quarantined, and the worker skips it until new data replaces it
  * (a different entry version has a different key) or the owner retries.
+ *
+ * The interrupted count is cumulative. A caught failure clears only the
+ * in-flight marker and keeps the count, so crash, caught failure, crash still
+ * reaches the cap; the count resets only on a successful upload, a new entry
+ * version (a different key) or an owner retry.
  *
  * What this does not bound: the first attempts (up to the cap) still run, and
  * it does not make an upload use less memory. Caught-failure backoff stays in
@@ -94,8 +98,11 @@ export interface UploadAttemptLedger {
   isQuarantined(key: string): boolean;
   /** Persist the marker for an attempt; resolves once durable. */
   begin(entry: IndexEntry): Promise<void>;
-  /** The attempt settled (success or caught failure): drop its marker. */
-  settle(entry: IndexEntry): Promise<void>;
+  /**
+   * The attempt settled. `success` forgets the entry. `failure` (caught and
+   * recorded elsewhere) clears the in-flight marker but keeps the count.
+   */
+  settle(entry: IndexEntry, outcome: "success" | "failure"): Promise<void>;
   /**
    * Drop records of entry versions that are no longer among `entries`. After
    * a partial (paged) scan pass the scanned row-id range: only records whose
@@ -107,8 +114,8 @@ export interface UploadAttemptLedger {
     scanned?: { afterId: number; throughId: number },
   ): Promise<void>;
   /**
-   * Owner retry: lift quarantine (and the interrupted count) for `scope`, or
-   * for every scope. Returns the paths released.
+   * Owner retry: reset the interrupted count and lift quarantine for `scope`,
+   * or for every scope. Returns the quarantined paths released.
    */
   release(scope?: string): Promise<string[]>;
   /** Quarantined records, for status. */
@@ -177,8 +184,16 @@ export function createUploadAttemptLedger(
       });
       await persist();
     },
-    async settle(entry) {
-      if (records.delete(keyOf(entry))) await persist();
+    async settle(entry, outcome) {
+      const key = keyOf(entry);
+      const record = records.get(key);
+      if (!record) return;
+      if (outcome === "success" || record.interrupted === 0) {
+        records.delete(key);
+      } else {
+        record.inFlight = false;
+      }
+      await persist();
     },
     async reconcile(entries, scanned) {
       const keep = new Set(entries.map(keyOf));
@@ -196,13 +211,15 @@ export function createUploadAttemptLedger(
     },
     async release(scope) {
       const released: string[] = [];
+      let changed = false;
       for (const [key, record] of [...records]) {
-        if (!record.quarantined) continue;
+        if (record.inFlight) continue;
         if (scope !== undefined && record.scope !== scope) continue;
         records.delete(key);
-        released.push(record.path);
+        if (record.quarantined) released.push(record.path);
+        changed = true;
       }
-      if (released.length > 0) await persist();
+      if (changed) await persist();
       return released;
     },
     quarantined() {

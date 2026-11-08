@@ -106,3 +106,8 @@ export {
   type PublicationFence,
   type PublicationRecord,
 } from "../publication/publish.js";
+
+export {
+  withCancellableRegistration,
+  type CancellableRegistration,
+} from "./cancellable-gateway.js";

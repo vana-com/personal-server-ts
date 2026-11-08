@@ -246,6 +246,63 @@ describe("uploadAll — durable attempt markers", () => {
     expect(results.map((r) => r.path)).toEqual([a.path]);
   });
 
+  it("keeps the interrupted count across a caught failure: crash, caught failure, crash quarantines", async () => {
+    const a = makeEntry(1);
+    const b = makeEntry(2);
+    const index = makeIndex([a]);
+    const store = createMemoryUploadAttemptStore();
+
+    // Boot 1: the process dies mid-upload of a.
+    index.dies.add(a.path);
+    void uploadAll(boot(index, store).deps);
+    await flush();
+
+    // Boot 2: a's attempt fails with a caught 503 and goes through backoff.
+    index.dies.clear();
+    const failing = boot(index, store, {
+      storageAdapter: {
+        upload: vi.fn(async (key: string) => {
+          if (key.startsWith(a.scope)) throw new Error("503 unavailable");
+          return "https://storage.test/blob";
+        }),
+        urlForKey: (key: string) => `https://storage.test/${key}`,
+        exists: vi.fn().mockResolvedValue(true),
+      } as unknown as StorageAdapter,
+    });
+    await uploadAll(failing.deps);
+    expect(failing.uploadState.snapshot().retrying).toEqual([
+      expect.objectContaining({ path: a.path }),
+    ]);
+
+    // Boot 3: it dies again.
+    index.dies.add(a.path);
+    void uploadAll(boot(index, store).deps);
+    await flush();
+
+    // Boot 4: two interrupted attempts in total: a is quarantined, and the
+    // entry behind it (new data) uploads.
+    index.dies.clear();
+    index.rows.push(b);
+    const host = boot(index, store);
+    const results = await uploadAll(host.deps);
+    expect(host.uploadState.snapshot().stopped).toEqual([
+      expect.objectContaining({ path: a.path }),
+    ]);
+    expect(results.map((r) => r.path)).toEqual([b.path]);
+  });
+
+  it("forgets the count after a successful upload", async () => {
+    const a = makeEntry(1);
+    const index = makeIndex([a]);
+    const store = createMemoryUploadAttemptStore();
+    index.dies.add(a.path);
+    void uploadAll(boot(index, store).deps);
+    await flush();
+    index.dies.clear();
+    await uploadAll(boot(index, store).deps);
+    expect(await store.read()).toEqual([]);
+  });
+
   describe("attempt deadline", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());

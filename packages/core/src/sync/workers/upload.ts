@@ -3,6 +3,7 @@ import { isReplicaScope } from "../../replication/namespace.js";
 import type { DurableAdditionsService } from "../../additions/durable.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
+import type { CancellableRegistration } from "../cancellable-gateway.js";
 import {
   publishVersion,
   type FencedPublicationPort,
@@ -47,7 +48,12 @@ export interface UploadWorkerDeps {
   fencedPublication?: FencedPublicationPort;
   storage: DataStoragePort;
   storageAdapter: StorageAdapter;
-  gateway: GatewayClient;
+  /**
+   * Wrap the default SDK client with `withCancellableRegistration` so the
+   * attempt deadline closes an in-flight registry write; a client that ignores
+   * the signal only stops at the next checkpoint.
+   */
+  gateway: GatewayClient & Partial<CancellableRegistration>;
   signer: Pick<ServerSigner, "signAddData" | "signLineageAttestation">;
   masterKey: Uint8Array;
   serverOwner: string;
@@ -307,6 +313,7 @@ export async function uploadOne(
       ? deps.dataPointFeed.getDataPoint({
           ownerAddress: serverOwner,
           scope: entry.scope,
+          signal,
         })
       : gateway.getDataPoint(computeDataPointId(serverOwner, entry.scope));
   const checkHead = async (remote: PublicationRecord | null) => {
@@ -730,6 +737,7 @@ export async function uploadAll(
       continue;
     }
     const target = plan ? plan.head : entry;
+    let outcome: "success" | "failure" = "failure";
     // Earlier entries may have taken minutes: judge this one at its own time.
     if (!state.shouldAttempt(target.path, clock())) continue;
     // A first attempt at an entry is new data: it releases the scope's
@@ -744,6 +752,7 @@ export async function uploadAll(
         (signal) => uploadOne(deps, target, { signal }),
       );
       results.push(result);
+      outcome = "success";
       state.clear(target.path);
       if (plan) await supersede(plan.head);
     } catch (err) {
@@ -755,6 +764,7 @@ export async function uploadAll(
         err instanceof OrphanedEntryError ||
         err instanceof DeletedScopeEntryError
       ) {
+        outcome = "success";
         state.clear(target.path);
         continue;
       }
@@ -780,8 +790,8 @@ export async function uploadAll(
         );
       }
     } finally {
-      // Settled (success, or a failure caught above): not a crash.
-      await attempts?.settle(target).catch((err: unknown) => {
+      // Settled: not a crash. A caught failure keeps the interrupted count.
+      await attempts?.settle(target, outcome).catch((err: unknown) => {
         deps.logger.warn(
           {
             path: target.path,

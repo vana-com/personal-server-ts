@@ -37,11 +37,13 @@ export interface FencedPublicationPort {
   read(input: {
     ownerAddress: string;
     scope: string;
+    signal?: AbortSignal;
   }): Promise<PublicationFence>;
   commit(
     input: Registration & {
       mode: "register" | "adopt";
       fence: PublicationFence;
+      signal?: AbortSignal;
     },
   ): Promise<{ dataPointId: string; fence: PublicationFence }>;
 }
@@ -74,7 +76,17 @@ export interface PublishOptions {
   storageAdapter: StorageAdapter;
   signer: Pick<ServerSigner, "signAddData"> &
     Partial<Pick<ServerSigner, "signLineageAttestation">>;
-  gateway: Pick<GatewayClient, "registerDataPoint">;
+  /**
+   * `registerDataPoint` receives the attempt's signal as a second argument. A
+   * client that ignores it (the plain SDK client) keeps an in-flight request
+   * running past the deadline; wrap it with `withCancellableRegistration`.
+   */
+  gateway: {
+    registerDataPoint(
+      params: Parameters<GatewayClient["registerDataPoint"]>[0],
+      options?: { signal?: AbortSignal },
+    ): ReturnType<GatewayClient["registerDataPoint"]>;
+  };
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   fencedPublication?: FencedPublicationPort;
   /** Undefined means the caller has no initial registry observation. */
@@ -95,8 +107,10 @@ export interface PublishOptions {
    */
   deletionAcknowledgedAtIngest?: boolean;
   /**
-   * Checked before each remote effect. Once aborted, publication stops at the
-   * next step instead of continuing after the caller gave up on it.
+   * Passed into every remote request (storage, registry, fenced port) and
+   * checked before each remote effect. Once aborted, the request in flight is
+   * cancelled and publication stops instead of continuing after the caller
+   * gave up on it.
    */
   signal?: AbortSignal;
 }
@@ -191,13 +205,19 @@ export async function publishPreparedVersion(
   options: PreparedPublishOptions,
 ): Promise<PublicationResult> {
   const { scope, storageAdapter, fencedPublication, signer } = options;
-  const checkpoint = () => options.signal?.throwIfAborted();
+  const signal = options.signal;
+  const checkpoint = () => signal?.throwIfAborted();
+  // Trailing arguments appear only under a signal, so ports written before
+  // the signal existed see the calls they always saw.
+  const sig: [AbortSignal] | [] = signal ? [signal] : [];
+  const opts: [{ signal: AbortSignal }] | [] = signal ? [{ signal }] : [];
   checkpoint();
   const isDeleted = (row: PublicationRecord) =>
     Boolean(row.deletedAt) || isTombstoneRecord(row);
   let fence = await fencedPublication?.read({
     ownerAddress: options.ownerAddress,
     scope,
+    signal,
   });
   let head = fence ? fence.head : options.head;
   await options.checkHead?.(head ?? null);
@@ -222,7 +242,7 @@ export async function publishPreparedVersion(
   const keyUrl = (version: bigint) =>
     storageAdapter.urlForKey(`${scope}/${version}`);
   async function readCandidate(version: bigint): Promise<PublicationCandidate> {
-    const bytes = await storageAdapter.download(keyUrl(version));
+    const bytes = await storageAdapter.download(keyUrl(version), ...sig);
     return verifyStored(bytes);
   }
   async function commit(
@@ -275,6 +295,7 @@ export async function publishPreparedVersion(
         ...lineageFields,
         mode,
         fence: previous,
+        signal,
       });
       const registered = result.fence.head;
       if (
@@ -295,11 +316,11 @@ export async function publishPreparedVersion(
       id = head?.id;
     } else {
       const result = lineageFields
-        ? await options.lineageGateway!.registerDataPoint({
-            ...request,
-            ...lineageFields,
-          })
-        : await options.gateway.registerDataPoint(request);
+        ? await options.lineageGateway!.registerDataPoint(
+            { ...request, ...lineageFields },
+            ...opts,
+          )
+        : await options.gateway.registerDataPoint(request, ...opts);
       id = result.dataPointId;
     }
     if (!id)
@@ -328,7 +349,7 @@ export async function publishPreparedVersion(
     if (head && !isDeleted(head) && sameHash(head.dataHash, wantedHash)) {
       version = BigInt(head.expectedVersion);
       const url = keyUrl(version);
-      if (!(await storageAdapter.exists(url))) {
+      if (!(await storageAdapter.exists(url, ...sig))) {
         // Recreating bytes can race a delete's cleanup; that needs the fence.
         requireFence("healing a committed version's missing bytes");
         if (!sameHash(wanted.metadataHash, head.metadataHash))
@@ -336,7 +357,7 @@ export async function publishPreparedVersion(
             "Missing committed blob cannot be healed: metadata commitment mismatch",
           );
         try {
-          await storageAdapter.upload(`${scope}/${version}`, encrypted);
+          await storageAdapter.upload(`${scope}/${version}`, encrypted, ...sig);
         } catch (error) {
           if (!(error instanceof StoredBlobConflictError)) throw error;
         }
@@ -354,7 +375,7 @@ export async function publishPreparedVersion(
       version = BigInt(head.expectedVersion) + 1n;
     let value = wanted;
     try {
-      await storageAdapter.upload(`${scope}/${version}`, encrypted);
+      await storageAdapter.upload(`${scope}/${version}`, encrypted, ...sig);
     } catch (error) {
       if (!(error instanceof StoredBlobConflictError)) throw error;
       value = await readCandidate(version);
