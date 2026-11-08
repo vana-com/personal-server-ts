@@ -10,7 +10,10 @@ import {
 } from "../upload-attempts.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
-import { retireLegacyScopes } from "../workers/retire-legacy.js";
+import {
+  countsOnlyLogger,
+  retireLegacyScopes,
+} from "../workers/retire-legacy.js";
 import {
   deleteScope,
   retryPendingBlobDeletions,
@@ -457,7 +460,13 @@ export function createSyncManager(
         storage: uploadDeps.storage,
         viewIsComplete: (scope) => retire.viewIsComplete(scope),
         async deleteScope(scope) {
-          const outcome = await deleteScope(deleteScopeDeps(), scope);
+          const outcome = await deleteScope(
+            {
+              ...deleteScopeDeps(),
+              logger: countsOnlyLogger(uploadDeps.logger),
+            },
+            scope,
+          );
           uploadState.reconcile(uploadDeps.storage.findUnsynced());
           if (outcome.durable) deleteAdditionsAfter(scope);
           return outcome;

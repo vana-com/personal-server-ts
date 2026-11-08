@@ -116,4 +116,20 @@ describe("sync manager: retire legacy scopes after the switch", () => {
     await manager.trigger();
     expect(r.scopes.size).toBe(2);
   });
+
+  it("the delete path logs no scope name, data point id or error text", async () => {
+    const r = rig();
+    const manager = createSyncManager(r.upload, r.download, {
+      deleteData: r.deleteData,
+      retireLegacy: { viewIsComplete: () => true },
+    });
+    await manager.trigger();
+    const logged = JSON.stringify([
+      ...(r.upload.logger.info as ReturnType<typeof vi.fn>).mock.calls,
+      ...(r.upload.logger.warn as ReturnType<typeof vi.fn>).mock.calls,
+      ...(r.upload.logger.error as ReturnType<typeof vi.fn>).mock.calls,
+    ]);
+    expect(logged).not.toContain("acme");
+    expect(logged).not.toContain("0x1");
+  });
 });

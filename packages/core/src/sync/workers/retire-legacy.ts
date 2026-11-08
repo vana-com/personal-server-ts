@@ -88,3 +88,38 @@ export async function retireLegacyScopes(
   }
   return result;
 }
+
+const IDENTIFYING_FIELDS = new Set([
+  "scope",
+  "dataPointId",
+  "error",
+  "version",
+]);
+
+/**
+ * A logger for the retire step's `deleteScope` calls: log payloads keep their
+ * counts and statuses and lose the scope name, data point id, version and
+ * error text. The message string is fixed text and stays.
+ */
+export function countsOnlyLogger(logger: Logger): Logger {
+  const strip = (payloadOrMessage?: unknown): unknown => {
+    if (
+      typeof payloadOrMessage !== "object" ||
+      payloadOrMessage === null ||
+      Array.isArray(payloadOrMessage)
+    ) {
+      return payloadOrMessage;
+    }
+    return Object.fromEntries(
+      Object.entries(payloadOrMessage).filter(
+        ([key]) => !IDENTIFYING_FIELDS.has(key),
+      ),
+    );
+  };
+  return {
+    debug: (p, m) => logger.debug(strip(p), m),
+    info: (p, m) => logger.info(strip(p), m),
+    warn: (p, m) => logger.warn(strip(p), m),
+    error: (p, m) => logger.error(strip(p), m),
+  };
+}
