@@ -47,7 +47,6 @@ import {
   encodeHead,
   encodeLine,
   encodePart,
-  headComplete,
   inPrefix,
   isNoop,
   isPlainObject,
@@ -62,7 +61,6 @@ import {
   streamRunResult,
   streamScope,
   verifyHead,
-  writerCompatibility,
   BucketReducer,
   type BucketResult,
   type CheckpointDecision,
@@ -81,9 +79,19 @@ import {
   type OutboxProblem,
   type OutboxStream,
   type StartSnapshot,
-  type VersionOrder,
+  canonicalBytes32,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { publicationMetadataHash } from "../publication/publish.js";
+import {
+  NO_FLOOR,
+  compareConnectorVersions,
+  planStreamStep,
+  stampBefore,
+  type ExecutedStep,
+  type PlanHead,
+  type PlanRun,
+  type StreamFloor,
+} from "./publish-plan.js";
 import { streamSyncHashes } from "./crypto.js";
 import type { StreamSyncHome } from "./home.js";
 import {
@@ -109,6 +117,19 @@ import {
   shardPath,
 } from "./spool.js";
 
+import {
+  pinnedWriterSnapshot,
+  overlayPlanKey,
+  type WriterOverlayLog,
+} from "./writer-overlay.js";
+import type {
+  StreamSyncOverlaySnapshot,
+  StreamSyncOverlayRun,
+  StreamSyncOverlayStream,
+  StreamSyncImportedCoverage,
+  StreamSyncPublishReceipt,
+} from "../stream-sync-read/ports.js";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -123,7 +144,11 @@ export type StreamSyncHostProblem =
   | "base_unreadable"
   | "unsupported_format"
   | "ambiguous_reply"
-  | "registry_refused";
+  | "registry_refused"
+  /** An older run than the newest commit on the stream; it never commits (commit order). */
+  | "out_of_order"
+  /** An earlier run of the stream did not commit in this pass; commits stay in order. */
+  | "earlier_run_pending";
 
 export interface StreamSyncCheckpoint {
   readonly ns: string;
@@ -156,9 +181,24 @@ interface WriterState {
   receipts: Record<string, SeedReceipt>;
   /** The last three finished-run verdicts per connector, newest last. */
   recent?: Record<string, ("good" | "bad")[]>;
+  /**
+   * Per stream (`floorKey`), the highest connector version that registered on
+   * it and the newest commit: the version floor and the commit order of the
+   * publish plan. Only moves forward. A state file without it reads as none.
+   */
+  streamFloors?: Record<
+    string,
+    { version: string; committed: [observedAt: number, runId: string] }
+  >;
 }
 
 interface HostStream {
+  /** Persisted in the same atomic entry write as committed/noop. */
+  receipt?: StreamSyncPublishReceipt;
+  /** The plan step this stream executed (committed/noop): what the head became. */
+  executed?: ExecutedStep;
+  /** The plan step of a persisted request, for a resend; with its version floor. */
+  planned?: ExecutedStep & { floor: string };
   index: number;
   primaryKey: string[];
   profile: HeadProfile;
@@ -212,6 +252,12 @@ interface HostEntry {
   target: number | null;
   streams: Record<string, HostStream>;
   outcome: RunOutcome | null;
+  /** Intake crossed the durable ready barrier (absent on older entries). */
+  ready?: boolean;
+  /** Verified read binding, never inferred while taking a snapshot. */
+  generation?: number | null;
+  /** Immutable intake identity; persisted before exposure, including on upgrade. */
+  overlayRevision?: string;
   /** Seed streams this run must hold receipts for before its checkpoint. */
   seedStreams: string[];
   /** M5: who the run writes for; checked again before it publishes. */
@@ -296,6 +342,8 @@ export interface StreamSyncWriterOptions {
   /** Budget for one reduce pass and one shard compaction, in line bytes. */
   readonly reduceBudgetBytes?: number;
   readonly now?: () => number;
+  /** Receives cleanup failures; the payload holds a run id and a message, never row data. */
+  readonly logger?: { warn(obj: Record<string, unknown>, msg?: string): void };
   /** Test hook: throw at a named point to model a crash. */
   readonly fault?: (
     point: StreamSyncFaultPoint,
@@ -305,22 +353,51 @@ export interface StreamSyncWriterOptions {
   readonly onRestartFull?: (connector: string) => void;
 }
 
-/** Compare connector versions as dotted numbers (§2.5 compatible writer). */
-export function compareConnectorVersions(a: string, b: string): VersionOrder {
-  const pa = a
-    .split(/[^0-9]+/)
-    .filter(Boolean)
-    .map(Number);
-  const pb = b
-    .split(/[^0-9]+/)
-    .filter(Boolean)
-    .map(Number);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
-    const x = pa[i] ?? 0;
-    const y = pb[i] ?? 0;
-    if (x !== y) return x > y ? "higher" : "lower";
-  }
-  return "equal";
+export { compareConnectorVersions } from "./publish-plan.js";
+
+/** The `streamFloors` key of a stream. */
+function floorKey(connector: string, ns: string, stream: string): string {
+  return JSON.stringify([connector, ns, stream]);
+}
+
+function floorOf(
+  state: WriterState,
+  connector: string,
+  ns: string,
+  stream: string,
+): StreamFloor {
+  const held = state.streamFloors?.[floorKey(connector, ns, stream)];
+  if (!held) return NO_FLOOR;
+  return {
+    version: held.version,
+    committed: { observedAt: held.committed[0], runId: held.committed[1] },
+  };
+}
+
+function planHeadOf(head: Head): PlanHead {
+  return {
+    generation: head.generation,
+    primaryKey: head.primaryKey,
+    profile: head.profile,
+    complete: head.complete,
+  };
+}
+
+function coverageKey(
+  binding: { owner: string; keyCheck: string },
+  connector: string,
+  ns: string,
+  stream: string,
+  generation: number,
+): string {
+  return JSON.stringify([
+    binding.owner.toLowerCase(),
+    binding.keyCheck,
+    connector,
+    ns,
+    stream,
+    generation,
+  ]);
 }
 
 function json(value: unknown): Uint8Array {
@@ -377,7 +454,31 @@ export class StreamSyncWriter {
   private intakeQueue: Promise<unknown> = Promise.resolve();
   private publishQueue: Promise<unknown> = Promise.resolve();
   private stateQueue: Promise<unknown> = Promise.resolve();
-  private recovered = false;
+  private recovery: Promise<void> | null = null;
+  /**
+   * Streams of a run the publish pass has selected and not yet resolved, as
+   * `runId|stream`. Memory only: it tells a snapshot that an execution order is
+   * about to be taken, before the request exists. It is never proof of a
+   * publication; `request_persisted` stays the durable form.
+   */
+  private readonly selected = new Set<string>();
+  private lifecycleQueue: Promise<unknown> = Promise.resolve();
+  /**
+   * Runs whose removal failed. They stay on disk, already covered and hidden
+   * from snapshots, and each later lifecycle step retries them. Nothing in the
+   * writer is poisoned for good: cleanup is garbage collection, so a failure
+   * to remove a run never turns off reads of other runs.
+   */
+  private readonly removalRetry = new Set<string>();
+  private readonly pins = new Map<string, number>();
+  /**
+   * Latest durable-import coverage per (owner, keyCheck, connector, ns, stream,
+   * generation), kept even when no receipt matches it yet: the reader can
+   * acknowledge before the writer stores its receipt, and a no-op run gets a
+   * receipt for a head the reader already imported. Memory only. It belongs to
+   * this reader/store lifetime, so startup must reconcile it again.
+   */
+  private readonly coverage = new Map<string, StreamSyncImportedCoverage>();
 
   constructor(private readonly options: StreamSyncWriterOptions) {
     if (
@@ -428,10 +529,18 @@ export class StreamSyncWriter {
     return bytes ? (JSON.parse(decoder.decode(bytes)) as HostEntry) : null;
   }
 
-  private async writeEntry(host: HostEntry): Promise<void> {
-    await this.options.home.files.write(
-      `runs/${host.entry.runId}/entry.json`,
-      json(host),
+  private lifecycle<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.lifecycleQueue.then(work, work);
+    this.lifecycleQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  private writeEntry(host: HostEntry): Promise<void> {
+    return this.lifecycle(() =>
+      this.options.home.files.write(
+        `runs/${host.entry.runId}/entry.json`,
+        json(host),
+      ),
     );
   }
 
@@ -641,6 +750,8 @@ export class StreamSyncWriter {
           ? { ns: checkpointUsed.ns, generation: checkpointUsed.generation }
           : null,
         target: null,
+        generation: verifiedGeneration(state, input.connector),
+        overlayRevision: globalThis.crypto.randomUUID(),
         streams: {},
         outcome: null,
         seedStreams: [],
@@ -851,7 +962,13 @@ export class StreamSyncWriter {
           ns,
           checkpointCandidate: input.checkpointCandidate,
         };
+        host.generation ??= verifiedGeneration(
+          await this.readState(),
+          connector,
+        );
+        host.overlayRevision ??= globalThis.crypto.randomUUID();
         host.phase = "ready";
+        host.ready = true;
         await this.writeEntry(host);
       } finally {
         this.forget(runId);
@@ -1004,19 +1121,61 @@ export class StreamSyncWriter {
     return this.publish(async () => {
       await this.recover();
       const runs: StreamSyncRunStatus[] = [];
-      const hosts: HostEntry[] = [];
-      for (const runId of await this.runIds()) {
-        const host = await this.readEntry(runId);
-        if (host && host.phase === "ready") hosts.push(host);
-      }
-      hosts.sort(
-        (a, b) =>
-          a.entry.observedAt - b.entry.observedAt ||
-          (a.entry.runId < b.entry.runId ? -1 : 1),
-      );
-      for (const host of hosts) {
-        await this.publishEntry(host);
-        runs.push(this.statusOf(host));
+      // Selection is one critical section of the lifecycle queue, the lock
+      // ready-entry writes and snapshots also take: the run list, the entry
+      // reads, the sort and the reservation. A snapshot sees no selection or
+      // the whole reserved one, and a run that turns ready meanwhile is either
+      // in the list or written after it. The section holds only local reads
+      // (one list and one entry read per run); every network step (build,
+      // sign, upload, registry) runs after it. The reserve map is in `reserved`
+      // before the section ends, so the `finally` below always releases it.
+      const { hosts, reserved } = await this.lifecycle(async () => {
+        const hosts: HostEntry[] = [];
+        for (const runId of await this.runIds()) {
+          const host = await this.readEntry(runId);
+          if (host && host.phase === "ready") hosts.push(host);
+        }
+        hosts.sort(
+          (a, b) =>
+            a.entry.observedAt - b.entry.observedAt ||
+            (a.entry.runId < b.entry.runId ? -1 : 1),
+        );
+        return {
+          hosts,
+          reserved: new Map(hosts.map((h) => [h, this.reserve(h)])),
+        };
+      });
+      try {
+        // Commit order: a stream an earlier run did not resolve in this pass
+        // holds back every later run of that stream until the next pass.
+        const held = new Set<string>();
+        for (const host of hosts) {
+          try {
+            await this.publishEntry(host, held);
+          } finally {
+            for (const key of reserved.get(host)!) this.selected.delete(key);
+          }
+          runs.push(this.statusOf(host));
+          if (host.phase === "done" || host.entry.ns === null) continue;
+          for (const [name, outbox] of Object.entries(host.entry.streams)) {
+            if (
+              outbox.state === "committed" ||
+              outbox.state === "noop" ||
+              outbox.state === "discarded"
+            )
+              continue;
+            const problem = host.streams[name]?.problem;
+            if (
+              problem === "connector_update_required" ||
+              problem === "out_of_order"
+            )
+              continue;
+            held.add(floorKey(host.entry.connector, host.entry.ns, name));
+          }
+        }
+      } finally {
+        for (const keys of reserved.values())
+          for (const key of keys) this.selected.delete(key);
       }
       return { runs };
     });
@@ -1032,21 +1191,25 @@ export class StreamSyncWriter {
   }
 
   /** Discard runs left collecting by an earlier process. */
-  private async recover(): Promise<void> {
-    if (this.recovered) return;
-    this.recovered = true;
-    for (const runId of await this.runIds()) {
-      if (this.active.has(runId)) continue;
-      const host = await this.readEntry(runId);
-      if (host?.phase === "collecting") {
-        await this.finish(host, {
-          kind: "failed",
-          why: "the process stopped before the run finished collecting",
-        });
-      } else if (host?.phase === "done") {
-        await this.options.home.files.remove(`runs/${runId}`);
+  private recover(): Promise<void> {
+    this.recovery ??= (async () => {
+      for (const runId of await this.runIds()) {
+        if (this.active.has(runId)) continue;
+        const host = await this.readEntry(runId);
+        if (host?.phase === "collecting") {
+          await this.finish(host, {
+            kind: "failed",
+            why: "the process stopped before the run finished collecting",
+          });
+        } else if (host?.phase === "done") {
+          await this.reclaim(host);
+        }
       }
-    }
+    })().catch((error) => {
+      this.recovery = null;
+      throw error;
+    });
+    return this.recovery;
   }
 
   /**
@@ -1112,6 +1275,14 @@ export class StreamSyncWriter {
     }
     switch (decision.kind) {
       case "publish":
+        if (host.generation != null && host.generation !== decision.target) {
+          throw new PendingStream(
+            "registry_inconsistent",
+            "admission differs from the run generation",
+          );
+        }
+        host.generation = decision.target;
+        await this.writeEntry(host);
         return decision.target;
       case "discard":
         throw new Discard(decision, `control reads ${describe(current)}`);
@@ -1168,7 +1339,22 @@ export class StreamSyncWriter {
     };
   }
 
-  private async publishEntry(host: HostEntry): Promise<void> {
+  /** Mark every unresolved stream of `host` as selected; returns the keys. */
+  private reserve(host: HostEntry): string[] {
+    const keys: string[] = [];
+    for (const [name, outbox] of Object.entries(host.entry.streams)) {
+      if (outbox.state === "committed" || outbox.state === "noop") continue;
+      const key = `${host.entry.runId}|${name}`;
+      this.selected.add(key);
+      keys.push(key);
+    }
+    return keys;
+  }
+
+  private async publishEntry(
+    host: HostEntry,
+    held: ReadonlySet<string> = new Set(),
+  ): Promise<void> {
     try {
       // M5: a run publishes only for the owner and key it began with.
       const bound = host.binding;
@@ -1211,6 +1397,13 @@ export class StreamSyncWriter {
     for (const name of Object.keys(host.streams).sort()) {
       const state = host.entry.streams[name]!.state;
       if (state === "committed" || state === "noop") continue;
+      if (held.has(floorKey(host.entry.connector, host.entry.ns!, name))) {
+        host.streams[name]!.problem = "earlier_run_pending";
+        host.streams[name]!.detail =
+          "an earlier run of this stream is not committed yet";
+        await this.writeEntry(host);
+        continue;
+      }
       try {
         await this.publishStream(host, name);
         host.streams[name]!.problem = null;
@@ -1376,12 +1569,27 @@ export class StreamSyncWriter {
     const result = await this.options.registry.post(request);
     this.fault("after_post_reply", runId, name);
     if (result.kind === "committed") {
+      const stream = host.streams[name]!;
       await this.committed(
         host,
         name,
         outbox.generation!,
         outbox.complete!,
         "committed",
+        Number(request.expectedVersion),
+        request.dataHash,
+        stream.planned ?? {
+          // A request persisted before plan steps were recorded.
+          kind: "publish",
+          head: {
+            generation: outbox.generation!,
+            primaryKey: stream.primaryKey,
+            profile: stream.profile,
+            complete: outbox.complete!,
+          },
+          replacesBase: false,
+          floor: stream.profile.version,
+        },
       );
       return true;
     }
@@ -1439,36 +1647,71 @@ export class StreamSyncWriter {
         "stale_generation: control still admits the target",
       );
     }
-    let base = choice.kind === "base" ? choice.head : null;
-    if (base) {
-      const compat = writerCompatibility(
-        base,
-        stream.primaryKey,
-        compareConnectorVersions(stream.profile.version, base.profile.version),
+    // The publish plan decides this step (publish-plan.ts); this method only
+    // executes it: the parts, the head upload and the POST.
+    const decision = planStreamStep(
+      {
+        head: head && planHeadOf(head),
+        floor: floorOf(await this.readState(), entry.connector, ns, name),
+      },
+      this.planRun(host, name, await this.readState(), true),
+    );
+    if (decision.kind === "refused") {
+      throw new PendingStream(
+        decision.reason,
+        decision.reason === "out_of_order"
+          ? "a newer run already committed on this stream"
+          : `base primary key ${JSON.stringify(head?.primaryKey ?? [])} needs a newer connector`,
       );
-      if (compat.kind === "connector_update_required") {
-        throw new PendingStream(
-          "connector_update_required",
-          `base primary key ${JSON.stringify(base.primaryKey)} needs a newer connector`,
-        );
-      }
-      if (compat.kind === "empty_base") base = null;
     }
+    if (decision.kind === "deferred") {
+      throw new PendingStream(
+        "registry_inconsistent",
+        `publish plan deferred the stream: ${decision.reason}`,
+      );
+    }
+    const base =
+      choice.kind === "base" &&
+      (decision.kind === "noop" || !decision.replacesBase)
+        ? choice.head
+        : null;
     if (stream.seedApplies) await this.spoolSeed(host, name);
-
-    let complete = headComplete({
-      full: entry.full || stream.fullStream,
-      baseComplete: base?.complete ?? false,
-      seedMerged: stream.seedApplies,
-    });
-    // §2.12: a run resumed from another namespace's checkpoint is incomplete.
-    if (host.checkpointUsed && host.checkpointUsed.ns !== ns) complete = false;
+    const next = decision.head;
+    const complete = next.complete;
 
     const built = await this.buildParts(host, name, scope, target, base);
-    if (isNoop(base, built.parts, complete)) {
-      await this.committed(host, name, target, complete, "noop");
+    // A step whose parts, completeness, key and profile all equal the base's
+    // changes nothing a reader sees: record a no-op of the same head.
+    if (
+      isNoop(base, built.parts, complete, {
+        primaryKey: next.primaryKey,
+        profile: next.profile,
+      })
+    ) {
+      if (!row.found) throw new Error("no-op requires a registered base");
+      await this.committed(
+        host,
+        name,
+        target,
+        complete,
+        "noop",
+        row.version,
+        row.dataHash,
+        {
+          kind: "noop",
+          head: planHeadOf(base!),
+          replacesBase: false,
+          floor: decision.floor,
+        },
+      );
       return true;
     }
+    const step: ExecutedStep & { floor: string } = {
+      kind: "publish",
+      head: next,
+      replacesBase: decision.kind === "publish" && decision.replacesBase,
+      floor: decision.floor,
+    };
     const clear = encodeHead({
       complete,
       connector: entry.connector,
@@ -1478,8 +1721,8 @@ export class StreamSyncWriter {
       ns,
       observedAt: entry.observedAt,
       parts: built.parts,
-      primaryKey: stream.primaryKey,
-      profile: stream.profile,
+      primaryKey: next.primaryKey,
+      profile: next.profile,
       recordCount: built.parts.reduce((n, p) => n + p.count, 0),
       stream: name,
     });
@@ -1503,6 +1746,7 @@ export class StreamSyncWriter {
     const headCipherRef = `runs/${runId}/head-s${stream.index}.bin`;
     await this.options.home.files.write(headCipherRef, cipher);
     await this.options.home.files.write(requestRef, json(request));
+    stream.planned = step;
     this.setStream(host, name, {
       state: "request_persisted",
       requestRef,
@@ -1516,12 +1760,79 @@ export class StreamSyncWriter {
     const result = await this.options.registry.post(request);
     this.fault("after_post_reply", runId, name);
     if (result.kind === "committed") {
-      await this.committed(host, name, target, complete, "committed");
+      await this.committed(
+        host,
+        name,
+        target,
+        complete,
+        "committed",
+        version,
+        request.dataHash,
+        step,
+      );
       return true;
     }
     this.setStream(host, name, { state: "planned" });
     await this.writeEntry(host);
     return false;
+  }
+
+  /** What the publish plan reads of one run's stream. */
+  private planRun(
+    host: HostEntry,
+    name: string,
+    state: WriterState,
+    executing = false,
+  ): PlanRun {
+    const { entry } = host;
+    const stream = host.streams[name]!;
+    const seed = this.options.seed;
+    const seedOpen =
+      seed !== undefined &&
+      entry.ns !== null &&
+      host.target === null &&
+      state.seedTargets[entry.connector] === entry.ns &&
+      state.receipts[
+        `${seed.installId}|${entry.connector}|${entry.ns}|${name}`
+      ] === undefined;
+    const outbox = entry.streams[name];
+    const executed: ExecutedStep | undefined =
+      stream.executed ??
+      ((outbox?.state === "committed" || outbox?.state === "noop") &&
+      outbox.generation !== undefined
+        ? {
+            // An entry from before plan steps were recorded.
+            kind: outbox.state === "noop" ? "noop" : "publish",
+            head: {
+              generation: outbox.generation,
+              primaryKey: stream.primaryKey,
+              profile: stream.profile,
+              complete: outbox.complete ?? false,
+            },
+            replacesBase: false,
+          }
+        : undefined);
+    return {
+      runId: entry.runId,
+      observedAt: entry.observedAt,
+      generation: host.target ?? host.generation ?? null,
+      primaryKey: stream.primaryKey,
+      profile: stream.profile,
+      full: entry.full || stream.fullStream,
+      foreignCheckpoint:
+        host.checkpointUsed !== null && host.checkpointUsed.ns !== entry.ns,
+      empty: (stream.shardBytes ?? []).every((bytes) => bytes === 0),
+      seed: stream.seedApplies ? "merged" : seedOpen ? "unresolved" : "none",
+      ...(executed ? { executed } : {}),
+      // Selected by a running pass, or signed and persisted: either way the
+      // registry's answer is not recorded yet.
+      ...(!executed &&
+      (outbox?.state === "request_persisted" ||
+        // The executing pass plans its own step: it is not its own barrier.
+        (!executing && this.selected.has(`${entry.runId}|${name}`)))
+        ? { inFlight: true }
+        : {}),
+    };
   }
 
   /** Record a commit or no-op: `needsFull` and seed receipt, then the outbox. */
@@ -1531,10 +1842,30 @@ export class StreamSyncWriter {
     generation: number,
     complete: boolean,
     kind: "committed" | "noop",
+    registryVersion: number,
+    dataHash: string,
+    step: ExecutedStep & { floor: string },
   ): Promise<void> {
     const { entry } = host;
     const stream = host.streams[name]!;
     await this.withState((state) => {
+      // The version floor and the commit order only move forward.
+      const key = floorKey(entry.connector, entry.ns!, name);
+      const prev = floorOf(state, entry.connector, entry.ns!, name);
+      const stamp = { observedAt: entry.observedAt, runId: entry.runId };
+      const version =
+        prev.version === null ||
+        compareConnectorVersions(step.floor, prev.version) === "higher"
+          ? step.floor
+          : prev.version;
+      const committed =
+        prev.committed && stampBefore(stamp, prev.committed)
+          ? prev.committed
+          : stamp;
+      (state.streamFloors ??= {})[key] = {
+        version,
+        committed: [committed.observedAt, committed.runId],
+      };
       // §3.0: a stream declared `incremental: false` is read whole every run.
       const effect = afterCommit(state.needsFull, {
         connector: entry.connector,
@@ -1553,6 +1884,17 @@ export class StreamSyncWriter {
         ] = "merged";
       }
     });
+    stream.receipt = {
+      registryVersion,
+      dataHash: canonicalBytes32(dataHash),
+      generation,
+    };
+    stream.executed = {
+      kind: step.kind,
+      head: step.head,
+      replacesBase: step.replacesBase,
+    };
+    delete stream.planned;
     this.setStream(host, name, {
       state: kind,
       generation,
@@ -1672,6 +2014,8 @@ export class StreamSyncWriter {
   }
 
   private async finish(host: HostEntry, outcome: RunOutcome): Promise<void> {
+    // Older ready entries have no explicit ready marker.
+    host.ready ??= host.phase === "ready";
     host.outcome = outcome;
     host.phase = "done";
     const runId = host.entry.runId;
@@ -1680,7 +2024,7 @@ export class StreamSyncWriter {
       `results/${runId}.json`,
       json(this.statusOf(host)),
     );
-    await this.options.home.files.remove(`runs/${runId}`);
+    await this.reclaim(host);
     if (!(outcome.kind === "aborted" && outcome.reason === "cancelled")) {
       const bad =
         outcome.kind === "failed" ||
@@ -1691,6 +2035,282 @@ export class StreamSyncWriter {
     for (const dir of [...this.derived.keys()]) {
       if (dir.startsWith(`runs/${runId}/`)) this.derived.delete(dir);
     }
+  }
+
+  /**
+   * A stream is covered only when its own receipt satisfies the latest
+   * coverage for the same binding, connector, namespace, stream and generation.
+   * Never treat a missing pre-upgrade receipt as proof of read coverage.
+   */
+  private isCovered(host: HostEntry, name: string): boolean {
+    const receipt = host.streams[name]?.receipt;
+    if (
+      !receipt ||
+      !host.binding ||
+      host.entry.ns === null ||
+      host.generation == null
+    )
+      return false;
+    const coverage = this.coverage.get(
+      coverageKey(
+        host.binding,
+        host.entry.connector,
+        host.entry.ns,
+        name,
+        host.generation,
+      ),
+    );
+    if (!coverage) return false;
+    if (coverage.registryVersion !== receipt.registryVersion)
+      return coverage.registryVersion > receipt.registryVersion;
+    try {
+      return coverage.dataHash === canonicalBytes32(receipt.dataHash);
+    } catch {
+      return false; // an unreadable stored hash never proves coverage
+    }
+  }
+
+  private retainedStreams(host: HostEntry): string[] {
+    if (host.ready === false || host.outcome?.kind === "aborted") return [];
+    // A stream only the seed fills stays until its receipt is covered: it
+    // publishes a head later runs of the stream meet, so the reader's plan
+    // needs its step. It holds no intake rows and exposes no seed rows.
+    return Object.keys(host.streams).filter(
+      (name) =>
+        host.entry.streams[name]?.state !== "discarded" &&
+        !this.isCovered(host, name),
+    );
+  }
+
+  private reclaim(host: HostEntry): Promise<void> {
+    return this.lifecycle(() => this.reclaimLocked(host));
+  }
+
+  private async reclaimLocked(host: HostEntry): Promise<void> {
+    if (host.phase !== "done" || this.inconsistentReceipt(host)) return;
+    if (
+      (this.pins.get(host.entry.runId) ?? 0) > 0 ||
+      this.retainedStreams(host).length > 0
+    )
+      return;
+    const runId = host.entry.runId;
+    try {
+      await this.options.home.files.remove(`runs/${runId}`);
+      this.removalRetry.delete(runId);
+    } catch (error) {
+      this.removalRetry.add(runId);
+      this.reportCleanup(runId, error);
+    }
+  }
+
+  private reportCleanup(runId: string, error: unknown): void {
+    this.options.logger?.warn(
+      {
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      "stream-sync run cleanup failed; it will be retried",
+    );
+  }
+
+  /** Retry removals that failed earlier. Call inside the lifecycle queue. */
+  private async retryRemovals(): Promise<void> {
+    for (const runId of [...this.removalRetry]) {
+      this.removalRetry.delete(runId);
+      try {
+        const host = await this.readEntry(runId);
+        if (host) await this.reclaimLocked(host);
+      } catch (error) {
+        this.removalRetry.add(runId);
+        this.reportCleanup(runId, error);
+      }
+    }
+  }
+
+  /** Called only by the home-bound overlay adapter. Does no network I/O. */
+  async snapshotOverlay(connector: string): Promise<StreamSyncOverlaySnapshot> {
+    await this.recover();
+    const bound = await this.binding();
+    return this.lifecycle(async () => {
+      await this.retryRemovals();
+      const runs: StreamSyncOverlayRun[] = [];
+      const logs = new Map<
+        StreamSyncOverlayRun,
+        ReadonlyMap<string, WriterOverlayLog>
+      >();
+      const state = await this.readState();
+      const plans = new Map<string, { floor: StreamFloor; runs: PlanRun[] }>();
+      for (const runId of await this.runIds()) {
+        const host = await this.readEntry(runId);
+        if (
+          !host ||
+          host.entry.connector !== connector ||
+          host.phase === "collecting" ||
+          host.ready === false ||
+          host.outcome?.kind === "aborted" ||
+          host.entry.ns === null ||
+          !host.binding ||
+          host.binding.owner.toLowerCase() !== bound.owner.toLowerCase() ||
+          host.binding.keyCheck !== bound.keyCheck
+        )
+          continue;
+        const generation = host.generation ?? null;
+        // Never expose or reclaim an inconsistent run, including a discarded receipt.
+        if (this.inconsistentReceipt(host)) continue;
+        if (!host.overlayRevision) {
+          host.overlayRevision = globalThis.crypto.randomUUID();
+          await this.options.home.files.write(
+            `runs/${runId}/entry.json`,
+            json(host),
+          );
+        }
+        const streams: StreamSyncOverlayStream[] = [];
+        const runLogs = new Map<string, WriterOverlayLog>();
+        for (const name of this.retainedStreams(host)) {
+          const stream = host.streams[name]!;
+          if (stream.shardBytes === null)
+            throw new Error("ready stream has no intake byte counts");
+          const descriptor = {
+            name,
+            primaryKey: Object.freeze([...stream.primaryKey]),
+            profile: Object.freeze({ ...stream.profile }),
+            complete:
+              (host.entry.full || stream.fullStream) &&
+              (!host.checkpointUsed ||
+                host.checkpointUsed.ns === host.entry.ns),
+            state: stream.receipt
+              ? ("published" as const)
+              : stream.problem
+                ? ("failed" as const)
+                : ("pending" as const),
+            ...(stream.receipt
+              ? { receipt: Object.freeze({ ...stream.receipt }) }
+              : {}),
+          };
+          streams.push(
+            Object.freeze({
+              ...descriptor,
+              contentRevision: JSON.stringify([
+                host.overlayRevision,
+                runId,
+                host.entry.ns,
+                generation,
+                host.entry.observedAt,
+                descriptor,
+              ]),
+            }),
+          );
+          const planKey = overlayPlanKey(host.entry.ns, name);
+          const plan = plans.get(planKey) ?? {
+            floor: floorOf(state, connector, host.entry.ns, name),
+            runs: [],
+          };
+          plan.runs.push(Object.freeze(this.planRun(host, name, state)));
+          plans.set(planKey, plan);
+          // A seed-only stream has no intake log: its rows are never read.
+          if (stream.seedOnly) continue;
+          runLogs.set(name, {
+            path: spoolLogPath(`runs/${runId}/spool/s${stream.index}`),
+            bytes: stream.shardBytes.reduce((sum, n) => sum + n, 0),
+            primaryKey: descriptor.primaryKey,
+          });
+        }
+        if (streams.length === 0) continue;
+        const run: StreamSyncOverlayRun = Object.freeze({
+          runId,
+          connector,
+          ns: host.entry.ns,
+          generation,
+          observedAt: host.entry.observedAt,
+          state: streams.every((s) => s.state === "published")
+            ? "published"
+            : streams.some((s) => s.state === "failed")
+              ? "failed"
+              : "pending",
+          streams: Object.freeze(streams),
+        });
+        runs.push(run);
+        logs.set(run, runLogs);
+      }
+      for (const run of runs)
+        this.pins.set(run.runId, (this.pins.get(run.runId) ?? 0) + 1);
+      return pinnedWriterSnapshot(
+        this.options.home.files,
+        Object.freeze(runs),
+        logs,
+        () => {
+          void this.lifecycle(async () => {
+            for (const run of runs) {
+              const count = this.pins.get(run.runId)! - 1;
+              if (count === 0) this.pins.delete(run.runId);
+              else this.pins.set(run.runId, count);
+            }
+            for (const run of runs) {
+              try {
+                const host = await this.readEntry(run.runId);
+                if (host?.phase === "done") await this.reclaimLocked(host);
+              } catch (error) {
+                // Unreadable metadata fails the read of that run, not the writer.
+                this.removalRetry.add(run.runId);
+                this.reportCleanup(run.runId, error);
+              }
+            }
+            await this.retryRemovals();
+          });
+        },
+        plans,
+      );
+    });
+  }
+
+  private inconsistentReceipt(host: HostEntry): boolean {
+    return Object.values(host.streams).some(
+      (stream) =>
+        stream.receipt &&
+        (host.generation == null ||
+          stream.receipt.generation !== host.generation),
+    );
+  }
+
+  /** The caller has committed these bytes to its durable read store. */
+  async acknowledgeOverlay(offered: StreamSyncImportedCoverage): Promise<void> {
+    // Reject a malformed digest before it can be stored or reclaim anything.
+    const coverage = {
+      ...offered,
+      dataHash: canonicalBytes32(offered.dataHash),
+    };
+    await this.recover();
+    const binding = await this.binding();
+    await this.lifecycle(async () => {
+      await this.retryRemovals();
+      const key = coverageKey(
+        binding,
+        coverage.connector,
+        coverage.ns,
+        coverage.stream,
+        coverage.generation,
+      );
+      const known = this.coverage.get(key);
+      if (!known || coverage.registryVersion >= known.registryVersion)
+        this.coverage.set(key, Object.freeze({ ...coverage }));
+      for (const runId of await this.runIds()) {
+        const host = await this.readEntry(runId);
+        if (
+          !host ||
+          host.entry.connector !== coverage.connector ||
+          host.entry.ns === null ||
+          host.entry.ns !== coverage.ns ||
+          host.generation == null ||
+          host.generation !== coverage.generation ||
+          this.inconsistentReceipt(host) ||
+          !host.binding ||
+          host.binding.owner.toLowerCase() !== binding.owner.toLowerCase() ||
+          host.binding.keyCheck !== binding.keyCheck
+        )
+          continue;
+        await this.reclaimLocked(host);
+      }
+    });
   }
 
   // --------------------------------------------------------------- merge
@@ -1962,7 +2582,7 @@ export class StreamSyncWriter {
     const pending: StreamSyncRunStatus[] = [];
     for (const runId of await this.runIds()) {
       const host = await this.readEntry(runId);
-      if (host) pending.push(this.statusOf(host));
+      if (host && host.phase !== "done") pending.push(this.statusOf(host));
     }
     const finished: StreamSyncRunStatus[] = [];
     for (const path of await this.options.home.files.list("results")) {
@@ -2079,3 +2699,14 @@ function describe(state: ControlState): string {
       return `foreign(${state.version})`;
   }
 }
+
+/** A persisted watermark is verified provenance; an arbitrary checkpoint is not. */
+function verifiedGeneration(
+  state: WriterState,
+  connector: string,
+): number | null {
+  const control = state.observedControl?.[connector]?.[IDENTITYLESS_NS];
+  return control?.kind === "active" ? control.generation : null;
+}
+
+export { createWriterOverlaySource } from "./writer-overlay.js";

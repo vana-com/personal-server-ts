@@ -3,6 +3,8 @@
  * I/O: hosts inject every hash and the namespace HMAC.
  */
 
+import { InvalidArgumentError } from "./errors.js";
+
 /** SHA-256 of the exact bytes, as the 32-byte digest. */
 export type Sha256 = (data: Uint8Array) => Promise<Uint8Array>;
 
@@ -75,3 +77,21 @@ export const NAME_LIMIT_BYTES = 256;
 export const PLANNER_DEPTH_CAP = 16;
 /** §2.6: number of spool shards (first pkHash byte). */
 export const SHARD_COUNT = 256;
+
+const BYTES32_HEX = /^(?:0[xX])?([0-9a-fA-F]{64})$/;
+
+/**
+ * The one spelling of a 32-byte digest: lowercase hex with a `0x` prefix.
+ * Accepts exactly 64 hex digits, with an optional `0x` or `0X` prefix, in any
+ * case. Throws on any other input, so a malformed digest never compares equal
+ * to a real one.
+ */
+export function canonicalBytes32(value: string): `0x${string}` {
+  const match = BYTES32_HEX.exec(value);
+  if (!match) {
+    throw new InvalidArgumentError(
+      "expected a bytes32 value: 64 hex digits with an optional 0x prefix",
+    );
+  }
+  return `0x${match[1]!.toLowerCase()}`;
+}
