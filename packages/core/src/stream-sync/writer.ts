@@ -109,6 +109,7 @@ import {
 import {
   SpoolWriter,
   deriveShards,
+  FLUSH_BYTES,
   spoolLogPath,
   compactShard,
   countShard,
@@ -393,6 +394,8 @@ export interface StreamSyncWriterOptions {
   readonly partTargetBytes?: number;
   /** Budget for one reduce pass and one shard compaction, in line bytes. */
   readonly reduceBudgetBytes?: number;
+  /** Spool flush threshold: buffered intake or shard bytes before a write (default 8 MiB). */
+  readonly spoolFlushBytes?: number;
   readonly now?: () => number;
   /** Receives cleanup failures; the payload holds a run id and a message, never row data. */
   readonly logger?: { warn(obj: Record<string, unknown>, msg?: string): void };
@@ -497,6 +500,7 @@ export class StreamSyncWriter {
   private readonly hashes = streamSyncHashes;
   private readonly targetBytes: number;
   private readonly reduceBudget: number;
+  private readonly spoolFlushBytes: number;
   private readonly now: () => number;
   private keyCheck: string | null = null;
   private control: ControlHashes | null = null;
@@ -541,6 +545,7 @@ export class StreamSyncWriter {
     }
     this.targetBytes = options.partTargetBytes ?? DEFAULT_PART_TARGET_BYTES;
     this.reduceBudget = options.reduceBudgetBytes ?? PART_LIMIT_BYTES;
+    this.spoolFlushBytes = options.spoolFlushBytes ?? FLUSH_BYTES;
     this.now = options.now ?? (() => Date.now());
   }
 
@@ -991,7 +996,7 @@ export class StreamSyncWriter {
       // Active before the entry exists, so a recovery pass on the publish
       // queue never mistakes this run for one a dead process left behind.
       this.active.set(input.runId, {
-        spool: new SpoolWriter(this.options.home.files),
+        spool: new SpoolWriter(this.options.home.files, this.spoolFlushBytes),
         shardBytes: new Map(),
         recordTooLarge: new Map(),
         records: new Map(),
@@ -1741,7 +1746,10 @@ export class StreamSyncWriter {
     await this.options.home.files.remove(dir);
     await this.options.home.files.remove(spoolLogPath(dir));
     this.derived.delete(dir);
-    const writer = new SpoolWriter(this.options.home.files);
+    const writer = new SpoolWriter(
+      this.options.home.files,
+      this.spoolFlushBytes,
+    );
     const bytes = emptyShardBytes();
     for await (const record of seed.records(host.entry.connector, name)) {
       if (!isPlainObject(record)) continue;
@@ -1780,7 +1788,7 @@ export class StreamSyncWriter {
   ): Promise<number[]> {
     const known = this.derived.get(dir);
     if (known) return known;
-    await deriveShards(this.options.home.files, dir);
+    await deriveShards(this.options.home.files, dir, this.spoolFlushBytes);
     const bytes = [...counted];
     await this.compact(dir, bytes);
     this.derived.set(dir, bytes);
