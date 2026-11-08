@@ -26,8 +26,8 @@ function reference(bytes: Uint8Array) {
 }
 
 /** Stores the file as one chunk; the adapter then yields exact CHUNK-byte reads. */
-async function fileOf(bytes: Uint8Array) {
-  const base = createMemoryStreamSyncFiles(CHUNK);
+async function fileOf(bytes: Uint8Array, chunk = CHUNK) {
+  const base = createMemoryStreamSyncFiles(chunk);
   const path = "runs/r/spool/s0/edges.log";
   await base.write(path, bytes);
   const sizes: number[] = [];
@@ -54,12 +54,12 @@ async function readAll(files: StreamSyncFiles, path: string) {
 }
 
 /** Asserts readSpool yields exactly the reference lines, at the real chunk size. */
-async function expectMatchesReference(bytes: Uint8Array) {
+async function expectMatchesReference(bytes: Uint8Array, chunk = CHUNK) {
   const ref = reference(bytes);
-  const { files, path, sizes } = await fileOf(bytes);
+  const { files, path, sizes } = await fileOf(bytes, chunk);
   const got = await readAll(files, path);
 
-  expect(sizes[0]).toBe(CHUNK);
+  expect(sizes[0]).toBe(Math.min(chunk, bytes.length));
   expect(sizes.reduce((n, s) => n + s, 0)).toBe(bytes.length);
   expect(got.lines).toEqual(ref.lines);
   if (ref.unterminated) {
@@ -133,5 +133,80 @@ describe("readSpool at 1 MiB chunk edges", () => {
     const { ref } = await expectMatchesReference(bytes);
     expect(ref.unterminated).toBe(true);
     expect(ref.lines).toHaveLength(1);
+  });
+});
+
+// The whole-file decoder strips a U+FEFF only at the very start of the file.
+// Decoding each line on its own must match that rule exactly.
+const BOM = "\uFEFF";
+
+/** Line 1 is ASCII and ends so that line 2 starts at `start` with a BOM. */
+function lineStartBomFile(start: number) {
+  // Line 1 is 66 + k bytes including its "\n".
+  const k = start - 66;
+  return `${hashOf(1)} ${"a".repeat(k)}\n${BOM}${hashOf(2)} two\n`;
+}
+
+describe("readSpool and the byte order mark", () => {
+  it("strips a BOM at the start of the file", async () => {
+    await expectMatchesReference(
+      encoder.encode(`${BOM}${hashOf(1)} one\n${hashOf(2)} two\n`),
+    );
+  });
+
+  it("strips a BOM at the start of the file across 1-byte reads", async () => {
+    await expectMatchesReference(
+      encoder.encode(`${BOM}${hashOf(1)} one\n${hashOf(2)} two\n`),
+      1,
+    );
+  });
+
+  it("keeps a U+FEFF inside a line", async () => {
+    const bytes = encoder.encode(`${hashOf(1)} a${BOM}b\n${hashOf(2)} two\n`);
+    const { ref } = await expectMatchesReference(bytes);
+    expect(ref.lines[0]?.text).toBe(`a${BOM}b`);
+  });
+
+  it.each([1, 2])(
+    "keeps a U+FEFF inside a line that straddles the 1 MiB boundary (split %i)",
+    async (split) => {
+      const bytes = encoder.encode(straddleFile(BOM, split));
+      const at = CHUNK - split;
+      expect(bytes.subarray(at, at + 3)).toEqual(encoder.encode(BOM));
+      const { ref } = await expectMatchesReference(bytes);
+      expect(ref.lines[1]?.text).toContain(BOM);
+    },
+  );
+
+  // Red on the per-line decode: each line used to lose a leading U+FEFF.
+  it.each([
+    ["a small file", 100],
+    ["a line that starts at the 1 MiB boundary", CHUNK - 1],
+  ])("does not strip a U+FEFF at a line start: %s", async (_name, start) => {
+    const bytes = encoder.encode(lineStartBomFile(start));
+    expect(bytes[start]).toBe(0xef);
+    const { files, path } = await fileOf(bytes);
+    const got = await readAll(files, path);
+    expect(got.lines).toEqual([
+      { pkHash: hashOf(1), text: "a".repeat(start - 66) },
+    ]);
+    expect(got.error?.message).toBe("malformed spool line");
+  });
+
+  // Red on the per-line decode: the file has no lines, so no error either.
+  it.each([
+    ["in one read", CHUNK],
+    ["across 1-byte reads", 1],
+  ])(
+    "a file that is only a BOM has no lines and no error: %s",
+    async (_name, chunk) => {
+      await expectMatchesReference(encoder.encode(BOM), chunk);
+    },
+  );
+
+  it("reads a file with no BOM unchanged", async () => {
+    await expectMatchesReference(
+      encoder.encode(`${hashOf(1)} one\n${hashOf(2)} two\n`),
+    );
   });
 });
