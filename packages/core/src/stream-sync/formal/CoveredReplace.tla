@@ -84,6 +84,14 @@ CoverMax == LET cs == {Stamp[r] : r \in {x \in done : cov[x]}}
             IN IF cs = {} THEN 0 ELSE CHOOSE m \in cs : \A c \in cs : c <= m
 Oracle(k) == \E r \in done : k \in content[r] /\ Stamp[r] >= CoverMax
 
+\* Replacement oracle for the fence: only a covered run whose basis matched at publish
+\* replaces. A covered run that merged (basis stale at publish) is an ordinary merge.
+\* At a successful post, req[r].exp = ver = basis[r] exactly when the basis matched.
+FencedCover(r) == cov[r] /\ basis[r] = req[r].exp
+CoverMaxFenced == LET cs == {Stamp[r] : r \in {x \in done : FencedCover(x)}}
+                  IN IF cs = {} THEN 0 ELSE CHOOSE m \in cs : \A c \in cs : c <= m
+OracleFenced(k) == \E r \in done : k \in content[r] /\ Stamp[r] >= CoverMaxFenced
+
 \* Nothing the oracle holds is ever missing (a covered run drops only what it omits).
 NoWrongDrop == \A k \in Keys : Oracle(k) => head[k] > 0
 \* An extra key can only be a line of a run that arrived after a newer covered refresh
@@ -91,8 +99,10 @@ NoWrongDrop == \A k \in Keys : Oracle(k) => head[k] > 0
 \* until the next covered refresh: a safe leftover, never a wrong drop. Nothing else.
 OnlyLateExtras == \A k \in Keys : (head[k] > 0 /\ ~Oracle(k)) =>
     \E r \in done : k \in content[r] /\ Stamp[r] = head[k] /\ Stamp[r] < CoverMax
-\* With arrival in stamp order the view equals the oracle exactly.
-ExactWhenInOrder == \A k \in Keys : InOrder => ((head[k] > 0) <=> Oracle(k))
+\* With arrival in stamp order the view equals the fenced oracle exactly. A covered run
+\* whose basis went stale merges, so it neither replaces nor drops: its lines stay in
+\* the oracle, as they do for any merge.
+ExactWhenInOrder == \A k \in Keys : InOrder => ((head[k] > 0) <=> OracleFenced(k))
 
 \* An uncovered run never removes a key.
 MergeNeverRemoves == [][\A r \in Runs :
