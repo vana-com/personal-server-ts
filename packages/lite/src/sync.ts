@@ -1,6 +1,7 @@
 import { createStreamSyncReadCacheFiles } from "./stream-sync-read-cache-files.js";
 import {
   StreamSyncWriter,
+  createWriterOverlaySource,
   createStreamSyncIntake,
   type ResolveArtifact,
   type RunIntake,
@@ -486,6 +487,23 @@ export async function createPsLiteSyncManager(
   // browser context cannot acquire the home and writes stay off until reload.
   let syncManager!: ReturnType<typeof createSyncManager>;
   try {
+    const streamSyncWriter = streamSyncHome
+      ? new StreamSyncWriter({
+          ownerAddress: serverOwner,
+          registry: createGatewayStreamSyncRegistry({
+            gatewayUrl: options.config.gateway.url,
+            ownerAddress: serverOwner,
+          }),
+          blobs: createStorageStreamSyncBlobs(storageAdapter),
+          home: streamSyncHome.home,
+          keys: createStreamSyncKeyPorts(options.ownerSignature),
+          signer,
+        })
+      : null;
+    // Opened after the writer: the writer's own publications overlay this
+    // reader. The writer-home cache is durable, so the reader acknowledges what
+    // it installs and the writer can reclaim its spool. Caller-supplied files
+    // stay non-durable (no acknowledgment) because their durability is unknown.
     const readKeys = options.streamSyncRead
       ? await createStreamSyncReadKeys(masterKey)
       : undefined;
@@ -502,24 +520,14 @@ export async function createPsLiteSyncManager(
           blobs: createStorageBlobReader(storageAdapter),
           keys: readKeys!,
           logger: logger as never,
+          durable: !options.streamSyncRead.files && Boolean(streamSyncHome),
           ...(options.streamSyncRead.overlay
             ? { overlay: options.streamSyncRead.overlay }
-            : {}),
+            : streamSyncWriter
+              ? { overlay: createWriterOverlaySource(streamSyncWriter) }
+              : {}),
         })
       : undefined;
-    const streamSyncWriter = streamSyncHome
-      ? new StreamSyncWriter({
-          ownerAddress: serverOwner,
-          registry: createGatewayStreamSyncRegistry({
-            gatewayUrl: options.config.gateway.url,
-            ownerAddress: serverOwner,
-          }),
-          blobs: createStorageStreamSyncBlobs(storageAdapter),
-          home: streamSyncHome.home,
-          keys: createStreamSyncKeyPorts(options.ownerSignature),
-          signer,
-        })
-      : null;
     const streamSyncIntake = streamSyncWriter
       ? createStreamSyncIntake({
           writer: streamSyncWriter,
