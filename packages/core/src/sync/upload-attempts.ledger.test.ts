@@ -4,6 +4,7 @@ import {
   createMemoryUploadAttemptStore,
   createUploadAttemptLedger,
   UPLOAD_ATTEMPTS_RESET_NOTICE,
+  UploadAttemptStorageFailedError,
   UploadAttemptStoreInvalidError,
   UploadAttemptWriteUncertainError,
   uploadAttemptKey,
@@ -296,12 +297,31 @@ function controlledStore() {
     hold: null as Promise<void> | null,
     started: 0,
     rejectNext: null as Error | null,
+    /** Reject (without storing) the write that is call number N. */
+    rejectOnCall: null as { call: number; error: Error } | null,
+    /** Store the envelope, then fail with this error, on the next write. */
+    commitThenReject: null as Error | null,
+    /** Fail the write after the next one (the repair of a begin). */
+    failAfterCommitThen: false,
   };
   const store: UploadAttemptStore = {
     namespace: inner.namespace,
     read: () => inner.read(),
     async write(envelope) {
       control.started += 1;
+      if (control.rejectOnCall?.call === control.started) {
+        throw control.rejectOnCall.error;
+      }
+      if (control.failAfterCommitThen && !control.commitThenReject) {
+        control.failAfterCommitThen = false;
+        throw new Error("repair failed");
+      }
+      if (control.commitThenReject) {
+        const error = control.commitThenReject;
+        control.commitThenReject = null;
+        await inner.write(envelope);
+        throw error;
+      }
       if (control.rejectNext) {
         const error = control.rejectNext;
         control.rejectNext = null;
@@ -385,19 +405,89 @@ describe("a begin whose write was rejected", () => {
     );
   });
 
-  it("keeps the marker when the write's outcome is unknown", async () => {
+  it("does not let an older queued write commit a later begin that fails", async () => {
     const { store, control, inner } = controlledStore();
     const ledger = createUploadAttemptLedger(store, OWNER_A, {
       maxInterrupted: 1,
     });
     await ledger.recover();
-    control.rejectNext = new UploadAttemptWriteUncertainError("sync failed");
+    const x = await ledger.begin(entry(1));
+    const y = await ledger.begin(entry(2));
+
+    let release!: () => void;
+    control.hold = new Promise<void>((r) => (release = r));
+    const before = control.started;
+    const settleX = ledger.settle(x, "success"); // write held after its snapshot
+    await vi.waitFor(() => expect(control.started).toBe(before + 1));
+    const settleY = ledger.settle(y, "success"); // queued behind X
+    // X, Y and then A's own write: the third call fails, storing nothing.
+    control.rejectOnCall = {
+      call: before + 3,
+      error: new Error("disk full"),
+    };
+    const begunA = ledger.begin(entry(3));
+    const failed = expect(begunA).rejects.toThrow("disk full");
+    release();
+    await Promise.all([settleX, settleY, failed]);
+    await ledger.close();
+
+    for (let boot = 0; boot < 2; boot++) {
+      const next = createUploadAttemptLedger(processOver(inner), OWNER_A, {
+        maxInterrupted: 1,
+      });
+      await next.recover();
+      expect(next.quarantined()).toEqual([]);
+      await next.close();
+    }
+    expect(((await inner.read()) as { records: unknown[] }).records).toEqual(
+      [],
+    );
+  });
+
+  it("does not count a start whose marker write was uncertain, because its body never ran", async () => {
+    const { store, control, inner } = controlledStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A, {
+      maxInterrupted: 1,
+    });
+    await ledger.recover();
+    control.commitThenReject = new UploadAttemptWriteUncertainError("sync");
     await expect(ledger.begin(entry(1))).rejects.toThrow(/unknown/);
     const b = await ledger.begin(entry(2));
     await ledger.settle(b, "success");
-    expect(
-      ((await inner.read()) as { records: Array<{ inFlight: boolean }> })
-        .records,
-    ).toEqual([expect.objectContaining({ inFlight: true })]);
+    await ledger.close();
+
+    for (let boot = 0; boot < 2; boot++) {
+      const next = createUploadAttemptLedger(processOver(inner), OWNER_A, {
+        maxInterrupted: 1,
+      });
+      await next.recover();
+      expect(next.quarantined()).toEqual([]);
+      await next.close();
+    }
+    expect(((await inner.read()) as { records: unknown[] }).records).toEqual(
+      [],
+    );
+  });
+
+  it("fails closed when an uncertain begin cannot be repaired", async () => {
+    const { store, control, inner } = controlledStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A, {
+      maxInterrupted: 1,
+    });
+    await ledger.recover();
+    control.commitThenReject = new UploadAttemptWriteUncertainError("sync");
+    control.failAfterCommitThen = true;
+    await expect(ledger.begin(entry(1))).rejects.toBeInstanceOf(
+      UploadAttemptStorageFailedError,
+    );
+    // The next begin first repairs; it succeeds and clears the marker.
+    const b = await ledger.begin(entry(2));
+    await ledger.settle(b, "success");
+    await ledger.close();
+    const next = createUploadAttemptLedger(processOver(inner), OWNER_A, {
+      maxInterrupted: 1,
+    });
+    await next.recover();
+    expect(next.quarantined()).toEqual([]);
   });
 });

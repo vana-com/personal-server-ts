@@ -7,6 +7,7 @@ import {
   CRASHED_UPLOAD_REASON,
   createMemoryUploadAttemptStore,
   createUploadAttemptLedger,
+  UploadAttemptWriteUncertainError,
   uploadAttemptKey,
   type UploadAttemptRecord,
   type UploadAttemptStore,
@@ -422,6 +423,37 @@ describe("uploadAll — durable attempt markers", () => {
       ]);
       expect(results.map((r) => r.path)).toEqual([b.path]);
     });
+  });
+});
+
+describe("uploadAll — a start that cannot be repaired", () => {
+  it("stops the pass with a storage failure and counts no crash", async () => {
+    const a = makeEntry(1);
+    const b = makeEntry(2);
+    const index = makeIndex([a, b]);
+    const inner = createMemoryUploadAttemptStore();
+    let calls = 0;
+    const flaky: UploadAttemptStore = {
+      namespace: inner.namespace,
+      read: () => inner.read(),
+      preserveCorrupt: (v, stamp) => inner.preserveCorrupt(v, stamp),
+      async write(envelope) {
+        calls += 1;
+        if (calls === 1) {
+          await inner.write(envelope); // A's marker is stored, outcome unknown
+          throw new UploadAttemptWriteUncertainError("sync");
+        }
+        throw new Error("repair failed");
+      },
+    };
+    const first = boot(index, flaky);
+    await expect(uploadAll(first.deps)).rejects.toThrow();
+    expect(index.reads).toEqual([]); // no body ran, for A or for B
+
+    const next = boot(index, inner);
+    const results = await uploadAll(next.deps);
+    expect(results.length).toBe(2);
+    expect(next.uploadState.snapshot().stopped).toEqual([]);
   });
 });
 

@@ -86,6 +86,23 @@ export class UploadAttemptWriteUncertainError extends Error {
   }
 }
 
+/**
+ * A begin whose marker write was uncertain could not be undone in storage. The
+ * body did not start, but a marker for it may be durable: no further upload
+ * may start until a write of the corrected ledger succeeds.
+ */
+export class UploadAttemptStorageFailedError extends Error {
+  constructor(cause: unknown) {
+    super(
+      `Upload attempt store could not be repaired: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+      { cause },
+    );
+    this.name = "UploadAttemptStorageFailedError";
+  }
+}
+
 /** Status text recorded when a malformed ledger was preserved and reset. */
 export const UPLOAD_ATTEMPTS_RESET_NOTICE =
   "Upload crash protection was reset; earlier interruption counts were lost";
@@ -341,6 +358,8 @@ export function createUploadAttemptLedger(
   let lease: UploadAttemptLease | null = null;
   let recovering: Promise<boolean> | null = null;
   let writes: Promise<unknown> = Promise.resolve();
+  /** A marker for an attempt that never started may be in storage. */
+  let unrepaired = false;
   /** Set once a malformed value was replaced: it is not replaced twice. */
   let resetOnce = false;
   let closeWhenIdle = false;
@@ -359,18 +378,32 @@ export function createUploadAttemptLedger(
       throw new Error("Upload attempt ledger is not recovered");
   }
 
+  const writeCurrent = () =>
+    store.write({
+      version: UPLOAD_ATTEMPTS_ENVELOPE_VERSION,
+      records: [...records.values()],
+    });
+
   /** Serialised, whole-value persist of the current records. */
-  function persist(onRejected?: (error: unknown) => void): Promise<void> {
+  function persist(
+    onRejected?: (error: unknown) => void | Promise<void>,
+  ): Promise<void> {
     assertOwned();
-    const run = writes.then(() =>
-      store.write({
-        version: UPLOAD_ATTEMPTS_ENVELOPE_VERSION,
-        records: [...records.values()],
-      }),
-    );
-    // The rollback runs before the next queued write reads `records`.
+    const run = writes.then(async () => {
+      await writeCurrent();
+      unrepaired = false;
+    });
+    // The rollback (and any repair) finishes before the next queued write.
     writes = run.catch((error) => onRejected?.(error));
     return run;
+  }
+
+  /** Wait until no write is queued, so a begin joins no earlier write. */
+  async function drainWrites() {
+    for (let seen = writes; ; seen = writes) {
+      await seen;
+      if (seen === writes) return;
+    }
   }
 
   /**
@@ -466,6 +499,17 @@ export function createUploadAttemptLedger(
     },
     async begin(entry) {
       assertOwned();
+      // An older queued write reads `records` when it runs; this attempt's
+      // tentative record must not be visible to it, so wait for the queue.
+      await drainWrites();
+      assertOwned();
+      if (unrepaired) {
+        try {
+          await persist();
+        } catch (error) {
+          throw new UploadAttemptStorageFailedError(error);
+        }
+      }
       const key = keyOf(entry);
       if (live.has(key))
         throw new Error("An upload attempt for this entry is still running");
@@ -482,20 +526,30 @@ export function createUploadAttemptLedger(
         quarantined: false,
       });
       live.set(key, token);
-      // A write that failed before storing anything must not leave this
-      // attempt in memory, or a later whole-ledger write would persist an
-      // attempt that never ran. A write of unknown outcome keeps the marker:
-      // it may be on disk, and counting a start that did not run is safer than
-      // missing one that did.
-      const rollback = (error: unknown) => {
-        if (error instanceof UploadAttemptWriteUncertainError) return;
+      // The body starts only after this resolves, so a rejected begin never
+      // ran: take the record back out of memory. Storage may still hold it
+      // when the outcome was unknown; write the corrected ledger before any
+      // later write, or fail closed.
+      let repairFailure: unknown;
+      const rollback = async (error: unknown) => {
         if (known) records.set(key, known);
         else records.delete(key);
+        if (!(error instanceof UploadAttemptWriteUncertainError)) return;
+        unrepaired = true;
+        try {
+          await writeCurrent();
+          unrepaired = false;
+        } catch (repair) {
+          repairFailure = repair;
+        }
       };
       try {
         await persist(rollback);
       } catch (error) {
         if (live.get(key) === token) live.delete(key);
+        await writes;
+        if (repairFailure !== undefined)
+          throw new UploadAttemptStorageFailedError(repairFailure);
         throw error;
       }
       return token;

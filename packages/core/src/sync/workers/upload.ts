@@ -38,6 +38,7 @@ import {
 import {
   DEFAULT_ABANDON_GRACE_MS,
   uploadAttemptKey,
+  UploadAttemptStorageFailedError,
   type UploadAttemptLedger,
 } from "../upload-attempts.js";
 
@@ -808,6 +809,8 @@ export async function uploadAll(
       state.clear(target.path);
       if (plan) await supersede(plan.head);
     } catch (err) {
+      // A marker that cannot be repaired stops the pass, not just this entry.
+      if (err instanceof UploadAttemptStorageFailedError) throw err;
       abandoned = err instanceof UploadDeadlineError;
       // A dropped orphan is a self-heal, not a failure: the row is already
       // gone, there is nothing to retry, and surfacing it would keep the
