@@ -148,20 +148,27 @@ describe("format-2 parts", () => {
 describe("FrameReducer", () => {
   it("keeps the greatest stamp, the later add on a tie, and splits on small bytes only", () => {
     const r = new FrameReducer<string>("");
-    r.add({ k: key(1), o: 1, r: "a", size: 10, ref: "old" });
-    r.add({ k: key(1), o: 2, r: "a", size: 10, ref: "new" });
-    r.add({ k: key(1), o: 1, r: "z", size: 10, ref: "stale" });
-    r.add({ k: key(2), o: 5, r: "a", size: 5, ref: "tie1" });
-    r.add({ k: key(2), o: 5, r: "a", size: 5, ref: "tie2" });
-    r.add({ k: key(3), o: 1, r: "a", size: 90 * 1024 * 1024, ref: "long" });
+    r.add({ k: key(1), o: 1, r: "a", size: 10, held: true, ref: "old" });
+    r.add({ k: key(1), o: 2, r: "a", size: 10, held: true, ref: "new" });
+    r.add({ k: key(1), o: 1, r: "z", size: 10, held: true, ref: "stale" });
+    r.add({ k: key(2), o: 5, r: "a", size: 5, held: true, ref: "tie1" });
+    r.add({ k: key(2), o: 5, r: "a", size: 5, held: true, ref: "tie2" });
+    r.add({
+      k: key(3),
+      o: 1,
+      r: "a",
+      size: 90 * 1024 * 1024,
+      held: false,
+      ref: "long",
+    });
     const result = r.finish(1024);
     expect(result.kind).toBe("ok");
     if (result.kind !== "ok") return;
     expect(result.winners.map((w) => w.ref)).toEqual(["new", "tie2", "long"]);
     expect(result.smallBytes).toBe(15);
     const tight = new FrameReducer<string>("");
-    tight.add({ k: key(1), o: 1, r: "a", size: 600, ref: "a" });
-    tight.add({ k: key(2), o: 1, r: "a", size: 600, ref: "b" });
+    tight.add({ k: key(1), o: 1, r: "a", size: 600, held: true, ref: "a" });
+    tight.add({ k: key(2), o: 1, r: "a", size: 600, held: true, ref: "b" });
     expect(tight.finish(1000).kind).toBe("split");
   });
 

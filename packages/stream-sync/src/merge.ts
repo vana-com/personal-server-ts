@@ -10,12 +10,7 @@
  * distinct keys of the bucket, not with the versions fed to it.
  */
 
-import {
-  FRAME_SMALL_BYTES,
-  PART_LIMIT_BYTES,
-  PLANNER_DEPTH_CAP,
-  utf8Length,
-} from "./bytes.js";
+import { PART_LIMIT_BYTES, PLANNER_DEPTH_CAP, utf8Length } from "./bytes.js";
 import { InvalidArgumentError } from "./errors.js";
 import { encodeLine, inPrefix, type Line } from "./records.js";
 
@@ -148,6 +143,8 @@ export interface FrameWinner<Ref> {
   readonly r: string;
   /** Frame size: envelope, LF, body, LF. */
   readonly size: number;
+  /** True when the host keeps the frame's bytes in memory; only these count toward the split. */
+  readonly held: boolean;
   readonly ref: Ref;
 }
 
@@ -174,9 +171,9 @@ export type FrameBucketResult<Ref> =
 /**
  * The §2.6 merge over envelopes. Per key the greatest `(o, r)` wins and, on
  * equal stamps, the later `add` wins. It reads no body. A bucket splits when
- * its small winners (frames up to `FRAME_SMALL_BYTES`, which the host keeps
- * in memory) pass the limit; long frames are located, not held, so they do
- * not count.
+ * its held winners (frames the host keeps in memory, normally those up to
+ * `FRAME_SMALL_BYTES`) pass the limit; long frames are located, not held, so
+ * they do not count.
  */
 export class FrameReducer<Ref> {
   readonly prefix: string;
@@ -209,8 +206,7 @@ export class FrameReducer<Ref> {
       a.k < b.k ? -1 : a.k > b.k ? 1 : 0,
     );
     let smallBytes = 0;
-    for (const w of winners)
-      if (w.size <= FRAME_SMALL_BYTES) smallBytes += w.size;
+    for (const w of winners) if (w.held) smallBytes += w.size;
     if (smallBytes > limitBytes) {
       return this.prefix.length < PLANNER_DEPTH_CAP
         ? { kind: "split", prefix: this.prefix, smallBytes }
