@@ -54,6 +54,11 @@ describe.each([
           },
           { gc },
         );
+        const http = await run<{ padLength: number }>(
+          { module: WORKLOAD, exportName: "httpBatchWorkload", args: base },
+          { gc },
+        );
+        expect(http.result.padLength).toBe(bodyBytes - 64);
         const body = canonicalJson(bigRecord(bodyBytes));
         expect(forward.result.bytes).toBe(bodyBytes);
         expect(forward.result.sha256).toBe(
@@ -63,7 +68,7 @@ describe.each([
         await appendFile(
           process.env.BIG_RECORD_OUT ?? "/dev/null",
 
-          `MEMORY ${surface}/${gc} ${bodyBytes / MiB} MiB: write ${(write.peakBytes / MiB).toFixed(0)} MiB, read-forward ${(forward.peakBytes / MiB).toFixed(0)} MiB, read-parse ${(parse.peakBytes / MiB).toFixed(0)} MiB\n`,
+          `MEMORY ${surface}/${gc} ${bodyBytes / MiB} MiB: write ${(write.peakBytes / MiB).toFixed(0)} MiB, read-forward ${(forward.peakBytes / MiB).toFixed(0)} MiB, read-parse ${(parse.peakBytes / MiB).toFixed(0)} MiB, http-parse ${(http.peakBytes / MiB).toFixed(0)} MiB\n`,
         );
         // Forwarding must not scale with the record: a few parts, not the body.
         if (surface === "node")

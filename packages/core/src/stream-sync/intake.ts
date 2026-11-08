@@ -458,74 +458,123 @@ export class StreamSyncIntake implements RunIntake {
     ) {
       throw invalid("batch and records are required");
     }
-    if (req.batch <= run.lastBatch) {
-      return { applied: false, accepted: 0, deletesSkipped: 0 };
-    }
-    if (req.batch > run.lastBatch + 1) {
-      throw new RunIntakeError("batch_gap", "batch_gap", run.lastBatch + 1);
-    }
+    const skipped = this.skipBatch(run, req.batch);
+    if (skipped) return skipped;
 
     // Check the whole batch before any line is spooled, so a refused batch
     // leaves no trace and the producer may resend it.
-    const checked: { stream: string; delete: boolean; data: JsonObject }[] = [];
-    for (const record of req.records) {
-      if (!isPlainObject(record as unknown as JsonObject)) {
-        throw invalid("a record is not an object");
-      }
-      const decl = run.decl.get(record.stream);
-      if (!decl)
-        throw invalid(`stream ${String(record.stream)} is not declared`);
-      if (
-        record.op !== undefined &&
-        record.op !== "upsert" &&
-        record.op !== "delete"
-      ) {
-        throw invalid("op must be upsert or delete");
-      }
-      if (!isPlainObject(record.data as JsonObject)) {
-        throw invalid("data must be an object");
-      }
-      const data = record.data as JsonObject;
-      if (record.op === "delete") {
-        checked.push({ stream: record.stream, delete: true, data });
-        continue;
-      }
-      try {
-        primaryKeyValues(data, decl.primaryKey);
-      } catch (error) {
-        if (error instanceof MissingKeyFieldError) {
-          throw invalid(`a record of ${record.stream} lacks its primary key`);
-        }
-        throw error;
-      }
-      checked.push({ stream: record.stream, delete: false, data });
-    }
-
-    const response = {
-      applied: true,
-      accepted: 0,
-      deletesSkipped: 0,
-    };
+    const checked = req.records.map((record) => this.checkRecord(run, record));
+    const response = { applied: true, accepted: 0, deletesSkipped: 0 };
     for (const record of checked) {
-      // R17: a delete is skipped and counted, never stored.
-      if (record.delete) {
-        response.deletesSkipped += 1;
-        run.deletesSkipped += 1;
-        continue;
-      }
-      if (run.willDiscard) continue;
-      const decl = run.decl.get(record.stream)!;
-      const profile: HeadProfile = { key: null, version: run.version };
-      await this.options.writer.append(runId, record.stream, record.data, {
-        primaryKey: decl.primaryKey,
-        profile,
-        incremental: decl.incremental !== false,
-      });
-      run.hadRecords = true;
-      response.accepted += 1;
+      await this.applyRecord(runId, run, record, response);
     }
     run.lastBatch = req.batch;
     return response;
+  }
+
+  /**
+   * The same batch with its records arriving one at a time, so a host that
+   * reads a request body as a stream holds one record, not the whole batch.
+   * Each record is checked and spooled as it arrives. A record that fails the
+   * check ends the batch with `invalid_request` and `lastBatch` stays put;
+   * the records before it stay spooled, and a resend spools them again under
+   * the same key and stamp, which the merge treats as one record.
+   */
+  async batchStream(
+    runId: string,
+    batch: number,
+    records: AsyncIterable<unknown>,
+  ): Promise<BatchResponse> {
+    const run = await this.live(runId);
+    if (!Number.isInteger(batch) || batch < 0) {
+      throw invalid("batch and records are required");
+    }
+    const skipped = this.skipBatch(run, batch);
+    if (skipped) {
+      // Drain nothing: the caller stops reading the body.
+      return skipped;
+    }
+    const response = { applied: true, accepted: 0, deletesSkipped: 0 };
+    for await (const record of records) {
+      await this.applyRecord(
+        runId,
+        run,
+        this.checkRecord(run, record),
+        response,
+      );
+    }
+    run.lastBatch = batch;
+    return response;
+  }
+
+  /** A replayed batch answers unapplied; a gap is an error; else null. */
+  private skipBatch(run: Run, batch: number): BatchResponse | null {
+    if (batch <= run.lastBatch) {
+      return { applied: false, accepted: 0, deletesSkipped: 0 };
+    }
+    if (batch > run.lastBatch + 1) {
+      throw new RunIntakeError("batch_gap", "batch_gap", run.lastBatch + 1);
+    }
+    return null;
+  }
+
+  private checkRecord(
+    run: Run,
+    record: unknown,
+  ): { stream: string; delete: boolean; data: JsonObject } {
+    if (!isPlainObject(record as JsonObject)) {
+      throw invalid("a record is not an object");
+    }
+    const entry = record as BatchRequest["records"][number];
+    const decl = run.decl.get(entry.stream);
+    if (!decl) throw invalid(`stream ${String(entry.stream)} is not declared`);
+    if (
+      entry.op !== undefined &&
+      entry.op !== "upsert" &&
+      entry.op !== "delete"
+    ) {
+      throw invalid("op must be upsert or delete");
+    }
+    if (!isPlainObject(entry.data as JsonObject)) {
+      throw invalid("data must be an object");
+    }
+    const data = entry.data as JsonObject;
+    if (entry.op === "delete") {
+      return { stream: entry.stream, delete: true, data };
+    }
+    try {
+      primaryKeyValues(data, decl.primaryKey);
+    } catch (error) {
+      if (error instanceof MissingKeyFieldError) {
+        throw invalid(`a record of ${entry.stream} lacks its primary key`);
+      }
+      throw error;
+    }
+    return { stream: entry.stream, delete: false, data };
+  }
+
+  private async applyRecord(
+    runId: string,
+    run: Run,
+    record: { stream: string; delete: boolean; data: JsonObject },
+    response: { accepted: number; deletesSkipped: number },
+  ): Promise<void> {
+    // R17: a delete is skipped and counted, never stored.
+    if (record.delete) {
+      response.deletesSkipped += 1;
+      run.deletesSkipped += 1;
+      return;
+    }
+    if (run.willDiscard) return;
+    const decl = run.decl.get(record.stream)!;
+    const profile: HeadProfile = { key: null, version: run.version };
+    await this.options.writer.append(runId, record.stream, record.data, {
+      primaryKey: decl.primaryKey,
+      profile,
+      incremental: decl.incremental !== false,
+    });
+    run.hadRecords = true;
+    response.accepted += 1;
   }
 
   // ----------------------------------------------------------------- end

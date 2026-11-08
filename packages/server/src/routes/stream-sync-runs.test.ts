@@ -25,7 +25,11 @@ import {
   startLocalStorage,
   type OracleEnv,
 } from "../stream-sync/oracle.test-utils.js";
-import { MAX_BATCH_BYTES, streamSyncRunsRoutes } from "./stream-sync-runs.js";
+import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  MAX_BATCH_REQUEST_BYTES,
+  streamSyncRunsRoutes,
+} from "./stream-sync-runs.js";
 
 const TOKEN = "runs-route-test-token";
 const DECLARATIONS: Omit<IntakeDeclarations, "connector"> = {
@@ -79,11 +83,13 @@ async function build(device: string) {
     path: string,
     json: unknown,
     token: string | null = TOKEN,
+    headers: Record<string, string> = {},
   ) =>
     outer.request(`/v1/stream-sync/runs/${path}`, {
       method,
       headers: {
         "content-type": "application/json",
+        ...headers,
         ...(token ? { authorization: `Bearer ${token}` } : {}),
       },
       body: typeof json === "string" ? json : JSON.stringify(json),
@@ -210,19 +216,84 @@ describe("stream-sync run intake route", () => {
     expect(await res.json()).toMatchObject({ error: "connection_stopped" });
   });
 
-  it("refuses a body over the batch cap", async () => {
-    const { call } = await build("route-cap");
-    await call("PUT", "c1", beginBody());
-    const big = JSON.stringify({
+  it("takes a 30 MiB record through the batch route and reads it back byte-exact", async () => {
+    const { writer, call } = await build("route-30mib");
+    const body = beginBody();
+    await call("PUT", "big1", body);
+    const huge = { id: "huge", pad: 'é"\\}{'.repeat(5 * 1024 * 1024) };
+    expect(JSON.stringify(huge).length).toBeGreaterThan(30 * 1024 * 1024);
+    const sent = await call("POST", "big1/batches", {
       batch: 0,
       records: [
-        {
-          stream: "items",
-          data: { id: "a", pad: "x".repeat(MAX_BATCH_BYTES) },
-        },
+        { stream: "items", data: { id: "small", n: 1 } },
+        { stream: "items", data: huge },
+        { stream: "items", data: { id: "tail", n: 2 } },
       ],
     });
-    expect((await call("POST", "c1/batches", big)).status).toBe(400);
+    expect(sent.status).toBe(200);
+    expect(await sent.json()).toMatchObject({ accepted: 3, applied: true });
+    const ended = await call("POST", "big1/end", {
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      checkpointCandidate: { items: "c1" },
+      lastBatch: 0,
+    });
+    expect(ended.status).toBe(200);
+    await writer.cycle();
+    expect(finishedOutcome(await writer.status(), "big1")?.outcome?.kind).toBe(
+      "checkpointed",
+    );
+    const view = await readStream(
+      env.registry,
+      env.blobs,
+      body.connector,
+      "",
+      "items",
+    );
+    if (!view || view === "tombstoned") throw new Error("stream missing");
+    expect([...view.records.keys()].sort()).toEqual(["huge", "small", "tail"]);
+    expect(canonicalJson(view.records.get("huge"))).toBe(canonicalJson(huge));
+  }, 120_000);
+
+  it("takes members in any order", async () => {
+    const { call } = await build("route-order");
+    await call("PUT", "o1", beginBody());
+    const res = await call(
+      "POST",
+      "o1/batches",
+      '{"records":[{"stream":"items","data":{"id":"a"}},{"stream":"items","data":{"id":"b"}}],"batch":0,"note":{"x":[1,2]}}',
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ accepted: 2, applied: true });
+  });
+
+  it("refuses a malformed or incomplete batch body with 400", async () => {
+    const { call } = await build("route-malformed");
+    await call("PUT", "m1", beginBody());
+    for (const text of [
+      "",
+      "[]",
+      "{not json",
+      '{"batch":0}',
+      '{"records":[]}',
+      '{"batch":"0","records":[]}',
+      '{"batch":0,"records":{}}',
+      '{"batch":0,"records":[1]}',
+      '{"batch":0,"records":[{"stream":"items","data":{"id":"a"}}',
+      '{"batch":0,"records":[]} trailing',
+    ]) {
+      const res = await call("POST", "m1/batches", text);
+      expect(res.status, text).toBe(400);
+    }
+  });
+
+  it("refuses a request that declares a body over the ceiling", async () => {
+    const { call } = await build("route-ceiling");
+    await call("PUT", "c1", beginBody());
+    const res = await call("POST", "c1/batches", "{}", TOKEN, {
+      "content-length": String(MAX_BATCH_REQUEST_BYTES + 1),
+    });
+    expect(res.status).toBe(400);
   });
 
   it("refuses a caller that is not the owner", async () => {
