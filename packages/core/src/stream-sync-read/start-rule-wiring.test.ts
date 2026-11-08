@@ -45,8 +45,11 @@ async function setup(seed: number, activate: boolean) {
 }
 
 /** What the owner's read serves: the decision kind and the record ids. */
-async function served(service: StreamSyncReadService) {
-  const decision = await service.resolve(ask("pdpp.acme.items"));
+async function served(
+  service: StreamSyncReadService,
+  extra: { connection?: string } = {},
+) {
+  const decision = await service.resolve(ask("pdpp.acme.items", extra));
   if (decision.kind !== "view" && decision.kind !== "local_pending") {
     return { kind: decision.kind, ids: [] as string[] };
   }
@@ -106,6 +109,34 @@ describe("reader wiring of the start rule", () => {
     const service = await f.service();
     await f.sync(service);
     expect((await served(service)).kind).not.toBe("view");
+  });
+
+  // The physical-name read (`pdpp.acme~<ns>.items`) selects a connection by
+  // its ns, and eligible.ts requires that connection to be active. A deleted
+  // connection with a deleted-start full connect run is not served as a view:
+  // the owner sees the run as pending.
+  it("does not serve a read of a deleted connection with a pending run as a view", async () => {
+    const { f, ns } = await setup(66, true);
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      records: [{ id: "a", v: 1 }],
+      observedAt: T - 1000,
+    });
+    const version = await f.deleteConnection("acme", ns);
+    f.overlay.runs = [
+      run(ns, { kind: "deleted", version }, version + 1, {
+        userConnect: true,
+        full: true,
+      }),
+    ];
+    const service = await f.service();
+    await f.sync(service);
+    // Both selections: the logical name and the physical ns.
+    expect((await served(service)).kind).not.toBe("view");
+    expect((await served(service, { connection: ns })).kind).not.toBe("view");
   });
 
   it("serves no view while the connection is absent", async () => {
