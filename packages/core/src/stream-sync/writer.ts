@@ -1777,6 +1777,10 @@ export class StreamSyncWriter {
       empty: (stream.shardBytes ?? []).every((bytes) => bytes === 0),
       seed: stream.seedApplies ? "merged" : seedOpen ? "unresolved" : "none",
       ...(executed ? { executed } : {}),
+      // The request is signed and persisted; the registry's answer is not.
+      ...(!executed && outbox?.state === "request_persisted"
+        ? { inFlight: true }
+        : {}),
     };
   }
 

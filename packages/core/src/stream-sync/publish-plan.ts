@@ -117,6 +117,8 @@ export interface PlanRun extends CommitStamp {
   readonly seed: PlanSeed;
   /** Present once the writer committed or recorded a no-op for this stream. */
   readonly executed?: ExecutedStep;
+  /** The writer persisted a signed request and has not recorded the registry's answer. */
+  readonly inFlight?: boolean;
 }
 
 /** Which rows a head holds, relative to the head the plan started from. */
@@ -139,7 +141,13 @@ export type DeferredReason =
   /** The stream holds a newer generation than the run's target. */
   | "stale_generation"
   /** An earlier run of the stream is not resolved; commits stay in order. */
-  | "earlier_run_pending";
+  | "earlier_run_pending"
+  /**
+   * The writer sent a signed request for this run, or a later run, and the
+   * registry's answer is not recorded. The request may have committed: until
+   * it is reconciled, no run it would supersede or reorder has a known fate.
+   */
+  | "publication_in_flight";
 
 export type StepDecision =
   /** The writer publishes `head`; the parts may turn out unchanged, then it records a no-op of the same head. */
@@ -272,9 +280,16 @@ export function planStream(
   let rows: PlanRows = { fromHead: head !== null, runs: [], seed: false };
   let waiting = false;
   const steps: PlanStep[] = [];
-  for (const run of [...runs].sort(commitOrder)) {
+  const ordered = [...runs].sort(commitOrder);
+  // A signed request is never proof of success. The newest run in flight may
+  // commit, which refuses every older run, or fail, which does not: neither
+  // that run nor an older one has a known fate yet, and a later run waits.
+  const barrier = ordered.filter((r) => r.inFlight && !r.executed).at(-1);
+  for (const run of ordered) {
     let decision: StepDecision;
-    if (run.executed) {
+    if (!run.executed && barrier && commitOrder(run, barrier) <= 0) {
+      decision = { kind: "deferred", reason: "publication_in_flight" };
+    } else if (run.executed) {
       const { executed } = run;
       decision =
         executed.kind === "noop"

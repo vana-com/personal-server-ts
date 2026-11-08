@@ -56,6 +56,8 @@ export interface Fold {
   readonly withheld: readonly WithheldContribution[];
   /** Runs with a stream that has no publish receipt yet. */
   readonly unpublished: readonly string[];
+  /** Runs with a stream the writer published and the reader has not imported: no view shows them until it does. */
+  readonly awaiting: readonly string[];
   /** Primary key and profile of the head the view shows; null with no base and no run. */
   readonly shape: {
     readonly primaryKey: readonly string[];
@@ -130,6 +132,9 @@ export function foldPlan(
     withheld,
     unpublished: candidates
       .filter((c) => c.stream.receipt === undefined)
+      .map((c) => c.run.runId),
+    awaiting: candidates
+      .filter((c) => c.stream.receipt !== undefined)
       .map((c) => c.run.runId),
     shape: head && { primaryKey: head.primaryKey, profile: head.profile },
     complete: !blocked && (head?.complete ?? false),

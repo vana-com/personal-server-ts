@@ -123,6 +123,13 @@ export interface OwnerNotes {
    * newer: the owner is told.
    */
   readonly pending?: { readonly runs: number };
+  /**
+   * A legacy body answers while published local runs wait for import: the
+   * body does not reflect them. `runs` counts distinct runs with a stream the
+   * writer published and the reader has not imported yet. Cleared by import
+   * coverage, not by the publish receipt.
+   */
+  readonly awaitingImport?: { readonly runs: number };
 }
 
 export type ReadDecision =
@@ -141,6 +148,11 @@ export type ReadDecision =
   | { readonly kind: "invalid_cursor" }
   | { readonly kind: "invalid_connection" }
   | { readonly kind: "too_large"; readonly bytes: number }
+  /**
+   * Imports or writer publications into the streams this read touched kept
+   * changing under it. Nothing is wrong with the data: ask again.
+   */
+  | { readonly kind: "busy"; readonly retryAfterSeconds: number }
   /**
    * The owner's partial view, built on this device: the live imported heads,
    * complete or not, and the local runs the writer will publish on them, when
@@ -443,6 +455,7 @@ const NO_SNAPSHOT: StreamSyncOverlaySnapshot = {
 
 /** Reads start over this many times when an import lands under them. */
 const MAX_COHERENCE_ATTEMPTS = 8;
+const BUSY_RETRY_AFTER_SECONDS = 1;
 
 export class StreamSyncReadService {
   private spoolCounter = 0;
@@ -635,7 +648,12 @@ export class StreamSyncReadService {
         ),
       ),
     );
-    return { ...replay, withheld: all.withheld, unpublished: all.unpublished };
+    return {
+      ...replay,
+      withheld: all.withheld,
+      unpublished: all.unpublished,
+      awaiting: all.awaiting,
+    };
   }
 
   /** §2.10 inputs for connector c: every connection this server knows. */
@@ -722,8 +740,19 @@ export class StreamSyncReadService {
     // import that lands after it carries commits the plan does not know, so
     // pairing that base with this plan could show a run the writer refuses.
     // The read starts over when an import lands before the decision is made.
+    // Only the streams this read touches can invalidate it: the import
+    // revisions of the target streams are its basis. The snapshot pins the
+    // writer state of those streams (a publication in flight is part of it),
+    // so a later writer change alone cannot pair a base with another plan.
+    const touched = [...targets, ...candidates];
+    const basis = () =>
+      touched
+        .flatMap((t) =>
+          t.streams.map((s) => this.views.revision(t.connector, s)),
+        )
+        .join(",");
     for (let attempt = 1; ; attempt += 1) {
-      const epoch = this.views.epoch;
+      const before = basis();
       const snapshots = new Map<string, StreamSyncOverlaySnapshot>();
       let decision: ReadDecision;
       try {
@@ -747,12 +776,10 @@ export class StreamSyncReadService {
       } finally {
         for (const snapshot of snapshots.values()) snapshot.release();
       }
-      if (this.views.epoch === epoch) return decision;
+      if (basis() === before) return decision;
       if ("body" in decision) await decision.body.cancel();
       if (attempt >= MAX_COHERENCE_ATTEMPTS) {
-        throw new Error(
-          "stream-sync read: imports kept changing the base under the read",
-        );
+        return { kind: "busy", retryAfterSeconds: BUSY_RETRY_AFTER_SECONDS };
       }
     }
   }
@@ -886,6 +913,11 @@ export class StreamSyncReadService {
         );
         notes = { ...notes, pending: { runs: scan.unpublished } };
       }
+      // Published is not reflected: until import covers a published run, the
+      // legacy body does not show it either.
+      if (input.legacyFile && scan.awaiting > 0) {
+        notes = { ...notes, awaitingImport: { runs: scan.awaiting } };
+      }
     }
     if (cursor) return { kind: "cursor_stale" };
     if (deleted) {
@@ -976,6 +1008,7 @@ export class StreamSyncReadService {
     } | null;
     withheld: WithheldRun[];
     unpublished: number;
+    awaiting: number;
     connectors: string[];
   } {
     let best: {
@@ -986,6 +1019,7 @@ export class StreamSyncReadService {
     } | null = null;
     const withheld: WithheldRun[] = [];
     const unpublished = new Set<string>();
+    const awaiting = new Set<string>();
     const connectors = new Set<string>();
     for (const target of targets) {
       const snapshot = snapshots.get(target.connector);
@@ -1039,6 +1073,9 @@ export class StreamSyncReadService {
           for (const runId of local.unpublished) {
             unpublished.add(JSON.stringify([target.connector, ns, runId]));
           }
+          for (const runId of local.awaiting) {
+            awaiting.add(JSON.stringify([target.connector, ns, runId]));
+          }
           at = Math.max(
             at,
             live?.head.observedAt ?? 0,
@@ -1060,6 +1097,7 @@ export class StreamSyncReadService {
       best,
       withheld: uniqueWithheld(withheld),
       unpublished: unpublished.size,
+      awaiting: awaiting.size,
       connectors: [...connectors],
     };
   }

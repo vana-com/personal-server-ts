@@ -110,8 +110,12 @@ export function isUsableViewKey(key: ViewKey): boolean {
 
 export class ViewStore {
   private readonly current = new Map<string, ImportedVersion>();
-  /** Counts the imports that changed a current version; a read compares it before and after it pairs a base with a plan. */
-  private importEpoch = 0;
+  /**
+   * Per connector and stream: how many imports changed a current version of
+   * it, whatever the namespace. A read records the revisions of the streams it
+   * touches and compares them when it has paired a base with a plan.
+   */
+  private readonly importRevisions = new Map<string, number>();
   /** id → version → lease count. */
   private readonly leases = new Map<string, Map<number, number>>();
   /** id → versions on disk that are not current. */
@@ -175,8 +179,9 @@ export class ViewStore {
     return store;
   }
 
-  get epoch(): number {
-    return this.importEpoch;
+  /** The import revision of one stream of one connector (all namespaces). */
+  revision(connector: string, stream: string): number {
+    return this.importRevisions.get(`${connector}\n${stream}`) ?? 0;
   }
 
   get(key: ViewKey): ImportedVersion | null {
@@ -270,7 +275,11 @@ export class ViewStore {
     const previous = this.current.get(id);
     this.keys.set(id, key);
     this.current.set(id, { version, dataHash, head });
-    this.importEpoch += 1;
+    const touched = `${key.connector}\n${key.stream}`;
+    this.importRevisions.set(
+      touched,
+      (this.importRevisions.get(touched) ?? 0) + 1,
+    );
     if (previous && previous.version !== version) {
       let retained = this.retained.get(id);
       if (!retained) this.retained.set(id, (retained = new Map()));

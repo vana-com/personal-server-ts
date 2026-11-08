@@ -638,6 +638,11 @@ function ownerNoteHeaders(
   if (notes?.pending) {
     headers["X-Stream-Sync-Pending"] = String(notes.pending.runs);
   }
+  if (notes?.awaitingImport) {
+    headers["X-Stream-Sync-Awaiting-Import"] = String(
+      notes.awaitingImport.runs,
+    );
+  }
   return headers;
 }
 
@@ -696,6 +701,20 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
         409,
         "CURSOR_STALE",
         "The cursor names a version this server no longer holds; read again without it",
+      );
+    case "busy":
+      return jsonResponse(
+        {
+          error: {
+            code: 503,
+            errorCode: "STREAM_SYNC_READ_BUSY",
+            message: "This data is changing; read again shortly",
+          },
+        },
+        {
+          status: 503,
+          headers: { "Retry-After": String(decision.retryAfterSeconds) },
+        },
       );
     case "invalid_cursor":
       return errorResponse(400, "INVALID_CURSOR", "cursor is not valid");
