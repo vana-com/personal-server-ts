@@ -1,157 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type {
-  JsonObject,
-  Line,
-} from "@opendatalabs/personal-server-ts-stream-sync";
-import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import type { JsonObject } from "@opendatalabs/personal-server-ts-stream-sync";
 import { projectPdppRecordsToLegacyPayload } from "../legacy-projection/index.js";
-import { createStreamSyncReadKeys } from "./keys.js";
-import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
-import type { MirrorFeedRow } from "./mirror.js";
-import type { StreamSyncOverlayEntry } from "./ports.js";
-import {
-  liveStreamCounts,
-  readTargets,
-  StreamSyncReadService,
-  type ReadDecision,
-} from "./service.js";
-import { buildTestHead, testOwnerKey, type TestOwnerKey } from "./testing.js";
-
-const META = `0x${"ab".repeat(32)}`;
-const silent = { info() {}, warn() {}, error() {} };
-
-function masterKey(seed: number): Uint8Array {
-  return Uint8Array.from({ length: 32 }, (_, i) => (seed * 31 + i) & 0xff);
-}
-
-class Fixture {
-  readonly blobs = new Map<string, Uint8Array>();
-  readonly rows = new Map<string, MirrorFeedRow>();
-  readonly files = createMemoryStreamSyncReadFiles();
-  readonly blobGets: string[] = [];
-  overlay: StreamSyncOverlayEntry[] = [];
-  private clock = Date.parse("2026-11-01T00:00:00Z");
-
-  constructor(readonly key: TestOwnerKey) {}
-
-  private row(
-    scope: string,
-    dataHash: string,
-    metadataHash: string,
-    deleted = false,
-  ) {
-    const previous = this.rows.get(scope);
-    const version = previous ? Number(previous.expectedVersion) + 1 : 1;
-    this.clock += 1000;
-    this.rows.set(scope, {
-      scope,
-      dataHash,
-      metadataHash,
-      expectedVersion: String(version),
-      addedAt: new Date(this.clock).toISOString(),
-      deletedAt: deleted ? new Date(this.clock).toISOString() : null,
-    });
-    return version;
-  }
-
-  async activate(
-    connector: string,
-    ns: string,
-    key = this.key,
-  ): Promise<number> {
-    const { active } = await key.control();
-    return this.row(
-      controlScope(connector, ns),
-      active.dataHash,
-      active.metadataHash,
-    );
-  }
-
-  async deleteConnection(connector: string, ns: string): Promise<number> {
-    const { tombstone } = await this.key.control();
-    return this.row(
-      controlScope(connector, ns),
-      tombstone.dataHash,
-      tombstone.metadataHash,
-      true,
-    );
-  }
-
-  async publish(input: {
-    connector: string;
-    ns: string;
-    stream: string;
-    generation: number;
-    records: JsonObject[];
-    primaryKey?: string[];
-    complete?: boolean;
-    observedAt?: number;
-    prefixes?: string[];
-    key?: TestOwnerKey;
-    encryptWith?: TestOwnerKey;
-    withholdBlobs?: boolean;
-  }) {
-    const built = await buildTestHead({
-      key: input.key ?? this.key,
-      connector: input.connector,
-      ns: input.ns,
-      stream: input.stream,
-      generation: input.generation,
-      primaryKey: input.primaryKey ?? ["id"],
-      records: input.records,
-      observedAt: input.observedAt ?? this.clock,
-      complete: input.complete,
-      prefixes: input.prefixes,
-      encryptWith: input.encryptWith,
-    });
-    if (!input.withholdBlobs) {
-      for (const [k, v] of built.blobs) this.blobs.set(k, v);
-    }
-    this.row(built.scope, built.dataHash, META);
-    return built;
-  }
-
-  async service(): Promise<StreamSyncReadService> {
-    return StreamSyncReadService.open({
-      files: this.files,
-      blobs: {
-        get: async (k) => {
-          this.blobGets.push(k);
-          return this.blobs.get(k) ?? null;
-        },
-      },
-      keys: await createStreamSyncReadKeys(this.key.masterKey),
-      logger: silent,
-      overlay: { entries: async () => this.overlay },
-      now: () => new Date("2026-11-02T00:00:00Z"),
-    });
-  }
-
-  async sync(service: StreamSyncReadService): Promise<void> {
-    await service.observe([...this.rows.values()], {
-      fromStart: true,
-      lastPage: true,
-    });
-    await service.importPending();
-  }
-}
-
-async function body(decision: ReadDecision): Promise<Record<string, any>> {
-  if (decision.kind !== "view")
-    throw new Error(`expected view, got ${decision.kind}`);
-  return JSON.parse(await new Response(decision.body).text());
-}
-
-const ask = (
-  scope: string,
-  extra: Partial<Parameters<StreamSyncReadService["resolve"]>[0]> = {},
-) => ({
-  scope,
-  connection: null,
-  cursor: null,
-  legacyFile: false,
-  ...extra,
-});
+import type { StreamSyncReadService } from "./service.js";
+import { liveStreamCounts, readTargets } from "./service.js";
+import { testOwnerKey } from "./testing.js";
+import { ask, body, Fixture, masterKey } from "./service-fixture.js";
 
 describe("stream-sync reads", () => {
   it("serves a logical stream read as {records} from the imported view", async () => {
@@ -497,21 +350,21 @@ describe("stream-sync reads", () => {
     const f = new Fixture(await testOwnerKey(masterKey(8)));
     const ns = await f.key.ns("acme", "account-1");
     await f.activate("acme", ns);
-    f.overlay = [
+    f.overlay.runs = [
       {
         runId: "local",
         ns,
+        generation: 1,
         state: "failed",
-        error: "permanently failed",
-        streams: ["items"],
-        async *lines(): AsyncGenerator<Line> {
-          yield {
-            o: 5_000_000_000_000,
-            r: "local",
-            v: { id: "a", local: true },
-          };
-          yield { o: 5_000_000_000_000, r: "local", v: { id: "only-local" } };
-        },
+        streams: [
+          {
+            name: "items",
+            rows: [
+              { o: 5_000_000_000_000, r: "local", v: { id: "a", local: true } },
+              { o: 5_000_000_000_000, r: "local", v: { id: "only-local" } },
+            ],
+          },
+        ],
       },
     ];
     await f.publish({

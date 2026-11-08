@@ -20,14 +20,22 @@
  */
 
 import type { ControlState } from "./control.js";
+import { admitStart } from "./admission.js";
 import { hasOwn } from "./json.js";
 
 export type StartSnapshot = Readonly<Record<string, ControlState>> | null;
 
 export type StartState = { readonly kind: "unknown" } | ControlState;
 
-export function startState(start: StartSnapshot, ns: string): StartState {
-  if (start === null) return { kind: "unknown" };
+/**
+ * The one decoder for a run's start state. A missing snapshot (`null`, or a
+ * persisted entry with no `start`) is `unknown`: the run is discarded.
+ */
+export function startState(
+  start: StartSnapshot | undefined,
+  ns: string,
+): StartState {
+  if (start == null) return { kind: "unknown" };
   return hasOwn(start, ns) ? start[ns]! : { kind: "absent" };
 }
 
@@ -79,49 +87,70 @@ const DISCARD = {
   restartFull: false,
 } as const;
 
+/** The starts a publish cell can take: `unknown` and `foreign` never publish. */
+type PublishStart = Extract<
+  StartState,
+  { readonly kind: "absent" | "active" | "deleted" }
+>;
+
+function publishable(s: StartState): s is PublishStart {
+  return s.kind === "absent" || s.kind === "active" || s.kind === "deleted";
+}
+
 function table(input: DecideInput): Decision {
-  const { start: s, current: c, userConnect, full, phase } = input;
+  const { start: s, current: c } = input;
   // `any | foreign` overrides the `other` cells (see DESIGN-QUESTIONS.md Q1).
   if (c.kind === "foreign")
     return { kind: "keep_pending", reason: "key_mismatch" };
-  switch (s.kind) {
-    case "unknown":
-      return { ...DISCARD, recollect: true };
-    case "absent":
-      if (c.kind === "absent") return { kind: "create", target: 1 };
-      if (c.kind === "active" && c.generation === 1) {
-        return { kind: "publish", target: 1 };
-      }
-      return DISCARD;
-    case "active": {
-      const g0 = s.generation;
-      if (c.kind === "active" && c.generation === g0) {
-        return { kind: "publish", target: g0 };
-      }
-      if (c.kind === "absent" || (c.kind === "active" && c.generation < g0)) {
-        return phase === "reread"
-          ? { kind: "keep_pending", reason: "registry_inconsistent" }
-          : { kind: "reread" };
-      }
-      return { ...DISCARD, clearCheckpoints: true };
-    }
-    case "deleted": {
-      const v0 = s.version;
-      const sameDelete = c.kind === "deleted" && c.version === v0;
-      const reconnected = c.kind === "active" && c.generation === v0 + 1;
-      if (userConnect && full) {
-        if (sameDelete) return { kind: "reconnect", target: v0 + 1 };
-        if (reconnected) return { kind: "publish", target: v0 + 1 };
-      }
-      return {
-        ...DISCARD,
-        restartFull: userConnect && !full && (sameDelete || reconnected),
-      };
-    }
-    case "foreign":
-      // No table row starts from foreign (DESIGN-QUESTIONS.md Q2).
-      return DISCARD;
+  // The one mapping: the rule's verdict decides the cell's decision.
+  const admission = admitStart(s, c, input);
+  if (admission === "publish" && publishable(s)) return publishing(s, c);
+  if (admission === "wait") {
+    return input.phase === "reread"
+      ? { kind: "keep_pending", reason: "registry_inconsistent" }
+      : { kind: "reread" };
   }
+  return discarding(s, input);
+}
+
+/**
+ * The writer takes the run's target. A connection that must be created or
+ * reconnected is written first, then decide runs again with `after_write`.
+ * The parameter type leaves out `unknown` and `foreign`, so this switch has no
+ * case for them. A publish verdict for either falls through to `discarding`,
+ * which keeps `recollect` for `unknown`; the rule-level decide test catches
+ * such a change, since `Admission` is not typed by start kind.
+ */
+function publishing(s: PublishStart, c: ControlState): Decision {
+  switch (s.kind) {
+    case "absent":
+      return c.kind === "absent"
+        ? { kind: "create", target: 1 }
+        : { kind: "publish", target: 1 };
+    case "active":
+      return { kind: "publish", target: s.generation };
+    case "deleted":
+      return c.kind === "deleted"
+        ? { kind: "reconnect", target: s.version + 1 }
+        : { kind: "publish", target: s.version + 1 };
+  }
+}
+
+/** A discarded run: the start kind picks the discard's flags. */
+function discarding(s: StartState, input: DecideInput): Decision {
+  const { current: c, userConnect, full } = input;
+  // A connect that was not full restarts as a full run, once the connection
+  // is at the generation its deleted start leads to.
+  const reconnectable =
+    s.kind === "deleted" &&
+    ((c.kind === "deleted" && c.version === s.version) ||
+      (c.kind === "active" && c.generation === s.version + 1));
+  return {
+    ...DISCARD,
+    recollect: s.kind === "unknown",
+    clearCheckpoints: s.kind === "active",
+    restartFull: reconnectable && userConnect && !full,
+  };
 }
 
 export function decide(input: DecideInput): Decision {

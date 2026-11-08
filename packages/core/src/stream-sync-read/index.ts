@@ -5,8 +5,12 @@ export {
 } from "./routing.js";
 export type {
   StreamSyncBlobReader,
-  StreamSyncOverlayEntry,
-  StreamSyncOverlaySource,
+  StreamSyncImportedCoverage,
+  StreamSyncOverlayRun,
+  StreamSyncOverlaySnapshot,
+  StreamSyncOverlaySnapshotSource,
+  StreamSyncOverlayStream,
+  StreamSyncPublishReceipt,
   StreamSyncReadFiles,
   StreamSyncReadKeys,
   StreamSyncReadLogger,

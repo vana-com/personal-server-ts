@@ -17,7 +17,11 @@ import {
 
 const STORE = "chunks";
 const SEP = "\u0001";
+// Bound each IndexedDB record to 1 MiB to limit memory used by a read step.
+const CHUNK_SIZE = 1024 * 1024;
 const SEQ_WIDTH = 10;
+// Sorts before every chunk key, so no file or directory range contains it.
+const RECHUNK_MARKER = "\u0000rechunked-v1";
 
 interface Chunk {
   readonly key: string;
@@ -50,6 +54,104 @@ const chunkKey = (path: string, seq: number) =>
   `${path}${SEP}${String(seq).padStart(SEQ_WIDTH, "0")}`;
 const pathOf = (key: string) => key.slice(0, key.lastIndexOf(SEP));
 
+/** Run `visit` on each cursor position; resolves at the end of the cursor. */
+function walk(
+  request: IDBRequest<IDBCursorWithValue | null>,
+  visit: (cursor: IDBCursorWithValue) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return resolve();
+      try {
+        visit(cursor);
+        cursor.continue();
+      } catch (error) {
+        reject(error);
+      }
+    };
+  });
+}
+
+/**
+ * Records written before files were split into chunks are one record per
+ * write, and can be larger than CHUNK_SIZE. Split them once, when the adapter
+ * opens (the caller holds the home lock). A marker record makes later opens
+ * skip the work, so the cost is one pass over the home, one record in memory
+ * at a time, at the first open only. Remove this once no home written before
+ * chunking can exist.
+ *
+ * Each affected file is replaced in one strict transaction, so a crash leaves
+ * the old records or the new ones. Chunk sequence numbers are contiguous
+ * (`write` and `appendMany` both produce them), so the file is renumbered
+ * from its last record down: a new key is never below its old key, and never
+ * overwrites a record not yet read. A file with a gap in its sequence is left
+ * as it is.
+ */
+async function rechunkOversizedRecords(
+  database: IDBDatabase,
+  fileRange: (path: string) => IDBKeyRange,
+): Promise<void> {
+  const marked = await promisify(
+    database
+      .transaction(STORE, "readonly")
+      .objectStore(STORE)
+      .get(RECHUNK_MARKER),
+  );
+  if (marked) return;
+
+  const sizes = new Map<string, number[]>();
+  const sparse = new Set<string>();
+  await walk(
+    database.transaction(STORE, "readonly").objectStore(STORE).openCursor(),
+    (cursor) => {
+      const key = String(cursor.key);
+      if (!key.includes(SEP)) return;
+      const path = pathOf(key);
+      const lengths = sizes.get(path) ?? [];
+      if (Number(key.slice(path.length + 1)) !== lengths.length)
+        sparse.add(path);
+      lengths.push((cursor.value as Chunk).bytes.length);
+      sizes.set(path, lengths);
+    },
+  );
+
+  for (const [path, lengths] of sizes) {
+    if (sparse.has(path) || lengths.every((n) => n <= CHUNK_SIZE)) continue;
+    const counts = lengths.map((n) => Math.max(1, Math.ceil(n / CHUNK_SIZE)));
+    const starts: number[] = [];
+    counts.reduce((start, n) => (starts.push(start), start + n), 0);
+    const tx = database.transaction(STORE, "readwrite", {
+      durability: "strict",
+    });
+    const committed = done(tx);
+    committed.catch(() => {});
+    const store = tx.objectStore(STORE);
+    let index = lengths.length;
+    try {
+      await walk(store.openCursor(fileRange(path), "prev"), (cursor) => {
+        index -= 1;
+        const { bytes } = cursor.value as Chunk;
+        for (let part = 0; part < counts[index]!; part += 1) {
+          store.put({
+            key: chunkKey(path, starts[index]! + part),
+            bytes: bytes.slice(part * CHUNK_SIZE, (part + 1) * CHUNK_SIZE),
+          } satisfies Chunk);
+        }
+      });
+    } catch (error) {
+      tx.abort();
+      throw error;
+    }
+    await committed;
+  }
+
+  const tx = database.transaction(STORE, "readwrite", { durability: "strict" });
+  tx.objectStore(STORE).put({ key: RECHUNK_MARKER, bytes: new Uint8Array(0) });
+  await done(tx);
+}
+
 export function createIndexedDbStreamSyncFiles(
   options: IndexedDbStreamSyncFilesOptions = {},
 ): StreamSyncFiles & { close(): void } {
@@ -65,17 +167,32 @@ export function createIndexedDbStreamSyncFiles(
   const dbName = options.dbName ?? "ps-lite-stream-sync";
   let opened: Promise<IDBDatabase> | null = null;
   const db = (): Promise<IDBDatabase> => {
-    opened ??= new Promise((resolve, reject) => {
+    opened ??= new Promise<IDBDatabase>((resolve, reject) => {
       const request = factory.open(dbName, 1);
       request.onupgradeneeded = () => {
         request.result.createObjectStore(STORE, { keyPath: "key" });
+        // A new database holds no record written before chunking.
+        request.transaction?.objectStore(STORE).put({
+          key: RECHUNK_MARKER,
+          bytes: new Uint8Array(0),
+        });
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
+    }).then(async (database) => {
+      try {
+        await rechunkOversizedRecords(database, fileRange);
+      } catch (error) {
+        database.close();
+        opened = null;
+        throw error;
+      }
+      return database;
     });
     return opened;
   };
 
+  // Engines without the durability option ignore it. The phone WebView engine is unknown.
   async function lastSeq(store: IDBObjectStore, path: string): Promise<number> {
     const cursor = await promisify(
       store.openKeyCursor(fileRange(path), "prev"),
@@ -90,13 +207,21 @@ export function createIndexedDbStreamSyncFiles(
       opened = null;
     },
     async write(path, bytes) {
-      const tx = (await db()).transaction(STORE, "readwrite");
+      const tx = (await db()).transaction(STORE, "readwrite", {
+        durability: "strict",
+      });
       const store = tx.objectStore(STORE);
       store.delete(fileRange(path));
-      store.put({
-        key: chunkKey(path, 0),
-        bytes: bytes.slice(),
-      } satisfies Chunk);
+      for (
+        let offset = 0, seq = 0;
+        offset < bytes.length || seq === 0;
+        offset += CHUNK_SIZE, seq += 1
+      ) {
+        store.put({
+          key: chunkKey(path, seq),
+          bytes: bytes.slice(offset, offset + CHUNK_SIZE),
+        } satisfies Chunk);
+      }
       await done(tx);
     },
     async read(path) {
@@ -119,18 +244,27 @@ export function createIndexedDbStreamSyncFiles(
       if (entries.length === 0) return;
       // One transaction for the whole batch: a spool flush touches up to 256
       // shard files, and a transaction per file would commit 256 times.
-      const tx = (await db()).transaction(STORE, "readwrite");
+      const tx = (await db()).transaction(STORE, "readwrite", {
+        durability: "strict",
+      });
       const store = tx.objectStore(STORE);
       const committed = done(tx);
       const next = new Map<string, number>();
       for (const { path, bytes } of entries) {
         let seq = next.get(path);
         if (seq === undefined) seq = (await lastSeq(store, path)) + 1;
-        next.set(path, seq + 1);
-        store.put({
-          key: chunkKey(path, seq),
-          bytes: bytes.slice(),
-        } satisfies Chunk);
+        for (
+          let offset = 0;
+          offset < bytes.length || offset === 0;
+          offset += CHUNK_SIZE
+        ) {
+          store.put({
+            key: chunkKey(path, seq),
+            bytes: bytes.slice(offset, offset + CHUNK_SIZE),
+          } satisfies Chunk);
+          seq += 1;
+        }
+        next.set(path, seq);
       }
       await committed;
     },
@@ -144,9 +278,9 @@ export function createIndexedDbStreamSyncFiles(
           after === null
             ? fileRange(path)
             : KeyRange.bound(after, `${path}${SEP}\uffff`, true);
-        const chunk = (await promisify(tx.objectStore(STORE).get(range))) as
-          Chunk | undefined;
-        if (!chunk) return;
+        const cursor = await promisify(tx.objectStore(STORE).openCursor(range));
+        if (!cursor) return;
+        const chunk = cursor.value as Chunk;
         after = chunk.key;
         yield chunk.bytes;
       }
@@ -166,7 +300,9 @@ export function createIndexedDbStreamSyncFiles(
       return [...new Set(keys.map(pathOf))].sort();
     },
     async remove(prefix) {
-      const tx = (await db()).transaction(STORE, "readwrite");
+      const tx = (await db()).transaction(STORE, "readwrite", {
+        durability: "strict",
+      });
       const store = tx.objectStore(STORE);
       store.delete(fileRange(prefix));
       store.delete(dirRange(prefix));

@@ -421,9 +421,14 @@ describe.each(matrix)(
       const c = freshConnector("late-head");
       const elsewhere = await env.writer("late-head-elsewhere");
       let raced = false;
+      let streamReads = 0;
       const registry = interpose(env.newRegistry(), {
         async beforeRead(scope) {
           if (raced || scope !== streamScope(c, NS, "s")) return;
+          // The first read is the stream-row stamp taken at collection; the
+          // race is the publish-time read after admission.
+          streamReads += 1;
+          if (streamReads < 2) return;
           raced = true;
           // After this run was admitted at gen 1: delete, then a reconnect
           // elsewhere commits gen 3.
@@ -667,10 +672,15 @@ describe.each(matrix)(
       const postsAfterPause: string[] = [];
       let h3: string | null = null;
       let paused = false;
+      let streamReads = 0;
       const a = await env.writer("dot-a", {
         registry: interpose(env.newRegistry(), {
           async beforeRead(read) {
             if (paused || read !== scope) return;
+            // The first read is the stream-row stamp taken at collection; the
+            // pause is before the publish-time read.
+            streamReads += 1;
+            if (streamReads < 2) return;
             paused = true;
             // While A is paused: B deletes (control v2), reconnects (v3),
             // commits H3 with record x and checkpoints.

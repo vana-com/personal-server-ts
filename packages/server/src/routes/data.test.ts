@@ -2463,6 +2463,12 @@ describe("DELETE /v1/data/:scope", () => {
     });
   });
 
+  it("refuses a DELETE of a stream-sync control scope with 409: connection delete goes through the stream-sync writer (review item 2)", async () => {
+    const app = createApp();
+    const res = await deleteWithAuth(app, "pdpp.acme~0123456789abcdef");
+    expect(res.status).toBe(409);
+  });
+
   it("returns 502 DELETE_TOMBSTONE_FAILED and keeps local data when the gateway tombstone fails", async () => {
     const accessLogWriter = createMockAccessLogWriter();
     const app = createApp({

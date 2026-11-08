@@ -9,6 +9,7 @@ export * from "./merge.js";
 export * from "./parts.js";
 export * from "./planner.js";
 export * from "./head.js";
+export * from "./admission.js";
 export * from "./control.js";
 export * from "./decide.js";
 export * from "./needs-full.js";

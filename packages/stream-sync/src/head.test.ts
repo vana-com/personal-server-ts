@@ -133,6 +133,31 @@ describe("head", () => {
     );
   });
 
+  // A control that is not active has no generation to match, so no head is
+  // live under it, including a head that records no generation (null).
+  it("is not live under a deleted control, even for a head with no generation", () => {
+    expect(isHeadLive({ kind: "deleted", version: 2 }, "present", null)).toBe(
+      false,
+    );
+    expect(isHeadLive({ kind: "deleted", version: 2 }, "present", 2)).toBe(
+      false,
+    );
+  });
+
+  it("is not live when there is no control, even for a head with no generation", () => {
+    expect(isHeadLive({ kind: "absent" }, "present", null)).toBe(false);
+    expect(isHeadLive({ kind: "absent" }, "present", 1)).toBe(false);
+  });
+
+  it("is not live under an active control at a different generation", () => {
+    expect(isHeadLive({ kind: "active", generation: 2 }, "present", 1)).toBe(
+      false,
+    );
+    expect(isHeadLive({ kind: "active", generation: 2 }, "present", null)).toBe(
+      false,
+    );
+  });
+
   it("chooses the base by generation, with stale_generation (F1)", () => {
     // head.generation is 2
     expect(chooseBase("present", head, 2)).toEqual({ kind: "base", head });
