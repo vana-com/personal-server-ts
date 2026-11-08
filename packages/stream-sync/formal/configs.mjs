@@ -45,6 +45,9 @@ export const DESIGN = {
   FullRefreshNoCursor: "TRUE",
   KeepProvOnSuccess: "TRUE",
   TailEndsWhenDone: "TRUE",
+  CoveredEndsAttempt: "TRUE",
+  CoveredEndsKept: "TRUE",
+  RetryNeedsReceipt: "FALSE",
   PerStreamRetryResume: "TRUE",
   // R30 (amendments to R28), each guard a control:
   RetrySeedDeferred: "TRUE",
@@ -545,6 +548,7 @@ export const SAFETY = [
   "RetryPubSetOnly",
   "StreamKindEligibility",
   "NoResumeAfterTombstone",
+  "NoResumeAfterCoveredAttempt",
   "SiblingContinuationKept",
 ];
 
@@ -684,6 +688,8 @@ export const CONFIGS = [
   // --- R30 positives (amendments to R28) ---
   ["R30-pub", "R30.1-3, 8: retry publication set, completeness guard, issued-mode fact, oversized-only retry; the Desktop seeds", "r30-pub", {}, "pass"],
   ["R30-prov", "R30.4, 7: active_attempt and history_tail, an incremental:false sibling, per-stream clearing", "r30-prov", {}, "pass"],
+  ["R30-pub-rcpt", "R30-pub with the Desktop seed receipt required at retry ends (the F3 behaviour, for comparison)", "r30-pub", { RetryNeedsReceipt: "TRUE" }, "pass"],
+  ["R30-prov-rcpt", "R30-prov-3r with the Desktop seed receipt required at retry ends (the F3 behaviour, for comparison; three runs because four time out)", "r30-prov", { MaxRuns: 3, RetryNeedsReceipt: "TRUE" }, "pass"],
   ["R30-wit", "R30.5: the history witness; an old-client stream DELETE", "r30-wit", {}, "pass"],
   ["R30-sib", "R30.7: an incomplete stream never clears a sibling's checkpoint entry", "r30-sib", {}, "pass"],
   ["Snap-live", "R30 liveness: an incremental:false stream returns to full/null after its attempt ends", "snap-live", {}, "pass", "liveness"],
@@ -714,6 +720,8 @@ export const CONFIGS = [
   ["F3-provenance-delete-1s", "retry, success preserves provenance, next continuation and delete (one stream)", "split", { Desktop: "nodesk", Streams: "{s1}", MaxRuns: 3, MaxRetry: 1, PartialCover: "FALSE", MaxVer: 2 }, "pass"],
   ["R30-prov-3r", "R30.4, 7 with three runs (not four)", "r30-prov", { MaxRuns: 3 }, "pass"],
   ["F3-provenance-sibling-delete-2r", "partial success keeps an omitted sibling's provenance (two runs, not three)", "split", { Desktop: "nodesk", MaxRuns: 2, MaxRetry: 1, PartialCover: "TRUE", MaxVer: 2 }, "pass"],
+  ["C-covered-attempt-kept-in-cand", "a covered incremental:false stream in the saved candidate keeps active_attempt at a mixed retry end", "r30-prov", { CoveredEndsAttempt: "FALSE" }, "NoResumeAfterCoveredAttempt"],
+  ["C-covered-attempt-kept-omitted", "a covered incremental:false stream left out of the saved candidate keeps its old active_attempt", "r30-prov", { CoveredEndsKept: "FALSE" }, "NoResumeAfterCoveredAttempt"],
   ["C-tail-forever", "history_tail lasts through every covered incremental read of a non-budgeted stream: the head never completes", "live", { MaxRetry: 1, PartialCover: "FALSE", Readers: "{}", Views: "FALSE", TailEndsWhenDone: "FALSE" }, "L3_NoStuckIncomplete", "liveness"],
   // Shrunk copies of F3 rows whose first bounds timed out at 30 min: record versions cut from 6 to 3.
   ["Bud-delete-v3", "R28: a budgeted backfill (two pages), two devices, a delete (MaxVer 3, not 6)", "bud", { MaxDeletes: 1, MaxSessions: 0, MaxVer: 3 }, "pass"],
@@ -759,6 +767,9 @@ export const CONFIGS = [
   ["W-budget-resume", "R28: a budgeted stream resumes at page 2 from its saved cursor", "bud", { MaxDeletes: 0, MaxSessions: 0 }, "NotBudgetResume", "witness"],
   ["W-token-resume", "R28: a retry token is issued incremental under needsFull", "retry1", {}, "NotTokenResume", "witness"],
   ["W-mixed-modes", "R28: a retrying stream resumes while a sibling with needsFull is issued nothing", "retry1", {}, "NotMixedModes", "witness"],
+  ["W-covered-snapshot-in-cand", "R30.4: a mixed retry end covers an incremental:false stream in its candidate (the dot's R1)", "r30-prov", {}, "NotCoveredSnapshotInCand", "witness"],
+  ["W-covered-snapshot-omitted", "R30.4: a retry end covers an incremental:false stream that holds an active_attempt and omits it from the candidate", "r30-prov", {}, "NotCoveredSnapshotOmitted", "witness"],
+  ["W-retry-save-no-receipt", "R30 waiver: a retry end saves the Desktop's checkpoint on the seed target before every seed receipt exists", "r30-prov", {}, "NotRetrySaveNoReceipt", "witness"],
   ["W-snapshot-resume", "R30.4: an incremental:false stream is issued its cursor from an active attempt", "r30-prov", {}, "NotSnapshotResume", "witness"],
   ["W-tomb-invalidates", "R29/R30.5: a begin is full/null for a stream whose continuation a tombstone invalidated", "r30-wit", {}, "NotTombInvalidates", "witness"],
   ["W-oversized-only", "R30.8: a retry run whose received upserts were all oversized", "r30-pub", {}, "NotOversizedOnly", "witness"],

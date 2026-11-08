@@ -53,7 +53,7 @@ model. Read "R28" below.
 No other counterexample was found within the bounds below. Read
 "Results" for what was checked at which bounds and in which mode.
 
-Model: `StreamSync.tla`, sha256 prefix `3cc40833c1f1`. TLC 2026.11.03
+Model: `StreamSync.tla`, sha256 prefix `b983f1f13457` (round 2). TLC 2026.11.03
 (`tla2tools.jar`).
 
 
@@ -651,7 +651,7 @@ How the properties read here:
 
 This section extends the model with the R28 amendments of ruling R30,
 items 1-5, 7 and 8. Item 6 (the invalidation epoch for stale finalizers) is
-not modeled. The model sha256 is `8be6f1cb42a18a5d34bc4c9f4fbe6bd3fc997da508ab13f65eb8d75d8befe399`.
+not modeled. The round 1 model sha256 was `8be6f1cb42a18a5d34bc4c9f4fbe6bd3fc997da508ab13f65eb8d75d8befe399`; round 2 changed it (see the round 2 section).
 
 ### What was added
 
@@ -664,10 +664,12 @@ one rule off and must fail with a named property.
 | `RetryGuardFull` | 2 | A retry head is complete only if the stream was covered **and** actually read full. |
 | `EffFullFact` | 3 | "Actually read full" is the mode issued per stream (`iss[s] = 0`), not the `incremental: false` declaration. |
 | `TwoProvStates` | 4 | Provenance is `active_attempt` or `history_tail`. An `incremental: false` stream has only `active_attempt`, which ends when the attempt is covered. |
+| `CoveredEndsAttempt`, `CoveredEndsKept` (round 2) | 4 | A retry end that covers an `incremental: false` stream retires its `active_attempt`: `CoveredEndsAttempt` for a stream in the saved candidate, `CoveredEndsKept` for a stream the candidate omits (its old pair would otherwise be kept). |
+| `RetryNeedsReceipt` (round 2) | Lead decision | `FALSE` (default): a retry end does not need the Desktop seed receipts to save its checkpoint. `TRUE` is F3's behaviour, kept for comparison rows. |
 | `WitnessAtBegin`, `WitnessAtSave` | 5 | A head tombstone above the continuation's witness invalidates it. Checked at begin (no cursor issued) and at save (the save does not renew it). |
 | `PerStreamClear` | 7 | An incomplete stream clears only its own checkpoint entry. |
 | `ReceivedCount` | 8 | "All empty" counts received upserts, not spooled rows. An oversized-only retry follows the ordinary exclusion path. |
-| `TailEndsWhenDone` | 4 (gap, finding 2) | `history_tail` ends when a covered, non-budgeted incremental read ends. Budgeted streams keep it while pages remain. |
+| `TailEndsWhenDone` | 4 (gap, finding 2) | `history_tail` ends when a covered, non-budgeted incremental read ends. Budgeted streams are exempt unconditionally: the model does not test whether their pages are exhausted. Adopted as contract. |
 
 Bounds, not guards: `Oversized` (a retry run may receive oversized
 upserts), `Periodic` (scheduled covering reruns for the snapshot liveness
@@ -676,12 +678,16 @@ flight; used only by two liveness rows).
 
 New ghost state: head fields `gr` (grounded completeness) and `sr`
 (seed-only on a retry run); checkpoint fields `ph` (provenance state), `wv`
-(witness: the stream row length at save) and `tw` (a tombstone was above the
-witness); entry fields `ovz`, `ep`, `wb`, `rb`; variable `sib`.
+(witness: the stream row length at save), `tw` (a tombstone was above the
+witness) and `cvd` (round 2: the end that saved or kept the pair covered the
+stream); entry fields `ovz`, `ep`, `wb`, `rb`, `cb` (round 2: streams issued
+an active_attempt cursor an earlier end had covered); variable `sib`.
 
 New properties: `NoFalseComplete`, `RetryPubSetOnly`,
 `StreamKindEligibility`, `NoResumeAfterTombstone`,
-`SiblingContinuationKept`, and the extended `ProvenanceAtomic`. New
+`SiblingContinuationKept`, `NoResumeAfterCoveredAttempt` (round 2: no begin
+issues an `active_attempt` cursor to an `incremental: false` stream that an
+earlier end covered), and the extended `ProvenanceAtomic`. New
 liveness: `L6_SnapshotReturns` (an `incremental: false` stream returns to
 full/null after its attempt ends). All earlier properties stay.
 
@@ -704,7 +710,15 @@ bound artifact.
    untouched. (6) The next ordinary run begins and START issues the stored
    cursor for `s1`, although the history under it is tombstoned.
    Rule broken: R29, R30.5; property `NoResumeAfterTombstone`.
-   Smallest contract fix: evaluate the history witness for **every**
+   This is conformance to rules that already exist (R29: a head tombstone
+   invalidates retry provenance, so the next begin is full/null; R30.5: the
+   witness is checked before START). It is a missing implementation of an
+   existing rule, not a new contract rule. The original raw trace of this
+   `R30-wit` failure was overwritten and is unavailable; the narrative above
+   is a reconstruction. The raw evidence is the control
+   `C-resume-after-tombstone`, which fails `NoResumeAfterTombstone` on the
+   final model.
+   Smallest fix: evaluate the history witness for **every**
    stream that holds stored provenance at **every** begin, and issue no
    cursor to a stream whose witness is broken. Eligibility alone is not
    enough, because a stream can hold a plain incremental cursor. The model
@@ -719,19 +733,32 @@ bound artifact.
    `history_tail` because debt remains. (4) The next run resumes
    incrementally again. Every scheduled run repeats step 2. No run is full
    unless the owner asks. `L3_NoStuckIncomplete` fails.
-   Rule broken: R30.4 says `history_tail` survives incremental pages but gives
-   no end for a stream with no pages. Smallest contract fix: a succeeded
+   Rule broken: none. R30.4 says `history_tail` survives incremental pages but
+   gives no end for a stream with no pages; this is a contract completion,
+   adopted by the Lead. It is not a data-loss counterexample. The control
+   `C-tail-forever-rr3` is **not** the unbounded loop: its lasso is three
+   `Rerun` steps on one device, then stuttering after the global rerun budget
+   is exhausted (the other device never runs). The pair
+   `C-tail-forever-rr3` / `F3-live-retry-delete-rr3` shows that the rule
+   changes the outcome at those bounds. **The bounded pair does not prove the
+   unbounded loop.** No single-device, no-seed row with an explicit loop
+   witness was added. Smallest contract fix: a succeeded
    end that covers a non-budgeted stream consumes its provenance. The debt
    stays, so the next begin is full/null and clears it. A budgeted stream
-   keeps `history_tail` while pages remain. Required build test: missing
+   is exempt unconditionally (the model does not test page exhaustion). Required build test: missing
    from the R28 test plan (M5 below).
 3. **Not a finding: rerun budget.** The first `F3-live-retry-delete`
-   (`MaxReruns 2`) failed again after finding 2 was fixed. The retry run,
-   its continuation and the full repair need three scheduled reruns. With
+   (`MaxReruns 2`) failed again after finding 2 was fixed. `Rerun` always
+   runs with `out = "ok"`; a `retry_pending` end spends `MaxRuns` and
+   `MaxRetry`, not `MaxReruns`. At these constants the covering
+   continuation and the full repair, plus one more scheduled run, need three
+   reruns before the global counter stops owing another run. Three is a
+   bound that suffices here, not a required attempt count. With
    `MaxReruns 3` the row passes whether runs overlap (`-overlap`) or not
    (`-rr3`). The same artifact hit `L6_SnapshotReturns` (reruns spent
    before the retry that opened the attempt). That property now needs one
-   rerun left in the bound. A scheduled rerun now also starts from a current
+   rerun left in the bound, so the `Snap-live` pass assumes a rerun remains.
+   A scheduled rerun now also starts from a current
    listing (`FreshListing`), because a rerun on a stale listing is
    discarded and wastes the bounded supply.
 
@@ -746,7 +773,106 @@ also ended the one-bit provenance of an `incremental: false` stream, so
 `C-one-prov-bit` passed. It now exempts `FullStreams`, and the control fails
 with `StreamKindEligibility` again.
 
-### Results
+### Round 2: covered snapshot streams on retry ends, and the seed-receipt waiver
+
+A dot review of round 1 found a false pass against R30.4. A snapshot stream
+(`incremental: false`) that a mixed `retry_pending` end covered kept
+`active_attempt`, so the next begin could resume it. Round 1's
+`StreamKindEligibility` checked only that an issued snapshot cursor had phase
+`A`, so it missed this.
+
+**Model fix.** At every end, a covered `incremental: false` stream loses
+`active_attempt`:
+
+- `CoveredEndsAttempt`: in `rawPh` a retry end saves `n` (not `A`) for a
+  covered snapshot stream in the saved candidate.
+- `CoveredEndsKept`: in `kph` a covered snapshot stream the candidate
+  omits has its kept `A` pair retired. Round 1 kept it.
+
+The stored cursor may stay. The next begin issues no state for the stream
+(full/null), because the stream is not eligible.
+
+**New invariant.** `NoResumeAfterCoveredAttempt`: no begin issues an
+`active_attempt` cursor to an `incremental: false` stream that an earlier end
+covered. It is checked at the begin entry (ghost `cb`), fed by checkpoint
+ghost `cvd` (the end that saved or kept the pair covered the stream).
+
+**Named mutants (controls).** Each reverts one half of the fix and must fail
+on `NoResumeAfterCoveredAttempt` alone. `check.mjs` compares the invariant
+name.
+
+- `C-covered-attempt-kept-in-cand` (`CoveredEndsAttempt FALSE`). Shortest
+  trace, 13 states deep: run 1 ends `retry_pending` covering `s2` and saves
+  its cursor with phase `A`; run 2 begins and is issued `s2` with `ep = A`,
+  `cb = {s2}`. TLC: `Error: Invariant NoResumeAfterCoveredAttempt is violated.`
+- `C-covered-attempt-kept-omitted` (`CoveredEndsKept FALSE`). Shortest trace,
+  18 states deep: a retry end saves `s2` with phase `A`; a second retry end
+  covers `s2` and omits it from the candidate, so the old `A` pair is kept;
+  the next begin is issued `s2` with `ep = A`, `cb = {s2}`. TLC: `Error:
+  Invariant NoResumeAfterCoveredAttempt is violated.`
+
+The shortest control trace has `emit = {s2}`, not the dot's exact shape
+(`emit = {s1,s2}`, `cov = {s2}`, `cand = {s1,s2}`). The witness
+`W-covered-snapshot-in-cand` shows that exact shape is reachable on the fixed
+model (a retry end with both streams emitted, `s2` covered, `s1` uncovered,
+`cand = {s1,s2}`). `R30-prov-3r` passes exhaustively with the invariant on,
+so no begin follows that shape with an `A` cursor. The two-run trace fails
+on the reverted model and passes on the fixed one by the pair control /
+`R30-prov-3r`.
+`W-covered-snapshot-omitted` witnesses the omitted-candidate case.
+
+**Seed-receipt waiver.** The Lead adopted waiving the Desktop seed receipt at
+retry ends on one condition: all R29/R30 invariants, including the new one,
+still hold. `RetryNeedsReceipt` is now `FALSE` by default (a retry end saves
+its checkpoint without the receipts). Result: **every R29/R30 invariant
+holds with the receipt waived**; no invariant needs the receipt. The waived
+model is `b983f1f13457`. The rows that run a Desktop (`R30-pub`,
+`R30-prov-3r`) pass waived; `R30-pub-rcpt` and `R30-prov-rcpt` (receipt
+required, F3's behaviour) pass too, so the waiver does not change the
+outcome. `W-retry-save-no-receipt` shows the waiver is exercised: a retry
+end saves the Desktop's checkpoint before every seed receipt exists.
+`R30-wit`, `R30-sib` and `Snap-live` use `Desktop nodesk`, so the waiver is
+vacuous there; their passes do not count for it. `R30-prov` at four runs
+timed out (11.6 million distinct states, 2.7 million on the queue, 30 min, no
+violation); it is **inconclusive**, and `R30-prov-3r` is the exhaustive form.
+
+Round 2 results (model `b983f1f134572441202e9818f538aad510bd7c86a1aaf5c6a55896a74655590d`).
+Every row ran on this model, one at a time, 4 workers, under 30 minutes.
+Rows not listed here keep their round 1 result on an earlier hash; the
+round 2 edits touch only the provenance save and the retry receipt rule, and
+these rows were not rerun.
+
+| Config | Property | Expected | Result | Distinct states | Depth | Seconds |
+|---|---|---|---|---|---|---|
+| `R30-prov` | all (four runs) | pass | TIMEOUT (inconclusive) | >11.6M | | 1800 |
+| `R30-prov-3r` | all, incl. `NoResumeAfterCoveredAttempt` | pass | pass | 3506101 | 29 | 490 |
+| `R30-sib` | all | pass | pass | 30840 | 25 | 5 |
+| `R30-wit` | all | pass | pass | 3190375 | 29 | 222 |
+| `R30-pub` (receipt waived) | all | pass | pass | 4827543 | 29 | 697 |
+| `R30-pub-rcpt` (receipt required) | all | pass | pass | 4078679 | 29 | 899 |
+| `R30-prov-rcpt` (3 runs, receipt required) | all | pass | pass | 3034387 | 29 | 451 |
+| `Snap-live` | L6 | pass | pass | 554 | 20 | 1 |
+| `F3-live-retry-delete-rr3` | L1, L3, L4 | pass | pass | 178164 | 35 | 126 |
+| `C-covered-attempt-kept-in-cand` | `NoResumeAfterCoveredAttempt` | violate | violates NoResumeAfterCoveredAttempt | 24748 | 13 | 2 |
+| `C-covered-attempt-kept-omitted` | `NoResumeAfterCoveredAttempt` | violate | violates NoResumeAfterCoveredAttempt | 252788 | 18 | 12 |
+| `C-retry-seed-only` | `RetryPubSetOnly` | violate | violates RetryPubSetOnly | 14689 | 10 | 2 |
+| `C-retry-guard-uncovered-only` | `NoFalseComplete` | violate | violates NoFalseComplete | 2394305 | 23 | 80 |
+| `C-decl-is-full` | `NoFalseComplete` | violate | violates NoFalseComplete | 909629 | 20 | 34 |
+| `C-one-prov-bit` | `StreamKindEligibility` | violate | violates StreamKindEligibility | 1979627 | 23 | 85 |
+| `C-one-prov-bit-live` | L6 | violate | violates L6_SnapshotReturns | 554 | 20 | 1 |
+| `C-resume-after-tombstone` | `NoResumeAfterTombstone` | violate | violates NoResumeAfterTombstone | 7522 | 14 | 3 |
+| `C-save-after-tombstone` | `NoResumeAfterTombstone` | violate | violates NoResumeAfterTombstone | 3201 | 12 | 1 |
+| `C-whole-envelope-clear` | `SiblingContinuationKept` | violate | violates SiblingContinuationKept | 14874 | 16 | 2 |
+| `C-oversized-token-only` | `S7_CheckpointSafety` | violate | violates S7_CheckpointSafety | 30822 | 13 | 3 |
+| `C-tail-forever-rr3` | L3 | violate | violates L3_NoStuckIncomplete | 200791 | 38 | 96 |
+| `W-covered-snapshot-in-cand` | witness | reached | reached | 242 | 6 | 1 |
+| `W-covered-snapshot-omitted` | witness | reached | reached | 25520 | 13 | 2 |
+| `W-retry-save-no-receipt` | witness | reached | reached | 16446 | 12 | 2 |
+
+The round 1 results tables below are on earlier hashes. Where a row appears
+in both, the round 2 row replaces it.
+
+### Results (round 1)
 
 Every row ran one at a time under the TLC cap (4 workers, `nice -n 19`,
 `-cleanup`), each under 30 minutes. The last column says which bound or cut
@@ -868,18 +994,18 @@ their behavior is the same.
 
 ### What each F3 section 2 gap needs
 
-| Gap in the review | Status |
+| Gap in the review | Status (round 2: credit dropped where no scenario witness exists) |
 |---|---|
-| Retry run, two uncovered streams, delete between them | **Closed** by `F3-retry-split` (exhaustive pass). |
-| Token-only retry meets a delete | **Closed**, one stream, by `F3-token-middle-delete-1s`. The two-stream form timed out; open. |
-| Retry, provenance-preserving success, continuation and delete | **Half closed**: `F3-provenance-delete-1s` passes with one stream. The two-stream, two-device form timed out. |
+| Retry run, two uncovered streams, delete between them | Passes, with **no scenario witness**, so not credited as closed: `F3-retry-split` (exhaustive pass). It keeps `PartialCover FALSE`, which constrains only `ok` runs: retry runs still leave streams uncovered, so it does test uncovered retry streams. No scenario witness was added; the credit is a safety pass at that bound. |
+| Token-only retry meets a delete | Passes, one stream, with **no scenario witness**, so not credited as closed: `F3-token-middle-delete-1s`. The two-stream form timed out; open. |
+| Retry, provenance-preserving success, continuation and delete | **Open.** `F3-provenance-delete-1s` cannot do a provenance-preserving save: it has no budgeted or `incremental: false` stream, every `ok` run covers everything, and a successful save stores phase `n`. Its next debt-bearing begin is a full repair. The row is a retry-plus-delete row, not a provenance-preservation row. The two-stream, two-device form timed out. |
 | Partial success omits a sibling and a remote delete splits the rest | **Open.** `F3-provenance-sibling-delete-1d` passes, but with one device the delete is the device's own and clears its outbox. It is not a remote mid-run delete. The two-device rows timed out with no violation in 14-26 million states. |
-| Two-key merge, delete splits a two-stream run | **Half closed**: `F3-retry-merge-delete-1s` passes with one stream, two keys. Two streams timed out. |
-| Retry chain (record retry, token-only retry, continuation) and delete | **Half closed**: `F3-retry-chain-delete-1s`. Two streams timed out. |
+| Two-key merge, delete splits a two-stream run | Passes at one stream, with **no scenario witness**, so not credited as closed: `F3-retry-merge-delete-1s` passes with one stream, two keys. Two streams timed out. |
+| Retry chain (record retry, token-only retry, continuation) and delete | Passes at one stream, with **no scenario witness**, so not credited as closed: `F3-token-middle-delete-1s` (three runs, two retries, one stream). `F3-retry-chain-delete-1s` has two runs and zero reruns, so it does **not** run record retry, token-only retry and a consuming continuation. Two streams timed out. No scenario witness was added for the chain, so the credit is for the safety pass at that bound only. |
 | Budgeted stream with a sibling and a delete | **Open.** The `F3-budget-*` rows test R28 budget behavior, not an R30 rule, so they were not added. `Bud-delete-r3` passes with one stream. |
 | Budgeted retry with a restart and a delete | **Open**, same reason. `Bud-restart-r3` has no delete. |
-| Retry head reply lost across a delete | **Closed** by `F3-retry-lost-delete` (exhaustive pass, one stream). |
-| Liveness with retry debt and UserDelete | **Closed** by `F3-live-retry-delete-rr3` and `-overlap` (pass, MaxReruns 3). Finding 2 is the contract gap it exposed. |
+| Retry head reply lost across a delete | Passes, with **no scenario witness**, so not credited as closed: `F3-retry-lost-delete` (exhaustive pass, one stream). |
+| Liveness with retry debt and UserDelete | Passes, with **no scenario witness**, so not credited as closed: `F3-live-retry-delete-rr3` and `-overlap` (pass, MaxReruns 3). Finding 2 is the contract gap it exposed. |
 | `Slice-intake` (two devices, two streams, abort, partial cover) | **Open.** Both bounds timed out. `Slice-intake1-r3` passes with one device. |
 
 ### Vacuity
@@ -889,8 +1015,10 @@ their behavior is the same.
   `IncompleteOwned` and `LaterWriteSurvives` are not vacuous there. Each
   R30 witness shows its scenario is reached.
 - `F3-retry-split` and `F3-retry-lost-delete` keep F3's split profile with
-  `PartialCover FALSE`. They test retry plus delete, **not** `CoveredOnly`
-  or partial coverage. Do not count them as coverage of those properties.
+  `PartialCover FALSE`. That bound constrains only `ok` runs, so these rows
+  do test uncovered retry streams. They do **not** exercise `CoveredOnly`
+  or partial coverage of `ok` runs. Do not count them as coverage of those
+  properties.
   `F3-provenance-sibling-delete-1d` has `PartialCover TRUE`.
 - `Live-rr1` has one scheduled rerun. It passes, but it checks less than
   `Live` would. `Live` itself timed out.
@@ -910,6 +1038,7 @@ their behavior is the same.
 | `ProvenanceAtomic`, `history_tail` | 6, 27, 43, 49 | none |
 | `StreamKindEligibility` | 7, 41, 42 | none |
 | `NoResumeAfterTombstone` | 47, 49 | **M2**: a tombstone lands during an explicit `wantFull` run, which issues no cursor and does not re-save the checkpoint. The next ordinary begin must be full/null for that stream (finding 1). **M3**: a tombstone lands while a run holds a cursor for the stream. The save must not renew the continuation (control `C-save-after-tombstone`). Test 38 checks generation, not a tombstone. |
+| `NoResumeAfterCoveredAttempt` (R30.4, round 2) | 28, 29, 42, 45 | **M6**: a retry_pending end covers an `incremental: false` stream and the next begin issues it full/null. Two cases: the stream is inside the saved candidate (`C-covered-attempt-kept-in-cand`), and the stream is outside it while an older `active_attempt` pair is kept (`C-covered-attempt-kept-omitted`). The stored cursor may stay, but the next begin must issue no state for that stream. |
 | `SiblingContinuationKept` (R30.7) | 41, 45, 49 | none |
 | `S7_CheckpointSafety` with oversized-only (R30.8) | 1, 58 | **M4**: an oversized upsert plus one accepted upsert in the same retry run. "All empty" must then be false. Test 58 covers the oversized-only run. |
 | `L3_NoStuckIncomplete`, `L6_SnapshotReturns`, history_tail end | 6, 42, 43 | **M5**: a non-budgeted, incremental-capable stream with debt finishes a covered incremental continuation that ends with no further token. The next begin must be full/null, and a full covered read must clear the debt (finding 2). |
@@ -928,14 +1057,16 @@ their behavior is the same.
 4. **Effective-full fact (item 3).** Taken as "no cursor issued at begin".
    F3's choices stand: the status is per stream, a record-free retry end
    saves only its checkpoint, and an explicit `wantFull` issues no cursor.
-5. **Desktop seed receipt.** F3's `rcptOk` stays: a seed receipt blocks the
-   retry checkpoint on a first run that seeds. Recommended: waive it on
-   retry ends, so a seeded retry run still saves progress. Flagged, not
-   changed.
+5. **Desktop seed receipt.** F3's `rcptOk` blocked the retry checkpoint on a
+   first run that seeds. The Lead adopted waiving it on retry ends, on one
+   condition: every R29/R30 invariant must still hold. Round 2 checked
+   that (`RetryNeedsReceipt FALSE` is the default; see the round 2 table).
 6. **Oversized upserts.** Modeled only on retry runs, on uncovered streams.
-7. **Budgeted streams under `TailEndsWhenDone`.** Exempt, because pages
-   remain. A debt tail on an incremental-capable stream that has no budget
-   reaches a full read only through the rule above.
+7. **Budgeted streams under `TailEndsWhenDone`.** Exempt unconditionally
+   (`s \in Budgeted` in `rawPh`). The model does not test whether the pages
+   are exhausted, so no property checks that a budgeted tail retires after
+   its last page. A debt tail on an incremental-capable stream that has no
+   budget reaches a full read only through the rule above.
 
 Not modeled: R30 item 6 (the invalidation epoch for stale finalizers).
 `F3-live-retry-delete-overlap` shows that, in the bounds checked, overlapping

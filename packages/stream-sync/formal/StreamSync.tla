@@ -115,6 +115,9 @@ CONSTANTS
   WitnessAtBegin,        \* a head tombstone invalidates a continuation before START (R30.5, R29)
   WitnessAtSave,         \* ... and before the save (R30.5)
   TailEndsWhenDone,      \* history_tail ends when a covered, non-budgeted incremental read ends (R30.4 gap)
+  CoveredEndsAttempt,    \* a covered incremental:false stream in the saved candidate saves no active_attempt (R30.4)
+  CoveredEndsKept,       \* a covered incremental:false stream outside the candidate loses its kept active_attempt (R30.4)
+  RetryNeedsReceipt,     \* a retry end saves a checkpoint only once the Desktop seed receipts are in (F3); FALSE waives it
   PerStreamClear,        \* an incomplete stream clears only its own checkpoint entry (R30.7)
   ReceivedCount,         \* "all empty" counts received upserts, not spooled rows (R30.8)
   Oversized,             \* a bound, not a guard: a retry run may receive oversized upserts
@@ -187,10 +190,10 @@ NoCur == [s \in Streams |-> 0]
 NoPh == [s \in Streams |-> "n"]
 NoTw == [s \in Streams |-> FALSE]
 NoCk == [n |-> "none", g |-> 0, cur |-> NoCur, pg |-> NoCur, prov |-> NoCur,
-         ph |-> NoPh, wv |-> NoCur, tw |-> NoTw, ctlOk |-> FALSE]
+         ph |-> NoPh, wv |-> NoCur, tw |-> NoTw, cvd |-> NoTw, ctlOk |-> FALSE]
 \* R30.7: one stream's checkpoint entry is cleared alone.
 ClearS(ck, s) == [ck EXCEPT !.cur[s] = 0, !.pg[s] = 0, !.prov[s] = 0, !.ph[s] = "n",
-                            !.wv[s] = 0, !.tw[s] = FALSE]
+                            !.wv[s] = 0, !.tw[s] = FALSE, !.cvd[s] = FALSE]
 NormCk(ck) == IF \A s \in Streams : ck.cur[s] = 0 THEN NoCk ELSE ck
 \* An entry.  full: the issued collection mode is full_refresh (never read
 \* from the state).  sw: the issued state belongs to another namespace.
@@ -214,7 +217,7 @@ NoEntry == [rid |-> 0, a |-> "none", n |-> "none", start |-> Null, uc |-> FALSE,
             \* stream was issued from; wb, the witness anchor of each
             \* stream's continuation; rb (ghost), streams issued a cursor
             \* whose witness was already broken.
-            ovz |-> {}, ep |-> NoPh, wb |-> NoCur, rb |-> {},
+            ovz |-> {}, ep |-> NoPh, wb |-> NoCur, rb |-> {}, cb |-> {},
             st |-> [s \in Streams |-> "none"], g |-> [s \in Streams |-> 0],
             req |-> [s \in Streams |-> NoReq], seeding |-> {},
             seen |-> [s \in Streams |-> 0]]
@@ -569,7 +572,9 @@ SaveCk(d, n, g, S, e, ok) ==
       \* TwoProvStates (control) there is one bit and no attempt ever ends.
       rawPh(s) ==
         IF e.out = "retry"
-        THEN (IF s \in FullStreams \/ debt(s) THEN "A" ELSE "n")
+        THEN (IF s \in FullStreams
+              THEN (IF CoveredEndsAttempt /\ s \in e.cov THEN "n" ELSE "A")
+              ELSE IF debt(s) THEN "A" ELSE "n")
         ELSE IF s \in e.el /\ KeepProvOnSuccess
              THEN (IF s \in FullStreams /\ TwoProvStates THEN "n"
                    ELSE IF debt(s) /\ (~TailEndsWhenDone \/ s \in Budgeted \/ s \notin e.cov \/ s \in FullStreams)
@@ -582,7 +587,10 @@ SaveCk(d, n, g, S, e, ok) ==
       Sv == {s \in S : wok(s)}
       phv(s) == IF s \in Sv THEN rawPh(s) ELSE "n"
       \* Streams not saved by this run keep their pair while it stays eligible.
+      \* R30.4: a covered incremental:false stream's attempt ends at that end,
+      \* even when the stream is outside the saved candidate.
       kph(s) == IF prev.ph[s] = "n" THEN "n"
+                ELSE IF CoveredEndsKept /\ s \in FullStreams /\ s \in e.cov THEN "n"
                 ELSE IF debt(s) \/ s \in FullStreams THEN prev.ph[s] ELSE "n"
   IN [n |-> n, g |-> g,
       cur |-> [s \in Streams |-> IF s \in Sv THEN e.rid ELSE IF s \in S THEN 0 ELSE prev.cur[s]],
@@ -594,6 +602,9 @@ SaveCk(d, n, g, S, e, ok) ==
                                  ELSE (IF kph(s) # "n" THEN prev.wv[s] ELSE 0)],
       tw |-> [s \in Streams |-> IF s \in S THEN (phv(s) # "n" /\ TombAfter(n, s, e.wb[s]))
                                  ELSE (kph(s) # "n" /\ prev.tw[s])],
+      \* ghost: the end that last saved or kept this pair covered the stream
+      cvd |-> [s \in Streams |-> IF s \in S THEN s \in e.cov
+                                 ELSE (kph(s) # "n" /\ (prev.cvd[s] \/ s \in e.cov))],
       ctlOk |-> ok]
 
 \* Without CheckpointAfterAll the checkpoint is saved at the first commit.
@@ -659,7 +670,7 @@ LateApply ==
 Finish(d) ==
   LET e == ob[d]
       ctlOk == CtlNow(e.n, Key(d)) = [k |-> "active", g |-> e.T]
-      rcptOk == (d = Desktop /\ e.n = seedTarget) => \A s \in Streams : <<e.n, s>> \in rcpt
+      rcptOk == (d = Desktop /\ e.n = seedTarget /\ (RetryNeedsReceipt \/ e.out # "retry")) => \A s \in Streams : <<e.n, s>> \in rcpt
       keep == KeepSet(e)
       save == CheckpointAfterAll /\ ctlOk /\ ~e.incomp /\ rcptOk /\ keep # {}
   IN /\ e # NoEntry /\ ~e.dead /\ (e.out = "ok" \/ (e.out = "retry" /\ ~AllEmpty(e)))
@@ -846,6 +857,8 @@ StartRunFor(d, a, uc, out, allCov) ==
                       !.rb = IF wf THEN {}
                              ELSE {s \in Streams : K0 # NoCk /\ K0.n = n /\ K0.ph[s] # "n" /\ hi[s] # 0
                                                    /\ ~WitNow(n, s, K0.wv[s])},
+                      !.cb = IF wf THEN {}
+                             ELSE {s \in FullStreams : K0 # NoCk /\ K0.n = n /\ K0.ph[s] = "A" /\ K0.cvd[s] /\ hi[s] # 0},
                       !.nf = {s \in Streams : nfd(s)},
                       !.pg = [s \in Streams |-> pgS(s)],
                       !.rs = \E s \in Budgeted :
@@ -1345,6 +1358,11 @@ NoResumeAfterTombstone ==
     /\ ob[d] # NoEntry => ob[d].rb = {}
     /\ ckpt[d] # NoCk => \A s \in Streams : ~ckpt[d].tw[s]
 
+\* R30.4: no begin issues an active_attempt cursor to an incremental:false
+\* stream that an earlier end covered.
+NoResumeAfterCoveredAttempt ==
+  \A d \in Devices : ob[d] # NoEntry => ob[d].cb = {}
+
 \* R30.7: an incomplete stream's publish never clears a sibling's entry.
 SiblingContinuationKept == ~sib
 
@@ -1503,6 +1521,25 @@ NotRetryMerge ==
 \* An incremental:false stream is issued its cursor from an active attempt.
 NotSnapshotResume ==
   ~\E d \in Devices, s \in FullStreams : ob[d] # NoEntry /\ ob[d].iss[s] # 0
+\* R30.4: a retry end covers an incremental:false stream that is in its saved
+\* candidate, with both streams emitted and the sibling uncovered (the dot's
+\* two-run shape, run 1: emit={s1,s2}, cov={s2}, cand={s1,s2}).
+NotCoveredSnapshotInCand ==
+  ~\E d \in Devices, s \in FullStreams :
+     ob[d] # NoEntry /\ ob[d].out = "retry" /\ s \in ob[d].cov /\ s \in ob[d].emit
+     /\ ob[d].cand = Streams
+     /\ \E t \in Streams \ {s} : t \in ob[d].emit /\ t \notin ob[d].cov
+\* R30.4: a retry end covers an incremental:false stream that holds a saved
+\* active_attempt and omits it from the candidate.
+NotCoveredSnapshotOmitted ==
+  ~\E d \in Devices, s \in FullStreams :
+     ob[d] # NoEntry /\ ob[d].out = "retry" /\ s \in ob[d].cov /\ s \notin ob[d].cand
+     /\ ckpt[d] # NoCk /\ ckpt[d].n = ob[d].n /\ ckpt[d].ph[s] = "A"
+\* R30 waiver: the Desktop's checkpoint on the seed target is saved while a
+\* seed receipt is still missing (only a retry end can do this).
+NotRetrySaveNoReceipt ==
+  ~(ckpt[Desktop] # NoCk /\ ckpt[Desktop].n = seedTarget
+    /\ \E s \in Streams : <<seedTarget, s>> \notin rcpt)
 \* A begin is full/null for a stream whose saved continuation a tombstone invalidated.
 NotTombInvalidates ==
   ~\E d \in Devices, s \in Streams :
