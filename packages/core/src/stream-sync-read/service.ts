@@ -635,10 +635,6 @@ export class StreamSyncReadService {
       }
       return { ...none, withheld: held };
     }
-    // Published: only while the connection is active. Pending: each run is
-    // judged by the rule below, so a deleted connection shows only the full
-    // connect runs the writer will publish.
-    if (!pending && control.kind !== "active") return none;
     // A receipt at or below the stream's deletion floor was published before
     // the owner deleted the stream: the same rule servableView applies to
     // imported views, on every overlay path (owner, pending and overlay-only).

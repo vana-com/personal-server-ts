@@ -1,8 +1,9 @@
 /**
  * The reader's wiring of the start-to-current rule, with the rule's inputs
  * set directly on the overlay run. These pin what the reader does with the
- * run's recorded `userConnect`, and with the non-pending guard, so that a
- * change to either fails here and not only in decide's table.
+ * run's recorded `userConnect`, and that a published view is served only for
+ * an active connection (eligible.ts), so that a change to either fails here
+ * and not only in decide's table.
  */
 
 import { describe, expect, it } from "vitest";
@@ -73,11 +74,25 @@ describe("reader wiring of the start rule", () => {
     expect((await served(service)).ids).not.toContain("b");
   });
 
-  // A published view is served only for an active connection (eligible), so
-  // a pending run under a non-active control is never published. The imported
-  // row `a` is the precondition that a view is served at all. This pins the
-  // served output; it does not kill the non-pending guard in service.ts.
-  it("does not serve a pending full connect in the published view while the connection is deleted", async () => {
+  // eligible.ts serves a view only for an active connection. The same
+  // imported row is served as a view while the connection is active; with the
+  // connection deleted or absent it is not.
+  it("serves the imported row as a view while the connection is active", async () => {
+    const { f, ns } = await setup(64, true);
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      records: [{ id: "a", v: 1 }],
+      observedAt: T - 1000,
+    });
+    const service = await f.service();
+    await f.sync(service);
+    expect(await served(service)).toEqual({ kind: "view", ids: ["a"] });
+  });
+
+  it("serves no view while the connection is deleted", async () => {
     const { f, ns } = await setup(62, true);
     await f.publish({
       connector: "acme",
@@ -87,37 +102,24 @@ describe("reader wiring of the start rule", () => {
       records: [{ id: "a", v: 1 }],
       observedAt: T - 1000,
     });
-    const version = await f.deleteConnection("acme", ns);
-    f.overlay.runs = [
-      run(ns, { kind: "deleted", version }, version + 1, {
-        userConnect: true,
-        full: true,
-      }),
-    ];
+    await f.deleteConnection("acme", ns);
     const service = await f.service();
     await f.sync(service);
-    // Under a non-active control the owner sees the run as pending, never as
-    // a published view.
     expect((await served(service)).kind).not.toBe("view");
   });
 
-  it("does not serve a pending absent-start run in the published view while the connection is absent", async () => {
-    const { f, ns } = await setup(63, false);
+  it("serves no view while the connection is absent", async () => {
+    const { f } = await setup(63, false);
     await f.publish({
       connector: "acme",
-      ns,
+      ns: await f.key.ns("acme", "account-1"),
       stream: "items",
       generation: 1,
       records: [{ id: "a", v: 1 }],
       observedAt: T - 1000,
     });
-    f.overlay.runs = [
-      run(ns, { kind: "absent" }, 1, { userConnect: true, full: true }),
-    ];
     const service = await f.service();
     await f.sync(service);
-    // Under a non-active control the owner sees the run as pending, never as
-    // a published view.
     expect((await served(service)).kind).not.toBe("view");
   });
 });
