@@ -38,6 +38,15 @@ describe("runDeletedSince", async () => {
     ).toBe(true);
   });
 
+  it("control arm: a lower active generation is not a delete (the writer rereads it)", () => {
+    expect(
+      runDeletedSince(
+        { control: { kind: "active", generation: 3 } },
+        { control: { kind: "active", generation: 2 }, hashes },
+      ),
+    ).toBe(false);
+  });
+
   it("control arm: an unchanged active connection is not deleted", () => {
     expect(
       runDeletedSince(

@@ -107,7 +107,7 @@ export function deletedSinceStart(
   if (now.kind === "deleted") return true;
   // A reconnect after a delete lands at a higher generation. That is still
   // deleted since start: a generation can only rise through a delete.
-  return now.kind === "active" && now.generation !== start.generation;
+  return now.kind === "active" && now.generation > start.generation;
 }
 
 /**
