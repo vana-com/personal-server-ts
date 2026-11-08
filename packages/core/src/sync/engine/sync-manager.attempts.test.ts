@@ -185,4 +185,41 @@ describe("upload attempts across manager stop and start", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(second.storage.readEnvelope).not.toHaveBeenCalled();
   });
+
+  it("records a failed stop, resolves it, and the old manager hands the store over once storage heals", async () => {
+    const inner = createMemoryUploadAttemptStore();
+    let failWrites = false;
+    const store: UploadAttemptStore = {
+      namespace: inner.namespace,
+      read: () => inner.read(),
+      write: async (envelope) => {
+        if (failWrites) throw new Error("disk full");
+        await inner.write(envelope);
+      },
+      preserveCorrupt: () => inner.preserveCorrupt(),
+    };
+    const first = buildManager(store);
+    first.manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(first.bodies).toHaveLength(1);
+
+    // The body fails while storage is down: the settlement cannot be saved.
+    failWrites = true;
+    first.bodies[0]!.fail();
+    await vi.advanceTimersByTimeAsync(0);
+    await first.manager.stop(); // does not reject
+
+    const errors = first.manager.getStatus().errors.map((e) => e.message);
+    expect(errors.join("\n")).toMatch(/could not be saved on stop/);
+
+    // Storage heals; nobody calls the old manager again.
+    failWrites = false;
+    await vi.advanceTimersByTimeAsync(60_000);
+    const second = buildManager(store);
+    second.manager.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(second.storage.readEnvelope).toHaveBeenCalledTimes(1);
+    const [stored] = await recordsOf(store);
+    expect(stored).toEqual(expect.objectContaining({ interrupted: 0 }));
+  });
 });

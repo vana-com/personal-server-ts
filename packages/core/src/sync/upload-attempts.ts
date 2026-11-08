@@ -26,7 +26,15 @@
  * store (`UploadAttemptStore`); the ledger keeps the semantics, orders the
  * writes and takes the store's single-owner lock, named by that store.
  *
- * Two things hold by construction:
+ * Three things hold by construction:
+ * - Order: one queue runs every state change (begin, settle, reconcile,
+ *   release, close, recover) alone, start to finish. An operation reads the
+ *   committed state, builds the next one, writes it, and only then adopts it,
+ *   so no write ever carries another operation's tentative change. If
+ *   storage may differ from the committed state (an uncertain or failed
+ *   write), every operation repairs that first and the lease is never given
+ *   up until it is repaired. A store write that never returns blocks the
+ *   queue; no timeout may release the lease in its place.
  * - Identity: the lock is keyed by the store's `namespace` (Lite: IndexedDB
  *   database + object store + key; server: the resolved file path). Never by
  *   a wrapper object, never one name for all stores. Browser locks cover every
@@ -345,21 +353,29 @@ export function createUploadAttemptLedger(
     maxInterrupted?: number;
     /** Crash protection lost something; the owner should be told. */
     onDegraded?: (message: string) => void;
+    /** First wait before a stop that could not repair storage is retried. */
+    repairRetryMs?: number;
   } = {},
 ): UploadAttemptLedger {
   const maxInterrupted =
     options.maxInterrupted ?? MAX_INTERRUPTED_UPLOAD_ATTEMPTS;
   const owner = ownerAddress.toLowerCase();
-  /** Every owner's records: the whole value is replaced on each write. */
-  const records = new Map<string, UploadAttemptRecord>();
+  /**
+   * The committed state: what storage is known to hold (see `dirty`). Every
+   * owner's records, because the whole value is replaced on each write. It is
+   * replaced, never edited, and only inside an operation, after a write.
+   */
+  let records = new Map<string, UploadAttemptRecord>();
   const live = new Map<string, UploadAttemptToken>();
   let generation = 0;
   let attempts = 0;
   let lease: UploadAttemptLease | null = null;
   let recovering: Promise<boolean> | null = null;
-  let writes: Promise<unknown> = Promise.resolve();
-  /** A marker for an attempt that never started may be in storage. */
-  let unrepaired = false;
+  /**
+   * Storage may differ from `records` (an uncertain or failed write). Every
+   * operation repairs this first; a lease is never given up while it is set.
+   */
+  let dirty = false;
   /** Set once a malformed value was replaced: it is not replaced twice. */
   let resetOnce = false;
   let closeWhenIdle = false;
@@ -368,9 +384,34 @@ export function createUploadAttemptLedger(
    * lease). A release that began earlier sees the change and stands down.
    */
   let reactivations = 0;
+  const baseRetryMs = options.repairRetryMs ?? 1_000;
+  let retryDelay = baseRetryMs;
   const idleWaiters: Array<() => void> = [];
   const keyOf = (entry: IndexEntry) => uploadAttemptKey(owner, entry);
   const mine = (record: UploadAttemptRecord) => record.owner === owner;
+
+  /**
+   * The one queue. Each operation runs alone, start to finish: it reads the
+   * committed state, builds the next one, writes it, and only then adopts it.
+   * No other operation can see, or snapshot, a tentative state.
+   */
+  let tail: Promise<void> = Promise.resolve();
+  function enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const run = tail.then(operation);
+    tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  const draft = () =>
+    new Map([...records].map(([key, record]) => [key, { ...record }]));
+  const write = (next: Map<string, UploadAttemptRecord>) =>
+    store.write({
+      version: UPLOAD_ATTEMPTS_ENVELOPE_VERSION,
+      records: [...next.values()],
+    });
 
   /** A ledger that does not own a valid, loaded store must not write it. */
   function assertOwned() {
@@ -378,47 +419,65 @@ export function createUploadAttemptLedger(
       throw new Error("Upload attempt ledger is not recovered");
   }
 
-  const writeCurrent = () =>
-    store.write({
-      version: UPLOAD_ATTEMPTS_ENVELOPE_VERSION,
-      records: [...records.values()],
-    });
-
-  /** Serialised, whole-value persist of the current records. */
-  function persist(
-    onRejected?: (error: unknown) => void | Promise<void>,
-  ): Promise<void> {
-    assertOwned();
-    const run = writes.then(async () => {
-      await writeCurrent();
-      unrepaired = false;
-    });
-    // The rollback (and any repair) finishes before the next queued write.
-    writes = run.catch((error) => onRejected?.(error));
-    return run;
-  }
-
-  /** Wait until no write is queued, so a begin joins no earlier write. */
-  async function drainWrites() {
-    for (let seen = writes; ; seen = writes) {
-      await seen;
-      if (seen === writes) return;
+  /** Write the committed state again; fail closed if storage still refuses. */
+  async function repair() {
+    if (!dirty) return;
+    try {
+      await write(records);
+      dirty = false;
+    } catch (error) {
+      throw new UploadAttemptStorageFailedError(error);
     }
   }
 
   /**
-   * Give up the store. `since` is the `reactivations` count when the release
-   * was decided; the checks after the wait are the ones that count, because a
-   * manager may have taken the store back, and begun an attempt, meanwhile.
+   * Write `next`; adopt it only once the write succeeded. An uncertain write
+   * is undone in the same operation by writing the committed state back.
+   */
+  async function persist(next: Map<string, UploadAttemptRecord>) {
+    try {
+      await write(next);
+    } catch (error) {
+      if (error instanceof UploadAttemptWriteUncertainError) {
+        dirty = true;
+        await repair();
+      }
+      throw error;
+    }
+    records = next;
+    dirty = false;
+  }
+
+  /**
+   * Give up the store, if still due: `since` is the `reactivations` count when
+   * the release was decided; a manager may have taken the store back, and
+   * begun an attempt, since. Storage must hold the committed state first.
    */
   async function giveUp(since: number) {
-    await writes;
+    if (reactivations !== since || live.size > 0 || !lease) return;
+    try {
+      await repair();
+    } catch (error) {
+      // The stop could not hand the store over. This ledger keeps the lease
+      // and the repair duty: it retries on its own until storage heals, so a
+      // discarded manager does not leave the store owned for good.
+      closeWhenIdle = true; // the stop is still owed, whatever else happens
+      const delay = retryDelay;
+      retryDelay = Math.min(retryDelay * 2, 30 * baseRetryMs);
+      const timer = setTimeout(
+        () => void enqueue(() => giveUp(since)).catch(() => undefined),
+        delay,
+      );
+      (timer as { unref?: () => void }).unref?.();
+      throw error;
+    }
     if (reactivations !== since || live.size > 0 || !lease) return;
     lease.release();
     lease = null;
     recovering = null;
     closeWhenIdle = false;
-    records.clear();
+    retryDelay = baseRetryMs;
+    records = new Map();
   }
 
   async function load(): Promise<boolean> {
@@ -439,25 +498,28 @@ export function createUploadAttemptLedger(
         stored = [];
         replaced = true;
       }
-      lease = taken;
-      generation += 1;
       let changed = replaced;
+      const next = new Map<string, UploadAttemptRecord>();
       for (const record of stored) {
-        const next = { ...record };
-        if (mine(next)) {
-          if (next.inFlight) {
-            next.inFlight = false;
-            next.interrupted += 1;
+        const entry = { ...record };
+        if (mine(entry)) {
+          if (entry.inFlight) {
+            entry.inFlight = false;
+            entry.interrupted += 1;
             changed = true;
           }
-          if (!next.quarantined && next.interrupted >= maxInterrupted) {
-            next.quarantined = true;
+          if (!entry.quarantined && entry.interrupted >= maxInterrupted) {
+            entry.quarantined = true;
             changed = true;
           }
         }
-        records.set(next.key, next);
+        next.set(entry.key, entry);
       }
-      if (changed) await persist();
+      if (changed) await write(next);
+      records = next;
+      dirty = false;
+      lease = taken;
+      generation += 1;
       if (replaced) {
         resetOnce = true;
         options.onDegraded?.(UPLOAD_ATTEMPTS_RESET_NOTICE);
@@ -465,10 +527,72 @@ export function createUploadAttemptLedger(
       return true;
     } catch (error) {
       lease = null;
-      records.clear();
+      records = new Map();
       taken.release();
       throw error;
     }
+  }
+
+  /** Drop this owner's idle records chosen by `drop`; returns the dropped. */
+  async function dropRecords(drop: (record: UploadAttemptRecord) => boolean) {
+    assertOwned();
+    await repair();
+    const next = draft();
+    const dropped: UploadAttemptRecord[] = [];
+    for (const [key, record] of next) {
+      if (!mine(record) || live.has(key) || !drop(record)) continue;
+      next.delete(key);
+      dropped.push(record);
+    }
+    if (dropped.length) await persist(next);
+    return dropped;
+  }
+
+  /** A running attempt's token `token`: stop it and write the outcome. */
+  async function settleOperation(
+    token: UploadAttemptToken,
+    outcome: "success" | "failure",
+  ) {
+    const current = live.get(token.key);
+    if (
+      !current ||
+      current.generation !== token.generation ||
+      current.seq !== token.seq
+    )
+      return;
+    const since = reactivations;
+    live.delete(token.key);
+    let failure: unknown;
+    const record = records.get(token.key);
+    if (record) {
+      const next = draft();
+      if (outcome === "success" || record.interrupted === 0) {
+        next.delete(token.key);
+      } else {
+        next.get(token.key)!.inFlight = false;
+      }
+      // The body has stopped whatever storage says, so `next` is adopted
+      // either way; a failed write leaves `dirty` for the next operation.
+      try {
+        await write(next);
+        dirty = false;
+      } catch (error) {
+        dirty = true;
+        failure = error;
+      }
+      records = next;
+    }
+    if (live.size === 0) {
+      for (const wake of idleWaiters.splice(0)) wake();
+      if (closeWhenIdle) {
+        try {
+          await giveUp(since);
+        } catch (error) {
+          failure ??= error;
+        }
+      }
+    }
+    if (failure !== undefined) throw failure;
   }
 
   return {
@@ -478,7 +602,7 @@ export function createUploadAttemptLedger(
         reactivations += 1;
         return recovering;
       }
-      recovering ??= load();
+      recovering ??= enqueue(load);
       const attempt = recovering;
       // A refused or failed load must not stick: the next cycle tries again.
       attempt.then(
@@ -497,124 +621,56 @@ export function createUploadAttemptLedger(
     isLive(key) {
       return live.has(key);
     },
-    async begin(entry) {
-      assertOwned();
-      // An older queued write reads `records` when it runs; this attempt's
-      // tentative record must not be visible to it, so wait for the queue.
-      await drainWrites();
-      assertOwned();
-      if (unrepaired) {
-        try {
-          await persist();
-        } catch (error) {
-          throw new UploadAttemptStorageFailedError(error);
-        }
-      }
-      const key = keyOf(entry);
-      if (live.has(key))
-        throw new Error("An upload attempt for this entry is still running");
-      const known = records.get(key);
-      const token: UploadAttemptToken = { key, generation, seq: ++attempts };
-      records.set(key, {
-        key,
-        owner,
-        scope: entry.scope,
-        path: entry.path,
-        rowId: entry.id,
-        interrupted: known?.interrupted ?? 0,
-        inFlight: true,
-        quarantined: false,
+    begin(entry) {
+      return enqueue(async () => {
+        assertOwned();
+        if (closeWhenIdle) throw new Error("Upload attempt ledger is stopping");
+        await repair(); // refused until storage holds the committed state
+        const key = keyOf(entry);
+        if (live.has(key))
+          throw new Error("An upload attempt for this entry is still running");
+        const next = draft();
+        next.set(key, {
+          key,
+          owner,
+          scope: entry.scope,
+          path: entry.path,
+          rowId: entry.id,
+          interrupted: records.get(key)?.interrupted ?? 0,
+          inFlight: true,
+          quarantined: false,
+        });
+        // The body starts only after this resolves. If the write fails the
+        // marker is never adopted (and an uncertain one is written away).
+        await persist(next);
+        const token: UploadAttemptToken = { key, generation, seq: ++attempts };
+        live.set(key, token);
+        return token;
       });
-      live.set(key, token);
-      // The body starts only after this resolves, so a rejected begin never
-      // ran: take the record back out of memory. Storage may still hold it
-      // when the outcome was unknown; write the corrected ledger before any
-      // later write, or fail closed.
-      let repairFailure: unknown;
-      const rollback = async (error: unknown) => {
-        if (known) records.set(key, known);
-        else records.delete(key);
-        if (!(error instanceof UploadAttemptWriteUncertainError)) return;
-        unrepaired = true;
-        try {
-          await writeCurrent();
-          unrepaired = false;
-        } catch (repair) {
-          repairFailure = repair;
-        }
-      };
-      try {
-        await persist(rollback);
-      } catch (error) {
-        if (live.get(key) === token) live.delete(key);
-        await writes;
-        if (repairFailure !== undefined)
-          throw new UploadAttemptStorageFailedError(repairFailure);
-        throw error;
-      }
-      return token;
     },
-    async settle(token, outcome) {
-      const current = live.get(token.key);
-      if (
-        !current ||
-        current.generation !== token.generation ||
-        current.seq !== token.seq
-      )
-        return;
-      live.delete(token.key);
-      const record = records.get(token.key);
-      if (record) {
-        if (outcome === "success" || record.interrupted === 0) {
-          records.delete(token.key);
-        } else {
-          record.inFlight = false;
-        }
-      }
-      const done = record ? persist() : Promise.resolve();
-      if (live.size === 0) {
-        for (const wake of idleWaiters.splice(0)) wake();
-        if (closeWhenIdle) {
-          const since = reactivations;
-          await done.catch(() => undefined);
-          await giveUp(since);
-          return;
-        }
-      }
-      await done;
-    },
+    settle: (token, outcome) => enqueue(() => settleOperation(token, outcome)),
     async reconcile(entries, scanned) {
       const keep = new Set(entries.map(keyOf));
-      let changed = false;
-      for (const [key, record] of [...records]) {
-        if (!mine(record) || live.has(key)) continue;
-        const covered =
-          !scanned ||
-          (record.rowId > scanned.afterId && record.rowId <= scanned.throughId);
-        if (covered && !keep.has(key)) {
-          records.delete(key);
-          changed = true;
-        }
-      }
-      if (changed) await persist();
+      await enqueue(() =>
+        dropRecords(
+          (record) =>
+            (!scanned ||
+              (record.rowId > scanned.afterId &&
+                record.rowId <= scanned.throughId)) &&
+            !keep.has(record.key),
+        ),
+      );
     },
     async release(scope) {
-      const released: string[] = [];
-      let changed = false;
-      for (const [key, record] of [...records]) {
-        if (!mine(record) || live.has(key)) continue;
-        if (scope !== undefined && record.scope !== scope) continue;
-        records.delete(key);
-        if (record.quarantined) released.push(record.path);
-        changed = true;
-      }
-      if (changed) await persist();
-      return released;
+      const dropped = await enqueue(() =>
+        dropRecords((record) => scope === undefined || record.scope === scope),
+      );
+      return dropped.filter((r) => r.quarantined).map((r) => r.path);
     },
     quarantined() {
-      return [...records.values()].filter(
-        (record) => mine(record) && record.quarantined,
-      );
+      return [...records.values()]
+        .filter((record) => mine(record) && record.quarantined)
+        .map((record) => ({ ...record }));
     },
     async close(graceMs = DEFAULT_ABANDON_GRACE_MS) {
       const since = reactivations;
@@ -629,12 +685,14 @@ export function createUploadAttemptLedger(
         ]);
         clearTimeout(timer);
       }
-      if (reactivations !== since) return;
-      if (live.size > 0) {
-        closeWhenIdle = true;
-        return;
-      }
-      await giveUp(since);
+      await enqueue(async () => {
+        if (reactivations !== since) return;
+        if (live.size > 0) {
+          closeWhenIdle = true;
+          return;
+        }
+        await giveUp(since);
+      });
     },
   };
 }

@@ -303,6 +303,9 @@ function controlledStore() {
     commitThenReject: null as Error | null,
     /** Fail the write after the next one (the repair of a begin). */
     failAfterCommitThen: false,
+    /** Reject (storing nothing) the Nth write that carries this scope's marker. */
+    rejectCarrying: null as { scope: string; nth: number } | null,
+    carried: 0,
   };
   const store: UploadAttemptStore = {
     namespace: inner.namespace,
@@ -311,6 +314,13 @@ function controlledStore() {
       control.started += 1;
       if (control.rejectOnCall?.call === control.started) {
         throw control.rejectOnCall.error;
+      }
+      if (control.rejectCarrying) {
+        const { scope, nth } = control.rejectCarrying;
+        const carries = envelope.records.some(
+          (r) => r.scope === scope && r.inFlight,
+        );
+        if (carries && ++control.carried === nth) throw new Error("disk full");
       }
       if (control.failAfterCommitThen && !control.commitThenReject) {
         control.failAfterCommitThen = false;
@@ -334,6 +344,127 @@ function controlledStore() {
   };
   return { store, control, inner };
 }
+
+describe("serialized operations", () => {
+  it("never stores a marker for a begin whose own write failed, when a settle is queued the microtask after it", async () => {
+    const { store, control, inner } = controlledStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A, {
+      maxInterrupted: 1,
+    });
+    await ledger.recover();
+    const x = await ledger.begin(entry(1));
+    // The second write that carries A's marker fails and stores nothing.
+    control.rejectCarrying = { scope: entry(2).scope, nth: 2 };
+    const begunA = ledger.begin(entry(2));
+    await Promise.resolve();
+    const settledX = ledger.settle(x, "success");
+    const outcome = await Promise.allSettled([begunA, settledX]);
+    // Whether A ran or was refused, only a body that ran may leave a marker.
+    if (outcome[0].status === "fulfilled")
+      await ledger.settle(outcome[0].value, "success").catch(() => undefined);
+    await ledger.close().catch(() => undefined);
+
+    for (let boot = 0; boot < 2; boot++) {
+      const next = createUploadAttemptLedger(processOver(inner), OWNER_A, {
+        maxInterrupted: 1,
+      });
+      await next.recover();
+      expect(next.quarantined()).toEqual([]);
+      await next.close();
+    }
+  });
+
+  it("keeps the store and the corrected ledger when a failed repair meets an immediate stop, and hands it over by itself once storage heals", async () => {
+    const { store, control, inner } = controlledStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A, {
+      maxInterrupted: 1,
+      repairRetryMs: 5,
+    });
+    await ledger.recover();
+    control.commitThenReject = new UploadAttemptWriteUncertainError("sync");
+    control.failAfterCommitThen = true; // the repair fails too
+    await expect(ledger.begin(entry(1))).rejects.toBeInstanceOf(
+      UploadAttemptStorageFailedError,
+    );
+
+    // Stop at once: the repair is retried, fails, and the lease stays.
+    control.rejectNext = new Error("still down");
+    await expect(ledger.close()).rejects.toBeInstanceOf(
+      UploadAttemptStorageFailedError,
+    );
+    const rebuilt = createUploadAttemptLedger(store, OWNER_A, {
+      maxInterrupted: 1,
+    });
+    expect(await rebuilt.recover()).toBe(false);
+    await expect(ledger.begin(entry(2))).rejects.toThrow(/stopping/);
+
+    // Storage heals. No command goes to the old ledger: it repairs itself.
+    await vi.waitFor(async () => expect(await rebuilt.recover()).toBe(true));
+    expect(rebuilt.quarantined()).toEqual([]);
+    expect(((await inner.read()) as { records: unknown[] }).records).toEqual(
+      [],
+    );
+  });
+
+  it("keeps a settlement whose write failed, so a stop cannot hand over a marker for a body that stopped", async () => {
+    const { store, control, inner } = controlledStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A, {
+      maxInterrupted: 1,
+    });
+    await ledger.recover();
+    const a = await ledger.begin(entry(1));
+    control.rejectNext = new Error("disk full");
+    await expect(ledger.settle(a, "success")).rejects.toThrow("disk full");
+    // The body is over: it is no longer live, and the stop repairs storage.
+    expect(ledger.isLive(a.key)).toBe(false);
+    await ledger.close();
+
+    const next = createUploadAttemptLedger(processOver(inner), OWNER_A, {
+      maxInterrupted: 1,
+    });
+    await next.recover();
+    expect(next.quarantined()).toEqual([]);
+    expect(((await inner.read()) as { records: unknown[] }).records).toEqual(
+      [],
+    );
+  });
+
+  it("counts a leftover marker once when the recovery write is uncertain and tried again", async () => {
+    const { store, control, inner } = controlledStore();
+    const dead = createUploadAttemptLedger(store, OWNER_A);
+    await dead.recover();
+    await dead.begin(entry(1)); // the process dies mid-upload
+
+    const reboot = createUploadAttemptLedger(processOver(store), OWNER_A, {
+      maxInterrupted: 5,
+    });
+    control.commitThenReject = new UploadAttemptWriteUncertainError("sync");
+    await expect(reboot.recover()).rejects.toThrow(/unknown/);
+    expect(await reboot.recover()).toBe(true);
+    const [record] = (
+      (await inner.read()) as {
+        records: Array<{ interrupted: number; inFlight: boolean }>;
+      }
+    ).records;
+    expect(record).toEqual(
+      expect.objectContaining({ interrupted: 1, inFlight: false }),
+    );
+  });
+
+  it("lets a stop that waits for a running attempt and that attempt's settlement both finish", async () => {
+    const { store, inner } = controlledStore();
+    const ledger = createUploadAttemptLedger(store, OWNER_A);
+    await ledger.recover();
+    const a = await ledger.begin(entry(1));
+    const closing = ledger.close(Infinity);
+    await Promise.resolve();
+    await ledger.settle(a, "success");
+    await closing;
+    expect(await createUploadAttemptLedger(inner, OWNER_A).recover()).toBe(
+      true,
+    );
+  });
+});
 
 describe("release against reactivation", () => {
   it("keeps ownership when a manager takes the store back and begins an attempt while a pending close is writing", async () => {

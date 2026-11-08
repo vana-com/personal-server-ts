@@ -479,7 +479,21 @@ export function createSyncManager(
       // Without a stable store namespace a rebuilt manager gets a fresh,
       // unrelated lock, so only a fully drained stop keeps two managers over
       // the same persistence from overlapping.
-      await uploadAttempts.close(namelessAttempts ? Infinity : undefined);
+      try {
+        await uploadAttempts.close(namelessAttempts ? Infinity : undefined);
+      } catch (err) {
+        // The ledger keeps the store and retries the repair itself; say so.
+        pushError({
+          fileId: null,
+          scope: null,
+          message: `Upload crash protection could not be saved on stop: ${(err as Error).message}`,
+          timestamp: new Date().toISOString(),
+        });
+        uploadDeps.logger.error(
+          { error: (err as Error).message },
+          "Upload attempt store could not be repaired on stop",
+        );
+      }
     },
 
     async trigger() {
