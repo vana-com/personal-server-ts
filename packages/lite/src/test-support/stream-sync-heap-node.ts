@@ -35,16 +35,18 @@ import {
   StreamSyncWriter,
   bindStreamSyncHome,
   createStreamSyncKeyPorts,
+  streamSyncHashes,
   type StreamSyncBlobs,
   type StreamSyncFiles,
   type StreamSyncKeyPorts,
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
-  decodeHead,
-  decodeLine,
+  decodePart,
+  deriveKeyCheck,
   partBlobName,
   streamScope,
+  verifyHead,
   type ControlRead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
@@ -344,6 +346,19 @@ export interface RunOptions {
   readonly spoolFlushBytes?: number;
   /** Scratch root for this run's files and blobs; the caller removes it. */
   readonly dir: string;
+  /**
+   * In-process only (not serializable, so not passed to the child). Runs after
+   * publish and before verification, to build a wrong or corrupted published
+   * state for the oracle's mutant tests.
+   */
+  readonly tamper?: (ctx: TamperContext) => Promise<void>;
+}
+
+export interface TamperContext {
+  readonly scope: string;
+  readonly registry: StreamSyncRegistry;
+  readonly blobs: StreamSyncBlobs & { keys(): string[] };
+  readonly keys: StreamSyncKeyPorts;
 }
 
 /**
@@ -521,6 +536,9 @@ export async function runScenario(
     report.runs.find((r) => r.runId === RUN_ID)?.streams[STREAM]?.state ??
     "missing";
   const scope = streamScope(CONNECTOR, NS, STREAM);
+  if (options.tamper) {
+    await options.tamper({ scope, registry, blobs, keys: baseKeys });
+  }
   const row = await registry.read(scope);
   const verified = await verify(scope, row, blobs, baseKeys);
   const expected = expectedDigest(spec);
@@ -542,6 +560,13 @@ export async function runScenario(
   };
 }
 
+/**
+ * Verify the published stream the way a real reader does: the head is the one
+ * the registry's dataHash names, checked by verifyHead; every part is checked
+ * by decodePart (SHA-256, byte length, line count, primary-key placement); and
+ * the verified line total must equal the head's recordCount. Any failure throws,
+ * so a wrong published state fails the run instead of reporting expected totals.
+ */
 async function verify(
   scope: string,
   row: ControlRead,
@@ -553,32 +578,52 @@ async function verify(
   partBytesMax: number;
   outputCount: number;
 }> {
+  if (!row.found) throw new Error(`oracle: no registry row for ${scope}`);
+  const headName = `h-${row.dataHash.toLowerCase().replace(/^0x/, "")}`;
+  const headCipher = await blobs.get(`${scope}/${headName}`);
+  if (!headCipher) throw new Error(`oracle: head ${headName} is missing`);
+  const keyCheck = await deriveKeyCheck((m) => keys.namespaceHmac(m));
+  const verified = await verifyHead(
+    streamSyncHashes.keccak256,
+    await keys.decrypt(scope, headCipher),
+    {
+      dataHash: row.dataHash,
+      connector: CONNECTOR,
+      ns: NS,
+      stream: STREAM,
+      keyCheck,
+    },
+  );
+  if (verified.kind !== "ok") {
+    throw new Error(`oracle: head rejected (${verified.kind})`);
+  }
+  const head = verified.head;
   const digest = new SetDigest();
   let parts = 0;
   let partBytesMax = 0;
   let outputCount = 0;
-  if (!row.found)
-    return { digest: digest.hex(), parts, partBytesMax, outputCount };
-  const headKey = blobs.keys().find((k) => k.startsWith(`${scope}/h-`));
-  const headCipher = headKey ? await blobs.get(headKey) : null;
-  if (!headCipher)
-    return { digest: digest.hex(), parts, partBytesMax, outputCount };
-  const decoded = decodeHead(await keys.decrypt(scope, headCipher));
-  if (decoded.kind !== "ok")
-    return { digest: digest.hex(), parts, partBytesMax, outputCount };
-  for (const part of decoded.head.parts) {
+  for (const part of head.parts) {
     parts += 1;
     partBytesMax = Math.max(partBytesMax, part.bytes);
     const cipher = await blobs.get(
-      `${scope}/${partBlobName(decoded.head.generation, part.hash)}`,
+      `${scope}/${partBlobName(head.generation, part.hash)}`,
     );
-    const clear = await keys.decrypt(scope, cipher!);
-    for (const text of new TextDecoder().decode(clear).split("\n")) {
-      if (text === "") continue;
-      const line = decodeLine(text);
+    if (!cipher) throw new Error(`oracle: part ${part.hash} is missing`);
+    const lines = await decodePart(
+      streamSyncHashes.sha256,
+      await keys.decrypt(scope, cipher),
+      part,
+      head.primaryKey,
+    );
+    for (const { line } of lines) {
       digest.add(outputLine(line.o, line.r, line.v));
       outputCount += 1;
     }
+  }
+  if (outputCount !== head.recordCount) {
+    throw new Error(
+      `oracle: head recordCount ${head.recordCount} != verified lines ${outputCount}`,
+    );
   }
   return { digest: digest.hex(), parts, partBytesMax, outputCount };
 }
