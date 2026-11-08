@@ -107,6 +107,12 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       const unsynced = entries.filter((entry) => entry.dataPointId === null);
       return options?.limit ? unsynced.slice(0, options.limit) : unsynced;
     },
+    findUnsyncedPage({ afterId, limit }) {
+      return entries
+        .filter((entry) => entry.dataPointId === null && entry.id > afterId)
+        .sort((a, b) => a.id - b.id)
+        .slice(0, limit);
+    },
     async readEnvelope(scope, collectedAt) {
       const envelope = envelopes.get(key(scope, collectedAt));
       if (!envelope)

@@ -57,6 +57,8 @@ export interface IndexManager {
    * first).
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
+  /** Unsynced rows with `id > afterId`, `id` ascending, at most `limit`. */
+  findUnsyncedPage(options: { afterId: number; limit: number }): IndexEntry[];
   /**
    * Update the fileId for an index entry (after successful upload + on-chain registration).
    * @returns true if row was updated, false if path not found

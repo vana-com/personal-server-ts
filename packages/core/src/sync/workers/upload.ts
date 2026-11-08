@@ -95,8 +95,17 @@ export interface UploadResult {
   dataPointId: string;
 }
 
+/** Default most unsynced rows read per cycle (index rows only, no bodies). */
+export const UPLOAD_SCAN_BUDGET = 2000;
+
 export interface UploadAllOptions {
   batchSize?: number;
+  /**
+   * Most unsynced rows read in one cycle, on a host with `findUnsyncedPage`.
+   * A larger backlog is swept in windows of this size across cycles.
+   * Default `UPLOAD_SCAN_BUDGET`.
+   */
+  scanBudget?: number;
   onError?: (entry: IndexEntry, error: Error) => void;
   /** Clock for the coalesced-scope quiet window. Defaults to the wall clock. */
   now?: () => Date;
@@ -518,16 +527,35 @@ export async function uploadAll(
 ): Promise<UploadResult[]> {
   const batchSize = options?.batchSize ?? 50;
   const clock = () => (options?.now ?? (() => new Date()))().getTime();
-  // The whole unsynced set (index rows only, no bodies), not a limited page:
-  // entries that cannot be attempted now must not occupy the batch, or they
-  // hide every entry behind them. The batch is chosen below.
-  const entries = deps.storage.findUnsynced();
+  // Unsynced index rows only, no bodies. Entries that cannot be attempted now
+  // must not occupy the batch, or they hide every entry behind them, so the
+  // batch is chosen below from everything listed, not from a limited page.
+  // A host with keyset paging lists one window of at most `scanBudget` rows
+  // per cycle, resuming where the last cycle stopped, so a huge backlog costs
+  // a bounded amount per cycle and is still swept in full. Any other host is
+  // listed whole.
   const state = deps.uploadState ?? createUploadStateTracker();
-  // Every unsynced row is listed, so a tracked path missing here is gone
-  // (deleted or synced elsewhere), and one whose row id or size changed was
-  // rewritten (replaced or repaired): forget both on every cycle, so state
-  // held for an old row never applies to a new one.
-  state.reconcile(entries);
+  const paged = deps.storage.findUnsyncedPage;
+  const scanBudget = options?.scanBudget ?? UPLOAD_SCAN_BUDGET;
+  const scanAfter = paged ? state.scanCursor() : 0;
+  const entries = paged
+    ? paged.call(deps.storage, { afterId: scanAfter, limit: scanBudget })
+    : deps.storage.findUnsynced();
+  const windowFull = paged !== undefined && entries.length >= scanBudget;
+  // Tracked state is dropped for rows that are gone or were rewritten. After a
+  // partial window only the id range actually listed counts, so backoff of
+  // rows beyond it survives; a window that reached the end covers the rest.
+  state.reconcile(
+    entries,
+    paged
+      ? {
+          afterId: scanAfter,
+          throughId: windowFull
+            ? Number(entries[entries.length - 1]?.id)
+            : Number.POSITIVE_INFINITY,
+        }
+      : undefined,
+  );
   const plans = coalescePlan(deps, entries, clock());
   const results: UploadResult[] = [];
 
@@ -548,8 +576,15 @@ export async function uploadAll(
   const batch: Work[] = [];
   const planned = new Set<string>();
   const selectedAt = clock();
+  // Last listed row the selection looked at; the next window resumes after it.
+  let lastLookedAt = scanAfter;
+  let selectionStopped = false;
   for (const entry of entries) {
-    if (batch.length >= batchSize) break;
+    if (batch.length >= batchSize) {
+      selectionStopped = true;
+      break;
+    }
+    lastLookedAt = Number(entry.id);
     const plan = plans.get(entry.scope);
     if (plan) {
       if (planned.has(entry.scope)) continue;
@@ -563,6 +598,12 @@ export async function uploadAll(
     // alone, so they cost no batch slot even the first time they are seen.
     if (holdBackTerminal(deps, state, plan ? plan.head : entry)) continue;
     batch.push({ entry, plan });
+  }
+
+  if (paged) {
+    // Stopped early: resume right after the last row looked at. Looked at all
+    // of a full window: continue past it. Reached the end: start over.
+    state.setScanCursor(selectionStopped || windowFull ? lastLookedAt : 0);
   }
 
   for (const { entry, plan } of batch) {

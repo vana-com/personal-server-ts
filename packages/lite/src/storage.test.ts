@@ -1566,3 +1566,42 @@ describe("same-path replacement of an unsynced row", () => {
     });
   });
 });
+
+describe("findUnsyncedPage", () => {
+  it("pages unsynced rows by id and skips synced ones", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore("custom"),
+    );
+    const rows = [];
+    for (let i = 0; i < 5; i++) {
+      const collectedAt = `2026-11-07T12:00:0${i}.000Z`;
+      rows.push(
+        await storage.writeEnvelopeAndIndex!(
+          createDataFileEnvelope(`notes.s${i}`, collectedAt, { value: i }),
+          {
+            fileId: null,
+            scope: `notes.s${i}`,
+            collectedAt,
+            dataPointId: i === 2 ? "0xdp" : null,
+          },
+        ),
+      );
+    }
+
+    const first = storage.findUnsyncedPage!({ afterId: 0, limit: 2 });
+    const second = storage.findUnsyncedPage!({
+      afterId: first[first.length - 1].id,
+      limit: 2,
+    });
+    const done = storage.findUnsyncedPage!({
+      afterId: second[second.length - 1].id,
+      limit: 2,
+    });
+
+    expect(first.map((e) => e.id)).toEqual([rows[0].id, rows[1].id]);
+    expect(second.map((e) => e.id)).toEqual([rows[3].id, rows[4].id]);
+    expect(done).toEqual([]);
+  });
+});

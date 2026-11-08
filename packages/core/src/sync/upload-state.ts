@@ -93,6 +93,12 @@ export interface RowIdentity {
   sizeBytes: unknown;
 }
 
+/** Row ids `afterId < id <= throughId` were all listed by the scan. */
+export interface ScannedRange {
+  afterId: number;
+  throughId: number;
+}
+
 export interface UploadStateEntry {
   scope: string;
   path: string;
@@ -151,8 +157,19 @@ export interface UploadStateTracker {
    * is absent (the row is gone) or its row identity or size changed (the path
    * was rewritten). State recorded without an identity is kept while the path
    * exists.
+   *
+   * `rows` is normally the whole unsynced set. After a partial (paged) scan,
+   * pass the row-id range that was scanned: an entry is then judged missing
+   * only when its row id lies inside that range, so state for rows the scan
+   * did not reach is never pruned against an incomplete view.
    */
-  reconcile(rows: readonly (RowIdentity & { path: string })[]): void;
+  reconcile(
+    rows: readonly (RowIdentity & { path: string })[],
+    scanned?: ScannedRange,
+  ): void;
+  /** Where the next paged scan of the unsynced rows resumes (row id, 0 = start). */
+  scanCursor(): number;
+  setScanCursor(afterId: number): void;
   /** New data arrived for `scope`: stopped entries there try again. */
   releaseStopped(scope: string): void;
   /** The entry synced or was removed: forget it. */
@@ -176,6 +193,7 @@ export function createUploadStateTracker(
 ): UploadStateTracker {
   const maxFailures = options.maxFailures ?? MAX_UPLOAD_FAILURES;
   const states = new Map<string, Tracked>();
+  let scanAfterId = 0;
   const iso = (ms: number) => new Date(ms).toISOString();
 
   return {
@@ -231,19 +249,35 @@ export function createUploadStateTracker(
     has(path) {
       return states.has(path);
     },
-    reconcile(rows) {
+    reconcile(rows, scanned) {
       const current = new Map<string, RowIdentity>();
       for (const row of rows) current.set(row.path, row);
       for (const [path, state] of states) {
         const row = current.get(path);
-        if (
-          !row ||
-          (state.identity &&
+        if (row) {
+          if (
+            state.identity &&
             (state.identity.id !== row.id ||
-              !Object.is(state.identity.sizeBytes, row.sizeBytes)))
-        )
-          states.delete(path);
+              !Object.is(state.identity.sizeBytes, row.sizeBytes))
+          )
+            states.delete(path);
+          continue;
+        }
+        // Not listed: gone, unless the scan never looked where it would be.
+        const id = state.identity?.id;
+        const covered =
+          !scanned ||
+          (typeof id === "number" &&
+            id > scanned.afterId &&
+            id <= scanned.throughId);
+        if (covered) states.delete(path);
       }
+    },
+    scanCursor() {
+      return scanAfterId;
+    },
+    setScanCursor(afterId) {
+      scanAfterId = afterId;
     },
     releaseStopped(scope) {
       for (const [path, state] of states) {
