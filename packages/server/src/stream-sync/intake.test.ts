@@ -21,12 +21,15 @@ import {
   createOracleEnv,
   artifactFor,
   finishedOutcome,
+  fixedSeed,
   freshConnector,
+  oldDelete,
   readStream,
   resolveTestArtifact,
   startLocalStorage,
   type OracleEnv,
 } from "./oracle.test-utils.js";
+import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 
 const T0 = Date.UTC(2026, 10, 1);
 const DECLARATIONS: Omit<IntakeDeclarations, "connector"> = {
@@ -761,3 +764,302 @@ describe("run intake: no account derivation (R23)", { timeout: 30_000 }, () => {
     ).not.toBeNull();
   });
 });
+
+/**
+ * Retry progress: a retry_pending end publishes its records and keeps the
+ * provenance of its cursor. Red until that build lands: the current writer
+ * saves a retry_pending end as a checkpoint only, so the publication these
+ * tests expect does not exist yet.
+ */
+async function setNeedsFull(h: Host, connector: string, stream: string) {
+  const files = await env.files(h.name);
+  const state = JSON.parse(
+    new TextDecoder().decode((await files.read("state.json"))!),
+  );
+  state.needsFull = [{ connector, ns: "", stream }];
+  await files.write(
+    "state.json",
+    new TextEncoder().encode(JSON.stringify(state)),
+  );
+}
+
+describe(
+  "run intake: retry progress provenance (red until the retry build lands)",
+  { timeout: 30_000 },
+  () => {
+    it("a head tombstone during an explicit full run makes the next ordinary begin full/null", async () => {
+      const c = freshConnector("r28-m2");
+      const h = await host();
+      await run(h, "r1", c, {
+        records: [],
+        covered: [],
+        candidate: { items: "c1" },
+        outcome: "retry_pending",
+      });
+      await publish(h, "r1");
+      // An explicit full run issues no cursor and does not re-save the checkpoint.
+      await h.intake.begin(
+        "r2",
+        begin(c, { wantFull: true, observedAt: T0 + 1 }),
+      );
+      await oldDelete(env, streamScope(c, "", "items"));
+      await h.intake.batch("r2", {
+        batch: 0,
+        records: [{ stream: "items", data: row("b") }],
+      });
+      await h.intake.end("r2", {
+        outcome: "succeeded",
+        coveredStreams: ["items"],
+        checkpointCandidate: null,
+        lastBatch: 0,
+      });
+      await publish(h, "r2");
+      const next = await h.intake.begin("r3", begin(c, { observedAt: T0 + 2 }));
+      expect(next.start).toEqual({
+        collection_mode: "full_refresh",
+        state: null,
+      });
+      await h.intake.abort("r3", "cancelled");
+    });
+
+    it("without a tombstone, an explicit full run keeps the retry cursor for the next begin", async () => {
+      const c = freshConnector("r28-m2-twin");
+      const h = await host();
+      await run(h, "r1", c, {
+        records: [],
+        covered: [],
+        candidate: { items: "c1" },
+        outcome: "retry_pending",
+      });
+      await publish(h, "r1");
+      await run(h, "r2", c, {
+        records: [{ stream: "items", data: row("b") }],
+        covered: ["items"],
+        candidate: null,
+        begin: { wantFull: true, observedAt: T0 + 1 },
+      });
+      await publish(h, "r2");
+      const next = await h.intake.begin("r3", begin(c, { observedAt: T0 + 2 }));
+      expect(next.start).toEqual({
+        collection_mode: "incremental",
+        state: { items: "c1" },
+      });
+      await h.intake.abort("r3", "cancelled");
+    });
+
+    it("a covered whole-read stream in a mixed retry end restarts full/null, not from its saved cursor", async () => {
+      const c = freshConnector("r28-m6a");
+      const h = await host();
+      await run(h, "r1", c, {
+        records: [
+          { stream: "items", data: row("a") },
+          { stream: "snapshot", data: row("s") },
+        ],
+        covered: ["snapshot"],
+        candidate: { items: "i1", snapshot: "s1" },
+        outcome: "retry_pending",
+      });
+      await publish(h, "r1");
+      const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
+      expect(next.streams.find((s) => s.name === "snapshot")?.mode).toBe(
+        "full_refresh",
+      );
+      expect(next.start.state).toEqual({ items: "i1" });
+      await h.intake.abort("r2", "cancelled");
+    });
+
+    it("a covered whole-read stream omitted from the saved candidate restarts full/null", async () => {
+      const c = freshConnector("r28-m6b");
+      const h = await host();
+      await run(h, "r1", c, {
+        records: [
+          { stream: "items", data: row("a") },
+          { stream: "snapshot", data: row("s") },
+        ],
+        covered: [],
+        candidate: { items: "i1", snapshot: "s1" },
+        outcome: "retry_pending",
+      });
+      await publish(h, "r1");
+      await run(h, "r2", c, {
+        records: [
+          { stream: "items", data: row("b") },
+          { stream: "snapshot", data: row("t") },
+        ],
+        covered: ["snapshot"],
+        candidate: { items: "i2" },
+        outcome: "retry_pending",
+        begin: { observedAt: T0 + 1 },
+      });
+      await publish(h, "r2");
+      const next = await h.intake.begin("r3", begin(c, { observedAt: T0 + 2 }));
+      expect(next.streams.find((s) => s.name === "snapshot")?.mode).toBe(
+        "full_refresh",
+      );
+      expect(next.start.state).toEqual({ items: "i2" });
+      await h.intake.abort("r3", "cancelled");
+    });
+
+    it("a retry run plans no seed-only head for a seeded stream it does not publish", async () => {
+      const c = freshConnector("r28-m1");
+      const h = await host({
+        seed: fixedSeed("desktop-install", {
+          items: [row("seed-i")],
+          events: [{ id: "seed-e", n: "seed" }],
+        }),
+      });
+      await run(h, "r1", c, {
+        records: [{ stream: "items", data: row("a") }],
+        covered: [],
+        candidate: { items: "i1" },
+        outcome: "retry_pending",
+      });
+      const { status } = await publish(h, "r1");
+      // The seed-only stream gets no head and its receipt stays deferred.
+      expect(
+        await readStream(env.registry, env.blobs, c, "", "events"),
+      ).toBeNull();
+      expect(status.receipts[`desktop-install|${c}||events`]).not.toBe(
+        "merged",
+      );
+      // Retry records publish; this leg is red until that build lands.
+      expect(
+        await readStream(env.registry, env.blobs, c, "", "items"),
+      ).not.toBeNull();
+    });
+
+    it("a retry cursor saved after a head tombstone lands does not renew the continuation", async () => {
+      const c = freshConnector("r28-m3");
+      const h = await host();
+      await run(h, "r1", c, {
+        records: [],
+        covered: [],
+        candidate: { items: "c1" },
+        outcome: "retry_pending",
+      });
+      await publish(h, "r1");
+      // r2 holds the cursor c1 from its begin.
+      const held = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
+      expect(held.start).toEqual({
+        collection_mode: "incremental",
+        state: { items: "c1" },
+      });
+      await oldDelete(env, streamScope(c, "", "items"));
+      await h.intake.batch("r2", {
+        batch: 0,
+        records: [{ stream: "items", data: row("b") }],
+      });
+      await h.intake.end("r2", {
+        outcome: "retry_pending",
+        coveredStreams: [],
+        checkpointCandidate: { items: "c2" },
+        lastBatch: 0,
+      });
+      await publish(h, "r2");
+      const next = await h.intake.begin("r3", begin(c, { observedAt: T0 + 2 }));
+      expect(next.start).toEqual({
+        collection_mode: "full_refresh",
+        state: null,
+      });
+      await h.intake.abort("r3", "cancelled");
+    });
+
+    it("an oversized upsert beside an accepted one is not an all-empty retry", async () => {
+      const c = freshConnector("r28-m4");
+      const h = await host();
+      const { batch, ended } = await run(h, "r1", c, {
+        records: [
+          { stream: "items", data: row("a") },
+          {
+            stream: "items",
+            data: { id: "big", n: "x".repeat(8 * 1024 * 1024) },
+          },
+        ],
+        covered: [],
+        candidate: { items: "c1" },
+        outcome: "retry_pending",
+      });
+      expect(batch).toMatchObject({ accepted: 1, tooLarge: 1 });
+      expect(ended.result).toBe("queued");
+      await publish(h, "r1");
+      const items = await readStream(env.registry, env.blobs, c, "", "items");
+      expect(items).not.toBeNull();
+      expect([
+        ...(items as { records: Map<string, unknown> }).records.keys(),
+      ]).toEqual(["a"]);
+      const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
+      expect(next.start).toEqual({
+        collection_mode: "incremental",
+        state: { items: "c1" },
+      });
+      await h.intake.abort("r2", "cancelled");
+    });
+
+    it("a covered incremental continuation with no further token ends the retry; a full covered read clears the debt", async () => {
+      const c = freshConnector("r28-m5");
+      const h = await host();
+      await run(h, "r0", c, {
+        records: [{ stream: "items", data: row("z") }],
+        covered: ["items"],
+        candidate: { items: "c0" },
+      });
+      await publish(h, "r0");
+      await setNeedsFull(h, c, "items");
+      await run(h, "r1", c, {
+        records: [],
+        covered: [],
+        candidate: { items: "c1" },
+        outcome: "retry_pending",
+        begin: { observedAt: T0 + 1 },
+      });
+      await publish(h, "r1");
+      // The retry continuation resumes incrementally despite the debt.
+      const cont = await h.intake.begin("r2", begin(c, { observedAt: T0 + 2 }));
+      expect(cont.start).toEqual({
+        collection_mode: "incremental",
+        state: { items: "c1" },
+      });
+      await h.intake.batch("r2", {
+        batch: 0,
+        records: [{ stream: "items", data: row("b") }],
+      });
+      await h.intake.end("r2", {
+        outcome: "succeeded",
+        coveredStreams: ["items"],
+        checkpointCandidate: null,
+        lastBatch: 0,
+      });
+      await publish(h, "r2");
+      // The covered tail ends with no token: the next begin is full/null.
+      const after = await h.intake.begin(
+        "r3",
+        begin(c, { observedAt: T0 + 3 }),
+      );
+      expect(after.start).toEqual({
+        collection_mode: "full_refresh",
+        state: null,
+      });
+      await h.intake.batch("r3", {
+        batch: 0,
+        records: [{ stream: "items", data: row("c") }],
+      });
+      await h.intake.end("r3", {
+        outcome: "succeeded",
+        coveredStreams: ["items"],
+        checkpointCandidate: { items: "c3" },
+        lastBatch: 0,
+      });
+      await publish(h, "r3");
+      // A covered, truly full read has cleared the debt: incremental resumes.
+      const repaired = await h.intake.begin(
+        "r4",
+        begin(c, { observedAt: T0 + 4 }),
+      );
+      expect(repaired.start).toEqual({
+        collection_mode: "incremental",
+        state: { items: "c3" },
+      });
+      await h.intake.abort("r4", "cancelled");
+    });
+  },
+);
