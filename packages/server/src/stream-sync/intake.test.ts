@@ -1551,3 +1551,142 @@ describe(
     });
   },
 );
+
+/**
+ * Covered ends and empty retries (formal spec M7, review P1 and M5 twin).
+ * Red until the build retires covered provenance on every covered end, and
+ * keeps the provenance of a zero-record retry whose candidate has a token.
+ */
+describe(
+  "run intake: covered empty candidates and empty retry continuations (M7, P1, M5)",
+  { timeout: 30_000 },
+  () => {
+    /** Run 1 leaves s2 (snapshot) mid-attempt; run 2 issues it and covers it. */
+    async function snapshotAttempt(
+      c: string,
+      run2Candidate: Record<string, string> | null,
+    ) {
+      const h = await host();
+      await run(h, "r1", c, {
+        records: [{ stream: "items", data: row("a") }],
+        covered: [],
+        candidate: { items: "i1", snapshot: "s-tok" },
+        outcome: "retry_pending",
+      });
+      await publish(h, "r1");
+      const issued = await h.intake.begin(
+        "r2",
+        begin(c, { observedAt: T0 + 1 }),
+      );
+      expect(issued.start.state).toEqual({ items: "i1", snapshot: "s-tok" });
+      await finish(h, "r2", {
+        records: [{ stream: "snapshot", data: row("b") }],
+        covered: ["snapshot"],
+        candidate: run2Candidate,
+        outcome: "retry_pending",
+      });
+      await publish(h, "r2");
+      return h;
+    }
+
+    it("empty-candidate covered end must not resume the old cursor (M7)", async () => {
+      const c = freshConnector("m7-empty");
+      const h = await snapshotAttempt(c, {});
+      const next = await h.intake.begin("r3", begin(c, { observedAt: T0 + 2 }));
+      expect(next.streams.find((s) => s.name === "snapshot")?.mode).toBe(
+        "full_refresh",
+      );
+      expect(next.start.state ?? {}).not.toHaveProperty("snapshot");
+      await h.intake.abort("r3", "cancelled");
+    });
+
+    it("omitted-candidate variant: a covered end whose candidate omits the stream must not resume its old cursor (M7)", async () => {
+      const c = freshConnector("m7-omitted");
+      const h = await snapshotAttempt(c, { items: "i2" });
+      const next = await h.intake.begin("r3", begin(c, { observedAt: T0 + 2 }));
+      expect(next.streams.find((s) => s.name === "snapshot")?.mode).toBe(
+        "full_refresh",
+      );
+      expect(next.start.state ?? {}).not.toHaveProperty("snapshot");
+      await h.intake.abort("r3", "cancelled");
+    });
+
+    it("empty snapshot retry without prior debt keeps its continuation (P1a)", async () => {
+      const c = freshConnector("p1-snapshot");
+      const h = await host();
+      const { ended } = await run(h, "r1", c, {
+        records: [],
+        covered: [],
+        candidate: { snapshot: "job-token" },
+        outcome: "retry_pending",
+      });
+      expect(ended.result).toBe("checkpoint_only");
+      await publish(h, "r1");
+      const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
+      expect(next.start).toEqual({
+        collection_mode: "incremental",
+        state: { snapshot: "job-token" },
+      });
+      await h.intake.abort("r2", "cancelled");
+    });
+
+    it("empty retry cursor tombstoned before begin is not reissued (P1b)", async () => {
+      const c = freshConnector("p1-tombstoned");
+      const h = await host();
+      await run(h, "r1", c, {
+        records: [],
+        covered: [],
+        candidate: { items: "c1" },
+        outcome: "retry_pending",
+      });
+      await publish(h, "r1");
+      await oldDelete(env, streamScope(c, "", "items"));
+      const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
+      expect(next.start).toEqual({
+        collection_mode: "full_refresh",
+        state: null,
+      });
+      await h.intake.abort("r2", "cancelled");
+    });
+
+    it("spooled but unemitted rows do not turn an empty retry into publication (M5)", async () => {
+      const c = freshConnector("m5-unemitted");
+      const h = await host({
+        seed: fixedSeed("desktop-install", { items: [row("seed-i")] }),
+      });
+      const { ended } = await run(h, "r1", c, {
+        records: [],
+        covered: [],
+        candidate: { export: "tok" },
+        outcome: "retry_pending",
+      });
+      expect(ended.result).toBe("checkpoint_only");
+      await publish(h, "r1");
+      expect(
+        await readStream(env.registry, env.blobs, c, "", "items"),
+      ).toBeNull();
+      const next = await h.intake.begin("r2", begin(c, { observedAt: T0 + 1 }));
+      expect(next.start).toEqual({
+        collection_mode: "incremental",
+        state: { export: "tok" },
+      });
+      await h.intake.abort("r2", "cancelled");
+    });
+
+    it("twin: a producer upsert on the same empty-candidate retry publishes its row (M5)", async () => {
+      const c = freshConnector("m5-upsert");
+      const h = await host({
+        seed: fixedSeed("desktop-install", { items: [row("seed-i")] }),
+      });
+      const { ended } = await run(h, "r1", c, {
+        records: [{ stream: "items", data: row("a") }],
+        covered: [],
+        candidate: { export: "tok" },
+        outcome: "retry_pending",
+      });
+      expect(ended.result).toBe("queued");
+      await publish(h, "r1");
+      expect(await recordKeys(c, "items")).toContain("a");
+    });
+  },
+);
