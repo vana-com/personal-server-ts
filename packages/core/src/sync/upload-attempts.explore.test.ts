@@ -23,15 +23,26 @@
  *    bodies that entered and never settled allow. A crash between a durable
  *    marker and the body (or between a body and its settle) cannot be told
  *    apart in storage; those entries are exempt, as the contract says.
+ * 5. Quarantine comes only from interruptions: a key is quarantined exactly
+ *    when its stored count reached the threshold, and never without enough
+ *    events that could leave a marker (a body that entered and never settled,
+ *    an abrupt crash that held an admission, or a stop that gave up).
+ * 6. A stop rejects only after its repair window has passed; a clean stop
+ *    leaves no marker behind, however many admissions it refused.
  * Liveness: once faults stop and held writes are released, every operation
  * finishes, a stop that failed hands the store over by itself, and a clean
  * close always succeeds.
+ *
+ * Intentional shutdown (`stop`, then the realm ends) is explored with no
+ * abrupt-crash exemptions: its bodies and refused admissions are counted only
+ * by what storage could still hold.
  */
 import { describe, expect, it } from "vitest";
 
 import {
   acquireProcessLock,
   createUploadAttemptLedger,
+  STOP_REPAIR_WINDOW_MS,
   UploadAttemptWriteUncertainError,
   uploadAttemptKey,
   type UploadAttemptLedger,
@@ -122,6 +133,8 @@ interface Manager {
   held: Array<() => void>;
   /** Entries with a begin in flight, or rejected while storage was failing. */
   suspect: Map<number, number>;
+  /** A stop was started; the realm ends once it has resolved. */
+  shutting: boolean;
 }
 
 class Failure extends Error {}
@@ -151,6 +164,8 @@ async function runSeed(seed: number, maxSteps = Infinity) {
   const pick = <T>(items: readonly T[]) =>
     items[Math.floor(rng() * items.length)]!;
 
+  // Some seeds use a threshold a schedule can reach; the rest never quarantine.
+  const threshold = rng() < 0.35 ? 2 : 1_000;
   // Initial storage.
   const start = rng();
   const malformed = { version: 99, records: "?" };
@@ -190,6 +205,17 @@ async function runSeed(seed: number, maxSteps = Infinity) {
   const exempt = new Set<number>();
   const lo = new Map<number, number>(expectedStart);
   const hi = new Map<number, number>(expectedStart);
+  /**
+   * Quarantine evidence. `real`: crashes or shutdowns that left a body which
+   * entered and never settled (plus leftovers). `admitted`: abrupt crashes that
+   * held an admission, and shutdowns whose stop gave up (only after the
+   * window). A clean stop adds nothing. Never reset: each is an upper bound on
+   * what can have counted.
+   */
+  const real = new Map<number, number>(expectedStart);
+  const admitted = new Map<number, number>();
+  /** Namespaces whose intentional stop resolved clean. */
+  const cleanStops = new Set<string>();
   const bump = (m: Map<number, number>, k: number, by: number) =>
     m.set(k, (m.get(k) ?? 0) + by);
   const tick = async () => {
@@ -216,6 +242,7 @@ async function runSeed(seed: number, maxSteps = Infinity) {
       pending: 0,
       held: [],
       suspect: new Map(),
+      shutting: false,
     };
     const never = () => new Promise<never>(() => undefined);
     const store: UploadAttemptStore = {
@@ -291,7 +318,7 @@ async function runSeed(seed: number, maxSteps = Infinity) {
       },
     };
     manager.ledger = createUploadAttemptLedger(store, OWNER, {
-      maxInterrupted: 1_000,
+      maxInterrupted: threshold,
       repairRetryMs: 1,
     });
     alive.push(manager);
@@ -324,9 +351,20 @@ async function runSeed(seed: number, maxSteps = Infinity) {
       (b) =>
         b.entry === n && b.settle === "none" && !b.manager.dead && !b.counted,
     );
-  /** A body whose marker storage may still hold. */
+  /**
+   * A live body whose marker storage may still hold. Bodies of ended realms
+   * are not live: their markers are leftovers, tracked by `leftover`.
+   */
+  const keyFor = (n: number) => uploadAttemptKey(OWNER, entry(n));
   const owns = (n: number) =>
-    bodies.some((b) => b.entry === n && b.settle !== "ok" && !b.cleared);
+    bodies.some(
+      (b) => b.entry === n && !b.counted && b.settle !== "ok" && !b.cleared,
+    );
+  /** The stop gave up (rejected) only after the window had passed. */
+  const stopGaveUp = (started: number, rejected: boolean) => {
+    if (rejected && Date.now() - started < STOP_REPAIR_WINDOW_MS)
+      flag("6", "a stop gave up before its repair window had passed");
+  };
 
   function checkStable(label: string) {
     const groups = new Set(alive.map((m) => m.ns));
@@ -355,6 +393,30 @@ async function runSeed(seed: number, maxSteps = Infinity) {
     }
   }
 
+  /**
+   * A stop that resolved clean left the store handed over: its lock is free
+   * and no durable marker lacks a body that will settle it.
+   */
+  function checkCleanStops() {
+    for (const ns of cleanStops) {
+      if (!lockFree(ns)) continue;
+      for (const record of recordsOf(durable)) {
+        if (record.owner !== OWNER || !record.inFlight) continue;
+        if (
+          exempt.has(record.rowId) ||
+          leftover.has(record.rowId) ||
+          owns(record.rowId)
+        )
+          continue;
+        fail(
+          "2",
+          `clean stop left a marker for entry ${record.rowId} that no body owns`,
+        );
+      }
+    }
+    cleanStops.clear();
+  }
+
   async function stable(label: string) {
     for (let round = 0; round < 600; round++) {
       await new Promise<void>((r) => setImmediate(r));
@@ -366,8 +428,10 @@ async function runSeed(seed: number, maxSteps = Infinity) {
         }
       if (violations.length)
         fail("?", violations[0]!.replace(/^invariant /, ""));
-      if (!released && alive.every((m) => m.pending === 0 && !m.held.length))
+      if (!released && alive.every((m) => m.pending === 0 && !m.held.length)) {
+        checkCleanStops();
         return;
+      }
       if (round > 5 && !released)
         await new Promise<void>((r) => setTimeout(r, 1));
     }
@@ -398,19 +462,40 @@ async function runSeed(seed: number, maxSteps = Infinity) {
     });
   }
 
-  function crash() {
-    covered("crash");
-    for (const old of alive) {
-      old.dead = true;
-      old.held.length = 0;
-      for (const [n, count] of old.suspect) if (count > 0) exempt.add(n);
-      if (old.stopFailed) for (const n of KEYS) exempt.add(n);
-    }
+  /**
+   * A realm ends. Each body that never settled is counted once; each body
+   * whose settle was in flight or refused may leave a marker. Refused
+   * admissions may leave one too, but only where `admissions` says so.
+   */
+  function endRealm(old: Manager, admissions: boolean) {
+    old.dead = true;
+    old.held.length = 0;
     for (const body of bodies) {
-      if (body.counted || !body.manager.dead || body.settle === "ok") continue;
+      if (body.counted || body.manager !== old || body.settle === "ok")
+        continue;
       body.counted = true;
       bump(hi, body.entry, 1);
-      if (body.settle === "none") bump(lo, body.entry, 1);
+      leftover.add(body.entry);
+      if (body.settle === "none") {
+        bump(lo, body.entry, 1);
+        bump(real, body.entry, 1);
+      } else bump(admitted, body.entry, 1);
+    }
+    for (const [n, count] of old.suspect) {
+      if (count <= 0 || !admissions) continue;
+      bump(hi, n, 1);
+      leftover.add(n);
+      bump(admitted, n, 1);
+    }
+    alive.splice(alive.indexOf(old), 1);
+  }
+
+  function crash() {
+    covered("crash");
+    for (const old of [...alive]) {
+      for (const [n, count] of old.suspect) if (count > 0) exempt.add(n);
+      if (old.stopFailed) for (const n of KEYS) exempt.add(n);
+      endRealm(old, true);
     }
     alive.length = 0;
   }
@@ -441,7 +526,10 @@ async function runSeed(seed: number, maxSteps = Infinity) {
   };
 
   const first = makeManager();
-  const steps = Math.min(20 + Math.floor(rng() * 30), maxSteps);
+  const steps = Math.min(
+    20 + Math.floor(rng() * 30) + (threshold < 1_000 ? 60 : 0),
+    maxSteps,
+  );
   doRecover(first);
   for (let step = 0; step < steps; step++) {
     if (violations.length) break;
@@ -459,7 +547,23 @@ async function runSeed(seed: number, maxSteps = Infinity) {
         events.push(
           `m${manager.id} begin${n} -> ${result.ok ? "ok" : errorName(result.error)}`,
         );
-        if (result.ok) startBody(manager, n, result.value);
+        if (result.ok && manager.dead) {
+          // The marker is durable, but the realm ended before its body
+          // could start: an interruption, counted at the next boot.
+          covered("begin after realm end");
+          bodies.push({
+            entry: n,
+            manager,
+            token: result.value,
+            settle: "none",
+            counted: true,
+            cleared: false,
+          });
+          bump(hi, n, 1);
+          bump(lo, n, 1);
+          bump(real, n, 1);
+          leftover.add(n);
+        } else if (result.ok) startBody(manager, n, result.value);
       });
     } else if (roll < 0.42) {
       const mine = bodies.filter(
@@ -502,9 +606,11 @@ async function runSeed(seed: number, maxSteps = Infinity) {
       events.push(`m${manager.id} close(${grace})`);
       manager.closeCalls += 1;
       const reactivated = manager.recoverCalls;
+      const started = Date.now();
       void track(manager, manager.ledger.close(grace), grace === Infinity).then(
         (result) => {
           covered(`close ${result.ok ? "ok" : errorName(result.error)}`);
+          stopGaveUp(started, !result.ok);
           if (manager.recoverCalls !== reactivated) return;
           if (result.ok) manager.closed = true;
           else manager.stopFailed = true;
@@ -543,11 +649,39 @@ async function runSeed(seed: number, maxSteps = Infinity) {
       void track(manager, manager.ledger.release(scope)).then((result) =>
         covered(`retry ${result.ok ? "ok" : errorName(result.error)}`),
       );
-    } else if (roll < 0.94) {
+    } else if (roll < 0.92) {
       events.push(`m${manager.id} release-held`);
       const held = manager.held;
       if (held.length) held.splice(Math.floor(rng() * held.length), 1)[0]!();
-    } else {
+    } else if (roll < 0.95) {
+      // Intentional shutdown: stop, then the realm ends. No crash exemptions;
+      // a realm is one process, so every manager in it ends with the stop.
+      if (manager.shutting) continue;
+      manager.shutting = true;
+      events.push(`m${manager.id} shutdown`);
+      manager.closeCalls += 1;
+      const reactivated = manager.recoverCalls;
+      const started = Date.now();
+      void track(manager, manager.ledger.close(0)).then((result) => {
+        covered(`shutdown ${result.ok ? "clean" : "stop refused"}`);
+        events.push(
+          `m${manager.id} shutdown -> ${result.ok ? "ok" : errorName(result.error)}`,
+        );
+        if (manager.dead || manager.recoverCalls !== reactivated) return;
+        stopGaveUp(started, !result.ok);
+        // Handed over: the stop resolved and no attempt is still live. Only
+        // then does a refused admission's marker count as gone.
+        const handedOver =
+          result.ok && KEYS.every((n) => !manager.ledger.isLive(keyFor(n)));
+        // Checked at the next stable boundary, once no operation can still
+        // commit a marker.
+        if (handedOver) cleanStops.add(manager.ns);
+        else if (!result.ok) manager.stopFailed = true;
+        // The realm is the process: once this stop has resolved, every
+        // manager in it ends. Admissions count unless this stop handed over.
+        for (const old of [...alive])
+          endRealm(old, old !== manager || !handedOver);
+      });
       events.push("stable");
       await stable("mid-run");
       checkStable(`after step ${step}`);
@@ -635,6 +769,24 @@ async function runSeed(seed: number, maxSteps = Infinity) {
   for (const record of recordsOf(durable))
     if (record.owner === OWNER && record.inFlight)
       fail("1", `marker left after recovery for entry ${record.rowId}`);
+  for (const n of KEYS) {
+    const stored = recordsOf(durable).find(
+      (r) => r.owner === OWNER && r.rowId === n,
+    ) as (Rec & { quarantined?: boolean }) | undefined;
+    const interrupted = stored?.interrupted ?? 0;
+    const quarantined = stored?.quarantined === true;
+    if (quarantined) covered("quarantine set");
+    if (quarantined !== interrupted >= threshold)
+      fail(
+        "5",
+        `entry ${n}: quarantined=${quarantined} with ${interrupted} interrupted at threshold ${threshold}`,
+      );
+    if (quarantined && (real.get(n) ?? 0) + (admitted.get(n) ?? 0) < threshold)
+      fail(
+        "5",
+        `entry ${n} quarantined on ${real.get(n) ?? 0} real and ${admitted.get(n) ?? 0} admitted interruptions, below ${threshold}`,
+      );
+  }
   if (start >= 0.12 && start < 0.27) {
     const kept = recordsOf(durable).find((r) => r.owner === FOREIGN);
     if (JSON.stringify(kept) !== JSON.stringify(FOREIGN_RECORD))
@@ -688,8 +840,8 @@ describe("upload attempt ledger: seeded schedule exploration", () => {
         "begin UploadAttemptStorageFailedError",
         "settle Error",
         "stale settle",
-        "close UploadAttemptStorageFailedError",
-        "unaided hand-over",
+        "shutdown clean",
+        "quarantine set",
         "recover refused",
         "recover failed",
         "crash",
