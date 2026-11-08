@@ -164,7 +164,9 @@ export interface PsLiteSyncOptions {
    * Stream-sync reads (`streamSync.read`). Present = on: the sync loop
    * imports stream heads, and the returned `streamSyncRead` answers reads.
    * Without `files`, the reader uses the writer home when available;
-   * otherwise it uses memory and rebuilds on each start.
+   * otherwise it uses memory and rebuilds on each start. An `overlay` needs
+   * `files`: caller files never acknowledge, so the reader cannot acknowledge
+   * into a source it does not own.
    */
   streamSyncRead?: {
     readonly files?: StreamSyncReadFiles;
@@ -500,6 +502,14 @@ export async function createPsLiteSyncManager(
           signer,
         })
       : null;
+    // A caller overlay is the caller's own source. The writer-home cache would
+    // acknowledge installs into it, so a caller overlay must come with caller
+    // files, which never acknowledge.
+    if (options.streamSyncRead?.overlay && !options.streamSyncRead.files) {
+      throw new Error(
+        "streamSyncRead.overlay needs streamSyncRead.files: the writer-home read cache only acknowledges into the writer's own overlay",
+      );
+    }
     // Opened after the writer: the writer's own publications overlay this
     // reader. The writer-home cache is durable, so the reader acknowledges what
     // it installs and the writer can reclaim its spool. Caller-supplied files
