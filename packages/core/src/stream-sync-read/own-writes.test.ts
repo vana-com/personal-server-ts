@@ -1,15 +1,12 @@
 /**
- * Own-write visibility (all cases `it.skip`: "needs ow-writer source"; the
- * integration lane unskips them once the real writer-backed overlay source
- * exists and `openReader` passes it): data a device collected itself must stay readable on
+ * Own-write visibility: data a device collected itself must stay readable on
  * that device while stream-sync reads are on, whatever state its publish is in.
  *
  * Every test uses the real `StreamSyncWriter` and the real
  * `StreamSyncReadService` together, over in-memory files and a registry fake
- * whose publish can fail. The reader is opened the way both hosts open it
- * today (`openReader`): no overlay source. These tests are red until a reader
- * sees its own writer's rows; they must stay red for that reason only (the row
- * is missing from the answer).
+ * whose publish can fail. The reader is opened over the writer's own overlay
+ * source, the way a host wires it (`openReader`). Memory files are not durable,
+ * so the reader never acknowledges coverage here.
  */
 
 import { describe, expect, it } from "vitest";
@@ -17,6 +14,7 @@ import {
   AmbiguousRegistryReplyError,
   bindStreamSyncHome,
   createMemoryStreamSyncFiles,
+  createWriterOverlaySource,
   createStreamSyncKeyPorts,
   StreamSyncWriter,
   type RegistryPostResult,
@@ -32,6 +30,7 @@ import {
 import { createStreamSyncReadKeys } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
+import type { StreamSyncOverlaySnapshotSource } from "./ports.js";
 import { StreamSyncReadService } from "./service.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
@@ -147,8 +146,17 @@ class Device {
     });
   }
 
-  /** The reader as both hosts build it today: no overlay source. */
-  async openReader(): Promise<StreamSyncReadService> {
+  /**
+   * The reader, opened over this device's writer as its overlay source.
+   * `durable` says whether its files may acknowledge imports to the writer;
+   * `overlay` replaces the writer source (a lossy one, for restart tests).
+   */
+  async openReader(
+    durable = false,
+    overlay: StreamSyncOverlaySnapshotSource = createWriterOverlaySource(
+      this.writer,
+    ),
+  ): Promise<StreamSyncReadService> {
     return StreamSyncReadService.open({
       files: this.readFiles,
       blobs: { get: async (key) => this.blobMap.get(key) ?? null },
@@ -156,6 +164,8 @@ class Device {
         streamMasterKeyFromSignature(SIGNATURE),
       ),
       logger: silent,
+      overlay,
+      durable,
       now: () => new Date(T0 + 3_600_000),
     });
   }
@@ -218,7 +228,10 @@ class Device {
   }
 }
 
-/** A latest read of `pdpp.acme.items`, as the shared handler asks. */
+/**
+ * A latest read of `pdpp.acme.items`, as the shared handler asks. `view` and
+ * `local_pending` both carry the rows; `origin` is the body's marker.
+ */
 async function latest(service: StreamSyncReadService) {
   const decision = await service.resolve({
     scope: `pdpp.${CONNECTOR}.items`,
@@ -227,11 +240,17 @@ async function latest(service: StreamSyncReadService) {
     legacyFile: false,
     isOwnerView: true,
   });
-  if (decision.kind !== "view") return { kind: decision.kind, rows: {} };
+  if (decision.kind !== "view" && decision.kind !== "local_pending") {
+    return { kind: decision.kind, rows: {} };
+  }
   const envelope = JSON.parse(await new Response(decision.body).text());
   const rows: Record<string, number> = {};
   for (const r of envelope.data.records) rows[r.id] = r.v;
-  return { kind: "view", rows };
+  return {
+    kind: decision.kind,
+    rows,
+    ...(envelope.origin ? { origin: envelope.origin as string } : {}),
+  };
 }
 
 const H1 = [
@@ -249,7 +268,7 @@ describe("own-write visibility (G1: older imported view)", () => {
     expect(await latest(service)).toEqual(OLD_VIEW);
   });
 
-  it.skip("shows a new row and a newer value while the publish is pending [needs ow-writer source]", async () => {
+  it("shows a new row and a newer value while the publish is pending", async () => {
     const d = new Device();
     const service = await d.openReader();
     await d.importedView(service, [{ id: "r", v: 1 }]);
@@ -263,7 +282,12 @@ describe("own-write visibility (G1: older imported view)", () => {
     });
   });
 
-  it.skip("shows the new rows while the publish keeps failing [needs ow-writer source]", async () => {
+  // DESIGN QUESTION (see the hand-back): once the writer has signed a POST and
+  // recorded no answer, the run may have committed, so the reader defers it
+  // with `publication_in_flight` (own-writes-state-table.md rule 10). The owner
+  // still sees the older view, and the withheld run is named, never dropped.
+  // The spec wanted the new rows here; that needs the rule changed first.
+  it("withholds the new rows and names the run while the publish outcome is unknown", async () => {
     const d = new Device();
     const service = await d.openReader();
     await d.importedView(service, [{ id: "r", v: 1 }]);
@@ -276,12 +300,25 @@ describe("own-write visibility (G1: older imported view)", () => {
     expect(d.streamVersion()).toBe(1); // nothing committed
     expect(d.runFiles(runId)).toBeGreaterThan(0); // spool kept
     expect(await latest(service)).toEqual({
-      kind: "view",
-      rows: { r: 2, new: 1 },
+      kind: "local_pending",
+      rows: { r: 1 },
+      origin: "local-pending",
     });
+    const decision = await service.resolve({
+      scope: `pdpp.${CONNECTOR}.items`,
+      connection: null,
+      cursor: null,
+      legacyFile: false,
+      isOwnerView: true,
+    });
+    expect(decision).toMatchObject({
+      kind: "local_pending",
+      withheld: [{ runId, reason: "publication_in_flight" }],
+    });
+    if ("body" in decision) await decision.body.cancel();
   });
 
-  it.skip("shows the new rows while the gateway is unreachable [needs ow-writer source]", async () => {
+  it("shows the new rows while the gateway is unreachable", async () => {
     const d = new Device();
     const service = await d.openReader();
     await d.importedView(service, [{ id: "r", v: 1 }]);
@@ -293,24 +330,25 @@ describe("own-write visibility (G1: older imported view)", () => {
     d.storageDown = true;
     await d.publish();
     expect(d.runFiles(runId)).toBeGreaterThan(0); // spool kept
-    expect(await latest(service)).toEqual({
-      kind: "view",
-      rows: { r: 2, new: 1 },
-    });
+    expect(await latest(service)).toMatchObject({ rows: { r: 2, new: 1 } });
   });
 });
 
 describe("own-write visibility (G2: no imported head)", () => {
-  it.skip("serves a first local stream from its pending rows [needs ow-writer source]", async () => {
+  it("serves a first local stream from its pending rows", async () => {
     const d = new Device();
     const service = await d.openReader();
     await d.collect([{ id: "r", v: 1 }]); // publish pending, nothing imported
-    expect(await latest(service)).toEqual({ kind: "view", rows: { r: 1 } });
+    expect(await latest(service)).toEqual({
+      kind: "local_pending",
+      rows: { r: 1 },
+      origin: "local-pending",
+    });
   });
 });
 
 describe("own-write visibility (G3: commit before self-import)", () => {
-  it.skip("still shows the new row after a successful publish, before the reader observes it [needs ow-writer source]", async () => {
+  it("still shows the new row after a successful publish, before the reader observes it", async () => {
     const d = new Device();
     const service = await d.openReader();
     await d.importedView(service, [{ id: "r", v: 1 }]);
@@ -320,28 +358,76 @@ describe("own-write visibility (G3: commit before self-import)", () => {
     ]);
     await d.publish(); // committed; the reader has not listed the new row
     expect(d.streamVersion()).toBe(2);
-    expect(await latest(service)).toEqual({
-      kind: "view",
+    expect(await latest(service)).toMatchObject({
       rows: { r: 2, new: 1 },
     });
   });
 
-  it.skip("still shows the new row after the run directory is removed, while offline [needs ow-writer source]", async () => {
+  it("still shows the new row after the run directory is removed, while offline", async () => {
     const d = new Device();
-    const service = await d.openReader();
+    // Durable files: the reader's import is acknowledged, so the writer may
+    // retire the run. In-memory files are durable enough for one test process.
+    const service = await d.openReader(true);
     await d.importedView(service, [{ id: "r", v: 1 }]);
     const runId = await d.collect([
       { id: "r", v: 2 },
       { id: "new", v: 1 },
     ]);
     await d.publish();
-    // Precondition: the writer retired the spool of the committed run.
     expect(d.streamVersion()).toBe(2);
-    expect(d.runFiles(runId)).toBe(0);
+    // Committed but not imported: the spool stays until the reader covers it.
+    expect(d.runFiles(runId)).toBeGreaterThan(0);
+    await d.syncReader(service); // imports version 2 and acknowledges it
+    expect(d.runFiles(runId)).toBe(0); // the writer retired the spool
     d.gateway.down = true; // the reader cannot list or import its own head
-    expect(await latest(service)).toEqual({
+    expect(await latest(service)).toMatchObject({
       kind: "view",
       rows: { r: 2, new: 1 },
     });
+  });
+});
+
+describe("own-write visibility (G4: restart and acknowledgment)", () => {
+  it("reclaims the spool after a restart re-acknowledges an import whose acknowledgment was lost", async () => {
+    const d = new Device();
+    const writerSource = createWriterOverlaySource(d.writer);
+    // The first process imports, but its acknowledgment never reaches the writer.
+    const lossy = await d.openReader(true, {
+      snapshot: writerSource.snapshot,
+      acknowledge: async () => {
+        throw new Error("acknowledgment lost");
+      },
+    });
+    const runId = await d.collect([{ id: "r", v: 1 }]);
+    await d.publish();
+    await d.syncReader(lossy);
+    expect(d.streamVersion()).toBe(1);
+    expect(d.runFiles(runId)).toBeGreaterThan(0); // still covered by no acknowledgment
+
+    // Restart over the same read files with the real source: startup covers
+    // every durable current view, so the writer retires the spool.
+    const restarted = await d.openReader(true);
+    expect(d.runFiles(runId)).toBe(0);
+    expect(await latest(restarted)).toMatchObject({ rows: { r: 1 } });
+  });
+
+  // Named mutant: canonicalBytes32 returns its input unchanged (no lowercase).
+  // The writer then compares the reader's upper-case digest with its lower-case
+  // receipt, finds no coverage, and keeps the spool.
+  it("reclaims a run when the reader acknowledges the digest in another letter case", async () => {
+    const d = new Device();
+    const service = await d.openReader(true, {
+      snapshot: createWriterOverlaySource(d.writer).snapshot,
+      acknowledge: async (coverage) =>
+        d.writer.acknowledgeOverlay({
+          ...coverage,
+          dataHash: `0x${coverage.dataHash.slice(2).toUpperCase()}`,
+        }),
+    });
+    const runId = await d.collect([{ id: "r", v: 1 }]);
+    await d.publish();
+    await d.syncReader(service);
+    expect(d.streamVersion()).toBe(1);
+    expect(d.runFiles(runId)).toBe(0);
   });
 });
