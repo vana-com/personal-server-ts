@@ -236,38 +236,3 @@ export async function readParseWorkload(
   }
   return { bytes, padLength };
 }
-
-/**
- * The HTTP batch stage alone: a request body of one record of `bodyBytes`
- * arrives in 64 KiB chunks and is scanned and parsed by `openBatchBody`. The
- * child never holds the whole body: chunks are made on demand. It returns the
- * parsed pad length. The writer step is measured by `writeWorkload`.
- */
-export async function httpBatchWorkload(
-  args: unknown,
-): Promise<{ padLength: number }> {
-  const { bodyBytes } = args as BigArgs;
-  const { openBatchBody } = await import("../routes/stream-sync-batch-body.js");
-  const padBytes = bodyBytes - 64;
-  const head = new TextEncoder().encode(
-    '{"batch":0,"records":[{"stream":"s","data":{"id":"big","pad":"',
-  );
-  const tail = new TextEncoder().encode('"}}]}');
-  async function* chunks() {
-    yield head;
-    const block = new TextEncoder().encode("a".repeat(64 * 1024));
-    let left = padBytes;
-    while (left > 0) {
-      const take = Math.min(left, block.length);
-      yield take === block.length ? block : block.subarray(0, take);
-      left -= take;
-    }
-    yield tail;
-  }
-  const open = await openBatchBody(chunks(), 1 << 30);
-  let padLength = 0;
-  for await (const record of open.records) {
-    padLength = (record as { data: { pad: string } }).data.pad.length;
-  }
-  return { padLength };
-}

@@ -24,14 +24,15 @@ import {
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { TokenStore } from "../token-store.js";
 import { createServerApiAuth } from "../api-auth.js";
-import { DATA_INGEST_MAX_SIZE } from "../middleware/body-limit.js";
-import { openBatchBody } from "./stream-sync-batch-body.js";
+import {
+  createBodyLimit,
+  DATA_INGEST_MAX_SIZE,
+} from "../middleware/body-limit.js";
 
 /**
- * Ceiling on one batch request, the same 512 MiB the legacy ingest routes
- * allow. It guards the server against an unbounded upload; it is not a record
- * limit. The body is read as a stream, so memory follows the largest record in
- * the batch, not this number.
+ * Ceiling on one batch request: the 512 MiB the legacy ingest routes allow. It
+ * guards the server against an unbounded upload; it is not a record limit.
+ * The body is read whole and parsed, so a batch costs a few times its size.
  */
 export const MAX_BATCH_REQUEST_BYTES = DATA_INGEST_MAX_SIZE;
 
@@ -102,29 +103,15 @@ export function streamSyncRunsRoutes(deps: StreamSyncRunsRouteDeps): Hono {
       ),
     ),
   );
-  app.post("/:runId/batches", (c) =>
-    answer(c, async () => {
-      const declared = Number(c.req.header("content-length") ?? 0);
-      if (declared > MAX_BATCH_REQUEST_BYTES) {
-        throw new RunIntakeError("invalid_request", "the body is too large");
-      }
-      const stream = c.req.raw.body;
-      if (!stream) {
-        throw new RunIntakeError("invalid_request", "the body is not JSON");
-      }
-      const open = await openBatchBody(
-        stream as unknown as AsyncIterable<Uint8Array>,
-        MAX_BATCH_REQUEST_BYTES,
-      );
-      const batch = open.batch;
-      if (typeof batch !== "number") {
-        throw new RunIntakeError(
-          "invalid_request",
-          "batch and records are required",
-        );
-      }
-      return intake.batchStream(c.req.param("runId"), batch, open.records);
-    }),
+  app.post("/:runId/batches", createBodyLimit(MAX_BATCH_REQUEST_BYTES), (c) =>
+    answer(c, async () =>
+      intake.batch(
+        c.req.param("runId"),
+        (await body(c, MAX_BATCH_REQUEST_BYTES)) as Parameters<
+          typeof intake.batch
+        >[1],
+      ),
+    ),
   );
   app.post("/:runId/end", (c) =>
     answer(c, async () =>

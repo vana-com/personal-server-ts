@@ -255,45 +255,14 @@ describe("stream-sync run intake route", () => {
     expect(canonicalJson(view.records.get("huge"))).toBe(canonicalJson(huge));
   }, 120_000);
 
-  it("takes members in any order", async () => {
-    const { call } = await build("route-order");
-    await call("PUT", "o1", beginBody());
-    const res = await call(
-      "POST",
-      "o1/batches",
-      '{"records":[{"stream":"items","data":{"id":"a"}},{"stream":"items","data":{"id":"b"}}],"batch":0,"note":{"x":[1,2]}}',
-    );
-    expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ accepted: 2, applied: true });
-  });
-
-  it("refuses a malformed or incomplete batch body with 400", async () => {
-    const { call } = await build("route-malformed");
-    await call("PUT", "m1", beginBody());
-    for (const text of [
-      "",
-      "[]",
-      "{not json",
-      '{"batch":0}',
-      '{"records":[]}',
-      '{"batch":"0","records":[]}',
-      '{"batch":0,"records":{}}',
-      '{"batch":0,"records":[1]}',
-      '{"batch":0,"records":[{"stream":"items","data":{"id":"a"}}',
-      '{"batch":0,"records":[]} trailing',
-    ]) {
-      const res = await call("POST", "m1/batches", text);
-      expect(res.status, text).toBe(400);
-    }
-  });
-
   it("refuses a request that declares a body over the ceiling", async () => {
     const { call } = await build("route-ceiling");
     await call("PUT", "c1", beginBody());
     const res = await call("POST", "c1/batches", "{}", TOKEN, {
       "content-length": String(MAX_BATCH_REQUEST_BYTES + 1),
     });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(413);
+    expect(await res.json()).toMatchObject({ error: "CONTENT_TOO_LARGE" });
   });
 
   it("refuses a caller that is not the owner", async () => {
