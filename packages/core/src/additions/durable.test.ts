@@ -1530,3 +1530,76 @@ it("returns freshly verified history without crossing a deleted portable-summary
   expect(cold.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
   expect((await f.readRegistry())[ADDITIONS_SUMMARY_SCOPE]).toEqual(before);
 });
+
+// Stream-sync physical names are transport identifiers (ruling Q7). They must
+// never reach the legacy additions path, even when the inventory lists them.
+const PHYSICAL_POINT = "pdpp.chatgpt~0123456789abcdef.conversations";
+const PHYSICAL_HASHES = {
+  dataHash:
+    "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+  metadataHash:
+    "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90",
+};
+
+// Test 1: a physical registry head with no legacy `{scope}/1` envelope must not
+// turn owner additions into partial coverage. Mutant: revert isSystemScope, and
+// the initial and final inventory filters both keep the physical scope.
+it("summarizes legacy scopes completely twice when a physical registration sits beside them", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.setSlot(PHYSICAL_POINT, {
+    expectedVersion: "1",
+    ...PHYSICAL_HASHES,
+    status: "confirmed",
+    addedAt: T2,
+    isTombstone: false,
+  });
+  const first = await f.actor().summarize(QUERY);
+  expect(first).toMatchObject({
+    coverage: "complete",
+    total: 1,
+    through: { [SOURCE]: "1" },
+  });
+  expect(first.through).not.toHaveProperty(PHYSICAL_POINT);
+  const second = await f.actor().summarize(QUERY);
+  expect(second).toMatchObject({ coverage: "complete", total: 1 });
+  expect(second.through).not.toHaveProperty(PHYSICAL_POINT);
+});
+
+// Test 5: physical upload and delete hints do no additions work at all.
+// Ordinary hints still reach the inventory and the sidecar deleter.
+it("returns from physical upload and delete hints without touching additions state", async () => {
+  const f = await fixture();
+  const inventory = {
+    list: vi.fn(async () => ({ head: null, versions: [] })),
+    listScopes: vi.fn(async () => []),
+    page: vi.fn(),
+    head: vi.fn(async () => null),
+  };
+  const storageAdapter = {
+    urlForKey: vi.fn(),
+    upload: vi.fn(),
+    download: vi.fn(),
+    delete: vi.fn(),
+    exists: vi.fn(),
+  };
+  const deleteSystemScope = vi.fn(async () => undefined);
+  const service = f.actor({
+    inventory: inventory as never,
+    storageAdapter: storageAdapter as never,
+    deleteSystemScope,
+  });
+
+  await service.recordUpload({ scope: PHYSICAL_POINT });
+  await service.deleteScope(PHYSICAL_POINT);
+  expect(inventory.list).not.toHaveBeenCalled();
+  expect(storageAdapter.upload).not.toHaveBeenCalled();
+  expect(storageAdapter.download).not.toHaveBeenCalled();
+  expect(storageAdapter.delete).not.toHaveBeenCalled();
+  expect(deleteSystemScope).not.toHaveBeenCalled();
+
+  await service.recordUpload({ scope: SOURCE });
+  expect(inventory.list).toHaveBeenCalled();
+  await service.deleteScope(SOURCE);
+  expect(deleteSystemScope).toHaveBeenCalledWith(additionsLedgerScope(SOURCE));
+});

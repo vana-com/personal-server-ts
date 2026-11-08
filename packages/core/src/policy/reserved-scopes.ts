@@ -1,7 +1,12 @@
 import { isReplicaScope } from "../replication/namespace.js";
+import { isPhysicalScope } from "../stream-sync/scope-routing.js";
 /** Private runtime state is never authorized by delegated grants or MCP. */
 export function isSystemScope(scope: string): boolean {
-  return scope.startsWith("vana.system.") || isReplicaScope(scope);
+  return (
+    scope.startsWith("vana.system.") ||
+    isReplicaScope(scope) ||
+    isPhysicalScope(scope)
+  );
 }
 
 /**
