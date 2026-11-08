@@ -1,5 +1,7 @@
+import { createStreamSyncReadCacheFiles } from "./stream-sync-read-cache-files.js";
 import {
   StreamSyncWriter,
+  createWriterOverlaySource,
   createStreamSyncIntake,
   type ResolveArtifact,
   type RunIntake,
@@ -21,7 +23,7 @@ import {
   createStorageBlobReader,
   createStreamSyncReadKeys,
   StreamSyncReadService,
-  type StreamSyncOverlaySource,
+  type StreamSyncOverlaySnapshotSource,
   type StreamSyncReadFiles,
 } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
@@ -40,6 +42,7 @@ import {
   normalizePendingBlobDeletions,
   type PendingBlobDeletionPlanned,
   type ScopeDeletionTracker,
+  type UploadAttemptStore,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   DataPointFeedPort,
@@ -62,9 +65,10 @@ import {
   deriveMasterKey,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
-import type {
-  DownloadDiagnosticsHook,
-  DownloadWorkerDeps,
+import {
+  withCancellableRegistration,
+  type DownloadDiagnosticsHook,
+  type DownloadWorkerDeps,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type { PsLiteStateStore } from "./state.js";
@@ -81,6 +85,7 @@ import type { DiagnosticsRecorder } from "./diagnostics.js";
 
 const SYNC_CURSOR_KEY = "sync-cursor-v1";
 const PENDING_BLOB_DELETIONS_KEY = "pending-blob-deletions-v1";
+const UPLOAD_ATTEMPTS_KEY = "upload-attempts-v1";
 
 interface PsLitePendingBlobDeletionsState {
   /** Exact (scope, version) keys; `scopes` is the pre-key format. */
@@ -141,7 +146,20 @@ export interface PsLiteSyncOptions {
   autoStartSync?: boolean;
   /** Storage authentication origin, independent of its routing endpoint. */
   storageAudience?: string;
+  /**
+   * Gateway client. The default SDK client is wrapped so the upload deadline
+   * closes its in-flight registry write. A client supplied here is used as
+   * given: it is cancellable only if it declares so (see
+   * `withCancellableRegistration`); otherwise a hung registry write runs on
+   * past the deadline and its entry waits for it.
+   */
   gateway?: GatewayClient;
+  /**
+   * Names the backing store of `stateStore` for upload crash protection when
+   * the store does not name itself. Without either, that protection is kept
+   * in memory and does not survive a restart.
+   */
+  uploadAttemptNamespace?: string;
   /**
    * Deletion-aware gateway feed. Defaults to a REST feed on the configured
    * gateway URL; inject alongside a mock `gateway` in tests.
@@ -161,12 +179,14 @@ export interface PsLiteSyncOptions {
   /**
    * Stream-sync reads (`streamSync.read`). Present = on: the sync loop
    * imports stream heads, and the returned `streamSyncRead` answers reads.
-   * Without `files`, state is in memory and rebuilt by a full listing on
-   * each start.
+   * Without `files`, the reader uses the writer home when available;
+   * otherwise it uses memory and rebuilds on each start. An `overlay` needs
+   * `files`: caller files never acknowledge, so the reader cannot acknowledge
+   * into a source it does not own.
    */
   streamSyncRead?: {
     readonly files?: StreamSyncReadFiles;
-    readonly overlay?: StreamSyncOverlaySource;
+    readonly overlay?: StreamSyncOverlaySnapshotSource;
   };
 }
 
@@ -201,6 +221,49 @@ export function createPsLiteSyncCursor(
       await stateStore.set<PsLiteSyncCursorState>(SYNC_CURSOR_KEY, {
         lastProcessedTimestamp: timestamp,
       });
+    },
+  };
+}
+
+const MAX_CORRUPT_COPIES = 3;
+const CORRUPT_INDEX_KEY = "upload-attempts-v1.corrupt-index";
+
+/**
+ * Upload-attempt markers in the same durable state store as the sync cursor,
+ * so a WebView or manager rebuild keeps the interrupted-attempt count. The
+ * single-owner lock is named by the backing store (`namespace`, from the
+ * store or the host), never by the wrapper object: managers over the same
+ * store exclude each other, managers over different stores do not. Browser
+ * locks are shared by every tab of the origin; a runtime without them
+ * excludes only within this JS realm.
+ */
+export function createPsLiteUploadAttemptStore(
+  stateStore: PsLiteStateStore,
+  options: { namespace?: string } = {},
+): UploadAttemptStore {
+  const namespace = options.namespace ?? stateStore.namespace;
+  if (!namespace)
+    throw new Error(
+      "Upload attempt markers need a namespace: the host must name the backing store",
+    );
+  return {
+    namespace: `${namespace}/${UPLOAD_ATTEMPTS_KEY}`,
+    crossRealmLock: true,
+    read() {
+      return stateStore.get<unknown>(UPLOAD_ATTEMPTS_KEY);
+    },
+    async write(envelope) {
+      await stateStore.set(UPLOAD_ATTEMPTS_KEY, envelope);
+    },
+    async preserveCorrupt(value, stamp) {
+      const kept = [
+        ...((await stateStore.get<string[]>(CORRUPT_INDEX_KEY)) ?? []),
+        stamp,
+      ];
+      await stateStore.set(`${UPLOAD_ATTEMPTS_KEY}.corrupt-${stamp}`, value);
+      await stateStore.set(CORRUPT_INDEX_KEY, kept.slice(-MAX_CORRUPT_COPIES));
+      for (const old of kept.slice(0, -MAX_CORRUPT_COPIES))
+        await stateStore.delete(`${UPLOAD_ATTEMPTS_KEY}.corrupt-${old}`);
     },
   };
 }
@@ -349,7 +412,13 @@ export async function createPsLiteSyncManager(
   }
   const masterKey = deriveMasterKey(options.ownerSignature);
   const gateway =
-    options.gateway ?? createGatewayClient(options.config.gateway.url);
+    options.gateway ??
+    withCancellableRegistration(
+      createGatewayClient(options.config.gateway.url),
+      options.config.gateway.url,
+    );
+  const uploadAttemptNamespace =
+    options.uploadAttemptNamespace ?? options.stateStore.namespace;
   const storageAdapter = createVanaSyncStorageAdapter({
     config: options.config,
     serverOwner,
@@ -411,6 +480,11 @@ export async function createPsLiteSyncManager(
       : undefined;
   const cursor = createPsLiteSyncCursor(options.stateStore);
   const logger = createBrowserLogger(options.logger);
+  if (!uploadAttemptNamespace)
+    logger.warn(
+      {},
+      "State store names no backing store; upload crash protection is kept in memory",
+    );
   const dataPointFeed =
     options.dataPointFeed ??
     createGatewayDataPointFeed({
@@ -453,18 +527,6 @@ export async function createPsLiteSyncManager(
       },
     }),
   );
-  const streamSyncRead = options.streamSyncRead
-    ? await StreamSyncReadService.open({
-        files:
-          options.streamSyncRead.files ?? createMemoryStreamSyncReadFiles(),
-        blobs: createStorageBlobReader(storageAdapter),
-        keys: await createStreamSyncReadKeys(masterKey),
-        logger: logger as never,
-        ...(options.streamSyncRead.overlay
-          ? { overlay: options.streamSyncRead.overlay }
-          : {}),
-      })
-    : undefined;
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
@@ -492,98 +554,160 @@ export async function createPsLiteSyncManager(
       "Stream sync is off in this instance: its storage is held by another instance, or Web Locks are unavailable",
     );
   }
-  const streamSyncWriter = streamSyncHome
-    ? new StreamSyncWriter({
-        ownerAddress: serverOwner,
-        registry: createGatewayStreamSyncRegistry({
-          gatewayUrl: options.config.gateway.url,
+  // The home (and its Web Lock) belongs to this function until the manager
+  // is returned. A failure before that must release it, or a retry in this
+  // browser context cannot acquire the home and writes stay off until reload.
+  let syncManager!: ReturnType<typeof createSyncManager>;
+  try {
+    const streamSyncWriter = streamSyncHome
+      ? new StreamSyncWriter({
           ownerAddress: serverOwner,
-        }),
-        blobs: createStorageStreamSyncBlobs(storageAdapter),
-        home: streamSyncHome.home,
-        keys: createStreamSyncKeyPorts(options.ownerSignature),
+          registry: createGatewayStreamSyncRegistry({
+            gatewayUrl: options.config.gateway.url,
+            ownerAddress: serverOwner,
+          }),
+          blobs: createStorageStreamSyncBlobs(storageAdapter),
+          home: streamSyncHome.home,
+          keys: createStreamSyncKeyPorts(options.ownerSignature),
+          signer,
+        })
+      : null;
+    // A caller overlay is the caller's own source. The writer-home cache would
+    // acknowledge installs into it, so a caller overlay must come with caller
+    // files, which never acknowledge.
+    if (options.streamSyncRead?.overlay && !options.streamSyncRead.files) {
+      throw new Error(
+        "streamSyncRead.overlay needs streamSyncRead.files: the writer-home read cache only acknowledges into the writer's own overlay",
+      );
+    }
+    // Opened after the writer: the writer's own publications overlay this
+    // reader. The writer-home cache is durable, so the reader acknowledges what
+    // it installs and the writer can reclaim its spool. Caller-supplied files
+    // stay non-durable (no acknowledgment) because their durability is unknown.
+    const readKeys = options.streamSyncRead
+      ? await createStreamSyncReadKeys(masterKey)
+      : undefined;
+    const streamSyncRead = options.streamSyncRead
+      ? await StreamSyncReadService.open({
+          files:
+            options.streamSyncRead.files ??
+            (streamSyncHome
+              ? createStreamSyncReadCacheFiles(
+                  streamSyncHome.home.files,
+                  readKeys!.keyCheck,
+                )
+              : createMemoryStreamSyncReadFiles()),
+          blobs: createStorageBlobReader(storageAdapter),
+          keys: readKeys!,
+          logger: logger as never,
+          durable: !options.streamSyncRead.files && Boolean(streamSyncHome),
+          ...(options.streamSyncRead.overlay
+            ? { overlay: options.streamSyncRead.overlay }
+            : streamSyncWriter
+              ? { overlay: createWriterOverlaySource(streamSyncWriter) }
+              : {}),
+        })
+      : undefined;
+    const streamSyncIntake = streamSyncWriter
+      ? createStreamSyncIntake({
+          writer: streamSyncWriter,
+          resolveArtifact: options.streamSyncDeclarations ?? (() => null),
+        })
+      : null;
+    syncManager = createSyncManager(
+      {
+        additions,
+        storage: options.storage,
+        storageAdapter,
+        gateway,
         signer,
-      })
-    : null;
-  const streamSyncIntake = streamSyncWriter
-    ? createStreamSyncIntake({
-        writer: streamSyncWriter,
-        resolveArtifact: options.streamSyncDeclarations ?? (() => null),
-      })
-    : null;
-  const syncManager = createSyncManager(
-    {
-      additions,
-      storage: options.storage,
-      storageAdapter,
-      gateway,
-      signer,
-      masterKey,
-      serverOwner,
-      logger: logger as never,
-      lineageGateway: options.lineageGateway,
-      dataPointFeed,
-      scopeDeletions,
-    },
-    {
-      storage: options.storage,
-      storageAdapter,
-      gateway,
-      cursor,
-      masterKey,
-      serverOwner,
-      logger: logger as never,
-      diagnostics: downloadDiagnostics,
-      dataPointFeed,
-      scopeDeletions,
-      onDataPointIndexed: options.onDataPointIndexed,
-      streamSync: streamSyncRead,
-    },
-    {
-      streamSync: streamSyncWriter
-        ? { write: true, publisher: streamSyncWriter }
-        : null,
-      deleteData,
-      pendingBlobDeletions,
-      tombstoneFinality,
-      async canSync() {
-        if (options.ownerSyncSigner) return { ok: true };
-        try {
-          const serverInfo = await gateway.getServer(
-            options.serverAccount.address,
-          );
-          if (serverInfo?.id) return { ok: true };
-          return {
-            ok: false,
-            reason: "unregistered",
-            message: "Register this Personal Server before syncing.",
-          };
-        } catch (err) {
-          logger.warn(
-            { error: err instanceof Error ? err.message : String(err) },
-            "Could not verify server registration for sync",
-          );
-          return {
-            ok: false,
-            reason: "registration_check_failed",
-            message: "Could not verify server registration before syncing.",
-          };
-        }
+        masterKey,
+        serverOwner,
+        logger: logger as never,
+        lineageGateway: options.lineageGateway,
+        dataPointFeed,
+        scopeDeletions,
       },
-    },
-  );
-  if (options.autoStartSync !== false) syncManager.start();
-  return {
-    syncManager,
-    additions,
-    serverOwner,
-    dataPointFeed,
-    scopeDeletions,
-    streamSyncWriter,
-    closeStreamSync: async () => {
+      {
+        storage: options.storage,
+        storageAdapter,
+        gateway,
+        cursor,
+        masterKey,
+        serverOwner,
+        logger: logger as never,
+        diagnostics: downloadDiagnostics,
+        dataPointFeed,
+        scopeDeletions,
+        onDataPointIndexed: options.onDataPointIndexed,
+        streamSync: streamSyncRead,
+      },
+      {
+        streamSync: streamSyncWriter
+          ? { write: true, publisher: streamSyncWriter }
+          : null,
+        deleteData,
+        pendingBlobDeletions,
+        uploadAttemptStore: uploadAttemptNamespace
+          ? createPsLiteUploadAttemptStore(options.stateStore, {
+              namespace: uploadAttemptNamespace,
+            })
+          : undefined,
+        tombstoneFinality,
+        async canSync() {
+          if (options.ownerSyncSigner) return { ok: true };
+          try {
+            const serverInfo = await gateway.getServer(
+              options.serverAccount.address,
+            );
+            if (serverInfo?.id) return { ok: true };
+            return {
+              ok: false,
+              reason: "unregistered",
+              message: "Register this Personal Server before syncing.",
+            };
+          } catch (err) {
+            logger.warn(
+              { error: err instanceof Error ? err.message : String(err) },
+              "Could not verify server registration for sync",
+            );
+            return {
+              ok: false,
+              reason: "registration_check_failed",
+              message: "Could not verify server registration before syncing.",
+            };
+          }
+        },
+      },
+    );
+    if (options.autoStartSync !== false) syncManager.start();
+    return {
+      syncManager,
+      additions,
+      serverOwner,
+      dataPointFeed,
+      scopeDeletions,
+      streamSyncWriter,
+      closeStreamSync: async () => {
+        await streamSyncHome?.close();
+      },
+      streamSyncIntake,
+      streamSyncRead,
+    };
+  } catch (error) {
+    try {
       await streamSyncHome?.close();
-    },
-    streamSyncIntake,
-    streamSyncRead,
-  };
+    } catch (closeError) {
+      logger.warn(
+        {
+          error:
+            closeError instanceof Error
+              ? closeError.message
+              : String(closeError),
+        },
+        "Could not release stream sync storage after a failed start",
+      );
+    }
+    throw error;
+  }
 }

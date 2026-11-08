@@ -88,6 +88,7 @@ export interface LineageGatewayPort {
    */
   registerDataPoint(
     params: RegisterDataPointWithLineageParams,
+    options?: { signal?: AbortSignal },
   ): Promise<RegisterDataPointWithLineageResult>;
 }
 
@@ -336,8 +337,9 @@ export function createGatewayLineageClient(
       return { ok: true, data, proof };
     },
 
-    async registerDataPoint(params) {
+    async registerDataPoint(params, callOptions) {
       const res = await doFetch(`${base}/v1/data`, {
+        ...(callOptions?.signal ? { signal: callOptions.signal } : {}),
         method: "POST",
         headers: {
           "Content-Type": "application/json",

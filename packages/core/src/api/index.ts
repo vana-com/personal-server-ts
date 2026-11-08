@@ -97,9 +97,11 @@ import {
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
 import type {
+  OwnerNotes,
   ReadDecision,
   ResolveInput,
   StreamSyncReadStatus,
+  WithheldRun,
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
@@ -615,8 +617,43 @@ async function supersedeAfterCommit(
   }
 }
 
-function contractErrorResponse(err: DataContractError): Response {
-  return jsonResponse(err.body, { status: err.status });
+function contractErrorResponse(
+  err: DataContractError,
+  notes?: OwnerNotes,
+): Response {
+  return jsonResponse(withOwnerBody(err.body, notes), {
+    status: err.status,
+    headers: ownerNoteHeaders(notes),
+  });
+}
+
+/** What only the owner is told when the existing path answers a stream read. */
+function ownerNoteHeaders(
+  notes: OwnerNotes | undefined,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (notes?.withheld?.length) {
+    headers["X-Stream-Sync-Withheld"] = withheldReasons(notes.withheld);
+  }
+  if (notes?.pending) {
+    headers["X-Stream-Sync-Pending"] = String(notes.pending.runs);
+  }
+  if (notes?.awaitingImport) {
+    headers["X-Stream-Sync-Awaiting-Import"] = String(
+      notes.awaitingImport.runs,
+    );
+  }
+  if (notes?.notReflected) {
+    headers["X-Stream-Sync-Not-Reflected"] = String(notes.notReflected.streams);
+  }
+  return headers;
+}
+
+function withOwnerBody<T extends object>(
+  body: T,
+  notes: OwnerNotes | undefined,
+): T | (T & { withheld: readonly WithheldRun[] }) {
+  return notes?.withheld?.length ? { ...body, withheld: notes.withheld } : body;
 }
 
 function protocolErrorResponse(err: ProtocolError): Response {
@@ -627,16 +664,20 @@ function errorResponse(
   status: JsonStatus,
   errorCode: string,
   message: string,
+  notes?: OwnerNotes,
 ): Response {
   return jsonResponse(
-    {
-      error: {
-        code: status,
-        errorCode,
-        message,
+    withOwnerBody(
+      {
+        error: {
+          code: status,
+          errorCode,
+          message,
+        },
       },
-    },
-    { status },
+      notes,
+    ),
+    { status, headers: ownerNoteHeaders(notes) },
   );
 }
 
@@ -649,6 +690,7 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
             404,
             "CONNECTION_NOT_FOUND",
             "No connection of this name's connector matches the connection parameter",
+            decision,
           )
         : null;
     case "key_mismatch":
@@ -662,6 +704,20 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
         409,
         "CURSOR_STALE",
         "The cursor names a version this server no longer holds; read again without it",
+      );
+    case "busy":
+      return jsonResponse(
+        {
+          error: {
+            code: 503,
+            errorCode: "STREAM_SYNC_READ_BUSY",
+            message: "This data is changing; read again shortly",
+          },
+        },
+        {
+          status: 503,
+          headers: { "Retry-After": String(decision.retryAfterSeconds) },
+        },
       );
     case "invalid_cursor":
       return errorResponse(400, "INVALID_CURSOR", "cursor is not valid");
@@ -695,7 +751,7 @@ async function serveStreamSyncView(
     authResult: Awaited<
       ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
     >;
-    decision: Extract<ReadDecision, { kind: "view" }>;
+    decision: Extract<ReadDecision, { kind: "view" | "local_pending" }>;
     paymentResponseHeader: string | undefined;
   },
 ): Promise<Response> {
@@ -748,11 +804,27 @@ async function serveStreamSyncView(
       "Transfer-Encoding": "chunked",
       "X-Vana-Data-Source": "stream-sync",
       "X-Stream-Sync-Cursor": decision.cursor,
+      // An owner-only view built on this device; it may be partial.
+      ...(decision.kind === "local_pending"
+        ? {
+            "X-Stream-Sync-Origin": "local-pending",
+            "X-Stream-Sync-Complete": String(decision.complete),
+          }
+        : {}),
+      // Owner only: the service attaches this to no other audience.
+      ...(decision.withheld?.length
+        ? { "X-Stream-Sync-Withheld": withheldReasons(decision.withheld) }
+        : {}),
       ...(input.paymentResponseHeader
         ? { "X-PAYMENT-RESPONSE": input.paymentResponseHeader }
         : {}),
     },
   });
+}
+
+/** The distinct reasons of the withheld runs, for the response header. */
+function withheldReasons(withheld: readonly WithheldRun[]): string {
+  return [...new Set(withheld.map((w) => w.reason))].join(",");
 }
 
 function methodNotAllowed(): Response {
@@ -2587,51 +2659,79 @@ export async function handlePersonalServerDataRequest(
       // legacy history, but a deleted connector serves nothing at all.
       const latestRead =
         fileIdParam === undefined && atParam === undefined && view === null;
+      // What only the owner is told when the existing path answers a stream
+      // read: local runs the writer will not publish.
+      let ownerNotes: OwnerNotes | undefined;
       if (deps.streamSyncRead) {
         const decision = await deps.streamSyncRead.resolve({
           scope: scopeResult.scope,
           connection: latestRead ? url.searchParams.get("connection") : null,
           cursor: latestRead ? url.searchParams.get("cursor") : null,
           legacyFile: Boolean(selectedEntry) || latest?.kind === "canonical",
+          isOwnerView: isOwnerView(authResult),
         });
         if (decision.kind === "unavailable" && decision.reason === "deleted") {
           throw new DataDeletedError({ scope: scopeResult.scope });
         }
         if (latestRead) {
+          if (
+            decision.kind === "pass" ||
+            decision.kind === "legacy" ||
+            decision.kind === "unavailable"
+          ) {
+            ownerNotes = decision;
+          }
           const refusal = streamSyncRefusal(decision);
           if (refusal) return refusal;
+          if (decision.kind === "local_pending") {
+            // Owner-only and unregistered: nothing to bill and no version to
+            // bind in an access record.
+            notifyDataRead(deps, { scope: scopeResult.scope });
+            return serveStreamSyncView(deps, request, {
+              scope: scopeResult.scope,
+              grantId,
+              authResult,
+              decision,
+              paymentResponseHeader: undefined,
+            });
+          }
           if (decision.kind === "view") {
             notifyDataRead(deps, { scope: scopeResult.scope });
             // The same charge as a file read; the access record binds the
             // stream head the view serves.
             let paymentResponseHeader: string | undefined;
-            const ownApp = await ownAppReadStatus(deps, authResult);
-            if (ownApp instanceof Response) {
-              await decision.body.cancel();
-              return ownApp;
-            }
-            const charge = readCharge(
-              deps,
-              scopeResult.scope,
-              authResult,
-              ownApp,
-            );
-            if (charge) {
-              let paid: Awaited<ReturnType<typeof payForRead>>;
-              try {
-                paid = await payForRead(deps, request, charge, {
-                  scope: scopeResult.scope,
-                  servedEntry: decision.served,
-                });
-              } catch (error) {
+            // An owner-only view with no registered head has nothing to
+            // charge against: the service serves it to the owner alone.
+            if (decision.served !== null) {
+              const served = decision.served;
+              const ownApp = await ownAppReadStatus(deps, authResult);
+              if (ownApp instanceof Response) {
                 await decision.body.cancel();
-                throw error;
+                return ownApp;
               }
-              if (paid.kind === "refused") {
-                await decision.body.cancel();
-                return paid.response;
+              const charge = readCharge(
+                deps,
+                scopeResult.scope,
+                authResult,
+                ownApp,
+              );
+              if (charge) {
+                let paid: Awaited<ReturnType<typeof payForRead>>;
+                try {
+                  paid = await payForRead(deps, request, charge, {
+                    scope: scopeResult.scope,
+                    servedEntry: served,
+                  });
+                } catch (error) {
+                  await decision.body.cancel();
+                  throw error;
+                }
+                if (paid.kind === "refused") {
+                  await decision.body.cancel();
+                  return paid.response;
+                }
+                paymentResponseHeader = paid.paymentResponseHeader;
               }
-              paymentResponseHeader = paid.paymentResponseHeader;
             }
             return serveStreamSyncView(deps, request, {
               scope: scopeResult.scope,
@@ -2705,7 +2805,7 @@ export async function handlePersonalServerDataRequest(
         paymentResponseHeader = paid.paymentResponseHeader;
       }
 
-      const headers: Record<string, string> = {};
+      const headers = ownerNoteHeaders(ownerNotes);
       if (ownApp) headers["X-Vana-Payment-Exemption"] = "own-app";
       headers["X-Vana-Data-Source"] =
         latest?.kind === "canonical" ? "canonical" : "legacy";
@@ -2729,7 +2829,7 @@ export async function handlePersonalServerDataRequest(
             // 404, when that is why.
             await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
           }
-          return contractErrorResponse(result);
+          return contractErrorResponse(result, ownerNotes);
         }
         envelope = result.envelope;
         servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
@@ -2811,7 +2911,9 @@ export async function handlePersonalServerDataRequest(
         });
         return response;
       }
-      const response = jsonResponse(servedEnvelope, { headers });
+      const response = jsonResponse(withOwnerBody(servedEnvelope, ownerNotes), {
+        headers,
+      });
       reportReadFulfillment();
       return response;
     }

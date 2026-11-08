@@ -76,6 +76,7 @@ import {
   createInventoryTombstoneFinality,
   createScopeDeletionTracker,
   createSyncManager,
+  withCancellableRegistration,
   type PdppImporter,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -85,6 +86,7 @@ import {
   resolveVanaStorageEndpoint,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
+import { createFileUploadAttemptStore } from "./upload-attempts.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
@@ -128,6 +130,7 @@ import {
 import { createSqliteQuestionStore } from "./storage/question-store.js";
 import {
   StreamSyncWriter,
+  createWriterOverlaySource,
   createStreamSyncIntake,
   type StreamSyncIntake,
   createGatewayStreamSyncRegistry,
@@ -306,6 +309,7 @@ export async function createServer(
     storageRoot,
     "pending-blob-deletions.json",
   );
+  const uploadAttemptsPath = join(storageRoot, "upload-attempts.json");
   const tokensPath = join(storageRoot, "tokens.json");
   const revisionJournalDir = join(storageRoot, "cas-revisions");
   const metadataSentinelPath = join(storageRoot, "cas-metadata-initialized");
@@ -831,7 +835,11 @@ export async function createServer(
       additions,
       storage: rawDataStorage,
       storageAdapter,
-      gateway: gatewayClient,
+      // An injected client is a test double or a host's own; only the default
+      // SDK client needs wrapping to take the attempt signal.
+      gateway: options?.gatewayClient
+        ? gatewayClient
+        : withCancellableRegistration(gatewayClient, config.gateway.url),
       signer: serverSigner,
       masterKey,
       serverOwner,
@@ -839,38 +847,6 @@ export async function createServer(
       lineageGateway,
       dataPointFeed,
       scopeDeletions,
-    };
-
-    if (config.streamSync.read) {
-      streamSyncRead = await StreamSyncReadService.open({
-        files: await createFsStreamSyncReadFiles(
-          join(storageRoot, "stream-sync-read"),
-        ),
-        blobs: createStorageBlobReader(storageAdapter),
-        keys: await createStreamSyncReadKeys(masterKey),
-        logger,
-      });
-    }
-
-    const downloadDeps = {
-      streamSync: streamSyncRead,
-      storage: rawDataStorage,
-      storageAdapter,
-      gateway: gatewayClient,
-      cursor,
-      masterKey,
-      serverOwner,
-      logger,
-      dataPointFeed,
-      scopeDeletions,
-      onDataPointIndexed: (event: {
-        scope: string;
-        lineageSources?: string[];
-      }) =>
-        derivativeScheduler.markSourceChanged(event.scope, {
-          lineageSources: event.lineageSources,
-        }),
-      pdppImporter,
     };
 
     // Durable deletion: gateway tombstone signed with the same server
@@ -964,6 +940,44 @@ export async function createServer(
       }
     }
 
+    // The read service opens after the writer, so an owner's own publications
+    // can overlay its reads and the reader can acknowledge what it installed.
+    if (config.streamSync.read) {
+      streamSyncRead = await StreamSyncReadService.open({
+        files: await createFsStreamSyncReadFiles(
+          join(storageRoot, "stream-sync-read"),
+        ),
+        blobs: createStorageBlobReader(storageAdapter),
+        keys: await createStreamSyncReadKeys(masterKey),
+        logger,
+        durable: true,
+        ...(streamSyncWriter
+          ? { overlay: createWriterOverlaySource(streamSyncWriter) }
+          : {}),
+      });
+    }
+
+    const downloadDeps = {
+      streamSync: streamSyncRead,
+      storage: rawDataStorage,
+      storageAdapter,
+      gateway: gatewayClient,
+      cursor,
+      masterKey,
+      serverOwner,
+      logger,
+      dataPointFeed,
+      scopeDeletions,
+      onDataPointIndexed: (event: {
+        scope: string;
+        lineageSources?: string[];
+      }) =>
+        derivativeScheduler.markSourceChanged(event.scope, {
+          lineageSources: event.lineageSources,
+        }),
+      pdppImporter,
+    };
+
     syncManager = createSyncManager(uploadDeps, downloadDeps, {
       streamSync: streamSyncWriter
         ? { write: true, publisher: streamSyncWriter }
@@ -971,6 +985,7 @@ export async function createServer(
       deleteData,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
+      uploadAttemptStore: createFileUploadAttemptStore(uploadAttemptsPath),
       tombstoneFinality,
       transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {

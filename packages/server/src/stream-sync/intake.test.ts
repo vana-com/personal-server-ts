@@ -18,7 +18,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   OWNER,
+  activateControl,
   createOracleEnv,
+  deleteConnection,
   artifactFor,
   finishedOutcome,
   fixedSeed,
@@ -1690,3 +1692,64 @@ describe(
     });
   },
 );
+
+describe("run intake of a stopped connection (review P2-3, P2-4, P3-3)", () => {
+  it("answers a scheduled begin of a deleted connection with connection_stopped (409), not an unmapped error", async () => {
+    const c = freshConnector("p2-3-stopped");
+    await activateControl(env.registry, c, "");
+    await deleteConnection(env.registry, c, "", []);
+    const h = await host();
+    const error = await fails(h.intake.begin("p2-3-sched", begin(c)));
+    expect(error.code).toBe("connection_stopped");
+    expect(error.status).toBe(409);
+  });
+
+  it("refuses a scheduled full refresh (wantFull) of a deleted connection: wantFull is not an explicit connect", async () => {
+    const c = freshConnector("p2-4-wantfull");
+    await activateControl(env.registry, c, "");
+    await deleteConnection(env.registry, c, "", []);
+    const h = await host();
+    const error = await fails(
+      h.intake.begin("p2-4-full", begin(c, { wantFull: true })),
+    );
+    expect(error.code).toBe("connection_stopped");
+  });
+
+  it("an explicit connect (connect: true) of a deleted connection is accepted and reconnects it", async () => {
+    const c = freshConnector("p2-4-connect");
+    await activateControl(env.registry, c, "");
+    await deleteConnection(env.registry, c, "", []);
+    const h = await host();
+    const response = await h.intake.begin(
+      "p2-4-connect-run",
+      begin(c, { wantFull: true, connect: true } as Partial<BeginRequest>),
+    );
+    expect(response.status).toBe("collecting");
+  });
+
+  it("a scheduled begin while the control listing is unreachable still refuses a connection this device saw deleted", async () => {
+    const c = freshConnector("p3-3-offline");
+    const device = await env.writer("p3-3-device");
+    await activateControl(env.registry, c, "");
+    await device.refreshControls();
+    await device.deleteConnection(c); // persisted: deleted is observed
+    let down = true;
+    const inner = env.newRegistry();
+    const offline = await host(
+      {
+        registry: {
+          ...inner,
+          listControlRows: async () => {
+            if (down) throw new Error("registry unreachable");
+            return inner.listControlRows();
+          },
+        },
+      },
+      {},
+      "p3-3-device",
+    );
+    const error = await fails(offline.intake.begin("p3-3-sched", begin(c)));
+    expect(error.code).toBe("connection_stopped");
+    down = false;
+  });
+});
