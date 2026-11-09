@@ -19,6 +19,8 @@ import { uploadAll } from "../workers/upload.js";
 import { downloadAll } from "../workers/download.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { createSyncManager } from "./sync-manager.js";
+import { entityKeySets } from "../../storage/legacy-entity-key-sets.js";
+import type { RetireLegacyOption } from "../workers/retire-legacy.js";
 
 const logger = () =>
   ({
@@ -28,10 +30,15 @@ const logger = () =>
     debug: vi.fn(),
   }) as unknown as Logger;
 
+/** Local legacy bodies by `scope@collectedAt`; every entry below is one version. */
+const BODY = { activities: [{ id: "a" }] };
+
 function rig() {
   const storage = {
     findUnsynced: () => [],
     listScopes: () => ({ total: 0, scopes: [] }),
+    listVersions: (scope: string) => [{ id: "1", scope, collectedAt: T0 }],
+    readEnvelope: async () => ({ data: BODY }),
   } as unknown as DataStoragePort;
   const upload = {
     storage,
@@ -68,9 +75,27 @@ function predicates() {
     .mock.calls.at(-1)?.[2]?.skipScope;
   return { upload, requeue };
 }
-const entry = (scope: string) => ({ scope }) as IndexEntry;
+const T0 = "2026-11-01T00:00:00.000Z";
+const entry = (scope: string) =>
+  ({ id: "1", scope, collectedAt: T0 }) as IndexEntry;
 
-const CARRIED = "instagram.profile"; // a legacy binding the stream carries
+/** The retire inputs a host gives; only the owner view matters to the gate. */
+function retireWith(
+  view: (scope: string) => ReturnType<typeof entityKeySets> | Promise<null>,
+): () => RetireLegacyOption {
+  return () => ({
+    coverage: () => ({ kind: "skip", reason: "incomplete" }),
+    viewKeys: async () => null,
+    ownerViewKeys: async (scope) => view(scope),
+    switchedAt: undefined,
+  });
+}
+const holdsA = retireWith((scope) => entityKeySets(scope, BODY));
+const holdsNothing = retireWith((scope) =>
+  entityKeySets(scope, { activities: [] }),
+);
+
+const CARRIED = "strava.activities"; // a legacy binding the stream carries
 const MEMORY = "memory.notes.0"; // agent memory: legacy path only
 const REPLICA = "pdpp_replica_v1.items"; // replica transport: legacy path only
 
@@ -82,16 +107,16 @@ describe("sync manager: legacy is read-only history after the switch", () => {
     const h = hostSwitch({ on: true });
     const manager = createSyncManager(r.upload, r.download, {
       streamSync: h.streamSync,
+      retireLegacy: holdsA,
     });
     await manager.trigger();
     const { upload, requeue } = predicates();
-    expect(upload?.(entry(CARRIED))).toBe(true);
-    expect(upload?.(entry("pdpp.acme.items"))).toBe(true);
-    expect(upload?.(entry(MEMORY))).toBe(false);
-    expect(upload?.(entry(REPLICA))).toBe(false);
-    expect(requeue?.(CARRIED)).toBe(true);
-    expect(requeue?.(MEMORY)).toBe(false);
-    expect(requeue?.(REPLICA)).toBe(false);
+    expect(await upload?.(entry(CARRIED))).toBe(true);
+    expect(await upload?.(entry(MEMORY))).toBe(false);
+    expect(await upload?.(entry(REPLICA))).toBe(false);
+    expect(await requeue?.(CARRIED)).toBe(true);
+    expect(await requeue?.(MEMORY)).toBe(false);
+    expect(await requeue?.(REPLICA)).toBe(false);
     expect(h.publish).toHaveBeenCalledTimes(1);
     expect(downloadAll).toHaveBeenCalledTimes(1);
   });
@@ -101,12 +126,13 @@ describe("sync manager: legacy is read-only history after the switch", () => {
     const h = hostSwitch({ on: false });
     const manager = createSyncManager(r.upload, r.download, {
       streamSync: h.streamSync,
+      retireLegacy: holdsA,
     });
     await manager.trigger();
     const { upload, requeue } = predicates();
     for (const scope of [CARRIED, MEMORY, REPLICA]) {
-      expect(upload?.(entry(scope))).toBe(false);
-      expect(requeue?.(scope)).toBe(false);
+      expect(await upload?.(entry(scope))).toBe(false);
+      expect(await requeue?.(scope)).toBe(false);
     }
     expect(h.publish).not.toHaveBeenCalled();
   });
@@ -116,8 +142,8 @@ describe("sync manager: legacy is read-only history after the switch", () => {
     const manager = createSyncManager(r.upload, r.download, {});
     await manager.trigger();
     const { upload, requeue } = predicates();
-    expect(upload?.(entry(CARRIED)) ?? false).toBe(false);
-    expect(requeue?.(CARRIED) ?? false).toBe(false);
+    expect((await upload?.(entry(CARRIED))) ?? false).toBe(false);
+    expect((await requeue?.(CARRIED)) ?? false).toBe(false);
   });
 
   it("switched off mid-run: the next cycle uploads stream-carried scopes again", async () => {
@@ -126,12 +152,13 @@ describe("sync manager: legacy is read-only history after the switch", () => {
     const h = hostSwitch(state);
     const manager = createSyncManager(r.upload, r.download, {
       streamSync: h.streamSync,
+      retireLegacy: holdsA,
     });
     await manager.trigger();
-    expect(predicates().upload?.(entry(CARRIED))).toBe(true);
+    expect(await predicates().upload?.(entry(CARRIED))).toBe(true);
     state.on = false;
     await manager.trigger();
-    expect(predicates().upload?.(entry(CARRIED))).toBe(false);
+    expect(await predicates().upload?.(entry(CARRIED))).toBe(false);
     expect(h.publish).toHaveBeenCalledTimes(1);
   });
 
@@ -141,12 +168,13 @@ describe("sync manager: legacy is read-only history after the switch", () => {
     const h = hostSwitch(state);
     const manager = createSyncManager(r.upload, r.download, {
       streamSync: h.streamSync,
+      retireLegacy: holdsA,
     });
     await manager.trigger();
     const { upload } = predicates();
-    expect(upload?.(entry(CARRIED))).toBe(true);
+    expect(await upload?.(entry(CARRIED))).toBe(true);
     state.on = false;
-    expect(upload?.(entry(CARRIED))).toBe(false);
+    expect(await upload?.(entry(CARRIED))).toBe(false);
   });
 
   it("a failing publish is reported", async () => {
@@ -168,12 +196,42 @@ describe("sync manager: legacy is read-only history after the switch", () => {
     const manager = createSyncManager(r.upload, r.download, {
       streamSync: {
         ...h.streamSync,
-        carries: (scope) => scope === "only.this",
+        carries: (scope) => scope === CARRIED,
       },
+      retireLegacy: holdsA,
     });
     await manager.trigger();
     const { upload } = predicates();
-    expect(upload?.(entry("only.this"))).toBe(true);
-    expect(upload?.(entry(CARRIED))).toBe(false);
+    expect(await upload?.(entry(CARRIED))).toBe(true);
+    expect(await upload?.(entry("instagram.profile"))).toBe(false);
+  });
+
+  // Mutant killed: gate on `carries` alone (skip every carried scope). A run
+  // the writer discarded or refused is in no view; its legacy file is the
+  // only copy, so it must keep uploading.
+  it("a carried scope whose data the stream does not hold keeps uploading and requeuing", async () => {
+    const r = rig();
+    const h = hostSwitch({ on: true });
+    const manager = createSyncManager(r.upload, r.download, {
+      streamSync: h.streamSync,
+      retireLegacy: holdsNothing,
+    });
+    await manager.trigger();
+    const { upload, requeue } = predicates();
+    expect(await upload?.(entry(CARRIED))).toBe(false);
+    expect(await requeue?.(CARRIED)).toBe(false);
+  });
+
+  it("a view that cannot be read, or a host with no reader, keeps uploading", async () => {
+    for (const retireLegacy of [retireWith(async () => null), undefined]) {
+      const r = rig();
+      const h = hostSwitch({ on: true });
+      const manager = createSyncManager(r.upload, r.download, {
+        streamSync: h.streamSync,
+        ...(retireLegacy ? { retireLegacy } : {}),
+      });
+      await manager.trigger();
+      expect(await predicates().upload?.(entry(CARRIED))).toBe(false);
+    }
   });
 });

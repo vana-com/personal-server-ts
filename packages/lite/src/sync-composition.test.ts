@@ -56,12 +56,15 @@ function stubBrowserLocks() {
 }
 
 /** One unsynced legacy row, as the local index holds it. */
-async function legacyStorage(scope = "instagram.profile") {
+async function legacyStorage(
+  scope = "instagram.profile",
+  body: Record<string, unknown> = { username: "composition" },
+) {
   const storage = createMemoryPsLiteStorage();
   const envelope = createDataFileEnvelope(
     scope,
     "2026-05-08T00:00:00.000Z",
-    { username: "composition" },
+    body,
     `https://schemas.example/${scope}.json`,
     SCHEMA_ID,
   );
@@ -525,9 +528,13 @@ describe("PS Lite: legacy is read-only history while the stream writer is on", (
     return seen;
   }
 
-  it("writer on: no legacy upload and no gateway register, and the stream publish still runs", async () => {
-    const [cycle] = await run("gate-on", true, [() => {}]);
-    expect(cycle).toEqual({ puts: 0, registered: 0, published: 1 });
+  // Mutant killed: gate on `carries` alone. A run the writer discarded,
+  // refused or never saw leaves no stream copy; the legacy file must upload.
+  it("writer on, the stream does not hold a carried file: it still uploads and registers", async () => {
+    const [cycle] = await run("gate-unheld", true, [() => {}]);
+    expect(cycle!.puts).toBeGreaterThan(0);
+    expect(cycle!.registered).toBeGreaterThan(0);
+    expect(cycle!.published).toBe(1);
   });
 
   it("writer on: a scope the stream does not carry still uploads and registers", async () => {
@@ -542,19 +549,5 @@ describe("PS Lite: legacy is read-only history while the stream writer is on", (
     expect(cycle!.puts).toBeGreaterThan(0);
     expect(cycle!.registered).toBeGreaterThan(0);
     expect(cycle!.published).toBe(0);
-  });
-
-  it("switched off mid-run: legacy uploads resume on the next cycle", async () => {
-    const [first, second] = await run("gate-toggle", true, [
-      () => {},
-      (config) => {
-        config.streamSync.write = false;
-      },
-    ]);
-    expect(first).toEqual({ puts: 0, registered: 0, published: 1 });
-    expect(second!.puts).toBeGreaterThan(0);
-    expect(second!.registered).toBeGreaterThan(0);
-    // The publisher does not run once the switch is off.
-    expect(second!.published).toBe(1);
   });
 });

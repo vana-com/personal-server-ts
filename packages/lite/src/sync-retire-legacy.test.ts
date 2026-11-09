@@ -280,4 +280,38 @@ describe("PS Lite: retire legacy scopes after the switch (real reader and writer
     expect(scopesOf(o.storage)).toEqual([OTHER]);
     await o.lite.syncManager.stop();
   });
+
+  describe("the legacy upload gate (real reader and writer)", () => {
+    const failedUploads = (o: Awaited<ReturnType<typeof switched>>) =>
+      o.lite.syncManager
+        .getStatus()
+        .errors.filter((e) => e.message.startsWith("Upload failed for"))
+        .map((e) => e.scope);
+
+    it("the stream holds every key of the file: no legacy upload is attempted once its head is imported", async () => {
+      // A switch time before the files, so nothing retires and the files stay.
+      const o = await switched({
+        ...ON,
+        switchedAt: "2026-10-01T00:00:00.000Z",
+      });
+      // The first cycle imports the head (after its upload step).
+      await cycle(o);
+      const before = failedUploads(o).filter((s) => s === SCOPE).length;
+      await cycle(o);
+      const after = failedUploads(o).filter((s) => s === SCOPE).length;
+      expect(after).toBe(before);
+      await o.lite.syncManager.stop();
+    });
+
+    // Mutant killed: gate on `carries` alone (skip every carried scope).
+    it("the stream lacks a key of the file: it still uploads as legacy", async () => {
+      const o = await switched(
+        { ...ON, switchedAt: "2026-10-01T00:00:00.000Z" },
+        { localIds: ["a", "b"], viewIds: ["a"] },
+      );
+      await cycle(o);
+      expect(failedUploads(o)).toContain(SCOPE);
+      await o.lite.syncManager.stop();
+    });
+  });
 });

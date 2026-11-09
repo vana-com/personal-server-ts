@@ -285,6 +285,38 @@ async function retireWith(
 }
 
 describe("membership against the real reader", () => {
+  // Mutant killed: `viewKeys` reading as the owner. A key held only by this
+  // device's unpublished run is on no other device; counting it would let the
+  // remote legacy copy be deleted while the only stream copy is local.
+  it("a key held only by an unpublished local run does not count; the owner view shows it", async () => {
+    const { f, service } = await stravaView(922, ["a"]);
+    const runFor = async (connector: string, profileKey: string | null) => ({
+      runId: `local-${connector}`,
+      ns: await f.key.ns(connector, "account-1"),
+      generation: 1,
+      streams: [
+        {
+          name: "activities",
+          rows: [{ o: 9e12, r: `local-${connector}`, v: activityRow("z") }],
+          ...(profileKey ? { profileKey, version: "2.0.0" } : {}),
+        },
+      ],
+    });
+    // The fake overlay serves one connector: the browser connector's head is
+    // the one the owner view is read from (registered last).
+    f.overlay.connector = CONNECTOR;
+    f.overlay.runs = [await runFor(CONNECTOR, CONNECTOR)];
+    expect(await service.ownerViewKeys(SCOPE)).toEqual(
+      entityKeySets(SCOPE, body(["a", "z"])),
+    );
+    expect(await service.viewKeys(SCOPE)).toEqual(
+      entityKeySets(SCOPE, body(["a"])),
+    );
+    const { result, deleted } = await retireWith(service, ["a", "z"]);
+    expect(deleted).toEqual([]);
+    expect(result.skipped.notInView).toBe(1);
+  });
+
   it("viewKeys returns the keys the served view holds", async () => {
     const { service } = await stravaView(920, ["a", "c"]);
     expect(await service.viewKeys(SCOPE)).toEqual(

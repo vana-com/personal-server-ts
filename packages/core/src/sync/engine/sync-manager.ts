@@ -1,3 +1,5 @@
+import type { IndexEntry } from "../../storage/index/types.js";
+import type { EntityKeySets } from "../../storage/legacy-entity-key-sets.js";
 import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
@@ -14,6 +16,8 @@ import { downloadAll, downloadScopes } from "../workers/download.js";
 import {
   countsOnlyLogger,
   errorClass,
+  localKeysHeld,
+  localRows,
   retireLegacyScopes,
   type RetireLegacyOption,
 } from "../workers/retire-legacy.js";
@@ -249,6 +253,7 @@ export function createSyncManager(
     cycleInFlight = exclusive(async () => {
       do {
         rerunRequested = false;
+        ownerViews.clear();
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
@@ -288,7 +293,13 @@ export function createSyncManager(
                 lostDataPointRetryScopes ?? undefined,
                 // Requeueing re-registers legacy files with the gateway: not
                 // for scopes the stream carries once the writer is on.
-                { skipScope: legacyUploadOff },
+                {
+                  skipScope: (scope) =>
+                    legacyUploadOff(
+                      scope,
+                      localRows(uploadDeps.storage, scope),
+                    ),
+                },
               );
               lostDataPointRetryScopes = failed;
             } catch (err) {
@@ -391,15 +402,39 @@ export function createSyncManager(
       });
   }
 
+  /** Owner views read this cycle, per scope (cleared at each cycle start). */
+  const ownerViews = new Map<string, Promise<EntityKeySets | null>>();
+  /** Scopes the last retire pass found not held, keyed by what it read. */
+  const notHeldMemo = new Map<string, string>();
+
   /**
-   * Whether a legacy upload of `scope` is off: the account has switched
-   * (read live from the host) and the stream carries the scope.
+   * Whether a legacy upload of `scope` is off: the account has switched (read
+   * live from the host), the stream carries the scope, and the stream holds
+   * every key of `rows` as the owner reads it (published, or pending in this
+   * device's writer). Data the writer never took (a discarded or refused run,
+   * a withheld one) is not in that view, so it keeps uploading as legacy; so
+   * does any file whose keys cannot be read.
    */
-  function legacyUploadOff(scope: string): boolean {
-    return (
-      options?.streamSync?.write === true &&
-      (options.streamSync.carries ?? defaultCarries)(scope)
-    );
+  async function legacyUploadOff(
+    scope: string,
+    rows: readonly IndexEntry[],
+  ): Promise<boolean> {
+    if (
+      options?.streamSync?.write !== true ||
+      !(options.streamSync.carries ?? defaultCarries)(scope)
+    ) {
+      return false;
+    }
+    const read = options.retireLegacy?.()?.ownerViewKeys;
+    if (!read) return false;
+    let pending = ownerViews.get(scope);
+    if (!pending) {
+      pending = read(scope).catch(() => null);
+      ownerViews.set(scope, pending);
+    }
+    const view = await pending;
+    if (!view) return false;
+    return localKeysHeld(uploadDeps.storage, scope, rows, view);
   }
 
   async function runUploadCycle(): Promise<void> {
@@ -459,7 +494,7 @@ export function createSyncManager(
     try {
       const uploadResults = await uploadAll(workerUploadDeps, {
         batchSize: uploadBatchSize,
-        skipEntry: (entry) => legacyUploadOff(entry.scope),
+        skipEntry: (entry) => legacyUploadOff(entry.scope, [entry]),
         onError(entry, error) {
           pushError({
             fileId: entry.fileId,
@@ -524,6 +559,10 @@ export function createSyncManager(
         switchedAt: retire.switchedAt,
         coverage: (scope) => retire.coverage(scope),
         viewKeys: (scope) => retire.viewKeys(scope),
+        ...(retire.viewRevision
+          ? { viewRevision: (scope: string) => retire.viewRevision!(scope) }
+          : {}),
+        notHeldMemo,
         // Turning the switch off mid-pass stops the next delete.
         stillOn: () => options.retireLegacy?.() != null,
         async registeredAt(scope) {

@@ -147,6 +147,8 @@ interface RunOptions {
   switchedAt?: string | undefined;
   registeredAt?: (scope: string) => Promise<string | null>;
   viewKeys?: (scope: string) => Promise<EntityKeySets | null>;
+  viewRevision?: (scope: string) => string;
+  notHeldMemo?: Map<string, string>;
   stillOn?: () => boolean;
   log?: ReturnType<typeof logger>;
 }
@@ -160,6 +162,8 @@ function run(w: ReturnType<typeof world>, o: RunOptions = {}) {
     registeredAt: o.registeredAt ?? (async () => BEFORE),
     viewKeys: o.viewKeys ?? (async (scope) => viewOf(scope, ["a"])),
     ...(o.stillOn ? { stillOn: o.stillOn } : {}),
+    ...(o.viewRevision ? { viewRevision: o.viewRevision } : {}),
+    ...(o.notHeldMemo ? { notHeldMemo: o.notHeldMemo } : {}),
     deleteScope: (scope) =>
       deleteScope(
         {
@@ -402,26 +406,130 @@ describe("retireLegacyScopes", () => {
       }
     });
 
-    it("only the newest local version is compared; an older one holding extra keys is history", async () => {
+    /** Several local versions of one scope, each with its own key list. */
+    function versioned(
+      w: ReturnType<typeof world>,
+      scope: string,
+      byTime: Record<string, readonly string[]>,
+    ) {
+      const rows = Object.keys(byTime).map((collectedAt, i) =>
+        entryFor(scope, { collectedAt, id: i + 1 } as Partial<Row>),
+      );
+      w.storage.listVersions = (() => rows) as never;
+      w.storage.readEnvelope = (async (_s: string, at: string) => ({
+        data: keyedBody(scope, byTime[at]!),
+      })) as never;
+      return rows;
+    }
+
+    // Mutant killed: compare only the newest local version. A windowed
+    // connector drops old keys from later versions; the delete removes all.
+    it("every local version must be held: an older version's key the view lacks keeps the scope", async () => {
       const w = world(["github.events"]);
-      const versions = [
-        entryFor("github.events", { collectedAt: BEFORE }),
-        entryFor("github.events", { collectedAt: "2026-10-01T00:00:00.000Z" }),
-      ];
-      w.storage.listVersions = (() => versions) as never;
-      const reads: string[] = [];
-      w.storage.readEnvelope = (async (_scope: string, at: string) => {
-        reads.push(at);
-        return {
-          data: keyedBody(
-            "github.events",
-            at === BEFORE ? ["a"] : ["a", "old"],
-          ),
-        };
-      }) as never;
-      const result = await run(w);
-      expect(reads).toEqual([BEFORE]);
+      versioned(w, "github.events", {
+        "2026-10-01T00:00:00.000Z": ["a", "b", "c"],
+        "2026-10-15T00:00:00.000Z": ["c", "d"],
+      });
+      const result = await run(w, {
+        viewKeys: async (s) => viewOf(s, ["c", "d"]),
+      });
+      expect(result.deleted).toBe(0);
+      expect(result.skipped.notInView).toBe(1);
+      expect(w.tombstones).toEqual([]);
+      expect([...w.local]).toEqual(["github.events"]);
+    });
+
+    it("every local version held: the scope retires", async () => {
+      const w = world(["github.events"]);
+      versioned(w, "github.events", {
+        "2026-10-01T00:00:00.000Z": ["a", "b", "c"],
+        "2026-10-15T00:00:00.000Z": ["c", "d"],
+      });
+      const result = await run(w, {
+        viewKeys: async (s) => viewOf(s, ["a", "b", "c", "d"]),
+      });
       expect(result.deleted).toBe(1);
+    });
+  });
+
+  describe("a file that lands while the checks run", () => {
+    // Mutant killed: no listing right before the delete. The delete erases
+    // every version it lists, so a version added during the view read was
+    // never checked.
+    it("is not erased unchecked: the scope waits for the next cycle", async () => {
+      const w = world(["github.events"]);
+      const rows = [entryFor("github.events", { id: 1 } as Partial<Row>)];
+      w.storage.listVersions = (() => rows) as never;
+      const result = await run(w, {
+        viewKeys: async (s) => {
+          // A new version lands (another path writes it) during the read.
+          rows.push(
+            entryFor("github.events", {
+              id: 2,
+              collectedAt: "2026-11-02T00:00:00.000Z",
+            } as Partial<Row>),
+          );
+          return viewOf(s, ["a"]);
+        },
+      });
+      expect(result.deleted).toBe(0);
+      expect(w.tombstones).toEqual([]);
+      // The next cycle checks both versions and retires.
+      const next = await run(w, { viewKeys: async (s) => viewOf(s, ["a"]) });
+      expect(next.deleted).toBe(1);
+    });
+  });
+
+  describe("a scope that never retires is not re-read each cycle", () => {
+    // Mutant killed: no memo (or a token that ignores the view revision or
+    // the local versions).
+    it("recomputes only when the view revision or the local versions change", async () => {
+      const w = world(["github.events"]);
+      const rows = [entryFor("github.events", { id: 1 } as Partial<Row>)];
+      w.storage.listVersions = (() => rows) as never;
+      let reads = 0;
+      w.storage.readEnvelope = (async () => {
+        reads += 1;
+        return { data: keyedBody("github.events", ["a", "b"]) };
+      }) as never;
+      const viewKeys = vi.fn(async (s: string) => viewOf(s, ["a"]));
+      let revision = "r1";
+      const memo = new Map<string, string>();
+      const go = () =>
+        run(w, { viewKeys, viewRevision: () => revision, notHeldMemo: memo });
+      expect((await go()).skipped.notInView).toBe(1);
+      expect((await go()).skipped.notInView).toBe(1);
+      expect(reads).toBe(1);
+      expect(viewKeys).toHaveBeenCalledTimes(1);
+      revision = "r2"; // the view changed
+      await go();
+      expect(reads).toBe(2);
+      rows.push(
+        entryFor("github.events", {
+          id: 2,
+          collectedAt: "2026-11-02T00:00:00.000Z",
+        } as Partial<Row>),
+      ); // a new local version
+      await go();
+      expect(reads).toBe(3); // read again (stops at the first unheld version)
+    });
+
+    it("a transient view failure is not remembered", async () => {
+      const w = world(["github.events"]);
+      const memo = new Map<string, string>();
+      let fail = true;
+      const go = () =>
+        run(w, {
+          viewKeys: async (s) => {
+            if (fail) throw new Error("read failed");
+            return viewOf(s, ["a"]);
+          },
+          viewRevision: () => "r1",
+          notHeldMemo: memo,
+        });
+      expect((await go()).deleted).toBe(0);
+      fail = false;
+      expect((await go()).deleted).toBe(1);
     });
   });
 

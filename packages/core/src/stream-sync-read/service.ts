@@ -744,21 +744,26 @@ export class StreamSyncReadService {
   }
 
   /**
-   * The entity keys the served view of the legacy scope holds, read as the
-   * owner from the live imported heads (no unpublished local runs). `null`
+   * The entity keys the served view of the legacy scope holds, read from the
+   * live imported heads only: an unpublished local run does not count, since
+   * its rows are on no other device. With `asOwner`, the view the owner reads
+   * on this device, unpublished local runs included. `null`
    * when no complete view serves it, the body is not keyed, or the read
    * fails. The retire step compares a local legacy file's keys against this:
    * a complete head means the view can replace the file for reads, not that
    * it holds every record the file holds.
    */
-  async viewKeys(scope: string): Promise<EntityKeySets | null> {
+  async viewKeys(
+    scope: string,
+    asOwner = false,
+  ): Promise<EntityKeySets | null> {
     try {
       const decision = await this.resolve({
         scope,
         connection: null,
         cursor: null,
         legacyFile: true,
-        isOwnerView: true,
+        isOwnerView: asOwner,
       });
       if (decision.kind !== "view") return null;
       const parsed = JSON.parse(await new Response(decision.body).text()) as {
@@ -768,6 +773,18 @@ export class StreamSyncReadService {
     } catch {
       return null;
     }
+  }
+
+  /** Owner view keys (this device's unpublished runs count); see `viewKeys`. */
+  ownerViewKeys(scope: string): Promise<EntityKeySets | null> {
+    return this.viewKeys(scope, true);
+  }
+
+  /** Changes whenever an imported view of one of the scope's streams changes. */
+  viewRevision(scope: string): string {
+    return readTargets(scope)
+      .flatMap((t) => t.streams.map((s) => this.views.revision(t.connector, s)))
+      .join(",");
   }
 
   /** §2.10 inputs for connector c: every connection this server knows. */

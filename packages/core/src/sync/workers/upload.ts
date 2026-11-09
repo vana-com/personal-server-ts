@@ -142,7 +142,7 @@ export interface UploadAllOptions {
    * registration). The host uses it to stop legacy uploads of scopes a
    * stream carries once the account has switched.
    */
-  skipEntry?: (entry: IndexEntry) => boolean;
+  skipEntry?: (entry: IndexEntry) => boolean | Promise<boolean>;
   onError?: (entry: IndexEntry, error: Error) => void;
   /** Clock for the coalesced-scope quiet window. Defaults to the wall clock. */
   now?: () => Date;
@@ -714,7 +714,7 @@ export async function uploadAll(
     lastLookedAt = Number(entry.id);
     // The host left this entry alone: no read, upload or registration. It
     // stays unsynced, and the sweep moves past it.
-    if (options?.skipEntry?.(entry)) continue;
+    if (await options?.skipEntry?.(entry)) continue;
     const plan = plans.get(entry.scope);
     if (plan) {
       if (planned.has(entry.scope)) continue;

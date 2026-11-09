@@ -35,6 +35,14 @@ export interface RetireLegacyOption {
    * of the file, so deleting needs the keys.
    */
   viewKeys(scope: string): Promise<EntityKeySets | null>;
+  /**
+   * Like `viewKeys`, but as the owner reads: this device's unpublished local
+   * runs count. For the upload gate only, never for a delete: a key held only
+   * by an unpublished run is not yet on any other device.
+   */
+  ownerViewKeys?(scope: string): Promise<EntityKeySets | null>;
+  /** Changes whenever an imported view of the scope changes; keys a memo. */
+  viewRevision?(scope: string): string;
   /** ISO time the Account switch was last turned on; absent retires nothing. */
   switchedAt: string | undefined;
 }
@@ -52,6 +60,8 @@ export function liveRetireLegacy(input: {
     | {
         viewCoverage(scope: string): RetireCoverage;
         viewKeys(scope: string): Promise<EntityKeySets | null>;
+        ownerViewKeys?(scope: string): Promise<EntityKeySets | null>;
+        viewRevision?(scope: string): string;
       }
     | null
     | undefined;
@@ -64,6 +74,12 @@ export function liveRetireLegacy(input: {
     return {
       coverage: (scope) => reader.viewCoverage(scope),
       viewKeys: (scope) => reader.viewKeys(scope),
+      ...(reader.ownerViewKeys
+        ? { ownerViewKeys: (scope: string) => reader.ownerViewKeys!(scope) }
+        : {}),
+      ...(reader.viewRevision
+        ? { viewRevision: (scope: string) => reader.viewRevision!(scope) }
+        : {}),
       switchedAt: input.config.streamSync.switchedAt,
     };
   };
@@ -83,6 +99,14 @@ export interface RetireLegacyDeps {
   coverage(scope: string): RetireCoverage;
   /** The keys the served view holds for the scope; see `RetireLegacyOption`. */
   viewKeys(scope: string): Promise<EntityKeySets | null>;
+  /** Changes whenever an imported view of the scope changes. Absent: no memo. */
+  viewRevision?(scope: string): string;
+  /**
+   * Scopes found not held, keyed to the view revision and local versions that
+   * produced the answer. The caller keeps it across cycles so a scope that
+   * never retires is not re-read until its view or its files change.
+   */
+  notHeldMemo?: Map<string, string>;
   /**
    * Whether the switch is still on. Read before each scope's delete, so
    * turning it off mid-pass stops further deletes. Absent: always on.
@@ -149,7 +173,7 @@ function emptyResult(): RetireLegacyResult {
   };
 }
 
-function localRows(
+export function localRows(
   storage: Pick<DataStoragePort, "listVersions">,
   scope: string,
 ): IndexEntry[] {
@@ -235,12 +259,19 @@ export async function retireLegacyScopes(
       continue;
     }
     if (budget === 0) continue; // next cycle
-    if (!(await newestFileIsHeld(deps, scope, rows))) {
+    if (!(await versionsAreHeld(deps, scope, rows))) {
       result.skipped.notInView += 1;
       continue;
     }
     // The switch may have been turned off while this pass ran.
     if (deps.stillOn && !deps.stillOn()) break;
+    // Files can land while the checks above awaited. The delete erases every
+    // version it lists, so list again right here (no await before the delete
+    // lists them itself): a changed set was not all checked; next cycle.
+    if (fingerprint(localRows(deps.storage, scope)) !== fingerprint(rows)) {
+      result.skipped.notInView += 1;
+      continue;
+    }
     budget -= 1;
     try {
       const outcome = await deps.deleteScope(scope);
@@ -256,34 +287,65 @@ export async function retireLegacyScopes(
   return result;
 }
 
+/** Identity of a set of local versions: a new or replaced file changes it. */
+function fingerprint(rows: readonly IndexEntry[]): string {
+  return rows
+    .map((row) => `${row.id}|${row.collectedAt}`)
+    .sort()
+    .join(",");
+}
+
 /**
- * Membership: every entity key of the scope's newest local file is in the
- * served view. Unknown (no key table, unreadable file or view) is not held.
+ * Every entity key of every local version of the scope is in `view`. The
+ * delete removes all versions, so each one must be held, not only the newest
+ * (a connector that exposes a window drops old keys from later versions).
+ * Unknown (no key table, an unreadable file) is not held.
  */
-async function newestFileIsHeld(
-  deps: Pick<RetireLegacyDeps, "storage" | "viewKeys">,
+export async function localKeysHeld(
+  storage: Pick<DataStoragePort, "readEnvelope">,
+  scope: string,
+  rows: readonly IndexEntry[],
+  view: EntityKeySets,
+): Promise<boolean> {
+  for (const row of rows) {
+    let local: EntityKeySets | null;
+    try {
+      const envelope = await storage.readEnvelope(scope, row.collectedAt);
+      local = entityKeySets(scope, envelope.data);
+    } catch {
+      return false;
+    }
+    if (!local || !keysHeld(local, view)) return false;
+  }
+  return true;
+}
+
+async function versionsAreHeld(
+  deps: Pick<
+    RetireLegacyDeps,
+    "storage" | "viewKeys" | "viewRevision" | "notHeldMemo"
+  >,
   scope: string,
   rows: readonly IndexEntry[],
 ): Promise<boolean> {
   if (rows.length === 0) return true; // nothing local to lose
-  const newest = rows.reduce((a, b) =>
-    Date.parse(b.collectedAt) > Date.parse(a.collectedAt) ? b : a,
-  );
-  let local: EntityKeySets | null;
-  try {
-    const envelope = await deps.storage.readEnvelope(scope, newest.collectedAt);
-    local = entityKeySets(scope, envelope.data);
-  } catch {
-    return false;
-  }
-  if (!local) return false;
+  const revision = deps.viewRevision?.(scope);
+  const token =
+    revision === undefined ? null : `${revision}#${fingerprint(rows)}`;
+  if (token !== null && deps.notHeldMemo?.get(scope) === token) return false;
   let view: EntityKeySets | null;
   try {
     view = await deps.viewKeys(scope);
   } catch {
-    return false;
+    return false; // transient: not remembered
   }
-  return view !== null && keysHeld(local, view);
+  if (view === null) return false;
+  const held = await localKeysHeld(deps.storage, scope, rows, view);
+  if (token !== null && deps.notHeldMemo) {
+    if (held) deps.notHeldMemo.delete(scope);
+    else deps.notHeldMemo.set(scope, token);
+  }
+  return held;
 }
 
 const STATUS_VALUES = new Set(["ok", "skipped", "failed", "deferred"]);
