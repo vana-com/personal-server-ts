@@ -9,11 +9,20 @@
  * A local version is deleted only when ALL of these hold:
  *   1. the delete is enabled and this is not a dry run;
  *   2. this device's own import finished for every connector of the scope;
- *   3. a stored readback of exactly this version passed (see `readback.ts`);
+ *   3. a readback of exactly this version passed (see `readback.ts`), and a
+ *      FRESH readback taken in the same pass, immediately before the delete,
+ *      passes too: the published view can change after an earlier pass was
+ *      stored, so a stored pass never deletes on its own;
  *   4. when the readback relied on the delete fence, every target stream of
  *      the scope that has seen a delete has since been re-collected by a full
  *      run on this device (a record the fence dropped must not be retired
- *      before the device could collect it again).
+ *      before the device could collect it again). After a whole-source delete
+ *      the readback passes (the file predates the delete) but the file stays
+ *      until the source is reconnected and a full run commits.
+ *
+ * The registry must be an authority for the scope (`deleteBasis`): covered by
+ * live complete heads, or deleted whole, and not ambiguous. Otherwise the
+ * scope is skipped: neither fenced nor passed.
  *
  * Retire writes nothing to the gateway: no tombstone of the legacy name and
  * no remote blob delete. It erases only this device's checked local versions,
@@ -25,8 +34,16 @@ import type { DataStoragePort } from "../../ports/index.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import { isPhysicalScope } from "../../stream-sync/scope-routing.js";
 import { isGatewayReservedScope } from "../delete-data-port.js";
-import { readbackVersion, type ReadbackView } from "./readback.js";
-import { versionKey, type RetireLedger } from "./ledger.js";
+import {
+  readbackVersion,
+  type DeleteBasis,
+  type ReadbackView,
+} from "./readback.js";
+import {
+  versionKey,
+  type ReadbackRecord,
+  type RetireLedger,
+} from "./ledger.js";
 
 const PAGE_SIZE = 200;
 const VERSION_PAGE_SIZE = 500;
@@ -115,18 +132,15 @@ async function decide(
   deps: RetireDeps,
   scope: string,
   row: IndexEntry,
-  streams: readonly {
-    connector: string;
-    stream: string;
-    deleteVersion: number;
-  }[],
+  basis: DeleteBasis,
+  stored: ReadbackRecord | null,
 ): Promise<RetireFileReport> {
   const version = versionKey(row);
+  const { streams } = basis;
   let importDone = streams.length > 0;
   for (const connector of new Set(streams.map((s) => s.connector))) {
     if (!(await deps.host.importDone(connector))) importDone = false;
   }
-  const stored = await deps.ledger.readback(scope, version);
   const readback = stored === null ? "none" : stored.pass ? "pass" : "fail";
   const report = (decision: RetireDecision): RetireFileReport => ({
     scope,
@@ -155,13 +169,15 @@ async function decide(
 
 /**
  * One pass over the local legacy scopes: read back every version that has no
- * stored readback (or a failed one, since the stream may have caught up),
- * then, when enabled, delete the versions that are ready.
+ * passing readback, then, when enabled, delete the versions that are ready.
+ * A delete always follows a readback taken in this pass (see the header).
+ * A dry run reads every version back and marks what it stores as dry.
  */
 export async function retireLegacyFiles(
   deps: RetireDeps,
 ): Promise<RetireReport> {
   const mayDelete = deps.deleteEnabled && deps.dryRun !== true;
+  const dry = deps.dryRun === true;
   const mode = deps.dryRun
     ? "dry-run"
     : deps.deleteEnabled
@@ -169,31 +185,39 @@ export async function retireLegacyFiles(
       : "readback-only";
   const files: RetireFileReport[] = [];
   let deleted = 0;
+  const readbackDeps = {
+    storage: deps.storage,
+    view: deps.host,
+    ledger: deps.ledger,
+    dry,
+    ...(deps.now ? { now: deps.now } : {}),
+  };
   for (const scope of legacyScopes(deps.storage)) {
-    const streams = deps.host.streamDeletes(scope);
-    if (streams === null) continue; // no read target / listing not whole
+    const basis = deps.host.deleteBasis(scope);
+    if (basis === null) continue; // no authority, no read target or listing not whole
     const rows = localRows(deps.storage, scope);
     for (const row of rows) {
-      const stored = await deps.ledger.readback(scope, versionKey(row));
+      let record = await deps.ledger.readback(scope, versionKey(row));
       // Read back only once import is done: a readback before it would fail
       // for a reason the import is about to fix.
-      let importReady = streams.length > 0;
-      for (const connector of new Set(streams.map((s) => s.connector))) {
+      let importReady = basis.streams.length > 0;
+      for (const connector of new Set(basis.streams.map((s) => s.connector))) {
         if (!(await deps.host.importDone(connector))) importReady = false;
       }
-      if (importReady && (stored === null || !stored.pass)) {
-        await readbackVersion(
-          {
-            storage: deps.storage,
-            view: deps.host,
-            ledger: deps.ledger,
-            ...(deps.now ? { now: deps.now } : {}),
-          },
-          scope,
-          row,
-        );
+      if (importReady && (dry || record === null || !record.pass)) {
+        record = await readbackVersion(readbackDeps, scope, row);
       }
-      const report = await decide(deps, scope, row, streams);
+      let report = await decide(deps, scope, row, basis, record);
+      if (report.wouldDelete && mayDelete) {
+        // The stored pass may be stale: take the readback again now, and
+        // decide on that one. The basis is read again with it.
+        const fresh = await readbackVersion(readbackDeps, scope, row);
+        const freshBasis = deps.host.deleteBasis(scope);
+        report =
+          freshBasis === null
+            ? { ...report, decision: "no_readback", wouldDelete: false }
+            : await decide(deps, scope, row, freshBasis, fresh);
+      }
       files.push(report);
       if (!report.wouldDelete || !mayDelete) continue;
       const removed = await deps.storage.deleteVersion(scope, row.collectedAt, {
