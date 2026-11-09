@@ -43,7 +43,7 @@ describe("POST /v1/account-mode/evidence", () => {
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "account-mode-route-"));
     index = createIndexManager(initializeDatabase(":memory:"));
-    authority = createModeAuthority({ store: store(), bootId: "b" });
+    authority = createModeAuthority({ store: store() });
     await authority.ready;
     app = createApp({
       logger: pino({ level: "silent" }),
@@ -91,8 +91,6 @@ describe("POST /v1/account-mode/evidence", () => {
   const evidence = (state: string, extra: Record<string, unknown> = {}) => ({
     owner: owner.address,
     state,
-    fetchStartedAt: Date.now(),
-    rawStatus: 200,
     ...extra,
   });
 
@@ -121,40 +119,49 @@ describe("POST /v1/account-mode/evidence", () => {
   it("takes the first launch's explicit Off as the very first call, and legacy work proceeds", async () => {
     const res = await post(evidence("off"));
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({
-      decision: "legacy",
-      importRequired: false,
-    });
+    expect(await res.json()).toEqual({ decision: "legacy" });
     expect((await legacyWrite()).status).toBe(201);
   });
 
   it("takes the first launch's On and answers streams, then refuses a legacy write with 426", async () => {
     const res = await post(evidence("on"));
-    expect(await res.json()).toEqual({
-      decision: "streams",
-      importRequired: false,
-    });
+    expect(await res.json()).toEqual({ decision: "streams" });
     expect((await legacyWrite()).status).toBe(426);
   });
 
-  // refusal_http_status_code_matrix (the real module's two route refusals)
-  it("answers an Account answer that was unknown with 503, Retry-After and the refusal body", async () => {
-    for (const body of [
-      evidence("unknown", { rawStatus: 503 }),
-      evidence("unknown", { rawStatus: null }),
-      evidence("off", { rawStatus: 500 }),
-    ]) {
-      const res = await post(body);
-      expect(res.status).toBe(503);
-      expect(res.headers.get("retry-after")).toBe("5");
-      expect(await res.json()).toEqual({
-        decision: "refuse",
-        importRequired: false,
-        code: "ACCOUNT_MODE_UNKNOWN",
-        status: 503,
-      });
-    }
+  it("answers an unknown state with the decision and changes nothing", async () => {
+    const before = await post(evidence("unknown"));
+    expect(before.status).toBe(503);
+    expect(before.headers.get("retry-after")).toBe("5");
+    expect(await before.json()).toEqual({
+      decision: "refuse",
+      code: "ACCOUNT_MODE_UNKNOWN",
+      status: 503,
+    });
     expect((await legacyWrite()).status).toBe(503);
+    await post(evidence("off"));
+    expect((await (await post(evidence("unknown"))).json()).decision).toBe(
+      "legacy",
+    );
+  });
+
+  it("accepts and ignores the fetchStartedAt and rawStatus fields older hosts send", async () => {
+    const res = await post(
+      evidence("off", { fetchStartedAt: Date.now(), rawStatus: 200 }),
+    );
+    expect(await res.json()).toEqual({ decision: "legacy" });
+  });
+
+  it("keeps an Off with no expiry", async () => {
+    await post(evidence("off"));
+    const later = createModeAuthority({
+      store: createMemoryModeRecordStore([
+        ["x", { answer: "off", generation: 0, receivedAt: 1 }],
+      ]),
+      now: () => 1e15,
+    });
+    await later.ready;
+    expect(later.read("x").kind).toBe("legacy");
   });
 
   // OFF_AFTER_ON_LOWERS
@@ -179,10 +186,7 @@ describe("POST /v1/account-mode/evidence", () => {
     }
     const reset = await post(evidence("off", { generation: 4 }));
     expect(reset.status).toBe(200);
-    expect(await reset.json()).toEqual({
-      decision: "legacy",
-      importRequired: false,
-    });
+    expect(await reset.json()).toEqual({ decision: "legacy" });
     expect((await legacyWrite()).status).toBe(201);
   });
 
@@ -191,7 +195,7 @@ describe("POST /v1/account-mode/evidence", () => {
       const res = await post(evidence("on", { generation }));
       expect(res.status, JSON.stringify(generation)).toBe(400);
     }
-    expect(authority.snapshot().size).toBe(0);
+    expect(authority.read(owner.address).kind).toBe("refuse");
   });
 
   // OWNERLESS_READ_ANSWERS, CROSS_OWNER_READ_ANSWERS
@@ -206,19 +210,18 @@ describe("POST /v1/account-mode/evidence", () => {
       },
     });
     expect(authority.read(stranger.address).kind).toBe("refuse");
-    expect(authority.snapshot().size).toBe(0);
   });
 
   it("rejects a caller that is not the owner", async () => {
     const res = await post(evidence("on"), stranger);
     expect(res.status).toBe(401);
-    expect(authority.snapshot().size).toBe(0);
+    expect(authority.read(owner.address).kind).toBe("refuse");
   });
 
   it("rejects a call with no credentials", async () => {
     const res = await post(evidence("on"), null);
     expect(res.status).toBe(401);
-    expect(authority.snapshot().size).toBe(0);
+    expect(authority.read(owner.address).kind).toBe("refuse");
   });
 
   it("rejects a body that is not evidence with a 400", async () => {
@@ -226,116 +229,11 @@ describe("POST /v1/account-mode/evidence", () => {
       {},
       { owner: owner.address, state: "maybe" },
       { owner: 7, state: "on" },
-      { ...evidence("on"), rawStatus: "200" },
     ]) {
       const res = await post(body);
       expect(res.status, JSON.stringify(body)).toBe(400);
     }
-    expect(authority.snapshot().size).toBe(0);
-  });
-});
-
-describe("POST /v1/account-mode/import-done", () => {
-  let dir: string;
-  let index: IndexManager;
-  let authority: ModeAuthority;
-  let app: ReturnType<typeof createApp>;
-
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "account-mode-import-done-"));
-    index = createIndexManager(initializeDatabase(":memory:"));
-    authority = createModeAuthority({
-      store: createMemoryModeRecordStore(),
-      bootId: "b",
-      hasLegacyFiles: () => true,
-    });
-    await authority.ready;
-    app = createApp({
-      logger: pino({ level: "silent" }),
-      version: "0.0.1",
-      startedAt: new Date(),
-      indexManager: index,
-      hierarchyOptions: { dataDir: join(dir, "data") },
-      serverOrigin: ORIGIN,
-      serverOwner: owner.address,
-      gateway: {} as GatewayClient,
-      accessLogWriter: { write: async () => undefined },
-      accountModeAuthority: authority,
-    });
-  });
-  afterEach(async () => {
-    index.close();
-    await rm(dir, { recursive: true, force: true });
-  });
-
-  async function call(
-    path: string,
-    body: unknown,
-    wallet: ReturnType<typeof createTestWallet> = owner,
-  ) {
-    const text = JSON.stringify(body);
-    return app.request(path, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: await buildWeb3SignedHeader({
-          wallet,
-          aud: ORIGIN,
-          method: "POST",
-          uri: path,
-          body: new TextEncoder().encode(text),
-        }),
-      },
-      body: text,
-    });
-  }
-
-  const latchOn = () =>
-    call("/v1/account-mode/evidence", {
-      owner: owner.address,
-      state: "on",
-      fetchStartedAt: Date.now(),
-      rawStatus: 200,
-    });
-
-  it("keeps importRequired on every answer until the host reports the import done", async () => {
-    expect((await (await latchOn()).json()).importRequired).toBe(true);
-    expect((await (await latchOn()).json()).importRequired).toBe(true);
-    const done = await call("/v1/account-mode/import-done", {
-      owner: owner.address,
-    });
-    expect(await done.json()).toEqual({
-      decision: "streams",
-      importRequired: false,
-    });
-    expect((await (await latchOn()).json()).importRequired).toBe(false);
-  });
-
-  it("answers a caller that is not the owner with 401, and another owner's report with 403", async () => {
-    await latchOn();
-    const stranger401 = await call(
-      "/v1/account-mode/import-done",
-      { owner: owner.address },
-      stranger,
-    );
-    expect(stranger401.status).toBe(401);
-    const other = await call("/v1/account-mode/import-done", {
-      owner: stranger.address,
-    });
-    expect(other.status).toBe(403);
-    expect(JSON.stringify(await other.json())).not.toContain("decision");
-    // Neither closed the barrier.
-    expect(
-      await authority.commitStream(owner.address, "op", () => 1),
-    ).toMatchObject({
-      ok: false,
-      decision: { code: "IMPORT_PENDING" },
-    });
-  });
-
-  it("rejects a body without an owner with 400", async () => {
-    const res = await call("/v1/account-mode/import-done", {});
-    expect(res.status).toBe(400);
+    expect(authority.read(owner.address).kind).toBe("refuse");
   });
 });
 
@@ -406,13 +304,7 @@ describe("the app's mode comes from the module and nothing else", () => {
     expect(
       (await legacyWrite({ accountModeAuthority: authority })).status,
     ).toBe(201);
-    await authority.submitEvidence({
-      owner: owner.address,
-      authOwner: owner.address,
-      state: "on",
-      fetchStartedAt: Date.now(),
-      rawStatus: 200,
-    });
+    await authority.submitEvidence({ owner: owner.address, state: "on" });
     expect(
       (await legacyWrite({ accountModeAuthority: authority })).status,
     ).toBe(426);

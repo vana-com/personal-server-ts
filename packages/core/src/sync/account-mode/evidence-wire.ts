@@ -1,37 +1,26 @@
 /**
- * The wire shape hosts use to give the module an Account answer, and the shape
- * of the decision it returns. Host-neutral JSON: the same body is posted by the
- * Desktop and phone hosts and built in-process by Web.
+ * The wire shape hosts use to give the module an Account answer
+ * (POST /v1/account-mode/evidence), and the decision it returns. Host-neutral
+ * JSON: Desktop and phone post it, Web builds it in process.
  */
 
-import type { ModeDecision, ModeState } from "./mode-machine.js";
+import type { ModeEvidenceInput } from "./authority.js";
+import type { ModeDecision } from "./record.js";
 
-export interface EvidenceBody {
+export interface EvidenceBody extends ModeEvidenceInput {
   owner: string;
-  state: ModeState;
-  /** Epoch milliseconds, host clock, when the Account request started. */
-  fetchStartedAt: number;
-  /** HTTP status of the Account response, or null when there was none. */
-  rawStatus: number | null;
-  /**
-   * The Account generation of the answer: 0 for everyone, raised by one only
-   * by a Dev reset. Absent on the wire means 0. A non-negative integer.
-   */
-  generation?: number;
 }
 
 export interface DecisionBody {
   decision: ModeDecision["kind"];
-  importRequired: boolean;
-  /** Present when the decision is a refusal. */
-  code?: Extract<ModeDecision, { kind: "refuse" }>["code"];
+  code?: string;
   status?: 503 | 426;
 }
 
 /**
- * A body that does not parse is rejected by the route (400). A body that
- * parses but carries nothing usable becomes `state: "unknown"` so it changes
- * no state.
+ * `{owner, state: "on"|"off"|"unknown", generation?}`. Other fields hosts
+ * already send (fetchStartedAt, rawStatus) are accepted and ignored. Null when
+ * the value is not a body.
  */
 export function parseEvidenceBody(value: unknown): EvidenceBody | null {
   if (typeof value !== "object" || value === null) return null;
@@ -40,16 +29,6 @@ export function parseEvidenceBody(value: unknown): EvidenceBody | null {
   if (v.state !== "on" && v.state !== "off" && v.state !== "unknown") {
     return null;
   }
-  const rawStatus =
-    typeof v.rawStatus === "number" && Number.isInteger(v.rawStatus)
-      ? v.rawStatus
-      : v.rawStatus === null || v.rawStatus === undefined
-        ? null
-        : Number.NaN;
-  if (Number.isNaN(rawStatus)) return null;
-  const fetchStartedAt =
-    typeof v.fetchStartedAt === "number" ? v.fetchStartedAt : Number.NaN;
-  // Absent is 0; anything but a non-negative integer is not a body.
   if (
     v.generation !== undefined &&
     !(Number.isSafeInteger(v.generation) && (v.generation as number) >= 0)
@@ -59,8 +38,6 @@ export function parseEvidenceBody(value: unknown): EvidenceBody | null {
   return {
     owner: v.owner,
     state: v.state,
-    fetchStartedAt,
-    rawStatus,
     ...(v.generation === undefined
       ? {}
       : { generation: v.generation as number }),
@@ -68,17 +45,7 @@ export function parseEvidenceBody(value: unknown): EvidenceBody | null {
 }
 
 export function decisionBody(decision: ModeDecision): DecisionBody {
-  switch (decision.kind) {
-    case "streams":
-      return { decision: "streams", importRequired: decision.importRequired };
-    case "legacy":
-      return { decision: "legacy", importRequired: false };
-    case "refuse":
-      return {
-        decision: "refuse",
-        importRequired: false,
-        code: decision.code,
-        status: decision.status,
-      };
-  }
+  return decision.kind === "refuse"
+    ? { decision: "refuse", code: decision.code, status: decision.status }
+    : { decision: decision.kind };
 }

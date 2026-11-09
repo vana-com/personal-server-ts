@@ -2,37 +2,21 @@
  * Account-mode evidence from a host (the Account's answer, per owner).
  *
  *   POST /v1/account-mode/evidence
- *     body {owner, state: "on"|"off"|"unknown", fetchStartedAt, rawStatus}
- *     -> 200 {decision: "streams"|"legacy", importRequired}
- *     -> 503 | 426 {decision: "refuse", importRequired, code, status}
+ *     body {owner, state: "on"|"off"|"unknown", generation?}
+ *     -> 200 {decision: "streams"|"legacy"}
+ *     -> 503 | 426 {decision: "refuse", code, status}
  *
- * Only the owner may call it, and only about the owner. The caller is this
- * server's owner; a body that names any other owner is answered 403 with a
- * plain error body before the module is asked anything, so the answer says
- * nothing about whether another owner has a record. A host that has no answer
- * posts `state: "unknown"`, which changes nothing and returns the decision, so
- * it doubles as a read.
+ * Only the owner may call it, and only about the owner: a body that names any
+ * other owner is answered 403 before the module is asked anything. A host that
+ * has no answer posts `state: "unknown"`, which changes nothing and returns the
+ * decision, so it doubles as a read. Fields the first hosts also send
+ * (fetchStartedAt, rawStatus) are ignored. The HTTP status is the decision's
+ * own: 200 for streams and legacy, and 503 (retryable, `Retry-After: 5`)
+ * before the owner's first answer.
  *
- * The HTTP status is the decision's own status: 200 for streams and legacy,
- * and for a refusal the status in the body (503 retryable, with
- * `Retry-After: 5`; 426 not retryable). A client that only reads the status
- * code therefore never takes a refusal for success. The JSON decision body is
- * the same on every status. `importRequired` is true on every answer for an
- * owner whose first On was saved with legacy data present, until the host
- * reports the import done.
- *
- *   POST /v1/account-mode/import-done
- *     body {owner}
- *     -> the same answers as evidence
- *
- * The host calls it once it has imported its legacy data into streams. The
- * module saves the clean record before it opens stream writes (which are
- * refused with 503 IMPORT_PENDING until then). Idempotent: for an owner with
- * no pending import it changes nothing.
- *
- * Both paths take POST only (405 otherwise, with `Allow: POST`), a body of at
- * most 16 KiB (413 above it, whether sized or chunked), and a flat JSON object
- * of at most 8 plain values (400 otherwise).
+ * POST only (405 otherwise, with `Allow: POST`), a body of at most 16 KiB
+ * (413 above it), and a flat JSON object of at most 8 plain values (400
+ * otherwise).
  */
 
 import { Hono, type Context } from "hono";
@@ -139,7 +123,7 @@ export function accountModeRoutes(deps: AccountModeRouteDeps): Hono {
     return body;
   }
 
-  for (const path of ["/evidence", "/import-done"]) {
+  for (const path of ["/evidence"]) {
     app.use(path, createBodyLimit(MAX_BODY_BYTES));
   }
 
@@ -152,34 +136,14 @@ export function accountModeRoutes(deps: AccountModeRouteDeps): Hono {
       throw new ProtocolError(
         400,
         "INVALID_ACCOUNT_MODE_EVIDENCE",
-        "Body must be {owner, state, fetchStartedAt, rawStatus}",
+        "Body must be {owner, state, generation?}",
       );
     }
     // The caller is this server's owner and so is the body's owner.
-    return answer(
-      c,
-      await deps.accountModeAuthority.submitEvidence({
-        ...body,
-        authOwner: deps.serverOwner ?? "",
-      }),
-    );
+    return answer(c, await deps.accountModeAuthority.submitEvidence(body));
   });
 
-  app.post("/import-done", async (c) => {
-    await auth.authorizeOwner(c.req.raw);
-    const raw = await readBody(c);
-    if (typeof raw.owner !== "string") {
-      throw new ProtocolError(
-        400,
-        "INVALID_ACCOUNT_MODE_IMPORT_DONE",
-        "Body must be {owner}",
-      );
-    }
-    const owner = boundOwner(raw.owner);
-    return answer(c, await deps.accountModeAuthority.importDone(owner));
-  });
-
-  for (const path of ["/evidence", "/import-done"]) {
+  for (const path of ["/evidence"]) {
     app.all(path, (c) => {
       c.header("Allow", "POST");
       return c.json(

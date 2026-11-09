@@ -2,7 +2,7 @@
  * The account storage mode port: one answer, shared by the legacy write gate
  * and the read selector. Every test drives production code; none copies it.
  * The answer itself comes from the account-mode module
- * (`sync/account-mode`), which has its own vectors and tests.
+ * (`sync/account-mode`), which has its own tests.
  */
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -93,10 +93,8 @@ describe("accountStorageModeFor", () => {
 });
 
 describe("selectAccountStorageMode", () => {
-  // UNKNOWN_READS_LEGACY
-  it("refuses, never legacy, when no mode is wired", () => {
-    const selection = selectAccountStorageMode({});
-    expect(selection.kind).toBe("refuse");
+  it("keeps reads on the legacy path when no mode is wired", () => {
+    expect(selectAccountStorageMode({})).toEqual({ kind: "legacy" });
   });
 
   // UNSWITCHED_CHANGED
@@ -116,19 +114,12 @@ describe("selectAccountStorageMode", () => {
     ).toEqual({ kind: "streams" });
   });
 
-  // UNKNOWN_READS_LEGACY
-  it("refuses with a retryable 503 when the mode is unknown", async () => {
-    const selection = selectAccountStorageMode({
-      accountStorageMode: fixedOwnedAccountStorageMode("unknown"),
-    });
-    expect(selection.kind).toBe("refuse");
-    if (selection.kind !== "refuse") throw new Error("unreachable");
-    expect(selection.retryable).toBe(true);
-    expect(selection.reason).toBe("mode_unknown");
-    expect(selection.response.status).toBe(503);
-    expect(selection.response.headers.get("retry-after")).toBe("5");
-    const body = await selection.response.json();
-    expect(body.error.errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
+  it("keeps reads open before the owner's first answer", () => {
+    expect(
+      selectAccountStorageMode({
+        accountStorageMode: fixedOwnedAccountStorageMode("unknown"),
+      }),
+    ).toEqual({ kind: "legacy" });
   });
 
   // READER_PRESENCE_AS_MODE
@@ -142,7 +133,7 @@ describe("selectAccountStorageMode", () => {
     const noModeWithReader = selectAccountStorageMode({
       streamSyncRead: reader,
     } as never);
-    expect(noModeWithReader.kind).toBe("refuse");
+    expect(noModeWithReader.kind).toBe("legacy");
     expect(reader.resolve).not.toHaveBeenCalled();
   });
 });
@@ -156,8 +147,7 @@ describe("the write gate and the read selector share one answer", () => {
     "unswitched",
   ];
 
-  // GATE_AND_SELECTOR_DISAGREE
-  it("refuse a legacy write exactly when the selector refuses, through every value", async () => {
+  it("send a legacy write to streams only when switched, through every value", async () => {
     let current: AccountStorageModeValue = "unswitched";
     const deps = dataDeps({
       accountStorageMode: {
@@ -172,8 +162,8 @@ describe("the write gate and the read selector share one answer", () => {
       const expectedStatus =
         value === "switched" ? 426 : value === "unknown" ? 503 : 201;
       expect(write.status, `mode ${value}`).toBe(expectedStatus);
-      expect(selection === "legacy", `mode ${value}`).toBe(
-        value === "unswitched",
+      expect(selection === "streams", `mode ${value}`).toBe(
+        value === "switched",
       );
     }
   });
@@ -190,14 +180,13 @@ describe("the write gate and the read selector share one answer", () => {
     expect((await write.json()).error.errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
   });
 
-  // UNKNOWN_READS_LEGACY
-  it("refuses a legacy write when no mode is wired", async () => {
+  it("pauses a legacy write when no mode is wired", async () => {
     const write = await handlePersonalServerDataRequest(post(), dataDeps());
     expect(write.status).toBe(503);
   });
 
   // OWNERLESS_READ_ANSWERS
-  it("gives a runtime of another owner unknown at the gate and the selector alike", async () => {
+  it("gives a runtime of another owner a paused write and a legacy read", async () => {
     const authority = await authorityHearing(OWNER_A, "on");
     const deps = dataDeps({
       serverOwner: OWNER_B,
@@ -206,7 +195,7 @@ describe("the write gate and the read selector share one answer", () => {
         OWNER_B,
       ),
     });
-    expect(selectAccountStorageMode(deps).kind).toBe("refuse");
+    expect(selectAccountStorageMode(deps).kind).toBe("legacy");
     expect((await handlePersonalServerDataRequest(post(), deps)).status).toBe(
       503,
     );

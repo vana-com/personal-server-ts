@@ -303,7 +303,7 @@ describe("createServer", () => {
       await second.cleanup();
     });
 
-    it("does not carry an Off across a restart", async () => {
+    it("keeps an Off across a restart, with no new answer", async () => {
       const options = {
         serverDir: tempDir,
         dataDir: join(tempDir, "data"),
@@ -314,8 +314,6 @@ describe("createServer", () => {
       await first.cleanup();
 
       const second = await createServer(makeDefaultConfig(), options);
-      expect((await write(second)).status).toBe(503);
-      await declareAccountMode(second, "off");
       expect((await write(second)).status).toBe(201);
       await second.cleanup();
     });

@@ -17,10 +17,7 @@ export async function declareAccountMode(
   const owner = context.serverOwner ?? "";
   await context.accountModeAuthority.submitEvidence({
     owner,
-    authOwner: owner,
     state,
-    fetchStartedAt: Date.now(),
-    rawStatus: 200,
   });
 }
 

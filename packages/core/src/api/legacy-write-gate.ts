@@ -1,6 +1,6 @@
 /**
- * The one check that refuses a legacy-format write unless the account has a
- * fresh explicit Off.
+ * The one check that refuses a legacy-format write unless the account has
+ * answered Off.
  *
  * The gate reads the owner-bound `AccountStorageMode`, the same instance the
  * read selector reads, so it holds no state of its own. Three answers:
@@ -36,8 +36,8 @@ export const UPDATE_REQUIRED_MESSAGE =
 export type LegacyWriteMode = Pick<OwnedAccountStorageMode, "read">;
 
 /**
- * The one decision: whether a legacy write must be refused right now. Only a
- * fresh explicit Off lets it through.
+ * The one decision: whether a legacy write must be refused right now. Only an
+ * answered Off lets it through.
  */
 export function legacyWritesRefused(
   mode: LegacyWriteMode | undefined,

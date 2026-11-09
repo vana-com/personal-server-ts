@@ -8,11 +8,7 @@
     "declarationMap": true,
     "sourceMap": true
   },
-  "include": [
-    "src/**/*.ts",
-    "src/sync/account-mode/vectors.json",
-    "src/sync/account-mode/vectors.schema.json"
-  ],
+  "include": ["src/**/*.ts"],
   "exclude": [
     "src/**/*.test.ts",
     "src/legacy-projection/github-browser-parity-fixtures.ts",

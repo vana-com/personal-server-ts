@@ -24,17 +24,12 @@ import type {
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
+  createMemoryModeRecordStore,
   createModeAuthority,
-  legacyFlagEvidence,
   type ModeAuthority,
   type ModeRecordStore,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
-import {
-  createIndexedDbModeRecordStore,
-  createUnavailableModeRecordStore,
-  webLocksOwnerLock,
-  type AcquireOwnerLock,
-} from "./account-mode-store.js";
+import { createIndexedDbModeRecordStore } from "./account-mode-store.js";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import type { InferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
 import {
@@ -110,13 +105,6 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    * durable place (a native bundle) injects a store.
    */
   accountModeStore?: ModeRecordStore;
-  /**
-   * How the default IndexedDB records take their owner lock. Default: Web Locks
-   * (the claim fails closed in a context without them). A host with its own
-   * lock injects it; a host with its own store injects `accountModeStore`,
-   * which owns its locking.
-   */
-  acquireOwnerLock?: AcquireOwnerLock;
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible fetch client on `config.inference`; tests inject a
@@ -457,41 +445,20 @@ export async function createIndexedDbPsLiteRuntime(
         : {}),
     });
   // One mode, from one place: the account-mode module. Its records live in
-  // their own IndexedDB database, never in the data store, and load before the
-  // runtime serves anything.
+  // their own IndexedDB database, never in the data store. Boot does not wait
+  // for the Account: before the first answer reads stay legacy and legacy
+  // writes pause. A host that injects its own persistence has not offered
+  // browser IndexedDB, so without an `accountModeStore` the records are in
+  // memory and the Account's answer at the next launch restores them.
   const accountModeAuthority = createModeAuthority({
-    // A host that injects its own persistence has not offered browser
-    // IndexedDB, so the module does not open it either. Without a store from
-    // that host the module has no durable records and decides nothing: every
-    // answer is a retryable 503, never an in-memory store that forgets an On at
-    // the next boot. (A test passes a memory store as `accountModeStore`.)
     store:
       options.accountModeStore ??
       (options.persistence
-        ? createUnavailableModeRecordStore()
-        : createIndexedDbModeRecordStore(`${dbName}-account-mode`, {
-            acquireOwnerLock: options.acquireOwnerLock ?? webLocksOwnerLock(),
-          })),
-    bootId: crypto.randomUUID(),
-    // A first On reports an import when the legacy store holds any scope.
-    hasLegacyFiles: () => storage.listScopes({ limit: 1, offset: 0 }).total > 0,
+        ? createMemoryModeRecordStore()
+        : createIndexedDbModeRecordStore(`${dbName}-account-mode`)),
+    onWarning: (message, detail) => console.warn(message, detail),
   });
-  // A store that cannot be read does not stop the runtime: the module fails
-  // closed (every legacy read and write is refused with a retryable 503) and
-  // loads again on the next evidence.
-  await accountModeAuthority.ready
-    .then(() =>
-      // The old spawn-time flag is evidence of nothing: it can never mint Off.
-      accountModeAuthority.submitEvidence(
-        legacyFlagEvidence(config.streamSync, serverOwner ?? "", Date.now()),
-      ),
-    )
-    .catch((err: unknown) => {
-      console.warn(
-        "account mode records could not be loaded; refusing legacy work until they can",
-        err,
-      );
-    });
+  await accountModeAuthority.ready;
   const runtime = createPsLiteRuntime({
     ...options,
     accountModeAuthority,

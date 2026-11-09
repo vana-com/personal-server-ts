@@ -10,14 +10,12 @@
  * because there is one record. No consumer derives the mode from config.
  *
  * Three values:
- * - `switched`: the Account has said On for this owner at least once. One-way
- *   here: a later Off, an unknown answer or an expiry does not reopen legacy
- *   storage.
- * - `unswitched`: the Account recently said an explicit Off for this owner and
- *   has never said On. "Recently" is bounded (see `OFF_TTL_MS`).
- * - `unknown`: anything else, including an owner the module has never heard
- *   about and a caller that names no owner or another owner. Unknown refuses
- *   legacy reads and writes with a retryable 503; it is never permission.
+ * - `switched`: the Account has said On for this owner. Permanent: a later Off
+ *   at the same generation does not reopen legacy storage.
+ * - `unswitched`: the Account said Off and has never said On. No expiry.
+ * - `unknown`: no answer yet for this owner (a new owner, or another owner).
+ *   Reads stay on the legacy path and never wait; legacy writes pause with a
+ *   retryable 503 until the first answer. It is never permission to write.
  *
  * Reader presence is never the mode. Whether a stream reader is wired says what
  * this runtime can do; the mode says what the account has chosen.
@@ -65,27 +63,17 @@ export function accountStorageModeFor(
 export type StorageSelection =
   /** The account is switched: every read is answered from stream data only. */
   | { readonly kind: "streams" }
-  /** The account has a fresh explicit Off: reads behave as before the switch. */
-  | { readonly kind: "legacy" }
-  /**
-   * The mode cannot be established and nothing is latched. Never legacy: the
-   * caller answers `response` (503, retryable) and reads nothing.
-   */
-  | {
-      readonly kind: "refuse";
-      readonly reason: "mode_unknown";
-      readonly retryable: true;
-      readonly response: Response;
-    };
+  /** Off, or no answer yet: reads behave as before the switch. */
+  | { readonly kind: "legacy" };
 
 export const ACCOUNT_MODE_UNKNOWN_CODE = "ACCOUNT_MODE_UNKNOWN";
 export const ACCOUNT_MODE_UNKNOWN_STATUS = 503;
 export const ACCOUNT_MODE_RETRY_AFTER_SECONDS = 5;
 
-/** The retryable 503 for a request the module cannot place yet. */
+/** The retryable 503 a legacy write gets before the owner's first answer. */
 export function accountModeUnknownResponse(): Response {
   const message =
-    "This server cannot tell yet whether the account has moved to stream sync. Retry shortly.";
+    "This server has not heard from the account yet, so legacy writes are paused. Retry shortly.";
   return new Response(
     JSON.stringify({
       error: {
@@ -111,24 +99,14 @@ export interface StorageSelectionDeps {
 }
 
 /**
- * The one decision a read makes before it touches any store. Depends only on
- * the account mode; the presence of a stream reader plays no part.
+ * The one decision a read makes before it touches any store. Only a switched
+ * account reads streams; everything else, including an owner with no answer
+ * yet, reads as before. Depends only on the account mode.
  */
 export function selectAccountStorageMode(
   deps: StorageSelectionDeps,
 ): StorageSelection {
-  // No mode wired is unknown, never "behave as before the switch existed".
-  switch (deps.accountStorageMode?.read() ?? "unknown") {
-    case "switched":
-      return { kind: "streams" };
-    case "unswitched":
-      return { kind: "legacy" };
-    case "unknown":
-      return {
-        kind: "refuse",
-        reason: "mode_unknown",
-        retryable: true,
-        response: accountModeUnknownResponse(),
-      };
-  }
+  return deps.accountStorageMode?.read() === "switched"
+    ? { kind: "streams" }
+    : { kind: "legacy" };
 }

@@ -171,9 +171,9 @@ export interface PsLiteRuntimeOptions {
    * The account-mode module: the only source of the account's storage mode.
    * The legacy write gate, the data routes and the MCP engines read the port
    * derived from it, and no option supplies a mode separately. When wired, the
-   * owner-authenticated `POST /v1/account-mode/evidence` and
-   * `POST /v1/account-mode/import-done` routes answer and the host gives the
-   * module the Account's answers through them. Absent = unknown: every legacy
+   * owner-authenticated `POST /v1/account-mode/evidence`
+   * route answers and the host gives the module the Account's answers
+   * through it. Absent = unknown: every legacy
    * write answers a retryable 503.
    */
   accountModeAuthority?: ModeAuthority;
@@ -1368,45 +1368,13 @@ export function createPsLiteRuntime(
             return errorResponse(
               400,
               "INVALID_ACCOUNT_MODE_EVIDENCE",
-              "Body must be {owner, state, fetchStartedAt, rawStatus}",
+              "Body must be {owner, state, generation?}",
             );
           }
           // authorizeOwner succeeded, so the caller is this runtime's owner,
           // and so is the body's.
-          const decision = await options.accountModeAuthority.submitEvidence({
-            ...body,
-            authOwner: modeOwner() ?? "",
-          });
-          return decisionResponse(decision);
-        }
-
-        if (
-          url.pathname === "/v1/account-mode/import-done" &&
-          options.accountModeAuthority
-        ) {
-          if (request.method !== "POST") return modeMethodNotAllowed();
-          await auth.authorizeOwner(request);
-          const raw = await readModeBody(request);
-          const bad = modeBodyRefusal(
-            raw,
-            "INVALID_ACCOUNT_MODE_BODY",
-            "Body must be a flat JSON object",
-          );
-          if (bad) return bad;
-          const body = raw as Record<string, unknown>;
-          if (typeof body.owner !== "string") {
-            return errorResponse(
-              400,
-              "INVALID_ACCOUNT_MODE_IMPORT_DONE",
-              "Body must be {owner}",
-            );
-          }
-          // Another owner's import is not this caller's to report, and its mode
-          // is not this caller's to read: refused before the module is asked.
-          const mismatch = modeOwnerRefusal(body.owner);
-          if (mismatch) return mismatch;
           return decisionResponse(
-            await options.accountModeAuthority.importDone(body.owner),
+            await options.accountModeAuthority.submitEvidence(body),
           );
         }
 

@@ -40,9 +40,6 @@ import {
 import {
   accountStorageModeOf,
   createModeAuthority,
-  legacyFlagEvidence,
-  ModeStoreOwnedError,
-  normalizeOwner,
   type ModeAuthority,
   type ModeRecordStore,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
@@ -310,43 +307,18 @@ function resolveLocalApprovalPort(serverPort: number): number {
   return DEFAULT_LOCAL_APPROVAL_PORT;
 }
 
-/**
- * What a failed start must let go of. The account-mode authority holds the
- * record folder's kernel lock from the moment it is created, so a start that
- * throws after that must close it, or this process would keep the folder from
- * the next start.
- */
-interface StartupHolds {
-  accountModeAuthority?: ModeAuthority;
-  logger?: Logger;
-}
-
 export async function createServer(
   config: ServerConfig,
   options?: CreateServerOptions,
 ): Promise<ServerContext> {
-  const holds: StartupHolds = {};
-  try {
-    return await bootstrapServer(config, options, holds);
-  } catch (error) {
-    await holds.accountModeAuthority?.close().catch((closeError: unknown) => {
-      // The start error is the one to report.
-      (holds.logger ?? createLogger(config.logging)).warn(
-        { err: closeError },
-        "account mode records could not be released after a failed start",
-      );
-    });
-    throw error;
-  }
+  return bootstrapServer(config, options);
 }
 
 async function bootstrapServer(
   config: ServerConfig,
   options: CreateServerOptions | undefined,
-  holds: StartupHolds,
 ): Promise<ServerContext> {
   const logger = createLogger(config.logging);
-  holds.logger = logger;
   const startedAt = new Date();
   const isEnclave = options?.profile === "enclave";
   if (isEnclave && process.env.VANA_OWNER_PRIVATE_KEY) {
@@ -415,79 +387,33 @@ async function bootstrapServer(
     await fsyncDirectory(parent);
   }
 
-  // Ownership comes before any data step. Until this runtime owns the account
-  // mode records, it opens no index, migrates nothing, repairs nothing and
-  // starts no service: a runtime that another one owns stops here, with
-  // `ModeStoreOwnedError`, and has touched only the two directories above.
-  // The owner is derived first (a pure step); the key file is not read yet.
   const masterKeySignature =
     options?.ownerSignature ??
     (process.env.VANA_MASTER_KEY_SIGNATURE as `0x${string}` | undefined);
   const serverOwner: `0x${string}` | undefined = masterKeySignature
     ? await recoverOwnerAddress(masterKeySignature)
     : undefined;
-  // One mode per runtime, from one place: the shared account-mode module.
-  // The write gate, the read selector, the PDPP importer and every MCP engine
+  // One mode per runtime, from one place: the shared account-mode module. The
+  // write gate, the read selector, the PDPP importer and every MCP engine
   // consume the bound view of this one authority. Hosts feed it the Account's
   // answers through `POST /v1/account-mode/evidence` (or
-  // `context.accountModeAuthority`).
-  let legacyInventory: IndexManager | null = null;
+  // `context.accountModeAuthority`). Boot reads the saved records from disk and
+  // never waits for the Account.
   const accountModeAuthority = createModeAuthority({
     store:
       options?.accountModeStore ??
       createFileModeRecordStore(join(storageRoot, "account-mode"), {
-        onCorrupt: (file, reason) =>
-          logger.warn({ file, reason }, "account mode record moved aside"),
+        onCorrupt: (file) =>
+          logger.warn({ file }, "account mode record could not be read"),
       }),
-    bootId: randomUUID(),
-    // A first On reports an import when the legacy index holds anything. The
-    // index opens later: until it has been brought up to date, nothing is
-    // known to be absent, so the answer is "yes".
-    hasLegacyFiles: () =>
-      legacyInventory === null ||
-      legacyInventory.listIndexedScopes().length > 0,
     onWarning: (message, detail) => logger.warn({ detail }, message),
   });
-  holds.accountModeAuthority = accountModeAuthority;
-  const modeLoaded = await accountModeAuthority.ready.then(
-    () => true,
-    (err: unknown) => {
-      // Another runtime owns the records: this one is inert. The caller
-      // decides whether to try again later.
-      if (err instanceof ModeStoreOwnedError) throw err;
-      // A store that cannot be read does not stop the runtime: the module
-      // fails closed (every legacy read and write is refused with a retryable
-      // 503), loads again on the next evidence, and no legacy repair runs.
-      logger.warn(
-        { err },
-        "account mode records could not be loaded; refusing legacy work until they can",
-      );
-      return false;
-    },
-  );
-  if (modeLoaded) {
-    // The old spawn-time flag is evidence of nothing: it can never mint Off.
-    await accountModeAuthority
-      .submitEvidence(
-        legacyFlagEvidence(config.streamSync, serverOwner ?? "", Date.now()),
-      )
-      .catch((err: unknown) => {
-        logger.warn({ err }, "account mode flag evidence was not applied");
-      });
-  }
+  await accountModeAuthority.ready;
   // Legacy maintenance (recovering staged files, closing scopes, rebuilding the
-  // index) writes the legacy store, so it runs only for an owner who can still
-  // use it: never for a saved On, and never when the saved mode is unknown.
-  // TODO(seal): this early check is replaced by running the maintenance under
-  // the authority's legacy commit seal once the host hears an explicit Off.
+  // index) writes the legacy store, so it never runs for a switched owner.
   const legacyMaintenanceMayRun =
-    modeLoaded &&
-    ![...accountModeAuthority.snapshot().values()].some(
-      (record) =>
-        (record.switched || record.historyUnknown === true) &&
-        (serverOwner === undefined ||
-          normalizeOwner(record.owner) === normalizeOwner(serverOwner)),
-    );
+    serverOwner === undefined ||
+    accountModeAuthority.read(serverOwner).kind !== "streams";
 
   const reindexInProgressPath = join(storageRoot, "reindex-in-progress");
   const hasReindexInProgress = async (): Promise<boolean> => {
@@ -613,11 +539,8 @@ async function bootstrapServer(
       });
       await clearReindexInProgress();
     }
-    legacyInventory = indexManager;
   } else {
-    logger.info(
-      "Legacy maintenance skipped: the saved account mode is On or unknown",
-    );
+    logger.info("Legacy maintenance skipped: the account has switched");
   }
   // Sync moves stored bytes and must see them unchanged (the upload hashes
   // them). Every reader gets the served port, which projects legacy scope
@@ -1508,8 +1431,6 @@ async function bootstrapServer(
   });
 
   const cleanup = async () => {
-    // First: admissions stop. The stream-sync routes refuse from here on, and
-    // the authority below refuses new work the moment its close begins.
     backgroundClosed = true;
     try {
       clearRegistrationPoll();
@@ -1531,11 +1452,9 @@ async function bootstrapServer(
       // stops the stream-sync routes from admitting new requests.
       await releaseStreamSyncHome?.();
     } finally {
-      // However the steps above ended, the authority drains the legacy and
-      // stream work it already admitted (they still need the index, which is
-      // open until it is done) and only then lets go of the account mode
-      // record folder, so the next runtime cannot own it while a write of
-      // this one is still landing.
+      // However the steps above ended, the authority drains the legacy writes
+      // it already admitted (they still need the index, which stays open until
+      // they are done).
       try {
         await accountModeAuthority.close();
       } finally {

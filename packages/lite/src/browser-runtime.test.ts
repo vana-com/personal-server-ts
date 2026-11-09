@@ -564,32 +564,16 @@ describe("the account-mode records of a runtime over injected persistence", () =
   ) =>
     runtime.accountModeAuthority.submitEvidence({
       owner: ownerAddress,
-      authOwner: ownerAddress,
       state,
-      fetchStartedAt: Date.now(),
-      rawStatus: 200,
     });
 
-  // LITE_MEMORY_MODE_STORE
-  it("has no durable mode store of its own, so it decides nothing: an On is not kept and no Off is ever believed", async () => {
+  it("keeps the answer in memory when the host injects persistence but no mode store: the next launch's answer restores it", async () => {
     const bundle = memoryBundle();
     const first = await plain(bundle);
-    expect(await answer(first, "on")).toMatchObject({
-      kind: "refuse",
-      code: "ACCOUNT_MODE_STORE_OWNED",
-      status: 503,
-    });
-    await first.accountModeAuthority.close();
+    expect((await answer(first, "on")).kind).toBe("streams");
+    expect(first.accountModeAuthority.read(ownerAddress).kind).toBe("streams");
     const second = await plain(bundle);
-    expect(await answer(second, "off")).toMatchObject({
-      kind: "refuse",
-      status: 503,
-    });
-    const owner = ownerAddress;
-    expect(second.accountModeAuthority.read(owner).kind).toBe("refuse");
-    expect(
-      (await second.accountModeAuthority.commitLegacy(owner, "op", () => 1)).ok,
-    ).toBe(false);
+    expect(second.accountModeAuthority.read(ownerAddress).kind).toBe("refuse");
   });
 
   it("keeps an On through a restart when the host injects a durable store, and a later Off is refused", async () => {
@@ -603,13 +587,8 @@ describe("the account-mode records of a runtime over injected persistence", () =
     const second = await plain(bundle, store);
     expect((await answer(second, "off")).kind).toBe("streams");
     expect(
-      (
-        await second.accountModeAuthority.commitLegacy(
-          ownerAddress,
-          "op",
-          () => 1,
-        )
-      ).ok,
+      (await second.accountModeAuthority.commitLegacy(ownerAddress, () => 1))
+        .ok,
     ).toBe(false);
   });
 });

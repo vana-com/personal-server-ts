@@ -168,8 +168,6 @@
       "types": "./dist/sync/account-mode/index.d.ts",
       "import": "./dist/sync/account-mode/index.js"
     },
-    "./account-mode/vectors.json": "./dist/sync/account-mode/vectors.json",
-    "./account-mode/vectors.schema.json": "./dist/sync/account-mode/vectors.schema.json",
     "./sync": {
       "types": "./dist/sync/index.d.ts",
       "import": "./dist/sync/index.js"

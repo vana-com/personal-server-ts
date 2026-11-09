@@ -256,16 +256,10 @@ export interface PersonalServerHandle {
   /**
    * Give the account-mode module the Account's answer for this server's
    * owner, as a host does after sign-in and at every launch. Until a fresh
-   * explicit answer arrives the server refuses legacy reads and writes with a
-   * retryable 503. Absent on a runtime that takes evidence another way.
+   * answer arrives, reads stay legacy and legacy writes pause with a retryable
+   * 503; the answer is kept with no expiry. Absent on a runtime that takes evidence another way.
    */
   submitAccountModeEvidence?(input: ModeEvidenceInput): Promise<ModeDecision>;
-  /**
-   * Report that the host imported the owner's legacy data into streams, after
-   * an answer said `importRequired`. Stream writes stay refused until it is
-   * saved.
-   */
-  reportAccountModeImportDone?(owner: string): Promise<ModeDecision>;
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
   info(): Promise<PersonalServerInfo>;
   prepareRegistration(

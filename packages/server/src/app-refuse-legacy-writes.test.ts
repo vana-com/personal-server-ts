@@ -19,7 +19,6 @@ import {
 import {
   createMemoryModeRecordStore,
   createModeAuthority,
-  legacyFlagEvidence,
   type ModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import {
@@ -140,38 +139,13 @@ describe("createApp legacy-write refusal", () => {
     expect(index.countByScope("github.events")).toBe(0);
   });
 
-  // FLAG_MINTS_OFF
   it("does not read the old spawn-time flags as an Off", async () => {
-    const authority = await authorityHearing(owner, "off");
-    // A fresh authority told only what the flags say has no Off to give.
     const flagOnly = createModeAuthority({
       store: createMemoryModeRecordStore(),
-      bootId: "flag-only",
     });
     await flagOnly.ready;
-    await flagOnly.submitEvidence(
-      legacyFlagEvidence(
-        { write: false, refuseLegacyWrites: false },
-        owner,
-        Date.now(),
-      ),
-    );
-    const app = makeApp(flagOnly, {
-      write: false,
-      refuseLegacyWrites: false,
-    });
+    const app = makeApp(flagOnly, { write: true, refuseLegacyWrites: false });
     expect((await post(app)).status).toBe(503);
-    // The same flags with a real Off from the Account do accept.
-    expect(
-      (
-        await post(
-          makeApp(authority, {
-            write: true,
-            refuseLegacyWrites: true,
-          }),
-        )
-      ).status,
-    ).toBe(201);
   });
 
   // UNSWITCHED_CHANGED
@@ -181,10 +155,7 @@ describe("createApp legacy-write refusal", () => {
     expect((await post(app)).status).toBe(201);
     await authority.submitEvidence({
       owner,
-      authOwner: owner,
       state: "on",
-      fetchStartedAt: Date.now(),
-      rawStatus: 200,
     });
     expect((await post(app)).status).toBe(426);
     expect(index.countByScope("github.events")).toBe(1);

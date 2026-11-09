@@ -31,8 +31,8 @@ export function fixedOwnedAccountStorageMode(
 }
 
 /**
- * A real mode authority over a memory store that has already heard an explicit
- * answer for `owner`. For tests of consumers that must see the real module.
+ * A real mode authority over a memory store that has already heard an answer
+ * for `owner`. For tests of consumers that must see the real module.
  */
 export async function authorityHearing(
   owner: string,
@@ -40,22 +40,15 @@ export async function authorityHearing(
 ): Promise<ModeAuthority> {
   const authority = createModeAuthority({
     store: createMemoryModeRecordStore(),
-    bootId: "test-boot",
   });
   await authority.ready;
-  await authority.submitEvidence({
-    owner,
-    authOwner: owner,
-    state,
-    fetchStartedAt: Date.now(),
-    rawStatus: 200,
-  });
+  await authority.submitEvidence({ owner, state });
   return authority;
 }
 
 const FIXED_DECISION: Record<AccountStorageModeValue, ModeDecision> = {
   unswitched: { kind: "legacy" },
-  switched: { kind: "streams", importRequired: false },
+  switched: { kind: "streams" },
   unknown: { kind: "refuse", code: "ACCOUNT_MODE_UNKNOWN", status: 503 },
 };
 
@@ -69,54 +62,26 @@ export function fixedModeAuthority(
   value: AccountStorageModeValue,
 ): ModeAuthority {
   const decision = FIXED_DECISION[value];
-  const sealed = (write: () => unknown) =>
-    decision.kind === "legacy"
-      ? Promise.resolve(write()).then((v) => ({ ok: true as const, value: v }))
-      : Promise.resolve({
-          ok: false as const,
-          decision:
-            decision.kind === "refuse"
-              ? decision
-              : ({
-                  kind: "refuse",
-                  code: "LEGACY_REFUSED_SWITCHED",
-                  status: 426,
-                } as const),
-        });
   return {
     ready: Promise.resolve(),
     submitEvidence: async () => decision,
-    submitEvidenceMono: async () => decision,
     read: () => decision,
-    admit: () => decision,
-    commitLegacy: ((_owner: string, _op: string, write: () => unknown) =>
-      sealed(write)) as ModeAuthority["commitLegacy"],
-    commitStream: (async (_owner: string, _op: string, write: () => unknown) =>
-      decision.kind === "streams" && !decision.importRequired
-        ? {
-            ok: true as const,
-            value: await write(),
-            importRequired: false,
-          }
+    commitLegacy: async (_owner, write) =>
+      decision.kind === "legacy"
+        ? { ok: true as const, value: await write() }
         : {
             ok: false as const,
             decision:
               decision.kind === "refuse"
                 ? decision
-                : ({
+                : {
                     kind: "refuse",
-                    code:
-                      decision.kind === "streams"
-                        ? "IMPORT_PENDING"
-                        : "ACCOUNT_MODE_UNKNOWN",
-                    status: 503,
-                  } as const),
-          }) as ModeAuthority["commitStream"],
-    importPending: async () =>
-      decision.kind === "streams" && decision.importRequired,
-    importDone: async () => decision,
+                    code: "LEGACY_REFUSED_SWITCHED",
+                    status: 426,
+                  },
+          },
+    commitRemoval: async (work) => work(),
     close: async () => {},
-    snapshot: () => new Map(),
   };
 }
 

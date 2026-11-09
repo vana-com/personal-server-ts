@@ -20,10 +20,7 @@ export async function createUnswitchedIndexedDbPsLiteRuntime(
   const owner = options.ownerAddress ?? "";
   await runtime.accountModeAuthority.submitEvidence({
     owner,
-    authOwner: owner,
     state: "off",
-    fetchStartedAt: Date.now(),
-    rawStatus: 200,
   });
   return runtime;
 }
