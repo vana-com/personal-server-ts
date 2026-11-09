@@ -11,9 +11,20 @@
  * Install it before anything else starts. Only `GET` to an allowed host passes.
  * The host is the one Node connects to (options `hostname`, else `host`, over
  * the URL; a `socketPath` is refused), and the port must be a default port
- * unless the allowed entry names it. `fetch` never follows a redirect, so a
- * reply from an allowed host cannot send the request to another one.
- * (`http` and `https` never follow redirects on their own.)
+ * unless the allowed entry names it. A request's own `agent` may name another
+ * host or port that Node connects to instead, so the agent's `host`, `hostname`
+ * and `port` are checked too.
+ * Every `http`/`https` request, including a `ClientRequest` built directly or
+ * by a subclass declared before the guard installed, is checked when it is
+ * queued on its agent (`Agent.prototype.addRequest`), which Node calls for
+ * every request it creates. `fetch` never follows a redirect, so a reply from
+ * an allowed host cannot send the request to another one. (`http` and `https`
+ * never follow redirects on their own.)
+ *
+ * Known limits: the check is on host names, not the IP addresses they resolve
+ * to; an agent's `createConnection` picks the socket and is not inspected; raw
+ * `net`/`tls` sockets and HTTP clients that bypass `http`/`https` (for example
+ * a direct `undici` dispatcher) are not covered.
  */
 
 import http from "node:http";
@@ -93,13 +104,37 @@ function targetOf(input: unknown, options: unknown): Target {
     : isOptions(input)
       ? input
       : {};
-  const merged = { ...base, ...given };
+  return targetOfOptions({ ...base, ...given });
+}
+
+function targetOfOptions(merged: Record<string, unknown>): Target {
   if (merged.socketPath !== undefined) return { host: "(socket)", port: "" };
   const port = merged.port;
   return {
     host: firstHost(merged.hostname, merged.host),
     port: port === undefined || port === null ? "" : String(port),
   };
+}
+
+/**
+ * The targets a queued request can reach. An agent that sets its own `host`,
+ * `hostname` or `port` can send the request elsewhere, so each one it sets is a
+ * target too, next to the request's own.
+ */
+function agentTargets(request: Target, agent: unknown): Target[] {
+  const own = isOptions(agent) && isOptions(agent.options) ? agent.options : {};
+  const targets = [request];
+  const port =
+    own.port === undefined || own.port === null
+      ? request.port
+      : String(own.port);
+  for (const name of ["host", "hostname"] as const) {
+    if (own[name] !== undefined) {
+      targets.push({ host: firstHost(own[name]), port });
+    }
+  }
+  if (own.port !== undefined) targets.push({ host: request.host, port });
+  return targets;
 }
 
 function methodOf(input: unknown, options: unknown): string {
@@ -181,22 +216,30 @@ export function installNetworkGuard(input: {
       });
     }
   }
-  // `new http.ClientRequest(...)` is what `request` builds, and it takes the
-  // same arguments. https has no class of its own: an https request is a
-  // ClientRequest given the https agent and protocol, so this covers both.
-  const RealClientRequest = http.ClientRequest;
-  (http as unknown as Record<string, unknown>).ClientRequest = new Proxy(
-    RealClientRequest,
-    {
-      construct(target, args: unknown[], newTarget) {
-        check(methodOf(args[0], args[1]), targetOf(args[0], args[1]));
-        return Reflect.construct(target, args, newTarget);
-      },
-    },
-  );
+  // Every request Node makes is queued on an agent, and the queue call takes
+  // the same options the request was built with. Checking there covers a
+  // `ClientRequest` built directly, one built by a subclass declared before the
+  // guard installed, and an agent that names another host (it is checked as
+  // well). https uses the same method (it inherits it from `http.Agent`).
+  const agentProto = http.Agent.prototype as unknown as Record<string, unknown>;
+  const RealAddRequest = agentProto.addRequest as (
+    this: unknown,
+    ...args: unknown[]
+  ) => unknown;
+  agentProto.addRequest = function addRequest(
+    this: unknown,
+    request: { method?: string },
+    options: unknown,
+    ...rest: unknown[]
+  ) {
+    const requested = targetOfOptions(isOptions(options) ? options : {});
+    for (const target of agentTargets(requested, this)) {
+      check(request.method ?? "GET", target);
+    }
+    return RealAddRequest.call(this, request, options, ...rest);
+  };
   restores.push(() => {
-    (http as unknown as Record<string, unknown>).ClientRequest =
-      RealClientRequest;
+    agentProto.addRequest = RealAddRequest;
   });
   syncBuiltinESMExports();
 
