@@ -734,6 +734,34 @@ export class StreamSyncWriter {
     });
   }
 
+  /** Delete stream rows, including absent rows. A CAS loss retries the person's delete. */
+  deleteStreams(connector: string, streams: readonly string[]): Promise<void> {
+    return this.publish(async () => {
+      const { control } = await this.keys();
+      for (const stream of new Set(streams)) {
+        const scope = streamScope(connector, IDENTITYLESS_NS, stream);
+        for (;;) {
+          const { row } = await this.readStreamRow(
+            connector,
+            IDENTITYLESS_NS,
+            stream,
+          );
+          const version = row.found ? row.version + 1 : 1;
+          const request = await this.sign(
+            scope,
+            control.tombstoneData,
+            control.tombstoneMetadata,
+            version,
+          );
+          const result = await this.options.registry.post(request);
+          if (result.kind !== "committed") continue;
+          await this.observeDelete(connector, stream, version);
+          break;
+        }
+      }
+    });
+  }
+
   /**
    * Tombstone each pinned control row. A fresh delete must end deleted; if a
    * pin's tombstone did not land, the intent is dropped and the delete throws
@@ -1885,12 +1913,20 @@ export class StreamSyncWriter {
       rowKind === "tombstoned" && row.found
         ? row.version
         : (head?.lastDeleteVersion ?? 0);
+    await this.observeDelete(connector, stream, lastDeleteVersion);
+    return { row, rowKind, head, lastDeleteVersion };
+  }
+
+  private async observeDelete(
+    connector: string,
+    stream: string,
+    version: number,
+  ): Promise<void> {
     await this.withState((state) => {
       const cache = (state.lastDeletes ??= {});
       const streams = (cache[connector] ??= {});
-      streams[stream] = Math.max(streams[stream] ?? 0, lastDeleteVersion);
+      streams[stream] = Math.max(streams[stream] ?? 0, version);
     });
-    return { row, rowKind, head, lastDeleteVersion };
   }
 
   /** §2.7 from "read control" to the POST. True when committed or no-op. */
@@ -1914,6 +1950,27 @@ export class StreamSyncWriter {
       ns,
       name,
     );
+    // Seed history was collected before stream deletes existed. It always has stamp zero.
+    if (stream.seedApplies && lastDeleteVersion > 0) {
+      await this.withState((state) => {
+        state.receipts[
+          `${this.options.seed!.installId}|${entry.connector}|${ns}|${name}`
+        ] = "skipped";
+      });
+      stream.seedApplies = false;
+      stream.seedShardBytes = null;
+      if (stream.seedOnly) {
+        // No live contribution remains, and the registry row must stay untouched.
+        this.setStream(host, name, {
+          state: "noop",
+          generation: target,
+          complete: false,
+        });
+        await this.writeEntry(host);
+        return true;
+      }
+      await this.writeEntry(host);
+    }
     if (lastDeleteVersion > (host.collectedAt?.[name] ?? 0)) {
       throw new Discard(
         {
@@ -2683,9 +2740,11 @@ export class StreamSyncWriter {
       runDir,
       stream.shardBytes ?? emptyShardBytes(),
     );
-    const seedBytes = stream.seedShardBytes
-      ? await this.readyShards(seedDir, stream.seedShardBytes)
-      : emptyShardBytes();
+    const dirs = stream.seedApplies ? [runDir, seedDir] : [runDir];
+    const seedBytes =
+      stream.seedApplies && stream.seedShardBytes
+        ? await this.readyShards(seedDir, stream.seedShardBytes)
+        : emptyShardBytes();
     const shardBytes = runBytes.map((b, i) => b + seedBytes[i]!);
     const baseParts = base?.parts ?? [];
 
@@ -2697,10 +2756,10 @@ export class StreamSyncWriter {
     if (plan.kind === "needs_counts") {
       const counts: Record<number, number[]> = {};
       for (const shard of plan.shards) {
-        counts[shard] = await countShard(this.options.home.files, [
-          shardPath(runDir, shard),
-          shardPath(seedDir, shard),
-        ]);
+        counts[shard] = await countShard(
+          this.options.home.files,
+          dirs.map((dir) => shardPath(dir, shard)),
+        );
       }
       plan = planBuckets({
         targetBytes: this.targetBytes,
@@ -2763,7 +2822,7 @@ export class StreamSyncWriter {
         scope,
         target,
         base,
-        [runDir, seedDir],
+        dirs,
       );
       for (const result of results) {
         if (result.kind === "split") {

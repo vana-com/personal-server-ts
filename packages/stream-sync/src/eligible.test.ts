@@ -77,3 +77,22 @@ describe("eligible (property)", () => {
     ).toThrow(InvalidArgumentError);
   });
 });
+
+it("tombstoned head reads as deleted (mutant: ignore stream tombstones)", () => {
+  expect(
+    eligible({
+      connections: [
+        {
+          ns: "",
+          control: { kind: "active", generation: 1 },
+          latestHeadRegistration: 1,
+          streams: {
+            items: { live: false, complete: false, tombstoned: true },
+          },
+        },
+      ],
+      target: { kind: "logical", streams: ["items"] },
+      legacyFile: true,
+    }),
+  ).toEqual({ kind: "unavailable", reason: "deleted" });
+});

@@ -1,3 +1,4 @@
+import { ask } from "../stream-sync-read/service-fixture.js";
 import { expect, it } from "vitest";
 import {
   Rig,
@@ -70,6 +71,9 @@ it("six steps preserve delete history (mutant: counter copied from base resets a
   await tombstone(r);
   await r.collect(spec("c"));
   await discarded(r, "c");
+  await r.collect(spec("c-fresh"));
+  await r.publish();
+  expect((await r.registeredHead())?.lastDeleteVersion).toBe(4);
 });
 it("low stamp discards once and survives restart (mutants: discard does not update cache; refuse whenever lastDeleteVersion > 0)", async () => {
   const r = new Rig();
@@ -161,4 +165,110 @@ it("CAS retry reruns the fence (mutant: check only before first post)", async ()
     await tombstone(r);
   };
   await discarded(r, "stale");
+});
+
+it("delete absent stream fences a zero-stamped import (mutant: skip absent rows)", async () => {
+  const r = new Rig();
+  await r.open();
+  await r.other.deleteStreams(CONNECTOR, ["items"]);
+  expect(await r.registeredVersion()).toBe(1);
+  await r.collect(spec("import"));
+  await discarded(r, "import");
+});
+it("delete retries a CAS lost to a publish (mutant: Superseded swallowed)", async () => {
+  const r = new Rig();
+  await r.open();
+  await r.collect(spec("base"));
+  await r.publish();
+  await r.collect(spec("b", true));
+  // The concurrent publish must carry a readable head.
+  const headRow = await r.gateway.read(streamScope(CONNECTOR, "", "items"));
+  r.gateway.beforePost = async (request) => {
+    r.gateway.beforePost = undefined;
+    if (!headRow.found) throw new Error("missing head");
+    await r.gateway.post({
+      ...request,
+      dataHash: headRow.dataHash,
+      metadataHash: headRow.metadataHash,
+    });
+  };
+  await r.writer.deleteStreams(CONNECTOR, ["items"]);
+  const row = await r.gateway.read(streamScope(CONNECTOR, "", "items"));
+  const hashes = await controlHashes(
+    streamSyncHashes.keccak256,
+    "0000000000000000",
+  );
+  expect(row).toMatchObject({
+    found: true,
+    version: 4,
+    dataHash: hashes.tombstoneData,
+  });
+});
+it("seed-only refusal is skipped and next run publishes (mutant: discard whole run)", async () => {
+  const r = new Rig({
+    stream: "seed",
+    key: "id",
+    version: "1.0.0",
+    rows: [{ id: "old" }],
+  });
+  await r.open();
+  await r.writer.deleteStreams(CONNECTOR, ["seed"]);
+  await r.collect(spec("live"));
+  expect(
+    (await r.publish()).find((s) => s.runId === "live")?.outcome?.kind,
+  ).not.toBe("discarded");
+  expect((await r.writer.seedStatus(CONNECTOR)).receipts).toEqual({
+    seed: "skipped",
+  });
+  expect((await r.registeredHead())?.recordCount).toBe(1);
+  await r.collect({ ...spec("next"), stream: "seed" });
+  await r.publish();
+  expect((await r.registeredHead("seed"))?.recordCount).toBe(1);
+});
+it("merged seed is dropped while live records publish (mutant: discard whole run)", async () => {
+  const r = new Rig({ key: "id", version: "1.0.0", rows: [{ id: "old" }] });
+  await r.open();
+  await r.other.deleteStreams(CONNECTOR, ["items"]);
+  // Observe the delete before the live run starts.
+  await r.collect(spec("learn"));
+  await r.publish();
+  await r.collect(spec("live"));
+  await r.publish();
+  expect((await r.writer.seedStatus(CONNECTOR)).receipts).toEqual({
+    items: "skipped",
+  });
+  expect((await r.registeredHead())?.recordCount).toBe(1);
+});
+
+it("replacing the merge base keeps delete history (mutant: counter copied from chosen base)", async () => {
+  const r = new Rig();
+  await r.open();
+  await tombstone(r);
+  await r.collect(spec("learn"));
+  await r.publish();
+  await r.collect(spec("fresh"));
+  await r.publish();
+  await r.collect({
+    ...spec("replace"),
+    key: "uid",
+    version: "2.0.0",
+    rows: [{ uid: "new" }],
+  });
+  await r.publish();
+  expect((await r.registeredHead())?.lastDeleteVersion).toBe(1);
+  expect((await r.registeredHead())?.recordCount).toBe(1);
+});
+
+it("tombstoned head reads as deleted through the read service (mutant: omit tombstoned view)", async () => {
+  const r = new Rig();
+  await r.open();
+  await r.collect(spec("base"));
+  await r.publish();
+  await r.sync();
+  await r.writer.deleteStreams(CONNECTOR, ["items"]);
+  await r.sync();
+  expect(await r.service.resolve(ask("pdpp.acme.items"))).toMatchObject({
+    kind: "unavailable",
+    reason: "deleted",
+  });
 });

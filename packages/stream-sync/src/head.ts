@@ -1,11 +1,11 @@
 /**
- * §2.5 head format 1, and the head rules of §2.4, §2.5, §2.6 and §2.7:
+ * §2.5 head format 3, and the head rules of §2.4, §2.5, §2.6 and §2.7:
  * liveness, base choice, the compatible-writer rule, `complete` and no-op.
  *
  * Clear head bytes are canonical JSON:
  *
- *   {"complete":bool,"connector":c,"format":1,"generation":"<dec>",
- *    "keyCheck":"<16 hex>","ns":ns,"observedAt":<ms>,
+ *   {"complete":bool,"connector":c,"format":3,"generation":"<dec>",
+ *    "keyCheck":"<16 hex>","lastDeleteVersion":n,"ns":ns,"observedAt":<ms>,
  *    "parts":[{"bytes":n,"count":n,"hash":"<sha256>","prefix":"<bits>"}],
  *    "primaryKey":[...],"profile":{"key":<string|null>,"version":"<v>"},
  *    "recordCount":n,"stream":s}
@@ -30,7 +30,7 @@ import { headBlobName } from "./names.js";
 import type { HeadPart } from "./parts.js";
 import type { ControlState } from "./control.js";
 
-/** The format new writers write. Readers also accept {@link HEAD_FORMAT_PREVIOUS}. */
+/** Writers emit fenced heads; readers also accept the pre-fence formats 1 and 2. */
 export const HEAD_FORMAT = 3;
 /** Parts are NDJSON lines (§2.2). Readers still accept it; writers no longer write it. */
 export const HEAD_FORMAT_PREVIOUS = 1;
@@ -101,7 +101,7 @@ function headProblem(
   const fields =
     format === 3 ? [...HEAD_FIELDS, "lastDeleteVersion"].sort() : HEAD_FIELDS;
   if (!exactKeys(value, fields)) {
-    return `fields must be exactly: ${HEAD_FIELDS.join(", ")}`;
+    return `fields must be exactly: ${fields.join(", ")}`;
   }
   const v = value;
   if (format === 3 && !isCount(v["lastDeleteVersion"], 0))

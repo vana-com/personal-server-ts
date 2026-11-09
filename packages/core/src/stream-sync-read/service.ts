@@ -725,6 +725,7 @@ export class StreamSyncReadService {
           live ? imported : null,
         );
         streams[stream] = {
+          tombstoned: kind === "tombstoned",
           live: live || local.merged.length > 0,
           complete: local.complete,
         };
