@@ -101,6 +101,8 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   ownerSignature: `0x${string}`;
   ownerSyncSigner?: PsLiteOwnerSyncSigner;
   additionsWorkerFactory?: PsLiteSyncOptions["additionsWorkerFactory"];
+  /** `false` builds the sync manager without starting it; the caller starts it. */
+  autoStartSync?: PsLiteSyncOptions["autoStartSync"];
   dbName?: string;
   stateStoreName?: string;
   storageDbName?: string;
@@ -316,6 +318,7 @@ export async function createIndexedDbPsLiteRuntime(
       ownerAddress: options.ownerAddress,
       ownerSyncSigner: options.ownerSyncSigner,
       additionsWorkerFactory: options.additionsWorkerFactory,
+      autoStartSync: options.autoStartSync,
       serverAccount: identity.account,
       gateway,
       dataPointFeed: options.dataPointFeed,

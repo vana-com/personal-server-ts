@@ -6,8 +6,11 @@ export {
 
 export {
   startPersonalServer,
+  unstoppedRuntimeOf,
+  type PersonalServerStartError,
   type StartPersonalServerLiteOptions,
   type StartPersonalServerLiteRelayOptions,
+  type UnstoppedPersonalServerRuntime,
 } from "./client.js";
 export type {
   PersonalServerHandle,

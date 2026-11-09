@@ -592,7 +592,25 @@ export function startPsLiteRelayClient(
     const acceptsFrames = () =>
       isCurrent() && currentSocket.readyState === currentSocket.OPEN;
     socket.binaryType = "arraybuffer";
-    options.onStatus?.("connecting");
+    try {
+      options.onStatus?.("connecting");
+    } catch (error) {
+      // The caller never gets a client to close, so release what this
+      // connect opened before the throw escapes.
+      closed = true;
+      stopHeartbeat();
+      if (reconnectTimer !== undefined) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }
+      disposeStreams();
+      try {
+        currentSocket.close(1000, "status-handler-threw");
+      } catch {
+        // The status handler's error is the one to report.
+      }
+      throw error;
+    }
 
     socket.onopen = () => {
       if (!acceptsFrames()) return;

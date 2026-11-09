@@ -1004,3 +1004,26 @@ describe("buildHttpResponse framing", () => {
     expect(wire.slice(wire.indexOf("\r\n\r\n") + 4)).toBe(json);
   });
 });
+
+describe("startPsLiteRelayClient when the status callback throws", () => {
+  it("relay_connect_throw_closes_socket: closes the socket it opened before rethrowing", () => {
+    const socket = new FakeRelayWebSocket();
+    const failure = new Error("status handler failed");
+
+    expect(() =>
+      startPsLiteRelayClient({
+        sessionId: "status-throw-session",
+        runtime: { fetch: async () => new Response("") } as ReturnType<
+          typeof createTestRuntime
+        >,
+        tls: false,
+        webSocketFactory: () => socket,
+        onStatus() {
+          throw failure;
+        },
+      }),
+    ).toThrow(failure);
+
+    expect(socket.readyState).toBe(3);
+  });
+});

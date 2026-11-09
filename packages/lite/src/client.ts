@@ -103,32 +103,95 @@ export type PersonalServerLiteHandle = PersonalServerHandle & {
   readonly streamSyncIntake: RunIntake | null;
 };
 
+/** Longest the cleanup stop of a failed start may take before it is given up. */
+export const START_CLEANUP_STOP_TIMEOUT_MS = 15_000;
+
+/** What a caller needs to retry stopping a runtime a failed start left behind. */
+export interface UnstoppedPersonalServerRuntime {
+  stop(): Promise<void>;
+}
+
 /**
- * Undo a start that threw after the runtime bundle began syncing. Best effort:
- * the original start error is the one the caller needs. A supplied runtime
- * (no bundle) belongs to the caller and is left alone.
+ * A start error that may carry the runtime the failed start could not stop.
+ * The caller never receives a handle from a rejected start, so this is the
+ * only way to find and stop it.
+ */
+export interface PersonalServerStartError extends Error {
+  unstoppedRuntime?: UnstoppedPersonalServerRuntime;
+}
+
+/** The runtime a failed start could not stop, when the error carries one. */
+export function unstoppedRuntimeOf(
+  error: unknown,
+): UnstoppedPersonalServerRuntime | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const candidate = (error as PersonalServerStartError).unstoppedRuntime;
+  return typeof candidate?.stop === "function" ? candidate : undefined;
+}
+
+/**
+ * Undo a start that threw after the runtime bundle was built. A supplied
+ * runtime (no bundle) belongs to the caller and is left alone. Returns
+ * `undefined` once everything is proven stopped. Otherwise (a stop failed, or
+ * did not finish within the bound) it returns a handle the caller can use to
+ * stop it again, so the failure is never swallowed.
  */
 async function abandonStartedRuntime(
   runtimeBundle: IndexedDbPsLiteRuntime | null,
   relayClient: PsLiteRelayClient | undefined,
   runtime: PsLiteRuntime,
-): Promise<void> {
-  if (!runtimeBundle) return;
+): Promise<UnstoppedPersonalServerRuntime | undefined> {
+  if (!runtimeBundle) return undefined;
+  const handle: UnstoppedPersonalServerRuntime = {
+    async stop() {
+      const failures: unknown[] = [];
+      try {
+        relayClient?.close("personal-server-start-failed");
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        runtime.deactivate();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        await runtimeBundle.syncManager?.stop?.();
+      } catch (error) {
+        failures.push(error);
+      }
+      if (failures.length > 0) throw failures[0];
+    },
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    relayClient?.close("personal-server-start-failed");
+    await Promise.race([
+      handle.stop(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Stopping the failed start timed out")),
+          START_CLEANUP_STOP_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    return undefined;
   } catch {
-    // Keep stopping the rest.
+    return handle;
+  } finally {
+    clearTimeout(timer);
   }
-  try {
-    runtime.deactivate();
-  } catch {
-    // Keep stopping the rest.
-  }
-  try {
-    await runtimeBundle.syncManager?.stop?.();
-  } catch {
-    // The start error is the one to report.
-  }
+}
+
+function withUnstoppedRuntime(
+  error: unknown,
+  unstopped: UnstoppedPersonalServerRuntime,
+): unknown {
+  const carrier: PersonalServerStartError =
+    typeof error === "object" && error !== null
+      ? (error as PersonalServerStartError)
+      : new Error(String(error), { cause: error });
+  carrier.unstoppedRuntime = unstopped;
+  return carrier;
 }
 
 export async function startPersonalServer(
@@ -190,6 +253,9 @@ export async function startPersonalServer(
     ? null
     : await createIndexedDbPsLiteRuntime({
         ...options,
+        // Sync starts last, inside the guarded section below, so a throw
+        // anywhere earlier cannot leave a sync cycle running with no owner.
+        autoStartSync: false,
         readFulfillmentReporter,
         ownerSignature: requiredOwnerSignature(options.ownerSignature),
         active: options.active ?? true,
@@ -214,9 +280,10 @@ export async function startPersonalServer(
     options.onStatus?.(nextStatus);
   };
 
-  // The runtime bundle's sync manager is already running here. If anything
-  // below throws, the caller never gets a handle to stop it, so stop it
-  // before rethrowing instead of leaving a sync cycle writing with no owner.
+  // The runtime bundle's sync manager is built but not started. Start it only
+  // after everything else has succeeded. If anything below throws, the caller
+  // never gets a handle, so stop what started before rethrowing. When that
+  // stop fails or hangs, the error carries a handle to stop it again.
   try {
     if (options.active ?? true) {
       runtime.activate();
@@ -240,9 +307,17 @@ export async function startPersonalServer(
       });
       relayClientForDrain = relayClient;
     }
+
+    if (options.autoStartSync !== false) {
+      runtimeBundle?.syncManager?.start?.();
+    }
   } catch (error) {
-    await abandonStartedRuntime(runtimeBundle, relayClient, runtime);
-    throw error;
+    const unstopped = await abandonStartedRuntime(
+      runtimeBundle,
+      relayClient,
+      runtime,
+    );
+    throw unstopped ? withUnstoppedRuntime(error, unstopped) : error;
   }
 
   async function info(): Promise<PersonalServerInfo> {
