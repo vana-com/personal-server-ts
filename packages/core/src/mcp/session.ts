@@ -356,11 +356,15 @@ export function createMcpSessionAuthPort(params: {
         await assertScopeNotDeleted(
           deps,
           input.scope,
-          deps.storage.findEntry({
-            scope: input.scope,
-            fileId: input.fileId,
-            at: input.at,
-          }),
+          // A served stream head is the entry: the legacy file `fileId`
+          // names was not served, so it is not the deletion subject.
+          input.servedEntry
+            ? undefined
+            : deps.storage.findEntry({
+                scope: input.scope,
+                fileId: input.fileId,
+                at: input.at,
+              }),
         );
         const cycle = await handleX402Cycle({
           deps: params.payment.dataApiDeps,
@@ -372,6 +376,9 @@ export function createMcpSessionAuthPort(params: {
           // than the latest entry) — otherwise the challenge/accessRecord
           // would settle against different bytes than were returned.
           atParam: input.at,
+          // The stream head the read decision served and validated, taken
+          // unchanged: never looked up again here.
+          ...(input.servedEntry ? { servedEntry: input.servedEntry } : {}),
           grantId: params.grantId,
           builder: params.builderAddress,
           gateway: params.payment.gateway,

@@ -137,6 +137,14 @@ export interface PersonalServerReadAuthInput {
    */
   at?: string;
   /**
+   * The registered data point version the body comes from, when it is not
+   * the stored entry of `scope`: a stream view serves a stream head. Taken
+   * unchanged from the read decision, so settlement names the head that was
+   * validated and served. When present, `fileId` and `at` select no
+   * settlement entry.
+   */
+  servedEntry?: { scope: string; version: number };
+  /**
    * The read serves no block values, only a scope's table of contents (block
    * ids, paths, sizes). Grant policy still applies; payment-enforcing auth
    * ports do not charge it, the same way search is free discovery.
@@ -2772,8 +2780,15 @@ export async function handlePersonalServerDataRequest(
           ? { metadataOnly: true }
           : {}),
       });
-      const settle = async (): Promise<void> => {
-        if (settleLast) await deps.auth.authorizeBuilderRead(authInput);
+      // `served` is the stream head the read decision chose and validated.
+      // It is passed through as is: settlement never looks the head up again.
+      const settle = async (
+        served?: { scope: string; version: number } | null,
+      ): Promise<void> => {
+        if (!settleLast) return;
+        await deps.auth.authorizeBuilderRead(
+          served ? { ...authInput, servedEntry: served } : authInput,
+        );
       };
 
       // Select the body after auth and before deletion or payment. A file's
@@ -2884,7 +2899,7 @@ export async function handlePersonalServerDataRequest(
               }
             }
             const checked = await validateStreamBody(decision, inProcess);
-            await settle();
+            await settle(decision.served);
             return serveStreamSyncView(deps, request, {
               scope: scopeResult.scope,
               grantId,

@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
+  dataRegistryDomain,
   escrowPaymentDomain,
   GENERIC_PAYMENT_TYPES,
+  RECORD_DATA_ACCESS_TYPES,
 } from "@opendatalabs/vana-sdk/browser";
 import { handlePersonalServerDataRequest } from "../api/index.js";
 import { createMcpDataReadClient, McpDataReadError } from "./read-client.js";
@@ -14,6 +16,7 @@ import { readBuiltScopeBlocks } from "../storage/blocks/page.js";
 import { Fixture, masterKey } from "../stream-sync-read/service-fixture.js";
 import { testOwnerKey } from "../stream-sync-read/testing.js";
 import { buildBinaryEnvelopeData } from "../contracts/binary.js";
+import { computeDataPointId } from "../sync/data-point-id.js";
 
 /**
  * What a paid MCP session charges, pinned at the counts the pre-handler storage
@@ -29,7 +32,6 @@ import { buildBinaryEnvelopeData } from "../contracts/binary.js";
  */
 
 const SERVER_ORIGIN = "https://personal-server.test";
-const SERVER_ADDRESS = "0x0000000000000000000000000000000000000ccc";
 const OWNER = "0x0000000000000000000000000000000000000aaa";
 const SCOPE = "instagram.profile";
 const STREAM_SCOPE = "pdpp.acme.items";
@@ -77,10 +79,18 @@ interface HarnessOptions {
   legacyScope?: string;
   /** Items in the legacy file. Defaults to RECORDS. */
   legacyItems?: unknown[];
+  /** Runs after a read decision chose its body, before the read settles. */
+  afterDecision?: (stream: {
+    f: Fixture;
+    ns: string;
+    service: Awaited<ReturnType<Fixture["service"]>>;
+  }) => Promise<void>;
 }
 
 async function harness(options: HarnessOptions = {}) {
   const builder = privateKeyToAccount(generatePrivateKey());
+  // The server key signs each access record, as a challenge would.
+  const serverAccount = privateKeyToAccount(generatePrivateKey());
   const fee = { totalDue: "100", asset: ASSET };
   const gatewayGrant = {
     id: GRANT_ID,
@@ -155,6 +165,10 @@ async function harness(options: HarnessOptions = {}) {
   // Pass-through when no stream is wired: the scope has no stream view, so
   // the handler serves the legacy body.
   let streamSyncRead: unknown = { resolve: async () => ({ kind: "pass" }) };
+  /** The stream head each read decision served, in order. */
+  const servedByDecision: ({ scope: string; version: number } | null)[] = [];
+  let fixture: Fixture | undefined;
+  let streamNs = "";
   if (options.stream) {
     const f = new Fixture(await testOwnerKey(masterKey(341)));
     const ns = await f.key.ns("acme", "account-1");
@@ -174,7 +188,18 @@ async function harness(options: HarnessOptions = {}) {
     }
     const service = await f.service();
     await f.sync(service);
-    streamSyncRead = service;
+    fixture = f;
+    streamNs = ns;
+    // Records what each decision served, then lets a test move the head
+    // before the read settles: the settlement must still name the served one.
+    streamSyncRead = {
+      resolve: async (input: Parameters<typeof service.resolve>[0]) => {
+        const decision = await service.resolve(input);
+        if (decision.kind === "view") servedByDecision.push(decision.served);
+        await options.afterDecision?.({ f, ns, service });
+        return decision;
+      },
+    };
   }
 
   const paymentFetch = vi.fn(async () => new Response("{}", { status: 200 }));
@@ -185,7 +210,7 @@ async function harness(options: HarnessOptions = {}) {
     streamSyncRead,
     accessLogWriter: { write: accessLogWrite },
     readFulfillmentReporter: { report: readFulfillmentReport },
-    serverAddress: SERVER_ADDRESS,
+    serverAddress: serverAccount.address,
     serverOwner: OWNER,
     paymentFetch,
   } as never as Parameters<typeof createMcpDataReadClient>[0]["dataApiDeps"];
@@ -212,7 +237,10 @@ async function harness(options: HarnessOptions = {}) {
   });
 
   /** One fresh builder-signed x402 proof per paid call, as the app sends. */
-  async function proof(): Promise<string> {
+  async function proof(bind?: {
+    scope: string;
+    version: number;
+  }): Promise<string> {
     const message = {
       payerAddress: builder.address,
       opType: "grant",
@@ -231,11 +259,38 @@ async function harness(options: HarnessOptions = {}) {
         paymentNonce: BigInt(message.paymentNonce),
       },
     });
+    // A proof that names the entry it pays for, as a challenge would have.
+    let accessRecord: Record<string, string> | undefined;
+    if (bind) {
+      const recordId = `0x${"cd".repeat(32)}` as const;
+      accessRecord = {
+        dataPointId: computeDataPointId(OWNER, bind.scope),
+        version: String(bind.version),
+        accessor: builder.address,
+        recordId,
+        signature: await serverAccount.signTypedData({
+          domain: dataRegistryDomain(GATEWAY_CONFIG),
+          types: RECORD_DATA_ACCESS_TYPES,
+          primaryType: "RecordDataAccess",
+          message: {
+            ownerAddress: OWNER,
+            scope: bind.scope,
+            version: BigInt(bind.version),
+            accessor: builder.address,
+            recordId,
+          },
+        }),
+      };
+    }
     return encodePaymentHeader({
       x402Version: 1,
       scheme: "vana-escrow-grant",
       network: "vana:14800",
-      payload: { message, signature },
+      payload: {
+        message,
+        signature,
+        ...(accessRecord ? { accessRecord } : {}),
+      },
     } as never);
   }
 
@@ -272,6 +327,9 @@ async function harness(options: HarnessOptions = {}) {
     readFulfillmentReport,
     proof,
     httpRead,
+    servedByDecision,
+    fixture,
+    streamNs,
   };
 }
 
@@ -436,6 +494,99 @@ describe("mcp/read-client charges on a stream view", () => {
     expect(h.readFulfillmentReport.mock.calls[0]?.[0]).toMatchObject({
       source: "mcp",
       tool: "read_scope",
+    });
+  });
+
+  /** The access record a read sent to the gateway when it settled. */
+  function settledAccessRecord(h: Awaited<ReturnType<typeof harness>>) {
+    expect(h.paymentFetch).toHaveBeenCalledTimes(1);
+    const init = (
+      h.paymentFetch.mock.calls[0] as unknown as [string, RequestInit]
+    )[1];
+    return (
+      JSON.parse(String(init.body)) as { accessRecord?: Record<string, string> }
+    ).accessRecord;
+  }
+
+  /** What a read of the stream name would serve now, without reading it. */
+  async function servedNow(h: Awaited<ReturnType<typeof harness>>) {
+    const decision = await (
+      h.deps.streamSyncRead as { resolve(i: unknown): Promise<any> }
+    ).resolve({
+      scope: STREAM_SCOPE,
+      connection: null,
+      cursor: null,
+      legacyFile: false,
+      isOwnerView: true,
+    });
+    await decision.body.cancel();
+    h.servedByDecision.pop();
+    return decision.served as { scope: string; version: number };
+  }
+
+  it("settles against the stream head when the view wins over a legacy file of the same name", async () => {
+    const h = await harness({
+      stream: true,
+      legacy: true,
+      legacyScope: STREAM_SCOPE,
+      legacyItems: [{ id: "stale-0", text: "stale legacy record" }],
+    });
+    const head = await servedNow(h);
+    const page = await h.client.readScopeBlocks({
+      scope: STREAM_SCOPE,
+      grantId: GRANT_ID,
+      payment: await h.proof(head),
+      tool: "read_scope",
+    });
+
+    expect(JSON.stringify(page)).not.toContain("stale legacy record");
+    // Exactly the head the view served: its registry data point and version,
+    // not the legacy file's entry (which has no data point at all).
+    expect(h.servedByDecision).toEqual([head]);
+    expect(settledAccessRecord(h)).toMatchObject({
+      dataPointId: computeDataPointId(OWNER, head.scope),
+      version: String(head.version),
+    });
+  });
+
+  it("settles against the head it served when the head advances before settlement", async () => {
+    let advance = false;
+    let advanced = false;
+    const h = await harness({
+      stream: true,
+      afterDecision: async ({ f, ns, service }) => {
+        if (!advance || advanced) return;
+        advanced = true;
+        await f.publish({
+          connector: "acme",
+          ns,
+          stream: "items",
+          generation: 1,
+          records: [...RECORDS, { id: "item-late", text: "published late" }],
+          observedAt: T + 1000,
+          profileVersion: "1.0.0",
+        });
+        await f.sync(service);
+      },
+    });
+    const validated = await servedNow(h);
+    advance = true;
+    const page = await h.client.readScopeBlocks({
+      scope: STREAM_SCOPE,
+      grantId: GRANT_ID,
+      payment: await h.proof(validated),
+      tool: "read_scope",
+    });
+
+    expect(JSON.stringify(page)).not.toContain("published late");
+    // The race is real: a later lookup finds a newer head than the one served.
+    expect(advanced).toBe(true);
+    advance = false;
+    expect((await servedNow(h)).version).toBeGreaterThan(validated.version);
+    expect(h.servedByDecision).toEqual([validated]);
+    expect(settledAccessRecord(h)).toMatchObject({
+      dataPointId: computeDataPointId(OWNER, validated.scope),
+      version: String(validated.version),
     });
   });
 
