@@ -2,7 +2,10 @@ import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-cor
 import { resolveLiteReplication } from "./replication-door.js";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createReplicationNetworkPorts } from "@opendatalabs/personal-server-ts-core/replication/host-ports";
-import { createGatewayDataPointFeed } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  createGatewayDataPointFeed,
+  withCancellableRegistration,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import type { StreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type {
   RunIntake,
@@ -33,10 +36,8 @@ import type {
   DataPointFeedPort,
   DataStoragePort,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import {
-  createGatewayClient,
-  deriveMasterKey,
-} from "@opendatalabs/vana-sdk/browser";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
+import { legacyMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   createInMemoryWriteProofReplayStore,
   createInMemoryWriteSessionStore,
@@ -232,7 +233,12 @@ export async function createIndexedDbPsLiteRuntime(
       }),
       options.dataFileStore,
     ));
-  const gateway = options.gateway ?? createGatewayClient(config.gateway.url);
+  const gateway =
+    options.gateway ??
+    withCancellableRegistration(
+      createGatewayClient(config.gateway.url),
+      config.gateway.url,
+    );
   const serverOwner = await resolvePsLiteOwner({
     ownerAddress: options.ownerAddress,
     ownerSignature: options.ownerSignature,
@@ -356,7 +362,7 @@ export async function createIndexedDbPsLiteRuntime(
           createReplicationNetworkPorts({
             config,
             owner,
-            masterKey: deriveMasterKey(options.ownerSignature),
+            masterKey: legacyMasterKey(options.ownerSignature),
             storage: objectStorage,
             gateway,
             feed:

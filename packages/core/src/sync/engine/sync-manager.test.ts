@@ -11,6 +11,12 @@ import type {
   DataStoragePort,
   PendingBlobDeletion,
 } from "../../ports/index.js";
+import {
+  createMemoryUploadAttemptStore,
+  UPLOAD_ATTEMPTS_RESET_NOTICE,
+  uploadAttemptKey,
+  type UploadAttemptStore,
+} from "../upload-attempts.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 
 // Mock workers so we control their behavior
@@ -31,6 +37,7 @@ import { uploadAll } from "../workers/upload.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { createSyncManager } from "./sync-manager.js";
+import { createUploadStateTracker } from "../upload-state.js";
 
 function makeMockLogger(): Logger {
   return {
@@ -652,6 +659,99 @@ describe("SyncManager", () => {
       });
     });
 
+    describe("upload state across a delete", () => {
+      const row = (n: number, scope = "instagram.profile") => ({
+        id: n,
+        path: `${scope}/${n}.json`,
+        scope,
+        collectedAt: `2026-08-0${n}T00:00:00.000Z`,
+        version: n,
+        sizeBytes: 1024,
+        dataPointId: null,
+        afterTombstoneVersion: null,
+      });
+
+      /** Three held entries of the scope (+ one of another), all still unsynced. */
+      function heldState(rows: ReturnType<typeof row>[]) {
+        const state = createUploadStateTracker();
+        const [tooLarge, retrying, stopped, other] = rows;
+        state.markTooLarge(
+          { scope: tooLarge.scope, path: tooLarge.path },
+          337 * 1024 * 1024,
+        );
+        state.recordFailure(
+          { scope: retrying.scope, path: retrying.path },
+          "boom",
+          Date.parse("2026-11-07T12:00:00Z"),
+        );
+        for (let i = 0; i < 8; i++)
+          state.recordFailure(
+            { scope: stopped.scope, path: stopped.path },
+            "boom",
+            Date.parse("2026-11-07T12:00:00Z"),
+          );
+        state.recordFailure(
+          { scope: other.scope, path: other.path },
+          "boom",
+          Date.parse("2026-11-07T12:00:00Z"),
+        );
+        return state;
+      }
+
+      it("keeps retrying, stopped and too-large state when the gateway tombstone fails", async () => {
+        const rows = [row(1), row(2), row(3), row(4, "notes.entries")];
+        const uploadDeps = makeMockUploadDeps();
+        const uploadState = heldState(rows);
+        uploadDeps.uploadState = uploadState;
+        uploadDeps.storage.findUnsynced = vi.fn(() => rows);
+        uploadDeps.storage.listVersions = vi.fn(() => rows);
+        uploadDeps.storage.deleteVersion = vi.fn(async () => true);
+        const deleteData = makeDeleteData();
+        deleteData.tombstone.mockRejectedValue(new Error("gateway down"));
+        const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+          deleteData,
+          pendingBlobDeletions: makePending(),
+        });
+
+        const result = await manager.deleteScope("instagram.profile");
+
+        expect(result.steps.gateway.status).toBe("failed");
+        expect(uploadDeps.storage.deleteVersion).not.toHaveBeenCalled();
+        const held = uploadState.snapshot();
+        expect(held.tooLarge).toHaveLength(1);
+        expect(held.retrying).toHaveLength(2);
+        expect(held.stopped).toHaveLength(1);
+        // The retrying entry is not due early because a delete failed.
+        const failedAt = Date.parse("2026-11-07T12:00:00Z");
+        expect(uploadState.shouldAttempt(rows[1].path, failedAt + 1000)).toBe(
+          false,
+        );
+      });
+
+      it("clears upload state for exactly the entries the delete removed", async () => {
+        const rows = [row(1), row(2), row(3), row(4, "notes.entries")];
+        const uploadDeps = makeMockUploadDeps();
+        const uploadState = heldState(rows);
+        uploadDeps.uploadState = uploadState;
+        uploadDeps.storage.findUnsynced = vi.fn(() => [...rows]);
+        uploadDeps.storage.listVersions = vi.fn(() => []);
+        // The local delete removes entries 1 and 2 and leaves entry 3 behind.
+        uploadDeps.storage.deleteScope = vi.fn(async () => {
+          rows.splice(0, 2);
+          return 2;
+        });
+        const manager = createSyncManager(uploadDeps, makeMockDownloadDeps());
+
+        await manager.deleteScope("instagram.profile");
+
+        const paths = (list: { path: string }[]) => list.map((e) => e.path);
+        const held = uploadState.snapshot();
+        expect(paths(held.tooLarge)).toEqual([]);
+        expect(paths(held.retrying)).toEqual(["notes.entries/4.json"]);
+        expect(paths(held.stopped)).toEqual(["instagram.profile/3.json"]);
+      });
+    });
+
     it("retries pending blob deletions at the start of every cycle", async () => {
       const deleteData = makeDeleteData();
       const pending = makePending([
@@ -890,5 +990,120 @@ describe("SyncManager", () => {
       await manager.trigger();
       expect(uploadAll).toHaveBeenCalledTimes(1);
     });
+  });
+});
+
+describe("sync manager upload state", () => {
+  it("shares one upload state with the upload worker and reports it in the status", async () => {
+    const uploadDeps = makeMockUploadDeps();
+    const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+      pollInterval: 60_000,
+    });
+    let seen: UploadWorkerDeps | undefined;
+    (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async (deps) => {
+      seen = deps;
+      deps.uploadState?.markTooLarge({ scope: "s.big", path: "s/1.json" }, 9);
+      return [];
+    });
+
+    expect(manager.getStatus().uploads).toEqual({
+      tooLarge: [],
+      unsizable: [],
+      retrying: [],
+      stopped: [],
+    });
+    await manager.trigger();
+    await manager.stop();
+
+    expect(seen?.uploadState).toBeDefined();
+    expect(manager.getStatus().uploads?.tooLarge).toEqual([
+      expect.objectContaining({ scope: "s.big", path: "s/1.json" }),
+    ]);
+  });
+});
+
+describe("sync manager upload attempt markers", () => {
+  const entry = {
+    id: 1,
+    scope: "s.crashy",
+    path: "s/1.json",
+    collectedAt: "2026-11-07T10:00:00Z",
+    version: 1,
+    sizeBytes: 10,
+  } as never;
+
+  /** The ledger the manager hands the upload worker on its next cycle. */
+  async function ledgerOf(manager: ReturnType<typeof createSyncManager>) {
+    let seen: UploadWorkerDeps | undefined;
+    (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async (deps) => {
+      seen = deps;
+      return [];
+    });
+    // start(), not trigger(): an owner trigger may lift the quarantine.
+    manager.start();
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    return seen!.uploadAttempts!;
+  }
+
+  /** A later process over the same bytes: it holds no dead predecessor's lock. */
+  let boots = 0;
+  const processOver = (store: UploadAttemptStore): UploadAttemptStore => ({
+    namespace: `${store.namespace}#boot-${++boots}`,
+    read: () => store.read(),
+    write: (envelope) => store.write(envelope),
+    preserveCorrupt: (value, stamp) => store.preserveCorrupt(value, stamp),
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("keeps the count and the quarantine when the manager is rebuilt over the same store", async () => {
+    const store = createMemoryUploadAttemptStore();
+    const build = () =>
+      createSyncManager(makeMockUploadDeps(), makeMockDownloadDeps(), {
+        uploadAttemptStore: processOver(store),
+      });
+
+    for (let boot = 0; boot < 2; boot++) {
+      const manager = build();
+      const ledger = await ledgerOf(manager);
+      await ledger.recover();
+      await ledger.begin(entry); // the process dies without settling
+    }
+    const rebuilt = build();
+    const ledger = await ledgerOf(rebuilt);
+    await ledger.recover();
+    expect(
+      ledger.isQuarantined(
+        uploadAttemptKey(makeMockUploadDeps().serverOwner, entry),
+      ),
+    ).toBe(true);
+
+    await rebuilt.retryQuarantinedUploads();
+    expect(ledger.quarantined()).toEqual([]);
+    await rebuilt.stop();
+  });
+
+  it("tells the owner, in the status errors, when a malformed ledger was reset", async () => {
+    const store = createMemoryUploadAttemptStore();
+    await store.write({ version: 9, records: [] } as never);
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      { uploadAttemptStore: store },
+    );
+    const ledger = await ledgerOf(manager);
+
+    expect(await ledger.recover()).toBe(true);
+
+    expect(manager.getStatus().errors).toEqual([
+      expect.objectContaining({
+        message: UPLOAD_ATTEMPTS_RESET_NOTICE,
+      }),
+    ]);
+    await manager.stop();
   });
 });

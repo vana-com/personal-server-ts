@@ -20,9 +20,18 @@ import {
   createMemoryPsLiteStateStore,
   createMemoryPsLiteStorage,
 } from "./test-support/memory.js";
-import { loadOrCreatePsLiteServerIdentity } from "./state.js";
+import {
+  createUploadAttemptLedger,
+  uploadAttemptKey,
+} from "@opendatalabs/personal-server-ts-core/sync";
+import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index/types";
+import {
+  createIndexedDbPsLiteStateStore,
+  loadOrCreatePsLiteServerIdentity,
+} from "./state.js";
 import {
   createPsLitePendingBlobDeletionStore,
+  createPsLiteUploadAttemptStore,
   createPsLiteSyncManager,
 } from "./sync.js";
 
@@ -293,6 +302,8 @@ describe("PS Lite sync", () => {
         scope: "instagram.profile",
         expectedVersion: "1",
       }),
+      // The attempt's signal reaches the registry write.
+      { signal: expect.any(AbortSignal) },
     );
   });
 
@@ -452,5 +463,215 @@ describe("PS Lite read-side deletion memory", () => {
       deleted: true,
       deletedAt: "2026-05-09T00:00:00.000Z",
     });
+  });
+});
+
+describe("createPsLiteUploadAttemptStore ownership", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
+  const entry = {
+    id: 1,
+    scope: "chatgpt.conversations",
+    path: "chatgpt.conversations/2026-11-07T10:00:00Z.json",
+    collectedAt: "2026-11-07T10:00:00Z",
+    version: 1,
+    sizeBytes: 4096,
+  } as IndexEntry;
+
+  /** A state store over the named backing store. */
+  const stateAt = (namespace: string) =>
+    Object.assign(createMemoryPsLiteStateStore(), { namespace });
+  /** Another wrapper object over the same backing store. */
+  const wrapperOf = (store: ReturnType<typeof stateAt>) => ({ ...store });
+  const ledgerOver = (store: ReturnType<typeof stateAt>) =>
+    createUploadAttemptLedger(createPsLiteUploadAttemptStore(store), OWNER);
+
+  /** Browser locks as one origin shares them: by name, held until released. */
+  function stubBrowserLocks() {
+    const held = new Set<string>();
+    vi.stubGlobal("navigator", {
+      locks: {
+        request: async (
+          name: string,
+          _options: unknown,
+          callback: (lock: object | null) => Promise<void> | undefined,
+        ) => {
+          if (held.has(name)) return callback(null);
+          held.add(name);
+          try {
+            await callback({});
+          } finally {
+            held.delete(name);
+          }
+        },
+      },
+    });
+  }
+
+  it("excludes a second wrapper over the same store without browser locks, and loses no marker", async () => {
+    vi.stubGlobal("navigator", {});
+    const first = stateAt("indexeddb:personal-server-lite/state");
+    const holder = ledgerOver(first);
+    expect(await holder.recover()).toBe(true);
+    const token = await holder.begin(entry);
+
+    const rival = ledgerOver(wrapperOf(first));
+    expect(await rival.recover()).toBe(false);
+
+    // The holder's marker is intact: it was not counted as a crash, and it
+    // settles normally.
+    expect(
+      (
+        (await first.get("upload-attempts-v1")) as {
+          records: Array<{ inFlight: boolean; interrupted: number }>;
+        }
+      ).records,
+    ).toEqual([expect.objectContaining({ inFlight: true, interrupted: 0 })]);
+    await holder.settle(token, "success");
+    await holder.close();
+    expect(await ledgerOver(wrapperOf(first)).recover()).toBe(true);
+  });
+
+  it("excludes a second wrapper over the same store with browser locks", async () => {
+    stubBrowserLocks();
+    const first = stateAt("indexeddb:personal-server-lite/state");
+    expect(await ledgerOver(first).recover()).toBe(true);
+    expect(await ledgerOver(wrapperOf(first)).recover()).toBe(false);
+  });
+
+  it.each([
+    ["without browser locks", () => vi.stubGlobal("navigator", {})],
+    ["with browser locks", stubBrowserLocks],
+  ])(
+    "does not starve a different store on the same origin (%s)",
+    async (_name, setup) => {
+      setup();
+      const a = ledgerOver(stateAt("indexeddb:db-a/state"));
+      const b = ledgerOver(stateAt("indexeddb:db-b/state"));
+      expect(await a.recover()).toBe(true);
+      expect(await b.recover()).toBe(true);
+    },
+  );
+
+  it("names the backing store of an IndexedDB state store", () => {
+    expect(
+      createIndexedDbPsLiteStateStore({ dbName: "a", storeName: "s" })
+        .namespace,
+    ).toBe('indexeddb:["a","s"]');
+  });
+
+  it.each([
+    ["without browser locks", () => vi.stubGlobal("navigator", {})],
+    ["with browser locks", stubBrowserLocks],
+  ])(
+    "does not merge database/store names that concatenate alike (%s)",
+    async (_name, setup) => {
+      setup();
+      const first = createIndexedDbPsLiteStateStore({
+        dbName: "tenant/a",
+        storeName: "state",
+      });
+      const second = createIndexedDbPsLiteStateStore({
+        dbName: "tenant",
+        storeName: "a/state",
+      });
+      expect(first.namespace).not.toBe(second.namespace);
+      const a = ledgerOver(stateAt(first.namespace!));
+      const b = ledgerOver(stateAt(second.namespace!));
+      expect(await a.recover()).toBe(true);
+      expect(await b.recover()).toBe(true);
+    },
+  );
+
+  it("refuses to guess a lock identity when the host names no store", () => {
+    expect(() =>
+      createPsLiteUploadAttemptStore({
+        ...createMemoryPsLiteStateStore(),
+        namespace: undefined,
+      }),
+    ).toThrow(/namespace/);
+  });
+});
+
+describe("createPsLiteUploadAttemptStore", () => {
+  const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
+  const entry = {
+    id: 1,
+    scope: "chatgpt.conversations",
+    path: "chatgpt.conversations/2026-11-07T10:00:00Z.json",
+    collectedAt: "2026-11-07T10:00:00Z",
+    version: 1,
+    sizeBytes: 4096,
+  } as IndexEntry;
+
+  it("keeps an unsettled attempt in the durable state store across rebuilds and quarantines at the second", async () => {
+    const stateStore = Object.assign(createMemoryPsLiteStateStore(), {
+      namespace: "indexeddb:personal-server-lite/state",
+    });
+    // Each boot is a new WebView: it holds no lock of its dead predecessor.
+    const boot = (n: number) =>
+      createUploadAttemptLedger(
+        createPsLiteUploadAttemptStore(stateStore, {
+          namespace: `${stateStore.namespace}#boot-${n}`,
+        }),
+        OWNER,
+      );
+    for (let n = 0; n < 2; n++) {
+      const ledger = boot(n);
+      await ledger.recover();
+      expect(ledger.quarantined()).toEqual([]);
+      await ledger.begin(entry); // the WebView dies here, never settles
+    }
+    const ledger = boot(2);
+    await ledger.recover();
+    expect(ledger.isQuarantined(uploadAttemptKey(OWNER, entry))).toBe(true);
+  });
+
+  it("preserves a malformed ledger under a side key, then starts a valid empty one", async () => {
+    const stateStore = Object.assign(
+      createMemoryPsLiteStateStore({
+        "upload-attempts-v1": { version: 1, records: [{ key: 7 }] },
+      }),
+      { namespace: "indexeddb:corrupt-ledger-test/state" },
+    );
+    const writes: Array<[string, unknown]> = [];
+    const set = stateStore.set.bind(stateStore);
+    stateStore.set = async (key, value) => {
+      writes.push([key, value]);
+      await set(key, value);
+    };
+    const degraded: string[] = [];
+    const ledger = createUploadAttemptLedger(
+      createPsLiteUploadAttemptStore(stateStore),
+      OWNER,
+      { onDegraded: (message) => degraded.push(message) },
+    );
+
+    expect(await ledger.recover()).toBe(true);
+
+    const side = writes.find(([key]) =>
+      key.startsWith("upload-attempts-v1.corrupt-"),
+    );
+    expect(side?.[1]).toEqual({ version: 1, records: [{ key: 7 }] });
+    // The copy is durable before the ledger is replaced.
+    expect(writes.indexOf(side!)).toBeLessThan(
+      writes.findIndex(([key]) => key === "upload-attempts-v1"),
+    );
+    expect(await stateStore.get("upload-attempts-v1")).toEqual({
+      version: 1,
+      records: [],
+    });
+    expect(degraded).toEqual([
+      "Upload crash protection was reset; earlier interruption counts were lost",
+    ]);
+    // New attempts are protected again.
+    await ledger.begin(entry);
+    expect(
+      (
+        (await stateStore.get("upload-attempts-v1")) as {
+          records: unknown[];
+        }
+      ).records,
+    ).toHaveLength(1);
   });
 });

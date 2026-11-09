@@ -6,7 +6,7 @@ import type { ServerConfig } from "../../schemas/server-config.js";
 import type { ServerAccount } from "../../keys/server-account.js";
 import type { BoundedStorageAdapter, StorageAdapter } from "./interface.js";
 import { createAudienceVanaAdapter } from "./vana-audience.js";
-import { createSdkStorageAdapter } from "./sdk.js";
+import { createSdkStorageAdapter, type SdkStorageProvider } from "./sdk.js";
 
 // Default endpoint baked into the SDK's vana-storage provider; mirrored here
 // so urlForKey resolves to the same host the provider uploads to when no
@@ -62,6 +62,23 @@ export function createVanaSyncStorageAdapter(params: {
     };
   }
 
+  const sdkProvider = (signal?: AbortSignal) =>
+    createVanaStorageProvider({
+      endpoint: params.config.storage.config.vana?.apiUrl,
+      chainId,
+      ownerAddress: owner,
+      signer: {
+        address: params.serverAccount.address,
+        signMessage: (message: string) =>
+          params.serverAccount.signMessage(message),
+      },
+      ...(signal
+        ? {
+            fetchImpl: (input: RequestInfo | URL, init?: RequestInit) =>
+              fetch(input, { ...init, signal }),
+          }
+        : {}),
+    });
   const adapter =
     params.audience && params.audience !== endpoint
       ? createAudienceVanaAdapter({
@@ -71,31 +88,22 @@ export function createVanaSyncStorageAdapter(params: {
           owner,
           signer: params.serverAccount,
         })
-      : createSdkStorageAdapter(
-          createVanaStorageProvider({
-            endpoint: params.config.storage.config.vana?.apiUrl,
-            chainId,
-            ownerAddress: owner,
-            signer: {
-              address: params.serverAccount.address,
-              signMessage: (message: string) =>
-                params.serverAccount.signMessage(message),
-            },
-          }),
-          {
-            // Mirror the provider's keying: PUT/GET target
-            // `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${encodeURIComponent-per-segment(key)}`.
-            // The download worker hands us `{scope}/{version}` and we rebuild the
-            // exact URL the provider's pathFromUrl() validator accepts.
-            urlForKey: (key) => {
-              const subpath = key
-                .split("/")
-                .map((segment) => encodeURIComponent(segment))
-                .join("/");
-              return `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${subpath}`;
-            },
+      : createSdkStorageAdapter(sdkProvider(), {
+          // The provider's transport is its `fetchImpl`; a provider built
+          // per signal sends every request of one call under that signal.
+          providerFor: (signal) => sdkProvider(signal),
+          // Mirror the provider's keying: PUT/GET target
+          // `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${encodeURIComponent-per-segment(key)}`.
+          // The download worker hands us `{scope}/{version}` and we rebuild the
+          // exact URL the provider's pathFromUrl() validator accepts.
+          urlForKey: (key) => {
+            const subpath = key
+              .split("/")
+              .map((segment) => encodeURIComponent(segment))
+              .join("/");
+            return `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${subpath}`;
           },
-        );
+        });
   return { ...adapter, downloadBounded };
 }
 
@@ -148,61 +156,64 @@ function createPublicReadAdapter(options: {
     );
   }
 
-  return createSdkStorageAdapter(
-    {
-      async upload() {
-        throw new ServerSigningUnavailableError();
-      },
+  const provider = (signal?: AbortSignal): SdkStorageProvider => ({
+    async upload() {
+      throw new ServerSigningUnavailableError();
+    },
 
-      async download(storageUrl) {
-        let requestUrl: string;
-        try {
-          const parsed = new URL(storageUrl);
-          if (ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)) {
-            throw invalidBlobUrl();
-          }
-          requestUrl = parsed.href;
-        } catch {
+    async download(storageUrl) {
+      let requestUrl: string;
+      try {
+        const parsed = new URL(storageUrl);
+        if (ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)) {
           throw invalidBlobUrl();
         }
-        if (!requestUrl.startsWith(blobPrefix)) {
-          throw invalidBlobUrl();
-        }
+        requestUrl = parsed.href;
+      } catch {
+        throw invalidBlobUrl();
+      }
+      if (!requestUrl.startsWith(blobPrefix)) {
+        throw invalidBlobUrl();
+      }
 
-        let response: Response;
-        try {
-          response = await fetch(requestUrl, { method: GET_METHOD });
-        } catch (cause) {
-          throw new StorageError(
-            "vana-storage public download network error",
-            DOWNLOAD_ERROR,
-            VANA_STORAGE,
-            { cause: cause instanceof Error ? cause : undefined },
-          );
-        }
-        if (!response.ok) {
-          throw new StorageError(
-            `vana-storage download failed: ${response.status} ${response.statusText}`,
-            DOWNLOAD_FAILED,
-            VANA_STORAGE,
-          );
-        }
+      let response: Response;
+      try {
+        response = await fetch(requestUrl, {
+          method: GET_METHOD,
+          ...(signal ? { signal } : {}),
+        });
+      } catch (cause) {
+        throw new StorageError(
+          "vana-storage public download network error",
+          DOWNLOAD_ERROR,
+          VANA_STORAGE,
+          { cause: cause instanceof Error ? cause : undefined },
+        );
+      }
+      if (!response.ok) {
+        throw new StorageError(
+          `vana-storage download failed: ${response.status} ${response.statusText}`,
+          DOWNLOAD_FAILED,
+          VANA_STORAGE,
+        );
+      }
 
-        return response.blob();
-      },
-
-      async delete() {
-        throw new ServerSigningUnavailableError();
-      },
+      return response.blob();
     },
-    {
-      urlForKey(key) {
-        const subpath = key
-          .split("/")
-          .map((segment) => encodeURIComponent(segment))
-          .join("/");
-        return `${blobPrefix}${subpath}`;
-      },
+
+    async delete() {
+      throw new ServerSigningUnavailableError();
     },
-  );
+  });
+
+  return createSdkStorageAdapter(provider(), {
+    providerFor: (signal) => provider(signal),
+    urlForKey(key) {
+      const subpath = key
+        .split("/")
+        .map((segment) => encodeURIComponent(segment))
+        .join("/");
+      return `${blobPrefix}${subpath}`;
+    },
+  });
 }

@@ -462,6 +462,51 @@ describe("IndexManager", () => {
     expect(twEntries).toHaveLength(1);
   });
 
+  // --- findUnsyncedPage ---
+
+  it("findUnsyncedPage pages unsynced rows by id, skipping synced ones", () => {
+    const rows = [0, 1, 2, 3, 4].map((i) =>
+      manager.insert({
+        fileId: null,
+        path: `s/${i}.json`,
+        scope: `s.${i}`,
+        collectedAt: `2026-01-21T10:00:0${i}Z`,
+        sizeBytes: 10,
+      }),
+    );
+    manager.updateDataPointId(rows[2].path, "0xdp");
+
+    const first = manager.findUnsyncedPage({ afterId: 0, limit: 2 });
+    const second = manager.findUnsyncedPage({
+      afterId: first[first.length - 1].id,
+      limit: 2,
+    });
+    const done = manager.findUnsyncedPage({
+      afterId: second[second.length - 1].id,
+      limit: 2,
+    });
+
+    expect(first.map((e) => e.path)).toEqual(["s/0.json", "s/1.json"]);
+    expect(second.map((e) => e.path)).toEqual(["s/3.json", "s/4.json"]);
+    expect(done).toEqual([]);
+  });
+
+  it("maxUnsyncedId is the highest unsynced id, 0 when none", () => {
+    expect(manager.maxUnsyncedId()).toBe(0);
+    const rows = [0, 1, 2].map((i) =>
+      manager.insert({
+        fileId: null,
+        path: `m/${i}.json`,
+        scope: `m.${i}`,
+        collectedAt: `2026-01-21T10:00:0${i}Z`,
+        sizeBytes: 10,
+      }),
+    );
+    expect(manager.maxUnsyncedId()).toBe(rows[2].id);
+    manager.updateDataPointId(rows[2].path, "0xdp");
+    expect(manager.maxUnsyncedId()).toBe(rows[1].id);
+  });
+
   // --- findUnsynced ---
 
   it("findUnsynced returns entries with fileId === null", () => {

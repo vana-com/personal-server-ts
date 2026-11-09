@@ -49,8 +49,9 @@ export interface TestOwnerKey {
 }
 
 export async function testOwnerKey(
-  masterKey: Uint8Array,
+  input: Uint8Array | Promise<Uint8Array>,
 ): Promise<TestOwnerKey> {
+  const masterKey = await input;
   const kNs = deriveScopeKey(masterKey, NAMESPACE_KEY_LABEL);
   const mac = async (message: Uint8Array) => hmac(nobleSha256, kNs, message);
   const keyCheck = await deriveKeyCheck(mac);

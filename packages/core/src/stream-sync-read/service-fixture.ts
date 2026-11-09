@@ -3,6 +3,9 @@ import type {
   Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { hexToBytes, keccak256, parseSignature, toBytes, toHex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { OWNER_MASTER_KEY_MESSAGE } from "../keys/owner-master-key.js";
 import { createStreamSyncReadKeys } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
@@ -28,8 +31,26 @@ import {
 const META = `0x${"ab".repeat(32)}`;
 const silent = { info() {}, warn() {}, error() {} };
 
-export function masterKey(seed: number): Uint8Array {
-  return Uint8Array.from({ length: 32 }, (_, i) => (seed * 31 + i) & 0xff);
+/**
+ * The owner signature of test owner `seed`: a real secp256k1 signature over
+ * the master-key message, made with a test key derived from the seed. It is in
+ * canonical form (v = 27/28, low s), the form the reader's normalization maps
+ * to itself, so the fixture keys equal the keys of the raw bytes.
+ */
+export async function masterKey(seed: number): Promise<Uint8Array> {
+  const account = privateKeyToAccount(
+    keccak256(toBytes(`pdpp-test-owner-key:${seed}`)),
+  );
+  const sig = parseSignature(
+    await account.sign({
+      hash: keccak256(toBytes(OWNER_MASTER_KEY_MESSAGE)),
+    }),
+  );
+  const out = new Uint8Array(65);
+  out.set(hexToBytes(toHex(BigInt(sig.r), { size: 32 })), 0);
+  out.set(hexToBytes(toHex(BigInt(sig.s), { size: 32 })), 32);
+  out[64] = 27 + (sig.yParity ?? 0);
+  return out;
 }
 
 export class Fixture {

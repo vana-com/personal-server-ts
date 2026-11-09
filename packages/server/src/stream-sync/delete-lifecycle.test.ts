@@ -8,7 +8,7 @@
  * pins on the next boot.
  */
 
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -693,7 +693,9 @@ describe.each(matrix)(
     it("collect, delete, run a pass: no file of that scope remains under the home", async () => {
       const c = freshConnector("p4r2-purge-files");
       await activateControl(env.registry, c, NS); // active(1)
-      const root = await mkdtemp(join(homedir(), ".tmp", "p4r2-purge-"));
+      const tmpParent = join(homedir(), ".tmp");
+      await mkdir(tmpParent, { recursive: true });
+      const root = await mkdtemp(join(tmpParent, "p4r2-purge-"));
       try {
         const a = await env.writer("p4r2-purge-device", {
           files: createFsStreamSyncFiles(join(root, "home")),

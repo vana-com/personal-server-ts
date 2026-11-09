@@ -6,6 +6,7 @@ import type { DataPointFeedRecord } from "../../ports/index.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
 import { createMemoryStreamSyncReadFiles } from "../../stream-sync-read/memory-files.js";
 import { createStreamSyncReadKeys } from "../../stream-sync-read/keys.js";
+import { masterKey } from "../../stream-sync-read/service-fixture.js";
 import { StreamSyncReadService } from "../../stream-sync-read/service.js";
 import { downloadAll, downloadOne, downloadScopes } from "./download.js";
 
@@ -130,7 +131,7 @@ describe("download worker routing of stream-sync rows", () => {
     const service = await StreamSyncReadService.open({
       files: createMemoryStreamSyncReadFiles(),
       blobs: { get: async () => null },
-      keys: await createStreamSyncReadKeys(new Uint8Array(65).fill(7)),
+      keys: await createStreamSyncReadKeys(await masterKey(7)),
       logger: { info() {}, warn() {}, error() {} },
     });
     const observe = vi.spyOn(service, "observe");

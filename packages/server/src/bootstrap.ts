@@ -53,11 +53,11 @@ import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createAccessLogWriter } from "./logging/access-log.js";
 import { createAccessLogReader } from "./logging/access-reader.js";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/node";
 import {
-  buildWeb3SignedHeader,
-  deriveMasterKey,
-  recoverServerOwner,
-} from "@opendatalabs/vana-sdk/node";
+  legacyMasterKey,
+  recoverOwnerAddress,
+} from "@opendatalabs/personal-server-ts-core/keys";
 import { loadOrCreateServerAccount } from "./keys/server-account.js";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import {
@@ -76,6 +76,7 @@ import {
   createInventoryTombstoneFinality,
   createScopeDeletionTracker,
   createSyncManager,
+  withCancellableRegistration,
   type PdppImporter,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -85,6 +86,7 @@ import {
   resolveVanaStorageEndpoint,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
+import { createFileUploadAttemptStore } from "./upload-attempts.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
@@ -307,6 +309,7 @@ export async function createServer(
     storageRoot,
     "pending-blob-deletions.json",
   );
+  const uploadAttemptsPath = join(storageRoot, "upload-attempts.json");
   const tokensPath = join(storageRoot, "tokens.json");
   const revisionJournalDir = join(storageRoot, "cas-revisions");
   const metadataSentinelPath = join(storageRoot, "cas-metadata-initialized");
@@ -524,9 +527,9 @@ export async function createServer(
   let identity: IdentityInfo | undefined;
 
   if (masterKeySignature) {
-    const recoveredServerOwner = await recoverServerOwner(masterKeySignature);
+    const recoveredServerOwner = await recoverOwnerAddress(masterKeySignature);
     serverOwner = recoveredServerOwner;
-    deriveMasterKey(masterKeySignature); // validate signature format
+    legacyMasterKey(masterKeySignature); // validate signature format
     logger.info({ owner: serverOwner }, "Server owner derived from master key");
     if (
       ownerTunnelSigner &&
@@ -802,7 +805,7 @@ export async function createServer(
           serverAccount,
           reads: isEnclave ? "public" : "signed",
         }),
-      masterKey: deriveMasterKey(masterKeySignature),
+      masterKey: legacyMasterKey(masterKeySignature),
       signer: options?.additionsWriter?.signer ?? serverSigner,
       gateway: options?.additionsWriter?.gateway ?? gatewayClient,
     });
@@ -815,7 +818,7 @@ export async function createServer(
     serverAccount &&
     serverSigner
   ) {
-    const masterKey = deriveMasterKey(masterKeySignature);
+    const masterKey = legacyMasterKey(masterKeySignature);
 
     const storageAdapter = createVanaSyncStorageAdapter({
       config,
@@ -832,7 +835,11 @@ export async function createServer(
       additions,
       storage: rawDataStorage,
       storageAdapter,
-      gateway: gatewayClient,
+      // An injected client is a test double or a host's own; only the default
+      // SDK client needs wrapping to take the attempt signal.
+      gateway: options?.gatewayClient
+        ? gatewayClient
+        : withCancellableRegistration(gatewayClient, config.gateway.url),
       signer: serverSigner,
       masterKey,
       serverOwner,
@@ -978,6 +985,7 @@ export async function createServer(
       deleteData,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
+      uploadAttemptStore: createFileUploadAttemptStore(uploadAttemptsPath),
       tombstoneFinality,
       transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {
@@ -1134,7 +1142,7 @@ export async function createServer(
               createReplicationNetworkPorts({
                 config,
                 owner,
-                masterKey: deriveMasterKey(masterKeySignature),
+                masterKey: legacyMasterKey(masterKeySignature),
                 storage: createVanaSyncStorageAdapter({
                   config,
                   serverOwner,
@@ -1230,7 +1238,7 @@ export async function createServer(
     !isEnclave && masterKeySignature
       ? await openLocalMcpState({
           path: join(storageRoot, "mcp-state.json"),
-          masterKey: deriveMasterKey(masterKeySignature),
+          masterKey: legacyMasterKey(masterKeySignature),
           logger,
         })
       : undefined;

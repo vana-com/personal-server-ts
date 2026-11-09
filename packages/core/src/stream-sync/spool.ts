@@ -23,7 +23,8 @@ import {
 import type { StreamSyncFiles } from "./ports.js";
 
 const encoder = new TextEncoder();
-const FLUSH_BYTES = 8 * 1024 * 1024;
+/** Default spool flush threshold: buffered lines written per append batch. */
+export const FLUSH_BYTES = 8 * 1024 * 1024;
 
 export function shardName(shard: number): string {
   return shard.toString(16).padStart(2, "0");
@@ -48,7 +49,10 @@ export class SpoolWriter {
   private buffered = 0;
   private failure: unknown = null;
 
-  constructor(private readonly files: StreamSyncFiles) {}
+  constructor(
+    private readonly files: StreamSyncFiles,
+    private readonly flushBytes: number = FLUSH_BYTES,
+  ) {}
 
   /** Queue one line. `bytes` is the canonical line's UTF-8 length. */
   async add(
@@ -64,7 +68,7 @@ export class SpoolWriter {
     }
     buffer.push(`${pkHash} ${text}\n`);
     this.buffered += bytes + 66;
-    if (this.buffered >= FLUSH_BYTES) await this.flush();
+    if (this.buffered >= this.flushBytes) await this.flush();
   }
 
   /** Drop every buffered line without writing it. */
@@ -104,6 +108,7 @@ export class SpoolWriter {
 export async function deriveShards(
   files: StreamSyncFiles,
   dir: string,
+  flushBytes: number = FLUSH_BYTES,
 ): Promise<void> {
   await files.remove(dir);
   const buffers = new Map<number, string[]>();
@@ -128,7 +133,7 @@ export async function deriveShards(
     }
     buffer.push(`${line.pkHash} ${line.text}\n`);
     buffered += line.text.length + 66;
-    if (buffered >= FLUSH_BYTES) await flush();
+    if (buffered >= flushBytes) await flush();
   }
   await flush();
 }
@@ -144,21 +149,43 @@ export async function* readSpool(
   files: StreamSyncFiles,
   path: string,
 ): AsyncGenerator<SpoolLine> {
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let rest = "";
+  // ignoreBOM keeps a U+FEFF in the decoded text. A decoder strips a BOM at the
+  // start of every decode call, so a per-line decode would strip one from every
+  // line. The whole-file decoder strips only the file's first BOM; match that.
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  // Split on the newline byte, then decode each line on its own. Decoding the
+  // whole chunk and slicing lines out of it would make every line a view that
+  // pins its 1 MiB chunk for as long as any caller keeps the line's text.
+  // 0x0a cannot occur inside a multi-byte UTF-8 sequence, so the split is safe.
+  let rest = new Uint8Array(0);
+  let firstLine = true;
   for await (const chunk of files.readChunks(path)) {
-    rest += decoder.decode(chunk, { stream: true });
-    let newline = rest.indexOf("\n");
+    const bytes = new Uint8Array(rest.length + chunk.length);
+    bytes.set(rest);
+    bytes.set(chunk, rest.length);
     let start = 0;
+    let newline = bytes.indexOf(0x0a, start);
     while (newline !== -1) {
-      yield parseSpoolLine(rest.slice(start, newline));
+      let raw = decoder.decode(bytes.subarray(start, newline));
+      if (firstLine && raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+      firstLine = false;
+      yield parseSpoolLine(raw);
       start = newline + 1;
-      newline = rest.indexOf("\n", start);
+      newline = bytes.indexOf(0x0a, start);
     }
-    rest = rest.slice(start);
+    rest = bytes.slice(start);
   }
-  rest += decoder.decode();
-  if (rest !== "") throw new Error(`spool file ${path} ends mid-line`);
+  if (rest.length !== 0) {
+    // A file that holds only a BOM has no lines, as the whole-file decoder gives.
+    const bomOnly =
+      firstLine &&
+      rest.length === 3 &&
+      rest[0] === 0xef &&
+      rest[1] === 0xbb &&
+      rest[2] === 0xbf;
+    if (bomOnly) return;
+    throw new Error(`spool file ${path} ends mid-line`);
+  }
 }
 
 function parseSpoolLine(raw: string): SpoolLine {
