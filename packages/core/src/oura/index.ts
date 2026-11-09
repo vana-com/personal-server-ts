@@ -406,7 +406,25 @@ async function importLocked(
       { basePath: "/v1/data" },
     );
     if (!response.ok) {
-      const failure = (await response.json()) as { error?: string };
+      // A refused legacy write carries its words in a nested `error` object.
+      // Name it, so the caller can tell "stop, the account moved" (426) from
+      // "try again" (503) instead of reading an object as a reason.
+      if (response.status === 426) {
+        return { ok: false, reason: "update_required", scope };
+      }
+      const failure = (await response.json()) as {
+        error?: string | { errorCode?: string };
+      };
+      if (typeof failure.error === "object") {
+        return {
+          ok: false,
+          reason:
+            failure.error?.errorCode === "ACCOUNT_MODE_UNKNOWN"
+              ? "account_mode_unknown"
+              : "ingest_failed",
+          scope,
+        };
+      }
       return { ok: false, reason: failure.error ?? "ingest_failed", scope };
     }
   }

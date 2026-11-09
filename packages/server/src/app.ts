@@ -19,6 +19,11 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import {
+  createLegacyWriteSeal,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { unwiredLegacyWriteSeal } from "./storage/unwired-legacy-write-seal.js";
 import type {
   DataPortabilityGatewayConfig,
   GatewayClient,
@@ -181,6 +186,15 @@ export interface AppDeps {
   tokenStore?: TokenStore;
   runtimeAvailability?: RuntimeAvailabilityPort;
   dataStorage?: DataStoragePort;
+  /**
+   * The seal legacy writes through the routes here become durable behind. The
+   * host passes the seal of its one account-mode authority (the same one its
+   * storage was built with). Without it the app derives one from
+   * `accountModeAuthority`, and with neither it refuses every legacy write as
+   * unknown. Only matters to a route that builds its own fallback storage or
+   * finalizes a chunked import; a given `dataStorage` carries its own seal.
+   */
+  legacyWriteSeal?: LegacyWriteSeal;
   /** Canonical latest bodies for GET /v1/data; absent = file reads only. */
   legacyScopeView?: LegacyScopeViewPort;
   /** Stream-sync reads (`streamSync.read`); absent = reads as before. */
@@ -355,6 +369,18 @@ export function createApp(deps: AppDeps): Hono {
       : { read: () => "unknown" },
     deps.serverOwner,
   );
+  // The one seal for the legacy writes these routes make durable: the host's
+  // own, else one over the host's authority, else a seal that refuses (no
+  // authority wired is unknown, never permission).
+  const legacyWriteSeal =
+    deps.legacyWriteSeal ??
+    deps.dataStorage?.legacyWriteSeal ??
+    (deps.accountModeAuthority
+      ? createLegacyWriteSeal({
+          authority: deps.accountModeAuthority,
+          owner: deps.serverOwner,
+        })
+      : unwiredLegacyWriteSeal());
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
   // derivative question registration), and one replay guard for the proofs
   // both redeeming routes verify.
@@ -556,7 +582,7 @@ export function createApp(deps: AppDeps): Hono {
 
   app.route(
     "/v1/import/oura-browser",
-    ouraRoutes({ ...deps, accountStorageMode }),
+    ouraRoutes({ ...deps, legacyWriteSeal, accountStorageMode }),
   );
 
   if (deps.accountModeAuthority) {
@@ -642,6 +668,7 @@ export function createApp(deps: AppDeps): Hono {
       scopeDeletions: deps.scopeDeletions,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
+      legacyWriteSeal,
       legacyScopeView,
       streamSyncRead: deps.streamSyncRead,
       // The account's storage mode (see the top of createApp).
@@ -805,6 +832,7 @@ export function createApp(deps: AppDeps): Hono {
     indexManager: deps.indexManager,
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,
+    legacyWriteSeal,
     streamSyncRead: deps.streamSyncRead,
     accountStorageMode,
     runtimeAvailability: deps.runtimeAvailability,

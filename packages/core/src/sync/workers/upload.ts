@@ -12,6 +12,7 @@ import {
 export { parseGatewayNextVersion } from "../../publication/publish.js";
 import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "../../logger/index.js";
+import { LegacyWriteRefusedError } from "../../api/legacy-write-gate.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import type {
   DataPointFeedPort,
@@ -352,6 +353,8 @@ export async function uploadOne(
         signer,
         lineageGateway: deps.lineageGateway,
         fencedPublication: deps.fencedPublication,
+        // Each remote legacy write (blob upload, registration) is sealed.
+        legacyWriteSeal: storage.legacyWriteSeal,
         signal,
         head: initialHead,
         readHead,
@@ -790,7 +793,8 @@ export async function uploadAll(
             token!,
             error === undefined ||
               error instanceof OrphanedEntryError ||
-              error instanceof DeletedScopeEntryError
+              error instanceof DeletedScopeEntryError ||
+              error instanceof LegacyWriteRefusedError
               ? "success"
               : "failure",
           ),
@@ -822,6 +826,16 @@ export async function uploadAll(
       ) {
         state.clear(target.path);
         continue;
+      }
+      // The account no longer accepts legacy writes (switched) or has not said
+      // yet (unknown). Nothing is wrong with this entry: it is not a failure,
+      // spends no retry budget, and the rest of the pass would be refused too.
+      if (err instanceof LegacyWriteRefusedError) {
+        deps.logger.info(
+          { path: target.path, scope: target.scope, verdict: err.verdict },
+          "Stopped uploading: legacy writes are not open for this account",
+        );
+        break;
       }
       const error = err as Error;
       state.recordFailure(

@@ -29,6 +29,7 @@ import {
   type ModeAuthority,
   type ModeRecordStore,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { createLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import { createIndexedDbModeRecordStore } from "./account-mode-store.js";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import type { InferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
@@ -168,6 +169,10 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    * identity/config/sync/auth/signer composition. This is all-or-nothing:
    * either omit it for the default Web IndexedDB/OPFS path, or provide every
    * port for a host-owned persistence implementation.
+   *
+   * The seal over the account-mode module is built here and given only to the
+   * default storage. An injected `storage` is the host's own and must seal its
+   * own legacy writes: this factory cannot reach into it.
    */
   persistence?: PsLitePersistenceBundle;
 }
@@ -242,6 +247,32 @@ export async function createIndexedDbPsLiteRuntime(
       dbName,
       storeName: "accessLogs",
     });
+  const serverOwner = await resolvePsLiteOwner({
+    ownerAddress: options.ownerAddress,
+    ownerSignature: options.ownerSignature,
+  });
+  // One mode, from one place: the account-mode module. Its records live in
+  // their own IndexedDB database, never in the data store. Boot does not wait
+  // for the Account: before the first answer reads stay legacy and legacy
+  // writes pause. A host that injects its own persistence has not offered
+  // browser IndexedDB, so without an `accountModeStore` the records are in
+  // memory and the Account's answer at the next launch restores them.
+  const accountModeAuthority = createModeAuthority({
+    store:
+      options.accountModeStore ??
+      (options.persistence
+        ? createMemoryModeRecordStore()
+        : createIndexedDbModeRecordStore(`${dbName}-account-mode`)),
+    onWarning: (message, detail) => console.warn(message, detail),
+  });
+  await accountModeAuthority.ready;
+  // The one seal over that module. The storage makes a legacy version durable
+  // only inside it, so the lock that answers an On is the lock every legacy
+  // write holds. A runtime without an owner gets a seal that answers unknown.
+  const legacyWriteSeal = createLegacyWriteSeal({
+    authority: accountModeAuthority,
+    owner: serverOwner,
+  });
   const storage =
     injected?.storage ??
     (await createPersistentPsLiteStorage(
@@ -252,6 +283,7 @@ export async function createIndexedDbPsLiteRuntime(
         key: options.storageKey ?? "data-storage-v1",
       }),
       options.dataFileStore,
+      legacyWriteSeal,
     ));
   const gateway =
     options.gateway ??
@@ -259,10 +291,6 @@ export async function createIndexedDbPsLiteRuntime(
       createGatewayClient(config.gateway.url),
       config.gateway.url,
     );
-  const serverOwner = await resolvePsLiteOwner({
-    ownerAddress: options.ownerAddress,
-    ownerSignature: options.ownerSignature,
-  });
   const serverSigner =
     options.serverSigner ??
     createServerSigner(identity.account, {
@@ -444,21 +472,6 @@ export async function createIndexedDbPsLiteRuntime(
           }
         : {}),
     });
-  // One mode, from one place: the account-mode module. Its records live in
-  // their own IndexedDB database, never in the data store. Boot does not wait
-  // for the Account: before the first answer reads stay legacy and legacy
-  // writes pause. A host that injects its own persistence has not offered
-  // browser IndexedDB, so without an `accountModeStore` the records are in
-  // memory and the Account's answer at the next launch restores them.
-  const accountModeAuthority = createModeAuthority({
-    store:
-      options.accountModeStore ??
-      (options.persistence
-        ? createMemoryModeRecordStore()
-        : createIndexedDbModeRecordStore(`${dbName}-account-mode`)),
-    onWarning: (message, detail) => console.warn(message, detail),
-  });
-  await accountModeAuthority.ready;
   const runtime = createPsLiteRuntime({
     ...options,
     accountModeAuthority,

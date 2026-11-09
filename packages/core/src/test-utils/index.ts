@@ -30,3 +30,8 @@ export {
   spyOnModeAuthority,
   type ModeAsked,
 } from "./account-mode.js";
+export {
+  HOLD_FOR_TESTS,
+  fixedLegacyWriteSeal,
+  openLegacyWriteSealForTests,
+} from "./legacy-write-seal.js";

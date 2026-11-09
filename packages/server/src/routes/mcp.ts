@@ -110,9 +110,13 @@ import type {
 import type { TokenStore } from "../token-store.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
+import { unwiredLegacyWriteSeal } from "../storage/unwired-legacy-write-seal.js";
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 export interface McpRouteDeps {
   logger: Logger;
+  /** The seal for the fallback storage built when no `dataStorage` is given. */
+  legacyWriteSeal?: LegacyWriteSeal;
   /**
    * `serverOrigin` used both as the Web3Signed `aud` for the per-connection
    * grantee's self-issued read requests AND as the base URL printed back to
@@ -377,6 +381,7 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
           createNodeDataStorage({
             indexManager: deps.indexManager,
             hierarchyOptions: deps.hierarchyOptions,
+            legacyWriteSeal: deps.legacyWriteSeal ?? unwiredLegacyWriteSeal(),
           }),
         )
       : undefined);

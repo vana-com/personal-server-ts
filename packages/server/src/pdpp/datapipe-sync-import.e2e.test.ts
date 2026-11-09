@@ -39,7 +39,7 @@
  * path.
  */
 
-import { fixedOwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { fixedLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -373,7 +373,7 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
     expect(document).toBe(DECLARATION_DOCUMENT);
 
     return createPdppImporter({
-      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       store: target,
       declarations: [
         {
@@ -421,7 +421,7 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
   async function syncObserved(envelope: DataFileEnvelope) {
     let outcome: PdppImportOutcome | undefined;
     const observed: PdppImporter = {
-      importEnvelope: (e) => (outcome = importer.importEnvelope(e)),
+      importEnvelope: async (e) => (outcome = await importer.importEnvelope(e)),
       needsRetry: (scope, at) => importer.needsRetry(scope, at),
     };
     const legacy = await syncOne(envelope, observed);
@@ -431,7 +431,7 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
   it("decrypts, keeps legacy indexing, and refuses the record at the method fence", async () => {
     let outcome: PdppImportOutcome | undefined;
     const observed: PdppImporter = {
-      importEnvelope: (e) => (outcome = importer.importEnvelope(e)),
+      importEnvelope: async (e) => (outcome = await importer.importEnvelope(e)),
       needsRetry: (scope, at) => importer.needsRetry(scope, at),
     };
     const legacy = await syncOne(

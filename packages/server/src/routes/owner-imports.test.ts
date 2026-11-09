@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fixedOwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
+import {
+  fixedLegacyWriteSeal,
+  fixedOwnedAccountStorageMode,
+  openLegacyWriteSealForTests,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +30,7 @@ describe("owner import acceptance across restart", () => {
     index = createIndexManager(initializeDatabase(join(root, "index.db")));
     app = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
       logger: pino({ level: "silent" }),
@@ -147,11 +152,13 @@ describe("owner import acceptance across restart", () => {
 
   it("refuses unsupported storage and invalid import combinations before creating data", async () => {
     const raw = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
     });
     const unsupported = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
       dataStorage: { ...raw, kind: "custom", commitVersion: undefined },

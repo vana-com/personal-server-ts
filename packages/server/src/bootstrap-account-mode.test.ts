@@ -1,10 +1,18 @@
 /**
  * What the saved account-mode record does at boot: a switched owner's legacy
- * store is left alone, an unreadable record starts the server unknown (legacy
+ * store gets no new file, an owner not yet heard keeps its repair for the pass
+ * that runs when the Account answers, an unreadable record starts the server unknown (legacy
  * writes pause, boot does not fail), and shutdown drains an admitted legacy
  * write before the index closes.
  */
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -42,7 +50,7 @@ describe("the server's hold on the account mode records", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("a saved On plus a reindex condition at boot produces no legacy write", async () => {
+  it("a saved On plus a reindex condition at boot writes no legacy file, and the leftover marker is removed", async () => {
     const first = await start();
     await declareAccountMode(first, "on");
     await first.cleanup();
@@ -52,16 +60,28 @@ describe("the server's hold on the account mode records", () => {
     await writeFile(marker, "left over\n");
 
     const second = await start();
-    expect(await readFile(marker, "utf8")).toBe("left over\n");
     expect(
       second.accountModeAuthority.read(second.serverOwner ?? "").kind,
     ).toBe("streams");
+    // Removal is admitted in every mode; nothing new was written.
+    await expect(readFile(marker, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const files = await readdir(join(dir, "data"), {
+      recursive: true,
+      withFileTypes: true,
+    });
+    expect(files.filter((entry) => entry.isFile())).toEqual([]);
   }, 30_000);
 
-  it("an owner with no saved On repairs the legacy store at boot, as before", async () => {
+  it("an owner who has not been heard leaves the repair for the pass that runs once the mode is heard", async () => {
     const marker = join(dir, "reindex-in-progress");
     await writeFile(marker, "left over\n");
-    await start();
+    const ctx = await start();
+    // Mode unknown: the marker is untouched.
+    expect(await readFile(marker, "utf8")).toBe("left over\n");
+    // The Account answers Off: the repair runs once, then the marker is gone.
+    await declareAccountMode(ctx, "off");
     await expect(readFile(marker, "utf8")).rejects.toMatchObject({
       code: "ENOENT",
     });

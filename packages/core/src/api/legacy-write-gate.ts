@@ -1,18 +1,19 @@
 /**
- * The one check that refuses a legacy-format write unless the account has
- * answered Off.
+ * The legacy-write gate: the words a refused legacy write is answered with.
  *
- * The gate reads the owner-bound `AccountStorageMode`, the same instance the
- * read selector reads, so it holds no state of its own. Three answers:
- * - `unswitched`: the write may proceed.
- * - `switched`: refused with 426, from every caller. No request header and no
- *   delegated builder signature exempts a write. A client built for stream
- *   sync that still makes a legacy write is refused too.
- * - `unknown`, or no mode wired: refused with a retryable 503
- *   (`ACCOUNT_MODE_UNKNOWN`). A missing answer is never permission.
+ * It decides nothing. The mode module (`sync/account-mode`) decides, and the
+ * legacy-write seal (`storage/legacy-write-seal.ts`) asks it under the
+ * module's lock. This file only turns an answer into the 426 or 503 a legacy
+ * client reads, and carries that answer through a handler as an error.
  *
- * This is an admission check. The write that follows must still pass the
- * module's commit seal (`ModeAuthority.commitLegacy`) at its durable step.
+ * - switched: 426 `update_required`, from every caller. No request header and
+ *   no delegated builder signature exempts a write.
+ * - unknown, or no mode wired: a retryable 503 `ACCOUNT_MODE_UNKNOWN`. A
+ *   missing answer is never permission.
+ *
+ * `refuseLegacyWrite` is the early, unlocked refusal a route gives before it
+ * reads a body. It is a courtesy: the write that follows must still pass the
+ * seal at its durable step.
  */
 
 import {
@@ -32,29 +33,14 @@ export const STREAM_SYNC_CLIENT_HEADER = "vana-stream-sync-client";
 export const UPDATE_REQUIRED_MESSAGE =
   "This account has moved to stream sync. Update the Vana app to keep syncing. The data already on this device is untouched.";
 
-/** What the gate reads: the owner-bound mode, or nothing wired. */
+/** What the early refusal reads: the owner-bound mode, or nothing wired. */
 export type LegacyWriteMode = Pick<OwnedAccountStorageMode, "read">;
 
-/**
- * The one decision: whether a legacy write must be refused right now. Only an
- * answered Off lets it through.
- */
-export function legacyWritesRefused(
-  mode: LegacyWriteMode | undefined,
-): boolean {
-  return (mode?.read() ?? "unknown") !== "unswitched";
-}
+/** Why a legacy write was refused: the account switched, or the mode is unknown. */
+export type LegacyWriteVerdict = "switched" | "unknown";
 
-/**
- * The refusal for a legacy write, or `null` when the write may proceed.
- * HTTP entries return this response; the decision is `legacyWritesRefused`.
- */
-export function refuseLegacyWrite(
-  mode: LegacyWriteMode | undefined,
-): Response | null {
-  const value = mode?.read() ?? "unknown";
-  if (value === "unswitched") return null;
-  if (value === "unknown") return accountModeUnknownResponse();
+/** The 426 an old client reads. */
+export function updateRequiredResponse(): Response {
   // Both error shapes the legacy surface uses, so an old client reads the
   // message from whichever field it already knows.
   return new Response(
@@ -76,4 +62,54 @@ export function refuseLegacyWrite(
       },
     },
   );
+}
+
+/**
+ * A refused legacy write, carried through a handler or a background caller.
+ * Thrown by the legacy-write seal; `verdict` says why: `switched` (426, never
+ * retry) or `unknown` (503, retry).
+ */
+export class LegacyWriteRefusedError extends Error {
+  constructor(
+    readonly response: Response,
+    readonly verdict: LegacyWriteVerdict = response.status === 426
+      ? "switched"
+      : "unknown",
+  ) {
+    super(
+      verdict === "switched"
+        ? "legacy write refused: the account has moved to stream sync"
+        : "legacy write refused: the account storage mode is unknown",
+    );
+    this.name = "LegacyWriteRefusedError";
+  }
+}
+
+/** The error for a module answer that refused a legacy write. */
+export function legacyWriteRefusedErrorFor(
+  verdict: LegacyWriteVerdict,
+): LegacyWriteRefusedError {
+  return new LegacyWriteRefusedError(
+    verdict === "switched"
+      ? updateRequiredResponse()
+      : accountModeUnknownResponse(),
+    verdict,
+  );
+}
+
+/**
+ * The early, unlocked refusal for a legacy write, or `null` when the mode
+ * says unswitched. A translation of the module's answer and nothing more.
+ */
+export function refuseLegacyWrite(
+  mode: LegacyWriteMode | undefined,
+): Response | null {
+  switch (mode?.read() ?? "unknown") {
+    case "unswitched":
+      return null;
+    case "switched":
+      return updateRequiredResponse();
+    case "unknown":
+      return accountModeUnknownResponse();
+  }
 }

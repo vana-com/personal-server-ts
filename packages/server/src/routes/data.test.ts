@@ -20,6 +20,7 @@ import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
   fixedOwnedAccountStorageMode,
@@ -203,6 +204,7 @@ describe("POST /v1/data/:scope", () => {
 
     app = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -258,6 +260,7 @@ describe("POST /v1/data/:scope", () => {
     );
     const localApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: localIndexManager,
       hierarchyOptions,
       logger,
@@ -287,6 +290,7 @@ describe("POST /v1/data/:scope", () => {
     );
     const localApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: localIndexManager,
       hierarchyOptions,
       logger,
@@ -352,6 +356,7 @@ describe("POST /v1/data/:scope", () => {
     const indexManager = createIndexManager(db);
     const localApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -438,6 +443,7 @@ describe("POST /v1/data/:scope", () => {
     });
     const localApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -479,6 +485,7 @@ describe("POST /v1/data/:scope", () => {
 
     const localApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -506,6 +513,7 @@ describe("POST /v1/data/:scope", () => {
 
     const localApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -541,6 +549,7 @@ describe("POST /v1/data/:scope", () => {
 
     const localApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -601,6 +610,7 @@ describe("GET /v1/data (list scopes)", () => {
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -772,6 +782,7 @@ describe("GET /v1/data listings are scoped to the builder's grants", () => {
   ) {
     return dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1099,6 +1110,7 @@ describe("GET /v1/data/additions", () => {
     });
     return dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1303,6 +1315,7 @@ describe("GET /v1/data/:scope/versions", () => {
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1461,6 +1474,7 @@ describe("GET /v1/data/:scope", () => {
 
     return dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -2282,6 +2296,7 @@ describe("DELETE /v1/data/:scope", () => {
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -2406,7 +2421,12 @@ describe("DELETE /v1/data/:scope", () => {
     const res = await deleteWithAuth(app, "instagram.profile");
 
     expect(res.status).toBe(200);
-    expect(deleteScope).toHaveBeenCalledWith("instagram.profile");
+    // The route hands the sync manager the seal's commit, so the mode decision
+    // and the local delete happen under one lock.
+    expect(deleteScope).toHaveBeenCalledWith(
+      "instagram.profile",
+      expect.any(Function),
+    );
     expect(await res.json()).toMatchObject({
       durable: true,
       steps: { gateway: { status: "ok", version: "3" } },
@@ -3052,6 +3072,7 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     });
     return dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,

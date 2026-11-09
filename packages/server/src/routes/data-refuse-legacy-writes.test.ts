@@ -13,6 +13,8 @@ import { join } from "node:path";
 import { pino } from "pino";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { STREAM_SYNC_CLIENT_HEADER } from "@opendatalabs/personal-server-ts-core/api";
+import { createLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "./data.js";
@@ -91,7 +93,22 @@ describe("refuse legacy writes after the stream-sync switch", () => {
     writeHooks = [];
     root = await mkdtemp(join(tmpdir(), "refuse-legacy-"));
     index = createIndexManager(initializeDatabase(join(root, "index.db")));
+    // A test stand-in that follows the flag in both directions (the real
+    // mode latches once switched), seen by the seal as well as the early check.
+    const open = fixedModeAuthority("unswitched");
+    const shut = fixedModeAuthority("switched");
+    const current = () => (switchedOn ? shut : open);
+    const legacyWriteSeal = createLegacyWriteSeal({
+      authority: {
+        admit: (...args) => current().admit(...args),
+        read: (...args) => current().read(...args),
+        commitLegacy: (...args) => current().commitLegacy(...args),
+        commitRemoval: (...args) => current().commitRemoval(...args),
+      },
+      owner,
+    });
     app = dataRoutes({
+      legacyWriteSeal,
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
       logger: pino({ level: "silent" }),
@@ -367,7 +384,7 @@ describe("refuse legacy writes after the stream-sync switch", () => {
         const { importId } = await opened.json();
         gatewayTouched = [];
         writeHooks = [];
-        const stagedBeforeSwitch = await dataTree();
+        expect(await dataTree()).not.toEqual([]);
 
         switchedOn = true;
         const chunkRefused = await putChunk(importId, extra);
@@ -377,15 +394,19 @@ describe("refuse legacy writes after the stream-sync switch", () => {
         const beginRefused = await begin(extra);
         expect(beginRefused.status).toBe(426);
 
-        await expectNothingTouched(stagedBeforeSwitch);
+        // The 426 drops the session it names and stages nothing.
+        await expectNothingTouched([]);
 
-        // Nothing was staged: with the switch off the refused chunk is still
-        // missing, and the session completes only once the chunk is re-sent.
+        // With the switch off again the dropped session is gone, so the
+        // client has to open a new one.
         switchedOn = false;
         expect((await finalize(importId)).status).not.toBe(201);
         expect(index.countByScope(scope)).toBe(0);
-        expect((await putChunk(importId)).status).toBe(200);
-        expect((await finalize(importId)).status).toBe(201);
+        const reopened = await begin();
+        expect(reopened.status).toBe(201);
+        const { importId: nextId } = await reopened.json();
+        expect((await putChunk(nextId)).status).toBe(200);
+        expect((await finalize(nextId)).status).toBe(201);
         expect(index.countByScope(scope)).toBe(1);
       },
     );

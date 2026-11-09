@@ -11,6 +11,7 @@ import { isTombstoneRecord } from "../sync/tombstone.js";
 import { readStoredLineage } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import type { ServerSigner } from "../signing/signer.js";
+import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import {
   StoredBlobConflictError,
   type StorageAdapter,
@@ -89,6 +90,15 @@ export interface PublishOptions {
   };
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   fencedPublication?: FencedPublicationPort;
+  /**
+   * The seal on legacy writes. Each remote write (a blob upload, a registry
+   * registration) runs as its own `legacyWriteSeal.commit`, so none starts
+   * after the account has moved to stream sync. The lock is held only across
+   * that one remote call; reads, signing and verification stay outside.
+   * Absent means the caller does not seal (a host with no stream-sync switch).
+   * A refused write throws `LegacyWriteRefusedError`.
+   */
+  legacyWriteSeal?: LegacyWriteSeal;
   /** Undefined means the caller has no initial registry observation. */
   head?: PublicationRecord | null;
   readHead(): Promise<PublicationRecord | null>;
@@ -230,6 +240,10 @@ export async function publishPreparedVersion(
   });
   let head = fence ? fence.head : options.head;
   await options.checkHead?.(head ?? null);
+  // One remote legacy write, alone in the seal. A refusal throws
+  // `LegacyWriteRefusedError` before the remote call is made.
+  const sealed = <T>(write: () => Promise<T>): Promise<T> =>
+    options.legacyWriteSeal ? options.legacyWriteSeal.commit(write) : write();
   function requireFence(reason: string): PublicationFence {
     if (!fence) throw new NeedsFencedPublicationError(scope, reason);
     return fence;
@@ -301,13 +315,15 @@ export async function publishPreparedVersion(
     let id: string | undefined;
     if (fencedPublication) {
       const previous = requireFence("registration/adoption");
-      const result = await fencedPublication.commit({
-        ...request,
-        ...lineageFields,
-        mode,
-        fence: previous,
-        signal,
-      });
+      const result = await sealed(() =>
+        fencedPublication.commit({
+          ...request,
+          ...lineageFields,
+          mode,
+          fence: previous,
+          signal,
+        }),
+      );
       const registered = result.fence.head;
       if (
         result.fence.generation !== previous.generation ||
@@ -326,12 +342,14 @@ export async function publishPreparedVersion(
       // No remote effect: the caller verified the live row's stored bytes.
       id = head?.id;
     } else {
-      const result = lineageFields
-        ? await options.lineageGateway!.registerDataPoint(
-            { ...request, ...lineageFields },
-            ...opts,
-          )
-        : await options.gateway.registerDataPoint(request, ...opts);
+      const result = await sealed(() =>
+        lineageFields
+          ? options.lineageGateway!.registerDataPoint(
+              { ...request, ...lineageFields },
+              ...opts,
+            )
+          : options.gateway.registerDataPoint(request, ...opts),
+      );
       id = result.dataPointId;
     }
     if (!id)
@@ -369,7 +387,9 @@ export async function publishPreparedVersion(
           );
         checkpoint();
         try {
-          await storageAdapter.upload(`${scope}/${version}`, encrypted, ...sig);
+          await sealed(() =>
+            storageAdapter.upload(`${scope}/${version}`, encrypted, ...sig),
+          );
         } catch (error) {
           if (!(error instanceof StoredBlobConflictError)) throw error;
         }
@@ -387,7 +407,9 @@ export async function publishPreparedVersion(
       version = BigInt(head.expectedVersion) + 1n;
     let value = wanted;
     try {
-      await storageAdapter.upload(`${scope}/${version}`, encrypted, ...sig);
+      await sealed(() =>
+        storageAdapter.upload(`${scope}/${version}`, encrypted, ...sig),
+      );
     } catch (error) {
       if (!(error instanceof StoredBlobConflictError)) throw error;
       value = await readCandidate(version);

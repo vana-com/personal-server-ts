@@ -61,9 +61,10 @@ import type {
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { Logger } from "../logger/index.js";
 import {
-  type LegacyWriteMode,
+  LegacyWriteRefusedError,
   UPDATE_REQUIRED_MESSAGE,
 } from "../api/legacy-write-gate.js";
+import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 
 /** The reserved key carrying PDPP import metadata inside `data`. */
 export const PDPP_METADATA_KEY = "$pdpp";
@@ -226,18 +227,20 @@ export interface PdppImporterDeps {
    */
   instanceFor: (sourceId: string) => string | undefined;
   /**
-   * The account's storage mode (see `legacy-write-gate.ts`). While it is
-   * switched, a canonical publish is refused: the stream store is the only
-   * store. While it is unknown, or not wired, the publish waits: the envelope
-   * is not settled and a later cycle offers it again.
+   * The seal on legacy writes (see `storage/legacy-write-seal.ts`). The
+   * canonical publish runs inside `legacyWriteSeal.commit`, so the mode is
+   * decided and the store is written under one lock. While the account is
+   * switched, the publish is refused: the stream store is the only store.
+   * While the mode is unknown, or no seal is wired, the publish waits: the
+   * envelope is not settled and a later cycle offers it again.
    */
-  accountStorageMode?: LegacyWriteMode;
+  legacyWriteSeal?: LegacyWriteSeal;
   logger: Logger;
 }
 
 export interface PdppImporter {
   /** Import one decrypted envelope. Never throws; failures are outcomes. */
-  importEnvelope(envelope: ImportableEnvelope): PdppImportOutcome;
+  importEnvelope(envelope: ImportableEnvelope): Promise<PdppImportOutcome>;
   /**
    * Whether re-offering this already-indexed (scope, collectedAt) could still
    * change anything.
@@ -474,8 +477,10 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
    * Only a transient rejection stays unsettled — that is the one outcome a
    * later cycle can genuinely improve on.
    */
-  function importAndSettle(envelope: ImportableEnvelope): PdppImportOutcome {
-    const outcome = importEnvelope(envelope);
+  async function importAndSettle(
+    envelope: ImportableEnvelope,
+  ): Promise<PdppImportOutcome> {
+    const outcome = await importEnvelope(envelope);
     const retryable =
       outcome.status === "rejected" && !isPermanentRejection(outcome.rejection);
     if (!retryable) {
@@ -484,7 +489,9 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
     return outcome;
   }
 
-  function importEnvelope(envelope: ImportableEnvelope): PdppImportOutcome {
+  async function importEnvelope(
+    envelope: ImportableEnvelope,
+  ): Promise<PdppImportOutcome> {
     const read = readMetadata(envelope.data);
     if (read === null) return { status: "skipped" };
     if (!read.ok) return reject("malformed_metadata", read.reason);
@@ -644,13 +651,33 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
       op: meta.record.op,
     };
 
-    // A canonical publish is a legacy write: refuse it on a switched account
-    // before anything is stored. This is the only gate on the publish path.
-    const mode = deps.accountStorageMode?.read() ?? "unknown";
-    if (mode === "switched") {
-      return reject("legacy_write_refused", UPDATE_REQUIRED_MESSAGE);
+    // A canonical publish is a legacy write. It runs inside the seal, so the
+    // mode decision and the store write share one lock: a switch cannot land
+    // between them. Everything above only reads.
+    const seal = deps.legacyWriteSeal;
+    if (!seal) {
+      return reject(
+        "account_mode_unknown",
+        "The account storage mode is not known yet",
+      );
     }
-    if (mode === "unknown") {
+    let result: ReturnType<PdppRecordStore["ingestBatch"]>;
+    try {
+      // One envelope per call, but through the batch API so the store's own
+      // transaction wraps the write: a failure rolls back rather than leaving
+      // a row without its history entry.
+      result = await seal.commit(() =>
+        store.ingestBatch(
+          [input],
+          () => declaredStream.semantics,
+          () => declaredStream.primaryKey,
+        ),
+      );
+    } catch (err) {
+      if (!(err instanceof LegacyWriteRefusedError)) throw err;
+      if (err.verdict === "switched") {
+        return reject("legacy_write_refused", UPDATE_REQUIRED_MESSAGE);
+      }
       // Not a permanent verdict: the mode is unknown now and a later cycle may
       // find it unswitched. Nothing is stored in the meantime.
       return reject(
@@ -658,15 +685,6 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
         "The account storage mode is not known yet",
       );
     }
-
-    // One envelope per call, but through the batch API so the store's own
-    // transaction wraps the write: a failure rolls back rather than leaving
-    // a row without its history entry.
-    const result = store.ingestBatch(
-      [input],
-      () => declaredStream.semantics,
-      () => declaredStream.primaryKey,
-    );
     if (result.rejected.length > 0) {
       const reason = result.rejected[0].reason;
       return reject(

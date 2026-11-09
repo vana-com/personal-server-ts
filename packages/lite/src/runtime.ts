@@ -40,6 +40,7 @@ import {
   handlePersonalServerDataRequest,
   handlePersonalServerScopeUploadAppend,
   refuseLegacyWrite,
+  LegacyWriteRefusedError,
   type OwnedAccountStorageMode,
   accountStorageModeFor,
   createScopeUploadRegistry,
@@ -1424,7 +1425,10 @@ export function createPsLiteRuntime(
               "METHOD_NOT_ALLOWED",
               "Method not allowed",
             );
-          // An Oura browser import is a legacy write: a switched account refuses it.
+          // An Oura browser import is a legacy write: a switched account refuses
+          // it. This is the early refusal; each stream the import stores is a
+          // storage write that passes the storage's seal on its own, so an
+          // account that switches mid-batch stops at the next stream.
           const refusal = refuseLegacyWrite(accountStorageMode);
           if (refusal) return refusal;
           let body;
@@ -1433,24 +1437,29 @@ export function createPsLiteRuntime(
           } catch {
             return errorResponse(400, "INVALID_BODY", "Body must be JSON");
           }
-          const result = await importOuraBrowserRecords(
-            toDataStoragePort(options.storage),
-            body,
-            {
-              accountStorageMode,
-              additions: options.additions,
-              scopeDeletions: options.scopeDeletions,
-              syncManager: options.syncManager ?? null,
-              onDataWritten: options.derivatives
-                ? (event) =>
-                    options.derivatives?.scheduler.markSourceChanged(
-                      event.scope,
-                      { lineageSources: event.lineageSources },
-                    )
-                : undefined,
-            },
-          );
-          return jsonResponse(result, { status: result.ok ? 200 : 409 });
+          try {
+            const result = await importOuraBrowserRecords(
+              toDataStoragePort(options.storage),
+              body,
+              {
+                accountStorageMode,
+                additions: options.additions,
+                scopeDeletions: options.scopeDeletions,
+                syncManager: options.syncManager ?? null,
+                onDataWritten: options.derivatives
+                  ? (event) =>
+                      options.derivatives?.scheduler.markSourceChanged(
+                        event.scope,
+                        { lineageSources: event.lineageSources },
+                      )
+                  : undefined,
+              },
+            );
+            return jsonResponse(result, { status: result.ok ? 200 : 409 });
+          } catch (error) {
+            if (error instanceof LegacyWriteRefusedError) return error.response;
+            throw error;
+          }
         }
 
         const dataPrefix = "/v1/data";

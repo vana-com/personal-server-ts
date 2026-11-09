@@ -21,7 +21,12 @@ import {
   createModeAuthority,
   type ModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import {
+  createLegacyWriteSeal,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import { createApp } from "../app.js";
+import { unwiredLegacyWriteSeal } from "../storage/unwired-legacy-write-seal.js";
 import { initializeDatabase } from "../storage/index-schema.js";
 import {
   createIndexManager,
@@ -250,7 +255,23 @@ describe("the app's mode comes from the module and nothing else", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  // How many times a write reached the seal. The route's own early check sits
+  // before it, so a request the module's mode refuses never gets this far.
+  let sealReached = 0;
+
   async function legacyWrite(extra: Record<string, unknown>) {
+    sealReached = 0;
+    const authority = extra.accountModeAuthority as ModeAuthority | undefined;
+    const sealed: LegacyWriteSeal = authority
+      ? createLegacyWriteSeal({ authority, owner: owner.address })
+      : unwiredLegacyWriteSeal();
+    const countingSeal: LegacyWriteSeal = {
+      ...sealed,
+      commit: (write) => {
+        sealReached += 1;
+        return sealed.commit(write);
+      },
+    };
     const app = createApp({
       logger: pino({ level: "silent" }),
       version: "0.0.1",
@@ -261,6 +282,7 @@ describe("the app's mode comes from the module and nothing else", () => {
       serverOwner: owner.address,
       gateway: {} as GatewayClient,
       accessLogWriter: { write: async () => undefined },
+      legacyWriteSeal: countingSeal,
       ...extra,
     } as never);
     return app.request("/v1/data/github.events", {
@@ -287,6 +309,7 @@ describe("the app's mode comes from the module and nothing else", () => {
       accountStorageMode: fixedAccountStorageMode("unswitched"),
     });
     expect(res.status).toBe(426);
+    expect(sealReached).toBe(0);
     expect(index.countByScope("github.events")).toBe(0);
   });
 
@@ -296,6 +319,7 @@ describe("the app's mode comes from the module and nothing else", () => {
       accountStorageMode: fixedAccountStorageMode("unswitched"),
     });
     expect(res.status).toBe(503);
+    expect(sealReached).toBe(0);
     expect(index.countByScope("github.events")).toBe(0);
   });
 

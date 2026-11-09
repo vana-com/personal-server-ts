@@ -7,7 +7,10 @@
  *
  * Known fixture limits are listed in the PR body under "Not proven".
  */
-import { createUnswitchedIndexedDbPsLiteRuntime } from "./test-support/unswitched-runtime.js";
+import {
+  createSwitchedIndexedDbPsLiteRuntime,
+  createUnswitchedIndexedDbPsLiteRuntime,
+} from "./test-support/unswitched-runtime.js";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -204,7 +207,12 @@ async function boot(net: Network, browser: Browser, write?: boolean) {
   // Passthrough spy only: capture the real service the browser factory wires.
   const opened = vi.spyOn(StreamSyncReadService, "open");
   const before = opened.mock.results.length;
-  const built = await createUnswitchedIndexedDbPsLiteRuntime({
+  // A stream write needs a saved On; a legacy write needs an account that is
+  // not switched. The instance that writes streams is the switched one.
+  const createRuntime = write
+    ? createSwitchedIndexedDbPsLiteRuntime
+    : createUnswitchedIndexedDbPsLiteRuntime;
+  const built = await createRuntime({
     ownerAddress: ACCOUNT.address,
     ownerSignature: net.signature,
     ownerSyncSigner: {

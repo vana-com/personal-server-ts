@@ -27,7 +27,9 @@ import {
 } from "./pdpp-import.js";
 import type { Logger } from "../logger/index.js";
 import type { AccountStorageModeValue } from "../api/account-storage-mode.js";
-import { fixedOwnedAccountStorageMode } from "../test-utils/account-mode.js";
+import { createLegacyWriteSeal } from "../storage/legacy-write-seal.js";
+import { authorityHearing } from "../test-utils/account-mode.js";
+import { fixedLegacyWriteSeal } from "../test-utils/legacy-write-seal.js";
 
 const SCOPE = "instagram.profile";
 const COLLECTED_AT = "2026-09-17T10:00:00.000Z";
@@ -85,7 +87,7 @@ function setup(overrides: Partial<RetainedDeclaration> = {}): {
 } {
   const store = createMemoryRecordStore();
   const importer = createPdppImporter({
-    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+    legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
     store,
     declarations: [{ ...RETAINED, ...overrides }],
     instanceFor: (sourceId) => (sourceId === SOURCE_ID ? INSTANCE : undefined),
@@ -219,23 +221,25 @@ describe("retry classification", () => {
     ).toBe(false);
   });
 
-  it("settles a version once its outcome cannot improve", () => {
+  it("settles a version once its outcome cannot improve", async () => {
     const { importer } = setup();
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
 
-    expect(importer.importEnvelope(envelope()).status).toBe("imported");
+    expect((await importer.importEnvelope(envelope())).status).toBe("imported");
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
   });
 
-  it("settles a permanently-rejected version", () => {
+  it("settles a permanently-rejected version", async () => {
     const { importer } = setup();
-    importer.importEnvelope(envelope({ digest: `sha256:${"b".repeat(64)}` }));
+    await importer.importEnvelope(
+      envelope({ digest: `sha256:${"b".repeat(64)}` }),
+    );
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
   });
 
-  it("settles a non-PDPP version so it is never re-read", () => {
+  it("settles a non-PDPP version so it is never re-read", async () => {
     const { importer } = setup();
-    const outcome = importer.importEnvelope({
+    const outcome = await importer.importEnvelope({
       scope: SCOPE,
       collectedAt: COLLECTED_AT,
       data: { id: "1" },
@@ -244,26 +248,26 @@ describe("retry classification", () => {
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
   });
 
-  it("leaves a transiently-rejected version open for retry", () => {
+  it("leaves a transiently-rejected version open for retry", async () => {
     const store = createMemoryRecordStore();
     // No instance derivable yet — the deployment is still coming up.
     const importer = createPdppImporter({
-      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       store,
       declarations: [RETAINED],
       instanceFor: () => undefined,
       logger: silentLogger(),
     });
 
-    expect(importer.importEnvelope(envelope()).status).toBe("rejected");
+    expect((await importer.importEnvelope(envelope())).status).toBe("rejected");
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
   });
 
-  it("settles a store method-authority refusal and leaves other store refusals open", () => {
-    const refusingWith = (reason: string) => {
+  it("settles a store method-authority refusal and leaves other store refusals open", async () => {
+    const refusingWith = async (reason: string) => {
       const store = createMemoryRecordStore();
       const importer = createPdppImporter({
-        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
         store: {
           ...store,
           ingestBatch: (envelopes) => ({
@@ -281,7 +285,7 @@ describe("retry classification", () => {
         instanceFor: () => INSTANCE,
         logger: silentLogger(),
       });
-      return { importer, outcome: importer.importEnvelope(envelope()) };
+      return { importer, outcome: await importer.importEnvelope(envelope()) };
     };
 
     for (const reason of [
@@ -289,21 +293,21 @@ describe("retry classification", () => {
       "binding_required",
       "blob_unclaimed",
     ]) {
-      const { importer, outcome } = refusingWith(reason);
+      const { importer, outcome } = await refusingWith(reason);
       expect(outcome).toEqual({
         status: "rejected",
         rejection: { code: "method_authority", message: reason },
       });
       expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
     }
-    const { importer, outcome } = refusingWith("database is locked");
+    const { importer, outcome } = await refusingWith("database is locked");
     expect(outcome).toMatchObject({ rejection: { code: "store_rejected" } });
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
   });
 
-  it("tracks versions independently", () => {
+  it("tracks versions independently", async () => {
     const { importer } = setup();
-    importer.importEnvelope(envelope());
+    await importer.importEnvelope(envelope());
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
     // A different version of the same scope has its own verdict.
     expect(importer.needsRetry(SCOPE, "2026-09-18T10:00:00.000Z")).toBe(true);
@@ -311,10 +315,10 @@ describe("retry classification", () => {
 });
 
 describe("createPdppImporter", () => {
-  it("imports a verified envelope and strips $pdpp from the stored record", () => {
+  it("imports a verified envelope and strips $pdpp from the stored record", async () => {
     const { importer, store } = setup();
 
-    const outcome = importer.importEnvelope(envelope());
+    const outcome = await importer.importEnvelope(envelope());
 
     expect(outcome).toMatchObject({
       status: "imported",
@@ -337,17 +341,17 @@ describe("createPdppImporter", () => {
     expect(stored?.version).toBe(1);
   });
 
-  it("accepts a bare-hex digest as readily as the prefixed form", () => {
+  it("accepts a bare-hex digest as readily as the prefixed form", async () => {
     const { importer } = setup();
-    const outcome = importer.importEnvelope(
+    const outcome = await importer.importEnvelope(
       envelope({ digest: DOCUMENT_DIGEST }),
     );
     expect(outcome.status).toBe("imported");
   });
 
-  it("leaves a non-PDPP envelope alone", () => {
+  it("leaves a non-PDPP envelope alone", async () => {
     const { importer, store } = setup();
-    const outcome = importer.importEnvelope({
+    const outcome = await importer.importEnvelope({
       scope: "instagram.profile",
       collectedAt: "2026-09-17T10:00:00.000Z",
       data: { id: "235680975", username: "callumflack" },
@@ -357,14 +361,16 @@ describe("createPdppImporter", () => {
   });
 
   describe("idempotency and change semantics", () => {
-    it("reports an unchanged re-import without allocating a new version", () => {
+    it("reports an unchanged re-import without allocating a new version", async () => {
       const { importer, store } = setup();
-      expect(importer.importEnvelope(envelope()).status).toBe("imported");
+      expect((await importer.importEnvelope(envelope())).status).toBe(
+        "imported",
+      );
 
       // The sync worker re-downloads the same data point on any full
       // reconcile. A second ingest here would bump the version and publish a
       // changes_since entry for a record that did not change.
-      const second = importer.importEnvelope(envelope());
+      const second = await importer.importEnvelope(envelope());
 
       expect(second.status).toBe("unchanged");
       expect(store.getRecord(INSTANCE, "profile", "235680975")?.version).toBe(
@@ -372,9 +378,9 @@ describe("createPdppImporter", () => {
       );
     });
 
-    it("treats a key-order-only difference as unchanged", () => {
+    it("treats a key-order-only difference as unchanged", async () => {
       const { importer, store } = setup();
-      importer.importEnvelope(envelope());
+      await importer.importEnvelope(envelope());
 
       const reordered = envelope();
       const data = reordered.data as Record<string, unknown>;
@@ -387,17 +393,19 @@ describe("createPdppImporter", () => {
         id: data.id,
       };
 
-      expect(importer.importEnvelope(reordered).status).toBe("unchanged");
+      expect((await importer.importEnvelope(reordered)).status).toBe(
+        "unchanged",
+      );
       expect(store.getRecord(INSTANCE, "profile", "235680975")?.version).toBe(
         1,
       );
     });
 
-    it("imports a new version when the payload actually changes", () => {
+    it("imports a new version when the payload actually changes", async () => {
       const { importer, store } = setup();
-      importer.importEnvelope(envelope());
+      await importer.importEnvelope(envelope());
 
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({
           username: "callum",
           collectedAt: "2026-09-18T10:00:00.000Z",
@@ -410,7 +418,7 @@ describe("createPdppImporter", () => {
       expect(stored?.data.username).toBe("callum");
     });
 
-    it("surfaces only real changes through changes_since", () => {
+    it("surfaces only real changes through changes_since", async () => {
       const { importer, store } = setup();
       const start = store.changesSince("profile", {
         instanceIds: [INSTANCE],
@@ -419,11 +427,11 @@ describe("createPdppImporter", () => {
       const anchor = start.nextChangesSince;
       expect(anchor).toBeDefined();
 
-      importer.importEnvelope(envelope());
+      await importer.importEnvelope(envelope());
       // Three re-syncs of an unchanged record.
-      importer.importEnvelope(envelope());
-      importer.importEnvelope(envelope());
-      importer.importEnvelope(envelope());
+      await importer.importEnvelope(envelope());
+      await importer.importEnvelope(envelope());
+      await importer.importEnvelope(envelope());
 
       const page = store.changesSince("profile", {
         instanceIds: [INSTANCE],
@@ -436,20 +444,20 @@ describe("createPdppImporter", () => {
       expect(page.data[0].recordKey).toBe("235680975");
     });
 
-    it("ignores a delete for a record it never held", () => {
+    it("ignores a delete for a record it never held", async () => {
       const { importer, store } = setup();
-      const outcome = importer.importEnvelope(envelope({ op: "delete" }));
+      const outcome = await importer.importEnvelope(envelope({ op: "delete" }));
       // Writing a tombstone here would announce the removal of something
       // this store never served.
       expect(outcome.status).toBe("unchanged");
       expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
     });
 
-    it("applies a delete for a record it holds", () => {
+    it("applies a delete for a record it holds", async () => {
       const { importer, store } = setup();
-      importer.importEnvelope(envelope());
+      await importer.importEnvelope(envelope());
 
-      const outcome = importer.importEnvelope(envelope({ op: "delete" }));
+      const outcome = await importer.importEnvelope(envelope({ op: "delete" }));
 
       expect(outcome.status).toBe("imported");
       expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
@@ -457,9 +465,9 @@ describe("createPdppImporter", () => {
   });
 
   describe("fail-closed verification", () => {
-    it("rejects a digest that does not match the retained document", () => {
+    it("rejects a digest that does not match the retained document", async () => {
       const { importer, store } = setup();
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({ digest: `sha256:${"b".repeat(64)}` }),
       );
       expect(outcome).toMatchObject({
@@ -469,9 +477,9 @@ describe("createPdppImporter", () => {
       expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
     });
 
-    it("rejects a non-sha256 digest algorithm", () => {
+    it("rejects a non-sha256 digest algorithm", async () => {
       const { importer } = setup();
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({ digest: `sha512:${DOCUMENT_DIGEST}` }),
       );
       expect(outcome).toMatchObject({
@@ -480,7 +488,7 @@ describe("createPdppImporter", () => {
       });
     });
 
-    it("rejects a digest taken over a re-serialization of the document", () => {
+    it("rejects a digest taken over a re-serialization of the document", async () => {
       // Guards the exact interop break found against the producer: digesting
       // a canonicalized (key-sorted, minified) form instead of the retained
       // bytes. It is the same document semantically, and it must still fail
@@ -492,7 +500,7 @@ describe("createPdppImporter", () => {
       expect(canonicalDigest).not.toBe(DOCUMENT_DIGEST);
 
       const { importer } = setup();
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({ digest: `sha256:${canonicalDigest}` }),
       );
       expect(outcome).toMatchObject({
@@ -501,18 +509,20 @@ describe("createPdppImporter", () => {
       });
     });
 
-    it("rejects an unsupported $pdpp version", () => {
+    it("rejects an unsupported $pdpp version", async () => {
       const { importer } = setup();
-      const outcome = importer.importEnvelope(envelope({ metaVersion: 2 }));
+      const outcome = await importer.importEnvelope(
+        envelope({ metaVersion: 2 }),
+      );
       expect(outcome).toMatchObject({
         status: "rejected",
         rejection: { code: "unsupported_metadata_version" },
       });
     });
 
-    it("rejects a source with no retained declaration", () => {
+    it("rejects a source with no retained declaration", async () => {
       const { importer } = setup();
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({ sourceId: "https://registry.pdpp.dev/connectors/spotify" }),
       );
       expect(outcome).toMatchObject({
@@ -521,9 +531,9 @@ describe("createPdppImporter", () => {
       });
     });
 
-    it("rejects a declaration version that disagrees with the retained one", () => {
+    it("rejects a declaration version that disagrees with the retained one", async () => {
       const { importer } = setup();
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({ declarationVersion: "9.9.9" }),
       );
       expect(outcome).toMatchObject({
@@ -532,7 +542,7 @@ describe("createPdppImporter", () => {
       });
     });
 
-    it("rejects metadata whose scope disagrees with the envelope's", () => {
+    it("rejects metadata whose scope disagrees with the envelope's", async () => {
       // Metadata for one scope riding on a blob decrypted under another
       // scope's key.
       const { importer } = setup();
@@ -546,16 +556,16 @@ describe("createPdppImporter", () => {
           primaryKey: ["id"],
         },
       };
-      const outcome = importer.importEnvelope(e);
+      const outcome = await importer.importEnvelope(e);
       expect(outcome).toMatchObject({
         status: "rejected",
         rejection: { code: "scope_mismatch" },
       });
     });
 
-    it("rejects a stream the retained declaration does not declare", () => {
+    it("rejects a stream the retained declaration does not declare", async () => {
       const { importer } = setup();
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({ streamName: "followers" }),
       );
       expect(outcome).toMatchObject({
@@ -564,9 +574,9 @@ describe("createPdppImporter", () => {
       });
     });
 
-    it("rejects a primary key that disagrees with the declaration", () => {
+    it("rejects a primary key that disagrees with the declaration", async () => {
       const { importer } = setup();
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({ primaryKey: ["username"] }),
       );
       expect(outcome).toMatchObject({
@@ -575,9 +585,9 @@ describe("createPdppImporter", () => {
       });
     });
 
-    it("rejects semantics that disagree with what this deployment derived", () => {
+    it("rejects semantics that disagree with what this deployment derived", async () => {
       const { importer } = setup();
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({ semantics: "append_only" }),
       );
       expect(outcome).toMatchObject({
@@ -586,12 +596,12 @@ describe("createPdppImporter", () => {
       });
     });
 
-    it("rejects a record key that does not describe the payload", () => {
+    it("rejects a record key that does not describe the payload", async () => {
       const { importer, store } = setup();
       // The producer claims one identity; the payload carries another. Stored
       // under the claimed key, a grant naming it would authorize a row that
       // is not the row it names.
-      const outcome = importer.importEnvelope(
+      const outcome = await importer.importEnvelope(
         envelope({ recordKey: { id: "999999999" } }),
       );
       expect(outcome).toMatchObject({
@@ -602,16 +612,16 @@ describe("createPdppImporter", () => {
       expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
     });
 
-    it("rejects when no instance handle can be derived", () => {
+    it("rejects when no instance handle can be derived", async () => {
       const store = createMemoryRecordStore();
       const importer = createPdppImporter({
-        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
         store,
         declarations: [RETAINED],
         instanceFor: () => undefined,
         logger: silentLogger(),
       });
-      const outcome = importer.importEnvelope(envelope());
+      const outcome = await importer.importEnvelope(envelope());
       expect(outcome).toMatchObject({
         status: "rejected",
         rejection: { code: "no_instance" },
@@ -664,9 +674,9 @@ describe("createPdppImporter", () => {
           record: { key: { id: "1" }, op: "destroy" },
         },
       ],
-    ])("rejects when %s", (_label, pdpp) => {
+    ])("rejects when %s", async (_label, pdpp) => {
       const { importer, store } = setup();
-      const outcome = importer.importEnvelope(envelope({ pdpp }));
+      const outcome = await importer.importEnvelope(envelope({ pdpp }));
       expect(outcome).toMatchObject({
         status: "rejected",
         rejection: { code: "malformed_metadata" },
@@ -674,7 +684,7 @@ describe("createPdppImporter", () => {
       expect(store.listStreams([INSTANCE])).toEqual([]);
     });
 
-    it("never throws on hostile metadata shapes", () => {
+    it("never throws on hostile metadata shapes", async () => {
       const { importer } = setup();
       for (const pdpp of [
         [],
@@ -685,7 +695,7 @@ describe("createPdppImporter", () => {
       ]) {
         // `null` means "no $pdpp key at all" in the helper, which is skipped;
         // everything else must be a rejection, and nothing may throw.
-        expect(() => importer.importEnvelope(envelope({ pdpp }))).not.toThrow();
+        expect(await importer.importEnvelope(envelope({ pdpp }))).toBeDefined();
       }
     });
   });
@@ -699,16 +709,16 @@ describe("the stream-sync switch refuses canonical publishes", () => {
       declarations: [RETAINED],
       instanceFor: (sourceId) =>
         sourceId === SOURCE_ID ? INSTANCE : undefined,
-      accountStorageMode: fixedOwnedAccountStorageMode(mode),
+      legacyWriteSeal: fixedLegacyWriteSeal(mode),
       logger: silentLogger(),
     });
     return { importer, store };
   }
 
-  it("refuses a publish on a switched account, stores nothing, and does not retry it", () => {
+  it("refuses a publish on a switched account, stores nothing, and does not retry it", async () => {
     const { importer, store } = importerWith("switched");
     const ingest = vi.spyOn(store, "ingestBatch");
-    const outcome = importer.importEnvelope(envelope());
+    const outcome = await importer.importEnvelope(envelope());
     expect(outcome).toMatchObject({
       status: "rejected",
       rejection: { code: "legacy_write_refused" },
@@ -719,10 +729,10 @@ describe("the stream-sync switch refuses canonical publishes", () => {
   });
 
   // UNKNOWN_AS_OFF
-  it("defers a publish while the mode is unknown, and asks for a retry", () => {
+  it("defers a publish while the mode is unknown, and asks for a retry", async () => {
     const { importer, store } = importerWith("unknown");
     const ingest = vi.spyOn(store, "ingestBatch");
-    const outcome = importer.importEnvelope(envelope());
+    const outcome = await importer.importEnvelope(envelope());
     expect(outcome).toMatchObject({
       status: "rejected",
       rejection: { code: "account_mode_unknown" },
@@ -731,7 +741,7 @@ describe("the stream-sync switch refuses canonical publishes", () => {
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
   });
 
-  it("defers a publish when no mode is wired", () => {
+  it("defers a publish when no mode is wired", async () => {
     const store = createMemoryRecordStore();
     const importer = createPdppImporter({
       store,
@@ -740,15 +750,105 @@ describe("the stream-sync switch refuses canonical publishes", () => {
         sourceId === SOURCE_ID ? INSTANCE : undefined,
       logger: silentLogger(),
     });
-    expect(importer.importEnvelope(envelope())).toMatchObject({
+    expect(await importer.importEnvelope(envelope())).toMatchObject({
       status: "rejected",
       rejection: { code: "account_mode_unknown" },
     });
   });
 
-  it("imports the same publish on an unswitched account", () => {
+  it("defers a publish when no seal is wired", async () => {
+    const store = createMemoryRecordStore();
+    const importer = createPdppImporter({
+      store,
+      declarations: [RETAINED],
+      instanceFor: (sourceId) =>
+        sourceId === SOURCE_ID ? INSTANCE : undefined,
+      logger: silentLogger(),
+    });
+    expect(await importer.importEnvelope(envelope())).toMatchObject({
+      status: "rejected",
+      rejection: { code: "account_mode_unknown" },
+    });
+    expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
+  });
+
+  describe("against a real mode authority", () => {
+    const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
+    const onEvidence = () => ({
+      owner: OWNER,
+      state: "on" as const,
+    });
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    // PUBLISH_OUTSIDE_SEAL
+    it("lets a publish already in the seal land before the switch is answered", async () => {
+      const authority = await authorityHearing(OWNER, "off");
+      const real = createLegacyWriteSeal({ authority, owner: OWNER });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered = false;
+      // The write runs inside the real lock; the gate holds it open there.
+      const seal = {
+        ...real,
+        commit: <T>(write: Parameters<typeof real.commit<T>>[0]) =>
+          real.commit(async (hold) => {
+            entered = true;
+            await held;
+            return write(hold);
+          }),
+      };
+      const store = createMemoryRecordStore();
+      const importer = createPdppImporter({
+        store,
+        declarations: [RETAINED],
+        instanceFor: (sourceId) =>
+          sourceId === SOURCE_ID ? INSTANCE : undefined,
+        legacyWriteSeal: seal,
+        logger: silentLogger(),
+      });
+
+      const publishing = importer.importEnvelope(envelope());
+      await vi.waitFor(() => expect(entered).toBe(true));
+      let storedWhenAnswered: unknown = "unset";
+      const answered = authority.submitEvidence(onEvidence()).then(() => {
+        storedWhenAnswered = store.getRecord(INSTANCE, "profile", "235680975");
+      });
+      await tick();
+      await tick();
+      expect(storedWhenAnswered).toBe("unset");
+      release();
+      expect(await publishing).toMatchObject({ status: "imported" });
+      await answered;
+      expect(storedWhenAnswered).toBeDefined();
+    });
+
+    it("refuses a publish that starts after the switch, and stores nothing", async () => {
+      const authority = await authorityHearing(OWNER, "off");
+      const store = createMemoryRecordStore();
+      const ingest = vi.spyOn(store, "ingestBatch");
+      const importer = createPdppImporter({
+        store,
+        declarations: [RETAINED],
+        instanceFor: (sourceId) =>
+          sourceId === SOURCE_ID ? INSTANCE : undefined,
+        legacyWriteSeal: createLegacyWriteSeal({ authority, owner: OWNER }),
+        logger: silentLogger(),
+      });
+      await authority.submitEvidence(onEvidence());
+      expect(await importer.importEnvelope(envelope())).toMatchObject({
+        status: "rejected",
+        rejection: { code: "legacy_write_refused" },
+      });
+      expect(ingest).not.toHaveBeenCalled();
+      expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
+    });
+  });
+
+  it("imports the same publish on an unswitched account", async () => {
     const { importer, store } = importerWith("unswitched");
-    expect(importer.importEnvelope(envelope()).status).toBe("imported");
+    expect((await importer.importEnvelope(envelope())).status).toBe("imported");
     expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeDefined();
   });
 });

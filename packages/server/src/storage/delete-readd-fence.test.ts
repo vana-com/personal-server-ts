@@ -12,7 +12,10 @@ import {
   createScopeDeletionTracker,
   deleteScope,
 } from "@opendatalabs/personal-server-ts-core/sync";
-import { fixedOwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
+import {
+  fixedOwnedAccountStorageMode,
+  openLegacyWriteSealForTests,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createIndexManager } from "./index-manager.js";
 import { initializeDatabase } from "./index-schema.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
@@ -25,6 +28,7 @@ const DELETED_AT = "2026-10-02T00:00:00Z";
 function openServer(root: string) {
   const index = createIndexManager(initializeDatabase(join(root, "index.db")));
   const storage = createNodeDataStorage({
+    legacyWriteSeal: openLegacyWriteSealForTests(),
     indexManager: index,
     hierarchyOptions: { dataDir: join(root, "data") },
   });

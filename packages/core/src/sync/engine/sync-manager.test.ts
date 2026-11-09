@@ -634,11 +634,13 @@ describe("SyncManager", () => {
         "instagram.profile",
         "2026-08-01T00:00:00.000Z",
         expect.objectContaining({ path: "instagram.profile/v1.json" }),
+        undefined,
       );
       expect(uploadDeps.storage.deleteVersion).toHaveBeenCalledWith(
         "instagram.profile",
         "2026-08-02T00:00:00.000Z",
         expect.objectContaining({ path: "instagram.profile/v2.json" }),
+        undefined,
       );
       expect(result.durable).toBe(true);
       expect(result.steps.local).toEqual({ status: "ok", deletedCount: 2 });
@@ -657,6 +659,65 @@ describe("SyncManager", () => {
         status: "skipped",
         reason: "sync-disabled",
       });
+    });
+
+    it("deleteScope(scope, within) enters the seal only after the running cycle leaves the mutation queue", async () => {
+      // A cycle holds the queue and asks the seal for its own writes. If the
+      // delete took the seal first it would wait on that cycle while the cycle
+      // waits behind a pending On: a deadlock.
+      let release!: () => void;
+      const cycleHeld = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        await cycleHeld;
+        return [];
+      });
+      const uploadDeps = makeMockUploadDeps();
+      uploadDeps.storage.deleteScope = vi.fn(async () => 1);
+      uploadDeps.storage.listVersions = vi.fn(() => []);
+      const manager = createSyncManager(uploadDeps, makeMockDownloadDeps());
+      const cycle = manager.trigger();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const within = vi.fn(async (write: (hold: never) => Promise<unknown>) =>
+        write({} as never),
+      );
+      const deleting = manager.deleteScope(
+        "instagram.profile",
+        within as never,
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      expect(within).not.toHaveBeenCalled();
+
+      release();
+      await cycle;
+      await deleting;
+      expect(within).toHaveBeenCalledOnce();
+      // The local removal got the hold the seal handed out.
+      expect(uploadDeps.storage.deleteScope).toHaveBeenCalledWith(
+        "instagram.profile",
+        expect.anything(),
+      );
+    });
+
+    it("deleteScope(scope, within) sends and removes nothing when the seal refuses", async () => {
+      const uploadDeps = makeMockUploadDeps();
+      uploadDeps.storage.deleteScope = vi.fn(async () => 1);
+      uploadDeps.storage.listVersions = vi.fn(() => []);
+      const deleteData = makeDeleteData();
+      const manager = createSyncManager(uploadDeps, makeMockDownloadDeps(), {
+        deleteData,
+        pendingBlobDeletions: makePending(),
+      });
+      const refusal = new Error("refused");
+      await expect(
+        manager.deleteScope("instagram.profile", (async () => {
+          throw refusal;
+        }) as never),
+      ).rejects.toBe(refusal);
+      expect(deleteData.tombstone).not.toHaveBeenCalled();
+      expect(uploadDeps.storage.deleteScope).not.toHaveBeenCalled();
     });
 
     describe("upload state across a delete", () => {

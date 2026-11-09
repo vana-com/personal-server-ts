@@ -15,6 +15,7 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
   fixedModeAuthority,
+  openLegacyWriteSealForTests,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   createDataFileEnvelope,
@@ -668,7 +669,10 @@ describe("createPsLiteRuntime", () => {
 
   it("deletes a scope with owner auth", async () => {
     const runtime = createTestRuntime({
-      storage: createMemoryPsLiteStorage(),
+      // The delete route commits through the storage's seal.
+      storage: createMemoryPsLiteStorage({
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      }),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
         builderToken: "builder-token",

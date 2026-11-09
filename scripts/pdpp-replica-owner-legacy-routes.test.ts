@@ -14,6 +14,7 @@ import {
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedLegacyWriteSeal,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createServerSigner } from "../packages/core/src/signing/signer.js";
 import { createAccessLogWriter } from "../packages/server/src/logging/access-log.js";
@@ -48,7 +49,10 @@ afterEach(() => {
 function setup() {
   const root = mkdtempSync(join(tmpdir(), "legacy-routes-test-"));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
-  const storage = openReplicaOwnerLegacyStorage({ root });
+  const storage = openReplicaOwnerLegacyStorage({
+    root,
+    legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
+  });
   cleanups.push(storage.close);
   const { indexManager, hierarchyOptions, rawDataStorage } = storage;
   const serverSigner = createServerSigner(
@@ -89,7 +93,12 @@ function setup() {
     accessLogWriter: createAccessLogWriter(join(root, "logs")),
     granteeAddress: grantee.address,
   };
-  return { app: createReplicaOwnerLegacyRoutes(deps), deps, fetch };
+  return {
+    app: createReplicaOwnerLegacyRoutes(deps),
+    deps,
+    fetch,
+    storage,
+  };
 }
 
 async function signed(
@@ -241,26 +250,17 @@ it("runs the production data handler: unauthenticated denial, then owner-signed 
 });
 
 it("serves an actual normal retained envelope from the filesystem, using deterministic test data only", async () => {
-  const { app, deps, fetch } = setup();
+  const { app, storage, fetch } = setup();
   const scope = "strava.activities";
   const collectedAt = "2026-10-20T00:00:00.000Z";
   const data = {
     activities: [{ id: "deterministic-test-activity", distance: 123 }],
   };
-  const written = await deps.rawDataStorage.writeEnvelope({
-    version: "1.0",
-    scope,
-    collectedAt,
-    data,
-  });
-  deps.indexManager.insert({
-    scope,
-    collectedAt,
-    path: written.relativePath,
-    sizeBytes: written.sizeBytes,
-    fileId: null,
-    schemaId: null,
-  });
+  const written = await storage.rawDataStorage.writeEnvelopeAndIndex?.(
+    { version: "1.0", scope, collectedAt, data },
+    { scope, collectedAt, fileId: null, schemaId: null },
+  );
+  expect(written).toBeDefined();
   const path = `/v1/data/${scope}`;
   const response = await app.request(`${origin}${path}`, {
     headers: {

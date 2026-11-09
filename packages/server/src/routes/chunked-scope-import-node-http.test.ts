@@ -7,6 +7,7 @@ import { pino } from "pino";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
 import {
+  fixedLegacyWriteSeal,
   buildWeb3SignedHeader,
   createTestWallet,
   fixedOwnedAccountStorageMode,
@@ -146,6 +147,7 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
       "/v1/data",
       dataRoutes({
         accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
         indexManager,
         hierarchyOptions,
         logger,
@@ -240,6 +242,7 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
       "/v1/data",
       dataRoutes({
         accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
         indexManager,
         hierarchyOptions: { dataDir },
         logger,
@@ -316,6 +319,7 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
         "/v1/data",
         dataRoutes({
           accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+          legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
           indexManager,
           hierarchyOptions: { dataDir },
           logger,

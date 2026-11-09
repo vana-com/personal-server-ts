@@ -20,6 +20,7 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
   fixedModeAuthority,
+  openLegacyWriteSealForTests,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITE_SIGNATURE_HEADER,
@@ -108,6 +109,7 @@ describe("/v1/derivatives/questions (composed app)", () => {
     const indexManager = createIndexManager(db);
     const hierarchyOptions = { dataDir };
     const dataStorage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager,
       hierarchyOptions,
     });

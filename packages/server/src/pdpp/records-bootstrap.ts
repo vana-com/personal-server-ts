@@ -32,7 +32,7 @@ import { createHash } from "node:crypto";
 import type { Database } from "better-sqlite3";
 import type { Logger } from "pino";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
-import type { LegacyWriteMode } from "@opendatalabs/personal-server-ts-core/api";
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import {
   createSourceStreamDeclarationRegistry,
   type PdppRecordStore,
@@ -497,8 +497,8 @@ export function createPdppSyncImporter(options: {
   /** Exact retained bytes per source id, from the AS boot. */
   documents: Map<string, string>;
   serverOwner: `0x${string}` | undefined;
-  /** The account's storage mode; only a fresh explicit Off lets a publish through. */
-  accountStorageMode?: LegacyWriteMode;
+  /** The one seal every canonical publish runs inside; only an Off record lets it through. */
+  legacyWriteSeal?: LegacyWriteSeal;
   logger: Logger;
 }): PdppImporter | undefined {
   const { records, serverOwner, logger } = options;
@@ -552,7 +552,7 @@ export function createPdppSyncImporter(options: {
       if (connections.length > 1) return undefined;
       return undefined;
     },
-    accountStorageMode: options.accountStorageMode,
+    legacyWriteSeal: options.legacyWriteSeal,
     logger,
   });
 }

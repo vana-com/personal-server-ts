@@ -5,7 +5,10 @@
  * environment. Browser defaults remain exercised by the existing suite.
  */
 
-import { createUnswitchedIndexedDbPsLiteRuntime } from "./test-support/unswitched-runtime.js";
+import {
+  createSwitchedIndexedDbPsLiteRuntime,
+  createUnswitchedIndexedDbPsLiteRuntime,
+} from "./test-support/unswitched-runtime.js";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
@@ -322,7 +325,7 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
     );
     const dbName = `ps-lite-own-reads-${Math.random()}`;
     const { runtime, streamSyncWriter } =
-      await createUnswitchedIndexedDbPsLiteRuntime({
+      await createSwitchedIndexedDbPsLiteRuntime({
         ownerAddress,
         ownerSignature,
         dbName,

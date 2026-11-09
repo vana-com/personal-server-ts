@@ -1,4 +1,6 @@
 import type { Logger } from "../../logger/index.js";
+import { LegacyWriteRefusedError } from "../../api/legacy-write-gate.js";
+import type { LegacyWriteHold } from "../../storage/legacy-write-seal.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import { withScopeLock } from "../../additions/scope-lock.js";
 import type {
@@ -223,15 +225,18 @@ async function eraseCoveredEntries(
   storage: Pick<DataStoragePort, "deleteVersion" | "deleteFirstSeenLedger">,
   scope: string,
   fence: CoveredEntry[],
+  hold: LegacyWriteHold | undefined,
 ): Promise<number> {
   if (fence.length === 0) return 0;
   let erased = 0;
   try {
     for (const captured of fence) {
-      const removed = await storage.deleteVersion(scope, captured.collectedAt, {
-        id: captured.id,
-        path: captured.path,
-      });
+      const removed = await storage.deleteVersion(
+        scope,
+        captured.collectedAt,
+        { id: captured.id, path: captured.path },
+        hold,
+      );
       if (removed) erased += 1;
     }
   } finally {
@@ -326,6 +331,29 @@ export interface DeleteScopeOptions {
    * caller's own pass already used this cycle's storage budget.
    */
   storagePass?: boolean;
+  /**
+   * Set when the caller is already inside `LegacyWriteSeal.commit` (the DELETE
+   * route decides and deletes under one commit). The gateway tombstone and the
+   * local removal then run inside that lock and do not take it again: the lock
+   * is not re-entrant.
+   */
+  hold?: LegacyWriteHold;
+}
+
+/**
+ * The gateway tombstone adds a NEW fact in the registry, so it is a legacy
+ * write: refused once the account has moved to stream sync. Inside a caller's
+ * `commit` (`hold` given) it runs directly. A storage with no seal (a test
+ * double) cannot refuse, so it runs. Only the remote call is sealed, never the
+ * reads and retries around it.
+ */
+function sealedTombstone<T>(
+  storage: Pick<DataStoragePort, "legacyWriteSeal">,
+  hold: LegacyWriteHold | undefined,
+  send: () => Promise<T>,
+): Promise<T> {
+  const seal = storage.legacyWriteSeal;
+  return hold || !seal ? send() : seal.commit(send);
 }
 
 export async function deleteScope(
@@ -374,9 +402,11 @@ export async function deleteScope(
     let replacedHead: TombstoneFence | null = null;
     try {
       const tombstone = () =>
-        options.fence
-          ? deleteData.tombstone(scope, options.fence)
-          : deleteData.tombstone(scope);
+        sealedTombstone(storage, options.hold, () =>
+          options.fence
+            ? deleteData.tombstone(scope, options.fence)
+            : deleteData.tombstone(scope),
+        );
       let outcome = await tombstone();
       if (outcome.status === "not-registered") {
         // "Nothing to tombstone" is only durable if the registry still has
@@ -437,6 +467,10 @@ export async function deleteScope(
       }
       result.durable = true;
     } catch (err) {
+      // The seal refused the tombstone: legacy writes are closed. Nothing was
+      // sent and nothing local was touched; this is neither a gateway failure
+      // nor a retry-budget failure, so hand it to the caller to stop on.
+      if (err instanceof LegacyWriteRefusedError) throw err;
       const message = errorMessage(err);
       result.steps.gateway = { status: "failed", error: message };
       result.steps.storage = { status: "skipped", reason: "gateway-failed" };
@@ -496,8 +530,8 @@ export async function deleteScope(
   // there is no fence and the whole local copy goes.
   try {
     const deletedCount = covered
-      ? await eraseCoveredEntries(storage, scope, covered)
-      : await storage.deleteScope(scope);
+      ? await eraseCoveredEntries(storage, scope, covered, options.hold)
+      : await storage.deleteScope(scope, options.hold);
     result.steps.local = { status: "ok", deletedCount };
   } catch (err) {
     const message = errorMessage(err);
@@ -991,7 +1025,7 @@ export type RetryPendingBlobDeletionsDeps = Pick<
   | "logger"
 > & {
   /** Local index, for expanding unexpanded markers into exact keys. */
-  storage?: Pick<DataStoragePort, "listVersions">;
+  storage?: Pick<DataStoragePort, "listVersions" | "legacyWriteSeal">;
   /**
    * Re-submits the user's delete of a scope whose tombstone failed, through
    * the ordinary delete path. The caller runs it inside the same mutation
@@ -1218,6 +1252,18 @@ async function resubmitRolledBackDeletion(
     return;
   }
   if (!tracker.due(scope)) return;
+  // The re-submission sends a new tombstone, which legacy storage no longer
+  // accepts once the account has moved to stream sync (or while its mode is
+  // not known). Stop before spending an attempt; the seal at the tombstone is
+  // what decides, this only avoids the wasted attempt.
+  const verdict = deps.storage?.legacyWriteSeal?.verdict();
+  if (verdict !== undefined && verdict !== "allow") {
+    logger.info(
+      { scope, tombstoneVersion: failedVersion, verdict },
+      "Scope delete re-submission paused: legacy storage is not accepting writes",
+    );
+    return;
+  }
   const attempt = tracker.recordAttempt(scope, failedVersion);
   logger.warn(
     { scope, tombstoneVersion: failedVersion, attempt },
@@ -1235,6 +1281,15 @@ async function resubmitRolledBackDeletion(
       );
     }
   } catch (err) {
+    if (err instanceof LegacyWriteRefusedError) {
+      // The account switched between the check above and the tombstone. The
+      // attempt is spent, but nothing was sent and this is not a failure.
+      logger.info(
+        { scope, attempt, verdict: err.verdict },
+        "Scope delete re-submission refused: legacy storage is not accepting writes",
+      );
+      return;
+    }
     logger.warn(
       { scope, attempt, error: errorMessage(err) },
       "Re-submitted scope delete failed; will retry",

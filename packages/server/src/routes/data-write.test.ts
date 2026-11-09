@@ -19,9 +19,11 @@ import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
   fixedOwnedAccountStorageMode,
+  openLegacyWriteSealForTests,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITE_SIGNATURE_HEADER,
@@ -197,6 +199,7 @@ describe("POST /v1/data/:scope with a write session", () => {
 
     app = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -381,12 +384,14 @@ describe("POST /v1/data/:scope with a write session", () => {
     // request must be accepted on retry rather than rejected as a replay.
     const flakyIndex = createIndexManager(initializeDatabase(":memory:"));
     const realStorage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: flakyIndex,
       hierarchyOptions,
     });
     let failures = 1;
     const flakyApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: flakyIndex,
       hierarchyOptions,
       logger,
@@ -446,12 +451,14 @@ describe("POST /v1/data/:scope with a write session", () => {
     // post-commit step. Retrying with the same proof would duplicate it.
     const partialIndex = createIndexManager(initializeDatabase(":memory:"));
     const realStorage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: partialIndex,
       hierarchyOptions,
     });
     let indexFailures = 1;
     const partialApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: partialIndex,
       hierarchyOptions,
       logger,
@@ -725,6 +732,7 @@ describe("POST /v1/data/:scope with a write session after the stream-sync switch
         "switched",
         ownerWallet.address,
       ),
+      legacyWriteSeal: fixedLegacyWriteSeal("switched", ownerWallet.address),
     });
   });
 

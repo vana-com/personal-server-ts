@@ -4,11 +4,17 @@ import type {
   NewIndexEntry,
   ScopeSummary,
 } from "./types.js";
+import type { LegacyWriteHold } from "../legacy-write-seal.js";
 
 export interface IndexManager {
-  insert(entry: NewIndexEntry): IndexEntry;
+  /**
+   * Every call that adds a row takes a `LegacyWriteHold`: a row is a visible
+   * legacy version, and a hold exists only inside `LegacyWriteSeal.commit`.
+   */
+  insert(hold: LegacyWriteHold, entry: NewIndexEntry): IndexEntry;
   /** Check a legacy write and allocate its CAS revision in one SQLite transaction. */
   insertIfCurrent(
+    hold: LegacyWriteHold,
     entry: NewIndexEntry,
     precondition?: { kind: "none" } | { kind: "match"; version: number },
   ):
@@ -29,7 +35,7 @@ export interface IndexManager {
    * Internal recovery path for already persisted envelopes. Bypasses the
    * closed-for-writes guard while preserving CAS allocation and journals.
    */
-  insertRecovered(entry: NewIndexEntry): IndexEntry;
+  insertRecovered(hold: LegacyWriteHold, entry: NewIndexEntry): IndexEntry;
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
   findLatestByScope(scope: string): IndexEntry | undefined;

@@ -40,9 +40,11 @@ import {
   type McpToolContext,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
   fixedOwnedAccountStorageMode,
+  openLegacyWriteSealForTests,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type {
   Builder,
@@ -207,6 +209,7 @@ async function ingestScope(opts: {
 }) {
   const subApp = dataRoutes({
     accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+    legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
     indexManager: opts.indexManager,
     hierarchyOptions: opts.hierarchyOptions,
     logger,
@@ -1613,6 +1616,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     accessLogWriter: AccessLogWriter,
   ): PersonalServerDataApiDeps {
     const dataStorage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager,
       hierarchyOptions,
     });
@@ -1733,6 +1737,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
 
     const dataApp = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,

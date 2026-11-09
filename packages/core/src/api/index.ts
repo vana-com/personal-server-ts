@@ -105,10 +105,16 @@ import type {
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
+  accountModeUnknownResponse,
   selectAccountStorageMode,
   type OwnedAccountStorageMode,
 } from "./account-storage-mode.js";
-import { refuseLegacyWrite } from "./legacy-write-gate.js";
+import {
+  LegacyWriteRefusedError,
+  refuseLegacyWrite,
+} from "./legacy-write-gate.js";
+import { switchedDeleteRefusalResponse } from "./switched-delete-refusal.js";
+import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
@@ -334,8 +340,17 @@ export interface PersonalServerIngestSyncManager {
    * Durable scope deletion (gateway tombstone -> storage blobs -> local).
    * When absent the DELETE route deletes the local copy only and reports
    * `durable: false`.
+   *
+   * `within` is the legacy-write seal's `commit`. The manager runs its delete
+   * inside it, AFTER it has taken its own mutation queue: the seal must be the
+   * innermost lock (a sync cycle holds the queue and asks for the seal, so
+   * asking for the seal first would wait on a cycle that waits on the seal).
+   * Pass it on every call that must refuse on a switched account.
    */
-  deleteScope?(scope: string): Promise<DeleteScopeResult>;
+  deleteScope?(
+    scope: string,
+    within?: LegacyWriteSeal["commit"],
+  ): Promise<DeleteScopeResult>;
 }
 
 /** The read side of stream sync, as the data API uses it. */
@@ -982,6 +997,12 @@ async function withApiErrors(
   } catch (err) {
     if (err instanceof ProtocolError) {
       return protocolErrorResponse(err);
+    }
+    // A durable step refused by the legacy-write seal (the account switched,
+    // or its mode is not known) after the route's early check passed. The
+    // answer is the same 426 or 503 the early check gives, never a 500.
+    if (err instanceof LegacyWriteRefusedError) {
+      return err.response;
     }
     if (context) {
       context.logger?.error?.(
@@ -1961,13 +1982,13 @@ function notifyDataWritten(
  * something this deployment could not verify — actionable, but not a failure
  * of the write, which has already committed.
  */
-function importIngestedIntoPdpp(
+async function importIngestedIntoPdpp(
   deps: Pick<PersonalServerDataApiDeps, "pdppImporter" | "logger">,
   envelope: { scope: string; collectedAt: string; data: unknown },
-): void {
+): Promise<void> {
   if (!deps.pdppImporter) return;
   try {
-    const outcome = deps.pdppImporter.importEnvelope(envelope);
+    const outcome = await deps.pdppImporter.importEnvelope(envelope);
     if (outcome.status === "rejected") {
       const permanent = isPermanentRejection(outcome.rejection);
       deps.logger?.warn?.(
@@ -2228,13 +2249,22 @@ export {
   type StorageSelectionDeps,
 } from "./account-storage-mode.js";
 export {
+  USE_CONNECTOR_DELETE_CODE,
+  USE_CONNECTOR_DELETE_MESSAGE,
+  USE_CONNECTOR_DELETE_STATUS,
+  switchedDeleteRefusalResponse,
+} from "./switched-delete-refusal.js";
+export {
   STREAM_SYNC_CLIENT_HEADER,
   UPDATE_REQUIRED_CODE,
   UPDATE_REQUIRED_MESSAGE,
   UPDATE_REQUIRED_STATUS,
-  legacyWritesRefused,
+  LegacyWriteRefusedError,
+  legacyWriteRefusedErrorFor,
   refuseLegacyWrite,
+  updateRequiredResponse,
   type LegacyWriteMode,
+  type LegacyWriteVerdict,
 } from "./legacy-write-gate.js";
 
 /**
@@ -3414,7 +3444,7 @@ export async function handlePersonalServerDataRequest(
         // The parsed body is the envelope's `data`, which is where a producer
         // stamps `$pdpp`. Offered here rather than inside the ingest contract
         // so the import stays strictly after the record is durable.
-        importIngestedIntoPdpp(deps, {
+        await importIngestedIntoPdpp(deps, {
           scope: scopeResult.scope,
           collectedAt: collectedAtValue,
           data: parsed.body,
@@ -3501,17 +3531,41 @@ export async function handlePersonalServerDataRequest(
       // sync manager owns the remote ports; without one (sync disabled or
       // no owner key material) only the local copy goes and the result says
       // so (`durable: false`) rather than pretending.
-      const result = deps.syncManager?.deleteScope
-        ? await deps.syncManager.deleteScope(parsed.scope)
-        : await deleteScopeLocally(
-            {
-              storage: deps.storage,
-              serverOwner: deps.serverOwner,
-              deleteData: null,
-              logger: apiLoggerAsLogger(deps.logger),
-            },
-            parsed.scope,
-          );
+      //
+      // The mode decision and the delete are one `commit`: on a switched
+      // account a legacy-only delete would report "deleted" while the stream
+      // rows stay readable, so it is refused (409) and the connector delete is
+      // the way to erase. An unknown mode (or a storage with no seal) is a
+      // retryable 503. An On cannot land between the decision and the delete.
+      const seal = deps.storage.legacyWriteSeal;
+      if (!seal) return accountModeUnknownResponse();
+      let result: DeleteScopeResult;
+      try {
+        result = deps.syncManager?.deleteScope
+          ? await deps.syncManager.deleteScope(
+              parsed.scope,
+              seal.commit.bind(seal),
+            )
+          : await seal.commit((hold) =>
+              deleteScopeLocally(
+                {
+                  storage: deps.storage,
+                  serverOwner: deps.serverOwner,
+                  deleteData: null,
+                  logger: apiLoggerAsLogger(deps.logger),
+                },
+                parsed.scope,
+                { hold },
+              ),
+            );
+      } catch (err) {
+        if (err instanceof LegacyWriteRefusedError) {
+          return err.verdict === "switched"
+            ? switchedDeleteRefusalResponse()
+            : err.response;
+        }
+        throw err;
+      }
 
       if (result.steps.gateway.status === "failed") {
         // Nothing was deleted: the local copy is kept on purpose so sync

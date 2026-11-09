@@ -20,6 +20,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { testOwnerKey } from "@opendatalabs/personal-server-ts-core/stream-sync-read/testing";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
   fixedOwnedAccountStorageMode,
@@ -208,6 +209,7 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
 
     http = dataRoutes({
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,

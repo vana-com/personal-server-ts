@@ -22,6 +22,8 @@ import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schema
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  HOLD_FOR_TESTS,
+  openLegacyWriteSealForTests,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
 import type { ServerContext } from "./bootstrap.js";
@@ -243,6 +245,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     expect(envelope.producer).toBe("pdpp-projector");
     expect(envelope.producer_provenance).toEqual(source);
     const syncEnvelope = await createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: server!.indexManager,
       hierarchyOptions: { dataDir: join(root, "data") },
     }).readEnvelope(SCOPE, envelope.collectedAt);
@@ -463,7 +466,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     oldEnvelope.collectedAt = oldAt;
     oldEnvelope.data = { id: "old" };
     await writeFile(join(root, "data", oldPath), JSON.stringify(oldEnvelope));
-    server!.indexManager.insert({
+    server!.indexManager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: oldPath,
       scope: SCOPE,
@@ -630,7 +633,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     const interruptedIndex = createIndexManager(interruptedDb, {
       revisionJournalDir: join(root, "cas-revisions"),
     });
-    interruptedIndex.insert({
+    interruptedIndex.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: manualRow.path,
       scope: SCOPE,
@@ -693,7 +696,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     const interruptedIndex = createIndexManager(interruptedDb, {
       revisionJournalDir: join(root, "cas-revisions"),
     });
-    interruptedIndex.insert({
+    interruptedIndex.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: firstRow!.path,
       scope: SCOPE,

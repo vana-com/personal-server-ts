@@ -17,10 +17,16 @@ import type {
   NewIndexEntry,
   ScopeSummary,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type { LegacyWriteHold } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 export interface IndexManager {
-  insert(entry: NewIndexEntry): IndexEntry;
+  /**
+   * Every call that adds a row takes a `LegacyWriteHold`: a row is a visible
+   * legacy version, and a hold exists only inside `LegacyWriteSeal.commit`.
+   */
+  insert(hold: LegacyWriteHold, entry: NewIndexEntry): IndexEntry;
   insertIfCurrent(
+    hold: LegacyWriteHold,
     entry: NewIndexEntry,
     precondition?: { kind: "none" } | { kind: "match"; version: number },
   ):
@@ -32,7 +38,7 @@ export interface IndexManager {
       };
   closeScopeForWrites(scope: string): void;
   hasTrustedRevisionJournal(scope: string): boolean;
-  insertRecovered(entry: NewIndexEntry): IndexEntry;
+  insertRecovered(hold: LegacyWriteHold, entry: NewIndexEntry): IndexEntry;
   findByPath(path: string): IndexEntry | undefined;
   findByScope(options: IndexListOptions): IndexEntry[];
   findLatestByScope(scope: string): IndexEntry | undefined;
@@ -445,7 +451,7 @@ export function createIndexManager(
       .get(result.lastInsertRowid) as RawRow;
     return rowToEntry(row);
   };
-  const insertIfCurrent = db.transaction(
+  const insertIfCurrentTransaction = db.transaction(
     (
       entry: NewIndexEntry,
       precondition?: { kind: "none" } | { kind: "match"; version: number },
@@ -493,13 +499,16 @@ export function createIndexManager(
     },
   );
 
+  // The `hold` parameters are compile-time proof that the caller is inside the
+  // legacy-write seal; the row insert itself needs nothing from them.
   const manager: IndexManager = {
-    insert(entry) {
-      const result = insertIfCurrent(entry);
+    insert(_hold, entry) {
+      const result = insertIfCurrentTransaction(entry);
       if (!result.ok) throw new Error("Unconditional insert was rejected");
       return result.entry;
     },
-    insertIfCurrent,
+    insertIfCurrent: (_hold, entry, precondition) =>
+      insertIfCurrentTransaction(entry, precondition),
     closeScopeForWrites(scope) {
       ensureScopeRevisionStmt.run({ scope });
       // Durable fail-closed marker. There is no HTTP reset path; clearing this
@@ -511,7 +520,7 @@ export function createIndexManager(
       closeScopeForWritesStmt.run({ scope });
     },
     hasTrustedRevisionJournal,
-    insertRecovered(entry) {
+    insertRecovered(_hold, entry) {
       return insertRow(entry);
     },
 

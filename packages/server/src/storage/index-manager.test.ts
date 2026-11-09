@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { initializeDatabase } from "./index-schema.js";
 import { createIndexManager, type IndexManager } from "./index-manager.js";
 import type Database from "better-sqlite3";
+import { HOLD_FOR_TESTS } from "@opendatalabs/personal-server-ts-core/test-utils";
 
 describe("IndexManager", () => {
   let db: Database.Database;
@@ -17,7 +18,7 @@ describe("IndexManager", () => {
   });
 
   it("insert returns IndexEntry with auto-generated id and createdAt", () => {
-    const entry = manager.insert({
+    const entry = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "instagram/profile/2026-01-21T10-00-00Z.json",
       scope: "instagram.profile",
@@ -36,7 +37,7 @@ describe("IndexManager", () => {
   });
 
   it("insert with fileId null stores null", () => {
-    const entry = manager.insert({
+    const entry = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "test/scope/2026-01-21T10-00-00Z.json",
       scope: "test.scope",
@@ -48,7 +49,7 @@ describe("IndexManager", () => {
   });
 
   it("insert with schemaId stores schema linkage", () => {
-    const entry = manager.insert({
+    const entry = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       schemaId: "0xschema",
       path: "test/scope/2026-01-21T10-00-00Z.json",
@@ -70,12 +71,12 @@ describe("IndexManager", () => {
       sizeBytes: 256,
     };
 
-    manager.insert(common);
-    expect(() => manager.insert(common)).toThrow();
+    manager.insert(HOLD_FOR_TESTS, common);
+    expect(() => manager.insert(HOLD_FOR_TESTS, common)).toThrow();
   });
 
   it("findByPath returns inserted entry", () => {
-    const inserted = manager.insert({
+    const inserted = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "instagram/profile/2026-01-21T10-00-00Z.json",
       scope: "instagram.profile",
@@ -97,21 +98,21 @@ describe("IndexManager", () => {
   });
 
   it("findByScope keeps chronological order when an older row arrives late", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-03T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-03T00:00:00Z",
       sizeBytes: 200,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-02T00-00-00Z.json",
       scope: "instagram.profile",
@@ -126,7 +127,7 @@ describe("IndexManager", () => {
 
   it("findByScope respects limit and offset", () => {
     for (let i = 1; i <= 5; i++) {
-      manager.insert({
+      manager.insert(HOLD_FOR_TESTS, {
         fileId: null,
         path: `ig/profile/2026-01-0${i}T00-00-00Z.json`,
         scope: "instagram.profile",
@@ -146,7 +147,7 @@ describe("IndexManager", () => {
   });
 
   it("findLatestByScope returns the newest collectedAt after a backfill", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
@@ -154,7 +155,7 @@ describe("IndexManager", () => {
       sizeBytes: 100,
       version: 10,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-03T00-00-00Z.json",
       scope: "instagram.profile",
@@ -171,21 +172,21 @@ describe("IndexManager", () => {
   it("countByScope returns correct count", () => {
     expect(manager.countByScope("instagram.profile")).toBe(0);
 
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-02T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-02T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "other/scope/2026-01-01T00-00-00Z.json",
       scope: "other.scope",
@@ -207,21 +208,21 @@ describe("IndexManager", () => {
   });
 
   it("listDistinctScopes returns correct scope, latestCollectedAt, versionCount", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-03T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-03T00:00:00Z",
       sizeBytes: 200,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "tw/likes/2026-01-02T00-00-00Z.json",
       scope: "twitter.likes",
@@ -244,14 +245,14 @@ describe("IndexManager", () => {
   });
 
   it("listDistinctScopes scopePrefix filter works", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "tw/likes/2026-01-01T00-00-00Z.json",
       scope: "twitter.likes",
@@ -266,21 +267,21 @@ describe("IndexManager", () => {
   });
 
   it("listDistinctScopes limit pagination works", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "a/scope/2026-01-01T00-00-00Z.json",
       scope: "a.scope",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "b/scope/2026-01-01T00-00-00Z.json",
       scope: "b.scope",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "c/scope/2026-01-01T00-00-00Z.json",
       scope: "c.scope",
@@ -303,7 +304,7 @@ describe("IndexManager", () => {
 
   it("findClosestByScope compares mixed timestamp formats as instants", () => {
     const insert = (scope: string, collectedAt: string) =>
-      manager.insert({
+      manager.insert(HOLD_FOR_TESTS, {
         fileId: null,
         path: scope + "/" + collectedAt + ".json",
         scope,
@@ -328,21 +329,21 @@ describe("IndexManager", () => {
   });
 
   it("findClosestByScope returns entry at or before given time", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-03T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-03T00:00:00Z",
       sizeBytes: 200,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-05T00-00-00Z.json",
       scope: "instagram.profile",
@@ -367,7 +368,7 @@ describe("IndexManager", () => {
   });
 
   it("findClosestByScope returns undefined when no entry at or before time", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-03T00-00-00Z.json",
       scope: "instagram.profile",
@@ -385,7 +386,7 @@ describe("IndexManager", () => {
   // --- findByFileId ---
 
   it("findByFileId returns correct entry or undefined", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: "file-abc-123",
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
@@ -405,21 +406,21 @@ describe("IndexManager", () => {
   // --- deleteByScope ---
 
   it("deleteByScope with entries returns deleted count", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-02T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-02T00:00:00Z",
       sizeBytes: 200,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-03T00-00-00Z.json",
       scope: "instagram.profile",
@@ -437,14 +438,14 @@ describe("IndexManager", () => {
   });
 
   it("deleteByScope removes entries so findByScope returns empty", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "tw/likes/2026-01-01T00-00-00Z.json",
       scope: "twitter.likes",
@@ -466,7 +467,7 @@ describe("IndexManager", () => {
 
   it("findUnsyncedPage pages unsynced rows by id, skipping synced ones", () => {
     const rows = [0, 1, 2, 3, 4].map((i) =>
-      manager.insert({
+      manager.insert(HOLD_FOR_TESTS, {
         fileId: null,
         path: `s/${i}.json`,
         scope: `s.${i}`,
@@ -494,7 +495,7 @@ describe("IndexManager", () => {
   it("maxUnsyncedId is the highest unsynced id, 0 when none", () => {
     expect(manager.maxUnsyncedId()).toBe(0);
     const rows = [0, 1, 2].map((i) =>
-      manager.insert({
+      manager.insert(HOLD_FOR_TESTS, {
         fileId: null,
         path: `m/${i}.json`,
         scope: `m.${i}`,
@@ -510,14 +511,14 @@ describe("IndexManager", () => {
   // --- findUnsynced ---
 
   it("findUnsynced returns entries with fileId === null", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-02T00-00-00Z.json",
       scope: "instagram.profile",
@@ -535,14 +536,14 @@ describe("IndexManager", () => {
   });
 
   it("findUnsynced excludes entries with dataPointId !== null", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-02T00-00-00Z.json",
       scope: "instagram.profile",
@@ -558,7 +559,7 @@ describe("IndexManager", () => {
 
   it("findUnsynced with limit returns at most N entries", () => {
     for (let i = 1; i <= 5; i++) {
-      manager.insert({
+      manager.insert(HOLD_FOR_TESTS, {
         fileId: null,
         path: `ig/profile/2026-01-0${i}T00-00-00Z.json`,
         scope: "instagram.profile",
@@ -574,7 +575,7 @@ describe("IndexManager", () => {
   // --- updateFileId ---
 
   it("updateFileId sets fileId without affecting sync status", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
@@ -601,7 +602,7 @@ describe("IndexManager", () => {
   // --- updateDataPointId / findByDataPointId ---
 
   it("updateDataPointId marks an entry synced (out of findUnsynced)", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
@@ -630,7 +631,7 @@ describe("IndexManager", () => {
       [2, "2026-10-06T18:04:01Z"],
       [3, "2026-10-06T18:09:43Z"],
     ] as const) {
-      manager.insert({
+      manager.insert(HOLD_FOR_TESTS, {
         fileId: null,
         path: `github/repositories/${at}.json`,
         scope: "github.repositories",
@@ -647,7 +648,7 @@ describe("IndexManager", () => {
   });
 
   it("deleteByPath returns true when exists, false otherwise", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
@@ -668,7 +669,7 @@ describe("IndexManager", () => {
 
   it("deleteUnsyncedByPath removes an unsynced row but preserves a synced one", () => {
     const path = "spotify/savedTracks/2026-07-14T00-00-00Z.json";
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path,
       scope: "spotify.savedTracks",
@@ -681,7 +682,7 @@ describe("IndexManager", () => {
     expect(manager.findByPath(path)).toBeUndefined();
 
     // Re-insert and mark synced → the guard must NOT delete it.
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path,
       scope: "spotify.savedTracks",
@@ -696,7 +697,7 @@ describe("IndexManager", () => {
   // ─── DPv2: per-scope version + dataPointId ─────────────────────────────
 
   it("insert without version assigns 1 for a fresh scope", () => {
-    const entry = manager.insert({
+    const entry = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
@@ -710,21 +711,21 @@ describe("IndexManager", () => {
   });
 
   it("insert without version increments the per-scope counter", () => {
-    const first = manager.insert({
+    const first = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    const second = manager.insert({
+    const second = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-02T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-02T00:00:00Z",
       sizeBytes: 120,
     });
-    const otherScope = manager.insert({
+    const otherScope = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "tw/posts/2026-01-02T00-00-00Z.json",
       scope: "twitter.posts",
@@ -741,7 +742,7 @@ describe("IndexManager", () => {
   });
 
   it("insert without version does not reuse a deleted scope CAS revision", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
@@ -750,7 +751,7 @@ describe("IndexManager", () => {
     });
     manager.deleteByScope("instagram.profile");
 
-    const recreated = manager.insert({
+    const recreated = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-02T00-00-00Z.json",
       scope: "instagram.profile",
@@ -764,7 +765,7 @@ describe("IndexManager", () => {
   });
 
   it("insert respects an explicit version", () => {
-    const entry = manager.insert({
+    const entry = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
@@ -782,14 +783,14 @@ describe("IndexManager", () => {
   });
 
   it("findLatestVersionByScope returns max version after inserts", () => {
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
       collectedAt: "2026-01-01T00:00:00Z",
       sizeBytes: 100,
     });
-    manager.insert({
+    manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-02T00-00-00Z.json",
       scope: "instagram.profile",
@@ -801,7 +802,7 @@ describe("IndexManager", () => {
   });
 
   it("updateVersion can lower or raise sync version without changing CAS revision", () => {
-    const entry = manager.insert({
+    const entry = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",
@@ -825,7 +826,7 @@ describe("IndexManager", () => {
   });
 
   it("updateDataPointId persists the id and returns true", () => {
-    const entry = manager.insert({
+    const entry = manager.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "ig/profile/2026-01-01T00-00-00Z.json",
       scope: "instagram.profile",

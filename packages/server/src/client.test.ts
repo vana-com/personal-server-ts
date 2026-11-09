@@ -116,10 +116,7 @@ async function declareOff(ps: PersonalServerHandle) {
   if (!owner) throw new Error("the test server has no owner");
   await ps.submitAccountModeEvidence?.({
     owner,
-    authOwner: owner,
     state: "off",
-    fetchStartedAt: Date.now(),
-    rawStatus: 200,
   });
 }
 

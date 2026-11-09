@@ -19,6 +19,7 @@ import type {
 } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
   fixedOwnedAccountStorageMode,
@@ -198,6 +199,7 @@ describe("derivative data routes", () => {
     lineageGateway = createMockLineageGateway();
     deps = {
       accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -659,6 +661,7 @@ describe("derivative data routes", () => {
     it("answers 503 when the server has no lineage gateway", async () => {
       const localApp = dataRoutes({
         accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
         ...deps,
         lineageGateway: undefined,
       });
@@ -892,6 +895,7 @@ describe("derivative data routes", () => {
     it("serves the full envelope to a policy-bypass credential", async () => {
       const localApp = dataRoutes({
         accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
         ...deps,
         devToken: "dev-secret",
       });
