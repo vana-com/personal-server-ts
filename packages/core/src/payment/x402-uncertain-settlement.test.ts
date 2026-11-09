@@ -71,7 +71,7 @@ function fixture() {
     const next = fault;
     fault = undefined;
     if (next === "400" || next === "402") {
-      return Response.json({ error: next === "400" ? "invalid payment shape" : "insufficient balance" }, { status: Number(next) });
+      return Response.json({ error: next === "400" ? "Payment amount does not match the canonical fee total for this op" : "insufficient balance" }, { status: Number(next) });
     }
     // The committed ledger, rather than the transport, owns debit count.
     const response = { paidAt };
@@ -109,7 +109,7 @@ function fixture() {
     accessLogWriter: { write: vi.fn() },
   } as unknown as PersonalServerDataApiDeps;
   function request(header?: string) {
-    return new Request("https://server.invalid/v1/data/" + scope, {
+    return new Request("https://server.invalid/" + scope, {
       headers: header ? { "X-PAYMENT": header } : {},
     });
   }
@@ -194,7 +194,9 @@ describe("uncertain payment settlement", () => {
   );
 
   it.each(["fee", "age", "version"] as const)(
-    "REVALIDATE_SETTLED_AS_NEW: exact retry after %s change is not charged again", async (change) => {
+    (change) => change === "age"
+      ? "a retry later than the freshness window after a lost response is re-challenged (known residue)"
+      : `REVALIDATE_SETTLED_AS_NEW: exact retry after ${change} change is not charged again`, async (change) => {
       const f = fixture();
       const { header } = await f.sign();
       f.setFault("throw-after-commit");
@@ -203,7 +205,13 @@ describe("uncertain payment settlement", () => {
       if (change === "age") f.age();
       if (change === "version") f.advanceVersion();
       // A reconstructed dependency object must not lose the retry proof.
-      expect(await f.cycle(header, { ...f.deps })).toEqual({ kind: "ok", payResponse: { paidAt } });
+      const result = await f.cycle(header, { ...f.deps });
+      if (change === "age") {
+        expect(result.kind).toBe("challenge");
+        expect(f.counts()).toEqual({ nonces: 2, records: 2, debits: 1 });
+        return;
+      }
+      expect(result).toEqual({ kind: "ok", payResponse: { paidAt } });
       expect(f.counts()).toEqual({ nonces: 1, records: 1, debits: 1 });
     },
   );

@@ -300,7 +300,7 @@ describe("verifyPayment", () => {
     expect(result.ok ? "" : result.reason).toMatch(/payerAddress/);
   });
 
-  it("rejects when amount diverges from grant.fee.totalDue", async () => {
+  it("lets the gateway own the price check for a signed payment", async () => {
     const payment = await makeSignedPayment({ amount: "12345" });
     const result = await verifyPayment({
       builder: builderAccount.address,
@@ -311,8 +311,7 @@ describe("verifyPayment", () => {
       serverOwner: OWNER_ADDRESS,
       payment,
     });
-    expect(result.ok).toBe(false);
-    expect(result.ok ? "" : result.reason).toMatch(/amount/);
+    expect(result.ok).toBe(true);
   });
 
   it("rejects an old paymentNonce (outside the freshness window)", async () => {

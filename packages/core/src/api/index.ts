@@ -954,9 +954,9 @@ export async function handleX402Cycle(
         grantId: opIdLower,
         error: (err as Error).message,
       },
-      "X402 gateway forward threw; reissuing challenge",
+      "X402 gateway forward outcome is unknown",
     );
-    return { kind: "challenge", body: await buildFreshChallenge() };
+    return { kind: "gateway-error", status: 503, body: { error: "PAYMENT_OUTCOME_UNKNOWN", message: "Payment outcome is unknown. Retry with the same X-PAYMENT header." } };
   }
 
   if (gatewayRes.ok) {
@@ -981,18 +981,31 @@ export async function handleX402Cycle(
     errorBody = { error: gatewayRes.statusText };
   }
 
-  // 409 (replay or race) and 400 (amount mismatch / shape error) are
-  // recoverable with a fresh challenge — the builder re-signs with the
-  // new state and retries. 402 (insufficient balance) is relayed verbatim
-  // because the builder needs to fix their escrow, not their signature.
-  // 5xx is treated like 402-relayed since the personal server can't
-  // distinguish "transient" from "permanent" without more info.
-  if (gatewayRes.status === 409 || gatewayRes.status === 400) {
+  // The gateway has no error codes yet; exact strings are a stopgap.
+  const knownNoDebit409 = new Set([
+    "accessRecord.recordId is already paid for a different payer, op, asset, data version, accessor, or signature; use a fresh accessRecord for a new read",
+    "paymentNonce already used by this payer — pick a higher nonce and re-sign",
+  ]);
+  const revokedOrExpired409 = new Set([
+    "Grant has been revoked and cannot be paid for",
+    "Grant has expired and cannot be paid for",
+  ]);
+  const errorText = typeof errorBody === "object" && errorBody !== null && "error" in errorBody && typeof errorBody.error === "string" ? errorBody.error : "";
+  if (gatewayRes.status === 409 && revokedOrExpired409.has(errorText)) {
+    return { kind: "gateway-error", status: 409, body: errorBody };
+  }
+  if (gatewayRes.status === 409 && knownNoDebit409.has(errorText)) {
+    return { kind: "challenge", body: await buildFreshChallenge() };
+  }
+  if (gatewayRes.status === 400) {
     deps.logger?.info?.(
       { scope, grantId: opIdLower, status: gatewayRes.status, errorBody },
       "Gateway rejected X-PAYMENT; reissuing X402 challenge",
     );
     return { kind: "challenge", body: await buildFreshChallenge() };
+  }
+  if (gatewayRes.status === 409 || gatewayRes.status >= 500) {
+    return { kind: "gateway-error", status: 503, body: { error: "PAYMENT_OUTCOME_UNKNOWN", message: "Payment outcome is unknown. Retry with the same X-PAYMENT header." } };
   }
   return { kind: "gateway-error", status: gatewayRes.status, body: errorBody };
 }
