@@ -95,10 +95,24 @@ export function createGatewayStreamSyncRegistry(
         if (typeof row.scope !== "string" || !keep(row.scope)) continue;
         out.push({ scope: row.scope, read: toControlRead(row) });
       }
-      cursor =
-        envelope.pagination?.hasMore === false
-          ? null
-          : (envelope.pagination?.nextCursor ?? null);
+      // A delete depends on the whole listing: a missing or inconsistent page
+      // marker must fail, not end the listing early.
+      const page = envelope.pagination;
+      if (page === undefined || page === null) {
+        throw new Error("registry listing has no pagination marker");
+      }
+      if (page.hasMore === false) {
+        cursor = null;
+      } else if (
+        typeof page.nextCursor === "string" &&
+        page.nextCursor !== ""
+      ) {
+        cursor = page.nextCursor;
+      } else {
+        throw new Error(
+          "registry listing says more rows follow but gives no cursor",
+        );
+      }
     } while (cursor !== null);
     return out;
   }

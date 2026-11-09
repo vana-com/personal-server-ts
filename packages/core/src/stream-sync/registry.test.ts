@@ -71,3 +71,47 @@ it("still lists control rows only", async () => {
     (await registry.listControlRows()).map((entry) => entry.scope),
   ).toEqual([controlScope("acme", "")]);
 });
+
+/** One listing response with the given `pagination` marker. */
+function registryWithMarker(pagination: unknown) {
+  return createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: "0x" + "11".repeat(20),
+    fetch: (async () =>
+      new Response(
+        JSON.stringify({
+          data: { dataPoints: [row(streamScope("acme", "", "items"), 1)] },
+          ...(pagination === undefined ? {} : { pagination }),
+        }),
+      )) as typeof fetch,
+  });
+}
+
+it.each([
+  ["has no pagination marker", undefined],
+  [
+    "says more rows follow but gives no cursor",
+    { hasMore: true, nextCursor: null },
+  ],
+  [
+    "says more rows follow with an empty cursor",
+    { hasMore: true, nextCursor: "" },
+  ],
+  ["gives neither flag nor cursor", {}],
+])(
+  "a listing that %s fails instead of ending early (mutant: LISTING_TRUNCATED_SILENTLY)",
+  async (_name, pagination) => {
+    const registry = registryWithMarker(pagination);
+    await expect(registry.listStreamRows("acme")).rejects.toThrow(
+      /registry listing/,
+    );
+    await expect(registry.listControlRows()).rejects.toThrow(
+      /registry listing/,
+    );
+  },
+);
+
+it("a listing that says it is complete ends", async () => {
+  const registry = registryWithMarker({ hasMore: false, nextCursor: null });
+  expect(await registry.listStreamRows("acme")).toHaveLength(1);
+});

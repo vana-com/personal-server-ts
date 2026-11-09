@@ -78,6 +78,7 @@ import {
   type ControlHashes,
   classifyStreamRow,
   type ControlState,
+  sameControl,
   type Decision,
   type DecidePhase,
   type Head,
@@ -181,6 +182,14 @@ interface DeletePin {
 interface StreamPin {
   readonly ns: string;
   readonly stream: string;
+  /**
+   * The state of this namespace's control row when the intent was saved. A
+   * stream delete is signed only while the control row is still in that
+   * state: any other state means the connection was deleted or reconnected
+   * since, possibly by another device, and the data on the row is no longer
+   * the data this delete is about.
+   */
+  readonly control: ControlState;
   /**
    * The version of the delete head last signed for the row. The delete
    * landed once the row's delete history reaches it. Absent until signed.
@@ -763,7 +772,11 @@ export class StreamSyncWriter {
         if (parsed?.kind !== "stream" || parsed.connector !== connector) {
           continue;
         }
-        streams.push({ ns: parsed.ns, stream: parsed.stream });
+        streams.push({
+          ns: parsed.ns,
+          stream: parsed.stream,
+          control: await this.readControl(connector, parsed.ns),
+        });
       }
       if (pins.length === 0 && streams.length === 0) return;
       const intent: DeleteIntent = { pins, streams };
@@ -790,6 +803,8 @@ export class StreamSyncWriter {
     for (const target of streams) {
       const scope = streamScope(connector, target.ns, target.stream);
       for (let attempt = 0; attempt < CONFLICTS_PER_PASS; attempt += 1) {
+        // Re-issue only while the control row is as the intent saw it.
+        if (!(await this.controlHoldsPin(connector, target))) break;
         const pin = (await this.readState()).deletes?.[
           connector
         ]?.streams?.find(
@@ -860,6 +875,17 @@ export class StreamSyncWriter {
           throw new Error("stream delete pending after version conflicts");
       }
     }
+  }
+
+  /** True while the control row of the stream's namespace is as the intent saw it. */
+  private async controlHoldsPin(
+    connector: string,
+    target: StreamPin,
+  ): Promise<boolean> {
+    return sameControl(
+      await this.readControl(connector, target.ns),
+      target.control,
+    );
   }
 
   /**
