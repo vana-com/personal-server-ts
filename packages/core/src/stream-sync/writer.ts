@@ -1662,7 +1662,7 @@ export class StreamSyncWriter {
     if (open.length === 0) {
       return {
         state: "done",
-        skipped: all.filter((stream) => receiptOf(stream) === "skipped"),
+        skipped: all.filter((stream) => receiptOf(stream) !== "merged"),
       };
     }
     for (const runId of await this.runIds()) {
