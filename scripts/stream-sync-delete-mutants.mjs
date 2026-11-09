@@ -30,6 +30,13 @@ const NODE_TESTS = ["packages/server/src/routes/owner-connectors.test.ts"];
 const LITE_TESTS = ["packages/lite/src/owner-connectors.test.ts"];
 const HANDLER = "packages/core/src/api/owner-connector-delete.ts";
 const WRITER = "packages/core/src/stream-sync/writer.ts";
+const DECLARED_HOOK = "packages/server/src/stream-sync/declared-streams.ts";
+const DECLARED_HOOK_TESTS = [
+  "packages/server/src/stream-sync/declared-streams.test.ts",
+];
+const DECLARED_TESTS = [
+  "packages/core/src/stream-sync/writer-delete-declared.test.ts",
+];
 
 /** @type {Array<{name: string, edits: Array<{file: string, find: string, replace: string}>, tests: string[], aim: string, build?: boolean}>} */
 const MUTANTS = [
@@ -123,9 +130,9 @@ const MUTANTS = [
       },
       {
         file: WRITER,
-        find: "        delete state.seedTargets[connector];\n      });\n      return null;",
+        find: "        delete state.seedTargets[connector];\n      });\n      await this.skipStagedSeed(connector);\n      return null;",
         replace:
-          "        delete state.seedTargets[connector];\n        delete state.deletes?.[connector];\n      });\n      return null;",
+          "        delete state.seedTargets[connector];\n        delete state.deletes?.[connector];\n      });\n      await this.skipStagedSeed(connector);\n      return null;",
       },
     ],
     tests: REQUEST_TESTS,
@@ -197,6 +204,50 @@ const MUTANTS = [
     ],
     tests: LITE_TESTS,
     aim: "answers a wrong method only to the owner",
+  },
+  {
+    // The Node server ignores the host's declaredStreams option: a connector
+    // the host names but no manifest verifies is refused as unverified.
+    name: "SERVER_DECLARED_STREAMS_IGNORED",
+    edits: [
+      {
+        file: DECLARED_HOOK,
+        find: "for (const stream of option?.(connector) ?? []) names.add(stream);",
+        replace:
+          "for (const stream of [] as readonly string[]) names.add(stream);",
+      },
+    ],
+    tests: DECLARED_HOOK_TESTS,
+    aim: "the host option's streams are deleted",
+  },
+  {
+    // The host's option replaces the retained manifests instead of joining
+    // them: a manifest stream the option omits survives the delete.
+    name: "DECLARED_STREAMS_NOT_UNIONED",
+    edits: [
+      {
+        file: DECLARED_HOOK,
+        find: "  return (connector) => {\n",
+        replace:
+          "  return (connector) => {\n    if (option) return [...option(connector)];\n",
+      },
+    ],
+    tests: DECLARED_HOOK_TESTS,
+    aim: "a manifest stream is kept beside the host option's streams",
+  },
+  {
+    // A staged seed of a connector with no registry rows is not marked
+    // skipped on delete, so the next identified run seeds it back.
+    name: "ROWLESS_DECLARED_STREAM_UNFENCED",
+    edits: [
+      {
+        file: WRITER,
+        find: "      await this.skipStagedSeed(connector);\n      return null;",
+        replace: "      return null;",
+      },
+    ],
+    tests: DECLARED_TESTS,
+    aim: "a staged seed of a connector with no registry rows does not return",
   },
 ];
 

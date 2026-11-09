@@ -135,12 +135,12 @@ import {
   type StreamSyncIntake,
   createGatewayStreamSyncRegistry,
   manifestArtifactResolver,
-  manifestStreamLister,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
   streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openFsStreamSyncHome } from "./stream-sync/fs-home.js";
+import { declaredStreamsHook } from "./stream-sync/declared-streams.js";
 import {
   createSeedStaging,
   type SeedStaging,
@@ -253,6 +253,14 @@ export interface CreateServerOptions {
   mcpGrantTtlSeconds?: number;
   profile?: "standard" | "enclave";
   serverAccount?: ServerAccount;
+  /**
+   * Stream names a connection delete fences for a connector, beside the
+   * streams of the manifests this server retained. A host that no longer
+   * verifies a connector (uninstalled, manifest not retained) names its
+   * streams here; without it such a connector's delete refuses
+   * (CONNECTOR_NOT_VERIFIED). Read at delete time.
+   */
+  declaredStreams?: (connector: string) => readonly string[];
   /**
    * Rotate the replica writer identity before this boot writes anything
    * (host contract §3.2). A host sets it when this database may be a copy:
@@ -936,10 +944,13 @@ export async function createServer(
           signer: serverSigner,
           seed: seedSource,
           // Read at delete time: the pinned manifests are verified by then.
-          // Empty for a connector with no pinned manifest: the delete of a
-          // connector that has registry rows then refuses (CONNECTOR_NOT_VERIFIED).
-          declaredStreams: (connector) =>
-            manifestStreamLister(pdppAuth?.retainedManifests ?? [])(connector),
+          // Empty for a connector with no pinned manifest and no host option:
+          // the delete of a connector that has registry rows then refuses
+          // (CONNECTOR_NOT_VERIFIED).
+          declaredStreams: declaredStreamsHook(
+            options?.declaredStreams,
+            () => pdppAuth?.retainedManifests ?? [],
+          ),
         });
         writerForSeed = streamSyncWriter;
         streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };

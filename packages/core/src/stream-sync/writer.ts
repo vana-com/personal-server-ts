@@ -912,6 +912,28 @@ export class StreamSyncWriter {
   }
 
   /**
+   * A seed the host staged for a connector the registry never listed is
+   * stored data with no row to fence, and writing a delete head there would
+   * add a row the connector never had. Each staged stream gets the receipt a
+   * seed gets once the connector's generation has moved on: `skipped`. The
+   * next identified run of the connector then does not seed it back. No
+   * registry write.
+   */
+  private async skipStagedSeed(connector: string): Promise<void> {
+    const seed = this.options.seed;
+    if (!seed) return;
+    const staged = await seed.streams(connector);
+    if (staged.length === 0) return;
+    await this.withState((state) => {
+      for (const entry of staged) {
+        state.receipts[
+          `${seed.installId}|${connector}|${IDENTITYLESS_NS}|${entry.stream}`
+        ] ??= "skipped";
+      }
+    });
+  }
+
+  /**
    * Plan a fresh delete of `connector` from the registry listing, and persist
    * it before any write. `null` when the registry lists nothing of the
    * connector: this device's runs, results and seed target for it are purged
@@ -929,6 +951,7 @@ export class StreamSyncWriter {
       await this.withState((state) => {
         delete state.seedTargets[connector];
       });
+      await this.skipStagedSeed(connector);
       return null;
     }
     const intent: DeleteIntent = {
