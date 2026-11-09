@@ -61,6 +61,7 @@ import {
   startState,
   streamRunResult,
   streamScope,
+  utf8Length,
   verifyHead,
   BucketReducer,
   type BucketResult,
@@ -1178,12 +1179,13 @@ export class StreamSyncWriter {
         await run.spool.flush();
         if (input.coveredStreams) this.keepCovered(host, input.coveredStreams);
         if (run.excluded.length > 0) {
-          await this.options.home.files.appendMany([
-            {
-              path: `runs/${runId}/excluded.ndjson`,
-              bytes: encoder.encode(run.excluded.map((l) => `${l}\n`).join("")),
-            },
-          ]);
+          for (const line of run.excluded)
+            await run.spool.addLine(
+              `runs/${runId}/excluded.ndjson`,
+              line,
+              utf8Length(line),
+            );
+          await run.spool.flush();
         }
         const connector = host.entry.connector;
         const ns = IDENTITYLESS_NS;
@@ -1346,6 +1348,7 @@ export class StreamSyncWriter {
         shardPath(dir, shard),
         shard,
         this.reduceBudget,
+        this.spoolFlushBytes,
       );
       if (after !== null) shardBytes[shard] = after;
     }

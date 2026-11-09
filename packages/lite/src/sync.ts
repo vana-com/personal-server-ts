@@ -12,6 +12,11 @@ import {
   streamSyncNetwork,
   type StreamSyncFiles,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import {
+  LITE_PART_TARGET_BYTES,
+  LITE_REDUCE_BUDGET_BYTES,
+  LITE_SPOOL_FLUSH_BYTES,
+} from "./stream-sync-budget.js";
 import { openIndexedDbStreamSyncHome } from "./stream-sync-files.js";
 import {
   createVersionInventoryClient,
@@ -572,6 +577,9 @@ export async function createPsLiteSyncManager(
           home: streamSyncHome.home,
           keys: createStreamSyncKeyPorts(options.ownerSignature),
           signer,
+          partTargetBytes: LITE_PART_TARGET_BYTES,
+          reduceBudgetBytes: LITE_REDUCE_BUDGET_BYTES,
+          spoolFlushBytes: LITE_SPOOL_FLUSH_BYTES,
         })
       : null;
     // A caller overlay is the caller's own source. The writer-home cache would

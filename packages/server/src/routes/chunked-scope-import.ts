@@ -299,6 +299,25 @@ export interface ScopeImportDeps {
   afterTombstoneVersion?(scope: string): Promise<number | null>;
   onDataWritten?(event: { scope: string; collectedAt: string }): void;
   syncManager?: { notifyNewData?(): void; trigger?(): Promise<void> } | null;
+  /**
+   * Returns the refusal response while the account's stream-sync switch is on
+   * and the request did not declare a stream-sync client. Checked after owner
+   * authorization by every operation that writes: begin, chunk and finalize.
+   * A session opened before the switch is refused too.
+   */
+  refuseLegacyWrite?(request: Request): Response | null;
+}
+
+/** Thrown to hand a ready 426 response back through the import route. */
+export class LegacyWriteRefused extends Error {
+  constructor(readonly response: Response) {
+    super("legacy write refused");
+  }
+}
+
+function refuseIfLegacy(deps: ScopeImportDeps, request: Request): void {
+  const refusal = deps.refuseLegacyWrite?.(request);
+  if (refusal) throw new LegacyWriteRefused(refusal);
 }
 
 export class ScopeImportError extends Error {
@@ -492,6 +511,7 @@ export async function beginScopeImport(
   body: unknown,
 ): Promise<{ importId: string; chunkBytes: number; expiresAt: string }> {
   await deps.authorizeOwner(request, scope);
+  refuseIfLegacy(deps, request);
   if (!deps.serverOwner) {
     throw new ScopeImportError(
       500,
@@ -651,6 +671,7 @@ export async function putScopeImportChunk(
   index: number,
 ): Promise<{ accepted: true; index: number; bytes: number; sha256: string }> {
   await deps.authorizeOwner(request, scope);
+  refuseIfLegacy(deps, request);
   const bodyBytes = await cacheRequestBodyBytes(
     request,
     SCOPE_IMPORT_CHUNK_BYTES,
@@ -790,6 +811,7 @@ export async function finalizeScopeImport(
   id: string,
 ): Promise<Record<string, unknown>> {
   await deps.authorizeOwner(request, scope);
+  refuseIfLegacy(deps, request);
   if (abortingImports.has(id)) {
     throw new ScopeImportError(
       409,
