@@ -35,6 +35,10 @@ import {
   createInMemoryWriteSessionStore,
   verifyStoredWriterAttribution,
 } from "@opendatalabs/personal-server-ts-core/write";
+import {
+  createAccountStorageMode,
+  type AccountStorageMode,
+} from "@opendatalabs/personal-server-ts-core/api";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "./data.js";
@@ -118,7 +122,10 @@ describe("MCP remember tool", () => {
     await rm(dataDir, { recursive: true, force: true });
   });
 
-  async function setup(scopes: string[]) {
+  async function setup(
+    scopes: string[],
+    options: { accountStorageMode?: AccountStorageMode } = {},
+  ) {
     const created = await createMcpConnection(
       { displayName: "Claude" },
       { store, publicOrigin: SERVER_ORIGIN },
@@ -162,6 +169,7 @@ describe("MCP remember tool", () => {
         connectionStore: store,
         indexManager,
         hierarchyOptions,
+        accountStorageMode: options.accountStorageMode,
         mcpWrites: {
           sessionStore: writeSessionStore,
           dispatch: async (request) => root.fetch(request),
@@ -286,6 +294,37 @@ describe("MCP remember tool", () => {
     expect(String(write?.builder).toLowerCase()).toBe(
       t.granteeAddress.toLowerCase(),
     );
+  });
+
+  it("MEMORY_READBACK: a switched account is refused before legacy storage is read, and nothing is saved", async () => {
+    const t = await setup([`write:${MEMORY_SCOPE}`], {
+      accountStorageMode: createAccountStorageMode({ source: () => true }),
+    });
+
+    const result = await t.callTool("remember", {
+      scope: MEMORY_SCOPE,
+      text: "Prefers TypeScript and pnpm for new projects.",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.payload)).toContain(
+      "STREAM_SYNC_WRITE_UNAVAILABLE",
+    );
+    expect((await t.ownerRead(MEMORY_SCOPE)).status).toBe(404);
+  });
+
+  it("an unswitched account saves through the same route as before", async () => {
+    const t = await setup([`write:${MEMORY_SCOPE}`], {
+      accountStorageMode: createAccountStorageMode({ source: () => false }),
+    });
+
+    const result = await t.callTool("remember", {
+      scope: MEMORY_SCOPE,
+      text: "Prefers TypeScript and pnpm for new projects.",
+    });
+
+    expect(result.isError).toBe(false);
+    expect((await t.ownerRead(MEMORY_SCOPE)).status).toBe(200);
   });
 
   it("appends memories and replaces one saved again under the same key", async () => {
