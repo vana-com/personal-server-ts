@@ -60,6 +60,11 @@ import type {
 } from "../storage/pdpp-records/index.js";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { Logger } from "../logger/index.js";
+import {
+  legacyWritesRefused,
+  type LegacyWriteSwitch,
+  UPDATE_REQUIRED_MESSAGE,
+} from "../api/legacy-write-gate.js";
 
 /** The reserved key carrying PDPP import metadata inside `data`. */
 export const PDPP_METADATA_KEY = "$pdpp";
@@ -122,7 +127,8 @@ export type PdppImportRejectionCode =
   | "record_key_mismatch"
   | "no_instance"
   | "method_authority"
-  | "store_rejected";
+  | "store_rejected"
+  | "legacy_write_refused";
 
 export interface PdppImportRejection {
   code: PdppImportRejectionCode;
@@ -144,6 +150,9 @@ export interface PdppImportRejection {
  * write it refuses today may be accepted once it is healthy.
  * `method_authority` IS here: the importer carries no acquisition method, so
  * the store's method and binding checks (P8a, P8c) refuse it on every cycle.
+ * `legacy_write_refused` IS here as well, although it reads deployment state:
+ * the stream-sync switch is one-way, so once the latch has set, no later cycle
+ * on this account can accept a legacy publish.
  */
 const PERMANENT_REJECTION_CODES: ReadonlySet<PdppImportRejectionCode> = new Set(
   [
@@ -157,6 +166,7 @@ const PERMANENT_REJECTION_CODES: ReadonlySet<PdppImportRejectionCode> = new Set(
     "semantics_mismatch",
     "record_key_mismatch",
     "method_authority",
+    "legacy_write_refused",
   ],
 );
 
@@ -215,6 +225,11 @@ export interface PdppImporterDeps {
    * use so an imported record is readable under a grant for that source.
    */
   instanceFor: (sourceId: string) => string | undefined;
+  /**
+   * The account's stream-sync switch (see `legacy-write-gate.ts`). While it
+   * is on, a canonical publish is refused: the stream store is the only store.
+   */
+  legacyWritesRefused?: LegacyWriteSwitch;
   logger: Logger;
 }
 
@@ -626,6 +641,12 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
       emitted_at: envelope.collectedAt,
       op: meta.record.op,
     };
+
+    // A canonical publish is a legacy write: refuse it on a switched account
+    // before anything is stored. This is the only gate on the publish path.
+    if (legacyWritesRefused(deps.legacyWritesRefused)) {
+      return reject("legacy_write_refused", UPDATE_REQUIRED_MESSAGE);
+    }
 
     // One envelope per call, but through the batch API so the store's own
     // transaction wraps the write: a failure rolls back rather than leaving

@@ -12,6 +12,8 @@
 
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
+import type { LegacyWriteSwitch } from "@opendatalabs/personal-server-ts-core/api";
+import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -100,6 +102,7 @@ function createWriteGateway(grant: GatewayGrantResponse | null): MockGateway {
 
 interface Harness {
   runtime: PsLiteRuntime;
+  storage: DataStoragePort;
   gateway: MockGateway;
   sessionStore: WriteSessionStore;
   accessLog: ReturnType<typeof createMemoryPsLiteAccessLogStore>;
@@ -110,6 +113,8 @@ function setup(
     grant?: GatewayGrantResponse | null;
     /** Omit the whole write-session wiring (owner-only ingest). */
     writeSessions?: false;
+    /** The stream-sync switch the host wires (see `legacy-write-gate.ts`). */
+    legacyWritesRefused?: LegacyWriteSwitch;
   } = {},
 ): Harness {
   const gateway = createWriteGateway(
@@ -120,9 +125,11 @@ function setup(
   const accessLog = createMemoryPsLiteAccessLogStore();
   const enabled = options.writeSessions !== false;
   const policyPorts = { authSessionVerifier: gateway, grantVerifier: gateway };
+  const storage = createMemoryPsLiteStorage();
   const runtime = createPsLiteRuntime({
-    storage: createMemoryPsLiteStorage(),
+    storage,
     gateway,
+    legacyWritesRefused: options.legacyWritesRefused,
     serverOwner: ownerWallet.address,
     serverOrigin: PS_ORIGIN,
     accessLogReader: accessLog,
@@ -143,7 +150,7 @@ function setup(
       : {}),
     active: true,
   });
-  return { runtime, gateway, sessionStore, accessLog };
+  return { runtime, storage, gateway, sessionStore, accessLog };
 }
 
 /** The builder's Web3Signed handshake to POST /v1/write/session. */
@@ -744,5 +751,124 @@ describe("PS-Lite write sessions on the bearer-token auth adapter", () => {
       }),
     );
     expect(forged.status).toBe(401);
+  });
+});
+
+describe("the stream-sync switch refuses every legacy write on the browser runtime", () => {
+  const switchedOn: LegacyWriteSwitch = () => true;
+
+  /** An owner-signed request: the owner's own client, no builder session. */
+  async function ownerSigned(
+    runtime: PsLiteRuntime,
+    method: "POST" | "PUT",
+    path: string,
+    body: unknown,
+    headers: Record<string, string> = {},
+  ): Promise<Response> {
+    const rawBody = JSON.stringify(body);
+    const authorization = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: PS_ORIGIN,
+      method,
+      uri: path,
+      body: new TextEncoder().encode(rawBody),
+    });
+    return runtime.fetch(
+      new Request(`${PS_ORIGIN}${path}`, {
+        method,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: authorization,
+          ...headers,
+        },
+        body: rawBody,
+      }),
+    );
+  }
+
+  it("refuses an owner data write with 426 and stores nothing", async () => {
+    const h = setup({ legacyWritesRefused: switchedOn });
+    const response = await ownerSigned(h.runtime, "POST", `/v1/data/${SCOPE}`, {
+      v: 1,
+    });
+    expect(response.status).toBe(426);
+    expect((await response.json()).errorCode).toBe("update_required");
+    expect(h.storage.findEntry({ scope: SCOPE })).toBeFalsy();
+  });
+
+  it("refuses an owner data write that declares a stream-sync client", async () => {
+    const h = setup({ legacyWritesRefused: switchedOn });
+    const response = await ownerSigned(
+      h.runtime,
+      "POST",
+      `/v1/data/${SCOPE}`,
+      { v: 1 },
+      { "Vana-Stream-Sync-Client": "1" },
+    );
+    expect(response.status).toBe(426);
+    expect(h.storage.findEntry({ scope: SCOPE })).toBeFalsy();
+  });
+
+  it("refuses a verified builder's write and stores nothing", async () => {
+    const h = setup({ legacyWritesRefused: switchedOn });
+    const token = await openSession(h.runtime);
+    const response = await sessionWrite(h.runtime, { v: 1 }, { token });
+    expect(response.status).toBe(426);
+    expect(h.storage.findEntry({ scope: SCOPE })).toBeFalsy();
+  });
+
+  it("refuses an Oura browser import and stores nothing", async () => {
+    const h = setup({ legacyWritesRefused: switchedOn });
+    const response = await ownerSigned(
+      h.runtime,
+      "POST",
+      "/v1/import/oura-browser",
+      { streams: [] },
+    );
+    expect(response.status).toBe(426);
+    expect(h.storage.findEntry({ scope: "oura.sleep" })).toBeFalsy();
+  });
+
+  it("refuses a scope-upload append with 426", async () => {
+    const h = setup({ legacyWritesRefused: switchedOn });
+    expect(h.runtime.appendScopeUpload).toBeDefined();
+    const path = `/v1/data/${SCOPE}/uploads/u1/batches/0`;
+    const authorization = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: PS_ORIGIN,
+      method: "PUT",
+      uri: path,
+      body: new TextEncoder().encode("{}"),
+    });
+    const response = await h.runtime.appendScopeUpload!(
+      new Request(`${PS_ORIGIN}${path}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: authorization,
+        },
+        body: "{}",
+      }),
+      // Refused before the batch is read; a placeholder is never inspected.
+      {} as never,
+    );
+    expect(response.status).toBe(426);
+  });
+
+  it("lets the same owner writes through when the switch is off", async () => {
+    const h = setup({ legacyWritesRefused: () => false });
+    const write = await ownerSigned(h.runtime, "POST", `/v1/data/${SCOPE}`, {
+      v: 1,
+    });
+    expect(write.status).not.toBe(426);
+    const oura = await ownerSigned(
+      h.runtime,
+      "POST",
+      "/v1/import/oura-browser",
+      {
+        streams: [],
+      },
+    );
+    expect(oura.status).not.toBe(426);
   });
 });

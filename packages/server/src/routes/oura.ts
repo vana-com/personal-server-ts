@@ -3,7 +3,10 @@ import {
   DATA_INGEST_MAX_SIZE,
 } from "../middleware/body-limit.js";
 import { Hono } from "hono";
-import { handleOuraCollectionRequirementsRequest } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  handleOuraCollectionRequirementsRequest,
+  refuseLegacyWrite,
+} from "@opendatalabs/personal-server-ts-core/api";
 import {
   importOuraBrowserRecords,
   type OuraBrowserImportInput,
@@ -34,6 +37,7 @@ type OuraRouteDeps = Pick<
   | "scopeDeletions"
   | "additions"
   | "derivativeCompute"
+  | "legacyWritesRefused"
 >;
 const SCOPES = ["oura.sleep", "oura.readiness", "oura.activity"];
 
@@ -113,6 +117,10 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
     } else {
       await auth.authorizeOwner(c.req.raw);
     }
+    // An Oura browser import is a legacy write (it lands in the legacy scope
+    // store), so a switched account refuses it on every path.
+    const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
+    if (refusal) return refusal;
     if (
       deps.config?.pdpp.optInMethods.includes("oura-browser") &&
       SCOPES.some((scope) => {

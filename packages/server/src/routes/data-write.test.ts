@@ -726,10 +726,10 @@ describe("POST /v1/data/:scope with a write session after the stream-sync switch
     await rm(dataDir, { recursive: true, force: true });
   });
 
-  it("still accepts a builder write whose signature verifies", async () => {
+  it("refuses a builder write whose signature verifies: no delegated builder is exempt", async () => {
     const res = await sessionWrite(app, SCOPE, { note: "builder" });
-    expect(res.status).toBe(201);
-    expect(index.countByScope(SCOPE)).toBe(1);
+    expect(res.status).toBe(426);
+    expect(index.countByScope(SCOPE)).toBe(0);
   });
 
   it("stores nothing from a builder write whose signature does not verify", async () => {

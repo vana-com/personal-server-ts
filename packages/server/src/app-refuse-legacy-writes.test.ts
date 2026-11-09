@@ -80,12 +80,41 @@ describe("createApp legacy-write refusal", () => {
     expect((await response.json()).errorCode).toBe("update_required");
   });
 
-  it("accepts a declaring client's write when both flags are on", async () => {
+  it("refuses a declaring client's write when both flags are on: a header is no exemption", async () => {
     const response = await post(
       makeApp({ write: true, refuseLegacyWrites: true }),
       { [STREAM_SYNC_CLIENT_HEADER]: "1" },
     );
-    expect(response.status).toBe(201);
+    expect(response.status).toBe(426);
+    expect(index.countByScope("github.events")).toBe(0);
+  });
+
+  it("refuses an Oura browser import when both flags are on, and stores nothing", async () => {
+    const app = makeApp({ write: true, refuseLegacyWrites: true });
+    const response = await app.request("/v1/import/oura-browser", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ streams: [] }),
+    });
+    expect(response.status).toBe(426);
+    expect((await response.json()).errorCode).toBe("update_required");
+    expect(index.countByScope("oura.sleep")).toBe(0);
+  });
+
+  it("lets an Oura browser import through when the switch is off", async () => {
+    const app = makeApp({ write: true, refuseLegacyWrites: false });
+    const response = await app.request("/v1/import/oura-browser", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ streams: [] }),
+    });
+    expect(response.status).not.toBe(426);
   });
 
   it("accepts an old client's write when streamSync.write is off", async () => {

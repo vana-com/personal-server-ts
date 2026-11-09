@@ -5,17 +5,23 @@
  * Switch state: the server already holds it locally as `streamSync.write`,
  * which its host sets from the Account setting (`GET /api/v1/me/stream-sync`)
  * before each launch. A caller passes that state in; this module never reads
- * config or the network.
+ * config or the network. Each host wraps its source in
+ * `latchLegacyWriteSwitch`, so the state it reads cannot fall back once seen.
  *
- * Who is refused: a legacy write that does not declare itself stream-sync
- * aware. A client built for stream sync sends `Vana-Stream-Sync-Client: 1` on
- * every legacy write it still makes; a client built before stream sync cannot
- * send it. The header is a capability declaration, not a credential: it
- * decides which message the caller gets, never what the caller may read.
+ * Who is refused: every legacy write for a switched account, from every
+ * caller. No request header and no delegated builder signature exempts a
+ * write. A client built for stream sync that still makes a legacy write is
+ * refused too, so the client must stop making legacy writes on switched
+ * accounts. Unswitched accounts are never refused.
  */
 
 export const UPDATE_REQUIRED_CODE = "update_required";
 export const UPDATE_REQUIRED_STATUS = 426;
+/**
+ * The header a stream-sync client sends on the legacy writes it still makes.
+ * It declares nothing that changes the outcome: a switched account refuses the
+ * write whether or not this header is present.
+ */
 export const STREAM_SYNC_CLIENT_HEADER = "vana-stream-sync-client";
 
 export const UPDATE_REQUIRED_MESSAGE =
@@ -24,20 +30,48 @@ export const UPDATE_REQUIRED_MESSAGE =
 /** The switch state a server reads at the moment of the write. */
 export type LegacyWriteSwitch = () => boolean;
 
-export function declaresStreamSyncClient(request: Request): boolean {
-  return request.headers.get(STREAM_SYNC_CLIENT_HEADER) === "1";
+/**
+ * A one-way latch over the switch source. Once the source has said true, the
+ * latch stays true for the life of this server: a later `false` or a source
+ * that cannot be read does not reopen legacy writes. Before the source has
+ * ever said true, a source that throws reads as not switched, so an
+ * unreachable source never blocks an unswitched account's writes (fail open).
+ *
+ * One latch per server: a server holds exactly one owner.
+ */
+export function latchLegacyWriteSwitch(
+  source: LegacyWriteSwitch,
+): LegacyWriteSwitch {
+  let latched = false;
+  return () => {
+    if (latched) return true;
+    try {
+      latched = source() === true;
+    } catch {
+      latched = false;
+    }
+    return latched;
+  };
+}
+
+/**
+ * The one decision: whether a legacy write must be refused right now.
+ * `switchedOn` absent means no gate was wired: nothing is refused.
+ */
+export function legacyWritesRefused(
+  switchedOn: LegacyWriteSwitch | undefined,
+): boolean {
+  return switchedOn !== undefined && switchedOn() === true;
 }
 
 /**
  * The refusal for a legacy write, or `null` when the write may proceed.
- * `switchedOn` absent means no gate was wired: every write proceeds.
+ * HTTP entries return this response; the decision is `legacyWritesRefused`.
  */
 export function refuseLegacyWrite(
-  request: Request,
   switchedOn: LegacyWriteSwitch | undefined,
 ): Response | null {
-  if (!switchedOn || !switchedOn()) return null;
-  if (declaresStreamSyncClient(request)) return null;
+  if (!legacyWritesRefused(switchedOn)) return null;
   // Both error shapes the legacy surface uses, so an old client reads the
   // message from whichever field it already knows.
   return new Response(

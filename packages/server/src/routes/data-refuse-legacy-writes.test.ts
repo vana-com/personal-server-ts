@@ -154,10 +154,10 @@ describe("refuse legacy writes after the stream-sync switch", () => {
       expect(response.status).not.toBe(426);
     });
 
-    it("is not refused for a client that declares stream sync", async () => {
+    it("is refused for a client that declares stream sync: a header is no exemption", async () => {
       switchedOn = true;
       const response = await send(route, { [STREAM_SYNC_CLIENT_HEADER]: "1" });
-      expect(response.status).not.toBe(426);
+      expect(response.status).toBe(426);
     });
   });
 
@@ -168,17 +168,17 @@ describe("refuse legacy writes after the stream-sync switch", () => {
     expect(index.countByScope(scope)).toBe(0);
   });
 
-  it("still stores a declaring client's write when the switch is on", async () => {
+  it("refuses a declaring client's writes and stores nothing when the switch is on", async () => {
     switchedOn = true;
     const post = await send(LEGACY_WRITE_ROUTES[0], {
       [STREAM_SYNC_CLIENT_HEADER]: "1",
     });
-    expect(post.status).toBe(201);
+    expect(post.status).toBe(426);
     const put = await send(LEGACY_WRITE_ROUTES[1], {
       [STREAM_SYNC_CLIENT_HEADER]: "1",
     });
-    expect(put.status).toBe(201);
-    expect(index.countByScope(scope)).toBe(2);
+    expect(put.status).toBe(426);
+    expect(index.countByScope(scope)).toBe(0);
   });
 
   it("answers a refused write before reading an oversized body", async () => {
@@ -342,15 +342,12 @@ describe("refuse legacy writes after the stream-sync switch", () => {
       expect(index.countByScope(scope)).toBe(1);
     });
 
-    it("completes with enforcement on and the client declaration", async () => {
+    it("refuses a declaring client's import with enforcement on", async () => {
       switchedOn = true;
       const declared = { [STREAM_SYNC_CLIENT_HEADER]: "1" };
       const opened = await begin(declared);
-      expect(opened.status).toBe(201);
-      const { importId } = await opened.json();
-      expect((await putChunk(importId, declared)).status).toBe(200);
-      expect((await finalize(importId, declared)).status).toBe(201);
-      expect(index.countByScope(scope)).toBe(1);
+      expect(opened.status).toBe(426);
+      expect(index.countByScope(scope)).toBe(0);
     });
 
     it.each([

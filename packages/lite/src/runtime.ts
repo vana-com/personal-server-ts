@@ -31,6 +31,8 @@ import {
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
   handlePersonalServerScopeUploadAppend,
+  refuseLegacyWrite,
+  type LegacyWriteSwitch,
   createScopeUploadRegistry,
   handleOuraCollectionRequirementsRequest,
   handlePersonalServerGrantsRequest,
@@ -156,6 +158,11 @@ export interface PsLiteRuntimeOptions {
     payment?: { enabled?: boolean };
   };
   saveConfig?: (config: unknown) => Promise<void>;
+  /**
+   * The account's stream-sync switch, latched by the host (see
+   * `latchLegacyWriteSwitch`). Absent = no legacy write is refused.
+   */
+  legacyWritesRefused?: LegacyWriteSwitch;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
@@ -1065,7 +1072,13 @@ export function createPsLiteRuntime(
             if (!active) return unavailableResponse();
             return handlePersonalServerScopeUploadAppend(
               request,
-              { storage: dataStorage, auth, accessLogWriter, scopeUploads },
+              {
+                storage: dataStorage,
+                auth,
+                accessLogWriter,
+                scopeUploads,
+                legacyWritesRefused: options.legacyWritesRefused,
+              },
               batch,
             );
           },
@@ -1233,6 +1246,9 @@ export function createPsLiteRuntime(
               "METHOD_NOT_ALLOWED",
               "Method not allowed",
             );
+          // An Oura browser import is a legacy write: a switched account refuses it.
+          const refusal = refuseLegacyWrite(options.legacyWritesRefused);
+          if (refusal) return refusal;
           let body;
           try {
             body = await request.json();
@@ -1268,6 +1284,7 @@ export function createPsLiteRuntime(
             request,
             {
               storage: dataStorage,
+              legacyWritesRefused: options.legacyWritesRefused,
               auth,
               logger: options.logger,
               accessLogWriter,

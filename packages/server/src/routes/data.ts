@@ -1,7 +1,6 @@
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
-import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerApiDispatchOptions,
@@ -187,25 +186,16 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     pdppOwnerBearer: deps.pdppOwnerBearer,
   });
 
-  // Early 426 for a clean request, before any body is read. This is only an
-  // optimisation: the core write operations refuse again after real
-  // authorization, and that is what makes the refusal hold. Only plain
-  // `POST /:scope` can be a delegated builder write, so only it defers when a
-  // write signature is present (this layer cannot verify it: it signs the
-  // body); the core exempts it only if the proof verified. Every other route
-  // is owner-only and has no exemption.
+  // Early 426 for a clean request, before any body is read. Every legacy
+  // write route refuses here and again in the core write operations after
+  // authorization, so the refusal holds even for a request that skips this
+  // layer. No route has an exemption: not a header, not a verified builder.
   const refuseLegacy: MiddlewareHandler = async (c, next) => {
-    const refusal = refuseLegacyWrite(c.req.raw, deps.legacyWritesRefused);
+    const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
     if (refusal) return refusal;
     await next();
   };
-  const refuseLegacyUnlessProofPresent: MiddlewareHandler = async (c, next) => {
-    if (c.req.header(WRITE_SIGNATURE_HEADER) === undefined) {
-      return refuseLegacy(c, next);
-    }
-    await next();
-  };
-  app.post("/:scope", refuseLegacyUnlessProofPresent);
+  app.post("/:scope", refuseLegacy);
   app.post("/:scope/imports", refuseLegacy);
   app.put("/:scope/imports/:id/chunks/:index", refuseLegacy);
   app.post("/:scope/imports/:id/finalize", refuseLegacy);
@@ -222,8 +212,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       auth.authorizeOwnerScope({ request, scope }),
     syncManager: deps.syncManager,
     onDataWritten: deps.onDataWritten,
-    refuseLegacyWrite: (request) =>
-      refuseLegacyWrite(request, deps.legacyWritesRefused),
+    refuseLegacyWrite: () => refuseLegacyWrite(deps.legacyWritesRefused),
     afterTombstoneVersion: async (scope) => {
       if (!deps.scopeDeletions) return null;
       const verdict = await deps.scopeDeletions.resolve(scope);

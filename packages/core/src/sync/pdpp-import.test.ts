@@ -11,7 +11,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createMemoryRecordStore,
   type PdppRecordStore,
@@ -682,5 +682,39 @@ describe("createPdppImporter", () => {
         expect(() => importer.importEnvelope(envelope({ pdpp }))).not.toThrow();
       }
     });
+  });
+});
+
+describe("the stream-sync switch refuses canonical publishes", () => {
+  function importerWith(legacyWritesRefused: () => boolean) {
+    const store = createMemoryRecordStore();
+    const importer = createPdppImporter({
+      store,
+      declarations: [RETAINED],
+      instanceFor: (sourceId) =>
+        sourceId === SOURCE_ID ? INSTANCE : undefined,
+      legacyWritesRefused,
+      logger: silentLogger(),
+    });
+    return { importer, store };
+  }
+
+  it("refuses a publish on a switched account, stores nothing, and does not retry it", () => {
+    const { importer, store } = importerWith(() => true);
+    const ingest = vi.spyOn(store, "ingestBatch");
+    const outcome = importer.importEnvelope(envelope());
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      rejection: { code: "legacy_write_refused" },
+    });
+    expect(ingest).not.toHaveBeenCalled();
+    expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
+  });
+
+  it("imports the same publish on an unswitched account", () => {
+    const { importer, store } = importerWith(() => false);
+    expect(importer.importEnvelope(envelope()).status).toBe("imported");
+    expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeDefined();
   });
 });

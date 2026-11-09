@@ -2217,7 +2217,8 @@ export {
   UPDATE_REQUIRED_CODE,
   UPDATE_REQUIRED_MESSAGE,
   UPDATE_REQUIRED_STATUS,
-  declaresStreamSyncClient,
+  latchLegacyWriteSwitch,
+  legacyWritesRefused,
   refuseLegacyWrite,
   type LegacyWriteSwitch,
 } from "./legacy-write-gate.js";
@@ -2250,7 +2251,7 @@ async function handleScopeUploadRequest(
   // An upload is owner-only: no delegated builder writes through it, so there
   // is no exemption. Aborting only discards staged data and stays allowed.
   if (route.kind !== "abort") {
-    const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+    const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
     if (refusal) return refusal;
   }
   const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
@@ -2507,7 +2508,7 @@ export async function handlePersonalServerDataRequest(
       // Owner-only: a builder has no durable-import route, so a signature
       // header earns no exemption here. This runs on the normalized path, so
       // `/imports/<op>/` and repeated slashes land here too.
-      const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+      const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
       if (refusal) return refusal;
       const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
@@ -3146,11 +3147,12 @@ export async function handlePersonalServerDataRequest(
       } else {
         await deps.auth.authorizeOwner(request);
       }
-      // `writeAuth` exists only after the builder's session and write
-      // signature verified, so only a verified builder skips the refusal.
-      if (!writeAuth) {
-        const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
-        if (refusal) return refusal;
+      // A switched account refuses every legacy write here, verified builder
+      // or not: a delegated write is a legacy write too.
+      const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
+      if (refusal) {
+        await writeAuth?.releaseProof?.();
+        return refusal;
       }
       // `?supersede=legacy`: once this write commits, delete the scope's
       // older legacy-form versions (see supersedeLegacyVersions). It deletes

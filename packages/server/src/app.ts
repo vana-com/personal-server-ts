@@ -26,9 +26,11 @@ import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type {
+  LegacyWriteSwitch,
   PersonalServerReadFulfillmentReporter,
   StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
+import { latchLegacyWriteSwitch } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import {
@@ -214,6 +216,11 @@ export interface AppDeps {
    * and `$pdpp` envelopes are stored and indexed exactly as before.
    */
   pdppImporter?: PdppImporter;
+  /**
+   * The account's stream-sync switch, latched once per server by the host
+   * (see `latchLegacyWriteSwitch`). Absent = latched here from `config`.
+   */
+  legacyWritesRefused?: LegacyWriteSwitch;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
    * Invoked when the /ui/api registration route confirms the server is
@@ -329,6 +336,15 @@ function streamSyncClosing(): ProtocolError {
 
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
+  // One switch for every legacy write this server accepts. The host passes
+  // its latch; the fallback latches the same config fields the host reads.
+  const legacyWritesRefused =
+    deps.legacyWritesRefused ??
+    latchLegacyWriteSwitch(
+      () =>
+        deps.config?.streamSync.write === true &&
+        deps.config.streamSync.refuseLegacyWrites === true,
+    );
 
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
   // derivative question registration), and one replay guard for the proofs
@@ -529,7 +545,10 @@ export function createApp(deps: AppDeps): Hono {
     );
   }
 
-  app.route("/v1/import/oura-browser", ouraRoutes(deps));
+  app.route(
+    "/v1/import/oura-browser",
+    ouraRoutes({ ...deps, legacyWritesRefused }),
+  );
 
   app.use("/v1/stream-sync/*", async (_c, next) => {
     if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
@@ -601,12 +620,8 @@ export function createApp(deps: AppDeps): Hono {
       dataStorage: deps.dataStorage,
       legacyScopeView,
       streamSyncRead: deps.streamSyncRead,
-      // The account's stream-sync switch as this server holds it: its host
-      // sets `streamSync.write` from the Account setting before launch.
-      // Enforcement is its own flag and ships off.
-      legacyWritesRefused: () =>
-        deps.config?.streamSync.write === true &&
-        deps.config.streamSync.refuseLegacyWrites === true,
+      // The account's stream-sync switch (see the top of createApp).
+      legacyWritesRefused,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,

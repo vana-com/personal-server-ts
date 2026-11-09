@@ -33,7 +33,10 @@ function takeoverLimit(name: string, fallback: number): number {
   return value;
 }
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  latchLegacyWriteSwitch,
+  type PersonalServerReadFulfillmentReporter,
+} from "@opendatalabs/personal-server-ts-core/api";
 import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
 import { createLogger, type Logger } from "./logger/index.js";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -663,6 +666,13 @@ export async function createServer(
    * delegate reports every envelope as skipped — sync behaves exactly as it
    * did before this existed.
    */
+  // The account's stream-sync switch, latched once for this server. The PDPP
+  // importer and every legacy route read this one value (see app.ts).
+  const legacyWritesRefused = latchLegacyWriteSwitch(
+    () =>
+      config.streamSync.write === true &&
+      config.streamSync.refuseLegacyWrites === true,
+  );
   let pdppImporterImpl: PdppImporter | null = null;
   const pdppImporter: PdppImporter = {
     importEnvelope: (envelope) =>
@@ -1229,6 +1239,7 @@ export async function createServer(
       declarations: pdppAuth?.retainedDeclarations ?? [],
       documents: pdppAuth?.retainedDocuments ?? new Map(),
       serverOwner,
+      legacyWritesRefused,
       logger,
     }) ?? null;
 
@@ -1257,6 +1268,7 @@ export async function createServer(
       : undefined;
 
   const app = createApp({
+    legacyWritesRefused,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
     // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).

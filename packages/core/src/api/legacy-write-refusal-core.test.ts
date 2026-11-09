@@ -8,6 +8,7 @@ import {
   handlePersonalServerDataRequest,
   STREAM_SYNC_CLIENT_HEADER,
   type PersonalServerDataApiDeps,
+  type PersonalServerWriteAuthResult,
 } from "./index.js";
 import type { ScopeUploadRegistry } from "./scope-uploads.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
@@ -66,6 +67,7 @@ describe("the core refuses legacy writes after owner authorization", () => {
     ["upload begin", "POST", `/${scope}/uploads`],
     ["upload batch", "PUT", `/${scope}/uploads/u1/batches/0`],
     ["upload commit", "POST", `/${scope}/uploads/u1/commit`],
+    ["owner data write", "POST", `/${scope}`],
   ] as const;
 
   describe.each(cases)("%s", (_name, method, path) => {
@@ -98,11 +100,60 @@ describe("the core refuses legacy writes after owner authorization", () => {
       expect(response.status).not.toBe(426);
     });
 
-    it("is not refused for a declaring client", async () => {
+    it("is refused for a declaring client too: a header is no exemption", async () => {
       const f = fixture({ value: true });
       const response = await handlePersonalServerDataRequest(
         request(method, path, { [STREAM_SYNC_CLIENT_HEADER]: "1" }),
         f.deps,
+      );
+      expect(response.status).toBe(426);
+      expect(f.commitVersion).not.toHaveBeenCalled();
+      expect(f.storage.entries).toHaveLength(0);
+    });
+  });
+
+  describe("a verified delegated builder earns no exemption", () => {
+    const builderAuth = (): PersonalServerWriteAuthResult =>
+      ({
+        builder: "0x2222222222222222222222222222222222222222",
+        grantId: "grant-1",
+        attribution: {},
+        releaseProof: vi.fn(async () => undefined),
+      }) as unknown as PersonalServerWriteAuthResult;
+
+    it("answers 426 on a switched account and writes nothing", async () => {
+      const f = fixture({ value: true });
+      const auth = builderAuth();
+      const deps = {
+        ...f.deps,
+        auth: {
+          ...f.deps.auth,
+          authorizeWrite: vi.fn(async () => auth),
+        },
+      } as PersonalServerDataApiDeps;
+      const response = await handlePersonalServerDataRequest(
+        request("POST", `/${scope}`, forged),
+        deps,
+      );
+      expect(response.status).toBe(426);
+      expect((await response.json()).errorCode).toBe("update_required");
+      expect(f.storage.entries).toHaveLength(0);
+      expect(f.commitVersion).not.toHaveBeenCalled();
+      expect(auth.releaseProof).toHaveBeenCalledOnce();
+    });
+
+    it("is not refused with the switch off", async () => {
+      const f = fixture({ value: false });
+      const deps = {
+        ...f.deps,
+        auth: {
+          ...f.deps.auth,
+          authorizeWrite: vi.fn(async () => builderAuth()),
+        },
+      } as PersonalServerDataApiDeps;
+      const response = await handlePersonalServerDataRequest(
+        request("POST", `/${scope}`, forged),
+        deps,
       );
       expect(response.status).not.toBe(426);
     });

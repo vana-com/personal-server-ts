@@ -300,12 +300,11 @@ export interface ScopeImportDeps {
   onDataWritten?(event: { scope: string; collectedAt: string }): void;
   syncManager?: { notifyNewData?(): void; trigger?(): Promise<void> } | null;
   /**
-   * Returns the refusal response while the account's stream-sync switch is on
-   * and the request did not declare a stream-sync client. Checked after owner
-   * authorization by every operation that writes: begin, chunk and finalize.
-   * A session opened before the switch is refused too.
+   * Returns the refusal response while the account's stream-sync switch is on.
+   * Checked after owner authorization by every operation that writes: begin,
+   * chunk and finalize. A session opened before the switch is refused too.
    */
-  refuseLegacyWrite?(request: Request): Response | null;
+  refuseLegacyWrite?(): Response | null;
 }
 
 /** Thrown to hand a ready 426 response back through the import route. */
@@ -315,8 +314,8 @@ export class LegacyWriteRefused extends Error {
   }
 }
 
-function refuseIfLegacy(deps: ScopeImportDeps, request: Request): void {
-  const refusal = deps.refuseLegacyWrite?.(request);
+function refuseIfLegacy(deps: ScopeImportDeps): void {
+  const refusal = deps.refuseLegacyWrite?.();
   if (refusal) throw new LegacyWriteRefused(refusal);
 }
 
@@ -511,7 +510,7 @@ export async function beginScopeImport(
   body: unknown,
 ): Promise<{ importId: string; chunkBytes: number; expiresAt: string }> {
   await deps.authorizeOwner(request, scope);
-  refuseIfLegacy(deps, request);
+  refuseIfLegacy(deps);
   if (!deps.serverOwner) {
     throw new ScopeImportError(
       500,
@@ -671,7 +670,7 @@ export async function putScopeImportChunk(
   index: number,
 ): Promise<{ accepted: true; index: number; bytes: number; sha256: string }> {
   await deps.authorizeOwner(request, scope);
-  refuseIfLegacy(deps, request);
+  refuseIfLegacy(deps);
   const bodyBytes = await cacheRequestBodyBytes(
     request,
     SCOPE_IMPORT_CHUNK_BYTES,
@@ -811,7 +810,7 @@ export async function finalizeScopeImport(
   id: string,
 ): Promise<Record<string, unknown>> {
   await deps.authorizeOwner(request, scope);
-  refuseIfLegacy(deps, request);
+  refuseIfLegacy(deps);
   if (abortingImports.has(id)) {
     throw new ScopeImportError(
       409,

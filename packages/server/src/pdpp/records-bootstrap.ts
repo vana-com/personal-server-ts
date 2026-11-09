@@ -32,6 +32,7 @@ import { createHash } from "node:crypto";
 import type { Database } from "better-sqlite3";
 import type { Logger } from "pino";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
+import type { LegacyWriteSwitch } from "@opendatalabs/personal-server-ts-core/api";
 import {
   createSourceStreamDeclarationRegistry,
   type PdppRecordStore,
@@ -496,6 +497,8 @@ export function createPdppSyncImporter(options: {
   /** Exact retained bytes per source id, from the AS boot. */
   documents: Map<string, string>;
   serverOwner: `0x${string}` | undefined;
+  /** The account's stream-sync switch; a switched account refuses publishes. */
+  legacyWritesRefused?: LegacyWriteSwitch;
   logger: Logger;
 }): PdppImporter | undefined {
   const { records, serverOwner, logger } = options;
@@ -549,6 +552,7 @@ export function createPdppSyncImporter(options: {
       if (connections.length > 1) return undefined;
       return undefined;
     },
+    legacyWritesRefused: options.legacyWritesRefused,
     logger,
   });
 }
