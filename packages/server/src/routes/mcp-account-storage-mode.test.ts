@@ -29,11 +29,17 @@ import type {
 import {
   accountStorageModeFor,
   type AccountStorageMode,
-  type AccountStorageModeValue,
   type StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
-import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
-import { authorityHearing } from "@opendatalabs/personal-server-ts-core/test-utils";
+import {
+  accountStorageModeOf,
+  type ModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import {
+  authorityHearing,
+  spyOnModeAuthority,
+  type ModeAsked,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createApp } from "../app.js";
 import { initializeDatabase } from "../storage/index-schema.js";
@@ -109,26 +115,25 @@ const readScope = JSON.stringify({
 
 /** What the mode was asked and what it answered, across every call. */
 interface ModeSpy extends AccountStorageMode {
-  calls: Array<{ owner: string; answer: AccountStorageModeValue }>;
+  calls: ModeAsked[];
+  /** The module the app is given; its port is this spy. */
+  authority: ModeAuthority;
 }
 
-function spyOn(inner: AccountStorageMode): ModeSpy {
-  const calls: ModeSpy["calls"] = [];
+function spyOn(inner: ModeAuthority): ModeSpy {
+  const spied = spyOnModeAuthority(inner);
   return {
-    calls,
-    read(requestOwner) {
-      const answer = inner.read(requestOwner);
-      calls.push({ owner: requestOwner, answer });
-      return answer;
-    },
+    calls: spied.calls,
+    authority: spied.authority,
+    read: accountStorageModeOf(spied.authority).read,
   };
 }
 
-/** A mode bound to `owner` that has already latched switched. */
-async function latchedSwitchedFor(owner: string): Promise<AccountStorageMode> {
-  const mode = accountStorageModeOf(await authorityHearing(owner, "on"));
-  expect(mode.read(owner)).toBe("switched");
-  return mode;
+/** A module for `owner` that has already latched switched. */
+async function latchedSwitchedFor(owner: string): Promise<ModeAuthority> {
+  const authority = await authorityHearing(owner, "on");
+  expect(authority.read(owner).kind).toBe("streams");
+  return authority;
 }
 
 describe.each([
@@ -248,7 +253,7 @@ describe.each([
         accessLogWriter: { write: vi.fn(async () => undefined) },
         mcpConnectionStore: store,
         streamSyncRead: emptyReader,
-        accountStorageMode: mode,
+        accountModeAuthority: mode.authority,
         config: ServerConfigSchema.parse({}),
       });
       const res = await app.request(

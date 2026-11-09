@@ -27,12 +27,14 @@ import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type {
-  AccountStorageMode,
   PersonalServerReadFulfillmentReporter,
   StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
-import type { ModeAuthority } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import {
+  accountStorageModeOf,
+  type ModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import {
@@ -219,16 +221,12 @@ export interface AppDeps {
    */
   pdppImporter?: PdppImporter;
   /**
-   * The account's storage mode: the port over the account-mode module (see
-   * `accountStorageModeOf`). The legacy write gate, the data routes and every
-   * MCP engine consume this one instance. Absent = unknown: every legacy
-   * write answers a retryable 503.
-   */
-  accountStorageMode?: AccountStorageMode;
-  /**
-   * The account-mode module itself. When wired, the owner-authenticated
-   * `POST /v1/account-mode/evidence` route mounts and hosts give the module
-   * the Account's answers through it.
+   * The account-mode module: the only source of the account's storage mode.
+   * The legacy write gate, the data routes and every MCP engine read the port
+   * derived from it, and no option supplies a mode separately. When wired, the
+   * owner-authenticated `POST /v1/account-mode/evidence` and
+   * `POST /v1/account-mode/import-done` routes mount. Absent = unknown: every
+   * legacy write answers a retryable 503.
    */
   accountModeAuthority?: ModeAuthority;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
@@ -346,12 +344,15 @@ function streamSyncClosing(): ProtocolError {
 
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
-  // One mode for every read and legacy write this server serves. The host
-  // passes its instance; with none, the mode is unknown and legacy writes
-  // refuse. Bound to this server's owner once, here: every consumer below
-  // receives the bound view, which cannot be asked about another account.
+  // One mode for every read and legacy write this server serves, derived
+  // from the account-mode module and nothing else; with no module, the mode
+  // is unknown and legacy writes refuse. Bound to this server's owner once,
+  // here: every consumer below receives the bound view, which cannot be asked
+  // about another account.
   const accountStorageMode = accountStorageModeFor(
-    deps.accountStorageMode ?? { read: () => "unknown" },
+    deps.accountModeAuthority
+      ? accountStorageModeOf(deps.accountModeAuthority)
+      : { read: () => "unknown" },
     deps.serverOwner,
   );
   // One store for mint (POST /v1/write/session) and redeem (data ingest and

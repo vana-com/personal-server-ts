@@ -385,7 +385,7 @@ describe("named safety mutants and boundary cases", () => {
     }
   });
 
-  it("sets importRequired once, at the first durable On, from the legacy-files probe", () => {
+  it("saves importPending with the first On, and keeps it until importDone", () => {
     const off = accept(null, evidence("off"));
     const on = reduceAccountMode(
       off,
@@ -394,22 +394,124 @@ describe("named safety mutants and boundary cases", () => {
     );
     expect(on.persist).toBe(true);
     expect(on.decision).toEqual(unknown);
+    // The flag is in the record that is written, not only in the answer.
+    expect(toDurable(on.record!).importPending).toBe(true);
     const saved = reduceAccountMode(
       on.record,
       { type: "saveComplete", owner: "A" },
       clock,
     );
     expect(saved.decision).toEqual({ kind: "streams", importRequired: true });
+    // Every later answer still says an import is owed.
     const later = reduceAccountMode(saved.record, read, clock);
-    expect(later.decision).toEqual({ kind: "streams", importRequired: false });
-    // A second On answer, even with legacy files present, owes nothing.
+    expect(later.decision).toEqual({ kind: "streams", importRequired: true });
     const again = reduceAccountMode(
       later.record,
-      evidence("on", { legacyFiles: true }),
+      evidence("on", { legacyFiles: false }),
       clock,
     );
     expect(again.persist).toBe(false);
-    expect(again.decision).toEqual({ kind: "streams", importRequired: false });
+    expect(again.decision).toEqual({ kind: "streams", importRequired: true });
+    // A restart reads the same flag back from the disk.
+    const restarted = fromDurable("a", toDurable(saved.record!));
+    expect(
+      reduceAccountMode(restarted, { ...read, owner: "a" }, clock).decision,
+    ).toEqual({ kind: "streams", importRequired: true });
+  });
+
+  it("STREAM_WRITE_BEFORE_IMPORT_DONE: a stream commit is refused until the import is done", () => {
+    const pending = accept(null, evidence("on", { legacyFiles: true }));
+    const streamCommit = { ...commit, sink: "stream" } as ModeEvent;
+    expect(reduceAccountMode(pending, streamCommit, clock).decision).toEqual({
+      kind: "refuse",
+      code: "IMPORT_PENDING",
+      status: 503,
+    });
+    const done = reduceAccountMode(
+      pending,
+      { type: "importDone", owner: "A" },
+      clock,
+    );
+    expect(done.persist).toBe(true);
+    expect(toDurable(done.record!).importPending).toBe(false);
+    // Save before use: nothing is served as clean until the save completes.
+    expect(done.decision).toEqual(unknown);
+    expect(
+      reduceAccountMode(done.record, streamCommit, clock).decision,
+    ).toEqual(unknown);
+    const saved = reduceAccountMode(
+      done.record,
+      { type: "saveComplete", owner: "A" },
+      clock,
+    );
+    expect(saved.decision).toEqual({ kind: "streams", importRequired: false });
+    expect(
+      reduceAccountMode(saved.record, streamCommit, clock).decision,
+    ).toEqual({ kind: "streams", importRequired: false });
+    // A failed save of the clean record keeps the owner unknown, and a later
+    // importDone asks for the save again.
+    const failed = reduceAccountMode(
+      done.record,
+      { type: "saveFailed", owner: "A" },
+      clock,
+    );
+    expect(failed.decision).toEqual(unknown);
+    expect(
+      reduceAccountMode(
+        failed.record,
+        { type: "importDone", owner: "A" },
+        clock,
+      ).persist,
+    ).toBe(true);
+  });
+
+  it("admits an import seed publish while pending, and only that", () => {
+    const pending = accept(null, evidence("on", { legacyFiles: true }));
+    const seed = { ...commit, sink: "importSeed" } as ModeEvent;
+    // ORDINARY_WRITE_PASSES_WHILE_PENDING: the ordinary stream commit stays refused.
+    expect(
+      reduceAccountMode(pending, { ...commit, sink: "stream" }, clock).decision,
+    ).toEqual({ kind: "refuse", code: "IMPORT_PENDING", status: 503 });
+    // IMPORT_SEED_REFUSED_WHILE_PENDING
+    expect(reduceAccountMode(pending, seed, clock).decision).toEqual({
+      kind: "streams",
+      importRequired: true,
+    });
+    // It changes nothing: no save, same record.
+    const again = reduceAccountMode(pending, seed, clock);
+    expect(again.persist).toBe(false);
+    expect(again.record).toEqual(pending);
+  });
+
+  it("does not admit an import seed publish for an unsaved On or an Off", () => {
+    const seed = { ...commit, sink: "importSeed" } as ModeEvent;
+    const unsavedOn = reduceAccountMode(
+      null,
+      evidence("on", { legacyFiles: true }),
+      clock,
+    );
+    expect(reduceAccountMode(unsavedOn.record, seed, clock).decision).toEqual(
+      unknown,
+    );
+    const off = reduceAccountMode(null, evidence("off"), clock);
+    expect(reduceAccountMode(off.record, seed, clock).decision.kind).not.toBe(
+      "streams",
+    );
+  });
+
+  it("importDone changes nothing for an owner that has no pending import", () => {
+    const done = { type: "importDone", owner: "A" } as ModeEvent;
+    expect(reduceAccountMode(null, done, clock)).toEqual({
+      record: null,
+      decision: unknown,
+      persist: false,
+    });
+    const off = accept(null, evidence("off"));
+    expect(reduceAccountMode(off, done, clock).persist).toBe(false);
+    const clean = accept(null, evidence("on"));
+    const result = reduceAccountMode(clean, done, clock);
+    expect(result.persist).toBe(false);
+    expect(result.decision).toEqual({ kind: "streams", importRequired: false });
   });
 
   it("owes no import when the probe finds no legacy files", () => {
@@ -420,6 +522,7 @@ describe("named safety mutants and boundary cases", () => {
       clock,
     );
     expect(saved.decision).toEqual({ kind: "streams", importRequired: false });
+    expect(toDurable(on.record!).importPending).toBe(false);
   });
 
   it("rejects future and expired Off timestamps and an invalid status", () => {
@@ -462,11 +565,12 @@ describe("the durable projection", () => {
       switched: true,
       switchedAt: on.switchedAt,
       persistence: "saved",
-      importPending: false,
+      importPending: true,
     });
     expect(Object.keys(toDurable(on)).sort()).toEqual([
       "bootId",
       "cleanOffAt",
+      "importPending",
       "offFetchStartMono",
       "switched",
       "switchedAt",

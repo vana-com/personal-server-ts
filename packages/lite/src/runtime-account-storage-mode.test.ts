@@ -21,15 +21,15 @@ import {
   authorityHearing,
   buildWeb3SignedHeader,
   createTestWallet,
+  spyOnModeAuthority,
+  type ModeAsked,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type {
   Builder,
   GatewayClient,
   GatewayGrantResponse,
 } from "@opendatalabs/vana-sdk/browser";
 import {
-  type AccountStorageMode,
   type AccountStorageModeValue,
   type StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -100,11 +100,6 @@ async function ownerSigned(
 
 const OTHER = "0x2222222222222222222222222222222222222222";
 
-interface Call {
-  owner: string;
-  answer: AccountStorageModeValue;
-}
-
 async function harness(bound: string, latched: boolean) {
   const store = createInMemoryMcpConnectionStore();
   const created = await createMcpConnection(
@@ -112,18 +107,9 @@ async function harness(bound: string, latched: boolean) {
     { store, publicOrigin: SERVER_ORIGIN },
   );
   const gateway = gatewayFor(created.granteeAddress);
-  const calls: Call[] = [];
-  const inner = accountStorageModeOf(
-    await authorityHearing(bound, latched ? "on" : "off"),
-  );
-  expect(inner.read(bound)).toBe(latched ? "switched" : "unswitched");
-  const mode: AccountStorageMode = {
-    read: (requestOwner) => {
-      const answer = inner.read(requestOwner);
-      calls.push({ owner: requestOwner, answer });
-      return answer;
-    },
-  };
+  const inner = await authorityHearing(bound, latched ? "on" : "off");
+  expect(inner.read(bound).kind).toBe(latched ? "streams" : "legacy");
+  const { authority: mode, calls } = spyOnModeAuthority(inner);
   const sink = {
     async write() {},
     async read() {
@@ -142,7 +128,7 @@ async function harness(bound: string, latched: boolean) {
     serverOwner: owner.address,
     mcpConnectionStore: store,
     streamSyncRead: emptyReader,
-    accountStorageMode: mode,
+    accountModeAuthority: mode,
     auth: createWeb3SignedPsLiteAuth({
       origin: SERVER_ORIGIN,
       ownerAddress: owner.address,
@@ -163,7 +149,7 @@ async function harness(bound: string, latched: boolean) {
 }
 
 function expectOnlyThisRuntimesOwnerWasAsked(
-  calls: Call[],
+  calls: ModeAsked[],
   answer: AccountStorageModeValue,
 ) {
   expect(calls.length).toBeGreaterThan(0);

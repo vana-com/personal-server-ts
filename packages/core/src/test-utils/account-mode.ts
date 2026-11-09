@@ -7,6 +7,8 @@ import {
   createMemoryModeRecordStore,
   createModeAuthority,
   type ModeAuthority,
+  type ModeDecision,
+  decisionToModeValue,
 } from "../sync/account-mode/index.js";
 
 /**
@@ -49,4 +51,80 @@ export async function authorityHearing(
     rawStatus: 200,
   });
   return authority;
+}
+
+const FIXED_DECISION: Record<AccountStorageModeValue, ModeDecision> = {
+  unswitched: { kind: "legacy" },
+  switched: { kind: "streams", importRequired: false },
+  unknown: { kind: "refuse", code: "ACCOUNT_MODE_UNKNOWN", status: 503 },
+};
+
+/**
+ * A module that always gives the same answer, for tests of a server or runtime
+ * that needs one known mode and does not exercise the module itself. It has no
+ * records and no store; the app derives its mode port from it exactly as it
+ * does from the real module. Production code never uses this.
+ */
+export function fixedModeAuthority(
+  value: AccountStorageModeValue,
+): ModeAuthority {
+  const decision = FIXED_DECISION[value];
+  const sealed = (write: () => unknown) =>
+    decision.kind === "legacy"
+      ? Promise.resolve(write()).then((v) => ({ ok: true as const, value: v }))
+      : Promise.resolve({
+          ok: false as const,
+          decision:
+            decision.kind === "refuse"
+              ? decision
+              : ({
+                  kind: "refuse",
+                  code: "LEGACY_REFUSED_SWITCHED",
+                  status: 426,
+                } as const),
+        });
+  return {
+    ready: Promise.resolve(),
+    submitEvidence: async () => decision,
+    submitEvidenceMono: async () => decision,
+    read: () => decision,
+    admit: () => decision,
+    commitLegacy: ((_owner: string, _op: string, write: () => unknown) =>
+      sealed(write)) as ModeAuthority["commitLegacy"],
+    commitStream: () => decision,
+    commitImportSeed: () => decision,
+    importPending: async () =>
+      decision.kind === "streams" && decision.importRequired,
+    importDone: async () => decision,
+    close: async () => {},
+    snapshot: () => new Map(),
+  };
+}
+
+/** Who the mode was asked about and what it answered. */
+export interface ModeAsked {
+  owner: string;
+  answer: AccountStorageModeValue;
+}
+
+/**
+ * The same module, with every read recorded. The app derives its mode port
+ * from the module, so the record shows what each consumer asked.
+ */
+export function spyOnModeAuthority(authority: ModeAuthority): {
+  authority: ModeAuthority;
+  calls: ModeAsked[];
+} {
+  const calls: ModeAsked[] = [];
+  return {
+    calls,
+    authority: {
+      ...authority,
+      read(owner) {
+        const decision = authority.read(owner);
+        calls.push({ owner, answer: decisionToModeValue(decision) });
+        return decision;
+      },
+    },
+  };
 }

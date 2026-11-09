@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fixedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -32,7 +32,7 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
     stateCapabilities: { config: "memory" },
   };
   return createPsLiteRuntime({
-    accountStorageMode: fixedAccountStorageMode("unswitched"),
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     ...defaults,
     ...options,
     storage: options.storage ?? defaults.storage,

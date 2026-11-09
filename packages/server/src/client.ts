@@ -438,6 +438,8 @@ export async function startPersonalServer(
     kind: "node",
     submitAccountModeEvidence: (input) =>
       context.accountModeAuthority.submitEvidence(input),
+    reportAccountModeImportDone: (owner) =>
+      context.accountModeAuthority.importDone(owner),
     replication: {
       status: () => replicationStatus,
       writerRotation: () => replicaWriterRotation,

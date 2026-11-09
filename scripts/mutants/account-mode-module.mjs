@@ -29,11 +29,37 @@ const AUTHORITY = `${DIR}/authority.ts`;
 const CORE = `${DIR}/mode-machine.ts`;
 const FLAG = `${DIR}/flag-evidence.ts`;
 
+const RECORD_STORE = `${DIR}/record-store.ts`;
+const NODE_STORE = "packages/server/src/account-mode/file-record-store.ts";
+const LITE_STORE = "packages/lite/src/account-mode-store.ts";
+const APP = "packages/server/src/app.ts";
+const LITE_RUNTIME = "packages/lite/src/runtime.ts";
+
 const AUTHORITY_TESTS = `${DIR}/authority.test.ts`;
 const FLAG_TESTS = `${DIR}/flag-evidence.test.ts`;
 // Runs the shared vectors (vectors.json) and the policy's unit tests.
 const CORE_TESTS = `${DIR}/mode-machine.test.ts`;
-const TEST_FILES = [AUTHORITY_TESTS, FLAG_TESTS, CORE_TESTS];
+const NODE_STORE_TESTS =
+  "packages/server/src/account-mode/file-record-store.test.ts";
+const LITE_STORE_TESTS = "packages/lite/src/account-mode-store.test.ts";
+const SERVER_APP_TESTS = "packages/server/src/routes/account-mode.test.ts";
+const LITE_RUNTIME_TESTS = "packages/lite/src/runtime-account-mode.test.ts";
+// The core files run for every mutant of core code. A mutant of a host file
+// names its own test files: those import the host source directly, and reach
+// the module through its built output, which a mutant of core cannot change.
+const CORE_FILES = [AUTHORITY_TESTS, FLAG_TESTS, CORE_TESTS];
+const TEST_FILES = [
+  ...CORE_FILES,
+  NODE_STORE_TESTS,
+  LITE_STORE_TESTS,
+  SERVER_APP_TESTS,
+  LITE_RUNTIME_TESTS,
+];
+
+const nodeStore = (name) => ({ file: NODE_STORE_TESTS, name });
+const liteStore = (name) => ({ file: LITE_STORE_TESTS, name });
+const serverApp = (name) => ({ file: SERVER_APP_TESTS, name });
+const liteRuntime = (name) => ({ file: LITE_RUNTIME_TESTS, name });
 
 const vector = (id) => ({
   file: CORE_TESTS,
@@ -122,7 +148,7 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        "      await options.store.save(owner, toDurable(record));",
+        "      await settleWithin(\n        options.store.save(owner, next, stored.get(owner) ?? null),\n        saveTimeoutMs,\n      );",
         "      await Promise.resolve();",
       ],
     ],
@@ -136,8 +162,8 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        "    try {\n      await options.store.save(owner, toDurable(record));",
-        '    apply({ type: "saveComplete", owner });\n    try {\n      await options.store.save(owner, toDurable(record));',
+        "    try {\n      await settleWithin(",
+        '    apply({ type: "saveComplete", owner });\n    try {\n      await settleWithin(',
       ],
     ],
     aimed: [
@@ -229,8 +255,8 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        '      return apply({ type: "saveFailed", owner }).decision;',
-        '      return apply({ type: "saveComplete", owner }).decision;',
+        '      const decision = apply({ type: "saveFailed", owner }).decision;',
+        '      const decision = apply({ type: "saveComplete", owner }).decision;',
       ],
     ],
     aimed: [
@@ -245,8 +271,8 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        '      warn("account mode record could not be saved", error);\n      return apply({ type: "saveFailed", owner }).decision;',
-        '      warn("account mode record could not be saved", error);\n      const stored = (await options.store.load()).get(owner);\n      if (stored) records.set(owner, fromDurable(owner, stored));\n      return decide({ type: "read", owner });',
+        '      const decision = apply({ type: "saveFailed", owner }).decision;',
+        '      apply({ type: "saveFailed", owner });\n      const prior = stored.get(owner);\n      if (prior) records.set(owner, fromDurable(owner, prior));\n      const decision = decide({ type: "read", owner });',
       ],
     ],
     aimed: [
@@ -293,6 +319,345 @@ const MUTANTS = [
     ],
   },
   {
+    name: "SECOND_RUNTIME_ADMITTED (core: the claim is not required)",
+    edits: [
+      [
+        AUTHORITY,
+        "    const mine = await options.store.claim();",
+        "    const mine = await options.store\n      .claim()\n      .catch((): ModeStoreLease => ({ release: async () => {} }));",
+      ],
+    ],
+    aimed: [
+      authority(
+        "refuses a second runtime on the same store, and it never admits a legacy write",
+      ),
+      vector("second-runtime-is-refused"),
+    ],
+  },
+  {
+    name: "SECOND_RUNTIME_ADMITTED (Node: the lock file is not checked)",
+    files: [NODE_STORE_TESTS],
+    edits: [
+      [
+        NODE_STORE,
+        "        if (await createLock(token)) {",
+        "        await createLock(token);\n        {",
+      ],
+    ],
+    aimed: [
+      nodeStore(
+        "lets one runtime own the folder, and refuses a second without touching its files",
+      ),
+      nodeStore(
+        "two authorities on the folder: the second is refused and its Off never reaches the disk",
+      ),
+    ],
+  },
+  {
+    name: "SECOND_RUNTIME_ADMITTED (Lite: the Web Lock is not checked)",
+    files: [LITE_STORE_TESTS],
+    edits: [
+      [
+        LITE_STORE,
+        "            if (!lock) {\n              reject(new ModeStoreOwnedError());\n              return;\n            }\n",
+        "",
+      ],
+    ],
+    aimed: [
+      liteStore(
+        "lets one tab own the database and refuses a second until the first lets go",
+      ),
+      liteStore(
+        "two authorities on the database: the second is refused and writes nothing",
+      ),
+    ],
+  },
+  {
+    name: "LIVE_LOCK_TAKEN_OVER",
+    files: [NODE_STORE_TESTS],
+    edits: [
+      [
+        NODE_STORE,
+        "    if (!body || body.host !== hostname() || !processIsGone(body.pid)) {",
+        "    if (!body) {",
+      ],
+    ],
+    aimed: [
+      nodeStore(
+        "takes over a lock whose process is gone, and keeps one held by a live process",
+      ),
+    ],
+  },
+  {
+    name: "SWEEP_BY_NON_OWNER (a load deletes another runtime's temp file)",
+    files: [NODE_STORE_TESTS],
+    edits: [
+      [
+        NODE_STORE,
+        "      const records = new Map<string, DurableModeRecord>();\n      for (const name of await readdir(dir)) {\n        const match",
+        "      const records = new Map<string, DurableModeRecord>();\n      await sweepTemps();\n      for (const name of await readdir(dir)) {\n        const match",
+      ],
+    ],
+    aimed: [
+      nodeStore(
+        "sweeps the temp file of a crashed save when it becomes the owner, and at no other time",
+      ),
+      nodeStore(
+        "lets one runtime own the folder, and refuses a second without touching its files",
+      ),
+    ],
+  },
+  {
+    name: "BLIND_OFF_OVERWRITES_ON (core: a stored On can be lowered)",
+    edits: [
+      [
+        RECORD_STORE,
+        '    if (!next.switched) {\n      throw new ModeStoreConflictError("an On record cannot be lowered");\n    }\n',
+        "",
+      ],
+    ],
+    aimed: [
+      authority(
+        "rejects an Off write over a stored On, and a write based on a stale read",
+      ),
+    ],
+  },
+  {
+    name: "BLIND_OFF_OVERWRITES_ON (core: the expected record is not compared)",
+    edits: [
+      [
+        RECORD_STORE,
+        "  if (!sameDurableRecord(current, expected)) {",
+        "  if (false) {",
+      ],
+    ],
+    aimed: [
+      authority(
+        "rejects an Off write over a stored On, and a write based on a stale read",
+      ),
+    ],
+  },
+  {
+    name: "BLIND_OFF_OVERWRITES_ON (Node: the file is written without the check)",
+    files: [NODE_STORE_TESTS],
+    edits: [
+      [
+        NODE_STORE,
+        "        assertMonotoneWrite(await readCurrent(owner), expected, record);\n",
+        "",
+      ],
+    ],
+    aimed: [
+      nodeStore(
+        "rejects an Off over a stored On and a write based on a stale read, leaving the file as it was",
+      ),
+    ],
+  },
+  {
+    name: "BLIND_OFF_OVERWRITES_ON (Lite: the row is written without the check)",
+    files: [LITE_STORE_TESTS],
+    edits: [
+      [
+        LITE_STORE,
+        "              assertMonotoneWrite(\n                found === undefined ? null : toRecord(found as StoredRow),\n                expected,\n                record,\n              );\n",
+        "",
+      ],
+    ],
+    aimed: [
+      liteStore(
+        "rejects an Off over a stored On and a write based on a stale read, in one transaction",
+      ),
+    ],
+  },
+  {
+    name: "COMMIT_TRUSTS_MEMORY (the commit does not re-read the store)",
+    edits: [
+      [
+        AUTHORITY,
+        "        if (!(await refresh(normalizeOwner(owner)))) {",
+        "        if (false) {",
+      ],
+    ],
+    aimed: [
+      authority(
+        "picks up an On that something other than this runtime saved to the store",
+      ),
+    ],
+  },
+  {
+    name: "ASYNC_CALLBACK_ESCAPES_SYNC_SEAL (a synchronous commit exists again)",
+    edits: [
+      [
+        AUTHORITY,
+        "    async commitLegacy(owner, operationId, write) {",
+        "    commitLegacySync(owner: string, operationId: string, write: () => unknown) {\n      const refused = refusal(decide(commitEvent(owner, operationId)));\n      if (refused) return { ok: false, decision: refused };\n      return { ok: true, value: write() };\n    },\n\n    async commitLegacy(owner, operationId, write) {",
+      ],
+    ],
+    aimed: [
+      authority(
+        "has no synchronous commit: every legacy write holds the lock until it settles",
+      ),
+    ],
+  },
+  {
+    name: "INDEPENDENT_APP_MODE_PORT (server: the app takes a mode beside the module)",
+    files: [SERVER_APP_TESTS],
+    edits: [
+      [
+        APP,
+        '    deps.accountModeAuthority\n      ? accountStorageModeOf(deps.accountModeAuthority)\n      : { read: () => "unknown" },',
+        '    (deps as { accountStorageMode?: never }).accountStorageMode ??\n      (deps.accountModeAuthority\n        ? accountStorageModeOf(deps.accountModeAuthority)\n        : { read: () => "unknown" }),',
+      ],
+    ],
+    aimed: [
+      serverApp(
+        "ignores a mode passed beside the module: an On in the module refuses a legacy write",
+      ),
+      serverApp(
+        "ignores a mode passed with no module: legacy writes stay refused with 503",
+      ),
+    ],
+  },
+  {
+    name: "INDEPENDENT_APP_MODE_PORT (Lite: the runtime takes a mode beside the module)",
+    files: [LITE_RUNTIME_TESTS],
+    edits: [
+      [
+        LITE_RUNTIME,
+        '    options.accountModeAuthority\n      ? accountStorageModeOf(options.accountModeAuthority)\n      : { read: () => "unknown" },',
+        '    (options as { accountStorageMode?: never }).accountStorageMode ??\n      (options.accountModeAuthority\n        ? accountStorageModeOf(options.accountModeAuthority)\n        : { read: () => "unknown" }),',
+      ],
+    ],
+    aimed: [
+      liteRuntime(
+        "ignores a mode passed beside the module: an On in the module refuses a legacy write",
+      ),
+      liteRuntime(
+        "ignores a mode passed with no module: legacy writes stay refused with 503",
+      ),
+    ],
+  },
+  {
+    name: "IMPORT_FLAG_NOT_PERSISTED",
+    edits: [
+      [
+        CORE,
+        "    bootId: record.bootId,\n    importPending: record.importPending,\n  };",
+        "    bootId: record.bootId,\n    importPending: false,\n  };",
+      ],
+    ],
+    aimed: [
+      authority(
+        "saves importPending in the same write as the first On, when the owner has legacy files",
+      ),
+      authority(
+        "survives a crash between the On save and the answer: a restarted host is told again",
+      ),
+      vector("import-pending-survives-crash"),
+    ],
+  },
+  {
+    name: "STREAM_WRITE_BEFORE_IMPORT_DONE",
+    edits: [
+      [
+        CORE,
+        '  if (\n    event.type === "commit" &&\n    event.sink === "stream" &&\n    record.importPending\n  ) {\n    return { kind: "refuse", code: "IMPORT_PENDING", status: 503 };\n  }\n',
+        "",
+      ],
+    ],
+    aimed: [
+      authority(
+        "refuses stream commits with 503 IMPORT_PENDING until importDone is saved",
+      ),
+      core(
+        "STREAM_WRITE_BEFORE_IMPORT_DONE: a stream commit is refused until the import is done",
+      ),
+      vector("import-pending-survives-crash"),
+    ],
+  },
+  {
+    name: "ORDINARY_WRITE_PASSES_WHILE_PENDING",
+    edits: [
+      [
+        AUTHORITY,
+        '      decide({ type: "commit", owner, operationId, sink: "stream" }),',
+        '      decide({ type: "commit", owner, operationId, sink: "importSeed" }),',
+      ],
+    ],
+    aimed: [
+      authority(
+        "admits only the importer's seed publish while the import is pending",
+      ),
+      authority(
+        "refuses stream commits with 503 IMPORT_PENDING until importDone is saved",
+      ),
+      vector("import-seed-publish-while-pending"),
+    ],
+  },
+  {
+    name: "IMPORT_SEED_REFUSED_WHILE_PENDING",
+    edits: [
+      [
+        AUTHORITY,
+        '      decide({ type: "commit", owner, operationId, sink: "importSeed" }),',
+        '      decide({ type: "commit", owner, operationId, sink: "stream" }),',
+      ],
+    ],
+    aimed: [
+      authority(
+        "admits only the importer's seed publish while the import is pending",
+      ),
+      vector("import-seed-publish-while-pending"),
+    ],
+  },
+  {
+    name: "IMPORT_DONE_USED_BEFORE_SAVE",
+    edits: [
+      [
+        CORE,
+        '        { ...base, importPending: false, persistence: "pending" },',
+        '        { ...base, importPending: false, persistence: "saved" },',
+      ],
+    ],
+    aimed: [
+      core(
+        "STREAM_WRITE_BEFORE_IMPORT_DONE: a stream commit is refused until the import is done",
+      ),
+      vector("import-done-opens-streams"),
+    ],
+  },
+  {
+    name: "FUTURE_FETCH_MINTS_FRESH_OFF",
+    edits: [
+      [
+        AUTHORITY,
+        "        fetchStartMono: future ? Number.NaN : clock.mono() - age,",
+        "        fetchStartMono: clock.mono() - age,",
+      ],
+    ],
+    aimed: [
+      authority(
+        "treats an Off whose fetch started more than 60 s in the future as unknown",
+      ),
+      vector("future-fetch-start-is-unknown"),
+    ],
+  },
+  {
+    name: "HUNG_SAVE_HOLDS_LOCK",
+    edits: [
+      [
+        AUTHORITY,
+        "      await settleWithin(\n        options.store.save(owner, next, stored.get(owner) ?? null),\n        saveTimeoutMs,\n      );",
+        "      await options.store.save(owner, next, stored.get(owner) ?? null);",
+      ],
+    ],
+    aimed: [
+      authority(
+        "counts as a failed save after the bound, releases the lock and refuses until a later save",
+      ),
+    ],
+  },
+  {
     name: "PROBE_THROW_MEANS_NONE",
     edits: [
       [
@@ -332,7 +697,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 const outDir = join(homedir(), ".tmp", "account-mode-mutants");
 mkdirSync(outDir, { recursive: true });
 
-function runTests(label) {
+function runTests(label, files = TEST_FILES) {
   const outputFile = join(outDir, `${label.replace(/\W+/g, "-")}.json`);
   return new Promise((resolve) => {
     child = spawn(
@@ -346,7 +711,7 @@ function runTests(label) {
         "--maxWorkers=4",
         "--reporter=json",
         `--outputFile=${outputFile}`,
-        ...TEST_FILES,
+        ...files,
       ],
       { stdio: ["ignore", "ignore", "ignore"] },
     );
@@ -380,6 +745,26 @@ function digest(report) {
 
 const find = (cases, aim) =>
   cases.filter((c) => c.file.endsWith(aim.file) && c.name.includes(aim.name));
+
+// Every anchor must match exactly once before anything runs.
+for (const m of MUTANTS) {
+  const current = new Map();
+  for (const [file, from, to] of m.edits) {
+    const text = current.get(file) ?? original(file);
+    if (text.split(from).length !== 2) {
+      console.error(`${m.name}: expected exactly one match in ${file}`);
+      process.exit(2);
+    }
+    current.set(
+      file,
+      text.replace(from, () => to),
+    );
+  }
+}
+if (process.env.CHECK_ONLY) {
+  console.log(`${MUTANTS.length} mutants: every anchor matches once`);
+  process.exit(0);
+}
 
 console.log("baseline (unmutated)");
 const base = digest(await runTests("baseline"));
@@ -422,7 +807,7 @@ try {
       );
     }
     for (const [file, text] of current) writeFileSync(file, text);
-    const result = digest(await runTests(m.name));
+    const result = digest(await runTests(m.name, m.files ?? CORE_FILES));
     restoreAll();
 
     let outcome;

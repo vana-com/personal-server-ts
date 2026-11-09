@@ -23,7 +23,7 @@ import { testOwnerKey } from "@opendatalabs/personal-server-ts-core/stream-sync-
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-  fixedAccountStorageMode,
+  fixedModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type {
   Builder,
@@ -212,7 +212,7 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
       grantVerifier: gateway,
     };
     runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       active: true,
       storage: createMemoryPsLiteStorage(),
       config: { gateway: gatewayConfig },

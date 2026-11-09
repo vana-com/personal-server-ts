@@ -260,6 +260,12 @@ export interface PersonalServerHandle {
    * retryable 503. Absent on a runtime that takes evidence another way.
    */
   submitAccountModeEvidence?(input: ModeEvidenceInput): Promise<ModeDecision>;
+  /**
+   * Report that the host imported the owner's legacy data into streams, after
+   * an answer said `importRequired`. Stream writes stay refused until it is
+   * saved.
+   */
+  reportAccountModeImportDone?(owner: string): Promise<ModeDecision>;
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
   info(): Promise<PersonalServerInfo>;
   prepareRegistration(

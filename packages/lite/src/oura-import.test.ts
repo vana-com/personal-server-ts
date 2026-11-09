@@ -1,6 +1,6 @@
 import ouraProfileProvenance from "../../core/src/legacy-projection/declarations/oura-browser.provenance.json";
 import {
-  fixedAccountStorageMode,
+  fixedModeAuthority,
   fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
@@ -159,7 +159,7 @@ function runtimeFor(
 ) {
   const accessLogs = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
-    accountStorageMode: fixedAccountStorageMode("unswitched"),
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     storage,
     active: true,
     accessLogReader: accessLogs,
@@ -427,7 +427,7 @@ describe("Lite Oura browser takeover", () => {
     );
     const accessLogs = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       storage: reloaded,
       active: true,
       auth: createBearerTokenPsLiteAuth({

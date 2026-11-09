@@ -4,7 +4,7 @@
  * removed with the scope.
  */
 
-import { fixedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { describe, expect, it } from "vitest";
 import { ingestDataContract } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
@@ -30,7 +30,7 @@ function createRuntime() {
   const storage = createMemoryPsLiteStorage();
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
-    accountStorageMode: fixedAccountStorageMode("unswitched"),
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     storage,
     gateway: createMockPsLiteGateway(),
     accessLogReader: accessLogStore,

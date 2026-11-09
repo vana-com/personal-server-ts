@@ -10,9 +10,10 @@
  *   fetchStart       the host starts asking the Account (clock, requestId)
  *   accountResult    the host's answer for a fetch (rawFixture + evidence)
  *   admit / read     ask for the mode
- *   commit           a durable write asks to commit (sink legacy|stream)
+ *   commit           a durable write asks to commit (sink legacy|stream|importSeed)
  *   clock            move time forward
  *   pauseDurableSave / completeDurableSave / failDurableSave   record store faults
+ *   importDone       the host finished importing the owner's legacy data
  *   crash            restart every runtime from the durable records
  *                    (clockTrusted:false, discardPausedSaves:true)
  *   wipeDataDb       the legacy data store is emptied; mode records are not
@@ -50,7 +51,7 @@ export interface VectorEvent {
   rawFixture?: string;
   evidence?: { owner: string; state: ModeState };
   operationId?: string;
-  sink?: "legacy" | "stream";
+  sink?: "legacy" | "stream" | "importSeed";
   fail?: boolean;
   clockTrusted?: boolean;
   discardPausedSaves?: boolean;
@@ -153,7 +154,10 @@ export async function runVector(vector: Vector): Promise<string[]> {
     runtimes = new Map(
       runtimeNames.map((name) => [name, makeRuntime(clockTrusted)]),
     );
-    await Promise.all([...runtimes.values()].map((r) => r.ready));
+    // A runtime the store refuses never becomes ready; that is a result.
+    await Promise.all(
+      [...runtimes.values()].map((r) => r.ready.catch(() => undefined)),
+    );
   };
   await boot(true);
 
@@ -220,6 +224,10 @@ export async function runVector(vector: Vector): Promise<string[]> {
           decisions.set(event.id, runtime.commitStream(owner, operationId));
           break;
         }
+        if (event.sink === "importSeed") {
+          decisions.set(event.id, runtime.commitImportSeed(owner, operationId));
+          break;
+        }
         await track(
           event.id,
           runtime
@@ -244,8 +252,13 @@ export async function runVector(vector: Vector): Promise<string[]> {
       case "failDurableSave":
         store.failSaves(event.fail !== false);
         break;
+      case "importDone":
+        await track(event.id, runtime.importDone(address(event.owner ?? "")));
+        break;
       case "crash":
         if (event.discardPausedSaves) store.abandonHeldSaves();
+        // Every runtime dies, and with it the ownership of the store.
+        store.dropLease();
         await boot(event.clockTrusted !== false);
         break;
       case "wipeDataDb":

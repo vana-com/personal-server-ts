@@ -5,11 +5,14 @@
  */
 import { describe, expect, it } from "vitest";
 import { createModeAuthority, type ModeAuthority } from "./authority.js";
+import { OFF_TTL_MS } from "./mode-machine.js";
 import { createMemoryModeRecordStore } from "./memory-record-store.js";
 import { accountStorageModeOf } from "./port.js";
 
 const A = "0x1111111111111111111111111111111111111111";
 const B = "0x2222222222222222222222222222222222222222";
+const C = "0x3333333333333333333333333333333333333333";
+const MIXED = "0xAbCdEf1111111111111111111111111111AbCdEf";
 
 function evidence(
   owner: string,
@@ -128,10 +131,6 @@ describe("the commit seal", () => {
       },
     });
     expect(wrote).toBe(0);
-    expect(authority.commitLegacySync(A, "op-1", () => (wrote += 1)).ok).toBe(
-      false,
-    );
-    expect(wrote).toBe(0);
   });
 
   // SEAL_OUTSIDE_LOCK
@@ -197,20 +196,41 @@ describe("the commit seal", () => {
     await both;
   });
 
-  it("picks up an On that another runtime saved to the same store", async () => {
-    const store = createMemoryModeRecordStore();
-    const first = (await boot(store)).authority;
-    const second = createModeAuthority({ store, bootId: "boot-2" });
-    await second.ready;
-    await first.submitEvidence(evidence(A, "off"));
-    await second.submitEvidence(evidence(A, "off"));
-    // The second runtime latches On; the first has not heard of it.
-    await second.submitEvidence(evidence(A, "on"));
-    expect(first.read(A).kind).toBe("legacy");
-    const sealed = await first.commitLegacy(A, "op", () => {
-      throw new Error("a stale runtime must not write legacy data");
+  it("picks up an On that something other than this runtime saved to the store", async () => {
+    const { authority, store } = await boot();
+    await authority.submitEvidence(evidence(A, "off"));
+    expect(authority.read(A).kind).toBe("legacy");
+    // A writer that bypassed the store's ownership latches On on the disk.
+    store.durable.set(A, { ...store.durable.get(A)!, switched: true });
+    const sealed = await authority.commitLegacy(A, "op", () => {
+      throw new Error("a stale view must not write legacy data");
     });
     expect(sealed.ok).toBe(false);
+  });
+
+  // ASYNC_CALLBACK_ESCAPES_SYNC_SEAL
+  it("has no synchronous commit: every legacy write holds the lock until it settles", async () => {
+    const { authority } = await boot();
+    expect("commitLegacySync" in authority).toBe(false);
+    await authority.submitEvidence(evidence(A, "off"));
+    const barrier = gate();
+    let landed = false;
+    const write = authority.commitLegacy(A, "op", async () => {
+      await barrier.opened;
+      landed = true;
+    });
+    await tick();
+    let latched = false;
+    const on = authority.submitEvidence(evidence(A, "on")).then(() => {
+      latched = true;
+    });
+    await tick();
+    await tick();
+    expect(latched).toBe(false);
+    barrier.open();
+    await write;
+    await on;
+    expect(landed).toBe(true);
   });
 });
 
@@ -228,6 +248,7 @@ describe("the durable On record", () => {
     const store = createMemoryModeRecordStore();
     const first = (await boot(store)).authority;
     await first.submitEvidence(evidence(A, "on"));
+    store.dropLease(); // the process died, and the lease with it
     const restarted = (await boot(store)).authority;
     expect(restarted.read(A).kind).toBe("streams");
     // A stale Off after the restart does not lower it.
@@ -244,7 +265,7 @@ describe("the durable On record", () => {
     await tick();
     expect(authority.read(A).kind).toBe("refuse");
     expect(authority.admit(A, "op").kind).toBe("refuse");
-    expect(authority.commitLegacySync(A, "op", () => 1).ok).toBe(false);
+    expect((await authority.commitLegacy(A, "op", () => 1)).ok).toBe(false);
     store.releaseSaves();
     expect((await pending).kind).toBe("streams");
     expect(authority.read(A).kind).toBe("streams");
@@ -258,7 +279,7 @@ describe("the durable On record", () => {
       "refuse",
     );
     expect(authority.read(A).kind).toBe("refuse");
-    expect(authority.commitLegacySync(A, "op", () => 1).ok).toBe(false);
+    expect((await authority.commitLegacy(A, "op", () => 1)).ok).toBe(false);
     store.failSaves(false);
     expect((await authority.submitEvidence(evidence(A, "on"))).kind).toBe(
       "streams",
@@ -285,7 +306,7 @@ describe("an On whose first save is rejected", () => {
       kind: "refuse",
       status: 503,
     });
-    expect(authority.commitLegacySync(A, "op", () => 1).ok).toBe(false);
+    expect((await authority.commitLegacy(A, "op", () => 1)).ok).toBe(false);
     // The async commit re-reads the store inside its lock; it must not see legacy either.
     const result = await authority.commitLegacy(A, "op-2", () => 1);
     expect(result.ok).toBe(false);
@@ -348,28 +369,32 @@ describe("a new user's first launch", () => {
   });
 });
 
-describe("importRequired", () => {
-  it("is reported once, at the first On of an owner that has legacy files", async () => {
-    const { authority } = await boot(undefined, {
-      hasLegacyFiles: (owner) => owner === A,
-    });
+describe("the import barrier", () => {
+  const withLegacy = (extra: Parameters<typeof boot>[1] = {}) =>
+    boot(undefined, { hasLegacyFiles: (owner) => owner === A, ...extra });
+
+  it("saves importPending in the same write as the first On, when the owner has legacy files", async () => {
+    const { authority, store } = await withLegacy();
     await authority.submitEvidence(evidence(A, "off"));
     expect(await authority.submitEvidence(evidence(A, "on"))).toEqual({
       kind: "streams",
       importRequired: true,
     });
-    expect(await authority.submitEvidence(evidence(A, "on"))).toEqual({
-      kind: "streams",
-      importRequired: false,
+    // IMPORT_FLAG_NOT_PERSISTED
+    expect(store.durable.get(A)).toMatchObject({
+      switched: true,
+      importPending: true,
     });
+    expect(store.durable.get(B)).toBeUndefined();
     expect(await authority.submitEvidence(evidence(B, "on"))).toEqual({
       kind: "streams",
       importRequired: false,
     });
+    expect(store.durable.get(B)?.importPending).toBe(false);
   });
 
   it("counts a probe that throws as legacy files present", async () => {
-    const { authority } = await boot(undefined, {
+    const { authority, store } = await boot(undefined, {
       hasLegacyFiles: () => {
         throw new Error("probe failed");
       },
@@ -379,21 +404,154 @@ describe("importRequired", () => {
       kind: "streams",
       importRequired: true,
     });
+    expect(store.durable.get(A)?.importPending).toBe(true);
   });
 
-  it("is reported again after a failed save, because the first answer never went out", async () => {
-    const { authority, store } = await boot(undefined, {
-      hasLegacyFiles: () => true,
-    });
-    store.failSaves(true);
-    expect((await authority.submitEvidence(evidence(A, "on"))).kind).toBe(
-      "refuse",
-    );
-    store.failSaves(false);
-    expect(await authority.submitEvidence(evidence(A, "on"))).toEqual({
+  // IMPORT_FLAG_NOT_PERSISTED
+  it("survives a crash between the On save and the answer: a restarted host is told again", async () => {
+    const store = createMemoryModeRecordStore();
+    const first = (await withLegacy({ store })).authority;
+    await first.submitEvidence(evidence(A, "on"));
+    // The answer never reached the host. The process dies; the lease dies too.
+    await first.close();
+    const restarted = (await withLegacy({ store })).authority;
+    expect(restarted.read(A)).toEqual({
       kind: "streams",
       importRequired: true,
     });
+    // The Account's next On answer is not "first" and clears nothing.
+    expect(await restarted.submitEvidence(evidence(A, "on"))).toEqual({
+      kind: "streams",
+      importRequired: true,
+    });
+  });
+
+  // STREAM_WRITE_BEFORE_IMPORT_DONE
+  it("refuses stream commits with 503 IMPORT_PENDING until importDone is saved", async () => {
+    const { authority, store } = await withLegacy();
+    await authority.submitEvidence(evidence(A, "on"));
+    const refused = {
+      kind: "refuse",
+      code: "IMPORT_PENDING",
+      status: 503,
+    };
+    expect(authority.commitStream(A, "op")).toEqual(refused);
+    store.pauseSaves();
+    const done = authority.importDone(A);
+    await tick();
+    // Save before use: while the clean record is being written, still closed.
+    expect(authority.commitStream(A, "op").kind).toBe("refuse");
+    store.releaseSaves();
+    expect(await done).toEqual({ kind: "streams", importRequired: false });
+    expect(store.durable.get(A)?.importPending).toBe(false);
+    expect(authority.commitStream(A, "op")).toEqual({
+      kind: "streams",
+      importRequired: false,
+    });
+  });
+
+  it("keeps the barrier closed when the importDone save fails, and a restart imports again", async () => {
+    const store = createMemoryModeRecordStore();
+    const { authority } = await withLegacy({ store });
+    await authority.submitEvidence(evidence(A, "on"));
+    store.failSaves(true);
+    expect((await authority.importDone(A)).kind).toBe("refuse");
+    expect(authority.commitStream(A, "op").kind).toBe("refuse");
+    expect(store.durable.get(A)?.importPending).toBe(true);
+    await authority.close();
+    store.failSaves(false);
+    const restarted = (await withLegacy({ store })).authority;
+    expect(restarted.read(A)).toEqual({
+      kind: "streams",
+      importRequired: true,
+    });
+    expect(await restarted.importDone(A)).toEqual({
+      kind: "streams",
+      importRequired: false,
+    });
+  });
+
+  // ORDINARY_WRITE_PASSES_WHILE_PENDING, IMPORT_SEED_REFUSED_WHILE_PENDING
+  it("admits only the importer's seed publish while the import is pending", async () => {
+    const { authority } = await withLegacy();
+    await authority.submitEvidence(evidence(A, "on"));
+    expect(authority.commitStream(A, "client-delivery")).toEqual({
+      kind: "refuse",
+      code: "IMPORT_PENDING",
+      status: 503,
+    });
+    expect(authority.commitImportSeed(A, "seed-1")).toEqual({
+      kind: "streams",
+      importRequired: true,
+    });
+    // The seed publish is a re-run after a crash: still admitted, still pending.
+    expect(authority.commitImportSeed(A, "seed-1")).toEqual({
+      kind: "streams",
+      importRequired: true,
+    });
+    expect(authority.commitStream(A, "client-delivery").kind).toBe("refuse");
+    expect(await authority.importDone(A)).toEqual({
+      kind: "streams",
+      importRequired: false,
+    });
+    expect(authority.commitStream(A, "client-delivery")).toEqual({
+      kind: "streams",
+      importRequired: false,
+    });
+  });
+
+  it("does not admit a seed publish where no stream write may commit", async () => {
+    const { authority, store } = await withLegacy();
+    // Unknown owner.
+    expect(authority.commitImportSeed(A, "seed").kind).toBe("refuse");
+    // An On whose save has not completed is not served.
+    store.pauseSaves();
+    const answer = authority.submitEvidence(evidence(A, "on"));
+    await tick();
+    expect(authority.commitImportSeed(A, "seed").kind).toBe("refuse");
+    store.releaseSaves();
+    await answer;
+    expect(authority.commitImportSeed(A, "seed").kind).toBe("streams");
+    // An unswitched account never takes a seed publish.
+    await authority.submitEvidence(evidence(B, "off"));
+    expect(authority.commitImportSeed(B, "seed").kind).not.toBe("streams");
+  });
+
+  it("answers importPending(owner) from the saved record", async () => {
+    const { authority } = await withLegacy();
+    await authority.submitEvidence(evidence(A, "on"));
+    expect(await authority.importPending(A)).toBe(true);
+    await authority.importDone(A);
+    expect(await authority.importPending(A)).toBe(false);
+    // An owner with no legacy files has nothing to import.
+    await authority.submitEvidence(evidence(B, "on"));
+    expect(await authority.importPending(B)).toBe(false);
+    // An unswitched account has nothing to import into streams.
+    await authority.submitEvidence(evidence(C, "off"));
+    expect(await authority.importPending(C)).toBe(false);
+  });
+
+  it("lowercases the owner for importPending and importDone", async () => {
+    const { authority } = await withLegacy({
+      hasLegacyFiles: (owner) => owner === MIXED.toLowerCase(),
+    });
+    await authority.submitEvidence(evidence(MIXED, "on"));
+    expect(await authority.importPending(MIXED)).toBe(true);
+    expect(await authority.importPending(MIXED.toLowerCase())).toBe(true);
+    await authority.importDone(MIXED);
+    expect(await authority.importPending(MIXED.toLowerCase())).toBe(false);
+  });
+
+  it("does not answer importPending for an owner it does not know", async () => {
+    const { authority } = await withLegacy();
+    await expect(authority.importPending(A)).rejects.toThrow(/unknown/i);
+  });
+
+  it("opens nothing for an owner with no pending import", async () => {
+    const { authority } = await withLegacy();
+    expect((await authority.importDone(A)).kind).toBe("refuse");
+    await authority.submitEvidence(evidence(A, "off"));
+    expect((await authority.importDone(A)).kind).toBe("legacy");
   });
 });
 
@@ -499,6 +657,7 @@ describe("expiry", () => {
     await authority.submitEvidence(evidence(A, "on"));
     now.mono = WEEK * 10;
     expect(authority.read(A).kind).toBe("streams");
+    store.dropLease();
     const restarted = createModeAuthority({
       store,
       bootId: "boot-2",
@@ -507,5 +666,180 @@ describe("expiry", () => {
     });
     await restarted.ready;
     expect(restarted.read(A).kind).toBe("streams");
+  });
+});
+
+describe("one owning runtime per store", () => {
+  const owned = {
+    kind: "refuse",
+    code: "ACCOUNT_MODE_STORE_OWNED",
+    status: 503,
+  };
+
+  // SECOND_RUNTIME_ADMITTED
+  it("refuses a second runtime on the same store, and it never admits a legacy write", async () => {
+    const { authority: first, store } = await boot();
+    await first.submitEvidence(evidence(A, "off"));
+    const second = createModeAuthority({ store, bootId: "boot-2" });
+    await expect(second.ready).rejects.toThrow();
+    expect(second.read(A)).toEqual(owned);
+    expect(second.admit(A, "op")).toEqual(owned);
+    expect(await second.submitEvidence(evidence(A, "off"))).toEqual(owned);
+    let wrote = 0;
+    expect(
+      await second.commitLegacy(A, "op", () => {
+        wrote += 1;
+      }),
+    ).toEqual({ ok: false, decision: owned });
+    expect(wrote).toBe(0);
+    // The owner is untouched.
+    expect(first.admit(A, "op").kind).toBe("legacy");
+  });
+
+  it("lets a second runtime take over after the owner lets go", async () => {
+    const { authority: first, store } = await boot();
+    await first.submitEvidence(evidence(A, "off"));
+    const second = createModeAuthority({ store, bootId: "boot-2" });
+    await second.ready.catch(() => undefined);
+    await first.close();
+    // The owner's closed authority admits nothing.
+    expect(first.admit(A, "op").kind).toBe("refuse");
+    // The next evidence retries the claim.
+    expect((await second.submitEvidence(evidence(A, "off"))).kind).toBe(
+      "legacy",
+    );
+  });
+});
+
+describe("a record write is monotone at the store", () => {
+  // BLIND_OFF_OVERWRITES_ON
+  it("rejects an Off write over a stored On, and a write based on a stale read", async () => {
+    const store = createMemoryModeRecordStore();
+    const off = {
+      switched: false,
+      switchedAt: null,
+      cleanOffAt: 1,
+      offFetchStartMono: 1,
+      bootId: "b",
+      importPending: false,
+    };
+    await store.claim();
+    await store.save(A, off, null);
+    const on = {
+      ...off,
+      switched: true,
+      switchedAt: 2,
+      offFetchStartMono: null,
+    };
+    await store.save(A, on, off);
+    // Lowering On to Off fails even when the writer's read is current.
+    await expect(store.save(A, off, on)).rejects.toThrow();
+    // A write based on an older read fails.
+    await expect(
+      store.save(A, { ...on, switchedAt: 3 }, off),
+    ).rejects.toThrow();
+    // A write over a record that was never read fails.
+    await expect(store.save(A, on, null)).rejects.toThrow();
+    expect(store.durable.get(A)).toEqual(on);
+  });
+
+  it("treats a stale-read Off save as a failed save: the durable On stays and the authority adopts it", async () => {
+    const inner = createMemoryModeRecordStore();
+    let block: Promise<void> | null = null;
+    const entered = gate();
+    const store = {
+      ...inner,
+      claim: () => inner.claim(),
+      load: () => inner.load(),
+      save: async (
+        owner: string,
+        next: Parameters<typeof inner.save>[1],
+        expected: Parameters<typeof inner.save>[2],
+      ) => {
+        if (block) {
+          entered.open();
+          await block;
+        }
+        return inner.save(owner, next, expected);
+      },
+    };
+    const { authority } = await boot(store as never);
+    await authority.submitEvidence(evidence(A, "off"));
+    const hold = gate();
+    block = hold.opened;
+    const later = authority.submitEvidence({
+      ...evidence(A, "off"),
+      fetchStartedAt: Date.now() + 1,
+    });
+    await entered.opened;
+    // Another writer latches On while the Off save is held up at the store.
+    inner.durable.set(A, {
+      ...inner.durable.get(A)!,
+      switched: true,
+      switchedAt: 7,
+    });
+    block = null;
+    hold.open();
+    expect((await later).kind).toBe("refuse");
+    expect(inner.durable.get(A)?.switched).toBe(true);
+    expect(authority.read(A).kind).toBe("streams");
+    expect((await authority.commitLegacy(A, "op", () => 1)).ok).toBe(false);
+  });
+});
+
+describe("the fetch start of an Off", () => {
+  const fixedClock = { mono: () => 1_000_000, wall: () => 5_000_000 };
+
+  // FUTURE_FETCH_MINTS_FRESH_OFF
+  it("treats an Off whose fetch started more than 60 s in the future as unknown", async () => {
+    const { authority, store } = await boot(undefined, { clock: fixedClock });
+    const decision = await authority.submitEvidence({
+      ...evidence(A, "off"),
+      fetchStartedAt: 5_000_000 + 61_000,
+    });
+    expect(decision).toEqual({
+      kind: "refuse",
+      code: "ACCOUNT_MODE_UNKNOWN",
+      status: 503,
+    });
+    expect(store.durable.has(A)).toBe(false);
+    expect(authority.admit(A, "op").kind).toBe("refuse");
+  });
+
+  it("clamps a small skew to age zero, and ages a past fetch normally", async () => {
+    const { authority } = await boot(undefined, { clock: fixedClock });
+    expect(
+      (
+        await authority.submitEvidence({
+          ...evidence(A, "off"),
+          fetchStartedAt: 5_000_000 + 59_000,
+        })
+      ).kind,
+    ).toBe("legacy");
+    const old = await authority.submitEvidence({
+      ...evidence(B, "off"),
+      fetchStartedAt: 5_000_000 - OFF_TTL_MS,
+    });
+    expect(old.kind).toBe("refuse");
+  });
+});
+
+describe("a save that never settles", () => {
+  it("counts as a failed save after the bound, releases the lock and refuses until a later save", async () => {
+    const { authority, store } = await boot(undefined, { saveTimeoutMs: 25 });
+    store.pauseSaves();
+    const started = Date.now();
+    const first = authority.submitEvidence(evidence(A, "on"));
+    const queued = authority.submitEvidence(evidence(B, "off"));
+    expect((await first).kind).toBe("refuse");
+    expect((await queued).kind).toBe("refuse");
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(authority.read(A).kind).toBe("refuse");
+    // The held write lands late; the next evidence adopts what is on disk.
+    store.releaseSaves();
+    await tick();
+    expect((await authority.submitEvidence(evidence(A, "on"))).kind).toBe(
+      "streams",
+    );
   });
 });

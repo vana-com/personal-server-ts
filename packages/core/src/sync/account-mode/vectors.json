@@ -1366,7 +1366,7 @@
       {
         "after": "e4",
         "decision": "streams",
-        "importRequired": false
+        "importRequired": true
       },
       {
         "after": "e5",
@@ -1812,8 +1812,8 @@
   },
   {
     "version": 1,
-    "id": "two-runtimes-reject-stale-authorization",
-    "description": "Two live runtimes share one durable record. The first latches On; the second, still holding a fresh Off in memory and an earlier admission, refuses the stale authorization, a swapped owner and a replayed operation at commit.",
+    "id": "second-runtime-is-refused",
+    "description": "Two runtimes open one store. The first owns it. The second is refused with 503 and never admits a legacy write, not before the first latches On and not after. A record is only ever written by its owner.",
     "policy": {
       "offTtlMs": 604800000
     },
@@ -1842,7 +1842,6 @@
       },
       {
         "id": "e1",
-        "runtime": "R1",
         "op": "accountResult",
         "authOwner": "A",
         "requestId": "r1",
@@ -1850,11 +1849,11 @@
         "evidence": {
           "owner": "A",
           "state": "off"
-        }
+        },
+        "runtime": "R1"
       },
       {
         "id": "e2",
-        "runtime": "R2",
         "op": "accountResult",
         "authOwner": "A",
         "requestId": "r1",
@@ -1862,7 +1861,8 @@
         "evidence": {
           "owner": "A",
           "state": "off"
-        }
+        },
+        "runtime": "R2"
       },
       {
         "id": "e3",
@@ -1870,6 +1870,21 @@
         "op": "admit",
         "owner": "A",
         "operationId": "w1"
+      },
+      {
+        "id": "e4",
+        "runtime": "R2",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w1",
+        "sink": "legacy"
+      },
+      {
+        "id": "e5",
+        "runtime": "R1",
+        "op": "admit",
+        "owner": "A",
+        "operationId": "w2"
       },
       {
         "id": "f2",
@@ -1883,8 +1898,7 @@
         }
       },
       {
-        "id": "e4",
-        "runtime": "R1",
+        "id": "e6",
         "op": "accountResult",
         "authOwner": "A",
         "requestId": "r2",
@@ -1892,58 +1906,79 @@
         "evidence": {
           "owner": "A",
           "state": "on"
-        }
-      },
-      {
-        "id": "e5",
-        "runtime": "R2",
-        "op": "commit",
-        "owner": "A",
-        "operationId": "w1",
-        "sink": "legacy"
-      },
-      {
-        "id": "e6",
-        "runtime": "R2",
-        "op": "commit",
-        "owner": "B",
-        "operationId": "w1",
-        "sink": "legacy"
+        },
+        "runtime": "R1"
       },
       {
         "id": "e7",
         "runtime": "R2",
+        "op": "read",
+        "owner": "A"
+      },
+      {
+        "id": "e8",
+        "runtime": "R2",
         "op": "commit",
         "owner": "A",
         "operationId": "w1",
+        "sink": "legacy"
+      },
+      {
+        "id": "e9",
+        "runtime": "R1",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w3",
         "sink": "legacy"
       }
     ],
     "expect": [
       {
-        "after": "e3",
+        "after": "e1",
         "decision": "legacy"
       },
       {
+        "after": "e2",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_STORE_OWNED",
+        "status": 503
+      },
+      {
+        "after": "e3",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_STORE_OWNED",
+        "status": 503
+      },
+      {
         "after": "e4",
-        "decision": "streams"
+        "legacyMutations": 0,
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_STORE_OWNED",
+        "status": 503
       },
       {
         "after": "e5",
-        "decision": "refuse",
-        "code": "LEGACY_REFUSED_SWITCHED",
-        "status": 426,
-        "legacyMutations": 0
+        "decision": "legacy"
       },
       {
         "after": "e6",
-        "decision": "refuse",
-        "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503,
-        "legacyMutations": 0
+        "decision": "streams"
       },
       {
         "after": "e7",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_STORE_OWNED",
+        "status": 503
+      },
+      {
+        "after": "e8",
+        "legacyMutations": 0,
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_STORE_OWNED",
+        "status": 503
+      },
+      {
+        "after": "e9",
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
@@ -1954,7 +1989,7 @@
   {
     "version": 1,
     "id": "remote-switch-under-fresh-off",
-    "description": "The Account switches on another device while this device holds a fresh Off. Legacy commits are allowed while that Off is fresh (migration-only loss is accepted). At the first On this device observes, the module reports importRequired so the host imports its own legacy files before its first stream run. Only that first On reports it.",
+    "description": "The Account switches on another device while this device holds a fresh Off. Legacy commits are allowed while that Off is fresh (migration-only loss is accepted). At the first On this device observes, the module saves importPending with the On. Every answer says importRequired until the host reports importDone.",
     "policy": {
       "offTtlMs": 604800000
     },
@@ -2058,6 +2093,11 @@
         }
       },
       {
+        "id": "e6a",
+        "op": "importDone",
+        "owner": "A"
+      },
+      {
         "id": "e7",
         "op": "commit",
         "owner": "A",
@@ -2079,12 +2119,28 @@
       {
         "after": "e5",
         "decision": "streams",
-        "importRequired": true
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "importPending": true
+          }
+        }
       },
       {
         "after": "e6",
         "decision": "streams",
-        "importRequired": false
+        "importRequired": true
+      },
+      {
+        "after": "e6a",
+        "decision": "streams",
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "importPending": false
+          }
+        }
       },
       {
         "after": "e7",
@@ -2663,6 +2719,545 @@
         "after": "e7",
         "decision": "legacy",
         "legacyMutations": 1
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "import-pending-survives-crash",
+    "description": "The first On is saved with importPending. The process dies before the host hears the answer. After the restart every answer still says an import is owed, and stream commits are refused with 503 IMPORT_PENDING. Legacy stays refused with 426.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222",
+      "C": "0x3333333333333333333333333333333333333333",
+      "D": "0x4444444444444444444444444444444444444444",
+      "E": "0x5555555555555555555555555555555555555555",
+      "F": "0x6666666666666666666666666666666666666666"
+    },
+    "initial": {
+      "legacyFiles": ["A"]
+    },
+    "events": [
+      {
+        "id": "f1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on"
+        }
+      },
+      {
+        "id": "e2",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "s1",
+        "sink": "stream"
+      },
+      {
+        "id": "e3",
+        "op": "crash",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 0,
+          "wallMs": 1000500
+        }
+      },
+      {
+        "id": "e4",
+        "op": "read",
+        "owner": "A"
+      },
+      {
+        "id": "e5",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "s2",
+        "sink": "stream"
+      },
+      {
+        "id": "e6",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w1",
+        "sink": "legacy"
+      },
+      {
+        "id": "f2",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r2",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 50,
+          "wallMs": 1000550
+        }
+      },
+      {
+        "id": "e7",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r2",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "importPending": true
+          }
+        }
+      },
+      {
+        "after": "e2",
+        "decision": "refuse",
+        "code": "IMPORT_PENDING",
+        "status": 503
+      },
+      {
+        "after": "e4",
+        "decision": "streams",
+        "importRequired": true
+      },
+      {
+        "after": "e5",
+        "decision": "refuse",
+        "code": "IMPORT_PENDING",
+        "status": 503
+      },
+      {
+        "after": "e6",
+        "decision": "refuse",
+        "code": "LEGACY_REFUSED_SWITCHED",
+        "status": 426,
+        "legacyMutations": 0
+      },
+      {
+        "after": "e7",
+        "decision": "streams",
+        "importRequired": true
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "import-done-opens-streams",
+    "description": "importDone is saved before it is used. Once saved, stream commits pass and importRequired is false, also after a restart. An importDone for an owner with no pending import changes nothing.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222",
+      "C": "0x3333333333333333333333333333333333333333",
+      "D": "0x4444444444444444444444444444444444444444",
+      "E": "0x5555555555555555555555555555555555555555",
+      "F": "0x6666666666666666666666666666666666666666"
+    },
+    "initial": {
+      "legacyFiles": ["A"]
+    },
+    "events": [
+      {
+        "id": "f1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on"
+        }
+      },
+      {
+        "id": "e2",
+        "op": "pauseDurableSave"
+      },
+      {
+        "id": "e3",
+        "op": "importDone",
+        "owner": "A"
+      },
+      {
+        "id": "e4",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "s1",
+        "sink": "stream"
+      },
+      {
+        "id": "e5",
+        "op": "completeDurableSave"
+      },
+      {
+        "id": "e6",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "s2",
+        "sink": "stream"
+      },
+      {
+        "id": "e7",
+        "op": "crash",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 0,
+          "wallMs": 1000500
+        }
+      },
+      {
+        "id": "e8",
+        "op": "read",
+        "owner": "A"
+      },
+      {
+        "id": "e9",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "s3",
+        "sink": "stream"
+      },
+      {
+        "id": "e10",
+        "op": "importDone",
+        "owner": "B"
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "importRequired": true
+      },
+      {
+        "after": "e4",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503
+      },
+      {
+        "after": "e6",
+        "decision": "streams",
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "importPending": false
+          }
+        }
+      },
+      {
+        "after": "e8",
+        "decision": "streams",
+        "importRequired": false
+      },
+      {
+        "after": "e9",
+        "decision": "streams",
+        "importRequired": false
+      },
+      {
+        "after": "e10",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "future-fetch-start-is-unknown",
+    "description": "An Off whose fetch started more than 60 s after the module's wall clock is unknown evidence: it creates no record and refuses legacy. A fetch start 59 s ahead is clamped to age zero and counts.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222",
+      "C": "0x3333333333333333333333333333333333333333",
+      "D": "0x4444444444444444444444444444444444444444",
+      "E": "0x5555555555555555555555555555555555555555",
+      "F": "0x6666666666666666666666666666666666666666"
+    },
+    "initial": {},
+    "events": [
+      {
+        "id": "f1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1061000
+        }
+      },
+      {
+        "id": "c1",
+        "op": "clock",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off"
+        }
+      },
+      {
+        "id": "e2",
+        "op": "admit",
+        "owner": "A",
+        "operationId": "w1"
+      },
+      {
+        "id": "f2",
+        "op": "fetchStart",
+        "owner": "B",
+        "requestId": "r2",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 20,
+          "wallMs": 1059020
+        }
+      },
+      {
+        "id": "c2",
+        "op": "clock",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 30,
+          "wallMs": 1000030
+        }
+      },
+      {
+        "id": "e3",
+        "op": "accountResult",
+        "authOwner": "B",
+        "requestId": "r2",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "B",
+          "state": "off"
+        }
+      },
+      {
+        "id": "e4",
+        "op": "admit",
+        "owner": "B",
+        "operationId": "w2"
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "durable": {
+          "A": null
+        }
+      },
+      {
+        "after": "e2",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503
+      },
+      {
+        "after": "e3",
+        "decision": "legacy"
+      },
+      {
+        "after": "e4",
+        "decision": "legacy"
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "import-seed-publish-while-pending",
+    "description": "While the import is pending, an ordinary stream commit gets 503 IMPORT_PENDING and the importer's seed publish for the same owner is admitted. The seed publish is admitted again after a crash, still pending. After importDone ordinary commits pass. A seed publish for an owner the module has no On for is not admitted.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222",
+      "C": "0x3333333333333333333333333333333333333333",
+      "D": "0x4444444444444444444444444444444444444444",
+      "E": "0x5555555555555555555555555555555555555555",
+      "F": "0x6666666666666666666666666666666666666666"
+    },
+    "initial": {
+      "legacyFiles": ["A"]
+    },
+    "events": [
+      {
+        "id": "f1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on"
+        }
+      },
+      {
+        "id": "e2",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "s1",
+        "sink": "stream"
+      },
+      {
+        "id": "e3",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "seed1",
+        "sink": "importSeed"
+      },
+      {
+        "id": "e4",
+        "op": "crash",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 0,
+          "wallMs": 1000500
+        }
+      },
+      {
+        "id": "e5",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "s2",
+        "sink": "stream"
+      },
+      {
+        "id": "e6",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "seed2",
+        "sink": "importSeed"
+      },
+      {
+        "id": "e7",
+        "op": "importDone",
+        "owner": "A"
+      },
+      {
+        "id": "e8",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "s3",
+        "sink": "stream"
+      },
+      {
+        "id": "e9",
+        "op": "commit",
+        "owner": "B",
+        "operationId": "seed3",
+        "sink": "importSeed"
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "importRequired": true
+      },
+      {
+        "after": "e2",
+        "decision": "refuse",
+        "code": "IMPORT_PENDING",
+        "status": 503
+      },
+      {
+        "after": "e3",
+        "decision": "streams",
+        "importRequired": true
+      },
+      {
+        "after": "e5",
+        "decision": "refuse",
+        "code": "IMPORT_PENDING",
+        "status": 503
+      },
+      {
+        "after": "e6",
+        "decision": "streams",
+        "importRequired": true
+      },
+      {
+        "after": "e7",
+        "decision": "streams",
+        "importRequired": false
+      },
+      {
+        "after": "e8",
+        "decision": "streams",
+        "importRequired": false
+      },
+      {
+        "after": "e9",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503
       }
     ]
   }

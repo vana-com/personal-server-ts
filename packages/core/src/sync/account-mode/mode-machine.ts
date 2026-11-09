@@ -19,8 +19,13 @@
  * - An Off lasts `OFF_TTL_MS` from the start of its Account request, on the
  *   monotonic clock of one boot. Equal to the deadline counts as expired. A
  *   restart expires every Off.
- * - `importRequired` is set once, when an On is first saved, from the legacy
- *   files probe the authority passes in. It is delivered with that save.
+ * - The first On is saved with `importPending` set when the owner has legacy
+ *   files (the probe the authority passes in), in the same write. Every answer
+ *   says `importRequired` while it is set, and a stream commit is refused with
+ *   503 IMPORT_PENDING. Only an `importDone` event, saved before use, clears it.
+ *   A crash after the On is saved cannot lose the import: the flag is on disk.
+ *   The importer's own seed publish (sink `importSeed`) is the one commit
+ *   admitted while the flag is set, so the import can finish.
  */
 
 /**
@@ -54,7 +59,7 @@ export interface AccountModeRecord {
   readonly bootId: string;
   /** Whether the latest accepted On or Off has reached the disk. */
   readonly persistence: "none" | "pending" | "saved" | "failed";
-  /** An import is owed and has not been reported yet. */
+  /** The host owes an import of its legacy files and has not reported it done. */
   readonly importPending: boolean;
 }
 
@@ -65,6 +70,8 @@ export interface DurableModeRecord {
   cleanOffAt: number | null;
   offFetchStartMono: number | null;
   bootId: string | null;
+  /** An import is owed; cleared only by importDone. */
+  importPending: boolean;
 }
 
 export type ModeEvent =
@@ -86,6 +93,8 @@ export type ModeEvent =
       readonly clockTrusted: boolean;
     }
   | { readonly type: "read"; readonly owner: string }
+  /** The host finished importing its legacy files into streams. */
+  | { readonly type: "importDone"; readonly owner: string }
   | {
       readonly type: "admit";
       readonly owner: string;
@@ -95,7 +104,11 @@ export type ModeEvent =
       readonly type: "commit";
       readonly owner: string;
       readonly operationId: string;
-      readonly sink: "legacy" | "stream";
+      /**
+       * `importSeed` is the legacy importer's own publish into streams. It is
+       * admitted while the import is pending; `stream` is not.
+       */
+      readonly sink: "legacy" | "stream" | "importSeed";
     }
   | { readonly type: "saveComplete" | "saveFailed"; readonly owner: string };
 
@@ -105,7 +118,13 @@ export type ModeDecision =
   | {
       readonly kind: "refuse";
       /** 503 is retryable; 426 is not. */
-      readonly code: "ACCOUNT_MODE_UNKNOWN" | "LEGACY_REFUSED_SWITCHED";
+      readonly code:
+        | "ACCOUNT_MODE_UNKNOWN"
+        | "LEGACY_REFUSED_SWITCHED"
+        /** Another runtime owns the record store. */
+        | "ACCOUNT_MODE_STORE_OWNED"
+        /** A stream write before the owed import is done. */
+        | "IMPORT_PENDING";
       readonly status: 503 | 426;
     };
 
@@ -158,6 +177,7 @@ export function toDurable(record: AccountModeRecord): DurableModeRecord {
     cleanOffAt: record.cleanOffAt,
     offFetchStartMono: record.offFetchStartMono,
     bootId: record.bootId,
+    importPending: record.importPending,
   };
 }
 
@@ -174,7 +194,7 @@ export function fromDurable(
     offFetchStartMono: record.offFetchStartMono,
     bootId: record.bootId ?? "",
     persistence: "saved",
-    importPending: false,
+    importPending: record.importPending,
   };
 }
 
@@ -238,7 +258,14 @@ function decide(
       status: 426,
     };
   }
-  return { kind: "streams", importRequired: false };
+  if (
+    event.type === "commit" &&
+    event.sink === "stream" &&
+    record.importPending
+  ) {
+    return { kind: "refuse", code: "IMPORT_PENDING", status: 503 };
+  }
+  return { kind: "streams", importRequired: record.importPending };
 }
 
 export function reduceAccountMode(
@@ -269,7 +296,8 @@ export function reduceAccountMode(
   if (
     event.type === "commit" &&
     event.sink !== "legacy" &&
-    event.sink !== "stream"
+    event.sink !== "stream" &&
+    event.sink !== "importSeed"
   )
     return refuseUnchanged();
   if (
@@ -344,15 +372,26 @@ export function reduceAccountMode(
     }
     case "saveComplete": {
       const base = record as AccountModeRecord;
-      const next = { ...base, persistence: "saved" as const };
-      if (next.switched && next.importPending) {
-        // The import request goes out once, with the first durable On.
-        return settle(
-          { ...next, importPending: false },
-          { kind: "streams", importRequired: true },
-        );
+      return settle({ ...base, persistence: "saved" });
+    }
+    case "importDone": {
+      const base = record as AccountModeRecord;
+      // Only a saved On can owe an import. Unsaved, nothing is closed or
+      // opened here: the owner stays unknown until a save lands.
+      if (!base.switched || base.persistence === "none") return settle(base);
+      if (base.persistence !== "saved") {
+        // A failed importDone save is asked again; a failed On save is not
+        // cleared, because the host was never told to import.
+        return base.importPending
+          ? settle(base)
+          : settle(base, undefined, true);
       }
-      return settle(next);
+      if (!base.importPending) return settle(base);
+      return settle(
+        { ...base, importPending: false, persistence: "pending" },
+        undefined,
+        true,
+      );
     }
     case "saveFailed":
       return settle({

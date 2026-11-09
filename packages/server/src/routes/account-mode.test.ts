@@ -11,11 +11,12 @@ import { join } from "node:path";
 import { pino } from "pino";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import {
+  authorityHearing,
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
-  accountStorageModeOf,
   createMemoryModeRecordStore,
   createModeAuthority,
   type ModeAuthority,
@@ -54,7 +55,6 @@ describe("POST /v1/account-mode/evidence", () => {
       serverOwner: owner.address,
       gateway: {} as GatewayClient,
       accessLogWriter: { write: async () => undefined },
-      accountStorageMode: accountStorageModeOf(authority),
       accountModeAuthority: authority,
     });
   });
@@ -194,5 +194,185 @@ describe("POST /v1/account-mode/evidence", () => {
       expect(res.status, JSON.stringify(body)).toBe(400);
     }
     expect(authority.snapshot().size).toBe(0);
+  });
+});
+
+describe("POST /v1/account-mode/import-done", () => {
+  let dir: string;
+  let index: IndexManager;
+  let authority: ModeAuthority;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "account-mode-import-done-"));
+    index = createIndexManager(initializeDatabase(":memory:"));
+    authority = createModeAuthority({
+      store: createMemoryModeRecordStore(),
+      bootId: "b",
+      hasLegacyFiles: () => true,
+    });
+    await authority.ready;
+    app = createApp({
+      logger: pino({ level: "silent" }),
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager: index,
+      hierarchyOptions: { dataDir: join(dir, "data") },
+      serverOrigin: ORIGIN,
+      serverOwner: owner.address,
+      gateway: {} as GatewayClient,
+      accessLogWriter: { write: async () => undefined },
+      accountModeAuthority: authority,
+    });
+  });
+  afterEach(async () => {
+    index.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function call(
+    path: string,
+    body: unknown,
+    wallet: ReturnType<typeof createTestWallet> = owner,
+  ) {
+    const text = JSON.stringify(body);
+    return app.request(path, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: await buildWeb3SignedHeader({
+          wallet,
+          aud: ORIGIN,
+          method: "POST",
+          uri: path,
+          body: new TextEncoder().encode(text),
+        }),
+      },
+      body: text,
+    });
+  }
+
+  const latchOn = () =>
+    call("/v1/account-mode/evidence", {
+      owner: owner.address,
+      state: "on",
+      fetchStartedAt: Date.now(),
+      rawStatus: 200,
+    });
+
+  it("keeps importRequired on every answer until the host reports the import done", async () => {
+    expect((await (await latchOn()).json()).importRequired).toBe(true);
+    expect((await (await latchOn()).json()).importRequired).toBe(true);
+    const done = await call("/v1/account-mode/import-done", {
+      owner: owner.address,
+    });
+    expect(await done.json()).toEqual({
+      decision: "streams",
+      importRequired: false,
+    });
+    expect((await (await latchOn()).json()).importRequired).toBe(false);
+  });
+
+  it("answers a caller that is not the owner with 401, and another owner's report with a refusal", async () => {
+    await latchOn();
+    const stranger401 = await call(
+      "/v1/account-mode/import-done",
+      { owner: owner.address },
+      stranger,
+    );
+    expect(stranger401.status).toBe(401);
+    const other = await call("/v1/account-mode/import-done", {
+      owner: stranger.address,
+    });
+    expect((await other.json()).decision).toBe("refuse");
+    // Neither closed the barrier.
+    expect(authority.commitStream(owner.address, "op")).toMatchObject({
+      code: "IMPORT_PENDING",
+    });
+  });
+
+  it("rejects a body without an owner with 400", async () => {
+    const res = await call("/v1/account-mode/import-done", {});
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("the app's mode comes from the module and nothing else", () => {
+  let dir: string;
+  let index: IndexManager;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "account-mode-one-source-"));
+    index = createIndexManager(initializeDatabase(":memory:"));
+  });
+  afterEach(async () => {
+    index.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function legacyWrite(extra: Record<string, unknown>) {
+    const app = createApp({
+      logger: pino({ level: "silent" }),
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager: index,
+      hierarchyOptions: { dataDir: join(dir, "data") },
+      serverOrigin: ORIGIN,
+      serverOwner: owner.address,
+      gateway: {} as GatewayClient,
+      accessLogWriter: { write: async () => undefined },
+      ...extra,
+    } as never);
+    return app.request("/v1/data/github.events", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: await buildWeb3SignedHeader({
+          wallet: owner,
+          aud: ORIGIN,
+          method: "POST",
+          uri: "/v1/data/github.events",
+          body: new TextEncoder().encode('{"v":1}'),
+        }),
+      },
+      body: '{"v":1}',
+    });
+  }
+
+  // INDEPENDENT_APP_MODE_PORT
+  it("ignores a mode passed beside the module: an On in the module refuses a legacy write", async () => {
+    const authority = await authorityHearing(owner.address, "on");
+    const res = await legacyWrite({
+      accountModeAuthority: authority,
+      accountStorageMode: fixedAccountStorageMode("unswitched"),
+    });
+    expect(res.status).toBe(426);
+    expect(index.countByScope("github.events")).toBe(0);
+  });
+
+  // INDEPENDENT_APP_MODE_PORT
+  it("ignores a mode passed with no module: legacy writes stay refused with 503", async () => {
+    const res = await legacyWrite({
+      accountStorageMode: fixedAccountStorageMode("unswitched"),
+    });
+    expect(res.status).toBe(503);
+    expect(index.countByScope("github.events")).toBe(0);
+  });
+
+  it("follows the module: an Off writes, and a later On refuses", async () => {
+    const authority = await authorityHearing(owner.address, "off");
+    expect(
+      (await legacyWrite({ accountModeAuthority: authority })).status,
+    ).toBe(201);
+    await authority.submitEvidence({
+      owner: owner.address,
+      authOwner: owner.address,
+      state: "on",
+      fetchStartedAt: Date.now(),
+      rawStatus: 200,
+    });
+    expect(
+      (await legacyWrite({ accountModeAuthority: authority })).status,
+    ).toBe(426);
   });
 });

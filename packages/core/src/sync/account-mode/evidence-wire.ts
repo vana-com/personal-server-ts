@@ -19,7 +19,7 @@ export interface DecisionBody {
   decision: ModeDecision["kind"];
   importRequired: boolean;
   /** Present when the decision is a refusal. */
-  code?: "ACCOUNT_MODE_UNKNOWN" | "LEGACY_REFUSED_SWITCHED";
+  code?: Extract<ModeDecision, { kind: "refuse" }>["code"];
   status?: 503 | 426;
 }
 

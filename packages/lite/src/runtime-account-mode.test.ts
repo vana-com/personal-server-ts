@@ -5,13 +5,13 @@
  */
 import { describe, expect, it } from "vitest";
 import {
-  accountStorageModeOf,
   createMemoryModeRecordStore,
   createModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createPsLiteRuntime, createWeb3SignedPsLiteAuth } from "./runtime.js";
 import {
@@ -24,18 +24,25 @@ const ORIGIN = "https://ps-lite.local";
 const owner = createTestWallet(7);
 const stranger = createTestWallet(8);
 
-async function build() {
-  const authority = createModeAuthority({
-    store: createMemoryModeRecordStore(),
-    bootId: "b",
-  });
+async function build(
+  extra: Partial<Parameters<typeof createModeAuthority>[0]> = {},
+  runtimeExtra: Record<string, unknown> = {},
+  given?: ReturnType<typeof createModeAuthority>,
+) {
+  const authority =
+    given ??
+    createModeAuthority({
+      store: createMemoryModeRecordStore(),
+      bootId: "b",
+      ...extra,
+    });
   await authority.ready;
   const accessLog = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
     storage: createMemoryPsLiteStorage(),
     gateway: {} as never,
-    accountStorageMode: accountStorageModeOf(authority),
     accountModeAuthority: authority,
+    ...runtimeExtra,
     serverOwner: owner.address,
     serverOrigin: ORIGIN,
     accessLogReader: accessLog,
@@ -154,5 +161,89 @@ describe("the Lite runtime's account-mode evidence route", () => {
       new Request(`${ORIGIN}/v1/account-mode/evidence`),
     );
     expect(res.status).toBe(405);
+  });
+});
+
+describe("the Lite runtime's import-done route", () => {
+  const latch = (runtime: Awaited<ReturnType<typeof build>>["runtime"]) =>
+    signed(runtime, "/v1/account-mode/evidence", evidence("on"));
+
+  it("keeps importRequired on every answer until the host reports the import done", async () => {
+    const { runtime, authority } = await build({ hasLegacyFiles: () => true });
+    expect((await (await latch(runtime)).json()).importRequired).toBe(true);
+    expect(authority.commitStream(owner.address, "op")).toMatchObject({
+      code: "IMPORT_PENDING",
+    });
+    const done = await signed(runtime, "/v1/account-mode/import-done", {
+      owner: owner.address,
+    });
+    expect(await done.json()).toEqual({
+      decision: "streams",
+      importRequired: false,
+    });
+    expect(authority.commitStream(owner.address, "op").kind).toBe("streams");
+  });
+
+  it("answers a caller that is not the owner with 401, another owner's report with a refusal, a bad body with 400", async () => {
+    const { runtime, authority } = await build({ hasLegacyFiles: () => true });
+    await latch(runtime);
+    expect(
+      (
+        await signed(
+          runtime,
+          "/v1/account-mode/import-done",
+          { owner: owner.address },
+          stranger,
+        )
+      ).status,
+    ).toBe(401);
+    const other = await signed(runtime, "/v1/account-mode/import-done", {
+      owner: stranger.address,
+    });
+    expect((await other.json()).decision).toBe("refuse");
+    expect(
+      (await signed(runtime, "/v1/account-mode/import-done", {})).status,
+    ).toBe(400);
+    expect(authority.commitStream(owner.address, "op")).toMatchObject({
+      code: "IMPORT_PENDING",
+    });
+  });
+});
+
+describe("the Lite runtime's mode comes from the module and nothing else", () => {
+  // INDEPENDENT_APP_MODE_PORT
+  it("ignores a mode passed beside the module: an On in the module refuses a legacy write", async () => {
+    const { runtime } = await build(
+      {},
+      { accountStorageMode: fixedAccountStorageMode("unswitched") },
+    );
+    await signed(runtime, "/v1/account-mode/evidence", evidence("on"));
+    const write = await signed(runtime, "/v1/data/notes.entries", { v: 1 });
+    expect(write.status).toBe(426);
+  });
+
+  // INDEPENDENT_APP_MODE_PORT
+  it("ignores a mode passed with no module: legacy writes stay refused with 503", async () => {
+    const accessLog = createMemoryPsLiteAccessLogStore();
+    const runtime = createPsLiteRuntime({
+      storage: createMemoryPsLiteStorage(),
+      gateway: {} as never,
+      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      serverOwner: owner.address,
+      serverOrigin: ORIGIN,
+      accessLogReader: accessLog,
+      accessLogWriter: accessLog,
+      tokenStore: createMemoryPsLiteTokenStore(),
+      saveConfig: async () => {},
+      stateCapabilities: { config: "memory" },
+      auth: createWeb3SignedPsLiteAuth({
+        origin: ORIGIN,
+        ownerAddress: owner.address,
+        dataReadPolicyPorts: {} as never,
+      }),
+      active: true,
+    } as never);
+    const write = await signed(runtime, "/v1/data/notes.entries", { v: 1 });
+    expect(write.status).toBe(503);
   });
 });

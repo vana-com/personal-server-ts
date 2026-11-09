@@ -27,7 +27,9 @@ import {
   type DeviceSessionStore,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  accountStorageModeOf,
   decisionBody,
+  normalizeOwner,
   parseEvidenceBody,
   type ModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
@@ -37,7 +39,6 @@ import {
   handlePersonalServerDataRequest,
   handlePersonalServerScopeUploadAppend,
   refuseLegacyWrite,
-  type AccountStorageMode,
   type OwnedAccountStorageMode,
   accountStorageModeFor,
   createScopeUploadRegistry,
@@ -166,16 +167,13 @@ export interface PsLiteRuntimeOptions {
   };
   saveConfig?: (config: unknown) => Promise<void>;
   /**
-   * The account's storage mode: the port over the account-mode module (see
-   * `accountStorageModeOf`). The legacy write gate, the data routes and the
-   * MCP engines consume this one instance. Absent = unknown: every legacy
+   * The account-mode module: the only source of the account's storage mode.
+   * The legacy write gate, the data routes and the MCP engines read the port
+   * derived from it, and no option supplies a mode separately. When wired, the
+   * owner-authenticated `POST /v1/account-mode/evidence` and
+   * `POST /v1/account-mode/import-done` routes answer and the host gives the
+   * module the Account's answers through them. Absent = unknown: every legacy
    * write answers a retryable 503.
-   */
-  accountStorageMode?: AccountStorageMode;
-  /**
-   * The account-mode module behind `accountStorageMode`. When wired, the
-   * owner-authenticated `POST /v1/account-mode/evidence` route answers and the
-   * host gives the module the Account's answers through it.
    */
   accountModeAuthority?: ModeAuthority;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
@@ -929,7 +927,9 @@ export function createPsLiteRuntime(
   // answers `unknown` when it is bound to a different owner or this runtime
   // has none.
   const accountStorageMode: OwnedAccountStorageMode = accountStorageModeFor(
-    options.accountStorageMode ?? { read: () => "unknown" },
+    options.accountModeAuthority
+      ? accountStorageModeOf(options.accountModeAuthority)
+      : { read: () => "unknown" },
     ownerAddress(),
   );
 
@@ -1282,6 +1282,35 @@ export function createPsLiteRuntime(
             ...body,
             authOwner: ownerAddress() ?? "",
           });
+          return jsonResponse(decisionBody(decision));
+        }
+
+        if (
+          url.pathname === "/v1/account-mode/import-done" &&
+          options.accountModeAuthority
+        ) {
+          if (request.method !== "POST")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          await auth.authorizeOwner(request);
+          const body = (await request.json().catch(() => null)) as {
+            owner?: unknown;
+          } | null;
+          if (!body || typeof body.owner !== "string") {
+            return errorResponse(
+              400,
+              "INVALID_ACCOUNT_MODE_IMPORT_DONE",
+              "Body must be {owner}",
+            );
+          }
+          // Another owner's import is not this caller's to report.
+          const decision =
+            normalizeOwner(body.owner) === normalizeOwner(ownerAddress())
+              ? await options.accountModeAuthority.importDone(body.owner)
+              : options.accountModeAuthority.read(body.owner);
           return jsonResponse(decisionBody(decision));
         }
 

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { fixedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   LEGACY_SCOPE_BINDINGS,
   legacyBindingsForProfile,
@@ -171,7 +171,7 @@ describe("Lite and Desktop legacy profile parity", () => {
         const lite = createPsLiteRuntime({
           storage,
           active: true,
-          accountStorageMode: fixedAccountStorageMode("unswitched"),
+          accountModeAuthority: fixedModeAuthority("unswitched"),
           auth: createBearerTokenPsLiteAuth({
             ownerToken: "owner-token",
             builderToken: "builder-token",

@@ -2,10 +2,16 @@
  * An in-memory record store with failure and pause hooks, for tests and for
  * hosts with nothing durable to offer (such a host gets no durable On: every
  * restart starts with no records, so it refuses until the Account answers).
+ * It models ownership too: one claim at a time, freed by release or `dropLease`.
  */
 
 import type { DurableModeRecord } from "./mode-machine.js";
-import type { ModeRecordStore } from "./record-store.js";
+import {
+  ModeStoreOwnedError,
+  assertMonotoneWrite,
+  type ModeRecordStore,
+  type ModeStoreLease,
+} from "./record-store.js";
 
 export interface MemoryModeRecordStore extends ModeRecordStore {
   /** What is "on disk" right now. Survives a simulated restart. */
@@ -24,6 +30,11 @@ export interface MemoryModeRecordStore extends ModeRecordStore {
   failLoads(fail: boolean): void;
   /** Drop every record, as a wiped data folder would. */
   wipe(): void;
+  /**
+   * Free the ownership without a release call, as a crash does. Every
+   * holder's lease dies with its process, so the next `claim` succeeds.
+   */
+  dropLease(): void;
   readonly saveCalls: number;
 }
 
@@ -36,19 +47,36 @@ export function createMemoryModeRecordStore(
   let gate: Promise<void> | null = null;
   let open: (() => void) | null = null;
   let saveCalls = 0;
+  let holder: object | null = null;
   return {
     durable,
     get saveCalls() {
       return saveCalls;
     },
+    async claim() {
+      if (holder) throw new ModeStoreOwnedError();
+      const mine = {};
+      holder = mine;
+      const lease: ModeStoreLease = {
+        async release() {
+          if (holder === mine) holder = null;
+        },
+      };
+      return lease;
+    },
+    dropLease() {
+      holder = null;
+    },
     async load() {
       if (failingLoads) throw new Error("record store load failed");
       return new Map([...durable].map(([k, v]) => [k, { ...v }]));
     },
-    async save(owner, record) {
+    async save(owner, record, expected) {
       saveCalls += 1;
       if (gate) await gate;
       if (failing) throw new Error("record store save failed");
+      // Check and write with no await between them: one critical section.
+      assertMonotoneWrite(durable.get(owner) ?? null, expected, record);
       durable.set(owner, { ...record });
     },
     failSaves(fail) {

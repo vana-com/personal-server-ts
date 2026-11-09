@@ -51,6 +51,7 @@
             "pauseDurableSave",
             "completeDurableSave",
             "failDurableSave",
+            "importDone",
             "crash",
             "wipeDataDb"
           ]
@@ -71,7 +72,7 @@
           }
         },
         "operationId": { "type": "string" },
-        "sink": { "enum": ["legacy", "stream"] },
+        "sink": { "enum": ["legacy", "stream", "importSeed"] },
         "fail": { "type": "boolean" },
         "clockTrusted": { "type": "boolean" },
         "discardPausedSaves": { "type": "boolean" }
@@ -96,6 +97,10 @@
           "then": { "required": ["owner", "operationId", "sink"] }
         },
         {
+          "if": { "properties": { "op": { "const": "importDone" } } },
+          "then": { "required": ["owner"] }
+        },
+        {
           "if": { "properties": { "op": { "const": "clock" } } },
           "then": { "required": ["clock"] }
         }
@@ -110,7 +115,14 @@
         "after": { "type": "string", "minLength": 1 },
         "of": { "type": "string", "minLength": 1 },
         "decision": { "enum": ["streams", "legacy", "refuse"] },
-        "code": { "enum": ["ACCOUNT_MODE_UNKNOWN", "LEGACY_REFUSED_SWITCHED"] },
+        "code": {
+          "enum": [
+            "ACCOUNT_MODE_UNKNOWN",
+            "ACCOUNT_MODE_STORE_OWNED",
+            "IMPORT_PENDING",
+            "LEGACY_REFUSED_SWITCHED"
+          ]
+        },
         "status": { "enum": [426, 503] },
         "importRequired": { "type": "boolean" },
         "legacyMutations": { "type": "integer", "minimum": 0 },
@@ -129,7 +141,8 @@
                   "switchedAt": { "type": ["integer", "null"] },
                   "cleanOffAt": { "type": ["integer", "null"] },
                   "offFetchStartMono": { "type": ["integer", "null"] },
-                  "bootId": { "type": ["string", "null"] }
+                  "bootId": { "type": ["string", "null"] },
+                  "importPending": { "type": "boolean" }
                 }
               }
             ]

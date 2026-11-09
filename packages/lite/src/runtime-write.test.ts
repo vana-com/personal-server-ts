@@ -12,7 +12,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
-import { fixedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   buildWeb3SignedHeader,
@@ -129,7 +129,7 @@ function setup(
   const runtime = createPsLiteRuntime({
     storage,
     gateway,
-    accountStorageMode: fixedAccountStorageMode(options.mode ?? "unswitched"),
+    accountModeAuthority: fixedModeAuthority(options.mode ?? "unswitched"),
     serverOwner: ownerWallet.address,
     serverOrigin: PS_ORIGIN,
     accessLogReader: accessLog,
@@ -705,7 +705,7 @@ describe("PS-Lite write sessions on the bearer-token auth adapter", () => {
     const runtime = createPsLiteRuntime({
       storage: createMemoryPsLiteStorage(),
       gateway,
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       serverOwner: ownerWallet.address,
       serverOrigin: PS_ORIGIN,
       accessLogReader: accessLog,

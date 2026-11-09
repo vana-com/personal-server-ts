@@ -3,7 +3,8 @@
  *
  * `mode-machine.ts` is the policy: the one place that decides the mode, with
  * no clock, disk or network. `authority.ts` holds the records, the lock that
- * the commit seal and the latch write share, and the durable store. Every host
+ * the commit seal and the latch write share, and the durable store, which it
+ * owns alone: a second runtime on the same store is refused. Every host
  * and the Personal Server read the mode through the authority.
  *
  * The shared test vectors are `vectors.json` in this folder. They are
@@ -25,8 +26,17 @@ export {
   type ModeReduction,
   type ModeState,
 } from "./mode-machine.js";
-export type { ModeRecordStore } from "./record-store.js";
 export {
+  ModeStoreConflictError,
+  ModeStoreOwnedError,
+  assertMonotoneWrite,
+  sameDurableRecord,
+  type ModeRecordStore,
+  type ModeStoreLease,
+} from "./record-store.js";
+export {
+  DEFAULT_SAVE_TIMEOUT_MS,
+  MAX_FETCH_SKEW_MS,
   createModeAuthority,
   defaultAuthorityClock,
   type AuthorityClock,

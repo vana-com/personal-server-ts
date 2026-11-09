@@ -14,7 +14,7 @@ import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-cor
 import {
   buildWeb3SignedHeader,
   createTestWallet,
-  fixedAccountStorageMode,
+  fixedModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   createDataFileEnvelope,
@@ -37,7 +37,7 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
     stateCapabilities: { config: "memory" },
   };
   return createPsLiteRuntime({
-    accountStorageMode: fixedAccountStorageMode("unswitched"),
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     ...defaults,
     ...options,
     storage: options.storage ?? defaults.storage,
@@ -198,7 +198,7 @@ describe("createPsLiteRuntime", () => {
   it("rejects storage adapters instead of falling back to memory", () => {
     expect(() =>
       createPsLiteRuntime({
-        accountStorageMode: fixedAccountStorageMode("unswitched"),
+        accountModeAuthority: fixedModeAuthority("unswitched"),
         storage: { kind: "indexeddb" },
       }),
     ).toThrow(
@@ -211,7 +211,7 @@ describe("createPsLiteRuntime", () => {
 
     expect(() =>
       createPsLiteRuntime({
-        accountStorageMode: fixedAccountStorageMode("unswitched"),
+        accountModeAuthority: fixedModeAuthority("unswitched"),
         storage: createMemoryPsLiteStorage(),
       }),
     ).toThrow(
@@ -220,7 +220,7 @@ describe("createPsLiteRuntime", () => {
 
     expect(() =>
       createPsLiteRuntime({
-        accountStorageMode: fixedAccountStorageMode("unswitched"),
+        accountModeAuthority: fixedModeAuthority("unswitched"),
         storage: createMemoryPsLiteStorage(),
         accessLogReader: accessLogStore,
         accessLogWriter: accessLogStore,
@@ -229,7 +229,7 @@ describe("createPsLiteRuntime", () => {
 
     expect(() =>
       createPsLiteRuntime({
-        accountStorageMode: fixedAccountStorageMode("unswitched"),
+        accountModeAuthority: fixedModeAuthority("unswitched"),
         storage: createMemoryPsLiteStorage(),
         accessLogReader: accessLogStore,
         accessLogWriter: accessLogStore,

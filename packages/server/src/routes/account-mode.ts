@@ -12,14 +12,25 @@
  *
  * The HTTP status is 200 whenever the body was understood, even when the
  * decision is a refusal: the refusal is the answer, not a failure of the
- * request. `importRequired` is true once, on the answer that latches On for an
- * owner whose legacy store holds data.
+ * request. `importRequired` is true on every answer for an owner whose first
+ * On was saved with legacy data present, until the host reports the import
+ * done.
+ *
+ *   POST /v1/account-mode/import-done
+ *     body {owner}
+ *     -> 200 {decision, importRequired, code?, status?}
+ *
+ * The host calls it once it has imported its legacy data into streams. The
+ * module saves the clean record before it opens stream writes (which are
+ * refused with 503 IMPORT_PENDING until then). Idempotent: for an owner with
+ * no pending import it changes nothing.
  */
 
 import { Hono } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import {
   decisionBody,
+  normalizeOwner,
   parseEvidenceBody,
   type ModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
@@ -63,6 +74,27 @@ export function accountModeRoutes(deps: AccountModeRouteDeps): Hono {
       ...body,
       authOwner: deps.serverOwner ?? "",
     });
+    return c.json(decisionBody(decision));
+  });
+
+  app.post("/import-done", async (c) => {
+    await auth.authorizeOwner(c.req.raw);
+    const body = (await c.req.json().catch(() => null)) as {
+      owner?: unknown;
+    } | null;
+    if (!body || typeof body.owner !== "string") {
+      throw new ProtocolError(
+        400,
+        "INVALID_ACCOUNT_MODE_IMPORT_DONE",
+        "Body must be {owner}",
+      );
+    }
+    // The caller is this server's owner; another owner's import is not theirs
+    // to report, and changes nothing.
+    const decision =
+      normalizeOwner(body.owner) === normalizeOwner(deps.serverOwner)
+        ? await deps.accountModeAuthority.importDone(body.owner)
+        : deps.accountModeAuthority.read(body.owner);
     return c.json(decisionBody(decision));
   });
 

@@ -1319,7 +1319,6 @@ export async function createServer(
       : undefined;
 
   const app = createApp({
-    accountStorageMode,
     accountModeAuthority,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
@@ -1453,6 +1452,8 @@ export async function createServer(
     // stops the stream-sync routes from admitting new requests.
     await releaseStreamSyncHome?.();
     indexManager.close();
+    // Last: lets go of the account mode records so the next runtime can own them.
+    await accountModeAuthority.close();
   };
 
   const context: ServerContext = {

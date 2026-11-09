@@ -17,7 +17,7 @@ import { computeDataPointId } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
-  fixedAccountStorageMode,
+  fixedModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITE_SIGNATURE_HEADER,
@@ -125,7 +125,7 @@ async function setup(grant: GatewayGrantResponse = makeGrant()) {
     },
   });
   const runtime = createPsLiteRuntime({
-    accountStorageMode: fixedAccountStorageMode("unswitched"),
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     storage,
     gateway,
     serverOwner: ownerWallet.address,

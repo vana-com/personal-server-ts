@@ -25,5 +25,8 @@ export {
 export {
   authorityHearing,
   fixedAccountStorageMode,
+  fixedModeAuthority,
   fixedOwnedAccountStorageMode,
+  spyOnModeAuthority,
+  type ModeAsked,
 } from "./account-mode.js";

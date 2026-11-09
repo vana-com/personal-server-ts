@@ -16,7 +16,7 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-  fixedAccountStorageMode,
+  fixedModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
@@ -122,7 +122,7 @@ describe("createApp", () => {
   function makeApp() {
     const logger = pino({ level: "silent" });
     return createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -139,7 +139,7 @@ describe("createApp", () => {
   function makeAppWithControlPlaneToken() {
     const logger = pino({ level: "silent" });
     return createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -165,7 +165,7 @@ describe("createApp", () => {
   ) {
     const logger = pino({ level: "silent" });
     return createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -225,12 +225,12 @@ describe("createApp", () => {
       jobWorker: vi.fn(),
     };
     const standard = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       ...common,
       profile: "standard",
     });
     const enclave = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       ...common,
       profile: "enclave",
     });
@@ -269,7 +269,7 @@ describe("createApp", () => {
     };
     const off = createApp(common);
     const on = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       ...common,
       streamSyncIntake: intake,
     });
@@ -297,7 +297,7 @@ describe("createApp", () => {
       warn,
     } as unknown as ReturnType<typeof pino>;
     const app = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -331,7 +331,7 @@ describe("createApp", () => {
       abort: vi.fn(),
     };
     const app = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger: pino({ level: "silent" }),
       version: "0.0.1",
       startedAt: new Date(),
@@ -373,7 +373,7 @@ describe("createApp", () => {
       abort: vi.fn(),
     };
     const app = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger: pino({ level: "silent" }),
       version: "0.0.1",
       startedAt: new Date(),
@@ -855,7 +855,7 @@ describe("createApp", () => {
     const mockSyncManager = createMockSyncManager();
     const logger = pino({ level: "silent" });
     const app = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -890,7 +890,7 @@ describe("createApp", () => {
     const mockSyncManager = createMockSyncManager();
     const logger = pino({ level: "silent" });
     const app = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -930,7 +930,7 @@ describe("createApp", () => {
   it("without syncManager — GET /v1/sync/status returns disabled", async () => {
     const logger = pino({ level: "silent" });
     const app = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -1044,7 +1044,7 @@ describe("createApp", () => {
     );
 
     const app = createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -1328,7 +1328,7 @@ describe("dev UI loopback gate", () => {
 
   function makeUiApp(localApprovalPort: number | undefined) {
     return createApp({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger: pino({ level: "silent" }),
       version: "0.0.1",
       startedAt: new Date(),

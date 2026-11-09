@@ -14,18 +14,19 @@ import { pino } from "pino";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
   STREAM_SYNC_CLIENT_HEADER,
-  type AccountStorageMode,
   type AccountStorageModeValue,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
-  accountStorageModeOf,
   createMemoryModeRecordStore,
   createModeAuthority,
   legacyFlagEvidence,
+  type ModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import {
   authorityHearing,
-  fixedAccountStorageMode,
+  fixedModeAuthority,
+  spyOnModeAuthority,
+  type ModeAsked,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createApp } from "./app.js";
@@ -53,7 +54,7 @@ describe("createApp legacy-write refusal", () => {
   });
 
   function makeApp(
-    accountStorageMode?: AccountStorageMode,
+    accountModeAuthority?: ModeAuthority,
     streamSync: { write?: boolean; refuseLegacyWrites?: boolean } = {},
   ) {
     return createApp({
@@ -68,12 +69,12 @@ describe("createApp legacy-write refusal", () => {
       accessLogWriter: { write: async () => undefined },
       devToken: token,
       config: ServerConfigSchema.parse({ streamSync }),
-      accountStorageMode,
+      accountModeAuthority,
     });
   }
 
   const modeApp = (value: AccountStorageModeValue) =>
-    makeApp(fixedAccountStorageMode(value));
+    makeApp(fixedModeAuthority(value));
 
   function post(app: ReturnType<typeof makeApp>, headers = {}) {
     return app.request("/v1/data/github.events", {
@@ -155,7 +156,7 @@ describe("createApp legacy-write refusal", () => {
         Date.now(),
       ),
     );
-    const app = makeApp(accountStorageModeOf(flagOnly), {
+    const app = makeApp(flagOnly, {
       write: false,
       refuseLegacyWrites: false,
     });
@@ -164,7 +165,7 @@ describe("createApp legacy-write refusal", () => {
     expect(
       (
         await post(
-          makeApp(accountStorageModeOf(authority), {
+          makeApp(authority, {
             write: true,
             refuseLegacyWrites: true,
           }),
@@ -176,7 +177,7 @@ describe("createApp legacy-write refusal", () => {
   // UNSWITCHED_CHANGED
   it("takes the answer from the host's module: a fresh Off writes, a later On refuses", async () => {
     const authority = await authorityHearing(owner, "off");
-    const app = makeApp(accountStorageModeOf(authority));
+    const app = makeApp(authority);
     expect((await post(app)).status).toBe(201);
     await authority.submitEvidence({
       owner,
@@ -198,20 +199,14 @@ describe("createApp legacy-write refusal", () => {
       refused: 503,
     },
   ] as const)("a latched switched $name in this server", (c) => {
-    const calls: Array<{ owner: string; answer: AccountStorageModeValue }> = [];
+    let calls: ModeAsked[] = [];
 
     async function makeSpiedApp() {
-      calls.length = 0;
-      const inner = accountStorageModeOf(await authorityHearing(c.bound, "on"));
-      expect(inner.read(c.bound)).toBe("switched");
-      const spy: AccountStorageMode = {
-        read: (requestOwner) => {
-          const answer = inner.read(requestOwner);
-          calls.push({ owner: requestOwner, answer });
-          return answer;
-        },
-      };
-      return makeApp(spy);
+      const inner = await authorityHearing(c.bound, "on");
+      expect(inner.read(c.bound).kind).toBe("streams");
+      const spied = spyOnModeAuthority(inner);
+      calls = spied.calls;
+      return makeApp(spied.authority);
     }
 
     function expectOnlyThisServersOwnerWasAsked() {

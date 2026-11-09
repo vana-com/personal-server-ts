@@ -4,7 +4,7 @@
  * that does reach a 500 hands its cause to the runtime's logger.
  */
 
-import { fixedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { describe, expect, it, vi } from "vitest";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
@@ -22,7 +22,7 @@ async function createRuntime(
   const logger = { error: vi.fn() };
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
-    accountStorageMode: fixedAccountStorageMode("unswitched"),
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     storage: wrap(memory),
     gateway: createMockPsLiteGateway(),
     accessLogReader: accessLogStore,
@@ -105,7 +105,7 @@ describe("PS-Lite runtime errors", () => {
     const logger = { error: vi.fn() };
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       storage: createMemoryPsLiteStorage(),
       gateway: createMockPsLiteGateway(),
       accessLogReader: accessLogStore,

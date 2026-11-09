@@ -24,7 +24,6 @@ import type {
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
-  accountStorageModeOf,
   createMemoryModeRecordStore,
   createModeAuthority,
   legacyFlagEvidence,
@@ -198,7 +197,9 @@ export interface IndexedDbPsLiteRuntime {
   replicationHost?: LiteReplication;
   /**
    * The account-mode module. Web code gives it the Account's answer with
-   * `submitEvidence` before it starts the first collection.
+   * `submitEvidence` before it starts the first collection, and reports a
+   * finished legacy import with `importDone`. It owns the records for the life
+   * of the page: call `close()` on teardown so the next tab can own them.
    */
   accountModeAuthority: ModeAuthority;
 }
@@ -477,10 +478,8 @@ export async function createIndexedDbPsLiteRuntime(
         err,
       );
     });
-  const accountStorageMode = accountStorageModeOf(accountModeAuthority);
   const runtime = createPsLiteRuntime({
     ...options,
-    accountStorageMode,
     accountModeAuthority,
     replication: replicationHost?.runtime ?? options.replication,
     auth,
