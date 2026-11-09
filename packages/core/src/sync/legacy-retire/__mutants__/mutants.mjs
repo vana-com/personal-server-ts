@@ -672,15 +672,16 @@ export const MUTANTS = [
     edits: [
       {
         file: IMPORT,
-        find: `if ((await ledger.authorityState()) !== "pending") {
+        find: `if (state === "done") return this.retryGivenUp();
+    if (state !== "pending") {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }`,
         replace: "",
       },
       {
         file: IMPORT,
-        find: "if (known.imported[connector] || known.failures[connector]?.gaveUp) {",
-        replace: "if (false) {",
+        find: "if (known.imported[connector]) continue;",
+        replace: "",
       },
     ],
     tests: [IMPORT_SINK_TEST],
@@ -797,15 +798,16 @@ export const MUTANTS = [
     edits: [
       {
         file: IMPORT,
-        find: `if ((await ledger.authorityState()) !== "pending") {
+        find: `if (state === "done") return this.retryGivenUp();
+    if (state !== "pending") {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }`,
         replace: "",
       },
       {
         file: IMPORT,
-        find: "if (known.imported[connector] || known.failures[connector]?.gaveUp) {",
-        replace: "if (false) {",
+        find: "if (known.imported[connector]) continue;",
+        replace: "",
       },
     ],
     tests: [CANON_TEST],
@@ -850,7 +852,7 @@ export const MUTANTS = [
   {
     name: "SEED_WAITS_FOR_CONNECTOR_RUN",
     why: "staged rows are published only by the connector's next run",
-    edits: edit(IMPORT, "    await this.queueRuns();\n", ""),
+    edits: edit(IMPORT, "    await this.queueRuns(true);\n", ""),
     tests: [PUBLISH_TEST, BOOT_TEST],
     mustFail: ["SEED_WAITS_FOR_CONNECTOR_RUN"],
     build: true,
@@ -1090,7 +1092,8 @@ export const MUTANTS = [
     why: "the import runs though the authority says it is done",
     edits: edit(
       IMPORT,
-      'if ((await ledger.authorityState()) !== "pending") {',
+      `if (state === "done") return this.retryGivenUp();
+    if (state !== "pending") {`,
       "if (false) {",
     ),
     tests: [PUBLISH_TEST],
@@ -1149,11 +1152,7 @@ export const MUTANTS = [
   {
     name: "IMPORT_RERUN_RESTAGES_PUBLISHED",
     why: "a repeated import stages a connector again though its rows were already staged",
-    edits: edit(
-      IMPORT,
-      "if (known.imported[connector] || known.failures[connector]?.gaveUp) {",
-      "if (known.failures[connector]?.gaveUp) {",
-    ),
+    edits: edit(IMPORT, "if (known.imported[connector]) continue;", ""),
     tests: [REAL_TEST],
     mustFail: ["IMPORT_RERUN_RESTAGES_PUBLISHED"],
     build: true,
@@ -1227,10 +1226,10 @@ export const MUTANTS = [
     why: "the seed publish is not routed through the authority's commitImportSeed",
     edits: edit(
       IMPORT,
-      `const sealed = await ledger.sealSeedPublish(connector, () =>
-          publish(connector, stagedStreams),
-        );`,
-      "const sealed = { admitted: true as const, value: await publish(connector, stagedStreams) };",
+      `? await ledger.sealSeedPublish(connector, () =>
+              publish(connector, stagedStreams),
+            )`,
+      "? { admitted: true as const, value: await publish(connector, stagedStreams) }",
     ),
     tests: [UNKNOWN_TEST],
     mustFail: ["IMPORT_SEED_BYPASSES_AUTHORITY"],
