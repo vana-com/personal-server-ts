@@ -3,12 +3,25 @@
  * to when": the question a legacy delete asks.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   alternateLegacyBindingsForScope,
   LEGACY_SCOPE_BINDINGS,
 } from "../legacy-projection/index.js";
 import { Fixture, masterKey } from "./service-fixture.js";
+import { createSyncManager } from "../sync/engine/sync-manager.js";
+import { uploadAll } from "../sync/workers/upload.js";
+import { liveRetireLegacy } from "../sync/workers/retire-legacy.js";
+import type { IndexEntry } from "../storage/index/types.js";
+
+vi.mock("../sync/workers/upload.js", async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  uploadAll: vi.fn(async () => []),
+}));
+vi.mock("../sync/workers/download.js", async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  downloadAll: vi.fn(async () => []),
+}));
 import { testOwnerKey } from "./testing.js";
 
 const OBSERVED = Date.parse("2026-11-03T00:00:00Z");
@@ -266,6 +279,7 @@ async function retireWith(
     }),
     listVersions: () => (local.has(SCOPE) ? [entry] : []),
     readEnvelope: async () => ({ data: body(localIds) }),
+    markAfterTombstone: () => true,
   } as unknown as DataStoragePort;
   const deleted: string[] = [];
   const result = await retireLegacyScopes({
@@ -285,10 +299,11 @@ async function retireWith(
 }
 
 describe("membership against the real reader", () => {
-  // Mutant killed: `viewKeys` reading as the owner. A key held only by this
-  // device's unpublished run is on no other device; counting it would let the
-  // remote legacy copy be deleted while the only stream copy is local.
-  it("a key held only by an unpublished local run does not count; the owner view shows it", async () => {
+  // One test through the host: the service's published view reaches both the
+  // retire step and the upload gate, and a pending local run reaches neither.
+  // Mutants killed: the host (or the service's `viewKeys`) reading the owner
+  // view; gating the upload on it.
+  it("the host hands retire and the upload gate the published view only: a stuck pending run is not held", async () => {
     const { f, service } = await stravaView(922, ["a"]);
     const runFor = async (connector: string, profileKey: string | null) => ({
       runId: `local-${connector}`,
@@ -306,15 +321,81 @@ describe("membership against the real reader", () => {
     // the one the owner view is read from (registered last).
     f.overlay.connector = CONNECTOR;
     f.overlay.runs = [await runFor(CONNECTOR, CONNECTOR)];
-    expect(await service.ownerViewKeys(SCOPE)).toEqual(
-      entityKeySets(SCOPE, body(["a", "z"])),
-    );
-    expect(await service.viewKeys(SCOPE)).toEqual(
+    // Precondition: the owner would read z.
+    const owner = await service.resolve({
+      scope: SCOPE,
+      connection: null,
+      cursor: null,
+      legacyFile: true,
+      isOwnerView: true,
+    });
+    expect(
+      JSON.parse(
+        await new Response((owner as { body: ReadableStream }).body).text(),
+      )
+        .data.activities.map((a: { id: string }) => a.id)
+        .sort(),
+    ).toEqual(["a", "z"]);
+
+    const live = liveRetireLegacy({
+      config: {
+        streamSync: { write: true, switchedAt: "2026-11-05T00:00:00Z" },
+      },
+      writer: {},
+      reader: service,
+    })()!;
+    expect(await live.viewKeys(SCOPE)).toEqual(
       entityKeySets(SCOPE, body(["a"])),
     );
-    const { result, deleted } = await retireWith(service, ["a", "z"]);
-    expect(deleted).toEqual([]);
-    expect(result.skipped.notInView).toBe(1);
+
+    // The gate, built by the manager from the same host option.
+    const entry = (collectedAt: string) =>
+      ({
+        id: 1,
+        path: `p-${collectedAt}`,
+        scope: SCOPE,
+        collectedAt,
+      }) as IndexEntry;
+    const bodies: Record<string, string[]> = { held: ["a"], stuck: ["a", "z"] };
+    const storage = {
+      findUnsynced: () => [],
+      listScopes: () => ({ total: 0, scopes: [] }),
+      listVersions: () => [],
+      readEnvelope: async (_s: string, at: string) => ({
+        data: body(bodies[at]!),
+      }),
+    } as unknown as DataStoragePort;
+    const manager = createSyncManager(
+      {
+        storage,
+        serverOwner: "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12",
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+      } as never,
+      {
+        storage,
+        cursor: { read: async () => null, write: async () => {} },
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+      } as never,
+      {
+        streamSync: { write: true, publisher: { cycle: async () => {} } },
+        retireLegacy: liveRetireLegacy({
+          config: {
+            streamSync: { write: true, switchedAt: "2026-11-05T00:00:00Z" },
+          },
+          writer: {},
+          reader: service,
+        }),
+      },
+    );
+    await manager.trigger();
+    const skip = vi.mocked(uploadAll).mock.calls.at(-1)![1]!.skipEntry!;
+    expect(await skip(entry("held"))).toBe(true);
+    // The pending run holds z, but it may never publish: the file uploads.
+    expect(await skip(entry("stuck"))).toBe(false);
+    await manager.stop();
+    // A file the gate finished is still retired by the same published view.
+    const { deleted } = await retireWith(service, ["a"]);
+    expect(deleted).toEqual([SCOPE]);
   });
 
   it("viewKeys returns the keys the served view holds", async () => {

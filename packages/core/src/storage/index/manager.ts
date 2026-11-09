@@ -77,6 +77,8 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateDataPointId(path: string, dataPointId: string | null): boolean;
+  /** Set the tombstone version the row was ingested knowing (a re-add). */
+  markAfterTombstone(path: string, version: number): boolean;
   /**
    * Update the DPv2 `version` for an index entry. Used by the upload worker
    * when a registration is rebased onto the registry's live version after a

@@ -176,6 +176,12 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       entry.dataPointId = dataPointId;
       return true;
     },
+    markAfterTombstone(path, version) {
+      const entry = byPath(path);
+      if (!entry) return false;
+      entry.afterTombstoneVersion = version;
+      return true;
+    },
     updateEntryVersion(path, version) {
       const entry = byPath(path);
       if (!entry) return false;

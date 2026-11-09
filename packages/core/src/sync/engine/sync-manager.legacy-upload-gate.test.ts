@@ -79,14 +79,13 @@ const T0 = "2026-11-01T00:00:00.000Z";
 const entry = (scope: string) =>
   ({ id: "1", scope, collectedAt: T0 }) as IndexEntry;
 
-/** The retire inputs a host gives; only the owner view matters to the gate. */
+/** The retire inputs a host gives; only the published view matters to the gate. */
 function retireWith(
   view: (scope: string) => ReturnType<typeof entityKeySets> | Promise<null>,
 ): () => RetireLegacyOption {
   return () => ({
     coverage: () => ({ kind: "skip", reason: "incomplete" }),
-    viewKeys: async () => null,
-    ownerViewKeys: async (scope) => view(scope),
+    viewKeys: async (scope) => view(scope),
     switchedAt: undefined,
   });
 }
@@ -220,6 +219,26 @@ describe("sync manager: legacy is read-only history after the switch", () => {
     const { upload, requeue } = predicates();
     expect(await upload?.(entry(CARRIED))).toBe(false);
     expect(await requeue?.(CARRIED)).toBe(false);
+  });
+
+  // Mutant killed: re-prove a held file every cycle (no finished set). The
+  // gate would read and parse the file again on every poll.
+  it("a file the published view holds is finished: later cycles skip it without reading it", async () => {
+    const r = rig();
+    const reads = vi.fn(async () => ({ data: BODY }));
+    (r.upload.storage as unknown as { readEnvelope: unknown }).readEnvelope =
+      reads;
+    const h = hostSwitch({ on: true });
+    const manager = createSyncManager(r.upload, r.download, {
+      streamSync: h.streamSync,
+      retireLegacy: holdsA,
+    });
+    await manager.trigger();
+    expect(await predicates().upload?.(entry(CARRIED))).toBe(true);
+    expect(reads).toHaveBeenCalledTimes(1);
+    await manager.trigger();
+    expect(await predicates().upload?.(entry(CARRIED))).toBe(true);
+    expect(reads).toHaveBeenCalledTimes(1);
   });
 
   it("a view that cannot be read, or a host with no reader, keeps uploading", async () => {

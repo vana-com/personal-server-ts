@@ -77,6 +77,8 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateDataPointId(path: string, dataPointId: string | null): boolean;
+  /** Set the tombstone version the row was ingested knowing. */
+  markAfterTombstone(path: string, version: number): boolean;
   /**
    * Update the DPv2 `version` for an index entry (upload-worker rebase after
    * a stale-expectedVersion conflict).
@@ -373,6 +375,10 @@ export function createIndexManager(
     data_point_id: string | null;
     path: string;
   }>("UPDATE data_files SET data_point_id = @data_point_id WHERE path = @path");
+
+  const markAfterTombstoneStmt = db.prepare<{ version: number; path: string }>(
+    "UPDATE data_files SET after_tombstone_version = @version WHERE path = @path",
+  );
 
   const updateVersionStmt = db.prepare<{ version: number; path: string }>(
     "UPDATE data_files SET version = @version WHERE path = @path",
@@ -682,6 +688,11 @@ export function createIndexManager(
         data_point_id: dataPointId,
         path,
       });
+      return result.changes > 0;
+    },
+
+    markAfterTombstone(path, version) {
+      const result = markAfterTombstoneStmt.run({ version, path });
       return result.changes > 0;
     },
 

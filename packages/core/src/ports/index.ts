@@ -320,6 +320,16 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * the local row must follow the registered one.
    */
   updateEntryVersion(path: string, version: number): boolean | Promise<boolean>;
+  /**
+   * Records that the row at `path` was ingested knowing a gateway tombstone at
+   * `version`: a re-add, not a copy the tombstone covers. Optional; a host
+   * without it cannot retire legacy scopes, which needs it to keep a version
+   * that lands during a delete.
+   */
+  markAfterTombstone?(
+    path: string,
+    version: number,
+  ): boolean | Promise<boolean>;
   deleteScope(scope: string): Promise<number>;
   /**
    * Delete a single version (index entry + its local blob) by its gateway fileId.

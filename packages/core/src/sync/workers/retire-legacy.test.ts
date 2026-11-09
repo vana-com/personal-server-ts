@@ -8,6 +8,9 @@ import {
   type RetireCoverage,
 } from "./retire-legacy.js";
 import { deleteScope } from "./delete.js";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
+import { isEntryCoveredByTombstone } from "../scope-deletions.js";
 import type { Logger } from "../../logger/index.js";
 import type { DeleteDataPort, DataStoragePort } from "../../ports/index.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
@@ -87,6 +90,7 @@ function deviceStorage(
     listVersions: (scope: string) =>
       local.has(scope) ? [entryFor(scope, rows[scope])] : [],
     deleteVersion: async (scope: string) => local.delete(scope),
+    markAfterTombstone: () => true,
     readEnvelope: async (scope: string) => ({
       data: scope in bodies ? bodies[scope] : keyedBody(scope, ["a"]),
     }),
@@ -164,7 +168,7 @@ function run(w: ReturnType<typeof world>, o: RunOptions = {}) {
     ...(o.stillOn ? { stillOn: o.stillOn } : {}),
     ...(o.viewRevision ? { viewRevision: o.viewRevision } : {}),
     ...(o.notHeldMemo ? { notHeldMemo: o.notHeldMemo } : {}),
-    deleteScope: (scope) =>
+    deleteScope: (scope, entries) =>
       deleteScope(
         {
           storage: w.storage,
@@ -174,6 +178,7 @@ function run(w: ReturnType<typeof world>, o: RunOptions = {}) {
           logger: logger(),
         },
         scope,
+        { onlyEntries: entries },
       ),
     logger: log,
   });
@@ -452,31 +457,98 @@ describe("retireLegacyScopes", () => {
     });
   });
 
-  describe("a file that lands while the checks run", () => {
-    // Mutant killed: no listing right before the delete. The delete erases
-    // every version it lists, so a version added during the view read was
-    // never checked.
-    it("is not erased unchecked: the scope waits for the next cycle", async () => {
-      const w = world(["github.events"]);
-      const rows = [entryFor("github.events", { id: 1 } as Partial<Row>)];
-      w.storage.listVersions = (() => rows) as never;
-      const result = await run(w, {
-        viewKeys: async (s) => {
-          // A new version lands (another path writes it) during the read.
-          rows.push(
-            entryFor("github.events", {
-              id: 2,
-              collectedAt: "2026-11-02T00:00:00.000Z",
-            } as Partial<Row>),
-          );
-          return viewOf(s, ["a"]);
+  describe("a version that lands during the delete (real storage, real deleteScope)", () => {
+    const SCOPE = "github.events";
+    async function seeded() {
+      const storage = createMemoryDataStorage();
+      const add = async (collectedAt: string, ids: readonly string[]) => {
+        const envelope = createDataFileEnvelope(
+          SCOPE,
+          collectedAt,
+          keyedBody(SCOPE, ids),
+          "https://schemas.example/x.json",
+          `0x${"12".repeat(32)}`,
+        );
+        const write = await storage.writeEnvelope(envelope);
+        return storage.insertEntry({
+          fileId: null,
+          schemaId: null,
+          path: write.relativePath,
+          scope: SCOPE,
+          collectedAt,
+          sizeBytes: write.sizeBytes,
+        });
+      };
+      await add(BEFORE, ["a"]);
+      const deleteData: DeleteDataPort = {
+        async tombstone() {
+          // The file lands while the tombstone call is in flight.
+          await add("2026-11-02T00:00:00.000Z", ["z"]);
+          return {
+            status: "tombstoned",
+            dataPointId: "0x1",
+            version: "5",
+            deletedAt: "2026-11-02T01:00:00.000Z",
+          };
         },
+        async deleteBlobVersions(_scope, versions) {
+          return { deleted: [...versions], missing: [], failed: [] };
+        },
+      };
+      return { storage, deleteData };
+    }
+
+    // Mutant killed: erase by scope (ignore the checked ids). A version added
+    // during the tombstone call was never checked and is erased unseen.
+    it("is not erased, is kept as a re-add the upload guard will not drop", async () => {
+      const w = await seeded();
+      const result = await retireLegacyScopes({
+        storage: w.storage,
+        switchedAt: SWITCH,
+        coverage: () => covered(),
+        registeredAt: async () => BEFORE,
+        viewKeys: async (s) => viewOf(s, ["a"]),
+        deleteScope: (scope, entries) =>
+          deleteScope(
+            {
+              storage: w.storage,
+              serverOwner: OWNER,
+              deleteData: w.deleteData,
+              pendingBlobDeletions: createMemoryPendingBlobDeletionStore(),
+              logger: logger(),
+            },
+            scope,
+            { onlyEntries: entries },
+          ),
+        logger: logger(),
+      });
+      expect(result.deleted).toBe(1);
+      const left = w.storage.listVersions(SCOPE, { limit: 10, offset: 0 });
+      expect(left.map((e) => e.collectedAt)).toEqual([
+        "2026-11-02T00:00:00.000Z",
+      ]);
+      const survivor = left[0]!;
+      expect(survivor.dataPointId).toBeNull(); // still unsynced: it uploads
+      expect(survivor.afterTombstoneVersion).toBe(5);
+      expect(isEntryCoveredByTombstone(survivor, { version: "5" })).toBe(false);
+    });
+
+    it("a host without the stamp cannot retire", async () => {
+      const w = await seeded();
+      const storage = Object.create(w.storage);
+      storage.markAfterTombstone = undefined;
+      const result = await retireLegacyScopes({
+        storage,
+        switchedAt: SWITCH,
+        coverage: () => covered(),
+        registeredAt: async () => BEFORE,
+        viewKeys: async (s) => viewOf(s, ["a"]),
+        deleteScope: async () => {
+          throw new Error("must not delete");
+        },
+        logger: logger(),
       });
       expect(result.deleted).toBe(0);
-      expect(w.tombstones).toEqual([]);
-      // The next cycle checks both versions and retires.
-      const next = await run(w, { viewKeys: async (s) => viewOf(s, ["a"]) });
-      expect(next.deleted).toBe(1);
     });
   });
 
@@ -512,6 +584,28 @@ describe("retireLegacyScopes", () => {
       ); // a new local version
       await go();
       expect(reads).toBe(3); // read again (stops at the first unheld version)
+    });
+
+    // Mutant killed: cache any not-held answer. A file that could not be read
+    // is not a fact about the data; a quiet scope must retry and retire.
+    it("a read error is not remembered; a real mismatch is", async () => {
+      const w = world(["github.events"]);
+      const memo = new Map<string, string>();
+      let broken = true;
+      w.storage.readEnvelope = (async () => {
+        if (broken) throw new Error("disk hiccup");
+        return { data: keyedBody("github.events", ["a"]) };
+      }) as never;
+      const go = () =>
+        run(w, {
+          viewKeys: async (s) => viewOf(s, ["a"]),
+          viewRevision: () => "r1",
+          notHeldMemo: memo,
+        });
+      expect((await go()).deleted).toBe(0);
+      expect(memo.size).toBe(0);
+      broken = false;
+      expect((await go()).deleted).toBe(1);
     });
 
     it("a transient view failure is not remembered", async () => {

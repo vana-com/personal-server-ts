@@ -641,7 +641,12 @@ export async function createPersistentPsLiteStorage(
 
   function updateEntryField(
     path: string,
-    patch: Partial<Pick<IndexEntry, "fileId" | "dataPointId" | "version">>,
+    patch: Partial<
+      Pick<
+        IndexEntry,
+        "fileId" | "dataPointId" | "version" | "afterTombstoneVersion"
+      >
+    >,
   ): Promise<boolean> {
     return updateIndex((current) => {
       if (!current.entries.some((entry) => entry.path === path)) return null;
@@ -1130,6 +1135,10 @@ export async function createPersistentPsLiteStorage(
 
     updateDataPointId(path, dataPointId) {
       return updateEntryField(path, { dataPointId });
+    },
+
+    markAfterTombstone(path, version) {
+      return updateEntryField(path, { afterTombstoneVersion: version });
     },
 
     updateEntryVersion(path, version) {

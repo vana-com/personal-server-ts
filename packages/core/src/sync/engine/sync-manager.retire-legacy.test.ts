@@ -89,6 +89,7 @@ function rig(scopeNames = [SECRET, "github.events"], addedAt = BEFORE) {
           ]
         : [],
     readEnvelope: async (scope: string) => ({ data: keyedBody(scope) }),
+    markAfterTombstone: () => true,
     deleteScope: async (scope: string) => (scopes.delete(scope) ? 1 : 0),
     deleteVersion: async (scope: string) => scopes.delete(scope),
   } as unknown as DataStoragePort;

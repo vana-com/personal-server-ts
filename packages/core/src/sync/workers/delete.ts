@@ -148,6 +148,7 @@ export function planBlobDeletions(
   storage: Pick<DataStoragePort, "listVersions">,
   scope: string,
   tombstoneVersionValue: string | null,
+  includes: (entry: IndexEntry) => boolean = () => true,
 ): BlobDeletionPlan {
   const tombstone = { version: tombstoneVersionValue };
   const last =
@@ -158,6 +159,7 @@ export function planBlobDeletions(
     const entries = storage.listVersions(scope, { limit: PAGE_SIZE, offset });
     for (const entry of entries) {
       if (!isEntryCoveredByTombstone(entry, tombstone)) continue;
+      if (!includes(entry)) continue;
       const version = BigInt(entry.version);
       if (last !== null && version >= 1n && version <= last) continue;
       keys.add(version.toString());
@@ -169,6 +171,49 @@ export function planBlobDeletions(
     range:
       last === null || last < 1n ? null : { from: "1", to: last.toString() },
   };
+}
+
+/** Which rows a delete may erase: the named ones, or every row. */
+function erasableBy(
+  only: readonly Pick<IndexEntry, "id" | "path">[] | undefined,
+): (entry: Pick<IndexEntry, "id" | "path">) => boolean {
+  if (!only) return () => true;
+  const keys = new Set(only.map((e) => `${e.id}|${e.path}`));
+  return (entry) => keys.has(`${entry.id}|${entry.path}`);
+}
+
+/**
+ * Rows the delete was not asked to erase and the tombstone would otherwise
+ * cover (a file that landed during the tombstone call): record that they are
+ * re-adds made knowing the tombstone, so the upload guard keeps them.
+ */
+async function keepUnchecked(
+  storage: Pick<DataStoragePort, "listVersions" | "markAfterTombstone">,
+  scope: string,
+  erasable: (entry: Pick<IndexEntry, "id" | "path">) => boolean,
+  tombstoneVersionValue: string | null,
+  logger: Logger,
+): Promise<void> {
+  if (tombstoneVersionValue === null) return;
+  const unchecked = captureEntries(
+    storage,
+    scope,
+    (entry) =>
+      !erasable(entry) &&
+      isEntryCoveredByTombstone(entry, { version: tombstoneVersionValue }),
+  );
+  for (const entry of unchecked) {
+    const done = await storage.markAfterTombstone?.(
+      entry.path,
+      Number(tombstoneVersionValue),
+    );
+    if (!done) {
+      logger.warn(
+        { scope },
+        "A version landed during a delete and could not be kept",
+      );
+    }
+  }
 }
 
 /**
@@ -326,6 +371,15 @@ export interface DeleteScopeOptions {
    * caller's own pass already used this cycle's storage budget.
    */
   storagePass?: boolean;
+  /**
+   * Erase exactly these local versions (row id and path) and no others. A
+   * version that lands during the delete (one the caller never checked) is
+   * not erased, gets no blob deletion queued, and is recorded as a re-add
+   * made knowing the tombstone, so the upload guard keeps it and uploads it.
+   * Needs `storage.markAfterTombstone` whenever it can matter. Absent: the
+   * delete covers everything the tombstone covers.
+   */
+  onlyEntries?: readonly Pick<IndexEntry, "id" | "path">[];
 }
 
 export async function deleteScope(
@@ -456,9 +510,23 @@ export async function deleteScope(
     // not report cannot be expanded into registry keys yet; a version-less
     // marker asks the retry to expand it once the registry answers.
     // Fence first: the covered entries as they stand before the remote await.
-    covered = captureEntries(storage, scope, (entry) =>
-      isEntryCoveredByTombstone(entry, { version: tombstoneVersionValue }),
+    const erasable = erasableBy(options.onlyEntries);
+    covered = captureEntries(
+      storage,
+      scope,
+      (entry) =>
+        erasable(entry) &&
+        isEntryCoveredByTombstone(entry, { version: tombstoneVersionValue }),
     );
+    if (options.onlyEntries) {
+      await keepUnchecked(
+        storage,
+        scope,
+        erasable,
+        tombstoneVersionValue,
+        logger,
+      );
+    }
     if (tombstoneVersionValue !== null) {
       const anchor = BigInt(tombstoneVersionValue);
       const coveredIds = new Set(covered.map((entry) => entry.id));
@@ -466,12 +534,18 @@ export async function deleteScope(
         if (
           typeof entry.afterTombstoneVersion === "number" &&
           BigInt(entry.afterTombstoneVersion) <= anchor &&
-          !coveredIds.has(entry.id)
+          !coveredIds.has(entry.id) &&
+          erasable(entry)
         )
           covered.push(entry);
       }
     }
-    const plan = planBlobDeletions(storage, scope, tombstoneVersionValue);
+    const plan = planBlobDeletions(
+      storage,
+      scope,
+      tombstoneVersionValue,
+      erasable,
+    );
     const storageStep = await deleteScopeBlobs(
       {
         deleteData,
@@ -497,7 +571,13 @@ export async function deleteScope(
   try {
     const deletedCount = covered
       ? await eraseCoveredEntries(storage, scope, covered)
-      : await storage.deleteScope(scope);
+      : options.onlyEntries
+        ? await eraseCoveredEntries(
+            storage,
+            scope,
+            captureEntries(storage, scope, erasableBy(options.onlyEntries)),
+          )
+        : await storage.deleteScope(scope);
     result.steps.local = { status: "ok", deletedCount };
   } catch (err) {
     const message = errorMessage(err);

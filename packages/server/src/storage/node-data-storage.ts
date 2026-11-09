@@ -305,6 +305,9 @@ export function createNodeDataStorage(
     updateDataPointId(path: string, dataPointId: string | null) {
       return deps.indexManager.updateDataPointId(path, dataPointId);
     },
+    markAfterTombstone(path: string, version: number) {
+      return deps.indexManager.markAfterTombstone(path, version);
+    },
     updateEntryVersion(path: string, version: number) {
       return deps.indexManager.updateVersion(path, version);
     },

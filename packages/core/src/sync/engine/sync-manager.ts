@@ -253,7 +253,7 @@ export function createSyncManager(
     cycleInFlight = exclusive(async () => {
       do {
         rerunRequested = false;
-        ownerViews.clear();
+        publishedViews.clear();
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
@@ -402,18 +402,31 @@ export function createSyncManager(
       });
   }
 
-  /** Owner views read this cycle, per scope (cleared at each cycle start). */
-  const ownerViews = new Map<string, Promise<EntityKeySets | null>>();
+  /** Published views read this cycle, per scope (cleared at each cycle start). */
+  const publishedViews = new Map<string, Promise<EntityKeySets | null>>();
+  /**
+   * Legacy files the published view was found to hold: finished, so later
+   * cycles skip them without reading and parsing the file again. Kept in
+   * memory per manager, like the other upload trackers: the index has no
+   * column for it, and a persisted `dataPointId` would claim a gateway
+   * registration that does not exist (the lost-data-point check and the
+   * registry reconcile would act on the claim). A restart re-proves each
+   * file once.
+   */
+  const heldDone = new Set<string>();
+  const heldKey = (row: IndexEntry) =>
+    `${row.id}|${row.path}|${row.collectedAt}`;
   /** Scopes the last retire pass found not held, keyed by what it read. */
   const notHeldMemo = new Map<string, string>();
 
   /**
    * Whether a legacy upload of `scope` is off: the account has switched (read
-   * live from the host), the stream carries the scope, and the stream holds
-   * every key of `rows` as the owner reads it (published, or pending in this
-   * device's writer). Data the writer never took (a discarded or refused run,
-   * a withheld one) is not in that view, so it keeps uploading as legacy; so
-   * does any file whose keys cannot be read.
+   * live from the host), the stream carries the scope, and the PUBLISHED view
+   * (imported heads, the view retire uses) holds every key of `rows`. Until
+   * the stream copy is published, and for data the writer discarded, refused
+   * or withheld, the legacy file uploads as before; so does any file whose
+   * keys cannot be read. A pending local run does not count: it can fail at
+   * the registry for good and reach no other device.
    */
   async function legacyUploadOff(
     scope: string,
@@ -425,16 +438,22 @@ export function createSyncManager(
     ) {
       return false;
     }
-    const read = options.retireLegacy?.()?.ownerViewKeys;
+    if (rows.length > 0 && rows.every((row) => heldDone.has(heldKey(row)))) {
+      return true;
+    }
+    const read = options.retireLegacy?.()?.viewKeys;
     if (!read) return false;
-    let pending = ownerViews.get(scope);
+    let pending = publishedViews.get(scope);
     if (!pending) {
       pending = read(scope).catch(() => null);
-      ownerViews.set(scope, pending);
+      publishedViews.set(scope, pending);
     }
     const view = await pending;
     if (!view) return false;
-    return localKeysHeld(uploadDeps.storage, scope, rows, view);
+    const held = await localKeysHeld(uploadDeps.storage, scope, rows, view);
+    if (held !== "held") return false;
+    for (const row of rows) heldDone.add(heldKey(row));
+    return true;
   }
 
   async function runUploadCycle(): Promise<void> {
@@ -574,8 +593,10 @@ export function createSyncManager(
           });
           return row?.addedAt ?? null;
         },
-        async deleteScope(scope) {
-          const result = await deleteScope(deleteScopeDeps(), scope);
+        async deleteScope(scope, entries) {
+          const result = await deleteScope(deleteScopeDeps(), scope, {
+            onlyEntries: entries,
+          });
           uploadState.reconcile(uploadDeps.storage.findUnsynced());
           if (result.durable) deleteAdditionsAfter(scope);
           return result;

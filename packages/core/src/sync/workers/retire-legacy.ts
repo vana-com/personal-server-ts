@@ -35,12 +35,6 @@ export interface RetireLegacyOption {
    * of the file, so deleting needs the keys.
    */
   viewKeys(scope: string): Promise<EntityKeySets | null>;
-  /**
-   * Like `viewKeys`, but as the owner reads: this device's unpublished local
-   * runs count. For the upload gate only, never for a delete: a key held only
-   * by an unpublished run is not yet on any other device.
-   */
-  ownerViewKeys?(scope: string): Promise<EntityKeySets | null>;
   /** Changes whenever an imported view of the scope changes; keys a memo. */
   viewRevision?(scope: string): string;
   /** ISO time the Account switch was last turned on; absent retires nothing. */
@@ -60,7 +54,6 @@ export function liveRetireLegacy(input: {
     | {
         viewCoverage(scope: string): RetireCoverage;
         viewKeys(scope: string): Promise<EntityKeySets | null>;
-        ownerViewKeys?(scope: string): Promise<EntityKeySets | null>;
         viewRevision?(scope: string): string;
       }
     | null
@@ -74,9 +67,6 @@ export function liveRetireLegacy(input: {
     return {
       coverage: (scope) => reader.viewCoverage(scope),
       viewKeys: (scope) => reader.viewKeys(scope),
-      ...(reader.ownerViewKeys
-        ? { ownerViewKeys: (scope: string) => reader.ownerViewKeys!(scope) }
-        : {}),
       ...(reader.viewRevision
         ? { viewRevision: (scope: string) => reader.viewRevision!(scope) }
         : {}),
@@ -88,7 +78,7 @@ export function liveRetireLegacy(input: {
 export interface RetireLegacyDeps {
   storage: Pick<
     DataStoragePort,
-    "listScopes" | "listVersions" | "readEnvelope"
+    "listScopes" | "listVersions" | "readEnvelope" | "markAfterTombstone"
   >;
   /**
    * ISO time the Account switch was last turned on. Absent or unparsable:
@@ -119,8 +109,15 @@ export interface RetireLegacyDeps {
    * the scope's legacy files, from any device.
    */
   registeredAt(scope: string): Promise<string | null>;
-  /** Durable scope deletion: gateway tombstone, storage blobs, local copy. */
-  deleteScope(scope: string): Promise<DeleteScopeResult>;
+  /**
+   * Durable scope deletion: gateway tombstone, storage blobs, local copy. It
+   * erases exactly `entries`, the versions that were checked; a version that
+   * landed since survives.
+   */
+  deleteScope(
+    scope: string,
+    entries: readonly IndexEntry[],
+  ): Promise<DeleteScopeResult>;
   logger: Pick<Logger, "info" | "warn">;
 }
 
@@ -215,6 +212,8 @@ export async function retireLegacyScopes(
   deps: RetireLegacyDeps,
 ): Promise<RetireLegacyResult> {
   const result = emptyResult();
+  // A version landing during the delete is kept by stamping it; no stamp, no retire.
+  if (!deps.storage.markAfterTombstone) return result;
   const switchedAtMs = deps.switchedAt ? Date.parse(deps.switchedAt) : NaN;
   if (!Number.isFinite(switchedAtMs)) return result;
 
@@ -265,16 +264,9 @@ export async function retireLegacyScopes(
     }
     // The switch may have been turned off while this pass ran.
     if (deps.stillOn && !deps.stillOn()) break;
-    // Files can land while the checks above awaited. The delete erases every
-    // version it lists, so list again right here (no await before the delete
-    // lists them itself): a changed set was not all checked; next cycle.
-    if (fingerprint(localRows(deps.storage, scope)) !== fingerprint(rows)) {
-      result.skipped.notInView += 1;
-      continue;
-    }
     budget -= 1;
     try {
-      const outcome = await deps.deleteScope(scope);
+      const outcome = await deps.deleteScope(scope, rows);
       if (outcome.durable) result.deleted += 1;
       else result.skipped.failed += 1;
     } catch {
@@ -296,30 +288,37 @@ function fingerprint(rows: readonly IndexEntry[]): string {
 }
 
 /**
- * Every entity key of every local version of the scope is in `view`. The
- * delete removes all versions, so each one must be held, not only the newest
- * (a connector that exposes a window drops old keys from later versions).
- * Unknown (no key table, an unreadable file) is not held.
+ * Whether every entity key of the given local versions is in `view`.
+ * `held`: yes. `mismatch`: a version holds a key the view lacks (a fact about
+ * the data, stable until a file or the view changes). `unknown`: a file could
+ * not be read or has no reviewed key (not a fact about the data).
  */
 export async function localKeysHeld(
   storage: Pick<DataStoragePort, "readEnvelope">,
   scope: string,
   rows: readonly IndexEntry[],
   view: EntityKeySets,
-): Promise<boolean> {
+): Promise<"held" | "mismatch" | "unknown"> {
   for (const row of rows) {
     let local: EntityKeySets | null;
     try {
       const envelope = await storage.readEnvelope(scope, row.collectedAt);
       local = entityKeySets(scope, envelope.data);
     } catch {
-      return false;
+      return "unknown";
     }
-    if (!local || !keysHeld(local, view)) return false;
+    if (!local) return "unknown";
+    if (!keysHeld(local, view)) return "mismatch";
   }
-  return true;
+  return "held";
 }
 
+/**
+ * Every local version must be held: the delete erases exactly the versions
+ * checked here, all of them (a connector that exposes a window drops old keys
+ * from later versions). Only a real mismatch is remembered per (view
+ * revision, local versions); a read error is retried next cycle.
+ */
 async function versionsAreHeld(
   deps: Pick<
     RetireLegacyDeps,
@@ -342,10 +341,10 @@ async function versionsAreHeld(
   if (view === null) return false;
   const held = await localKeysHeld(deps.storage, scope, rows, view);
   if (token !== null && deps.notHeldMemo) {
-    if (held) deps.notHeldMemo.delete(scope);
-    else deps.notHeldMemo.set(scope, token);
+    if (held === "mismatch") deps.notHeldMemo.set(scope, token);
+    else deps.notHeldMemo.delete(scope);
   }
-  return held;
+  return held === "held";
 }
 
 const STATUS_VALUES = new Set(["ok", "skipped", "failed", "deferred"]);

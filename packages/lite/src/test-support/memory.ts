@@ -366,6 +366,13 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       return true;
     },
 
+    markAfterTombstone(path, version) {
+      const entry = entries.get(path);
+      if (!entry) return false;
+      entries.set(path, { ...entry, afterTombstoneVersion: version });
+      return true;
+    },
+
     updateEntryVersion(path, version) {
       const entry = entries.get(path);
       if (!entry) return false;
