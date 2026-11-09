@@ -1,6 +1,7 @@
 /**
  * NO_REMOTE_WRITES: a guard on every route out of the process that the Personal
- * Server stack uses: global `fetch`, and `http`/`https` `request`/`get`.
+ * Server stack uses: global `fetch`, `http`/`https` `request`/`get`, and a
+ * `ClientRequest` built directly.
  *
  * Any request that is not a GET, and any request to a host outside the allowed
  * list, throws at once. The guard also records the violation, so a caller that
@@ -180,6 +181,23 @@ export function installNetworkGuard(input: {
       });
     }
   }
+  // `new http.ClientRequest(...)` is what `request` builds, and it takes the
+  // same arguments. https has no class of its own: an https request is a
+  // ClientRequest given the https agent and protocol, so this covers both.
+  const RealClientRequest = http.ClientRequest;
+  (http as unknown as Record<string, unknown>).ClientRequest = new Proxy(
+    RealClientRequest,
+    {
+      construct(target, args: unknown[], newTarget) {
+        check(methodOf(args[0], args[1]), targetOf(args[0], args[1]));
+        return Reflect.construct(target, args, newTarget);
+      },
+    },
+  );
+  restores.push(() => {
+    (http as unknown as Record<string, unknown>).ClientRequest =
+      RealClientRequest;
+  });
   syncBuiltinESMExports();
 
   return {

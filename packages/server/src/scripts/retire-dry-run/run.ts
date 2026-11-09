@@ -34,6 +34,7 @@ import {
   parseConfig,
 } from "./published-heads.js";
 import { readHomeState } from "./home-state.js";
+import { recheckReadyFiles } from "./recheck.js";
 import { abortedReport, buildReport, type RedactedReport } from "./report.js";
 
 const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
@@ -186,11 +187,18 @@ export async function runLegacyRetireDryRun(
       dryRun: true,
       now,
     });
+    // The real pass hashes a file again right before it erases it. It never
+    // gets there in a dry run, so take that step here (read only).
+    const records = new Map(Object.entries((await ledger.read()).readbacks));
+    retire = await recheckReadyFiles({
+      retire,
+      records,
+      storage: store.storage,
+    });
     guard.assertNoViolations();
     if ((await fingerprintTree(dataDir)) !== before) {
       throw new Error("data_folder_changed");
     }
-    const records = new Map(Object.entries((await ledger.read()).readbacks));
     report = buildReport({
       generatedAt: now().toISOString(),
       retire,
@@ -200,6 +208,7 @@ export async function runLegacyRetireDryRun(
       deviceImport: {
         complete: home.importComplete,
         connectors: Object.keys(home.imported).length,
+        receipts: Object.values(home.imported).filter((i) => i.staged).length,
       },
       publishedListing: heads.listing,
       store: store.countVersions(),

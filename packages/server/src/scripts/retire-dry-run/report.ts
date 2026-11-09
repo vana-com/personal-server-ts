@@ -63,6 +63,8 @@ export interface RedactedReport {
   readonly deviceImport: {
     readonly complete: boolean;
     readonly connectors: number;
+    /** Of those, how many hold a per-stream receipt (older records hold none). */
+    readonly receipts: number;
   };
   readonly publishedListing: {
     readonly pages: number;
@@ -189,7 +191,7 @@ export function abortedReport(input: {
     mode: null,
     hosts: input.hosts,
     copy: null,
-    deviceImport: { complete: false, connectors: 0 },
+    deviceImport: { complete: false, connectors: 0, receipts: 0 },
     publishedListing: { pages: 0, rows: 0, deviceMirror: false },
     files: [],
     totals: {

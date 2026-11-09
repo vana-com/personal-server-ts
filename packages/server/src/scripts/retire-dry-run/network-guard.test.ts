@@ -1,4 +1,4 @@
-import http, { createServer, type Server } from "node:http";
+import http, { ClientRequest, createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import https from "node:https";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -93,6 +93,59 @@ describe("network guard", () => {
     expect(guard.violations).toHaveLength(6);
   });
 
+  it("covers a ClientRequest built directly (http, and https through its agent)", async () => {
+    const ok = await listen((res) => res.end("ok"));
+    guard = installNetworkGuard({
+      allowedHosts: ["gateway.test", `127.0.0.1:${ok.port}`],
+    });
+    expect(() => new http.ClientRequest("http://other.test/")).toThrow(
+      NetworkGuardError,
+    );
+    expect(
+      () =>
+        new http.ClientRequest({
+          hostname: "gateway.test",
+          method: "POST",
+        }),
+    ).toThrow(NetworkGuardError);
+    // An https request is a ClientRequest with the https agent and protocol.
+    expect(
+      () =>
+        new http.ClientRequest({
+          protocol: "https:",
+          agent: https.globalAgent,
+          hostname: "other.test",
+        }),
+    ).toThrow(NetworkGuardError);
+    expect(
+      () =>
+        new ClientRequest({
+          protocol: "https:",
+          agent: https.globalAgent,
+          hostname: "gateway.test",
+          method: "PUT",
+        }),
+    ).toThrow(NetworkGuardError);
+    // A subclass reaches the guard through super().
+    class Sub extends http.ClientRequest {}
+    expect(() => new Sub("http://other.test/")).toThrow(NetworkGuardError);
+    expect(guard.violations).toHaveLength(5);
+
+    // An allowed GET still works, and is a real ClientRequest.
+    const request = new http.ClientRequest(`http://127.0.0.1:${ok.port}/`);
+    const body = await new Promise<string>((resolve, reject) => {
+      request.on("response", (res) => {
+        let text = "";
+        res.on("data", (c) => (text += c));
+        res.on("end", () => resolve(text));
+      });
+      request.on("error", reject);
+      request.end();
+    });
+    expect(body).toBe("ok");
+    expect(request).toBeInstanceOf(http.ClientRequest);
+  });
+
   it("allows a host:port entry for that port only", async () => {
     const ok = await listen((res) => res.end("ok"));
     guard = installNetworkGuard({ allowedHosts: [`127.0.0.1:${ok.port}`] });
@@ -155,11 +208,21 @@ describe("network guard", () => {
   });
 
   it("uninstall restores the originals", () => {
-    const before = [globalThis.fetch, http.request, https.get];
+    const before = [
+      globalThis.fetch,
+      http.request,
+      https.get,
+      http.ClientRequest,
+    ];
     guard = installNetworkGuard({ allowedHosts: [] });
     expect(globalThis.fetch).not.toBe(before[0]);
     guard.uninstall();
     guard = null;
-    expect([globalThis.fetch, http.request, https.get]).toEqual(before);
+    expect([
+      globalThis.fetch,
+      http.request,
+      https.get,
+      http.ClientRequest,
+    ]).toEqual(before);
   });
 });

@@ -5,6 +5,7 @@
  */
 
 import { createHash } from "node:crypto";
+import http from "node:http";
 import {
   link,
   lstat,
@@ -242,6 +243,25 @@ describe("NO_REMOTE_WRITES", () => {
     expect(p.requests.map((r) => r.host)).not.toContain("elsewhere.test");
   });
 
+  it("aborts the run when the code under test builds a ClientRequest to another host, and swallows the refusal", async () => {
+    const p = await fixture();
+    hooks.retire = async () => {
+      try {
+        new http.ClientRequest({ hostname: "other.test", method: "POST" });
+      } catch {
+        // swallowed
+      }
+      return { mode: "dry-run", files: [], deleted: 0 };
+    };
+    await expect(runLegacyRetireDryRun(optionsOf(p))).rejects.toBeInstanceOf(
+      NetworkGuardError,
+    );
+    expect(JSON.parse(await readFile(p.outPath, "utf8"))).toMatchObject({
+      status: "aborted",
+      abortReason: "network_guard",
+    });
+  });
+
   it("restores fetch after the run", async () => {
     const p = await fixture();
     await runLegacyRetireDryRun(optionsOf(p));
@@ -324,7 +344,11 @@ describe("NO_IMPORT_NO_PUBLISH", () => {
     const p = await fixture({ importDone: false, fullRun: true });
     const before = await hashTree(p.dataDir);
     const report = await runLegacyRetireDryRun(optionsOf(p));
-    expect(report.deviceImport).toEqual({ complete: false, connectors: 0 });
+    expect(report.deviceImport).toEqual({
+      complete: false,
+      connectors: 0,
+      receipts: 0,
+    });
     expect(report.files.every((f) => f.decision === "no_import")).toBe(true);
     expect(report.totals.wouldDelete).toBe(0);
     // The import guard is the retire pass's own: before the import is done
@@ -415,8 +439,16 @@ describe("the synthetic fixture, in memory and persisted", () => {
     const ledger = new RetireLedger(createMemoryStreamSyncFiles());
     await ledger.update((d) => {
       d.importComplete = true;
-      for (const scope of fx.scopes)
-        d.imported[scope.connector] = { streams: 1, at: "x" };
+      for (const scope of fx.scopes) {
+        for (const s of fx.reader.retireBasis(scope.scope)?.streams ?? []) {
+          const entry = (d.imported[s.connector] ??= {
+            streams: 1,
+            at: "x",
+            staged: {},
+          });
+          (entry.staged as Record<string, number>)[s.stream] = 3;
+        }
+      }
     });
     const memory = await retireLegacyFiles({
       storage: fx.storage,
@@ -539,7 +571,77 @@ describe("the decisions in the report", () => {
     expect(report.totals.byDecision.fence_not_imported).toBe(1);
     expect(report.totals.wouldDelete).toBe(2);
   });
+
+  const fencedFile = (report: RedactedReport) =>
+    report.files.find((f) => f.scopeHash === scopeHash("instagram.following"));
+
+  it("holds a fenced file when the receipt names its stream with no row", async () => {
+    const p = await fixture({
+      importDone: true,
+      fullRun: true,
+      receipts: "zero",
+    });
+    const report = await runLegacyRetireDryRun(optionsOf(p));
+    expect(fencedFile(report)).toMatchObject({
+      decision: "fence_not_imported",
+      wouldDelete: false,
+    });
+    expect(report.deviceImport.receipts).toBeGreaterThan(0);
+    // The two files that do not rest on the fence are not affected.
+    expect(report.totals.wouldDelete).toBe(2);
+  });
+
+  it("holds a fenced file when the ledger was written before receipts", async () => {
+    const p = await fixture({
+      importDone: true,
+      fullRun: true,
+      receipts: "none",
+    });
+    const report = await runLegacyRetireDryRun(optionsOf(p));
+    expect(fencedFile(report)).toMatchObject({
+      decision: "fence_not_imported",
+      wouldDelete: false,
+    });
+    expect(report.deviceImport.connectors).toBeGreaterThan(0);
+    expect(report.deviceImport.receipts).toBe(0);
+    expect(report.totals.wouldDelete).toBe(2);
+  });
+
+  it("treats a receipt that is not a map of numbers as no receipt", async () => {
+    const p = await fixture({ importDone: true, fullRun: true });
+    const ledgerPath = await ledgerFileOf(p);
+    const ledger = JSON.parse(await readFile(ledgerPath, "utf8"));
+    for (const record of Object.values(ledger.imported) as {
+      staged: Record<string, unknown>;
+    }[]) {
+      // Numbers as text: not a count, though a loose compare would pass them.
+      record.staged = Object.fromEntries(
+        Object.keys(record.staged).map((stream) => [stream, "5"]),
+      );
+    }
+    await writeFile(ledgerPath, JSON.stringify(ledger));
+    const report = await runLegacyRetireDryRun(optionsOf(p));
+    expect(fencedFile(report)?.decision).toBe("fence_not_imported");
+    expect(report.deviceImport.receipts).toBe(0);
+  });
+
+  it("releases the fenced file once a receipt names its stream with rows", async () => {
+    const p = await fixture();
+    const report = await runLegacyRetireDryRun(optionsOf(p));
+    expect(fencedFile(report)).toMatchObject({
+      decision: "ready",
+      wouldDelete: true,
+    });
+    expect(report.deviceImport.receipts).toBe(report.deviceImport.connectors);
+  });
 });
+
+/** The device ledger the fixture wrote, in the copy. */
+async function ledgerFileOf(p: PersistedFixture): Promise<string> {
+  const homes = join(p.dataDir, "stream-sync-homes");
+  const [id] = await readdir(homes);
+  return join(homes, id!, "legacy-retire", "ledger.json");
+}
 
 describe("the device mirror", () => {
   it("without the device's registry mirror a fenced file cannot be explained and is kept", async () => {

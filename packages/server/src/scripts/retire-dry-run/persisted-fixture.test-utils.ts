@@ -67,6 +67,12 @@ export async function persistFixture(
      * nothing staged.
      */
     staged?: boolean;
+    /**
+     * With `staged`: what the ledger holds per stream. "rows" (default) is a
+     * receipt with rows for every target stream; "zero" a receipt that names
+     * each stream with no row; "none" a record written before receipts.
+     */
+    receipts?: "rows" | "zero" | "none";
     /** Make the full-run proof of every deleted stream true. */
     fullRun?: boolean;
     /** Write the device's registry mirror (default true). */
@@ -142,11 +148,21 @@ export async function persistFixture(
   });
   const homeDir = join(live, "stream-sync-homes", homeId);
   if (options.importDone) {
-    const imported: Record<string, { streams: number; at: string }> = {};
+    const imported: Record<
+      string,
+      { streams: number; at: string; staged?: Record<string, number> }
+    > = {};
+    const receipts = options.receipts ?? "rows";
     if (options.staged !== false) {
       for (const scope of fx.scopes) {
         for (const s of fx.reader.retireBasis(scope.scope)?.streams ?? []) {
-          imported[s.connector] = { streams: 1, at: "2026-10-30T00:00:00Z" };
+          const entry = (imported[s.connector] ??= {
+            streams: 1,
+            at: "2026-10-30T00:00:00Z",
+            ...(receipts === "none" ? {} : { staged: {} }),
+          });
+          if (entry.staged)
+            entry.staged[s.stream] = receipts === "rows" ? 3 : 0;
         }
       }
     }

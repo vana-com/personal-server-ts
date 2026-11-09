@@ -31,12 +31,16 @@ const F = {
   report: `${dir}/report.ts`,
   run: `${dir}/run.ts`,
   hosts: `${dir}/hosts.ts`,
+  home: `${dir}/home-state.ts`,
+  recheck: `${dir}/recheck.ts`,
   cli: "packages/server/src/scripts/legacy-retire-dry-run.ts",
 };
 const T = {
   run: `${dir}/run.test.ts`,
   guard: `${dir}/network-guard.test.ts`,
   hosts: `${dir}/hosts.test.ts`,
+  recheck: `${dir}/recheck.test.ts`,
+  changed: `${dir}/run-changed.test.ts`,
   cli: "packages/server/src/scripts/legacy-retire-dry-run.test.ts",
 };
 
@@ -391,16 +395,16 @@ const MUTANTS = [
   },
   {
     id: "P-staged",
-    what: "the staged record of the import is dropped",
+    what: "the per-stream receipt of the import is dropped",
     edits: [
       [
-        F.run,
-        "data.imported = home.imported;",
-        'data.imported = Object.fromEntries(Object.keys(home.fullSince).map((k) => [k, { streams: 1, at: "x" }]));',
+        F.home,
+        "entry.staged = staged as Record<string, number>;",
+        "void staged;",
       ],
     ],
     files: [T.run],
-    pattern: "staged no rows",
+    pattern: "receipt names its stream with rows",
   },
   {
     id: "P3.9",
@@ -414,6 +418,94 @@ const MUTANTS = [
     ],
     files: [T.run],
     pattern: "age of the copy",
+  },
+  // --- round 4 ---
+  {
+    id: "R4-recheck-off",
+    what: "the last hash check is not taken in the dry run",
+    edits: [
+      [
+        F.run,
+        "retire = await recheckReadyFiles({",
+        "retire = await (async (x: Parameters<typeof recheckReadyFiles>[0]) => x.retire)({",
+      ],
+    ],
+    files: [T.changed],
+    pattern: "holds a ready file that no longer hashes",
+  },
+  {
+    id: "R4-changed-holds",
+    what: "a file that hashes differently still counts as ready",
+    edits: [
+      [
+        F.recheck,
+        'holds ? file : { ...file, decision: "file_changed", wouldDelete: false },',
+        "file,",
+      ],
+    ],
+    files: [T.recheck, T.changed],
+    pattern: "reports file_changed|holds a ready file",
+  },
+  {
+    id: "R4-unreadable-holds",
+    what: "an unreadable file counts as unchanged",
+    edits: [
+      [
+        F.recheck,
+        "holds = false; // unreadable is not a match",
+        "holds = true;",
+      ],
+    ],
+    files: [T.recheck],
+    pattern: "cannot be read",
+  },
+  {
+    id: "R4-nohash-holds",
+    what: "a readback with no recorded hash counts as unchanged",
+    edits: [
+      [F.recheck, "let holds = false;", "let holds = readHash === undefined;"],
+    ],
+    files: [T.recheck],
+    pattern: "recorded no hash",
+  },
+  {
+    id: "R4-receipt-unchecked",
+    what: "a receipt of any shape is passed on",
+    edits: [
+      [
+        F.home,
+        "(n) => Number.isFinite(n) && (n as number) >= 0,",
+        "() => true,",
+      ],
+    ],
+    files: [T.run],
+    pattern: "not a map of numbers",
+  },
+  {
+    id: "R4-clientrequest",
+    what: "a ClientRequest built directly is not checked",
+    edits: [
+      [
+        F.guard,
+        "check(methodOf(args[0], args[1]), targetOf(args[0], args[1]));\n        return Reflect.construct",
+        "return Reflect.construct",
+      ],
+    ],
+    files: [T.guard, T.run],
+    pattern: "ClientRequest",
+  },
+  {
+    id: "R4-clientrequest-restore",
+    what: "the original ClientRequest is not put back",
+    edits: [
+      [
+        F.guard,
+        "(http as unknown as Record<string, unknown>).ClientRequest =\n      RealClientRequest;",
+        "void RealClientRequest;",
+      ],
+    ],
+    files: [T.guard],
+    pattern: "uninstall restores",
   },
 ];
 
