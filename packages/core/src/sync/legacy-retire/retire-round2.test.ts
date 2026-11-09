@@ -30,7 +30,7 @@ async function deleted(f: Flow, ids = ["e0", "e1"]): Promise<void> {
   await f.importer.run();
   await f.run("a", ids);
   await f.rig.publish();
-  await f.rig.other.deleteStreams(CONNECTOR, [STREAM]);
+  await f.rig.other.deleteConnection(CONNECTOR);
   await f.rig.sync();
 }
 
@@ -40,7 +40,7 @@ async function deleted(f: Flow, ids = ["e0", "e1"]): Promise<void> {
  * such run goes first to let this device learn the delete.
  */
 async function reconnected(f: Flow, ids: string[]): Promise<void> {
-  await f.run("learn", ["x"]);
+  await f.run("learn", ["x"], false, true);
   await f.rig.publish();
   await f.run("live", ids);
   await f.rig.publish();
@@ -260,7 +260,7 @@ describe("the delete fence excuses only a file written before the delete (FENCE_
     await f.importer.run();
     await f.run("a", ["e0", "e1"]);
     await f.rig.publish();
-    await f.rig.other.deleteStreams(CONNECTOR, [STREAM]);
+    await f.rig.other.deleteConnection(CONNECTOR);
     await reconnected(f, ["e5"]);
     const report = await f.retire();
     expect(
@@ -298,7 +298,7 @@ describe("the delete fence excuses only a file written before the delete (FENCE_
     await f.importer.run(); // vacuous: no connectors
     await f.run("a", ["x0"]);
     await f.rig.publish();
-    await f.rig.other.deleteStreams(CONNECTOR, [STREAM]);
+    await f.rig.other.deleteConnection(CONNECTOR);
     await f.rig.sync();
     await reconnected(f, ["x1"]);
     const report = await f.retire();
@@ -312,6 +312,8 @@ describe("the delete fence excuses only a file written before the delete (FENCE_
     const f = await flow({ local: ["e0", "e1"], seed: ["e0", "e1"] });
     await deleted(f);
     // A run that resumes from a checkpoint is no re-collect.
+    // The explicit connect is the only run a deleted connection accepts; it
+    // resumes from a checkpoint, so it still re-collects nothing.
     await f.rig.collect({
       runId: "partial",
       full: false,
@@ -319,6 +321,7 @@ describe("the delete fence excuses only a file written before the delete (FENCE_
       version: "1.0.0",
       stream: STREAM,
       rows: [raw("e5")],
+      userConnect: true,
     });
     await f.rig.publish();
     const report = await f.retire();

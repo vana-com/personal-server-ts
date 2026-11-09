@@ -148,7 +148,8 @@ export async function flow(options: {
       rows,
       otherDevice: other,
     });
-  const run = (runId: string, ids: string[], other = false) =>
+  // `connect`: an explicit connect, the only run a deleted connection accepts.
+  const run = (runId: string, ids: string[], other = false, connect = false) =>
     rig.collect({
       runId,
       full: true,
@@ -157,6 +158,7 @@ export async function flow(options: {
       stream: STREAM,
       rows: ids.map(raw),
       otherDevice: other,
+      userConnect: connect,
     });
   return { rig, importer, ledger, storage, retire, run, runRows, staged };
 }

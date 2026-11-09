@@ -62,9 +62,9 @@ describe("retire reads the published heads only (RETIRE_ON_SPOOL, READBACK_ON_SP
 describe("the delete fence (IMPORT_IGNORES_FENCE, DEVICE_ONLY_RETIRED_EARLY)", () => {
   it("does not import rows of a stream that was deleted", async () => {
     const f = await flow({ seed: ["e0", "e1"], local: ["e0", "e1"] });
-    await f.rig.other.deleteStreams(CONNECTOR, [STREAM]);
+    await f.rig.other.deleteConnection(CONNECTOR);
     await f.importer.run();
-    await f.run("learn", ["x"]);
+    await f.run("learn", ["x"], false, true);
     await f.rig.publish();
     await f.run("live", ["e9"]);
     await f.rig.publish();
@@ -84,7 +84,7 @@ describe("the delete fence (IMPORT_IGNORES_FENCE, DEVICE_ONLY_RETIRED_EARLY)", (
     // A run collected before the delete is seen, published after it: the fence
     // discards it, so it is no re-collect.
     await f.run("stale", ["s"]);
-    await f.rig.other.deleteStreams(CONNECTOR, [STREAM]);
+    await f.rig.other.deleteConnection(CONNECTOR);
     const published = await f.rig.publish();
     expect(published.find((s) => s.runId === "stale")?.outcome).toMatchObject({
       kind: "discarded",
@@ -99,7 +99,7 @@ describe("the delete fence (IMPORT_IGNORES_FENCE, DEVICE_ONLY_RETIRED_EARLY)", (
     expect(f.storage.entries).toHaveLength(1);
 
     // A full run that begins after the delete and commits re-collects it.
-    await f.run("live", ["e5"]);
+    await f.run("live", ["e5"], false, true);
     await f.rig.publish();
     const done = await f.retire();
     expect(done.files[0]).toMatchObject({ decision: "ready" });
