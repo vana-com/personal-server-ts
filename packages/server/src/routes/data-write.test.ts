@@ -695,3 +695,51 @@ describe("POST /v1/data/:scope with a write session", () => {
     expect(res.status).toBe(401);
   });
 });
+
+describe("POST /v1/data/:scope with a write session after the stream-sync switch", () => {
+  let dataDir: string;
+  let app: ReturnType<typeof dataRoutes>;
+  let index: ReturnType<typeof createIndexManager>;
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), "data-write-switch-test-"));
+    index = createIndexManager(initializeDatabase(":memory:"));
+    const writeSessionStore = createInMemoryWriteSessionStore();
+    await seedSession(writeSessionStore);
+    app = dataRoutes({
+      indexManager: index,
+      hierarchyOptions: { dataDir },
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway({
+        getGrant: vi.fn().mockResolvedValue(makeGrant()),
+      }),
+      accessLogWriter: { write: vi.fn().mockResolvedValue(undefined) },
+      writeSessionStore,
+      legacyWritesRefused: () => true,
+    });
+  });
+
+  afterEach(async () => {
+    index.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("still accepts a builder write whose signature verifies", async () => {
+    const res = await sessionWrite(app, SCOPE, { note: "builder" });
+    expect(res.status).toBe(201);
+    expect(index.countByScope(SCOPE)).toBe(1);
+  });
+
+  it("stores nothing from a builder write whose signature does not verify", async () => {
+    const res = await sessionWrite(
+      app,
+      SCOPE,
+      { note: "builder" },
+      { signatureWallet: ownerWallet },
+    );
+    expect(res.status).not.toBe(201);
+    expect(index.countByScope(SCOPE)).toBe(0);
+  });
+});
