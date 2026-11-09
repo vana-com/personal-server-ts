@@ -92,6 +92,11 @@ export function foldPlan(
   base: PlanHead | null,
   candidates: readonly Contribution[],
   steps: readonly PlanStep[],
+  /**
+   * The head the view shows when no run does, when the rows come from a head
+   * other than `base` (the plan's registry head). Default: `base`.
+   */
+  fallback: PlanHead | null | undefined = undefined,
 ): Fold {
   const byRun = new Map(candidates.map((c) => [c.run.runId, c]));
   const chain: Contribution[] = [];
@@ -127,7 +132,7 @@ export function foldPlan(
     chain.push(c);
     shown = step;
   }
-  const head = shown ? shown.head : base;
+  const head = shown ? shown.head : fallback === undefined ? base : fallback;
   return {
     chain,
     merged: shown ? shown.rows.runs.map((id) => byRun.get(id)!) : [],

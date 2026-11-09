@@ -267,9 +267,10 @@ export class Rig {
     await this.open();
   }
 
-  async open(): Promise<void> {
+  /** `fresh`: a reader with an empty store, as a device that never imported. */
+  async open(fresh = false): Promise<void> {
     this.service = await StreamSyncReadService.open({
-      files: this.readFiles,
+      files: fresh ? createMemoryStreamSyncReadFiles() : this.readFiles,
       blobs: { get: async (key) => this.blobMap.get(key) ?? null },
       keys: await createStreamSyncReadKeys(streamMasterKey(SIGNATURE)),
       logger: silent,

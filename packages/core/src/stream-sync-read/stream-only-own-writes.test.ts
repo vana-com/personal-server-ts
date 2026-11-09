@@ -49,4 +49,33 @@ describe("stream-only reads of this device's own writes", () => {
     });
     expect(await read(f, false)).toEqual({ ids: "unavailable", listed: [] });
   });
+
+  it("lists the owner's overlay-only connector, which the registry mirror has not seen", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(100)));
+    const ns = await f.key.ns("acme", "account-1");
+    f.overlay.runs = [
+      {
+        runId: "r1",
+        ns,
+        generation: 1,
+        streams: [{ name: "items", rows: [line("own")], complete: true }],
+      },
+    ];
+    const service = await f.service();
+    await f.sync(service);
+    const query = { streamOnly: true };
+    const decision = await service.resolve(
+      ask("pdpp.acme.items", { ...query, isOwnerView: true }),
+    );
+    expect(decision.kind).toBe("local_pending");
+    await (decision as any).body.cancel();
+    expect(
+      (await service.listScopes({ ...query, isOwnerView: true })).map(
+        (s) => s.scope,
+      ),
+    ).toContain("pdpp.acme.items");
+    expect(await service.listScopes({ ...query, isOwnerView: false })).toEqual(
+      [],
+    );
+  });
 });

@@ -2649,6 +2649,32 @@ export class StreamSyncWriter {
   }
 
   /** Called only by the home-bound overlay adapter. Does no network I/O. */
+  /** Connectors that have a run a snapshot would expose, in sorted order. */
+  async overlayConnectors(): Promise<string[]> {
+    await this.recover();
+    const bound = await this.binding();
+    return this.lifecycle(async () => {
+      const out = new Set<string>();
+      for (const runId of await this.runIds()) {
+        const host = await this.readEntry(runId);
+        if (
+          !host ||
+          host.phase === "collecting" ||
+          host.ready === false ||
+          host.outcome?.kind === "aborted" ||
+          host.entry.ns === null ||
+          !host.binding ||
+          host.binding.owner.toLowerCase() !== bound.owner.toLowerCase() ||
+          host.binding.keyCheck !== bound.keyCheck ||
+          this.inconsistentReceipt(host)
+        )
+          continue;
+        out.add(host.entry.connector);
+      }
+      return [...out].sort();
+    });
+  }
+
   async snapshotOverlay(connector: string): Promise<StreamSyncOverlaySnapshot> {
     await this.recover();
     const bound = await this.binding();

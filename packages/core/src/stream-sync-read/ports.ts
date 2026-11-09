@@ -179,6 +179,12 @@ export interface StreamSyncOverlaySnapshotSource {
     }[],
   ): Promise<void>;
   /**
+   * Connectors with at least one overlay run a snapshot would expose. The
+   * owner's listing names the streams of connectors the registry mirror has
+   * never seen, as a read of them does.
+   */
+  connectors?(): Promise<readonly string[]>;
+  /**
    * Pinned snapshot of every overlay run of `connector`. Acquire it BEFORE
    * leasing imported views, once per read, shared by all input streams.
    * A cursor replays only the exact members (run, stream, contentRevision,

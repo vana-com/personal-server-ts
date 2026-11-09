@@ -636,11 +636,20 @@ export class StreamSyncReadService {
     options: {
       readonly pending?: boolean;
       readonly steps?: readonly (readonly [string, string])[];
+      /**
+       * The live registry head, when `base` is the complete head the rows come
+       * from (stream-only reads). The writer plans a run from the registry
+       * head, so completeness and any refusal come from it; the rows stay on
+       * `base`.
+       */
+      readonly registry?: ImportedVersion | null;
     } = {},
   ): Fold {
     const { pending = false, steps } = options;
-    const head = base && planHeadOf(base.head);
-    const none = foldPlan(head, [], []);
+    const planned = options.registry === undefined ? base : options.registry;
+    const head = planned && planHeadOf(planned.head);
+    const rowsHead = base && planHeadOf(base.head);
+    const none = foldPlan(rowsHead, [], []);
     if (!snapshot || tombstoned) return none;
     // A foreign key holds every local run pending, as the writer does: none is
     // shown, and each is named withheld with the reason.
@@ -683,6 +692,7 @@ export class StreamSyncReadService {
           head,
           runs.map((c) => c.run.runId),
         ),
+        rowsHead,
       );
     const all = fold(candidates);
     if (!steps) return all;
@@ -743,6 +753,17 @@ export class StreamSyncReadService {
           control,
           kind === "tombstoned",
           live ? imported : null,
+          completeOnly
+            ? {
+                registry: this.liveImported(
+                  connector,
+                  ns,
+                  stream,
+                  control,
+                  row,
+                ),
+              }
+            : {},
         );
         streams[stream] = {
           tombstoned: kind === "tombstoned",
@@ -844,7 +865,14 @@ export class StreamSyncReadService {
     scopePrefix?: string;
   }): Promise<{ scope: string; collectedAt: string }[]> {
     const names = new Set<string>();
-    for (const connector of this.mirror.connectors()) {
+    const overlayConnectors =
+      input.isOwnerView && this.options.overlay?.connectors
+        ? await this.options.overlay.connectors()
+        : [];
+    for (const connector of new Set([
+      ...this.mirror.connectors(),
+      ...overlayConnectors,
+    ])) {
       // The owner also lists the streams of runs this device collected and has
       // not published: the read below serves them.
       const snapshot = input.isOwnerView
@@ -855,6 +883,10 @@ export class StreamSyncReadService {
           for (const stream of Object.keys(view.streams))
             names.add(`pdpp.${connector}.${stream}`);
         }
+        // A connector the mirror has never seen has no connection view.
+        for (const run of snapshot.runs)
+          for (const stream of run.streams)
+            names.add(`pdpp.${connector}.${stream.name}`);
       } finally {
         snapshot.release();
       }
@@ -1173,7 +1205,20 @@ export class StreamSyncReadService {
             row !== undefined &&
               this.importer.streamRowKind(row) === "tombstoned",
             live,
-            { pending: true },
+            {
+              pending: true,
+              ...(input.streamOnly
+                ? {
+                    registry: this.liveImported(
+                      target.connector,
+                      ns,
+                      stream,
+                      control,
+                      row,
+                    ),
+                  }
+                : {}),
+            },
           );
           if (local.withheld.length > 0 || local.unpublished.length > 0) {
             connectors.add(target.connector);
@@ -1316,7 +1361,21 @@ export class StreamSyncReadService {
           control,
           kind === "tombstoned",
           lease?.version ?? null,
-          { pending, ...(steps ? { steps } : {}) },
+          {
+            pending,
+            ...(steps ? { steps } : {}),
+            ...(completeOnly
+              ? {
+                  registry: this.liveImported(
+                    target.connector,
+                    ns,
+                    stream,
+                    control,
+                    row,
+                  ),
+                }
+              : {}),
+          },
         );
         if (cursor && !replaysPin(fold, pin!)) {
           releaseAll();

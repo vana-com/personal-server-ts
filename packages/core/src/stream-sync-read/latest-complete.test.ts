@@ -274,4 +274,36 @@ describe("latest complete head", () => {
       },
     );
   });
+
+  it("keeps at most one complete head besides the current one, and drops it once a newer complete head lands", async () => {
+    const { f, ns, complete } = await setup(130);
+    const service = await f.service();
+    const heads = async () => (await f.files.list(`${base(ns)}/heads`)).length;
+    await f.sync(service);
+    expect(await heads()).toBe(1);
+    await publishIncomplete(f, ns, complete);
+    await f.sync(service);
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      complete: false,
+      records: [{ id: "partial-2" }],
+      lastComplete: { version: 1, dataHash: complete.dataHash },
+    });
+    await f.sync(service);
+    // The current incomplete head and the one complete head: never more.
+    expect(await heads()).toBe(2);
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      complete: true,
+      records: [{ id: "later" }],
+    });
+    await f.sync(service);
+    expect(await heads()).toBe(1);
+  });
 });
