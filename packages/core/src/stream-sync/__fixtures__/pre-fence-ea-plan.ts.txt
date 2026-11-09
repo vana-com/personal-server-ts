@@ -1,0 +1,17 @@
+// Verbatim: ea9c5bec535b7842eb320d36055328ce906ea49b packages/core/src/stream-sync/writer.ts:309
+export function compareConnectorVersions(a: string, b: string): VersionOrder {
+  const pa = a
+    .split(/[^0-9]+/)
+    .filter(Boolean)
+    .map(Number);
+  const pb = b
+    .split(/[^0-9]+/)
+    .filter(Boolean)
+    .map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const x = pa[i] ?? 0;
+    const y = pb[i] ?? 0;
+    if (x !== y) return x > y ? "higher" : "lower";
+  }
+  return "equal";
+}

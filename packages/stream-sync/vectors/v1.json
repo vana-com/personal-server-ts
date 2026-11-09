@@ -1700,6 +1700,43 @@
         "text": "{\"complete\":false,\"connector\":\"weather\",\"format\":1,\"generation\":\"1\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"\",\"observedAt\":1700000000000,\"parts\":[],\"primaryKey\":[\"id\"],\"profile\":{\"key\":null,\"version\":\"0.1.0\"},\"recordCount\":0,\"stream\":\"daily\"}",
         "dataHash": "0xd9d16653d5b12653104cc5239c7eb744131cf86ddb75bed09ec709cf38044ad4",
         "blobName": "h-d9d16653d5b12653104cc5239c7eb744131cf86ddb75bed09ec709cf38044ad4"
+      },
+      {
+        "name": "fenced format 3",
+        "head": {
+          "complete": true,
+          "connector": "chatgpt",
+          "format": 3,
+          "generation": "3",
+          "keyCheck": "94e0f0e1aa1f8175",
+          "ns": "834ab4c2636bcdd5",
+          "observedAt": 1700000000000,
+          "parts": [
+            {
+              "bytes": 120,
+              "count": 2,
+              "hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+              "prefix": "0"
+            },
+            {
+              "bytes": 64,
+              "count": 1,
+              "hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+              "prefix": "10"
+            }
+          ],
+          "primaryKey": ["id"],
+          "profile": {
+            "key": "conversations",
+            "version": "1.4.0"
+          },
+          "recordCount": 3,
+          "stream": "conversations",
+          "lastDeleteVersion": 2
+        },
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":3,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "dataHash": "0x57eccce62913908b9f706070b1b1eeb558f88d6492ea6dc29a911da72f08b98b",
+        "blobName": "h-57eccce62913908b9f706070b1b1eeb558f88d6492ea6dc29a911da72f08b98b"
       }
     ],
     "decode": [
@@ -1709,8 +1746,28 @@
         "expected": "ok"
       },
       {
+        "name": "format 2",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":2,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "ok"
+      },
+      {
         "name": "format 3",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":3,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":2,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "ok"
+      },
+      {
+        "name": "format 3 missing delete version",
         "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":3,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "format 3 negative delete version",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":3,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"lastDeleteVersion\":-1,\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "expected": "malformed"
+      },
+      {
+        "name": "format 4",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":4,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
         "expected": "unsupported_format"
       },
       {
@@ -1862,9 +1919,9 @@
       },
       {
         "name": "unsupported format is reported before name and key",
-        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":3,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
+        "text": "{\"complete\":true,\"connector\":\"chatgpt\",\"format\":4,\"generation\":\"3\",\"keyCheck\":\"94e0f0e1aa1f8175\",\"ns\":\"834ab4c2636bcdd5\",\"observedAt\":1700000000000,\"parts\":[{\"bytes\":120,\"count\":2,\"hash\":\"169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0\",\"prefix\":\"0\"},{\"bytes\":64,\"count\":1,\"hash\":\"f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a\",\"prefix\":\"10\"}],\"primaryKey\":[\"id\"],\"profile\":{\"key\":\"conversations\",\"version\":\"1.4.0\"},\"recordCount\":3,\"stream\":\"conversations\"}",
         "expect": {
-          "dataHash": "0xb0351071655f18806dd71c0dac98e24cf7cc30b829277251493ab947af063966",
+          "dataHash": "0xf3e8602a9b31913a217093f346decb65eadcf156d3a3e2f353e99888f3552094",
           "connector": "chatgpt",
           "ns": "834ab4c2636bcdd5",
           "stream": "conversations",

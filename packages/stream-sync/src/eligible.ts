@@ -22,6 +22,8 @@ import { hasOwn } from "./json.js";
 export interface StreamHeadView {
   /** §2.4 liveness (`isHeadLive`). */
   readonly live: boolean;
+  /** The stream registry row is deleted, independently of connection control. */
+  readonly tombstoned?: boolean;
   readonly complete: boolean;
 }
 
@@ -91,6 +93,18 @@ export function eligible(input: EligibilityInput): Eligibility {
           (c) => c.ns === target.ns && c.control.kind === "active",
         ) ?? null)
       : selectConnection(connections);
+  const deletionViews = selected
+    ? [selected]
+    : connections.filter(
+        (c) => target.kind === "logical" || c.ns === target.ns,
+      );
+  if (
+    deletionViews.some((c) =>
+      target.streams.some((s) => c.streams[s]?.tombstoned),
+    )
+  ) {
+    return { kind: "unavailable", reason: "deleted" };
+  }
   if (
     selected &&
     target.streams.every((s) => {

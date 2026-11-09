@@ -531,8 +531,8 @@ describe.each(matrix)(
     });
 
     // L11 (ruling M3): an old install's non-exclusive DELETE tombstones one
-    // stream row. The next incremental publish onto that base is incomplete and
-    // sets needsFull; the run after it is full and the head ends complete.
+    // stream row. An unobserved delete discards the next incremental run and
+    // clears its checkpoint; the full re-collection ends complete.
     it("L11: an old DELETE tombstones one stream row; the next run is full and the head ends complete", async () => {
       const c = freshConnector("p4r2-l11-full");
       await activateControl(env.registry, c, NS); // control active(1)
@@ -557,18 +557,20 @@ describe.each(matrix)(
         checkpointUsed: { ns: NS, generation: 1 },
         streams: { s: rows(["r4"], "incremental") },
       });
-      await d.publishPending();
-      const partial = await readStream(env.registry, env.blobs, c, NS, "s");
-      expect(partial).not.toBeNull();
-      expect(partial).not.toBe("tombstoned");
-      expect((partial as StreamView).head.complete).toBe(false);
-      expect((await d.status()).needsFull).toEqual([
-        { connector: c, ns: NS, stream: "s" },
-      ]);
-      expect(await d.runPlan(c)).toEqual({
-        mustBeFull: true,
-        checkpoint: null,
+      const discarded = await d.publishPending();
+      expect(
+        discarded.runs.find((r) => r.runId === "p4r2-l11-full-1")?.outcome,
+      ).toMatchObject({
+        kind: "discarded",
+        clearCheckpoints: true,
+        restartFull: true,
       });
+      expect(await readStream(env.registry, env.blobs, c, NS, "s")).toBe(
+        "tombstoned",
+      );
+      expect((await d.issueStart(c, false)).start.collectionMode).toBe(
+        "full_refresh",
+      );
 
       // The next run is full: it re-collects everything upstream returns.
       await d.refreshControls();
@@ -616,8 +618,17 @@ describe.each(matrix)(
         observedAt: T0 + 1000,
         streams: { s: rows(["r1", "r2"], "relive") },
       });
+      const first = await relive.publishPending();
+      expect(first.runs[0]?.outcome?.kind).toBe("discarded");
+      await collect(relive, {
+        runId: "p4r2-l11-late-recollect",
+        connector: c,
+        observedAt: T0 + 2000,
+        streams: { s: rows(["r1", "r2"], "relive") },
+      });
       await relive.publishPending();
-      await old.publishPending();
+      const stale = await old.publishPending();
+      expect(stale.runs[0]?.outcome?.kind).toBe("discarded");
 
       const view = await readStream(env.registry, env.blobs, c, NS, "s");
       expect(view).not.toBeNull();

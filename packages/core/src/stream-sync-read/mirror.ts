@@ -9,6 +9,7 @@
  * (`needsFullListing`).
  */
 
+import { deleteMetadataHash } from "../stream-sync/delete-metadata.js";
 import {
   parseScope,
   type ControlRead,
@@ -151,6 +152,32 @@ export class RegistryMirror {
     return this.floors.get(scope) ?? 0;
   }
 
+  /** Delete history learned from a verified live or delete head. */
+  async recordDelete(scope: string, version: number): Promise<void> {
+    const pass = this.pending.then(async () => {
+      if (version <= this.deletionFloor(scope)) return;
+      const floors = new Map(this.floors);
+      floors.set(scope, version);
+      await this.persist(this.rows, floors, this.listed);
+      this.floors = floors;
+    });
+    this.pending = pass.catch(() => undefined);
+    await pass;
+  }
+
+  deleteObservations(): {
+    connector: string;
+    stream: string;
+    version: number;
+  }[] {
+    return [...this.floors].flatMap(([scope, version]) => {
+      const parsed = parseScope(scope);
+      return parsed?.kind === "stream"
+        ? [{ connector: parsed.connector, stream: parsed.stream, version }]
+        : [];
+    });
+  }
+
   /** True until one listing from the start of the registry has completed. */
   needsFullListing(): boolean {
     return !this.listed;
@@ -188,7 +215,11 @@ export class RegistryMirror {
     const raise = (row: MirrorRow): boolean => {
       if (
         parseScope(row.scope)?.kind !== "stream" ||
-        !this.isTombstone(row) ||
+        !(
+          this.isTombstone(row) ||
+          row.metadataHash.toLowerCase() ===
+            deleteMetadataHash(row.scope, row.version)
+        ) ||
         row.version <= (nextFloors.get(row.scope) ?? 0)
       ) {
         return false;

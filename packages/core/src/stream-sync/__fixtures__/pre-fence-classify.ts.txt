@@ -1,0 +1,11 @@
+// Verbatim: fde650c3601a79d6a07a97c0dd39d2f1f3182de4 packages/stream-sync/src/control.ts:71
+export function classifyStreamRow(
+  read: ControlRead,
+  hashes: Pick<ControlHashes, "tombstoneData" | "tombstoneMetadata">,
+): StreamRow {
+  if (!read.found) return "absent";
+  const tombstone =
+    read.dataHash.toLowerCase() === hashes.tombstoneData &&
+    read.metadataHash.toLowerCase() === hashes.tombstoneMetadata;
+  return read.deleted || tombstone ? "tombstoned" : "present";
+}

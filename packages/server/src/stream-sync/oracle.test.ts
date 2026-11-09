@@ -410,7 +410,9 @@ describe.each(matrix)(
       const plan = await w.runPlan(c);
       expect(plan.checkpoint).toBeNull();
 
-      // The next run uses no checkpoint, so it is full and publishes at gen 3.
+      // The next run has observed the stream delete before collection.
+      await w.observeDeletes([{ connector: c, stream: "s1", version: 2 }]);
+      // It uses no checkpoint, so it is full and publishes at gen 3.
       await w.refreshControls();
       await collect(w, {
         runId: "run-2",
@@ -517,7 +519,7 @@ describe.each(matrix)(
         expect(canonicalJson(view.records.get("huge"))).toBe(
           canonicalJson(huge),
         );
-        expect(view.head.format).toBe(2);
+        expect(view.head.format).toBe(3);
         expect(view.head.recordCount).toBe(2);
         // The long record is alone in parts of at most the piece size.
         for (const part of view.head.parts) {
@@ -657,6 +659,7 @@ describe.each(matrix)(
       expect(await readStream(env.registry, env.blobs, c, NS, "s")).toBe(
         "tombstoned",
       );
+      await w.observeDeletes([{ connector: c, stream: "s", version: 2 }]);
       await w.refreshControls();
       await collect(w, {
         runId: "run-2",
@@ -755,6 +758,7 @@ describe.each(matrix)(
       // complete:false head, and never runs again.
       const phone = await env.writer("muse-q9-phone");
       await phone.refreshControls();
+      await phone.observeDeletes([{ connector: c, stream: "s", version: 2 }]);
       await collect(phone, {
         runId: "p-1",
         connector: c,
@@ -768,6 +772,7 @@ describe.each(matrix)(
       expect(empty.head.complete).toBe(false);
       expect(empty.records.size).toBe(0);
 
+      await desktop.observeDeletes([{ connector: c, stream: "s", version: 2 }]);
       // D, first quiet incremental run: a no-op onto the incomplete base.
       let plan = await desktop.runPlan(c);
       expect(plan).toEqual({

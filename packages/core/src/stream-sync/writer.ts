@@ -26,7 +26,10 @@
  * publishing a partial run under the run's checkpoint.
  */
 
+import { legacyBindingsForProfile } from "../legacy-projection/index.js";
+import { deleteMetadataHash } from "./delete-metadata.js";
 import {
+  type ControlRead,
   IDENTITYLESS_NS,
   PART_LIMIT_BYTES,
   DEFAULT_PART_TARGET_BYTES,
@@ -68,7 +71,6 @@ import {
   pkHash,
   pkHashBits,
   planBuckets,
-  runDeletedSince,
   shardOf,
   startState,
   streamRunResult,
@@ -186,6 +188,10 @@ interface WriterState {
    * the first tombstone, so a crash resumes the same pins on the next boot.
    */
   deletes?: Record<string, { readonly pins: readonly DeletePin[] }>;
+  streamDeletes?: Record<
+    string,
+    Record<string, { request?: SignedRegistryPost }>
+  >;
   /**
    * Per connector, how many times its checkpoint was invalidated: a control
    * change seen, or a deliberate clear. It only grows and outlives the
@@ -200,6 +206,8 @@ interface WriterState {
    * it. Every decision uses this, never a raw read.
    */
   observedControl?: Record<string, Record<string, ControlState>>;
+  /** Monotone delete observations, scoped by this home to one owner. */
+  lastDeletes?: Record<string, Record<string, number>>;
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
   receipts: Record<string, SeedReceipt>;
@@ -232,17 +240,12 @@ interface HostStream {
   seedShardBytes: number[] | null;
   /** A seed stream added at publish (§2.9), with no run records. */
   seedOnly: boolean;
+  /** No publish receipt is needed for a seed that was terminally skipped. */
+  terminal?: "seed_skipped";
   /** Declared `incremental: false`: every run of it is a full read (§3.0). */
   fullStream: boolean;
   /** The seed is merged into this stream's publish. */
   seedApplies: boolean;
-  /**
-   * The stream row as the run declared the stream: whether it was already a
-   * tombstone. A publish that finds it tombstoned when it was not is a delete
-   * that came after collection, so the run discards. Absent on runs begun
-   * before this field existed, which skip the check.
-   */
-  rowAtStart?: { readonly tombstoned: boolean };
   problem: StreamSyncHostProblem | null;
   detail: string | null;
 }
@@ -290,6 +293,8 @@ interface HostEntry {
   overlayRevision?: string;
   /** Seed streams this run must hold receipts for before its checkpoint. */
   seedStreams: string[];
+  /** Snapshot at beginRun; streams learned later never consult the live cache. */
+  collectedAt?: Record<string, number>;
   /** M5: who the run writes for; checked again before it publishes. */
   binding?: { owner: string; keyCheck: string; leaseId: string | null };
 }
@@ -738,6 +743,139 @@ export class StreamSyncWriter {
     });
   }
 
+  /** Persist intent before any network write; every pass resumes unfinished streams. */
+  deleteStreams(connector: string, streams: readonly string[]): Promise<void> {
+    return this.publish(async () => {
+      // Until deleting multiple scopes is supported, shared aliases are indivisible.
+      const bindings = legacyBindingsForProfile(connector);
+      for (const stream of streams) {
+        const owners = [...bindings.values()].filter((binding) =>
+          binding.pdppStreams.includes(stream),
+        );
+        if (owners.length > 1)
+          throw new Error(
+            `stream ${stream} is shared by scopes ${owners.map((binding) => binding.scope).join(", ")}`,
+          );
+      }
+      await this.withState((state) => {
+        const pending = ((state.streamDeletes ??= {})[connector] ??= {});
+        // This API is a new user delete; background recovery retains existing pins.
+        for (const stream of new Set(streams)) pending[stream] = {};
+      });
+      await this.finishStreamDeletes(connector);
+    });
+  }
+
+  private async finishStreamDeletes(connector: string): Promise<void> {
+    const { keyCheck } = await this.keys();
+    for (const stream of Object.keys(
+      (await this.readState()).streamDeletes?.[connector] ?? {},
+    )) {
+      const scope = streamScope(connector, IDENTITYLESS_NS, stream);
+      for (let attempt = 0; attempt < CONFLICTS_PER_PASS; attempt += 1) {
+        let request = (await this.readState()).streamDeletes?.[connector]?.[
+          stream
+        ]?.request;
+        let observedRow: ControlRead | null = null;
+        if (request) {
+          const { row } = await this.readStreamRow(
+            connector,
+            IDENTITYLESS_NS,
+            stream,
+            true,
+          );
+          observedRow = row;
+          const pin = Number(request.expectedVersion);
+          const committed =
+            row.found &&
+            row.version === pin &&
+            row.dataHash.toLowerCase() === request.dataHash.toLowerCase();
+          if (committed || (row.found && row.version > pin)) {
+            if (committed) await this.observeDelete(connector, stream, pin);
+            await this.withState((state) => {
+              delete state.streamDeletes![connector]![stream];
+            });
+            break;
+          }
+          if (row.found && row.version === pin) {
+            // Another write won this CAS. Only this exact pin may be retried.
+            await this.withState((state) => {
+              delete state.streamDeletes![connector]![stream]!.request;
+            });
+            request = undefined;
+          }
+        }
+        if (!request) {
+          // Use the checked row for this CAS; a second read could advance past the pin.
+          const row =
+            observedRow ??
+            (await this.readStreamRow(connector, IDENTITYLESS_NS, stream, true))
+              .row;
+          const version = row.found ? row.version + 1 : 1;
+          // A delete head requires no old head, schema, or control-generation lookup.
+          const clear = encodeHead({
+            format: HEAD_FORMAT,
+            connector,
+            ns: IDENTITYLESS_NS,
+            stream,
+            generation: 1,
+            keyCheck,
+            lastDeleteVersion: version,
+            complete: false,
+            observedAt: this.now(),
+            parts: [],
+            primaryKey: ["id"],
+            profile: { key: null, version: "0.0.0" },
+            recordCount: 0,
+          });
+          const digest = await digestHead(this.hashes.keccak256, clear);
+          await this.options.blobs.put(
+            `${scope}/${digest.blobName}`,
+            await this.options.keys.encrypt(scope, clear),
+          );
+          request = await this.sign(
+            scope,
+            digest.dataHash,
+            deleteMetadataHash(scope, version),
+            version,
+          );
+          await this.withState((state) => {
+            state.streamDeletes![connector]![stream]!.request = request;
+          });
+        }
+        let conflict = false;
+        try {
+          conflict =
+            (await this.options.registry.post(request)).kind === "conflict";
+        } catch (error) {
+          // Ambiguous replies retain the exact signed request for replay after restart.
+          if (!(error instanceof RegistryRefusedError && error.status === 409))
+            throw error;
+          conflict = true;
+        }
+        if (!conflict) {
+          await this.observeDelete(
+            connector,
+            stream,
+            Number(request.expectedVersion),
+          );
+          await this.withState((state) => {
+            delete state.streamDeletes![connector]![stream];
+          });
+          break;
+        }
+        await new Promise<void>((resolve) =>
+          setTimeout(resolve, Math.min(10 * 2 ** attempt, 1000)),
+        );
+        if (attempt === CONFLICTS_PER_PASS - 1)
+          throw new Error("stream delete pending after version conflicts");
+      }
+    }
+    await this.withState((state) => {
+      delete state.streamDeletes?.[connector];
+    });
+  }
+
   /**
    * Tombstone each pinned control row. A fresh delete must end deleted; if a
    * pin's tombstone did not land, the intent is dropped and the delete throws
@@ -845,11 +983,13 @@ export class StreamSyncWriter {
    */
   private async resumeDeletes(): Promise<PendingDelete[]> {
     const pending: PendingDelete[] = [];
-    for (const connector of Object.keys(
-      (await this.readState()).deletes ?? {},
-    )) {
+    for (const connector of Object.keys({
+      ...(await this.readState()).deletes,
+      ...(await this.readState()).streamDeletes,
+    })) {
       try {
         await this.finishDelete(connector);
+        await this.finishStreamDeletes(connector);
       } catch (error) {
         pending.push({
           connector,
@@ -1013,6 +1153,7 @@ export class StreamSyncWriter {
         streams: {},
         outcome: null,
         seedStreams: [],
+        collectedAt: { ...state.lastDeletes?.[input.connector] },
         binding: {
           owner: this.options.ownerAddress,
           keyCheck,
@@ -1059,14 +1200,12 @@ export class StreamSyncWriter {
       host.streams[stream] = this.newStream(nextIndex(host), shape);
       // Every run publishes under the identity-less name (R23), so the scope
       // is known at collection even though `entry.ns` is set at finish.
-      const { control } = await this.keys();
-      const row = await this.options.registry.read(
-        streamScope(host.entry.connector, IDENTITYLESS_NS, stream),
+      await this.readStreamRow(
+        host.entry.connector,
+        IDENTITYLESS_NS,
+        stream,
+        true,
       );
-      host.streams[stream]!.rowAtStart = {
-        tombstoned:
-          row.found && classifyStreamRow(row, control) === "tombstoned",
-      };
       host.entry = {
         ...host.entry,
         streams: { ...host.entry.streams, [stream]: { state: "planned" } },
@@ -1876,6 +2015,75 @@ export class StreamSyncWriter {
     return false;
   }
 
+  /** Observe delete history independently of whether this head can be a merge base. */
+  private async readStreamRow(
+    connector: string,
+    ns: string,
+    stream: string,
+    bestEffort = false,
+  ) {
+    const { keyCheck, control } = await this.keys();
+    const scope = streamScope(connector, ns, stream);
+    const row = await this.options.registry.read(scope);
+    let rowKind = classifyStreamRow(row, control);
+    const deleteMarker =
+      row.found &&
+      row.metadataHash.toLowerCase() === deleteMetadataHash(scope, row.version);
+    let head: Head | null = null;
+    if (rowKind === "present" && row.found) {
+      try {
+        head = await this.loadHead(scope, row.dataHash, {
+          connector,
+          ns,
+          stream,
+          keyCheck,
+        });
+      } catch (error) {
+        if (!bestEffort && !deleteMarker) throw error;
+      }
+    }
+    if (
+      deleteMarker ||
+      (row.found &&
+        head &&
+        head.lastDeleteVersion === row.version &&
+        head.recordCount === 0)
+    )
+      rowKind = "tombstoned";
+    // Pre-fence heads have no delete history. Deletes use format 3 heads so an
+    // older writer refuses the base instead of overwriting a headless tombstone.
+    const lastDeleteVersion =
+      rowKind === "tombstoned" && row.found
+        ? row.version
+        : (head?.lastDeleteVersion ?? 0);
+    await this.observeDelete(connector, stream, lastDeleteVersion);
+    return { row, rowKind, head, lastDeleteVersion };
+  }
+
+  /** Called after the read mirror durably observes delete history, before collection can start. */
+  async observeDeletes(
+    observations: readonly {
+      connector: string;
+      stream: string;
+      version: number;
+    }[],
+  ): Promise<void> {
+    for (const row of observations)
+      await this.observeDelete(row.connector, row.stream, row.version);
+  }
+
+  private async observeDelete(
+    connector: string,
+    stream: string,
+    version: number,
+  ): Promise<void> {
+    await this.withState((state) => {
+      const cache = (state.lastDeletes ??= {});
+      const streams = (cache[connector] ??= {});
+      streams[stream] = Math.max(streams[stream] ?? 0, version);
+    });
+  }
+
   /** §2.7 from "read control" to the POST. True when committed or no-op. */
   private async planAndPost(host: HostEntry, name: string): Promise<boolean> {
     const { entry } = host;
@@ -1892,38 +2100,43 @@ export class StreamSyncWriter {
     const scope = streamScope(entry.connector, ns, name);
     const { keyCheck } = await this.keys();
 
-    const row = await this.options.registry.read(scope);
-    const rowKind = classifyStreamRow(row, this.control!);
-    // The delete predicate a reader shares (runDeletedSince): a stream row
-    // tombstoned after this run was collected discards it. A row already a
-    // tombstone at collection predates the run, so a reconnect keeps it.
-    if (
-      runDeletedSince(
-        {
-          control: { kind: "unknown" },
-          streamTombstoned: stream.rowAtStart?.tombstoned,
-        },
-        { stream: row, hashes: this.control! },
-      )
-    ) {
+    const { row, rowKind, head, lastDeleteVersion } = await this.readStreamRow(
+      entry.connector,
+      ns,
+      name,
+    );
+    // Seed history was collected before stream deletes existed. It always has stamp zero.
+    if (stream.seedApplies && lastDeleteVersion > 0) {
+      await this.withState((state) => {
+        state.receipts[
+          `${this.options.seed!.installId}|${entry.connector}|${ns}|${name}`
+        ] = "skipped";
+      });
+      stream.seedApplies = false;
+      stream.seedShardBytes = null;
+      if (stream.seedOnly) {
+        stream.terminal = "seed_skipped";
+        // No live contribution remains, and the registry row must stay untouched.
+        this.setStream(host, name, {
+          state: "noop",
+          generation: target,
+          complete: false,
+        });
+        await this.writeEntry(host);
+        return true;
+      }
+      await this.writeEntry(host);
+    }
+    if (lastDeleteVersion > (host.collectedAt?.[name] ?? 0)) {
       throw new Discard(
         {
           kind: "discard",
-          recollect: false,
-          clearCheckpoints: false,
-          restartFull: false,
+          recollect: true,
+          clearCheckpoints: true,
+          restartFull: true,
         },
-        "stream row tombstoned after this run was collected",
+        "stream deleted after collection snapshot",
       );
-    }
-    let head: Head | null = null;
-    if (rowKind === "present" && row.found) {
-      head = await this.loadHead(scope, row.dataHash, {
-        connector: entry.connector,
-        ns,
-        stream: name,
-        keyCheck,
-      });
     }
     const choice = chooseBase(rowKind, head, target);
     if (choice.kind === "stale_generation") {
@@ -1951,7 +2164,7 @@ export class StreamSyncWriter {
     // executes it: the parts, the head upload and the POST.
     const decision = planStreamStep(
       {
-        head: head && planHeadOf(head),
+        head: rowKind === "present" && head ? planHeadOf(head) : null,
         floor: floorOf(await this.readState(), entry.connector, ns, name),
       },
       this.planRun(host, name, await this.readState(), true),
@@ -2016,6 +2229,7 @@ export class StreamSyncWriter {
       complete,
       connector: entry.connector,
       format: HEAD_FORMAT,
+      lastDeleteVersion,
       generation: target,
       keyCheck,
       ns,
@@ -2340,6 +2554,7 @@ export class StreamSyncWriter {
    * Never treat a missing pre-upgrade receipt as proof of read coverage.
    */
   private isCovered(host: HostEntry, name: string): boolean {
+    if (host.streams[name]?.terminal === "seed_skipped") return true;
     const receipt = host.streams[name]?.receipt;
     if (
       !receipt ||
@@ -2469,6 +2684,7 @@ export class StreamSyncWriter {
             throw new Error("ready stream has no intake byte counts");
           const descriptor = {
             name,
+            collectedAt: host.collectedAt?.[name] ?? 0,
             primaryKey: Object.freeze([...stream.primaryKey]),
             profile: Object.freeze({ ...stream.profile }),
             complete:
@@ -2682,9 +2898,11 @@ export class StreamSyncWriter {
       runDir,
       stream.shardBytes ?? emptyShardBytes(),
     );
-    const seedBytes = stream.seedShardBytes
-      ? await this.readyShards(seedDir, stream.seedShardBytes)
-      : emptyShardBytes();
+    const dirs = stream.seedApplies ? [runDir, seedDir] : [runDir];
+    const seedBytes =
+      stream.seedApplies && stream.seedShardBytes
+        ? await this.readyShards(seedDir, stream.seedShardBytes)
+        : emptyShardBytes();
     const shardBytes = runBytes.map((b, i) => b + seedBytes[i]!);
     const baseParts = base?.parts ?? [];
 
@@ -2696,10 +2914,10 @@ export class StreamSyncWriter {
     if (plan.kind === "needs_counts") {
       const counts: Record<number, number[]> = {};
       for (const shard of plan.shards) {
-        counts[shard] = await countShard(this.options.home.files, [
-          shardPath(runDir, shard),
-          shardPath(seedDir, shard),
-        ]);
+        counts[shard] = await countShard(
+          this.options.home.files,
+          dirs.map((dir) => shardPath(dir, shard)),
+        );
       }
       plan = planBuckets({
         targetBytes: this.targetBytes,
@@ -2762,7 +2980,7 @@ export class StreamSyncWriter {
         scope,
         target,
         base,
-        [runDir, seedDir],
+        dirs,
       );
       for (const result of results) {
         if (result.kind === "split") {

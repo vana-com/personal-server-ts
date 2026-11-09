@@ -691,6 +691,10 @@ void partA;
 const headEncode = [
   { name: "two parts", head: baseHead },
   { name: "identity-less, no records", head: emptyHead },
+  {
+    name: "fenced format 3",
+    head: { ...baseHead, format: 3, lastDeleteVersion: 2 },
+  },
 ].map((c) => {
   const text = cj(c.head);
   return {
@@ -703,9 +707,25 @@ const headEncode = [
 const mutate = (patch) => cj({ ...baseHead, ...patch });
 const headDecode = [
   { name: "valid", text: cj(baseHead), expected: "ok" },
+  { name: "format 2", text: mutate({ format: 2 }), expected: "ok" },
   {
     name: "format 3",
+    text: mutate({ format: 3, lastDeleteVersion: 2 }),
+    expected: "ok",
+  },
+  {
+    name: "format 3 missing delete version",
     text: mutate({ format: 3 }),
+    expected: "malformed",
+  },
+  {
+    name: "format 3 negative delete version",
+    text: mutate({ format: 3, lastDeleteVersion: -1 }),
+    expected: "malformed",
+  },
+  {
+    name: "format 4",
+    text: mutate({ format: 4 }),
     expected: "unsupported_format",
   },
   {
@@ -838,10 +858,10 @@ const headVerify = [
   },
   {
     name: "unsupported format is reported before name and key",
-    text: mutate({ format: 3 }),
+    text: mutate({ format: 4 }),
     expect: {
       ...verifyExpect,
-      dataHash: keccak(mutate({ format: 3 })),
+      dataHash: keccak(mutate({ format: 4 })),
       keyCheck: otherKeyCheck,
     },
     result: "unsupported_format",

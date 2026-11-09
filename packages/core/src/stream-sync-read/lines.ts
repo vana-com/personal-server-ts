@@ -84,7 +84,7 @@ async function* partLines(
   const head = lease.version.head;
   const read = (part: { hash: string; bytes: number }) =>
     views.readPart(lease.key, part.hash, part.bytes);
-  if (head.format === 2) {
+  if (head.format !== 1) {
     // The store verified each part; frame structure is checked as it is read.
     for await (const line of linesOfParts(keys.hashes.sha256, head, read, {
       verify: false,
@@ -176,7 +176,7 @@ async function* partBodies(
   const head = lease.version.head;
   const read = (part: { hash: string; bytes: number }) =>
     views.readPart(lease.key, part.hash, part.bytes);
-  if (head.format === 2) {
+  if (head.format !== 1) {
     for await (const frame of framesOfParts(
       keys.hashes.sha256,
       head.parts,

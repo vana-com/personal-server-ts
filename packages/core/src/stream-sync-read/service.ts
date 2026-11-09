@@ -525,13 +525,15 @@ export class StreamSyncReadService {
       }
     }
     // Import whatever the mirror holds that a crash left unimported.
-    return new StreamSyncReadService(
+    const service = new StreamSyncReadService(
       options,
       mirror,
       views,
       importer,
       new Set(mirror.connectors()),
     );
+    await service.forwardDeletes();
+    return service;
   }
 
   /** True when the next listing must start from the registry's first page. */
@@ -547,6 +549,7 @@ export class StreamSyncReadService {
     for (const connector of await this.mirror.observe(rows, page)) {
       this.changed.add(connector);
     }
+    await this.forwardDeletes();
   }
 
   /** Import changed connectors and retry those with a retried problem. */
@@ -557,6 +560,13 @@ export class StreamSyncReadService {
     ]);
     this.changed = new Set();
     await this.importer.run([...connectors].sort());
+    await this.forwardDeletes();
+  }
+
+  private async forwardDeletes(): Promise<void> {
+    await this.options.overlay?.observeDeletes?.(
+      this.mirror.deleteObservations(),
+    );
   }
 
   status(): StreamSyncReadStatus {
@@ -653,6 +663,7 @@ export class StreamSyncReadService {
       // where this mirror still reads the deleted control the writer left.
       const verdict = admitStart(run.start, control, run);
       if (verdict === "discard" || (verdict === "wait" && !pending)) continue;
+      if (!local.receipt && (local.collectedAt ?? 0) < floor) continue;
       if (local.receipt && local.receipt.registryVersion <= floor) continue;
       if (local.receipt && base && covers(base, local.receipt)) continue;
       candidates.push({ run, stream: local });
@@ -725,6 +736,7 @@ export class StreamSyncReadService {
           live ? imported : null,
         );
         streams[stream] = {
+          tombstoned: kind === "tombstoned",
           live: live || local.merged.length > 0,
           complete: local.complete,
         };

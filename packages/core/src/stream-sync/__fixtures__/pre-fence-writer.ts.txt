@@ -1,0 +1,396 @@
+// Verbatim: fde650c3601a79d6a07a97c0dd39d2f1f3182de4 packages/core/src/stream-sync/writer.ts:472
+class PendingStream extends Error {
+  constructor(
+    readonly problem: StreamSyncHostProblem,
+    detail: string,
+  ) {
+    super(detail);
+  }
+}
+
+class Discard extends Error {
+  constructor(
+    readonly decision: Extract<Decision, { kind: "discard" }>,
+    readonly why: string,
+  ) {
+    super(why);
+  }
+}
+
+// Verbatim: fde650c3601a79d6a07a97c0dd39d2f1f3182de4 packages/core/src/stream-sync/writer.ts:414
+function floorKey(connector: string, ns: string, stream: string): string {
+  return JSON.stringify([connector, ns, stream]);
+}
+
+function floorOf(
+  state: WriterState,
+  connector: string,
+  ns: string,
+  stream: string,
+): StreamFloor {
+  const held = state.streamFloors?.[floorKey(connector, ns, stream)];
+  if (!held) return NO_FLOOR;
+  return {
+    version: held.version,
+    committed: { observedAt: held.committed[0], runId: held.committed[1] },
+  };
+}
+
+function planHeadOf(head: Head): PlanHead {
+  return {
+    generation: head.generation,
+    primaryKey: head.primaryKey,
+    profile: head.profile,
+    complete: head.complete,
+  };
+}
+
+class FrozenWriter {
+// Verbatim: fde650c3601a79d6a07a97c0dd39d2f1f3182de4 packages/core/src/stream-sync/writer.ts:1821
+  private async resend(host: HostEntry, name: string): Promise<boolean> {
+    const runId = host.entry.runId;
+    const outbox = host.entry.streams[name]!;
+    const request = JSON.parse(
+      decoder.decode((await this.options.home.files.read(outbox.requestRef!))!),
+    ) as SignedRegistryPost;
+    const cipher = await this.options.home.files.read(outbox.headCipherRef!);
+    const head = parseHeadKey(request);
+    if (cipher) await this.options.blobs.put(head, cipher);
+    const result = await this.options.registry.post(request);
+    this.fault("after_post_reply", runId, name);
+    if (result.kind === "committed") {
+      const stream = host.streams[name]!;
+      await this.committed(
+        host,
+        name,
+        outbox.generation!,
+        outbox.complete!,
+        "committed",
+        Number(request.expectedVersion),
+        request.dataHash,
+        stream.planned ?? {
+          // A request persisted before plan steps were recorded.
+          kind: "publish",
+          head: {
+            generation: outbox.generation!,
+            primaryKey: stream.primaryKey,
+            profile: stream.profile,
+            complete: outbox.complete!,
+          },
+          replacesBase: false,
+          floor: stream.profile.version,
+        },
+      );
+      return true;
+    }
+    this.setStream(host, name, { state: "planned" });
+    await this.writeEntry(host);
+    return false;
+  }
+
+// Verbatim: fde650c3601a79d6a07a97c0dd39d2f1f3182de4 packages/core/src/stream-sync/writer.ts:1863
+  private async planAndPost(host: HostEntry, name: string): Promise<boolean> {
+    const { entry } = host;
+    const runId = entry.runId;
+    const ns = entry.ns!;
+    const stream = host.streams[name]!;
+    const target = await this.admit(host, "first");
+    if (target !== host.target) {
+      throw new PendingStream(
+        "registry_inconsistent",
+        `admitted at ${target}, run is bound to ${host.target}`,
+      );
+    }
+    const scope = streamScope(entry.connector, ns, name);
+    const { keyCheck } = await this.keys();
+
+    const row = await this.options.registry.read(scope);
+    const rowKind = classifyStreamRow(row, this.control!);
+    // The delete predicate a reader shares (runDeletedSince): a stream row
+    // tombstoned after this run was collected discards it. A row already a
+    // tombstone at collection predates the run, so a reconnect keeps it.
+    if (
+      runDeletedSince(
+        {
+          control: { kind: "unknown" },
+          streamTombstoned: stream.rowAtStart?.tombstoned,
+        },
+        { stream: row, hashes: this.control! },
+      )
+    ) {
+      throw new Discard(
+        {
+          kind: "discard",
+          recollect: false,
+          clearCheckpoints: false,
+          restartFull: false,
+        },
+        "stream row tombstoned after this run was collected",
+      );
+    }
+    let head: Head | null = null;
+    if (rowKind === "present" && row.found) {
+      head = await this.loadHead(scope, row.dataHash, {
+        connector: entry.connector,
+        ns,
+        stream: name,
+        keyCheck,
+      });
+    }
+    const choice = chooseBase(rowKind, head, target);
+    if (choice.kind === "stale_generation") {
+      // F1: the stream holds a newer generation than this run's target.
+      try {
+        await this.admit(host, "stale_base");
+      } catch (error) {
+        if (error instanceof Discard) {
+          throw new Discard(error.decision, `stale_generation: ${error.why}`);
+        }
+        if (error instanceof PendingStream) {
+          throw new PendingStream(
+            error.problem,
+            `stale_generation: ${error.message}`,
+          );
+        }
+        throw error;
+      }
+      throw new PendingStream(
+        "registry_inconsistent",
+        "stale_generation: control still admits the target",
+      );
+    }
+    // The publish plan decides this step (publish-plan.ts); this method only
+    // executes it: the parts, the head upload and the POST.
+    const decision = planStreamStep(
+      {
+        head: head && planHeadOf(head),
+        floor: floorOf(await this.readState(), entry.connector, ns, name),
+      },
+      this.planRun(host, name, await this.readState(), true),
+    );
+    if (decision.kind === "refused") {
+      throw new PendingStream(
+        decision.reason,
+        decision.reason === "out_of_order"
+          ? "a newer run already committed on this stream"
+          : `base primary key ${JSON.stringify(head?.primaryKey ?? [])} needs a newer connector`,
+      );
+    }
+    if (decision.kind === "deferred") {
+      throw new PendingStream(
+        "registry_inconsistent",
+        `publish plan deferred the stream: ${decision.reason}`,
+      );
+    }
+    const base =
+      choice.kind === "base" &&
+      (decision.kind === "noop" || !decision.replacesBase)
+        ? choice.head
+        : null;
+    if (stream.seedApplies) await this.spoolSeed(host, name);
+    const next = decision.head;
+    const complete = next.complete;
+
+    const built = await this.buildParts(host, name, scope, target, base);
+    // A step whose parts, completeness, key and profile all equal the base's
+    // changes nothing a reader sees: record a no-op of the same head.
+    if (
+      isNoop(base, built.parts, complete, {
+        primaryKey: next.primaryKey,
+        profile: next.profile,
+      })
+    ) {
+      if (!row.found) throw new Error("no-op requires a registered base");
+      await this.committed(
+        host,
+        name,
+        target,
+        complete,
+        "noop",
+        row.version,
+        row.dataHash,
+        {
+          kind: "noop",
+          head: planHeadOf(base!),
+          replacesBase: false,
+          floor: decision.floor,
+        },
+      );
+      return true;
+    }
+    const step: ExecutedStep & { floor: string } = {
+      kind: "publish",
+      head: next,
+      replacesBase: decision.kind === "publish" && decision.replacesBase,
+      floor: decision.floor,
+    };
+    const clear = encodeHead({
+      complete,
+      connector: entry.connector,
+      format: 1,
+      generation: target,
+      keyCheck,
+      ns,
+      observedAt: entry.observedAt,
+      parts: built.parts,
+      primaryKey: next.primaryKey,
+      profile: next.profile,
+      recordCount: built.parts.reduce((n, p) => n + p.count, 0),
+      stream: name,
+    });
+    const digest = await digestHead(this.hashes.keccak256, clear);
+    const cipher = await this.options.keys.encrypt(scope, clear);
+    await this.options.blobs.put(`${scope}/${digest.blobName}`, cipher);
+    this.fault("after_head_upload", runId, name);
+
+    const version = row.found ? row.version + 1 : 1;
+    const request = await this.sign(
+      scope,
+      digest.dataHash,
+      publicationMetadataHash(
+        scope,
+        new Date(entry.observedAt).toISOString(),
+        clear.length,
+      ),
+      version,
+    );
+    const requestRef = `runs/${runId}/request-s${stream.index}.json`;
+    const headCipherRef = `runs/${runId}/head-s${stream.index}.bin`;
+    await this.options.home.files.write(headCipherRef, cipher);
+    await this.options.home.files.write(requestRef, json(request));
+    stream.planned = step;
+    this.setStream(host, name, {
+      state: "request_persisted",
+      requestRef,
+      headCipherRef,
+      generation: target,
+      complete,
+    });
+    await this.writeEntry(host);
+    this.fault("after_request_persisted", runId, name);
+
+    const result = await this.options.registry.post(request);
+    this.fault("after_post_reply", runId, name);
+    if (result.kind === "committed") {
+      await this.committed(
+        host,
+        name,
+        target,
+        complete,
+        "committed",
+        version,
+        request.dataHash,
+        step,
+      );
+      return true;
+    }
+    this.setStream(host, name, { state: "planned" });
+    await this.writeEntry(host);
+    return false;
+  }
+
+// Verbatim: fde650c3601a79d6a07a97c0dd39d2f1f3182de4 packages/core/src/stream-sync/writer.ts:2064
+  private planRun(
+    host: HostEntry,
+    name: string,
+    state: WriterState,
+    executing = false,
+  ): PlanRun {
+    const { entry } = host;
+    const stream = host.streams[name]!;
+    const seed = this.options.seed;
+    const seedOpen =
+      seed !== undefined &&
+      entry.ns !== null &&
+      host.target === null &&
+      state.seedTargets[entry.connector] === entry.ns &&
+      state.receipts[
+        `${seed.installId}|${entry.connector}|${entry.ns}|${name}`
+      ] === undefined;
+    const outbox = entry.streams[name];
+    const executed: ExecutedStep | undefined =
+      stream.executed ??
+      ((outbox?.state === "committed" || outbox?.state === "noop") &&
+      outbox.generation !== undefined
+        ? {
+            // An entry from before plan steps were recorded.
+            kind: outbox.state === "noop" ? "noop" : "publish",
+            head: {
+              generation: outbox.generation,
+              primaryKey: stream.primaryKey,
+              profile: stream.profile,
+              complete: outbox.complete ?? false,
+            },
+            replacesBase: false,
+          }
+        : undefined);
+    return {
+      runId: entry.runId,
+      observedAt: entry.observedAt,
+      generation: host.target ?? host.generation ?? null,
+      primaryKey: stream.primaryKey,
+      profile: stream.profile,
+      full: entry.full || stream.fullStream,
+      foreignCheckpoint:
+        host.checkpointUsed !== null && host.checkpointUsed.ns !== entry.ns,
+      empty: (stream.shardBytes ?? []).every((bytes) => bytes === 0),
+      seed: stream.seedApplies ? "merged" : seedOpen ? "unresolved" : "none",
+      ...(executed ? { executed } : {}),
+      // Selected by a running pass, or signed and persisted: either way the
+      // registry's answer is not recorded yet.
+      ...(!executed &&
+      (outbox?.state === "request_persisted" ||
+        // The executing pass plans its own step: it is not its own barrier.
+        (!executing && this.selected.has(`${entry.runId}|${name}`)))
+        ? { inFlight: true }
+        : {}),
+    };
+  }
+
+// Verbatim: fde650c3601a79d6a07a97c0dd39d2f1f3182de4 packages/core/src/stream-sync/writer.ts:2606
+  private async loadHead(
+    scope: string,
+    dataHash: string,
+    expected: {
+      connector: string;
+      ns: string;
+      stream: string;
+      keyCheck: string;
+    },
+  ): Promise<Head> {
+    const name = `h-${dataHash.toLowerCase().replace(/^0x/, "")}`;
+    const cipher = await this.options.blobs.get(`${scope}/${name}`);
+    if (!cipher)
+      throw new PendingStream("base_unreadable", `head ${name} is missing`);
+    let clear: Uint8Array;
+    try {
+      clear = await this.options.keys.decrypt(scope, cipher);
+    } catch {
+      throw new PendingStream("key_mismatch", `head ${name} does not decrypt`);
+    }
+    const verified = await verifyHead(this.hashes.keccak256, clear, {
+      dataHash,
+      ...expected,
+    });
+    switch (verified.kind) {
+      case "ok":
+        return verified.head;
+      case "key_mismatch":
+        throw new PendingStream(
+          "key_mismatch",
+          `head ${name} has another keyCheck`,
+        );
+      case "unsupported_format":
+        throw new PendingStream(
+          "unsupported_format",
+          `head ${name} format ${String(verified.format)}`,
+        );
+      default:
+        throw new PendingStream(
+          "base_unreadable",
+          `head ${name}: ${verified.kind}`,
+        );
+    }
+  }
+
+}

@@ -25,6 +25,7 @@ export function createWriterOverlaySource(
   writer: StreamSyncWriter,
 ): StreamSyncOverlaySnapshotSource {
   return {
+    observeDeletes: (observations) => writer.observeDeletes(observations),
     snapshot: (connector) => writer.snapshotOverlay(connector),
     acknowledge: (coverage) => writer.acknowledgeOverlay(coverage),
   };
