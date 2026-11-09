@@ -1,7 +1,8 @@
 /**
  * `DELETE /v1/owner/connectors/:connectorId` on the mounted app: owner only,
  * refused on an unswitched account, answered 202 only through the writer's
- * durable intent, and refused per scope once the account has switched.
+ * durable intent, and decided by the account storage mode port (unknown: 503).
+ * The per-scope delete refusal is not here; the storage-mode change owns it.
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -10,7 +11,10 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import type { ConnectionDeletePort } from "@opendatalabs/personal-server-ts-core/api";
+import type {
+  ConnectionDeletePort,
+  StorageModeRead,
+} from "@opendatalabs/personal-server-ts-core/api";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createApp } from "../app.js";
 import { initializeDatabase } from "../storage/index-schema.js";
@@ -47,6 +51,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
   function makeApp(opts: {
     switched: boolean;
     connectionDelete?: ConnectionDeletePort | null;
+    mode?: StorageModeRead;
   }) {
     return createApp({
       logger: pino({ level: "silent" }),
@@ -67,6 +72,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
       }),
       streamSyncConnectionDelete:
         opts.connectionDelete === undefined ? writer : opts.connectionDelete,
+      accountStorageMode: opts.mode,
     });
   }
 
@@ -125,36 +131,33 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
     expect(calls).toEqual([]);
   });
 
-  describe("per-scope delete", () => {
-    it("is refused on a switched account, naming the connector route (mutant: PER_SCOPE_DELETE_ON_SWITCHED)", async () => {
-      const response = await del(
-        makeApp({ switched: true }),
-        "/v1/data/github.events",
-      );
-      expect(response.status).toBe(409);
-      const body = await response.json();
-      expect(body.error).toBe("USE_CONNECTOR_DELETE");
-      expect(body.message).toContain("/v1/owner/connectors/:connectorId");
-    });
+  it("takes the mode from the port, not from the config (mutant: CONNECTOR_ROUTE_READS_CONFIG)", async () => {
+    // The config says unswitched; the port says switched.
+    const response = await del(
+      makeApp({ switched: false, mode: { read: () => "switched" } }),
+      "/v1/owner/connectors/github",
+    );
+    expect(response.status).toBe(202);
+    expect(calls).toEqual(["github"]);
+  });
 
-    it("says nothing of the switch to anyone but the owner (mutant: SCOPE_409_BEFORE_AUTH)", async () => {
-      const response = await del(
-        makeApp({ switched: true }),
-        "/v1/data/github.events",
-        {},
-      );
-      expect(response.status).toBeGreaterThanOrEqual(401);
-      expect(response.status).toBeLessThan(404);
-    });
+  it("answers 503 and deletes nothing while the mode is unknown (mutant: UNKNOWN_MODE_NOT_SWITCHED)", async () => {
+    const response = await del(
+      makeApp({ switched: true, mode: { read: () => "unknown" } }),
+      "/v1/owner/connectors/github",
+    );
+    expect(response.status).toBe(503);
+    expect((await response.json()).error).toBe("ACCOUNT_MODE_UNKNOWN");
+    expect(calls).toEqual([]);
+  });
 
-    it("is not refused by the switch on an unswitched account", async () => {
-      const response = await del(
-        makeApp({ switched: false }),
-        "/v1/data/github.events",
-      );
-      expect((await response.json().catch(() => ({}))).error).not.toBe(
-        "USE_CONNECTOR_DELETE",
-      );
-    });
+  it("asks the unknown mode only of the owner (mutant: MODE_BEFORE_AUTH)", async () => {
+    const response = await del(
+      makeApp({ switched: true, mode: { read: () => "unknown" } }),
+      "/v1/owner/connectors/github",
+      {},
+    );
+    expect(response.status).toBeGreaterThanOrEqual(401);
+    expect(response.status).toBeLessThan(404);
   });
 });

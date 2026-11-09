@@ -137,3 +137,16 @@ it("the owner delete also fences a declared stream with no registry row (mutant:
     lastDeleteVersion: 1,
   });
 });
+
+it("a delete that lists nothing clears the saved cursor, so the next import starts over (mutant: NOTHING_LISTED_KEEPS_STATE)", async () => {
+  const r = await publishedBase();
+  expect((await r.writer.runPlan(CONNECTOR)).checkpoint).not.toBeNull();
+  // The registry now lists nothing of the connector (another device deleted it
+  // and the rows are gone), while this device still holds its cursor.
+  r.gateway.listControlRows = async () => [];
+  r.gateway.listStreamRows = async () => [];
+  const answered = await r.writer.requestConnectionDelete(CONNECTOR);
+  expect(answered.deleteId).toEqual(expect.any(String));
+  expect((await r.writer.runPlan(CONNECTOR)).checkpoint).toBeNull();
+  expect((await persistedState(r)).deletes ?? {}).toEqual({});
+});

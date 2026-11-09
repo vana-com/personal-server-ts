@@ -28,9 +28,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
   handleOwnerConnectorDelete,
-  refuseScopeDelete,
   type ConnectionDeletePort,
-  type LegacyWriteSwitch,
+  type StorageModeRead,
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
@@ -154,8 +153,11 @@ export interface PsLiteRuntimeOptions {
    * /v1/owner/connectors/:id` answers 503, as the Node server does unwired.
    */
   streamSyncConnectionDelete?: ConnectionDeletePort | null;
-  /** The account's stream-sync switch. Absent = not switched. */
-  legacyWritesSwitched?: LegacyWriteSwitch;
+  /**
+   * The account's storage mode (`AccountStorageMode`). Absent = unswitched, so
+   * the connector delete answers NOT_SWITCHED.
+   */
+  accountStorageMode?: StorageModeRead;
   storage: PsLiteStorageAdapter | DataStoragePort;
   auth?: PsLiteAuthAdapter;
   active?: boolean;
@@ -1227,7 +1229,7 @@ export function createPsLiteRuntime(
           }
           return handleOwnerConnectorDelete(request, connectorId, {
             authorizeOwner: (req) => auth.authorizeOwner(req),
-            switched: options.legacyWritesSwitched ?? (() => false),
+            mode: options.accountStorageMode ?? { read: () => "unswitched" },
             connectionDelete: options.streamSyncConnectionDelete,
           });
         }
@@ -1304,19 +1306,6 @@ export function createPsLiteRuntime(
           url.pathname === dataPrefix ||
           url.pathname.startsWith(`${dataPrefix}/`)
         ) {
-          // A switched account deletes a source as a whole (owner connector
-          // route), never one of its scopes.
-          if (
-            request.method === "DELETE" &&
-            /^\/v1\/data\/[^/]+$/.test(url.pathname)
-          ) {
-            const refusal = await refuseScopeDelete(
-              request,
-              options.legacyWritesSwitched,
-              (req) => auth.authorizeOwner(req),
-            );
-            if (refusal) return refusal;
-          }
           const x402 = resolveX402Settings(options.config, boundGatewayConfig);
           return handlePersonalServerDataRequest(
             request,

@@ -4,9 +4,12 @@
  * and the Lite runtime both answer through this handler, so the two cannot
  * disagree about what the route refuses.
  *
- * The switch is the one the legacy write gate reads (`LegacyWriteSwitch`).
- * An unswitched account keeps the per-scope loop, so this route refuses it
- * with `NOT_SWITCHED` and changes nothing.
+ * The account's storage mode is read once per request from one port
+ * (`StorageModeRead`, the read shape of `AccountStorageMode`). An unswitched
+ * account keeps the per-scope loop, so this route refuses it with
+ * `NOT_SWITCHED` and changes nothing; a mode that cannot be read answers a
+ * retryable 503, never a guess. The per-scope DELETE refusal is not here: the
+ * storage-mode change owns it, after owner authorization.
  *
  * Answers:
  *   202 { deleteId }            the delete intent is durable; the landing runs
@@ -16,11 +19,19 @@
  *                               and the delete is already done
  *   400 INVALID_CONNECTOR       the id is not a connector key
  *   409 NOT_SWITCHED            the account has not moved to stream sync
+ *   503 ACCOUNT_MODE_UNKNOWN    the storage mode cannot be read yet; retry
  *   503 STREAM_SYNC_UNAVAILABLE no stream-sync writer is wired on this host
  */
 
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { LegacyWriteSwitch } from "./legacy-write-gate.js";
+
+/**
+ * What the route needs of the account's storage mode: the read shape of
+ * `AccountStorageMode`, so a host passes that one instance.
+ */
+export interface StorageModeRead {
+  read(requestOwner?: string): "switched" | "unswitched" | "unknown";
+}
 
 /** The writer's side of the route: persist the intent, then answer. */
 export interface ConnectionDeletePort {
@@ -32,8 +43,10 @@ export interface ConnectionDeletePort {
 export interface OwnerConnectorDeleteDeps {
   /** Throws the host's auth error for anyone but the owner. */
   authorizeOwner(request: Request): Promise<void>;
-  /** The account's switch, read at the moment of the request. */
-  switched: LegacyWriteSwitch;
+  /** The account's storage mode, read at the moment of the request. */
+  mode: StorageModeRead;
+  /** The owner this server answers for, passed to the mode read. */
+  owner?: string;
   /** Absent on a host that does not run stream sync. */
   connectionDelete: ConnectionDeletePort | null | undefined;
 }
@@ -70,7 +83,15 @@ export async function handleOwnerConnectorDelete(
       message: "connectorId is not a connector key",
     });
   }
-  if (!deps.switched()) {
+  const mode = deps.mode.read(deps.owner);
+  if (mode === "unknown") {
+    return json(503, {
+      error: "ACCOUNT_MODE_UNKNOWN",
+      message:
+        "This server cannot tell yet whether the account has moved to stream sync. Retry shortly.",
+    });
+  }
+  if (mode !== "switched") {
     return json(409, {
       error: "NOT_SWITCHED",
       message:
@@ -86,25 +107,4 @@ export async function handleOwnerConnectorDelete(
   const started =
     await deps.connectionDelete.requestConnectionDelete(connectorId);
   return json(202, { deleteId: started.deleteId });
-}
-
-/**
- * The refusal for a per-scope `DELETE` on a switched account. The source's
- * data is deleted per connector, so no part of a connection can be deleted
- * through a scope. Returns `null` when the delete may proceed. The caller is
- * authorized first: an unauthenticated caller learns nothing of the switch
- * (`authorizeOwner` throws the host's auth error).
- */
-export async function refuseScopeDelete(
-  request: Request,
-  switched: LegacyWriteSwitch | undefined,
-  authorizeOwner: (request: Request) => Promise<void>,
-): Promise<Response | null> {
-  if (!switched || !switched()) return null;
-  await authorizeOwner(request);
-  return json(409, {
-    error: "USE_CONNECTOR_DELETE",
-    message:
-      "This account has moved to stream sync. Delete a source with DELETE /v1/owner/connectors/:connectorId.",
-  });
 }

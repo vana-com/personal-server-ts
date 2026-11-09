@@ -1,7 +1,7 @@
 /**
  * `DELETE /v1/owner/connectors/:connectorId` on PS-Lite answers through the
  * same handler as the Node server. These tests pin the Lite side: the owner
- * check, the switch, the writer wiring, and the per-scope refusal.
+ * check, the switch, the writer wiring, and the unknown mode.
  */
 
 import { describe, expect, it } from "vitest";
@@ -17,6 +17,7 @@ const ownerAuth = { Authorization: "Bearer owner-token" };
 
 function runtimeWith(opts: {
   switched: boolean;
+  mode?: "switched" | "unswitched" | "unknown";
   connectionDelete?: {
     requestConnectionDelete: (c: string) => Promise<{ deleteId: string }>;
   } | null;
@@ -35,7 +36,9 @@ function runtimeWith(opts: {
       builderToken: "builder-token",
     }),
     active: true,
-    legacyWritesSwitched: () => opts.switched,
+    accountStorageMode: {
+      read: () => opts.mode ?? (opts.switched ? "switched" : "unswitched"),
+    },
     streamSyncConnectionDelete:
       opts.connectionDelete === undefined
         ? {
@@ -92,23 +95,13 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
     expect((await response.json()).error).toBe("STREAM_SYNC_UNAVAILABLE");
   });
 
-  it("refuses a per-scope delete on a switched account", async () => {
+  it("answers 503 while the mode is unknown (mutant: UNKNOWN_MODE_NOT_SWITCHED)", async () => {
     const response = await del(
-      runtimeWith({ switched: true }),
-      "/v1/data/github.events",
+      runtimeWith({ switched: true, mode: "unknown" }),
+      "/v1/owner/connectors/github",
     );
-    expect(response.status).toBe(409);
-    expect((await response.json()).error).toBe("USE_CONNECTOR_DELETE");
-  });
-
-  it("says nothing of the switch to anyone but the owner (mutant: SCOPE_409_BEFORE_AUTH)", async () => {
-    const response = await del(
-      runtimeWith({ switched: true }),
-      "/v1/data/github.events",
-      {},
-    );
-    expect(response.status).toBeGreaterThanOrEqual(401);
-    expect(response.status).toBeLessThanOrEqual(403);
+    expect(response.status).toBe(503);
+    expect((await response.json()).error).toBe("ACCOUNT_MODE_UNKNOWN");
   });
 
   it("answers 400, not 500, for a malformed percent-escape in the id (mutant: DECODE_THROWS_500)", async () => {
@@ -118,15 +111,5 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
     );
     expect(response.status).toBe(400);
     expect((await response.json()).error.errorCode).toBe("INVALID_CONNECTOR");
-  });
-
-  it("does not refuse a per-scope delete on an unswitched account", async () => {
-    const response = await del(
-      runtimeWith({ switched: false }),
-      "/v1/data/github.events",
-    );
-    expect((await response.json().catch(() => ({}))).error).not.toBe(
-      "USE_CONNECTOR_DELETE",
-    );
   });
 });

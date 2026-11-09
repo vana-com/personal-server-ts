@@ -8,7 +8,6 @@ import {
   type PersonalServerReadFulfillmentReporter,
   type StreamSyncReadPort,
   refuseLegacyWrite,
-  refuseScopeDelete,
   type LegacyWriteSwitch,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -404,16 +403,8 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   );
   // A stream-sync control scope (pdpp.<c>~<ns>) is owned by the connection
   // delete, not by a legacy data delete: refuse it before the scope grammar.
-  // On a switched account a source is deleted as a whole, through the owner
-  // connector route; no scope of it is deleted on its own.
-  app.delete("/:scope", async (c, next) => {
-    const refusal = await refuseScopeDelete(
-      c.req.raw,
-      deps.legacyWritesRefused,
-      (request) => auth.authorizeOwner(request),
-    );
-    if (refusal) return refusal;
-    return parseScope(c.req.param("scope"))?.kind === "control"
+  app.delete("/:scope", (c, next) =>
+    parseScope(c.req.param("scope"))?.kind === "control"
       ? c.json(
           {
             error: "STREAM_SYNC_CONTROL_SCOPE",
@@ -422,8 +413,8 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
           },
           409,
         )
-      : next();
-  });
+      : next(),
+  );
   app.all("*", (c) =>
     handlePersonalServerDataRequest(
       c.req.raw,

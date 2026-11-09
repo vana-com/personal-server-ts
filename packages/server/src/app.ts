@@ -28,7 +28,7 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type {
   ConnectionDeletePort,
-  LegacyWriteSwitch,
+  StorageModeRead,
   PersonalServerReadFulfillmentReporter,
   StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -169,6 +169,12 @@ export interface AppDeps {
   streamSyncIntake?: StreamSyncIntake;
   /** The stream-sync writer's connection delete (`DELETE /v1/owner/connectors/:id`). */
   streamSyncConnectionDelete?: ConnectionDeletePort | null;
+  /**
+   * The account's storage mode (`AccountStorageMode`). Absent: the mode is read
+   * from the config switch (`streamSync.write` and `refuseLegacyWrites`), as
+   * the legacy write gate reads it, and is never `unknown`.
+   */
+  accountStorageMode?: StorageModeRead;
   /**
    * False once the host is shutting down: stream-sync requests then answer
    * 503 before they start a file operation, so the home can close and drain.
@@ -334,11 +340,13 @@ function streamSyncClosing(): ProtocolError {
 
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
-  // The account's stream-sync switch: one reader for every route that depends
-  // on it. Its host sets `streamSync.write` from the Account setting.
-  const legacyWritesSwitched: LegacyWriteSwitch = () =>
-    deps.config?.streamSync.write === true &&
-    deps.config.streamSync.refuseLegacyWrites === true;
+  const storageMode: StorageModeRead = deps.accountStorageMode ?? {
+    read: () =>
+      deps.config?.streamSync.write === true &&
+      deps.config.streamSync.refuseLegacyWrites === true
+        ? "switched"
+        : "unswitched",
+  };
 
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
   // derivative question registration), and one replay guard for the proofs
@@ -564,7 +572,7 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       connectionDelete: deps.streamSyncConnectionDelete ?? null,
-      switched: legacyWritesSwitched,
+      mode: storageMode,
     }),
   );
 
@@ -634,7 +642,9 @@ export function createApp(deps: AppDeps): Hono {
       // The account's stream-sync switch as this server holds it: its host
       // sets `streamSync.write` from the Account setting before launch.
       // Enforcement is its own flag and ships off.
-      legacyWritesRefused: legacyWritesSwitched,
+      legacyWritesRefused: () =>
+        deps.config?.streamSync.write === true &&
+        deps.config.streamSync.refuseLegacyWrites === true,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,

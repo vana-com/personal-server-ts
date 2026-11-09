@@ -2224,9 +2224,9 @@ export {
 
 export {
   handleOwnerConnectorDelete,
-  refuseScopeDelete,
   type ConnectionDeletePort,
   type OwnerConnectorDeleteDeps,
+  type StorageModeRead,
 } from "./owner-connector-delete.js";
 
 /**

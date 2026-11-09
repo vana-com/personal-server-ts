@@ -11,7 +11,7 @@ import { Hono } from "hono";
 import {
   handleOwnerConnectorDelete,
   type ConnectionDeletePort,
-  type LegacyWriteSwitch,
+  type StorageModeRead,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { TokenStore } from "../token-store.js";
@@ -26,8 +26,8 @@ export interface OwnerConnectorsRouteDeps {
   tokenStore?: TokenStore;
   /** The stream-sync writer. Absent = the route answers 503. */
   connectionDelete?: ConnectionDeletePort | null;
-  /** The account's stream-sync switch, the one the legacy write gate reads. */
-  switched: LegacyWriteSwitch;
+  /** The account's storage mode: one port for every route that depends on it. */
+  mode: StorageModeRead;
 }
 
 export function ownerConnectorsRoutes(deps: OwnerConnectorsRouteDeps): Hono {
@@ -44,7 +44,8 @@ export function ownerConnectorsRoutes(deps: OwnerConnectorsRouteDeps): Hono {
   app.delete("/:connectorId", (c) =>
     handleOwnerConnectorDelete(c.req.raw, c.req.param("connectorId"), {
       authorizeOwner: (request) => auth.authorizeOwner(request),
-      switched: deps.switched,
+      mode: deps.mode,
+      owner: deps.serverOwner,
       connectionDelete: deps.connectionDelete,
     }),
   );
