@@ -123,14 +123,14 @@ const MUTANTS = [
   [
     "LITE_OURA_MODE_DROPPED",
     LITE,
-    "            accountStorageMode: options.accountStorageMode,\n            serverOwner: options.serverOwner,\n          });",
-    "          });",
+    "            storage: toDataStoragePort(options.storage),\n            accountStorageMode: options.accountStorageMode,\n            serverOwner: options.serverOwner,\n          });",
+    "            storage: toDataStoragePort(options.storage),\n          });",
   ],
   [
     "LITE_OURA_OWNER_DROPPED",
     LITE,
-    "            accountStorageMode: options.accountStorageMode,\n            serverOwner: options.serverOwner,\n          });",
-    "            accountStorageMode: options.accountStorageMode,\n          });",
+    "            storage: toDataStoragePort(options.storage),\n            accountStorageMode: options.accountStorageMode,\n            serverOwner: options.serverOwner,\n          });",
+    "            storage: toDataStoragePort(options.storage),\n            accountStorageMode: options.accountStorageMode,\n          });",
   ],
   [
     "LITE_OURA_POST_UNKNOWN",
