@@ -108,6 +108,16 @@ export class Fixture {
     );
   }
 
+  /**
+   * Delete a stream: its registry row becomes a tombstone (`deletedAt` set) at
+   * the next version. Returns that version.
+   */
+  tombstoneStream(scope: string): number {
+    const previous = this.rows.get(scope);
+    if (!previous) throw new Error(`no stream row for ${scope}`);
+    return this.row(scope, previous.dataHash, previous.metadataHash, true);
+  }
+
   async publish(input: {
     connector: string;
     ns: string;

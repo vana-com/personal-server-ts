@@ -31,6 +31,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   ConnectionStoppedError,
+  ImportPendingError,
   RunGoneError,
   type StreamSyncWriter,
 } from "./writer.js";
@@ -398,6 +399,10 @@ export class StreamSyncIntake implements RunIntake {
         if (error instanceof RunGoneError) throw new RunIntakeError("gone");
         if (error instanceof ConnectionStoppedError) {
           throw new RunIntakeError("connection_stopped");
+        }
+        if (error instanceof ImportPendingError) {
+          // Retryable: the producer begins again once the import finished.
+          throw new RunIntakeError("connection_busy", "import_pending");
         }
         throw error;
       }

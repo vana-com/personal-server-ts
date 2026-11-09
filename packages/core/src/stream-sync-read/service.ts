@@ -18,6 +18,7 @@ import {
   classifyStreamRow,
   controlHashes,
   eligible,
+  IDENTITYLESS_NS,
   isHeadLive,
   selectConnection,
   streamScope,
@@ -206,6 +207,19 @@ export type ReadDecision =
       readonly withheld?: readonly WithheldRun[];
       readonly body: ReadableStream<Uint8Array>;
     };
+
+/** See `StreamSyncReadService.retireBasis`. */
+export interface RetireBasis {
+  readonly covered: boolean;
+  readonly ambiguous: boolean;
+  readonly throughMs: number;
+  readonly streams: readonly {
+    readonly connector: string;
+    readonly stream: string;
+    /** Version of the stream's last delete; 0 = never deleted. */
+    readonly deleteVersion: number;
+  }[];
+}
 
 export interface StreamSyncConnectionStatus {
   readonly connector: string;
@@ -695,6 +709,121 @@ export class StreamSyncReadService {
       unpublished: all.unpublished,
       awaiting: all.awaiting,
     };
+  }
+
+  /**
+   * What a legacy delete asks about `scope`, from the PUBLISHED side only
+   * (imported heads; this device's spool and overlay never count).
+   * `null` when the mirror does not hold a whole listing or the scope has no
+   * read target. `covered` is false while any target stream lacks a live,
+   * complete head in the one active connection of its connector (more than
+   * one active connection is `ambiguous`). `throughMs` is the oldest
+   * `observedAt` of the heads used: a legacy row collected after it may hold
+   * data the views lack. `streams` lists every target stream with the
+   * version of its last delete (0 = never deleted), read from the mirror's
+   * deletion floor.
+   */
+  retireBasis(scope: string): RetireBasis | null {
+    const targets = readTargets(scope);
+    if (targets.length === 0 || this.mirror.needsFullListing()) return null;
+    const streams: RetireBasis["streams"][number][] = [];
+    for (const target of targets) {
+      for (const stream of target.streams) {
+        streams.push({
+          connector: target.connector,
+          stream,
+          deleteVersion: this.lastDeleteVersion(target.connector, stream),
+        });
+      }
+    }
+    let throughMs = Infinity;
+    let covered = true;
+    let ambiguous = false;
+    for (const target of targets) {
+      const connections = this.connectionViews(target.connector);
+      if (connections.filter((c) => c.control.kind === "active").length > 1) {
+        ambiguous = true;
+        covered = false;
+        break;
+      }
+      const eligibility = eligible({
+        connections,
+        target: { kind: "logical", streams: target.streams },
+        legacyFile: true,
+      });
+      if (eligibility.kind !== "view") {
+        covered = false;
+        continue;
+      }
+      for (const stream of target.streams) {
+        const imported = this.importer.servableView({
+          connector: target.connector,
+          ns: eligibility.ns,
+          stream,
+        });
+        if (!imported) {
+          covered = false;
+          continue;
+        }
+        throughMs = Math.min(throughMs, imported.head.observedAt);
+      }
+    }
+    return {
+      covered: covered && Number.isFinite(throughMs),
+      ambiguous,
+      throughMs: Number.isFinite(throughMs) ? throughMs : 0,
+      streams,
+    };
+  }
+
+  /** The highest delete version the mirror holds for a stream, in any namespace. */
+  private lastDeleteVersion(connector: string, stream: string): number {
+    const rows = this.mirror.rowsFor(connector);
+    const namespaces = new Set([
+      IDENTITYLESS_NS,
+      ...rows.controls.keys(),
+      ...rows.streams.keys(),
+    ]);
+    let floor = 0;
+    for (const ns of namespaces) {
+      floor = Math.max(
+        floor,
+        this.mirror.deletionFloor(streamScope(connector, ns, stream)),
+      );
+    }
+    return floor;
+  }
+
+  /**
+   * The legacy body the PUBLISHED view of `scope` serves, as a grant would
+   * read it: imported heads only, never an unpublished local run. `null` when
+   * no complete view serves it or the read fails. A readback compares a local
+   * legacy file with this body.
+   */
+  async publishedBody(scope: string): Promise<unknown | null> {
+    try {
+      const decision = await this.resolve({
+        scope,
+        connection: null,
+        cursor: null,
+        legacyFile: true,
+        isOwnerView: false,
+      });
+      if (decision.kind !== "view") return null;
+      const parsed = JSON.parse(await new Response(decision.body).text()) as {
+        data?: unknown;
+      };
+      return parsed.data ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Changes whenever an imported view of one of the scope's streams changes. */
+  viewRevision(scope: string): string {
+    return readTargets(scope)
+      .flatMap((t) => t.streams.map((s) => this.views.revision(t.connector, s)))
+      .join(",");
   }
 
   /** §2.10 inputs for connector c: every connection this server knows. */

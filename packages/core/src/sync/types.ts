@@ -28,6 +28,17 @@ export interface SyncStatus {
    * empty when nothing is owed.
    */
   uploads?: UploadStateSnapshot;
+  /**
+   * The last legacy retire pass, counts only (no scope, no file name):
+   * `ready` files passed import and readback; `deleted` is non-zero only when
+   * the delete switch is on.
+   */
+  legacyRetire?: {
+    mode: "delete" | "dry-run" | "readback-only";
+    files: number;
+    ready: number;
+    deleted: number;
+  };
 }
 
 export interface SyncBlockedReason {
