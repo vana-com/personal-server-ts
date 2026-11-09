@@ -27,6 +27,8 @@ const TIMEOUT_MS = 240_000;
 const SW = "switched listing and history > ";
 const BR = "readableScopes against the body read > ";
 const WB = "readableScopes work is bounded by the grant > ";
+const BUILD = "readableScopes against what a body read can build > ";
+const SURV = "readableScopes survives one connector's local failure > ";
 
 // [name, file, from, to, aimed test full name]
 const MUTANTS = [
@@ -47,6 +49,9 @@ const MUTANTS = [
   ["RESOLVE_BEFORE_GRANT_AND_PAGE", SVC, "      if (input.isCovered && !input.isCovered(scope)) continue;\n      let newest: number | null;\n      try {\n        const found = await this.readable(scope, input.isOwnerView);\n        if (!found) continue;", "      let newest: number | null;\n      try {\n        const found = await this.readable(scope, input.isOwnerView);\n        if (!found) continue;\n        if (input.isCovered && !input.isCovered(scope)) continue;", `${WB}checks only the covered scope among 1000 candidates`],
   ["ABORT_LIST_ON_ONE_FAILURE", SVC, "      } catch (error) {\n        this.skipped(scope, error);\n        continue;\n      }", "      } catch (error) {\n        throw error;\n      }", `${WB}skips a covered broken scope, logs it, and still lists the others`],
   ["BODY_BUILT_FOR_LISTING", SVC, "        const found = await this.readable(scope, input.isOwnerView);", "        const decision = await this.resolve({ scope, connection: null, cursor: null, legacyFile: false, isOwnerView: input.isOwnerView });\n        if (\"body\" in decision) await decision.body.cancel();\n        const found = await this.readable(scope, input.isOwnerView);", `${BR}builds no view or body while deciding`],
+  ["PROJECTABLE_KEY_OMITS_CONTROL", SVC, "      this.mirror.revision(),\n      targets.map((t) => [", "      0,\n      targets.map((t) => [", `${BUILD}a control change that imports nothing changes the listing`],
+  ["PROJECTOR_REFUSAL_NOT_CACHED", SVC, "    this.projectability.set(key, ok);", "    if (ok) this.projectability.set(key, ok);", `${BUILD}a projector refusal is built once across listings with no version change`],
+  ["OVERLAY_CONNECTORS_DROP_ALL", SVC, 'this.skipped("overlay connectors", error);', 'this.skipped("overlay connectors", error);\n        this.overlayConnectorsLastGood = [];', `${SURV}keeps the last good overlay connector set when connectors() fails`],
 ];
 
 // Harness mutants: the failure is an import error. The runner must call them

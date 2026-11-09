@@ -99,6 +99,8 @@ function replaces(next: MirrorRow, current: MirrorRow | undefined): boolean {
 
 export class RegistryMirror {
   private pending: Promise<void> = Promise.resolve();
+  /** Bumped on every persisted change to rows or deletion floors. */
+  private changes = 0;
 
   private constructor(
     private readonly files: StreamSyncReadFiles,
@@ -160,6 +162,7 @@ export class RegistryMirror {
       floors.set(scope, version);
       await this.persist(this.rows, floors, this.listed);
       this.floors = floors;
+      this.changes++;
     });
     this.pending = pass.catch(() => undefined);
     await pass;
@@ -176,6 +179,14 @@ export class RegistryMirror {
         ? [{ connector: parsed.connector, stream: parsed.stream, version }]
         : [];
     });
+  }
+
+  /**
+   * Changes every time a control or stream row, or a deletion floor, is
+   * persisted. Derived decisions that read the mirror key on it.
+   */
+  revision(): number {
+    return this.changes;
   }
 
   /** True until one listing from the start of the registry has completed. */
@@ -248,6 +259,7 @@ export class RegistryMirror {
     const listed = this.listed || nowListed;
     if (changed.size > 0 || nowListed) {
       await this.persist(nextRows, nextFloors, listed);
+      this.changes++;
     }
     this.rows = nextRows;
     this.floors = nextFloors;

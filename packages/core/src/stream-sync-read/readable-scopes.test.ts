@@ -252,6 +252,30 @@ describe("readableScopes survives one connector's local failure", () => {
       listed(service, true, { isCovered: (s) => s === "pdpp.bee.items" }),
     ).resolves.toEqual([]);
   });
+  // OVERLAY_CONNECTORS_DROP_ALL
+  it("keeps the last good overlay connector set when connectors() fails", async () => {
+    const warn = vi.fn();
+    const f = new Fixture(await testOwnerKey(masterKey(70)));
+    const ns = await f.key.ns("acme", "account-1");
+    f.overlay.runs = [overlayRun(ns, ["items"])];
+    const service = await f.service({
+      logger: { info() {}, warn, error() {} },
+    });
+    await f.sync(service);
+    const real = f.overlay.connectors.bind(f.overlay);
+    let down = false;
+    f.overlay.connectors = async () => {
+      if (down) throw new Error("overlay index unavailable");
+      return real();
+    };
+    expect(await listed(service, true)).toEqual(["pdpp.acme.items"]);
+    down = true;
+    expect(await listed(service, true)).toEqual(["pdpp.acme.items"]);
+    const skips = warn.mock.calls.filter((c) =>
+      JSON.stringify(c).includes("overlay connectors"),
+    );
+    expect(skips).toHaveLength(1);
+  });
 });
 
 describe("readableScopes against what a body read can build", () => {
@@ -358,5 +382,90 @@ describe("readableScopes against what a body read can build", () => {
     const names = await listed(service, true);
     expect(names).not.toContain("strava.activities");
     expect(names).toContain("pdpp.strava-browser.activities");
+  });
+
+  // PROJECTABLE_KEY_OMITS_CONTROL
+  it("a control change that imports nothing changes the listing", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(71)));
+    const small = await f.key.ns("linkedin", "account-1");
+    const big = await f.key.ns("linkedin", "account-2");
+    await f.activate("linkedin", small);
+    await f.activate("linkedin", big);
+    await f.publish({
+      connector: "linkedin",
+      ns: small,
+      stream: "skills",
+      generation: 1,
+      records: [{ id: "s", name: "x", endorsement_count: 1 }],
+      observedAt: T - 1000,
+    });
+    // Published last, so this namespace's head is the newest and serves.
+    await f.publish({
+      connector: "linkedin",
+      ns: big,
+      stream: "skills",
+      generation: 1,
+      records: Array.from({ length: 60 }, (_, i) => ({
+        id: `s${i}`,
+        name: `a skill with a fairly long name number ${i}`,
+        endorsement_count: i,
+      })),
+      observedAt: T - 1000,
+    });
+    const service = await f.service({ arrayProjectionBudgetBytes: 400 });
+    await f.sync(service);
+    const before = await readOk(service, "linkedin.skills", true);
+    expect(before).toBe(false);
+    expect((await listed(service, true)).includes("linkedin.skills")).toBe(
+      false,
+    );
+    // Deleting the serving namespace writes control only: nothing is imported.
+    await f.deleteConnection("linkedin", big);
+    await service.observe([...f.rows.values()], {
+      fromStart: true,
+      lastPage: true,
+    });
+    const after = await readOk(service, "linkedin.skills", true);
+    expect(after).toBe(true);
+    expect((await listed(service, true)).includes("linkedin.skills")).toBe(
+      true,
+    );
+  });
+
+  // PROJECTOR_REFUSAL_NOT_CACHED
+  it("a projector refusal is built once across listings with no version change", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(72)));
+    f.overlay.connector = "strava-browser";
+    const ns = await f.key.ns("strava-browser", "account-1");
+    await f.activate("strava-browser", ns);
+    await f.publish({
+      connector: "strava-browser",
+      ns,
+      stream: "activities",
+      generation: 1,
+      records: [{ id: "old" }],
+      observedAt: T - 1000,
+      profileKey: "unmapped",
+      profileVersion: "1.0.0",
+      complete: true,
+    });
+    const log = vi.fn();
+    const service = await f.service({
+      logger: { info: log, warn: log, error() {} },
+    });
+    await f.sync(service);
+    const resolve = vi.spyOn(service, "resolve");
+    const first = await listed(service, true);
+    const second = await listed(service, true);
+    expect(second).toEqual(first);
+    expect(first).not.toContain("strava.activities");
+    const builds = resolve.mock.calls.filter(
+      ([input]) => input.scope === "strava.activities",
+    );
+    expect(builds).toHaveLength(1);
+    const logged = log.mock.calls.filter((c) =>
+      JSON.stringify(c).includes("strava.activities"),
+    );
+    expect(logged).toHaveLength(1);
   });
 });

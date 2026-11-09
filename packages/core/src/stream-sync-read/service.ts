@@ -485,6 +485,8 @@ const BUSY_RETRY_AFTER_SECONDS = 1;
 export class StreamSyncReadService {
   private spoolCounter = 0;
   private readonly projectability = new Map<string, boolean>();
+  /** The overlay's connector set at the last listing that read it. */
+  private overlayConnectorsLastGood: readonly string[] = [];
 
   private constructor(
     private readonly options: StreamSyncReadOptions,
@@ -802,11 +804,13 @@ export class StreamSyncReadService {
     // overlay cannot be read is logged and skipped; the others are kept.
     if (input.isOwnerView && this.options.overlay) {
       try {
-        for (const connector of await this.options.overlay.connectors()) {
-          connectors.add(connector);
-        }
+        this.overlayConnectorsLastGood =
+          await this.options.overlay.connectors();
       } catch (error) {
         this.skipped("overlay connectors", error);
+      }
+      for (const connector of this.overlayConnectorsLastGood) {
+        connectors.add(connector);
       }
       for (const connector of connectors) {
         try {
@@ -872,6 +876,8 @@ export class StreamSyncReadService {
     const key = JSON.stringify([
       input.scope,
       input.isOwnerView,
+      // Control and stream rows the decision reads (connectionViews, eligibility).
+      this.mirror.revision(),
       targets.map((t) => [
         t.connector,
         t.streams.map((stream) => this.views.revision(t.connector, stream)),
@@ -885,9 +891,21 @@ export class StreamSyncReadService {
     ]);
     const known = this.projectability.get(key);
     if (known !== undefined) return known;
-    const decision = await this.resolve(input);
-    if ("body" in decision) await decision.body.cancel();
-    const ok = decision.kind === "view" || decision.kind === "local_pending";
+    let ok: boolean;
+    try {
+      const decision = await this.resolve(input);
+      if ("body" in decision) await decision.body.cancel();
+      ok = decision.kind === "view" || decision.kind === "local_pending";
+    } catch (error) {
+      // The projector refuses this alias at these versions. That outcome is
+      // the answer for the version, cached like `too_large`, logged once.
+      if (!(error instanceof ProjectionFailedError)) throw error;
+      this.options.logger.info(
+        { scope: input.scope, error: error.message },
+        "stream-sync read: the alias cannot be projected at these versions",
+      );
+      ok = false;
+    }
     if (this.projectability.size >= 1024) {
       this.projectability.delete(this.projectability.keys().next().value!);
     }
