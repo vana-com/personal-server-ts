@@ -297,7 +297,7 @@ const textDecoder = new TextDecoder();
 export async function* linesOfParts(
   sha256: Sha256,
   head: {
-    readonly format: 1 | 2;
+    readonly format: 1 | 2 | 3;
     readonly parts: readonly HeadPart[];
     readonly primaryKey: readonly string[];
   },

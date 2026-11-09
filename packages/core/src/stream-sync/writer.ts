@@ -68,7 +68,6 @@ import {
   pkHash,
   pkHashBits,
   planBuckets,
-  runDeletedSince,
   shardOf,
   startState,
   streamRunResult,
@@ -200,6 +199,8 @@ interface WriterState {
    * it. Every decision uses this, never a raw read.
    */
   observedControl?: Record<string, Record<string, ControlState>>;
+  /** Monotone delete observations, scoped by this home to one owner. */
+  lastDeletes?: Record<string, Record<string, number>>;
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
   receipts: Record<string, SeedReceipt>;
@@ -236,13 +237,6 @@ interface HostStream {
   fullStream: boolean;
   /** The seed is merged into this stream's publish. */
   seedApplies: boolean;
-  /**
-   * The stream row as the run declared the stream: whether it was already a
-   * tombstone. A publish that finds it tombstoned when it was not is a delete
-   * that came after collection, so the run discards. Absent on runs begun
-   * before this field existed, which skip the check.
-   */
-  rowAtStart?: { readonly tombstoned: boolean };
   problem: StreamSyncHostProblem | null;
   detail: string | null;
 }
@@ -290,6 +284,8 @@ interface HostEntry {
   overlayRevision?: string;
   /** Seed streams this run must hold receipts for before its checkpoint. */
   seedStreams: string[];
+  /** Snapshot at beginRun; streams learned later never consult the live cache. */
+  collectedAt?: Record<string, number>;
   /** M5: who the run writes for; checked again before it publishes. */
   binding?: { owner: string; keyCheck: string; leaseId: string | null };
 }
@@ -1013,6 +1009,7 @@ export class StreamSyncWriter {
         streams: {},
         outcome: null,
         seedStreams: [],
+        collectedAt: { ...state.lastDeletes?.[input.connector] },
         binding: {
           owner: this.options.ownerAddress,
           keyCheck,
@@ -1059,14 +1056,7 @@ export class StreamSyncWriter {
       host.streams[stream] = this.newStream(nextIndex(host), shape);
       // Every run publishes under the identity-less name (R23), so the scope
       // is known at collection even though `entry.ns` is set at finish.
-      const { control } = await this.keys();
-      const row = await this.options.registry.read(
-        streamScope(host.entry.connector, IDENTITYLESS_NS, stream),
-      );
-      host.streams[stream]!.rowAtStart = {
-        tombstoned:
-          row.found && classifyStreamRow(row, control) === "tombstoned",
-      };
+      await this.readStreamRow(host.entry.connector, IDENTITYLESS_NS, stream);
       host.entry = {
         ...host.entry,
         streams: { ...host.entry.streams, [stream]: { state: "planned" } },
@@ -1876,6 +1866,33 @@ export class StreamSyncWriter {
     return false;
   }
 
+  /** Observe delete history independently of whether this head can be a merge base. */
+  private async readStreamRow(connector: string, ns: string, stream: string) {
+    const { keyCheck, control } = await this.keys();
+    const scope = streamScope(connector, ns, stream);
+    const row = await this.options.registry.read(scope);
+    const rowKind = classifyStreamRow(row, control);
+    const head =
+      rowKind === "present" && row.found
+        ? await this.loadHead(scope, row.dataHash, {
+            connector,
+            ns,
+            stream,
+            keyCheck,
+          })
+        : null;
+    const lastDeleteVersion =
+      rowKind === "tombstoned" && row.found
+        ? row.version
+        : (head?.lastDeleteVersion ?? 0);
+    await this.withState((state) => {
+      const cache = (state.lastDeletes ??= {});
+      const streams = (cache[connector] ??= {});
+      streams[stream] = Math.max(streams[stream] ?? 0, lastDeleteVersion);
+    });
+    return { row, rowKind, head, lastDeleteVersion };
+  }
+
   /** §2.7 from "read control" to the POST. True when committed or no-op. */
   private async planAndPost(host: HostEntry, name: string): Promise<boolean> {
     const { entry } = host;
@@ -1892,38 +1909,21 @@ export class StreamSyncWriter {
     const scope = streamScope(entry.connector, ns, name);
     const { keyCheck } = await this.keys();
 
-    const row = await this.options.registry.read(scope);
-    const rowKind = classifyStreamRow(row, this.control!);
-    // The delete predicate a reader shares (runDeletedSince): a stream row
-    // tombstoned after this run was collected discards it. A row already a
-    // tombstone at collection predates the run, so a reconnect keeps it.
-    if (
-      runDeletedSince(
-        {
-          control: { kind: "unknown" },
-          streamTombstoned: stream.rowAtStart?.tombstoned,
-        },
-        { stream: row, hashes: this.control! },
-      )
-    ) {
+    const { row, rowKind, head, lastDeleteVersion } = await this.readStreamRow(
+      entry.connector,
+      ns,
+      name,
+    );
+    if (lastDeleteVersion > (host.collectedAt?.[name] ?? 0)) {
       throw new Discard(
         {
           kind: "discard",
-          recollect: false,
-          clearCheckpoints: false,
-          restartFull: false,
+          recollect: true,
+          clearCheckpoints: true,
+          restartFull: true,
         },
-        "stream row tombstoned after this run was collected",
+        "stream deleted after collection snapshot",
       );
-    }
-    let head: Head | null = null;
-    if (rowKind === "present" && row.found) {
-      head = await this.loadHead(scope, row.dataHash, {
-        connector: entry.connector,
-        ns,
-        stream: name,
-        keyCheck,
-      });
     }
     const choice = chooseBase(rowKind, head, target);
     if (choice.kind === "stale_generation") {
@@ -2016,6 +2016,7 @@ export class StreamSyncWriter {
       complete,
       connector: entry.connector,
       format: HEAD_FORMAT,
+      lastDeleteVersion,
       generation: target,
       keyCheck,
       ns,
