@@ -143,8 +143,8 @@ const MUTANTS = [
     edits: [
       [
         F.run,
-        "data.importComplete = home.importComplete;",
-        "data.importComplete = true;",
+        "importPending: async () => !home.importComplete,",
+        "importPending: async () => false,",
       ],
     ],
     files: [T.run],

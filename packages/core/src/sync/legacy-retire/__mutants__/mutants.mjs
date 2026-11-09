@@ -267,8 +267,12 @@ export const MUTANTS = [
     why: "the file is not hashed again right before the delete",
     edits: edit(
       RETIRE,
-      "if (report.wouldDelete && !(await holds(deps, scope, row, fresh))) {",
-      "if (false) {",
+      `if (
+          report.wouldDelete &&
+          !(await fileHolds(`,
+      `if (
+          false &&
+          !(await fileHolds(`,
     ),
     tests: [ROUND2],
     mustFail: ["FILE_CHANGED_BEFORE_DELETE"],

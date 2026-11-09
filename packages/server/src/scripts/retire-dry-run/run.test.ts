@@ -22,6 +22,7 @@ import {
 import { join, relative } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createMemoryImportAuthority,
   createRetireHost,
   retireLegacyFiles,
   RetireLedger,
@@ -436,9 +437,12 @@ describe("the synthetic fixture, in memory and persisted", () => {
     const { fx } = p;
 
     // The in-memory dry run of #595, on the same fixture.
-    const ledger = new RetireLedger(createMemoryStreamSyncFiles());
+    const ledger = new RetireLedger(
+      createMemoryStreamSyncFiles(),
+      p.ownerAddress,
+      createMemoryImportAuthority({ pending: false }),
+    );
     await ledger.update((d) => {
-      d.importComplete = true;
       for (const scope of fx.scopes) {
         for (const s of fx.reader.retireBasis(scope.scope)?.streams ?? []) {
           const entry = (d.imported[s.connector] ??= {
