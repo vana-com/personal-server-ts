@@ -1358,6 +1358,7 @@ export class StreamSyncWriter {
         shardPath(dir, shard),
         shard,
         this.reduceBudget,
+        this.spoolFlushBytes,
       );
       if (after !== null) shardBytes[shard] = after;
     }

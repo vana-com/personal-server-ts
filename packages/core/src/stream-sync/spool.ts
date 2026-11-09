@@ -28,6 +28,7 @@ import {
   SHARD_COUNT,
   shardOf,
   type Envelope,
+  utf8Length,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
@@ -35,6 +36,20 @@ import type { StreamSyncFiles } from "./ports.js";
 
 const encoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+
+/**
+ * The UTF-8 bytes of `lines` in one buffer. Joining them first would hold the
+ * joined string and its encoding at once, twice the flush size.
+ */
+function encodeLines(lines: readonly string[]): Uint8Array {
+  let total = 0;
+  for (const line of lines) total += utf8Length(line);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const line of lines)
+    at += encoder.encodeInto(line, out.subarray(at)).written;
+  return out;
+}
 /** Default spool flush threshold: buffered lines written per append batch. */
 export const FLUSH_BYTES = 8 * 1024 * 1024;
 /** A body longer than this goes to its own file instead of onto its line. */
@@ -165,7 +180,7 @@ export class SpoolWriter {
       this.buffers.set(logPath, buffer);
     }
     buffer.push(`${line}\n`);
-    this.buffered += line.length + 1;
+    this.buffered += utf8Length(line) + 1;
     if (this.buffered >= this.flushBytes) await this.flush();
   }
 
@@ -189,7 +204,7 @@ export class SpoolWriter {
       await this.files.appendMany(
         pending.map(([path, lines]) => ({
           path,
-          bytes: encoder.encode(lines.join("")),
+          bytes: encodeLines(lines),
         })),
       );
     } catch (error) {
@@ -218,7 +233,7 @@ export async function deriveShards(
     await files.appendMany(
       pending.map(([shard, lines]) => ({
         path: shardPath(dir, shard),
-        bytes: encoder.encode(lines.join("")),
+        bytes: encodeLines(lines),
       })),
     );
   };
@@ -230,7 +245,7 @@ export async function deriveShards(
       buffers.set(shard, buffer);
     }
     buffer.push(`${entry.line}\n`);
-    buffered += entry.line.length + 1;
+    buffered += utf8Length(entry.line) + 1;
     if (buffered >= flushBytes) await flush();
   }
   await flush();
@@ -245,29 +260,43 @@ export async function* readSpool(
   // start of every decode call, so a per-line decode would strip one from every
   // line. The whole-file decoder strips only the file's first BOM; match that.
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-  // Split on the newline byte, then decode each line on its own. A line is at
-  // most `INLINE_BODY_BYTES` plus an envelope, because a longer body lives in
-  // a file. 0x0a cannot occur inside a multi-byte UTF-8 sequence.
-  let rest = new Uint8Array(0);
+  // Split on the newline byte, then decode each line on its own. Decoding the
+  // whole chunk and slicing lines out of it would make every line a view that
+  // pins its 1 MiB chunk for as long as any caller keeps the line's text.
+  // 0x0a cannot occur inside a multi-byte UTF-8 sequence, so the split is safe.
+  // The line still open at the end of the last chunk lives in one growable
+  // buffer. Retained memory then tracks the line's size, not the number of
+  // chunks it arrived in, and doubling keeps the copying linear. The line's
+  // bytes are dropped before the parsed line is yielded, so a caller that
+  // holds the line holds one copy of its text, not its bytes too.
+  let open: OpenLine | null = null;
   let firstLine = true;
   for await (const chunk of files.readChunks(path)) {
-    const bytes = new Uint8Array(rest.length + chunk.length);
-    bytes.set(rest);
-    bytes.set(chunk, rest.length);
     let start = 0;
-    let newline = bytes.indexOf(0x0a, start);
+    let newline = chunk.indexOf(0x0a, start);
     while (newline !== -1) {
-      let raw = decoder.decode(bytes.subarray(start, newline));
+      let raw: string;
+      if (open === null) {
+        raw = decoder.decode(chunk.subarray(start, newline));
+      } else {
+        open.append(chunk.subarray(start, newline));
+        raw = decoder.decode(open.view());
+        open = null;
+      }
       if (firstLine && raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
       firstLine = false;
       yield parseSpoolLine(raw);
       start = newline + 1;
-      newline = bytes.indexOf(0x0a, start);
+      newline = chunk.indexOf(0x0a, start);
     }
-    rest = bytes.slice(start);
+    if (start < chunk.length) {
+      open ??= new OpenLine();
+      open.append(chunk.subarray(start));
+    }
   }
-  if (rest.length !== 0) {
+  if (open !== null && open.size > 0) {
     // A file that holds only a BOM has no lines, as the whole-file decoder gives.
+    const rest = open.view();
     const bomOnly =
       firstLine &&
       rest.length === 3 &&
@@ -276,6 +305,37 @@ export async function* readSpool(
       rest[2] === 0xbf;
     if (bomOnly) return;
     throw new Error(`spool file ${path} ends mid-line`);
+  }
+}
+
+/**
+ * Bytes of one spool line that has not reached its newline yet. Appends go
+ * into one buffer that doubles when full, so a line in any number of chunks
+ * is one allocation chain with at most twice its size in capacity.
+ */
+class OpenLine {
+  private buffer = new Uint8Array(0);
+  private length = 0;
+
+  get size(): number {
+    return this.length;
+  }
+
+  append(bytes: Uint8Array): void {
+    const need = this.length + bytes.length;
+    if (need > this.buffer.length) {
+      const grown = new Uint8Array(
+        Math.max(need, this.buffer.length * 2, 4096),
+      );
+      grown.set(this.buffer.subarray(0, this.length));
+      this.buffer = grown;
+    }
+    this.buffer.set(bytes, this.length);
+    this.length = need;
+  }
+
+  view(): Uint8Array {
+    return this.buffer.subarray(0, this.length);
   }
 }
 
@@ -293,6 +353,7 @@ export async function compactShard(
   path: string,
   shard: number,
   budgetBytes: number,
+  flushBytes: number = FLUSH_BYTES,
 ): Promise<number | null> {
   const prefix = shard.toString(2).padStart(8, "0");
   const reducer = new FrameReducer<string>(prefix);
@@ -315,14 +376,15 @@ export async function compactShard(
   const result = reducer.finish(Number.MAX_SAFE_INTEGER);
   if (result.kind !== "ok") return null;
   if (result.winners.length === seenLines) return null;
-  const text = result.winners.map((w) => `${w.ref}\n`).join("");
   let bytes = 0;
   for (const w of result.winners) bytes += w.size;
   // Replace the shard without a durable write per file: the run is still
   // collecting, and its one `sync` follows the last compaction (§2.6). A stop
   // between the two calls fails the run, as any stop while collecting does.
   await files.remove(path);
-  await files.appendMany([{ path, bytes: encoder.encode(text) }]);
+  const writer = new SpoolWriter(files, flushBytes);
+  for (const winner of result.winners) await writer.add(path, winner.ref);
+  await writer.flush();
   return bytes;
 }
 
