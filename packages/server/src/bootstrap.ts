@@ -39,7 +39,10 @@ import {
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   accountStorageModeOf,
+  createImportWaker,
   createModeAuthority,
+  type ImportRunner,
+  type ImportWaker,
   type ModeAuthority,
   type ModeRecordStore,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
@@ -213,6 +216,12 @@ export interface CreateServerOptions {
    * under the storage root, outside the data database. Tests inject a store.
    */
   accountModeStore?: ModeRecordStore;
+  /**
+   * The host's legacy importer. The server runs it when the Account says On
+   * and once at boot when the owner is already switched; what is owed and when
+   * it is done is the importer's own record. Without one no import starts.
+   */
+  legacyImporter?: ImportRunner;
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
   /** Inventory-route-only signer; never used by the owner-only scope feed. */
@@ -399,6 +408,7 @@ async function bootstrapServer(
   // answers through `POST /v1/account-mode/evidence` (or
   // `context.accountModeAuthority`). Boot reads the saved records from disk and
   // never waits for the Account.
+  let importWaker: ImportWaker | undefined;
   const accountModeAuthority = createModeAuthority({
     store:
       options?.accountModeStore ??
@@ -406,9 +416,19 @@ async function bootstrapServer(
         onCorrupt: (file) =>
           logger.warn({ file }, "account mode record could not be read"),
       }),
+    // An answer that leaves the owner On wakes the import.
+    onOn: () => void importWaker?.wake(),
     onWarning: (message, detail) => logger.warn({ detail }, message),
   });
   await accountModeAuthority.ready;
+  if (options?.legacyImporter && serverOwner) {
+    importWaker = createImportWaker({
+      authority: accountModeAuthority,
+      owner: serverOwner,
+      importer: options.legacyImporter,
+      onWarning: (message, detail) => logger.warn({ detail }, message),
+    });
+  }
   // Legacy maintenance (recovering staged files, closing scopes, rebuilding the
   // index) writes the legacy store, so it never runs for a switched owner.
   const legacyMaintenanceMayRun =
@@ -1433,6 +1453,8 @@ async function bootstrapServer(
   const cleanup = async () => {
     backgroundClosed = true;
     try {
+      // The importer writes through the stores that close below.
+      await importWaker?.stop();
       clearRegistrationPoll();
       // Before the database closes: abort the running step and let it settle.
       if (
@@ -1490,6 +1512,8 @@ async function bootstrapServer(
     accountModeAuthority,
     serverOwner,
     startBackgroundServices: async () => {
+      // An import owed from a saved On needs no new answer from the Account.
+      if (!backgroundClosed) void importWaker?.wake();
       // Steps once now, then follows the coordinator's next wake.
       if (!backgroundClosed) replicaHost?.driver.start();
       // Replay questions a previous run left pending or stale: nothing

@@ -14,7 +14,11 @@ import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
 import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
-import type { ModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import {
+  createMemoryModeRecordStore,
+  type ImportRunner,
+  type ModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type { PsLitePersistenceBundle } from "./persistence.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -577,8 +581,6 @@ describe("the account-mode records of a runtime over injected persistence", () =
   });
 
   it("keeps an On through a restart when the host injects a durable store, and a later Off is refused", async () => {
-    const { createMemoryModeRecordStore } =
-      await import("@opendatalabs/personal-server-ts-core/sync/account-mode");
     const store = createMemoryModeRecordStore();
     const bundle = memoryBundle();
     const first = await plain(bundle, store);
@@ -590,5 +592,131 @@ describe("the account-mode records of a runtime over injected persistence", () =
       (await second.accountModeAuthority.commitLegacy(ownerAddress, () => 1))
         .ok,
     ).toBe(false);
+  });
+});
+
+describe("the legacy import wake of a runtime", () => {
+  const withImporter = async (store: ModeRecordStore, importer: ImportRunner) =>
+    createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: store,
+      legacyImporter: importer,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+  const runningImporter = () => {
+    const runs: AbortSignal[] = [];
+    const importer: ImportRunner = {
+      run: (signal) =>
+        new Promise<void>((resolve) => {
+          runs.push(signal);
+          signal.addEventListener("abort", () => resolve());
+        }),
+    };
+    return { importer, runs };
+  };
+  const until = async (check: () => boolean) => {
+    for (let i = 0; i < 200 && !check(); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  it("runs the importer when the Account says On, and stop aborts it", async () => {
+    const store = createMemoryModeRecordStore();
+    const { importer, runs } = runningImporter();
+    const runtime = await withImporter(store, importer);
+    await runtime.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "off",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(runs).toHaveLength(0);
+
+    await runtime.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      state: "on",
+    });
+    await until(() => runs.length > 0);
+    expect(runs).toHaveLength(1);
+
+    await runtime.importWaker?.stop();
+    expect(runs[0]?.aborted).toBe(true);
+  });
+
+  it("runs it at boot when the saved answer is already On", async () => {
+    const store = createMemoryModeRecordStore();
+    await store.save(ownerAddress.toLowerCase(), {
+      answer: "on",
+      generation: 0,
+      receivedAt: 1,
+    });
+    const { importer, runs } = runningImporter();
+    const runtime = await withImporter(store, importer);
+    await until(() => runs.length > 0);
+    expect(runs).toHaveLength(1);
+    await runtime.importWaker?.stop();
+  });
+
+  it("startPersonalServer forwards the importer, and its stop aborts the run", async () => {
+    const store = createMemoryModeRecordStore();
+    await store.save(ownerAddress.toLowerCase(), {
+      answer: "on",
+      generation: 0,
+      receivedAt: 1,
+    });
+    const { importer, runs } = runningImporter();
+    const server = await startPersonalServer({
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: store,
+      legacyImporter: importer,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+      relay: false,
+    });
+    await until(() => runs.length > 0);
+    expect(runs).toHaveLength(1);
+    // Would hang if stop did not abort the run and wait for it.
+    await server.stop();
+    expect(runs[0]?.aborted).toBe(true);
+  });
+
+  it("starts nothing when the host passes no importer", async () => {
+    const runtime = await createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      accountModeStore: createMemoryModeRecordStore(),
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+    expect(runtime.importWaker).toBeUndefined();
   });
 });

@@ -689,6 +689,8 @@ export async function startPersonalServer(
     relayClient?.close("personal-server-stop");
     relayClient = undefined;
     runtime.deactivate();
+    // The importer writes through the stores; stop it before they wind down.
+    await runtimeBundle?.importWaker?.stop();
     await runtimeBundle?.syncManager?.stop?.();
     setStatus("stopped");
   }

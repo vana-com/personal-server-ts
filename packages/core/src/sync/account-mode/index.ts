@@ -29,3 +29,9 @@ export {
   type DecisionBody,
   type EvidenceBody,
 } from "./evidence-wire.js";
+export {
+  createImportWaker,
+  type ImportRunner,
+  type ImportWaker,
+  type ImportWakerOptions,
+} from "./import-waker.js";

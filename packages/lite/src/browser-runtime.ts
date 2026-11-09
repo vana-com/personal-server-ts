@@ -24,8 +24,11 @@ import type {
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
+  createImportWaker,
   createMemoryModeRecordStore,
   createModeAuthority,
+  type ImportRunner,
+  type ImportWaker,
   type ModeAuthority,
   type ModeRecordStore,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
@@ -105,6 +108,12 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    * durable place (a native bundle) injects a store.
    */
   accountModeStore?: ModeRecordStore;
+  /**
+   * The host's legacy importer. The runtime runs it when the Account says On
+   * and once at boot when the owner is already switched; what is owed and when
+   * it is done is the importer's own record. Without one no import starts.
+   */
+  legacyImporter?: ImportRunner;
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible fetch client on `config.inference`; tests inject a
@@ -196,11 +205,12 @@ export interface IndexedDbPsLiteRuntime {
   replicationHost?: LiteReplication;
   /**
    * The account-mode module. Web code gives it the Account's answer with
-   * `submitEvidence` before it starts the first collection, and reports a
-   * finished legacy import with `importDone`. It owns the records for the life
-   * of the page: call `close()` on teardown so the next tab can own them.
+   * `submitEvidence` before it starts the first collection. On teardown call
+   * `importWaker.stop()` first, then close the storage, then `close()`.
    */
   accountModeAuthority: ModeAuthority;
+  /** Wakes the host's importer; present when the host passed `legacyImporter`. */
+  importWaker?: ImportWaker;
 }
 
 export async function createIndexedDbPsLiteRuntime(
@@ -450,15 +460,26 @@ export async function createIndexedDbPsLiteRuntime(
   // writes pause. A host that injects its own persistence has not offered
   // browser IndexedDB, so without an `accountModeStore` the records are in
   // memory and the Account's answer at the next launch restores them.
+  let importWaker: ImportWaker | undefined;
   const accountModeAuthority = createModeAuthority({
     store:
       options.accountModeStore ??
       (options.persistence
         ? createMemoryModeRecordStore()
         : createIndexedDbModeRecordStore(`${dbName}-account-mode`)),
+    // An answer that leaves the owner On wakes the import.
+    onOn: () => void importWaker?.wake(),
     onWarning: (message, detail) => console.warn(message, detail),
   });
   await accountModeAuthority.ready;
+  if (options.legacyImporter && serverOwner) {
+    importWaker = createImportWaker({
+      authority: accountModeAuthority,
+      owner: serverOwner,
+      importer: options.legacyImporter,
+      onWarning: (message, detail) => console.warn(message, detail),
+    });
+  }
   const runtime = createPsLiteRuntime({
     ...options,
     accountModeAuthority,
@@ -498,6 +519,8 @@ export async function createIndexedDbPsLiteRuntime(
       injected?.mcpOAuthAuthorizations ?? options.mcpOAuthAuthorizationStore,
   });
   runtimeRef = runtime;
+  // An import owed from a saved On needs no new answer from the Account.
+  void importWaker?.wake();
 
   return {
     runtime,
@@ -514,5 +537,6 @@ export async function createIndexedDbPsLiteRuntime(
     replication,
     replicationHost,
     accountModeAuthority,
+    importWaker,
   };
 }
