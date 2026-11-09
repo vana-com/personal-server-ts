@@ -386,7 +386,7 @@ export async function createOracleEnv(input: {
         signer: accountSigner(
           input.surface === "full" ? SERVER_KEY : OWNER_KEY,
         ),
-        declaredStreams: () => [],
+        declaredStreams: () => ["s"],
         ...extra,
       });
     },

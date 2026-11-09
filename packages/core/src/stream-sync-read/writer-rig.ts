@@ -193,7 +193,7 @@ export class Rig {
   constructor(
     seed?: SeedRows,
     readonly connector: string = CONNECTOR,
-    private readonly declared: readonly string[] = [],
+    private readonly declared: readonly string[] = ["items"],
   ) {
     this.seed = seed;
     this.writer = this.device(this.files, seed);

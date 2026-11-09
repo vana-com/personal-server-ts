@@ -329,7 +329,7 @@ async function makeHost(input: {
   const blobs = storageBlobs(input.storageUrl);
   if (input.kind === "full") {
     const writer = new StreamSyncWriter({
-      declaredStreams: () => [],
+      declaredStreams: () => ["items"],
       ownerAddress: OWNER,
       registry: input.registry,
       blobs,
@@ -370,7 +370,7 @@ async function makeHost(input: {
   const handBuilt = viaLite
     ? null
     : new StreamSyncWriter({
-        declaredStreams: () => [],
+        declaredStreams: () => ["items"],
         ownerAddress: OWNER,
         registry: input.registry,
         blobs,

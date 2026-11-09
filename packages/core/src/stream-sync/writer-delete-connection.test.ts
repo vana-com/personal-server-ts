@@ -13,6 +13,7 @@ import {
 import { AmbiguousRegistryReplyError } from "./ports.js";
 import { ask } from "../stream-sync-read/service-fixture.js";
 import { manifestStreamLister } from "./artifacts.js";
+import { ConnectorNotVerifiedError } from "./writer.js";
 import {
   bindStreamSyncHome,
   createMemoryStreamSyncFiles,
@@ -448,4 +449,33 @@ it("a writer built without declaredStreams is refused, so a host cannot forget t
   expect(
     () => new StreamSyncWriter({ ...options, declaredStreams: () => [] }),
   ).not.toThrow();
+});
+
+it("refuses a connector with rows and no declared names, and writes nothing (mutant: EMPTY_DECLARED_ACCEPTED)", async () => {
+  // The host verified no manifest for this connector, so it cannot name the
+  // streams a delete must fence. Deleting anyway would leave a rowless stream
+  // open to an old record after a reconnect.
+  const r = new Rig(undefined, CONNECTOR, []);
+  await r.open();
+  await r.collect(spec("base"));
+  await r.publish();
+  const posts = r.gateway.log.length;
+  await expect(r.writer.deleteConnection(CONNECTOR)).rejects.toBeInstanceOf(
+    ConnectorNotVerifiedError,
+  );
+  expect(r.gateway.log).toHaveLength(posts);
+  expect(await r.registeredHead()).toMatchObject({ recordCount: 1 });
+  const state = JSON.parse(
+    new TextDecoder().decode((await r.files.read("state.json"))!),
+  );
+  expect(state.deletes ?? {}).toEqual({});
+  expect(await control(r)).toMatchObject({ deleted: false });
+});
+
+it("a connector with nothing in the registry is still deleted without declared names", async () => {
+  const r = new Rig(undefined, CONNECTOR, []);
+  await r.open();
+  await r.collect(spec("offline"));
+  await r.writer.deleteConnection(CONNECTOR);
+  expect(await r.files.list("runs")).toEqual([]);
 });

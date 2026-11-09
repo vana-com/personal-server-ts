@@ -936,7 +936,8 @@ export async function createServer(
           signer: serverSigner,
           seed: seedSource,
           // Read at delete time: the pinned manifests are verified by then.
-          // Empty without PDPP (no manifests verified): nothing to fence.
+          // Empty for a connector with no pinned manifest: the delete of a
+          // connector that has registry rows then refuses (CONNECTOR_NOT_VERIFIED).
           declaredStreams: (connector) =>
             manifestStreamLister(pdppAuth?.retainedManifests ?? [])(connector),
         });

@@ -373,6 +373,22 @@ export class ConnectionStoppedError extends Error {
 }
 
 /**
+ * A connection delete refused before it wrote anything: the registry holds
+ * rows of the connector, but this host verified no manifest that names its
+ * streams. A stream the registry has no row for could then keep a stale
+ * record that passes the fence after a reconnect, so the delete waits until
+ * the host can name the streams (retryable).
+ */
+export class ConnectorNotVerifiedError extends Error {
+  constructor(readonly connector: string) {
+    super(
+      `no verified manifest names the streams of ${connector}; its delete cannot fence rowless streams`,
+    );
+    this.name = "ConnectorNotVerifiedError";
+  }
+}
+
+/**
  * A fresh connection delete whose tombstone did not land: the connection
  * was reconnected or deleted again while the delete ran. The intent is
  * dropped; nothing was tombstoned at a version the caller did not see.
@@ -437,8 +453,9 @@ export interface StreamSyncWriterOptions {
    * posts a delete head on each of them that has no registry row yet, so a
    * stale record for such a stream cannot publish after the delete. Required:
    * a host that does not pass it cannot know which streams a delete must
-   * fence, so the omission would show only as returned data. A host with no
-   * verified manifests passes `() => []` on purpose.
+   * fence, so the omission would show only as returned data. An empty list
+   * for a connector that has registry rows makes its delete throw
+   * `ConnectorNotVerifiedError` before anything is written.
    */
   readonly declaredStreams: (connector: string) => readonly string[];
   /** Writer target per part (§2.2, at most 4 MiB). */
@@ -799,6 +816,10 @@ export class StreamSyncWriter {
       }
       const registered = streams.length;
       if (pins.length > 0 || registered > 0) {
+        // Nothing is persisted yet: refuse when no stream can be named.
+        if (this.options.declaredStreams(connector).length === 0) {
+          throw new ConnectorNotVerifiedError(connector);
+        }
         this.addRowlessStreams(connector, streams, controls);
       }
       if (pins.length === 0 && registered === 0) {

@@ -139,6 +139,8 @@ export interface PsLiteSyncOptions {
    * to `streamSyncDeclarations`). A connection delete posts a delete head on
    * each declared stream that has no registry row. Required: a host that omits
    * it lets a stale record of a rowless stream publish after a delete.
+   * A connector with registry rows and no declared names is not deleted
+   * (`ConnectorNotVerifiedError`).
    */
   streamSyncDeclaredStreams: (connector: string) => readonly string[];
   stateStore: PsLiteStateStore;
