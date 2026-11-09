@@ -157,7 +157,7 @@ describe("retire gates", () => {
     const { fx, ledger, host } = await setup();
     const calls: {
       scope: string;
-      fence: { id: number; path: string } | undefined;
+      fence: { id: number; path: string; contentHash?: string } | undefined;
     }[] = [];
     const rows = new Map(fx.storage.entries.map((e) => [e.scope, e]));
     const storage = {
@@ -165,7 +165,7 @@ describe("retire gates", () => {
       deleteVersion: (
         scope: string,
         at: string,
-        fence?: { id: number; path: string },
+        fence?: { id: number; path: string; contentHash?: string },
       ) => {
         calls.push({ scope, fence });
         return fx.storage.deleteVersion(scope, at, fence);
@@ -175,7 +175,11 @@ describe("retire gates", () => {
     expect(calls).toHaveLength(3);
     for (const call of calls) {
       const row = rows.get(call.scope)!;
-      expect(call.fence).toEqual({ id: row.id, path: row.path });
+      expect(call.fence).toEqual({
+        id: row.id,
+        path: row.path,
+        contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      });
     }
   });
 });

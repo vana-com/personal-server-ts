@@ -51,8 +51,19 @@ export interface ReadbackRecord {
 export interface LedgerData {
   /** A pass over the importable source finished with every stream staged. */
   importComplete: boolean;
-  /** Connectors whose streams were all staged. */
-  imported: Record<string, { readonly streams: number; readonly at: string }>;
+  /**
+   * Connectors whose streams were all staged. `staged` is the receipt: each
+   * stream this device handed to the writer, with how many rows. A record
+   * written before receipts existed has none, and proves no stream.
+   */
+  imported: Record<
+    string,
+    {
+      readonly streams: number;
+      readonly at: string;
+      readonly staged?: Readonly<Record<string, number>>;
+    }
+  >;
   readbacks: Record<string, ReadbackRecord>;
 }
 
@@ -102,12 +113,15 @@ export class RetireLedger {
   }
 
   /**
-   * This device staged rows for the connector. Stricter than `importDone`:
-   * a pass over an EMPTY source sets `importComplete` for every connector
-   * (nothing to wait for), but it staged nothing.
+   * This device staged at least one row of this stream. Stricter than
+   * `importDone`: a pass over an EMPTY source sets `importComplete` for every
+   * connector (nothing to wait for), and a source may list a connector with
+   * no stream, or a stream with no row. None of those staged anything, so
+   * none proves that a row of a file was ever delivered.
    */
-  async staged(connector: string): Promise<boolean> {
-    return (await this.read()).imported[connector] !== undefined;
+  async staged(connector: string, stream: string): Promise<boolean> {
+    const rows = (await this.read()).imported[connector]?.staged?.[stream];
+    return rows !== undefined && rows > 0;
   }
 
   /** The stored readback of this version, or null (a dry or pre-import record is none). */

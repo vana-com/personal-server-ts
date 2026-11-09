@@ -77,7 +77,7 @@ describe("the delete fence (IMPORT_IGNORES_FENCE, DEVICE_ONLY_RETIRED_EARLY)", (
   });
 
   it("keeps a file the fence dropped until this device re-collected the stream", async () => {
-    const f = await flow({ local: ["e0", "e1"], imported: true });
+    const f = await flow({ local: ["e0", "e1"], seed: ["e0", "e1"] });
     await f.importer.run();
     await f.run("a", ["e0", "e1"]);
     await f.rig.publish();

@@ -20,6 +20,7 @@ import type {
   NewIndexEntry,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
+import { fenceContentMatches } from "@opendatalabs/personal-server-ts-core/storage/legacy-entity-key-sets";
 import {
   IngestPersistedError,
   VersionSupersededError,
@@ -1207,16 +1208,26 @@ export async function createPersistentPsLiteStorage(
     deleteVersion(scope, collectedAt, fence) {
       // The path is fixed by (scope, collectedAt), so the lock is known now.
       const path = envelopePath(scope, collectedAt);
-      return withPathLock(path, () =>
-        eraseUnderPathLock(
+      return withPathLock(path, async () => {
+        // The content check and the erase share the path lock that every
+        // write of this path takes: no rewrite lands between them.
+        if (fence?.contentHash !== undefined) {
+          const present =
+            (await fileStore.readEnvelope(path)) ??
+            (await fallbackStore.readEnvelope(path));
+          if (!present || !fenceContentMatches(fence, present.data)) {
+            return false;
+          }
+        }
+        return eraseUnderPathLock(
           path,
           (e) =>
             e.scope === scope &&
             e.collectedAt === collectedAt &&
             e.path === path &&
             (fence === undefined || e.id === fence.id),
-        ),
-      ).then((outcome) => outcome === true);
+        );
+      }).then((outcome) => outcome === true);
     },
 
     // Only while the envelope is absent: the check and the erase both run

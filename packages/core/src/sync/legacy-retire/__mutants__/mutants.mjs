@@ -161,7 +161,7 @@ export const MUTANTS = [
     why: "a fenced file retires although this device staged no rows (an empty import source marks every connector done)",
     edits: edit(
       RETIRE,
-      "if (!(await deps.host.importStaged(connector))) {",
+      "if (!(await deps.host.importStaged(s.connector, s.stream))) {",
       "if (false) {",
     ),
     tests: [ROUND2],
@@ -174,7 +174,7 @@ export const MUTANTS = [
       ...edit(READBACK, "writtenAt < s.deleteAtMs", "true"),
       ...edit(
         RETIRE,
-        "if (!(await deps.host.importStaged(connector))) {",
+        "if (!(await deps.host.importStaged(s.connector, s.stream))) {",
         "if (false) {",
       ),
     ],
@@ -195,7 +195,11 @@ export const MUTANTS = [
   {
     name: "UNLISTED_SCALAR_IGNORED",
     why: "an uncovered top-level scalar is skipped, not compared",
-    edits: edit(KEYS, "if (derivedCount(key, value)) continue;", "continue;"),
+    edits: edit(
+      KEYS,
+      "if (READER_STAMPED_SCALARS.has(key)) continue;",
+      "continue;",
+    ),
     tests: [ROUND2],
     mustFail: ["UNLISTED_SCALAR_IGNORED"],
   },
@@ -204,8 +208,8 @@ export const MUTANTS = [
     why: "a `total` derived from a compared collection is compared too: an older snapshot never retires once the collection grew",
     edits: edit(
       KEYS,
-      "if (derivedCount(key, value)) continue;",
-      "if (false) continue;",
+      "contentHash(derivedCount(key, value) ? DERIVED_COUNT : value)",
+      "contentHash(value)",
     ),
     tests: [ROUND2],
     mustFail: ["still retires an older snapshot whose derived total"],
@@ -253,6 +257,102 @@ export const MUTANTS = [
     ),
     tests: [ROUND2],
     mustFail: ["FILE_CHANGED_BEFORE_DELETE"],
+  },
+  // ---- round 4 (review of 578fcd2b, and the #601 dry run at 7b7192ed) ----
+  {
+    name: "ZERO_STREAM_IMPORT_FENCES",
+    why: "a connector the source listed with no stream, or a stream with no row, counts as staged: the fence opens for rows never published",
+    edits: edit(
+      LEDGER,
+      "return rows !== undefined && rows > 0;",
+      "return (\n      rows !== undefined ||\n      (await this.read()).imported[connector] !== undefined\n    );",
+    ),
+    tests: [ROUND2],
+    mustFail: ["ZERO_STREAM_IMPORT_FENCES", "staged zero rows"],
+  },
+  {
+    name: "RECEIPT_ROWS_NOT_COUNTED",
+    why: "the importer records every staged stream with zero rows, so no fence ever opens",
+    edits: edit(
+      IMPORT,
+      "receipt[stream.stream] = (receipt[stream.stream] ?? 0) + 1;",
+      "receipt[stream.stream] = receipt[stream.stream] ?? 0;",
+    ),
+    tests: [ROUND2],
+    mustFail: ["retires a pre-delete file once the import staged rows"],
+  },
+  {
+    name: "HASH_NOT_PASSED_TO_ERASE",
+    why: "the erase is fenced by id and path only: a same-path rewrite after the recheck is erased",
+    edits: edit(
+      RETIRE,
+      "        ...(readHash === undefined ? {} : { contentHash: readHash }),\n",
+      "",
+    ),
+    tests: [ROUND2, GATES],
+    mustFail: ["HASH_NOT_PASSED_TO_ERASE"],
+  },
+  {
+    name: "PUBLISHED_TOTAL_IGNORED",
+    why: "a count derived on the local side is skipped without asking whether the published count is derived too",
+    edits: edit(
+      KEYS,
+      "if (READER_STAMPED_SCALARS.has(key)) continue;",
+      "if (READER_STAMPED_SCALARS.has(key) || derivedCount(key, value)) continue;",
+    ),
+    tests: [ROUND2],
+    mustFail: ["PUBLISHED_TOTAL_IGNORED"],
+  },
+  {
+    name: "FETCHED_AT_COMPARED",
+    why: "the reader's own `fetchedAt` stamp is compared: every scope that carries one fails its readback under the real clock",
+    edits: edit(KEYS, '  "fetchedAt",\n]);', "]);"),
+    tests: [ROUND2],
+    mustFail: ["FETCHED_AT_COMPARED"],
+  },
+  {
+    name: "FETCHED_AT_ITEM_COMPARED",
+    why: "a conversation item's reader-stamped `fetched_at` is hashed with the item",
+    edits: edit(
+      KEYS,
+      '"chatgpt.conversations": ["fetched_at"],',
+      '"chatgpt.conversations": [],',
+    ),
+    tests: [ROUND2],
+    mustFail: ["FETCHED_AT_COMPARED"],
+  },
+  {
+    name: "CONTENT_FENCE_IGNORED_NODE_OPS",
+    why: "the Node storage (import operations) erases without checking the content hash inside its transaction",
+    edits: edit(
+      "packages/server/src/storage/import-operations.ts",
+      "if (!fenceContentMatches(fence, stored.data)) return false;",
+      "",
+    ),
+    tests: ["packages/server/src/storage/node-data-storage.test.ts"],
+    mustFail: ["with import operations", "rewritten after the fence hash"],
+  },
+  {
+    name: "CONTENT_FENCE_IGNORED_NODE",
+    why: "the Node storage without import operations erases without checking the content hash",
+    edits: edit(
+      "packages/server/src/storage/node-data-storage.ts",
+      "if (!fenceContentMatches(fence, stored.data)) return false;",
+      "",
+    ),
+    tests: ["packages/server/src/storage/node-data-storage.test.ts"],
+    mustFail: ["without import operations", "rewritten after the fence hash"],
+  },
+  {
+    name: "CONTENT_FENCE_IGNORED_LITE",
+    why: "the Lite storage erases without checking the content hash under the path lock",
+    edits: edit(
+      "packages/lite/src/storage.ts",
+      "if (!present || !fenceContentMatches(fence, present.data)) {",
+      "if (false) {",
+    ),
+    tests: ["packages/lite/src/storage.test.ts"],
+    mustFail: ["an erase fenced by content"],
   },
   {
     name: "UNCOVERED_RETIRES",
@@ -406,6 +506,7 @@ export const MUTANTS = [
       `await deps.storage.deleteVersion(scope, row.collectedAt, {
         id: row.id,
         path: row.path,
+        ...(readHash === undefined ? {} : { contentHash: readHash }),
       });`,
       "await deps.storage.deleteVersion(scope, row.collectedAt);",
     ),

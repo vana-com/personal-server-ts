@@ -135,6 +135,15 @@ export type VersionCommitResult =
 export interface VersionFence {
   id: number;
   path: string;
+  /**
+   * SHA-256 hex of the canonical JSON of the envelope's `data` the caller
+   * decided on (`contentHash` in `storage/legacy-entity-key-sets`). Storage
+   * erases only while the stored envelope still hashes to it, checked under
+   * the same lock or transaction as the erase, so a rewrite of the same path
+   * after the caller's last read is not erased. An unreadable envelope is not
+   * a match. Absent: the row fence alone applies.
+   */
+  contentHash?: string;
 }
 
 /** One version being written by `DataStoragePort.openVersionWriter`. */

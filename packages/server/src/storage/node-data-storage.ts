@@ -23,6 +23,7 @@ import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
+import { fenceContentMatches } from "@opendatalabs/personal-server-ts-core/storage/legacy-entity-key-sets";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
@@ -397,6 +398,18 @@ export function createNodeDataStorage(
           const current = deps.indexManager.findByPath(entry.path);
           if (entry.path !== fence.path || current?.id !== fence.id) {
             return false;
+          }
+          if (fence.contentHash !== undefined) {
+            try {
+              const stored = await readDataFile(
+                deps.hierarchyOptions,
+                scope,
+                collectedAt,
+              );
+              if (!fenceContentMatches(fence, stored.data)) return false;
+            } catch {
+              return false; // unreadable is not a match
+            }
           }
         }
         // Same ordering as deleteByFileId: blob first (ENOENT-tolerant), then
