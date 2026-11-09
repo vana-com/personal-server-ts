@@ -801,7 +801,10 @@ const listGrantedScopes: McpToolDefinition = {
         if (typeof readClient.getScopeMetadata === "function") {
           try {
             meta = await withTimeout(
-              readClient.getScopeMetadata(scope),
+              readClient.getScopeMetadata(
+                scope,
+                resolveGrantForScope(connection, scope)?.grantId,
+              ),
               DEFAULT_SCOPE_METADATA_TIMEOUT_MS,
               `scope metadata for ${scope}`,
             );
@@ -1068,7 +1071,7 @@ const readScope: McpToolDefinition = {
       | undefined;
     if (typeof readClient.getScopeMetadata === "function") {
       void withTimeout(
-        readClient.getScopeMetadata(scope),
+        readClient.getScopeMetadata(scope, grant.grantId),
         DEFAULT_SCOPE_METADATA_TIMEOUT_MS,
         `scope metadata for ${scope}`,
       )
@@ -1956,7 +1959,7 @@ const getScopeFile: McpToolDefinition = {
             // single-use payment can't fund a second resources/read).
             let meta: { sizeBytes?: number } | null = null;
             try {
-              meta = await readClient.getScopeMetadata(scope);
+              meta = await readClient.getScopeMetadata(scope, grant.grantId);
             } catch {
               meta = null;
             }
