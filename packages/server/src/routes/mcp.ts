@@ -81,6 +81,7 @@ import {
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type {
+  AccountStorageMode,
   PersonalServerDataApiDeps,
   PersonalServerApiAuthPort,
   PersonalServerReadFulfillmentReporter,
@@ -149,6 +150,8 @@ export interface McpRouteDeps {
   hierarchyOptions?: HierarchyManagerOptions;
   dataStorage?: DataStoragePort;
   streamSyncRead?: StreamSyncReadPort;
+  /** The account's storage mode; every MCP engine reads through this one. */
+  accountStorageMode?: AccountStorageMode;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Per-process connection store. Defaults to in-memory. */
   connectionStore?: McpConnectionStore;
@@ -397,6 +400,7 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
   return {
     storage: dataStorage,
     streamSyncRead: deps.streamSyncRead,
+    accountStorageMode: deps.accountStorageMode,
     auth,
     accessLogWriter: deps.accessLogWriter,
     readFulfillmentReporter: deps.readFulfillmentReporter,

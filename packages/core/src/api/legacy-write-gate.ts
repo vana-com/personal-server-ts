@@ -5,8 +5,10 @@
  * Switch state: the server already holds it locally as `streamSync.write`,
  * which its host sets from the Account setting (`GET /api/v1/me/stream-sync`)
  * before each launch. A caller passes that state in; this module never reads
- * config or the network. Each host wraps its source in
- * `latchLegacyWriteSwitch`, so the state it reads cannot fall back once seen.
+ * config or the network. Each host builds one `AccountStorageMode` from its
+ * source and derives this gate's switch with `legacyWriteSwitchOf`, so the
+ * state it reads cannot fall back once seen and cannot differ from the
+ * answer the read selector gets.
  *
  * Who is refused: every legacy write for a switched account, from every
  * caller. No request header and no delegated builder signature exempts a
@@ -14,6 +16,11 @@
  * refused too, so the client must stop making legacy writes on switched
  * accounts. Unswitched accounts are never refused.
  */
+
+import {
+  createAccountStorageMode,
+  legacyWriteSwitchOf,
+} from "./account-storage-mode.js";
 
 export const UPDATE_REQUIRED_CODE = "update_required";
 export const UPDATE_REQUIRED_STATUS = 426;
@@ -31,27 +38,18 @@ export const UPDATE_REQUIRED_MESSAGE =
 export type LegacyWriteSwitch = () => boolean;
 
 /**
- * A one-way latch over the switch source. Once the source has said true, the
- * latch stays true for the life of this server: a later `false` or a source
- * that cannot be read does not reopen legacy writes. Before the source has
- * ever said true, a source that throws reads as not switched, so an
- * unreachable source never blocks an unswitched account's writes (fail open).
- *
- * One latch per server: a server holds exactly one owner.
+ * A one-way latch over the switch source, as the write gate's view of an
+ * `AccountStorageMode` (see `account-storage-mode.ts`, which owns the latch).
+ * Hosts build the mode once and pass that instance to the gate and to the read
+ * selector; this wrapper remains for a caller that has only a raw source.
+ * Before the source has ever said true, a source that throws reads as not
+ * switched, so an unreachable source never blocks an unswitched account's
+ * writes (fail open).
  */
 export function latchLegacyWriteSwitch(
   source: LegacyWriteSwitch,
 ): LegacyWriteSwitch {
-  let latched = false;
-  return () => {
-    if (latched) return true;
-    try {
-      latched = source() === true;
-    } catch {
-      latched = false;
-    }
-    return latched;
-  };
+  return legacyWriteSwitchOf(createAccountStorageMode({ source }));
 }
 
 /**

@@ -26,11 +26,11 @@ import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type {
-  LegacyWriteSwitch,
+  AccountStorageMode,
   PersonalServerReadFulfillmentReporter,
   StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
-import { latchLegacyWriteSwitch } from "@opendatalabs/personal-server-ts-core/api";
+import { createAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import {
@@ -217,10 +217,12 @@ export interface AppDeps {
    */
   pdppImporter?: PdppImporter;
   /**
-   * The account's stream-sync switch, latched once per server by the host
-   * (see `latchLegacyWriteSwitch`). Absent = latched here from `config`.
+   * The account's storage mode, built once per server by the host (see
+   * `createAccountStorageMode`). The legacy write gate, the data routes and
+   * every MCP engine consume this one instance. Absent = built here from
+   * `config`.
    */
-  legacyWritesRefused?: LegacyWriteSwitch;
+  accountStorageMode?: AccountStorageMode;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
    * Invoked when the /ui/api registration route confirms the server is
@@ -336,15 +338,17 @@ function streamSyncClosing(): ProtocolError {
 
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
-  // One switch for every legacy write this server accepts. The host passes
-  // its latch; the fallback latches the same config fields the host reads.
-  const legacyWritesRefused =
-    deps.legacyWritesRefused ??
-    latchLegacyWriteSwitch(
-      () =>
+  // One mode for every read and legacy write this server serves. The host
+  // passes its instance; the fallback reads the same config fields the host
+  // reads.
+  const accountStorageMode =
+    deps.accountStorageMode ??
+    createAccountStorageMode({
+      owner: deps.serverOwner,
+      source: () =>
         deps.config?.streamSync.write === true &&
         deps.config.streamSync.refuseLegacyWrites === true,
-    );
+    });
 
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
   // derivative question registration), and one replay guard for the proofs
@@ -547,7 +551,7 @@ export function createApp(deps: AppDeps): Hono {
 
   app.route(
     "/v1/import/oura-browser",
-    ouraRoutes({ ...deps, legacyWritesRefused }),
+    ouraRoutes({ ...deps, accountStorageMode }),
   );
 
   app.use("/v1/stream-sync/*", async (_c, next) => {
@@ -620,8 +624,8 @@ export function createApp(deps: AppDeps): Hono {
       dataStorage: deps.dataStorage,
       legacyScopeView,
       streamSyncRead: deps.streamSyncRead,
-      // The account's stream-sync switch (see the top of createApp).
-      legacyWritesRefused,
+      // The account's storage mode (see the top of createApp).
+      accountStorageMode,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,
@@ -782,6 +786,7 @@ export function createApp(deps: AppDeps): Hono {
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,
     streamSyncRead: deps.streamSyncRead,
+    accountStorageMode,
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,

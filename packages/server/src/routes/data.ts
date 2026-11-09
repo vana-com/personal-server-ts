@@ -7,6 +7,8 @@ import {
   type PersonalServerReadFulfillmentReporter,
   type StreamSyncReadPort,
   refuseLegacyWrite,
+  legacyWriteSwitchOf,
+  type AccountStorageMode,
   type LegacyWriteSwitch,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -102,6 +104,11 @@ export interface DataRouteDeps {
   legacyScopeView?: LegacyScopeViewPort;
   /** See `PersonalServerDataApiDeps.streamSyncRead`. Absent = reads as before. */
   streamSyncRead?: StreamSyncReadPort;
+  /**
+   * The account's storage mode: the one answer the legacy write gate and the
+   * read selector share. A switched account refuses legacy writes.
+   */
+  accountStorageMode?: AccountStorageMode;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /**
    * Write API sessions (POST /v1/write/session). When present, the ingest
@@ -152,12 +159,13 @@ export interface DataRouteDeps {
    */
   pdppImporter?: PdppImporter;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
-  /** The account's stream-sync switch; true refuses undeclared legacy writes. */
-  legacyWritesRefused?: LegacyWriteSwitch;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
   const app = new Hono();
+  const writeSwitch: LegacyWriteSwitch | undefined = deps.accountStorageMode
+    ? legacyWriteSwitchOf(deps.accountStorageMode)
+    : undefined;
   // These owner-scoped reads change after import and deletion; 410 is cacheable by default.
   app.use("*", async (c, next) => {
     await next();
@@ -191,7 +199,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   // authorization, so the refusal holds even for a request that skips this
   // layer. No route has an exemption: not a header, not a verified builder.
   const refuseLegacy: MiddlewareHandler = async (c, next) => {
-    const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
+    const refusal = refuseLegacyWrite(writeSwitch);
     if (refusal) return refusal;
     await next();
   };
@@ -212,7 +220,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       auth.authorizeOwnerScope({ request, scope }),
     syncManager: deps.syncManager,
     onDataWritten: deps.onDataWritten,
-    refuseLegacyWrite: () => refuseLegacyWrite(deps.legacyWritesRefused),
+    refuseLegacyWrite: () => refuseLegacyWrite(writeSwitch),
     afterTombstoneVersion: async (scope) => {
       if (!deps.scopeDeletions) return null;
       const verdict = await deps.scopeDeletions.resolve(scope);
@@ -409,10 +417,10 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       c.req.raw,
       {
         additions: deps.additions,
-        legacyWritesRefused: deps.legacyWritesRefused,
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
         streamSyncRead: deps.streamSyncRead,
+        accountStorageMode: deps.accountStorageMode,
         auth,
         accessLogWriter: deps.accessLogWriter,
         readFulfillmentReporter: deps.readFulfillmentReporter,

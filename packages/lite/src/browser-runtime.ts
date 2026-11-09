@@ -23,7 +23,7 @@ import type {
 } from "./replication-ports.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import { latchLegacyWriteSwitch } from "@opendatalabs/personal-server-ts-core/api";
+import { createAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import type { InferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
 import {
@@ -426,14 +426,15 @@ export async function createIndexedDbPsLiteRuntime(
         : {}),
     });
   // The account's stream-sync switch, read from the live config on each write.
-  const legacyWritesRefused = latchLegacyWriteSwitch(
-    () =>
+  const accountStorageMode = createAccountStorageMode({
+    owner: serverOwner,
+    source: () =>
       config.streamSync.write === true &&
       config.streamSync.refuseLegacyWrites === true,
-  );
+  });
   const runtime = createPsLiteRuntime({
     ...options,
-    legacyWritesRefused,
+    accountStorageMode,
     replication: replicationHost?.runtime ?? options.replication,
     auth,
     serverOrigin,

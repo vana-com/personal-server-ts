@@ -32,7 +32,8 @@ import {
   handlePersonalServerDataRequest,
   handlePersonalServerScopeUploadAppend,
   refuseLegacyWrite,
-  type LegacyWriteSwitch,
+  legacyWriteSwitchOf,
+  type AccountStorageMode,
   createScopeUploadRegistry,
   handleOuraCollectionRequirementsRequest,
   handlePersonalServerGrantsRequest,
@@ -159,10 +160,12 @@ export interface PsLiteRuntimeOptions {
   };
   saveConfig?: (config: unknown) => Promise<void>;
   /**
-   * The account's stream-sync switch, latched by the host (see
-   * `latchLegacyWriteSwitch`). Absent = no legacy write is refused.
+   * The account's storage mode, built once by the host (see
+   * `createAccountStorageMode`). The legacy write gate, the data routes and
+   * the MCP engines consume this one instance. Absent = no legacy write is
+   * refused and reads are unchanged.
    */
-  legacyWritesRefused?: LegacyWriteSwitch;
+  accountStorageMode?: AccountStorageMode;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
@@ -1077,7 +1080,7 @@ export function createPsLiteRuntime(
                 auth,
                 accessLogWriter,
                 scopeUploads,
-                legacyWritesRefused: options.legacyWritesRefused,
+                accountStorageMode: options.accountStorageMode,
               },
               batch,
             );
@@ -1247,7 +1250,11 @@ export function createPsLiteRuntime(
               "Method not allowed",
             );
           // An Oura browser import is a legacy write: a switched account refuses it.
-          const refusal = refuseLegacyWrite(options.legacyWritesRefused);
+          const refusal = refuseLegacyWrite(
+            options.accountStorageMode
+              ? legacyWriteSwitchOf(options.accountStorageMode)
+              : undefined,
+          );
           if (refusal) return refusal;
           let body;
           try {
@@ -1284,7 +1291,7 @@ export function createPsLiteRuntime(
             request,
             {
               storage: dataStorage,
-              legacyWritesRefused: options.legacyWritesRefused,
+              accountStorageMode: options.accountStorageMode,
               auth,
               logger: options.logger,
               accessLogWriter,
@@ -1496,6 +1503,7 @@ export function createPsLiteRuntime(
             auth,
             dataStorage,
             streamSyncRead: options.streamSyncRead,
+            accountStorageMode: options.accountStorageMode,
             accessLogWriter,
             readFulfillmentReporter: options.readFulfillmentReporter,
             now,
@@ -1539,6 +1547,7 @@ async function handleMcpRoute(input: {
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
   streamSyncRead?: StreamSyncReadPort;
+  accountStorageMode?: AccountStorageMode;
   accessLogWriter: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
   now: () => Date;
@@ -2133,6 +2142,7 @@ async function handleMcpRoute(input: {
       dataApiDeps: {
         storage: input.dataStorage,
         streamSyncRead: input.streamSyncRead,
+        accountStorageMode: input.accountStorageMode,
         auth: input.auth,
         accessLogWriter: input.accessLogWriter,
         readFulfillmentReporter: input.readFulfillmentReporter,

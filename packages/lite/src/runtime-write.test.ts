@@ -12,7 +12,10 @@
 
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
-import type { LegacyWriteSwitch } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  createAccountStorageMode,
+  type LegacyWriteSwitch,
+} from "@opendatalabs/personal-server-ts-core/api";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   buildWeb3SignedHeader,
@@ -129,7 +132,9 @@ function setup(
   const runtime = createPsLiteRuntime({
     storage,
     gateway,
-    legacyWritesRefused: options.legacyWritesRefused,
+    accountStorageMode: options.legacyWritesRefused
+      ? createAccountStorageMode({ source: options.legacyWritesRefused })
+      : undefined,
     serverOwner: ownerWallet.address,
     serverOrigin: PS_ORIGIN,
     accessLogReader: accessLog,

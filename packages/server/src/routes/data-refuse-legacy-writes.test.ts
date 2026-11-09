@@ -116,7 +116,11 @@ describe("refuse legacy writes after the stream-sync switch", () => {
           writeHooks.push("notifyNewData");
         },
       },
-      legacyWritesRefused: () => switchedOn,
+      // A test stand-in that follows the flag in both directions (the real
+      // mode latches once switched).
+      accountStorageMode: {
+        read: () => (switchedOn ? "switched" : "unswitched"),
+      },
     });
   });
 

@@ -105,9 +105,26 @@ import type {
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
+  legacyWriteSwitchOf,
+  selectAccountStorageMode,
+  type AccountStorageMode,
+} from "./account-storage-mode.js";
+import {
   refuseLegacyWrite,
   type LegacyWriteSwitch,
 } from "./legacy-write-gate.js";
+
+/** The write gate's switch: the shared mode when wired, else the plain switch. */
+function writeSwitchOf(
+  deps: Pick<
+    PersonalServerDataApiDeps,
+    "accountStorageMode" | "legacyWritesRefused"
+  >,
+): LegacyWriteSwitch | undefined {
+  return deps.accountStorageMode
+    ? legacyWriteSwitchOf(deps.accountStorageMode)
+    : deps.legacyWritesRefused;
+}
 import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
@@ -350,6 +367,13 @@ export interface PersonalServerDataApiDeps {
    * `legacy-write-gate.ts`). Absent = never refuse.
    */
   legacyWritesRefused?: LegacyWriteSwitch;
+  /**
+   * The account's storage mode: the one answer the write gate and the read
+   * selector share (see `account-storage-mode.ts`). When wired it supplies the
+   * write gate's switch too, so `legacyWritesRefused` is ignored. Absent =
+   * every read and write behaves as before the switch existed.
+   */
+  accountStorageMode?: AccountStorageMode;
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
   /**
@@ -2213,6 +2237,19 @@ export function redactEnvelopeForGrantee(
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
 export {
+  ACCOUNT_MODE_RETRY_AFTER_SECONDS,
+  ACCOUNT_MODE_UNKNOWN_CODE,
+  ACCOUNT_MODE_UNKNOWN_STATUS,
+  createAccountStorageMode,
+  legacyWriteSwitchOf,
+  selectAccountStorageMode,
+  type AccountStorageMode,
+  type AccountStorageModeValue,
+  type CreateAccountStorageModeInput,
+  type StorageSelection,
+  type StorageSelectionDeps,
+} from "./account-storage-mode.js";
+export {
   STREAM_SYNC_CLIENT_HEADER,
   UPDATE_REQUIRED_CODE,
   UPDATE_REQUIRED_MESSAGE,
@@ -2251,7 +2288,7 @@ async function handleScopeUploadRequest(
   // An upload is owner-only: no delegated builder writes through it, so there
   // is no exemption. Aborting only discards staged data and stays allowed.
   if (route.kind !== "abort") {
-    const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
+    const refusal = refuseLegacyWrite(writeSwitchOf(deps));
     if (refusal) return refusal;
   }
   const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
@@ -2447,6 +2484,16 @@ export async function handlePersonalServerDataRequest(
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
 
+    // The account's storage mode, decided once before any list, version,
+    // lineage or body branch. No read site acts on the decision yet (they are
+    // routed through it one by one), so a switched account still reads as
+    // before; it is recorded with every error this request logs.
+    if (request.method === "GET") {
+      logContext.detail = {
+        storageSelection: selectAccountStorageMode(deps).kind,
+      };
+    }
+
     if (pathname === "/" || pathname === "") {
       if (request.method !== "GET") return methodNotAllowed();
       const listAuth = await deps.auth.authorizeBuilderList(request, {
@@ -2508,7 +2555,7 @@ export async function handlePersonalServerDataRequest(
       // Owner-only: a builder has no durable-import route, so a signature
       // header earns no exemption here. This runs on the normalized path, so
       // `/imports/<op>/` and repeated slashes land here too.
-      const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
+      const refusal = refuseLegacyWrite(writeSwitchOf(deps));
       if (refusal) return refusal;
       const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
@@ -2738,7 +2785,10 @@ export async function handlePersonalServerDataRequest(
         ? parseDataReadScopeContract(scopeParam)
         : parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
-      logContext.detail = { scope: scopeResult.scope };
+      logContext.detail = {
+        ...logContext.detail,
+        scope: scopeResult.scope,
+      };
       // An empty `fileId=` or `at=` selects no version: it is the latest
       // read, as storage already treats it.
       const fileIdParam = url.searchParams.get("fileId") || undefined;
@@ -3149,7 +3199,7 @@ export async function handlePersonalServerDataRequest(
       }
       // A switched account refuses every legacy write here, verified builder
       // or not: a delegated write is a legacy write too.
-      const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
+      const refusal = refuseLegacyWrite(writeSwitchOf(deps));
       if (refusal) {
         await writeAuth?.releaseProof?.();
         return refusal;

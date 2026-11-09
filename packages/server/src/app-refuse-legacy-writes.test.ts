@@ -122,4 +122,30 @@ describe("createApp legacy-write refusal", () => {
       (await post(makeApp({ write: false, refuseLegacyWrites: true }))).status,
     ).toBe(201);
   });
+  it("uses the host's one mode instance for the write gate, not a second one built from config", async () => {
+    const reads: Array<string | undefined> = [];
+    const app = createApp({
+      logger: pino({ level: "silent" }),
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager: index,
+      hierarchyOptions: { dataDir: join(dir, "data") },
+      serverOrigin: "http://localhost:8080",
+      serverOwner: owner,
+      gateway: {} as GatewayClient,
+      accessLogWriter: { write: async () => undefined },
+      devToken: token,
+      // Config says the account is unswitched; the host's mode says switched.
+      config: ServerConfigSchema.parse({ streamSync: {} }),
+      accountStorageMode: {
+        read: (requestOwner) => {
+          reads.push(requestOwner);
+          return "switched";
+        },
+      },
+    });
+    expect((await post(app)).status).toBe(426);
+    expect(reads.length).toBeGreaterThan(0);
+    expect(index.countByScope("github.events")).toBe(0);
+  });
 });

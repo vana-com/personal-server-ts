@@ -34,7 +34,8 @@ function takeoverLimit(name: string, fallback: number): number {
 }
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
-  latchLegacyWriteSwitch,
+  createAccountStorageMode,
+  legacyWriteSwitchOf,
   type PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
 import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
@@ -668,11 +669,15 @@ export async function createServer(
    */
   // The account's stream-sync switch, latched once for this server. The PDPP
   // importer and every legacy route read this one value (see app.ts).
-  const legacyWritesRefused = latchLegacyWriteSwitch(
-    () =>
+  // One mode per runtime: the write gate, the read selector and every MCP
+  // engine of this server consume this same instance.
+  const accountStorageMode = createAccountStorageMode({
+    owner: serverOwner,
+    source: () =>
       config.streamSync.write === true &&
       config.streamSync.refuseLegacyWrites === true,
-  );
+  });
+  const legacyWritesRefused = legacyWriteSwitchOf(accountStorageMode);
   let pdppImporterImpl: PdppImporter | null = null;
   const pdppImporter: PdppImporter = {
     importEnvelope: (envelope) =>
@@ -1268,7 +1273,7 @@ export async function createServer(
       : undefined;
 
   const app = createApp({
-    legacyWritesRefused,
+    accountStorageMode,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
     // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).

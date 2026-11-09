@@ -5,6 +5,7 @@ import {
 import { Hono } from "hono";
 import {
   handleOuraCollectionRequirementsRequest,
+  legacyWriteSwitchOf,
   refuseLegacyWrite,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
@@ -37,7 +38,7 @@ type OuraRouteDeps = Pick<
   | "scopeDeletions"
   | "additions"
   | "derivativeCompute"
-  | "legacyWritesRefused"
+  | "accountStorageMode"
 >;
 const SCOPES = ["oura.sleep", "oura.readiness", "oura.activity"];
 
@@ -119,7 +120,11 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
     }
     // An Oura browser import is a legacy write (it lands in the legacy scope
     // store), so a switched account refuses it on every path.
-    const refusal = refuseLegacyWrite(deps.legacyWritesRefused);
+    const refusal = refuseLegacyWrite(
+      deps.accountStorageMode
+        ? legacyWriteSwitchOf(deps.accountStorageMode)
+        : undefined,
+    );
     if (refusal) return refusal;
     if (
       deps.config?.pdpp.optInMethods.includes("oura-browser") &&
