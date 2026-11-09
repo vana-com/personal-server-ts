@@ -34,13 +34,15 @@ export interface LegacyImportSource {
 export interface LegacyImportSink {
   /**
    * Hand one stream's rows to the writer's seed intake. The previous upload
-   * of the stream is replaced, so calling it again is safe.
+   * of the stream is replaced, so calling it again is safe. Returns how many
+   * rows the intake KEPT, counted at its commit point. Pulling a row is not
+   * keeping it: an intake may drop a row it cannot key.
    */
   stage(
     connector: string,
     stream: ImportStream,
     rows: AsyncIterable<Record<string, unknown>>,
-  ): Promise<void>;
+  ): Promise<number>;
 }
 
 export interface LegacyImporterOptions {
@@ -59,16 +61,6 @@ export interface ImportPassResult {
   readonly ran: boolean;
   readonly connectorsStaged: number;
   readonly failed: number;
-}
-
-async function* counted<T>(
-  rows: AsyncIterable<T>,
-  onRow: () => void,
-): AsyncIterable<T> {
-  for await (const row of rows) {
-    onRow();
-    yield row;
-  }
 }
 
 export class LegacyImporter {
@@ -111,16 +103,13 @@ export class LegacyImporter {
       if ((await ledger.read()).imported[connector]) continue;
       try {
         const streams = await source.streams(connector);
-        // The receipt: per stream, the rows the sink actually consumed.
+        // The receipt: per stream, the rows the sink says it kept.
         const receipt: Record<string, number> = {};
         for (const stream of streams) {
-          receipt[stream.stream] = 0;
-          await sink.stage(
+          receipt[stream.stream] = await sink.stage(
             connector,
             stream,
-            counted(stream.records(), () => {
-              receipt[stream.stream] = (receipt[stream.stream] ?? 0) + 1;
-            }),
+            stream.records(),
           );
         }
         const at = (this.options.now?.() ?? new Date()).toISOString();

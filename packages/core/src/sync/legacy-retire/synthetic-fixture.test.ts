@@ -29,6 +29,7 @@ async function run(fullRun: boolean) {
       let count = 0;
       for await (const _ of rows) count += 1;
       staged[`${connector}/${stream.stream}`] = count;
+      return count;
     },
   };
   const importer = new LegacyImporter({

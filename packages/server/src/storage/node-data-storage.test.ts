@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { tmpdir } from "node:os";
@@ -9,6 +16,7 @@ import { createIndexManager } from "./index-manager.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataBlocks } from "@opendatalabs/personal-server-ts-core/storage/blocks/build";
 
@@ -972,6 +980,31 @@ describe.each([
       }),
     ).resolves.toBe(false);
     expect(index.findByPath(fence.path)).toBeDefined();
+  });
+
+  it("waits for the scope lock to write, so no write lands between an erase's check and its unlink (WRITE_ENVELOPE_UNLOCKED)", async () => {
+    let release!: () => void;
+    const held = withScopeLock(
+      scope,
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+    const write = storage.writeEnvelope(envelopeOf("b"));
+    // An unlocked write creates its directories within a few milliseconds;
+    // wait long enough to see that, then expect to see nothing.
+    const dataDir = join(root, "data");
+    let started = false;
+    for (let i = 0; i < 60 && !started; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      started = await readdir(dataDir).then(
+        (names) => names.length > 0,
+        () => false,
+      );
+    }
+    expect(started).toBe(false);
+    release();
+    await held;
+    await write;
+    expect((await readdir(dataDir)).length).toBeGreaterThan(0);
   });
 
   it("keeps the row when the file cannot be read, which is not a match", async () => {

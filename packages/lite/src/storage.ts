@@ -1212,10 +1212,17 @@ export async function createPersistentPsLiteStorage(
         // The content check and the erase share the path lock that every
         // write of this path takes: no rewrite lands between them.
         if (fence?.contentHash !== undefined) {
-          const present =
-            (await fileStore.readEnvelope(path)) ??
-            (await fallbackStore.readEnvelope(path));
-          if (!present || !fenceContentMatches(fence, present.data)) {
+          // The erase below removes every copy, so every copy is checked.
+          const present = (
+            await Promise.all([
+              fileStore.readEnvelope(path),
+              fallbackStore.readEnvelope(path),
+            ])
+          ).filter((copy) => copy != null);
+          if (
+            present.length === 0 ||
+            !present.every((copy) => fenceContentMatches(fence, copy.data))
+          ) {
             return false;
           }
         }

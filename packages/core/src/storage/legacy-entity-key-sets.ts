@@ -47,17 +47,28 @@ export const READER_STAMPED_ITEM_FIELDS: Readonly<
 /**
  * Top-level counts the projection computes from a collection of the same
  * body (`total: items.length`, `totalOrders: orders.length` in
- * `legacy-projection/bindings.ts`), mapped to the collection they count
- * (null: any covered collection). A body holds such a count as the marker
+ * `legacy-projection/bindings.ts`), named per scope with the collection each
+ * counts. A scalar the table does not name for the scope is unknown and is
+ * compared as data (fails closed). A body holds such a count as the marker
  * `DERIVED_COUNT` when it equals the length of its own collection, so two
  * snapshots of a growing collection still agree, and holds the value when it
  * does not, so a count that is not derived is compared like any scalar. The
  * marker is decided per body: a derived local count matches only a derived
  * published count.
  */
-export const DERIVED_COUNT_SCALARS: Readonly<Record<string, string | null>> = {
-  total: null,
-  totalOrders: "orders",
+export const DERIVED_COUNT_SCALARS: Readonly<
+  Record<string, Readonly<Record<string, string>>>
+> = {
+  "amazon.orders": { total: "orders" },
+  "chatgpt.conversations": { total: "conversations" },
+  "chatgpt.memories": { total: "memories" },
+  "claude.conversations": { total: "conversations" },
+  "claude.projects": { total: "projects" },
+  "heb.orders": { totalOrders: "orders" },
+  "instagram.following": { total: "accounts" },
+  "shop.orders": { total: "orders" },
+  "spotify.playlists": { total: "playlists" },
+  "wholefoods.orders": { totalOrders: "orders" },
 };
 const DERIVED_COUNT = "$derived-count";
 const TOP_LEVEL_PATH = /^\$\.([A-Za-z0-9_]+)$/;
@@ -123,17 +134,13 @@ export function entityHashes(
   );
   const scalars = new Map<string, Map<string, string>>();
   const record = body as Record<string, unknown>;
+  // A count is derived only for the collection this scope's projector counts;
+  // a scope or key the table does not name is unknown, and compared as data.
   const derivedCount = (key: string, value: unknown): boolean => {
-    if (!Object.hasOwn(DERIVED_COUNT_SCALARS, key)) return false;
-    const counted = DERIVED_COUNT_SCALARS[key];
-    return [...covered].some((c) => {
-      const items = record[c];
-      return (
-        (counted === null || counted === c) &&
-        Array.isArray(items) &&
-        items.length === value
-      );
-    });
+    const counted = DERIVED_COUNT_SCALARS[scope]?.[key];
+    if (counted === undefined || !covered.has(counted)) return false;
+    const items = record[counted];
+    return Array.isArray(items) && items.length === value;
   };
   for (const [key, value] of Object.entries(body)) {
     if (covered.has(key) || value === undefined) continue;

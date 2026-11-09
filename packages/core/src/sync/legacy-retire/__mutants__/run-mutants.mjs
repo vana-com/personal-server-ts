@@ -9,8 +9,9 @@
  *   ... --list
  *   ... --keep            (keep the scratch copy)
  *
- * Needs the repository installed and built (`npm ci && npm run build`) on
- * Node 22. Exit 0 only when the baseline is green and every mutant is RED.
+ * Needs the repository installed (`npm ci`) on Node 22; the baseline builds
+ * core's dist in the scratch copy first, and stops with a clear message if
+ * that build fails. A test file that did not load is never a kill. Exit 0 only when the baseline is green and every mutant is RED.
  * Prints a markdown table.
  */
 
@@ -185,6 +186,24 @@ let bad = 0;
 try {
   // Every edit still applies exactly once (fails fast on a stale edit).
   for (const m of selected) applyEdits(m.edits)();
+  // The tests of server and lite read core through its built output, so the
+  // baseline starts from a fresh build of the unmutated tree.
+  try {
+    buildCore();
+  } catch (error) {
+    console.error(
+      `BASELINE BUILD FAILED; no mutant was run (a missing build is not a kill)\n${error.message}`,
+    );
+    process.exitCode = 1;
+    throw new Error("baseline");
+  }
+  if (!existsSync(join(scratch, "packages/core/dist/sync/index.js"))) {
+    console.error(
+      "BASELINE BUILD PRODUCED NO packages/core/dist; no mutant was run",
+    );
+    process.exitCode = 1;
+    throw new Error("baseline");
+  }
   // Baseline: every test any mutant relies on is green without a mutation.
   const baselineTests = [...new Set(selected.flatMap((m) => m.tests))];
   const baseline = vitest(baselineTests);
@@ -209,6 +228,8 @@ try {
     );
     let verdict;
     if (outcome.crashed) verdict = "ERROR (tests did not run)";
+    else if (outcome.failed.some((name) => name.endsWith("(did not run)")))
+      verdict = "ERROR (a test file did not load; not a kill)";
     else if (outcome.ok) verdict = "SURVIVED";
     else if (missing.length > 0)
       verdict = `RED, but not in: ${missing.join("; ")}`;

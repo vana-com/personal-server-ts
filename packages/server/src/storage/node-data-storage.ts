@@ -232,8 +232,12 @@ export function createNodeDataStorage(
     readBlockManifest(scope: string, collectedAt: string) {
       return readScopeBlockManifest(deps.hierarchyOptions, scope, collectedAt);
     },
+    // Under the scope lock like every erase of the scope, so a write cannot
+    // land between an erase's content check and its unlink.
     writeEnvelope(envelope: DataFileEnvelope) {
-      return writeDataFile(deps.hierarchyOptions, envelope);
+      return withScopeLock(envelope.scope, () =>
+        writeDataFile(deps.hierarchyOptions, envelope),
+      );
     },
     // The file is durable at its final path before its row exists, and the
     // scope lock keeps every erase of the scope (all of which take it) from

@@ -440,6 +440,29 @@ describe("a body with data the key table does not cover is never proven (UNLISTE
     );
   });
 
+  it("holds a count as derived only for the collection its scope counts (DERIVED_TOTAL_ANY_COLLECTION)", () => {
+    // github.history has two collections and the table names no count for it:
+    // `total` equal to the length of one of them is still just a number.
+    const total = (pullRequests: number, value: number) =>
+      entityHashes("github.history", {
+        pullRequests: Array.from({ length: pullRequests }, (_, i) => ({
+          id: i + 1,
+        })),
+        issues: [],
+        total: value,
+      })!.get("$scalar.total");
+    expect(total(2, 2)).not.toEqual(total(3, 3));
+    expect(total(2, 2)).toEqual(total(2, 2));
+    // A scope the table names: the named collection decides, no other.
+    const memories = (items: number, value: number) =>
+      entityHashes("chatgpt.memories", {
+        memories: Array.from({ length: items }, (_, i) => legacy(`m${i}`)),
+        total: value,
+      })!.get("$scalar.total");
+    expect(memories(2, 2)).toEqual(memories(3, 3));
+    expect(memories(2, 3)).not.toEqual(memories(2, 2));
+  });
+
   it("is one-sided no more: a derived local total does not match a published total that is not derived (PUBLISHED_TOTAL_IGNORED)", async () => {
     const f = await flow({ local: ["e0", "e1"] });
     await f.importer.run();
@@ -479,7 +502,9 @@ describe("a body with data the key table does not cover is never proven (UNLISTE
     );
     expect(keys(body({ fetchedBy: "x" }))).toContain("$scalar.fetchedBy");
     expect(keys(body({ fetched_at: "x" }))).toContain("$scalar.fetched_at");
-    // A conversation's own stamp is dropped from its hash; its content is not.
+  });
+
+  it("does not hash a conversation's own reader-made fetched_at, and still hashes its content (FETCHED_AT_ITEM_COMPARED)", () => {
     const convo = (extra: Record<string, unknown>) =>
       entityHashes("chatgpt.conversations", {
         conversations: [{ id: "c1", title: "t", messages: [], ...extra }],
@@ -576,6 +601,21 @@ describe("a fence needs rows this device staged (VACUOUS_IMPORT_FENCE_DELETES)",
     const f = await flow({ local: ["e0", "e1"], seed: [] });
     await deleted(f);
     await reconnected(f, ["e5"]);
+    const report = await f.retire();
+    expect(report.files[0]).toMatchObject({ decision: "fence_not_imported" });
+    expect(report.deleted).toBe(0);
+  });
+
+  it("keeps a pre-delete file when the sink pulled the rows but kept none (RECEIPT_COUNTED_ON_PULL)", async () => {
+    const f = await flow({
+      local: ["e0", "e1"],
+      seed: ["e0", "e1"],
+      sinkKeepsNone: true,
+    });
+    await deleted(f);
+    await reconnected(f, ["e5"]);
+    expect(await f.importer.importDone(CONNECTOR)).toBe(true);
+    expect(await f.ledger.staged(CONNECTOR, STREAM)).toBe(false);
     const report = await f.retire();
     expect(report.files[0]).toMatchObject({ decision: "fence_not_imported" });
     expect(report.deleted).toBe(0);

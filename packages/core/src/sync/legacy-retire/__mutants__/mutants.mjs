@@ -275,11 +275,33 @@ export const MUTANTS = [
     why: "the importer records every staged stream with zero rows, so no fence ever opens",
     edits: edit(
       IMPORT,
-      "receipt[stream.stream] = (receipt[stream.stream] ?? 0) + 1;",
-      "receipt[stream.stream] = receipt[stream.stream] ?? 0;",
+      "receipt[stream.stream] = await sink.stage(\n            connector,\n            stream,\n            stream.records(),\n          );",
+      "await sink.stage(connector, stream, stream.records());\n          receipt[stream.stream] = 0;",
     ),
     tests: [ROUND2],
     mustFail: ["retires a pre-delete file once the import staged rows"],
+  },
+  {
+    name: "RECEIPT_COUNTED_ON_PULL",
+    why: "the importer counts the rows the sink pulled, not the rows it kept: an intake that drops every row still opens the fence",
+    edits: edit(
+      IMPORT,
+      "receipt[stream.stream] = await sink.stage(\n            connector,\n            stream,\n            stream.records(),\n          );",
+      "let pulled = 0;\n          await sink.stage(\n            connector,\n            stream,\n            (async function* () {\n              for await (const row of stream.records()) {\n                pulled += 1;\n                yield row;\n              }\n            })(),\n          );\n          receipt[stream.stream] = pulled;",
+    ),
+    tests: [ROUND2],
+    mustFail: ["RECEIPT_COUNTED_ON_PULL"],
+  },
+  {
+    name: "DERIVED_TOTAL_ANY_COLLECTION",
+    why: "a `total` is derived whenever it equals the length of any covered collection, whatever the scope counts",
+    edits: edit(
+      KEYS,
+      "const counted = DERIVED_COUNT_SCALARS[scope]?.[key];\n    if (counted === undefined || !covered.has(counted)) return false;\n    const items = record[counted];\n    return Array.isArray(items) && items.length === value;",
+      "if (!Object.values(DERIVED_COUNT_SCALARS).some((t) => Object.hasOwn(t, key))) return false;\n    return [...covered].some((c) => {\n      const items = record[c];\n      return Array.isArray(items) && items.length === value;\n    });",
+    ),
+    tests: [ROUND2],
+    mustFail: ["DERIVED_TOTAL_ANY_COLLECTION"],
   },
   {
     name: "HASH_NOT_PASSED_TO_ERASE",
@@ -319,7 +341,7 @@ export const MUTANTS = [
       '"chatgpt.conversations": [],',
     ),
     tests: [ROUND2],
-    mustFail: ["FETCHED_AT_COMPARED"],
+    mustFail: ["FETCHED_AT_ITEM_COMPARED"],
   },
   {
     name: "CONTENT_FENCE_IGNORED_NODE_OPS",
@@ -348,11 +370,44 @@ export const MUTANTS = [
     why: "the Lite storage erases without checking the content hash under the path lock",
     edits: edit(
       "packages/lite/src/storage.ts",
-      "if (!present || !fenceContentMatches(fence, present.data)) {",
-      "if (false) {",
+      "!present.every((copy) => fenceContentMatches(fence, copy.data))",
+      "false",
     ),
     tests: ["packages/lite/src/storage.test.ts"],
     mustFail: ["an erase fenced by content"],
+  },
+  {
+    name: "SINK_RETURNS_PULLED",
+    why: "the seed sink reports the rows it was handed, not the rows the intake kept",
+    edits: edit(
+      "packages/server/src/stream-sync/legacy-import-sink.ts",
+      "return seed.records;",
+      "return count;",
+    ),
+    tests: [IMPORT_SINK_TEST],
+    mustFail: ["SINK_RETURNS_PULLED"],
+  },
+  {
+    name: "NODE_WRITE_ENVELOPE_UNLOCKED",
+    why: "the Node storage writes an envelope without the scope lock every erase takes, so a write can land between an erase's content check and its unlink",
+    edits: edit(
+      "packages/server/src/storage/node-data-storage.ts",
+      "return withScopeLock(envelope.scope, () =>\n        writeDataFile(deps.hierarchyOptions, envelope),\n      );",
+      "return writeDataFile(deps.hierarchyOptions, envelope);",
+    ),
+    tests: ["packages/server/src/storage/node-data-storage.test.ts"],
+    mustFail: ["WRITE_ENVELOPE_UNLOCKED"],
+  },
+  {
+    name: "LITE_HASH_ONE_COPY",
+    why: "the Lite erase checks the first copy of the file only, but removes every copy",
+    edits: edit(
+      "packages/lite/src/storage.ts",
+      "!present.every((copy) => fenceContentMatches(fence, copy.data))",
+      "!fenceContentMatches(fence, present[0]!.data)",
+    ),
+    tests: ["packages/lite/src/storage.test.ts"],
+    mustFail: ["LITE_HASH_ONE_COPY"],
   },
   {
     name: "UNCOVERED_RETIRES",

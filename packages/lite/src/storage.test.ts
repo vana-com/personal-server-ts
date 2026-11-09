@@ -541,6 +541,49 @@ describe("createPersistentPsLiteStorage", () => {
     });
   });
 
+  describe("an erase fenced by content checks every copy it removes", () => {
+    const scope = "instagram.profile";
+    const collectedAt = "2026-05-08T00:00:00.000Z";
+    const path = `data/${scope}/${collectedAt}.json`;
+
+    it("keeps both copies when the file store holds the fenced content but the fallback copy is other content (LITE_HASH_ONE_COPY)", async () => {
+      const files = createMemoryPsLiteDataFileStore("custom");
+      await files.writeEnvelope(
+        path,
+        createDataFileEnvelope(scope, collectedAt, { username: "old" }),
+      );
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        createMemoryPsLitePersistence({
+          version: 1,
+          nextId: 1,
+          entries: [],
+          envelopes: [
+            createDataFileEnvelope(scope, collectedAt, { username: "stale" }),
+          ],
+        }),
+        files,
+      );
+      const entry = await storage.insertEntry({
+        fileId: null,
+        path,
+        scope,
+        collectedAt,
+        sizeBytes: 1,
+      });
+      const fence = {
+        id: entry.id,
+        path,
+        contentHash: contentHash({ username: "old" }),
+      };
+      await expect(
+        storage.deleteVersion(scope, collectedAt, fence),
+      ).resolves.toBe(false);
+      expect(storage.countVersions(scope)).toBe(1);
+      expect(await files.readEnvelope(path)).not.toBeNull();
+    });
+  });
+
   describe("an erase in flight on one path", () => {
     const scope = "instagram.profile";
     const X = "2026-05-08T00:00:00.000Z";
