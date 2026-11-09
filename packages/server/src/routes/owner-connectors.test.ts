@@ -52,6 +52,8 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
     switched: boolean;
     connectionDelete?: ConnectionDeletePort | null;
     mode?: StorageModeRead;
+    /** No mode is handed to the app; the config is write-only, as Desktop sets it. */
+    unwired?: boolean;
   }) {
     return createApp({
       logger: pino({ level: "silent" }),
@@ -66,13 +68,17 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
       devToken: token,
       config: ServerConfigSchema.parse({
         streamSync: {
-          write: opts.switched,
+          write: opts.switched || opts.unwired === true,
           refuseLegacyWrites: opts.switched,
         },
       }),
       streamSyncConnectionDelete:
         opts.connectionDelete === undefined ? writer : opts.connectionDelete,
-      accountStorageMode: opts.mode,
+      accountStorageMode: opts.unwired
+        ? undefined
+        : (opts.mode ?? {
+            read: () => (opts.switched ? "switched" : "unswitched"),
+          }),
     });
   }
 
@@ -128,6 +134,16 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
       "/v1/owner/connectors/a~b",
     );
     expect(response.status).toBe(400);
+    expect(calls).toEqual([]);
+  });
+
+  it("answers 503, not 409, when no mode is wired, even on a write-only config (mutant: UNWIRED_MODE_FROM_CONFIG)", async () => {
+    const response = await del(
+      makeApp({ switched: false, unwired: true }),
+      "/v1/owner/connectors/github",
+    );
+    expect(response.status).toBe(503);
+    expect((await response.json()).error).toBe("ACCOUNT_MODE_UNKNOWN");
     expect(calls).toEqual([]);
   });
 

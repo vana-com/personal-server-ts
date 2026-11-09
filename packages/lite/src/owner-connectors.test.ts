@@ -18,6 +18,8 @@ const ownerAuth = { Authorization: "Bearer owner-token" };
 function runtimeWith(opts: {
   switched: boolean;
   mode?: "switched" | "unswitched" | "unknown";
+  /** No mode is handed to the runtime. */
+  unwired?: boolean;
   connectionDelete?: {
     requestConnectionDelete: (c: string) => Promise<{ deleteId: string }>;
   } | null;
@@ -36,9 +38,14 @@ function runtimeWith(opts: {
       builderToken: "builder-token",
     }),
     active: true,
-    accountStorageMode: {
-      read: () => opts.mode ?? (opts.switched ? "switched" : "unswitched"),
-    },
+    ...(opts.unwired
+      ? {}
+      : {
+          accountStorageMode: {
+            read: () =>
+              opts.mode ?? (opts.switched ? "switched" : "unswitched"),
+          },
+        }),
     streamSyncConnectionDelete:
       opts.connectionDelete === undefined
         ? {
@@ -93,6 +100,15 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
     );
     expect(response.status).toBe(503);
     expect((await response.json()).error).toBe("STREAM_SYNC_UNAVAILABLE");
+  });
+
+  it("answers 503, not 409, when no mode is wired (mutant: UNWIRED_MODE_FROM_CONFIG)", async () => {
+    const response = await del(
+      runtimeWith({ switched: false, unwired: true }),
+      "/v1/owner/connectors/github",
+    );
+    expect(response.status).toBe(503);
+    expect((await response.json()).error).toBe("ACCOUNT_MODE_UNKNOWN");
   });
 
   it("answers 503 while the mode is unknown (mutant: UNKNOWN_MODE_NOT_SWITCHED)", async () => {

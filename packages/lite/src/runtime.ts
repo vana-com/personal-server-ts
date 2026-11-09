@@ -154,8 +154,8 @@ export interface PsLiteRuntimeOptions {
    */
   streamSyncConnectionDelete?: ConnectionDeletePort | null;
   /**
-   * The account's storage mode (`AccountStorageMode`). Absent = unswitched, so
-   * the connector delete answers NOT_SWITCHED.
+   * The account's storage mode (`AccountStorageMode`). Absent means unknown:
+   * the connector delete answers 503 `ACCOUNT_MODE_UNKNOWN`.
    */
   accountStorageMode?: StorageModeRead;
   storage: PsLiteStorageAdapter | DataStoragePort;
@@ -1229,7 +1229,7 @@ export function createPsLiteRuntime(
           }
           return handleOwnerConnectorDelete(request, connectorId, {
             authorizeOwner: (req) => auth.authorizeOwner(req),
-            mode: options.accountStorageMode ?? { read: () => "unswitched" },
+            mode: options.accountStorageMode ?? { read: () => "unknown" },
             connectionDelete: options.streamSyncConnectionDelete,
           });
         }

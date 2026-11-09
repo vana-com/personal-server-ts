@@ -170,9 +170,9 @@ export interface AppDeps {
   /** The stream-sync writer's connection delete (`DELETE /v1/owner/connectors/:id`). */
   streamSyncConnectionDelete?: ConnectionDeletePort | null;
   /**
-   * The account's storage mode (`AccountStorageMode`). Absent: the mode is read
-   * from the config switch (`streamSync.write` and `refuseLegacyWrites`), as
-   * the legacy write gate reads it, and is never `unknown`.
+   * The account's storage mode (`AccountStorageMode`). Absent means unknown:
+   * the connector delete answers 503 `ACCOUNT_MODE_UNKNOWN`, never a guess from
+   * the config. A host that calls the route passes its one instance.
    */
   accountStorageMode?: StorageModeRead;
   /**
@@ -341,11 +341,7 @@ function streamSyncClosing(): ProtocolError {
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
   const storageMode: StorageModeRead = deps.accountStorageMode ?? {
-    read: () =>
-      deps.config?.streamSync.write === true &&
-      deps.config.streamSync.refuseLegacyWrites === true
-        ? "switched"
-        : "unswitched",
+    read: () => "unknown",
   };
 
   // One store for mint (POST /v1/write/session) and redeem (data ingest and

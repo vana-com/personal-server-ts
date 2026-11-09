@@ -448,16 +448,7 @@ export async function createIndexedDbPsLiteRuntime(
     scopeDeletions,
     streamSyncRead,
     streamSyncConnectionDelete: streamSyncWriter,
-    // Until a host hands over its `AccountStorageMode`, the mode is the config
-    // switch the legacy write gate reads (`streamSync.write` and
-    // `refuseLegacyWrites`), and is never `unknown`.
-    accountStorageMode: {
-      read: () =>
-        config.streamSync.write === true &&
-        config.streamSync.refuseLegacyWrites === true
-          ? "switched"
-          : "unswitched",
-    },
+    accountStorageMode: options.accountStorageMode,
     diagnostics,
     lineageGateway,
     derivatives,
