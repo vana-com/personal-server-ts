@@ -510,51 +510,57 @@ export class StreamSyncReadService {
     const unsubscribe =
       options.overlay?.planInputs?.((connector) => revisions.bump(connector)) ??
       null;
-    const mirror = await RegistryMirror.open(
-      options.files,
-      (row) => classifyStreamRow(toControlRead(row), hashes) === "tombstoned",
-      revisions,
-    );
-    const views = await ViewStore.open(options.files, revisions);
-    await options.files.remove("spool");
-    const importer = new StreamSyncImporter({
-      mirror,
-      views,
-      blobs: options.blobs,
-      keys: options.keys,
-      controlHashes: hashes,
-      logger: options.logger,
-      // Only durable files may let the source retire what they cover.
-      ...(options.durable && options.overlay
-        ? {
-            acknowledge: (coverage: StreamSyncImportedCoverage) =>
-              options.overlay!.acknowledge(coverage),
-          }
-        : {}),
-    });
-    // Every durable current view is covered already: say so, so a restart
-    // retires what an interrupted acknowledgment left behind.
-    if (options.durable && options.overlay) {
-      for (const { key, version } of views.views()) {
-        await importer.acknowledge(key, {
-          version: version.version,
-          dataHash: version.dataHash,
-          generation: version.head.generation,
-        });
+    try {
+      const mirror = await RegistryMirror.open(
+        options.files,
+        (row) => classifyStreamRow(toControlRead(row), hashes) === "tombstoned",
+        revisions,
+      );
+      const views = await ViewStore.open(options.files, revisions);
+      await options.files.remove("spool");
+      const importer = new StreamSyncImporter({
+        mirror,
+        views,
+        blobs: options.blobs,
+        keys: options.keys,
+        controlHashes: hashes,
+        logger: options.logger,
+        // Only durable files may let the source retire what they cover.
+        ...(options.durable && options.overlay
+          ? {
+              acknowledge: (coverage: StreamSyncImportedCoverage) =>
+                options.overlay!.acknowledge(coverage),
+            }
+          : {}),
+      });
+      // Every durable current view is covered already: say so, so a restart
+      // retires what an interrupted acknowledgment left behind.
+      if (options.durable && options.overlay) {
+        for (const { key, version } of views.views()) {
+          await importer.acknowledge(key, {
+            version: version.version,
+            dataHash: version.dataHash,
+            generation: version.head.generation,
+          });
+        }
       }
+      // Import whatever the mirror holds that a crash left unimported.
+      const service = new StreamSyncReadService(
+        options,
+        mirror,
+        views,
+        importer,
+        revisions,
+        new Set(mirror.connectors()),
+      );
+      service.unsubscribePlanInputs = unsubscribe;
+      await service.forwardDeletes();
+      return service;
+    } catch (error) {
+      // A failed open returns no service to close: drop its subscription now.
+      unsubscribe?.();
+      throw error;
     }
-    // Import whatever the mirror holds that a crash left unimported.
-    const service = new StreamSyncReadService(
-      options,
-      mirror,
-      views,
-      importer,
-      revisions,
-      new Set(mirror.connectors()),
-    );
-    service.unsubscribePlanInputs = unsubscribe;
-    await service.forwardDeletes();
-    return service;
   }
 
   /** Stop following the overlay's plan-input changes. */

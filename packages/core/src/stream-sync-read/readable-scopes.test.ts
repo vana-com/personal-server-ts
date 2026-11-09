@@ -14,9 +14,9 @@ import type { MirrorFeedRow } from "./mirror.js";
 import type { FakeRun } from "./service-fixture.js";
 import { ask, Fixture, masterKey } from "./service-fixture.js";
 import { testOwnerKey } from "./testing.js";
-import type { StreamSyncReadService } from "./service.js";
+import { StreamSyncReadService } from "./service.js";
 import { ConnectorRevisions } from "./connector-revisions.js";
-import { Rig } from "./writer-rig.js";
+import { CONNECTOR, Rig } from "./writer-rig.js";
 
 const T = Date.parse("2026-11-01T00:00:00Z");
 const row = (id: string): Line => ({ o: T, r: "r1", v: { id } });
@@ -921,5 +921,99 @@ describe("readableScopes cache misses after every write under the connector", ()
     } finally {
       bump.mockRestore();
     }
+  });
+
+  // LISTENER_LOGGER_ESCAPE (aimed by the mutant runner)
+  it("a throwing listener and a throwing logger do not fail the run or silence later listeners", async () => {
+    const rig = new Rig(undefined, CONNECTOR, {
+      warn() {
+        throw new Error("logger broke");
+      },
+    });
+    rig.writer.onPlanInputs(() => {
+      throw new Error("listener broke");
+    });
+    await rig.open();
+    const bump = vi.spyOn(ConnectorRevisions.prototype, "bump");
+    try {
+      await rig.collect({
+        runId: "first",
+        key: "id",
+        version: "1.0.0",
+        rows: [{ id: "a" }],
+        full: true,
+      });
+      expect(bump).toHaveBeenCalledWith(rig.connector);
+      expect(rig.files.paths()).toContain("runs/first/entry.json");
+    } finally {
+      bump.mockRestore();
+    }
+  });
+
+  it("a listener error whose message getter throws does not fail the run or silence later listeners", async () => {
+    const rig = new Rig(undefined, CONNECTOR, { warn() {} });
+    rig.writer.onPlanInputs(() => {
+      const error = new Error("listener broke");
+      Object.defineProperty(error, "message", {
+        get() {
+          throw new Error("message getter broke");
+        },
+      });
+      throw error;
+    });
+    await rig.open();
+    const bump = vi.spyOn(ConnectorRevisions.prototype, "bump");
+    try {
+      await rig.collect({
+        runId: "first",
+        key: "id",
+        version: "1.0.0",
+        rows: [{ id: "a" }],
+        full: true,
+      });
+      expect(bump).toHaveBeenCalledWith(rig.connector);
+      expect(rig.files.paths()).toContain("runs/first/entry.json");
+    } finally {
+      bump.mockRestore();
+    }
+  });
+
+  // OPEN_FAILURE_KEEPS_SUBSCRIPTION (aimed by the mutant runner)
+  it("a failed open leaves no plan-input callback behind", async () => {
+    const rig = new Rig();
+    const live = new Set<(connector: string) => void>();
+    const overlay = {
+      ...rig.overlay,
+      planInputs: (listener: (connector: string) => void) => {
+        const off = rig.overlay.planInputs!(listener);
+        live.add(listener);
+        return () => {
+          live.delete(listener);
+          off();
+        };
+      },
+    };
+    const fail = async (): Promise<never> => {
+      throw new Error("disk is gone");
+    };
+    const broken = {
+      write: fail,
+      read: fail,
+      readChunks: async function* () {
+        await fail();
+      },
+      list: fail,
+      remove: fail,
+    };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(rig.open({ files: broken, overlay })).rejects.toThrow(
+        "disk is gone",
+      );
+    }
+    expect(live.size).toBe(0);
+    await rig.open({ overlay });
+    expect(live.size).toBe(1);
+    rig.service.close();
+    expect(live.size).toBe(0);
   });
 });

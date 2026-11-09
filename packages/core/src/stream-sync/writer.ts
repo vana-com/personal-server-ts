@@ -1838,13 +1838,19 @@ export class StreamSyncWriter {
       try {
         listener(connector);
       } catch (error) {
-        this.options.logger?.warn(
-          {
-            connector,
-            error: error instanceof Error ? error.message : "unknown",
-          },
-          "stream-sync writer: a plan-input listener failed",
-        );
+        // Reporting is best effort too: a throwing logger or `message` getter
+        // must not stop the other listeners.
+        try {
+          this.options.logger?.warn(
+            {
+              connector,
+              error: error instanceof Error ? error.message : "unknown",
+            },
+            "stream-sync writer: a plan-input listener failed",
+          );
+        } catch {
+          // Nothing left to report to.
+        }
       }
     }
   }

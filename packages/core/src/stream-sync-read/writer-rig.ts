@@ -34,7 +34,10 @@ import { createStreamSyncReadKeys } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
 import { StreamSyncReadService } from "./service.js";
-import type { StreamSyncOverlaySnapshotSource } from "./ports.js";
+import type {
+  StreamSyncOverlaySnapshotSource,
+  StreamSyncReadFiles,
+} from "./ports.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
 const SIGNATURE = `0x${"1f".repeat(32)}${"2a".repeat(32)}1b` as const;
@@ -180,6 +183,8 @@ export class Rig {
   constructor(
     seed?: SeedRows,
     readonly connector: string = CONNECTOR,
+    /** The writer's logger; default none. */
+    private readonly writerLogger?: { warn(obj: Record<string, unknown>, msg?: string): void },
   ) {
     this.seed = seed;
     this.writer = this.device(this.files, seed);
@@ -223,6 +228,7 @@ export class Rig {
       get: async (key) => this.blobMap.get(key) ?? null,
     };
     return new StreamSyncWriter({
+      ...(this.writerLogger ? { logger: this.writerLogger } : {}),
       ownerAddress: OWNER,
       registry: this.gateway,
       blobs,
@@ -270,15 +276,20 @@ export class Rig {
   }
 
   async open(
-    options: { arrayProjectionBudgetBytes?: number } = {},
+    options: {
+      arrayProjectionBudgetBytes?: number;
+      files?: StreamSyncReadFiles;
+      overlay?: StreamSyncOverlaySnapshotSource;
+    } = {},
   ): Promise<void> {
+    const { files = this.readFiles, overlay = this.overlay, ...rest } = options;
     this.service = await StreamSyncReadService.open({
-      ...options,
-      files: this.readFiles,
+      ...rest,
+      files,
       blobs: { get: async (key) => this.blobMap.get(key) ?? null },
       keys: await createStreamSyncReadKeys(streamMasterKey(SIGNATURE)),
       logger: silent,
-      overlay: this.overlay,
+      overlay,
       durable: true,
       now: () => new Date(T0 + 7_200_000),
     });
