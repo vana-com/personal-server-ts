@@ -43,6 +43,7 @@ const CANON_STORE_TEST =
 const BOOT_TEST = "packages/server/src/canonical-import-boot.test.ts";
 const REAL_TEST = "packages/server/src/stream-sync/import-real-writer.test.ts";
 const UNKNOWN_TEST = `${R}/import-unknown.test.ts`;
+const LITE_OWNER_TEST = "packages/lite/src/sync-legacy-owner.test.ts";
 
 const edit = (file, find, replace) => [{ file, find, replace }];
 
@@ -1110,8 +1111,8 @@ export const MUTANTS = [
     why: "the switch ignores the account-mode authority",
     edits: edit(
       `${R}/switch.ts`,
-      'return mode.read(owner) === "switched";',
-      'return mode.read(owner) !== "unswitched";',
+      'return accountModeOf(mode, owner) === "switched";',
+      'return accountModeOf(mode, owner) !== "unswitched";',
     ),
     tests: [`${R}/switch.test.ts`],
     mustFail: ["SWITCH_READS_FLAG"],
@@ -1122,7 +1123,7 @@ export const MUTANTS = [
     edits: [
       {
         file: BOOTSTRAP,
-        find: "mode: () => accountMode.read(serverOwner),",
+        find: "mode: () => accountModeOf(accountMode, serverOwner),",
         replace: 'mode: () => "switched" as const,',
       },
     ],
@@ -1225,8 +1226,10 @@ export const MUTANTS = [
     why: "the seed publish is not routed through the authority's commitImportSeed",
     edits: edit(
       IMPORT,
-      "if (!ledger.admitSeedPublish(connector)) continue;",
-      "",
+      `const sealed = await ledger.sealSeedPublish(connector, () =>
+          publish(connector, stagedStreams),
+        );`,
+      "const sealed = { admitted: true as const, value: await publish(connector, stagedStreams) };",
     ),
     tests: [UNKNOWN_TEST],
     mustFail: ["IMPORT_SEED_BYPASSES_AUTHORITY"],
@@ -1248,9 +1251,9 @@ export const MUTANTS = [
     edits: [
       {
         file: BOOTSTRAP,
-        find: "mode: () => accountMode.read(serverOwner),",
+        find: "mode: () => accountModeOf(accountMode, serverOwner),",
         replace:
-          'mode: () => (accountMode.read(serverOwner) === "unknown" ? "unswitched" : accountMode.read(serverOwner)),',
+          'mode: () => (accountModeOf(accountMode, serverOwner) === "unknown" ? "unswitched" : accountModeOf(accountMode, serverOwner)),',
       },
     ],
     tests: [BOOT_TEST],
@@ -1273,5 +1276,60 @@ export const MUTANTS = [
     tests: [BOOT_TEST],
     mustFail: ["BOOT_RETIRE_MODE_IGNORED"],
     build: true,
+  },
+
+  // ---- round 5 (recheck of 058d5867) ----
+  {
+    name: "OWNER_NOT_LOWERCASED",
+    why: "the owner reaches the mode authority checksum-cased",
+    edits: edit(
+      `${R}/switch.ts`,
+      "return mode.read(owner.toLowerCase());",
+      "return mode.read(owner);",
+    ),
+    tests: [`${R}/switch.test.ts`, BOOT_TEST, LITE_OWNER_TEST],
+    mustFail: ["OWNER_NOT_LOWERCASED"],
+    build: true,
+  },
+  {
+    name: "SEED_ASKED_DEFAULTED",
+    why: "publishSeed takes no streams and judges an empty list again",
+    edits: edit(
+      WRITER,
+      `    asked: readonly string[],
+  ): Promise<SeedPublication> {`,
+      `    asked: readonly string[] = [],
+  ): Promise<SeedPublication> {`,
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["SEED_ASKED_DEFAULTED"],
+  },
+  {
+    name: "IMPORT_SEED_PUBLISHED_OUTSIDE_SEAL",
+    why: "the seed publish runs after the authority's seal returns, not inside it",
+    edits: edit(
+      IMPORT,
+      `const sealed = await ledger.sealSeedPublish(connector, () =>
+          publish(connector, stagedStreams),
+        );`,
+      `const gate = await ledger.sealSeedPublish(connector, async () => undefined);
+        const sealed = gate.admitted
+          ? { admitted: true as const, value: await publish(connector, stagedStreams) }
+          : gate;`,
+    ),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["IMPORT_SEED_PUBLISHED_OUTSIDE_SEAL"],
+  },
+  {
+    name: "IMPORT_DONE_WITHOUT_PUBLISH",
+    why: "an import with no publish bound reads every staged seed as final",
+    edits: edit(
+      IMPORT,
+      "const bound = this.options.publish !== undefined;",
+      `const bound = this.options.publish !== undefined;
+    if (!bound) return true;`,
+    ),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["IMPORT_DONE_WITHOUT_PUBLISH"],
   },
 ];

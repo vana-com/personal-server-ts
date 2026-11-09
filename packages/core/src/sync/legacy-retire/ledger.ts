@@ -215,14 +215,22 @@ export class RetireLedger {
   }
 
   /**
-   * Ask the authority to admit this connector's seed publish while the import
-   * is pending. True only when it admits it.
+   * Run this connector's seed publish inside the authority's seal while the
+   * import is pending. The authority runs `write` itself and answers with its
+   * result, or refuses and runs nothing: nothing publishes outside the call.
    */
-  admitSeedPublish(connector: string): boolean {
-    return (
-      this.authority.commitImportSeed(this.owner, `import-seed:${connector}`)
-        .kind === "streams"
+  async sealSeedPublish<T>(
+    connector: string,
+    write: () => Promise<T>,
+  ): Promise<{ admitted: false } | { admitted: true; value: T }> {
+    const sealed = await this.authority.commitImportSeed(
+      this.owner,
+      `import-seed:${connector}`,
+      write,
     );
+    return sealed.kind === "streams"
+      ? { admitted: true, value: sealed.value }
+      : { admitted: false };
   }
 
   /**

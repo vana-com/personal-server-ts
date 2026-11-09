@@ -154,9 +154,11 @@ describe("the importer's own seed publish goes through the authority (IMPORT_SEE
     const asked: { owner: string; operationId: string }[] = [];
     const authority: ImportAuthority = {
       ...base,
-      commitImportSeed: (owner, operationId) => {
+      commitImportSeed: (owner, operationId, write) => {
         asked.push({ owner, operationId });
-        return { kind: admit ? "streams" : "refuse" };
+        return admit
+          ? base.commitImportSeed(owner, operationId, write)
+          : Promise.resolve({ kind: "refuse" });
       },
     };
     let published = 0;
@@ -178,6 +180,97 @@ describe("the importer's own seed publish goes through the authority (IMPORT_SEE
     admit = true;
     await f.importer.run();
     expect(published).toBe(1);
+  });
+});
+
+describe("the seed publish runs inside the authority's seal (IMPORT_SEED_PUBLISHED_OUTSIDE_SEAL)", () => {
+  it("publishes only while the authority holds its lock, and never after the call returns", async () => {
+    const base = createMemoryImportAuthority();
+    let sealed = false;
+    const outside: string[] = [];
+    const authority: ImportAuthority = {
+      ...base,
+      commitImportSeed: (owner, operationId, write) =>
+        base.commitImportSeed(owner, operationId, async () => {
+          sealed = true;
+          try {
+            return await write();
+          } finally {
+            sealed = false;
+          }
+        }),
+    };
+    const f = await flow({
+      local: ["e0", "e1"],
+      source: twoRows(),
+      owner: OWNER,
+      authority,
+      publishSeed: async (connector, streams) => {
+        if (!sealed) outside.push(connector);
+        return f.rig.writer.publishSeed(connector, streams);
+      },
+    });
+    await f.importer.run();
+    await publish(f);
+    await f.importer.run();
+    await f.importer.run();
+    expect(base.seedCommits.length).toBeGreaterThan(0);
+    expect(outside).toEqual([]);
+    expect((await f.rig.registeredHead(STREAM))?.recordCount).toBe(2);
+  });
+
+  it("publishes nothing when the authority runs no write", async () => {
+    const base = createMemoryImportAuthority();
+    let calls = 0;
+    const authority: ImportAuthority = {
+      ...base,
+      commitImportSeed: () => Promise.resolve({ kind: "refuse" }),
+    };
+    const f = await flow({
+      local: ["e0", "e1"],
+      source: twoRows(),
+      owner: OWNER,
+      authority,
+      publishSeed: async (connector, streams) => {
+        calls += 1;
+        return f.rig.writer.publishSeed(connector, streams);
+      },
+    });
+    await f.importer.run();
+    await f.importer.run();
+    expect(calls).toBe(0);
+    expect(f.authority.doneCalls).toEqual([]);
+  });
+});
+
+describe("a host with no publish bound cannot finish the import over staged rows (IMPORT_DONE_WITHOUT_PUBLISH)", () => {
+  it("does not tell the authority the import is done while a connector holds staged rows", async () => {
+    const f = await flow({
+      local: ["e0", "e1"],
+      source: twoRows(),
+      owner: OWNER,
+      publishSeed: false,
+    });
+    await f.importer.run();
+    await f.importer.run();
+    expect(f.staged.size).toBe(1); // staged, and nobody will publish it
+    expect(f.authority.doneCalls).toEqual([]);
+    expect(await f.ledger.importPending()).toBe(true);
+  });
+
+  it("still finishes when the source lists no connector", async () => {
+    const f = await flow({
+      local: [],
+      source: {
+        owner: OWNER,
+        connectors: async () => [],
+        streams: async () => [],
+      },
+      owner: OWNER,
+      publishSeed: false,
+    });
+    await f.importer.run();
+    expect(f.authority.doneCalls).toEqual([OWNER.toLowerCase()]);
   });
 });
 

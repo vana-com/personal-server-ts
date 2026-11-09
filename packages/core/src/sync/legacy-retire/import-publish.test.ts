@@ -120,10 +120,10 @@ describe("a staged connector that never runs again is still readable (SEED_WAITS
       local: ["e0"],
       source: sourceOf([raw("e0")]),
       owner: OWNER,
-      publishSeed: async (connector) => {
+      publishSeed: async (connector, streams) => {
         calls += 1;
         if (calls === 1) throw new Error("the writer is busy");
-        return f.rig.writer.publishSeed(connector);
+        return f.rig.writer.publishSeed(connector, streams);
       },
     });
     await f.importer.run();
@@ -141,6 +141,21 @@ describe("a staged connector that never runs again is still readable (SEED_WAITS
     expect(calls).toBe(3); // done: not asked again
   });
 
+  it("needs the streams it was asked about (SEED_ASKED_DEFAULTED)", async () => {
+    const f = await flow({
+      local: ["e0"],
+      source: sourceOf([raw("e0")]),
+      owner: OWNER,
+    });
+    await f.importer.run();
+    // A missing argument is a type error; were it defaulted to empty, a
+    // stream the writer skipped would be reported as published.
+    await expect(
+      // @ts-expect-error `asked` is required
+      f.rig.writer.publishSeed(CONNECTOR),
+    ).rejects.toThrow();
+  });
+
   it("does not queue a second run while the first one waits (DUPLICATE_IMPORT_RUNS)", async () => {
     const f = await flow({
       local: ["e0"],
@@ -148,10 +163,10 @@ describe("a staged connector that never runs again is still readable (SEED_WAITS
       owner: OWNER,
     });
     await f.importer.run();
-    expect(await f.rig.writer.publishSeed(CONNECTOR)).toEqual({
+    expect(await f.rig.writer.publishSeed(CONNECTOR, [STREAM])).toEqual({
       state: "waiting",
     });
-    expect(await f.rig.writer.publishSeed(CONNECTOR)).toEqual({
+    expect(await f.rig.writer.publishSeed(CONNECTOR, [STREAM])).toEqual({
       state: "waiting",
     });
     await f.rig.writer.refreshControls();

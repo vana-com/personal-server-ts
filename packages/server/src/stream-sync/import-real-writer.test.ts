@@ -319,6 +319,10 @@ describe("the import through the real seed staging and writer", () => {
     await first.writer.publishPending().catch(() => undefined);
     expect(crash.fired).toBe(true);
     expect(durable.authority.doneCalls).toEqual([]);
+    // The crash sits between "the registry accepted the head" and "the
+    // receipt was saved": s1 is already readable, and no receipt exists.
+    expect((await f.reader().read("s1"))?.ids).toEqual(["a", "b"]);
+    expect((await first.writer.status()).receipts).toEqual({});
 
     // Second process, same owner, same files: the import repeats.
     const second = await boot(f, durable, { streams });
@@ -352,9 +356,15 @@ describe("the import through the real seed staging and writer", () => {
     expect(durable.authority.doneCalls).toEqual([OWNER.toLowerCase()]);
 
     // A third process: the authority says done, so nothing runs again.
+    let posts = 0;
+    f.beforePost(async () => {
+      posts += 1;
+    });
     const third = await boot(f, durable, { streams });
     expect(await third.importer.run()).toMatchObject({ ran: false });
+    expect((await third.writer.publishPending()).runs).toEqual([]);
     expect(third.stages).toEqual([]);
+    expect(posts).toBe(0); // the registry is not written again
     expect(await rows("s1")).toEqual(["a", "b"]);
     expect(await rows("s2")).toEqual(["c"]);
     expect(durable.authority.doneCalls).toEqual([OWNER.toLowerCase()]);

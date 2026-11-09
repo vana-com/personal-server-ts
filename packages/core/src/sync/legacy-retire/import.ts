@@ -413,15 +413,17 @@ export class LegacyImporter {
       if (record.published || record.seedDone) continue;
       if (this.stagedRows(record) === 0) continue;
       try {
-        // While the import is pending, only the authority's seed path admits
-        // the publish; a refusal is retried on the next pass.
-        if (!ledger.admitSeedPublish(connector)) continue;
-        const outcome = await publish(
-          connector,
-          Object.entries(record.staged ?? {})
-            .filter(([, rows]) => rows > 0)
-            .map(([stream]) => stream),
+        // While the import is pending, only the authority's seed seal admits
+        // the publish, and it runs inside the seal; a refusal is retried on
+        // the next pass.
+        const stagedStreams = Object.entries(record.staged ?? {})
+          .filter(([, rows]) => rows > 0)
+          .map(([stream]) => stream);
+        const sealed = await ledger.sealSeedPublish(connector, () =>
+          publish(connector, stagedStreams),
         );
+        if (!sealed.admitted) continue;
+        const outcome = sealed.value;
         if (outcome.state !== "done") continue;
         const skipped = outcome.skipped;
         await ledger.update((data) => {
@@ -459,14 +461,18 @@ export class LegacyImporter {
     return Object.values(record.staged ?? {}).reduce((sum, n) => sum + n, 0);
   }
 
-  /** Every staged connector has a final answer from the writer. */
+  /**
+   * Every staged connector has a final answer from the writer. With no
+   * `publish` bound nothing can ever give one, so a connector with staged
+   * rows is never final: the import is not done while it holds rows nobody
+   * will publish.
+   */
   private async allSeedsFinal(): Promise<boolean> {
-    if (!this.options.publish) return true;
     const { imported } = await this.options.ledger.read();
+    const bound = this.options.publish !== undefined;
     return Object.values(imported).every(
       (record) =>
-        record.published === true ||
-        record.seedDone === true ||
+        (bound && (record.published === true || record.seedDone === true)) ||
         this.stagedRows(record) === 0,
     );
   }

@@ -47,6 +47,7 @@ import {
   createScopeDeletionTracker,
   LegacyImporter,
   createMemoryImportAuthority,
+  accountModeOf,
   legacyRetireSwitched,
   RetireLedger,
   normalizePendingBlobDeletionPlanned,
@@ -634,7 +635,7 @@ export async function createPsLiteSyncManager(
           },
           ledger: retireLedger,
           owner: serverOwner,
-          mode: () => accountMode.read(serverOwner),
+          mode: () => accountModeOf(accountMode, serverOwner),
           deleted: async (connector) =>
             streamSyncWriter
               ? streamSyncWriter.connectionDeleted(connector)

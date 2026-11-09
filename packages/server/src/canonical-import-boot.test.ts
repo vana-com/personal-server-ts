@@ -47,10 +47,13 @@ const DECLARATION = JSON.stringify({
   ],
 });
 
-/** The account-mode authority says `switched` for this owner and knows no other. */
+/**
+ * The account-mode authority says `switched` for this owner and knows no
+ * other. It matches the owner exactly and keys it in lowercase, as the real
+ * authority does: a checksum-cased owner reads `unknown`.
+ */
 const switchedFor = (owner: string): AccountModeReader => ({
-  read: (asked) =>
-    asked.toLowerCase() === owner.toLowerCase() ? "switched" : "unknown",
+  read: (asked) => (asked === owner.toLowerCase() ? "switched" : "unknown"),
 });
 
 let tempDir: string;
@@ -69,7 +72,7 @@ afterEach(async () => {
 });
 
 describe("the legacy import in a real boot", () => {
-  it("stages the device's canonical rows at boot, with no connector run (BOOT_IMPORT_NEVER_BOUND, BOOT_PUBLISH_NOT_WIRED, STATUS_HIDES_EXCLUDED, STATUS_ROUTE_UNAUTHENTICATED)", async () => {
+  it("stages the device's canonical rows at boot, with no connector run (OWNER_NOT_LOWERCASED, BOOT_IMPORT_NEVER_BOUND, BOOT_PUBLISH_NOT_WIRED, STATUS_HIDES_EXCLUDED, STATUS_ROUTE_UNAUTHENTICATED)", async () => {
     const owner = await recoverServerOwner(KNOWN_SIG);
     // The device's legacy data: one index row for the scope (so the
     // declaration is trusted) and canonical rows under its connection.

@@ -339,7 +339,7 @@ describe("a re-run adds nothing (IMPORT_DUPLICATES_ON_RERUN)", () => {
       local: ["e0", "e1"],
       source: sourceOf({ store, declarations: declared }),
       owner: OWNER,
-      publishSeed: false,
+      publishSeed: async () => ({ state: "done", skipped: [] }),
       crashOnce: "more",
     });
     expect(await f.importer.run()).toEqual({

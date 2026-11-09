@@ -1627,7 +1627,7 @@ export class StreamSyncWriter {
    */
   async publishSeed(
     connector: string,
-    asked: readonly string[] = [],
+    asked: readonly string[],
   ): Promise<SeedPublication> {
     const seed = this.options.seed;
     if (!seed) return { state: "done", skipped: [] };

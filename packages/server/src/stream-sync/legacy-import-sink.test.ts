@@ -79,6 +79,7 @@ describe("importing through the real seed staging", () => {
       ledger,
       owner: OWNER,
       mode: () => "switched" as const,
+      publish: async () => ({ state: "done", skipped: [] }), // staging only
     });
 
     const first = await importer.run();
@@ -133,6 +134,7 @@ describe("importing through the real seed staging", () => {
       ledger,
       owner: OWNER,
       mode: () => "switched" as const,
+      publish: async () => ({ state: "done", skipped: [] }), // staging only
     });
     expect(await importer.run()).toMatchObject({ failed: 1 });
     expect(await importer.importDone("acme")).toBe(false);
@@ -178,6 +180,7 @@ describe("importing through the real seed staging", () => {
       ledger,
       owner: OWNER,
       mode: () => "switched" as const,
+      publish: async () => ({ state: "done", skipped: [] }), // staging only
     });
     await importer.run();
     expect(await ledger.staged("acme", "u")).toBe(false);

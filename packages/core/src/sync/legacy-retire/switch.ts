@@ -18,9 +18,22 @@ export interface AccountModeReader {
  */
 export type AccountMode = "switched" | "unswitched" | "unknown";
 
+/**
+ * What the authority says of `owner`. The ONE place the owner is lowercased
+ * on its way to the mode authority: an owner is checksum-cased where a host
+ * recovers it, the authority keys owners in lowercase, and an exact-match
+ * reader would answer `unknown` for a mixed-case one.
+ */
+export function accountModeOf(
+  mode: AccountModeReader,
+  owner: string,
+): AccountMode {
+  return mode.read(owner.toLowerCase());
+}
+
 export function legacyRetireSwitched(
   mode: AccountModeReader,
   owner: string,
 ): boolean {
-  return mode.read(owner) === "switched";
+  return accountModeOf(mode, owner) === "switched";
 }

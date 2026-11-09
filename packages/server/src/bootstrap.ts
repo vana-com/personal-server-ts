@@ -78,6 +78,7 @@ import {
   createScopeDeletionTracker,
   createRetireHost,
   createMemoryImportAuthority,
+  accountModeOf,
   legacyRetireSwitched,
   createSyncManager,
   LegacyImporter,
@@ -997,7 +998,7 @@ export async function createServer(
           sink: createSeedImportSink(seedStaging),
           ledger: retireLedger,
           owner: serverOwner,
-          mode: () => accountMode.read(serverOwner),
+          mode: () => accountModeOf(accountMode, serverOwner),
           deleted: async (connector) =>
             writerForSeed ? writerForSeed.connectionDeleted(connector) : false,
           // Staged rows are published by the writer's own run, so a connector

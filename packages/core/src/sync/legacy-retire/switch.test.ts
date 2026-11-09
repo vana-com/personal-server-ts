@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { legacyRetireSwitched, type AccountModeReader } from "./switch.js";
+import {
+  accountModeOf,
+  legacyRetireSwitched,
+  type AccountModeReader,
+} from "./switch.js";
 
 const modeOf = (answers: Record<string, "switched" | "unswitched">) =>
   ({
@@ -22,5 +26,20 @@ describe("legacyRetireSwitched asks the account-mode authority (SWITCH_READS_FLA
     expect(legacyRetireSwitched(mode, "0xa")).toBe(false);
     answers["0xa"] = "switched";
     expect(legacyRetireSwitched(mode, "0xa")).toBe(true);
+  });
+});
+
+describe("the owner reaches the authority in lowercase (OWNER_NOT_LOWERCASED)", () => {
+  it("asks for a checksum-cased owner by its lowercase form, in both entry points", () => {
+    const asked: string[] = [];
+    const mode: AccountModeReader = {
+      read: (owner) => {
+        asked.push(owner);
+        return owner === "0xab" ? "switched" : "unknown"; // exact match
+      },
+    };
+    expect(accountModeOf(mode, "0xAB")).toBe("switched");
+    expect(legacyRetireSwitched(mode, "0xAB")).toBe(true);
+    expect(asked).toEqual(["0xab", "0xab"]);
   });
 });

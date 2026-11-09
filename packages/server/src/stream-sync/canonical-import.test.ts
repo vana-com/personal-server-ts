@@ -99,6 +99,7 @@ describe("the canonical import source over a real record store (IMPORT_SOURCE_EM
       ledger,
       owner: OWNER,
       mode: () => "switched" as const,
+      publish: async () => ({ state: "done", skipped: [] }), // staging only
     });
 
     // Boot order: the importer exists before the canonical reader opens.
@@ -135,6 +136,7 @@ describe("the canonical import source over a real record store (IMPORT_SOURCE_EM
       ledger,
       owner: OWNER,
       mode: () => "switched" as const,
+      publish: async () => ({ state: "done", skipped: [] }), // staging only
     });
     expect(await again.run()).toMatchObject({ ran: false });
     expect(await staged(files, CONNECTOR)).toEqual({
