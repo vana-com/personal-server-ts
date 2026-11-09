@@ -54,3 +54,28 @@ export function useConnectorDeleteResponse(): Response {
     },
   );
 }
+
+export const STREAM_SYNC_TAKEOVER_RESET_UNAVAILABLE_CODE =
+  "STREAM_SYNC_TAKEOVER_RESET_UNAVAILABLE";
+
+/** A takeover reset changes legacy state, so it has its own code, apart from the read code. */
+export function streamSyncTakeoverResetUnavailableResponse(
+  scope: string,
+): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: STREAM_SYNC_LEGACY_READ_UNAVAILABLE_STATUS,
+        errorCode: STREAM_SYNC_TAKEOVER_RESET_UNAVAILABLE_CODE,
+        message: `Scope "${scope}" has no legacy takeover state to reset because this account stores its data as streams.`,
+      },
+    }),
+    {
+      status: STREAM_SYNC_LEGACY_READ_UNAVAILABLE_STATUS,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      },
+    },
+  );
+}

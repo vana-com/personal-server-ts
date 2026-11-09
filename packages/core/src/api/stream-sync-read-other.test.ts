@@ -6,6 +6,10 @@ import {
 } from "./index.js";
 import type { PersonalServerDataApiDeps } from "./index.js";
 import {
+  streamSyncLegacyReadUnavailableResponse,
+  streamSyncTakeoverResetUnavailableResponse,
+} from "./switched-read-refusal.js";
+import {
   createAccountStorageMode,
   type AccountStorageModeValue,
   type AccountStorageMode,
@@ -252,5 +256,19 @@ describe("LEGACY_ON_SWITCH_OTHER: Oura collection requirements", () => {
       },
     );
     expect(response.status).toBe(200);
+  });
+});
+
+describe("TAKEOVER_RESET_SHARES_READ_CODE: the takeover reset has its own code", () => {
+  it("differs from the read code and keeps the 409 status", async () => {
+    const reset = streamSyncTakeoverResetUnavailableResponse("a.b");
+    const read = streamSyncLegacyReadUnavailableResponse("x");
+    expect(reset.status).toBe(409);
+    const resetBody = (await reset.json()) as { error: { errorCode: string } };
+    const readBody = (await read.json()) as { error: { errorCode: string } };
+    expect(resetBody.error.errorCode).toBe(
+      "STREAM_SYNC_TAKEOVER_RESET_UNAVAILABLE",
+    );
+    expect(resetBody.error.errorCode).not.toBe(readBody.error.errorCode);
   });
 });

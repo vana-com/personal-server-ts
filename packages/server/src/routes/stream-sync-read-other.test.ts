@@ -130,6 +130,10 @@ describe("Node server group D routes", () => {
       });
       expect(touched).toEqual([]);
       expect(res.status).toBe(409);
+      // A reset has its own code, apart from the read code.
+      expect(await res.json()).toMatchObject({
+        error: { errorCode: "STREAM_SYNC_TAKEOVER_RESET_UNAVAILABLE" },
+      });
     });
 
     it("an unknown mode answers the retryable 503 and resets nothing", async () => {
@@ -176,6 +180,55 @@ describe("Node server group D routes", () => {
         expect(get.status).toBe(200);
       },
     );
+  });
+
+  describe("DELETE /:scope/imports/:id", () => {
+    const abort = () =>
+      dataApp().request("/claude.conversations/imports/abc", {
+        method: "DELETE",
+        headers: bearer,
+      });
+
+    it("IMPORT_ABORT_LEGACY_ON_SWITCH: a switched account refuses the legacy import abort", async () => {
+      const res = await abort();
+      expect(res.status).toBe(426);
+      expect(touched).toEqual([]);
+    });
+
+    it("an unknown mode answers the retryable 503", async () => {
+      value = "unknown";
+      const res = await abort();
+      expect(res.status).toBe(503);
+      expect(touched).toEqual([]);
+    });
+  });
+
+  describe("DELETE of a control scope", () => {
+    const control = "pdpp.acme~0123456789abcdef";
+    const del = () =>
+      dataApp().request(`/${control}`, { method: "DELETE", headers: bearer });
+
+    it("CONTROL_SCOPE_BEFORE_MODE: a switched account is told to use the connector delete", async () => {
+      const res = await del();
+      expect(res.status).toBe(409);
+      // The control-scope guard yields to the core delete, so this is not
+      // the legacy control-scope code.
+      expect(await res.text()).not.toContain("STREAM_SYNC_CONTROL_SCOPE");
+    });
+
+    it("an unknown mode answers the retryable 503", async () => {
+      value = "unknown";
+      expect((await del()).status).toBe(503);
+    });
+
+    it("an unswitched account keeps the control-scope refusal", async () => {
+      value = "unswitched";
+      const res = await del();
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({
+        error: "STREAM_SYNC_CONTROL_SCOPE",
+      });
+    });
   });
 
   describe("POST /v1/sync/file/:id (mount wiring)", () => {

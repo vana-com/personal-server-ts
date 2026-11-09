@@ -45,11 +45,10 @@ async function open(value: "switched" | "unswitched" | undefined) {
 }
 
 describe("LITE_SYNC_MANAGER_MODE_DROPPED: the Lite sync manager follows the account mode", () => {
-  it("a switched account's trigger reads no legacy storage and never asks the registry", async () => {
+  it("a switched account's trigger reads no legacy storage", async () => {
     const h = await open("switched");
     await h.sync.syncManager.trigger();
     expect(h.findUnsynced).not.toHaveBeenCalled();
-    expect(h.gateway.getServer).not.toHaveBeenCalled();
     expect(h.sync.syncManager.getStatus().blocked?.reason).toBe("stream_sync");
   });
 

@@ -10,6 +10,7 @@ import {
   legacyWriteSwitchOf,
   selectAccountStorageMode,
   streamSyncLegacyReadUnavailableResponse,
+  streamSyncTakeoverResetUnavailableResponse,
   type AccountStorageMode,
   type LegacyWriteSwitch,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -351,21 +352,35 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     ),
   );
   app.delete("/:scope/imports/:id", (c) =>
-    importRoute(c, () =>
-      abortScopeImport(
+    importRoute(c, () => {
+      // Aborting a legacy chunked import is a legacy-store operation: a
+      // switched account refuses it like the rest of the import routes, and
+      // an unknown mode answers the retryable 503.
+      const selection = selectAccountStorageMode({
+        accountStorageMode: deps.accountStorageMode,
+        serverOwner: deps.serverOwner,
+      });
+      if (selection.kind === "refuse")
+        throw new LegacyWriteRefused(selection.response);
+      const refusal = refuseLegacyWrite(writeSwitch);
+      if (refusal) throw new LegacyWriteRefused(refusal);
+      return abortScopeImport(
         importDeps,
         c.req.raw,
         c.req.param("scope"),
         c.req.param("id"),
-      ),
-    ),
+      );
+    }),
   );
 
   /**
    * Takeover state (reset flag, verdicts) lives in the legacy view. A switched
    * account has none to read or reset; an unknown mode is retryable.
    */
-  const refuseTakeoverOnStreams = (scope: string): void => {
+  const refuseTakeoverOnStreams = (
+    scope: string,
+    operation: "read" | "reset",
+  ): void => {
     const selection = selectAccountStorageMode({
       accountStorageMode: deps.accountStorageMode,
       serverOwner: deps.serverOwner,
@@ -374,9 +389,11 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       throw new LegacyWriteRefused(selection.response);
     if (selection.kind === "streams")
       throw new LegacyWriteRefused(
-        streamSyncLegacyReadUnavailableResponse(
-          `Scope "${scope}" has no legacy takeover state because this account stores its data as streams.`,
-        ),
+        operation === "reset"
+          ? streamSyncTakeoverResetUnavailableResponse(scope)
+          : streamSyncLegacyReadUnavailableResponse(
+              `Scope "${scope}" has no legacy takeover state because this account stores its data as streams.`,
+            ),
       );
   };
 
@@ -389,7 +406,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         request: c.req.raw,
         scope: parsed.scope,
       });
-      refuseTakeoverOnStreams(parsed.scope);
+      refuseTakeoverOnStreams(parsed.scope, "read");
       return {
         scope: parsed.scope,
         reset: deps.legacyScopeView?.isReset(parsed.scope) ?? false,
@@ -406,7 +423,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         request: c.req.raw,
         scope: parsed.scope,
       });
-      refuseTakeoverOnStreams(parsed.scope);
+      refuseTakeoverOnStreams(parsed.scope, "reset");
       deps.legacyScopeView?.resetTakeover(parsed.scope);
       return { scope: parsed.scope, reset: true };
     }),
@@ -423,8 +440,15 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   );
   // A stream-sync control scope (pdpp.<c>~<ns>) is owned by the connection
   // delete, not by a legacy data delete: refuse it before the scope grammar.
+  // When the account is not unswitched (switched, or the mode is unknown),
+  // the core delete answers first, so a control scope gets the same
+  // USE_CONNECTOR_DELETE / retryable 503 as any other scope, after auth.
   app.delete("/:scope", (c, next) =>
-    parseScope(c.req.param("scope"))?.kind === "control"
+    parseScope(c.req.param("scope"))?.kind === "control" &&
+    selectAccountStorageMode({
+      accountStorageMode: deps.accountStorageMode,
+      serverOwner: deps.serverOwner,
+    }).kind === "legacy"
       ? c.json(
           {
             error: "STREAM_SYNC_CONTROL_SCOPE",

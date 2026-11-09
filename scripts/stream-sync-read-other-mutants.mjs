@@ -25,6 +25,7 @@ const FOCUSED = [
   "packages/server/src/bootstrap-account-mode.test.ts",
   "packages/lite/src/runtime-stream-sync-read-other.test.ts",
   "packages/lite/src/sync-account-mode.test.ts",
+  "packages/lite/src/browser-runtime-account-mode.test.ts",
 ];
 
 const API = "packages/core/src/api/index.ts";
@@ -69,13 +70,13 @@ const MUTANTS = [
   [
     "TAKEOVER_LEGACY_ON_SWITCH",
     DATA,
-    "refuseTakeoverOnStreams(parsed.scope);\n      return {",
+    'refuseTakeoverOnStreams(parsed.scope, "read");\n      return {',
     "return {",
   ],
   [
     "TAKEOVER_RESET_LEGACY_ON_SWITCH",
     DATA,
-    "refuseTakeoverOnStreams(parsed.scope);\n      deps.legacyScopeView?.resetTakeover",
+    'refuseTakeoverOnStreams(parsed.scope, "reset");\n      deps.legacyScopeView?.resetTakeover',
     "deps.legacyScopeView?.resetTakeover",
   ],
   [
@@ -141,8 +142,8 @@ const MUTANTS = [
   [
     "SYNC_TRIGGER_CYCLE_ON_SWITCH",
     MGR,
-    '        const modeGate = accountModeGate();\n        if (modeGate) {\n          blocked = { reason: modeGate.reason, message: modeGate.message };\n          uploadDeps.logger.warn(blocked, "Sync cycle blocked");',
-    '        const modeGate = null as ReturnType<typeof accountModeGate>;\n        if (modeGate) {\n          blocked = { reason: modeGate.reason, message: modeGate.message };\n          uploadDeps.logger.warn(blocked, "Sync cycle blocked");',
+    "const modeGate = accountModeGate() ?? earlyGate;",
+    "const modeGate = null as ReturnType<typeof accountModeGate>;",
   ],
   [
     "STATUS_READS_LEGACY_ON_SWITCH",
@@ -153,8 +154,8 @@ const MUTANTS = [
   [
     "HYDRATE_ON_SWITCH",
     MGR,
-    'const modeGate = accountModeGate();\n        if (modeGate) {\n          blocked = { reason: modeGate.reason, message: modeGate.message };\n          downloadDeps.logger.warn(blocked, "Scope hydration blocked");',
-    'const modeGate = null as ReturnType<typeof accountModeGate>;\n        if (modeGate) {\n          blocked = { reason: modeGate.reason, message: modeGate.message };\n          downloadDeps.logger.warn(blocked, "Scope hydration blocked");',
+    'const earlyGate = accountModeGate();\n        if (earlyGate) {\n          blocked = { reason: earlyGate.reason, message: earlyGate.message };\n          downloadDeps.logger.warn(blocked, "Scope hydration blocked");',
+    'const earlyGate = null as ReturnType<typeof accountModeGate>;\n        if (earlyGate) {\n          blocked = { reason: earlyGate.reason, message: earlyGate.message };\n          downloadDeps.logger.warn(blocked, "Scope hydration blocked");',
   ],
   [
     "STREAM_PUBLISH_DROPPED_ON_SWITCH",
@@ -167,6 +168,54 @@ const MUTANTS = [
     MGR,
     "    return {\n      ok: false,\n      reason: SYNC_BLOCKED_ACCOUNT_MODE_UNKNOWN,",
     "    return null;\n    return {\n      ok: false,\n      reason: SYNC_BLOCKED_ACCOUNT_MODE_UNKNOWN,",
+  ],
+  [
+    "CYCLE_GATE_CAPTURED_ONCE",
+    MGR,
+    "const modeGate = accountModeGate() ?? earlyGate;",
+    "const modeGate = earlyGate;",
+  ],
+  [
+    "DOWNLOAD_GATE_DROPPED",
+    MGR,
+    "const downloadGate = accountModeGate();",
+    "const downloadGate = null as ReturnType<typeof accountModeGate>;",
+  ],
+  [
+    "HYDRATE_GATE_CAPTURED_ONCE",
+    MGR,
+    "// The mode can change while canSync awaits.\n        const modeGate = accountModeGate();",
+    "// The mode can change while canSync awaits.\n        const modeGate = null as ReturnType<typeof accountModeGate>;",
+  ],
+  [
+    "PUBLISH_BEFORE_CAN_SYNC",
+    MGR,
+    "if (earlyGate && earlyGate.reason !== SYNC_BLOCKED_STREAM_SYNC) {",
+    "if (earlyGate) {\n          if (earlyGate.reason === SYNC_BLOCKED_STREAM_SYNC)\n            await runStreamSyncPublish();",
+  ],
+  [
+    "CONTROL_SCOPE_BEFORE_MODE",
+    DATA,
+    'parseScope(c.req.param("scope"))?.kind === "control" &&\n    selectAccountStorageMode({\n      accountStorageMode: deps.accountStorageMode,\n      serverOwner: deps.serverOwner,\n    }).kind === "legacy"',
+    'parseScope(c.req.param("scope"))?.kind === "control"',
+  ],
+  [
+    "IMPORT_ABORT_LEGACY_ON_SWITCH",
+    DATA,
+    'if (selection.kind === "refuse")\n        throw new LegacyWriteRefused(selection.response);\n      const refusal = refuseLegacyWrite(writeSwitch);\n      if (refusal) throw new LegacyWriteRefused(refusal);\n      return abortScopeImport(',
+    "return abortScopeImport(",
+  ],
+  [
+    "TAKEOVER_RESET_SHARES_READ_CODE",
+    "packages/core/src/api/switched-read-refusal.ts",
+    "errorCode: STREAM_SYNC_TAKEOVER_RESET_UNAVAILABLE_CODE,",
+    'errorCode: "STREAM_SYNC_LEGACY_READ_UNAVAILABLE",',
+  ],
+  [
+    "LITE_BROWSER_MODE_DROPPED",
+    "packages/lite/src/browser-runtime.ts",
+    "      config,\n      accountStorageMode,\n      serverOwner,\n      stateStore,",
+    "      config,\n      stateStore,",
   ],
   [
     "NODE_SYNC_MANAGER_MODE_DROPPED",

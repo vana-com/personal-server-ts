@@ -249,18 +249,29 @@ export function createSyncManager(
     cycleInFlight = exclusive(async () => {
       do {
         rerunRequested = false;
-        const modeGate = accountModeGate();
-        if (modeGate) {
-          blocked = { reason: modeGate.reason, message: modeGate.message };
+        // Unknown: nothing runs. Switched: no legacy work; the stream
+        // publisher runs below, after the registration check, as before.
+        const earlyGate = accountModeGate();
+        if (earlyGate && earlyGate.reason !== SYNC_BLOCKED_STREAM_SYNC) {
+          blocked = { reason: earlyGate.reason, message: earlyGate.message };
           uploadDeps.logger.warn(blocked, "Sync cycle blocked");
-          if (modeGate.reason === SYNC_BLOCKED_STREAM_SYNC)
-            await runStreamSyncPublish();
           continue;
         }
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
           uploadDeps.logger.warn(blocked, "Sync cycle blocked");
+          continue;
+        }
+        // The mode can change while canSync awaits: read it again before any
+        // legacy work. (The closing guarantee is the storage-boundary seal on
+        // legacy writes; these re-checks only narrow the window.)
+        const modeGate = accountModeGate() ?? earlyGate;
+        if (modeGate) {
+          blocked = { reason: modeGate.reason, message: modeGate.message };
+          uploadDeps.logger.warn(blocked, "Sync cycle blocked");
+          if (modeGate.reason === SYNC_BLOCKED_STREAM_SYNC)
+            await runStreamSyncPublish();
           continue;
         }
         blocked = null;
@@ -304,6 +315,18 @@ export function createSyncManager(
             }
           }
           await runUploadCycle();
+        }
+
+        // The upload and hydration above can take a while: read the mode again
+        // before the legacy download.
+        const downloadGate = accountModeGate();
+        if (downloadGate) {
+          blocked = {
+            reason: downloadGate.reason,
+            message: downloadGate.message,
+          };
+          downloadDeps.logger.warn(blocked, "Sync cycle blocked");
+          continue;
         }
 
         try {
@@ -608,15 +631,22 @@ export function createSyncManager(
 
     hydrateScopes(scopes) {
       return exclusive(async () => {
-        const modeGate = accountModeGate();
-        if (modeGate) {
-          blocked = { reason: modeGate.reason, message: modeGate.message };
+        const earlyGate = accountModeGate();
+        if (earlyGate) {
+          blocked = { reason: earlyGate.reason, message: earlyGate.message };
           downloadDeps.logger.warn(blocked, "Scope hydration blocked");
           return;
         }
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
+          downloadDeps.logger.warn(blocked, "Scope hydration blocked");
+          return;
+        }
+        // The mode can change while canSync awaits.
+        const modeGate = accountModeGate();
+        if (modeGate) {
+          blocked = { reason: modeGate.reason, message: modeGate.message };
           downloadDeps.logger.warn(blocked, "Scope hydration blocked");
           return;
         }

@@ -2491,10 +2491,10 @@ export async function handlePersonalServerDataRequest(
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
 
-    // The account's storage mode, decided once before any list, version,
-    // lineage or body branch. No read site acts on the decision yet (they are
-    // routed through it one by one), so a switched account still reads as
-    // before; it is recorded with every error this request logs.
+    // The account's storage mode, recorded with every error this request
+    // logs. Each read site decides for itself: the list, additions, versions,
+    // lineage and body reads are routed in their own change (the listing and
+    // body branches); this change routes /sync/file, delete, Oura and takeover.
     if (request.method === "GET") {
       logContext.detail = {
         storageSelection: selectAccountStorageMode(deps).kind,
@@ -3834,6 +3834,8 @@ export {
   STREAM_SYNC_LEGACY_READ_UNAVAILABLE_CODE,
   STREAM_SYNC_LEGACY_READ_UNAVAILABLE_STATUS,
   streamSyncLegacyReadUnavailableResponse,
+  STREAM_SYNC_TAKEOVER_RESET_UNAVAILABLE_CODE,
+  streamSyncTakeoverResetUnavailableResponse,
   USE_CONNECTOR_DELETE_CODE,
   useConnectorDeleteResponse,
 } from "./switched-read-refusal.js";

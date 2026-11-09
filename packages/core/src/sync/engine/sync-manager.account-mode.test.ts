@@ -18,7 +18,7 @@ vi.mock("../workers/lost-data-points.js", () => ({
 }));
 
 import { uploadAll } from "../workers/upload.js";
-import { downloadAll } from "../workers/download.js";
+import { downloadAll, downloadScopes } from "../workers/download.js";
 import { createSyncManager } from "./sync-manager.js";
 
 const logger = {
@@ -32,7 +32,10 @@ const logger = {
 const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
 
 /** Every legacy storage read is counted; none is expected for a switched account. */
-function build(value: AccountStorageModeValue | undefined) {
+function build(
+  value: AccountStorageModeValue | undefined,
+  source?: { value: AccountStorageModeValue },
+) {
   const findUnsynced = vi.fn().mockReturnValue([]);
   const uploadDeps: UploadWorkerDeps = {
     storage: {
@@ -68,7 +71,7 @@ function build(value: AccountStorageModeValue | undefined) {
     ...(value === undefined
       ? {}
       : {
-          accountStorageMode: { read: () => value },
+          accountStorageMode: { read: () => (source ? source.value : value) },
           serverOwner: OWNER,
         }),
   });
@@ -90,8 +93,67 @@ describe("SYNC_TRIGGER_CYCLE_ON_SWITCH: the sync manager follows the account mod
     expect(uploadAll).not.toHaveBeenCalled();
     expect(downloadAll).not.toHaveBeenCalled();
     expect(h.findUnsynced).not.toHaveBeenCalled();
-    expect(h.canSync).not.toHaveBeenCalled();
     expect(h.publisher.cycle).toHaveBeenCalledTimes(1);
+  });
+
+  it("PUBLISH_AFTER_CAN_SYNC: a switched account's publish waits for canSync, as before", async () => {
+    const h = build("switched");
+    const order: string[] = [];
+    h.canSync.mockImplementation(async () => {
+      order.push("canSync");
+      return { ok: true as const };
+    });
+    h.publisher.cycle.mockImplementation(async () => {
+      order.push("publish");
+      return {};
+    });
+    await h.manager.trigger();
+    expect(order).toEqual(["canSync", "publish"]);
+  });
+
+  it("a switched account whose canSync refuses publishes nothing", async () => {
+    const h = build("switched");
+    h.canSync.mockResolvedValue({ ok: false as never, reason: "no" } as never);
+    await h.manager.trigger();
+    expect(h.publisher.cycle).not.toHaveBeenCalled();
+    expect(uploadAll).not.toHaveBeenCalled();
+  });
+
+  it("CYCLE_GATE_CAPTURED_ONCE: a flip to switched inside canSync stops the legacy upload and download", async () => {
+    const source = { value: "unswitched" as AccountStorageModeValue };
+    const h = build("unswitched", source);
+    h.canSync.mockImplementation(async () => {
+      source.value = "switched";
+      return { ok: true as const };
+    });
+    await h.manager.trigger();
+    expect(uploadAll).not.toHaveBeenCalled();
+    expect(downloadAll).not.toHaveBeenCalled();
+    expect(h.publisher.cycle).toHaveBeenCalledTimes(1);
+  });
+
+  it("CYCLE_GATE_CAPTURED_ONCE: a flip during the upload stops the download", async () => {
+    const source = { value: "unswitched" as AccountStorageModeValue };
+    const h = build("unswitched", source);
+    (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      source.value = "switched";
+      return [];
+    });
+    await h.manager.trigger();
+    expect(uploadAll).toHaveBeenCalledTimes(1);
+    expect(downloadAll).not.toHaveBeenCalled();
+  });
+
+  it("CYCLE_GATE_CAPTURED_ONCE: a flip inside canSync stops hydration", async () => {
+    const source = { value: "unswitched" as AccountStorageModeValue };
+    const h = build("unswitched", source);
+    h.canSync.mockImplementation(async () => {
+      source.value = "switched";
+      return { ok: true as const };
+    });
+    await h.manager.hydrateScopes(["instagram.profile"]);
+    expect(downloadScopes).not.toHaveBeenCalled();
+    expect(downloadAll).not.toHaveBeenCalled();
   });
 
   it("LOOP_TICK_ON_SWITCH: start(), the loop tick and notifyNewData touch no legacy storage", async () => {
