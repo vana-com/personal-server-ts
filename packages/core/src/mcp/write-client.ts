@@ -28,6 +28,10 @@ import {
   type WriteSessionStore,
 } from "../write/session.js";
 import { WRITE_SIGNATURE_HEADER } from "../write/attribution.js";
+import {
+  selectAccountStorageMode,
+  type StorageSelectionDeps,
+} from "../api/account-storage-mode.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 
 /** The current stored record of a scope, as the write's starting point. */
@@ -80,6 +84,13 @@ export interface CreateMcpDataWriteClientOptions {
   dispatch(request: Request): Promise<Response>;
   /** Where the data route is mounted. Defaults to `/v1/data`. */
   basePath?: string;
+  /**
+   * The account's storage mode, the same one the read client and the write
+   * gate use. `storage` is legacy storage: the record this client starts from
+   * is read from it only while the account has not switched. Absent = never
+   * switched.
+   */
+  accountStorage?: StorageSelectionDeps;
   /**
    * Runs the live write policy for (grantee, grantId, scope) BEFORE the
    * current record is read, so a caller whose grant was revoked learns
@@ -197,6 +208,28 @@ export function createMcpDataWriteClient(
         throw err;
       }
       for (let attempt = 1; ; attempt += 1) {
+        // Checked on every attempt: the mode may latch between two of them.
+        const selection = selectAccountStorageMode(
+          options.accountStorage ?? {},
+        );
+        if (selection.kind === "refuse") {
+          throw new McpDataWriteError(
+            selection.response.status,
+            await parseJsonOrText(selection.response),
+          );
+        }
+        if (selection.kind === "streams") {
+          // The current record would come from legacy storage, which is no
+          // longer this account's store.
+          throw new McpDataWriteError(409, {
+            error: {
+              code: 409,
+              errorCode: "STREAM_SYNC_WRITE_UNAVAILABLE",
+              message:
+                "This account is on stream sync. Saving through this connection is not available yet.",
+            },
+          });
+        }
         const { current, version } = await readCurrent(scope);
         const data = update(current);
         const response = await writeOnce({ scope, grantId, data, version });

@@ -48,6 +48,11 @@ import {
   type ReadDeletionEntry,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
+import {
+  selectAccountStorageMode,
+  type StorageSelection,
+} from "../api/account-storage-mode.js";
+import { sealLegacyReads } from "./legacy-seal.js";
 
 /**
  * Block sidecars are built from the FULL stored envelope, so they carry the
@@ -326,6 +331,14 @@ export interface McpDataReadClient {
   enforcesPayment?: boolean;
 
   /**
+   * What the account's storage mode says reads must use right now. Optional:
+   * a client without it behaves as an account that has not switched. Hosts
+   * that add `searchScopeIndex` get it for free; the index is legacy storage,
+   * so its shortcut is used only while this says `legacy`.
+   */
+  storageSelection?(): StorageSelection;
+
+  /**
    * Perform `GET /v1/data?scopePrefix=…` as the connection grantee. This is
    * used only for discovery/expanding wildcard grants before a grant-gated
    * read; it does not return scope contents. The listing only shows scopes
@@ -556,6 +569,7 @@ export function createMcpDataReadClient(
    * grant checks, x402 settlement and access logs; nothing here repeats them.
    */
   async function signedScopeRequest(params: {
+    dataApiDeps: PersonalServerDataApiDeps;
     scope: string;
     grantId: string;
     query?: URLSearchParams;
@@ -582,7 +596,7 @@ export function createMcpDataReadClient(
         ...(params.payment ? { "X-PAYMENT": params.payment } : {}),
       },
     });
-    return handlePersonalServerDataRequest(request, options.dataApiDeps, {
+    return handlePersonalServerDataRequest(request, params.dataApiDeps, {
       basePath,
       inProcess: params.inProcess,
     });
@@ -596,6 +610,7 @@ export function createMcpDataReadClient(
    * logged or reported as fulfilment is the caller's choice.
    */
   async function readWholeScope(params: {
+    dataApiDeps: PersonalServerDataApiDeps;
     scope: string;
     grantId: string;
     payment?: string;
@@ -606,6 +621,7 @@ export function createMcpDataReadClient(
   }): Promise<WholeScopeRead> {
     let served: PersonalServerServedRead | undefined;
     const response = await signedScopeRequest({
+      dataApiDeps: params.dataApiDeps,
       scope: params.scope,
       grantId: params.grantId,
       payment: params.payment,
@@ -766,9 +782,46 @@ export function createMcpDataReadClient(
     return { logId, timestamp, ipAddress, userAgent };
   }
 
+  /**
+   * Where this read may look, decided by the account's storage mode and
+   * nothing else. `streams` hands back deps with legacy storage sealed, so
+   * no legacy call can follow; a switched account with no stream reader is
+   * refused, never read from legacy. `legacy` is today's behavior, including
+   * its own choice between the stream reader and legacy files.
+   */
+  async function readRoute(): Promise<
+    | { kind: "legacy"; deps: PersonalServerDataApiDeps }
+    | { kind: "streams"; deps: PersonalServerDataApiDeps }
+  > {
+    const selection = selectAccountStorageMode(options.dataApiDeps);
+    switch (selection.kind) {
+      case "legacy":
+        return { kind: "legacy", deps: options.dataApiDeps };
+      case "refuse":
+        throw new McpDataReadError(
+          selection.response.status,
+          await parseJsonOrText(selection.response),
+        );
+      case "streams":
+        if (!options.dataApiDeps.streamSyncRead) {
+          throw new McpDataReadError(503, {
+            error: {
+              code: 503,
+              errorCode: "STREAM_SYNC_READS_UNAVAILABLE",
+              message:
+                "This account is on stream sync and this server cannot read stream data yet.",
+            },
+          });
+        }
+        return { kind: "streams", deps: sealLegacyReads(options.dataApiDeps) };
+    }
+  }
+
   return {
     enforcesPayment: options.enforcesPayment ?? false,
+    storageSelection: () => selectAccountStorageMode(options.dataApiDeps),
     async listScopes({ scopePrefix, limit, offset, grantId } = {}) {
+      const route = await readRoute();
       const params = new URLSearchParams();
       if (scopePrefix) params.set("scopePrefix", scopePrefix);
       if (limit !== undefined) params.set("limit", String(limit));
@@ -792,7 +845,7 @@ export function createMcpDataReadClient(
 
       const response = await handlePersonalServerDataRequest(
         request,
-        options.dataApiDeps,
+        route.deps,
         { basePath },
       );
 
@@ -809,13 +862,15 @@ export function createMcpDataReadClient(
       scope: string,
       grantId?: string,
     ): Promise<McpScopeMetadata | null> {
-      if (options.dataApiDeps.streamSyncRead) {
+      const route = await readRoute();
+      if (route.kind === "streams" || route.deps.streamSyncRead) {
         // Same response a read serves: size and version come from the body
         // the handler decided on, never from the legacy index.
         if (!grantId) return null;
         try {
           // Free discovery, as before: no charge, and no log or fulfilment.
           const read = await readWholeScope({
+            dataApiDeps: route.deps,
             scope,
             grantId,
             read: { metadataOnly: true, logAccess: false },
@@ -865,7 +920,8 @@ export function createMcpDataReadClient(
       blockIds,
       tool,
     }) {
-      if (options.dataApiDeps.streamSyncRead) {
+      const route = await readRoute();
+      if (route.kind === "streams" || route.deps.streamSyncRead) {
         // The handler answers the read (decision, grant, charge, access log);
         // blocks are paged from the body it served, so a view never pages
         // legacy bytes. Cursors are not pinned to a version: a cursor from an
@@ -877,6 +933,7 @@ export function createMcpDataReadClient(
         let cursorRefused = false;
         try {
           const read = await readWholeScope({
+            dataApiDeps: route.deps,
             scope,
             grantId,
             payment,
@@ -1072,11 +1129,13 @@ export function createMcpDataReadClient(
     },
 
     async readBlockManifest({ scope, grantId }) {
-      if (options.dataApiDeps.streamSyncRead) {
+      const route = await readRoute();
+      if (route.kind === "streams" || route.deps.streamSyncRead) {
         try {
           // A table of contents carries no values: grant-gated and logged,
           // never charged, never reported as fulfilment.
           const read = await readWholeScope({
+            dataApiDeps: route.deps,
             scope,
             grantId,
             read: { metadataOnly: true },
@@ -1144,7 +1203,9 @@ export function createMcpDataReadClient(
     },
 
     async readRawScopeFile({ scope, grantId, at, fileId, payment }) {
-      const streamSync = Boolean(options.dataApiDeps.streamSyncRead);
+      const route = await readRoute();
+      const streamSync =
+        route.kind === "streams" || Boolean(route.deps.streamSyncRead);
       if (!streamSync) {
         const storage = options.dataApiDeps.storage;
         const selectedEntry = storage.findEntry({
@@ -1193,7 +1254,7 @@ export function createMcpDataReadClient(
       let selected: { fileId?: string; collectedAt: string } | undefined;
       const response = await handlePersonalServerDataRequest(
         request,
-        options.dataApiDeps,
+        route.deps,
         {
           basePath,
           inProcess: {

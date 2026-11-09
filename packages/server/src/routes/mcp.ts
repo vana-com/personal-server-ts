@@ -421,6 +421,7 @@ function buildWriteClient(
     serverOrigin: resolveOrigin(deps.serverOrigin),
     granteeAccount,
     storage,
+    accountStorage: { accountStorageMode: deps.accountStorageMode },
     sessionStore: deps.mcpWrites.sessionStore,
     dispatch: deps.mcpWrites.dispatch,
     authorize: async ({ scope, grantId }) => {

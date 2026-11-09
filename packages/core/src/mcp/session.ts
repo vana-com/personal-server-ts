@@ -27,6 +27,10 @@ import type {
   RuntimeAvailabilityPort,
 } from "../ports/index.js";
 import { assertScopeNotDeleted, handleX402Cycle } from "../api/index.js";
+import {
+  ACCOUNT_MODE_UNKNOWN_CODE,
+  selectAccountStorageMode,
+} from "../api/account-storage-mode.js";
 import type {
   PersonalServerApiAuthPort,
   PersonalServerReadAuthInput,
@@ -353,6 +357,27 @@ export function createMcpSessionAuthPort(params: {
         // gate, so the gate must run here too: never challenge or settle a
         // read of a scope the owner deleted.
         const deps = params.payment.dataApiDeps;
+        // A settlement that names no served stream head can only bind to a
+        // legacy entry. That is allowed while the account is on legacy
+        // storage; for a switched account, or one whose mode cannot be told,
+        // it is refused rather than looked up.
+        if (!input.servedEntry) {
+          const selection = selectAccountStorageMode(deps);
+          if (selection.kind === "refuse") {
+            throw new ProtocolError(
+              selection.response.status,
+              ACCOUNT_MODE_UNKNOWN_CODE,
+              "This server cannot tell yet whether the account has moved to stream sync. Retry shortly.",
+            );
+          }
+          if (selection.kind === "streams") {
+            throw new ProtocolError(
+              409,
+              "STREAM_SYNC_HEAD_REQUIRED",
+              "This read was not served from a stream head, so it cannot be settled.",
+            );
+          }
+        }
         await assertScopeNotDeleted(
           deps,
           input.scope,

@@ -1515,6 +1515,10 @@ const searchPersonalContext: McpToolDefinition = {
       if (
         !resumeCursor &&
         !readClient.enforcesPayment &&
+        // The index is legacy storage: once the account has switched, or its
+        // mode cannot be told, only the bounded block read below may answer.
+        (readClient.storageSelection?.() ?? { kind: "legacy" }).kind ===
+          "legacy" &&
         typeof readClient.searchScopeIndex === "function"
       ) {
         const remainingMs = deadline - Date.now();
