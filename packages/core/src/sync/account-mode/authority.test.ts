@@ -4,8 +4,13 @@
  * cannot say: which call waits for which, and what a store sees when.
  */
 import { describe, expect, it } from "vitest";
-import { createModeAuthority, type ModeAuthority } from "./authority.js";
-import { OFF_TTL_MS } from "./mode-machine.js";
+import {
+  createModeAuthority,
+  createModeAuthorityWithImporter,
+  type ModeAuthority,
+  type StreamCommitResult,
+} from "./authority.js";
+import { OFF_TTL_MS, type ModeDecision } from "./mode-machine.js";
 import { createMemoryModeRecordStore } from "./memory-record-store.js";
 import { accountStorageModeOf } from "./port.js";
 
@@ -37,6 +42,22 @@ async function boot(
   return { authority, store };
 }
 
+/** A stream seal asked for its decision only (the write does nothing). */
+async function stream(
+  authority: Pick<ModeAuthority, "commitStream">,
+  owner: string,
+  operationId: string,
+): Promise<ModeDecision> {
+  const result: StreamCommitResult<undefined> = await authority.commitStream(
+    owner,
+    operationId,
+    () => undefined,
+  );
+  return result.ok
+    ? { kind: "streams", importRequired: result.importRequired }
+    : result.decision;
+}
+
 /** A promise a test settles by hand. */
 function gate() {
   let open!: () => void;
@@ -45,6 +66,12 @@ function gate() {
   });
   return { opened, open };
 }
+
+const UNKNOWN_REFUSAL = {
+  kind: "refuse",
+  code: "ACCOUNT_MODE_UNKNOWN",
+  status: 503,
+};
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -435,16 +462,16 @@ describe("the import barrier", () => {
       code: "IMPORT_PENDING",
       status: 503,
     };
-    expect(authority.commitStream(A, "op")).toEqual(refused);
+    expect(await stream(authority, A, "op")).toEqual(refused);
     store.pauseSaves();
     const done = authority.importDone(A);
     await tick();
     // Save before use: while the clean record is being written, still closed.
-    expect(authority.commitStream(A, "op").kind).toBe("refuse");
+    expect((await stream(authority, A, "op")).kind).toBe("refuse");
     store.releaseSaves();
     expect(await done).toEqual({ kind: "streams", importRequired: false });
     expect(store.durable.get(A)?.importPending).toBe(false);
-    expect(authority.commitStream(A, "op")).toEqual({
+    expect(await stream(authority, A, "op")).toEqual({
       kind: "streams",
       importRequired: false,
     });
@@ -456,7 +483,7 @@ describe("the import barrier", () => {
     await authority.submitEvidence(evidence(A, "on"));
     store.failSaves(true);
     expect((await authority.importDone(A)).kind).toBe("refuse");
-    expect(authority.commitStream(A, "op").kind).toBe("refuse");
+    expect((await stream(authority, A, "op")).kind).toBe("refuse");
     expect(store.durable.get(A)?.importPending).toBe(true);
     await authority.close();
     store.failSaves(false);
@@ -473,48 +500,68 @@ describe("the import barrier", () => {
 
   // ORDINARY_WRITE_PASSES_WHILE_PENDING, IMPORT_SEED_REFUSED_WHILE_PENDING
   it("admits only the importer's seed publish while the import is pending", async () => {
-    const { authority } = await withLegacy();
+    const store = createMemoryModeRecordStore();
+    const { authority, importSeed } = createModeAuthorityWithImporter({
+      store,
+      bootId: "boot-1",
+      hasLegacyFiles: (owner) => owner === A,
+    });
+    await authority.ready;
     await authority.submitEvidence(evidence(A, "on"));
-    expect(authority.commitStream(A, "client-delivery")).toEqual({
+    const seed = async (op: string) => {
+      const r = await importSeed.commitImportSeed(A, op, () => undefined);
+      return r.ok
+        ? { kind: "streams", importRequired: r.importRequired }
+        : r.decision;
+    };
+    expect(await stream(authority, A, "client-delivery")).toEqual({
       kind: "refuse",
       code: "IMPORT_PENDING",
       status: 503,
     });
-    expect(authority.commitImportSeed(A, "seed-1")).toEqual({
+    expect(await seed("seed-1")).toEqual({
       kind: "streams",
       importRequired: true,
     });
     // The seed publish is a re-run after a crash: still admitted, still pending.
-    expect(authority.commitImportSeed(A, "seed-1")).toEqual({
+    expect(await seed("seed-1")).toEqual({
       kind: "streams",
       importRequired: true,
     });
-    expect(authority.commitStream(A, "client-delivery").kind).toBe("refuse");
+    expect((await stream(authority, A, "client-delivery")).kind).toBe("refuse");
     expect(await authority.importDone(A)).toEqual({
       kind: "streams",
       importRequired: false,
     });
-    expect(authority.commitStream(A, "client-delivery")).toEqual({
+    expect(await stream(authority, A, "client-delivery")).toEqual({
       kind: "streams",
       importRequired: false,
     });
   });
 
   it("does not admit a seed publish where no stream write may commit", async () => {
-    const { authority, store } = await withLegacy();
+    const store = createMemoryModeRecordStore();
+    const { authority, importSeed } = createModeAuthorityWithImporter({
+      store,
+      bootId: "boot-1",
+      hasLegacyFiles: (owner) => owner === A,
+    });
+    await authority.ready;
+    const seed = async (owner: string) =>
+      (await importSeed.commitImportSeed(owner, "seed", () => undefined)).ok;
     // Unknown owner.
-    expect(authority.commitImportSeed(A, "seed").kind).toBe("refuse");
+    expect(await seed(A)).toBe(false);
     // An On whose save has not completed is not served.
     store.pauseSaves();
     const answer = authority.submitEvidence(evidence(A, "on"));
     await tick();
-    expect(authority.commitImportSeed(A, "seed").kind).toBe("refuse");
+    expect(await seed(A)).toBe(false);
     store.releaseSaves();
     await answer;
-    expect(authority.commitImportSeed(A, "seed").kind).toBe("streams");
+    expect(await seed(A)).toBe(true);
     // An unswitched account never takes a seed publish.
     await authority.submitEvidence(evidence(B, "off"));
-    expect(authority.commitImportSeed(B, "seed").kind).not.toBe("streams");
+    expect(await seed(B)).toBe(false);
   });
 
   it("answers importPending(owner) from the saved record", async () => {
@@ -825,7 +872,8 @@ describe("the fetch start of an Off", () => {
 });
 
 describe("a save that never settles", () => {
-  it("counts as a failed save after the bound, releases the lock and refuses until a later save", async () => {
+  // SAVE_TIMEOUT_WEDGES_QUEUE
+  it("poisons the authority: later work refuses at once, nothing queues behind the hung save and nothing writes", async () => {
     const { authority, store } = await boot(undefined, { saveTimeoutMs: 25 });
     store.pauseSaves();
     const started = Date.now();
@@ -834,12 +882,102 @@ describe("a save that never settles", () => {
     expect((await first).kind).toBe("refuse");
     expect((await queued).kind).toBe("refuse");
     expect(Date.now() - started).toBeLessThan(2000);
-    expect(authority.read(A).kind).toBe("refuse");
-    // The held write lands late; the next evidence adopts what is on disk.
+    expect(store.saveCalls).toBe(1);
+    // Later evidence, admits and reads refuse promptly, and write nothing.
+    const later = Date.now();
+    expect((await authority.submitEvidence(evidence(A, "on"))).kind).toBe(
+      "refuse",
+    );
+    expect(Date.now() - later).toBeLessThan(20);
+    expect(authority.read(A)).toEqual(UNKNOWN_REFUSAL);
+    expect(authority.admit(B, "op")).toEqual(UNKNOWN_REFUSAL);
+    expect((await authority.commitLegacy(B, "op", () => 1)).ok).toBe(false);
+    expect((await stream(authority, A, "op")).kind).toBe("refuse");
+    expect(store.saveCalls).toBe(1);
+    // The held write lands late; the authority stays poisoned.
     store.releaseSaves();
     await tick();
+    expect(authority.read(A)).toEqual(UNKNOWN_REFUSAL);
     expect((await authority.submitEvidence(evidence(A, "on"))).kind).toBe(
-      "streams",
+      "refuse",
     );
+    // A new authority over the store sees what landed.
+    await authority.close();
+    const reopened = (await boot(store)).authority;
+    expect(reopened.read(A).kind).toBe("streams");
+  });
+
+  // UNBOUNDED_PRE_SAVE_AWAIT
+  it("does not wait for a legacy-file probe that never settles: the import is owed", async () => {
+    const { authority, store } = await boot(undefined, {
+      saveTimeoutMs: 25,
+      hasLegacyFiles: () => new Promise<boolean>(() => undefined),
+      onWarning: () => undefined,
+    });
+    expect(await authority.submitEvidence(evidence(A, "on"))).toEqual({
+      kind: "streams",
+      importRequired: true,
+    });
+    expect(store.durable.get(A)?.importPending).toBe(true);
+  });
+
+  it("does not wait for a re-read that never settles, and then refuses everything", async () => {
+    const inner = createMemoryModeRecordStore();
+    let hang = false;
+    const store = {
+      claim: () => inner.claim(),
+      load: () => (hang ? new Promise<never>(() => undefined) : inner.load()),
+      save: inner.save.bind(inner),
+    };
+    const { authority } = await boot(store as never, {
+      saveTimeoutMs: 25,
+      onWarning: () => undefined,
+    });
+    await authority.submitEvidence(evidence(A, "off"));
+    hang = true;
+    // The commit re-reads the record under the lock: it stalls, so it refuses.
+    const started = Date.now();
+    expect((await authority.commitLegacy(A, "op", () => 1)).ok).toBe(false);
+    expect(Date.now() - started).toBeLessThan(2000);
+    // Not held up behind it: later work refuses at once.
+    const later = Date.now();
+    expect((await authority.submitEvidence(evidence(A, "off"))).kind).toBe(
+      "refuse",
+    );
+    expect((await authority.commitLegacy(A, "op", () => 1)).ok).toBe(false);
+    expect(Date.now() - later).toBeLessThan(20);
+  });
+
+  it("does not wait for the re-read that follows a failed save, and then refuses everything", async () => {
+    const inner = createMemoryModeRecordStore();
+    let hang = false;
+    const store = {
+      claim: () => inner.claim(),
+      load: () => (hang ? new Promise<never>(() => undefined) : inner.load()),
+      save: inner.save.bind(inner),
+    };
+    const { authority } = await boot(store as never, {
+      saveTimeoutMs: 25,
+      onWarning: () => undefined,
+    });
+    inner.failSaves(true);
+    expect((await authority.submitEvidence(evidence(A, "off"))).kind).toBe(
+      "refuse",
+    );
+    inner.failSaves(false);
+    hang = true;
+    // The owner is stale: this evidence re-reads before it saves, and stalls.
+    const started = Date.now();
+    expect((await authority.submitEvidence(evidence(A, "off"))).kind).toBe(
+      "refuse",
+    );
+    expect(Date.now() - started).toBeLessThan(2000);
+    const saves = inner.saveCalls;
+    const later = Date.now();
+    expect((await authority.submitEvidence(evidence(A, "off"))).kind).toBe(
+      "refuse",
+    );
+    expect(Date.now() - later).toBeLessThan(20);
+    expect(inner.saveCalls).toBe(saves);
   });
 });

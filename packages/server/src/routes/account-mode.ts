@@ -3,40 +3,76 @@
  *
  *   POST /v1/account-mode/evidence
  *     body {owner, state: "on"|"off"|"unknown", fetchStartedAt, rawStatus}
- *     -> 200 {decision: "streams"|"legacy"|"refuse", importRequired, code?, status?}
+ *     -> 200 {decision: "streams"|"legacy", importRequired}
+ *     -> 503 | 426 {decision: "refuse", importRequired, code, status}
  *
- * Only the owner may call it. The authenticated owner is this server's owner;
- * a body that names any other owner changes no state and answers a refusal.
- * A host that has no answer posts `state: "unknown"`, which changes nothing and
- * returns the decision, so it doubles as a read.
+ * Only the owner may call it, and only about the owner. The caller is this
+ * server's owner; a body that names any other owner is answered 403 with a
+ * plain error body before the module is asked anything, so the answer says
+ * nothing about whether another owner has a record. A host that has no answer
+ * posts `state: "unknown"`, which changes nothing and returns the decision, so
+ * it doubles as a read.
  *
- * The HTTP status is 200 whenever the body was understood, even when the
- * decision is a refusal: the refusal is the answer, not a failure of the
- * request. `importRequired` is true on every answer for an owner whose first
- * On was saved with legacy data present, until the host reports the import
- * done.
+ * The HTTP status is the decision's own status: 200 for streams and legacy,
+ * and for a refusal the status in the body (503 retryable, with
+ * `Retry-After: 5`; 426 not retryable). A client that only reads the status
+ * code therefore never takes a refusal for success. The JSON decision body is
+ * the same on every status. `importRequired` is true on every answer for an
+ * owner whose first On was saved with legacy data present, until the host
+ * reports the import done.
  *
  *   POST /v1/account-mode/import-done
  *     body {owner}
- *     -> 200 {decision, importRequired, code?, status?}
+ *     -> the same answers as evidence
  *
  * The host calls it once it has imported its legacy data into streams. The
  * module saves the clean record before it opens stream writes (which are
  * refused with 503 IMPORT_PENDING until then). Idempotent: for an owner with
  * no pending import it changes nothing.
+ *
+ * Both paths take POST only (405 otherwise, with `Allow: POST`), a body of at
+ * most 16 KiB (413 above it, whether sized or chunked), and a flat JSON object
+ * of at most 8 plain values (400 otherwise).
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import {
   decisionBody,
   normalizeOwner,
   parseEvidenceBody,
   type ModeAuthority,
+  type ModeDecision,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { TokenStore } from "../token-store.js";
 import { createServerApiAuth } from "../api-auth.js";
+import { createBodyLimit } from "../middleware/body-limit.js";
+
+/** A real body is under 200 bytes; this is the ceiling, not the norm. */
+const MAX_BODY_BYTES = 16 * 1024;
+/** More than a few plain fields is not an evidence or import-done body. */
+const MAX_BODY_KEYS = 8;
+/** An address is 42 characters; the record store allows 100. */
+const MAX_OWNER_LENGTH = 100;
+/** Seconds a client waits before it asks again after a 503. */
+const RETRY_AFTER_SECONDS = "5";
+
+/**
+ * A JSON object whose values are all strings, numbers, booleans or null, with
+ * a bounded number of keys. Nothing nested is ever walked.
+ */
+function flatBody(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const entries = Object.entries(value);
+  if (entries.length > MAX_BODY_KEYS) return null;
+  for (const [, v] of entries) {
+    if (v !== null && typeof v === "object") return null;
+  }
+  return value as Record<string, unknown>;
+}
 
 export interface AccountModeRouteDeps {
   serverOrigin: string | (() => string);
@@ -59,9 +95,59 @@ export function accountModeRoutes(deps: AccountModeRouteDeps): Hono {
     tokenStore: deps.tokenStore,
   });
 
+  /** Answer with the decision's own HTTP status. */
+  function answer(c: Context, decision: ModeDecision): Response {
+    if (decision.kind !== "refuse") return c.json(decisionBody(decision), 200);
+    if (decision.status === 503) c.header("Retry-After", RETRY_AFTER_SECONDS);
+    return c.json(decisionBody(decision), decision.status);
+  }
+
+  /**
+   * The body's owner, which must be this server's owner. Any other value is
+   * refused before the module is asked about it.
+   */
+  function boundOwner(owner: unknown): string {
+    if (typeof owner !== "string" || owner.length > MAX_OWNER_LENGTH) {
+      throw new ProtocolError(
+        400,
+        "INVALID_ACCOUNT_MODE_OWNER",
+        "Body owner must be a string of at most 100 characters",
+      );
+    }
+    if (
+      !deps.serverOwner ||
+      normalizeOwner(owner) !== normalizeOwner(deps.serverOwner)
+    ) {
+      throw new ProtocolError(
+        403,
+        "ACCOUNT_MODE_OWNER_MISMATCH",
+        "This server only takes account mode for its own owner",
+      );
+    }
+    return owner;
+  }
+
+  async function readBody(c: Context): Promise<Record<string, unknown>> {
+    const body = flatBody(await c.req.json().catch(() => null));
+    if (!body) {
+      throw new ProtocolError(
+        400,
+        "INVALID_ACCOUNT_MODE_BODY",
+        "Body must be a flat JSON object",
+      );
+    }
+    return body;
+  }
+
+  for (const path of ["/evidence", "/import-done"]) {
+    app.use(path, createBodyLimit(MAX_BODY_BYTES));
+  }
+
   app.post("/evidence", async (c) => {
     await auth.authorizeOwner(c.req.raw);
-    const body = parseEvidenceBody(await c.req.json().catch(() => null));
+    const raw = await readBody(c);
+    boundOwner(raw.owner);
+    const body = parseEvidenceBody(raw);
     if (!body) {
       throw new ProtocolError(
         400,
@@ -69,34 +155,43 @@ export function accountModeRoutes(deps: AccountModeRouteDeps): Hono {
         "Body must be {owner, state, fetchStartedAt, rawStatus}",
       );
     }
-    // authorizeOwner succeeded, so the caller is this server's owner.
-    const decision = await deps.accountModeAuthority.submitEvidence({
-      ...body,
-      authOwner: deps.serverOwner ?? "",
-    });
-    return c.json(decisionBody(decision));
+    // The caller is this server's owner and so is the body's owner.
+    return answer(
+      c,
+      await deps.accountModeAuthority.submitEvidence({
+        ...body,
+        authOwner: deps.serverOwner ?? "",
+      }),
+    );
   });
 
   app.post("/import-done", async (c) => {
     await auth.authorizeOwner(c.req.raw);
-    const body = (await c.req.json().catch(() => null)) as {
-      owner?: unknown;
-    } | null;
-    if (!body || typeof body.owner !== "string") {
+    const raw = await readBody(c);
+    if (typeof raw.owner !== "string") {
       throw new ProtocolError(
         400,
         "INVALID_ACCOUNT_MODE_IMPORT_DONE",
         "Body must be {owner}",
       );
     }
-    // The caller is this server's owner; another owner's import is not theirs
-    // to report, and changes nothing.
-    const decision =
-      normalizeOwner(body.owner) === normalizeOwner(deps.serverOwner)
-        ? await deps.accountModeAuthority.importDone(body.owner)
-        : deps.accountModeAuthority.read(body.owner);
-    return c.json(decisionBody(decision));
+    const owner = boundOwner(raw.owner);
+    return answer(c, await deps.accountModeAuthority.importDone(owner));
   });
+
+  for (const path of ["/evidence", "/import-done"]) {
+    app.all(path, (c) => {
+      c.header("Allow", "POST");
+      return c.json(
+        new ProtocolError(
+          405,
+          "METHOD_NOT_ALLOWED",
+          "Method not allowed",
+        ).toJSON(),
+        405,
+      );
+    });
+  }
 
   return app;
 }

@@ -14,6 +14,8 @@
  *   clock            move time forward
  *   pauseDurableSave / completeDurableSave / failDurableSave   record store faults
  *   importDone       the host finished importing the owner's legacy data
+ *   quarantineRecord the store cannot read the owner's record and sets it
+ *                    aside, keeping a tombstone (history unknown) in its place
  *   crash            restart every runtime from the durable records
  *                    (clockTrusted:false, discardPausedSaves:true)
  *   wipeDataDb       the legacy data store is emptied; mode records are not
@@ -22,11 +24,18 @@
  * Expectations are checked right after the event named by `after`:
  *   decision/code/status/importRequired  against that event's decision, or the
  *                                        event named by `of`
+ *   httpStatus                           the status a route answers with for that
+ *                                        decision: a refusal's status, else 200
  *   legacyMutations                      legacy writes allowed so far
- *   durable                              {alias: null | {field: value}}
+ *   durable                              {alias: null | {field: value}}; a boolean
+ *                                        field the store leaves out is false
  */
 
-import { createModeAuthority, type ModeAuthority } from "./authority.js";
+import {
+  createModeAuthorityWithImporter,
+  type ImportSeedCapability,
+  type ModeAuthority,
+} from "./authority.js";
 import { createMemoryModeRecordStore } from "./memory-record-store.js";
 import {
   OFF_TTL_MS,
@@ -63,6 +72,7 @@ export interface VectorExpectation {
   decision?: "streams" | "legacy" | "refuse";
   code?: string;
   status?: number;
+  httpStatus?: number;
   importRequired?: boolean;
   legacyMutations?: number;
   durable?: Record<string, null | Record<string, unknown>>;
@@ -91,6 +101,11 @@ const RAW_STATUS: Record<string, number | null> = {
 };
 
 const WALL_BASE = 1_700_000_000_000;
+
+const NO_SEED = {
+  ok: false,
+  decision: { kind: "refuse", code: "ACCOUNT_MODE_UNKNOWN", status: 503 },
+} as const;
 
 function flush(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
@@ -137,22 +152,25 @@ export async function runVector(vector: Vector): Promise<string[]> {
   let legacyMutations = 0;
   const clock = { mono: () => mono, wall: () => wall };
 
-  const makeRuntime = (clockTrusted: boolean): ModeAuthority => {
+  const seeds = new Map<string, ImportSeedCapability>();
+  const makeRuntime = (name: string, clockTrusted: boolean): ModeAuthority => {
     boots += 1;
-    return createModeAuthority({
+    const { authority, importSeed } = createModeAuthorityWithImporter({
       store,
       bootId: `boot-${boots}`,
       clockTrusted,
       clock,
       hasLegacyFiles: (owner) => legacyFiles.has(owner),
     });
+    seeds.set(name, importSeed);
+    return authority;
   };
 
   const runtimeNames = vector.initial.runtimes ?? ["R1"];
   let runtimes = new Map<string, ModeAuthority>();
   const boot = async (clockTrusted: boolean) => {
     runtimes = new Map(
-      runtimeNames.map((name) => [name, makeRuntime(clockTrusted)]),
+      runtimeNames.map((name) => [name, makeRuntime(name, clockTrusted)]),
     );
     // A runtime the store refuses never becomes ready; that is a result.
     await Promise.all(
@@ -220,12 +238,20 @@ export async function runVector(vector: Vector): Promise<string[]> {
       case "commit": {
         const owner = address(event.owner ?? "");
         const operationId = event.operationId ?? "";
-        if (event.sink === "stream") {
-          decisions.set(event.id, runtime.commitStream(owner, operationId));
-          break;
-        }
-        if (event.sink === "importSeed") {
-          decisions.set(event.id, runtime.commitImportSeed(owner, operationId));
+        if (event.sink === "stream" || event.sink === "importSeed") {
+          const seal = (
+            event.sink === "stream"
+              ? runtime.commitStream(owner, operationId, () => undefined)
+              : (seeds
+                  .get(event.runtime ?? runtimeNames[0])
+                  ?.commitImportSeed(owner, operationId, () => undefined) ??
+                Promise.resolve(NO_SEED))
+          ).then((result): ModeDecision =>
+            result.ok
+              ? { kind: "streams", importRequired: result.importRequired }
+              : result.decision,
+          );
+          await track(event.id, seal);
           break;
         }
         await track(
@@ -261,6 +287,9 @@ export async function runVector(vector: Vector): Promise<string[]> {
         store.dropLease();
         await boot(event.clockTrusted !== false);
         break;
+      case "quarantineRecord":
+        store.quarantine(address(event.owner ?? ""));
+        break;
       case "wipeDataDb":
         legacyFiles.clear();
         break;
@@ -279,6 +308,7 @@ export async function runVector(vector: Vector): Promise<string[]> {
       exp.decision !== undefined ||
       exp.code !== undefined ||
       exp.status !== undefined ||
+      exp.httpStatus !== undefined ||
       exp.importRequired !== undefined
     ) {
       const got = decisions.get(exp.of ?? exp.after);
@@ -299,6 +329,12 @@ export async function runVector(vector: Vector): Promise<string[]> {
           const status = got.kind === "refuse" ? got.status : undefined;
           if (status !== exp.status) {
             fail(`${label}: status ${status}, expected ${exp.status}`);
+          }
+        }
+        if (exp.httpStatus !== undefined) {
+          const http = got.kind === "refuse" ? got.status : 200;
+          if (http !== exp.httpStatus) {
+            fail(`${label}: httpStatus ${http}, expected ${exp.httpStatus}`);
           }
         }
         if (exp.importRequired !== undefined) {
@@ -330,7 +366,15 @@ export async function runVector(vector: Vector): Promise<string[]> {
         continue;
       }
       for (const [field, value] of Object.entries(want)) {
-        if ((record as unknown as Record<string, unknown>)[field] !== value) {
+        // A boolean the store leaves out (historyUnknown) is false.
+        const fields = record as unknown as Record<string, unknown>;
+        const got =
+          field in fields
+            ? fields[field]
+            : typeof value === "boolean"
+              ? false
+              : undefined;
+        if (got !== value) {
           fail(`${label}: durable ${alias}.${field} is not ${String(value)}`);
         }
       }

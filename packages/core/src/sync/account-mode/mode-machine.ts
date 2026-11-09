@@ -61,6 +61,12 @@ export interface AccountModeRecord {
   readonly persistence: "none" | "pending" | "saved" | "failed";
   /** The host owes an import of its legacy files and has not reported it done. */
   readonly importPending: boolean;
+  /**
+   * The store could not read this owner's record and set it aside, so nothing
+   * is known about the owner's history: it may have been On with an import
+   * owed. Absent means false. While set, no Off is accepted.
+   */
+  readonly historyUnknown?: true;
 }
 
 /** What is kept on disk for one owner (no save state: it is saved by being there). */
@@ -72,6 +78,14 @@ export interface DurableModeRecord {
   bootId: string | null;
   /** An import is owed; cleared only by importDone. */
   importPending: boolean;
+  /**
+   * A tombstone: the store set this owner's unreadable record aside, so the
+   * owner's history is unknown. Written only by a store's own quarantine path,
+   * never by `save`; serialized only when true (absent means false). Not a
+   * switched record, and no Off can be minted over it. An On replaces it, with
+   * the import owed.
+   */
+  historyUnknown?: true;
 }
 
 export type ModeEvent =
@@ -178,6 +192,26 @@ export function toDurable(record: AccountModeRecord): DurableModeRecord {
     offFetchStartMono: record.offFetchStartMono,
     bootId: record.bootId,
     importPending: record.importPending,
+    ...(record.historyUnknown === true
+      ? { historyUnknown: true as const }
+      : {}),
+  };
+}
+
+/**
+ * The record a store writes for an owner whose stored record it could not read
+ * and set aside: history unknown, not On, no Off evidence, no import flag.
+ * Only a store's own quarantine path writes it.
+ */
+export function tombstoneRecord(): DurableModeRecord {
+  return {
+    switched: false,
+    switchedAt: null,
+    cleanOffAt: null,
+    offFetchStartMono: null,
+    bootId: null,
+    importPending: false,
+    historyUnknown: true,
   };
 }
 
@@ -195,6 +229,9 @@ export function fromDurable(
     bootId: record.bootId ?? "",
     persistence: "saved",
     importPending: record.importPending,
+    ...(record.historyUnknown === true
+      ? { historyUnknown: true as const }
+      : {}),
   };
 }
 
@@ -331,15 +368,26 @@ export function reduceAccountMode(
       }
       let next = record ?? createModeRecord(owner, clock.bootId);
       let persist = false;
+      if (event.state === "off" && next.historyUnknown === true) {
+        // The owner's record was unreadable, so it may have been On: no Off
+        // is accepted until an On answers.
+        return settle(next);
+      }
       if (event.state === "on") {
         if (!next.switched) {
+          // From a tombstone the import is owed whatever the probe says: the
+          // lost record may have held a pending import, and the import is
+          // idempotent.
+          const owed =
+            next.historyUnknown === true || event.legacyFiles === true;
+          const { historyUnknown: _cleared, ...rest } = next;
           next = {
-            ...next,
+            ...rest,
             switched: true,
             switchedAt: finiteTime(clock.nowWall) ? clock.nowWall : null,
             offFetchStartMono: null,
             persistence: "pending",
-            importPending: event.legacyFiles === true,
+            importPending: owed,
           };
           persist = true;
         } else persist = unsaved(next);

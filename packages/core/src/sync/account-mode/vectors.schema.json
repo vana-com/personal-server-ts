@@ -52,6 +52,7 @@
             "completeDurableSave",
             "failDurableSave",
             "importDone",
+            "quarantineRecord",
             "crash",
             "wipeDataDb"
           ]
@@ -101,13 +102,17 @@
           "then": { "required": ["owner"] }
         },
         {
+          "if": { "properties": { "op": { "const": "quarantineRecord" } } },
+          "then": { "required": ["owner"] }
+        },
+        {
           "if": { "properties": { "op": { "const": "clock" } } },
           "then": { "required": ["clock"] }
         }
       ]
     },
     "expectation": {
-      "description": "Checked right after the event named by 'after'. decision, code, status and importRequired are read from that event's answer, or from the event named by 'of'.",
+      "description": "Checked right after the event named by 'after'. decision, code, status, httpStatus and importRequired are read from that event's answer, or from the event named by 'of'.",
       "type": "object",
       "additionalProperties": false,
       "required": ["after"],
@@ -124,6 +129,10 @@
           ]
         },
         "status": { "enum": [426, 503] },
+        "httpStatus": {
+          "description": "The HTTP status a host's route answers with for that decision: the refusal's status for a refusal, 200 for streams and legacy.",
+          "enum": [200, 426, 503]
+        },
         "importRequired": { "type": "boolean" },
         "legacyMutations": { "type": "integer", "minimum": 0 },
         "durable": {
@@ -142,7 +151,8 @@
                   "cleanOffAt": { "type": ["integer", "null"] },
                   "offFetchStartMono": { "type": ["integer", "null"] },
                   "bootId": { "type": ["string", "null"] },
-                  "importPending": { "type": "boolean" }
+                  "importPending": { "type": "boolean" },
+                  "historyUnknown": { "type": "boolean" }
                 }
               }
             ]

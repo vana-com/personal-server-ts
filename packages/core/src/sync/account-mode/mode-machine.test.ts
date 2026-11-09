@@ -7,6 +7,7 @@ import {
   fromDurable,
   reduceAccountMode,
   toDurable,
+  tombstoneRecord,
   type AccountModeRecord,
   type ModeClock,
   type ModeDecision,
@@ -106,6 +107,16 @@ describe("the vectors file other hosts copy", () => {
     }
   });
 
+  it("names the HTTP status of every decision it expects, and a route can only answer it that way", () => {
+    for (const vector of vectors) {
+      for (const exp of vector.expect) {
+        if (exp.decision === undefined) continue;
+        const want = exp.decision === "refuse" ? exp.status : 200;
+        expect(exp.httpStatus, `${vector.id} after ${exp.after}`).toBe(want);
+      }
+    }
+  });
+
   it("names only owners it defines", () => {
     for (const vector of vectors) {
       const known = new Set(Object.keys(vector.owners));
@@ -174,6 +185,57 @@ describe("the policy is a pure function", () => {
     expect(reduceAccountMode(off, event, clock)).toEqual(
       reduceAccountMode(off, event, clock),
     );
+  });
+});
+
+describe("a tombstone (an owner whose record could not be read)", () => {
+  const tombstone = () => fromDurable("a", tombstoneRecord());
+
+  it("round-trips, and is serialized only when true", () => {
+    expect(tombstoneRecord()).toEqual({
+      switched: false,
+      switchedAt: null,
+      cleanOffAt: null,
+      offFetchStartMono: null,
+      bootId: null,
+      importPending: false,
+      historyUnknown: true,
+    });
+    expect(toDurable(tombstone())).toMatchObject({
+      switched: false,
+      historyUnknown: true,
+    });
+    expect(toDurable(createModeRecord("A", "b"))).not.toHaveProperty(
+      "historyUnknown",
+    );
+  });
+
+  // TOMBSTONE_MINTS_OFF
+  it("TOMBSTONE_MINTS_OFF: an Off over a tombstone mints nothing and the owner stays unknown", () => {
+    const result = reduceAccountMode(tombstone(), evidence("off"), clock);
+    expect(result.persist).toBe(false);
+    expect(result.decision).toEqual(unknown);
+    expect(result.record).toEqual(tombstone());
+    expect(reduceAccountMode(tombstone(), commit, clock).decision).toEqual(
+      unknown,
+    );
+  });
+
+  it("an On over a tombstone owes the import, whatever the probe says, and clears it", () => {
+    for (const legacyFiles of [false, true, undefined]) {
+      const result = reduceAccountMode(
+        tombstone(),
+        evidence("on", { legacyFiles }),
+        clock,
+      );
+      expect(result.persist).toBe(true);
+      expect(result.record).toMatchObject({
+        switched: true,
+        importPending: true,
+        persistence: "pending",
+      });
+      expect(result.record).not.toHaveProperty("historyUnknown");
+    }
   });
 });
 

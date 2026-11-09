@@ -137,14 +137,16 @@ describe("POST /v1/account-mode/evidence", () => {
     expect((await legacyWrite()).status).toBe(426);
   });
 
-  it("answers a refusal, with a 200, for an Account answer that was unknown", async () => {
+  // refusal_http_status_code_matrix (the real module's two route refusals)
+  it("answers an Account answer that was unknown with 503, Retry-After and the refusal body", async () => {
     for (const body of [
       evidence("unknown", { rawStatus: 503 }),
       evidence("unknown", { rawStatus: null }),
       evidence("off", { rawStatus: 500 }),
     ]) {
       const res = await post(body);
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(503);
+      expect(res.headers.get("retry-after")).toBe("5");
       expect(await res.json()).toEqual({
         decision: "refuse",
         importRequired: false,
@@ -163,10 +165,17 @@ describe("POST /v1/account-mode/evidence", () => {
     expect((await legacyWrite()).status).toBe(426);
   });
 
-  // OWNERLESS_READ_ANSWERS
-  it("changes nothing for evidence about another owner", async () => {
+  // OWNERLESS_READ_ANSWERS, CROSS_OWNER_READ_ANSWERS
+  it("answers evidence about another owner with 403 and changes nothing", async () => {
     const res = await post(evidence("on", { owner: stranger.address }));
-    expect((await res.json()).decision).toBe("refuse");
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      error: {
+        code: 403,
+        errorCode: "ACCOUNT_MODE_OWNER_MISMATCH",
+        message: "This server only takes account mode for its own owner",
+      },
+    });
     expect(authority.read(stranger.address).kind).toBe("refuse");
     expect(authority.snapshot().size).toBe(0);
   });
@@ -273,7 +282,7 @@ describe("POST /v1/account-mode/import-done", () => {
     expect((await (await latchOn()).json()).importRequired).toBe(false);
   });
 
-  it("answers a caller that is not the owner with 401, and another owner's report with a refusal", async () => {
+  it("answers a caller that is not the owner with 401, and another owner's report with 403", async () => {
     await latchOn();
     const stranger401 = await call(
       "/v1/account-mode/import-done",
@@ -284,10 +293,14 @@ describe("POST /v1/account-mode/import-done", () => {
     const other = await call("/v1/account-mode/import-done", {
       owner: stranger.address,
     });
-    expect((await other.json()).decision).toBe("refuse");
+    expect(other.status).toBe(403);
+    expect(JSON.stringify(await other.json())).not.toContain("decision");
     // Neither closed the barrier.
-    expect(authority.commitStream(owner.address, "op")).toMatchObject({
-      code: "IMPORT_PENDING",
+    expect(
+      await authority.commitStream(owner.address, "op", () => 1),
+    ).toMatchObject({
+      ok: false,
+      decision: { code: "IMPORT_PENDING" },
     });
   });
 

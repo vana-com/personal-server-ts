@@ -24,13 +24,17 @@ import type {
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
-  createMemoryModeRecordStore,
   createModeAuthority,
   legacyFlagEvidence,
   type ModeAuthority,
   type ModeRecordStore,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
-import { createIndexedDbModeRecordStore } from "./account-mode-store.js";
+import {
+  createIndexedDbModeRecordStore,
+  createUnavailableModeRecordStore,
+  webLocksOwnerLock,
+  type AcquireOwnerLock,
+} from "./account-mode-store.js";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import type { InferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
 import {
@@ -106,6 +110,13 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    * durable place (a native bundle) injects a store.
    */
   accountModeStore?: ModeRecordStore;
+  /**
+   * How the default IndexedDB records take their owner lock. Default: Web Locks
+   * (the claim fails closed in a context without them). A host with its own
+   * lock injects it; a host with its own store injects `accountModeStore`,
+   * which owns its locking.
+   */
+  acquireOwnerLock?: AcquireOwnerLock;
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible fetch client on `config.inference`; tests inject a
@@ -451,13 +462,16 @@ export async function createIndexedDbPsLiteRuntime(
   const accountModeAuthority = createModeAuthority({
     // A host that injects its own persistence has not offered browser
     // IndexedDB, so the module does not open it either. Without a store from
-    // that host the records are held in memory: no On survives a restart, and
-    // the module refuses legacy work until the Account answers again.
+    // that host the module has no durable records and decides nothing: every
+    // answer is a retryable 503, never an in-memory store that forgets an On at
+    // the next boot. (A test passes a memory store as `accountModeStore`.)
     store:
       options.accountModeStore ??
       (options.persistence
-        ? createMemoryModeRecordStore()
-        : createIndexedDbModeRecordStore(`${dbName}-account-mode`)),
+        ? createUnavailableModeRecordStore()
+        : createIndexedDbModeRecordStore(`${dbName}-account-mode`, {
+            acquireOwnerLock: options.acquireOwnerLock ?? webLocksOwnerLock(),
+          })),
     bootId: crypto.randomUUID(),
     // A first On reports an import when the legacy store holds any scope.
     hasLegacyFiles: () => storage.listScopes({ limit: 1, offset: 0 }).total > 0,

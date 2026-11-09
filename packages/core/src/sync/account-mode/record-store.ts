@@ -64,7 +64,8 @@ export function sameDurableRecord(
     a.cleanOffAt === b.cleanOffAt &&
     a.offFetchStartMono === b.offFetchStartMono &&
     a.bootId === b.bootId &&
-    a.importPending === b.importPending
+    a.importPending === b.importPending &&
+    (a.historyUnknown === true) === (b.historyUnknown === true)
   );
 }
 
@@ -75,6 +76,10 @@ export function sameDurableRecord(
  *   that read an older record cannot overwrite a newer one.
  * - An On is never lowered to Off, and a cleared import flag is never raised
  *   again.
+ * - A tombstone (`historyUnknown`) is never written by `save`: only a store's
+ *   own quarantine path makes one, and an On is never replaced by one.
+ * - Over a tombstone only an On with the import owed is written. An Off record
+ *   is refused: the owner's history is unknown, so no Off can be minted.
  */
 export function assertMonotoneWrite(
   current: DurableModeRecord | null,
@@ -85,6 +90,19 @@ export function assertMonotoneWrite(
     throw new ModeStoreConflictError(
       "the write is based on a record that is no longer stored",
     );
+  }
+  if (next.historyUnknown === true) {
+    throw new ModeStoreConflictError(
+      "a tombstone is written only by the store's own quarantine",
+    );
+  }
+  if (current?.historyUnknown === true) {
+    if (!next.switched || !next.importPending) {
+      throw new ModeStoreConflictError(
+        "an owner with unknown history can only be written as On with an import owed",
+      );
+    }
+    return;
   }
   if (current?.switched === true) {
     if (!next.switched) {

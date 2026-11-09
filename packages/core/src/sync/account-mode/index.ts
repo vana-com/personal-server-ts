@@ -17,6 +17,7 @@ export {
   normalizeOwner,
   reduceAccountMode,
   toDurable,
+  tombstoneRecord,
   validModeOwner,
   type AccountModeRecord,
   type DurableModeRecord,
@@ -37,14 +38,18 @@ export {
 export {
   DEFAULT_SAVE_TIMEOUT_MS,
   MAX_FETCH_SKEW_MS,
+  DEFAULT_OWNER_RETRY_MS,
   createModeAuthority,
+  createModeAuthorityWithImporter,
   defaultAuthorityClock,
   type AuthorityClock,
   type CommitResult,
+  type ImportSeedCapability,
   type ModeAuthority,
   type ModeAuthorityOptions,
   type ModeEvidenceInput,
   type RefuseDecision,
+  type StreamCommitResult,
 } from "./authority.js";
 export {
   createMemoryModeRecordStore,

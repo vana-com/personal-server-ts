@@ -14,6 +14,7 @@ import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
 import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
+import type { ModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type { PsLitePersistenceBundle } from "./persistence.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -533,5 +534,82 @@ describe("createIndexedDbPsLiteRuntime data listings", () => {
       total: 2,
     });
     expect(listGrantsByUser).not.toHaveBeenCalled();
+  });
+});
+
+describe("the account-mode records of a runtime over injected persistence", () => {
+  const plain = (
+    bundle: PsLitePersistenceBundle,
+    accountModeStore?: ModeRecordStore,
+  ) =>
+    createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: bundle,
+      accountModeStore,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+  const answer = (
+    runtime: Awaited<ReturnType<typeof plain>>,
+    state: "on" | "off",
+  ) =>
+    runtime.accountModeAuthority.submitEvidence({
+      owner: ownerAddress,
+      authOwner: ownerAddress,
+      state,
+      fetchStartedAt: Date.now(),
+      rawStatus: 200,
+    });
+
+  // LITE_MEMORY_MODE_STORE
+  it("has no durable mode store of its own, so it decides nothing: an On is not kept and no Off is ever believed", async () => {
+    const bundle = memoryBundle();
+    const first = await plain(bundle);
+    expect(await answer(first, "on")).toMatchObject({
+      kind: "refuse",
+      code: "ACCOUNT_MODE_STORE_OWNED",
+      status: 503,
+    });
+    await first.accountModeAuthority.close();
+    const second = await plain(bundle);
+    expect(await answer(second, "off")).toMatchObject({
+      kind: "refuse",
+      status: 503,
+    });
+    const owner = ownerAddress;
+    expect(second.accountModeAuthority.read(owner).kind).toBe("refuse");
+    expect(
+      (await second.accountModeAuthority.commitLegacy(owner, "op", () => 1)).ok,
+    ).toBe(false);
+  });
+
+  it("keeps an On through a restart when the host injects a durable store, and a later Off is refused", async () => {
+    const { createMemoryModeRecordStore } =
+      await import("@opendatalabs/personal-server-ts-core/sync/account-mode");
+    const store = createMemoryModeRecordStore();
+    const bundle = memoryBundle();
+    const first = await plain(bundle, store);
+    expect((await answer(first, "on")).kind).toBe("streams");
+    await first.accountModeAuthority.close();
+    const second = await plain(bundle, store);
+    expect((await answer(second, "off")).kind).toBe("streams");
+    expect(
+      (
+        await second.accountModeAuthority.commitLegacy(
+          ownerAddress,
+          "op",
+          () => 1,
+        )
+      ).ok,
+    ).toBe(false);
   });
 });

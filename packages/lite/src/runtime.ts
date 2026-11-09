@@ -30,6 +30,7 @@ import {
   accountStorageModeOf,
   decisionBody,
   normalizeOwner,
+  type ModeDecision,
   parseEvidenceBody,
   type ModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
@@ -391,6 +392,82 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
   return new Response(JSON.stringify(body), { ...init, headers });
+}
+
+/**
+ * A mode answer: the decision body, with a refusal's own HTTP status. A 503 is
+ * retryable and says when to ask again.
+ */
+function decisionResponse(decision: ModeDecision): Response {
+  const refused = decision.kind === "refuse";
+  return jsonResponse(decisionBody(decision), {
+    status: refused ? decision.status : 200,
+    ...(refused && decision.status === 503
+      ? { headers: { "Retry-After": MODE_RETRY_AFTER_SECONDS } }
+      : {}),
+  });
+}
+
+// The mode routes take small bodies, as on the Node server: at most 16 KiB
+// (413 above it, sized or chunked), a flat object of at most 8 plain values,
+// and an owner of at most 100 characters (400 otherwise).
+const MODE_BODY_MAX_BYTES = 16 * 1024;
+const MODE_BODY_MAX_KEYS = 8;
+const MODE_OWNER_MAX_LENGTH = 100;
+const MODE_RETRY_AFTER_SECONDS = "5";
+const BODY_TOO_LARGE = Symbol("body too large");
+
+/** The request's flat JSON object, null when it is not one, or too large. */
+async function readModeBody(
+  request: Request,
+): Promise<Record<string, unknown> | null | typeof BODY_TOO_LARGE> {
+  if (Number(request.headers.get("content-length")) > MODE_BODY_MAX_BYTES) {
+    return BODY_TOO_LARGE;
+  }
+  const reader = request.body?.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let size = 0;
+  while (reader) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MODE_BODY_MAX_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      return BODY_TOO_LARGE;
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text + decoder.decode());
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+  const values = Object.values(parsed);
+  if (values.length > MODE_BODY_MAX_KEYS) return null;
+  if (values.some((v) => v !== null && typeof v === "object")) return null;
+  return parsed as Record<string, unknown>;
+}
+
+function modeBodyRefusal(
+  body: Record<string, unknown> | null | typeof BODY_TOO_LARGE,
+  code: string,
+  shape: string,
+): Response | null {
+  if (body === BODY_TOO_LARGE) {
+    return jsonResponse(
+      {
+        error: "CONTENT_TOO_LARGE",
+        message: `Request body exceeds maximum size of ${MODE_BODY_MAX_BYTES} bytes`,
+      },
+      { status: 413 },
+    );
+  }
+  return body ? null : errorResponse(400, code, shape);
 }
 
 function protocolErrorResponse(err: ProtocolError): Response {
@@ -921,6 +998,48 @@ export function createPsLiteRuntime(
     return options.serverOwner ?? options.identity?.address;
   }
 
+  // The owner the account mode is bound to: the person's owner only, as on the
+  // Node server. The server identity is never a substitute.
+  function modeOwner(): `0x${string}` | undefined {
+    return options.serverOwner;
+  }
+
+  function modeMethodNotAllowed(): Response {
+    return jsonResponse(
+      {
+        error: {
+          code: 405,
+          errorCode: "METHOD_NOT_ALLOWED",
+          message: "Method not allowed",
+        },
+      },
+      { status: 405, headers: { Allow: "POST" } },
+    );
+  }
+
+  /** A refusal unless the body's owner is the runtime's mode owner. */
+  function modeOwnerRefusal(owner: unknown): Response | null {
+    if (typeof owner !== "string" || owner.length > MODE_OWNER_MAX_LENGTH) {
+      return errorResponse(
+        400,
+        "INVALID_ACCOUNT_MODE_OWNER",
+        "Body owner must be a string of at most 100 characters",
+      );
+    }
+    const bound = modeOwner();
+    if (
+      bound === undefined ||
+      normalizeOwner(owner) !== normalizeOwner(bound)
+    ) {
+      return errorResponse(
+        403,
+        "ACCOUNT_MODE_OWNER_MISMATCH",
+        "This server only takes account mode for its own owner",
+      );
+    }
+    return null;
+  }
+
   // The host's mode, bound once to this runtime's owner. Every consumer below
   // (scope-upload append, the data handler, Oura, every MCP engine) receives
   // this bound view, which cannot be asked about another account. The mode
@@ -930,7 +1049,7 @@ export function createPsLiteRuntime(
     options.accountModeAuthority
       ? accountStorageModeOf(options.accountModeAuthority)
       : { read: () => "unknown" },
-    ownerAddress(),
+    modeOwner(),
   );
 
   async function handleAuthDevice(request: Request, url: URL) {
@@ -1225,6 +1344,72 @@ export function createPsLiteRuntime(
           );
         }
 
+        // Account-mode answers do not wait for activation: a host submits the
+        // first Off or On, and only then starts the workers that depend on it.
+        if (
+          url.pathname === "/v1/account-mode/evidence" &&
+          options.accountModeAuthority
+        ) {
+          if (request.method !== "POST") return modeMethodNotAllowed();
+          await auth.authorizeOwner(request);
+          const raw = await readModeBody(request);
+          const bad = modeBodyRefusal(
+            raw,
+            "INVALID_ACCOUNT_MODE_BODY",
+            "Body must be a flat JSON object",
+          );
+          if (bad) return bad;
+          const mismatch = modeOwnerRefusal(
+            (raw as Record<string, unknown>).owner,
+          );
+          if (mismatch) return mismatch;
+          const body = parseEvidenceBody(raw);
+          if (!body) {
+            return errorResponse(
+              400,
+              "INVALID_ACCOUNT_MODE_EVIDENCE",
+              "Body must be {owner, state, fetchStartedAt, rawStatus}",
+            );
+          }
+          // authorizeOwner succeeded, so the caller is this runtime's owner,
+          // and so is the body's.
+          const decision = await options.accountModeAuthority.submitEvidence({
+            ...body,
+            authOwner: modeOwner() ?? "",
+          });
+          return decisionResponse(decision);
+        }
+
+        if (
+          url.pathname === "/v1/account-mode/import-done" &&
+          options.accountModeAuthority
+        ) {
+          if (request.method !== "POST") return modeMethodNotAllowed();
+          await auth.authorizeOwner(request);
+          const raw = await readModeBody(request);
+          const bad = modeBodyRefusal(
+            raw,
+            "INVALID_ACCOUNT_MODE_BODY",
+            "Body must be a flat JSON object",
+          );
+          if (bad) return bad;
+          const body = raw as Record<string, unknown>;
+          if (typeof body.owner !== "string") {
+            return errorResponse(
+              400,
+              "INVALID_ACCOUNT_MODE_IMPORT_DONE",
+              "Body must be {owner}",
+            );
+          }
+          // Another owner's import is not this caller's to report, and its mode
+          // is not this caller's to read: refused before the module is asked.
+          const mismatch = modeOwnerRefusal(body.owner);
+          if (mismatch) return mismatch;
+          return decisionResponse(
+            await options.accountModeAuthority.importDone(body.owner),
+          );
+        }
+
         if (!active) {
           return unavailableResponse();
         }
@@ -1254,64 +1439,6 @@ export function createPsLiteRuntime(
           // up to its deadline. Its outcome shows in the status.
           void options.replication!.trigger("sync_now");
           return jsonResponse({ accepted: true, status }, { status: 202 });
-        }
-
-        if (
-          url.pathname === "/v1/account-mode/evidence" &&
-          options.accountModeAuthority
-        ) {
-          if (request.method !== "POST")
-            return errorResponse(
-              405,
-              "METHOD_NOT_ALLOWED",
-              "Method not allowed",
-            );
-          await auth.authorizeOwner(request);
-          const body = parseEvidenceBody(
-            await request.json().catch(() => null),
-          );
-          if (!body) {
-            return errorResponse(
-              400,
-              "INVALID_ACCOUNT_MODE_EVIDENCE",
-              "Body must be {owner, state, fetchStartedAt, rawStatus}",
-            );
-          }
-          // authorizeOwner succeeded, so the caller is this runtime's owner.
-          const decision = await options.accountModeAuthority.submitEvidence({
-            ...body,
-            authOwner: ownerAddress() ?? "",
-          });
-          return jsonResponse(decisionBody(decision));
-        }
-
-        if (
-          url.pathname === "/v1/account-mode/import-done" &&
-          options.accountModeAuthority
-        ) {
-          if (request.method !== "POST")
-            return errorResponse(
-              405,
-              "METHOD_NOT_ALLOWED",
-              "Method not allowed",
-            );
-          await auth.authorizeOwner(request);
-          const body = (await request.json().catch(() => null)) as {
-            owner?: unknown;
-          } | null;
-          if (!body || typeof body.owner !== "string") {
-            return errorResponse(
-              400,
-              "INVALID_ACCOUNT_MODE_IMPORT_DONE",
-              "Body must be {owner}",
-            );
-          }
-          // Another owner's import is not this caller's to report.
-          const decision =
-            normalizeOwner(body.owner) === normalizeOwner(ownerAddress())
-              ? await options.accountModeAuthority.importDone(body.owner)
-              : options.accountModeAuthority.read(body.owner);
-          return jsonResponse(decisionBody(decision));
         }
 
         if (url.pathname === "/v1/import/oura-browser/requirements") {

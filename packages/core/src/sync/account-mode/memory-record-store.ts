@@ -5,7 +5,7 @@
  * It models ownership too: one claim at a time, freed by release or `dropLease`.
  */
 
-import type { DurableModeRecord } from "./mode-machine.js";
+import { tombstoneRecord, type DurableModeRecord } from "./mode-machine.js";
 import {
   ModeStoreOwnedError,
   assertMonotoneWrite,
@@ -30,6 +30,11 @@ export interface MemoryModeRecordStore extends ModeRecordStore {
   failLoads(fail: boolean): void;
   /** Drop every record, as a wiped data folder would. */
   wipe(): void;
+  /**
+   * Make one owner's record unreadable, as a corrupt file is: the store sets
+   * it aside and keeps a tombstone (history unknown) in its place.
+   */
+  quarantine(owner: string): void;
   /**
    * Free the ownership without a release call, as a crash does. Every
    * holder's lease dies with its process, so the next `claim` succeeds.
@@ -103,6 +108,9 @@ export function createMemoryModeRecordStore(
     },
     wipe() {
       durable.clear();
+    },
+    quarantine(owner) {
+      durable.set(owner, tombstoneRecord());
     },
   };
 }

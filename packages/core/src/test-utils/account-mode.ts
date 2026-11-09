@@ -91,8 +91,27 @@ export function fixedModeAuthority(
     admit: () => decision,
     commitLegacy: ((_owner: string, _op: string, write: () => unknown) =>
       sealed(write)) as ModeAuthority["commitLegacy"],
-    commitStream: () => decision,
-    commitImportSeed: () => decision,
+    commitStream: (async (_owner: string, _op: string, write: () => unknown) =>
+      decision.kind === "streams" && !decision.importRequired
+        ? {
+            ok: true as const,
+            value: await write(),
+            importRequired: false,
+          }
+        : {
+            ok: false as const,
+            decision:
+              decision.kind === "refuse"
+                ? decision
+                : ({
+                    kind: "refuse",
+                    code:
+                      decision.kind === "streams"
+                        ? "IMPORT_PENDING"
+                        : "ACCOUNT_MODE_UNKNOWN",
+                    status: 503,
+                  } as const),
+          }) as ModeAuthority["commitStream"],
     importPending: async () =>
       decision.kind === "streams" && decision.importRequired,
     importDone: async () => decision,

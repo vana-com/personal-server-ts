@@ -61,6 +61,7 @@
       {
         "after": "e1",
         "decision": "legacy",
+        "httpStatus": 200,
         "durable": {
           "A": {
             "switched": false
@@ -69,16 +70,19 @@
       },
       {
         "after": "e2",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e3",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 1
       },
       {
         "after": "e4",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       }
     ]
   },
@@ -243,31 +247,36 @@
         "after": "e1",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e2",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e3",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e4",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e5",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0
       },
       {
@@ -275,6 +284,7 @@
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0
       },
       {
@@ -282,6 +292,7 @@
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0
       },
       {
@@ -289,6 +300,7 @@
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0
       },
       {
@@ -296,25 +308,29 @@
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0
       },
       {
         "after": "e10",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e11",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e12",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       }
     ]
   },
@@ -417,13 +433,15 @@
         "after": "e1",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e3",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "durable": {
           "A": null
         }
@@ -432,6 +450,7 @@
         "after": "e4",
         "of": "e2",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false,
         "durable": {
           "A": {
@@ -442,6 +461,7 @@
       {
         "after": "e5",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false
       },
       {
@@ -449,11 +469,13 @@
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 0
       },
       {
         "after": "e7",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       }
     ]
   },
@@ -619,43 +641,53 @@
     "expect": [
       {
         "after": "e1",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e2",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "a2",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e3",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "a3",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e4",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "a4",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e5",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "a5",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "c5",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 1
       }
     ]
@@ -797,6 +829,7 @@
       {
         "after": "e1",
         "decision": "streams",
+        "httpStatus": 200,
         "durable": {
           "A": {
             "switched": true
@@ -805,36 +838,43 @@
       },
       {
         "after": "e2",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e3",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e5",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e6",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e7",
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 0
       },
       {
         "after": "e9",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e10",
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 0
       }
     ]
@@ -950,15 +990,18 @@
     "expect": [
       {
         "after": "e4",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e5",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e6",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 1
       },
       {
@@ -966,6 +1009,7 @@
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 1
       }
     ]
@@ -1087,66 +1131,77 @@
         "after": "e1",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e2",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e3",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e4",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e5",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e6",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e7",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0
       },
       {
         "after": "e8",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e9",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e10",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e11",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0
       }
     ]
@@ -1236,17 +1291,20 @@
     "expect": [
       {
         "after": "e2",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e3",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e5",
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 0
       },
       {
@@ -1254,6 +1312,7 @@
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 0
       }
     ]
@@ -1356,6 +1415,7 @@
       {
         "after": "e1",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true,
         "durable": {
           "A": {
@@ -1366,6 +1426,7 @@
       {
         "after": "e4",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true
       },
       {
@@ -1373,11 +1434,13 @@
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 0
       },
       {
         "after": "e7",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       }
     ]
   },
@@ -1534,19 +1597,22 @@
         "after": "e2",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e3",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e4",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0,
         "durable": {
           "A": null
@@ -1557,6 +1623,7 @@
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "durable": {
           "A": null
         }
@@ -1565,13 +1632,15 @@
         "after": "e8",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e9",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0,
         "durable": {
           "A": null
@@ -1581,6 +1650,7 @@
         "after": "e10",
         "of": "e10",
         "decision": "streams",
+        "httpStatus": 200,
         "durable": {
           "A": {
             "switched": true
@@ -1589,7 +1659,8 @@
       },
       {
         "after": "e11",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       }
     ]
   },
@@ -1764,49 +1835,58 @@
       {
         "after": "e3",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 1
       },
       {
         "after": "e4",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e5",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 1
       },
       {
         "after": "e6",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e7",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e8",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e9",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 2
       },
       {
         "after": "e11",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e12",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       }
     ]
   },
@@ -1935,53 +2015,62 @@
     "expect": [
       {
         "after": "e1",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e2",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_STORE_OWNED",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e3",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_STORE_OWNED",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e4",
         "legacyMutations": 0,
         "decision": "refuse",
         "code": "ACCOUNT_MODE_STORE_OWNED",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e5",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e6",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e7",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_STORE_OWNED",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e8",
         "legacyMutations": 0,
         "decision": "refuse",
         "code": "ACCOUNT_MODE_STORE_OWNED",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e9",
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 0
       }
     ]
@@ -2109,16 +2198,19 @@
       {
         "after": "e2",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 1
       },
       {
         "after": "e4",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 2
       },
       {
         "after": "e5",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true,
         "durable": {
           "A": {
@@ -2130,11 +2222,13 @@
       {
         "after": "e6",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true
       },
       {
         "after": "e6a",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false,
         "durable": {
           "A": {
@@ -2147,6 +2241,7 @@
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 2
       }
     ]
@@ -2226,30 +2321,36 @@
         "after": "e0",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e1",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0
       },
       {
         "after": "e2",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e3",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e4",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e5",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 1
       }
     ]
@@ -2340,11 +2441,13 @@
         "after": "e0",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e1",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false,
         "durable": {
           "A": {
@@ -2355,15 +2458,18 @@
       {
         "after": "e2",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false
       },
       {
         "after": "e3",
-        "decision": "streams"
+        "decision": "streams",
+        "httpStatus": 200
       },
       {
         "after": "e4",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true
       }
     ]
@@ -2425,20 +2531,24 @@
     "expect": [
       {
         "after": "e1",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e2",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e3",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 1
       },
       {
         "after": "e4",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       }
     ]
   },
@@ -2552,33 +2662,39 @@
         "after": "e1",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e2",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e3",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e4",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e6",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e7",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 1
       }
     ]
@@ -2686,46 +2802,53 @@
         "after": "e1",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e2",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e3",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e4",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "legacyMutations": 0
       },
       {
         "after": "e5",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e6",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e7",
         "decision": "legacy",
+        "httpStatus": 200,
         "legacyMutations": 1
       }
     ]
   },
   {
     "version": 1,
-    "id": "import-pending-survives-crash",
-    "description": "The first On is saved with importPending. The process dies before the host hears the answer. After the restart every answer still says an import is owed, and stream commits are refused with 503 IMPORT_PENDING. Legacy stays refused with 426.",
+    "id": "import-pending-survives-restart",
+    "description": "The first On is saved with importPending and answered. The process then restarts (the answer was complete before the restart; this vector proves that the owed import is on disk, not the interval before a host hears an answer). After the restart every answer still says an import is owed, and stream commits are refused with 503 IMPORT_PENDING. Legacy stays refused with 426.",
     "policy": {
       "offTtlMs": 604800000
     },
@@ -2825,6 +2948,7 @@
       {
         "after": "e1",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true,
         "durable": {
           "A": {
@@ -2837,29 +2961,34 @@
         "after": "e2",
         "decision": "refuse",
         "code": "IMPORT_PENDING",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e4",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true
       },
       {
         "after": "e5",
         "decision": "refuse",
         "code": "IMPORT_PENDING",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e6",
         "decision": "refuse",
         "code": "LEGACY_REFUSED_SWITCHED",
         "status": 426,
+        "httpStatus": 426,
         "legacyMutations": 0
       },
       {
         "after": "e7",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true
       }
     ]
@@ -2963,17 +3092,20 @@
       {
         "after": "e1",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true
       },
       {
         "after": "e4",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e6",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false,
         "durable": {
           "A": {
@@ -2984,18 +3116,21 @@
       {
         "after": "e8",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false
       },
       {
         "after": "e9",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false
       },
       {
         "after": "e10",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       }
     ]
   },
@@ -3097,6 +3232,7 @@
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
         "status": 503,
+        "httpStatus": 503,
         "durable": {
           "A": null
         }
@@ -3105,15 +3241,18 @@
         "after": "e2",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e3",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       },
       {
         "after": "e4",
-        "decision": "legacy"
+        "decision": "legacy",
+        "httpStatus": 200
       }
     ]
   },
@@ -3219,45 +3358,351 @@
       {
         "after": "e1",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true
       },
       {
         "after": "e2",
         "decision": "refuse",
         "code": "IMPORT_PENDING",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e3",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true
       },
       {
         "after": "e5",
         "decision": "refuse",
         "code": "IMPORT_PENDING",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
       },
       {
         "after": "e6",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": true
       },
       {
         "after": "e7",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false
       },
       {
         "after": "e8",
         "decision": "streams",
+        "httpStatus": 200,
         "importRequired": false
       },
       {
         "after": "e9",
         "decision": "refuse",
         "code": "ACCOUNT_MODE_UNKNOWN",
-        "status": 503
+        "status": 503,
+        "httpStatus": 503
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "unreadable-record-cannot-erase-on",
+    "description": "A saved On with an owed import is set aside by the store because its record cannot be read; the store keeps a tombstone (history unknown). The owner is unknown: an Off is refused with 503 and mints nothing, no legacy write lands, and this holds across more restarts. An On re-establishes the latch with the import owed, even though no legacy files are left to find, and clears the tombstone. A second cycle of the same is stable.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222"
+    },
+    "initial": {
+      "legacyFiles": ["A"]
+    },
+    "events": [
+      {
+        "id": "fr1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on"
+        }
+      },
+      {
+        "id": "e2",
+        "op": "quarantineRecord",
+        "owner": "A"
+      },
+      {
+        "id": "e3",
+        "op": "crash",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 0,
+          "wallMs": 1000500
+        }
+      },
+      {
+        "id": "e4",
+        "op": "read",
+        "owner": "A"
+      },
+      {
+        "id": "fr2",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r2",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e5",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r2",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off"
+        }
+      },
+      {
+        "id": "e6",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w1",
+        "sink": "legacy"
+      },
+      {
+        "id": "e7",
+        "op": "crash",
+        "clock": {
+          "boot": "b3",
+          "monoMs": 0,
+          "wallMs": 1000900
+        }
+      },
+      {
+        "id": "e8",
+        "op": "read",
+        "owner": "A"
+      },
+      {
+        "id": "e9",
+        "op": "wipeDataDb"
+      },
+      {
+        "id": "fr3",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r3",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 20,
+          "wallMs": 1000020
+        }
+      },
+      {
+        "id": "e10",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r3",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on"
+        }
+      },
+      {
+        "id": "e11",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "s1",
+        "sink": "stream"
+      },
+      {
+        "id": "e12",
+        "op": "quarantineRecord",
+        "owner": "A"
+      },
+      {
+        "id": "e13",
+        "op": "crash",
+        "clock": {
+          "boot": "b4",
+          "monoMs": 0,
+          "wallMs": 1001500
+        }
+      },
+      {
+        "id": "fr4",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r4",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 30,
+          "wallMs": 1000030
+        }
+      },
+      {
+        "id": "e14",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r4",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off"
+        }
+      },
+      {
+        "id": "fr5",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r5",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 40,
+          "wallMs": 1000040
+        }
+      },
+      {
+        "id": "e15",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r5",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "importPending": true
+          }
+        }
+      },
+      {
+        "after": "e2",
+        "durable": {
+          "A": {
+            "switched": false,
+            "historyUnknown": true,
+            "importPending": false
+          }
+        }
+      },
+      {
+        "after": "e4",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503
+      },
+      {
+        "after": "e5",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503,
+        "durable": {
+          "A": {
+            "switched": false,
+            "offFetchStartMono": null,
+            "historyUnknown": true
+          }
+        }
+      },
+      {
+        "after": "e6",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503,
+        "legacyMutations": 0
+      },
+      {
+        "after": "e8",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503
+      },
+      {
+        "after": "e10",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "importPending": true,
+            "historyUnknown": false
+          }
+        }
+      },
+      {
+        "after": "e11",
+        "decision": "refuse",
+        "code": "IMPORT_PENDING",
+        "status": 503,
+        "httpStatus": 503
+      },
+      {
+        "after": "e14",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503,
+        "durable": {
+          "A": {
+            "switched": false,
+            "historyUnknown": true
+          }
+        }
+      },
+      {
+        "after": "e15",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "importPending": true,
+            "historyUnknown": false
+          }
+        }
       }
     ]
   }

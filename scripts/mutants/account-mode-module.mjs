@@ -6,20 +6,34 @@
  * code. The runner applies it in place, runs the focused tests, and reads the
  * vitest JSON report. A mutant is KILLED only when a test named as its aim ran
  * and failed. These outcomes are never kills:
- *   INVALID   the aimed test did not run, or a test file failed to load or build
+ *   INVALID   the aimed test did not run; a test file failed to load or build;
+ *             the run left no fresh, parseable report; or the report held no
+ *             test at all
  *   SURVIVED  the aimed test ran and passed
  *
- *   node scripts/mutants/account-mode-module.mjs [name-substring ...]
+ * Every vitest run writes its report to a new directory made for that run, so
+ * a report from an earlier run can never be read as this one, and the run is
+ * INVALID unless that report is newer than the moment the run started. A
+ * self-check runs before the first mutant: a mutant that cannot load and a run
+ * of a test file that does not exist must both come out INVALID.
+ *
+ *   node scripts/mutants/account-mode-module.mjs [name-substring | !name-substring ...]
  *
  * The unmutated baseline runs first. If any aimed test is missing or red, the
  * runner stops before it mutates anything. Every mutated file is put back byte
  * for byte, also on SIGINT and SIGTERM, and the runner checks that it did.
- * Exit code 1 for any mutant that is not killed, a red baseline, or a file that
- * did not restore. Run it with Node 22 from the repository root, in the
+ * Exit code 1 for any mutant that is not killed (SURVIVED or INVALID), a red
+ * baseline, a failed self-check, or a file that did not restore. Run it with Node 22 from the repository root, in the
  * foreground, to the end.
  */
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -34,38 +48,47 @@ const NODE_STORE = "packages/server/src/account-mode/file-record-store.ts";
 const LITE_STORE = "packages/lite/src/account-mode-store.ts";
 const APP = "packages/server/src/app.ts";
 const LITE_RUNTIME = "packages/lite/src/runtime.ts";
+const BROWSER_RUNTIME = "packages/lite/src/browser-runtime.ts";
 
 const AUTHORITY_TESTS = `${DIR}/authority.test.ts`;
+const LIFECYCLE_TESTS = `${DIR}/authority-lifecycle.test.ts`;
 const FLAG_TESTS = `${DIR}/flag-evidence.test.ts`;
 // Runs the shared vectors (vectors.json) and the policy's unit tests.
 const CORE_TESTS = `${DIR}/mode-machine.test.ts`;
 const NODE_STORE_TESTS =
   "packages/server/src/account-mode/file-record-store.test.ts";
 const LITE_STORE_TESTS = "packages/lite/src/account-mode-store.test.ts";
+const OWNER_LOCK = "packages/server/src/account-mode/owner-lock.ts";
+const SERVER_BOOTSTRAP = "packages/server/src/bootstrap.ts";
+const SERVER_ROUTE = "packages/server/src/routes/account-mode.ts";
+const NODE_OWNERSHIP_TESTS =
+  "packages/server/src/account-mode/file-record-store.ownership.test.ts";
+const SERVER_BOOT_TESTS =
+  "packages/server/src/bootstrap-account-mode-ownership.test.ts";
+const SERVER_CONTRACT_TESTS =
+  "packages/server/src/routes/account-mode.contract.test.ts";
 const SERVER_APP_TESTS = "packages/server/src/routes/account-mode.test.ts";
 const LITE_RUNTIME_TESTS = "packages/lite/src/runtime-account-mode.test.ts";
+const BROWSER_RUNTIME_TESTS = "packages/lite/src/browser-runtime.test.ts";
 // The core files run for every mutant of core code. A mutant of a host file
 // names its own test files: those import the host source directly, and reach
 // the module through its built output, which a mutant of core cannot change.
-const CORE_FILES = [AUTHORITY_TESTS, FLAG_TESTS, CORE_TESTS];
-const TEST_FILES = [
-  ...CORE_FILES,
-  NODE_STORE_TESTS,
-  LITE_STORE_TESTS,
-  SERVER_APP_TESTS,
-  LITE_RUNTIME_TESTS,
-];
+const CORE_FILES = [AUTHORITY_TESTS, LIFECYCLE_TESTS, FLAG_TESTS, CORE_TESTS];
 
 const nodeStore = (name) => ({ file: NODE_STORE_TESTS, name });
 const liteStore = (name) => ({ file: LITE_STORE_TESTS, name });
 const serverApp = (name) => ({ file: SERVER_APP_TESTS, name });
 const liteRuntime = (name) => ({ file: LITE_RUNTIME_TESTS, name });
+const nodeOwnership = (name) => ({ file: NODE_OWNERSHIP_TESTS, name });
+const serverBoot = (name) => ({ file: SERVER_BOOT_TESTS, name });
+const serverContract = (name) => ({ file: SERVER_CONTRACT_TESTS, name });
 
 const vector = (id) => ({
   file: CORE_TESTS,
   name: `the shared vectors, run through the module ${id}`,
 });
 const authority = (name) => ({ file: AUTHORITY_TESTS, name });
+const lifecycle = (name) => ({ file: LIFECYCLE_TESTS, name });
 const core = (name) => ({ file: CORE_TESTS, name });
 
 /**
@@ -148,8 +171,8 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        "      await settleWithin(\n        options.store.save(owner, next, stored.get(owner) ?? null),\n        saveTimeoutMs,\n      );",
-        "      await Promise.resolve();",
+        "        options.store.save(owner, next, stored.get(owner) ?? null),",
+        "        Promise.resolve(),",
       ],
     ],
     aimed: [
@@ -162,8 +185,8 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        "    try {\n      await settleWithin(",
-        '    apply({ type: "saveComplete", owner });\n    try {\n      await settleWithin(',
+        "    const next = toDurable(record);\n    try {\n",
+        '    const next = toDurable(record);\n    apply({ type: "saveComplete", owner });\n    try {\n',
       ],
     ],
     aimed: [
@@ -335,32 +358,13 @@ const MUTANTS = [
     ],
   },
   {
-    name: "SECOND_RUNTIME_ADMITTED (Node: the lock file is not checked)",
-    files: [NODE_STORE_TESTS],
-    edits: [
-      [
-        NODE_STORE,
-        "        if (await createLock(token)) {",
-        "        await createLock(token);\n        {",
-      ],
-    ],
-    aimed: [
-      nodeStore(
-        "lets one runtime own the folder, and refuses a second without touching its files",
-      ),
-      nodeStore(
-        "two authorities on the folder: the second is refused and its Off never reaches the disk",
-      ),
-    ],
-  },
-  {
     name: "SECOND_RUNTIME_ADMITTED (Lite: the Web Lock is not checked)",
     files: [LITE_STORE_TESTS],
     edits: [
       [
         LITE_STORE,
-        "            if (!lock) {\n              reject(new ModeStoreOwnedError());\n              return;\n            }\n",
-        "",
+        "      if (held === null) throw new ModeStoreOwnedError();\n",
+        "      if (held === null) {\n        const taken = {};\n        lease = taken;\n        return {\n          async release() {\n            if (lease === taken) lease = null;\n          },\n        };\n      }\n",
       ],
     ],
     aimed: [
@@ -373,29 +377,13 @@ const MUTANTS = [
     ],
   },
   {
-    name: "LIVE_LOCK_TAKEN_OVER",
+    name: "SWEEP_OUTSIDE_CLAIM (a load deletes temp files)",
     files: [NODE_STORE_TESTS],
     edits: [
       [
         NODE_STORE,
-        "    if (!body || body.host !== hostname() || !processIsGone(body.pid)) {",
-        "    if (!body) {",
-      ],
-    ],
-    aimed: [
-      nodeStore(
-        "takes over a lock whose process is gone, and keeps one held by a live process",
-      ),
-    ],
-  },
-  {
-    name: "SWEEP_BY_NON_OWNER (a load deletes another runtime's temp file)",
-    files: [NODE_STORE_TESTS],
-    edits: [
-      [
-        NODE_STORE,
-        "      const records = new Map<string, DurableModeRecord>();\n      for (const name of await readdir(dir)) {\n        const match",
-        "      const records = new Map<string, DurableModeRecord>();\n      await sweepTemps();\n      for (const name of await readdir(dir)) {\n        const match",
+        "      const records = new Map<string, DurableModeRecord>();\n      let changed = false;\n",
+        "      const records = new Map<string, DurableModeRecord>();\n      await sweepTemps(folder);\n      let changed = false;\n",
       ],
     ],
     aimed: [
@@ -403,7 +391,7 @@ const MUTANTS = [
         "sweeps the temp file of a crashed save when it becomes the owner, and at no other time",
       ),
       nodeStore(
-        "lets one runtime own the folder, and refuses a second without touching its files",
+        "lets one store own the folder, and a second touches none of its files",
       ),
     ],
   },
@@ -443,7 +431,7 @@ const MUTANTS = [
     edits: [
       [
         NODE_STORE,
-        "        assertMonotoneWrite(await readCurrent(owner), expected, record);\n",
+        "        assertMonotoneWrite(await readCurrent(folder, owner), expected, record);\n",
         "",
       ],
     ],
@@ -459,7 +447,7 @@ const MUTANTS = [
     edits: [
       [
         LITE_STORE,
-        "              assertMonotoneWrite(\n                found === undefined ? null : toRecord(found as StoredRow),\n                expected,\n                record,\n              );\n",
+        "                assertMonotoneWrite(\n                  found === undefined ? null : toRecord(found as StoredRow),\n                  expected,\n                  record,\n                );\n",
         "",
       ],
     ],
@@ -542,8 +530,8 @@ const MUTANTS = [
     edits: [
       [
         CORE,
-        "    bootId: record.bootId,\n    importPending: record.importPending,\n  };",
-        "    bootId: record.bootId,\n    importPending: false,\n  };",
+        "    bootId: record.bootId,\n    importPending: record.importPending,",
+        "    bootId: record.bootId,\n    importPending: false,",
       ],
     ],
     aimed: [
@@ -553,7 +541,7 @@ const MUTANTS = [
       authority(
         "survives a crash between the On save and the answer: a restarted host is told again",
       ),
-      vector("import-pending-survives-crash"),
+      vector("import-pending-survives-restart"),
     ],
   },
   {
@@ -572,7 +560,7 @@ const MUTANTS = [
       core(
         "STREAM_WRITE_BEFORE_IMPORT_DONE: a stream commit is refused until the import is done",
       ),
-      vector("import-pending-survives-crash"),
+      vector("import-pending-survives-restart"),
     ],
   },
   {
@@ -580,8 +568,8 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        '      decide({ type: "commit", owner, operationId, sink: "stream" }),',
-        '      decide({ type: "commit", owner, operationId, sink: "importSeed" }),',
+        'const event: ModeEvent = { type: "commit", owner, operationId, sink };',
+        'const event: ModeEvent = {\n      type: "commit",\n      owner,\n      operationId,\n      sink: "importSeed",\n    };',
       ],
     ],
     aimed: [
@@ -599,8 +587,8 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        '      decide({ type: "commit", owner, operationId, sink: "importSeed" }),',
-        '      decide({ type: "commit", owner, operationId, sink: "stream" }),',
+        'const event: ModeEvent = { type: "commit", owner, operationId, sink };',
+        'const event: ModeEvent = {\n      type: "commit",\n      owner,\n      operationId,\n      sink: "stream",\n    };',
       ],
     ],
     aimed: [
@@ -643,21 +631,6 @@ const MUTANTS = [
     ],
   },
   {
-    name: "HUNG_SAVE_HOLDS_LOCK",
-    edits: [
-      [
-        AUTHORITY,
-        "      await settleWithin(\n        options.store.save(owner, next, stored.get(owner) ?? null),\n        saveTimeoutMs,\n      );",
-        "      await options.store.save(owner, next, stored.get(owner) ?? null);",
-      ],
-    ],
-    aimed: [
-      authority(
-        "counts as a failed save after the bound, releases the lock and refuses until a later save",
-      ),
-    ],
-  },
-  {
     name: "PROBE_THROW_MEANS_NONE",
     edits: [
       [
@@ -668,11 +641,656 @@ const MUTANTS = [
     ],
     aimed: [authority("counts a probe that throws as legacy files present")],
   },
+  // ---- round 4: store ownership, drain on close, unreadable records ----
+  {
+    name: "CLOSE_BEFORE_DRAIN",
+    edits: [
+      [
+        AUTHORITY,
+        "        const release = await lock.exclusive();\n        try {\n          await Promise.allSettled([...inFlightSaves]);\n",
+        "        const release = () => {};\n        try {\n",
+      ],
+    ],
+    aimed: [
+      lifecycle(
+        "keeps the store while an admitted legacy write is in flight, and lands nothing after the next owner has it",
+      ),
+      lifecycle(
+        "keeps the store while an evidence save is in flight, and lands nothing after the next owner has it",
+      ),
+    ],
+  },
+  {
+    name: "CLOSE_IGNORES_TIMED_OUT_SAVE",
+    edits: [[AUTHORITY, "      inFlightSaves.add(work);\n", ""]],
+    aimed: [
+      lifecycle("also waits for a save the authority already gave up on"),
+    ],
+  },
+  {
+    name: "LOAD_AFTER_CLOSE_SERVES",
+    edits: [
+      [
+        AUTHORITY,
+        '      const rows = await options.store.load();\n      if (closed) throw new Error("The account mode authority is closed.");\n',
+        "      const rows = await options.store.load();\n",
+      ],
+    ],
+    aimed: [
+      lifecycle(
+        "never serves from a load that finishes after close, and gives the store back",
+      ),
+    ],
+  },
+  {
+    name: "READ_NEVER_RETRIES_OWNERSHIP",
+    edits: [
+      [
+        AUTHORITY,
+        "    if (closed || loaded || starting !== null) return;\n",
+        "    if (closed || loaded || starting !== null || true) return;\n",
+      ],
+    ],
+    aimed: [
+      lifecycle(
+        "claims again from an ordinary read once the owner has closed, and serves what is stored",
+      ),
+    ],
+  },
+  {
+    name: "RETRY_NOT_RATE_LIMITED",
+    edits: [
+      [
+        AUTHORITY,
+        "    if (lastAttempt !== null && clock.mono() - lastAttempt < ownerRetryMs) {\n      return;\n    }\n",
+        "",
+      ],
+    ],
+    aimed: [
+      lifecycle("asks again at most once per interval, and one ask at a time"),
+    ],
+  },
+  {
+    name: "SEED_CAPABILITY_PUBLIC",
+    edits: [
+      [
+        AUTHORITY,
+        "  const authority: ModeAuthority = {\n    ready,\n",
+        "  const authority: ModeAuthority = {\n    ...importSeed,\n    ready,\n",
+      ],
+    ],
+    aimed: [lifecycle("is not a method of the authority a caller is handed")],
+  },
+  {
+    name: "STREAM_COMMIT_OUTSIDE_LOCK",
+    edits: [
+      [
+        AUTHORITY,
+        '    if (early.kind !== "streams") return refuse(early);\n    const release = await lock.shared();\n',
+        '    if (early.kind !== "streams") return refuse(early);\n    const release = () => {};\n',
+      ],
+    ],
+    aimed: [
+      lifecycle(
+        "makes importDone, and a close, wait for a stream callback in flight",
+      ),
+    ],
+  },
+  {
+    name: "SAVE_TIMEOUT_WEDGES_QUEUE (the save is not bounded)",
+    edits: [
+      [
+        AUTHORITY,
+        '      await settleWithin(work, saveTimeoutMs, "save");',
+        "      await work;",
+      ],
+    ],
+    aimed: [
+      authority(
+        "poisons the authority: later work refuses at once, nothing queues behind the hung save and nothing writes",
+      ),
+    ],
+  },
+  {
+    name: "SAVE_TIMEOUT_WEDGES_QUEUE (a timed-out save does not poison)",
+    edits: [
+      [
+        AUTHORITY,
+        "      stale.add(owner);\n      if (error instanceof StoreStalledError) poisoned = true;\n",
+        "      stale.add(owner);\n      if (false) poisoned = true;\n",
+      ],
+    ],
+    aimed: [
+      authority(
+        "poisons the authority: later work refuses at once, nothing queues behind the hung save and nothing writes",
+      ),
+    ],
+  },
+  {
+    name: "UNBOUNDED_PRE_SAVE_AWAIT (the legacy-file probe)",
+    edits: [
+      [
+        AUTHORITY,
+        '      return await settleWithin(\n        Promise.resolve(options.hasLegacyFiles(owner)),\n        saveTimeoutMs,\n        "legacy file probe",\n      );',
+        "      return await options.hasLegacyFiles(owner);",
+      ],
+    ],
+    aimed: [
+      authority(
+        "does not wait for a legacy-file probe that never settles: the import is owed",
+      ),
+    ],
+  },
+  {
+    name: "UNBOUNDED_PRE_SAVE_AWAIT (the re-read)",
+    edits: [
+      [
+        AUTHORITY,
+        '      const rows = await settleWithin(\n        Promise.resolve(options.store.load()),\n        saveTimeoutMs,\n        "load",\n      );',
+        "      const rows = await options.store.load();",
+      ],
+    ],
+    aimed: [
+      authority(
+        "does not wait for a re-read that never settles, and then refuses everything",
+      ),
+      authority(
+        "does not wait for the re-read that follows a failed save, and then refuses everything",
+      ),
+    ],
+  },
+  {
+    name: "QUARANTINE_FORGETS_ON (core: a lost record is not held as a tombstone)",
+    edits: [
+      [
+        AUTHORITY,
+        "      (row.historyUnknown === true && !held.switched)\n",
+        "      false\n",
+      ],
+    ],
+    aimed: [
+      lifecycle(
+        "also wins over a fresh Off held in memory when the record is lost while running",
+      ),
+    ],
+  },
+  {
+    name: "TOMBSTONE_MINTS_OFF",
+    edits: [
+      [
+        CORE,
+        '      if (event.state === "off" && next.historyUnknown === true) {\n        // The owner\'s record was unreadable, so it may have been On: no Off\n        // is accepted until an On answers.\n        return settle(next);\n      }\n',
+        "",
+      ],
+    ],
+    aimed: [
+      core(
+        "TOMBSTONE_MINTS_OFF: an Off over a tombstone mints nothing and the owner stays unknown",
+      ),
+      vector("unreadable-record-cannot-erase-on"),
+    ],
+  },
+  {
+    name: "TOMBSTONE_ON_OWES_NO_IMPORT",
+    edits: [
+      [
+        CORE,
+        "            next.historyUnknown === true || event.legacyFiles === true;",
+        "            event.legacyFiles === true;",
+      ],
+    ],
+    aimed: [
+      core(
+        "an On over a tombstone owes the import, whatever the probe says, and clears it",
+      ),
+    ],
+  },
+  {
+    name: "TOMBSTONE_WRITTEN_BY_SAVE",
+    edits: [
+      [
+        RECORD_STORE,
+        '  if (next.historyUnknown === true) {\n    throw new ModeStoreConflictError(\n      "a tombstone is written only by the store\'s own quarantine",\n    );\n  }\n',
+        "",
+      ],
+    ],
+    aimed: [
+      lifecycle(
+        "never lets save write a tombstone over an On, or an Off over a tombstone",
+      ),
+    ],
+  },
+  {
+    name: "OFF_WRITTEN_OVER_TOMBSTONE",
+    edits: [
+      [
+        RECORD_STORE,
+        '    if (!next.switched || !next.importPending) {\n      throw new ModeStoreConflictError(\n        "an owner with unknown history can only be written as On with an import owed",\n      );\n    }\n',
+        "",
+      ],
+    ],
+    aimed: [
+      lifecycle(
+        "never lets save write a tombstone over an On, or an Off over a tombstone",
+      ),
+    ],
+  },
+  {
+    name: "QUARANTINE_FORGETS_ON (Node: the unreadable file leaves no tombstone)",
+    files: [NODE_STORE_TESTS],
+    edits: [
+      [
+        NODE_STORE,
+        "          await tombstoneUnreadable(folder, name);\n",
+        "          await unlink(join(folder, name));\n",
+      ],
+      [NODE_STORE, "          records.set(match[1], tombstoneRecord());\n", ""],
+    ],
+    aimed: [
+      nodeStore(
+        "is kept aside, never deleted, and its owner loads as a tombstone, not as never seen",
+      ),
+    ],
+  },
+  {
+    name: "QUARANTINE_FORGETS_ON (Lite: a malformed row leaves no tombstone)",
+    files: [LITE_STORE_TESTS],
+    edits: [
+      [
+        LITE_STORE,
+        "                store.put({ owner, ...tombstoneRecord() });",
+        "                store.delete(owner);",
+      ],
+      [
+        LITE_STORE,
+        "              records.set(owner, tombstoneRecord());\n",
+        "",
+      ],
+    ],
+    aimed: [
+      liteStore(
+        "sets a malformed row aside as a tombstone, so that owner is never read as unseen",
+      ),
+      liteStore(
+        "keeps a saved On through a corrupt row: after the restart an Off is refused and an On owes the import",
+      ),
+    ],
+  },
+  {
+    name: "LITE_SAVE_WITHOUT_LEASE (a call needs no lease)",
+    files: [LITE_STORE_TESTS],
+    edits: [
+      [
+        LITE_STORE,
+        "    if (mine === null) return Promise.reject(unowned());\n",
+        "",
+      ],
+    ],
+    aimed: [liteStore("neither reads nor writes without a live lease")],
+  },
+  {
+    name: "LITE_SAVE_WITHOUT_LEASE (the lease is not checked after the database opens)",
+    files: [LITE_STORE_TESTS],
+    edits: [
+      [
+        LITE_STORE,
+        "          // The lease may have been released while the database opened.\n          if (!stillMine()) throw unowned();\n",
+        "",
+      ],
+    ],
+    aimed: [
+      liteStore(
+        "gives up a save whose database opened after the lease was released, and frees the lock only after it",
+      ),
+    ],
+  },
+  {
+    name: "LITE_RELEASE_BEFORE_DRAIN",
+    files: [LITE_STORE_TESTS],
+    edits: [
+      [LITE_STORE, "          await Promise.allSettled([...running]);\n", ""],
+    ],
+    aimed: [
+      liteStore(
+        "gives up a save whose database opened after the lease was released, and frees the lock only after it",
+      ),
+    ],
+  },
+  {
+    name: "LITE_LOCK_PORT_OPTIONAL",
+    files: [LITE_STORE_TESTS],
+    edits: [
+      [
+        LITE_STORE,
+        "      const acquire = options.acquireOwnerLock;\n",
+        "      const acquire =\n        options.acquireOwnerLock ??\n        (async () => ({ release: async () => {} }));\n",
+      ],
+    ],
+    aimed: [
+      liteStore(
+        "starts only with an owner lock port: with none, every claim is refused and nothing is read or written",
+      ),
+    ],
+  },
+  {
+    name: "LITE_LOCK_NAME_IGNORES_DATABASE",
+    files: [LITE_STORE_TESTS],
+    edits: [
+      [
+        LITE_STORE,
+        "acquire(`${dbName}:owner`)",
+        'acquire("account-mode:owner")',
+      ],
+    ],
+    aimed: [
+      liteStore(
+        "includes the database name in the lock, so two databases do not contend",
+      ),
+    ],
+  },
+  {
+    name: "LITE_MEMORY_MODE_STORE",
+    files: [BROWSER_RUNTIME_TESTS],
+    edits: [
+      [
+        BROWSER_RUNTIME,
+        "  createUnavailableModeRecordStore,\n",
+        "  createUnavailableModeRecordStore as _unused,\n",
+      ],
+      [
+        BROWSER_RUNTIME,
+        "        ? createUnavailableModeRecordStore()\n",
+        "        ? createMemoryModeRecordStore()\n",
+      ],
+      [
+        BROWSER_RUNTIME,
+        "  createModeAuthority,\n",
+        "  createModeAuthority,\n  createMemoryModeRecordStore,\n",
+      ],
+    ],
+    aimed: [
+      {
+        file: BROWSER_RUNTIME_TESTS,
+        name: "has no durable mode store of its own, so it decides nothing: an On is not kept and no Off is ever believed",
+      },
+    ],
+  },
+  {
+    name: "LITE_REFUSAL_ANSWERED_200",
+    files: [LITE_RUNTIME_TESTS],
+    edits: [
+      [
+        LITE_RUNTIME,
+        "    status: refused ? decision.status : 200,\n",
+        "    status: 200,\n",
+      ],
+    ],
+    aimed: [
+      liteRuntime(
+        "answers every refusal with its own status and body, and a success with 200",
+      ),
+    ],
+  },
+  {
+    name: "LITE_MODE_OWNER_FALLS_BACK_TO_IDENTITY",
+    files: [LITE_RUNTIME_TESTS],
+    edits: [
+      [
+        LITE_RUNTIME,
+        "    return options.serverOwner;\n  }\n\n  function modeMethodNotAllowed",
+        "    return options.serverOwner ?? ownerAddress();\n  }\n\n  function modeMethodNotAllowed",
+      ],
+    ],
+    aimed: [
+      liteRuntime(
+        "refuses evidence when only a server identity is given, and latches nothing",
+      ),
+    ],
+  },
+  {
+    name: "LITE_IMPORT_DONE_READS_OTHER_OWNER",
+    files: [LITE_RUNTIME_TESTS],
+    edits: [
+      [
+        LITE_RUNTIME,
+        "          const mismatch = modeOwnerRefusal(body.owner);\n          if (mismatch) return mismatch;\n",
+        "          const mismatch = modeOwnerRefusal(body.owner);\n          if (mismatch) {\n            await options.accountModeAuthority.importDone(body.owner);\n            return mismatch;\n          }\n",
+      ],
+    ],
+    aimed: [
+      liteRuntime(
+        "does not read another owner's mode to answer their import-done report",
+      ),
+      liteRuntime(
+        "answers a caller that is not the owner with 401, another owner's report with 403, a bad body with 400",
+      ),
+    ],
+  },
+  {
+    name: "LITE_OWNER_MISMATCH_AFTER_BODY_VALIDATION",
+    files: [LITE_RUNTIME_TESTS],
+    edits: [
+      [
+        LITE_RUNTIME,
+        "          const mismatch = modeOwnerRefusal(\n            (raw as Record<string, unknown>).owner,\n          );\n          if (mismatch) return mismatch;\n          const body = parseEvidenceBody(raw);\n",
+        "          const body = parseEvidenceBody(raw);\n          const mismatch = modeOwnerRefusal(\n            (raw as Record<string, unknown>).owner,\n          );\n          if (body && mismatch) return mismatch;\n",
+      ],
+    ],
+    aimed: [
+      liteRuntime(
+        "answers another owner with 403 before the rest of the body is read, and never asks the module",
+      ),
+    ],
+  },
+  {
+    name: "LITE_503_WITHOUT_RETRY_AFTER",
+    files: [LITE_RUNTIME_TESTS],
+    edits: [
+      [
+        LITE_RUNTIME,
+        '      ? { headers: { "Retry-After": MODE_RETRY_AFTER_SECONDS } }\n',
+        "      ? {}\n",
+      ],
+    ],
+    aimed: [
+      liteRuntime(
+        "tells a client to retry a 503 after 5 seconds, and not a 426 or a success",
+      ),
+    ],
+  },
+  {
+    name: "LITE_BODY_CAP_COUNTS_ONLY_DECLARED_SIZE",
+    files: [LITE_RUNTIME_TESTS],
+    edits: [
+      [
+        LITE_RUNTIME,
+        "    if (size > MODE_BODY_MAX_BYTES) {\n",
+        "    if (false) {\n",
+      ],
+    ],
+    aimed: [
+      liteRuntime(
+        "answers 413 above 16 KiB, whether the length is declared or the body is chunked",
+      ),
+    ],
+  },
+
+  // ---- Node host: kernel-held owner lock, boot order, routes ------------
+  {
+    name: "LOCK_RELEASED_EARLY",
+    files: [NODE_OWNERSHIP_TESTS, NODE_STORE_TESTS],
+    edits: [
+      [
+        OWNER_LOCK,
+        "  const held = db;\n  return {",
+        "  const held = db;\n  held.close();\n  return {",
+      ],
+    ],
+    aimed: [
+      nodeOwnership("a: of two processes that claim at once"),
+      nodeOwnership("c: a stopped but live owner still owns"),
+      nodeStore("lets one store own the folder"),
+    ],
+  },
+  {
+    name: "SECOND_OWNER_ADMITTED",
+    files: [NODE_OWNERSHIP_TESTS, NODE_STORE_TESTS],
+    edits: [
+      [
+        OWNER_LOCK,
+        '  if (!db) {\n    throw new ModeStoreOwnedError(\n      "another runtime holds the account mode record folder",\n    );\n  }\n  const held = db;',
+        "  if (!db) {\n    return { dir: canonical, release() {} };\n  }\n  const held = db;",
+      ],
+    ],
+    aimed: [
+      nodeOwnership("a: of two processes that claim at once"),
+      nodeOwnership("a: a contender in this process is refused"),
+      nodeStore("lets one store own the folder"),
+    ],
+  },
+  {
+    name: "LOCK_ON_SHARED_DB_FILE",
+    files: [NODE_OWNERSHIP_TESTS],
+    edits: [
+      [
+        OWNER_LOCK,
+        'const LOCK_FILE = ".mode-owner.lock.db";',
+        'const LOCK_FILE = "index.db";',
+      ],
+    ],
+    aimed: [nodeOwnership("h: the owner using other files in the folder")],
+  },
+  {
+    name: "OWNED_REFUSAL_SWALLOWED",
+    files: [SERVER_BOOT_TESTS],
+    edits: [
+      [
+        SERVER_BOOTSTRAP,
+        "      if (err instanceof ModeStoreOwnedError) throw err;\n",
+        "      if (err instanceof ModeStoreOwnedError) return false;\n",
+      ],
+    ],
+    aimed: [serverBoot("a runtime another one owns is refused")],
+  },
+  {
+    name: "BOOT_DATA_BEFORE_OWNER",
+    files: [SERVER_BOOT_TESTS],
+    edits: [
+      [
+        SERVER_BOOTSTRAP,
+        "  const modeLoaded = await accountModeAuthority.ready.then(",
+        "  initializeDatabase(indexPath);\n  const modeLoaded = await accountModeAuthority.ready.then(",
+      ],
+    ],
+    aimed: [
+      serverBoot("a runtime another one owns is refused"),
+      serverBoot("opens no index while the records are still being claimed"),
+    ],
+  },
+  {
+    name: "NO_RELEASE_ON_FAILED_START",
+    files: [SERVER_BOOT_TESTS],
+    edits: [
+      [
+        SERVER_BOOTSTRAP,
+        "holds.accountModeAuthority?.close().catch(",
+        "Promise.resolve(holds.accountModeAuthority).catch(",
+      ],
+    ],
+    aimed: [serverBoot("a start that fails after the records are claimed")],
+  },
+  {
+    name: "SAVED_ON_REPAIRS_LEGACY",
+    files: [SERVER_BOOT_TESTS],
+    edits: [
+      [
+        SERVER_BOOTSTRAP,
+        "  const legacyMaintenanceMayRun =\n    modeLoaded &&\n",
+        "  const legacyMaintenanceMayRun =\n    true ||\n",
+      ],
+    ],
+    aimed: [
+      serverBoot("a saved On plus a reindex condition at boot"),
+      serverBoot("a saved mode that cannot be loaded starts the runtime"),
+    ],
+  },
+  {
+    name: "CROSS_OWNER_READ_ANSWERS",
+    files: [SERVER_CONTRACT_TESTS, SERVER_APP_TESTS],
+    edits: [
+      [
+        SERVER_ROUTE,
+        "    if (\n      !deps.serverOwner ||\n      normalizeOwner(owner) !== normalizeOwner(deps.serverOwner)\n    ) {",
+        "    if (false) {",
+      ],
+    ],
+    aimed: [
+      serverContract("answer 403 before the module is asked anything"),
+      serverContract("binds a bearer caller to the server's owner too"),
+    ],
+  },
+  {
+    name: "REFUSAL_STATUS_200",
+    files: [SERVER_CONTRACT_TESTS],
+    edits: [
+      [
+        SERVER_ROUTE,
+        "return c.json(decisionBody(decision), decision.status);",
+        "return c.json(decisionBody(decision), 200);",
+      ],
+    ],
+    aimed: [serverContract("answers 503 ACCOUNT_MODE_STORE_OWNED")],
+  },
+  {
+    name: "NO_RETRY_AFTER",
+    files: [SERVER_CONTRACT_TESTS],
+    edits: [
+      [
+        SERVER_ROUTE,
+        'if (decision.status === 503) c.header("Retry-After"',
+        'if (false) c.header("Retry-After"',
+      ],
+    ],
+    aimed: [serverContract("answers 503 ACCOUNT_MODE_STORE_OWNED")],
+  },
+  {
+    name: "NO_BODY_LIMIT",
+    files: [SERVER_CONTRACT_TESTS],
+    edits: [
+      [
+        SERVER_ROUTE,
+        "    app.use(path, createBodyLimit(MAX_BODY_BYTES));\n",
+        "",
+      ],
+    ],
+    aimed: [
+      serverContract(
+        "takes a body at the limit and refuses one a byte over it",
+      ),
+    ],
+  },
+  {
+    name: "NO_METHOD_GATE",
+    files: [SERVER_CONTRACT_TESTS],
+    edits: [
+      [
+        SERVER_ROUTE,
+        "    app.all(path, (c) => {",
+        '    app.all(path + "-x", (c) => {',
+      ],
+    ],
+    aimed: [serverContract("answers any method but POST with 405")],
+  },
 ];
 
-const filters = process.argv.slice(2);
+// Arguments pick mutants by a part of the name; "!part" leaves them out.
+const args = process.argv.slice(2);
+const include = args.filter((a) => !a.startsWith("!"));
+const exclude = args.filter((a) => a.startsWith("!")).map((a) => a.slice(1));
 const selected = MUTANTS.filter(
-  ({ name }) => filters.length === 0 || filters.some((f) => name.includes(f)),
+  ({ name }) =>
+    (include.length === 0 || include.some((f) => name.includes(f))) &&
+    !exclude.some((f) => name.includes(f)),
 );
 
 const originals = new Map();
@@ -684,22 +1302,36 @@ const restoreAll = () => {
   for (const [file, text] of originals) writeFileSync(file, text);
 };
 
+// One directory for this invocation; each vitest run gets a new directory in
+// it. Nothing outside it is ever read as a report.
+const outRoot = join(homedir(), ".tmp", "account-mode-mutants");
+mkdirSync(outRoot, { recursive: true });
+const runDir = mkdtempSync(join(outRoot, "run-"));
+const removeRunDir = () => rmSync(runDir, { recursive: true, force: true });
+
 let child = null;
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
     if (child) child.kill("SIGTERM");
     restoreAll();
+    removeRunDir();
     console.error(`\n${signal}: files restored`);
     process.exit(130);
   });
 }
 
-const outDir = join(homedir(), ".tmp", "account-mode-mutants");
-mkdirSync(outDir, { recursive: true });
-
-function runTests(label, files = TEST_FILES) {
-  const outputFile = join(outDir, `${label.replace(/\W+/g, "-")}.json`);
+/**
+ * Runs vitest once. Resolves {report} for a fresh, parseable report, or
+ * {problem} when there is none. It never reads a path an earlier run wrote.
+ */
+function runTests(label, files) {
+  const dir = mkdtempSync(
+    join(runDir, `${label.replace(/\W+/g, "-").slice(0, 40)}-`),
+  );
+  const outputFile = join(dir, "report.json");
+  const startedAt = Date.now();
   return new Promise((resolve) => {
+    let stderr = "";
     child = spawn(
       "nice",
       [
@@ -713,25 +1345,52 @@ function runTests(label, files = TEST_FILES) {
         `--outputFile=${outputFile}`,
         ...files,
       ],
-      { stdio: ["ignore", "ignore", "ignore"] },
+      { stdio: ["ignore", "ignore", "pipe"] },
     );
-    child.on("close", () => {
+    child.stderr.on("data", (chunk) => {
+      stderr = (stderr + chunk).slice(-400);
+    });
+    child.on("error", (error) => {
       child = null;
+      resolve({ problem: `vitest did not start: ${error.message}` });
+    });
+    child.on("close", (code) => {
+      child = null;
+      const tail = stderr.trim().split("\n").at(-1) ?? "";
+      let report;
       try {
-        resolve(JSON.parse(readFileSync(outputFile, "utf8")));
+        report = JSON.parse(readFileSync(outputFile, "utf8"));
       } catch {
-        resolve(null);
+        resolve({
+          problem: `no report from this run (exit ${code})${tail ? `: ${tail}` : ""}`,
+        });
+        return;
       }
+      if (
+        typeof report.startTime !== "number" ||
+        report.startTime < startedAt
+      ) {
+        resolve({ problem: "the report is older than the run that wrote it" });
+        return;
+      }
+      resolve({ report });
     });
   });
 }
 
-/** Cases that ran, by file and full name; plus files that did not load. */
-function digest(report) {
-  if (!report) return { loadFailure: "no report", cases: [] };
+/**
+ * Cases that ran, by file and full name. `invalid` says why the run proves
+ * nothing at all (no fresh report, no test, a requested file with no result);
+ * `loadFailure` names a test file that failed to load or build.
+ */
+function digest(run, files) {
+  if (run.problem)
+    return { invalid: run.problem, loadFailure: null, cases: [] };
   const cases = [];
   let loadFailure = null;
-  for (const file of report.testResults ?? []) {
+  const seen = [];
+  for (const file of run.report.testResults ?? []) {
+    seen.push(file.name);
     const results = file.assertionResults ?? [];
     if (file.status === "failed" && results.length === 0) {
       loadFailure = `${file.name}: ${String(file.message).split("\n")[0]}`;
@@ -740,20 +1399,45 @@ function digest(report) {
       cases.push({ file: file.name, name: r.fullName, status: r.status });
     }
   }
-  return { loadFailure, cases };
+  let invalid = null;
+  if (cases.length === 0 && loadFailure === null) {
+    invalid = "the report holds no test";
+  }
+  const absent = files.filter((f) => !seen.some((n) => n.endsWith(f)));
+  if (invalid === null && absent.length > 0) {
+    invalid = `no result for ${absent.join(", ")}`;
+  }
+  return { invalid, loadFailure, cases };
 }
 
 const find = (cases, aim) =>
   cases.filter((c) => c.file.endsWith(aim.file) && c.name.includes(aim.name));
 
+/** KILLED only when an aimed test ran and failed; see the header. */
+function classify(result, aimed) {
+  if (result.invalid) return { outcome: "INVALID", note: result.invalid };
+  if (result.loadFailure) {
+    return { outcome: "INVALID", note: `did not load: ${result.loadFailure}` };
+  }
+  const hits = aimed.flatMap((aim) => find(result.cases, aim));
+  if (hits.length === 0) {
+    return { outcome: "INVALID", note: "aimed test did not run" };
+  }
+  if (hits.some((c) => c.status === "failed")) {
+    return { outcome: "KILLED", note: "" };
+  }
+  return { outcome: "SURVIVED", note: "" };
+}
+
 // Every anchor must match exactly once before anything runs.
+const badAnchors = [];
 for (const m of MUTANTS) {
   const current = new Map();
   for (const [file, from, to] of m.edits) {
     const text = current.get(file) ?? original(file);
     if (text.split(from).length !== 2) {
-      console.error(`${m.name}: expected exactly one match in ${file}`);
-      process.exit(2);
+      badAnchors.push(`${m.name}: expected exactly one match in ${file}`);
+      break;
     }
     current.set(
       file,
@@ -761,97 +1445,150 @@ for (const m of MUTANTS) {
     );
   }
 }
+if (badAnchors.length > 0) {
+  for (const line of badAnchors) console.error(line);
+  removeRunDir();
+  process.exit(2);
+}
 if (process.env.CHECK_ONLY) {
   console.log(`${MUTANTS.length} mutants: every anchor matches once`);
+  removeRunDir();
   process.exit(0);
 }
 
-console.log("baseline (unmutated)");
-const base = digest(await runTests("baseline"));
-let baselineOk = base.loadFailure === null && base.cases.length > 0;
-const baselineProblems = [];
-if (base.loadFailure) baselineProblems.push(base.loadFailure);
-for (const c of base.cases) {
-  if (c.status !== "passed") baselineProblems.push(`${c.status}: ${c.name}`);
-}
-for (const m of MUTANTS) {
-  for (const aim of m.aimed) {
-    if (find(base.cases, aim).length === 0) {
-      baselineProblems.push(`aimed test not found: ${aim.name}`);
-    }
+/**
+ * Proves the runner cannot call a broken run a kill. Both probes must come out
+ * INVALID: a run of a test file that does not exist, and a run in which the
+ * module under test fails to load.
+ */
+async function selfCheck() {
+  const problems = [];
+  const aimed = [authority("a test that does not matter")];
+  const missingFile = `${DIR}/this-test-file-does-not-exist.test.ts`;
+  const missing = classify(
+    digest(await runTests("selfcheck-missing", [missingFile]), [missingFile]),
+    aimed,
+  );
+  if (missing.outcome !== "INVALID") {
+    problems.push(`a missing test file came out ${missing.outcome}`);
   }
-}
-if (baselineProblems.length > 0) baselineOk = false;
-console.log(
-  `${baselineOk ? "GREEN" : "RED  "}  ${base.cases.length} tests in ${TEST_FILES.length} files`,
-);
-if (!baselineOk) {
-  for (const p of baselineProblems) console.error(`  ${p}`);
-  console.error("baseline is not green: no mutant was run");
-  process.exit(1);
-}
-
-const rows = [];
-try {
-  for (const m of selected) {
-    // Edits to one file build on each other; each must match exactly once.
-    const current = new Map();
-    for (const [file, from, to] of m.edits) {
-      const text = current.get(file) ?? original(file);
-      if (text.split(from).length !== 2) {
-        throw new Error(`${m.name}: expected exactly one match in ${file}`);
-      }
-      current.set(
-        file,
-        text.replace(from, () => to),
-      );
-    }
-    for (const [file, text] of current) writeFileSync(file, text);
-    const result = digest(await runTests(m.name, m.files ?? CORE_FILES));
-    restoreAll();
-
-    let outcome;
-    let note = "";
-    const aimedHits = m.aimed.flatMap((aim) => find(result.cases, aim));
-    if (result.loadFailure) {
-      outcome = "INVALID";
-      note = `did not load: ${result.loadFailure}`;
-    } else if (aimedHits.length === 0) {
-      outcome = "INVALID";
-      note = "aimed test did not run";
-    } else if (aimedHits.some((c) => c.status === "failed")) {
-      outcome = "KILLED";
-    } else {
-      outcome = "SURVIVED";
-    }
-    const aimedFailed = aimedHits.filter((c) => c.status === "failed");
-    const failedTotal = result.cases.filter(
-      (c) => c.status === "failed",
-    ).length;
-    rows.push({ name: m.name, outcome });
-    console.log(
-      `${outcome.padEnd(8)} ${m.name}  (${failedTotal} failing)${note ? `  ${note}` : ""}`,
+  writeFileSync(AUTHORITY, `${original(AUTHORITY)}\nexport const = ;\n`);
+  try {
+    const broken = classify(
+      digest(await runTests("selfcheck-broken", [AUTHORITY_TESTS]), [
+        AUTHORITY_TESTS,
+      ]),
+      aimed,
     );
+    if (broken.outcome !== "INVALID") {
+      problems.push(`a module that cannot load came out ${broken.outcome}`);
+    }
+  } finally {
+    restoreAll();
+  }
+  return problems;
+}
+
+try {
+  console.log("self-check (a missing file and an unloadable module)");
+  const selfProblems = await selfCheck();
+  if (selfProblems.length > 0) {
+    for (const p of selfProblems) console.error(`  ${p}`);
+    console.error("self-check failed: the runner cannot be trusted");
+    process.exitCode = 1;
+  } else {
+    console.log("OK     both probes are INVALID");
+  }
+  if (process.exitCode === 1 || process.env.SELF_CHECK_ONLY) {
+    removeRunDir();
+    process.exit(process.exitCode ?? 0);
+  }
+
+  // The baseline runs the test files the selected mutants use, no others.
+  const baselineFiles = [
+    ...new Set(selected.flatMap((m) => m.files ?? CORE_FILES)),
+  ];
+  console.log("baseline (unmutated)");
+  const base = digest(await runTests("baseline", baselineFiles), baselineFiles);
+  const baselineProblems = [];
+  if (base.invalid) baselineProblems.push(base.invalid);
+  if (base.loadFailure) baselineProblems.push(base.loadFailure);
+  for (const c of base.cases) {
+    if (c.status !== "passed") baselineProblems.push(`${c.status}: ${c.name}`);
+  }
+  for (const m of selected) {
     for (const aim of m.aimed) {
-      const hit = aimedFailed.some((c) => find([c], aim).length > 0);
-      console.log(
-        `           aimed: ${aim.name}${hit ? "  [failed, as aimed]" : ""}`,
-      );
+      if (find(base.cases, aim).length === 0) {
+        baselineProblems.push(`aimed test not found: ${aim.name}`);
+      }
     }
   }
+  const baselineOk = baselineProblems.length === 0;
+  console.log(
+    `${baselineOk ? "GREEN" : "RED  "}  ${base.cases.length} tests in ${baselineFiles.length} files`,
+  );
+  if (!baselineOk) {
+    for (const p of baselineProblems) console.error(`  ${p}`);
+    console.error("baseline is not green: no mutant was run");
+    removeRunDir();
+    process.exit(1);
+  }
+
+  const rows = [];
+  try {
+    for (const m of selected) {
+      // Edits to one file build on each other; each must match exactly once.
+      const current = new Map();
+      for (const [file, from, to] of m.edits) {
+        const text = current.get(file) ?? original(file);
+        if (text.split(from).length !== 2) {
+          throw new Error(`${m.name}: expected exactly one match in ${file}`);
+        }
+        current.set(
+          file,
+          text.replace(from, () => to),
+        );
+      }
+      for (const [file, text] of current) writeFileSync(file, text);
+      const files = m.files ?? CORE_FILES;
+      const result = digest(await runTests(m.name, files), files);
+      restoreAll();
+
+      const { outcome, note } = classify(result, m.aimed);
+      const aimedFailed = m.aimed
+        .flatMap((aim) => find(result.cases, aim))
+        .filter((c) => c.status === "failed");
+      const failedTotal = result.cases.filter(
+        (c) => c.status === "failed",
+      ).length;
+      rows.push({ name: m.name, outcome });
+      console.log(
+        `${outcome.padEnd(8)} ${m.name}  (${failedTotal} failing)${note ? `  ${note}` : ""}`,
+      );
+      for (const aim of m.aimed) {
+        const hit = aimedFailed.some((c) => find([c], aim).length > 0);
+        console.log(
+          `           aimed: ${aim.name}${hit ? "  [failed, as aimed]" : ""}`,
+        );
+      }
+    }
+  } finally {
+    restoreAll();
+  }
+
+  let restored = true;
+  for (const [file, text] of originals) {
+    if (readFileSync(file, "utf8") !== text) {
+      restored = false;
+      console.error(`NOT RESTORED: ${file}`);
+    }
+  }
+  const notKilled = rows.filter((r) => r.outcome !== "KILLED");
+  console.log(
+    `\n${rows.length - notKilled.length}/${rows.length} mutants killed; files restored: ${restored}`,
+  );
+  removeRunDir();
+  process.exit(notKilled.length > 0 || !restored ? 1 : 0);
 } finally {
   restoreAll();
 }
-
-let restored = true;
-for (const [file, text] of originals) {
-  if (readFileSync(file, "utf8") !== text) {
-    restored = false;
-    console.error(`NOT RESTORED: ${file}`);
-  }
-}
-const notKilled = rows.filter((r) => r.outcome !== "KILLED");
-console.log(
-  `\n${rows.length - notKilled.length}/${rows.length} mutants killed; files restored: ${restored}`,
-);
-process.exit(notKilled.length > 0 || !restored ? 1 : 0);
