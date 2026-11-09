@@ -26,7 +26,7 @@ async function setup(
   if (options.importFirst !== false) {
     await new LegacyImporter({
       source: fx.source,
-      sink: { stage: async (_c, _s, rows) => void (await drain(rows)) },
+      sink: { stage: async (_c, _s, rows) => (await drain(rows)).length },
       ledger,
       switched: () => true,
     }).run();

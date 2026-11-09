@@ -37,7 +37,9 @@ export function createSeedImportSink(staging: SeedStaging): LegacyImportSink {
           throw new Error("legacy import source changed while it was staged");
         }
       }
-      await staging.stage(connector, stream.stream, body());
+      const seed = await staging.stage(connector, stream.stream, body());
+      // The intake drops a row it cannot key; only what it kept is delivered.
+      return seed.records;
     },
   } satisfies LegacyImportSink;
 }

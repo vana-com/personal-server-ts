@@ -52,7 +52,7 @@ describe("importing through the real seed staging", () => {
           crashOnce = false;
           throw new Error("injected crash");
         }
-        await sink.stage(connector, stream, rows);
+        return sink.stage(connector, stream, rows);
       },
     };
     const streams = [
@@ -119,5 +119,45 @@ describe("importing through the real seed staging", () => {
     expect(await importer.run()).toMatchObject({ failed: 1 });
     expect(await importer.importDone("acme")).toBe(false);
     expect(await staged(files, "acme")).toEqual({});
+  });
+
+  it("receipts the rows the intake kept, not the rows it was handed (SINK_RETURNS_PULLED)", async () => {
+    const files = createMemoryStreamSyncFiles(7);
+    const ledger = new RetireLedger(createMemoryStreamSyncFiles());
+    const unkeyed: ImportStream = {
+      stream: "u",
+      primaryKey: ["id"],
+      profile: { key: null, version: "1.0.0" },
+      async *records() {
+        yield { text: "no key 1" };
+        yield { text: "no key 2" };
+      },
+    };
+    const mixed: ImportStream = {
+      stream: "m",
+      primaryKey: ["id"],
+      profile: { key: null, version: "1.0.0" },
+      async *records() {
+        yield row("m1");
+        yield { text: "no key" };
+        yield row("m2");
+      },
+    };
+    const sink = createSeedImportSink(createSeedStaging(files));
+    expect(await sink.stage("acme", unkeyed, unkeyed.records())).toBe(0);
+    expect(await sink.stage("acme", mixed, mixed.records())).toBe(2);
+    const importer = new LegacyImporter({
+      source: {
+        connectors: async () => ["acme"],
+        streams: async () => [unkeyed, mixed],
+      },
+      sink,
+      ledger,
+      switched: () => true,
+    });
+    await importer.run();
+    expect(await ledger.staged("acme", "u")).toBe(false);
+    expect(await ledger.staged("acme", "m")).toBe(true);
+    expect((await ledger.read()).imported.acme?.staged).toEqual({ u: 0, m: 2 });
   });
 });

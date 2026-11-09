@@ -36,6 +36,8 @@ export const legacy = (id: string) => ({
 
 export async function flow(options: {
   seed?: string[];
+  /** The sink pulls every row of the seed and keeps none (an intake that drops rows it cannot key). */
+  sinkKeepsNone?: boolean;
   /**
    * The import source lists the connector (and stages `seed`, if any). The
    * default is production's: an empty source that stages nothing.
@@ -74,7 +76,9 @@ export async function flow(options: {
       async stage(_connector, stream, rows) {
         const out: Record<string, unknown>[] = [];
         for await (const row of rows) out.push(row);
+        if (options.sinkKeepsNone) return 0;
         staged.set(stream.stream, out);
+        return out.length;
       },
     },
     ledger,

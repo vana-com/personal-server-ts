@@ -76,6 +76,7 @@ import {
   createInventoryTombstoneFinality,
   createScopeDeletionTracker,
   createRetireHost,
+  legacyRetireSwitched,
   createSyncManager,
   LegacyImporter,
   RetireLedger,
@@ -942,7 +943,7 @@ export async function createServer(
           source: options?.legacyImportSource ?? NO_IMPORT_SOURCE,
           sink: createSeedImportSink(seedStaging),
           ledger: retireLedger,
-          switched: () => config.streamSync.write,
+          switched: () => legacyRetireSwitched(config),
           logger,
         });
         const seedSource = seedStaging.source(
@@ -1023,7 +1024,7 @@ export async function createServer(
       // Import, readback and (only with `streamSync.retireLegacy`) retire of
       // local legacy files; read live, null while the account is unswitched.
       legacyRetire: (): LegacyRetireOption | null =>
-        config.streamSync.write &&
+        legacyRetireSwitched(config) &&
         streamSyncWriter &&
         streamSyncRead &&
         retireLedger &&

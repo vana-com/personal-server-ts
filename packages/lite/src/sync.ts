@@ -45,6 +45,7 @@ import {
   createRetireHost,
   createScopeDeletionTracker,
   LegacyImporter,
+  legacyRetireSwitched,
   RetireLedger,
   normalizePendingBlobDeletionPlanned,
   normalizePendingBlobDeletions,
@@ -585,7 +586,7 @@ export async function createPsLiteSyncManager(
             },
           },
           ledger: retireLedger,
-          switched: () => Boolean(options.config.streamSync?.write),
+          switched: () => legacyRetireSwitched(options.config),
           logger,
         })
       : null;
@@ -680,7 +681,7 @@ export async function createPsLiteSyncManager(
           ? { write: true, publisher: streamSyncWriter }
           : null,
         legacyRetire: (): LegacyRetireOption | null =>
-          options.config.streamSync?.write &&
+          legacyRetireSwitched(options.config) &&
           streamSyncWriter &&
           streamSyncRead &&
           retireLedger &&

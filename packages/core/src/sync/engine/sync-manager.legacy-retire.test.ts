@@ -66,8 +66,10 @@ async function cycle(options: {
     sink: {
       // A sink stages the rows it consumes; the receipt counts them.
       stage: async (c, s, rows) => {
-        for await (const _row of rows) void _row;
+        let count = 0;
+        for await (const _row of rows) count += Number(_row !== undefined);
         staged.push(`${c}/${s.stream}`);
+        return count;
       },
     },
     ledger,
