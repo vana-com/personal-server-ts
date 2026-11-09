@@ -459,7 +459,16 @@ describe("retireLegacyScopes", () => {
 
   describe("a version that lands during the delete (real storage, real deleteScope)", () => {
     const SCOPE = "github.events";
-    async function seeded() {
+    async function seeded(
+      tomb: {
+        status: "tombstoned" | "already-deleted";
+        version: string | null;
+      } = {
+        status: "tombstoned",
+        version: "5",
+      },
+    ) {
+      let tombstoneCalls = 0;
       const storage = createMemoryDataStorage();
       const add = async (collectedAt: string, ids: readonly string[]) => {
         const envelope = createDataFileEnvelope(
@@ -482,20 +491,21 @@ describe("retireLegacyScopes", () => {
       await add(BEFORE, ["a"]);
       const deleteData: DeleteDataPort = {
         async tombstone() {
+          tombstoneCalls += 1;
           // The file lands while the tombstone call is in flight.
           await add("2026-11-02T00:00:00.000Z", ["z"]);
           return {
-            status: "tombstoned",
+            status: tomb.status,
             dataPointId: "0x1",
-            version: "5",
+            version: tomb.version,
             deletedAt: "2026-11-02T01:00:00.000Z",
-          };
+          } as never;
         },
         async deleteBlobVersions(_scope, versions) {
           return { deleted: [...versions], missing: [], failed: [] };
         },
       };
-      return { storage, deleteData };
+      return { storage, deleteData, calls: () => tombstoneCalls };
     }
 
     // Mutant killed: erase by scope (ignore the checked ids). A version added
@@ -531,6 +541,69 @@ describe("retireLegacyScopes", () => {
       expect(survivor.dataPointId).toBeNull(); // still unsynced: it uploads
       expect(survivor.afterTombstoneVersion).toBe(5);
       expect(isEntryCoveredByTombstone(survivor, { version: "5" })).toBe(false);
+    });
+
+    const retireSeeded = (
+      w: Awaited<ReturnType<typeof seeded>>,
+      extra: { registryDeleted?: () => Promise<boolean> } = {},
+    ) =>
+      retireLegacyScopes({
+        storage: w.storage,
+        switchedAt: SWITCH,
+        coverage: () => covered(),
+        registeredAt: async () => BEFORE,
+        viewKeys: async (s) => viewOf(s, ["a"]),
+        ...extra,
+        deleteScope: (scope, entries) =>
+          deleteScope(
+            {
+              storage: w.storage,
+              serverOwner: OWNER,
+              deleteData: w.deleteData,
+              pendingBlobDeletions: createMemoryPendingBlobDeletionStore(),
+              logger: logger(),
+            },
+            scope,
+            { onlyEntries: entries },
+          ),
+        logger: logger(),
+      });
+
+    // Mutant killed: drop the registry pre-check. An already-deleted row
+    // gives no tombstone version, so a file landing during the call could not
+    // be kept and a later reconcile would erase it.
+    it("a scope whose registry row is already deleted is not retired", async () => {
+      const w = await seeded({ status: "already-deleted", version: null });
+      const result = await retireSeeded(w, {
+        registryDeleted: async () => true,
+      });
+      expect(w.calls()).toBe(0);
+      expect(result.deleted).toBe(0);
+      expect(result.skipped.failed).toBe(1);
+      expect(
+        w.storage.listVersions(SCOPE, { limit: 10, offset: 0 }),
+      ).toHaveLength(1);
+    });
+
+    it("a registry that cannot be read is treated as deleted", async () => {
+      const w = await seeded();
+      const result = await retireSeeded(w, {
+        registryDeleted: async () => {
+          throw new Error("down");
+        },
+      });
+      expect(w.calls()).toBe(0);
+      expect(result.deleted).toBe(0);
+    });
+
+    // Mutant killed: count a tombstone with no known version as durable.
+    it("a tombstone that reports no version is not counted as retired", async () => {
+      const w = await seeded({ status: "tombstoned", version: null });
+      const result = await retireSeeded(w, {
+        registryDeleted: async () => false,
+      });
+      expect(result.deleted).toBe(0);
+      expect(result.skipped.failed).toBe(1);
     });
 
     it("a host without the stamp cannot retire", async () => {

@@ -115,7 +115,8 @@ function rig(scopeNames = [SECRET, "github.events"], addedAt = BEFORE) {
         : { deleted: versions, missing: [], failed: [] },
   };
   const feed: DataPointFeedPort = {
-    getDataPoint: async () => ({ addedAt }) as never,
+    getDataPoint: async () =>
+      ({ addedAt, dataHash: "0xaa", metadataHash: "0xbb" }) as never,
     listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
   };
   const upload = {
@@ -195,6 +196,28 @@ describe("sync manager: retire legacy scopes after the switch", () => {
     await manager.trigger();
     expect([...r.scopes]).toEqual(["github.events"]);
     expect(r.tombstone).toHaveBeenCalledTimes(1);
+  });
+
+  // Mutant killed: the host omits `registryDeleted`. A registry row another
+  // device already tombstoned gives the delete no version to keep a landing
+  // file with.
+  it("a scope whose registry row is already a tombstone is not retired", async () => {
+    const r = rig();
+    (
+      r.upload.dataPointFeed as unknown as { getDataPoint: unknown }
+    ).getDataPoint = async () => ({
+      addedAt: BEFORE,
+      deletedAt: "2026-11-02T00:00:00.000Z",
+      dataHash: "0xaa",
+      metadataHash: "0xbb",
+    });
+    const manager = createSyncManager(r.upload, r.download, {
+      deleteData: r.deleteData,
+      retireLegacy: on(),
+    });
+    await manager.trigger();
+    expect(r.tombstone).not.toHaveBeenCalled();
+    expect(r.scopes.size).toBe(2);
   });
 
   it("switch on but no remote delete port: nothing is deleted locally", async () => {

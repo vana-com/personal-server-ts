@@ -82,10 +82,15 @@ const entry = (scope: string) =>
 /** The retire inputs a host gives; only the published view matters to the gate. */
 function retireWith(
   view: (scope: string) => ReturnType<typeof entityKeySets> | Promise<null>,
+  o: { throughMs?: number; revision?: () => string } = {},
 ): () => RetireLegacyOption {
   return () => ({
-    coverage: () => ({ kind: "skip", reason: "incomplete" }),
+    coverage: () => ({
+      kind: "covered",
+      throughMs: o.throughMs ?? Date.parse(T0) + 86_400_000,
+    }),
     viewKeys: async (scope) => view(scope),
+    viewRevision: o.revision ?? (() => "r1"),
     switchedAt: undefined,
   });
 }
@@ -239,6 +244,106 @@ describe("sync manager: legacy is read-only history after the switch", () => {
     await manager.trigger();
     expect(await predicates().upload?.(entry(CARRIED))).toBe(true);
     expect(reads).toHaveBeenCalledTimes(1);
+  });
+
+  // Mutant killed: gate on keys only (no time check). The view holds key a
+  // through T0 with old content; the local file was collected later with new
+  // content under the same key. Skipping it would lose the edit.
+  it("a local file newer than the view's coverage keeps uploading", async () => {
+    const r = rig();
+    const h = hostSwitch({ on: true });
+    const manager = createSyncManager(r.upload, r.download, {
+      streamSync: h.streamSync,
+      retireLegacy: retireWith((scope) => entityKeySets(scope, BODY), {
+        throughMs: Date.parse(T0) - 1,
+      }),
+    });
+    await manager.trigger();
+    const { upload, requeue } = predicates();
+    expect(await upload?.(entry(CARRIED))).toBe(false);
+    expect(await requeue?.(CARRIED)).toBe(false);
+  });
+
+  it("coverage that is not complete keeps uploading", async () => {
+    const r = rig();
+    const h = hostSwitch({ on: true });
+    const manager = createSyncManager(r.upload, r.download, {
+      streamSync: h.streamSync,
+      retireLegacy: () => ({
+        coverage: () => ({ kind: "skip", reason: "incomplete" }),
+        viewKeys: async (scope) => entityKeySets(scope, BODY),
+        viewRevision: () => "r1",
+        switchedAt: undefined,
+      }),
+    });
+    await manager.trigger();
+    expect(await predicates().upload?.(entry(CARRIED))).toBe(false);
+  });
+
+  // Mutant killed: ignore the revision a mark was proved against.
+  it("a finished file is proved again when the view changes", async () => {
+    const r = rig();
+    const h = hostSwitch({ on: true });
+    let revision = "r1";
+    let view: ReturnType<typeof entityKeySets> = entityKeySets(CARRIED, BODY);
+    const manager = createSyncManager(r.upload, r.download, {
+      streamSync: h.streamSync,
+      retireLegacy: retireWith(async () => view as never, {
+        revision: () => revision,
+      }),
+    });
+    await manager.trigger();
+    expect(await predicates().upload?.(entry(CARRIED))).toBe(true);
+    revision = "r2";
+    view = entityKeySets(CARRIED, { activities: [] });
+    await manager.trigger();
+    expect(await predicates().upload?.(entry(CARRIED))).toBe(false);
+  });
+
+  // Mutant killed: never clear the finished set when the writer is off.
+  it("a finished file is proved again after the switch goes off and on", async () => {
+    const r = rig();
+    const reads = vi.fn(async () => ({ data: BODY }));
+    (r.upload.storage as unknown as { readEnvelope: unknown }).readEnvelope =
+      reads;
+    const state = { on: true };
+    const h = hostSwitch(state);
+    const manager = createSyncManager(r.upload, r.download, {
+      streamSync: h.streamSync,
+      retireLegacy: holdsA,
+    });
+    await manager.trigger();
+    expect(await predicates().upload?.(entry(CARRIED))).toBe(true);
+    expect(reads).toHaveBeenCalledTimes(1);
+    state.on = false;
+    await manager.trigger();
+    state.on = true;
+    await manager.trigger();
+    expect(await predicates().upload?.(entry(CARRIED))).toBe(true);
+    expect(reads).toHaveBeenCalledTimes(2);
+  });
+
+  // Mutant killed: clear the finished set only at cycle start. The switch can
+  // go off and on again between two predicate calls inside one cycle.
+  it("a finished file is proved again after an off-on flip inside one cycle", async () => {
+    const r = rig();
+    const reads = vi.fn(async () => ({ data: BODY }));
+    (r.upload.storage as unknown as { readEnvelope: unknown }).readEnvelope =
+      reads;
+    const state = { on: true };
+    const h = hostSwitch(state);
+    const manager = createSyncManager(r.upload, r.download, {
+      streamSync: h.streamSync,
+      retireLegacy: holdsA,
+    });
+    await manager.trigger();
+    const { upload } = predicates();
+    expect(await upload?.(entry(CARRIED))).toBe(true);
+    state.on = false;
+    expect(await upload?.(entry(CARRIED))).toBe(false);
+    state.on = true;
+    expect(await upload?.(entry(CARRIED))).toBe(true);
+    expect(reads).toHaveBeenCalledTimes(2);
   });
 
   it("a view that cannot be read, or a host with no reader, keeps uploading", async () => {

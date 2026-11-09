@@ -110,6 +110,14 @@ export interface RetireLegacyDeps {
    */
   registeredAt(scope: string): Promise<string | null>;
   /**
+   * Whether the registry row of the scope is already a tombstone (another
+   * device deleted it). Such a scope is not retired here: the delete would
+   * learn no tombstone version, and a file landing during it could not be
+   * kept. Its local files are left to the ordinary deletion feed. Throwing
+   * counts as deleted. Absent: not checked.
+   */
+  registryDeleted?(scope: string): Promise<boolean>;
+  /**
    * Durable scope deletion: gateway tombstone, storage blobs, local copy. It
    * erases exactly `entries`, the versions that were checked; a version that
    * landed since survives.
@@ -258,6 +266,18 @@ export async function retireLegacyScopes(
       continue;
     }
     if (budget === 0) continue; // next cycle
+    if (deps.registryDeleted) {
+      let deleted: boolean;
+      try {
+        deleted = await deps.registryDeleted(scope);
+      } catch {
+        deleted = true;
+      }
+      if (deleted) {
+        result.skipped.failed += 1;
+        continue;
+      }
+    }
     if (!(await versionsAreHeld(deps, scope, rows))) {
       result.skipped.notInView += 1;
       continue;
@@ -267,7 +287,12 @@ export async function retireLegacyScopes(
     budget -= 1;
     try {
       const outcome = await deps.deleteScope(scope, rows);
-      if (outcome.durable) result.deleted += 1;
+      // A tombstone with no known version could not keep a file that landed
+      // during the call: not durable for this purpose.
+      const gateway = outcome.steps?.gateway;
+      const versionless =
+        gateway?.status === "ok" && "version" in gateway && !gateway.version;
+      if (outcome.durable && !versionless) result.deleted += 1;
       else result.skipped.failed += 1;
     } catch {
       result.skipped.failed += 1;

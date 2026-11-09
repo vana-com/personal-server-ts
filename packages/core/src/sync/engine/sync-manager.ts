@@ -28,6 +28,7 @@ import {
   retryPendingBlobDeletions,
   type DeleteScopeResult,
 } from "../workers/delete.js";
+import { deletionTimestamp } from "../scope-deletions.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
 import { createTombstoneResubmitTracker } from "../tombstone-resubmits.js";
 import type {
@@ -254,6 +255,8 @@ export function createSyncManager(
       do {
         rerunRequested = false;
         publishedViews.clear();
+        // "Finished" marks are proved against a switched, writing account.
+        if (options?.streamSync?.write !== true) heldDone.clear();
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
@@ -411,9 +414,11 @@ export function createSyncManager(
    * column for it, and a persisted `dataPointId` would claim a gateway
    * registration that does not exist (the lost-data-point check and the
    * registry reconcile would act on the claim). A restart re-proves each
-   * file once.
+   * file once. Each mark keeps the view revision it was proved against and
+   * counts only while that revision is unchanged; it is cleared whenever the
+   * writer is off.
    */
-  const heldDone = new Set<string>();
+  const heldDone = new Map<string, string>();
   const heldKey = (row: IndexEntry) =>
     `${row.id}|${row.path}|${row.collectedAt}`;
   /** Scopes the last retire pass found not held, keyed by what it read. */
@@ -436,23 +441,42 @@ export function createSyncManager(
       options?.streamSync?.write !== true ||
       !(options.streamSync.carries ?? defaultCarries)(scope)
     ) {
+      heldDone.clear();
       return false;
     }
-    if (rows.length > 0 && rows.every((row) => heldDone.has(heldKey(row)))) {
+    const retire = options.retireLegacy?.();
+    if (!retire) return false;
+    // The one question retire asks: keys AND time.
+    const coverage = retire.coverage(scope);
+    if (coverage.kind !== "covered") return false;
+    if (
+      rows.some((row) => {
+        const t = Date.parse(row.collectedAt);
+        return !Number.isFinite(t) || t > coverage.throughMs;
+      })
+    ) {
+      return false;
+    }
+    const revision = retire.viewRevision?.(scope);
+    if (
+      revision !== undefined &&
+      rows.length > 0 &&
+      rows.every((row) => heldDone.get(heldKey(row)) === revision)
+    ) {
       return true;
     }
-    const read = options.retireLegacy?.()?.viewKeys;
-    if (!read) return false;
     let pending = publishedViews.get(scope);
     if (!pending) {
-      pending = read(scope).catch(() => null);
+      pending = retire.viewKeys(scope).catch(() => null);
       publishedViews.set(scope, pending);
     }
     const view = await pending;
     if (!view) return false;
     const held = await localKeysHeld(uploadDeps.storage, scope, rows, view);
     if (held !== "held") return false;
-    for (const row of rows) heldDone.add(heldKey(row));
+    if (revision !== undefined) {
+      for (const row of rows) heldDone.set(heldKey(row), revision);
+    }
     return true;
   }
 
@@ -592,6 +616,14 @@ export function createSyncManager(
             scope,
           });
           return row?.addedAt ?? null;
+        },
+        async registryDeleted(scope) {
+          if (!dataPointFeed) throw new Error("no registry to read");
+          const row = await dataPointFeed.getDataPoint({
+            ownerAddress: uploadDeps.serverOwner,
+            scope,
+          });
+          return deletionTimestamp(row) !== null;
         },
         async deleteScope(scope, entries) {
           const result = await deleteScope(deleteScopeDeps(), scope, {

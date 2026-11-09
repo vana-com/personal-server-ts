@@ -356,7 +356,12 @@ describe("membership against the real reader", () => {
         scope: SCOPE,
         collectedAt,
       }) as IndexEntry;
-    const bodies: Record<string, string[]> = { held: ["a"], stuck: ["a", "z"] };
+    const HELD = "2026-11-01T00:00:00.000Z";
+    const STUCK = "2026-11-01T00:00:01.000Z";
+    const bodies: Record<string, string[]> = {
+      [HELD]: ["a"],
+      [STUCK]: ["a", "z"],
+    };
     const storage = {
       findUnsynced: () => [],
       listScopes: () => ({ total: 0, scopes: [] }),
@@ -389,9 +394,9 @@ describe("membership against the real reader", () => {
     );
     await manager.trigger();
     const skip = vi.mocked(uploadAll).mock.calls.at(-1)![1]!.skipEntry!;
-    expect(await skip(entry("held"))).toBe(true);
+    expect(await skip(entry(HELD))).toBe(true);
     // The pending run holds z, but it may never publish: the file uploads.
-    expect(await skip(entry("stuck"))).toBe(false);
+    expect(await skip(entry(STUCK))).toBe(false);
     await manager.stop();
     // A file the gate finished is still retired by the same published view.
     const { deleted } = await retireWith(service, ["a"]);
