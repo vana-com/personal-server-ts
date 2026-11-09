@@ -150,6 +150,7 @@ export async function publishWorkload(args: unknown): Promise<PublishResult> {
     home: testStreamSyncHome(files),
     keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
     signer: accountSigner(SERVER_KEY),
+    declaredStreams: () => [],
     ...a.writer,
   });
   const runId = `run-${a.distinct}-${a.records}`;

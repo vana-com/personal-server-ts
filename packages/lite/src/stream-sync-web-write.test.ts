@@ -204,6 +204,7 @@ async function boot(net: Network, browser: Browser, write?: boolean) {
   const opened = vi.spyOn(StreamSyncReadService, "open");
   const before = opened.mock.results.length;
   const built = await createIndexedDbPsLiteRuntime({
+    streamSyncDeclaredStreams: () => [],
     ownerAddress: ACCOUNT.address,
     ownerSignature: net.signature,
     ownerSyncSigner: {

@@ -349,6 +349,9 @@ function fakeRegistry(): StreamSyncRegistry & {
     async listControlRows() {
       return [];
     },
+    async listStreamRows() {
+      return [];
+    },
   };
 }
 
@@ -512,6 +515,7 @@ export async function runScenario(
   );
   const registry = fakeRegistry();
   const writer = new StreamSyncWriter({
+    declaredStreams: () => [],
     ownerAddress: account.address,
     registry,
     blobs,

@@ -129,6 +129,7 @@ async function startManager(options: {
     ownerSignature,
   });
   const manager = await createPsLiteSyncManager({
+    streamSyncDeclaredStreams: () => [],
     config: ServerConfigSchema.parse({
       gateway: { url: GATEWAY },
       sync: { enabled: true },

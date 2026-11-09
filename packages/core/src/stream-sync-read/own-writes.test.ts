@@ -176,6 +176,18 @@ class Gateway implements StreamSyncRegistry {
     return out;
   }
 
+  async listStreamRows(connector: string) {
+    this.guard();
+    const out: { scope: string; read: ControlRead }[] = [];
+    for (const scope of this.versions.keys()) {
+      const parsed = parseScope(scope);
+      if (parsed?.kind === "stream" && parsed.connector === connector) {
+        out.push({ scope, read: await this.read(scope) });
+      }
+    }
+    return out;
+  }
+
   /** What the listing feed shows a reader. */
   feed(): MirrorFeedRow[] {
     return [...this.versions].map(([scope, rows]) => {
@@ -212,6 +224,7 @@ class Device {
       get: async (key) => this.blobMap.get(key) ?? null,
     };
     this.writer = new StreamSyncWriter({
+      declaredStreams: () => [],
       ownerAddress: OWNER,
       registry: this.gateway,
       blobs,

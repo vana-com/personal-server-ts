@@ -471,7 +471,10 @@ describe.each(matrix)(
       await a.publishPending();
 
       const view = await readStream(env.registry, env.blobs, c, NS, "s");
-      expect(view === null || view === "tombstoned").toBe(true);
+      // The declared stream has no row of its own: a delete head holds no record.
+      expect(
+        view === null || view === "tombstoned" || view.records.size === 0,
+      ).toBe(true);
       expect(
         finishedOutcome(await a.status(), "p4r2-purge-finished")?.outcome,
       ).not.toMatchObject({ kind: "checkpointed" });
@@ -527,7 +530,10 @@ describe.each(matrix)(
       ).rejects.toThrow(/gone/);
       await a.publishPending();
       const view = await readStream(env.registry, env.blobs, c, NS, "s");
-      expect(view === null || view === "tombstoned").toBe(true);
+      // The declared stream has no row of its own: a delete head holds no record.
+      expect(
+        view === null || view === "tombstoned" || view.records.size === 0,
+      ).toBe(true);
     });
 
     // L11 (ruling M3): an old install's non-exclusive DELETE tombstones one

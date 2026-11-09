@@ -46,6 +46,7 @@ async function startManager() {
     ownerSignature,
   });
   return createPsLiteSyncManager({
+    streamSyncDeclaredStreams: () => [],
     config: ServerConfigSchema.parse({
       sync: { enabled: true },
       streamSync: { write: true, read: true },

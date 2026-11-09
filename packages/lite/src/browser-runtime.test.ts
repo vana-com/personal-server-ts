@@ -62,6 +62,7 @@ function memoryBundle(): PsLitePersistenceBundle {
 
 function build(bundle: PsLitePersistenceBundle) {
   return createIndexedDbPsLiteRuntime({
+    streamSyncDeclaredStreams: () => [],
     ownerAddress,
     ownerSignature,
     persistence: bundle,
@@ -82,6 +83,7 @@ describe("createIndexedDbPsLiteRuntime persistence injection", () => {
   it("rejects a partial bundle instead of mixing native and IndexedDB stores", async () => {
     await expect(
       createIndexedDbPsLiteRuntime({
+        streamSyncDeclaredStreams: () => [],
         ownerAddress,
         ownerSignature,
         persistence: {} as PsLitePersistenceBundle,
@@ -238,6 +240,7 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
       builderToken: "builder-token",
     }),
     active: true,
+    streamSyncDeclaredStreams: () => [],
     ...extra,
   });
   const digest = `sha256:${"ab".repeat(32)}`;
@@ -320,6 +323,7 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
     );
     const dbName = `ps-lite-own-reads-${Math.random()}`;
     const { runtime, streamSyncWriter } = await createIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
       ownerAddress,
       ownerSignature,
       dbName,
@@ -396,6 +400,7 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
     // Default wiring: the route exists, and refuses an unauthenticated
     // handshake rather than 404ing as if delegated writes were unsupported.
     const withDefaults = await createIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
       ...base,
       dbName: "ps-lite-write-default",
       storageDbName: "ps-lite-write-default-storage",
@@ -405,6 +410,7 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
     // A caller that brings its own auth adapter owns the wiring: we must not
     // mint tokens that adapter has never heard of.
     const withOwnAuth = await createIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
       ...base,
       dbName: "ps-lite-write-own-auth",
       storageDbName: "ps-lite-write-own-auth-storage",
@@ -454,6 +460,7 @@ describe("createIndexedDbPsLiteRuntime data listings", () => {
     ]);
     const getGrant = vi.fn(async () => null);
     const { runtime } = await createIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
       ownerAddress,
       ownerSignature,
       persistence: memoryBundle(),

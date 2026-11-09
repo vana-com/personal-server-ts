@@ -167,14 +167,6 @@ it("CAS retry reruns the fence (mutant: check only before first post)", async ()
   await discarded(r, "stale");
 });
 
-it("delete absent stream fences a zero-stamped import (mutant: skip absent rows)", async () => {
-  const r = new Rig();
-  await r.open();
-  await r.other.deleteStreams(CONNECTOR, ["items"]);
-  expect(await r.registeredVersion()).toBe(1);
-  await r.collect(spec("import"));
-  await discarded(r, "import");
-});
 it("delete retries a CAS lost to a publish (mutant: Superseded swallowed)", async () => {
   const r = new Rig();
   await r.open();
@@ -192,7 +184,7 @@ it("delete retries a CAS lost to a publish (mutant: Superseded swallowed)", asyn
       metadataHash: headRow.metadataHash,
     });
   };
-  await r.writer.deleteStreams(CONNECTOR, ["items"]);
+  await r.deleteStreamHeadsOnly();
   const row = await r.gateway.read(streamScope(CONNECTOR, "", "items"));
   expect(row).toMatchObject({ found: true, version: 4 });
   expect(await r.registeredHead()).toMatchObject({
@@ -209,7 +201,10 @@ it("seed-only refusal is skipped and next run publishes (mutant: discard whole r
     rows: [{ id: "old" }],
   });
   await r.open();
-  await r.writer.deleteStreams(CONNECTOR, ["seed"]);
+  // Another device published the stream; the delete erases that row.
+  await r.collect({ ...spec("theirs", true), stream: "seed" });
+  await r.deleteStreamHeadsOnly(r.other);
+  await r.sync();
   await r.collect(spec("live"));
   expect(
     (await r.publish()).find((s) => s.runId === "live")?.outcome?.kind,
@@ -225,7 +220,8 @@ it("seed-only refusal is skipped and next run publishes (mutant: discard whole r
 it("merged seed is dropped while live records publish (mutant: discard whole run)", async () => {
   const r = new Rig({ key: "id", version: "1.0.0", rows: [{ id: "old" }] });
   await r.open();
-  await r.other.deleteStreams(CONNECTOR, ["items"]);
+  await r.collect(spec("theirs", true));
+  await r.deleteStreamHeadsOnly(r.other);
   // Observe the delete before the live run starts.
   await r.collect(spec("learn"));
   await r.publish();
@@ -262,7 +258,7 @@ it("tombstoned head reads as deleted through the read service (mutant: omit tomb
   await r.collect(spec("base"));
   await r.publish();
   await r.sync();
-  await r.writer.deleteStreams(CONNECTOR, ["items"]);
+  await r.deleteStreamHeadsOnly();
   await r.sync();
   expect(await r.service.resolve(ask("pdpp.acme.items"))).toMatchObject({
     kind: "unavailable",

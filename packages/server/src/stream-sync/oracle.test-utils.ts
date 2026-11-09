@@ -173,6 +173,16 @@ export function createFakeStreamSyncRegistry(): StreamSyncRegistry {
       }
       return out;
     },
+    async listStreamRows(connector: string) {
+      const out: { scope: string; read: ControlRead }[] = [];
+      for (const scope of rows.keys()) {
+        const parsed = parseScope(scope);
+        if (parsed?.kind === "stream" && parsed.connector === connector) {
+          out.push({ scope, read: await read(scope) });
+        }
+      }
+      return out;
+    },
   };
 }
 
@@ -202,6 +212,7 @@ export function interpose(
       return result;
     },
     listControlRows: () => inner.listControlRows(),
+    listStreamRows: (connector) => inner.listStreamRows(connector),
   };
 }
 
@@ -375,6 +386,7 @@ export async function createOracleEnv(input: {
         signer: accountSigner(
           input.surface === "full" ? SERVER_KEY : OWNER_KEY,
         ),
+        declaredStreams: () => ["s"],
         ...extra,
       });
     },

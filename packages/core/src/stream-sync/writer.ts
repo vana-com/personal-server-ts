@@ -26,10 +26,8 @@
  * publishing a partial run under the run's checkpoint.
  */
 
-import { legacyBindingsForProfile } from "../legacy-projection/index.js";
 import { deleteMetadataHash } from "./delete-metadata.js";
 import {
-  type ControlRead,
   IDENTITYLESS_NS,
   PART_LIMIT_BYTES,
   DEFAULT_PART_TARGET_BYTES,
@@ -80,6 +78,7 @@ import {
   type ControlHashes,
   classifyStreamRow,
   type ControlState,
+  sameControl,
   type Decision,
   type DecidePhase,
   type Head,
@@ -179,19 +178,47 @@ interface DeletePin {
   readonly version: number;
 }
 
+/** A stream row a delete must erase, found in the registry listing. */
+interface StreamPin {
+  readonly ns: string;
+  readonly stream: string;
+  /**
+   * The state of this namespace's control row when the intent was saved. A
+   * stream delete is signed only while the control row is still in that
+   * state: any other state means the connection was deleted or reconnected
+   * since, possibly by another device, and the data on the row is no longer
+   * the data this delete is about.
+   */
+  readonly control: ControlState;
+  /**
+   * The version of the delete head last signed for the row. The delete
+   * landed once the row's delete history reaches it. Absent until signed.
+   */
+  readonly pin?: number;
+}
+
+/**
+ * One connection delete. The stream delete heads land first and the control
+ * tombstones after them: no reconnect can exist while a stream delete is
+ * pending, so a stream delete that did not land is always re-issued.
+ */
+interface DeleteIntent {
+  readonly pins: readonly DeletePin[];
+  /** Absent in an intent from before streams were listed. */
+  readonly streams?: readonly StreamPin[];
+  /** Every stream delete landed: a resume never touches stream rows again. */
+  readonly streamsLanded?: true;
+}
+
 interface WriterState {
   version: 1;
   needsFull: NeedsFull;
   checkpoints: Record<string, StreamSyncCheckpoint>;
   /**
    * Connection deletes in progress (§2.11), per connector. Persisted before
-   * the first tombstone, so a crash resumes the same pins on the next boot.
+   * the first write, so a crash resumes the same intent on the next boot.
    */
-  deletes?: Record<string, { readonly pins: readonly DeletePin[] }>;
-  streamDeletes?: Record<
-    string,
-    Record<string, { request?: SignedRegistryPost }>
-  >;
+  deletes?: Record<string, DeleteIntent>;
   /**
    * Per connector, how many times its checkpoint was invalidated: a control
    * change seen, or a deliberate clear. It only grows and outlives the
@@ -346,6 +373,22 @@ export class ConnectionStoppedError extends Error {
 }
 
 /**
+ * A connection delete refused before it wrote anything: the registry holds
+ * rows of the connector, but this host verified no manifest that names its
+ * streams. A stream the registry has no row for could then keep a stale
+ * record that passes the fence after a reconnect, so the delete waits until
+ * the host can name the streams (retryable).
+ */
+export class ConnectorNotVerifiedError extends Error {
+  constructor(readonly connector: string) {
+    super(
+      `no verified manifest names the streams of ${connector}; its delete cannot fence rowless streams`,
+    );
+    this.name = "ConnectorNotVerifiedError";
+  }
+}
+
+/**
  * A fresh connection delete whose tombstone did not land: the connection
  * was reconnected or deleted again while the delete ran. The intent is
  * dropped; nothing was tombstoned at a version the caller did not see.
@@ -404,6 +447,17 @@ export interface StreamSyncWriterOptions {
   readonly signer: StreamSyncSigner;
   /** Desktop only: this install's retained rows (§2.9). */
   readonly seed?: StreamSyncSeedSource;
+  /**
+   * The stream names `connector` declares, from the connector manifests the
+   * host verified (never from a connector-id literal). A connection delete
+   * posts a delete head on each of them that has no registry row yet, so a
+   * stale record for such a stream cannot publish after the delete. Required:
+   * a host that does not pass it cannot know which streams a delete must
+   * fence, so the omission would show only as returned data. An empty list
+   * for a connector that has registry rows makes its delete throw
+   * `ConnectorNotVerifiedError` before anything is written.
+   */
+  readonly declaredStreams: (connector: string) => readonly string[];
   /** Writer target per part (§2.2, at most 4 MiB). */
   readonly partTargetBytes?: number;
   /** Budget for one reduce pass and one shard compaction, in line bytes. */
@@ -420,6 +474,13 @@ export interface StreamSyncWriterOptions {
   ) => void;
   /** Called when a discarded `userConnect` run asks for a fresh full run (§2.4). */
   readonly onRestartFull?: (connector: string) => void;
+  /**
+   * Erases this device's legacy scope files of `connector`. The purge of a
+   * connection delete calls it last, so nothing of the connector stays on the
+   * device once its tombstones landed. Idempotent: a throw leaves the delete
+   * open and the next publish pass runs it again. Default: none.
+   */
+  readonly eraseLegacy?: (connector: string) => Promise<void>;
 }
 
 export { compareConnectorVersions } from "./publish-plan.js";
@@ -568,6 +629,10 @@ export class StreamSyncWriter {
   private readonly coverage = new Map<string, StreamSyncImportedCoverage>();
 
   constructor(private readonly options: StreamSyncWriterOptions) {
+    // The type requires it; a caller that skips the type check is refused too.
+    if (typeof options.declaredStreams !== "function") {
+      throw new Error("StreamSyncWriter needs declaredStreams");
+    }
     if (
       options.home.ownerAddress.toLowerCase() !==
       options.ownerAddress.toLowerCase()
@@ -710,24 +775,33 @@ export class StreamSyncWriter {
   // -------------------------------------------------------------- delete
 
   /**
-   * §2.11 connection delete. The intent (the pinned version of each live
-   * control row of the connector) is persisted first; then each pinned row is
-   * tombstoned at `version + 1`. A fresh delete pins the row as read now, not
-   * as listed: a stale listing would tombstone a version already gone. A
-   * resumed delete writes only its stored pins, so a reconnect that lands in
-   * between is never tombstoned. An earlier intent for the connector is
-   * finished first. Other devices stop when their control read shows `deleted`.
+   * §2.11 connection delete: the one delete path. The intent is persisted
+   * first: the pinned version of each live control row of the connector and
+   * every stream row of the connector the registry lists, whichever device
+   * or connector version wrote it. Then each stream row gets a delete head
+   * (§2.11a), and only after all of them landed is each pinned control row
+   * tombstoned at `version + 1`. A fresh delete pins the control row as read
+   * now, not as listed: a stale listing would tombstone a version already
+   * gone. A resumed delete writes only its stored pins, so a reconnect that
+   * lands in between is never tombstoned. An earlier intent for the connector
+   * is finished first. Other devices stop when their control read shows
+   * `deleted`.
    */
   deleteConnection(connector: string): Promise<void> {
     return this.publish(async () => {
       await this.finishDelete(connector);
       const pins: DeletePin[] = [];
+      // The control state of each namespace as the pin loop read it. A stream
+      // pins this state, never a later read: a reconnect between the two reads
+      // would otherwise be recorded as the state the delete started from.
+      const controls = new Map<string, ControlState>();
       for (const row of await this.options.registry.listControlRows()) {
         const parsed = parseScope(row.scope);
         if (parsed?.kind !== "control" || parsed.connector !== connector) {
           continue;
         }
         const state = await this.readControl(connector, parsed.ns);
+        controls.set(parsed.ns, state);
         if (state.kind === "active" || state.kind === "foreign") {
           pins.push({
             ns: parsed.ns,
@@ -735,135 +809,159 @@ export class StreamSyncWriter {
           });
         }
       }
-      if (pins.length === 0) return;
-      await this.withState((state) => {
-        (state.deletes ??= {})[connector] = { pins };
-      });
-      await this.runDelete(connector, pins, true);
-    });
-  }
-
-  /** Persist intent before any network write; every pass resumes unfinished streams. */
-  deleteStreams(connector: string, streams: readonly string[]): Promise<void> {
-    return this.publish(async () => {
-      // Until deleting multiple scopes is supported, shared aliases are indivisible.
-      const bindings = legacyBindingsForProfile(connector);
-      for (const stream of streams) {
-        const owners = [...bindings.values()].filter((binding) =>
-          binding.pdppStreams.includes(stream),
-        );
-        if (owners.length > 1)
-          throw new Error(
-            `stream ${stream} is shared by scopes ${owners.map((binding) => binding.scope).join(", ")}`,
-          );
+      const streams: StreamPin[] = [];
+      for (const row of await this.options.registry.listStreamRows(connector)) {
+        const parsed = parseScope(row.scope);
+        if (parsed?.kind !== "stream" || parsed.connector !== connector) {
+          continue;
+        }
+        streams.push({
+          ns: parsed.ns,
+          stream: parsed.stream,
+          control: controls.get(parsed.ns) ?? { kind: "absent" },
+        });
       }
+      const registered = streams.length;
+      if (pins.length > 0 || registered > 0) {
+        // Nothing is persisted yet: refuse when no stream can be named.
+        if (this.options.declaredStreams(connector).length === 0) {
+          throw new ConnectorNotVerifiedError(connector);
+        }
+        this.addRowlessStreams(connector, streams, controls);
+      }
+      if (pins.length === 0 && registered === 0) {
+        // The registry lists nothing, so there is nothing to erase there. The
+        // device may still hold runs, results and a seed target for the
+        // connection (collected while the registry was out of reach): they
+        // must not publish later.
+        await this.purgeConnector(connector, []);
+        await this.withState((state) => {
+          delete state.seedTargets[connector];
+        });
+        return;
+      }
+      const intent: DeleteIntent = { pins, streams };
       await this.withState((state) => {
-        const pending = ((state.streamDeletes ??= {})[connector] ??= {});
-        // This API is a new user delete; background recovery retains existing pins.
-        for (const stream of new Set(streams)) pending[stream] = {};
+        (state.deletes ??= {})[connector] = intent;
       });
-      await this.finishStreamDeletes(connector);
+      await this.runDelete(connector, intent, true);
     });
   }
 
-  private async finishStreamDeletes(connector: string): Promise<void> {
+  /**
+   * A stream the connector declares but the registry has no row for gets a
+   * delete head too. Without one its row history is empty, so the publish
+   * fence (`lastDeleteVersion` against the run's `collectedAt`) admits an old
+   * record of that stream (a retained or imported one, collected at 0) after a
+   * reconnect, and the deleted data returns. These rows are in the identity-
+   * less namespace, where retained and imported records are published.
+   */
+  private addRowlessStreams(
+    connector: string,
+    streams: StreamPin[],
+    controls: ReadonlyMap<string, ControlState>,
+  ): void {
+    const listed = new Set(
+      streams
+        .filter((pin) => pin.ns === IDENTITYLESS_NS)
+        .map((pin) => pin.stream),
+    );
+    for (const stream of this.options.declaredStreams(connector)) {
+      if (listed.has(stream)) continue;
+      listed.add(stream);
+      streams.push({
+        ns: IDENTITYLESS_NS,
+        stream,
+        control: controls.get(IDENTITYLESS_NS) ?? { kind: "absent" },
+      });
+    }
+  }
+
+  /**
+   * Land a delete head on every stream row of the intent. A row is done when
+   * its delete history reaches the pin, or when it was already deleted before
+   * this intent. Otherwise the delete is signed at the version after the row
+   * as read now, so a delete whose post was lost is re-issued on top of
+   * whatever another device published since. The intent keeps the new pin
+   * before the post, so a restart knows what to look for.
+   */
+  private async deleteStreamRows(
+    connector: string,
+    streams: readonly StreamPin[],
+  ): Promise<void> {
     const { keyCheck } = await this.keys();
-    for (const stream of Object.keys(
-      (await this.readState()).streamDeletes?.[connector] ?? {},
-    )) {
-      const scope = streamScope(connector, IDENTITYLESS_NS, stream);
+    for (const target of streams) {
+      const scope = streamScope(connector, target.ns, target.stream);
       for (let attempt = 0; attempt < CONFLICTS_PER_PASS; attempt += 1) {
-        let request = (await this.readState()).streamDeletes?.[connector]?.[
-          stream
-        ]?.request;
-        let observedRow: ControlRead | null = null;
-        if (request) {
-          const { row } = await this.readStreamRow(
-            connector,
-            IDENTITYLESS_NS,
-            stream,
-            true,
-          );
-          observedRow = row;
-          const pin = Number(request.expectedVersion);
-          const committed =
-            row.found &&
-            row.version === pin &&
-            row.dataHash.toLowerCase() === request.dataHash.toLowerCase();
-          if (committed || (row.found && row.version > pin)) {
-            if (committed) await this.observeDelete(connector, stream, pin);
-            await this.withState((state) => {
-              delete state.streamDeletes![connector]![stream];
-            });
-            break;
-          }
-          if (row.found && row.version === pin) {
-            // Another write won this CAS. Only this exact pin may be retried.
-            await this.withState((state) => {
-              delete state.streamDeletes![connector]![stream]!.request;
-            });
-            request = undefined;
-          }
-        }
-        if (!request) {
-          // Use the checked row for this CAS; a second read could advance past the pin.
-          const row =
-            observedRow ??
-            (await this.readStreamRow(connector, IDENTITYLESS_NS, stream, true))
-              .row;
-          const version = row.found ? row.version + 1 : 1;
-          // A delete head requires no old head, schema, or control-generation lookup.
-          const clear = encodeHead({
-            format: HEAD_FORMAT,
-            connector,
-            ns: IDENTITYLESS_NS,
-            stream,
-            generation: 1,
-            keyCheck,
-            lastDeleteVersion: version,
-            complete: false,
-            observedAt: this.now(),
-            parts: [],
-            primaryKey: ["id"],
-            profile: { key: null, version: "0.0.0" },
-            recordCount: 0,
-          });
-          const digest = await digestHead(this.hashes.keccak256, clear);
-          await this.options.blobs.put(
-            `${scope}/${digest.blobName}`,
-            await this.options.keys.encrypt(scope, clear),
-          );
-          request = await this.sign(
-            scope,
-            digest.dataHash,
-            deleteMetadataHash(scope, version),
-            version,
-          );
-          await this.withState((state) => {
-            state.streamDeletes![connector]![stream]!.request = request;
-          });
-        }
+        const pin = (await this.readState()).deletes?.[
+          connector
+        ]?.streams?.find(
+          (entry) => entry.ns === target.ns && entry.stream === target.stream,
+        )?.pin;
+        const { row, deleteMarker, lastDeleteVersion } =
+          await this.readStreamRow(connector, target.ns, target.stream, true);
+        // Re-issue only while the control row is as the intent saw it. The
+        // check comes after the row read: a reconnect writes its control row
+        // before its streams, so a row that shows its data means the control
+        // row has moved and this check fails; a write after the row read loses
+        // the version CAS of the post below.
+        if (!(await this.controlHoldsPin(connector, target))) break;
+        // No pin yet: the row is done only if an earlier delete head holds it.
+        // A pin: done once the row's delete history reaches it.
+        const done =
+          pin === undefined ? deleteMarker : lastDeleteVersion >= pin;
+        if (done) break;
+        const version = row.found ? row.version + 1 : 1;
+        // A delete head requires no old head, schema, or control-generation lookup.
+        const clear = encodeHead({
+          format: HEAD_FORMAT,
+          connector,
+          ns: target.ns,
+          stream: target.stream,
+          generation: 1,
+          keyCheck,
+          lastDeleteVersion: version,
+          complete: false,
+          observedAt: this.now(),
+          parts: [],
+          primaryKey: ["id"],
+          profile: { key: null, version: "0.0.0" },
+          recordCount: 0,
+        });
+        const digest = await digestHead(this.hashes.keccak256, clear);
+        await this.options.blobs.put(
+          `${scope}/${digest.blobName}`,
+          await this.options.keys.encrypt(scope, clear),
+        );
+        const request = await this.sign(
+          scope,
+          digest.dataHash,
+          deleteMetadataHash(scope, version),
+          version,
+        );
+        await this.withState((state) => {
+          const intent = state.deletes?.[connector];
+          if (!intent?.streams) return;
+          state.deletes![connector] = {
+            ...intent,
+            streams: intent.streams.map((entry) =>
+              entry.ns === target.ns && entry.stream === target.stream
+                ? { ...entry, pin: version }
+                : entry,
+            ),
+          };
+        });
         let conflict = false;
         try {
           conflict =
             (await this.options.registry.post(request)).kind === "conflict";
         } catch (error) {
-          // Ambiguous replies retain the exact signed request for replay after restart.
+          // An ambiguous reply keeps the pin: a restart reads the row to learn if it landed.
           if (!(error instanceof RegistryRefusedError && error.status === 409))
             throw error;
           conflict = true;
         }
-        if (!conflict) {
-          await this.observeDelete(
-            connector,
-            stream,
-            Number(request.expectedVersion),
-          );
-          await this.withState((state) => {
-            delete state.streamDeletes![connector]![stream];
-          });
-          break;
-        }
+        if (!conflict) continue; // the next read shows the delete history
         await new Promise<void>((resolve) =>
           setTimeout(resolve, Math.min(10 * 2 ** attempt, 1000)),
         );
@@ -871,25 +969,41 @@ export class StreamSyncWriter {
           throw new Error("stream delete pending after version conflicts");
       }
     }
-    await this.withState((state) => {
-      delete state.streamDeletes?.[connector];
-    });
+  }
+
+  /** True while the control row of the stream's namespace is as the intent saw it. */
+  private async controlHoldsPin(
+    connector: string,
+    target: StreamPin,
+  ): Promise<boolean> {
+    return sameControl(
+      await this.readControl(connector, target.ns),
+      target.control,
+    );
   }
 
   /**
-   * Tombstone each pinned control row. A fresh delete must end deleted; if a
-   * pin's tombstone did not land, the intent is dropped and the delete throws
-   * `ConnectionDeleteSuperseded`. A resumed delete ends with its intent
-   * cleared whatever the rows show (it never tombstones a reconnect). Errors
-   * from the registry leave the intent for a later pass.
+   * Land the stream deletes, then tombstone each pinned control row. A fresh
+   * delete must end deleted; if a pin's tombstone did not land, the intent is
+   * dropped and the delete throws `ConnectionDeleteSuperseded`. A resumed
+   * delete ends with its intent cleared whatever the rows show (it never
+   * tombstones a reconnect). Errors from the registry leave the intent for a
+   * later pass.
    */
   private async runDelete(
     connector: string,
-    pins: readonly DeletePin[],
+    intent: DeleteIntent,
     fresh: boolean,
   ): Promise<void> {
+    if (intent.streams?.length && !intent.streamsLanded) {
+      await this.deleteStreamRows(connector, intent.streams);
+      await this.withState((state) => {
+        const open = state.deletes?.[connector];
+        if (open) state.deletes![connector] = { ...open, streamsLanded: true };
+      });
+    }
     const { control } = await this.keys();
-    for (const pin of pins) {
+    for (const pin of intent.pins) {
       const request = await this.sign(
         controlScope(connector, pin.ns),
         control.tombstoneData,
@@ -908,7 +1022,7 @@ export class StreamSyncWriter {
         throw new ConnectionDeleteSuperseded(connector);
       }
     }
-    await this.purgeConnector(connector, pins);
+    await this.purgeConnector(connector, intent.pins);
     await this.withState((state) => {
       delete state.deletes?.[connector];
     });
@@ -918,8 +1032,8 @@ export class StreamSyncWriter {
    * Remove this device's local copies of the connector's data once its
    * tombstones landed: the runs (in flight or finished) that started under a
    * generation the delete ended, their results, and the connector's checkpoint
-   * and `needsFull` entries. A run that started after a reconnect (a higher
-   * generation than the pin) is kept. A run in flight that is removed is gone:
+   * and `needsFull` entries, then the legacy scope files (`eraseLegacy`). A run
+   * that started after a reconnect (a higher generation than the pin) is kept. A run in flight that is removed is gone:
    * its later calls are refused and nothing of it publishes.
    */
   private async purgeConnector(
@@ -960,6 +1074,7 @@ export class StreamSyncWriter {
         (entry) => entry.connector !== connector,
       );
     });
+    await this.options.eraseLegacy?.(connector);
   }
 
   /**
@@ -973,7 +1088,7 @@ export class StreamSyncWriter {
   /** Finish the stored delete intent of `connector`, if one is open. */
   private async finishDelete(connector: string): Promise<void> {
     const intent = (await this.readState()).deletes?.[connector];
-    if (intent) await this.runDelete(connector, intent.pins, false);
+    if (intent) await this.runDelete(connector, intent, false);
   }
 
   /**
@@ -983,13 +1098,11 @@ export class StreamSyncWriter {
    */
   private async resumeDeletes(): Promise<PendingDelete[]> {
     const pending: PendingDelete[] = [];
-    for (const connector of Object.keys({
-      ...(await this.readState()).deletes,
-      ...(await this.readState()).streamDeletes,
-    })) {
+    for (const connector of Object.keys(
+      (await this.readState()).deletes ?? {},
+    )) {
       try {
         await this.finishDelete(connector);
-        await this.finishStreamDeletes(connector);
       } catch (error) {
         pending.push({
           connector,
@@ -2057,7 +2170,7 @@ export class StreamSyncWriter {
         ? row.version
         : (head?.lastDeleteVersion ?? 0);
     await this.observeDelete(connector, stream, lastDeleteVersion);
-    return { row, rowKind, head, lastDeleteVersion };
+    return { row, rowKind, head, lastDeleteVersion, deleteMarker };
   }
 
   /** Called after the read mirror durably observes delete history, before collection can start. */

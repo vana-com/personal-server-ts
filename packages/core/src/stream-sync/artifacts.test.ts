@@ -5,6 +5,7 @@ import {
   documentDigest,
   manifestArtifact,
   manifestArtifactResolver,
+  manifestStreamLister,
 } from "./artifacts.js";
 
 const MANIFEST = JSON.stringify({
@@ -117,5 +118,30 @@ describe("artifactResolver", () => {
     ]);
     expect(await resolve(sha("one"))).not.toBeNull();
     expect(await resolve("one")).toBeNull();
+  });
+});
+
+describe("manifestStreamLister", () => {
+  it("lists the streams a connector declares, from the manifest's own key", () => {
+    const list = manifestStreamLister([MANIFEST]);
+    expect(list("github-browser")).toEqual(["profile", "events"]);
+    expect(list("other")).toEqual([]);
+  });
+
+  it("joins the streams of every verified version and skips a malformed document", () => {
+    const next = JSON.stringify({
+      connector_key: "github-browser",
+      version: "0.4.0",
+      streams: [
+        { name: "profile", primary_key: ["id"] },
+        { name: "stars", primary_key: ["id"] },
+      ],
+    });
+    const list = manifestStreamLister([MANIFEST, "not json", next]);
+    expect(list("github-browser").sort()).toEqual([
+      "events",
+      "profile",
+      "stars",
+    ]);
   });
 });

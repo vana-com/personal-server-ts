@@ -137,6 +137,7 @@ async function openLite(opts: {
   readFiles?: ReturnType<typeof createMemoryStreamSyncReadFiles>;
 }) {
   return createPsLiteSyncManager({
+    streamSyncDeclaredStreams: () => [],
     config: ServerConfigSchema.parse({
       sync: { enabled: true },
       streamSync: { read: true, write: true },

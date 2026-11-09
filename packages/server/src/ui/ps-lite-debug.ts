@@ -225,6 +225,8 @@ async function makePersonalServer(
       builderToken: BUILDER_TOKEN,
     }),
     active: true,
+    // The debug page verifies no connector manifests.
+    streamSyncDeclaredStreams: () => [],
     gateway: undefined,
     accessToken: CONTROL_PLANE_TOKEN,
     relay: relayConfig,

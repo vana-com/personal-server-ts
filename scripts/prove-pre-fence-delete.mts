@@ -94,7 +94,7 @@ for (const checkout of checkouts) {
   await warm.observe(rig.gateway.feed(), { fromStart: true, lastPage: true });
   await warm.importPending();
   await collect("stale");
-  await rig.writer.deleteStreams(CONNECTOR, ["items"]);
+  await rig.deleteStreamHeadsOnly();
   const crypto = await import(
     pathToFileURL(`${path}/packages/core/dist/stream-sync/crypto.js`).href
   );
