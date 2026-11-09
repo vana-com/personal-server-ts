@@ -54,13 +54,25 @@ export interface ImportTransaction {
    */
   hasPart(sha256: string, expectedBytes?: number): Promise<boolean>;
   putPart(sha256: string, clear: Uint8Array): Promise<void>;
-  /** Make `version` current. Every part of `head` must be stored first. */
+  /**
+   * Make `version` current. Every part of `head` must be stored first.
+   * `lastComplete` is the complete head an incomplete `head` replaced, when
+   * this store has not seen it: its parts must be stored too.
+   */
   commit(
     version: number,
     dataHash: string,
     headBytes: Uint8Array,
     head: Head,
+    lastComplete?: LastCompleteHead,
   ): Promise<void>;
+}
+
+export interface LastCompleteHead {
+  readonly version: number;
+  readonly dataHash: string;
+  readonly headBytes: Uint8Array;
+  readonly head: Head;
 }
 
 const encoder = new TextEncoder();
@@ -148,64 +160,67 @@ export class ViewStore {
       const pointer = JSON.parse(
         decoder.decode((await files.read(path))!),
       ) as CurrentFile;
-      const headBytes = await files.read(
-        `${dir(key)}/heads/${pointer.version}.json`,
-      );
-      if (!headBytes) {
-        await files.remove(path);
-        continue;
-      }
-      const decoded = decodeHead(headBytes);
-      if (decoded.kind !== "ok") continue;
-      // A restore can bring back a pointer without all its parts. Drop the
-      // pointer so the stream imports again; surviving parts stay reusable.
-      let complete = true;
-      for (const part of decoded.head.parts) {
-        if (!(await store.partExists(key, part.hash))) {
-          complete = false;
-          break;
-        }
-      }
-      if (!complete) {
-        await files.remove(path);
-        continue;
-      }
       const id = viewKeyId(key);
-      store.keys.set(id, key);
-      store.current.set(id, {
-        version: pointer.version,
-        dataHash: pointer.dataHash,
-        head: decoded.head,
-      });
-      if (decoded.head.complete) store.complete.set(id, store.current.get(id)!);
-      else if (pointer.completeVersion !== undefined) {
-        const bytes = await files.read(
-          `${dir(key)}/heads/${pointer.completeVersion}.json`,
-        );
-        if (bytes) {
-          const prior = decodeHead(bytes);
-          if (
-            prior.kind === "ok" &&
-            prior.head.complete &&
-            (
-              await Promise.all(
-                prior.head.parts.map((p) => store.partExists(key, p.hash)),
-              )
-            ).every(Boolean)
-          ) {
-            if (pointer.completeDataHash)
-              store.complete.set(id, {
-                version: pointer.completeVersion,
-                dataHash: pointer.completeDataHash,
-                head: prior.head,
-              });
-          }
-        }
+      // The complete pointer stands on its own: load it before a damaged
+      // current view is discarded, so a lost incomplete cache hides nothing.
+      const fallback = await store.loadComplete(key, pointer);
+      const current = await store.loadCurrent(key, pointer);
+      // A restore can bring back a pointer without all its parts. With no
+      // complete head to keep either, drop the pointer so the stream imports
+      // again; surviving parts stay reusable.
+      if (!current && !fallback) {
+        await files.remove(path);
+        continue;
       }
+      if (current || fallback) store.keys.set(id, key);
+      if (current) store.current.set(id, current);
+      if (fallback) store.complete.set(id, fallback);
+      else if (current?.head.complete) store.complete.set(id, current);
       // Versions left behind by a crash between pointer write and cleanup.
       await store.collect(key);
     }
     return store;
+  }
+
+  /** The head at `version`, when it is intact with all its parts. */
+  private async loadIntact(
+    key: ViewKey,
+    version: number,
+    dataHash: string,
+    mustBeComplete: boolean,
+  ): Promise<ImportedVersion | null> {
+    const bytes = await this.files.read(`${dir(key)}/heads/${version}.json`);
+    if (!bytes) return null;
+    const decoded = decodeHead(bytes);
+    if (decoded.kind !== "ok") return null;
+    if (mustBeComplete && !decoded.head.complete) return null;
+    for (const part of decoded.head.parts) {
+      if (!(await this.partExists(key, part.hash))) return null;
+    }
+    return { version, dataHash, head: decoded.head };
+  }
+
+  private loadCurrent(key: ViewKey, pointer: CurrentFile) {
+    return this.loadIntact(key, pointer.version, pointer.dataHash, false);
+  }
+
+  /** The complete head the pointer names, if the current head is not it. */
+  private async loadComplete(
+    key: ViewKey,
+    pointer: CurrentFile,
+  ): Promise<ImportedVersion | null> {
+    if (
+      pointer.completeVersion === undefined ||
+      !pointer.completeDataHash ||
+      pointer.completeVersion === pointer.version
+    )
+      return null;
+    return this.loadIntact(
+      key,
+      pointer.completeVersion,
+      pointer.completeDataHash,
+      true,
+    );
   }
 
   /** The import revision of one stream of one connector (all namespaces). */
@@ -275,8 +290,8 @@ export class ViewStore {
         hasPart: (sha256, expectedBytes) =>
           this.hasPart(key, sha256, expectedBytes),
         putPart: (sha256, clear) => this.putPart(key, sha256, clear),
-        commit: (version, dataHash, headBytes, head) =>
-          this.commit(key, version, dataHash, headBytes, head),
+        commit: (version, dataHash, headBytes, head, lastComplete) =>
+          this.commit(key, version, dataHash, headBytes, head, lastComplete),
       }),
     );
   }
@@ -296,12 +311,24 @@ export class ViewStore {
     dataHash: string,
     headBytes: Uint8Array,
     head: Head,
+    lastComplete?: LastCompleteHead,
   ): Promise<void> {
     const base = dir(key);
     await this.files.write(`${base}/heads/${version}.json`, headBytes);
-    const complete = head.complete
-      ? { version, dataHash, head }
-      : this.getComplete(key);
+    const known = this.getComplete(key);
+    let complete: ImportedVersion | null;
+    if (head.complete) complete = { version, dataHash, head };
+    else if (lastComplete && (!known || known.version < lastComplete.version)) {
+      await this.files.write(
+        `${base}/heads/${lastComplete.version}.json`,
+        lastComplete.headBytes,
+      );
+      complete = {
+        version: lastComplete.version,
+        dataHash: lastComplete.dataHash,
+        head: lastComplete.head,
+      };
+    } else complete = known;
     const pointer: CurrentFile = {
       version,
       dataHash,
@@ -336,16 +363,18 @@ export class ViewStore {
 
   /**
    * Lease the current version, or `at` when given. `null` when there is no
-   * such version: nothing imported, or `at` was retired.
+   * such version: nothing imported, or `at` was retired. Only a caller that
+   * reads stream heads exclusively (`includeComplete`) may lease the retained
+   * complete head; for everyone else it retires like any older version.
    */
-  lease(key: ViewKey, at?: number): ViewLease | null {
+  lease(key: ViewKey, at?: number, includeComplete = false): ViewLease | null {
     const id = viewKeyId(key);
     const current = this.current.get(id);
     let version: ImportedVersion | undefined;
     if (at === undefined || current?.version === at) version = current;
     else
       version =
-        this.complete.get(id)?.version === at
+        includeComplete && this.complete.get(id)?.version === at
           ? this.complete.get(id)
           : this.retained.get(id)?.get(at);
     if (!version) return null;

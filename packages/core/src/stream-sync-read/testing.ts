@@ -91,6 +91,8 @@ export interface TestHeadInput {
   readonly prefixes?: readonly string[];
   /** Encrypt the head with this key instead (a foreign or wrong key). */
   readonly encryptWith?: TestOwnerKey;
+  /** Write a format 3 head that names the complete head it replaced. */
+  readonly lastComplete?: { version: number; dataHash: string };
 }
 
 export interface TestHead {
@@ -133,7 +135,10 @@ export async function buildTestHead(input: TestHeadInput): Promise<TestHead> {
   const head: Head = {
     complete: input.complete ?? true,
     connector: input.connector,
-    format: 1,
+    format: input.lastComplete ? 3 : 1,
+    ...(input.lastComplete
+      ? { lastDeleteVersion: 0, lastComplete: input.lastComplete }
+      : {}),
     generation: input.generation,
     keyCheck: encryptor.keyCheck,
     ns: input.ns,

@@ -2225,11 +2225,20 @@ export class StreamSyncWriter {
       replacesBase: decision.kind === "publish" && decision.replacesBase,
       floor: decision.floor,
     };
+    // An incomplete head names the last complete head it replaces, so a reader
+    // that never saw that head can still serve it.
+    const lastComplete =
+      complete || choice.kind !== "base" || !row.found
+        ? undefined
+        : choice.head.complete
+          ? { version: row.version, dataHash: row.dataHash.toLowerCase() }
+          : choice.head.lastComplete;
     const clear = encodeHead({
       complete,
       connector: entry.connector,
       format: HEAD_FORMAT,
       lastDeleteVersion,
+      ...(lastComplete ? { lastComplete } : {}),
       generation: target,
       keyCheck,
       ns,

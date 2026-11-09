@@ -144,3 +144,53 @@ describe("one-store canonical boundary", () => {
     },
   );
 });
+
+describe("switched listing", () => {
+  it("lists the stream scope with its collection time and total", async () => {
+    const { list } = await setup();
+    const listing = await list();
+    expect(listing.total).toBe(1);
+    expect(listing.scopes).toEqual([
+      {
+        scope: "pdpp.acme.items",
+        latestCollectedAt: expect.any(String),
+        versionCount: 0,
+      },
+    ]);
+  });
+
+  it("lists only what the caller's grant covers, and what it lists it can read", async () => {
+    const covered = await setup({
+      listAuth: { grantedScopes: ["pdpp.acme.items"] },
+      grantee: true,
+    });
+    const listed = names(await covered.list());
+    expect(listed).toEqual(["pdpp.acme.items"]);
+    for (const scope of listed)
+      expect((await covered.read(scope)).status).toBe(200);
+
+    const other = await setup({
+      listAuth: { grantedScopes: ["pdpp.other.things"] },
+      grantee: true,
+    });
+    expect(names(await other.list())).toEqual([]);
+  });
+
+  it("does not list a scope the same caller cannot read", async () => {
+    const { list, read } = await setup({
+      seed: async (f, ns) => {
+        await f.publish({
+          connector: "acme",
+          ns,
+          stream: "items",
+          generation: 1,
+          records: [{ id: "a" }],
+          complete: false,
+          observedAt: HEAD_AT,
+        });
+      },
+    });
+    expect((await read("pdpp.acme.items")).status).toBe(404);
+    expect(names(await list())).toEqual([]);
+  });
+});

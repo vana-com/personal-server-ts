@@ -24,6 +24,8 @@ import {
   streamScope,
   verifyHead,
   type ControlHashes,
+  type Head,
+  type LastComplete,
   type ControlState,
   type StreamRow,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -41,6 +43,7 @@ import type {
 import {
   isUsableViewKey,
   viewKeyId,
+  type LastCompleteHead,
   type ViewKey,
   type ViewStore,
 } from "./view-store.js";
@@ -230,7 +233,11 @@ export class StreamSyncImporter {
           continue;
         }
         const imported = this.servableView(key);
-        if (imported && imported.version >= row.version) {
+        if (
+          imported &&
+          imported.version >= row.version &&
+          !this.missesLastComplete(key, imported.head)
+        ) {
           this.issues.delete(id);
           continue;
         }
@@ -307,34 +314,61 @@ export class StreamSyncImporter {
     if ((head.lastDeleteVersion ?? 0) > 0)
       await this.options.mirror.recordDelete(scope, head.lastDeleteVersion!);
     if (!deleted && head.generation !== generation) return;
+    let fallbackProblem: Problem | null = null;
     await views.withImport(key, async (tx) => {
-      for (const part of head.parts) {
-        if (await tx.hasPart(part.hash, part.bytes)) continue;
-        const partCipher = await blobs.get(
-          `${scope}/${partBlobName(head.generation, part.hash)}`,
-        );
-        if (!partCipher)
-          throw new Problem("blob_missing", "part blob not found");
-        const partClear = await decrypt(keys, scope, partCipher);
+      const storeParts = async (h: Head) => {
+        for (const part of h.parts) {
+          if (await tx.hasPart(part.hash, part.bytes)) continue;
+          const partCipher = await blobs.get(
+            `${scope}/${partBlobName(h.generation, part.hash)}`,
+          );
+          if (!partCipher)
+            throw new Problem("blob_missing", "part blob not found");
+          const partClear = await decrypt(keys, scope, partCipher);
+          try {
+            if (h.format === 1) {
+              await decodePart(
+                keys.hashes.sha256,
+                partClear,
+                part,
+                h.primaryKey,
+              );
+            } else {
+              // Format 2: the part hash commits to the bytes. Frame structure
+              // spans parts, so it is checked as the view is read.
+              await checkPartBytes(keys.hashes.sha256, partClear, part);
+            }
+          } catch (error) {
+            throw new Problem("corrupt", `part: ${(error as Error).message}`);
+          }
+          await tx.putPart(part.hash, partClear);
+        }
+      };
+      await storeParts(head);
+      // This device may never have seen the complete head an incomplete one
+      // replaced. Fetch it by the name the head records. A failure never
+      // blocks the current head; it is reported and the next pass retries.
+      let lastComplete: LastCompleteHead | undefined;
+      if (this.missesLastComplete(key, head) && head.lastComplete) {
         try {
-          if (head.format === 1) {
-            await decodePart(
-              keys.hashes.sha256,
-              partClear,
-              part,
-              head.primaryKey,
-            );
-          } else {
-            // Format 2: the part hash commits to the bytes. Frame structure
-            // spans parts, so it is checked as the view is read.
-            await checkPartBytes(keys.hashes.sha256, partClear, part);
+          const found = await this.fetchLastComplete(
+            scope,
+            key,
+            head.lastComplete,
+            generation,
+          );
+          if (found) {
+            await storeParts(found.head);
+            lastComplete = found;
           }
         } catch (error) {
-          throw new Problem("corrupt", `part: ${(error as Error).message}`);
+          fallbackProblem =
+            error instanceof Problem
+              ? error
+              : new Problem("transient", (error as Error).message);
         }
-        await tx.putPart(part.hash, partClear);
       }
-      await tx.commit(row.version, row.dataHash, clear, head);
+      await tx.commit(row.version, row.dataHash, clear, head, lastComplete);
     });
     // The current pointer is durable: tell the overlay source what it holds.
     await this.acknowledge(key, {
@@ -342,6 +376,50 @@ export class StreamSyncImporter {
       dataHash: row.dataHash,
       generation: head.generation,
     });
+    if (fallbackProblem) throw fallbackProblem;
+  }
+
+  /**
+   * An incomplete head names the complete head it replaced; true while this
+   * store holds no complete head at or after it that is still servable.
+   */
+  private missesLastComplete(key: ViewKey, head: Head): boolean {
+    const last = head.lastComplete;
+    if (head.complete || !last) return false;
+    const scope = streamScope(key.connector, key.ns, key.stream);
+    if (last.version <= this.options.mirror.deletionFloor(scope)) return false;
+    return (this.options.views.getComplete(key)?.version ?? 0) < last.version;
+  }
+
+  /** The verified complete head `last` names, or `null` when it is not usable. */
+  private async fetchLastComplete(
+    scope: string,
+    key: ViewKey,
+    last: LastComplete,
+    generation: number | null,
+  ): Promise<LastCompleteHead | null> {
+    const { blobs, keys } = this.options;
+    const cipher = await blobs.get(`${scope}/${headBlobName(last.dataHash)}`);
+    if (!cipher)
+      throw new Problem("blob_missing", "last complete head not found");
+    const clear = await decrypt(keys, scope, cipher);
+    const verified = await verifyHead(keys.hashes.keccak256, clear, {
+      dataHash: last.dataHash,
+      connector: key.connector,
+      ns: key.ns,
+      stream: key.stream,
+      keyCheck: keys.keyCheck,
+    });
+    if (verified.kind !== "ok")
+      throw new Problem("corrupt", `last complete head ${verified.kind}`);
+    const head = verified.head;
+    if (!head.complete || head.generation !== generation) return null;
+    return {
+      version: last.version,
+      dataHash: last.dataHash,
+      headBytes: clear,
+      head,
+    };
   }
 }
 

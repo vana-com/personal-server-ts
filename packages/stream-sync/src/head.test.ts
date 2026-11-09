@@ -107,6 +107,36 @@ describe("head", () => {
     );
   });
 
+  it("round-trips lastComplete on an incomplete format 3 head only", () => {
+    const lastComplete = { version: 4, dataHash: `0x${"ab".repeat(32)}` };
+    const incomplete: Head = {
+      ...head,
+      complete: false,
+      format: 3,
+      lastDeleteVersion: 0,
+      lastComplete,
+    };
+    expect(decodeHead(encodeHead(incomplete))).toEqual({
+      kind: "ok",
+      head: incomplete,
+    });
+    expect(() => encodeHead({ ...incomplete, complete: true })).toThrow(
+      InvalidArgumentError,
+    );
+    expect(() =>
+      encodeHead({
+        ...incomplete,
+        lastComplete: { ...lastComplete, version: 0 },
+      }),
+    ).toThrow(InvalidArgumentError);
+    expect(() =>
+      encodeHead({
+        ...incomplete,
+        lastComplete: { ...lastComplete, dataHash: "ab".repeat(32) },
+      }),
+    ).toThrow(InvalidArgumentError);
+  });
+
   it("refuses to write a head readers would reject", () => {
     expect(() => encodeHead({ ...head, generation: 0 })).toThrow(
       InvalidArgumentError,

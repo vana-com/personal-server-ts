@@ -1265,14 +1265,14 @@ export class StreamSyncReadService {
               return { kind: "cursor_stale" };
             }
           } else {
-            lease = this.views.lease(key, pin!.b);
+            lease = this.views.lease(key, pin!.b, completeOnly);
             if (!lease) {
               releaseAll();
               return { kind: "cursor_stale" };
             }
           }
         } else if (currentLive) {
-          lease = this.views.lease(key, current!.version);
+          lease = this.views.lease(key, current!.version, completeOnly);
         }
         if (lease) leases.push(lease);
         if (

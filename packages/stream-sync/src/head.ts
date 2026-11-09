@@ -44,6 +44,12 @@ export interface HeadProfile {
   readonly version: string;
 }
 
+export interface LastComplete {
+  readonly version: number;
+  /** Registry form: `0x` + 64 lowercase hex. */
+  readonly dataHash: string;
+}
+
 export interface Head {
   readonly complete: boolean;
   readonly connector: string;
@@ -52,6 +58,13 @@ export interface Head {
   readonly generation: number;
   /** Version of the last tombstone; absent on pre-fence heads means zero. */
   readonly lastDeleteVersion?: number;
+  /**
+   * Format 3, incomplete heads only: the registry version and data hash of the
+   * last complete head of this generation that this head replaced. A reader
+   * that never saw that head can still fetch it, so a stream whose newest
+   * publish is incomplete stays readable at its last complete head.
+   */
+  readonly lastComplete?: LastComplete;
   readonly keyCheck: string;
   readonly ns: string;
   readonly observedAt: number;
@@ -99,7 +112,13 @@ function headProblem(
   format: HeadFormat,
 ): string | null {
   const fields =
-    format === 3 ? [...HEAD_FIELDS, "lastDeleteVersion"].sort() : HEAD_FIELDS;
+    format === 3
+      ? [
+          ...HEAD_FIELDS,
+          "lastDeleteVersion",
+          ...(hasOwn(value, "lastComplete") ? ["lastComplete"] : []),
+        ].sort()
+      : HEAD_FIELDS;
   if (!exactKeys(value, fields)) {
     return `fields must be exactly: ${fields.join(", ")}`;
   }
@@ -107,6 +126,19 @@ function headProblem(
   if (format === 3 && !isCount(v["lastDeleteVersion"], 0))
     return "lastDeleteVersion must be a non-negative safe integer";
   if (typeof v["complete"] !== "boolean") return "complete must be a boolean";
+  if (hasOwn(v, "lastComplete")) {
+    const last = v["lastComplete"];
+    if (v["complete"] !== false)
+      return "lastComplete is only allowed on an incomplete head";
+    if (
+      !isPlainObject(last) ||
+      !exactKeys(last, ["dataHash", "version"]) ||
+      !isCount(last["version"], 1) ||
+      typeof last["dataHash"] !== "string" ||
+      !/^0x[0-9a-f]{64}$/.test(last["dataHash"])
+    )
+      return "lastComplete must be {dataHash: 0x + 64 hex, version: positive integer}";
+  }
   const connector = v["connector"];
   if (
     typeof connector !== "string" ||
@@ -210,6 +242,14 @@ function toWire(head: Head): Record<string, unknown> {
     format: head.format,
     generation: String(head.generation),
     ...(head.format === 3 ? { lastDeleteVersion: head.lastDeleteVersion } : {}),
+    ...(head.format === 3 && head.lastComplete
+      ? {
+          lastComplete: {
+            dataHash: head.lastComplete.dataHash,
+            version: head.lastComplete.version,
+          },
+        }
+      : {}),
     keyCheck: head.keyCheck,
     ns: head.ns,
     observedAt: head.observedAt,
@@ -313,6 +353,9 @@ export function decodeHead(bytes: Uint8Array): DecodedHead {
       generation: Number(p["generation"]),
       ...(format === 3
         ? { lastDeleteVersion: p["lastDeleteVersion"] as number }
+        : {}),
+      ...(format === 3 && hasOwn(p, "lastComplete")
+        ? { lastComplete: p["lastComplete"] as LastComplete }
         : {}),
       keyCheck: p["keyCheck"] as string,
       ns: p["ns"] as string,
