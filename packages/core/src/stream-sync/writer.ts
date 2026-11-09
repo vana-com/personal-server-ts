@@ -1332,6 +1332,16 @@ export class StreamSyncWriter {
     return isStoppedState(await this.readState(), connector);
   }
 
+  /**
+   * Whether a connection delete is on record for `connector`, by any device:
+   * reads the control rows first, so a delete this device has not yet seen is
+   * seen here. The legacy importer asks this before it stages a connector.
+   */
+  async connectionDeleted(connector: string): Promise<boolean> {
+    await this.refreshControls();
+    return this.isStopped(connector);
+  }
+
   /** Finish the stored delete intent of `connector`, if one is open. */
   private async finishDelete(connector: string): Promise<void> {
     const intent = (await this.readState()).deletes?.[connector];
@@ -2523,6 +2533,11 @@ export class StreamSyncWriter {
     if (!seed) return false;
     const { connector } = host.entry;
     const state = await this.readState();
+    // A recorded connection delete retires every seed of the connector, one
+    // staged after the delete too: a crash between the tombstones and the
+    // legacy erase must not let an old seed publish. Keyed on the delete
+    // record, not on a stream row.
+    if (isStoppedState(state, connector)) return true;
     const admitted = host.seedStaged?.[name];
     if (
       admitted !== undefined &&

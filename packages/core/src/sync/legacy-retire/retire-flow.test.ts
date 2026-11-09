@@ -62,11 +62,17 @@ describe("retire reads the published heads only (RETIRE_ON_SPOOL, READBACK_ON_SP
 describe("the delete fence (IMPORT_IGNORES_FENCE, DEVICE_ONLY_RETIRED_EARLY)", () => {
   it("does not import rows of a stream that was deleted", async () => {
     const f = await flow({ seed: ["e0", "e1"], local: ["e0", "e1"] });
+    // The connection is live (control row written) before the delete.
+    await f.run("pre", ["e0"], true, true);
     await f.rig.other.deleteConnection(CONNECTOR);
     await f.importer.run();
-    await f.run("learn", ["x"], false, true);
+    // The explicit connect is the first run after the delete. Its first
+    // collection predates this device's read of the delete, so the publish
+    // fence discards it; the next run collects after the delete.
+    await f.run("live", ["e9"], false, true);
     await f.rig.publish();
-    await f.run("live", ["e9"]);
+    await f.importer.run();
+    await f.run("again", ["e9"]);
     await f.rig.publish();
     const head = await f.rig.registeredHead(STREAM);
     expect(head?.recordCount).toBe(1);
@@ -74,6 +80,42 @@ describe("the delete fence (IMPORT_IGNORES_FENCE, DEVICE_ONLY_RETIRED_EARLY)", (
       .at(-1)!
       .lines.map((l) => (l.v as { id: string }).id);
     expect(lines).toEqual(["e9"]);
+  });
+
+  it("crash after the delete tombstones but before eraseLegacy, then import: nothing comes back", async () => {
+    // The legacy erase is the last step of a connection delete. A crash before
+    // it leaves the legacy rows on the device; the import must not stage them,
+    // and the seed of the connector must not publish.
+    const f = await flow({ seed: ["e0", "e1"], local: ["e0", "e1"] });
+    await f.run("pre", ["e0"], true, true);
+    f.rig.eraseLegacyHook = async () => {
+      throw new Error("crash before eraseLegacy");
+    };
+    await expect(f.rig.other.deleteConnection(CONNECTOR)).rejects.toThrow(
+      "crash before eraseLegacy",
+    );
+    await f.importer.run();
+    await f.rig.sync();
+    await f.rig.publish();
+    expect(f.staged.size).toBe(0);
+    expect(await f.importer.importDone(CONNECTOR)).toBe(true);
+    expect((await f.rig.registeredHead(STREAM))?.recordCount ?? 0).toBe(0);
+  });
+
+  it("a new connection after a completed delete collects fresh and imports no old legacy rows", async () => {
+    const f = await flow({ seed: ["e0", "e1"], local: ["e0", "e1"] });
+    await f.run("pre", ["e0"], true, true);
+    await f.rig.other.deleteConnection(CONNECTOR);
+    await f.importer.run();
+    // The first connect collection is discarded by the fence (see above).
+    await f.run("live", ["x"], false, true);
+    await f.rig.publish();
+    await f.importer.run();
+    await f.run("again", ["e9"]);
+    await f.rig.publish();
+    expect(f.staged.size).toBe(0);
+    // Only the new record: no e0 or e1 from the legacy file.
+    expect((await f.rig.registeredHead(STREAM))?.recordCount).toBe(1);
   });
 
   it("keeps a file the fence dropped until this device re-collected the stream", async () => {

@@ -51,6 +51,12 @@ export interface LegacyImporterOptions {
   readonly ledger: RetireLedger;
   /** Whether the account is switched now; read on every call. */
   readonly switched: () => boolean;
+  /**
+   * Whether the connection of `connector` was deleted (by any device). A
+   * deleted connection's legacy rows are never staged: its import is recorded
+   * done with nothing staged, so a later reconnect does not bring them back.
+   */
+  readonly deleted?: (connector: string) => Promise<boolean>;
   readonly now?: () => Date;
   readonly logger?: {
     warn(obj: Record<string, unknown>, msg?: string): void;
@@ -101,6 +107,13 @@ export class LegacyImporter {
     let failed = 0;
     for (const connector of await source.connectors()) {
       if ((await ledger.read()).imported[connector]) continue;
+      if (await this.options.deleted?.(connector)) {
+        const at = (this.options.now?.() ?? new Date()).toISOString();
+        await ledger.update((data) => {
+          data.imported[connector] = { streams: 0, at, staged: {} };
+        });
+        continue;
+      }
       try {
         const streams = await source.streams(connector);
         // The receipt: per stream, the rows the sink says it kept.

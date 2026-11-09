@@ -83,6 +83,8 @@ export async function flow(options: {
     },
     ledger,
     switched: () => options.switched ?? true,
+    deleted: async (connector): Promise<boolean> =>
+      rig.writer.connectionDeleted(connector),
   });
   const seedSource: StreamSyncSeedSource = {
     installId: "install-1",
@@ -90,6 +92,7 @@ export async function flow(options: {
       connector === CONNECTOR
         ? [...staged.keys()].map((stream) => ({
             stream,
+            upload: "upload-1",
             primaryKey: ["id"],
             profile: { key: null, version: "1.0.0" },
           }))
@@ -98,7 +101,7 @@ export async function flow(options: {
       for (const row of staged.get(stream) ?? []) yield row;
     },
   };
-  const rig = new Rig(undefined, CONNECTOR, ["items"], {
+  const rig = new Rig(undefined, CONNECTOR, ["items"], [], {
     seedSource,
     writer: { importDone: importer.importDone },
   });

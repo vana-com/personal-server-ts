@@ -612,6 +612,10 @@ export async function createPsLiteSyncManager(
           },
           ledger: retireLedger,
           switched: () => legacyRetireSwitched(options.config),
+          deleted: async (connector) =>
+            streamSyncWriter
+              ? streamSyncWriter.connectionDeleted(connector)
+              : false,
           logger,
         })
       : null;

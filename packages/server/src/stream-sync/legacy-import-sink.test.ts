@@ -28,7 +28,10 @@ function streamOf(name: string, rows: string[]): ImportStream {
 
 async function staged(files: StreamSyncFiles, connector: string) {
   const staging = createSeedStaging(files);
-  const source = staging.source(await staging.installId(), async () => ({}));
+  const source = staging.source(await staging.installId(), async () => ({
+    receipts: {},
+    skipped: [],
+  }));
   const out: Record<string, string[]> = {};
   for (const { stream } of await source.streams(connector)) {
     const rows: { id: unknown }[] = [];

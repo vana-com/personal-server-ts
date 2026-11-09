@@ -967,6 +967,8 @@ export async function createServer(
           sink: createSeedImportSink(seedStaging),
           ledger: retireLedger,
           switched: () => legacyRetireSwitched(config),
+          deleted: async (connector) =>
+            writerForSeed ? writerForSeed.connectionDeleted(connector) : false,
           logger,
         });
         const seedSource = seedStaging.source(
