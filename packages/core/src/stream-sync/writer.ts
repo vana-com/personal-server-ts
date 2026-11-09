@@ -753,12 +753,17 @@ export class StreamSyncWriter {
     return this.publish(async () => {
       await this.finishDelete(connector);
       const pins: DeletePin[] = [];
+      // The control state of each namespace as the pin loop read it. A stream
+      // pins this state, never a later read: a reconnect between the two reads
+      // would otherwise be recorded as the state the delete started from.
+      const controls = new Map<string, ControlState>();
       for (const row of await this.options.registry.listControlRows()) {
         const parsed = parseScope(row.scope);
         if (parsed?.kind !== "control" || parsed.connector !== connector) {
           continue;
         }
         const state = await this.readControl(connector, parsed.ns);
+        controls.set(parsed.ns, state);
         if (state.kind === "active" || state.kind === "foreign") {
           pins.push({
             ns: parsed.ns,
@@ -775,10 +780,20 @@ export class StreamSyncWriter {
         streams.push({
           ns: parsed.ns,
           stream: parsed.stream,
-          control: await this.readControl(connector, parsed.ns),
+          control: controls.get(parsed.ns) ?? { kind: "absent" },
         });
       }
-      if (pins.length === 0 && streams.length === 0) return;
+      if (pins.length === 0 && streams.length === 0) {
+        // The registry lists nothing, so there is nothing to erase there. The
+        // device may still hold runs, results and a seed target for the
+        // connection (collected while the registry was out of reach): they
+        // must not publish later.
+        await this.purgeConnector(connector, []);
+        await this.withState((state) => {
+          delete state.seedTargets[connector];
+        });
+        return;
+      }
       const intent: DeleteIntent = { pins, streams };
       await this.withState((state) => {
         (state.deletes ??= {})[connector] = intent;
@@ -803,8 +818,6 @@ export class StreamSyncWriter {
     for (const target of streams) {
       const scope = streamScope(connector, target.ns, target.stream);
       for (let attempt = 0; attempt < CONFLICTS_PER_PASS; attempt += 1) {
-        // Re-issue only while the control row is as the intent saw it.
-        if (!(await this.controlHoldsPin(connector, target))) break;
         const pin = (await this.readState()).deletes?.[
           connector
         ]?.streams?.find(
@@ -812,6 +825,12 @@ export class StreamSyncWriter {
         )?.pin;
         const { row, deleteMarker, lastDeleteVersion } =
           await this.readStreamRow(connector, target.ns, target.stream, true);
+        // Re-issue only while the control row is as the intent saw it. The
+        // check comes after the row read: a reconnect writes its control row
+        // before its streams, so a row that shows its data means the control
+        // row has moved and this check fails; a write after the row read loses
+        // the version CAS of the post below.
+        if (!(await this.controlHoldsPin(connector, target))) break;
         // No pin yet: the row is done only if an earlier delete head holds it.
         // A pin: done once the row's delete history reaches it.
         const done =

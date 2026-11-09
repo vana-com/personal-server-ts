@@ -294,3 +294,70 @@ it("a head that lands under the old generation after the listing is not served a
   const items = await r.service.resolve(ask("pdpp.acme.items"));
   expect(items.kind).toBe("view");
 });
+
+/**
+ * A connection deleted on device B; device A's delete starts after it. While A
+ * works, B reconnects and publishes. `when` names the stream-row read of A at
+ * which the reconnect lands: the 1st is the registry listing, the 2nd is the
+ * read that A signs over.
+ */
+async function reconnectDuringDelete(when: 1 | 2) {
+  const r = await publishedBase();
+  await r.other.deleteConnection(CONNECTOR);
+  expect(await control(r)).toMatchObject({ version: 2 });
+  let reads = 0;
+  r.gateway.beforeRead = async (scope) => {
+    if (parseScope(scope)?.kind !== "stream") return;
+    reads += 1;
+    if (reads !== when) return;
+    r.gateway.beforeRead = undefined;
+    const onB = { otherDevice: true, userConnect: true };
+    await r.collect({ ...spec("learn", true), ...onB });
+    await r.collect({ ...spec("reborn", true), ...onB });
+  };
+  await r.writer.deleteConnection(CONNECTOR);
+  expect(reads).toBe(when);
+  return r;
+}
+
+it("a reconnect between the delete's control check and its stream read is not erased (mutant: CONTROL_CHECK_BEFORE_ROW_READ)", async () => {
+  const r = await reconnectDuringDelete(2);
+  expect(await control(r)).toMatchObject({ version: 3, deleted: false });
+  // Both runs of the reconnect are still there, and no delete head follows them.
+  expect(await r.registeredHead()).toMatchObject({
+    recordCount: 2,
+    lastDeleteVersion: 2,
+  });
+});
+
+it("a reconnect between the delete's control pin and its stream listing is not erased (mutant: STREAM_PIN_FROM_LATER_READ)", async () => {
+  const r = await reconnectDuringDelete(1);
+  expect(await control(r)).toMatchObject({ version: 3, deleted: false });
+  expect(await r.registeredHead()).toMatchObject({
+    recordCount: 2,
+    lastDeleteVersion: 2,
+  });
+});
+
+it("a delete with nothing in the registry still stops what this device collected (mutant: EMPTY_REGISTRY_DELETE_KEEPS_LOCAL)", async () => {
+  const r = new Rig({
+    stream: "seed",
+    key: "id",
+    version: "1.0.0",
+    rows: [{ id: "old" }],
+  });
+  await r.open();
+  // Collected while the registry was out of reach: nothing is registered yet.
+  await r.collect(spec("offline"));
+  expect(r.gateway.log).toHaveLength(0);
+  const seedTargets = async () =>
+    JSON.parse(new TextDecoder().decode((await r.files.read("state.json"))!))
+      .seedTargets;
+  expect(Object.keys(await seedTargets())).toContain(CONNECTOR);
+  await r.writer.deleteConnection(CONNECTOR);
+  expect(await r.files.list("runs")).toEqual([]);
+  expect(await r.files.list("results")).toEqual([]);
+  expect(await seedTargets()).toEqual({});
+  await r.publish();
+  expect(r.gateway.log).toHaveLength(0);
+});
