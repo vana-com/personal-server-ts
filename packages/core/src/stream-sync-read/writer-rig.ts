@@ -184,7 +184,9 @@ export class Rig {
     seed?: SeedRows,
     readonly connector: string = CONNECTOR,
     /** The writer's logger; default none. */
-    private readonly writerLogger?: { warn(obj: Record<string, unknown>, msg?: string): void },
+    private readonly writerLogger?: {
+      warn(obj: Record<string, unknown>, msg?: string): void;
+    },
   ) {
     this.seed = seed;
     this.writer = this.device(this.files, seed);

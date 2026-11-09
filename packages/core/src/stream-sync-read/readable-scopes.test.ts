@@ -14,7 +14,7 @@ import type { MirrorFeedRow } from "./mirror.js";
 import type { FakeRun } from "./service-fixture.js";
 import { ask, Fixture, masterKey } from "./service-fixture.js";
 import { testOwnerKey } from "./testing.js";
-import { StreamSyncReadService } from "./service.js";
+import type { StreamSyncReadService } from "./service.js";
 import { ConnectorRevisions } from "./connector-revisions.js";
 import { CONNECTOR, Rig } from "./writer-rig.js";
 
