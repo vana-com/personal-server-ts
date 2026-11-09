@@ -171,6 +171,8 @@ export interface EndRequest {
   readonly coveredStreams: readonly string[];
   readonly checkpointCandidate?: Readonly<Record<string, JsonValue>> | null;
   readonly lastBatch: number;
+  /** H: streams the producer proved it read whole. PS-2 reads it; today it is ignored. */
+  readonly provenFullStreams?: readonly string[];
 }
 
 export interface EndResponse {
