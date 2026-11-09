@@ -761,48 +761,71 @@ export class StreamSyncReadService {
 
   /**
    * The scopes this caller can read from stream data, for the scope listing of
-   * a switched account. A name is listed if and only if `resolve` serves it a
-   * view for the same caller with no legacy file: the listing asks the body
-   * read's own rule, it keeps no rule of its own. Candidates are the logical
-   * stream names of every connector the mirror knows and the retained legacy
-   * names. (A first-run local-pending scope of a connector the mirror has never
-   * seen is readable by name but has no candidate here: the overlay port cannot
-   * list connectors.)
+   * a switched account. A name is listed if and only if the body read would
+   * serve this caller a view of it with no legacy file. That is decided from
+   * metadata alone (`readable`: the same `eligible()` rule and owner pending
+   * scan `decide` uses), so no view, projection or body is built. A runtime
+   * failure of the body itself (a projection that cannot be built) is a read
+   * error, not a lack of eligibility.
+   *
+   * Candidates are the retained legacy names, the logical names of every
+   * mirrored stream, and, for the owner, every stream of the overlay's runs
+   * (a known connector's new stream, and a connector the mirror has never seen).
+   *
+   * `isCovered` runs before any check, so a grantee pays only for the scopes
+   * the grant names, and an uncovered scope can never fail the list. A covered
+   * candidate whose check throws is skipped and logged: failing the whole list
+   * would hide readable scopes, and a scope whose read cannot be decided is not
+   * one the caller can read.
    */
   async readableScopes(input: {
     readonly isOwnerView: boolean;
     readonly scopePrefix?: string;
+    readonly isCovered?: (scope: string) => boolean;
   }): Promise<ReadableScope[]> {
     const names = new Set<string>(LEGACY_SCOPE_BINDINGS.keys());
-    for (const connector of this.mirror.connectors()) {
-      for (const view of this.connectionViews(connector)) {
-        for (const stream of Object.keys(view.streams)) {
-          const name = `pdpp.${connector}.${stream}`;
-          if (logicalStreamScopeParts(name)) names.add(name);
+    const addLogical = (connector: string, stream: string) => {
+      const name = `pdpp.${connector}.${stream}`;
+      if (logicalStreamScopeParts(name)) names.add(name);
+    };
+    const connectors = new Set(this.mirror.connectors());
+    if (input.isOwnerView && this.options.overlay?.connectors) {
+      for (const connector of await this.options.overlay.connectors()) {
+        connectors.add(connector);
+      }
+    }
+    for (const connector of connectors) {
+      const snapshot = input.isOwnerView
+        ? await this.snapshot(connector)
+        : NO_SNAPSHOT;
+      try {
+        for (const view of this.connectionViews(connector, snapshot)) {
+          for (const stream of Object.keys(view.streams)) {
+            addLogical(connector, stream);
+          }
         }
+        for (const run of snapshot.runs) {
+          for (const stream of run.streams) addLogical(connector, stream.name);
+        }
+      } finally {
+        snapshot.release();
       }
     }
     const listed: ReadableScope[] = [];
     for (const scope of [...names].sort()) {
       if (input.scopePrefix && !scope.startsWith(input.scopePrefix)) continue;
-      const decision = await this.resolve({
-        scope,
-        connection: null,
-        cursor: null,
-        legacyFile: false,
-        isOwnerView: input.isOwnerView,
-      });
-      if ("body" in decision) await decision.body.cancel();
-      if (decision.kind !== "view" && decision.kind !== "local_pending") {
+      if (input.isCovered && !input.isCovered(scope)) continue;
+      let newest: number | null;
+      try {
+        const found = await this.readable(scope, input.isOwnerView);
+        if (!found) continue;
+        newest = found.newest;
+      } catch (error) {
+        this.options.logger.warn(
+          { scope, error: error instanceof Error ? error.message : "unknown" },
+          "stream-sync read: scope skipped in the listing",
+        );
         continue;
-      }
-      let newest: number | null = null;
-      for (const target of readTargets(scope)) {
-        for (const view of this.connectionViews(target.connector)) {
-          if (view.latestHeadRegistration !== null) {
-            newest = Math.max(newest ?? 0, view.latestHeadRegistration);
-          }
-        }
       }
       listed.push({
         scope,
@@ -814,6 +837,64 @@ export class StreamSyncReadService {
       });
     }
     return listed;
+  }
+
+  /**
+   * Whether `resolve` would serve `scope` to this caller as a view, decided
+   * from metadata only, and the registry time of its newest head.
+   */
+  private async readable(
+    scope: string,
+    isOwnerView: boolean,
+  ): Promise<{ newest: number | null } | null> {
+    const input: ResolveInput = {
+      scope,
+      connection: null,
+      cursor: null,
+      legacyFile: false,
+      isOwnerView,
+    };
+    const known = new Set(this.mirror.connectors());
+    const all = readTargets(scope);
+    const targets = all.filter((t) => known.has(t.connector));
+    const candidates =
+      this.options.overlay && isOwnerView
+        ? all.filter((t) => !known.has(t.connector))
+        : [];
+    if (targets.length === 0 && candidates.length === 0) return null;
+    const snapshots = new Map<string, StreamSyncOverlaySnapshot>();
+    try {
+      for (const target of [...targets, ...candidates]) {
+        snapshots.set(
+          target.connector,
+          isOwnerView ? await this.snapshot(target.connector) : NO_SNAPSHOT,
+        );
+      }
+      const eligibleViews = targets.filter((target) => {
+        const connections = this.connectionViews(
+          target.connector,
+          snapshots.get(target.connector),
+        );
+        return this.eligibility(input, target, connections).kind === "view";
+      });
+      const served =
+        eligibleViews.length > 0 ||
+        (isOwnerView &&
+          this.pendingScan(input, [...targets, ...candidates], snapshots)
+            .best !== null);
+      if (!served) return null;
+      let newest: number | null = null;
+      for (const target of [...targets, ...candidates]) {
+        for (const view of this.connectionViews(target.connector)) {
+          if (view.latestHeadRegistration !== null) {
+            newest = Math.max(newest ?? 0, view.latestHeadRegistration);
+          }
+        }
+      }
+      return { newest };
+    } finally {
+      for (const snapshot of snapshots.values()) snapshot.release();
+    }
   }
 
   async resolve(input: ResolveInput): Promise<ReadDecision> {

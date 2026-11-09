@@ -307,6 +307,10 @@ export class FakeOverlay implements StreamSyncOverlaySnapshotSource {
   /** Connector of every fake run. */
   connector = "acme";
 
+  async connectors(): Promise<readonly string[]> {
+    return this.runs.length > 0 ? [this.connector] : [];
+  }
+
   async snapshot(connector: string): Promise<StreamSyncOverlaySnapshot> {
     await this.beforeSnapshot?.();
     this.snapshots++;

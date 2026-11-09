@@ -367,6 +367,7 @@ export interface StreamSyncReadPort {
   readableScopes?(input: {
     isOwnerView: boolean;
     scopePrefix?: string;
+    isCovered?: (scope: string) => boolean;
   }): Promise<ReadableScope[]>;
 }
 
@@ -1000,6 +1001,8 @@ async function listStreamSyncScopes(
   const readable = await reader.readableScopes({
     isOwnerView: !listAuth,
     scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
+    isCovered: (scope) =>
+      !isSystemScope(scope) && (!listAuth || listAuthCovers(listAuth, scope)),
   });
   const scopes = readable.filter(
     (summary) =>
