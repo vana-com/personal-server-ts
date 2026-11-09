@@ -193,6 +193,7 @@ export class Rig {
   constructor(
     seed?: SeedRows,
     readonly connector: string = CONNECTOR,
+    private readonly declared: readonly string[] = [],
   ) {
     this.seed = seed;
     this.writer = this.device(this.files, seed);
@@ -250,6 +251,8 @@ export class Rig {
         },
       },
       now: () => T0 + 3_600_000,
+      declaredStreams: (connector) =>
+        connector === this.connector ? this.declared : [],
       onRestartFull: (connector) => {
         this.restarts.push(connector);
       },

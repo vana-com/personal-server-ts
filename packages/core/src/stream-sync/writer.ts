@@ -431,6 +431,14 @@ export interface StreamSyncWriterOptions {
   readonly signer: StreamSyncSigner;
   /** Desktop only: this install's retained rows (§2.9). */
   readonly seed?: StreamSyncSeedSource;
+  /**
+   * The stream names `connector` declares, from the connector manifests the
+   * host verified (never from a connector-id literal). A connection delete
+   * posts a delete head on each of them that has no registry row yet, so a
+   * stale record for such a stream cannot publish after the delete. Absent
+   * means only the streams the registry lists are erased.
+   */
+  readonly declaredStreams?: (connector: string) => readonly string[];
   /** Writer target per part (§2.2, at most 4 MiB). */
   readonly partTargetBytes?: number;
   /** Budget for one reduce pass and one shard compaction, in line bytes. */
@@ -783,7 +791,11 @@ export class StreamSyncWriter {
           control: controls.get(parsed.ns) ?? { kind: "absent" },
         });
       }
-      if (pins.length === 0 && streams.length === 0) {
+      const registered = streams.length;
+      if (pins.length > 0 || registered > 0) {
+        this.addRowlessStreams(connector, streams, controls);
+      }
+      if (pins.length === 0 && registered === 0) {
         // The registry lists nothing, so there is nothing to erase there. The
         // device may still hold runs, results and a seed target for the
         // connection (collected while the registry was out of reach): they
@@ -800,6 +812,35 @@ export class StreamSyncWriter {
       });
       await this.runDelete(connector, intent, true);
     });
+  }
+
+  /**
+   * A stream the connector declares but the registry has no row for gets a
+   * delete head too. Without one its row history is empty, so the publish
+   * fence (`lastDeleteVersion` against the run's `collectedAt`) admits an old
+   * record of that stream (a retained or imported one, collected at 0) after a
+   * reconnect, and the deleted data returns. These rows are in the identity-
+   * less namespace, where retained and imported records are published.
+   */
+  private addRowlessStreams(
+    connector: string,
+    streams: StreamPin[],
+    controls: ReadonlyMap<string, ControlState>,
+  ): void {
+    const listed = new Set(
+      streams
+        .filter((pin) => pin.ns === IDENTITYLESS_NS)
+        .map((pin) => pin.stream),
+    );
+    for (const stream of this.options.declaredStreams?.(connector) ?? []) {
+      if (listed.has(stream)) continue;
+      listed.add(stream);
+      streams.push({
+        ns: IDENTITYLESS_NS,
+        stream,
+        control: controls.get(IDENTITYLESS_NS) ?? { kind: "absent" },
+      });
+    }
   }
 
   /**

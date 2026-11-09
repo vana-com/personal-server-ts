@@ -320,7 +320,7 @@ async function reconnectDuringDelete(when: 1 | 2) {
   return r;
 }
 
-it("a reconnect between the delete's control check and its stream read is not erased (mutant: CONTROL_CHECK_BEFORE_ROW_READ)", async () => {
+it("a reconnect between the delete's control check and its stream read is not erased (mutant: CONTROL_READ_BEFORE_ROW)", async () => {
   const r = await reconnectDuringDelete(2);
   expect(await control(r)).toMatchObject({ version: 3, deleted: false });
   // Both runs of the reconnect are still there, and no delete head follows them.
@@ -340,12 +340,11 @@ it("a reconnect between the delete's control pin and its stream listing is not e
 });
 
 it("a delete with nothing in the registry still stops what this device collected (mutant: EMPTY_REGISTRY_DELETE_KEEPS_LOCAL)", async () => {
-  const r = new Rig({
-    stream: "seed",
-    key: "id",
-    version: "1.0.0",
-    rows: [{ id: "old" }],
-  });
+  const r = new Rig(
+    { stream: "seed", key: "id", version: "1.0.0", rows: [{ id: "old" }] },
+    CONNECTOR,
+    ["items"],
+  );
   await r.open();
   // Collected while the registry was out of reach: nothing is registered yet.
   await r.collect(spec("offline"));
@@ -358,6 +357,32 @@ it("a delete with nothing in the registry still stops what this device collected
   expect(await r.files.list("runs")).toEqual([]);
   expect(await r.files.list("results")).toEqual([]);
   expect(await seedTargets()).toEqual({});
+  // A connection that never reached the registry gets no delete head, even
+  // for a declared stream: there is nothing to fence.
+  expect(r.gateway.log).toHaveLength(0);
   await r.publish();
   expect(r.gateway.log).toHaveLength(0);
+});
+
+it("a declared stream with no registry row gets a delete head, so an old record of it cannot publish (mutant: ROWLESS_IMPORT_RESURRECTS)", async () => {
+  const r = new Rig(undefined, CONNECTOR, ["items", "extra"]);
+  await r.open();
+  await r.collect(spec("base"));
+  await r.publish();
+  // A record of `extra` collected before the delete (collectedAt 0), unpublished.
+  await r.collect({ ...spec("stale"), stream: "extra" });
+  expect(await r.registeredHead("extra")).toBeNull();
+  // The delete heads land; the control row is still active, so only the stream
+  // fence stands between the old record and the registry.
+  await r.deleteStreamHeadsOnly(r.other);
+  expect(await r.registeredHead("extra")).toMatchObject({
+    format: 3,
+    recordCount: 0,
+    lastDeleteVersion: 1,
+  });
+  const statuses = await r.publish();
+  expect(statuses.find((s) => s.runId === "stale")?.outcome).toMatchObject({
+    kind: "discarded",
+  });
+  expect(await r.registeredHead("extra")).toMatchObject({ recordCount: 0 });
 });

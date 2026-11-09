@@ -133,6 +133,12 @@ export interface PsLiteSyncOptions {
    * `unknown_artifact`.
    */
   streamSyncDeclarations?: ResolveArtifact;
+  /**
+   * The stream names a connector declares, from the manifests the host
+   * verified. A connection delete posts a delete head on each declared stream
+   * that has no registry row. Without it only listed streams are erased.
+   */
+  streamSyncDeclaredStreams?: (connector: string) => readonly string[];
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;
@@ -575,6 +581,7 @@ export async function createPsLiteSyncManager(
           home: streamSyncHome.home,
           keys: createStreamSyncKeyPorts(options.ownerSignature),
           signer,
+          declaredStreams: options.streamSyncDeclaredStreams,
           partTargetBytes: LITE_PART_TARGET_BYTES,
           reduceBudgetBytes: LITE_REDUCE_BUDGET_BYTES,
           spoolFlushBytes: LITE_SPOOL_FLUSH_BYTES,

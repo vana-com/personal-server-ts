@@ -145,3 +145,24 @@ export function manifestArtifactResolver(
   }
   return artifactResolver(artifacts);
 }
+
+/**
+ * The stream names each connector declares, from the manifest documents a host
+ * verified. The connector is the manifest's own `connector_key`, so no caller
+ * names a key. A connector with several verified manifest versions yields the
+ * union of their streams.
+ */
+export function manifestStreamLister(
+  documents: Iterable<string>,
+): (connector: string) => readonly string[] {
+  const table = new Map<string, Set<string>>();
+  for (const document of documents) {
+    const artifact = manifestArtifact(document);
+    if (!artifact) continue;
+    const { connector, streams } = artifact.declarations;
+    const names = table.get(connector) ?? new Set<string>();
+    for (const stream of streams) names.add(stream.name);
+    table.set(connector, names);
+  }
+  return (connector) => [...(table.get(connector) ?? [])];
+}

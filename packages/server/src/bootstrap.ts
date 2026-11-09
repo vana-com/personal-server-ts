@@ -135,6 +135,7 @@ import {
   type StreamSyncIntake,
   createGatewayStreamSyncRegistry,
   manifestArtifactResolver,
+  manifestStreamLister,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
   streamSyncNetwork,
@@ -934,6 +935,9 @@ export async function createServer(
           keys: createStreamSyncKeyPorts(masterKeySignature),
           signer: serverSigner,
           seed: seedSource,
+          // Read at delete time: the pinned manifests are verified by then.
+          declaredStreams: (connector) =>
+            manifestStreamLister(pdppAuth?.retainedManifests ?? [])(connector),
         });
         writerForSeed = streamSyncWriter;
         streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
