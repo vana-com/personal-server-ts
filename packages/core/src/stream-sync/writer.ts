@@ -444,6 +444,15 @@ function copyPlanInputs(state: WriterState): PlanInputs {
 }
 
 /**
+ * A void callback may still return a promise. Attach a rejection handler so a
+ * rejected return cannot reach `unhandledRejection`. Never throws: a thenable
+ * whose `then` throws becomes a rejection, and that is handled too.
+ */
+function settled(result: unknown): void {
+  Promise.resolve(result).catch(() => {});
+}
+
+/**
  * The connectors whose plan inputs differ between `before` and `state`. Keys:
  * a seed target by connector; a seed receipt `install|connector|ns|stream`
  * (the install id must not contain `|`); a stream floor `[connector, ns, stream]`.
@@ -1831,22 +1840,25 @@ export class StreamSyncWriter {
    * Tell every subscriber that a connector's plan inputs changed. Only the
    * three primitives call this: `writeEntry`, `withState` and `select` /
    * `unselect`. A failing listener is logged, never thrown, so it cannot fail
-   * the run or stop the other listeners.
+   * the run or stop the other listeners. A listener that returns a rejected
+   * promise is handled the same way, and so is a logger that does.
    */
   private planInputsChanged(connector: string): void {
     for (const listener of this.planInputListeners) {
       try {
-        listener(connector);
+        settled(listener(connector));
       } catch (error) {
         // Reporting is best effort too: a throwing logger or `message` getter
         // must not stop the other listeners.
         try {
-          this.options.logger?.warn(
-            {
-              connector,
-              error: error instanceof Error ? error.message : "unknown",
-            },
-            "stream-sync writer: a plan-input listener failed",
+          settled(
+            this.options.logger?.warn(
+              {
+                connector,
+                error: error instanceof Error ? error.message : "unknown",
+              },
+              "stream-sync writer: a plan-input listener failed",
+            ),
           );
         } catch {
           // Nothing left to report to.

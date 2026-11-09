@@ -507,9 +507,13 @@ export class StreamSyncReadService {
       options.keys.keyCheck,
     );
     const revisions = new ConnectorRevisions();
+    // Set before any cleanup: a disposer that throws before it removes this
+    // callback must still leave the callback inert.
+    let closed = false;
     const unsubscribe =
-      options.overlay?.planInputs?.((connector) => revisions.bump(connector)) ??
-      null;
+      options.overlay?.planInputs?.((connector) => {
+        if (!closed) revisions.bump(connector);
+      }) ?? null;
     try {
       const mirror = await RegistryMirror.open(
         options.files,
@@ -558,7 +562,13 @@ export class StreamSyncReadService {
       return service;
     } catch (error) {
       // A failed open returns no service to close: drop its subscription now.
-      unsubscribe?.();
+      // A disposer error must not replace the open error the caller needs.
+      closed = true;
+      try {
+        unsubscribe?.();
+      } catch {
+        // The callback is already inert; report the open error below.
+      }
       throw error;
     }
   }

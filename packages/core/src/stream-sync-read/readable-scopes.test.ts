@@ -978,6 +978,69 @@ describe("readableScopes cache misses after every write under the connector", ()
     }
   });
 
+  // LISTENER_ASYNC_REJECTION_ESCAPES (aimed by the mutant runner)
+  it("an async listener that rejects neither reaches unhandledRejection nor silences later listeners", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const rig = new Rig();
+      await rig.open();
+      const seen: string[] = [];
+      rig.writer.onPlanInputs(async () => {
+        throw new Error("async listener broke");
+      });
+      rig.writer.onPlanInputs((connector) => seen.push(connector));
+      await rig.collect({
+        runId: "first",
+        key: "id",
+        version: "1.0.0",
+        rows: [{ id: "a" }],
+        full: true,
+      });
+      // Node reports an unhandled rejection after the current turn drains.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(seen).toContain(rig.connector);
+      expect(rig.files.paths()).toContain("runs/first/entry.json");
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
+
+  it("a sync listener throw followed by an async rejecting logger neither reaches unhandledRejection nor silences later listeners", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const rig = new Rig(undefined, CONNECTOR, {
+        warn() {
+          return Promise.reject(new Error("async logger broke"));
+        },
+      });
+      await rig.open();
+      const bump = vi.spyOn(ConnectorRevisions.prototype, "bump");
+      rig.writer.onPlanInputs(() => {
+        throw new Error("listener broke");
+      });
+      try {
+        await rig.collect({
+          runId: "first",
+          key: "id",
+          version: "1.0.0",
+          rows: [{ id: "a" }],
+          full: true,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(bump).toHaveBeenCalledWith(rig.connector);
+        expect(rig.files.paths()).toContain("runs/first/entry.json");
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        bump.mockRestore();
+      }
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
+
   // OPEN_FAILURE_KEEPS_SUBSCRIPTION (aimed by the mutant runner)
   it("a failed open leaves no plan-input callback behind", async () => {
     const rig = new Rig();
@@ -1015,5 +1078,43 @@ describe("readableScopes cache misses after every write under the connector", ()
     expect(live.size).toBe(1);
     rig.service.close();
     expect(live.size).toBe(0);
+  });
+
+  it("a failed open whose disposer throws rethrows the open error and leaves the callback inert", async () => {
+    const rig = new Rig();
+    let listener: ((connector: string) => void) | undefined;
+    const overlay = {
+      ...rig.overlay,
+      planInputs: (next: (connector: string) => void) => {
+        listener = next;
+        // Throws before it removes the callback.
+        return () => {
+          throw new Error("disposer broke");
+        };
+      },
+    };
+    const fail = async (): Promise<never> => {
+      throw new Error("disk is gone");
+    };
+    const broken = {
+      write: fail,
+      read: fail,
+      readChunks: async function* () {
+        await fail();
+      },
+      list: fail,
+      remove: fail,
+    };
+    await expect(rig.open({ files: broken, overlay })).rejects.toThrow(
+      /^disk is gone$/,
+    );
+    expect(listener).toBeDefined();
+    const bump = vi.spyOn(ConnectorRevisions.prototype, "bump");
+    try {
+      listener!(rig.connector);
+      expect(bump).not.toHaveBeenCalled();
+    } finally {
+      bump.mockRestore();
+    }
   });
 });
