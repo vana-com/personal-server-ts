@@ -98,6 +98,7 @@ import type { LineageGatewayPort } from "../lineage/gateway.js";
 import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
 import type {
   OwnerNotes,
+  ReadableScope,
   ReadDecision,
   ResolveInput,
   StreamSyncReadStatus,
@@ -359,6 +360,14 @@ export interface StreamSyncReadPort {
   resolve(input: ResolveInput): Promise<ReadDecision>;
   /** Per-stream counts and open import problems, for owner diagnostics. */
   status?(): StreamSyncReadStatus;
+  /**
+   * The scopes `isOwnerView` can read from stream data: the scope listing of
+   * a switched account. Absent = such an account's listing is refused.
+   */
+  readableScopes?(input: {
+    isOwnerView: boolean;
+    scopePrefix?: string;
+  }): Promise<ReadableScope[]>;
 }
 
 export interface PersonalServerDataApiDeps {
@@ -952,6 +961,57 @@ async function serveStreamSyncView(
 /** The distinct reasons of the withheld runs, for the response header. */
 function withheldReasons(withheld: readonly WithheldRun[]): string {
   return [...new Set(withheld.map((w) => w.reason))].join(",");
+}
+
+/**
+ * A switched account's history metadata (versions, lineage, additions) has no
+ * stream-head source yet. Refused with a typed error; never read from legacy.
+ */
+function streamHistoryUnsupported(
+  what: "versions" | "lineage" | "additions",
+): Response {
+  return errorResponse(
+    501,
+    "STREAM_HISTORY_UNSUPPORTED",
+    `This account reads stream data only, which has no ${what} history.`,
+  );
+}
+
+/**
+ * The scope listing of a switched account: exactly the scopes the same caller
+ * can read from stream data, and nothing from legacy storage, the canonical
+ * view or the deletion ledger.
+ */
+async function listStreamSyncScopes(
+  deps: PersonalServerDataApiDeps,
+  url: URL,
+  listAuth: PersonalServerListAuthResult | void,
+): Promise<Response> {
+  const reader = deps.streamSyncRead;
+  if (!reader?.readableScopes) {
+    return errorResponse(
+      503,
+      "STREAM_READER_UNAVAILABLE",
+      "This account reads stream data only, and no stream reader is available yet. Retry shortly.",
+    );
+  }
+  const limit = normalizeLimit(url.searchParams.get("limit"), 20);
+  const offset = normalizeLimit(url.searchParams.get("offset"), 0);
+  const readable = await reader.readableScopes({
+    isOwnerView: !listAuth,
+    scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
+  });
+  const scopes = readable.filter(
+    (summary) =>
+      !isSystemScope(summary.scope) &&
+      (!listAuth || listAuthCovers(listAuth, summary.scope)),
+  );
+  return jsonResponse({
+    scopes: scopes.slice(offset, offset + limit),
+    total: scopes.length,
+    limit,
+    offset,
+  });
 }
 
 function methodNotAllowed(): Response {
@@ -2485,13 +2545,12 @@ export async function handlePersonalServerDataRequest(
     const pathname = stripBasePath(url.pathname, options.basePath);
 
     // The account's storage mode, decided once before any list, version,
-    // lineage or body branch. No read site acts on the decision yet (they are
-    // routed through it one by one), so a switched account still reads as
-    // before; it is recorded with every error this request logs.
-    if (request.method === "GET") {
-      logContext.detail = {
-        storageSelection: selectAccountStorageMode(deps).kind,
-      };
+    // lineage or body branch. The listing and history routes below act on it;
+    // it is recorded with every error this request logs.
+    const storageSelection =
+      request.method === "GET" ? selectAccountStorageMode(deps) : undefined;
+    if (storageSelection) {
+      logContext.detail = { storageSelection: storageSelection.kind };
     }
 
     if (pathname === "/" || pathname === "") {
@@ -2499,6 +2558,10 @@ export async function handlePersonalServerDataRequest(
       const listAuth = await deps.auth.authorizeBuilderList(request, {
         grantId: selectedGrantId(request, url),
       });
+      if (storageSelection?.kind === "refuse") return storageSelection.response;
+      if (storageSelection?.kind === "streams") {
+        return listStreamSyncScopes(deps, url, listAuth);
+      }
       // One budget for every stored and canonical-only scope, not per row.
       const deletionDeadlineAtMs = Date.now() + 250;
       const result = await listDataScopesContract({
@@ -2526,6 +2589,11 @@ export async function handlePersonalServerDataRequest(
       if (request.method !== "GET") return methodNotAllowed();
       // The counts span every scope, so only the owner may read them.
       await deps.auth.authorizeOwner(request);
+      if (storageSelection?.kind === "refuse") return storageSelection.response;
+      // The additions ledgers are legacy sidecars; stream data has none.
+      if (storageSelection?.kind === "streams") {
+        return streamHistoryUnsupported("additions");
+      }
       const daysRaw = url.searchParams.get("days");
       const result = await summarizeDataAdditionsContract({
         additions: deps.additions,
@@ -2655,6 +2723,11 @@ export async function handlePersonalServerDataRequest(
           requestedScope: scopeResult.scope,
         });
       }
+      if (storageSelection?.kind === "refuse") return storageSelection.response;
+      // A stream scope keeps one head, not a version history.
+      if (storageSelection?.kind === "streams") {
+        return streamHistoryUnsupported("versions");
+      }
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),
@@ -2710,6 +2783,11 @@ export async function handlePersonalServerDataRequest(
         scope: scopeResult.scope,
         grantId: selectedGrantId(request, url),
       });
+      if (storageSelection?.kind === "refuse") return storageSelection.response;
+      // Lineage is registered against the legacy data point of a scope.
+      if (storageSelection?.kind === "streams") {
+        return streamHistoryUnsupported("lineage");
+      }
       if (!deps.serverOwner) {
         throw new ServerNotConfiguredError({
           reason: "serverOwner is required to resolve the data point id",

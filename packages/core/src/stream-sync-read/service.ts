@@ -207,6 +207,14 @@ export type ReadDecision =
       readonly body: ReadableStream<Uint8Array>;
     };
 
+/** One row of the switched-account scope listing. */
+export interface ReadableScope {
+  readonly scope: string;
+  readonly latestCollectedAt: string;
+  /** Stream data keeps one head per stream. */
+  readonly versionCount: number;
+}
+
 export interface StreamSyncConnectionStatus {
   readonly connector: string;
   readonly ns: string;
@@ -749,6 +757,63 @@ export class StreamSyncReadService {
       out.push({ ns, control, latestHeadRegistration: latest, streams });
     }
     return out;
+  }
+
+  /**
+   * The scopes this caller can read from stream data, for the scope listing of
+   * a switched account. A name is listed if and only if `resolve` serves it a
+   * view for the same caller with no legacy file: the listing asks the body
+   * read's own rule, it keeps no rule of its own. Candidates are the logical
+   * stream names of every connector the mirror knows and the retained legacy
+   * names. (A first-run local-pending scope of a connector the mirror has never
+   * seen is readable by name but has no candidate here: the overlay port cannot
+   * list connectors.)
+   */
+  async readableScopes(input: {
+    readonly isOwnerView: boolean;
+    readonly scopePrefix?: string;
+  }): Promise<ReadableScope[]> {
+    const names = new Set<string>(LEGACY_SCOPE_BINDINGS.keys());
+    for (const connector of this.mirror.connectors()) {
+      for (const view of this.connectionViews(connector)) {
+        for (const stream of Object.keys(view.streams)) {
+          const name = `pdpp.${connector}.${stream}`;
+          if (logicalStreamScopeParts(name)) names.add(name);
+        }
+      }
+    }
+    const listed: ReadableScope[] = [];
+    for (const scope of [...names].sort()) {
+      if (input.scopePrefix && !scope.startsWith(input.scopePrefix)) continue;
+      const decision = await this.resolve({
+        scope,
+        connection: null,
+        cursor: null,
+        legacyFile: false,
+        isOwnerView: input.isOwnerView,
+      });
+      if ("body" in decision) await decision.body.cancel();
+      if (decision.kind !== "view" && decision.kind !== "local_pending") {
+        continue;
+      }
+      let newest: number | null = null;
+      for (const target of readTargets(scope)) {
+        for (const view of this.connectionViews(target.connector)) {
+          if (view.latestHeadRegistration !== null) {
+            newest = Math.max(newest ?? 0, view.latestHeadRegistration);
+          }
+        }
+      }
+      listed.push({
+        scope,
+        latestCollectedAt: (newest === null
+          ? (this.options.now ?? (() => new Date()))()
+          : new Date(newest)
+        ).toISOString(),
+        versionCount: 1,
+      });
+    }
+    return listed;
   }
 
   async resolve(input: ResolveInput): Promise<ReadDecision> {
