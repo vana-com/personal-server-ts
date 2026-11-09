@@ -123,3 +123,17 @@ it("a failed landing keeps its intent and the next pass finishes it", async () =
   expect((await persistedState(r)).deletes ?? {}).toEqual({});
   expect(await r.registeredHead()).toMatchObject({ recordCount: 0 });
 });
+
+it("the owner delete also fences a declared stream with no registry row (mutant: ROWLESS_IMPORT_RESURRECTS)", async () => {
+  const r = new Rig(undefined, CONNECTOR, ["items", "extra"]);
+  await r.open();
+  await r.collect(spec("base"));
+  await r.publish();
+  await r.writer.requestConnectionDelete(CONNECTOR);
+  await r.publish();
+  expect(await r.registeredHead("extra")).toMatchObject({
+    format: 3,
+    recordCount: 0,
+    lastDeleteVersion: 1,
+  });
+});
