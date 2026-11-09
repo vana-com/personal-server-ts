@@ -17,6 +17,8 @@ import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "./data.js";
 import { syncRoutes } from "./sync.js";
 import { ouraRoutes } from "./oura.js";
+import { createApp } from "../app.js";
+import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 
 const owner = "0x1111111111111111111111111111111111111111";
 const bearer = { Authorization: "Bearer read-other-test" };
@@ -170,6 +172,46 @@ describe("Node server group D routes", () => {
       const res = await build().request("/requirements", { headers: bearer });
       expect(touched).toEqual([]);
       expect(res.status).toBe(409);
+    });
+  });
+
+  describe("the mounted app", () => {
+    function mounted(trigger: () => Promise<void>) {
+      return createApp({
+        logger: pino({ level: "silent" }),
+        version: "0.0.1",
+        startedAt: new Date(),
+        indexManager: index,
+        hierarchyOptions: { dataDir: join(root, "data") },
+        serverOrigin: "http://localhost:8080",
+        serverOwner: owner,
+        devToken: "read-other-test",
+        gateway,
+        accessLogWriter: { write: async () => undefined },
+        syncManager: { trigger, getStatus: vi.fn() } as never,
+        accountStorageMode: mode(),
+        config: ServerConfigSchema.parse({}),
+      });
+    }
+
+    it("LEGACY_ON_SWITCH_OTHER: /v1/sync/file receives the app's mode", async () => {
+      const trigger = vi.fn(async () => undefined);
+      const res = await mounted(trigger).request("/v1/sync/file/abc", {
+        method: "POST",
+        headers: bearer,
+      });
+      expect(res.status).toBe(409);
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it("UNSWITCHED_PARITY: /v1/sync/file starts the sync", async () => {
+      value = "unswitched";
+      const trigger = vi.fn(async () => undefined);
+      const res = await mounted(trigger).request("/v1/sync/file/abc", {
+        method: "POST",
+        headers: bearer,
+      });
+      expect(res.status).toBe(202);
     });
   });
 });
