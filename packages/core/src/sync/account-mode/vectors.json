@@ -1,0 +1,2559 @@
+[
+  {
+    "version": 1,
+    "id": "01-fresh-off-commit",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "Authenticated fresh Off allows ordinary legacy access."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "admit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "admit",
+          "owner": "A",
+          "operationId": "op-1"
+        }
+      },
+      {
+        "id": "commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "off",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        },
+        "record": {
+          "switched": false,
+          "offFetchStartMono": 100
+        }
+      },
+      {
+        "after": "read",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "admit",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "commit",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "02-unknown-is-not-off",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "Each failed/malformed/missing answer invalidates a previous clean Off."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "timeout-baseline",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "timeout",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "unknown",
+          "fetchStartMono": 100,
+          "rawStatus": null
+        }
+      },
+      {
+        "id": "timeout-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "timeout-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "http-500-baseline",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "http-500",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 500
+        }
+      },
+      {
+        "id": "http-500-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "http-500-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "malformed-baseline",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "malformed",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "malformed",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "malformed-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "malformed-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "missing-field-baseline",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "missing-field",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "rawStatus": 200,
+          "fetchStartMono": 100
+        }
+      },
+      {
+        "id": "missing-field-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "missing-field-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "timeout-baseline",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "timeout",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "switched": false,
+          "offFetchStartMono": null
+        }
+      },
+      {
+        "after": "timeout-read",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "timeout-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "http-500-baseline",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "http-500",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "switched": false,
+          "offFetchStartMono": null
+        }
+      },
+      {
+        "after": "http-500-read",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "http-500-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "malformed-baseline",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "malformed",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "switched": false,
+          "offFetchStartMono": null
+        }
+      },
+      {
+        "after": "malformed-read",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "malformed-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "missing-field-baseline",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "missing-field",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "switched": false,
+          "offFetchStartMono": null
+        }
+      },
+      {
+        "after": "missing-field-read",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "missing-field-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "03-outage-then-on",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "A fresh owner refuses during outage and until On is saved."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "outage",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "unknown",
+          "fetchStartMono": 100,
+          "rawStatus": null
+        }
+      },
+      {
+        "id": "on",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "on",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "save",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "saveComplete",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "legacy-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "outage",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "on",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "switched": true,
+          "persistence": "pending",
+          "importPending": false
+        }
+      },
+      {
+        "after": "save",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        },
+        "record": {
+          "persistence": "saved"
+        }
+      },
+      {
+        "after": "read",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "legacy-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "LEGACY_REFUSED_SWITCHED",
+          "status": 426,
+          "retryable": false,
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "04-on-never-lowers",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "Stale Off, outage and unauthenticated/sign-out evidence cannot lower saved On."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "on",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "on",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "save",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "saveComplete",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "stale-off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 0,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "outage",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "unknown",
+          "fetchStartMono": 100,
+          "rawStatus": null
+        }
+      },
+      {
+        "id": "signed-out",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": null,
+          "state": "unknown",
+          "fetchStartMono": 100,
+          "rawStatus": null
+        }
+      },
+      {
+        "id": "read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "legacy-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "on",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "save",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "stale-off",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        },
+        "record": {
+          "switched": true,
+          "persistence": "saved"
+        }
+      },
+      {
+        "after": "outage",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "signed-out",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "unchanged": true
+      },
+      {
+        "after": "read",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "legacy-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "LEGACY_REFUSED_SWITCHED",
+          "status": 426,
+          "retryable": false,
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "05-independent-owners",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "A's On and B's clean Off are independent records."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "a-on",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "on",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "a-save",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "saveComplete",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "b-off",
+        "recordOwner": "B",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "B",
+          "authOwner": "B",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "b-commit",
+        "recordOwner": "B",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "B",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "a-again",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "a-on",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "a-save",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "b-off",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        },
+        "record": {
+          "owner": "B",
+          "switched": false
+        }
+      },
+      {
+        "after": "b-commit",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "a-again",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        },
+        "record": {
+          "owner": "A",
+          "switched": true
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "06-owner-required",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "Missing/mismatched evidence, read and commit refuse without changing the bound record."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "missing-evidence",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "authOwner": "A",
+          "state": "on",
+          "rawStatus": 200,
+          "fetchStartMono": 100
+        }
+      },
+      {
+        "id": "mismatched-evidence",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "B",
+          "authOwner": "B",
+          "state": "on",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "mismatched-auth",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "B",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "missing-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read"
+        }
+      },
+      {
+        "id": "mismatched-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "B"
+        }
+      },
+      {
+        "id": "missing-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "mismatched-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "B",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "missing-boot",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "boot",
+          "bootId": "boot-1",
+          "clockTrusted": false
+        }
+      },
+      {
+        "id": "valid-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "off",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "missing-evidence",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "unchanged": true
+      },
+      {
+        "after": "mismatched-evidence",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "unchanged": true
+      },
+      {
+        "after": "mismatched-auth",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "unchanged": true
+      },
+      {
+        "after": "missing-read",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "unchanged": true
+      },
+      {
+        "after": "mismatched-read",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "unchanged": true
+      },
+      {
+        "after": "missing-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "unchanged": true
+      },
+      {
+        "after": "mismatched-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "unchanged": true
+      },
+      {
+        "after": "missing-boot",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "unchanged": true
+      },
+      {
+        "after": "valid-read",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "07-admission-is-not-permission",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "On between admission and commit refuses the old operation at commit."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "admit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "admit",
+          "owner": "A",
+          "operationId": "op-1"
+        }
+      },
+      {
+        "id": "on",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "on",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "save",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "saveComplete",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "admit-again",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "admit",
+          "owner": "A",
+          "operationId": "op-1"
+        }
+      },
+      {
+        "id": "commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "read-after",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "off",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "admit",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "on",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "switched": true,
+          "persistence": "pending",
+          "importPending": true
+        }
+      },
+      {
+        "after": "save",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        },
+        "record": {
+          "importPending": true
+        }
+      },
+      {
+        "after": "admit-again",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        },
+        "record": {
+          "importPending": true
+        }
+      },
+      {
+        "after": "commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "LEGACY_REFUSED_SWITCHED",
+          "status": 426,
+          "retryable": false,
+          "importRequired": true
+        },
+        "record": {
+          "importPending": false
+        }
+      },
+      {
+        "after": "read-after",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "08-saved-on-survives-boot",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "Untrusted clocks and a new boot expire Off, never the On latch."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "on",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "on",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "save",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "saveComplete",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "boot",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 0,
+          "nowWall": 1700000000000,
+          "bootId": "boot-2"
+        },
+        "event": {
+          "type": "boot",
+          "owner": "A",
+          "bootId": "boot-2",
+          "clockTrusted": false
+        }
+      },
+      {
+        "id": "read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 1209600000,
+          "nowWall": 1701209600000,
+          "bootId": "boot-2"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "legacy-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 1209600000,
+          "nowWall": 1701209600000,
+          "bootId": "boot-2"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "on",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "save",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "boot",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        },
+        "record": {
+          "switched": true,
+          "persistence": "saved"
+        }
+      },
+      {
+        "after": "read",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "legacy-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "LEGACY_REFUSED_SWITCHED",
+          "status": 426,
+          "retryable": false,
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "09-save-failure",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "On cannot serve streams or legacy until a matching durable save completes."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "on",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "on",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "before-save-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "before-save-stream-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "stream"
+        }
+      },
+      {
+        "id": "failed",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "saveFailed",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "after-failure-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "after-failure-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "stale-off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "retry-save",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "saveComplete",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "retry-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "on",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "before-save-read",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "before-save-stream-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "failed",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "switched": true,
+          "persistence": "failed"
+        }
+      },
+      {
+        "after": "after-failure-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "after-failure-read",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "stale-off",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "switched": true,
+          "persistence": "failed"
+        }
+      },
+      {
+        "after": "retry-save",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "retry-read",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "10-off-ttl-and-boot",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "TTL is measured from fetch start, not response time; equality and untrusted/cross-domain boots expire it."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 1000,
+          "nowWall": 1700000001000,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "last-millisecond",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 604800099,
+          "nowWall": 1700604800099,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "deadline",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 604800100,
+          "nowWall": 1700604800100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "expired-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 604800100,
+          "nowWall": 1700604800100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "renew",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 604800100,
+          "nowWall": 1700604800100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 604800100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "untrusted-boot",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 604800100,
+          "nowWall": 1700604800100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "boot",
+          "owner": "A",
+          "bootId": "boot-1",
+          "clockTrusted": false
+        }
+      },
+      {
+        "id": "fresh-off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 604800101,
+          "nowWall": 1700604800101,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 604800101,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "new-trusted-domain",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 0,
+          "nowWall": 1700000000000,
+          "bootId": "boot-2"
+        },
+        "event": {
+          "type": "boot",
+          "owner": "A",
+          "bootId": "boot-2",
+          "clockTrusted": true
+        }
+      },
+      {
+        "id": "new-domain-off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 0,
+          "nowWall": 1700000000000,
+          "bootId": "boot-2"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 0,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "new-domain-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 1,
+          "nowWall": 1700000000001,
+          "bootId": "boot-2"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "off",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        },
+        "record": {
+          "offFetchStartMono": 100
+        }
+      },
+      {
+        "after": "last-millisecond",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "deadline",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "offFetchStartMono": null
+        }
+      },
+      {
+        "after": "expired-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "renew",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "untrusted-boot",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "fresh-off",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "new-trusted-domain",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "new-domain-off",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "new-domain-commit",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "11-unobserved-remote-switch",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "Accepted migration-only window: remote On not yet delivered here does not invalidate fresh Off; first local On requests import once."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "remote-on-not-yet-observed-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 101,
+          "nowWall": 1700000000101,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "first-local-on",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 102,
+          "nowWall": 1700000000102,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "on",
+          "fetchStartMono": 102,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "save",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 102,
+          "nowWall": 1700000000102,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "saveComplete",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "first-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 102,
+          "nowWall": 1700000000102,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "second-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 102,
+          "nowWall": 1700000000102,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "legacy-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 102,
+          "nowWall": 1700000000102,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "off",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "remote-on-not-yet-observed-commit",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "first-local-on",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "importPending": true
+        }
+      },
+      {
+        "after": "save",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "first-read",
+        "decision": {
+          "kind": "streams",
+          "importRequired": true
+        },
+        "record": {
+          "importPending": false
+        }
+      },
+      {
+        "after": "second-read",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "legacy-commit",
+        "decision": {
+          "kind": "refuse",
+          "code": "LEGACY_REFUSED_SWITCHED",
+          "status": 426,
+          "retryable": false,
+          "importRequired": false
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "12-new-user-first-launch",
+    "policy": {
+      "offTtlMs": 604800000,
+      "description": "Never-seen is unknown; first explicit Off has no post-evidence 503, while first explicit On needs no import."
+    },
+    "owners": [
+      "A",
+      "B"
+    ],
+    "initial": {
+      "A": null,
+      "B": null
+    },
+    "events": [
+      {
+        "id": "a-never-seen",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "a-never-seen-admit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "admit",
+          "owner": "A",
+          "operationId": "op-1"
+        }
+      },
+      {
+        "id": "a-off",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "A",
+          "authOwner": "A",
+          "state": "off",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "a-read",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "A"
+        }
+      },
+      {
+        "id": "a-commit",
+        "recordOwner": "A",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "A",
+          "operationId": "op-1",
+          "sink": "legacy"
+        }
+      },
+      {
+        "id": "b-never-seen",
+        "recordOwner": "B",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "B"
+        }
+      },
+      {
+        "id": "b-on",
+        "recordOwner": "B",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "evidence",
+          "owner": "B",
+          "authOwner": "B",
+          "state": "on",
+          "fetchStartMono": 100,
+          "rawStatus": 200
+        }
+      },
+      {
+        "id": "b-save",
+        "recordOwner": "B",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "saveComplete",
+          "owner": "B"
+        }
+      },
+      {
+        "id": "b-read",
+        "recordOwner": "B",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "read",
+          "owner": "B"
+        }
+      },
+      {
+        "id": "b-stream-commit",
+        "recordOwner": "B",
+        "clock": {
+          "nowMono": 100,
+          "nowWall": 1700000000100,
+          "bootId": "boot-1"
+        },
+        "event": {
+          "type": "commit",
+          "owner": "B",
+          "operationId": "op-1",
+          "sink": "stream"
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "a-never-seen",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "a-never-seen-admit",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "a-off",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "a-read",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "a-commit",
+        "decision": {
+          "kind": "legacy",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "b-never-seen",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        }
+      },
+      {
+        "after": "b-on",
+        "decision": {
+          "kind": "refuse",
+          "code": "ACCOUNT_MODE_UNKNOWN",
+          "status": 503,
+          "retryable": true,
+          "importRequired": false
+        },
+        "record": {
+          "importPending": false
+        }
+      },
+      {
+        "after": "b-save",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "b-read",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      },
+      {
+        "after": "b-stream-commit",
+        "decision": {
+          "kind": "streams",
+          "importRequired": false
+        }
+      }
+    ]
+  }
+]
