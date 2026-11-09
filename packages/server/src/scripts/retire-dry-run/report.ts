@@ -6,9 +6,10 @@
  * Hashes are cut to 8 hex characters. Everything here is built from the
  * retire report and the ledger's counts; no record value reaches this module.
  *
- * This is a dry run: a snapshot on a copy. The real pass re-reads and
- * re-decides before every delete, so it is never looser than this report, and
- * this report can only over-predict deletions.
+ * This is a dry run: a snapshot on a copy, with one readback per file. The
+ * real pass reads the remote record again and decides again before every
+ * delete, so it can reach a different decision if the remote changes in
+ * between.
  */
 
 import { createHash } from "node:crypto";

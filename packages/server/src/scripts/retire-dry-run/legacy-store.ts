@@ -20,6 +20,7 @@ import { initializeDatabase } from "../../storage/index-schema.js";
 import { createIndexManager } from "../../storage/index-manager.js";
 import { createNodeDataStorage } from "../../storage/node-data-storage.js";
 import { isInside } from "./copy-only.js";
+import { LegacyStoreError } from "./setup-error.js";
 
 export type LegacyStorage = RetireDeps["storage"];
 
@@ -30,12 +31,7 @@ export interface LegacyStore {
   close(): void;
 }
 
-export class LegacyStoreError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "LegacyStoreError";
-  }
-}
+export { LegacyStoreError } from "./setup-error.js";
 
 /** The data folder's database files that exist; `-shm` is never copied. */
 const SCOPE_PAGE = 200;

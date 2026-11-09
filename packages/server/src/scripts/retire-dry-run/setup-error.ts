@@ -1,7 +1,8 @@
 /**
- * A refusal to start, with fixed text. The message never holds input from the
+ * Refusals with fixed text. The message never holds input from the
  * environment, the data folder or a library error: those can carry the owner's
- * signature or a file name.
+ * signature or a file name. This module imports nothing, so the entry can load
+ * these classes before the guard installs.
  */
 
 export type DryRunSetupCode =
@@ -17,5 +18,13 @@ export class DryRunSetupError extends Error {
   ) {
     super(message);
     this.name = "DryRunSetupError";
+  }
+}
+
+/** The scratch folder or the copy's store refused an operation. */
+export class LegacyStoreError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LegacyStoreError";
   }
 }

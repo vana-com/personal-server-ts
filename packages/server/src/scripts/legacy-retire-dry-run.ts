@@ -13,10 +13,12 @@ import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { CopyOnlyError } from "./retire-dry-run/copy-only.js";
-import { LegacyStoreError } from "./retire-dry-run/legacy-store.js";
 import { NetworkGuardError } from "./retire-dry-run/network-guard.js";
 import { runLegacyRetireDryRun } from "./retire-dry-run/run.js";
-import { DryRunSetupError } from "./retire-dry-run/setup-error.js";
+import {
+  DryRunSetupError,
+  LegacyStoreError,
+} from "./retire-dry-run/setup-error.js";
 
 const USAGE =
   "Usage: legacy-retire-dry-run --data-dir <copy under ~/.tmp> --out <report.json> " +

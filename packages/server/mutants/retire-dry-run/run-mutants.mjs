@@ -569,7 +569,20 @@ const MUTANTS = [
       [
         F.run,
         'import { randomBytes } from "node:crypto";',
-        'import "./published-heads.js";\nimport { randomBytes } from "node:crypto";',
+        'import "./legacy-store.js";\nimport { randomBytes } from "node:crypto";',
+      ],
+    ],
+    files: [T.entryOrder],
+    pattern: "refuses a fetch captured at module load",
+  },
+  {
+    id: "ENTRY_IMPORTS_BEFORE_GUARD",
+    what: "the shipped entry statically loads the SQLite store before the guard installs",
+    edits: [
+      [
+        F.cli,
+        'import { CopyOnlyError } from "./retire-dry-run/copy-only.js";',
+        'import "./retire-dry-run/legacy-store.js";\nimport { CopyOnlyError } from "./retire-dry-run/copy-only.js";',
       ],
     ],
     files: [T.entryOrder],
