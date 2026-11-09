@@ -1,5 +1,5 @@
 /**
- * Runs the shared JSON vectors (`vectors/*.json`) against the real module: the
+ * Runs the shared JSON vectors (`vectors.json`) against the real module: the
  * authority, a record store with fault hooks, and the reducer.
  *
  * The vector format is host-neutral JSON. A host adapter (Rust, Dart, Web) runs
@@ -31,7 +31,7 @@ import {
   OFF_TTL_MS,
   type ModeDecision,
   type ModeState,
-} from "./reduce-adapter.js";
+} from "./mode-machine.js";
 
 export interface VectorClock {
   boot?: string;

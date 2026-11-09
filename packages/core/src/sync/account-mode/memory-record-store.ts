@@ -4,11 +4,12 @@
  * restart starts with no records, so it refuses until the Account answers).
  */
 
-import type { ModeRecordStore, OwnerModeRecord } from "./reduce-adapter.js";
+import type { DurableModeRecord } from "./mode-machine.js";
+import type { ModeRecordStore } from "./record-store.js";
 
 export interface MemoryModeRecordStore extends ModeRecordStore {
   /** What is "on disk" right now. Survives a simulated restart. */
-  readonly durable: Map<string, OwnerModeRecord>;
+  readonly durable: Map<string, DurableModeRecord>;
   /** Make the next saves fail until `failSaves(false)`. */
   failSaves(fail: boolean): void;
   /** Hold every save until `releaseSaves()`. Returns after the first is held. */
@@ -27,9 +28,9 @@ export interface MemoryModeRecordStore extends ModeRecordStore {
 }
 
 export function createMemoryModeRecordStore(
-  initial?: Iterable<[string, OwnerModeRecord]>,
+  initial?: Iterable<[string, DurableModeRecord]>,
 ): MemoryModeRecordStore {
-  const durable = new Map<string, OwnerModeRecord>(initial ?? []);
+  const durable = new Map<string, DurableModeRecord>(initial ?? []);
   let failing = false;
   let failingLoads = false;
   let gate: Promise<void> | null = null;

@@ -4,13 +4,13 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createModeAuthority,
-  type OwnerModeRecord,
+  type DurableModeRecord,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createFileModeRecordStore } from "./file-record-store.js";
 
 const A = "0x1111111111111111111111111111111111111111";
 
-const ON: OwnerModeRecord = {
+const ON: DurableModeRecord = {
   switched: true,
   switchedAt: 12,
   cleanOffAt: null,

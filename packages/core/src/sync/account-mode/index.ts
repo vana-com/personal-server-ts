@@ -1,38 +1,31 @@
 /**
  * The shared account-storage-mode module.
  *
- * Two layers. `mode-machine.ts` is the pure policy: it decides from one owner's
- * record, one event and a sampled clock, and reads nothing else. The authority
- * (`authority.ts`) holds every owner's record, the one lock that the commit
- * seal and the latch write share, and the durable store. `reduce-adapter.ts`
- * joins them. Every host and the Personal Server read the mode through the
- * authority.
+ * `mode-machine.ts` is the policy: the one place that decides the mode, with
+ * no clock, disk or network. `authority.ts` holds the records, the lock that
+ * the commit seal and the latch write share, and the durable store. Every host
+ * and the Personal Server read the mode through the authority.
+ *
+ * The shared test vectors are `vectors.json` in this folder. They are
+ * host-neutral JSON; a Desktop, phone or Web adapter runs the same file.
  */
 export {
   OFF_TTL_MS,
   createModeRecord,
+  fromDurable,
+  normalizeOwner,
   reduceAccountMode,
+  toDurable,
   validModeOwner,
   type AccountModeRecord,
-  type ModeClock as PureModeClock,
-  type ModeDecision as PureModeDecision,
-  type ModeEvent as PureModeEvent,
-  type ModeReduction,
-} from "./mode-machine.js";
-export {
-  MemoryAccountModeRecordStore,
-  reduceStoredAccountMode,
-  type AccountModeRecordStore,
-} from "./record-store.js";
-export {
-  reduce,
+  type DurableModeRecord,
+  type ModeClock,
   type ModeDecision,
   type ModeEvent,
-  type ModeRecordStore,
+  type ModeReduction,
   type ModeState,
-  type OwnerModeRecord,
-  type ReduceClock,
-} from "./reduce-adapter.js";
+} from "./mode-machine.js";
+export type { ModeRecordStore } from "./record-store.js";
 export {
   createModeAuthority,
   defaultAuthorityClock,

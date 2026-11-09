@@ -9,7 +9,7 @@ import type {
   AccountStorageModeValue,
 } from "../../api/account-storage-mode.js";
 import type { ModeAuthority } from "./authority.js";
-import type { ModeDecision } from "./reduce-adapter.js";
+import type { ModeDecision } from "./mode-machine.js";
 
 export function decisionToModeValue(
   decision: ModeDecision,

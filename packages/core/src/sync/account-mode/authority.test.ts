@@ -267,6 +267,40 @@ describe("the durable On record", () => {
   });
 });
 
+describe("an On whose first save is rejected", () => {
+  // DROP_PENDING_ON_ON_SAVE_FAILURE
+  it("is held in memory, so a store that still serves the old Off never brings legacy back", async () => {
+    const { authority, store } = await boot();
+    await authority.submitEvidence(evidence(A, "off"));
+    expect(authority.read(A).kind).toBe("legacy");
+    store.failSaves(true);
+    expect((await authority.submitEvidence(evidence(A, "on"))).kind).toBe(
+      "refuse",
+    );
+    // The store still serves reads, and still holds the old, unswitched Off.
+    expect(store.durable.get(A)?.switched).toBe(false);
+    expect((await store.load()).get(A)?.switched).toBe(false);
+    expect(authority.read(A)).toMatchObject({ kind: "refuse", status: 503 });
+    expect(authority.admit(A, "op")).toMatchObject({
+      kind: "refuse",
+      status: 503,
+    });
+    expect(authority.commitLegacySync(A, "op", () => 1).ok).toBe(false);
+    // The async commit re-reads the store inside its lock; it must not see legacy either.
+    const result = await authority.commitLegacy(A, "op-2", () => 1);
+    expect(result.ok).toBe(false);
+    // An Off that arrives meanwhile does not lower it.
+    await authority.submitEvidence(evidence(A, "off"));
+    expect(authority.read(A).kind).toBe("refuse");
+    // Only a successful On save ends the refusal.
+    store.failSaves(false);
+    expect((await authority.submitEvidence(evidence(A, "on"))).kind).toBe(
+      "streams",
+    );
+    expect(store.durable.get(A)?.switched).toBe(true);
+  });
+});
+
 describe("a new user's first launch", () => {
   it("uses an explicit Off as soon as it is saved, and not before", async () => {
     const { authority, store } = await boot();

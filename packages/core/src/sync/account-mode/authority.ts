@@ -1,22 +1,19 @@
 /**
  * The stateful half of the shared account-mode module.
  *
- * The pure reducer (`reduce`) decides; this file owns what a decision needs
- * around it: the in-memory records, the one lock that the commit seal and the
- * latch write share, the durable record store, and the evidence intake.
+ * The policy (`reduceAccountMode`, in `mode-machine.ts`) decides everything
+ * about the mode. This file does only what a pure function cannot: it holds
+ * the records, takes the one lock that the commit seal and the latch write
+ * share, probes for legacy files, and writes the durable store.
  *
- * Rules this file enforces (the reducer enforces the others):
- * - Nothing is answered before the stored records are loaded (P6). Until then
+ * - Nothing is answered before the stored records are loaded. Until then
  *   every read refuses with a retryable 503.
- * - A record that must be saved (On) is saved before any decision that depends
- *   on it is served (P6). The reducer keeps the owner in `pendingSave` until
- *   the save settles, and that blocks legacy work and stream answers alike.
- * - The commit seal and the latch write take the same lock (P4). Evidence takes
- *   it exclusively; a legacy commit takes it shared and re-reads the record
- *   inside it, with no await between that re-read and the start of the write.
- *   An On latch therefore waits for every legacy write already in flight, and
- *   no legacy write starts after the latch is set. A check done before the
- *   lock was taken is only an early refusal and is never trusted for a write.
+ * - Evidence takes the lock exclusively; a legacy commit takes it shared and
+ *   re-reads the record inside it, with no await between that re-read and the
+ *   start of the write. An On latch therefore waits for every legacy write
+ *   already in flight, and no legacy write starts after the latch is set. A
+ *   check done before the lock was taken is only an early refusal and is never
+ *   trusted for a write.
  *
  * Do not call `submitEvidence` from inside a commit callback: evidence waits
  * for every in-flight commit, so the call would wait for itself.
@@ -24,14 +21,17 @@
 
 import {
   OFF_TTL_MS,
-  reduce,
+  fromDurable,
+  normalizeOwner,
+  reduceAccountMode,
+  toDurable,
+  type AccountModeRecord,
   type ModeDecision,
   type ModeEvent,
-  type ModeRecordStore,
+  type ModeReduction,
   type ModeState,
-  type OwnerModeRecord,
-  type ReduceClock,
-} from "./reduce-adapter.js";
+} from "./mode-machine.js";
+import type { ModeRecordStore } from "./record-store.js";
 import { createRwLock, type RwLock } from "./rw-lock.js";
 
 export type RefuseDecision = Extract<ModeDecision, { kind: "refuse" }>;
@@ -119,7 +119,7 @@ export interface ModeAuthority {
   /** Whether a stream write may commit for this owner now. */
   commitStream(owner: string, operationId: string): ModeDecision;
   /** A copy of the in-memory records, for diagnostics and tests. */
-  snapshot(): Map<string, OwnerModeRecord>;
+  snapshot(): Map<string, AccountModeRecord>;
 }
 
 const REFUSE_UNKNOWN: RefuseDecision = {
@@ -141,70 +141,65 @@ export function createModeAuthority(
   const clock = options.clock ?? defaultAuthorityClock();
   const warn = options.onWarning ?? (() => {});
   const lock: RwLock = createRwLock();
-  let records = new Map<string, OwnerModeRecord>();
-  let pendingSave = new Set<string>();
+  const records = new Map<string, AccountModeRecord>();
   let loaded = false;
-  // Owners that latched On in this process and whose first `streams` answer
-  // has not been given yet. The first answer carries `importRequired`.
-  const unreported = new Set<string>();
   let starting: Promise<void> | null = null;
 
-  /** Apply an event that changes state. Synchronous: no await inside. */
-  function reduceClock(): ReduceClock {
-    return {
-      nowMono: clock.mono(),
-      nowWall: clock.wall(),
-      bootId: options.bootId,
-    };
-  }
-
-  function apply(event: ModeEvent) {
-    const result = reduce(records, pendingSave, event, reduceClock());
-    records = result.records;
-    pendingSave = result.pendingSave;
-    return result;
-  }
+  const now = () => ({
+    nowMono: clock.mono(),
+    nowWall: clock.wall(),
+    bootId: options.bootId,
+  });
 
   /** Ask for a decision without changing state. */
   function decide(event: ModeEvent): ModeDecision {
     if (!loaded) return REFUSE_UNKNOWN;
-    return (
-      reduce(records, pendingSave, event, reduceClock()).decision ??
-      REFUSE_UNKNOWN
-    );
+    return reduceAccountMode(
+      records.get(normalizeOwner(event.owner)) ?? null,
+      event,
+      now(),
+    ).decision;
   }
 
+  /** Apply an event that changes state. Synchronous: no await inside. */
+  function apply(event: ModeEvent): ModeReduction {
+    const owner = normalizeOwner(event.owner);
+    const result = reduceAccountMode(records.get(owner) ?? null, event, now());
+    if (result.record) records.set(owner, result.record);
+    return result;
+  }
+
+  /**
+   * Save the owner's record, then tell the policy how it went. Nothing that
+   * depends on the record is answered before this settles.
+   */
   async function persistOwner(owner: string): Promise<ModeDecision> {
     const record = records.get(owner);
     if (!record) return REFUSE_UNKNOWN;
     try {
-      await options.store.save(owner, { ...record });
+      await options.store.save(owner, toDurable(record));
     } catch (error) {
       warn("account mode record could not be saved", error);
-      return apply({ op: "saveFailed", owner }).decision ?? REFUSE_UNKNOWN;
+      return apply({ type: "saveFailed", owner }).decision;
     }
-    return apply({ op: "saveComplete", owner }).decision ?? REFUSE_UNKNOWN;
-  }
-
-  async function persistAll(owners: readonly string[]): Promise<void> {
-    for (const owner of owners) await persistOwner(owner);
+    return apply({ type: "saveComplete", owner }).decision;
   }
 
   async function load(): Promise<void> {
     const stored = await options.store.load();
-    records = new Map(
-      [...stored].map(([owner, record]) => [
-        owner.toLowerCase(),
-        { ...record },
-      ]),
-    );
-    pendingSave = new Set();
-    const boot = apply({
-      op: "boot",
-      bootId: options.bootId,
-      clockTrusted: options.clockTrusted ?? true,
-    });
-    await persistAll(boot.persist);
+    records.clear();
+    for (const [owner, record] of stored) {
+      const key = normalizeOwner(owner);
+      records.set(key, fromDurable(key, record));
+    }
+    for (const owner of [...records.keys()]) {
+      apply({
+        type: "boot",
+        owner,
+        bootId: options.bootId,
+        clockTrusted: options.clockTrusted ?? true,
+      });
+    }
     loaded = true;
   }
 
@@ -226,6 +221,16 @@ export function createModeAuthority(
     warn("account mode records could not be loaded", error),
   );
 
+  async function legacyFilesMayExist(owner: string): Promise<boolean> {
+    if (!options.hasLegacyFiles) return false;
+    try {
+      return await options.hasLegacyFiles(owner);
+    } catch (error) {
+      warn("legacy file probe failed; reporting an import is required", error);
+      return true;
+    }
+  }
+
   async function submit(
     input: Omit<ModeEvidenceInput, "fetchStartedAt"> & {
       fetchStartMono: number;
@@ -234,34 +239,22 @@ export function createModeAuthority(
     await start();
     const release = await lock.exclusive();
     try {
-      const owner = (input.owner ?? "").toLowerCase();
-      const wasSwitched = records.get(owner)?.switched === true;
+      const owner = normalizeOwner(input.owner);
+      // The probe is only read at a new On; the policy owns what it means.
+      const legacyFiles =
+        input.state === "on" && records.get(owner)?.switched !== true
+          ? await legacyFilesMayExist(owner)
+          : undefined;
       const applied = apply({
-        op: "evidence",
+        type: "evidence",
         owner: input.owner ?? "",
         authOwner: input.authOwner ?? "",
         state: input.state,
         fetchStartMono: input.fetchStartMono,
         rawStatus: input.rawStatus,
+        legacyFiles,
       });
-      let decision = applied.decision;
-      for (const target of applied.persist) {
-        const settled = await persistOwner(target);
-        if (target === owner) decision = settled;
-      }
-      decision ??= REFUSE_UNKNOWN;
-      if (!wasSwitched && records.get(owner)?.switched === true) {
-        unreported.add(owner);
-      }
-      if (decision.kind !== "streams") return decision;
-      // Only the first answer after the latch reports an import. A save that
-      // failed leaves the owner unreported, so the retry reports it.
-      if (!unreported.delete(owner)) {
-        return { kind: "streams", importRequired: false };
-      }
-      const importRequired =
-        decision.importRequired || (await legacyFilesMayExist(owner));
-      return { kind: "streams", importRequired };
+      return applied.persist ? await persistOwner(owner) : applied.decision;
     } finally {
       release();
     }
@@ -274,26 +267,16 @@ export function createModeAuthority(
    * leaves the owner unknown for this commit.
    */
   async function adoptDurableOn(owner: string): Promise<boolean> {
-    const key = owner.toLowerCase();
+    const key = normalizeOwner(owner);
     try {
       const stored = (await options.store.load()).get(key);
       if (stored?.switched === true && records.get(key)?.switched !== true) {
-        records = new Map(records).set(key, { ...stored });
+        records.set(key, fromDurable(key, stored));
       }
       return true;
     } catch (error) {
       warn("account mode record could not be re-read at commit", error);
       return false;
-    }
-  }
-
-  async function legacyFilesMayExist(owner: string): Promise<boolean> {
-    if (!options.hasLegacyFiles) return false;
-    try {
-      return await options.hasLegacyFiles(owner);
-    } catch (error) {
-      warn("legacy file probe failed; reporting an import is required", error);
-      return true;
     }
   }
 
@@ -310,7 +293,7 @@ export function createModeAuthority(
   }
 
   function commitEvent(owner: string, operationId: string): ModeEvent {
-    return { op: "commit", owner, operationId, sink: "legacy" };
+    return { type: "commit", owner, operationId, sink: "legacy" };
   }
 
   return {
@@ -331,8 +314,9 @@ export function createModeAuthority(
       });
     },
 
-    read: (owner) => decide({ op: "read", owner }),
-    admit: (owner, operationId) => decide({ op: "admit", owner, operationId }),
+    read: (owner) => decide({ type: "read", owner }),
+    admit: (owner, operationId) =>
+      decide({ type: "admit", owner, operationId }),
 
     commitLegacySync(owner, operationId, write) {
       const refused = refusal(decide(commitEvent(owner, operationId)));
@@ -360,7 +344,7 @@ export function createModeAuthority(
     },
 
     commitStream: (owner, operationId) =>
-      decide({ op: "commit", owner, operationId, sink: "stream" }),
+      decide({ type: "commit", owner, operationId, sink: "stream" }),
   };
 }
 

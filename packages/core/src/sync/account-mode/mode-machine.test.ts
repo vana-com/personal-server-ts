@@ -1,19 +1,18 @@
 import { readFileSync } from "node:fs";
+import { Ajv2020 } from "ajv2020/dist/2020.js";
 import { describe, expect, it, vi } from "vitest";
 import {
   OFF_TTL_MS,
   createModeRecord,
+  fromDurable,
   reduceAccountMode,
+  toDurable,
   type AccountModeRecord,
   type ModeClock,
   type ModeDecision,
   type ModeEvent,
 } from "./mode-machine.js";
-import {
-  MemoryAccountModeRecordStore,
-  reduceStoredAccountMode,
-  type AccountModeRecordStore,
-} from "./record-store.js";
+import { runVector, type Vector } from "./vector-runner.js";
 
 const clock: ModeClock = { nowMono: 100, nowWall: 1000, bootId: "boot-1" };
 const evidence = (
@@ -29,7 +28,6 @@ const evidence = (
   ...extra,
 });
 const read: ModeEvent = { type: "read", owner: "A" };
-const save: ModeEvent = { type: "saveComplete", owner: "A" };
 const commit: ModeEvent = {
   type: "commit",
   owner: "A",
@@ -40,55 +38,111 @@ const unknown: ModeDecision = {
   kind: "refuse",
   code: "ACCOUNT_MODE_UNKNOWN",
   status: 503,
-  retryable: true,
-  importRequired: false,
 };
 
-interface Vector {
-  id: string;
-  initial: Record<string, AccountModeRecord | null>;
-  events: Array<{
-    id: string;
-    recordOwner: string;
-    event: ModeEvent;
-    clock: ModeClock;
-  }>;
-  expect: Array<{
-    after: string;
-    decision: ModeDecision;
-    record?: Partial<AccountModeRecord>;
-    unchanged?: boolean;
-  }>;
-}
 const vectors: Vector[] = JSON.parse(
   readFileSync(new URL("./vectors.json", import.meta.url), "utf8"),
 );
 
-describe("pure real reducer against every shared vector", () => {
+describe("the shared vectors, run through the module", () => {
+  it("has the vectors every host runs", () => {
+    expect(vectors.length).toBeGreaterThanOrEqual(18);
+    expect(new Set(vectors.map((v) => v.id)).size).toBe(vectors.length);
+  });
   for (const vector of vectors) {
-    it(vector.id, () => {
-      const records = { ...vector.initial };
-      for (const step of vector.events) {
-        const before = records[step.recordOwner] ?? null;
-        const snapshot = before === null ? null : { ...before };
-        if (before) Object.freeze(before);
-        Object.freeze(step.event);
-        Object.freeze(step.clock);
-        const result = reduceAccountMode(before, step.event, step.clock);
-        expect(reduceAccountMode(before, step.event, step.clock)).toEqual(
-          result,
-        );
-        expect(before).toEqual(snapshot);
-        const expected = vector.expect.find((e) => e.after === step.id)!;
-        expect(result.decision, step.id).toEqual(expected.decision);
-        if (expected.record)
-          expect(result.record, step.id).toMatchObject(expected.record);
-        if (expected.unchanged) expect(result.record, step.id).toEqual(before);
-        records[step.recordOwner] = result.record;
-      }
+    it(vector.id, async () => {
+      expect(await runVector(vector)).toEqual([]);
     });
   }
+});
 
+/** Apply an event and, when the policy asks for a save, report it as done. */
+function accept(
+  record: AccountModeRecord | null,
+  event: ModeEvent,
+  at: ModeClock = clock,
+): AccountModeRecord | null {
+  const result = reduceAccountMode(record, event, at);
+  if (!result.persist) return result.record;
+  return reduceAccountMode(
+    result.record,
+    { type: "saveComplete", owner: result.record?.owner ?? "" },
+    at,
+  ).record;
+}
+
+describe("the vectors file other hosts copy", () => {
+  const read = (name: string) =>
+    JSON.parse(readFileSync(new URL(name, import.meta.url), "utf8"));
+  const schema = read("./vectors.schema.json");
+
+  it("is valid against its JSON schema", () => {
+    const validate = new Ajv2020({
+      allErrors: true,
+      strict: true,
+      strictRequired: false,
+    }).compile(schema);
+    expect(
+      validate(read("./vectors.json")),
+      JSON.stringify(validate.errors),
+    ).toBe(true);
+  });
+
+  it("is checked by a schema that rejects what a host cannot run", () => {
+    const validate = new Ajv2020({
+      strict: true,
+      strictRequired: false,
+    }).compile(schema);
+    const [first] = vectors;
+    for (const broken of [
+      { ...first, version: 2 },
+      { ...first, extra: true },
+      { ...first, policy: { offTtlMs: 1 } },
+      { ...first, events: [{ id: "x", op: "teleport" }] },
+      { ...first, events: [{ id: "x", op: "commit", owner: "A" }] },
+      { ...first, expect: [{ after: "x", decision: "maybe" }] },
+    ]) {
+      expect(validate([broken])).toBe(false);
+    }
+  });
+
+  it("names only owners it defines", () => {
+    for (const vector of vectors) {
+      const known = new Set(Object.keys(vector.owners));
+      const used = [
+        ...(vector.initial.legacyFiles ?? []),
+        ...vector.events.flatMap((e) =>
+          [e.owner, e.authOwner, e.evidence?.owner].filter(
+            (alias): alias is string => alias !== undefined && alias !== "",
+          ),
+        ),
+        ...vector.expect.flatMap((e) => Object.keys(e.durable ?? {})),
+      ];
+      for (const alias of used) {
+        expect(known.has(alias), `${vector.id}: ${alias}`).toBe(true);
+      }
+    }
+  });
+
+  it("is built into the package and exported under a stable path", () => {
+    const pkg = read("../../../package.json");
+    expect(pkg.files).toContain("dist");
+    expect(pkg.exports["./account-mode/vectors.json"]).toBe(
+      "./dist/sync/account-mode/vectors.json",
+    );
+    expect(pkg.exports["./account-mode/vectors.schema.json"]).toBe(
+      "./dist/sync/account-mode/vectors.schema.json",
+    );
+    const tsconfig = readFileSync(
+      new URL("../../../tsconfig.json", import.meta.url),
+      "utf8",
+    );
+    expect(tsconfig).toContain("src/sync/account-mode/vectors.json");
+    expect(tsconfig).toContain("src/sync/account-mode/vectors.schema.json");
+  });
+});
+
+describe("the policy is a pure function", () => {
   it("reads neither an ambient clock nor storage", () => {
     const now = vi.spyOn(Date, "now").mockImplementation(() => {
       throw Error("ambient clock");
@@ -99,35 +153,59 @@ describe("pure real reducer against every shared vector", () => {
     } finally {
       now.mockRestore();
     }
-    expect(result?.decision.kind).toBe("legacy");
+    expect(result?.persist).toBe(true);
     const source = readFileSync(
       new URL("./mode-machine.ts", import.meta.url),
       "utf8",
-    );
+    )
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
     expect(source).not.toMatch(
       /\b(?:Date|performance|process|fetch)\b|^import\s/m,
+    );
+  });
+
+  it("does not change its inputs and answers the same twice", () => {
+    const off = accept(null, evidence("off"));
+    Object.freeze(off);
+    Object.freeze(clock);
+    const event = evidence("on", { legacyFiles: true });
+    Object.freeze(event);
+    expect(reduceAccountMode(off, event, clock)).toEqual(
+      reduceAccountMode(off, event, clock),
     );
   });
 });
 
 describe("named safety mutants and boundary cases", () => {
-  it("UNKNOWN_AS_OFF: a failed answer invalidates an existing Off", () => {
-    const off = reduceAccountMode(null, evidence("off"), clock).record;
-    for (const failed of [
+  it("UNKNOWN_AS_OFF: an answer that is not a usable Off never mints or ends one", () => {
+    const failed = [
       evidence("unknown", { rawStatus: null }),
+      evidence("unknown"),
       evidence("off", { rawStatus: 500 }),
-    ]) {
-      const result = reduceAccountMode(off, failed, clock);
-      expect(result.decision).toEqual(unknown);
-      expect(reduceAccountMode(result.record, commit, clock).decision).toEqual(
-        unknown,
-      );
+      evidence("off", { rawStatus: null }),
+      evidence("off", { rawStatus: 300 }),
+      evidence("off", { fetchStartMono: null }),
+    ];
+    for (const event of failed) {
+      expect(reduceAccountMode(null, event, clock)).toEqual({
+        record: null,
+        decision: unknown,
+        persist: false,
+      });
+    }
+    const off = accept(null, evidence("off"));
+    expect(reduceAccountMode(off, read, clock).decision.kind).toBe("legacy");
+    for (const event of failed) {
+      const result = reduceAccountMode(off, event, clock);
+      expect(result.record).toEqual(off);
+      expect(result.persist).toBe(false);
+      expect(result.decision.kind).toBe("legacy");
     }
   });
 
-  it("OFF_AFTER_ON_LOWERS: stale Off and outage do not lower saved On", () => {
-    const pending = reduceAccountMode(null, evidence("on"), clock).record;
-    let record = reduceAccountMode(pending, save, clock).record;
+  it("OFF_AFTER_ON_LOWERS: a later Off and an outage do not lower a saved On", () => {
+    let record = accept(null, evidence("on"));
     for (const event of [
       evidence("off"),
       evidence("unknown", { rawStatus: null }),
@@ -140,40 +218,51 @@ describe("named safety mutants and boundary cases", () => {
     }
   });
 
-  it("OWNERLESS_READ_ANSWERS: missing and foreign owners change nothing", () => {
-    const off = reduceAccountMode(null, evidence("off"), clock).record;
+  it("OWNERLESS_READ_ANSWERS: a missing or foreign owner changes nothing", () => {
+    const off = accept(null, evidence("off"));
     for (const owner of [undefined, "", "B"]) {
       const result = reduceAccountMode(
         off,
         { type: "read", owner } as ModeEvent,
         clock,
       );
-      expect(result).toEqual({ record: off, decision: unknown });
+      expect(result).toEqual({
+        record: off,
+        decision: unknown,
+        persist: false,
+      });
     }
   });
 
-  it("ADMISSION_ONLY_CHECK: commit reloads after a saved On", async () => {
-    const store = new MemoryAccountModeRecordStore();
-    await reduceStoredAccountMode(store, evidence("off"), clock);
-    const admission = await reduceStoredAccountMode(
-      store,
+  it("owners are compared lowercased", () => {
+    const on = accept(
+      null,
+      evidence("on", { owner: "0xAB", authOwner: "0xab" }),
+    );
+    expect(on?.owner).toBe("0xab");
+    expect(
+      reduceAccountMode(on, { type: "read", owner: "0xaB" }, clock).decision
+        .kind,
+    ).toBe("streams");
+  });
+
+  it("ADMISSION_ONLY_CHECK: a legacy commit after a saved On is refused", () => {
+    const off = accept(null, evidence("off"));
+    const admission = reduceAccountMode(
+      off,
       { type: "admit", owner: "A", operationId: "same-operation" },
       clock,
     );
     expect(admission.decision.kind).toBe("legacy");
-    await reduceStoredAccountMode(store, evidence("on"), clock);
-    await reduceStoredAccountMode(store, save, clock);
-    const result = await reduceStoredAccountMode(store, commit, clock);
-    expect(result.decision).toEqual({
+    const on = accept(off, evidence("on"));
+    expect(reduceAccountMode(on, commit, clock).decision).toEqual({
       kind: "refuse",
       code: "LEGACY_REFUSED_SWITCHED",
       status: 426,
-      retryable: false,
-      importRequired: true,
     });
   });
 
-  it("LATCH_USED_BEFORE_SAVE: pending and failed On never serve either sink", () => {
+  it("LATCH_USED_BEFORE_SAVE: a pending or failed On serves neither sink", () => {
     let record = reduceAccountMode(null, evidence("on"), clock).record;
     for (const event of [
       read,
@@ -189,13 +278,42 @@ describe("named safety mutants and boundary cases", () => {
     ).record;
     expect(reduceAccountMode(record, read, clock).decision).toEqual(unknown);
     expect(record?.switched).toBe(true);
+    // A later On answer asks for the save again.
+    expect(reduceAccountMode(record, evidence("on"), clock).persist).toBe(true);
   });
 
-  it("OFF_NEVER_EXPIRES: deadline equality expires fetch-start freshness", () => {
-    const off = reduceAccountMode(null, evidence("off"), {
-      ...clock,
-      nowMono: 1000,
-    }).record;
+  it("OFF_USED_BEFORE_SAVE: an Off serves nothing until its save completes", () => {
+    const pending = reduceAccountMode(null, evidence("off"), clock);
+    expect(pending.persist).toBe(true);
+    expect(pending.decision).toEqual(unknown);
+    for (const event of [read, commit]) {
+      expect(reduceAccountMode(pending.record, event, clock).decision).toEqual(
+        unknown,
+      );
+    }
+    const failed = reduceAccountMode(
+      pending.record,
+      { type: "saveFailed", owner: "A" },
+      clock,
+    );
+    expect(failed.decision).toEqual(unknown);
+    expect(reduceAccountMode(failed.record, read, clock).decision).toEqual(
+      unknown,
+    );
+    // A later Off asks for the save again, and then serves.
+    expect(
+      reduceAccountMode(failed.record, evidence("off"), clock).persist,
+    ).toBe(true);
+    const saved = reduceAccountMode(
+      pending.record,
+      { type: "saveComplete", owner: "A" },
+      clock,
+    );
+    expect(saved.decision.kind).toBe("legacy");
+  });
+
+  it("OFF_NEVER_EXPIRES: the deadline itself is expired", () => {
+    const off = accept(null, evidence("off"), { ...clock, nowMono: 1000 });
     expect(
       reduceAccountMode(off, read, { ...clock, nowMono: 100 + OFF_TTL_MS - 1 })
         .decision.kind,
@@ -212,9 +330,8 @@ describe("named safety mutants and boundary cases", () => {
     ).toEqual(unknown);
   });
 
-  it("EXPIRY_LOWERS_LATCH: expiry and untrusted reboot retain saved On", () => {
-    const pending = reduceAccountMode(null, evidence("on"), clock).record;
-    const on = reduceAccountMode(pending, save, clock).record;
+  it("EXPIRY_LOWERS_LATCH: expiry and an untrusted reboot keep a saved On", () => {
+    const on = accept(null, evidence("on"));
     const reboot = reduceAccountMode(
       on,
       { type: "boot", owner: "A", bootId: "boot-2", clockTrusted: false },
@@ -230,48 +347,82 @@ describe("named safety mutants and boundary cases", () => {
     ).toBe("streams");
   });
 
-  it("NEVER_SEEN_OWNER_ADMITS: first access is unknown, first explicit Off is immediately usable", () => {
-    expect(reduceAccountMode(null, commit, clock).decision).toEqual(unknown);
-    const off = reduceAccountMode(null, evidence("off"), clock);
-    expect(off.decision.kind).toBe("legacy");
-    expect(reduceAccountMode(off.record, commit, clock).decision.kind).toBe(
-      "legacy",
+  it("an untrusted reboot expires an Off; a trusted one on the same boot keeps it", () => {
+    const off = accept(null, evidence("off"));
+    const same = reduceAccountMode(
+      off,
+      { type: "boot", owner: "A", bootId: "boot-1", clockTrusted: true },
+      clock,
     );
+    expect(same.decision.kind).toBe("legacy");
+    const untrusted = reduceAccountMode(
+      off,
+      { type: "boot", owner: "A", bootId: "boot-1", clockTrusted: false },
+      clock,
+    );
+    expect(untrusted.decision).toEqual(unknown);
+    expect(untrusted.record?.cleanOffAt).toBe(off?.cleanOffAt);
   });
 
-  it("MISMATCHED_AUTH_OWNER_OFF: another account cannot mint or erase this record's Off", () => {
-    const off = reduceAccountMode(null, evidence("off"), clock).record;
+  it("NEVER_SEEN_OWNER_ADMITS: first access is unknown and creates nothing", () => {
+    for (const event of [commit, read]) {
+      expect(reduceAccountMode(null, event, clock)).toEqual({
+        record: null,
+        decision: unknown,
+        persist: false,
+      });
+    }
+    const off = accept(null, evidence("off"));
+    expect(reduceAccountMode(off, commit, clock).decision.kind).toBe("legacy");
+  });
+
+  it("MISMATCHED_AUTH_OWNER_OFF: another account cannot mint or erase this Off", () => {
+    const off = accept(null, evidence("off"));
     for (const record of [null, off]) {
       expect(
         reduceAccountMode(record, evidence("off", { authOwner: "B" }), clock),
-      ).toEqual({ record, decision: unknown });
+      ).toEqual({ record, decision: unknown, persist: false });
     }
   });
 
-  it("delivers import exactly on the first read/commit, never admission or save", () => {
-    let record = reduceAccountMode(null, evidence("off"), clock).record;
-    record = reduceAccountMode(record, evidence("on"), clock).record;
-    const saved = reduceAccountMode(record, save, clock);
-    expect(saved.decision.importRequired).toBe(false);
-    const admission = reduceAccountMode(
-      saved.record,
-      { type: "admit", owner: "A", operationId: "op" },
+  it("sets importRequired once, at the first durable On, from the legacy-files probe", () => {
+    const off = accept(null, evidence("off"));
+    const on = reduceAccountMode(
+      off,
+      evidence("on", { legacyFiles: true }),
       clock,
     );
-    expect(admission.record?.importPending).toBe(true);
-    const first = reduceAccountMode(
-      admission.record,
-      { ...commit, sink: "stream" },
+    expect(on.persist).toBe(true);
+    expect(on.decision).toEqual(unknown);
+    const saved = reduceAccountMode(
+      on.record,
+      { type: "saveComplete", owner: "A" },
       clock,
     );
-    expect(first.decision).toEqual({ kind: "streams", importRequired: true });
-    expect(reduceAccountMode(first.record, read, clock).decision).toEqual({
-      kind: "streams",
-      importRequired: false,
-    });
+    expect(saved.decision).toEqual({ kind: "streams", importRequired: true });
+    const later = reduceAccountMode(saved.record, read, clock);
+    expect(later.decision).toEqual({ kind: "streams", importRequired: false });
+    // A second On answer, even with legacy files present, owes nothing.
+    const again = reduceAccountMode(
+      later.record,
+      evidence("on", { legacyFiles: true }),
+      clock,
+    );
+    expect(again.persist).toBe(false);
+    expect(again.decision).toEqual({ kind: "streams", importRequired: false });
   });
 
-  it("rejects future/expired/missing Off timestamps and invalid status without defaulting to Off", () => {
+  it("owes no import when the probe finds no legacy files", () => {
+    const on = reduceAccountMode(null, evidence("on"), clock);
+    const saved = reduceAccountMode(
+      on.record,
+      { type: "saveComplete", owner: "A" },
+      clock,
+    );
+    expect(saved.decision).toEqual({ kind: "streams", importRequired: false });
+  });
+
+  it("rejects future and expired Off timestamps and an invalid status", () => {
     for (const event of [
       evidence("off", { fetchStartMono: 101 }),
       evidence("off", { fetchStartMono: null }),
@@ -288,67 +439,41 @@ describe("named safety mutants and boundary cases", () => {
   });
 
   it("does not extend freshness when an older response arrives late", () => {
-    const newer = reduceAccountMode(
-      null,
-      evidence("off", { fetchStartMono: 150 }),
-      { ...clock, nowMono: 200 },
-    ).record;
+    const newer = accept(null, evidence("off", { fetchStartMono: 150 }), {
+      ...clock,
+      nowMono: 200,
+    });
     const older = reduceAccountMode(
       newer,
       evidence("off", { fetchStartMono: 100 }),
       { ...clock, nowMono: 300 },
     );
     expect(older.record?.offFetchStartMono).toBe(150);
+    expect(older.persist).toBe(false);
   });
 });
 
-describe("record-store test double and durable port contract", () => {
-  it("serializes same-owner transitions and does not alias records", async () => {
-    const store = new MemoryAccountModeRecordStore();
-    const [off, on] = await Promise.all([
-      reduceStoredAccountMode(store, evidence("off"), clock),
-      reduceStoredAccountMode(store, evidence("on"), clock),
+describe("the durable projection", () => {
+  it("round-trips, and a record read from disk counts as saved", () => {
+    const on = accept(null, evidence("on", { legacyFiles: true }))!;
+    const back = fromDurable("a", toDurable(on));
+    expect(back).toMatchObject({
+      owner: "a",
+      switched: true,
+      switchedAt: on.switchedAt,
+      persistence: "saved",
+      importPending: false,
+    });
+    expect(Object.keys(toDurable(on)).sort()).toEqual([
+      "bootId",
+      "cleanOffAt",
+      "offFetchStartMono",
+      "switched",
+      "switchedAt",
     ]);
-    expect(off.decision.kind).toBe("legacy");
-    expect(on.record?.switched).toBe(true);
-    const copied = await store.read("A");
-    Object.assign(copied!, { switched: false });
-    expect((await store.read("A"))?.switched).toBe(true);
-    expect(await store.read("B")).toBeNull();
   });
 
-  it("never returns a usable On decision after a durable-port failure", async () => {
-    const pending = reduceAccountMode(null, evidence("on"), clock).record!;
-    const store: AccountModeRecordStore = {
-      read: async () => pending,
-      transact: async (_owner, transition) => {
-        transition(pending);
-        throw Error("durable save failed");
-      },
-    };
-    await expect(reduceStoredAccountMode(store, save, clock)).rejects.toThrow(
-      "durable save failed",
-    );
-    const failed = reduceAccountMode(
-      pending,
-      { type: "saveFailed", owner: "A" },
-      clock,
-    );
-    expect(failed.decision).toEqual(unknown);
-  });
-
-  it("rejects foreign writes and remains usable after a rejected transition", async () => {
-    const store = new MemoryAccountModeRecordStore();
-    await expect(
-      store.transact("A", () => ({
-        record: createModeRecord("B", "boot-1"),
-        decision: unknown,
-      })),
-    ).rejects.toThrow("owner changed");
-    expect(await store.read("A")).toBeNull();
-    expect(
-      (await reduceStoredAccountMode(store, evidence("off"), clock)).decision
-        .kind,
-    ).toBe("legacy");
+  it("refuses to make a record without an owner", () => {
+    expect(() => createModeRecord("", "boot-1")).toThrow("needs an owner");
   });
 });

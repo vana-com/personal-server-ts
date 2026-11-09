@@ -4,7 +4,7 @@
  * Desktop and phone hosts and built in-process by Web.
  */
 
-import type { ModeDecision, ModeState } from "./reduce-adapter.js";
+import type { ModeDecision, ModeState } from "./mode-machine.js";
 
 export interface EvidenceBody {
   owner: string;

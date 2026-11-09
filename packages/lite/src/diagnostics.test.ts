@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fixedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   DiagnosticsRecorder,
   collectDiagnosticsWithTimeout,
@@ -394,7 +393,6 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
 
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       accessLogReader: accessLogStore,
       accessLogWriter: accessLogStore,
@@ -434,7 +432,6 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
 
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       accessLogReader: accessLogStore,
       accessLogWriter: accessLogStore,
@@ -482,7 +479,6 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
 
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       accessLogReader: accessLogStore,
       accessLogWriter: accessLogStore,
@@ -528,7 +524,6 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
     const recorder = new DiagnosticsRecorder();
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       accessLogReader: accessLogStore,
       accessLogWriter: accessLogStore,
@@ -565,7 +560,6 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
     const recorder = new DiagnosticsRecorder();
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       accessLogReader: accessLogStore,
       accessLogWriter: accessLogStore,
@@ -616,7 +610,6 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
 
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       accessLogReader: accessLogStore,
       accessLogWriter: accessLogStore,
@@ -674,7 +667,6 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
 
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       accessLogReader: accessLogStore,
       accessLogWriter: accessLogStore,
@@ -730,7 +722,6 @@ describe("DiagnosticsRecorder — runtime route integration", () => {
 
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
-      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       accessLogReader: accessLogStore,
       accessLogWriter: accessLogStore,

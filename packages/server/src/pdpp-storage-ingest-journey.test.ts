@@ -24,6 +24,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import { createUnswitchedServer } from "./account-mode/unswitched-server.test-utils.js";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { MAX_INGEST_BODY_BYTES } from "./routes/pdpp-records.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
@@ -103,7 +104,7 @@ async function boot(
       }),
     )
   ).filter((sourceId): sourceId is string => typeof sourceId === "string");
-  return createServer(
+  return createUnswitchedServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
       pdpp: {

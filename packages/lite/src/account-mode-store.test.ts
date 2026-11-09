@@ -2,12 +2,12 @@ import { IDBFactory } from "fake-indexeddb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createModeAuthority,
-  type OwnerModeRecord,
+  type DurableModeRecord,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createIndexedDbModeRecordStore } from "./account-mode-store.js";
 
 const A = "0x1111111111111111111111111111111111111111";
-const ON: OwnerModeRecord = {
+const ON: DurableModeRecord = {
   switched: true,
   switchedAt: 5,
   cleanOffAt: null,

@@ -8,13 +8,13 @@
 
 import type {
   ModeRecordStore,
-  OwnerModeRecord,
+  DurableModeRecord,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 
 export const ACCOUNT_MODE_DB_NAME = "personal-server-lite-account-mode";
 const STORE = "owners";
 
-interface StoredRow extends OwnerModeRecord {
+interface StoredRow extends DurableModeRecord {
   owner: string;
 }
 
@@ -64,7 +64,7 @@ export function createIndexedDbModeRecordStore(
           request.onerror = () =>
             reject(request.error ?? new Error("read failed"));
         });
-        const records = new Map<string, OwnerModeRecord>();
+        const records = new Map<string, DurableModeRecord>();
         for (const row of rows) {
           // A malformed row loads as a never-seen owner.
           if (!isRow(row)) continue;

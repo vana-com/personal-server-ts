@@ -25,25 +25,20 @@ import { join } from "node:path";
 
 const DIR = "packages/core/src/sync/account-mode";
 const AUTHORITY = `${DIR}/authority.ts`;
-// The pure per-owner policy and the seam that joins it to the authority.
+// The policy: the only place that decides what the mode is.
 const CORE = `${DIR}/mode-machine.ts`;
-const ADAPTER = `${DIR}/reduce-adapter.ts`;
 const FLAG = `${DIR}/flag-evidence.ts`;
 
 const AUTHORITY_TESTS = `${DIR}/authority.test.ts`;
-const VECTORS = `${DIR}/authority-vectors.test.ts`;
 const FLAG_TESTS = `${DIR}/flag-evidence.test.ts`;
+// Runs the shared vectors (vectors.json) and the policy's unit tests.
 const CORE_TESTS = `${DIR}/mode-machine.test.ts`;
-const CORE_VECTORS = `${DIR}/vectors.test.ts`;
-const TEST_FILES = [
-  AUTHORITY_TESTS,
-  VECTORS,
-  FLAG_TESTS,
-  CORE_TESTS,
-  CORE_VECTORS,
-];
+const TEST_FILES = [AUTHORITY_TESTS, FLAG_TESTS, CORE_TESTS];
 
-const vector = (id) => ({ file: VECTORS, name: `vector ${id}` });
+const vector = (id) => ({
+  file: CORE_TESTS,
+  name: `the shared vectors, run through the module ${id}`,
+});
 const authority = (name) => ({ file: AUTHORITY_TESTS, name });
 const core = (name) => ({ file: CORE_TESTS, name });
 
@@ -54,22 +49,13 @@ const core = (name) => ({ file: CORE_TESTS, name });
 const MUTANTS = [
   {
     name: "UNKNOWN_AS_OFF",
-    edits: [
-      [
-        CORE,
-        '          successful &&\n          event.state === "off" &&',
-        '          event.state === "off" &&',
-      ],
-      [
-        ADAPTER,
-        "const good = succeeded(event.rawStatus);",
-        "const good = true;",
-      ],
-    ],
+    edits: [[CORE, "        succeeded(event.rawStatus) &&\n", ""]],
     aimed: [
       authority("changes nothing for an answer that was not a success"),
       vector("unknown-evidence-refuses"),
-      core("UNKNOWN_AS_OFF: a failed answer invalidates an existing Off"),
+      core(
+        "UNKNOWN_AS_OFF: an answer that is not a usable Off never mints or ends one",
+      ),
     ],
   },
   {
@@ -77,32 +63,42 @@ const MUTANTS = [
     edits: [
       [
         CORE,
-        "      } else if (!next.switched) {\n        if (\n          successful &&",
-        "      } else {\n        if (\n          successful &&",
+        "      } else if (!next.switched) {\n        // An older",
+        "      } else {\n        // An older",
       ],
       [
         CORE,
-        "              cleanOffAt: clock.nowWall,\n              offFetchStartMono: event.fetchStartMono,",
-        "              switched: false,\n              cleanOffAt: clock.nowWall,\n              offFetchStartMono: event.fetchStartMono,",
+        "            cleanOffAt: clock.nowWall,\n            offFetchStartMono: event.fetchStartMono as number,",
+        "            switched: false,\n            cleanOffAt: clock.nowWall,\n            offFetchStartMono: event.fetchStartMono as number,",
       ],
     ],
     aimed: [
       vector("on-is-never-lowered"),
-      core("OFF_AFTER_ON_LOWERS: stale Off and outage do not lower saved On"),
+      core(
+        "OFF_AFTER_ON_LOWERS: a later Off and an outage do not lower a saved On",
+      ),
     ],
   },
   {
     name: "OWNERLESS_READ_ANSWERS",
     edits: [
       [
-        ADAPTER,
-        "  const owner = normalize(event.owner);\n  const before",
-        '  const owner =\n    normalize(event.owner) || (recordsIn.keys().next().value ?? "");\n  const before',
+        CORE,
+        "  if (!validModeOwner(owner)) return refuseUnchanged();\n  if (record !== null && record.owner !== owner) return refuseUnchanged();\n",
+        "",
+      ],
+      [
+        AUTHORITY,
+        "      records.get(normalizeOwner(event.owner)) ?? null,\n      event,\n      now(),\n    ).decision;",
+        "      records.get(normalizeOwner(event.owner)) ??\n        records.values().next().value ??\n        null,\n      event,\n      now(),\n    ).decision;",
       ],
     ],
     aimed: [
       authority("is unknown, even though other owners have answers"),
       vector("owner-mismatch-is-unknown"),
+      core(
+        "OWNERLESS_READ_ANSWERS: a missing or foreign owner changes nothing",
+      ),
     ],
   },
   {
@@ -126,7 +122,7 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        "      await options.store.save(owner, { ...record });",
+        "      await options.store.save(owner, toDurable(record));",
         "      await Promise.resolve();",
       ],
     ],
@@ -140,8 +136,8 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        "    try {\n      await options.store.save(owner, { ...record });",
-        '    apply({ op: "saveComplete", owner });\n    try {\n      await options.store.save(owner, { ...record });',
+        "    try {\n      await options.store.save(owner, toDurable(record));",
+        '    apply({ type: "saveComplete", owner });\n    try {\n      await options.store.save(owner, toDurable(record));',
       ],
     ],
     aimed: [
@@ -154,15 +150,13 @@ const MUTANTS = [
     edits: [
       [
         CORE,
-        "    clock.nowMono - record.offFetchStartMono < OFF_TTL_MS\n  );",
+        "    nowMono - fetchStartMono < OFF_TTL_MS\n  );",
         "    true\n  );",
       ],
     ],
     aimed: [
       vector("off-expires-at-deadline"),
-      core(
-        "OFF_NEVER_EXPIRES: deadline equality expires fetch-start freshness",
-      ),
+      core("OFF_NEVER_EXPIRES: the deadline itself is expired"),
     ],
   },
   {
@@ -176,7 +170,9 @@ const MUTANTS = [
     ],
     aimed: [
       vector("on-survives-crash-and-wipe"),
-      core("EXPIRY_LOWERS_LATCH: expiry and untrusted reboot retain saved On"),
+      core(
+        "EXPIRY_LOWERS_LATCH: expiry and an untrusted reboot keep a saved On",
+      ),
     ],
   },
   {
@@ -212,14 +208,19 @@ const MUTANTS = [
     edits: [
       [
         CORE,
-        "  if (!next.switched) {\n    if (!freshOff(next, clock))",
-        "  if (!next.switched) {\n    if (record !== null && !freshOff(next, clock))",
+        '  if (record === null && event.type !== "evidence") return refuseUnchanged();',
+        '  if (record === null && event.type !== "evidence")\n    record = createModeRecord(owner, clock.bootId);',
+      ],
+      [
+        CORE,
+        "    if (unsaved(record) || !freshOff(record, clock)) return UNKNOWN;",
+        "    if (unsaved(record) || (record.cleanOffAt !== null && !freshOff(record, clock)))\n      return UNKNOWN;",
       ],
     ],
     aimed: [
       authority("answers 503 for an owner it has never heard of"),
       core(
-        "NEVER_SEEN_OWNER_ADMITS: first access is unknown, first explicit Off is immediately usable",
+        "NEVER_SEEN_OWNER_ADMITS: first access is unknown and creates nothing",
       ),
     ],
   },
@@ -228,8 +229,8 @@ const MUTANTS = [
     edits: [
       [
         AUTHORITY,
-        '      return apply({ op: "saveFailed", owner }).decision ?? REFUSE_UNKNOWN;',
-        '      return apply({ op: "saveComplete", owner }).decision ?? REFUSE_UNKNOWN;',
+        '      return apply({ type: "saveFailed", owner }).decision;',
+        '      return apply({ type: "saveComplete", owner }).decision;',
       ],
     ],
     aimed: [
@@ -240,13 +241,67 @@ const MUTANTS = [
     ],
   },
   {
-    name: "OUTAGE_ENDS_FRESH_OFF",
-    edits: [[ADAPTER, "if (ownersAgree && !forwardable) {", "if (false) {"]],
+    name: "DROP_PENDING_ON_ON_SAVE_FAILURE",
+    edits: [
+      [
+        AUTHORITY,
+        '      warn("account mode record could not be saved", error);\n      return apply({ type: "saveFailed", owner }).decision;',
+        '      warn("account mode record could not be saved", error);\n      const stored = (await options.store.load()).get(owner);\n      if (stored) records.set(owner, fromDurable(owner, stored));\n      return decide({ type: "read", owner });',
+      ],
+    ],
     aimed: [
+      authority(
+        "is held in memory, so a store that still serves the old Off never brings legacy back",
+      ),
+    ],
+  },
+  {
+    name: "OUTAGE_ENDS_FRESH_OFF",
+    edits: [
+      [
+        CORE,
+        "return record === null ? refuseUnchanged() : settle(record);",
+        "return record === null ? refuseUnchanged() : settle(expireOff(record));",
+      ],
+    ],
+    aimed: [
+      vector("outage-keeps-fresh-off"),
       authority(
         "leave a still-fresh Off in place, because an unreachable Account blocks no one who has not switched",
       ),
     ],
+  },
+  {
+    name: "OLDER_RESPONSE_EXTENDS_OFF",
+    edits: [
+      [
+        CORE,
+        "          (event.fetchStartMono as number) >= next.offFetchStartMono;",
+        "          true;",
+      ],
+    ],
+    aimed: [
+      core("does not extend freshness when an older response arrives late"),
+    ],
+  },
+  {
+    name: "OWNER_CASE_SENSITIVE",
+    edits: [[CORE, "owner.toLowerCase()", "owner"]],
+    aimed: [
+      authority("is folded to lower case, so one address is one owner"),
+      core("owners are compared lowercased"),
+    ],
+  },
+  {
+    name: "PROBE_THROW_MEANS_NONE",
+    edits: [
+      [
+        AUTHORITY,
+        '      warn("legacy file probe failed; reporting an import is required", error);\n      return true;',
+        '      warn("legacy file probe failed; reporting an import is required", error);\n      return false;',
+      ],
+    ],
+    aimed: [authority("counts a probe that throws as legacy files present")],
   },
 ];
 

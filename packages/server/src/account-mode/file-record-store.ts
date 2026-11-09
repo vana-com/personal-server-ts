@@ -24,7 +24,7 @@ import {
 import { join } from "node:path";
 import type {
   ModeRecordStore,
-  OwnerModeRecord,
+  DurableModeRecord,
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 
 const OWNER_FILE = /^([a-z0-9_-]{1,100})\.json$/;
@@ -42,7 +42,7 @@ function numberOrNull(value: unknown): value is number | null {
   );
 }
 
-function parseRecord(text: string): OwnerModeRecord | null {
+function parseRecord(text: string): DurableModeRecord | null {
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -85,7 +85,7 @@ export function createFileModeRecordStore(
   return {
     async load() {
       await mkdir(dir, { recursive: true });
-      const records = new Map<string, OwnerModeRecord>();
+      const records = new Map<string, DurableModeRecord>();
       const sweep = !sweptTemps;
       sweptTemps = true;
       for (const name of await readdir(dir)) {
