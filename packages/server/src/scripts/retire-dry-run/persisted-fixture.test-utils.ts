@@ -104,6 +104,13 @@ export async function persistFixture(
     });
   }
 
+  // The in-memory fixture stores every legacy file at the memory store's
+  // epoch, long before the registry's delete. The delete fence needs the file
+  // to predate the delete by when this device stored it (created_at) too.
+  db.prepare("UPDATE data_files SET created_at = ?").run(
+    new Date(0).toISOString(),
+  );
+
   const signature = toHex(await masterKey(901)) as `0x${string}`;
   const ownerAddress = await recoverOwnerAddress(signature);
   const config = {

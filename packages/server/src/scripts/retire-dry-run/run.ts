@@ -183,7 +183,6 @@ export async function runLegacyRetireDryRun(
       ledger,
       deleteEnabled: false,
       dryRun: true,
-      readbackBeforeImport: true,
       now,
     });
     guard.assertNoViolations();

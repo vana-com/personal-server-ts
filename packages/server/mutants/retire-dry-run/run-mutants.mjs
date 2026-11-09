@@ -123,9 +123,13 @@ const MUTANTS = [
   },
   {
     id: "M4b",
-    what: "readback before import is off",
+    what: "the import-done guard is widened (ledger says done)",
     edits: [
-      [F.run, "readbackBeforeImport: true,", "readbackBeforeImport: false,"],
+      [
+        F.run,
+        "data.importComplete = home.importComplete;",
+        "data.importComplete = true;",
+      ],
     ],
     files: [T.run],
     pattern: "does not run an import",

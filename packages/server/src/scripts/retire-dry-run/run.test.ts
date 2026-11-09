@@ -325,9 +325,9 @@ describe("NO_IMPORT_NO_PUBLISH", () => {
     expect(report.deviceImport).toEqual({ complete: false, connectors: 0 });
     expect(report.files.every((f) => f.decision === "no_import")).toBe(true);
     expect(report.totals.wouldDelete).toBe(0);
-    // The published view is still compared, so the report says what a later
-    // import would find.
-    expect(report.files.filter((f) => f.readback === "pass")).toHaveLength(3);
+    // The import guard is the retire pass's own: before the import is done
+    // no readback is taken, so the report says "none", not a verdict.
+    expect(report.files.every((f) => f.readback === "none")).toBe(true);
     expect(await hashTree(p.dataDir)).toEqual(before);
   });
 
@@ -464,6 +464,36 @@ describe("the synthetic fixture, in memory and persisted", () => {
       report.files.find((f) => f.scopeHash === scopeHash("instagram.following"))
         ?.decision,
     ).toBe("fence_not_recollected");
+    expect(report.totals.wouldDelete).toBe(2);
+  });
+});
+
+describe("a failed published read", () => {
+  it("keeps the fenced file: a storage error is never an empty view", async () => {
+    const p = await fixture();
+    const actual = await vi.importActual<typeof CoreSync>(
+      "@opendatalabs/personal-server-ts-core/sync",
+    );
+    type Deps = Parameters<typeof actual.retireLegacyFiles>[0];
+    hooks.retire = async (deps) => {
+      const d = deps as Deps;
+      const host = Object.assign(Object.create(d.host), {
+        publishedBody: async (scope: string) => {
+          if (scope === "instagram.following") throw new Error("storage 500");
+          return d.host.publishedBody(scope);
+        },
+      });
+      return actual.retireLegacyFiles({ ...d, host });
+    };
+    const report = await runLegacyRetireDryRun(optionsOf(p));
+    const fenced = report.files.find(
+      (f) => f.scopeHash === scopeHash("instagram.following"),
+    );
+    expect(fenced).toMatchObject({
+      readback: "fail",
+      readbackReason: "no_published_view",
+      wouldDelete: false,
+    });
     expect(report.totals.wouldDelete).toBe(2);
   });
 });
