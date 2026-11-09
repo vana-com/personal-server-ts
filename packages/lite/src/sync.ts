@@ -600,11 +600,15 @@ export async function createPsLiteSyncManager(
     // the importer once, which the retire step requires, and the readback gate
     // still decides every delete of a local legacy file.
     const retireLedger = streamSyncHome
-      ? new RetireLedger(streamSyncHome.home.files)
+      ? new RetireLedger(streamSyncHome.home.files, serverOwner)
       : null;
     const legacyImporter = retireLedger
       ? new LegacyImporter({
-          source: { connectors: async () => [], streams: async () => [] },
+          source: {
+            owner: serverOwner,
+            connectors: async () => [],
+            streams: async () => [],
+          },
           sink: {
             stage: async () => {
               throw new Error("Lite stages no legacy rows");

@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 import { ImportPendingError } from "../../stream-sync/writer.js";
-import { CONNECTOR, flow, STREAM } from "./retire-rig.js";
+import { CONNECTOR, flow, OWNER, STREAM } from "./retire-rig.js";
 
 describe("a stream run of a connector waits for its import (RUN_BEFORE_IMPORT)", () => {
   it("refuses to begin a run until the import finished, then accepts it", async () => {
@@ -171,6 +171,8 @@ describe("unswitched accounts are unchanged (UNSWITCHED_CHANGED)", () => {
     expect(await f.importer.importDone(CONNECTOR)).toBe(true);
     await f.run("any", ["e1"]);
     expect(await f.ledger.read()).toEqual({
+      owner: OWNER,
+      excluded: {},
       importComplete: false,
       imported: {},
       readbacks: {},

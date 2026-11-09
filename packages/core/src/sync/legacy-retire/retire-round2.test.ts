@@ -19,7 +19,15 @@ import { createRetireHost } from "./host.js";
 import { RetireLedger } from "./ledger.js";
 import { predatesEveryDelete, readbackVersion } from "./readback.js";
 import { retireLegacyFiles, type RetireHost } from "./retire.js";
-import { AT, CONNECTOR, flow, legacy, raw, STREAM } from "./retire-rig.js";
+import {
+  AT,
+  CONNECTOR,
+  flow,
+  legacy,
+  OWNER,
+  raw,
+  STREAM,
+} from "./retire-rig.js";
 
 const AFTER_DELETE = "2026-11-02T00:00:00.000Z";
 
@@ -754,7 +762,7 @@ describe("a scope with a connector the registry never saw is never fenced (UNKNO
 
 describe("host wiring", () => {
   it("does not expose a basis the host cannot name (a host without delete basis)", async () => {
-    const ledger = new RetireLedger(createMemoryStreamSyncFiles());
+    const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
     const host: RetireHost = createRetireHost({
       reader: { publishedBody: async () => null, retireBasis: () => null },
       writer: { fullRunSince: async () => true },

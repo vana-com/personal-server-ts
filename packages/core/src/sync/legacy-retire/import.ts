@@ -25,10 +25,48 @@ export interface ImportStream {
   records(): AsyncIterable<Record<string, unknown>>;
 }
 
+/**
+ * Why some of a connector's rows are not imported. They stay in the legacy
+ * file, and the ledger keeps this count so that "not imported" is never mistaken
+ * for "nothing there". `stream` is null for a whole-connector reason.
+ */
+export interface ImportExclusion {
+  readonly stream: string | null;
+  readonly reason:
+    | "unmapped_stream"
+    | "no_primary_key"
+    | "unkeyed_row"
+    | "blob_reference"
+    | "ambiguous_connection";
+  readonly rows: number;
+}
+
+/**
+ * The source cannot be read yet (the host has not opened its stores). A pass
+ * that meets it is pending: it records nothing, and the writer keeps waiting.
+ * An empty source answers with an empty list, never with this.
+ */
+export class ImportSourceUnavailableError extends Error {
+  constructor() {
+    super("legacy import source is not available yet");
+    this.name = "ImportSourceUnavailableError";
+  }
+}
+
 export interface LegacyImportSource {
-  /** Connectors this device holds importable rows for. */
+  /**
+   * The Account owner whose device rows this source reads. A pass refuses a
+   * source whose owner is not the importer's.
+   */
+  readonly owner: string;
+  /**
+   * Connectors this device holds importable rows for. Throws
+   * `ImportSourceUnavailableError` while the source cannot be read.
+   */
   connectors(): Promise<readonly string[]>;
   streams(connector: string): Promise<readonly ImportStream[]>;
+  /** What `streams(connector)` left out; read right after it. */
+  excluded?(connector: string): Promise<readonly ImportExclusion[]>;
 }
 
 export interface LegacyImportSink {
@@ -67,6 +105,10 @@ export interface ImportPassResult {
   readonly ran: boolean;
   readonly connectorsStaged: number;
   readonly failed: number;
+  /** The source was not readable yet; nothing was recorded. */
+  readonly pending?: true;
+  /** The pass did not start: the source belongs to another owner. */
+  readonly refused?: "owner_mismatch";
 }
 
 export class LegacyImporter {
@@ -100,12 +142,37 @@ export class LegacyImporter {
     if (!this.options.switched()) {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }
+    if (source.owner.toLowerCase() !== ledger.owner) {
+      this.options.logger?.warn(
+        {},
+        "Legacy import source belongs to another owner",
+      );
+      return {
+        ran: false,
+        connectorsStaged: 0,
+        failed: 0,
+        refused: "owner_mismatch",
+      };
+    }
     if ((await ledger.read()).importComplete) {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }
+    let connectors: readonly string[];
+    try {
+      connectors = await source.connectors();
+    } catch (error) {
+      if (error instanceof ImportSourceUnavailableError) {
+        return { ran: true, connectorsStaged: 0, failed: 0, pending: true };
+      }
+      this.options.logger?.warn(
+        { error: error instanceof Error ? error.name : "NonError" },
+        "Legacy import source could not be listed; retried next cycle",
+      );
+      return { ran: true, connectorsStaged: 0, failed: 1 };
+    }
     let staged = 0;
     let failed = 0;
-    for (const connector of await source.connectors()) {
+    for (const connector of connectors) {
       if ((await ledger.read()).imported[connector]) continue;
       if (await this.options.deleted?.(connector)) {
         const at = (this.options.now?.() ?? new Date()).toISOString();
@@ -125,6 +192,7 @@ export class LegacyImporter {
             stream.records(),
           );
         }
+        const excluded = (await source.excluded?.(connector)) ?? [];
         const at = (this.options.now?.() ?? new Date()).toISOString();
         await ledger.update((data) => {
           data.imported[connector] = {
@@ -132,6 +200,8 @@ export class LegacyImporter {
             at,
             staged: receipt,
           };
+          if (excluded.length > 0) data.excluded[connector] = [...excluded];
+          else delete data.excluded[connector];
         });
         staged += 1;
       } catch (error) {

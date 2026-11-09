@@ -23,6 +23,7 @@ import { Fixture, masterKey } from "../../stream-sync-read/service-fixture.js";
 import type { StreamSyncReadService } from "../../stream-sync-read/service.js";
 import { testOwnerKey } from "../../stream-sync-read/testing.js";
 import type { LegacyImportSource, ImportStream } from "./import.js";
+import { OWNER } from "./retire-rig.js";
 
 export type ExpectedOutcome = "pass" | "fenced" | "tampered" | "empty";
 
@@ -231,6 +232,7 @@ export async function buildSyntheticFixture(): Promise<SyntheticFixture> {
     "chatgpt/messages": [],
   };
   const source: LegacyImportSource = {
+    owner: OWNER,
     connectors: async () => connectors,
     streams: async (connector) =>
       Object.entries(streamRows)

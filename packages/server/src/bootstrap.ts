@@ -73,6 +73,7 @@ import { createSyncCursor } from "./sync-cursor.js";
 import {
   createGatewayDataPointFeed,
   createGatewayDeleteDataPort,
+  createCanonicalImportSource,
   createInventoryTombstoneFinality,
   createScopeDeletionTracker,
   createRetireHost,
@@ -81,6 +82,7 @@ import {
   LegacyImporter,
   RetireLedger,
   withCancellableRegistration,
+  type CanonicalImportDeps,
   type LegacyImportSource,
   type LegacyRetireOption,
   type PdppImporter,
@@ -200,11 +202,6 @@ export interface ServerContext {
   replicaWriterRotation: ReplicaWriterRotation;
 }
 
-const NO_IMPORT_SOURCE: LegacyImportSource = {
-  connectors: async () => [],
-  streams: async () => [],
-};
-
 export interface CreateServerOptions {
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
@@ -222,8 +219,9 @@ export interface CreateServerOptions {
   hydrateScopes?: string[];
   /**
    * This device's own stream-shaped rows to import into stream data when the
-   * account is switched. Default: none (nothing is imported, the import gate
-   * opens at once). The canonical record store has no adapter yet.
+   * account is switched. Default: the canonical record store, mapped to streams
+   * through the retained connector declarations (opened later in boot; until
+   * then the import is pending, never complete). Tests inject a source.
    */
   legacyImportSource?: LegacyImportSource;
   /**
@@ -685,6 +683,10 @@ export async function createServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
+  // The canonical stores the legacy import reads, bound once they open. Null
+  // means "not available yet" to the import source, never "empty".
+  let canonicalImportDeps: CanonicalImportDeps | null = null;
+  let bootLegacyImporter: LegacyImporter | null = null;
   let streamSyncWriter: StreamSyncWriter | null = null;
   let releaseStreamSyncHome: (() => Promise<void>) | null = null;
   let streamSyncRead: StreamSyncReadService | undefined;
@@ -961,9 +963,15 @@ export async function createServer(
         const seedStaging = createSeedStaging(streamSyncHome.seedFiles);
         // Import first (design §4): a run of a connector waits for its import,
         // so the seed is merged into the first publish, never skipped.
-        retireLedger = new RetireLedger(streamSyncHome.home.files);
+        retireLedger = new RetireLedger(streamSyncHome.home.files, serverOwner);
         legacyImporter = new LegacyImporter({
-          source: options?.legacyImportSource ?? NO_IMPORT_SOURCE,
+          source:
+            options?.legacyImportSource ??
+            createCanonicalImportSource({
+              owner: serverOwner,
+              // Bound once the canonical reader opens, further down boot.
+              deps: () => canonicalImportDeps,
+            }),
           sink: createSeedImportSink(seedStaging),
           ledger: retireLedger,
           switched: () => legacyRetireSwitched(config),
@@ -971,6 +979,7 @@ export async function createServer(
             writerForSeed ? writerForSeed.connectionDeleted(connector) : false,
           logger,
         });
+        bootLegacyImporter = legacyImporter;
         const seedSource = seedStaging.source(
           await seedStaging.installId(),
           async (connector) =>
@@ -1011,13 +1020,6 @@ export async function createServer(
         });
         writerForSeed = streamSyncWriter;
         streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
-        // At boot, before any run is accepted; every sync cycle runs it again.
-        await legacyImporter.run().catch((error: unknown) => {
-          logger.warn(
-            { error: error instanceof Error ? error.name : "NonError" },
-            "Legacy import did not finish at boot; retried each cycle",
-          );
-        });
       }
     }
 
@@ -1318,6 +1320,22 @@ export async function createServer(
         ]),
       }
     : undefined;
+
+  // The canonical readers are open: the import source can read them now. Until
+  // this line it answered "not available", so no pass could finish empty.
+  // Starts at once, and a sync cycle joins the pass in flight.
+  if (pdppConnections && pdppAuth) {
+    canonicalImportDeps = {
+      store: pdppConnections.store,
+      declarations: pdppAuth.retainedDeclarations,
+    };
+  }
+  void bootLegacyImporter?.run().catch((error: unknown) => {
+    logger.warn(
+      { error: error instanceof Error ? error.name : "NonError" },
+      "Legacy import did not finish at boot; retried each cycle",
+    );
+  });
 
   // Close the sync→PDPP loop. Until this runs the download worker holds an
   // inert delegate; from here a synced envelope carrying verified `$pdpp`

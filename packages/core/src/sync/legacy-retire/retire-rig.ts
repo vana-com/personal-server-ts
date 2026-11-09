@@ -10,13 +10,18 @@ import type { StreamSyncSeedSource } from "../../stream-sync/index.js";
 import { Rig } from "../../stream-sync-read/writer-rig.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
 import { createRetireHost } from "./host.js";
-import { LegacyImporter, type ImportStream } from "./import.js";
+import {
+  LegacyImporter,
+  type ImportStream,
+  type LegacyImportSource,
+} from "./import.js";
 import { RetireLedger } from "./ledger.js";
 import { retireLegacyFiles, type RetireHost } from "./retire.js";
 
 export const CONNECTOR = "chatgpt";
 export const SCOPE = "chatgpt.memories";
 export const STREAM = "memories";
+export const OWNER = `0x${"aa".repeat(20)}`;
 export const AT = "2026-11-01T00:00:00.000Z";
 
 export const raw = (id: string) => ({
@@ -55,9 +60,19 @@ export async function flow(options: {
   localRows?: Record<string, unknown>[];
   /** More top-level keys of the legacy body. */
   extraBody?: Record<string, unknown>;
+  /** A real import source instead of `seed` / `imported`. */
+  source?: LegacyImportSource;
+  /** The Account owner of this home; default `OWNER`. */
+  owner?: string;
+  /** The sink throws the first time it is handed this stream. */
+  crashOnce?: string;
 }) {
   const staged = new Map<string, Record<string, unknown>[]>();
-  const ledger = new RetireLedger(createMemoryStreamSyncFiles());
+  const owner = options.owner ?? OWNER;
+  const files = createMemoryStreamSyncFiles();
+  const ledger = new RetireLedger(files, owner);
+  let stagings = 0;
+  let crashed = false;
   const importStream: ImportStream = {
     stream: STREAM,
     primaryKey: ["id"],
@@ -66,25 +81,37 @@ export async function flow(options: {
       for (const id of options.seed ?? []) yield raw(id);
     },
   };
-  const importer = new LegacyImporter({
-    source: {
-      connectors: async () =>
-        options.seed || options.imported ? [CONNECTOR] : [],
-      streams: async () => (options.seed ? [importStream] : []),
-    },
-    sink: {
-      async stage(_connector, stream, rows) {
-        const out: Record<string, unknown>[] = [];
-        for await (const row of rows) out.push(row);
-        if (options.sinkKeepsNone) return 0;
-        staged.set(stream.stream, out);
-        return out.length;
+  const defaultSource: LegacyImportSource = {
+    owner,
+    connectors: async () =>
+      options.seed || options.imported ? [CONNECTOR] : [],
+    streams: async () => (options.seed ? [importStream] : []),
+  };
+  const importerFor = (own: { source: LegacyImportSource; owner: string }) =>
+    new LegacyImporter({
+      source: own.source,
+      sink: {
+        async stage(_connector, stream, rows) {
+          stagings += 1;
+          if (options.crashOnce === stream.stream && !crashed) {
+            crashed = true;
+            throw new Error("crash while staging");
+          }
+          const out: Record<string, unknown>[] = [];
+          for await (const row of rows) out.push(row);
+          if (options.sinkKeepsNone) return 0;
+          staged.set(stream.stream, out);
+          return out.length;
+        },
       },
-    },
-    ledger,
-    switched: () => options.switched ?? true,
-    deleted: async (connector): Promise<boolean> =>
-      rig.writer.connectionDeleted(connector),
+      ledger: new RetireLedger(files, own.owner),
+      switched: () => options.switched ?? true,
+      deleted: async (connector): Promise<boolean> =>
+        rig.writer.connectionDeleted(connector),
+    });
+  const importer = importerFor({
+    source: options.source ?? defaultSource,
+    owner,
   });
   const seedSource: StreamSyncSeedSource = {
     installId: "install-1",
@@ -163,5 +190,19 @@ export async function flow(options: {
       otherDevice: other,
       userConnect: connect,
     });
-  return { rig, importer, ledger, storage, retire, run, runRows, staged };
+  return {
+    rig,
+    importer,
+    importerFor,
+    ledger,
+    files,
+    storage,
+    retire,
+    run,
+    runRows,
+    staged,
+    get stagings() {
+      return stagings;
+    },
+  };
 }

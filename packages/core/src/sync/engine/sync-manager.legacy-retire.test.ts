@@ -4,6 +4,7 @@
  * fixture). Every remote port is a recorder that fails the test when touched.
  */
 
+import { OWNER } from "../legacy-retire/retire-rig.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import type { Logger } from "../../logger/index.js";
@@ -59,7 +60,7 @@ async function cycle(options: {
   option: "switched" | "unswitched";
 }) {
   const fx = await buildSyntheticFixture();
-  const ledger = new RetireLedger(createMemoryStreamSyncFiles());
+  const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
   const staged: string[] = [];
   const importer = new LegacyImporter({
     source: fx.source,
@@ -154,6 +155,8 @@ describe("sync cycle with legacy import and retire", () => {
     expect(fx.storage.entries).toHaveLength(5);
     expect(remote).toEqual([]);
     expect(await ledger.read()).toEqual({
+      owner: OWNER,
+      excluded: {},
       importComplete: false,
       imported: {},
       readbacks: {},

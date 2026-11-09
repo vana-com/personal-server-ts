@@ -6,6 +6,7 @@
  */
 
 import type { StreamSyncFiles } from "../../stream-sync/ports.js";
+import type { ImportExclusion } from "./import.js";
 
 const PATH = "legacy-retire/ledger.json";
 
@@ -49,6 +50,10 @@ export interface ReadbackRecord {
 }
 
 export interface LedgerData {
+  /**
+   * The Account owner (lowercase) every field below was recorded for.
+   */
+  owner: string;
   /** A pass over the importable source finished with every stream staged. */
   importComplete: boolean;
   /**
@@ -64,12 +69,19 @@ export interface LedgerData {
       readonly staged?: Readonly<Record<string, number>>;
     }
   >;
+  /**
+   * Rows of each connector the import left in the legacy file, by reason.
+   * Counts only. A connector with an entry here keeps those rows' file.
+   */
+  excluded: Record<string, ImportExclusion[]>;
   readbacks: Record<string, ReadbackRecord>;
 }
 
-const empty = (): LedgerData => ({
+const empty = (owner: string): LedgerData => ({
+  owner,
   importComplete: false,
   imported: {},
+  excluded: {},
   readbacks: {},
 });
 
@@ -79,20 +91,36 @@ const encoder = new TextEncoder();
 export class RetireLedger {
   private chain: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly files: StreamSyncFiles) {}
+  /** The Account owner this ledger is for, lowercase. */
+  readonly owner: string;
 
+  constructor(
+    private readonly files: StreamSyncFiles,
+    owner: string,
+  ) {
+    this.owner = owner.toLowerCase();
+  }
+
+  /**
+   * What is recorded for this ledger's owner. A file recorded for nobody, or
+   * for another owner, reads as empty: it proves nothing here, and the next
+   * `update` replaces it.
+   */
   async read(): Promise<LedgerData> {
     const bytes = await this.files.read(PATH);
-    if (!bytes) return empty();
+    if (!bytes) return empty(this.owner);
     try {
       const parsed = JSON.parse(decoder.decode(bytes)) as Partial<LedgerData>;
+      if (parsed.owner !== this.owner) return empty(this.owner);
       return {
+        owner: this.owner,
         importComplete: parsed.importComplete === true,
         imported: parsed.imported ?? {},
+        excluded: parsed.excluded ?? {},
         readbacks: parsed.readbacks ?? {},
       };
     } catch {
-      return empty(); // unreadable = nothing proved
+      return empty(this.owner); // unreadable = nothing proved
     }
   }
 
@@ -107,6 +135,7 @@ export class RetireLedger {
     return next;
   }
 
+  /** Import is done for this connector (a ledger of any other owner is empty). */
   async importDone(connector: string): Promise<boolean> {
     const data = await this.read();
     return data.importComplete || data.imported[connector] !== undefined;

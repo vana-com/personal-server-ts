@@ -4,6 +4,7 @@
  * and one is empty. Every test runs the production `retireLegacyFiles`.
  */
 
+import { OWNER } from "./retire-rig.js";
 import { describe, expect, it } from "vitest";
 import { createMemoryStreamSyncFiles } from "../../stream-sync/memory-files.js";
 import { createRetireHost } from "./host.js";
@@ -17,7 +18,7 @@ async function setup(
   options: { importFirst?: boolean; fullRun?: boolean } = {},
 ) {
   const fx = await buildSyntheticFixture();
-  const ledger = new RetireLedger(createMemoryStreamSyncFiles());
+  const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
   const host = createRetireHost({
     reader: fx.reader,
     writer: { fullRunSince: async () => options.fullRun ?? true },

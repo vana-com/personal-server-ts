@@ -19,6 +19,8 @@ const SERVICE = "packages/core/src/stream-sync-read/service.ts";
 const MIRROR = "packages/core/src/stream-sync-read/mirror.ts";
 const KEYS = "packages/core/src/storage/legacy-entity-key-sets.ts";
 const WRITER = "packages/core/src/stream-sync/writer.ts";
+const CANON = `${R}/canonical-source.ts`;
+const BOOTSTRAP = "packages/server/src/bootstrap.ts";
 
 const ROUND2 = `${R}/retire-round2.test.ts`;
 const GATES = `${R}/retire.test.ts`;
@@ -30,6 +32,11 @@ const MIRROR_TEST = "packages/core/src/stream-sync-read/mirror.test.ts";
 const CYCLE_FILE = "packages/core/src/sync/engine/sync-manager.ts";
 const IMPORT_SINK_TEST =
   "packages/server/src/stream-sync/legacy-import-sink.test.ts";
+
+const CANON_TEST = `${R}/canonical-source.test.ts`;
+const CANON_STORE_TEST =
+  "packages/server/src/stream-sync/canonical-import.test.ts";
+const BOOT_TEST = "packages/server/src/canonical-import-boot.test.ts";
 
 const edit = (file, find, replace) => [{ file, find, replace }];
 
@@ -609,7 +616,7 @@ export const MUTANTS = [
       `false &&
         !(await this.options.importDone!(input.connector))`,
     ),
-    tests: [FLOW],
+    tests: [FLOW, CANON_TEST],
     mustFail: ["RUN_BEFORE_IMPORT"],
   },
   {
@@ -663,6 +670,142 @@ export const MUTANTS = [
     ),
     tests: [IMPORT_SINK_TEST],
     mustFail: ["IMPORT_DUPLICATES"],
+    build: true,
+  },
+
+  // ---- the canonical import source (stacked on #595) ----
+  {
+    name: "IMPORT_SOURCE_EMPTY_IN_PRODUCTION",
+    why: "the production source lists no connector, so the import completes empty",
+    edits: edit(
+      CANON,
+      "for (const [key, declarations] of sourcesOf(deps)) {",
+      "for (const [key, declarations] of new Map<string, DeclarationSnapshot[]>()) {",
+    ),
+    tests: [CANON_TEST, CANON_STORE_TEST, BOOT_TEST],
+    mustFail: ["IMPORT_SOURCE_EMPTY_IN_PRODUCTION"],
+    build: true,
+  },
+  {
+    name: "PENDING_COUNTED_AS_EMPTY",
+    why: "a source whose stores are not bound reads as having no rows",
+    edits: edit(
+      CANON,
+      "if (!deps) throw new ImportSourceUnavailableError();",
+      `if (!deps) {
+      return {
+        store: {
+          listConnections: () => [],
+          listStreams: () => [],
+          listRecords: () => ({ data: [], hasMore: false }),
+        },
+        declarations: [],
+      };
+    }`,
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["PENDING_COUNTED_AS_EMPTY"],
+  },
+  {
+    name: "UNMAPPED_SCOPE_DROPPED_SILENTLY",
+    why: "rows the import leaves in the file are not counted or explained",
+    edits: edit(
+      CANON,
+      "return scans.get(connector)?.excluded ?? [];",
+      "return [];",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["UNMAPPED_SCOPE_DROPPED_SILENTLY"],
+  },
+  {
+    name: "UNKEYED_ROW_IMPORTED",
+    why: "a row with a missing key field is staged",
+    edits: edit(
+      CANON,
+      "if (!primaryKey.every((field) => isKeyValue(row[field]))) {",
+      "if (false) {",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["UNKEYED_ROW_IMPORTED"],
+  },
+  {
+    name: "BLOB_ROW_IMPORTED",
+    why: "a row that points at a blob is staged though the blob cannot travel",
+    edits: edit(
+      CANON,
+      'return pointsAtBlob(row) ? "blob_reference" : "import";',
+      'return "import";',
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["BLOB_ROW_IMPORTED"],
+  },
+  {
+    name: "AMBIGUOUS_CONNECTION_IMPORTED",
+    why: "a connector with two live connections is imported as one",
+    edits: edit(
+      CANON,
+      "if (declarations.length !== 1 || instances.length !== 1) {",
+      "if (false) {",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["AMBIGUOUS_CONNECTION_IMPORTED"],
+  },
+  {
+    name: "DELETED_CONNECTION_IMPORTED",
+    why: "rows of a connection the owner deleted are imported",
+    edits: edit(
+      CANON,
+      "if (connection.deletedAt === null) instances.push(connection.instance);",
+      "instances.push(connection.instance);",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["DELETED_CONNECTION_IMPORTED"],
+  },
+  {
+    name: "IMPORT_DUPLICATES_ON_RERUN",
+    why: "a finished pass stages its connectors again on the next call",
+    edits: edit(
+      IMPORT,
+      `if ((await ledger.read()).importComplete) {
+      return { ran: false, connectorsStaged: 0, failed: 0 };
+    }`,
+      "",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["IMPORT_DUPLICATES_ON_RERUN"],
+  },
+  {
+    name: "IMPORT_WRONG_OWNER",
+    why: "a source of another owner stages into this home",
+    edits: edit(
+      IMPORT,
+      "if (source.owner.toLowerCase() !== ledger.owner) {",
+      "if (false) {",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["IMPORT_WRONG_OWNER"],
+  },
+  {
+    name: "LEDGER_OWNER_IGNORED",
+    why: "a ledger recorded for another owner (or none) is trusted",
+    edits: edit(
+      LEDGER,
+      "if (parsed.owner !== this.owner) return empty(this.owner);",
+      "",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["LEDGER_OWNER_IGNORED"],
+  },
+  {
+    name: "BOOT_IMPORT_NEVER_BOUND",
+    why: "boot never hands the canonical store to the import source",
+    edits: edit(
+      BOOTSTRAP,
+      "    canonicalImportDeps = {",
+      "    const unboundImportDeps = {",
+    ),
+    tests: [BOOT_TEST],
+    mustFail: ["BOOT_IMPORT_NEVER_BOUND"],
     build: true,
   },
 ];

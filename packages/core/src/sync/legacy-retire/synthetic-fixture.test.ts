@@ -4,6 +4,7 @@
  * report must match the outcome each scope was built for.
  */
 
+import { OWNER } from "./retire-rig.js";
 import { describe, expect, it } from "vitest";
 import { createMemoryStreamSyncFiles } from "../../stream-sync/memory-files.js";
 import type { ImportStream, LegacyImportSink } from "./import.js";
@@ -22,7 +23,7 @@ const listing = (storage: {
 
 async function run(fullRun: boolean) {
   const fx = await buildSyntheticFixture();
-  const ledger = new RetireLedger(createMemoryStreamSyncFiles());
+  const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
   const staged: Record<string, number> = {};
   const sink: LegacyImportSink = {
     async stage(connector: string, stream: ImportStream, rows) {
