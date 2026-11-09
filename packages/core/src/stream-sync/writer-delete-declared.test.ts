@@ -55,13 +55,14 @@ const retainedManifest = JSON.stringify({
 });
 
 it("a connector with rows and a retained declaration deletes when the host names nothing (202, nothing readable; mutant: RETAINED_DECLARATION_DROPPED)", async () => {
-  // The host passes no declared names. The retained manifest is the only
-  // source of `items`, which rows can only be stored under.
+  // The host passes no declared names. The registry's stream list is emptied
+  // too, so the retained manifest is the only source of `items`.
   const r = new Rig(undefined, CONNECTOR, [], [retainedManifest]);
   await r.open();
   await r.collect({ ...spec("base"), otherDevice: true });
   await r.publish();
   expect(await r.registeredHead()).toMatchObject({ recordCount: 1 });
+  r.gateway.listStreamRows = async () => [];
 
   await expect(
     r.writer.requestConnectionDelete(CONNECTOR),
@@ -98,7 +99,7 @@ it("the host's declared names and a retained manifest's streams are both fenced,
   });
 });
 
-it("rows written under a declaration, then a restart with the connector removed from config: the delete answers 202 and nothing stays readable (mutant: DURABLE_NAMES_IGNORED)", async () => {
+it("rows written under a declaration, then a restart with the connector removed from config: the delete answers 202 and nothing stays readable", async () => {
   // The declaration names `items`. The writer records it with the first row.
   const r = new Rig(undefined, CONNECTOR, ["items"]);
   await r.open();
@@ -119,23 +120,92 @@ it("rows written under a declaration, then a restart with the connector removed 
     format: 3,
     recordCount: 0,
   });
-  expect((await persistedState(r)).declaredNames ?? {}).toEqual({});
 });
 
-it("without declared names, an uninstalled connector with rows is refused and nothing is deleted (503 CONNECTOR_NOT_VERIFIED)", async () => {
-  // The rows came from another device, whose declaration this writer's state
-  // never recorded, and no host or retained manifest names the connector.
+it("pre-change rows (no durable name, connector absent from config) delete with 202 and tombstone the rows (mutant: PRECHANGE_ROWS_REFUSED)", async () => {
+  // Rows from another device, whose declaration this writer never recorded:
+  // the state an upgrade leaves behind: no name was ever recorded for them.
   const r = new Rig(undefined, CONNECTOR, []);
   await r.open();
   await r.collect({ ...spec("base"), otherDevice: true });
   await r.publish();
+
+  // Restart with the connector absent from config: no host name, no manifest.
+  r.setConfig([], []);
+  await r.restart();
+
+  await expect(
+    r.writer.requestConnectionDelete(CONNECTOR),
+  ).resolves.toMatchObject({ deleteId: expect.any(String) });
+  await r.publish();
+  expect(await r.registeredHead()).toMatchObject({
+    format: 3,
+    recordCount: 0,
+  });
+});
+
+it("rows appended under a declaration and never published: after a restart without the connector, the delete answers 202 and no later publish brings them back", async () => {
+  // The run appends under the declaration, then stops before finishRun: no
+  // registry row exists, so only the durable name can fence the stream.
+  const r = new Rig(undefined, CONNECTOR, ["items"]);
+  await r.open();
+  await r.collectUnfinished(spec("interrupted"));
+
+  r.setConfig([], []);
+  await r.restart();
+  await expect(
+    r.writer.requestConnectionDelete(CONNECTOR),
+  ).resolves.toMatchObject({ deleteId: expect.any(String) });
+  await r.publish();
+  await r.publish();
+
+  const { pending, finished } = await r.writer.status();
+  expect(pending).toEqual([]);
+  expect(
+    finished
+      .flatMap((run) => Object.values(run.streams))
+      .filter((s) => s.state === "committed"),
+  ).toEqual([]);
+  expect((await r.registeredHead())?.recordCount ?? 0).toBe(0);
+
+  // Resume: a new run publishes its own rows and nothing else.
+  await r.collect(spec("learn"));
+  await r.publish();
+  expect(await r.registeredHead()).toMatchObject({ recordCount: 1 });
+});
+
+it("rows appended under a declaration, run still collecting when the delete lands: a later finish is refused and nothing publishes (mutant: UNFINISHED_RUN_STREAMS_IGNORED)", async () => {
+  // The same process deletes while the run is open. The purge of the run is
+  // the only fence: a finish after it must be refused, and nothing publishes.
+  const r = new Rig(undefined, CONNECTOR, ["items"]);
+  await r.open();
+  await r.collectUnfinished(spec("open"));
+  await expect(
+    r.writer.requestConnectionDelete(CONNECTOR),
+  ).resolves.toMatchObject({ deleteId: expect.any(String) });
+  await expect(
+    r.writer.finishRun("open", { checkpointCandidate: { cursor: "open" } }),
+  ).rejects.toThrow();
+  await r.publish();
+  await r.publish();
+
+  expect(await r.files.list("runs")).toEqual([]);
+  expect((await r.registeredHead())?.recordCount ?? 0).toBe(0);
+});
+
+it("a pinned connector with no stream rows and no declared names is refused (503 CONNECTOR_NOT_VERIFIED) and nothing is deleted", async () => {
+  const r = new Rig(undefined, CONNECTOR, []);
+  await r.open();
+  await r.collect({ ...spec("base"), otherDevice: true });
+  await r.publish();
+  // The registry keeps the control pin but lists no stream row.
+  r.gateway.listStreamRows = async () => [];
   const posts = r.gateway.log.length;
 
   await expect(
     r.writer.requestConnectionDelete(CONNECTOR),
   ).rejects.toBeInstanceOf(ConnectorNotVerifiedError);
   expect(r.gateway.log).toHaveLength(posts);
-  expect(await r.registeredHead()).toMatchObject({ recordCount: 1 });
   expect((await persistedState(r)).deletes ?? {}).toEqual({});
 });
 
@@ -245,6 +315,31 @@ it("a seed staged before a delete with rows does not publish on reconnect", asyn
   const r = await seedAfterRowsDelete(seed);
   await r.collect({ ...spec("learn"), userConnect: true });
   await r.publish();
+  expect(await r.registeredHead("items")).toMatchObject({ recordCount: 1 });
+});
+
+it("a seed offered after a delete with rows is refused at a later generation: its status reads seed_skipped, nothing publishes, and an ordinary run then publishes (mutant: SEED_APPLIES_AFTER_DELETE)", async () => {
+  const seed: SeedRows = {
+    stream: "seed",
+    key: "id",
+    version: "1.0.0",
+    rows: [{ id: "old" }],
+    upload: "upload-1",
+  };
+  const r = await seedAfterRowsDelete(seed);
+  // The host stages a new upload for the seed after the delete.
+  seed.upload = "upload-2";
+  seed.rows = [{ id: "seeded" }];
+  await r.collect({ ...spec("learn"), userConnect: true });
+  const runs = await r.publish();
+
+  const statuses = runs.flatMap((run) => Object.entries(run.streams));
+  expect(statuses).toContainEqual([
+    "seed",
+    expect.objectContaining({ terminal: "seed_skipped" }),
+  ]);
+  expect(await r.registeredHead("seed")).toBeNull();
+  // The ordinary run publishes its own rows at the new generation.
   expect(await r.registeredHead("items")).toMatchObject({ recordCount: 1 });
 });
 

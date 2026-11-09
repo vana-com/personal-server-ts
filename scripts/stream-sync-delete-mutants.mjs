@@ -73,16 +73,61 @@ const MUTANTS = [
   },
   {
     // A connector with rows and no declared names is deleted anyway.
+    // A seed offered at a later generation applies after a delete.
+    name: "SEED_APPLIES_AFTER_DELETE",
+    edits: [
+      {
+        file: WRITER,
+        find: "    if (host.target !== 1) {\n      const open",
+        replace: "    if (false) {\n      const open",
+      },
+    ],
+    build: true,
+    tests: [...DECLARED_TESTS],
+    aim: "refused at a later generation",
+  },
+  {
+    // The purge keeps a run that is still collecting: after a delete it can
+    // finish and publish its appended rows.
+    name: "UNFINISHED_RUN_STREAMS_IGNORED",
+    edits: [
+      {
+        file: WRITER,
+        find: "      this.active.delete(runId);\n      for (const dir of [...this.derived.keys()]) {",
+        replace:
+          '      if (host.phase === "collecting") continue;\n      this.active.delete(runId);\n      for (const dir of [...this.derived.keys()]) {',
+      },
+    ],
+    build: true,
+    tests: [...DURABLE_TESTS],
+    aim: "a later finish is refused",
+  },
+  {
     name: "EMPTY_DECLARED_ACCEPTED",
     edits: [
       {
         file: WRITER,
-        find: "if (declared.length === 0) {",
+        find: "if (declared.length === 0 && registered === 0) {",
         replace: "if (false) {",
       },
     ],
     tests: [...DELETE_TESTS, ...REQUEST_TESTS],
-    aim: "refuses a connector with rows and no declared names",
+    aim: "refuses a pinned connector with no stream rows",
+  },
+  {
+    // The pre-change refusal: rows with no declared name answer 503 even
+    // though the registry lists their streams by scope.
+    name: "PRECHANGE_ROWS_REFUSED",
+    edits: [
+      {
+        file: WRITER,
+        find: "if (declared.length === 0 && registered === 0) {",
+        replace: "if (declared.length === 0) {",
+      },
+    ],
+    build: true,
+    tests: [...DURABLE_TESTS],
+    aim: "pre-change rows",
   },
   {
     // A second delete after a reconnect reuses a stale open intent.
@@ -209,21 +254,6 @@ const MUTANTS = [
     ],
     tests: LITE_TESTS,
     aim: "answers a wrong method only to the owner",
-  },
-  {
-    // The durable names are ignored: a delete reads the declarations only from
-    // config, so a connector removed from config keeps its rows and answers 503.
-    name: "DURABLE_NAMES_IGNORED",
-    edits: [
-      {
-        file: WRITER,
-        find: "for (const stream of durable) names.add(stream);",
-        replace: "for (const stream of [] as string[]) names.add(stream);",
-      },
-    ],
-    tests: DURABLE_TESTS,
-    build: true,
-    aim: "rows written under a declaration",
   },
   {
     // The retained manifests name nothing: a connector with rows and no host

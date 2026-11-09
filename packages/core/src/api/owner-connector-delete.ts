@@ -23,9 +23,9 @@
  *   409 NOT_SWITCHED            the account has not moved to stream sync
  *   503 ACCOUNT_MODE_UNKNOWN    the storage mode cannot be read yet; retry
  *   503 STREAM_SYNC_UNAVAILABLE no stream-sync writer is wired on this host
- *   503 CONNECTOR_NOT_VERIFIED  the registry holds rows of the connector but
- *                               this host verified no manifest naming its
- *                               streams; retry once it has
+ *   503 CONNECTOR_NOT_VERIFIED  the registry holds a pin of the connector, no
+ *                               stream row, and this host verified no manifest
+ *                               naming its streams; retry once it has
  *
  * Every refusal has the one error shape of the API, the `ProtocolError`
  * envelope: `{ error: { code, errorCode, message } }`.

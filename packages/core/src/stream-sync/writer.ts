@@ -297,14 +297,6 @@ interface WriterState {
     string,
     { version: string; committed: [observedAt: number, runId: string] }
   >;
-  /**
-   * Per connector, the stream names of the declarations a run under which
-   * wrote rows here. Kept until that connector's delete completes, so a later
-   * delete can fence those streams after the host no longer declares them
-   * (the connector was removed from config). A state file without it reads as
-   * none.
-   */
-  declaredNames?: Record<string, string[]>;
 }
 
 interface HostStream {
@@ -481,6 +473,8 @@ export interface StreamSyncStreamStatus {
   readonly complete?: boolean;
   readonly problem: StreamSyncHostProblem | null;
   readonly detail: string | null;
+  /** `seed_skipped`: a staged seed this run's generation refused; nothing published for it. */
+  readonly terminal?: "seed_skipped";
 }
 
 export interface StreamSyncRunStatus {
@@ -517,9 +511,9 @@ export interface StreamSyncWriterOptions {
    * a host that does not pass it cannot know which streams a delete must
    * fence, so the omission would show only as returned data. The names a
    * delete fences are this option, the streams of `retainedManifests`, and the
-   * registry's own rows. If that union is empty for a connector that has
-   * registry rows, the delete throws `ConnectorNotVerifiedError` before
-   * anything is written.
+   * registry's own stream rows. If that union is empty while the registry holds
+   * pins of the connector, the delete throws `ConnectorNotVerifiedError`
+   * before anything is written.
    */
   readonly declaredStreams: (connector: string) => readonly string[];
   /**
@@ -1081,8 +1075,10 @@ export class StreamSyncWriter {
     const registered = streams.length;
     if (pins.length > 0 || registered > 0) {
       const declared = await this.declaredNames(connector);
-      // Nothing is persisted yet: refuse when no stream can be named.
-      if (declared.length === 0) {
+      // Nothing is persisted yet. A registry-listed stream is already named by
+      // its scope, so refuse only when no stream at all can be named: pins
+      // with no stream rows and no declared names.
+      if (declared.length === 0 && registered === 0) {
         throw new ConnectorNotVerifiedError(connector);
       }
       this.addRowlessStreams(declared, streams, controls);
@@ -1091,35 +1087,17 @@ export class StreamSyncWriter {
   }
 
   /**
-   * The names a delete fences beyond the registry's own rows, each once: the
-   * host's declared names, the streams the writer recorded under a declaration
-   * that wrote rows here (durable, until the connector's delete completes), and
-   * the streams of every retained manifest. The durable set is required; the
-   * host and the retained manifests (both derived from config at boot) may only
-   * add to it.
+   * The names a delete fences beyond the registry's own stream rows, each
+   * once: the host's declared names and the streams of every retained manifest.
+   * Both come from config at boot and may only add to what the registry lists.
    */
   private async declaredNames(connector: string): Promise<string[]> {
     const names = new Set(this.options.declaredStreams(connector));
-    const durable = (await this.readState()).declaredNames?.[connector] ?? [];
-    for (const stream of durable) names.add(stream);
     const retained = this.options.retainedManifests?.() ?? [];
     for (const stream of manifestStreamLister(retained)(connector)) {
       names.add(stream);
     }
     return [...names];
-  }
-
-  /** Remember a stream a run under a declaration wrote rows to (idempotent). */
-  private async recordDeclaredName(
-    connector: string,
-    stream: string,
-  ): Promise<void> {
-    const known = (await this.readState()).declaredNames?.[connector] ?? [];
-    if (known.includes(stream)) return;
-    await this.withState((state) => {
-      const names = (state.declaredNames ??= {});
-      names[connector] = [...new Set([...(names[connector] ?? []), stream])];
-    });
   }
 
   /**
@@ -1315,7 +1293,6 @@ export class StreamSyncWriter {
     }
     await this.withState((state) => {
       delete state.checkpoints[connector];
-      delete state.declaredNames?.[connector];
       state.needsFull = state.needsFull.filter(
         (entry) => entry.connector !== connector,
       );
@@ -1645,7 +1622,6 @@ export class StreamSyncWriter {
         observedAt: host.entry.observedAt,
       };
       this.streamCache.set(`${runId}\u0000${stream}`, info);
-      await this.recordDeclaredName(host.entry.connector, stream);
     }
     if (!isPlainObject(record))
       throw new Error("a record must be a JSON object");
@@ -2241,6 +2217,7 @@ export class StreamSyncWriter {
         await this.withState((fresh) => {
           for (const s of open) this.retireUpload(fresh, entry.connector, s);
         });
+        for (const s of open) this.markSeedSkipped(host, s);
       }
       return;
     }
@@ -2260,6 +2237,28 @@ export class StreamSyncWriter {
       stream.seedApplies = true;
       if (!host.seedStreams.includes(s.stream)) host.seedStreams.push(s.stream);
     }
+  }
+
+  /**
+   * A seed the target generation refuses ends `seed_skipped` in this run's
+   * status, so the owner can see it and nothing publishes for it. A stream the
+   * run writes keeps its own status: `seed_skipped` counts as coverage.
+   */
+  private markSeedSkipped(
+    host: HostEntry,
+    staged: Awaited<ReturnType<StreamSyncSeedSource["streams"]>>[number],
+  ): void {
+    if (host.streams[staged.stream]) return;
+    const stream = this.newStream(nextIndex(host), staged);
+    stream.shardBytes = emptyShardBytes();
+    stream.seedOnly = true;
+    stream.terminal = "seed_skipped";
+    host.streams[staged.stream] = stream;
+    this.setStream(host, staged.stream, {
+      state: "noop",
+      generation: host.target!,
+      complete: false,
+    });
   }
 
   private async spoolSeed(host: HostEntry, name: string): Promise<void> {
@@ -3609,6 +3608,7 @@ export class StreamSyncWriter {
         ...(outbox.complete !== undefined ? { complete: outbox.complete } : {}),
         problem: info?.problem ?? null,
         detail: info?.detail ?? null,
+        ...(info?.terminal ? { terminal: info.terminal } : {}),
       };
     }
     return {

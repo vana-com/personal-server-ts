@@ -205,11 +205,12 @@ it("an empty plan keeps the open intent and answers with its id (mutant: EMPTY_P
   );
 });
 
-it("refuses a connector with rows and no declared names, and persists no intent", async () => {
+it("refuses a pinned connector with no stream rows and no declared names, and persists no intent", async () => {
   const r = new Rig(undefined, CONNECTOR, []);
   await r.open();
   await r.collect({ ...spec("base"), otherDevice: true });
   await r.publish();
+  r.gateway.listStreamRows = async () => [];
   await expect(
     r.writer.requestConnectionDelete(CONNECTOR),
   ).rejects.toBeInstanceOf(ConnectorNotVerifiedError);
@@ -231,6 +232,8 @@ it("a repeated request for a delete in flight answers its id even when the manif
   await r.publish();
   // The host restarts before its manifests verify: no names are declared.
   declared.length = 0;
+  // The registry lists no stream row either: only the open intent answers.
+  r.gateway.listStreamRows = async () => [];
   const second = await r.writer.requestConnectionDelete(CONNECTOR);
   expect(second.deleteId).toBe(first.deleteId);
   expect((await persistedState(r)).deletes?.[CONNECTOR]?.id).toBe(

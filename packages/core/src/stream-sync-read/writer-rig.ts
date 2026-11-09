@@ -262,7 +262,8 @@ export class Rig {
   }
 
   /** A finished run whose publish has not started; a second device's run is published at once. */
-  async collect(spec: RunSpec): Promise<void> {
+  /** Collect a run's rows and stop before `finishRun`: an interrupted run. */
+  async collectUnfinished(spec: RunSpec): Promise<void> {
     const writer = spec.otherDevice ? this.other : this.writer;
     this.order += 1;
     const observedAt = T0 + (spec.at ?? this.order * 1000);
@@ -292,6 +293,11 @@ export class Rig {
         await writer.append(spec.runId, name, { ...row });
       }
     }
+  }
+
+  async collect(spec: RunSpec): Promise<void> {
+    await this.collectUnfinished(spec);
+    const writer = spec.otherDevice ? this.other : this.writer;
     await writer.finishRun(spec.runId, {
       checkpointCandidate: { cursor: spec.runId },
     });

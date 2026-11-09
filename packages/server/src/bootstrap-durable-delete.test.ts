@@ -53,6 +53,10 @@ type Writer = {
   finishRun(runId: string, input: Record<string, unknown>): Promise<void>;
   publishPending(): Promise<void>;
   requestConnectionDelete(connector: string): Promise<{ deleteId: string }>;
+  status(): Promise<{
+    pending: unknown[];
+    finished: Array<{ streams: Record<string, { state: string }> }>;
+  }>;
 };
 
 let tempDir: string;
@@ -97,13 +101,19 @@ async function boot(
   return captured.writers.at(-1) as Writer;
 }
 
-it("rows written under a host declaration survive a restart without it: the delete answers and tombstones the row (mutant: DURABLE_NAMES_IGNORED)", async () => {
+/**
+ * Writes one row, restarts the server on the same data directory, and deletes
+ * the connector. `beforeRestart` may alter the state on disk. Returns the
+ * stream row's version before and after the delete.
+ */
+async function deleteAfterRestart(
+  firstDeclared: ((connector: string) => readonly string[]) | undefined,
+  beforeRestart: () => Promise<void>,
+) {
   const registry = createMemoryStreamSyncRegistry();
   const blobs = createMemoryStreamSyncBlobs();
 
-  const first = await boot(registry, blobs, (connector) =>
-    connector === CONNECTOR ? ["items"] : [],
-  );
+  const first = await boot(registry, blobs, firstDeclared);
   await first.refreshControls();
   await first.beginRun({
     runId: "run-1",
@@ -126,9 +136,10 @@ it("rows written under a host declaration survive a restart without it: the dele
   const scope = rows[0]!.scope;
   const before = (await registry.read(scope)) as { version: number };
 
-  // A restart with the connector removed from config: no host name.
   await ctx!.cleanup();
   ctx = undefined;
+  await beforeRestart();
+  // A restart with the connector removed from config: no host name, no manifest.
   const second = await boot(registry, blobs);
   await expect(
     second.requestConnectionDelete(CONNECTOR),
@@ -136,5 +147,100 @@ it("rows written under a host declaration survive a restart without it: the dele
   await second.publishPending();
 
   const after = (await registry.read(scope)) as { version: number };
-  expect(after.version).toBeGreaterThan(before.version);
+  return { before: before.version, after: after.version };
+}
+
+it("rows written under a host declaration survive a restart without it: the delete answers and tombstones the row", async () => {
+  const { before, after } = await deleteAfterRestart(
+    (connector) => (connector === CONNECTOR ? ["items"] : []),
+    async () => {},
+  );
+  expect(after).toBeGreaterThan(before);
+});
+
+it("pre-change rows: written before any name was recorded, connector absent from config; the delete answers 202 and tombstones the row (mutant: PRECHANGE_ROWS_REFUSED)", async () => {
+  const { before, after } = await deleteAfterRestart(undefined, async () => {});
+  expect(after).toBeGreaterThan(before);
+});
+
+it("rows appended under a host declaration and never published: after a restart without it, the delete answers 202 and no later publish brings them back", async () => {
+  const registry = createMemoryStreamSyncRegistry();
+  const blobs = createMemoryStreamSyncBlobs();
+
+  // The run appends, then stops before finishRun and before any publish.
+  const first = await boot(registry, blobs, (connector) =>
+    connector === CONNECTOR ? ["items"] : [],
+  );
+  await first.refreshControls();
+  await first.beginRun({
+    runId: "run-1",
+    connector: CONNECTOR,
+    userConnect: false,
+    observedAt: Date.now(),
+    identity: "none",
+    checkpointUsed: null,
+  });
+  await first.declareStream("run-1", "items", {
+    primaryKey: ["id"],
+    profile: { key: null, version: "1.0.0" },
+  });
+  await first.append("run-1", "items", { id: "a" });
+
+  // A restart on the same data directory, with the connector absent from config.
+  await ctx!.cleanup();
+  ctx = undefined;
+  const second = await boot(registry, blobs);
+  await expect(
+    second.requestConnectionDelete(CONNECTOR),
+  ).resolves.toMatchObject({ deleteId: expect.any(String) });
+  await second.publishPending();
+  await second.publishPending();
+
+  const { pending, finished } = await second.status();
+  expect(pending).toEqual([]);
+  expect(
+    finished
+      .flatMap((run) => Object.values(run.streams))
+      .filter((s) => s.state === "committed"),
+  ).toEqual([]);
+});
+
+it("rows appended under a host declaration, run still open when the delete lands: a later finish is refused and nothing publishes (mutant: UNFINISHED_RUN_STREAMS_IGNORED)", async () => {
+  const registry = createMemoryStreamSyncRegistry();
+  const blobs = createMemoryStreamSyncBlobs();
+  const first = await boot(registry, blobs, (connector) =>
+    connector === CONNECTOR ? ["items"] : [],
+  );
+  await first.refreshControls();
+  await first.beginRun({
+    runId: "run-1",
+    connector: CONNECTOR,
+    userConnect: false,
+    observedAt: Date.now(),
+    identity: "none",
+    checkpointUsed: null,
+  });
+  await first.declareStream("run-1", "items", {
+    primaryKey: ["id"],
+    profile: { key: null, version: "1.0.0" },
+  });
+  await first.append("run-1", "items", { id: "a" });
+
+  // The same process deletes while run-1 is still collecting.
+  await expect(first.requestConnectionDelete(CONNECTOR)).resolves.toMatchObject(
+    { deleteId: expect.any(String) },
+  );
+  await expect(
+    first.finishRun("run-1", { checkpointCandidate: { cursor: "run-1" } }),
+  ).rejects.toThrow();
+  await first.publishPending();
+  await first.publishPending();
+
+  const { pending, finished } = await first.status();
+  expect(pending).toEqual([]);
+  expect(
+    finished
+      .flatMap((run) => Object.values(run.streams))
+      .filter((s) => s.state === "committed"),
+  ).toEqual([]);
 });
