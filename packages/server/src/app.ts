@@ -552,12 +552,6 @@ export function createApp(deps: AppDeps): Hono {
     await next();
   });
 
-  app.use("/v1/owner/connectors/*", async (_c, next) => {
-    if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
-      throw streamSyncClosing();
-    }
-    await next();
-  });
   app.route(
     "/v1/owner/connectors",
     ownerConnectorsRoutes({
@@ -569,6 +563,12 @@ export function createApp(deps: AppDeps): Hono {
       tokenStore: deps.tokenStore,
       connectionDelete: deps.streamSyncConnectionDelete ?? null,
       mode: storageMode,
+      // Checked by the route after owner authorization.
+      assertAdmitting: () => {
+        if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
+          throw streamSyncClosing();
+        }
+      },
     }),
   );
 

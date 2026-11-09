@@ -28,6 +28,21 @@ export interface OwnerConnectorsRouteDeps {
   connectionDelete?: ConnectionDeletePort | null;
   /** The account's storage mode: one port for every route that depends on it. */
   mode: StorageModeRead;
+  /**
+   * Throws when the stream-sync services are shutting down. Called after owner
+   * authorization, so a caller who is not the owner learns nothing of it.
+   */
+  assertAdmitting?: () => void;
+}
+
+/** The path segment decoded strictly; `null` for a malformed percent-escape. */
+function decodeSegment(request: Request): string | null {
+  const segment = new URL(request.url).pathname.split("/").pop() ?? "";
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
 }
 
 export function ownerConnectorsRoutes(deps: OwnerConnectorsRouteDeps): Hono {
@@ -42,8 +57,11 @@ export function ownerConnectorsRoutes(deps: OwnerConnectorsRouteDeps): Hono {
   });
 
   app.delete("/:connectorId", (c) =>
-    handleOwnerConnectorDelete(c.req.raw, c.req.param("connectorId"), {
-      authorizeOwner: (request) => auth.authorizeOwner(request),
+    handleOwnerConnectorDelete(c.req.raw, decodeSegment(c.req.raw), {
+      authorizeOwner: async (request) => {
+        await auth.authorizeOwner(request);
+        deps.assertAdmitting?.();
+      },
       mode: deps.mode,
       owner: deps.serverOwner,
       connectionDelete: deps.connectionDelete,

@@ -71,13 +71,19 @@ function isConnectorKey(connectorId: string): boolean {
   }
 }
 
+/**
+ * `connectorId` is the path segment decoded strictly; a host passes `null`
+ * when it cannot be decoded (a malformed percent-escape), which answers 400
+ * after owner authorization like any other bad id. A host never falls back to
+ * the raw segment: that would name a connector the owner did not write.
+ */
 export async function handleOwnerConnectorDelete(
   request: Request,
-  connectorId: string,
+  connectorId: string | null,
   deps: OwnerConnectorDeleteDeps,
 ): Promise<Response> {
   await deps.authorizeOwner(request);
-  if (!isConnectorKey(connectorId)) {
+  if (connectorId === null || !isConnectorKey(connectorId)) {
     return json(400, {
       error: "INVALID_CONNECTOR",
       message: "connectorId is not a connector key",

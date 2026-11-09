@@ -1209,23 +1209,20 @@ export function createPsLiteRuntime(
         );
         if (connectorPath) {
           if (request.method !== "DELETE") {
+            // Owner first: a caller who is not the owner learns nothing of the route.
+            await auth.authorizeOwner(request);
             return errorResponse(
               405,
               "METHOD_NOT_ALLOWED",
               "Method not allowed",
             );
           }
-          let connectorId: string;
+          let connectorId: string | null;
           try {
             connectorId = decodeURIComponent(connectorPath[1]!);
           } catch {
-            // A malformed percent-escape is a bad id, not a server fault.
-            await auth.authorizeOwner(request);
-            return errorResponse(
-              400,
-              "INVALID_CONNECTOR",
-              "connectorId is not a connector key",
-            );
+            // A malformed percent-escape is a bad id (400 after authorization).
+            connectorId = null;
           }
           return handleOwnerConnectorDelete(request, connectorId, {
             authorizeOwner: (req) => auth.authorizeOwner(req),

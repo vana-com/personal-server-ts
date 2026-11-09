@@ -126,6 +126,31 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
       "/v1/owner/connectors/%E0%A4%A",
     );
     expect(response.status).toBe(400);
-    expect((await response.json()).error.errorCode).toBe("INVALID_CONNECTOR");
+    expect((await response.json()).error).toBe("INVALID_CONNECTOR");
+  });
+
+  it("asks a bad escape of the owner only", async () => {
+    const response = await del(
+      runtimeWith({ switched: true }),
+      "/v1/owner/connectors/%E0%A4%A",
+      {},
+    );
+    expect(response.status).toBeGreaterThanOrEqual(401);
+    expect(response.status).toBeLessThanOrEqual(403);
+  });
+
+  it("answers a wrong method only to the owner (mutant: PRE_AUTH_REFUSAL)", async () => {
+    const runtime = runtimeWith({ switched: true });
+    const request = (headers: Record<string, string>) =>
+      runtime.fetch(
+        new Request("http://localhost/v1/owner/connectors/github", {
+          method: "GET",
+          headers,
+        }),
+      );
+    const stranger = await request({});
+    expect(stranger.status).toBeGreaterThanOrEqual(401);
+    expect(stranger.status).toBeLessThanOrEqual(403);
+    expect((await request(ownerAuth)).status).toBe(405);
   });
 });

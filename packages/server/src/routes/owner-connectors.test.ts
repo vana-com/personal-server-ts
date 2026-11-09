@@ -54,6 +54,8 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
     mode?: StorageModeRead;
     /** No mode is handed to the app; the config is write-only, as Desktop sets it. */
     unwired?: boolean;
+    /** The stream-sync services are shutting down. */
+    closing?: boolean;
   }) {
     return createApp({
       logger: pino({ level: "silent" }),
@@ -72,6 +74,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
           refuseLegacyWrites: opts.switched,
         },
       }),
+      streamSyncAdmitting: () => opts.closing !== true,
       streamSyncConnectionDelete:
         opts.connectionDelete === undefined ? writer : opts.connectionDelete,
       accountStorageMode: opts.unwired
@@ -171,6 +174,47 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
     const response = await del(
       makeApp({ switched: true, mode: { read: () => "unknown" } }),
       "/v1/owner/connectors/github",
+      {},
+    );
+    expect(response.status).toBeGreaterThanOrEqual(401);
+    expect(response.status).toBeLessThan(404);
+  });
+
+  it("tells a caller who is not the owner nothing about shutdown (mutant: CLOSING_BEFORE_AUTH)", async () => {
+    const response = await del(
+      makeApp({ switched: true, closing: true }),
+      "/v1/owner/connectors/github",
+      {},
+    );
+    expect(response.status).toBeGreaterThanOrEqual(401);
+    expect(response.status).toBeLessThan(404);
+    expect(calls).toEqual([]);
+  });
+
+  it("answers the owner 503 while stream sync shuts down", async () => {
+    const response = await del(
+      makeApp({ switched: true, closing: true }),
+      "/v1/owner/connectors/github",
+    );
+    expect(response.status).toBe(503);
+    expect((await response.json()).error.errorCode).toBe("STREAM_SYNC_CLOSING");
+    expect(calls).toEqual([]);
+  });
+
+  it("refuses a malformed percent-escape as a bad id, not a connector (mutant: RAW_ID_ON_BAD_ESCAPE)", async () => {
+    const response = await del(
+      makeApp({ switched: true }),
+      "/v1/owner/connectors/%E0%A4%A",
+    );
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe("INVALID_CONNECTOR");
+    expect(calls).toEqual([]);
+  });
+
+  it("asks a bad escape of the owner only", async () => {
+    const response = await del(
+      makeApp({ switched: true }),
+      "/v1/owner/connectors/%E0%A4%A",
       {},
     );
     expect(response.status).toBeGreaterThanOrEqual(401);
