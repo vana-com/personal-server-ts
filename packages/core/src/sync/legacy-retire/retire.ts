@@ -142,17 +142,22 @@ function legacyScopes(storage: RetireDeps["storage"]): string[] {
   }
 }
 
-/** The local file still hashes to what the readback read. */
-async function holds(
-  deps: RetireDeps,
+/**
+ * The local file still hashes to what the readback read. The retire pass and
+ * the dry run's last check (`recheckReadyFiles`) both call this, so the dry run
+ * can never be looser than the real delete. A missing hash, an unreadable file
+ * and a different hash all mean "does not hold".
+ */
+export async function fileHolds(
+  storage: Pick<RetireDeps["storage"], "readEnvelope">,
   scope: string,
-  row: IndexEntry,
-  readback: ReadbackRecord,
+  collectedAt: string,
+  fileHash: string | undefined,
 ): Promise<boolean> {
-  if (readback.fileHash === undefined) return false;
+  if (fileHash === undefined) return false;
   try {
-    const envelope = await deps.storage.readEnvelope(scope, row.collectedAt);
-    return contentHash(envelope.data) === readback.fileHash;
+    const envelope = await storage.readEnvelope(scope, collectedAt);
+    return contentHash(envelope.data) === fileHash;
   } catch {
     return false;
   }
@@ -254,7 +259,15 @@ export async function retireLegacyFiles(
             ? { ...report, decision: "no_readback", wouldDelete: false }
             : await decide(deps, scope, row, freshBasis, fresh);
         // The file read back is the file deleted: hash it once more.
-        if (report.wouldDelete && !(await holds(deps, scope, row, fresh))) {
+        if (
+          report.wouldDelete &&
+          !(await fileHolds(
+            deps.storage,
+            scope,
+            row.collectedAt,
+            fresh.fileHash,
+          ))
+        ) {
           report = { ...report, decision: "file_changed", wouldDelete: false };
         }
         readHash = fresh.fileHash;

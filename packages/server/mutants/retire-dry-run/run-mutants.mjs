@@ -1,0 +1,914 @@
+/**
+ * Mutant runner for the legacy-retire dry run.
+ *
+ * Each mutant is a small source edit that breaks one guarantee of the tool.
+ * The runner applies it and runs the focused tests that guard that guarantee.
+ * Before any mutant runs, the unmutated baseline of every file set is run once;
+ * a red baseline aborts the run (exit 2).
+ *
+ * Each mutant ends in one of four results:
+ *   RED       the aimed test (its name matches `pattern`) fails: killed.
+ *   SURVIVED  the tests pass: the test is too weak.
+ *   MISS      tests fail, but none of them is the aimed test: not a kill.
+ *   ERROR     the run did not load or ran no tests (for example a native
+ *             module that did not self-register, or a file that did not
+ *             load): not a kill.
+ * Only RED counts as a kill. The source is restored from the text read before
+ * the edit, also on SIGINT/SIGTERM. Exit 1 if any mutant is not RED.
+ *
+ *   node packages/server/mutants/retire-dry-run/run-mutants.mjs            # all
+ *   node packages/server/mutants/retire-dry-run/run-mutants.mjs --only M2a,P2.4
+ *   node packages/server/mutants/retire-dry-run/run-mutants.mjs --check    # edits apply?
+ *   node packages/server/mutants/retire-dry-run/run-mutants.mjs --self-test # classifier
+ *
+ * Run from anywhere; it works from the repository root. Use Node 22 (the
+ * repository's pinned version; better-sqlite3 is built for it).
+ */
+
+import { spawn, spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
+const dir = "packages/server/src/scripts/retire-dry-run";
+const F = {
+  copyOnly: `${dir}/copy-only.ts`,
+  guard: `${dir}/network-guard.ts`,
+  store: `${dir}/legacy-store.ts`,
+  heads: `${dir}/published-heads.ts`,
+  report: `${dir}/report.ts`,
+  run: `${dir}/run.ts`,
+  hosts: `${dir}/hosts.ts`,
+  home: `${dir}/home-state.ts`,
+  recheck: `${dir}/recheck.ts`,
+  retire: "packages/core/src/sync/legacy-retire/retire.ts",
+  cli: "packages/server/src/scripts/legacy-retire-dry-run.ts",
+};
+const T = {
+  run: `${dir}/run.test.ts`,
+  guard: `${dir}/network-guard.test.ts`,
+  entryOrder: `${dir}/run-entry-order.test.ts`,
+  closure: `${dir}/entry-static-imports.test.ts`,
+  hosts: `${dir}/hosts.test.ts`,
+  recheck: `${dir}/recheck.test.ts`,
+  changed: `${dir}/run-changed.test.ts`,
+  cli: "packages/server/src/scripts/legacy-retire-dry-run.test.ts",
+};
+
+/** edits: [file, find (must occur once), replace]. tests: [files, -t pattern]. */
+const MUTANTS = [
+  // --- round 1 ---
+  {
+    id: "M1a",
+    what: "data folder need not be under ~/.tmp",
+    edits: [
+      [F.copyOnly, "if (!strictlyInside(tmpRoot, dataDir)) {", "if (false) {"],
+    ],
+    files: [T.run],
+    pattern: "refuses a folder outside",
+  },
+  {
+    id: "M1b",
+    what: "a -shm file is accepted",
+    edits: [[F.copyOnly, 'item.name.endsWith("-shm")', "false"]],
+    files: [T.run],
+    pattern: "holds a -shm file",
+  },
+  {
+    id: "M1c",
+    what: "~/.vana is not refused as such",
+    edits: [[F.copyOnly, "if (isInside(vanaHome, dataDir)) {", "if (false) {"]],
+    files: [T.run],
+    pattern: "refuses ~/.vana",
+  },
+  {
+    id: "M2a",
+    what: "a non-GET request is allowed",
+    edits: [[F.guard, 'method !== "GET"', "false"]],
+    files: [T.guard, T.run],
+    pattern: "passes a GET to an allowed host|code under test POSTs",
+  },
+  {
+    id: "M2b",
+    what: "any host is allowed",
+    edits: [[F.guard, ": !hostAllowed(target)", ": false"]],
+    files: [T.guard, T.run],
+    pattern: "passes a GET to an allowed host|outside the Dev gateway",
+  },
+  {
+    id: "M2c",
+    what: "a swallowed refusal is not re-checked",
+    edits: [[F.run, "guard.assertNoViolations();", ""]],
+    files: [T.run],
+    pattern: "swallows the refusal",
+  },
+  {
+    id: "M3a",
+    what: "database opened in place, tripwire off",
+    edits: [
+      [
+        F.store,
+        'initializeDatabase(join(input.scratchDir, "index.db"))',
+        'initializeDatabase(join(input.rootDir, "index.db"))',
+      ],
+      [F.run, "(await fingerprintTree(dataDir)) !== before", "false"],
+    ],
+    files: [T.run],
+    pattern: "byte-identical",
+  },
+  {
+    id: "M3b",
+    what: "tripwire disabled",
+    edits: [[F.run, "(await fingerprintTree(dataDir)) !== before", "false"]],
+    files: [T.run],
+    pattern: "tripwire",
+  },
+  {
+    id: "M4a",
+    what: "an importer is pulled in",
+    edits: [
+      [
+        F.run,
+        "const SIGNATURE =",
+        'const importer = "LegacyImporter";\nvoid importer;\nconst SIGNATURE =',
+      ],
+    ],
+    files: [T.run],
+    pattern: "uses no writer",
+  },
+  {
+    id: "M4b",
+    what: "the import-done guard is widened (ledger says done)",
+    edits: [
+      [
+        F.run,
+        "data.importComplete = home.importComplete;",
+        "data.importComplete = true;",
+      ],
+    ],
+    files: [T.run],
+    pattern: "does not run an import",
+  },
+  {
+    id: "M5a",
+    what: "full hash in the report",
+    edits: [[F.report, "record.aggregate.slice(0, 8)", "record.aggregate"]],
+    files: [T.run],
+    pattern: "holds counts, short hashes",
+  },
+  {
+    id: "M5b",
+    what: "raw version key in the report",
+    edits: [
+      [F.report, "version: hex8(file.version),", "version: file.version,"],
+    ],
+    files: [T.run],
+    pattern: "holds counts, short hashes",
+  },
+  {
+    id: "M6",
+    what: "device registry mirror not loaded",
+    edits: [[F.run, "return await readFile(path);", "return null;"]],
+    files: [T.run],
+    pattern: "device mirror",
+  },
+  // --- round 2 ---
+  {
+    id: "P1.2a-1",
+    what: "--out symlink/hard link/folder accepted",
+    edits: [
+      [F.copyOnly, "if (!info.isFile() || info.nlink > 1) {", "if (false) {"],
+    ],
+    files: [T.run],
+    pattern: "symlink to the copy's database|hard link, a folder",
+  },
+  {
+    id: "P1.2a-2",
+    what: "report written through the path (follows a link)",
+    edits: [
+      [
+        F.run,
+        "await rename(temp, outPath);",
+        "await writeFile(outPath, JSON.stringify(report, null, 2));",
+      ],
+    ],
+    files: [T.run],
+    pattern: "replaces, and does not follow",
+  },
+  {
+    id: "P1.2a-3",
+    what: "--out folder not resolved with realpath",
+    edits: [
+      [
+        F.copyOnly,
+        'await realOrThrow(\n    dirname(requested),\n    "The folder of --out",\n  )',
+        "dirname(requested)",
+      ],
+    ],
+    files: [T.run],
+    pattern: "hard link, a folder",
+  },
+  {
+    id: "P1.2b",
+    what: "scratch folder is <out>.work again",
+    edits: [
+      [
+        F.run,
+        'await mkdtemp(join(tmpRoot, "retire-dry-run-"))',
+        "join(dirname(outPath), `${basename(outPath)}.work`)",
+      ],
+    ],
+    files: [T.run],
+    pattern: "exact pair|already sits at",
+  },
+  // P2.3a (the URL host wins over options.hostname) is retired: the check at
+  // the agent queue refuses the same host, so the mutant changes nothing
+  // observable (the guard has two layers; see the PR body).
+  {
+    id: "P2.3b",
+    what: "port not checked",
+    edits: [
+      [
+        F.guard,
+        'if (port === "" || port === "80" || port === "443") {',
+        "if (true) {",
+      ],
+    ],
+    files: [T.guard],
+    pattern: "checks the host Node connects to|host:port entry",
+  },
+  {
+    id: "P2.3c",
+    what: "socketPath not refused",
+    edits: [[F.guard, "if (merged.socketPath !== undefined)", "if (false)"]],
+    files: [T.guard],
+    pattern: "checks the host Node connects to",
+  },
+  {
+    id: "P2.4",
+    what: "fetch follows redirects",
+    edits: [[F.guard, 'redirect: "error"', 'redirect: "follow"']],
+    files: [T.guard],
+    pattern: "asks fetch not to follow|does not follow a redirect from",
+  },
+  {
+    id: "P2.5a",
+    what: "any https host is pinned",
+    edits: [[F.hosts, "pinned.includes(url.hostname) &&", "true &&"]],
+    files: [T.hosts, T.run],
+    pattern: "pinned Dev host",
+  },
+  {
+    id: "P2.5b",
+    what: "loopback allowed without the test-only switch",
+    edits: [
+      [F.hosts, "testOnlyAllowLoopback &&\n    LOOPBACK.has", "LOOPBACK.has"],
+    ],
+    files: [T.hosts, T.run, T.cli],
+    pattern: "pinned Dev host|loopback URL without",
+  },
+  {
+    id: "P2.5c",
+    what: "production storage host pinned",
+    edits: [
+      [
+        F.hosts,
+        '["storage-dev.vana.org"]',
+        '["storage-dev.vana.org", "storage.vana.org"]',
+      ],
+    ],
+    files: [T.hosts, T.run],
+    pattern: "pinned Dev host",
+  },
+  {
+    id: "P2.5d",
+    what: "gateway from the copy's config.json ignored",
+    edits: [
+      [
+        F.run,
+        "options.gatewayUrl ?? stringOrUndefined(raw.gateway?.url)",
+        "options.gatewayUrl",
+      ],
+    ],
+    files: [T.run],
+    pattern: "gateway from the copy's config",
+  },
+  {
+    id: "DRY_RUN_READS_CONFIG_JSON_ONLY",
+    what: "the dry run reads config.json only, not the server.json the Desktop runtime reads",
+    edits: [
+      [
+        F.run,
+        'RUNTIME_CONFIG_FILES = ["server.json", "config.json"] as const;',
+        'RUNTIME_CONFIG_FILES = ["config.json"] as const;',
+      ],
+    ],
+    files: [T.run],
+    pattern: "takes the hosts from server.json",
+  },
+  {
+    id: "BOTH_FILES_PICKS_SILENTLY",
+    what: "a folder with both config files picks server.json silently instead of refusing",
+    edits: [
+      [
+        F.run,
+        "} else if (texts.size > 1) {",
+        "} else if (texts.size > 1 && false) {",
+      ],
+    ],
+    files: [T.run],
+    pattern: "refuses a folder that holds both server.json and config.json",
+  },
+  {
+    id: "ENTRY_TOPLEVEL_DYNAMIC_IMPORT",
+    what: "the shipped entry loads a package module at module scope, before main and before the guard",
+    edits: [
+      [
+        F.cli,
+        "export async function main(argv: readonly string[]): Promise<number> {",
+        'await import("@opendatalabs/personal-server-ts-core/sync");\n\nexport async function main(argv: readonly string[]): Promise<number> {',
+      ],
+    ],
+    files: [T.closure],
+    pattern: "no module-scope dynamic import",
+  },
+  {
+    id: "P2.6a",
+    what: "owner recovery not wrapped",
+    edits: [
+      [
+        F.heads,
+        "masterKey = legacyMasterKey(input.masterKeySignature);\n  } catch {",
+        "masterKey = legacyMasterKey(input.masterKeySignature);\n  } catch (e) {\n    throw e;\n  }\n  try {\n  } catch {",
+      ],
+    ],
+    files: [T.run],
+    pattern: "bad owner signature",
+  },
+  {
+    id: "P2.6b",
+    what: "owner recovery not wrapped and raw message printed",
+    edits: [
+      [
+        F.heads,
+        "masterKey = legacyMasterKey(input.masterKeySignature);\n  } catch {",
+        "masterKey = legacyMasterKey(input.masterKeySignature);\n  } catch (e) {\n    throw e;\n  }\n  try {\n  } catch {",
+      ],
+      [
+        F.cli,
+        "function messageFor(error: unknown): string {",
+        "function messageFor(error: unknown): string {\n  if (error instanceof Error) return `Failed: ${error.message}`;",
+      ],
+    ],
+    files: [T.cli],
+    pattern: "wrong but valid-looking",
+  },
+  {
+    id: "P2.7",
+    what: "non-empty scratch folder accepted (stale -wal)",
+    edits: [
+      [
+        F.store,
+        "if ((await readdir(input.scratchDir)).length > 0) {",
+        "if (false) {",
+      ],
+    ],
+    files: [T.run],
+    pattern: "scratch folder that is not empty",
+  },
+  {
+    id: "P2.8a",
+    what: "scope printed verbatim",
+    edits: [
+      [
+        F.report,
+        "connector: connectorLabel(file.scope),",
+        "connector: file.scope,",
+      ],
+    ],
+    files: [T.run],
+    pattern: "scopes and names|holds counts, short hashes",
+  },
+  {
+    id: "P2.8b",
+    what: "symlink refusal names the file",
+    edits: [
+      [
+        F.copyOnly,
+        '"Refusing: the data folder holds a symlink. Copy the bytes, not links."',
+        "`Refusing: symlink ${item.name}`",
+      ],
+    ],
+    files: [T.run],
+    pattern: "names no file",
+  },
+  {
+    id: "P2.8c",
+    what: "-shm refusal names the file",
+    edits: [
+      [
+        F.copyOnly,
+        '"Refusing: the data folder holds a -shm file. " +',
+        '"Refusing: " + item.name + " is a -shm file. " +',
+      ],
+    ],
+    files: [T.run],
+    pattern: "names no file",
+  },
+  {
+    id: "P-dec",
+    what: "decisions counted only when present",
+    edits: [
+      [
+        F.report,
+        "const byDecision = emptyDecisions();",
+        "const byDecision = {} as ReturnType<typeof emptyDecisions>;",
+      ],
+      [
+        F.report,
+        "byDecision[f.decision] += 1;",
+        "byDecision[f.decision] = (byDecision[f.decision] ?? 0) + 1;",
+      ],
+    ],
+    files: [T.run],
+    pattern: "counts every decision",
+  },
+  {
+    id: "P-staged",
+    what: "the per-stream receipt of the import is dropped",
+    edits: [
+      [
+        F.home,
+        "entry.staged = staged as Record<string, number>;",
+        "void staged;",
+      ],
+    ],
+    files: [T.run],
+    pattern: "receipt names its stream with rows",
+  },
+  {
+    id: "P3.9",
+    what: "copy time missing from the report",
+    edits: [
+      [
+        F.run,
+        "const copy = await copyAge(dataDir);",
+        "const copy = null as unknown as Awaited<ReturnType<typeof copyAge>>;",
+      ],
+    ],
+    files: [T.run],
+    pattern: "age of the copy",
+  },
+  // --- round 4 ---
+  {
+    id: "R4-recheck-off",
+    what: "the last hash check is not taken in the dry run",
+    edits: [
+      [
+        F.run,
+        "retire = await recheckReadyFiles({",
+        "retire = await (async (x: Parameters<typeof recheckReadyFiles>[0]) => x.retire)({",
+      ],
+    ],
+    files: [T.changed],
+    pattern: "holds a ready file that no longer hashes",
+  },
+  {
+    id: "R4-changed-holds",
+    what: "a file that hashes differently still counts as ready",
+    edits: [
+      [
+        F.recheck,
+        'holds ? file : { ...file, decision: "file_changed", wouldDelete: false },',
+        "file,",
+      ],
+    ],
+    files: [T.recheck, T.changed],
+    pattern: "reports file_changed|holds a ready file",
+  },
+  {
+    id: "R4-unreadable-holds",
+    what: "an unreadable file counts as unchanged",
+    edits: [
+      [
+        F.retire,
+        "    return contentHash(envelope.data) === fileHash;\n  } catch {\n    return false;",
+        "    return contentHash(envelope.data) === fileHash;\n  } catch {\n    return true;",
+      ],
+    ],
+    files: [T.recheck],
+    pattern: "cannot be read",
+  },
+  {
+    id: "R4-nohash-holds",
+    what: "a readback with no recorded hash counts as unchanged",
+    edits: [
+      [
+        F.retire,
+        "if (fileHash === undefined) return false;",
+        "if (fileHash === undefined) return true;",
+      ],
+    ],
+    files: [T.recheck],
+    pattern: "recorded no hash",
+  },
+  {
+    id: "R4-receipt-unchecked",
+    what: "a receipt of any shape is passed on",
+    edits: [
+      [
+        F.home,
+        "(n) => Number.isFinite(n) && (n as number) >= 0,",
+        "() => true,",
+      ],
+    ],
+    files: [T.run],
+    pattern: "not a map of numbers",
+  },
+  {
+    id: "R4-clientrequest",
+    what: "a ClientRequest built directly (or a subclass) is not checked",
+    edits: [
+      [F.guard, 'check(request.method ?? "GET", target);', "void target;"],
+    ],
+    files: [T.guard, T.run],
+    pattern: "ClientRequest",
+  },
+  {
+    id: "R4-clientrequest-restore",
+    what: "the original Agent.addRequest is not put back",
+    edits: [
+      [
+        F.guard,
+        "    agentProto.addRequest = RealAddRequest;",
+        "    void RealAddRequest;",
+      ],
+    ],
+    files: [T.guard],
+    pattern: "uninstall restores",
+  },
+  // --- round 5 ---
+  {
+    id: "R5-fileholds-true",
+    what: "the shared hash check holds every file (retire and dry run)",
+    edits: [
+      [
+        F.retire,
+        "return contentHash(envelope.data) === fileHash;",
+        "return true;",
+      ],
+    ],
+    files: [T.recheck, T.changed],
+    pattern: "reports file_changed|holds a ready file",
+  },
+  {
+    id: "R5-agent-check-off",
+    what: "an agent's own host is not checked",
+    edits: [
+      [
+        F.guard,
+        "for (const target of agentTargets(requested, this)) {",
+        "for (const target of [requested]) {",
+      ],
+    ],
+    files: [T.guard],
+    pattern: "checks the agent's own host and port",
+  },
+  {
+    id: "R5-agent-port-off",
+    what: "an agent's own port is not checked",
+    edits: [
+      [
+        F.guard,
+        "if (own.port !== undefined) targets.push({ host: request.host, port });",
+        "",
+      ],
+    ],
+    files: [T.guard],
+    pattern: "checks the agent's own host and port",
+  },
+  // --- round 6 ---
+  {
+    id: "CREATE_CONNECTION_UNCHECKED",
+    what: "a request that carries createConnection is not refused",
+    edits: [
+      [
+        F.guard,
+        '  if (merged.createConnection !== undefined) {\n    return { host: "(createConnection)", port: "" };\n  }\n',
+        "",
+      ],
+    ],
+    files: [T.guard],
+    pattern: "refuses a request with createConnection",
+  },
+  {
+    id: "GUARD_INSTALLED_AFTER_IMPORTS",
+    what: "a package module loads before the guard installs (it can capture fetch)",
+    edits: [
+      [
+        F.run,
+        'import { randomBytes } from "node:crypto";',
+        'import "./legacy-store.js";\nimport { randomBytes } from "node:crypto";',
+      ],
+    ],
+    files: [T.entryOrder],
+    pattern: "refuses a fetch captured at module load",
+  },
+  {
+    id: "ENTRY_STATIC_CORE_IMPORT",
+    what: "the shipped entry statically imports a package (core) module",
+    edits: [
+      [
+        F.cli,
+        'import { CopyOnlyError } from "./retire-dry-run/copy-only.js";',
+        'import "@opendatalabs/personal-server-ts-core/sync";\nimport { CopyOnlyError } from "./retire-dry-run/copy-only.js";',
+      ],
+    ],
+    files: [T.closure],
+    pattern: "allowlisted local files",
+  },
+  {
+    id: "RUN_STATIC_CORE_IMPORT",
+    what: "run.ts statically imports a package (core) module",
+    edits: [
+      [
+        F.run,
+        'import { randomBytes } from "node:crypto";',
+        'import "@opendatalabs/personal-server-ts-core/sync";\nimport { randomBytes } from "node:crypto";',
+      ],
+    ],
+    files: [T.closure],
+    pattern: "allowlisted local files",
+  },
+  {
+    id: "ENTRY_IMPORTS_BEFORE_GUARD",
+    what: "the shipped entry statically loads the SQLite store before the guard installs",
+    edits: [
+      [
+        F.cli,
+        'import { CopyOnlyError } from "./retire-dry-run/copy-only.js";',
+        'import "./retire-dry-run/legacy-store.js";\nimport { CopyOnlyError } from "./retire-dry-run/copy-only.js";',
+      ],
+    ],
+    files: [T.entryOrder],
+    pattern: "refuses a fetch captured at module load",
+  },
+];
+
+/** Output that means the run did not test the mutant at all. */
+const ENVIRONMENT_MARKERS = [
+  "did not self-register",
+  "ERR_DLOPEN_FAILED",
+  "Failed to load url",
+  "Failed to load",
+  "Failed to resolve import",
+  "Cannot find module",
+  "ERR_MODULE_NOT_FOUND",
+  "SyntaxError",
+  "No test found",
+];
+
+/** Failed test names: verbose reporter lines that start with a cross. */
+function failedTestNames(out) {
+  const names = [];
+  for (const line of out.split("\n")) {
+    const m = /^\s*×\s+(.+?)(?:\s+\d+ms)?\s*$/.exec(line);
+    if (m) names.push(m[1]);
+  }
+  return names;
+}
+
+/**
+ * Classify one vitest run of a mutant (or of a baseline with `pattern` null).
+ * Pure: the self-test feeds it canned output.
+ */
+export function classify({ status, out, pattern }) {
+  const env = ENVIRONMENT_MARKERS.find((m) => out.includes(m));
+  if (env) return { result: "ERROR", why: `environment or load error: ${env}` };
+  if (status === 0) {
+    const passed = /(\d+) passed/.exec(out)?.[1] ?? "0";
+    return { result: `SURVIVED (${passed} passed)`, why: "" };
+  }
+  const failed = failedTestNames(out);
+  if (failed.length === 0) {
+    return { result: `ERROR (exit ${status}, no test failed)`, why: "" };
+  }
+  if (pattern !== null && failed.some((n) => new RegExp(pattern).test(n))) {
+    return { result: `RED (${failed.length} failed)`, why: "" };
+  }
+  return {
+    result: `MISS (${failed.length} failed, none aimed)`,
+    why: failed[0],
+  };
+}
+
+function selfTest() {
+  const fail = (name) => `× packages/x.test.ts > suite > ${name} 12ms`;
+  const cases = [
+    [
+      "aimed test fails",
+      {
+        status: 1,
+        pattern: "refuses a folder",
+        out: `${fail("refuses a folder outside")}\n Tests 1 failed`,
+      },
+      "RED",
+    ],
+    [
+      "other test fails",
+      {
+        status: 1,
+        pattern: "refuses a folder",
+        out: `${fail("accepts a folder")}\n Tests 1 failed`,
+      },
+      "MISS",
+    ],
+    [
+      "module did not self-register",
+      {
+        status: 1,
+        pattern: "refuses a folder",
+        out: `${fail("refuses a folder outside")}\nError: Module did not self-register: x.node`,
+      },
+      "ERROR",
+    ],
+    [
+      "file did not load",
+      {
+        status: 1,
+        pattern: "refuses a folder",
+        out: " FAIL  x.test.ts [ x.test.ts ]\nSyntaxError: Unexpected token",
+      },
+      "ERROR",
+    ],
+    [
+      "no test matched the pattern",
+      { status: 1, pattern: "nothing", out: "No test found in 1 test file" },
+      "ERROR",
+    ],
+    [
+      "all pass",
+      { status: 0, pattern: "refuses a folder", out: " Tests 3 passed (3)" },
+      "SURVIVED",
+    ],
+  ];
+  let bad = 0;
+  for (const [name, input, want] of cases) {
+    const got = classify(input).result.split(" ")[0];
+    const ok = got === want;
+    if (!ok) bad += 1;
+    console.log(`${ok ? "ok  " : "FAIL"} ${name}: ${got} (want ${want})`);
+  }
+  process.exit(bad === 0 ? 0 : 1);
+}
+
+const args = process.argv.slice(2);
+if (args.includes("--self-test")) selfTest();
+const check = args.includes("--check");
+const onlyArg = args.indexOf("--only");
+const only = onlyArg >= 0 ? new Set(args[onlyArg + 1].split(",")) : null;
+
+const originals = new Map();
+let current = null;
+function restore() {
+  for (const [file, text] of originals) writeFileSync(join(root, file), text);
+  originals.clear();
+}
+process.on("exit", restore);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    current?.kill("SIGTERM");
+    restore();
+    process.exit(130);
+  });
+}
+
+/**
+ * Server tests import `@opendatalabs/personal-server-ts-core` from its dist, so
+ * the dist must exist before any run. `tsc -b` is incremental: a second call on
+ * an unchanged core is cheap.
+ */
+function buildCore() {
+  const build = spawnSync(
+    "nice",
+    ["-n", "19", "npx", "tsc", "-b", "packages/core/tsconfig.json"],
+    { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+  if (build.status !== 0)
+    throw new Error(`core build failed: ${build.stdout}${build.stderr}`);
+}
+
+/** A mutant that edits core must rebuild core before and after its run. */
+function buildCoreIfNeeded(paths) {
+  if (paths.some((file) => file.startsWith("packages/core/"))) buildCore();
+}
+
+function runVitest(files, pattern) {
+  const vitestArgs = [
+    "-n",
+    "19",
+    "npx",
+    "vitest",
+    "run",
+    "--maxWorkers=4",
+    "--reporter=verbose",
+    ...files,
+  ];
+  if (pattern !== null) vitestArgs.push("-t", pattern);
+  return new Promise((resolve) => {
+    const child = spawn("nice", vitestArgs, {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    current = child;
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (out += d));
+    child.on("close", (status) => {
+      current = null;
+      resolve({ status, out });
+    });
+  });
+}
+
+function apply(mutant) {
+  for (const [file, find, replace] of mutant.edits) {
+    const path = join(root, file);
+    if (!originals.has(file)) originals.set(file, readFileSync(path, "utf8"));
+    const text = readFileSync(path, "utf8");
+    const count = text.split(find).length - 1;
+    if (count !== 1) return `edit matches ${count} times in ${file}`;
+    writeFileSync(
+      path,
+      text.replace(find, () => replace),
+    );
+  }
+  return null;
+}
+
+const selected = MUTANTS.filter((m) => !only || only.has(m.id));
+const rows = [];
+let baselineFailed = false;
+if (!check) {
+  // The unmutated baseline of every file set, before any edit. Core is built
+  // once, unconditionally, so a fresh clone needs no manual build.
+  buildCore();
+  const seen = new Set();
+  for (const mutant of selected) {
+    const key = mutant.files.join(",");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const base = await runVitest(mutant.files, null);
+    const verdict = classify({
+      status: base.status,
+      out: base.out,
+      pattern: null,
+    });
+    if (base.status !== 0) {
+      baselineFailed = true;
+      console.error(`BASELINE RED for [${key}]: ${verdict.result}`);
+      console.error(base.out.split("\n").slice(-25).join("\n"));
+    } else {
+      console.error(`baseline ok: [${key}]`);
+    }
+  }
+  if (baselineFailed) {
+    console.error("Aborted: the unmutated baseline is not green.");
+    process.exit(2);
+  }
+}
+
+for (const mutant of selected) {
+  const problem = apply(mutant);
+  if (problem) {
+    restore();
+    rows.push({ ...mutant, result: `INVALID (${problem})` });
+    continue;
+  }
+  if (check) {
+    restore();
+    rows.push({ ...mutant, result: "applies" });
+    continue;
+  }
+  buildCoreIfNeeded(mutant.edits.map(([file]) => file));
+  const run = await runVitest(mutant.files, mutant.pattern);
+  restore();
+  buildCoreIfNeeded(mutant.edits.map(([file]) => file));
+  const verdict = classify({
+    status: run.status,
+    out: run.out,
+    pattern: mutant.pattern,
+  });
+  rows.push({ ...mutant, result: verdict.result });
+  console.error(
+    `${mutant.id}: ${verdict.result}${verdict.why ? ` [${verdict.why}]` : ""}`,
+  );
+}
+restore();
+
+console.log("\n| Mutant | Breaks | Result |\n|---|---|---|");
+for (const row of rows)
+  console.log(`| ${row.id} | ${row.what} | ${row.result} |`);
+const ok = (r) => (check ? r.result === "applies" : r.result.startsWith("RED"));
+process.exit(rows.every(ok) ? 0 : 1);
