@@ -31,3 +31,26 @@ export function streamSyncLegacyReadUnavailableResponse(
     },
   );
 }
+
+export const USE_CONNECTOR_DELETE_CODE = "USE_CONNECTOR_DELETE";
+
+/**
+ * The answer to a per-scope delete on a switched account. The apps reroute on
+ * this code, so it is one body for every per-scope delete.
+ */
+export function useConnectorDeleteResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      error: USE_CONNECTOR_DELETE_CODE,
+      message:
+        "This account has moved to stream sync. Delete a source with DELETE /v1/owner/connectors/:connectorId.",
+    }),
+    {
+      status: 409,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      },
+    },
+  );
+}

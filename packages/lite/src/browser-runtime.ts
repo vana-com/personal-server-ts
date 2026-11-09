@@ -308,9 +308,18 @@ export async function createIndexedDbPsLiteRuntime(
       "Derivative compute disabled: inference.baseUrl is the direct-provider default; point it at the Vana inference relay",
     );
   }
+  // The account's stream-sync switch, read from the live config on each write.
+  const accountStorageMode = createAccountStorageMode({
+    owner: serverOwner,
+    source: () =>
+      config.streamSync.write === true &&
+      config.streamSync.refuseLegacyWrites === true,
+  });
   if (!syncManager && config.sync.enabled) {
     const sync = await createPsLiteSyncManager({
       config,
+      accountStorageMode,
+      serverOwner,
       stateStore,
       storage,
       ownerSignature: options.ownerSignature,
@@ -425,13 +434,6 @@ export async function createIndexedDbPsLiteRuntime(
           }
         : {}),
     });
-  // The account's stream-sync switch, read from the live config on each write.
-  const accountStorageMode = createAccountStorageMode({
-    owner: serverOwner,
-    source: () =>
-      config.streamSync.write === true &&
-      config.streamSync.refuseLegacyWrites === true,
-  });
   const runtime = createPsLiteRuntime({
     ...options,
     accountStorageMode,

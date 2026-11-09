@@ -132,10 +132,11 @@ describe("LEGACY_ON_SWITCH_OTHER: delete and lineage cascade", () => {
     );
     expect(touched).toEqual([]);
     expect(response.status).toBe(409);
-    expect(
-      ((await response.json()) as { error: { errorCode: string } }).error
-        .errorCode,
-    ).toBe("STREAM_SYNC_LEGACY_READ_UNAVAILABLE");
+    expect(await response.json()).toEqual({
+      error: "USE_CONNECTOR_DELETE",
+      message:
+        "This account has moved to stream sync. Delete a source with DELETE /v1/owner/connectors/:connectorId.",
+    });
   });
 
   it("unknown mode refuses with the retryable response and touches nothing", async () => {
@@ -169,6 +170,25 @@ describe("LEGACY_ON_SWITCH_OTHER: delete and lineage cascade", () => {
       deleteDeps(modeOf("unswitched"), []),
     );
     expect(response.status).toBe(501);
+  });
+
+  it("NO_MODE_PARITY: with no mode wired a delete reaches the legacy delete and a cascade is 501", async () => {
+    const touched: string[] = [];
+    const deps = deleteDeps(modeOf("unswitched"), touched);
+    deps.accountStorageMode = undefined;
+    deps.legacyScopeView = undefined;
+    await handlePersonalServerDataRequest(
+      new Request("https://ps.test/instagram.profile", { method: "DELETE" }),
+      deps,
+    );
+    expect(touched).toEqual(["syncManager.deleteScope"]);
+    const cascade = await handlePersonalServerDataRequest(
+      new Request("https://ps.test/instagram.profile?cascade=lineage", {
+        method: "DELETE",
+      }),
+      deps,
+    );
+    expect(cascade.status).toBe(501);
   });
 
   it("a mode that latches mid-life refuses the next delete", async () => {
@@ -212,6 +232,14 @@ describe("LEGACY_ON_SWITCH_OTHER: Oura collection requirements", () => {
       expect(response.status).toBe(value === "switched" ? 409 : 503);
     },
   );
+
+  it("NO_MODE_PARITY: with no mode wired requirements are derived as before", async () => {
+    const response = await handleOuraCollectionRequirementsRequest(
+      new Request("https://ps.test/requirements"),
+      { storage: createMemoryDataStorage(), auth },
+    );
+    expect(response.status).toBe(200);
+  });
 
   it("UNSWITCHED_PARITY: an unswitched account still derives requirements", async () => {
     const response = await handleOuraCollectionRequirementsRequest(

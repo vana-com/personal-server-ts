@@ -33,6 +33,7 @@ import {
   handlePersonalServerScopeUploadAppend,
   refuseLegacyWrite,
   legacyWriteSwitchOf,
+  selectAccountStorageMode,
   type AccountStorageMode,
   createScopeUploadRegistry,
   handleOuraCollectionRequirementsRequest,
@@ -1251,7 +1252,13 @@ export function createPsLiteRuntime(
               "METHOD_NOT_ALLOWED",
               "Method not allowed",
             );
-          // An Oura browser import is a legacy write: a switched account refuses it.
+          // An Oura browser import is a legacy write: a switched account refuses
+          // it, and an unknown mode answers the retryable 503.
+          const ouraSelection = selectAccountStorageMode({
+            accountStorageMode: options.accountStorageMode,
+            serverOwner: options.serverOwner,
+          });
+          if (ouraSelection.kind === "refuse") return ouraSelection.response;
           const refusal = refuseLegacyWrite(
             options.accountStorageMode
               ? legacyWriteSwitchOf(options.accountStorageMode)

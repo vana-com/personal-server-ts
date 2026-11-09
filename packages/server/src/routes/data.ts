@@ -361,6 +361,25 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     ),
   );
 
+  /**
+   * Takeover state (reset flag, verdicts) lives in the legacy view. A switched
+   * account has none to read or reset; an unknown mode is retryable.
+   */
+  const refuseTakeoverOnStreams = (scope: string): void => {
+    const selection = selectAccountStorageMode({
+      accountStorageMode: deps.accountStorageMode,
+      serverOwner: deps.serverOwner,
+    });
+    if (selection.kind === "refuse")
+      throw new LegacyWriteRefused(selection.response);
+    if (selection.kind === "streams")
+      throw new LegacyWriteRefused(
+        streamSyncLegacyReadUnavailableResponse(
+          `Scope "${scope}" has no legacy takeover state because this account stores its data as streams.`,
+        ),
+      );
+  };
+
   app.get("/:scope/takeover", (c) =>
     importRoute(c, async () => {
       const parsed = parseDataScopeContract(c.req.param("scope"));
@@ -370,20 +389,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         request: c.req.raw,
         scope: parsed.scope,
       });
-      // The takeover verdicts and reset flag are legacy-view (canonical store)
-      // state. A switched account has no such state to report.
-      const selection = selectAccountStorageMode({
-        accountStorageMode: deps.accountStorageMode,
-        serverOwner: deps.serverOwner,
-      });
-      if (selection.kind === "refuse")
-        throw new LegacyWriteRefused(selection.response);
-      if (selection.kind === "streams")
-        throw new LegacyWriteRefused(
-          streamSyncLegacyReadUnavailableResponse(
-            `Scope "${parsed.scope}" has no legacy takeover state because this account stores its data as streams.`,
-          ),
-        );
+      refuseTakeoverOnStreams(parsed.scope);
       return {
         scope: parsed.scope,
         reset: deps.legacyScopeView?.isReset(parsed.scope) ?? false,
@@ -400,6 +406,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         request: c.req.raw,
         scope: parsed.scope,
       });
+      refuseTakeoverOnStreams(parsed.scope);
       deps.legacyScopeView?.resetTakeover(parsed.scope);
       return { scope: parsed.scope, reset: true };
     }),

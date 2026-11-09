@@ -1003,6 +1003,8 @@ export async function createServer(
       uploadAttemptStore: createFileUploadAttemptStore(uploadAttemptsPath),
       tombstoneFinality,
       transferMode: isEnclave ? "download-only" : "upload-download",
+      accountStorageMode,
+      serverOwner,
       async canSync() {
         try {
           const serverInfo = await gatewayClient.getServer(

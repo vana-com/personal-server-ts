@@ -27,7 +27,7 @@ async function signed(method: "GET" | "POST" | "DELETE", path: string) {
     wallet: owner,
     aud: ORIGIN,
     method,
-    uri: path,
+    uri: path.split("?")[0]!,
   });
   return new Request(`${ORIGIN}${path}`, {
     method,
@@ -35,7 +35,11 @@ async function signed(method: "GET" | "POST" | "DELETE", path: string) {
   });
 }
 
-function harness(value: AccountStorageModeValue, boundOwner?: string) {
+function harness(
+  value: AccountStorageModeValue,
+  boundOwner?: string,
+  extra: { withoutMode?: boolean } = {},
+) {
   const mode = createAccountStorageMode({
     owner: boundOwner,
     source: () => value === "switched",
@@ -59,7 +63,7 @@ function harness(value: AccountStorageModeValue, boundOwner?: string) {
     stateCapabilities: { config: "memory" },
     serverOwner: owner.address,
     syncManager: { trigger, getStatus: vi.fn() } as never,
-    accountStorageMode: mode,
+    accountStorageMode: extra.withoutMode ? undefined : mode,
     auth: createWeb3SignedPsLiteAuth({
       origin: ORIGIN,
       ownerAddress: owner.address,
@@ -110,11 +114,50 @@ describe("Lite passes the account mode to the group D entry points", () => {
     expect(res.status).toBe(200);
   });
 
-  it("LITE_MODE_DROPPED: a switched account's scope delete is refused", async () => {
+  it("DELETE_CODE_DIVERGES: a switched account's scope delete answers USE_CONNECTOR_DELETE", async () => {
     const h = harness("switched", owner.address);
+    for (const path of [
+      "/v1/data/instagram.profile",
+      "/v1/data/instagram.profile?cascade=lineage",
+    ]) {
+      const res = await h.runtime.fetch(await signed("DELETE", path));
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error: "USE_CONNECTOR_DELETE" });
+    }
+  });
+
+  it("LITE_OURA_OWNER_DROPPED: the Oura requirements read passes the owner, so a mode bound to another owner answers 503", async () => {
+    const h = harness(
+      "unswitched",
+      "0x2222222222222222222222222222222222222222",
+    );
+    const res = await h.runtime.fetch(
+      await signed("GET", "/v1/import/oura-browser/requirements"),
+    );
+    expect(res.status).toBe(503);
+  });
+
+  it("LITE_OURA_POST_UNKNOWN: an Oura import with an unknown mode answers the retryable 503, a switched one 426", async () => {
+    const unknown = harness(
+      "unswitched",
+      "0x2222222222222222222222222222222222222222",
+    );
+    const res = await unknown.runtime.fetch(
+      await signed("POST", "/v1/import/oura-browser"),
+    );
+    expect(res.status).toBe(503);
+    const switched = harness("switched", owner.address);
+    const refused = await switched.runtime.fetch(
+      await signed("POST", "/v1/import/oura-browser"),
+    );
+    expect(refused.status).toBe(426);
+  });
+
+  it("NO_MODE_PARITY: with no mode wired the delete is not refused", async () => {
+    const h = harness("switched", owner.address, { withoutMode: true });
     const res = await h.runtime.fetch(
       await signed("DELETE", "/v1/data/instagram.profile"),
     );
-    expect(res.status).toBe(409);
+    expect(await res.text()).not.toContain("USE_CONNECTOR_DELETE");
   });
 });

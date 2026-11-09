@@ -122,6 +122,62 @@ describe("Node server group D routes", () => {
     });
   });
 
+  describe("DELETE /:scope/takeover", () => {
+    it("TAKEOVER_RESET_LEGACY_ON_SWITCH: a switched account resets no legacy takeover state", async () => {
+      const res = await dataApp().request("/claude.conversations/takeover", {
+        method: "DELETE",
+        headers: bearer,
+      });
+      expect(touched).toEqual([]);
+      expect(res.status).toBe(409);
+    });
+
+    it("an unknown mode answers the retryable 503 and resets nothing", async () => {
+      value = "unknown";
+      const res = await dataApp().request("/claude.conversations/takeover", {
+        method: "DELETE",
+        headers: bearer,
+      });
+      expect(touched).toEqual([]);
+      expect(res.status).toBe(503);
+    });
+
+    it.each(["unswitched", "none"] as const)(
+      "%s: UNSWITCHED_PARITY / NO_MODE_PARITY reset still happens",
+      async (kind) => {
+        const resetTakeover = vi.fn();
+        const app = dataRoutes({
+          indexManager: index,
+          hierarchyOptions: { dataDir: join(root, "data") },
+          logger: pino({ level: "silent" }),
+          serverOrigin: "http://localhost:8080",
+          serverOwner: owner,
+          devToken: "read-other-test",
+          gateway,
+          accessLogWriter: { write: async () => undefined },
+          legacyScopeView: {
+            resetTakeover,
+            isReset: () => true,
+            verdictFor: () => [],
+          } as unknown as LegacyScopeViewPort,
+          ...(kind === "none"
+            ? {}
+            : { accountStorageMode: { read: () => "unswitched" as const } }),
+        });
+        const res = await app.request("/claude.conversations/takeover", {
+          method: kind === "none" ? "DELETE" : "DELETE",
+          headers: bearer,
+        });
+        expect(res.status).toBe(200);
+        expect(resetTakeover).toHaveBeenCalledWith("claude.conversations");
+        const get = await app.request("/claude.conversations/takeover", {
+          headers: bearer,
+        });
+        expect(get.status).toBe(200);
+      },
+    );
+  });
+
   describe("POST /v1/sync/file/:id (mount wiring)", () => {
     const build = (trigger: () => Promise<void>) =>
       syncRoutes({
@@ -175,7 +231,75 @@ describe("Node server group D routes", () => {
     });
   });
 
+  describe("POST / (Oura import)", () => {
+    const build = () =>
+      ouraRoutes({
+        dataStorage: throwing<DataStoragePort>("storage", touched),
+        legacyScopeView: throwing<LegacyScopeViewPort>("view", touched),
+        serverOrigin: "http://localhost:8080",
+        serverOwner: owner,
+        gateway,
+        devToken: "read-other-test",
+        accountStorageMode: mode(),
+      } as never);
+
+    it("OURA_POST_FAILS_OPEN_ON_UNKNOWN: an unknown mode answers the retryable 503 and touches nothing", async () => {
+      value = "unknown";
+      const res = await build().request("/", {
+        method: "POST",
+        headers: { ...bearer, "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(touched).toEqual([]);
+      expect(res.status).toBe(503);
+    });
+
+    it("a switched account is still refused with 426", async () => {
+      const res = await build().request("/", {
+        method: "POST",
+        headers: { ...bearer, "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(res.status).toBe(426);
+    });
+  });
+
   describe("the mounted app", () => {
+    it("DELETE_CODE_DIVERGES: a per-scope delete through createApp answers USE_CONNECTOR_DELETE", async () => {
+      const app = mounted(vi.fn(async () => undefined));
+      for (const q of ["", "?cascade=lineage"]) {
+        const res = await app.request(`/v1/data/instagram.profile${q}`, {
+          method: "DELETE",
+          headers: bearer,
+        });
+        expect(res.status).toBe(409);
+        expect(await res.json()).toMatchObject({
+          error: "USE_CONNECTOR_DELETE",
+        });
+      }
+    });
+
+    it("NO_MODE_PARITY: with no mode wired the delete is not refused", async () => {
+      const app = createApp({
+        logger: pino({ level: "silent" }),
+        version: "0.0.1",
+        startedAt: new Date(),
+        indexManager: index,
+        hierarchyOptions: { dataDir: join(root, "data") },
+        serverOrigin: "http://localhost:8080",
+        serverOwner: owner,
+        devToken: "read-other-test",
+        gateway,
+        accessLogWriter: { write: async () => undefined },
+        config: ServerConfigSchema.parse({}),
+      });
+      const res = await app.request("/v1/data/instagram.profile", {
+        method: "DELETE",
+        headers: bearer,
+      });
+      expect(await res.text()).not.toContain("USE_CONNECTOR_DELETE");
+    });
+
     function mounted(trigger: () => Promise<void>) {
       return createApp({
         logger: pino({ level: "silent" }),

@@ -31,6 +31,7 @@ import {
   type StreamSyncOverlaySnapshotSource,
   type StreamSyncReadFiles,
 } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
+import type { AccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import {
@@ -119,6 +120,12 @@ export interface PsLiteOwnerSyncSigner
 
 export interface PsLiteSyncOptions {
   config: ServerConfig;
+  /**
+   * The shared account mode and the owner it is bound to. A switched account
+   * runs no legacy sync cycle and an unknown mode runs none either.
+   */
+  accountStorageMode?: AccountStorageMode;
+  serverOwner?: string;
   /**
    * Durable files for whole-file stream sync, used only when
    * `config.streamSync.write` is on. Given the home id of the (owner,
@@ -662,6 +669,8 @@ export async function createPsLiteSyncManager(
             })
           : undefined,
         tombstoneFinality,
+        accountStorageMode: options.accountStorageMode,
+        serverOwner: options.serverOwner ?? serverOwner,
         async canSync() {
           if (options.ownerSyncSigner) return { ok: true };
           try {

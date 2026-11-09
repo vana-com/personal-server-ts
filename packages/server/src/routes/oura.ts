@@ -6,6 +6,7 @@ import { Hono } from "hono";
 import {
   handleOuraCollectionRequirementsRequest,
   legacyWriteSwitchOf,
+  selectAccountStorageMode,
   refuseLegacyWrite,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
@@ -121,7 +122,13 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
       await auth.authorizeOwner(c.req.raw);
     }
     // An Oura browser import is a legacy write (it lands in the legacy scope
-    // store), so a switched account refuses it on every path.
+    // store), so a switched account refuses it on every path. An unknown mode
+    // answers the same retryable 503 as the requirements read.
+    const selection = selectAccountStorageMode({
+      accountStorageMode: deps.accountStorageMode,
+      serverOwner: deps.serverOwner,
+    });
+    if (selection.kind === "refuse") return selection.response;
     const refusal = refuseLegacyWrite(
       deps.accountStorageMode
         ? legacyWriteSwitchOf(deps.accountStorageMode)

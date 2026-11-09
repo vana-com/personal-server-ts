@@ -113,7 +113,10 @@ import {
   refuseLegacyWrite,
   type LegacyWriteSwitch,
 } from "./legacy-write-gate.js";
-import { streamSyncLegacyReadUnavailableResponse } from "./switched-read-refusal.js";
+import {
+  streamSyncLegacyReadUnavailableResponse,
+  useConnectorDeleteResponse,
+} from "./switched-read-refusal.js";
 
 /** The write gate's switch: the shared mode when wired, else the plain switch. */
 function writeSwitchOf(
@@ -3490,6 +3493,13 @@ export async function handlePersonalServerDataRequest(
 
     if (request.method === "DELETE") {
       await deps.auth.authorizeOwner(request);
+      // A per-scope delete (and its lineage cascade) reads and removes legacy
+      // files, the canonical view and the legacy sync queue. A switched account
+      // deletes a source through the connector route instead; this one route
+      // decides that for Node and Lite alike.
+      const deleteStorage = selectAccountStorageMode(deps);
+      if (deleteStorage.kind === "refuse") return deleteStorage.response;
+      if (deleteStorage.kind === "streams") return useConnectorDeleteResponse();
       const cascade = url.searchParams.get("cascade");
       if (cascade !== null && cascade !== "lineage") {
         throw new InvalidCascadeError({ cascade });
@@ -3498,17 +3508,6 @@ export async function handlePersonalServerDataRequest(
       // wasted remote call.
       const parsed = parseDataScopeContract(scopeParam);
       if (!parsed.ok) return contractErrorResponse(parsed);
-      // A delete (single scope or lineage cascade) reads and removes legacy
-      // files, the canonical view and the legacy sync queue. For a switched
-      // account none of those is the store, so this route touches none of
-      // them; a stream delete goes through the connector delete route.
-      const deleteStorage = selectAccountStorageMode(deps);
-      if (deleteStorage.kind === "refuse") return deleteStorage.response;
-      if (deleteStorage.kind === "streams") {
-        return streamSyncLegacyReadUnavailableResponse(
-          `Scope "${parsed.scope}" cannot be deleted through the legacy scope route because this account stores its data as streams. Nothing was deleted.`,
-        );
-      }
       if (cascade === "lineage") {
         // Specified (docs/derivative-data-api.md, "Delete") but not
         // implemented here. The durable per-scope delete below is what a
@@ -3835,6 +3834,8 @@ export {
   STREAM_SYNC_LEGACY_READ_UNAVAILABLE_CODE,
   STREAM_SYNC_LEGACY_READ_UNAVAILABLE_STATUS,
   streamSyncLegacyReadUnavailableResponse,
+  USE_CONNECTOR_DELETE_CODE,
+  useConnectorDeleteResponse,
 } from "./switched-read-refusal.js";
 
 export {

@@ -15,6 +15,10 @@ import {
   retryPendingBlobDeletions,
   type DeleteScopeResult,
 } from "../workers/delete.js";
+import {
+  selectAccountStorageMode,
+  type AccountStorageMode,
+} from "../../api/account-storage-mode.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
 import { createTombstoneResubmitTracker } from "../tombstone-resubmits.js";
 import type {
@@ -32,6 +36,15 @@ export interface SyncManagerOptions {
   notifyDebounceMs?: number;
   /** Optional runtime gate. Returning blocked skips upload/download without an error. */
   canSync?: () => Promise<SyncCanRunResult> | SyncCanRunResult;
+  /**
+   * The shared account mode (with the owner it is bound to). Checked before
+   * `canSync` on every cycle, loop tick, hydration and status read: a switched
+   * account runs no legacy upload or download and reads no legacy storage (the
+   * stream-sync publisher still runs); an unknown mode runs nothing and
+   * reports a retryable reason.
+   */
+  accountStorageMode?: AccountStorageMode;
+  serverOwner?: string;
   /**
    * Remote deletion (gateway tombstone + storage blobs). Without it
    * `deleteScope` is local-only and reports `durable: false`.
@@ -65,6 +78,9 @@ export interface SyncManagerOptions {
     readonly publisher: { cycle(): Promise<unknown> };
   } | null;
 }
+
+export const SYNC_BLOCKED_STREAM_SYNC = "stream_sync";
+export const SYNC_BLOCKED_ACCOUNT_MODE_UNKNOWN = "account_mode_unknown";
 
 export type SyncCanRunResult =
   { ok: true } | { ok: false; reason: string; message: string };
@@ -118,6 +134,25 @@ export function createSyncManager(
   const notifyDebounceMs = options?.notifyDebounceMs ?? 500;
   const transferMode = options?.transferMode ?? "upload-download";
   const startupHydrateScopes = [...new Set(options?.hydrateScopes ?? [])];
+
+  /** The mode's verdict on legacy sync, or null when legacy sync may proceed. */
+  function accountModeGate(): Extract<SyncCanRunResult, { ok: false }> | null {
+    const selection = selectAccountStorageMode(options ?? {});
+    if (selection.kind === "legacy") return null;
+    if (selection.kind === "streams")
+      return {
+        ok: false,
+        reason: SYNC_BLOCKED_STREAM_SYNC,
+        message:
+          "This account has moved to stream sync. Legacy sync does not run.",
+      };
+    return {
+      ok: false,
+      reason: SYNC_BLOCKED_ACCOUNT_MODE_UNKNOWN,
+      message:
+        "This server cannot tell yet whether the account has moved to stream sync. Retry shortly.",
+    };
+  }
 
   let intervalId: ReturnType<typeof setInterval> | null = null;
   let notifyTimerId: ReturnType<typeof setTimeout> | null = null;
@@ -214,6 +249,14 @@ export function createSyncManager(
     cycleInFlight = exclusive(async () => {
       do {
         rerunRequested = false;
+        const modeGate = accountModeGate();
+        if (modeGate) {
+          blocked = { reason: modeGate.reason, message: modeGate.message };
+          uploadDeps.logger.warn(blocked, "Sync cycle blocked");
+          if (modeGate.reason === SYNC_BLOCKED_STREAM_SYNC)
+            await runStreamSyncPublish();
+          continue;
+        }
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
@@ -415,21 +458,24 @@ export function createSyncManager(
       );
     }
 
-    if (options?.streamSync?.write) {
-      try {
-        await options.streamSync.publisher.cycle();
-      } catch (err) {
-        pushError({
-          fileId: null,
-          scope: null,
-          message: `Stream sync publish failed: ${(err as Error).message}`,
-          timestamp: new Date().toISOString(),
-        });
-        uploadDeps.logger.warn(
-          { error: (err as Error).message },
-          "Stream sync publish failed",
-        );
-      }
+    await runStreamSyncPublish();
+  }
+
+  async function runStreamSyncPublish(): Promise<void> {
+    if (!options?.streamSync?.write) return;
+    try {
+      await options.streamSync.publisher.cycle();
+    } catch (err) {
+      pushError({
+        fileId: null,
+        scope: null,
+        message: `Stream sync publish failed: ${(err as Error).message}`,
+        timestamp: new Date().toISOString(),
+      });
+      uploadDeps.logger.warn(
+        { error: (err as Error).message },
+        "Stream sync publish failed",
+      );
     }
   }
 
@@ -537,13 +583,19 @@ export function createSyncManager(
     },
 
     getStatus(): SyncStatus {
-      const pendingFiles = uploadDeps.storage.findUnsynced().length;
+      // A switched or unknown account reads no legacy storage for a status.
+      const modeGate = accountModeGate();
+      const pendingFiles = modeGate
+        ? 0
+        : uploadDeps.storage.findUnsynced().length;
 
       return {
         enabled: true,
         running: isRunning,
         syncing: cycleInFlight !== null,
-        blocked,
+        blocked: modeGate
+          ? { reason: modeGate.reason, message: modeGate.message }
+          : blocked,
         lastSync,
         lastProcessedTimestamp,
         pendingFiles,
@@ -556,6 +608,12 @@ export function createSyncManager(
 
     hydrateScopes(scopes) {
       return exclusive(async () => {
+        const modeGate = accountModeGate();
+        if (modeGate) {
+          blocked = { reason: modeGate.reason, message: modeGate.message };
+          downloadDeps.logger.warn(blocked, "Scope hydration blocked");
+          return;
+        }
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
