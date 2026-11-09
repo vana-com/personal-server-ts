@@ -174,4 +174,39 @@ describe("RegistryMirror durable publication", () => {
     expect(version(mirror)).toBe(2);
     expect(version(await RegistryMirror.open(files))).toBe(2);
   });
+
+  it("keeps the registry time of the delete next to its version, and none when no row gave it (DELETE_TIME)", async () => {
+    const { files, mirror } = await fixture(true);
+    const at = "2026-11-01T00:00:10.000Z";
+    await mirror.observe([{ ...row(2), deletedAt: at, addedAt: at }], page);
+    expect(mirror.deletionTime("test-stream")).toBe(Date.parse(at));
+    expect((await RegistryMirror.open(files)).deletionTime("test-stream")).toBe(
+      Date.parse(at),
+    );
+
+    // A tombstone row without a time gives a floor and no time.
+    const bare = await fixture(true);
+    await bare.mirror.observe([{ ...row(2), deletedAt: at }], page);
+    expect(bare.mirror.deletionFloor("test-stream")).toBe(2);
+    expect(bare.mirror.deletionTime("test-stream")).toBeNull();
+  });
+
+  it("a delete learned from a head has no time until a listed tombstone of that version gives it (HEAD_FLOOR_HAS_NO_TIME)", async () => {
+    const { files, mirror } = await fixture(true);
+    await mirror.recordDelete("test-stream", 2);
+    expect(mirror.deletionFloor("test-stream")).toBe(2);
+    expect(mirror.deletionTime("test-stream")).toBeNull();
+
+    const at = "2026-11-01T00:00:10.000Z";
+    await mirror.observe([{ ...row(2), deletedAt: at, addedAt: at }], page);
+    expect(mirror.deletionTime("test-stream")).toBe(Date.parse(at));
+
+    // A later delete replaces the version; the old time must not stay on it.
+    await mirror.recordDelete("test-stream", 4);
+    expect(mirror.deletionFloor("test-stream")).toBe(4);
+    expect(mirror.deletionTime("test-stream")).toBeNull();
+    expect(
+      (await RegistryMirror.open(files)).deletionTime("test-stream"),
+    ).toBeNull();
+  });
 });
