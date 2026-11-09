@@ -27,6 +27,8 @@ export {
   liveStreamCounts,
   readTargets,
   StreamSyncReadService,
+  type ListedScope,
+  type ListScopesInput,
   type ReadDecision,
   type ResolveInput,
   type StreamSyncConnectionStatus,

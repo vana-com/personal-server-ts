@@ -20,6 +20,11 @@ import {
   RECORD_DATA_ACCESS_TYPES,
 } from "@opendatalabs/vana-sdk/browser";
 import { recoverTypedDataAddress } from "viem";
+import { testOwnerKey } from "../../core/src/stream-sync-read/testing.js";
+import {
+  Fixture,
+  masterKey,
+} from "../../core/src/stream-sync-read/service-fixture.js";
 import { privateKeyToAccount } from "viem/accounts";
 
 type PsLiteRuntimeOptions = Parameters<typeof createPsLiteRuntime>[0];
@@ -541,6 +546,55 @@ describe("createPsLiteRuntime", () => {
     expect(res.status).toBe(403);
     const body = await res.json();
     expect(body.error.errorCode).toBe("GRANT_REQUIRED");
+  });
+
+  it("lists a scope only a stream-sync head holds, which the read serves", async () => {
+    const fixture = new Fixture(await testOwnerKey(masterKey(5)));
+    const ns = await fixture.key.ns("acme", "account-1");
+    await fixture.activate("acme", ns);
+    const observedAt = Date.parse("2026-05-07T12:00:00.000Z");
+    await fixture.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      records: [{ id: "a" }],
+      complete: true,
+      observedAt,
+    });
+    const streamSyncRead = await fixture.service();
+    await fixture.sync(streamSyncRead);
+    const runtime = createTestRuntime({
+      storage: createMemoryPsLiteStorage(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      streamSyncRead,
+      now: () => new Date("2026-05-08T00:00:00.000Z"),
+    });
+    const owner = { headers: { Authorization: "Bearer owner-token" } };
+
+    const read = await runtime.fetch(
+      new Request("https://ps.local/v1/data/pdpp.acme.items", owner),
+    );
+    const listed = await runtime.fetch(
+      new Request("https://ps.local/v1/data", owner),
+    );
+
+    expect(read.status).toBe(200);
+    expect(listed.status).toBe(200);
+    await expect(listed.json()).resolves.toMatchObject({
+      scopes: [
+        {
+          scope: "pdpp.acme.items",
+          latestCollectedAt: new Date(observedAt).toISOString(),
+          versionCount: 0,
+        },
+      ],
+      total: 1,
+    });
   });
 
   it("lists scopes and versions from browser-local storage", async () => {

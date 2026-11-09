@@ -98,6 +98,8 @@ import type { LineageGatewayPort } from "../lineage/gateway.js";
 import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
 import type {
   OwnerNotes,
+  ListedScope,
+  ListScopesInput,
   ReadDecision,
   ResolveInput,
   StreamSyncReadStatus,
@@ -332,6 +334,11 @@ export interface PersonalServerIngestSyncManager {
 /** The read side of stream sync, as the data API uses it. */
 export interface StreamSyncReadPort {
   resolve(input: ResolveInput): Promise<ReadDecision>;
+  /**
+   * The scopes `resolve` serves a view of to this caller, for the scope
+   * listing. Absent = the listing shows no stream-sync-only scope.
+   */
+  listScopes?(input: ListScopesInput): Promise<ListedScope[]>;
   /** Per-stream counts and open import problems, for owner diagnostics. */
   status?(): StreamSyncReadStatus;
 }
@@ -1739,6 +1746,78 @@ function canonicalOnlyScopes(
 }
 
 /**
+ * Scopes only stream-sync heads hold, for the listing: no legacy write and no
+ * canonical record is needed to discover them. The read service lists what a
+ * read serves this caller. A scope the legacy store or the canonical view
+ * already lists keeps that row (the listing contract drops a stored name; the
+ * canonical view's names are skipped here), and a gateway deletion hides the
+ * rest the way it hides a canonical scope.
+ */
+function streamSyncOnlyScopes(
+  deps: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner" | "legacyScopeView" | "streamSyncRead"
+  >,
+  deadlineAtMs: number,
+  isOwnerView: boolean,
+): ((scopePrefix: string | undefined) => Promise<ScopeSummary[]>) | undefined {
+  const read = deps.streamSyncRead;
+  if (!read?.listScopes) return undefined;
+  return async (scopePrefix) => {
+    const listed: ScopeSummary[] = [];
+    for (const { scope, collectedAt } of await read.listScopes!({
+      isOwnerView,
+      ...(scopePrefix === undefined ? {} : { scopePrefix }),
+    })) {
+      // The canonical view owns the name: it lists it, or hides it. A scope
+      // the legacy store holds is dropped by the listing contract.
+      const owner = deps.legacyScopeView?.listingFor(scope).kind;
+      if (owner !== undefined && owner !== "file") continue;
+      if (
+        (await resolveReadDeletion(
+          deps,
+          scope,
+          undefined,
+          "canonical",
+          Math.max(0, deadlineAtMs - Date.now()),
+        )) !== null
+      ) {
+        continue;
+      }
+      listed.push({ scope, latestCollectedAt: collectedAt, versionCount: 0 });
+    }
+    return listed;
+  };
+}
+
+/**
+ * Every scope the listing adds to the stored ones: canonical-only scopes,
+ * then stream-sync-only scopes. The canonical view's names never come from
+ * the stream source, so no name is listed twice.
+ */
+function extraListedScopes(
+  deps: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner" | "legacyScopeView" | "streamSyncRead"
+  >,
+  deadlineAtMs: number,
+  isOwnerView: boolean,
+):
+  | ((
+      scopePrefix: string | undefined,
+      stored: ReadonlySet<string>,
+    ) => Promise<ScopeSummary[]>)
+  | undefined {
+  const canonical = canonicalOnlyScopes(deps, deadlineAtMs);
+  const stream = streamSyncOnlyScopes(deps, deadlineAtMs, isOwnerView);
+  if (!stream) return canonical;
+  return async (scopePrefix, stored) => [
+    ...(canonical ? await canonical(scopePrefix, stored) : []),
+    ...(await stream(scopePrefix)),
+  ];
+}
+
+/**
  * A canonical scope's listing row carries the canonical freshness. The
  * legacy head's size and block readiness describe a file the latest read
  * does not serve, so they are dropped.
@@ -2368,7 +2447,11 @@ export async function handlePersonalServerDataRequest(
         isListable: (scope) =>
           !isSystemScope(scope) &&
           (!listAuth || listAuthCovers(listAuth, scope)),
-        extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs),
+        extraScopes: extraListedScopes(
+          deps,
+          deletionDeadlineAtMs,
+          listAuth === undefined,
+        ),
       });
       return jsonResponse({
         ...result.response,

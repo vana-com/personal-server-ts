@@ -46,6 +46,11 @@ import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/a
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { listenHttpServer } from "../listen.js";
+import { testOwnerKey } from "../../../core/src/stream-sync-read/testing.js";
+import {
+  Fixture,
+  masterKey,
+} from "../../../core/src/stream-sync-read/service-fixture.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
@@ -748,6 +753,56 @@ describe("GET /v1/data (list scopes)", () => {
     const json = await res.json();
     expect(json.scopes).toHaveLength(1);
     expect(json.scopes[0].scope).toBe("instagram.profile");
+  });
+
+  it("lists a scope only a stream-sync head holds, which the read serves", async () => {
+    const sessionToken = "vana_ps_owner_session_token";
+    const fixture = new Fixture(await testOwnerKey(masterKey(3)));
+    const ns = await fixture.key.ns("acme", "account-1");
+    await fixture.activate("acme", ns);
+    const observedAt = Date.parse("2026-10-15T12:00:00.000Z");
+    await fixture.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      records: [{ id: "a" }],
+      complete: true,
+      observedAt,
+    });
+    const streamSyncRead = await fixture.service();
+    await fixture.sync(streamSyncRead);
+    const app = createApp({
+      streamSyncRead,
+      tokenStore: createMockTokenStore([sessionToken]),
+    });
+    await ingestData("instagram.profile", { username: "test" }, app);
+    const owner = { headers: { Authorization: `Bearer ${sessionToken}` } };
+
+    const read = await app.request("/pdpp.acme.items", {
+      headers: {
+        Authorization: await buildWeb3SignedHeader({
+          wallet: ownerWallet,
+          aud: SERVER_ORIGIN,
+          method: "GET",
+          uri: "/pdpp.acme.items",
+        }),
+      },
+    });
+    expect(read.status).toBe(200);
+    const res = await app.request("/", owner);
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.scopes).toMatchObject([
+      { scope: "instagram.profile", versionCount: 1 },
+      {
+        scope: "pdpp.acme.items",
+        latestCollectedAt: new Date(observedAt).toISOString(),
+        versionCount: 0,
+      },
+    ]);
+    expect(json.total).toBe(2);
   });
 });
 

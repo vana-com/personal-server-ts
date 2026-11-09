@@ -30,6 +30,7 @@ import {
 import {
   alternateLegacyBindingsForScope,
   LEGACY_SCOPE_BINDINGS,
+  legacyBindingsForProfile,
   type LegacyScopeBinding,
 } from "../legacy-projection/index.js";
 import {
@@ -206,6 +207,20 @@ export type ReadDecision =
       readonly withheld?: readonly WithheldRun[];
       readonly body: ReadableStream<Uint8Array>;
     };
+
+export interface ListScopesInput {
+  /** The caller reads as the owner (`isOwnerView`), not as a grantee. */
+  readonly isOwnerView: boolean;
+  /** Only scopes that start with this. */
+  readonly scopePrefix?: string;
+}
+
+/** A scope a stream-sync read serves, and the time of the data it shows. */
+export interface ListedScope {
+  readonly scope: string;
+  /** ISO time of the newest head or local run the read shows. */
+  readonly collectedAt: string;
+}
 
 export interface StreamSyncConnectionStatus {
   readonly connector: string;
@@ -469,6 +484,35 @@ const NO_SNAPSHOT: StreamSyncOverlaySnapshot = {
   },
   release() {},
 };
+
+/**
+ * The targets with a view to serve, best first: the newest registered head,
+ * then the lowest connector key.
+ */
+function rankedViews<
+  E extends {
+    target: Target;
+    connections: readonly ConnectionView[];
+    eligibility: Eligibility;
+  },
+>(evaluated: readonly E[]): (E & { ns: string })[] {
+  return evaluated
+    .filter((e) => e.eligibility.kind === "view")
+    .map((e) => {
+      const ns = (e.eligibility as { ns: string }).ns;
+      const selected = e.connections.find((c) => c.ns === ns)!;
+      return {
+        ...e,
+        ns,
+        registered: selected.latestHeadRegistration ?? -Infinity,
+      };
+    })
+    .sort(
+      (a, b) =>
+        b.registered - a.registered ||
+        (a.target.connector < b.target.connector ? -1 : 1),
+    );
+}
 
 /** Reads start over this many times when an import lands under them. */
 const MAX_COHERENCE_ATTEMPTS = 8;
@@ -814,6 +858,139 @@ export class StreamSyncReadService {
     }
   }
 
+  /**
+   * The scopes a read serves a stream view of to this caller, for the scope
+   * listing. A scope lists when `resolve` would answer it with a view, or,
+   * for the owner, with the partial view of this device's own writes. The
+   * listing runs the same rules as `decide` over the same connection views
+   * and builds no body.
+   *
+   * Names come from the connectors the registry mirror knows: each stream of
+   * each connection (`pdpp.<c>.<s>`) and each legacy name the connector can
+   * project. A legacy name lists only while a complete view serves it; a
+   * partial view needs the projector, which only a read can run, so the
+   * plain stream names carry the owner's partial data. A connector whose
+   * first run is still unpublished is not known to the mirror and lists
+   * nothing until its heads register.
+   */
+  async listScopes(input: ListScopesInput): Promise<ListedScope[]> {
+    const connectors = this.mirror.connectors();
+    const snapshots = new Map<string, StreamSyncOverlaySnapshot>();
+    try {
+      for (const connector of connectors) {
+        snapshots.set(
+          connector,
+          input.isOwnerView ? await this.snapshot(connector) : NO_SNAPSHOT,
+        );
+      }
+      const names = new Set<string>();
+      for (const connector of connectors) {
+        for (const view of this.connectionViews(
+          connector,
+          snapshots.get(connector),
+        )) {
+          for (const stream of Object.keys(view.streams)) {
+            const name = `pdpp.${connector}.${stream}`;
+            const parts = logicalStreamScopeParts(name);
+            if (parts?.connector === connector && parts.stream === stream) {
+              names.add(name);
+            }
+          }
+        }
+        for (const name of legacyBindingsForProfile(connector).keys()) {
+          names.add(name);
+        }
+      }
+      const listed: ListedScope[] = [];
+      for (const scope of [...names].sort()) {
+        if (input.scopePrefix && !scope.startsWith(input.scopePrefix)) continue;
+        const at = this.servedAt(scope, input.isOwnerView, snapshots);
+        if (at !== null) {
+          listed.push({ scope, collectedAt: new Date(at).toISOString() });
+        }
+      }
+      return listed;
+    } finally {
+      for (const snapshot of snapshots.values()) snapshot.release();
+    }
+  }
+
+  /** The time of the view a read of `scope` serves this caller, or null. */
+  private servedAt(
+    scope: string,
+    isOwnerView: boolean,
+    snapshots: ReadonlyMap<string, StreamSyncOverlaySnapshot>,
+  ): number | null {
+    const input: ResolveInput = {
+      scope,
+      connection: null,
+      cursor: null,
+      legacyFile: false,
+      isOwnerView,
+    };
+    const targets = readTargets(scope).filter((t) =>
+      snapshots.has(t.connector),
+    );
+    const evaluated = targets.map((target) => {
+      const connections = this.connectionViews(
+        target.connector,
+        snapshots.get(target.connector),
+      );
+      return {
+        target,
+        connections,
+        eligibility: this.eligibility(input, target, connections),
+      };
+    });
+    const best = rankedViews(evaluated)[0];
+    if (best) {
+      return this.viewAt(
+        best.target,
+        best.ns,
+        snapshots.get(best.target.connector)!,
+      );
+    }
+    if (!isOwnerView) return null;
+    const scan = this.pendingScan(input, targets, snapshots);
+    return scan.best && !scan.best.target.binding ? scan.best.at : null;
+  }
+
+  /** The newest head or local run a view of `target` in `ns` shows. */
+  private viewAt(
+    target: Target,
+    ns: string,
+    snapshot: StreamSyncOverlaySnapshot,
+  ): number {
+    const rows = this.mirror.rowsFor(target.connector);
+    const control = this.importer.controlState(rows.controls.get(ns));
+    let at = 0;
+    for (const stream of target.streams) {
+      const row = rows.streams.get(ns)?.get(stream);
+      const live = this.liveImported(
+        target.connector,
+        ns,
+        stream,
+        control,
+        row,
+      );
+      const local = this.contributions(
+        snapshot,
+        target.connector,
+        ns,
+        stream,
+        control,
+        row !== undefined && this.importer.streamRowKind(row) === "tombstoned",
+        live,
+      );
+      at = Math.max(
+        at,
+        live?.head.observedAt ?? 0,
+        ...local.merged.map((c) => c.run.observedAt),
+      );
+    }
+    return at;
+  }
+
   private snapshot(connector: string): Promise<StreamSyncOverlaySnapshot> {
     return this.options.overlay
       ? this.options.overlay.snapshot(connector)
@@ -853,22 +1030,7 @@ export class StreamSyncReadService {
           ).kind === "view",
       );
 
-    const views = evaluated
-      .filter((e) => !grantReadsFile && e.eligibility.kind === "view")
-      .map((e) => {
-        const ns = (e.eligibility as { ns: string }).ns;
-        const selected = e.connections.find((c) => c.ns === ns)!;
-        return {
-          ...e,
-          ns,
-          registered: selected.latestHeadRegistration ?? -Infinity,
-        };
-      })
-      .sort(
-        (a, b) =>
-          b.registered - a.registered ||
-          (a.target.connector < b.target.connector ? -1 : 1),
-      );
+    const views = grantReadsFile ? [] : rankedViews(evaluated);
     if (views.length > 0) {
       const best = views[0]!;
       // The view owns its snapshot from here: it releases it with the body.
