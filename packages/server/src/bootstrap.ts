@@ -1359,6 +1359,8 @@ export async function createServer(
     syncManager,
     streamSyncSeed,
     streamSyncIntake,
+    streamSyncConnectionDelete:
+      streamSyncWriter && !isEnclave ? streamSyncWriter : null,
     // Shutdown stops stream-sync requests first; the home then drains.
     streamSyncAdmitting: () => !backgroundClosed,
     serverSigner,

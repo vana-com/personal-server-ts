@@ -2222,6 +2222,13 @@ export {
   type LegacyWriteSwitch,
 } from "./legacy-write-gate.js";
 
+export {
+  handleOwnerConnectorDelete,
+  refuseScopeDelete,
+  type ConnectionDeletePort,
+  type OwnerConnectorDeleteDeps,
+} from "./owner-connector-delete.js";
+
 /**
  * `/v1/data/:scope/uploads...`: an owner writes one new version of a scope as
  * a sequence of record batches. The protocol and its guarantees are in

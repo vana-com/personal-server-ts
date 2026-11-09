@@ -27,6 +27,10 @@ import {
   type DeviceSessionStore,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  handleOwnerConnectorDelete,
+  refuseScopeDelete,
+  type ConnectionDeletePort,
+  type LegacyWriteSwitch,
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
@@ -145,6 +149,13 @@ export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
 }
 
 export interface PsLiteRuntimeOptions {
+  /**
+   * The stream-sync writer's connection delete. Absent = `DELETE
+   * /v1/owner/connectors/:id` answers 503, as the Node server does unwired.
+   */
+  streamSyncConnectionDelete?: ConnectionDeletePort | null;
+  /** The account's stream-sync switch. Absent = not switched. */
+  legacyWritesSwitched?: LegacyWriteSwitch;
   storage: PsLiteStorageAdapter | DataStoragePort;
   auth?: PsLiteAuthAdapter;
   active?: boolean;
@@ -1191,6 +1202,40 @@ export function createPsLiteRuntime(
           return unavailableResponse();
         }
 
+        const connectorPath = /^\/v1\/owner\/connectors\/([^/]+)$/.exec(
+          url.pathname,
+        );
+        if (connectorPath) {
+          if (request.method !== "DELETE") {
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          }
+          let connectorId: string;
+          try {
+            connectorId = decodeURIComponent(connectorPath[1]!);
+          } catch {
+            // A malformed percent-escape is a bad id, not a server fault.
+            await auth.authorizeOwner(request);
+            return errorResponse(
+              400,
+              "INVALID_CONNECTOR",
+              "connectorId is not a connector key",
+            );
+          }
+          return handleOwnerConnectorDelete(
+            request,
+            connectorId,
+            {
+              authorizeOwner: (req) => auth.authorizeOwner(req),
+              switched: options.legacyWritesSwitched ?? (() => false),
+              connectionDelete: options.streamSyncConnectionDelete,
+            },
+          );
+        }
+
         if (url.pathname === "/v1/replication/sync") {
           if (request.method !== "POST")
             return errorResponse(
@@ -1263,6 +1308,19 @@ export function createPsLiteRuntime(
           url.pathname === dataPrefix ||
           url.pathname.startsWith(`${dataPrefix}/`)
         ) {
+          // A switched account deletes a source as a whole (owner connector
+          // route), never one of its scopes.
+          if (
+            request.method === "DELETE" &&
+            /^\/v1\/data\/[^/]+$/.test(url.pathname)
+          ) {
+            const refusal = await refuseScopeDelete(
+              request,
+              options.legacyWritesSwitched,
+              (req) => auth.authorizeOwner(req),
+            );
+            if (refusal) return refusal;
+          }
           const x402 = resolveX402Settings(options.config, boundGatewayConfig);
           return handlePersonalServerDataRequest(
             request,

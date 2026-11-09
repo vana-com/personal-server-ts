@@ -203,6 +203,8 @@ interface StreamPin {
  * pending, so a stream delete that did not land is always re-issued.
  */
 interface DeleteIntent {
+  /** The id the owner route answered with. Absent in an intent from before ids. */
+  readonly id?: string;
   readonly pins: readonly DeletePin[];
   /** Absent in an intent from before streams were listed. */
   readonly streams?: readonly StreamPin[];
@@ -790,61 +792,8 @@ export class StreamSyncWriter {
   deleteConnection(connector: string): Promise<void> {
     return this.publish(async () => {
       await this.finishDelete(connector);
-      const pins: DeletePin[] = [];
-      // The control state of each namespace as the pin loop read it. A stream
-      // pins this state, never a later read: a reconnect between the two reads
-      // would otherwise be recorded as the state the delete started from.
-      const controls = new Map<string, ControlState>();
-      for (const row of await this.options.registry.listControlRows()) {
-        const parsed = parseScope(row.scope);
-        if (parsed?.kind !== "control" || parsed.connector !== connector) {
-          continue;
-        }
-        const state = await this.readControl(connector, parsed.ns);
-        controls.set(parsed.ns, state);
-        if (state.kind === "active" || state.kind === "foreign") {
-          pins.push({
-            ns: parsed.ns,
-            version: state.kind === "active" ? state.generation : state.version,
-          });
-        }
-      }
-      const streams: StreamPin[] = [];
-      for (const row of await this.options.registry.listStreamRows(connector)) {
-        const parsed = parseScope(row.scope);
-        if (parsed?.kind !== "stream" || parsed.connector !== connector) {
-          continue;
-        }
-        streams.push({
-          ns: parsed.ns,
-          stream: parsed.stream,
-          control: controls.get(parsed.ns) ?? { kind: "absent" },
-        });
-      }
-      const registered = streams.length;
-      if (pins.length > 0 || registered > 0) {
-        // Nothing is persisted yet: refuse when no stream can be named.
-        if (this.options.declaredStreams(connector).length === 0) {
-          throw new ConnectorNotVerifiedError(connector);
-        }
-        this.addRowlessStreams(connector, streams, controls);
-      }
-      if (pins.length === 0 && registered === 0) {
-        // The registry lists nothing, so there is nothing to erase there. The
-        // device may still hold runs, results and a seed target for the
-        // connection (collected while the registry was out of reach): they
-        // must not publish later.
-        await this.purgeConnector(connector, []);
-        await this.withState((state) => {
-          delete state.seedTargets[connector];
-        });
-        return;
-      }
-      const intent: DeleteIntent = { pins, streams };
-      await this.withState((state) => {
-        (state.deletes ??= {})[connector] = intent;
-      });
-      await this.runDelete(connector, intent, true);
+      const intent = await this.persistDeleteIntent(connector);
+      if (intent) await this.runDelete(connector, intent, true);
     });
   }
 
@@ -875,6 +824,100 @@ export class StreamSyncWriter {
         control: controls.get(IDENTITYLESS_NS) ?? { kind: "absent" },
       });
     }
+  }
+
+  /**
+   * The owner's connection delete, answered as soon as its intent is durable.
+   * The landing then runs on the publish queue after this resolves; if it
+   * fails, the intent stays and every later publish pass finishes it
+   * (`resumeDeletes`). An open intent of the connector is reused, not
+   * replaced, so the id names the delete that is actually in flight. When the
+   * registry lists nothing of the connector there is nothing to land: this
+   * device's local state is purged at once and the id names a delete that is
+   * already done.
+   */
+  async requestConnectionDelete(
+    connector: string,
+  ): Promise<{ readonly deleteId: string }> {
+    const intent = await this.publish(async () => {
+      const open = (await this.readState()).deletes?.[connector];
+      return open ?? (await this.persistDeleteIntent(connector));
+    });
+    if (!intent) return { deleteId: globalThis.crypto.randomUUID() };
+    // A landing that fails here is not lost: the intent stays on disk and the
+    // next publish pass retries it. It re-reads the intent, so a landing that
+    // another request or a resume already finished is not repeated.
+    void this.publish(() => this.finishDelete(connector)).catch(
+      () => undefined,
+    );
+    return { deleteId: intent.id ?? connector };
+  }
+
+  /**
+   * Plan a fresh delete of `connector` from the registry listing, and persist
+   * it before any write. `null` when the registry lists nothing of the
+   * connector: this device's runs, results and seed target for it are purged
+   * then, so what was collected while the registry was out of reach cannot
+   * publish afterwards. Caller holds the publish queue.
+   */
+  private async persistDeleteIntent(
+    connector: string,
+  ): Promise<DeleteIntent | null> {
+    const pins: DeletePin[] = [];
+    // The control state of each namespace as the pin loop read it. A stream
+    // pins this state, never a later read: a reconnect between the two reads
+    // would otherwise be recorded as the state the delete started from.
+    const controls = new Map<string, ControlState>();
+    for (const row of await this.options.registry.listControlRows()) {
+      const parsed = parseScope(row.scope);
+      if (parsed?.kind !== "control" || parsed.connector !== connector) {
+        continue;
+      }
+      const state = await this.readControl(connector, parsed.ns);
+      controls.set(parsed.ns, state);
+      if (state.kind === "active" || state.kind === "foreign") {
+        pins.push({
+          ns: parsed.ns,
+          version: state.kind === "active" ? state.generation : state.version,
+        });
+      }
+    }
+    const streams: StreamPin[] = [];
+    for (const row of await this.options.registry.listStreamRows(connector)) {
+      const parsed = parseScope(row.scope);
+      if (parsed?.kind !== "stream" || parsed.connector !== connector) {
+        continue;
+      }
+      streams.push({
+        ns: parsed.ns,
+        stream: parsed.stream,
+        control: controls.get(parsed.ns) ?? { kind: "absent" },
+      });
+    }
+    const registered = streams.length;
+    if (pins.length > 0 || registered > 0) {
+      // Nothing is persisted yet: refuse when no stream can be named.
+      if (this.options.declaredStreams(connector).length === 0) {
+        throw new ConnectorNotVerifiedError(connector);
+      }
+      this.addRowlessStreams(connector, streams, controls);
+    }
+    if (pins.length === 0 && registered === 0) {
+      await this.purgeConnector(connector, []);
+      await this.withState((state) => {
+        delete state.seedTargets[connector];
+      });
+      return null;
+    }
+    const intent: DeleteIntent = {
+      id: globalThis.crypto.randomUUID(),
+      pins,
+      streams,
+    };
+    await this.withState((state) => {
+      (state.deletes ??= {})[connector] = intent;
+    });
+    return intent;
   }
 
   /**

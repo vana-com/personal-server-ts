@@ -5,6 +5,7 @@ import {
 } from "./routes/stream-sync-seed.js";
 import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
 import { streamSyncReadStatusRoutes } from "./routes/stream-sync-read-status.js";
+import { ownerConnectorsRoutes } from "./routes/owner-connectors.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -26,6 +27,8 @@ import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type {
+  ConnectionDeletePort,
+  LegacyWriteSwitch,
   PersonalServerReadFulfillmentReporter,
   StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -164,6 +167,8 @@ export interface AppDeps {
   streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
   /** Run intake (V2 §2); absent when stream sync writing is off. */
   streamSyncIntake?: StreamSyncIntake;
+  /** The stream-sync writer's connection delete (`DELETE /v1/owner/connectors/:id`). */
+  streamSyncConnectionDelete?: ConnectionDeletePort | null;
   /**
    * False once the host is shutting down: stream-sync requests then answer
    * 503 before they start a file operation, so the home can close and drain.
@@ -329,6 +334,11 @@ function streamSyncClosing(): ProtocolError {
 
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
+  // The account's stream-sync switch: one reader for every route that depends
+  // on it. Its host sets `streamSync.write` from the Account setting.
+  const legacyWritesSwitched: LegacyWriteSwitch = () =>
+    deps.config?.streamSync.write === true &&
+    deps.config.streamSync.refuseLegacyWrites === true;
 
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
   // derivative question registration), and one replay guard for the proofs
@@ -538,6 +548,26 @@ export function createApp(deps: AppDeps): Hono {
     await next();
   });
 
+  app.use("/v1/owner/connectors/*", async (_c, next) => {
+    if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
+      throw streamSyncClosing();
+    }
+    await next();
+  });
+  app.route(
+    "/v1/owner/connectors",
+    ownerConnectorsRoutes({
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      connectionDelete: deps.streamSyncConnectionDelete ?? null,
+      switched: legacyWritesSwitched,
+    }),
+  );
+
   app.route(
     "/v1/stream-sync/seed",
     streamSyncSeedRoutes({
@@ -604,9 +634,7 @@ export function createApp(deps: AppDeps): Hono {
       // The account's stream-sync switch as this server holds it: its host
       // sets `streamSync.write` from the Account setting before launch.
       // Enforcement is its own flag and ships off.
-      legacyWritesRefused: () =>
-        deps.config?.streamSync.write === true &&
-        deps.config.streamSync.refuseLegacyWrites === true,
+      legacyWritesRefused: legacyWritesSwitched,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,

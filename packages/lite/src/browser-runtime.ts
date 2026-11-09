@@ -447,6 +447,12 @@ export async function createIndexedDbPsLiteRuntime(
     additions,
     scopeDeletions,
     streamSyncRead,
+    streamSyncConnectionDelete: streamSyncWriter,
+    // The same switch the server's legacy write gate reads (`streamSync.write`
+    // and `refuseLegacyWrites`), from the config this runtime was built with.
+    legacyWritesSwitched: () =>
+      config.streamSync.write === true &&
+      config.streamSync.refuseLegacyWrites === true,
     diagnostics,
     lineageGateway,
     derivatives,
