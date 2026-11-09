@@ -209,9 +209,9 @@ it("seed-only refusal is skipped and next run publishes (mutant: discard whole r
   expect(
     (await r.publish()).find((s) => s.runId === "live")?.outcome?.kind,
   ).not.toBe("discarded");
-  expect((await r.writer.seedStatus(CONNECTOR)).receipts).toEqual({
-    seed: "skipped",
-  });
+  expect((await r.writer.seedStatus(CONNECTOR)).skipped).toEqual([
+    { stream: "seed", upload: "upload-1" },
+  ]);
   expect((await r.registeredHead())?.recordCount).toBe(1);
   await r.collect({ ...spec("next"), stream: "seed" });
   await r.publish();
@@ -227,9 +227,9 @@ it("merged seed is dropped while live records publish (mutant: discard whole run
   await r.publish();
   await r.collect(spec("live"));
   await r.publish();
-  expect((await r.writer.seedStatus(CONNECTOR)).receipts).toEqual({
-    items: "skipped",
-  });
+  expect((await r.writer.seedStatus(CONNECTOR)).skipped).toEqual([
+    { stream: "items", upload: "upload-1" },
+  ]);
   expect((await r.registeredHead())?.recordCount).toBe(1);
 });
 

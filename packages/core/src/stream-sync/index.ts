@@ -17,3 +17,4 @@ export { createMemoryStreamSyncFiles } from "./memory-files.js";
 export * from "./intake.js";
 export * from "./artifacts.js";
 export * from "./io-barrier.js";
+export * from "./memory-registry.js";

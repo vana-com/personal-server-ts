@@ -400,9 +400,9 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     expect((await f.reader().read("s"))?.ids).toEqual(["fresh"]);
     expect((await f.reader().read("s"))?.head.generation).toBe(2);
     const restarted = desktop.open();
-    expect((await restarted.status()).receipts[receipt("desktop", "s")]).toBe(
-      "skipped",
-    );
+    expect((await restarted.seedStatus(C)).skipped).toEqual([
+      { stream: "s", upload: "upload-s" },
+    ]);
     await collect(
       restarted,
       "generation-two-again",
@@ -412,9 +412,9 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     await restarted.publishPending();
     expect((await f.reader().read("s"))?.ids).toEqual(["fresh", "later"]);
     expect(seed.reads).toEqual([]);
-    expect(
-      (await desktop.open().status()).receipts[receipt("desktop", "s")],
-    ).toBe("skipped");
+    expect((await desktop.open().seedStatus(C)).skipped).toEqual([
+      { stream: "s", upload: "upload-s" },
+    ]);
   });
 
   it("e: foreign rows stay isolated and foreign-install receipts cannot suppress own seed", async () => {

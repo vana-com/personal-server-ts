@@ -278,9 +278,9 @@ it("a seed with no registry row does not return after a reconnect (mutant: SEED_
   await r.collect({ ...spec("again"), userConnect: true });
   await r.publish();
   expect(await r.registeredHead("seed")).toBeNull();
-  expect((await r.writer.seedStatus(CONNECTOR)).receipts).toEqual({
-    seed: "skipped",
-  });
+  expect((await r.writer.seedStatus(CONNECTOR)).skipped).toEqual([
+    { stream: "seed", upload: "upload-1" },
+  ]);
 });
 
 it("a head that lands under the old generation after the listing is not served after a reconnect", async () => {
@@ -457,7 +457,7 @@ it("refuses a connector with rows and no declared names, and writes nothing (mut
   // open to an old record after a reconnect.
   const r = new Rig(undefined, CONNECTOR, []);
   await r.open();
-  await r.collect(spec("base"));
+  await r.collect({ ...spec("base"), otherDevice: true });
   await r.publish();
   const posts = r.gateway.log.length;
   await expect(r.writer.deleteConnection(CONNECTOR)).rejects.toBeInstanceOf(

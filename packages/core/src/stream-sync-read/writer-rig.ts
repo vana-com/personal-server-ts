@@ -10,13 +10,11 @@ import {
   createMemoryStreamSyncFiles,
   createStreamSyncKeyPorts,
   StreamSyncWriter,
-  type RegistryPostResult,
-  type SignedRegistryPost,
   type StreamSyncBlobs,
-  type StreamSyncRegistry,
   type StreamSyncRunStatus,
 } from "../stream-sync/index.js";
 import { streamSyncHashes } from "../stream-sync/crypto.js";
+import { MemoryStreamSyncRegistry } from "../stream-sync/memory-registry.js";
 import { createWriterOverlaySource } from "../stream-sync/writer.js";
 import {
   decodeHead,
@@ -25,7 +23,6 @@ import {
   partBlobName,
   parseScope,
   streamScope,
-  type ControlRead,
   type Head,
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -42,76 +39,13 @@ export const CONNECTOR = "acme";
 export const T0 = Date.UTC(2026, 10, 1);
 const silent = { info() {}, warn() {}, error() {} };
 
-class Gateway implements StreamSyncRegistry {
-  /** Every committed registry post, in order. */
-  readonly log: { scope: string; version: number; dataHash: string }[] = [];
-  private readonly versions = new Map<
-    string,
-    { dataHash: string; metadataHash: string; at: string }[]
-  >();
-
-  /** Runs inside every registry row read. */
-  beforeRead?: (scope: string) => Promise<void>;
-
-  async read(scope: string): Promise<ControlRead> {
-    await this.beforeRead?.(scope);
-    const rows = this.versions.get(scope);
-    if (!rows?.length) return { found: false };
-    const head = rows[rows.length - 1]!;
-    return {
-      found: true,
-      version: rows.length,
-      dataHash: head.dataHash,
-      metadataHash: head.metadataHash,
-      deleted: false,
-    };
-  }
-
-  /** A test holds a registry POST here, before it commits. */
-  beforePost?: (request: SignedRegistryPost) => Promise<void>;
-  /** A test holds the writer here: the registry committed, the writer has not heard. */
-  afterPost?: (request: SignedRegistryPost) => Promise<void>;
-
-  async post(request: SignedRegistryPost): Promise<RegistryPostResult> {
-    await this.beforePost?.(request);
-    const rows = this.versions.get(request.scope) ?? [];
-    if (Number(request.expectedVersion) !== rows.length + 1) {
-      return { kind: "conflict", latestVersion: String(rows.length) };
-    }
-    rows.push({
-      dataHash: request.dataHash,
-      metadataHash: request.metadataHash,
-      at: new Date(T0 + rows.length * 1000).toISOString(),
-    });
-    this.versions.set(request.scope, rows);
-    this.log.push({
-      scope: request.scope,
-      version: rows.length,
-      dataHash: request.dataHash,
-    });
-    await this.afterPost?.(request);
-    return { kind: "committed" };
-  }
-
-  async listControlRows() {
-    const out: { scope: string; read: ControlRead }[] = [];
-    for (const scope of this.versions.keys()) {
-      if (parseScope(scope)?.kind === "control") {
-        out.push({ scope, read: await this.read(scope) });
-      }
-    }
-    return out;
-  }
-
-  async listStreamRows(connector: string) {
-    const out: { scope: string; read: ControlRead }[] = [];
-    for (const scope of this.versions.keys()) {
-      const parsed = parseScope(scope);
-      if (parsed?.kind === "stream" && parsed.connector === connector) {
-        out.push({ scope, read: await this.read(scope) });
-      }
-    }
-    return out;
+/**
+ * The rig's registry: the shared in-memory registry, plus the mirror feed the
+ * read side consumes.
+ */
+class Gateway extends MemoryStreamSyncRegistry {
+  constructor() {
+    super(T0);
   }
 
   feed(): MirrorFeedRow[] {
@@ -164,6 +98,8 @@ export interface SeedRows {
   readonly stream?: string;
   /** Identity of the staged upload. Default `upload-1`; change it to stage a new one. */
   upload?: string;
+  /** Whether the upload is staged now. Default true; false hides it from the writer. */
+  staged?: boolean;
   readonly key: string;
   readonly version: string;
   rows: readonly Record<string, unknown>[];
@@ -197,7 +133,8 @@ export class Rig {
   constructor(
     seed?: SeedRows,
     readonly connector: string = CONNECTOR,
-    private readonly declared: readonly string[] = ["items"],
+    private declared: readonly string[] = ["items"],
+    private retained: readonly string[] = [],
   ) {
     this.seed = seed;
     this.writer = this.device(this.files, seed);
@@ -257,6 +194,7 @@ export class Rig {
       now: () => T0 + 3_600_000,
       declaredStreams: (connector) =>
         connector === this.connector ? this.declared : [],
+      retainedManifests: () => this.retained,
       onRestartFull: (connector) => {
         this.restarts.push(connector);
       },
@@ -267,14 +205,17 @@ export class Rig {
         ? {
             seed: {
               installId: "install-1",
-              streams: async () => [
-                {
-                  stream: seed.stream ?? "items",
-                  upload: seed.upload ?? "upload-1",
-                  primaryKey: [seed.key],
-                  profile: { key: null, version: seed.version },
-                },
-              ],
+              streams: async () =>
+                seed.staged === false
+                  ? []
+                  : [
+                      {
+                        stream: seed.stream ?? "items",
+                        upload: seed.upload ?? "upload-1",
+                        primaryKey: [seed.key],
+                        profile: { key: null, version: seed.version },
+                      },
+                    ],
               records: async function* () {
                 for (const row of seed.rows) yield row;
               },
@@ -285,6 +226,15 @@ export class Rig {
   }
 
   /** A process restart: a new writer and a new reader over the same files. */
+  /**
+   * The host's declared names and retained manifests from now on: a restart
+   * under changed config (a connector removed from it, for example).
+   */
+  setConfig(declared: readonly string[], retained: readonly string[]): void {
+    this.declared = declared;
+    this.retained = retained;
+  }
+
   async restart(): Promise<void> {
     this.writer = this.device(this.files, this.seed);
     this.bindOverlay();

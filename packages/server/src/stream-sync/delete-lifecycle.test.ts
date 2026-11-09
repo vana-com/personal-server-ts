@@ -663,7 +663,11 @@ describe.each(matrix)(
       await a.publishPending();
 
       const view = await readStream(env.registry, env.blobs, c, NS, "s");
-      expect(view === null || view === "tombstoned").toBe(true);
+      // The delete fences the stream with an empty head (no record readable),
+      // so the assertion is on the records, not on the head being absent.
+      expect(
+        view === null || view === "tombstoned" || view.records.size === 0,
+      ).toBe(true);
       expect(
         finishedOutcome(await a.status(), "p4r2-stream-tomb-only-old")?.outcome,
       ).not.toMatchObject({ kind: "checkpointed" });
@@ -923,7 +927,11 @@ describe.each(matrix)(
       await a.deleteConnection(c); // deleted(2)
       await a.publishPending();
       const view = await readStream(env.registry, env.blobs, c, NS, "brandnew");
-      expect(view === null || view === "tombstoned").toBe(true);
+      // The delete fences the stream with an empty head (no record readable),
+      // so the assertion is on the records, not on the head being absent.
+      expect(
+        view === null || view === "tombstoned" || view.records.size === 0,
+      ).toBe(true);
     });
 
     // S5

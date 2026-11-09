@@ -30,12 +30,13 @@ const NODE_TESTS = ["packages/server/src/routes/owner-connectors.test.ts"];
 const LITE_TESTS = ["packages/lite/src/owner-connectors.test.ts"];
 const HANDLER = "packages/core/src/api/owner-connector-delete.ts";
 const WRITER = "packages/core/src/stream-sync/writer.ts";
-const DECLARED_HOOK = "packages/server/src/stream-sync/declared-streams.ts";
-const DECLARED_HOOK_TESTS = [
-  "packages/server/src/stream-sync/declared-streams.test.ts",
-];
 const DECLARED_TESTS = [
   "packages/core/src/stream-sync/writer-delete-declared.test.ts",
+];
+const DURABLE_TESTS = [
+  ...DECLARED_TESTS,
+  "packages/lite/src/sync-stream-delete-durable.test.ts",
+  "packages/server/src/bootstrap-durable-delete.test.ts",
 ];
 const BOOTSTRAP = "packages/server/src/bootstrap.ts";
 const BOOTSTRAP_TESTS = [
@@ -50,7 +51,7 @@ const MUTANTS = [
     edits: [
       {
         file: WRITER,
-        find: "for (const stream of this.options.declaredStreams(connector)) {",
+        find: "for (const stream of declared) {",
         replace: "for (const stream of []) {",
       },
     ],
@@ -76,7 +77,7 @@ const MUTANTS = [
     edits: [
       {
         file: WRITER,
-        find: "if (this.options.declaredStreams(connector).length === 0) {",
+        find: "if (declared.length === 0) {",
         replace: "if (false) {",
       },
     ],
@@ -210,34 +211,48 @@ const MUTANTS = [
     aim: "answers a wrong method only to the owner",
   },
   {
-    // The Node server ignores the host's declaredStreams option: a connector
-    // the host names but no manifest verifies is refused as unverified.
-    name: "SERVER_DECLARED_STREAMS_IGNORED",
+    // The durable names are ignored: a delete reads the declarations only from
+    // config, so a connector removed from config keeps its rows and answers 503.
+    name: "DURABLE_NAMES_IGNORED",
     edits: [
       {
-        file: DECLARED_HOOK,
-        find: "for (const stream of option?.(connector) ?? []) names.add(stream);",
-        replace:
-          "for (const stream of [] as readonly string[]) names.add(stream);",
+        file: WRITER,
+        find: "for (const stream of durable) names.add(stream);",
+        replace: "for (const stream of [] as string[]) names.add(stream);",
       },
     ],
-    tests: DECLARED_HOOK_TESTS,
-    aim: "the host option's streams are deleted",
+    tests: DURABLE_TESTS,
+    build: true,
+    aim: "rows written under a declaration",
   },
   {
-    // The host's option replaces the retained manifests instead of joining
-    // them: a manifest stream the option omits survives the delete.
+    // The retained manifests name nothing: a connector with rows and no host
+    // names is refused as unverified although its manifest is retained.
+    name: "RETAINED_DECLARATION_DROPPED",
+    edits: [
+      {
+        file: WRITER,
+        find: "for (const stream of manifestStreamLister(retained)(connector)) {",
+        replace: "for (const stream of [] as readonly string[]) {",
+      },
+    ],
+    tests: DECLARED_TESTS,
+    aim: "a connector with rows and a retained declaration deletes",
+  },
+  {
+    // The host's names replace the retained manifests instead of joining
+    // them: a manifest stream the host omits survives the delete.
     name: "DECLARED_STREAMS_NOT_UNIONED",
     edits: [
       {
-        file: DECLARED_HOOK,
-        find: "  return (connector) => {\n",
+        file: WRITER,
+        find: "for (const stream of manifestStreamLister(retained)(connector)) {",
         replace:
-          "  return (connector) => {\n    if (option) return [...option(connector)];\n",
+          "for (const stream of this.options.declaredStreams(connector).length > 0 ? [] : manifestStreamLister(retained)(connector)) {",
       },
     ],
-    tests: DECLARED_HOOK_TESTS,
-    aim: "a manifest stream is kept beside the host option's streams",
+    tests: DECLARED_TESTS,
+    aim: "the host's declared names and a retained manifest's streams are both fenced",
   },
   {
     // A staged seed of a connector with no registry rows is not marked
@@ -246,8 +261,8 @@ const MUTANTS = [
     edits: [
       {
         file: WRITER,
-        find: "      await this.skipStagedSeed(connector);\n      await this.purgeConnector(connector, []);",
-        replace: "      await this.purgeConnector(connector, []);",
+        find: "    await this.skipStagedSeed(connector);\n    if (planIsEmpty({ pins, streams, registered })) {",
+        replace: "    if (planIsEmpty({ pins, streams, registered })) {",
       },
     ],
     tests: DECLARED_TESTS,
@@ -260,9 +275,9 @@ const MUTANTS = [
     edits: [
       {
         file: WRITER,
-        find: "      await this.skipStagedSeed(connector);\n      await this.purgeConnector(connector, []);",
+        find: "    await this.skipStagedSeed(connector);\n    if (planIsEmpty({ pins, streams, registered })) {\n      await this.purgeConnector(connector, []);",
         replace:
-          "      await this.purgeConnector(connector, []);\n      await this.skipStagedSeed(connector);",
+          "    if (planIsEmpty({ pins, streams, registered })) {\n      await this.purgeConnector(connector, []);\n      await this.skipStagedSeed(connector);",
       },
     ],
     build: true,
@@ -276,8 +291,8 @@ const MUTANTS = [
     edits: [
       {
         file: WRITER,
-        find: "      ] === s.upload;",
-        replace: "      ] !== undefined;",
+        find: "      ] === upload.upload",
+        replace: "      ] !== undefined",
       },
     ],
     build: true,
@@ -285,13 +300,28 @@ const MUTANTS = [
     aim: "a new seed staged after a delete publishes on reconnect",
   },
   {
+    // The stream-keyed rule, on the stream-delete path: a retired upload
+    // blocks a later upload of the same stream.
+    name: "DELETE_SKIP_BY_STREAM",
+    edits: [
+      {
+        file: WRITER,
+        find: "      ] === upload.upload",
+        replace: "      ] !== undefined",
+      },
+    ],
+    build: true,
+    tests: DECLARED_TESTS,
+    aim: "a new upload staged after another device's stream delete publishes",
+  },
+  {
     // The host's declaredStreams option is not passed to the writer's hook.
     name: "BOOTSTRAP_OPTION_DROPPED",
     edits: [
       {
         file: BOOTSTRAP,
-        find: "options?.declaredStreams,",
-        replace: "undefined,",
+        find: "declaredStreams: options?.declaredStreams ?? (() => []),",
+        replace: "declaredStreams: (() => []),",
       },
     ],
     tests: BOOTSTRAP_TESTS,

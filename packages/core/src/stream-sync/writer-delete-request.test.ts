@@ -208,7 +208,7 @@ it("an empty plan keeps the open intent and answers with its id (mutant: EMPTY_P
 it("refuses a connector with rows and no declared names, and persists no intent", async () => {
   const r = new Rig(undefined, CONNECTOR, []);
   await r.open();
-  await r.collect(spec("base"));
+  await r.collect({ ...spec("base"), otherDevice: true });
   await r.publish();
   await expect(
     r.writer.requestConnectionDelete(CONNECTOR),
@@ -220,7 +220,7 @@ it("a repeated request for a delete in flight answers its id even when the manif
   const declared = ["items"];
   const r = new Rig(undefined, CONNECTOR, declared);
   await r.open();
-  await r.collect(spec("base"));
+  await r.collect({ ...spec("base"), otherDevice: true });
   await r.publish();
   r.gateway.beforePost = async (request) => {
     if (parseScope(request.scope)?.kind === "stream") {

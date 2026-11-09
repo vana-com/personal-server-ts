@@ -133,6 +133,8 @@ import {
   createWriterOverlaySource,
   createStreamSyncIntake,
   type StreamSyncIntake,
+  type StreamSyncBlobs,
+  type StreamSyncRegistry,
   createGatewayStreamSyncRegistry,
   manifestArtifactResolver,
   createStorageStreamSyncBlobs,
@@ -140,7 +142,6 @@ import {
   streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openFsStreamSyncHome } from "./stream-sync/fs-home.js";
-import { declaredStreamsHook } from "./stream-sync/declared-streams.js";
 import {
   createSeedStaging,
   type SeedStaging,
@@ -261,6 +262,18 @@ export interface CreateServerOptions {
    * (CONNECTOR_NOT_VERIFIED). Read at delete time.
    */
   declaredStreams?: (connector: string) => readonly string[];
+  /**
+   * The stream-sync registry. Default: the gateway client at `gateway.url`. A
+   * test with no gateway passes its own (for example
+   * `createMemoryStreamSyncRegistry()`).
+   */
+  streamSyncRegistry?: StreamSyncRegistry;
+  /**
+   * The stream-sync blob store. Default: the storage service at `gateway.url`.
+   * A test with no storage service passes its own (for example
+   * `createMemoryStreamSyncBlobs()`).
+   */
+  streamSyncBlobs?: StreamSyncBlobs;
   /**
    * Rotate the replica writer identity before this boot writes anything
    * (host contract §3.2). A host sets it when this database may be a copy:
@@ -934,23 +947,25 @@ export async function createServer(
         );
         streamSyncWriter = new StreamSyncWriter({
           ownerAddress: serverOwner,
-          registry: createGatewayStreamSyncRegistry({
-            gatewayUrl: config.gateway.url,
-            ownerAddress: serverOwner,
-          }),
-          blobs: createStorageStreamSyncBlobs(storageAdapter),
+          registry:
+            options?.streamSyncRegistry ??
+            createGatewayStreamSyncRegistry({
+              gatewayUrl: config.gateway.url,
+              ownerAddress: serverOwner,
+            }),
+          blobs:
+            options?.streamSyncBlobs ??
+            createStorageStreamSyncBlobs(storageAdapter),
           home: streamSyncHome.home,
           keys: createStreamSyncKeyPorts(masterKeySignature),
           signer: serverSigner,
           seed: seedSource,
-          // Read at delete time: the pinned manifests are verified by then.
-          // Empty for a connector with no pinned manifest and no host option:
-          // the delete of a connector that has registry rows then refuses
+          // The writer unions these with the retained manifests below, read at
+          // delete time. Empty for a connector with neither: the delete of a
+          // connector that has registry rows then refuses
           // (CONNECTOR_NOT_VERIFIED).
-          declaredStreams: declaredStreamsHook(
-            options?.declaredStreams,
-            () => pdppAuth?.retainedManifests ?? [],
-          ),
+          declaredStreams: options?.declaredStreams ?? (() => []),
+          retainedManifests: () => pdppAuth?.retainedManifests ?? [],
         });
         writerForSeed = streamSyncWriter;
         streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };

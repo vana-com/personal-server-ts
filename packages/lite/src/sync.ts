@@ -5,6 +5,7 @@ import {
   createStreamSyncIntake,
   type ResolveArtifact,
   type RunIntake,
+  type StreamSyncRegistry,
   createGatewayStreamSyncRegistry,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
@@ -143,6 +144,19 @@ export interface PsLiteSyncOptions {
    * (`ConnectorNotVerifiedError`).
    */
   streamSyncDeclaredStreams: (connector: string) => readonly string[];
+  /**
+   * The manifest documents the host retains, read at delete time. A connection
+   * delete also fences the streams these declare, so a host that passes no
+   * `streamSyncDeclaredStreams` names for a connector with rows still deletes
+   * it. Default: none.
+   */
+  streamSyncRetainedManifests?: () => readonly string[];
+  /**
+   * The stream-sync registry. Default: the gateway client at `config.gateway.url`.
+   * A host or test that has no gateway passes its own registry (for example
+   * `createMemoryStreamSyncRegistry()`).
+   */
+  streamSyncRegistry?: StreamSyncRegistry;
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;
@@ -577,15 +591,18 @@ export async function createPsLiteSyncManager(
     const streamSyncWriter = streamSyncHome
       ? new StreamSyncWriter({
           ownerAddress: serverOwner,
-          registry: createGatewayStreamSyncRegistry({
-            gatewayUrl: options.config.gateway.url,
-            ownerAddress: serverOwner,
-          }),
+          registry:
+            options.streamSyncRegistry ??
+            createGatewayStreamSyncRegistry({
+              gatewayUrl: options.config.gateway.url,
+              ownerAddress: serverOwner,
+            }),
           blobs: createStorageStreamSyncBlobs(storageAdapter),
           home: streamSyncHome.home,
           keys: createStreamSyncKeyPorts(options.ownerSignature),
           signer,
           declaredStreams: options.streamSyncDeclaredStreams,
+          retainedManifests: options.streamSyncRetainedManifests,
           partTargetBytes: LITE_PART_TARGET_BYTES,
           reduceBudgetBytes: LITE_REDUCE_BUDGET_BYTES,
           spoolFlushBytes: LITE_SPOOL_FLUSH_BYTES,

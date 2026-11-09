@@ -77,7 +77,7 @@ describe("seed staging", () => {
     await staging.stage("c", "s", pieces(text, 5));
     await staging.stage("c", "t", pieces(text, 5));
     const source = staging.source("install", async () => ({
-      receipts: { s: "skipped" },
+      receipts: { s: "merged" },
       skipped: [],
     }));
     expect((await source.streams("c")).map((s) => s.stream)).toEqual(["t"]);
