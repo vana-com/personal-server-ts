@@ -182,6 +182,8 @@ export type ReadDecision =
       readonly cursor: string;
       /** The view holds everything the writer will publish, and that is complete. */
       readonly complete: boolean;
+      /** ISO time of the data the body shows: the body's `collectedAt`. */
+      readonly collectedAt: string;
       /** Owner only; absent when none. */
       readonly withheld?: readonly WithheldRun[];
       readonly body: ReadableStream<Uint8Array>;
@@ -190,6 +192,8 @@ export type ReadDecision =
       readonly kind: "view";
       readonly connector: string;
       readonly ns: string;
+      /** ISO time of the data the body shows: the body's `collectedAt`. */
+      readonly collectedAt: string;
       /** Pins `(stream → head version)` of every input head. */
       readonly cursor: string;
       /**
@@ -1468,7 +1472,8 @@ export class StreamSyncReadService {
       }
       const withheld = isOwnerView ? withheldAll : [];
       const complete = inputs.every((i) => i.fold.complete);
-      const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},${pending ? `"origin":"local-pending","complete":${complete},` : ""}${withheld.length > 0 ? `"withheld":${JSON.stringify(withheld)},` : ""}"data":`;
+      const collectedAt = new Date(observedAt).toISOString();
+      const open = `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(collectedAt)},${pending ? `"origin":"local-pending","complete":${complete},` : ""}${withheld.length > 0 ? `"withheld":${JSON.stringify(withheld)},` : ""}"data":`;
       let payload: AsyncIterable<string>;
       if (!target.binding) {
         payload = recordsPayload(lines(target.streams[0]!));
@@ -1507,6 +1512,7 @@ export class StreamSyncReadService {
           kind: "local_pending",
           connector: target.connector,
           ns,
+          collectedAt,
           cursor: nextCursor,
           complete,
           ...(withheld.length > 0 ? { withheld } : {}),
@@ -1517,6 +1523,7 @@ export class StreamSyncReadService {
         kind: "view",
         connector: target.connector,
         ns,
+        collectedAt,
         cursor: nextCursor,
         // A view with an input that has no registered head has no registry
         // entry to bind a paid read to.

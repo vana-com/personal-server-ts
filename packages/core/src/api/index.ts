@@ -23,6 +23,7 @@ import type { SyncManager } from "../sync/index.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
   isEntryCoveredByTombstone,
+  isStreamHeadCoveredByTombstone,
   type ScopeDeletionTracker,
 } from "../sync/scope-deletions.js";
 import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
@@ -1634,6 +1635,66 @@ export async function resolveReadDeletion(
 }
 
 /**
+ * The deletion that applies to a read of a stream view of `scope`, or null
+ * when the view may be served. `collectedAt` is the time of the data the view
+ * shows (the body's own `collectedAt`).
+ *
+ * A stream view has no registry version or ingest marker to compare with the
+ * tombstone (see `isStreamHeadCoveredByTombstone`), so unlike a file it is
+ * judged by time: the newest tombstone known for the scope (the gateway's
+ * current one, or the remembered one when the gateway now shows the scope
+ * live) refuses a view collected at or before it and frees one collected
+ * after it. Canonical bodies refuse every remembered tombstone because no
+ * canonical re-add seam exists; a stream head states when it was collected,
+ * so a re-add is provable. A view without a trustworthy time is refused.
+ *
+ * The scope listing and the read both call this, so a listed scope never
+ * answers 410 and a scope that answers 410 is never listed.
+ */
+export async function resolveStreamViewDeletion(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  scope: string,
+  collectedAt: string,
+  gatewayTimeoutMs?: number,
+): Promise<{
+  scope: string;
+  dataPointId: string | null;
+  deletedAt: string;
+} | null> {
+  if (!deps.scopeDeletions) return null;
+  const verdict = await deps.scopeDeletions.resolve(scope, {
+    consultGateway: "always",
+    ...(gatewayTimeoutMs === undefined ? {} : { gatewayTimeoutMs }),
+  });
+  const tombstone = newestTombstone(
+    deps.scopeDeletions.deletionHistory?.get(scope) ?? null,
+    verdict.deleted ? verdict : null,
+  );
+  if (!tombstone) return null;
+  if (!isStreamHeadCoveredByTombstone(collectedAt, tombstone)) return null;
+  return {
+    scope,
+    dataPointId: deps.serverOwner
+      ? computeDataPointId(deps.serverOwner, scope)
+      : null,
+    deletedAt: tombstone.deletedAt,
+  };
+}
+
+/** The later of two tombstones; one whose time is unreadable wins (it covers all). */
+function newestTombstone<T extends { deletedAt: string }>(
+  a: T | null,
+  b: T | null,
+): T | null {
+  if (!a || !b) return a ?? b;
+  const at = Date.parse(a.deletedAt);
+  const bt = Date.parse(b.deletedAt);
+  if (!Number.isFinite(at)) return a;
+  if (!Number.isFinite(bt)) return b;
+  return bt >= at ? b : a;
+}
+
+/**
  * Throw 410 DATA_DELETED when `resolveReadDeletion` says the read must not be
  * served. Call it before any payment step: a builder must never be charged
  * for a scope the owner deleted.
@@ -1751,7 +1812,7 @@ function canonicalOnlyScopes(
  * read serves this caller. A scope the legacy store or the canonical view
  * already lists keeps that row (the listing contract drops a stored name; the
  * canonical view's names are skipped here), and a gateway deletion hides the
- * rest the way it hides a canonical scope.
+ * rest by the rule a stream read applies (`resolveStreamViewDeletion`).
  */
 function streamSyncOnlyScopes(
   deps: Pick<
@@ -1774,11 +1835,10 @@ function streamSyncOnlyScopes(
       const owner = deps.legacyScopeView?.listingFor(scope).kind;
       if (owner !== undefined && owner !== "file") continue;
       if (
-        (await resolveReadDeletion(
+        (await resolveStreamViewDeletion(
           deps,
           scope,
-          undefined,
-          "canonical",
+          collectedAt,
           Math.max(0, deadlineAtMs - Date.now()),
         )) !== null
       ) {
@@ -2795,7 +2855,26 @@ export async function handlePersonalServerDataRequest(
           }
           const refusal = streamSyncRefusal(decision);
           if (refusal) return refusal;
-          if (decision.kind === "local_pending") {
+          // Deletion gate for a stream view, after auth and before demand,
+          // payment or an access record: the rule the listing applies. A
+          // covered view serves nothing. A stored file may still answer on
+          // its own re-add rule through the legacy gate below.
+          let covered = false;
+          if (decision.kind === "view" || decision.kind === "local_pending") {
+            const deletion = await resolveStreamViewDeletion(
+              deps,
+              scopeResult.scope,
+              decision.collectedAt,
+            );
+            if (deletion) {
+              await decision.body.cancel();
+              if (!selectedEntry && latest?.kind !== "canonical") {
+                throw new DataDeletedError(deletion);
+              }
+              covered = true;
+            }
+          }
+          if (!covered && decision.kind === "local_pending") {
             // Owner-only and unregistered: nothing to bill and no version to
             // bind in an access record.
             notifyDataRead(deps, { scope: scopeResult.scope });
@@ -2807,7 +2886,7 @@ export async function handlePersonalServerDataRequest(
               paymentResponseHeader: undefined,
             });
           }
-          if (decision.kind === "view") {
+          if (!covered && decision.kind === "view") {
             notifyDataRead(deps, { scope: scopeResult.scope });
             // The same charge as a file read; the access record binds the
             // stream head the view serves.

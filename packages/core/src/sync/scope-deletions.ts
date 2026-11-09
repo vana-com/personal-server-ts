@@ -508,3 +508,30 @@ export function isEntryCoveredByTombstone(
   }
   return BigInt(marker) < tombstoned;
 }
+
+/**
+ * True when a stream-sync head is part of what a gateway tombstone deleted.
+ *
+ * A stream head has no registry entry under the scope the tombstone names
+ * (its heads register under physical stream scopes), so neither registry
+ * versions nor the ingest marker can say whether it predates the deletion.
+ * The one fact the head carries is when its data was collected, so this
+ * compares that time with the tombstone's `deletedAt`: data collected after
+ * the deletion is a re-add, anything else is covered.
+ *
+ * The comparison is conservative on every doubt. A collection time or a
+ * tombstone time that cannot be read covers the head, and so does equality.
+ * A head without a stamp reports the epoch, which precedes every deletion. Two clocks are compared (the collecting device's and the
+ * gateway's), so a device whose clock runs ahead can show data collected just
+ * before the deletion as a re-add; the window is the clock skew.
+ */
+export function isStreamHeadCoveredByTombstone(
+  collectedAt: string,
+  tombstone: Pick<ScopeTombstone, "deletedAt">,
+): boolean {
+  const collected = Date.parse(collectedAt);
+  const deleted = Date.parse(tombstone.deletedAt);
+  if (!Number.isFinite(collected)) return true;
+  if (!Number.isFinite(deleted)) return true;
+  return collected <= deleted;
+}
