@@ -5,6 +5,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { ConnectorNotVerifiedError } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -81,7 +82,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(409);
-    expect((await response.json()).error).toBe("NOT_SWITCHED");
+    expect((await response.json()).error.errorCode).toBe("NOT_SWITCHED");
   });
 
   it("answers 202 with the delete id on a switched account", async () => {
@@ -99,7 +100,9 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
-    expect((await response.json()).error).toBe("STREAM_SYNC_UNAVAILABLE");
+    expect((await response.json()).error.errorCode).toBe(
+      "STREAM_SYNC_UNAVAILABLE",
+    );
   });
 
   it("answers 503, not 409, when no mode is wired (mutant: UNWIRED_MODE_FROM_CONFIG)", async () => {
@@ -108,7 +111,9 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
-    expect((await response.json()).error).toBe("ACCOUNT_MODE_UNKNOWN");
+    expect((await response.json()).error.errorCode).toBe(
+      "ACCOUNT_MODE_UNKNOWN",
+    );
   });
 
   it("answers 503 while the mode is unknown (mutant: UNKNOWN_MODE_NOT_SWITCHED)", async () => {
@@ -117,7 +122,9 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
-    expect((await response.json()).error).toBe("ACCOUNT_MODE_UNKNOWN");
+    expect((await response.json()).error.errorCode).toBe(
+      "ACCOUNT_MODE_UNKNOWN",
+    );
   });
 
   it("answers 400, not 500, for a malformed percent-escape in the id (mutant: DECODE_THROWS_500)", async () => {
@@ -126,7 +133,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
       "/v1/owner/connectors/%E0%A4%A",
     );
     expect(response.status).toBe(400);
-    expect((await response.json()).error).toBe("INVALID_CONNECTOR");
+    expect((await response.json()).error.errorCode).toBe("INVALID_CONNECTOR");
   });
 
   it("asks a bad escape of the owner only", async () => {
@@ -152,5 +159,65 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
     expect(stranger.status).toBeGreaterThanOrEqual(401);
     expect(stranger.status).toBeLessThanOrEqual(403);
     expect((await request(ownerAuth)).status).toBe(405);
+  });
+
+  it("gives every refusal the API's one error envelope (mutant: TOP_LEVEL_ERROR_BODY)", async () => {
+    const cases: Array<[number, string, Response]> = [
+      [
+        400,
+        "INVALID_CONNECTOR",
+        await del(runtimeWith({ switched: true }), "/v1/owner/connectors/a~b"),
+      ],
+      [
+        409,
+        "NOT_SWITCHED",
+        await del(
+          runtimeWith({ switched: false }),
+          "/v1/owner/connectors/github",
+        ),
+      ],
+      [
+        503,
+        "ACCOUNT_MODE_UNKNOWN",
+        await del(
+          runtimeWith({ switched: true, mode: "unknown" }),
+          "/v1/owner/connectors/github",
+        ),
+      ],
+      [
+        405,
+        "METHOD_NOT_ALLOWED",
+        await runtimeWith({ switched: true }).fetch(
+          new Request("http://localhost/v1/owner/connectors/github", {
+            method: "GET",
+            headers: ownerAuth,
+          }),
+        ),
+      ],
+    ];
+    for (const [status, errorCode, response] of cases) {
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({
+        error: { code: status, errorCode, message: expect.any(String) },
+      });
+    }
+  });
+
+  it("answers 503 CONNECTOR_NOT_VERIFIED when the writer cannot name the streams", async () => {
+    const response = await del(
+      runtimeWith({
+        switched: true,
+        connectionDelete: {
+          requestConnectionDelete: async (connector) => {
+            throw new ConnectorNotVerifiedError(connector);
+          },
+        },
+      }),
+      "/v1/owner/connectors/github",
+    );
+    expect(response.status).toBe(503);
+    expect((await response.json()).error.errorCode).toBe(
+      "CONNECTOR_NOT_VERIFIED",
+    );
   });
 });

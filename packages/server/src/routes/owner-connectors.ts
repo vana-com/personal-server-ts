@@ -10,6 +10,7 @@
 import { Hono } from "hono";
 import {
   handleOwnerConnectorDelete,
+  ownerConnectorRefusal,
   type ConnectionDeletePort,
   type StorageModeRead,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -67,5 +68,15 @@ export function ownerConnectorsRoutes(deps: OwnerConnectorsRouteDeps): Hono {
       connectionDelete: deps.connectionDelete,
     }),
   );
+  // Any other method: the owner learns it is not allowed; a stranger learns
+  // nothing (the same order as the Lite runtime).
+  app.all("/:connectorId", async (c) => {
+    await auth.authorizeOwner(c.req.raw);
+    return ownerConnectorRefusal(
+      405,
+      "METHOD_NOT_ALLOWED",
+      "Method not allowed",
+    );
+  });
   return app;
 }

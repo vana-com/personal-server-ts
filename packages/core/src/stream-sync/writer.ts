@@ -220,6 +220,15 @@ interface DeletePlan {
   readonly registered: number;
 }
 
+/**
+ * True when the registry lists nothing of the connector. An open intent then
+ * stays: its landing may be what emptied the registry, or may still be owed,
+ * and clearing it would drop that work and answer with an id of no delete.
+ */
+function planIsEmpty(plan: DeletePlan): boolean {
+  return plan.pins.length === 0 && plan.registered === 0;
+}
+
 /** True when `plan` erases the same rows, in the same control states, as `intent`. */
 function sameDeletePlan(intent: DeleteIntent, plan: DeletePlan): boolean {
   const pinKey = (pin: DeletePin) => `${pin.ns}:${pin.version}`;
@@ -878,7 +887,9 @@ export class StreamSyncWriter {
       // it was made from. If a reconnect (on any device) moved a control row
       // or added a stream since, reusing it would erase nothing of what the
       // owner now sees, and the answer would name a delete that is not theirs.
-      if (open && sameDeletePlan(open, plan)) return open;
+      if (open && (planIsEmpty(plan) || sameDeletePlan(open, plan))) {
+        return open;
+      }
       return this.persistDeleteIntent(connector, plan);
     });
     if (!intent) return { deleteId: globalThis.crypto.randomUUID() };
@@ -904,12 +915,10 @@ export class StreamSyncWriter {
   ): Promise<DeleteIntent | null> {
     const { pins, streams, registered } =
       plan ?? (await this.planDelete(connector));
-    if (pins.length === 0 && registered === 0) {
+    if (planIsEmpty({ pins, streams, registered })) {
       await this.purgeConnector(connector, []);
       await this.withState((state) => {
         delete state.seedTargets[connector];
-        // An open intent of an earlier plan is void: nothing is left to erase.
-        delete state.deletes?.[connector];
       });
       return null;
     }

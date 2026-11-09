@@ -6,6 +6,7 @@
  */
 import { expect, it } from "vitest";
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { ConnectorNotVerifiedError } from "./writer.js";
 import { ask } from "../stream-sync-read/service-fixture.js";
 import {
   Rig,
@@ -180,4 +181,37 @@ it("a second delete after a reconnect deletes the reconnect, not the old plan (m
   expect(["view", "local_pending"]).not.toContain(served.kind);
   expect((await persistedState(r)).deletes ?? {}).toEqual({});
   expect(second.deleteId).not.toBe(first.deleteId);
+});
+
+it("an empty plan keeps the open intent and answers with its id (mutant: EMPTY_PLAN_CLEARS_OPEN)", async () => {
+  const r = await publishedBase();
+  r.gateway.beforePost = async (request) => {
+    if (parseScope(request.scope)?.kind === "stream") {
+      throw new Error("registry down");
+    }
+  };
+  const first = await r.writer.requestConnectionDelete(CONNECTOR);
+  await r.publish();
+  expect((await persistedState(r)).deletes?.[CONNECTOR]?.id).toBe(
+    first.deleteId,
+  );
+  // The registry now lists nothing of the connector; the landing is still owed.
+  r.gateway.listControlRows = async () => [];
+  r.gateway.listStreamRows = async () => [];
+  const second = await r.writer.requestConnectionDelete(CONNECTOR);
+  expect(second.deleteId).toBe(first.deleteId);
+  expect((await persistedState(r)).deletes?.[CONNECTOR]?.id).toBe(
+    first.deleteId,
+  );
+});
+
+it("refuses a connector with rows and no declared names, and persists no intent", async () => {
+  const r = new Rig(undefined, CONNECTOR, []);
+  await r.open();
+  await r.collect(spec("base"));
+  await r.publish();
+  await expect(
+    r.writer.requestConnectionDelete(CONNECTOR),
+  ).rejects.toBeInstanceOf(ConnectorNotVerifiedError);
+  expect((await persistedState(r)).deletes ?? {}).toEqual({});
 });

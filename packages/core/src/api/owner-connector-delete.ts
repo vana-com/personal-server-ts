@@ -21,9 +21,16 @@
  *   409 NOT_SWITCHED            the account has not moved to stream sync
  *   503 ACCOUNT_MODE_UNKNOWN    the storage mode cannot be read yet; retry
  *   503 STREAM_SYNC_UNAVAILABLE no stream-sync writer is wired on this host
+ *   503 CONNECTOR_NOT_VERIFIED  the registry holds rows of the connector but
+ *                               this host verified no manifest naming its
+ *                               streams; retry once it has
+ *
+ * Every refusal has the one error shape of the API, the `ProtocolError`
+ * envelope: `{ error: { code, errorCode, message } }`.
  */
 
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { ConnectorNotVerifiedError } from "../stream-sync/writer.js";
 
 /**
  * What the route needs of the account's storage mode: the read shape of
@@ -51,9 +58,27 @@ export interface OwnerConnectorDeleteDeps {
   connectionDelete: ConnectionDeletePort | null | undefined;
 }
 
-function json(status: number, body: Record<string, string>): Response {
-  return new Response(JSON.stringify(body), {
-    status,
+/** A refusal in the API's one error shape (the `ProtocolError` envelope). */
+export function ownerConnectorRefusal(
+  status: number,
+  errorCode: string,
+  message: string,
+): Response {
+  return new Response(
+    JSON.stringify({ error: { code: status, errorCode, message } }),
+    {
+      status,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      },
+    },
+  );
+}
+
+function accepted(deleteId: string): Response {
+  return new Response(JSON.stringify({ deleteId }), {
+    status: 202,
     headers: {
       "content-type": "application/json",
       "cache-control": "no-store",
@@ -84,33 +109,46 @@ export async function handleOwnerConnectorDelete(
 ): Promise<Response> {
   await deps.authorizeOwner(request);
   if (connectorId === null || !isConnectorKey(connectorId)) {
-    return json(400, {
-      error: "INVALID_CONNECTOR",
-      message: "connectorId is not a connector key",
-    });
+    return ownerConnectorRefusal(
+      400,
+      "INVALID_CONNECTOR",
+      "connectorId is not a connector key",
+    );
   }
   const mode = deps.mode.read(deps.owner);
   if (mode === "unknown") {
-    return json(503, {
-      error: "ACCOUNT_MODE_UNKNOWN",
-      message:
-        "This server cannot tell yet whether the account has moved to stream sync. Retry shortly.",
-    });
+    return ownerConnectorRefusal(
+      503,
+      "ACCOUNT_MODE_UNKNOWN",
+      "This server cannot tell yet whether the account has moved to stream sync. Retry shortly.",
+    );
   }
   if (mode !== "switched") {
-    return json(409, {
-      error: "NOT_SWITCHED",
-      message:
-        "This account has not moved to stream sync. Delete each scope of the source instead.",
-    });
+    return ownerConnectorRefusal(
+      409,
+      "NOT_SWITCHED",
+      "This account has not moved to stream sync. Delete each scope of the source instead.",
+    );
   }
   if (!deps.connectionDelete) {
-    return json(503, {
-      error: "STREAM_SYNC_UNAVAILABLE",
-      message: "Stream sync is not running on this server.",
-    });
+    return ownerConnectorRefusal(
+      503,
+      "STREAM_SYNC_UNAVAILABLE",
+      "Stream sync is not running on this server.",
+    );
   }
-  const started =
-    await deps.connectionDelete.requestConnectionDelete(connectorId);
-  return json(202, { deleteId: started.deleteId });
+  try {
+    const started =
+      await deps.connectionDelete.requestConnectionDelete(connectorId);
+    return accepted(started.deleteId);
+  } catch (error) {
+    if (error instanceof ConnectorNotVerifiedError) {
+      return ownerConnectorRefusal(
+        503,
+        "CONNECTOR_NOT_VERIFIED",
+        "This server has not verified the source's streams yet, so it cannot delete the source safely. Retry shortly.",
+      );
+    }
+    throw error;
+  }
 }

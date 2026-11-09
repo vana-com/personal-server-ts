@@ -2224,6 +2224,7 @@ export {
 
 export {
   handleOwnerConnectorDelete,
+  ownerConnectorRefusal,
   type ConnectionDeletePort,
   type OwnerConnectorDeleteDeps,
   type StorageModeRead,
