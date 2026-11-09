@@ -1130,6 +1130,175 @@ function listAuthCovers(
 }
 
 /**
+ * What one read needs to answer from a stream-sync decision: the scope and
+ * the caller, and how a charged read settles.
+ */
+interface StreamDecisionContext {
+  scope: string;
+  grantId: string | undefined;
+  authResult: Awaited<
+    ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
+  >;
+  inProcess: PersonalServerInProcessRead | undefined;
+  wantsRawContent: boolean;
+  settle: (served?: { scope: string; version: number } | null) => Promise<void>;
+  /**
+   * Where a charge may look for an entry to bind. `streams`: nowhere, the
+   * charge binds the served stream head or nothing.
+   */
+  readEntriesFrom: "legacy" | "streams";
+}
+
+/**
+ * Answer a read from a stream-sync decision: the refusal it carries, or its
+ * view. `undefined` when the decision serves nothing (`pass`, `legacy`, and
+ * `unavailable` without a refusal): the caller decides what follows.
+ */
+async function serveStreamDecision(
+  deps: PersonalServerDataApiDeps,
+  request: Request,
+  ctx: StreamDecisionContext,
+  decision: ReadDecision,
+): Promise<Response | undefined> {
+  const { scope, grantId, authResult, inProcess, wantsRawContent, settle } =
+    ctx;
+  const refusal = streamSyncRefusal(decision);
+  if (refusal) return refusal;
+  if (
+    inProcess &&
+    wantsRawContent &&
+    (decision.kind === "view" || decision.kind === "local_pending")
+  ) {
+    // A view has no raw bytes. Refused before any charge, log or
+    // fulfilment, so a caller never pays for a read it cannot use.
+    await decision.body.cancel();
+    return jsonResponse(
+      {
+        error: "STREAM_VIEW_NOT_RAW",
+        message: `Scope "${scope}" is served from its stream view, which has no raw binary content.`,
+        scope,
+      },
+      { status: 409 },
+    );
+  }
+  if (decision.kind === "local_pending") {
+    // Owner-only and unregistered: nothing to bill and no version to
+    // bind in an access record.
+    const checked = await validateStreamBody(decision, inProcess);
+    await settle();
+    notifyDataRead(deps, { scope });
+    return serveStreamSyncView(deps, request, {
+      scope,
+      grantId,
+      authResult,
+      decision: checked,
+      paymentResponseHeader: undefined,
+      inProcess,
+    });
+  }
+  if (decision.kind === "view") {
+    notifyDataRead(deps, { scope });
+    // The same charge as a file read; the access record binds the
+    // stream head the view serves.
+    let paymentResponseHeader: string | undefined;
+    // An owner-only view with no registered head has nothing to
+    // charge against: the service serves it to the owner alone.
+    if (decision.served !== null) {
+      const served = decision.served;
+      const ownApp = await ownAppReadStatus(deps, authResult);
+      if (ownApp instanceof Response) {
+        await decision.body.cancel();
+        return ownApp;
+      }
+      const charge = readCharge(deps, scope, authResult, ownApp);
+      if (charge) {
+        let paid: Awaited<ReturnType<typeof payForRead>>;
+        try {
+          paid = await payForRead(deps, request, charge, {
+            scope,
+            servedEntry: served,
+            readEntriesFrom: ctx.readEntriesFrom,
+          });
+        } catch (error) {
+          await decision.body.cancel();
+          throw error;
+        }
+        if (paid.kind === "refused") {
+          await decision.body.cancel();
+          return paid.response;
+        }
+        paymentResponseHeader = paid.paymentResponseHeader;
+      }
+    }
+    const checked = await validateStreamBody(decision, inProcess);
+    await settle(decision.served);
+    return serveStreamSyncView(deps, request, {
+      scope,
+      grantId,
+      authResult,
+      decision: checked,
+      paymentResponseHeader,
+      inProcess,
+    });
+  }
+  return undefined;
+}
+
+/**
+ * The body of a read on a switched account: the stream view or a typed
+ * refusal, never a legacy file. Explicit history (`fileId`, `at`,
+ * `view=stored`) names legacy versions, which streams do not keep, so it is
+ * refused rather than served from legacy.
+ */
+async function serveBodyFromStreams(
+  deps: PersonalServerDataApiDeps,
+  request: Request,
+  ctx: StreamDecisionContext,
+  input: {
+    explicitHistory: boolean;
+    connection: string | null;
+    cursor: string | null;
+  },
+): Promise<Response> {
+  if (input.explicitHistory) {
+    return errorResponse(
+      404,
+      "STREAM_HISTORY_UNAVAILABLE",
+      "This account reads from streams, which keep no versions to select by file or time",
+    );
+  }
+  if (!deps.streamSyncRead) {
+    return errorResponse(
+      503,
+      "STREAM_READER_UNAVAILABLE",
+      "This account reads from streams and this server has no stream reader",
+    );
+  }
+  const decision = await deps.streamSyncRead.resolve({
+    scope: ctx.scope,
+    connection: input.connection,
+    cursor: input.cursor,
+    legacyFile: false,
+    isOwnerView: isOwnerView(ctx.authResult),
+  });
+  if (decision.kind === "unavailable" && decision.reason === "deleted") {
+    throw new DataDeletedError({ scope: ctx.scope });
+  }
+  const served = await serveStreamDecision(deps, request, ctx, decision);
+  if (served) return served;
+  return errorResponse(
+    404,
+    "STREAM_DATA_NOT_FOUND",
+    `No stream data answers scope "${ctx.scope}"`,
+    decision.kind === "pass" ||
+      decision.kind === "legacy" ||
+      decision.kind === "unavailable"
+      ? decision
+      : undefined,
+  );
+}
+
+/**
  * Whether the app reading is the data owner's own app, which is exempt from
  * the read fee. `false` when no Account authority is configured or the read
  * is owner-signalled; a `Response` (503) when eligibility cannot be
@@ -1279,7 +1448,7 @@ async function payForRead(
   charge: ReadCharge,
   read: Pick<
     X402CycleInput,
-    "scope" | "fileIdParam" | "atParam" | "servedEntry"
+    "scope" | "fileIdParam" | "atParam" | "servedEntry" | "readEntriesFrom"
   >,
 ): Promise<
   | { kind: "refused"; response: Response }
@@ -1323,6 +1492,13 @@ export interface X402CycleInput {
    * is not the stored entry of `scope`: a stream view serves a stream head.
    */
   servedEntry?: { scope: string; version: number };
+  /**
+   * Where the challenge may look for an entry to bind when `servedEntry` is
+   * absent. `legacy` (default): the stored entry of `scope`. `streams`: the
+   * account has switched, so storage is never consulted and a charge with no
+   * served head binds no entry.
+   */
+  readEntriesFrom?: "legacy" | "streams";
   grantId: string;
   builder: `0x${string}`;
   gateway: Pick<GatewayClient, "getGrant">;
@@ -1377,13 +1553,14 @@ export async function handleX402Cycle(
   // Bind the accessRecord to the entry being served, if it exists and has
   // been registered with DPv2 yet. A served stream head is registered: it
   // was listed from the registry.
-  const entryRow = input.servedEntry
-    ? undefined
-    : deps.storage.findEntry({
-        scope,
-        fileId: input.fileIdParam,
-        at: input.atParam,
-      });
+  const entryRow =
+    input.servedEntry || input.readEntriesFrom === "streams"
+      ? undefined
+      : deps.storage.findEntry({
+          scope,
+          fileId: input.fileIdParam,
+          at: input.atParam,
+        });
   const entryForChallenge = input.servedEntry
     ? {
         dataPointId: deps.serverOwner
@@ -2803,11 +2980,18 @@ export async function handlePersonalServerDataRequest(
           'view must be "stored" or absent',
         );
       }
-      const selectedEntry = deps.storage.findEntry({
-        scope: scopeResult.scope,
-        fileId: fileIdParam,
-        at: atParam,
-      });
+      // The account's storage mode decides, before any store is touched,
+      // whether this body comes from streams or from legacy storage. On a
+      // switched account no legacy lookup happens at all.
+      const bodySelection = selectAccountStorageMode(deps);
+      const selectedEntry =
+        bodySelection.kind === "legacy"
+          ? deps.storage.findEntry({
+              scope: scopeResult.scope,
+              fileId: fileIdParam,
+              at: atParam,
+            })
+          : undefined;
       // Holds the base64-encoded gateway payForOperation response body when
       // X402 succeeds — emitted on the final read response as X-PAYMENT-RESPONSE.
       let paymentResponseHeader: string | undefined;
@@ -2841,6 +3025,31 @@ export async function handlePersonalServerDataRequest(
           served ? { ...authInput, servedEntry: served } : authInput,
         );
       };
+
+      if (bodySelection.kind === "refuse") return bodySelection.response;
+      if (bodySelection.kind === "streams") {
+        return serveBodyFromStreams(
+          deps,
+          request,
+          {
+            scope: scopeResult.scope,
+            grantId,
+            authResult,
+            inProcess,
+            wantsRawContent,
+            settle,
+            readEntriesFrom: "streams",
+          },
+          {
+            explicitHistory:
+              fileIdParam !== undefined ||
+              atParam !== undefined ||
+              view !== null,
+            connection: url.searchParams.get("connection"),
+            cursor: url.searchParams.get("cursor"),
+          },
+        );
+      }
 
       // Select the body after auth and before deletion or payment. A file's
       // version and re-add marker authorize that file, not canonical rows.
@@ -2877,89 +3086,21 @@ export async function handlePersonalServerDataRequest(
           ) {
             ownerNotes = decision;
           }
-          const refusal = streamSyncRefusal(decision);
-          if (refusal) return refusal;
-          if (
-            inProcess &&
-            wantsRawContent &&
-            (decision.kind === "view" || decision.kind === "local_pending")
-          ) {
-            // A view has no raw bytes. Refused before any charge, log or
-            // fulfilment, so a caller never pays for a read it cannot use.
-            await decision.body.cancel();
-            return jsonResponse(
-              {
-                error: "STREAM_VIEW_NOT_RAW",
-                message: `Scope "${scopeResult.scope}" is served from its stream view, which has no raw binary content.`,
-                scope: scopeResult.scope,
-              },
-              { status: 409 },
-            );
-          }
-          if (decision.kind === "local_pending") {
-            // Owner-only and unregistered: nothing to bill and no version to
-            // bind in an access record.
-            const checked = await validateStreamBody(decision, inProcess);
-            await settle();
-            notifyDataRead(deps, { scope: scopeResult.scope });
-            return serveStreamSyncView(deps, request, {
+          const served = await serveStreamDecision(
+            deps,
+            request,
+            {
               scope: scopeResult.scope,
               grantId,
               authResult,
-              decision: checked,
-              paymentResponseHeader: undefined,
               inProcess,
-            });
-          }
-          if (decision.kind === "view") {
-            notifyDataRead(deps, { scope: scopeResult.scope });
-            // The same charge as a file read; the access record binds the
-            // stream head the view serves.
-            let paymentResponseHeader: string | undefined;
-            // An owner-only view with no registered head has nothing to
-            // charge against: the service serves it to the owner alone.
-            if (decision.served !== null) {
-              const served = decision.served;
-              const ownApp = await ownAppReadStatus(deps, authResult);
-              if (ownApp instanceof Response) {
-                await decision.body.cancel();
-                return ownApp;
-              }
-              const charge = readCharge(
-                deps,
-                scopeResult.scope,
-                authResult,
-                ownApp,
-              );
-              if (charge) {
-                let paid: Awaited<ReturnType<typeof payForRead>>;
-                try {
-                  paid = await payForRead(deps, request, charge, {
-                    scope: scopeResult.scope,
-                    servedEntry: served,
-                  });
-                } catch (error) {
-                  await decision.body.cancel();
-                  throw error;
-                }
-                if (paid.kind === "refused") {
-                  await decision.body.cancel();
-                  return paid.response;
-                }
-                paymentResponseHeader = paid.paymentResponseHeader;
-              }
-            }
-            const checked = await validateStreamBody(decision, inProcess);
-            await settle(decision.served);
-            return serveStreamSyncView(deps, request, {
-              scope: scopeResult.scope,
-              grantId,
-              authResult,
-              decision: checked,
-              paymentResponseHeader,
-              inProcess,
-            });
-          }
+              wantsRawContent,
+              settle,
+              readEntriesFrom: "legacy",
+            },
+            decision,
+          );
+          if (served) return served;
         }
       }
 
