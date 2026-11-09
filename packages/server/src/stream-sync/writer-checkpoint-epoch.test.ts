@@ -91,6 +91,7 @@ function controlReadHooks(inner: StreamSyncRegistry) {
     async listControlRows() {
       return listings.shift() ?? inner.listControlRows();
     },
+    listStreamRows: (connector) => inner.listStreamRows(connector),
     async read(scope) {
       const control = parseScope(scope)?.kind === "control";
       if (control) controlReads += 1;

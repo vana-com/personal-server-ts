@@ -57,6 +57,14 @@ export interface StreamSyncRegistry {
   listControlRows(): Promise<
     readonly { readonly scope: string; readonly read: ControlRead }[]
   >;
+  /**
+   * Every stream scope row of `connector` in any namespace, deleted or not,
+   * whichever device or connector version wrote it. A connection delete
+   * finds the streams to erase here, not in local state.
+   */
+  listStreamRows(
+    connector: string,
+  ): Promise<readonly { readonly scope: string; readonly read: ControlRead }[]>;
 }
 
 /** Encrypted blob storage, keyed `<physical scope>/<blob name>`. */

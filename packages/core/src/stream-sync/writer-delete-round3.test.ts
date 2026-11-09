@@ -25,7 +25,8 @@ it("republishes a login-keyed stream at the same connector version (mutant: DELE
     rows: [{ login: "base" }],
   });
   await r.publish();
-  await r.writer.deleteStreams(CONNECTOR, ["items"]);
+  await r.deleteStreamHeadsOnly(r.other);
+  await r.sync();
   await r.collect({
     ...spec("fresh"),
     key: "login",
@@ -49,9 +50,7 @@ it("ambiguous delete replay preserves a newer publish (mutant: REPLAY_REDELETES)
     r.gateway.afterPost = undefined;
     throw new Error("reply lost");
   };
-  await expect(r.writer.deleteStreams(CONNECTOR, ["items"])).rejects.toThrow(
-    "reply lost",
-  );
+  await expect(r.deleteStreamHeadsOnly()).rejects.toThrow("reply lost");
   await r.collect(spec("learn", true));
   await r.collect(spec("fresh", true));
   expect(await r.registeredVersion()).toBe(3);
@@ -68,7 +67,7 @@ it("missing delete-head blob still reads deleted (mutant: FLOOR_ONLY_FROM_HEAD)"
   await r.collect(spec("base"));
   await r.publish();
   await r.sync();
-  await r.other.deleteStreams(CONNECTOR, ["items"]);
+  await r.deleteStreamHeadsOnly(r.other);
   const scope = streamScope(CONNECTOR, "", "items");
   const row = await r.gateway.read(scope);
   if (!row.found) throw new Error("missing delete");
@@ -101,25 +100,6 @@ it("an ordinary missing head keeps the previous readable view", async () => {
   if (read.kind !== "view") throw new Error(read.kind);
   expect((await body(read)).data.records).toEqual([{ id: "base" }]);
 });
-it.each([
-  ["github", "user"],
-  ["icloud-notes", "folders"],
-])(
-  "refuses shared %s/%s before saving intent (mutant: SHARED_STREAM_DELETED)",
-  async (connector, stream) => {
-    const r = new Rig(undefined, connector);
-    await r.open();
-    await expect(r.writer.deleteStreams(connector, [stream])).rejects.toThrow(
-      /shared/,
-    );
-    expect(r.gateway.log).toEqual([]);
-    const state = await r.files.read("state.json");
-    expect(
-      state && JSON.parse(new TextDecoder().decode(state)).streamDeletes,
-    ).toBeFalsy();
-  },
-);
-
 it("delete metadata binds scope and version in its own hash domain", () => {
   const scope = streamScope(CONNECTOR, "", "items");
   expect(deleteMetadataHash(scope, 2)).toBe(deleteMetadataHash(scope, 2));
@@ -141,13 +121,13 @@ it("a new user delete replaces the superseded intent (mutant: NEW_DELETE_REUSES_
     r.gateway.afterPost = undefined;
     throw new Error("reply lost");
   };
-  await expect(r.writer.deleteStreams(CONNECTOR, ["items"])).rejects.toThrow(
+  await expect(r.writer.deleteConnection(CONNECTOR)).rejects.toThrow(
     "reply lost",
   );
   await r.collect(spec("learn", true));
   await r.collect(spec("fresh", true));
   expect(await r.registeredVersion()).toBe(3);
-  await r.writer.deleteStreams(CONNECTOR, ["items"]);
+  await r.writer.deleteConnection(CONNECTOR);
   expect(await r.registeredVersion()).toBe(4);
   expect(await r.registeredHead()).toMatchObject({
     lastDeleteVersion: 4,

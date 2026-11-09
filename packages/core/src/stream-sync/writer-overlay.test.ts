@@ -68,6 +68,9 @@ async function fixture(chunkBytes = 7) {
         .filter(([scope]) => scope === controlScope(connector, ""))
         .map(([scope, read]) => ({ scope, read }));
     },
+    async listStreamRows() {
+      return [];
+    },
     async post(request) {
       posts++;
       const version = Number(request.expectedVersion);

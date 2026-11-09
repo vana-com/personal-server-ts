@@ -5,7 +5,10 @@ import {
   CONNECTOR,
   type RunSpec,
 } from "../stream-sync-read/writer-rig.js";
-import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  controlScope,
+  streamScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import { AmbiguousRegistryReplyError, RegistryRefusedError } from "./ports.js";
 
 const spec = (runId: string, otherDevice = false): RunSpec => ({
@@ -34,7 +37,7 @@ it("P2 reclaims seed-only skips and reads a view (mutant: drop terminal state)",
     rows: [{ id: "old" }],
   });
   await r.open();
-  await r.writer.deleteStreams(CONNECTOR, ["seed"]);
+  await r.deleteStreamHeadsOnly();
   await r.collect(spec("live"));
   await r.publish();
   await r.restart();
@@ -59,14 +62,16 @@ it.each(["missing", "unreadable"])(
         else r.blobMap.set(k, new Uint8Array([0, 1, 2]));
       }
     await r.collect(spec("next"));
-    await r.writer.deleteStreams(CONNECTOR, ["items"]);
+    await r.deleteStreamHeadsOnly();
     expect(await r.registeredVersion()).toBe(2);
   },
 );
-it("P6 same-device delete drops only seed records (mutant: keep seed with live records)", async () => {
+it("P6 a delete by another device drops only seed records (mutant: keep seed with live records)", async () => {
   const r = new Rig({ key: "id", version: "1.0.0", rows: [{ id: "old" }] });
   await r.open();
-  await r.writer.deleteStreams(CONNECTOR, ["items"]);
+  await r.collect(spec("theirs", true));
+  await r.deleteStreamHeadsOnly(r.other);
+  await r.sync();
   await r.collect(spec("live"));
   await r.publish();
   await r.sync();
@@ -84,7 +89,7 @@ it("discard clears checkpoint and restarts full (mutants: no checkpoint clear; n
     (await r.writer.issueStart(CONNECTOR, false)).checkpoint,
   ).not.toBeNull();
   await r.collect(spec("stale"));
-  await r.other.deleteStreams(CONNECTOR, ["items"]);
+  await r.deleteStreamHeadsOnly(r.other);
   await r.publish();
   expect((await r.writer.issueStart(CONNECTOR, false)).checkpoint).toBeNull();
   expect(r.restarts).toEqual([CONNECTOR]);
@@ -94,7 +99,7 @@ it("observed tombstones stamp the next run (mutant: do not forward mirror delete
   await r.open();
   await r.collect(spec("base"));
   await r.publish();
-  await r.other.deleteStreams(CONNECTOR, ["items"]);
+  await r.deleteStreamHeadsOnly(r.other);
   await r.sync();
   await r.collect(spec("fresh"));
   expect(
@@ -108,46 +113,68 @@ it("P7 owner reads drop stale unpublished runs after missed tombstone (mutant: s
   await r.collect(spec("base"));
   await r.publish();
   await r.collect(spec("stale"));
-  await r.other.deleteStreams(CONNECTOR, ["items"]);
-  await r.collect(spec("fresh", true));
+  await r.deleteStreamHeadsOnly(r.other);
+  await r.collect({ ...spec("fresh", true), userConnect: true });
   await r.sync();
   expect((await read(r)).ids).toEqual(["fresh"]);
 });
+async function publishedStreams(r: Rig, ...streams: string[]) {
+  await r.open();
+  await r.collect({
+    ...spec("base"),
+    stream: streams[0],
+    also: streams.slice(1).map((stream) => ({
+      stream,
+      key: "id",
+      version: "1.0.0",
+      rows: [{ id: "base" }],
+    })),
+  });
+  await r.publish();
+}
+async function controlState(r: Rig) {
+  return r.gateway.read(controlScope(CONNECTOR, ""));
+}
 it("saved delete survives ambiguous reply and restart (mutant: no saved intent)", async () => {
   const r = new Rig();
-  await r.open();
+  await publishedStreams(r, "items");
   r.gateway.beforePost = async () => {
     r.gateway.beforePost = undefined;
     throw new AmbiguousRegistryReplyError("reply lost");
   };
-  await expect(r.writer.deleteStreams(CONNECTOR, ["items"])).rejects.toThrow(
+  await expect(r.writer.deleteConnection(CONNECTOR)).rejects.toThrow(
     "reply lost",
   );
   await r.restart();
   await r.publish();
-  expect(await r.registeredVersion()).toBe(1);
+  expect(await r.registeredVersion()).toBe(2);
+  expect(await r.registeredHead()).toMatchObject({
+    lastDeleteVersion: 2,
+    recordCount: 0,
+  });
+  expect(await controlState(r)).toMatchObject({ version: 2 });
 });
 it("delete retries Gateway 409 with backoff (mutant: no backoff)", async () => {
   const r = new Rig();
-  await r.open();
+  await publishedStreams(r, "items");
   const timer = vi.spyOn(globalThis, "setTimeout");
   try {
     r.gateway.beforePost = async () => {
       r.gateway.beforePost = undefined;
       throw new RegistryRefusedError("conflict", 409);
     };
-    await r.writer.deleteStreams(CONNECTOR, ["items"]);
-    expect(await r.registeredVersion()).toBe(1);
+    await r.writer.deleteConnection(CONNECTOR);
+    expect(await r.registeredVersion()).toBe(2);
     expect(timer.mock.calls.some(([, ms]) => ms === 10)).toBe(true);
   } finally {
     timer.mockRestore();
   }
 });
 
-it("delete head on an absent stream reads as deleted without control", async () => {
+it("a stream delete head reads as deleted while the control row is active", async () => {
   const r = new Rig();
-  await r.open();
-  await r.writer.deleteStreams(CONNECTOR, ["items"]);
+  await publishedStreams(r, "items");
+  await r.deleteStreamHeadsOnly();
   await r.sync();
   expect(await r.service.resolve(ask("pdpp.acme.items"))).toMatchObject({
     kind: "unavailable",
@@ -155,52 +182,52 @@ it("delete head on an absent stream reads as deleted without control", async () 
   });
   expect(await r.registeredHead()).toMatchObject({
     format: 3,
-    lastDeleteVersion: 1,
+    lastDeleteVersion: 2,
     recordCount: 0,
   });
+  expect(await controlState(r)).toMatchObject({ version: 1, deleted: false });
 });
 
 it("delete resumes only unfinished streams after a committed ambiguous reply", async () => {
   const r = new Rig();
-  await r.open();
+  await publishedStreams(r, "items", "second");
   r.gateway.afterPost = async (request) => {
-    if (request.scope !== streamScope(CONNECTOR, "", "second")) return;
+    if (request.scope !== streamScope(CONNECTOR, "", "items")) return;
     r.gateway.afterPost = undefined;
     throw new AmbiguousRegistryReplyError("reply lost after commit");
   };
-  await expect(
-    r.writer.deleteStreams(CONNECTOR, ["items", "second"]),
-  ).rejects.toThrow("reply lost after commit");
+  await expect(r.writer.deleteConnection(CONNECTOR)).rejects.toThrow(
+    "reply lost after commit",
+  );
   await r.restart();
   await r.publish();
-  expect(await r.registeredVersion()).toBe(1);
-  expect(await r.registeredHead("second")).toMatchObject({
-    recordCount: 0,
-    lastDeleteVersion: 1,
-  });
-  expect(
-    await r.gateway.read(streamScope(CONNECTOR, "", "second")),
-  ).toMatchObject({ version: 1 });
-  const pending = JSON.parse(
+  for (const stream of ["items", "second"]) {
+    expect(await r.registeredVersion(stream)).toBe(2);
+    expect(await r.registeredHead(stream)).toMatchObject({
+      recordCount: 0,
+      lastDeleteVersion: 2,
+    });
+  }
+  const state = JSON.parse(
     new TextDecoder().decode((await r.files.read("state.json"))!),
-  ).streamDeletes;
-  expect(Object.keys(pending ?? {})).toEqual([]);
+  );
+  expect(Object.keys(state.deletes ?? {})).toEqual([]);
 });
 
 it("conflict retries are bounded and retain intent for the next pass", async () => {
   const r = new Rig();
-  await r.open();
+  await publishedStreams(r, "items");
   let attempts = 0;
   r.gateway.beforePost = async () => {
     attempts++;
     throw new RegistryRefusedError("conflict", 409);
   };
-  await expect(r.writer.deleteStreams(CONNECTOR, ["items"])).rejects.toThrow(
+  await expect(r.writer.deleteConnection(CONNECTOR)).rejects.toThrow(
     "pending after version conflicts",
   );
   expect(attempts).toBe(8);
   r.gateway.beforePost = undefined;
   await r.restart();
   await r.publish();
-  expect(await r.registeredVersion()).toBe(1);
+  expect(await r.registeredVersion()).toBe(2);
 });

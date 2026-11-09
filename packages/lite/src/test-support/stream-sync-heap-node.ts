@@ -349,6 +349,9 @@ function fakeRegistry(): StreamSyncRegistry & {
     async listControlRows() {
       return [];
     },
+    async listStreamRows() {
+      return [];
+    },
   };
 }
 

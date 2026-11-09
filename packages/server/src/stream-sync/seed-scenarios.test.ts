@@ -108,6 +108,14 @@ async function fixture(generation = 1) {
         .filter(([scope]) => parseScope(scope)?.kind === "control")
         .map(([scope, read]) => ({ scope, read }));
     },
+    async listStreamRows(connector) {
+      return [...rows]
+        .filter(([scope]) => {
+          const parsed = parseScope(scope);
+          return parsed?.kind === "stream" && parsed.connector === connector;
+        })
+        .map(([scope, read]) => ({ scope, read }));
+    },
     async post(request) {
       await beforePost?.(request);
       const old = rows.get(request.scope);

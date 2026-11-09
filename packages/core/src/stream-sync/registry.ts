@@ -72,6 +72,37 @@ export function createGatewayStreamSyncRegistry(
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const pageSize = options.listPageSize ?? 500;
 
+  /** Page through every owner row and keep the scopes `keep` accepts. */
+  async function listRows(keep: (scope: string) => boolean) {
+    const out: { scope: string; read: ControlRead }[] = [];
+    let cursor: string | null = null;
+    do {
+      const params = new URLSearchParams({
+        user: options.ownerAddress,
+        includeDeleted: "true",
+        limit: String(pageSize),
+      });
+      if (cursor !== null) params.set("cursor", cursor);
+      const res = await fetchImpl(`${base}/v1/data?${params.toString()}`);
+      if (!res.ok) {
+        throw new Error(`registry listing failed: ${res.status}`);
+      }
+      const envelope = (await res.json()) as {
+        data?: { dataPoints?: RegistryRow[] };
+        pagination?: { hasMore?: boolean; nextCursor?: string | null };
+      };
+      for (const row of envelope.data?.dataPoints ?? []) {
+        if (typeof row.scope !== "string" || !keep(row.scope)) continue;
+        out.push({ scope: row.scope, read: toControlRead(row) });
+      }
+      cursor =
+        envelope.pagination?.hasMore === false
+          ? null
+          : (envelope.pagination?.nextCursor ?? null);
+    } while (cursor !== null);
+    return out;
+  }
+
   return {
     async read(scope) {
       const id = computeDataPointId(options.ownerAddress, scope);
@@ -132,35 +163,13 @@ export function createGatewayStreamSyncRegistry(
       );
     },
 
-    async listControlRows() {
-      const out: { scope: string; read: ControlRead }[] = [];
-      let cursor: string | null = null;
-      do {
-        const params = new URLSearchParams({
-          user: options.ownerAddress,
-          includeDeleted: "true",
-          limit: String(pageSize),
-        });
-        if (cursor !== null) params.set("cursor", cursor);
-        const res = await fetchImpl(`${base}/v1/data?${params.toString()}`);
-        if (!res.ok) {
-          throw new Error(`registry listing failed: ${res.status}`);
-        }
-        const envelope = (await res.json()) as {
-          data?: { dataPoints?: RegistryRow[] };
-          pagination?: { hasMore?: boolean; nextCursor?: string | null };
-        };
-        for (const row of envelope.data?.dataPoints ?? []) {
-          if (typeof row.scope !== "string") continue;
-          if (parseScope(row.scope)?.kind !== "control") continue;
-          out.push({ scope: row.scope, read: toControlRead(row) });
-        }
-        cursor =
-          envelope.pagination?.hasMore === false
-            ? null
-            : (envelope.pagination?.nextCursor ?? null);
-      } while (cursor !== null);
-      return out;
-    },
+    listControlRows: () =>
+      listRows((scope) => parseScope(scope)?.kind === "control"),
+
+    listStreamRows: (connector) =>
+      listRows((scope) => {
+        const parsed = parseScope(scope);
+        return parsed?.kind === "stream" && parsed.connector === connector;
+      }),
   };
 }

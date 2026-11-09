@@ -191,7 +191,7 @@ it.each(["fde", "ea"] as const)(
       signature: "0x00",
     });
     const old = await device(r, snapshot);
-    await r.writer.deleteStreams(CONNECTOR, ["items"]);
+    await r.deleteStreamHeadsOnly();
     expect(old.classify(await r.gateway.read(old.scope), old.control)).toBe(
       "present",
     );
@@ -233,8 +233,17 @@ it.each(["fde", "ea"] as const)(
       "stop before POST",
     );
     old.writer.fault = () => {};
+    // Another device takes the version first, then the delete advances the row.
+    await r.collect({
+      runId: "base",
+      key: "id",
+      version: "1.0.0",
+      full: true,
+      rows: [{ id: "base" }],
+    });
+    await r.publish();
     // Capture the signed request, then advance the row with the new delete head.
-    await r.writer.deleteStreams(CONNECTOR, ["items"]);
+    await r.deleteStreamHeadsOnly();
     expect(old.classify(await r.gateway.read(old.scope), old.control)).toBe(
       "present",
     );
@@ -243,7 +252,7 @@ it.each(["fde", "ea"] as const)(
     expect(r.gateway.log).toHaveLength(commits);
     expect(await r.registeredHead()).toMatchObject({
       format: 3,
-      lastDeleteVersion: 1,
+      lastDeleteVersion: 2,
       recordCount: 0,
     });
   },

@@ -103,6 +103,17 @@ class Gateway implements StreamSyncRegistry {
     return out;
   }
 
+  async listStreamRows(connector: string) {
+    const out: { scope: string; read: ControlRead }[] = [];
+    for (const scope of this.versions.keys()) {
+      const parsed = parseScope(scope);
+      if (parsed?.kind === "stream" && parsed.connector === connector) {
+        out.push({ scope, read: await this.read(scope) });
+      }
+    }
+    return out;
+  }
+
   feed(): MirrorFeedRow[] {
     return [...this.versions].map(([scope, rows]) => {
       const head = rows[rows.length - 1]!;
@@ -144,6 +155,8 @@ export interface RunSpec extends StreamSpec {
   readonly at?: number;
   /** Collect and publish on a second device of the same owner. */
   readonly otherDevice?: boolean;
+  /** An explicit connect: it reconnects a deleted connection. Default false. */
+  readonly userConnect?: boolean;
 }
 
 export interface SeedRows {
@@ -297,7 +310,7 @@ export class Rig {
     await writer.beginRun({
       runId: spec.runId,
       connector: this.connector,
-      userConnect: false,
+      userConnect: spec.userConnect ?? false,
       observedAt,
       identity: "none",
       checkpointUsed: spec.full
@@ -322,6 +335,30 @@ export class Rig {
       checkpointCandidate: { cursor: spec.runId },
     });
     if (spec.otherDevice) await writer.publishPending();
+  }
+
+  /**
+   * Run `deleteConnection` on `writer` up to the point where every stream
+   * delete head landed and the control tombstone has not: the window a crash
+   * or a lost connection leaves. The device keeps its intent, and the control
+   * row stays active, so nothing but the stream delete heads fences a stale
+   * publish. Resume it with `writer.publishPending()`.
+   */
+  async deleteStreamHeadsOnly(writer: StreamSyncWriter = this.writer) {
+    const before = this.gateway.beforePost;
+    this.gateway.beforePost = async (request) => {
+      if (parseScope(request.scope)?.kind === "control") {
+        throw new Error("control post held");
+      }
+      await before?.(request);
+    };
+    try {
+      await writer.deleteConnection(this.connector);
+    } catch (error) {
+      if ((error as Error).message !== "control post held") throw error;
+    } finally {
+      this.gateway.beforePost = before;
+    }
   }
 
   /** The head the registry holds now for `stream`, decrypted; null when none. */
