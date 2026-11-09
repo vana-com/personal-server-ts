@@ -3705,5 +3705,1138 @@
         }
       }
     ]
+  },
+  {
+    "version": 1,
+    "id": "reset-needs-a-higher-generation",
+    "description": "An On latched at generation 3 is lowered only by an Off at a higher generation. An Off at 2 or at 3 changes nothing, and legacy stays refused with 426. An Off at 4 (the Account was reset) is saved before any answer depends on it, clears the latch and the owed import, and legacy is allowed. A stale On at 3 after that changes nothing. An On at 4 latches again with the import owed, because legacy files are still there.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222"
+    },
+    "initial": {
+      "legacyFiles": ["A"]
+    },
+    "events": [
+      {
+        "id": "fr1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 3
+        }
+      },
+      {
+        "id": "fr2",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r2",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e2",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r2",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 2
+        }
+      },
+      {
+        "id": "e3",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w1",
+        "sink": "legacy"
+      },
+      {
+        "id": "fr3",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r3",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 20,
+          "wallMs": 1000020
+        }
+      },
+      {
+        "id": "e4",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r3",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 3
+        }
+      },
+      {
+        "id": "fr4",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r4",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 30,
+          "wallMs": 1000030
+        }
+      },
+      {
+        "id": "e5",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r4",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 4
+        }
+      },
+      {
+        "id": "e6",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w2",
+        "sink": "legacy"
+      },
+      {
+        "id": "fr5",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r5",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 40,
+          "wallMs": 1000040
+        }
+      },
+      {
+        "id": "e7",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r5",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 3
+        }
+      },
+      {
+        "id": "fr6",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r6",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 50,
+          "wallMs": 1000050
+        }
+      },
+      {
+        "id": "e8",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r6",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 4
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "importPending": true,
+            "generation": 3
+          }
+        }
+      },
+      {
+        "after": "e2",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 3
+          }
+        }
+      },
+      {
+        "after": "e3",
+        "decision": "refuse",
+        "code": "LEGACY_REFUSED_SWITCHED",
+        "status": 426,
+        "httpStatus": 426,
+        "legacyMutations": 0
+      },
+      {
+        "after": "e4",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 3
+          }
+        }
+      },
+      {
+        "after": "e5",
+        "decision": "legacy",
+        "httpStatus": 200,
+        "durable": {
+          "A": {
+            "switched": false,
+            "importPending": false,
+            "generation": 4
+          }
+        }
+      },
+      {
+        "after": "e6",
+        "decision": "legacy",
+        "httpStatus": 200,
+        "legacyMutations": 1
+      },
+      {
+        "after": "e7",
+        "decision": "legacy",
+        "httpStatus": 200,
+        "durable": {
+          "A": {
+            "switched": false,
+            "generation": 4
+          }
+        }
+      },
+      {
+        "after": "e8",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "importPending": true,
+            "generation": 4
+          }
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "a-higher-generation-on-raises-the-latch",
+    "description": "An On at a higher generation than the latch raises it, and a restart keeps it. An On at an equal or lower generation changes nothing. After the raise to 5, an Off at 4 (below the latch it learned) is refused, and an Off at 6 resets.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222"
+    },
+    "initial": {},
+    "events": [
+      {
+        "id": "fr1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 3
+        }
+      },
+      {
+        "id": "fr2",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r2",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e2",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r2",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 5
+        }
+      },
+      {
+        "id": "e3",
+        "op": "crash",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 0,
+          "wallMs": 1000500
+        }
+      },
+      {
+        "id": "fr3",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r3",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e4",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r3",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 4
+        }
+      },
+      {
+        "id": "fr4",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r4",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 20,
+          "wallMs": 1000020
+        }
+      },
+      {
+        "id": "e5",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r4",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 4
+        }
+      },
+      {
+        "id": "fr5",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r5",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 30,
+          "wallMs": 1000030
+        }
+      },
+      {
+        "id": "e6",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r5",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 5
+        }
+      },
+      {
+        "id": "fr6",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r6",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 40,
+          "wallMs": 1000040
+        }
+      },
+      {
+        "id": "e7",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r6",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 6
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 3
+          }
+        }
+      },
+      {
+        "after": "e2",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 5
+          }
+        }
+      },
+      {
+        "after": "e4",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 5
+          }
+        }
+      },
+      {
+        "after": "e5",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 5
+          }
+        }
+      },
+      {
+        "after": "e6",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 5
+          }
+        }
+      },
+      {
+        "after": "e7",
+        "decision": "legacy",
+        "httpStatus": 200,
+        "durable": {
+          "A": {
+            "switched": false,
+            "generation": 6
+          }
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "reset-survives-a-restart",
+    "description": "After an Off at a higher generation cleared the latch and was saved, a restart does not bring the On back: the durable record is Off at the new generation. The restarted module has no fresh Off, so it answers unknown (503), never streams, until the Account answers again. A stale On at the old generation changes nothing. A fresh Off then allows legacy.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222"
+    },
+    "initial": {},
+    "events": [
+      {
+        "id": "fr1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 3
+        }
+      },
+      {
+        "id": "fr2",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r2",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e2",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r2",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 4
+        }
+      },
+      {
+        "id": "e3",
+        "op": "crash",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 0,
+          "wallMs": 1000500
+        }
+      },
+      {
+        "id": "e4",
+        "op": "read",
+        "owner": "A"
+      },
+      {
+        "id": "fr3",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r3",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e5",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r3",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 3
+        }
+      },
+      {
+        "id": "fr4",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r4",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 20,
+          "wallMs": 1000020
+        }
+      },
+      {
+        "id": "e6",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r4",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 4
+        }
+      },
+      {
+        "id": "e7",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w1",
+        "sink": "legacy"
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 3
+          }
+        }
+      },
+      {
+        "after": "e2",
+        "decision": "legacy",
+        "httpStatus": 200,
+        "durable": {
+          "A": {
+            "switched": false,
+            "generation": 4
+          }
+        }
+      },
+      {
+        "after": "e4",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503,
+        "durable": {
+          "A": {
+            "switched": false,
+            "generation": 4
+          }
+        }
+      },
+      {
+        "after": "e5",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503,
+        "durable": {
+          "A": {
+            "switched": false,
+            "generation": 4
+          }
+        }
+      },
+      {
+        "after": "e6",
+        "decision": "legacy",
+        "httpStatus": 200
+      },
+      {
+        "after": "e7",
+        "decision": "legacy",
+        "httpStatus": 200,
+        "legacyMutations": 1
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "reset-that-fails-to-save-is-not-forgotten",
+    "description": "The Off at a higher generation is not used until it is saved. When the save fails, the answer is unknown (503), the stored On stays, and legacy stays refused. The same Off answered again, with the store working, resets and allows legacy.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222"
+    },
+    "initial": {},
+    "events": [
+      {
+        "id": "fr1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 3
+        }
+      },
+      {
+        "id": "x1",
+        "op": "failDurableSave",
+        "fail": true
+      },
+      {
+        "id": "fr2",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r2",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e2",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r2",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 4
+        }
+      },
+      {
+        "id": "e3",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w1",
+        "sink": "legacy"
+      },
+      {
+        "id": "x2",
+        "op": "failDurableSave",
+        "fail": false
+      },
+      {
+        "id": "fr3",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r3",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 20,
+          "wallMs": 1000020
+        }
+      },
+      {
+        "id": "e4",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r3",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 4
+        }
+      },
+      {
+        "id": "e5",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w2",
+        "sink": "legacy"
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 3
+          }
+        }
+      },
+      {
+        "after": "e2",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 3
+          }
+        }
+      },
+      {
+        "after": "e3",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503,
+        "legacyMutations": 0
+      },
+      {
+        "after": "e4",
+        "decision": "legacy",
+        "httpStatus": 200,
+        "durable": {
+          "A": {
+            "switched": false,
+            "generation": 4
+          }
+        }
+      },
+      {
+        "after": "e5",
+        "decision": "legacy",
+        "httpStatus": 200,
+        "legacyMutations": 1
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "a-missing-generation-is-zero",
+    "description": "An answer with no generation counts as generation 0. An On with none latches at 0 (stored without the field, read as 0). An Off with none, or at 0, does not lower it. An Off at 1 does. A reset record then reads as generation 1.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222"
+    },
+    "initial": {},
+    "events": [
+      {
+        "id": "fr1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on"
+        }
+      },
+      {
+        "id": "fr2",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r2",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e2",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r2",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off"
+        }
+      },
+      {
+        "id": "fr3",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r3",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 20,
+          "wallMs": 1000020
+        }
+      },
+      {
+        "id": "e3",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r3",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 0
+        }
+      },
+      {
+        "id": "e4",
+        "op": "commit",
+        "owner": "A",
+        "operationId": "w1",
+        "sink": "legacy"
+      },
+      {
+        "id": "fr4",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r4",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 30,
+          "wallMs": 1000030
+        }
+      },
+      {
+        "id": "e5",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r4",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 1
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false,
+        "durable": {
+          "A": {
+            "switched": true,
+            "generation": 0
+          }
+        }
+      },
+      {
+        "after": "e2",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false
+      },
+      {
+        "after": "e3",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false
+      },
+      {
+        "after": "e4",
+        "decision": "refuse",
+        "code": "LEGACY_REFUSED_SWITCHED",
+        "status": 426,
+        "httpStatus": 426,
+        "legacyMutations": 0
+      },
+      {
+        "after": "e5",
+        "decision": "legacy",
+        "httpStatus": 200,
+        "durable": {
+          "A": {
+            "switched": false,
+            "generation": 1
+          }
+        }
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "id": "a-tombstone-refuses-an-off-whatever-the-generation",
+    "description": "An owner whose record could not be read is unknown. An Off is refused at any generation, higher or not, and mints nothing. An On at a generation re-establishes the latch at that generation with the import owed.",
+    "policy": {
+      "offTtlMs": 604800000
+    },
+    "owners": {
+      "A": "0x1111111111111111111111111111111111111111",
+      "B": "0x2222222222222222222222222222222222222222"
+    },
+    "initial": {},
+    "events": [
+      {
+        "id": "fr1",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r1",
+        "clock": {
+          "boot": "b1",
+          "monoMs": 0,
+          "wallMs": 1000000
+        }
+      },
+      {
+        "id": "e1",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r1",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 3
+        }
+      },
+      {
+        "id": "e2",
+        "op": "quarantineRecord",
+        "owner": "A"
+      },
+      {
+        "id": "e3",
+        "op": "crash",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 0,
+          "wallMs": 1000500
+        }
+      },
+      {
+        "id": "fr2",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r2",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 10,
+          "wallMs": 1000010
+        }
+      },
+      {
+        "id": "e4",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r2",
+        "rawFixture": "explicit-off",
+        "evidence": {
+          "owner": "A",
+          "state": "off",
+          "generation": 9
+        }
+      },
+      {
+        "id": "fr3",
+        "op": "fetchStart",
+        "owner": "A",
+        "requestId": "r3",
+        "clock": {
+          "boot": "b2",
+          "monoMs": 20,
+          "wallMs": 1000020
+        }
+      },
+      {
+        "id": "e5",
+        "op": "accountResult",
+        "authOwner": "A",
+        "requestId": "r3",
+        "rawFixture": "explicit-on",
+        "evidence": {
+          "owner": "A",
+          "state": "on",
+          "generation": 3
+        }
+      }
+    ],
+    "expect": [
+      {
+        "after": "e1",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": false
+      },
+      {
+        "after": "e4",
+        "decision": "refuse",
+        "code": "ACCOUNT_MODE_UNKNOWN",
+        "status": 503,
+        "httpStatus": 503,
+        "durable": {
+          "A": {
+            "switched": false,
+            "historyUnknown": true
+          }
+        }
+      },
+      {
+        "after": "e5",
+        "decision": "streams",
+        "httpStatus": 200,
+        "importRequired": true,
+        "durable": {
+          "A": {
+            "switched": true,
+            "importPending": true,
+            "historyUnknown": false,
+            "generation": 3
+          }
+        }
+      }
+    ]
   }
 ]

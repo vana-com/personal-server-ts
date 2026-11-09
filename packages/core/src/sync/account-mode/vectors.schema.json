@@ -69,7 +69,12 @@
           "required": ["owner", "state"],
           "properties": {
             "owner": { "$ref": "#/$defs/alias" },
-            "state": { "enum": ["on", "off", "unknown"] }
+            "state": { "enum": ["on", "off", "unknown"] },
+            "generation": {
+              "description": "The Account generation of the answer. Absent means 0.",
+              "type": "integer",
+              "minimum": 0
+            }
           }
         },
         "operationId": { "type": "string" },
@@ -152,7 +157,8 @@
                   "offFetchStartMono": { "type": ["integer", "null"] },
                   "bootId": { "type": ["string", "null"] },
                   "importPending": { "type": "boolean" },
-                  "historyUnknown": { "type": "boolean" }
+                  "historyUnknown": { "type": "boolean" },
+                  "generation": { "type": "integer", "minimum": 0 }
                 }
               }
             ]

@@ -152,7 +152,11 @@ function isRow(value: unknown): value is StoredRow {
     num(v.offFetchStartMono) &&
     (v.bootId === null || typeof v.bootId === "string") &&
     (v.importPending === undefined || typeof v.importPending === "boolean") &&
-    (v.historyUnknown === undefined || v.historyUnknown === true)
+    (v.historyUnknown === undefined || v.historyUnknown === true) &&
+    (v.generation === undefined ||
+      (typeof v.generation === "number" &&
+        Number.isSafeInteger(v.generation) &&
+        v.generation >= 0))
   );
 }
 

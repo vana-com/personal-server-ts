@@ -421,6 +421,32 @@ describe("the IndexedDB record store", () => {
     expect((await store.load()).get(A)).toEqual(ON);
   });
 
+  // GENERATION_NOT_PERSISTED
+  it("keeps a generation, and lets only an Off at a higher generation replace an On", async () => {
+    const locks = createLocks();
+    const store = await claimed("m", locks);
+    const at3 = { ...ON, generation: 3 };
+    await store.save(A, at3, null);
+    await expect(
+      store.save(A, { ...OFF, generation: 3 }, at3),
+    ).rejects.toBeInstanceOf(ModeStoreConflictError);
+    await expect(store.save(A, OFF, at3)).rejects.toBeInstanceOf(
+      ModeStoreConflictError,
+    );
+    const reset = { ...OFF, generation: 4 };
+    await store.save(A, reset, at3);
+    await store.release();
+    const loaded = await (await claimed("m", locks)).load();
+    expect(loaded.get(A)).toEqual(reset);
+  });
+
+  it("sets aside a row whose generation is not a non-negative integer", async () => {
+    const locks = createLocks();
+    await putRaw("m", { owner: A, ...ON, generation: -1 });
+    const loaded = await (await claimed("m", locks)).load();
+    expect(loaded.get(A)).toEqual(tombstoneRecord());
+  });
+
   it("lets only one of two racing saves from the same read win", async () => {
     const store = await claimed();
     await store.save(A, OFF, null);

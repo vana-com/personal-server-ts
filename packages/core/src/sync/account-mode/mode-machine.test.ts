@@ -13,6 +13,8 @@ import {
   type ModeDecision,
   type ModeEvent,
 } from "./mode-machine.js";
+import { parseEvidenceBody } from "./evidence-wire.js";
+import { ModeStoreConflictError, assertMonotoneWrite } from "./record-store.js";
 import { runVector, type Vector } from "./vector-runner.js";
 
 const clock: ModeClock = { nowMono: 100, nowWall: 1000, bootId: "boot-1" };
@@ -641,5 +643,185 @@ describe("the durable projection", () => {
 
   it("refuses to make a record without an owner", () => {
     expect(() => createModeRecord("", "boot-1")).toThrow("needs an owner");
+  });
+});
+
+describe("the generation reset", () => {
+  const onAt = (generation?: number, extra = {}) =>
+    accept(null, evidence("on", { generation, ...extra }))!;
+  const off = (
+    record: AccountModeRecord | null,
+    generation?: number,
+    at: Partial<Extract<ModeEvent, { type: "evidence" }>> = {},
+  ) => reduceAccountMode(record, evidence("off", { generation, ...at }), clock);
+
+  it("starts at 0, and a record with none reads as 0 and is stored without the field", () => {
+    expect(createModeRecord("A", "b").generation).toBe(0);
+    expect(toDurable(onAt())).not.toHaveProperty("generation");
+    const { generation: _drop, ...old } = toDurable(onAt(3));
+    expect(fromDurable("A", old).generation).toBe(0);
+    expect(toDurable(onAt(3))).toHaveProperty("generation", 3);
+    expect(fromDurable("A", toDurable(onAt(3))).generation).toBe(3);
+  });
+
+  // RESET_ACCEPTS_EQUAL_GENERATION
+  it("RESET_ACCEPTS_EQUAL_GENERATION: an Off lowers an On only above the latched generation", () => {
+    const latched = onAt(3);
+    for (const generation of [undefined, 0, 2, 3]) {
+      const result = off(latched, generation);
+      expect(result.record?.switched, String(generation)).toBe(true);
+      expect(result.persist).toBe(false);
+      expect(result.decision.kind).toBe("streams");
+    }
+    const reset = off(latched, 4);
+    expect(reset.record).toMatchObject({
+      switched: false,
+      switchedAt: null,
+      importPending: false,
+      generation: 4,
+      persistence: "pending",
+    });
+    expect(reset.persist).toBe(true);
+  });
+
+  // OFF_AFTER_ON_WITHOUT_GENERATION
+  it("OFF_AFTER_ON_WITHOUT_GENERATION: an Off with no generation counts as 0 and never clears an On", () => {
+    for (const latched of [onAt(), onAt(1)]) {
+      expect(off(latched).record?.switched).toBe(true);
+    }
+    expect(off(onAt(), 0).record?.switched).toBe(true);
+  });
+
+  it("an On with a higher generation raises the latch; an equal or lower one changes nothing", () => {
+    const raised = reduceAccountMode(
+      onAt(3),
+      evidence("on", { generation: 5 }),
+      clock,
+    );
+    expect(raised.record).toMatchObject({ switched: true, generation: 5 });
+    expect(raised.persist).toBe(true);
+    const settled = accept(onAt(3), evidence("on", { generation: 5 }))!;
+    for (const generation of [undefined, 3, 5]) {
+      const same = reduceAccountMode(
+        settled,
+        evidence("on", { generation }),
+        clock,
+      );
+      expect(same.record?.generation).toBe(5);
+      expect(same.persist).toBe(false);
+    }
+  });
+
+  it("an On after a reset latches again at the new generation and owes the import", () => {
+    const reset = accept(onAt(3), evidence("off", { generation: 4 }))!;
+    const stale = reduceAccountMode(
+      reset,
+      evidence("on", { generation: 3, legacyFiles: true }),
+      clock,
+    );
+    expect(stale.record?.switched).toBe(false);
+    expect(stale.persist).toBe(false);
+    const again = reduceAccountMode(
+      reset,
+      evidence("on", { generation: 4, legacyFiles: true }),
+      clock,
+    );
+    expect(again.record).toMatchObject({
+      switched: true,
+      importPending: true,
+      generation: 4,
+    });
+  });
+
+  it("a reset needs a usable Off: an unknown answer, a failed fetch or a bad generation resets nothing", () => {
+    const latched = onAt(3);
+    for (const event of [
+      evidence("unknown", { generation: 9 }),
+      evidence("off", { generation: 9, rawStatus: 500 }),
+      evidence("off", { generation: 9, fetchStartMono: null }),
+      evidence("off", { generation: -1 }),
+      evidence("off", { generation: 9.5 }),
+      evidence("off", { generation: Number.NaN }),
+    ]) {
+      expect(reduceAccountMode(latched, event, clock).record?.switched).toBe(
+        true,
+      );
+    }
+  });
+
+  it("an Off over a tombstone is refused whatever the generation", () => {
+    const tomb = fromDurable("A", tombstoneRecord());
+    for (const generation of [undefined, 0, 9]) {
+      const result = off(tomb, generation);
+      expect(result.persist).toBe(false);
+      expect(result.record).toEqual(tomb);
+    }
+  });
+});
+
+describe("the store rule for a reset", () => {
+  const on = toDurable(accept(null, evidence("on", { generation: 3 }))!);
+  const offAt = (generation?: number) => ({
+    ...on,
+    switched: false,
+    switchedAt: null,
+    importPending: false,
+    cleanOffAt: 5,
+    offFetchStartMono: 5,
+    ...(generation === undefined ? {} : { generation }),
+  });
+
+  it("lets an Off replace an On only at a higher generation, and never lowers a generation", () => {
+    expect(() => assertMonotoneWrite(on, on, offAt(4))).not.toThrow();
+    expect(() => assertMonotoneWrite(on, on, offAt(9))).not.toThrow();
+    for (const generation of [undefined, 0, 2, 3]) {
+      expect(() => assertMonotoneWrite(on, on, offAt(generation))).toThrow(
+        ModeStoreConflictError,
+      );
+    }
+    expect(() => assertMonotoneWrite(on, on, { ...on, generation: 2 })).toThrow(
+      ModeStoreConflictError,
+    );
+    expect(() =>
+      assertMonotoneWrite(on, on, { ...on, generation: 5 }),
+    ).not.toThrow();
+    expect(() =>
+      assertMonotoneWrite(on, on, { ...on, generation: -1 }),
+    ).toThrow(ModeStoreConflictError);
+    expect(() =>
+      assertMonotoneWrite(on, on, { ...on, generation: 1.5 }),
+    ).toThrow(ModeStoreConflictError);
+  });
+
+  it("lets a later On latch again after a reset", () => {
+    const reset = offAt(4);
+    expect(() =>
+      assertMonotoneWrite(reset, reset, {
+        ...on,
+        generation: 4,
+        switchedAt: 9,
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe("the generation on the evidence wire", () => {
+  const body = { owner: "A", state: "on", fetchStartedAt: 1, rawStatus: 200 };
+
+  // WIRE_ACCEPTS_BAD_GENERATION
+  it("WIRE_ACCEPTS_BAD_GENERATION: takes an absent or non-negative integer generation and nothing else", () => {
+    expect(parseEvidenceBody(body)).not.toHaveProperty("generation");
+    expect(parseEvidenceBody({ ...body, generation: 0 })).toMatchObject({
+      generation: 0,
+    });
+    expect(parseEvidenceBody({ ...body, generation: 7 })).toMatchObject({
+      generation: 7,
+    });
+    for (const generation of [-1, 1.5, "2", null, true, [], {}, 2 ** 60]) {
+      expect(
+        parseEvidenceBody({ ...body, generation }),
+        JSON.stringify(generation),
+      ).toBeNull();
+    }
   });
 });

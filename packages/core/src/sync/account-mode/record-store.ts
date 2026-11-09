@@ -65,7 +65,8 @@ export function sameDurableRecord(
     a.offFetchStartMono === b.offFetchStartMono &&
     a.bootId === b.bootId &&
     a.importPending === b.importPending &&
-    (a.historyUnknown === true) === (b.historyUnknown === true)
+    (a.historyUnknown === true) === (b.historyUnknown === true) &&
+    (a.generation ?? 0) === (b.generation ?? 0)
   );
 }
 
@@ -75,7 +76,8 @@ export function sameDurableRecord(
  * - The write must be based on the current record (`expected`), so a writer
  *   that read an older record cannot overwrite a newer one.
  * - An On is never lowered to Off, and a cleared import flag is never raised
- *   again.
+ *   again. The one exception is a reset: an Off whose generation is higher
+ *   than the stored On's. A generation is never lowered by any write.
  * - A tombstone (`historyUnknown`) is never written by `save`: only a store's
  *   own quarantine path makes one, and an On is never replaced by one.
  * - Over a tombstone only an On with the import owed is written. An Off record
@@ -104,8 +106,17 @@ export function assertMonotoneWrite(
     }
     return;
   }
+  const generation = next.generation ?? 0;
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new ModeStoreConflictError("a generation is a non-negative integer");
+  }
+  if (current !== null && generation < (current.generation ?? 0)) {
+    throw new ModeStoreConflictError("a generation is never lowered");
+  }
   if (current?.switched === true) {
     if (!next.switched) {
+      // A reset is the one lowering: it needs a higher generation than the On.
+      if (generation > (current.generation ?? 0)) return;
       throw new ModeStoreConflictError("an On record cannot be lowered");
     }
     if (!current.importPending && next.importPending) {

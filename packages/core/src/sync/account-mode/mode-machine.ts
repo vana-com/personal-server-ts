@@ -67,6 +67,12 @@ export interface AccountModeRecord {
    * owed. Absent means false. While set, no Off is accepted.
    */
   readonly historyUnknown?: true;
+  /**
+   * The Account generation this owner's latch was judged at: 0 for everyone,
+   * raised by an On (or a reset) with a higher generation, never lowered.
+   * An Off clears an On only when its generation is higher than this.
+   */
+  readonly generation: number;
 }
 
 /** What is kept on disk for one owner (no save state: it is saved by being there). */
@@ -86,6 +92,12 @@ export interface DurableModeRecord {
    * the import owed.
    */
   historyUnknown?: true;
+  /**
+   * The Account generation of the latch (see `AccountModeRecord.generation`).
+   * Absent means 0, so a record written before the field existed reads as 0;
+   * serialized only when above 0.
+   */
+  generation?: number;
 }
 
 export type ModeEvent =
@@ -99,6 +111,11 @@ export type ModeEvent =
       readonly rawStatus: number | null;
       /** Whether legacy files exist for the owner. Only read at a new On. */
       readonly legacyFiles?: boolean;
+      /**
+       * The Account generation of this answer; absent means 0. A reset (Dev
+       * only) raises it by one. An Off lowers an On only at a higher one.
+       */
+      readonly generation?: number;
     }
   | {
       readonly type: "boot";
@@ -181,6 +198,7 @@ export function createModeRecord(
     bootId,
     persistence: "none",
     importPending: false,
+    generation: 0,
   };
 }
 
@@ -195,6 +213,7 @@ export function toDurable(record: AccountModeRecord): DurableModeRecord {
     ...(record.historyUnknown === true
       ? { historyUnknown: true as const }
       : {}),
+    ...(record.generation > 0 ? { generation: record.generation } : {}),
   };
 }
 
@@ -232,6 +251,7 @@ export function fromDurable(
     ...(record.historyUnknown === true
       ? { historyUnknown: true as const }
       : {}),
+    generation: record.generation ?? 0,
   };
 }
 
@@ -355,7 +375,10 @@ export function reduceAccountMode(
 
   switch (event.type) {
     case "evidence": {
+      const generation = event.generation ?? 0;
       const usable =
+        Number.isSafeInteger(generation) &&
+        generation >= 0 &&
         succeeded(event.rawStatus) &&
         (event.state === "on" ||
           (event.state === "off" &&
@@ -373,8 +396,32 @@ export function reduceAccountMode(
         // is accepted until an On answers.
         return settle(next);
       }
+      if (
+        event.state === "off" &&
+        next.switched &&
+        generation > next.generation
+      ) {
+        // The one sanctioned lowering: the Account was reset (Dev only) and
+        // says Off at a higher generation than the latch. Any other Off after
+        // an On changes nothing. The import flag goes with the latch; stream
+        // data is not touched.
+        next = {
+          ...next,
+          switched: false,
+          switchedAt: null,
+          cleanOffAt: clock.nowWall,
+          offFetchStartMono: event.fetchStartMono as number,
+          bootId: clock.bootId,
+          persistence: "pending",
+          importPending: false,
+          generation,
+        };
+        return settle(next, undefined, true);
+      }
       if (event.state === "on") {
         if (!next.switched) {
+          // An On older than a reset this owner already saw is stale.
+          if (generation < next.generation) return settle(next);
           // From a tombstone the import is owed whatever the probe says: the
           // lost record may have held a pending import, and the import is
           // idempotent.
@@ -388,7 +435,12 @@ export function reduceAccountMode(
             offFetchStartMono: null,
             persistence: "pending",
             importPending: owed,
+            generation,
           };
+          persist = true;
+        } else if (generation > next.generation) {
+          // The Account says On at a higher generation: learn it.
+          next = { ...next, generation, persistence: "pending" };
           persist = true;
         } else persist = unsaved(next);
       } else if (!next.switched) {

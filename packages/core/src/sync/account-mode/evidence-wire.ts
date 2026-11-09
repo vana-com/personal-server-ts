@@ -13,6 +13,11 @@ export interface EvidenceBody {
   fetchStartedAt: number;
   /** HTTP status of the Account response, or null when there was none. */
   rawStatus: number | null;
+  /**
+   * The Account generation of the answer: 0 for everyone, raised by one only
+   * by a Dev reset. Absent on the wire means 0. A non-negative integer.
+   */
+  generation?: number;
 }
 
 export interface DecisionBody {
@@ -44,11 +49,21 @@ export function parseEvidenceBody(value: unknown): EvidenceBody | null {
   if (Number.isNaN(rawStatus)) return null;
   const fetchStartedAt =
     typeof v.fetchStartedAt === "number" ? v.fetchStartedAt : Number.NaN;
+  // Absent is 0; anything but a non-negative integer is not a body.
+  if (
+    v.generation !== undefined &&
+    !(Number.isSafeInteger(v.generation) && (v.generation as number) >= 0)
+  ) {
+    return null;
+  }
   return {
     owner: v.owner,
     state: v.state,
     fetchStartedAt,
     rawStatus,
+    ...(v.generation === undefined
+      ? {}
+      : { generation: v.generation as number }),
   };
 }
 

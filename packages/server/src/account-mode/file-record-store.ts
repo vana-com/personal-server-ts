@@ -91,6 +91,14 @@ function parseRecord(text: string): DurableModeRecord | null {
   // Absent means false; only `true` is ever written.
   if (!(v.historyUnknown === undefined || v.historyUnknown === true))
     return null;
+  // Absent means generation 0; a stored generation is a non-negative integer.
+  if (!(
+    v.generation === undefined ||
+    (typeof v.generation === "number" &&
+      Number.isSafeInteger(v.generation) &&
+      v.generation >= 0)
+  ))
+    return null;
   return {
     importPending: v.importPending === true,
     switched: v.switched,
@@ -99,6 +107,9 @@ function parseRecord(text: string): DurableModeRecord | null {
     offFetchStartMono: v.offFetchStartMono as number | null,
     bootId: v.bootId as string | null,
     ...(v.historyUnknown === true ? { historyUnknown: true as const } : {}),
+    ...(typeof v.generation === "number" && v.generation > 0
+      ? { generation: v.generation }
+      : {}),
   };
 }
 

@@ -150,6 +150,38 @@ describe("the file record store", () => {
     );
   });
 
+  // GENERATION_NOT_PERSISTED
+  it("keeps a generation on disk, reads a record without one as generation 0, and lets only a higher Off replace an On", async () => {
+    const store = await owner();
+    const at3 = { ...ON, generation: 3 };
+    await store.save(A, at3, null);
+    expect(JSON.parse(await readFile(join(dir, `${A}.json`), "utf8"))).toEqual(
+      at3,
+    );
+    const lowerOff = { ...OFF, generation: 3 };
+    await expect(store.save(A, lowerOff, at3)).rejects.toBeInstanceOf(
+      ModeStoreConflictError,
+    );
+    await expect(store.save(A, OFF, at3)).rejects.toBeInstanceOf(
+      ModeStoreConflictError,
+    );
+    const reset = { ...OFF, generation: 4 };
+    await store.save(A, reset, at3);
+    expect((await store.load()).get(A)).toEqual(reset);
+    expect(JSON.parse(await readFile(join(dir, `${A}.json`), "utf8"))).toEqual(
+      reset,
+    );
+  });
+
+  it("sets aside a record whose generation is not a non-negative integer", async () => {
+    await writeFile(
+      join(dir, `${A}.json`),
+      JSON.stringify({ ...ON, generation: -1 }),
+    );
+    const store = await owner();
+    expect((await store.load()).get(A)).toEqual(tombstoneRecord());
+  });
+
   it("reads a record written before importPending existed as having none", async () => {
     const { importPending: _drop, ...old } = ON;
     await writeFile(join(dir, `${A}.json`), JSON.stringify(old));

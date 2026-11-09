@@ -58,7 +58,7 @@ export interface VectorEvent {
   authOwner?: string;
   requestId?: string;
   rawFixture?: string;
-  evidence?: { owner: string; state: ModeState };
+  evidence?: { owner: string; state: ModeState; generation?: number };
   operationId?: string;
   sink?: "legacy" | "stream" | "importSeed";
   fail?: boolean;
@@ -222,6 +222,9 @@ export async function runVector(vector: Vector): Promise<string[]> {
             state: event.evidence?.state ?? "unknown",
             fetchStartedAt: started ? started.wall : Number.NaN,
             rawStatus: RAW_STATUS[fixture],
+            ...(event.evidence?.generation === undefined
+              ? {}
+              : { generation: event.evidence.generation }),
           }),
         );
         break;
@@ -366,14 +369,17 @@ export async function runVector(vector: Vector): Promise<string[]> {
         continue;
       }
       for (const [field, value] of Object.entries(want)) {
-        // A boolean the store leaves out (historyUnknown) is false.
+        // A boolean the store leaves out (historyUnknown) is false, and a
+        // generation it leaves out is 0.
         const fields = record as unknown as Record<string, unknown>;
         const got =
           field in fields
             ? fields[field]
-            : typeof value === "boolean"
-              ? false
-              : undefined;
+            : field === "generation"
+              ? 0
+              : typeof value === "boolean"
+                ? false
+                : undefined;
         if (got !== value) {
           fail(`${label}: durable ${alias}.${field} is not ${String(value)}`);
         }

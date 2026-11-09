@@ -165,6 +165,35 @@ describe("POST /v1/account-mode/evidence", () => {
     expect((await legacyWrite()).status).toBe(426);
   });
 
+  // RESET_ACCEPTS_EQUAL_GENERATION, OFF_AFTER_ON_WITHOUT_GENERATION
+  it("lowers an On only for an Off at a higher generation, then lets legacy work proceed", async () => {
+    await post(evidence("on", { generation: 3 }));
+    for (const body of [
+      evidence("off"),
+      evidence("off", { generation: 2 }),
+      evidence("off", { generation: 3 }),
+    ]) {
+      const res = await post(body);
+      expect((await res.json()).decision, JSON.stringify(body)).toBe("streams");
+      expect((await legacyWrite()).status).toBe(426);
+    }
+    const reset = await post(evidence("off", { generation: 4 }));
+    expect(reset.status).toBe(200);
+    expect(await reset.json()).toEqual({
+      decision: "legacy",
+      importRequired: false,
+    });
+    expect((await legacyWrite()).status).toBe(201);
+  });
+
+  it("rejects a generation that is not a non-negative integer with a 400", async () => {
+    for (const generation of [-1, 1.5, "2", null, true, 2 ** 60]) {
+      const res = await post(evidence("on", { generation }));
+      expect(res.status, JSON.stringify(generation)).toBe(400);
+    }
+    expect(authority.snapshot().size).toBe(0);
+  });
+
   // OWNERLESS_READ_ANSWERS, CROSS_OWNER_READ_ANSWERS
   it("answers evidence about another owner with 403 and changes nothing", async () => {
     const res = await post(evidence("on", { owner: stranger.address }));

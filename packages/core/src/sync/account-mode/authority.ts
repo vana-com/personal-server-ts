@@ -93,6 +93,12 @@ export interface ModeEvidenceInput {
   fetchStartedAt: number;
   /** HTTP status of the Account response, or null when there was none. */
   rawStatus: number | null;
+  /**
+   * The Account generation of the answer; absent means 0. A reset (Dev only)
+   * raises it by one. An Off lowers a saved On only at a higher generation than
+   * the latch, and an On at a higher one raises the latch.
+   */
+  generation?: number;
 }
 
 export interface AuthorityClock {
@@ -530,6 +536,13 @@ export function createModeAuthorityWithImporter(
       // store refuses everything: stop here.
       if (closed || poisoned) return REFUSE_UNKNOWN;
       const owner = normalizeOwner(input.owner);
+      // After a failed save, learn what the store holds before judging this
+      // answer against it: a reset that failed to save must not be forgotten
+      // by the retry that follows it.
+      if (stale.has(owner)) {
+        await refresh(owner);
+        if (closed || poisoned) return REFUSE_UNKNOWN;
+      }
       // The probe is only read at a new On; the policy owns what it means.
       // An owner whose record was lost owes the import without asking.
       const held = records.get(owner);
@@ -547,6 +560,7 @@ export function createModeAuthorityWithImporter(
         fetchStartMono: input.fetchStartMono,
         rawStatus: input.rawStatus,
         legacyFiles,
+        generation: input.generation,
       });
       return applied.persist ? await persistOwner(owner) : applied.decision;
     } finally {
@@ -627,6 +641,7 @@ export function createModeAuthorityWithImporter(
         authOwner: input.authOwner,
         state: input.state,
         rawStatus: input.rawStatus,
+        generation: input.generation,
         fetchStartMono: future ? Number.NaN : clock.mono() - age,
       });
     },

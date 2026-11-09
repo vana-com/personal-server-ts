@@ -162,6 +162,45 @@ describe("the Lite runtime's account-mode evidence route", () => {
     expect(write.status).toBe(426);
   });
 
+  // RESET_ACCEPTS_EQUAL_GENERATION, OFF_AFTER_ON_WITHOUT_GENERATION
+  it("lowers an On only for an Off at a higher generation, then lets legacy work proceed", async () => {
+    const { runtime } = await build();
+    const send = (body: unknown) =>
+      signed(runtime, "/v1/account-mode/evidence", body);
+    await send(evidence("on", { generation: 3 }));
+    for (const body of [
+      evidence("off"),
+      evidence("off", { generation: 2 }),
+      evidence("off", { generation: 3 }),
+    ]) {
+      const res = await send(body);
+      expect((await res.json()).decision, JSON.stringify(body)).toBe("streams");
+      const write = await signed(runtime, "/v1/data/notes.entries", { v: 1 });
+      expect(write.status).toBe(426);
+    }
+    const reset = await send(evidence("off", { generation: 4 }));
+    expect(reset.status).toBe(200);
+    expect(await reset.json()).toEqual({
+      decision: "legacy",
+      importRequired: false,
+    });
+    const write = await signed(runtime, "/v1/data/notes.entries", { v: 1 });
+    expect(write.status).toBe(201);
+  });
+
+  it("rejects a generation that is not a non-negative integer with a 400", async () => {
+    const { runtime, authority } = await build();
+    for (const generation of [-1, 1.5, "2", null, true, 2 ** 60]) {
+      const res = await signed(
+        runtime,
+        "/v1/account-mode/evidence",
+        evidence("on", { generation }),
+      );
+      expect(res.status, JSON.stringify(generation)).toBe(400);
+    }
+    expect(authority.snapshot().size).toBe(0);
+  });
+
   // OWNERLESS_READ_ANSWERS
   it("changes nothing for evidence about another owner", async () => {
     const { runtime, authority } = await build();

@@ -400,8 +400,8 @@ const MUTANTS = [
     edits: [
       [
         RECORD_STORE,
-        '    if (!next.switched) {\n      throw new ModeStoreConflictError("an On record cannot be lowered");\n    }\n',
-        "",
+        '      throw new ModeStoreConflictError("an On record cannot be lowered");\n',
+        "      return;\n",
       ],
     ],
     aimed: [
@@ -1111,6 +1111,196 @@ const MUTANTS = [
     aimed: [
       liteRuntime(
         "answers 413 above 16 KiB, whether the length is declared or the body is chunked",
+      ),
+    ],
+  },
+
+  // ---- Dev reset by generation ------------------------------------------
+  {
+    name: "RESET_ACCEPTS_EQUAL_GENERATION",
+    edits: [
+      [
+        CORE,
+        "        next.switched &&\n        generation > next.generation\n",
+        "        next.switched &&\n        generation >= next.generation\n",
+      ],
+    ],
+    aimed: [
+      vector("reset-needs-a-higher-generation"),
+      vector("a-higher-generation-on-raises-the-latch"),
+      core(
+        "RESET_ACCEPTS_EQUAL_GENERATION: an Off lowers an On only above the latched generation",
+      ),
+    ],
+  },
+  {
+    name: "OFF_AFTER_ON_WITHOUT_GENERATION",
+    edits: [
+      [
+        CORE,
+        "        next.switched &&\n        generation > next.generation\n",
+        "        next.switched &&\n        (event.generation === undefined || generation > next.generation)\n",
+      ],
+    ],
+    aimed: [
+      vector("a-missing-generation-is-zero"),
+      vector("on-is-never-lowered"),
+      core(
+        "OFF_AFTER_ON_WITHOUT_GENERATION: an Off with no generation counts as 0 and never clears an On",
+      ),
+    ],
+  },
+  {
+    name: "GENERATION_NOT_PERSISTED",
+    edits: [
+      [
+        CORE,
+        "    ...(record.generation > 0 ? { generation: record.generation } : {}),\n",
+        "",
+      ],
+    ],
+    aimed: [
+      vector("reset-needs-a-higher-generation"),
+      vector("a-higher-generation-on-raises-the-latch"),
+      vector("reset-survives-a-restart"),
+      core(
+        "starts at 0, and a record with none reads as 0 and is stored without the field",
+      ),
+    ],
+  },
+  {
+    name: "FAILED_RESET_FORGOTTEN",
+    edits: [
+      [
+        AUTHORITY,
+        "      if (stale.has(owner)) {\n        await refresh(owner);\n        if (closed || poisoned) return REFUSE_UNKNOWN;\n      }\n      // The probe is only read",
+        "      // The probe is only read",
+      ],
+    ],
+    aimed: [vector("reset-that-fails-to-save-is-not-forgotten")],
+  },
+  {
+    name: "RESET_STORE_ACCEPTS_EQUAL_GENERATION",
+    edits: [
+      [
+        RECORD_STORE,
+        "      if (generation > (current.generation ?? 0)) return;",
+        "      if (generation >= (current.generation ?? 0)) return;",
+      ],
+    ],
+    aimed: [
+      core(
+        "lets an Off replace an On only at a higher generation, and never lowers a generation",
+      ),
+    ],
+  },
+  {
+    name: "STORE_LOWERS_A_GENERATION",
+    edits: [
+      [
+        RECORD_STORE,
+        '  if (current !== null && generation < (current.generation ?? 0)) {\n    throw new ModeStoreConflictError("a generation is never lowered");\n  }\n',
+        "",
+      ],
+    ],
+    aimed: [
+      core(
+        "lets an Off replace an On only at a higher generation, and never lowers a generation",
+      ),
+    ],
+  },
+  {
+    name: "WIRE_ACCEPTS_BAD_GENERATION",
+    edits: [
+      [
+        `${DIR}/evidence-wire.ts`,
+        "    v.generation !== undefined &&\n    !(Number.isSafeInteger(v.generation) && (v.generation as number) >= 0)\n",
+        "    false\n",
+      ],
+    ],
+    aimed: [
+      core(
+        "WIRE_ACCEPTS_BAD_GENERATION: takes an absent or non-negative integer generation and nothing else",
+      ),
+    ],
+  },
+  {
+    name: "NODE_STORE_DROPS_GENERATION",
+    files: [NODE_STORE_TESTS],
+    edits: [
+      [
+        NODE_STORE,
+        '    ...(typeof v.generation === "number" && v.generation > 0\n      ? { generation: v.generation }\n      : {}),\n',
+        "",
+      ],
+    ],
+    aimed: [
+      nodeStore(
+        "keeps a generation on disk, reads a record without one as generation 0, and lets only a higher Off replace an On",
+      ),
+    ],
+  },
+  {
+    name: "NODE_STORE_ACCEPTS_BAD_GENERATION",
+    files: [NODE_STORE_TESTS],
+    edits: [
+      [
+        NODE_STORE,
+        '    (typeof v.generation === "number" &&\n      Number.isSafeInteger(v.generation) &&\n      v.generation >= 0)\n',
+        "    true\n",
+      ],
+    ],
+    aimed: [
+      nodeStore(
+        "sets aside a record whose generation is not a non-negative integer",
+      ),
+    ],
+  },
+  {
+    name: "LITE_STORE_ACCEPTS_BAD_GENERATION",
+    files: [LITE_STORE_TESTS],
+    edits: [
+      [
+        LITE_STORE,
+        '      (typeof v.generation === "number" &&\n        Number.isSafeInteger(v.generation) &&\n        v.generation >= 0))\n',
+        "      true)\n",
+      ],
+    ],
+    aimed: [
+      liteStore(
+        "sets aside a row whose generation is not a non-negative integer",
+      ),
+    ],
+  },
+  {
+    name: "NODE_ROUTE_DROPS_GENERATION",
+    files: [SERVER_APP_TESTS],
+    edits: [
+      [
+        SERVER_ROUTE,
+        '        ...body,\n        authOwner: deps.serverOwner ?? "",\n',
+        '        ...body,\n        generation: undefined,\n        authOwner: deps.serverOwner ?? "",\n',
+      ],
+    ],
+    aimed: [
+      serverApp(
+        "lowers an On only for an Off at a higher generation, then lets legacy work proceed",
+      ),
+    ],
+  },
+  {
+    name: "LITE_ROUTE_DROPS_GENERATION",
+    files: [LITE_RUNTIME_TESTS],
+    edits: [
+      [
+        LITE_RUNTIME,
+        '            ...body,\n            authOwner: modeOwner() ?? "",\n          });\n          return decisionResponse(decision);',
+        '            ...body,\n            generation: undefined,\n            authOwner: modeOwner() ?? "",\n          });\n          return decisionResponse(decision);',
+      ],
+    ],
+    aimed: [
+      liteRuntime(
+        "lowers an On only for an Off at a higher generation, then lets legacy work proceed",
       ),
     ],
   },
