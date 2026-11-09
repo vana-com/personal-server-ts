@@ -537,6 +537,7 @@ describe("retireLegacyScopes", () => {
       const w = await seeded();
       const storage = Object.create(w.storage);
       storage.markAfterTombstone = undefined;
+      let attempted = 0;
       const result = await retireLegacyScopes({
         storage,
         switchedAt: SWITCH,
@@ -544,11 +545,13 @@ describe("retireLegacyScopes", () => {
         registeredAt: async () => BEFORE,
         viewKeys: async (s) => viewOf(s, ["a"]),
         deleteScope: async () => {
-          throw new Error("must not delete");
+          attempted += 1;
+          return { durable: true } as never;
         },
         logger: logger(),
       });
       expect(result.deleted).toBe(0);
+      expect(attempted).toBe(0);
     });
   });
 
