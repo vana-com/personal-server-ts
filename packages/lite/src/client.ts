@@ -103,6 +103,34 @@ export type PersonalServerLiteHandle = PersonalServerHandle & {
   readonly streamSyncIntake: RunIntake | null;
 };
 
+/**
+ * Undo a start that threw after the runtime bundle began syncing. Best effort:
+ * the original start error is the one the caller needs. A supplied runtime
+ * (no bundle) belongs to the caller and is left alone.
+ */
+async function abandonStartedRuntime(
+  runtimeBundle: IndexedDbPsLiteRuntime | null,
+  relayClient: PsLiteRelayClient | undefined,
+  runtime: PsLiteRuntime,
+): Promise<void> {
+  if (!runtimeBundle) return;
+  try {
+    relayClient?.close("personal-server-start-failed");
+  } catch {
+    // Keep stopping the rest.
+  }
+  try {
+    runtime.deactivate();
+  } catch {
+    // Keep stopping the rest.
+  }
+  try {
+    await runtimeBundle.syncManager?.stop?.();
+  } catch {
+    // The start error is the one to report.
+  }
+}
+
 export async function startPersonalServer(
   options: StartPersonalServerLiteOptions,
 ): Promise<PersonalServerLiteHandle> {
@@ -173,10 +201,6 @@ export async function startPersonalServer(
       });
   const runtime = options.runtime ?? runtimeBundle!.runtime;
 
-  if (options.active ?? true) {
-    runtime.activate();
-  }
-
   let status: PersonalServerStatus = "ready";
   let relayStatus: PsLiteRelayStatus = "closed";
   let relayClient: PsLiteRelayClient | undefined;
@@ -190,23 +214,35 @@ export async function startPersonalServer(
     options.onStatus?.(nextStatus);
   };
 
-  if (resolvedRelayOptions) {
-    relayStatus = "connecting";
-    publicUrl = initialPublicUrl;
-    relayClient = startPsLiteRelayClient({
-      ...resolvedRelayOptions,
-      runtime,
-      origin: runtimeOrigin,
-      tlsIdentityStore:
-        options.persistence?.relayTlsIdentity ??
-        resolvedRelayOptions.tlsIdentityStore,
-      onStatus(nextRelayStatus, detail) {
-        relayStatus = nextRelayStatus;
-        if (nextRelayStatus === "error") setStatus("error");
-        resolvedRelayOptions.onStatus?.(nextRelayStatus, detail);
-      },
-    });
-    relayClientForDrain = relayClient;
+  // The runtime bundle's sync manager is already running here. If anything
+  // below throws, the caller never gets a handle to stop it, so stop it
+  // before rethrowing instead of leaving a sync cycle writing with no owner.
+  try {
+    if (options.active ?? true) {
+      runtime.activate();
+    }
+
+    if (resolvedRelayOptions) {
+      relayStatus = "connecting";
+      publicUrl = initialPublicUrl;
+      relayClient = startPsLiteRelayClient({
+        ...resolvedRelayOptions,
+        runtime,
+        origin: runtimeOrigin,
+        tlsIdentityStore:
+          options.persistence?.relayTlsIdentity ??
+          resolvedRelayOptions.tlsIdentityStore,
+        onStatus(nextRelayStatus, detail) {
+          relayStatus = nextRelayStatus;
+          if (nextRelayStatus === "error") setStatus("error");
+          resolvedRelayOptions.onStatus?.(nextRelayStatus, detail);
+        },
+      });
+      relayClientForDrain = relayClient;
+    }
+  } catch (error) {
+    await abandonStartedRuntime(runtimeBundle, relayClient, runtime);
+    throw error;
   }
 
   async function info(): Promise<PersonalServerInfo> {
