@@ -63,6 +63,10 @@ import type {
   StreamSyncReadKeys,
   StreamSyncReadLogger,
 } from "./ports.js";
+import {
+  entityKeySets,
+  type EntityKeySets,
+} from "../storage/legacy-entity-key-sets.js";
 import { planProjection, ProjectionFailedError } from "./projection.js";
 import { isPhysicalScope, logicalStreamScopeParts } from "./routing.js";
 import {
@@ -708,12 +712,10 @@ export class StreamSyncReadService {
     if (targets.length === 0 || this.mirror.needsFullListing()) {
       return { kind: "skip", reason: "incomplete" };
     }
-    const known = new Set(this.mirror.connectors());
     let throughMs = Infinity;
     for (const target of targets) {
-      if (!known.has(target.connector)) {
-        return { kind: "skip", reason: "incomplete" };
-      }
+      // A connector the mirror does not know has no connections, and
+      // `eligible()` never answers "view" for none: no separate check.
       const connections = this.connectionViews(target.connector);
       if (connections.filter((c) => c.control.kind === "active").length > 1) {
         return { kind: "skip", reason: "ambiguous" };
@@ -739,6 +741,33 @@ export class StreamSyncReadService {
     return Number.isFinite(throughMs)
       ? { kind: "covered", throughMs }
       : { kind: "skip", reason: "incomplete" };
+  }
+
+  /**
+   * The entity keys the served view of the legacy scope holds, read as the
+   * owner from the live imported heads (no unpublished local runs). `null`
+   * when no complete view serves it, the body is not keyed, or the read
+   * fails. The retire step compares a local legacy file's keys against this:
+   * a complete head means the view can replace the file for reads, not that
+   * it holds every record the file holds.
+   */
+  async viewKeys(scope: string): Promise<EntityKeySets | null> {
+    try {
+      const decision = await this.resolve({
+        scope,
+        connection: null,
+        cursor: null,
+        legacyFile: true,
+        isOwnerView: true,
+      });
+      if (decision.kind !== "view") return null;
+      const parsed = JSON.parse(await new Response(decision.body).text()) as {
+        data?: unknown;
+      };
+      return entityKeySets(scope, parsed.data);
+    } catch {
+      return null;
+    }
   }
 
   /** §2.10 inputs for connector c: every connection this server knows. */

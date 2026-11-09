@@ -149,6 +149,27 @@ describe("upload worker", () => {
     );
   });
 
+  describe("skipEntry", () => {
+    it("leaves skipped entries unread and unregistered, and uploads the rest", async () => {
+      const deps = makeMockDeps();
+      const keep = makeEntry({ id: 1, scope: "a.kept", path: "a/kept.json" });
+      const skip = makeEntry({
+        id: 2,
+        scope: "b.skipped",
+        path: "b/skip.json",
+      });
+      deps.storage.findUnsynced = vi.fn().mockReturnValue([skip, keep]);
+      const results = await uploadAll(deps, {
+        skipEntry: (entry) => entry.scope === "b.skipped",
+      });
+      expect(results.map((r) => r.path)).toEqual(["a/kept.json"]);
+      const read = (deps.storage.readEnvelope as ReturnType<typeof vi.fn>).mock
+        .calls;
+      expect(read.map((c) => c[0])).toEqual(["a.kept"]);
+      expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("orphaned entry (missing local payload)", () => {
     it("drops the index row and does not head-block when the payload file is gone", async () => {
       const deps = makeMockDeps();

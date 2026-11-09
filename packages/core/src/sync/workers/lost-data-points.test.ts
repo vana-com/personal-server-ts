@@ -57,6 +57,28 @@ describe("requeueLostDataPoints", () => {
     ]);
   });
 
+  it("skips a scope the host names: no lookup, no requeue", async () => {
+    const storage = await seed("chatgpt.memories", 1, "0xlost");
+    const gateway = gatewayReturning({ "0xlost": null });
+    const skipScope = (scope: string) => scope === "chatgpt.memories";
+    expect(
+      await requeueLostDataPoints({ storage, gateway, logger }, undefined, {
+        skipScope,
+      }),
+    ).toEqual({ requeued: [], failed: [] });
+    expect(
+      await requeueLostDataPoints(
+        { storage, gateway, logger },
+        ["chatgpt.memories"],
+        { skipScope },
+      ),
+    ).toEqual({ requeued: [], failed: [] });
+    expect(gateway.getDataPoint).not.toHaveBeenCalled();
+    expect(storage.findEntry({ scope: "chatgpt.memories" })?.dataPointId).toBe(
+      "0xlost",
+    );
+  });
+
   it("leaves a scope alone whenever the gateway has any version of it", async () => {
     // An older head (rolled back) is deliberately not re-queued: the download
     // worker would re-stamp the row from it before a failed re-upload retried.

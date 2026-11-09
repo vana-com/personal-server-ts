@@ -65,7 +65,8 @@ export interface DownloadWorkerDeps {
   /**
    * Called once at the end of `downloadAll` that did not throw: `complete` is
    * false when any registry row, stream-sync row, data point or stream-sync
-   * import failed in that pass. Anything that acts on the mirror (deleting
+   * import failed in that pass, or a remote version was skipped for good
+   * (give-up or quarantine). Anything that acts on the mirror (deleting
    * legacy scopes) must wait for a complete pass.
    */
   onCycleOutcome?: (outcome: { complete: boolean }) => void;
@@ -670,6 +671,10 @@ export async function downloadAll(
     (dataPoint) => !isPhysicalScope(dataPoint.scope),
   );
   let failed = false;
+  // A remote version this pass skipped for good (give-up, quarantine). It
+  // does not block the cursor, but the pass did not read everything, so it
+  // is not complete for a retire.
+  let skippedRemote = false;
   if (deps.streamSync) {
     try {
       await deps.streamSync.observe(
@@ -749,6 +754,7 @@ export async function downloadAll(
         { dataPointId: dataPoint.id, scope: dataPoint.scope },
         "Skipping data point after exhausted download retries",
       );
+      skippedRemote = true;
       continue;
     }
     if (decision === "backoff") {
@@ -788,6 +794,7 @@ export async function downloadAll(
           },
           "Quarantined corrupt synced data point",
         );
+        skippedRemote = true;
         continue;
       }
       logger.error(
@@ -825,7 +832,9 @@ export async function downloadAll(
     }
   }
 
-  deps.onCycleOutcome?.({ complete: !failed && !importFailed });
+  deps.onCycleOutcome?.({
+    complete: !failed && !importFailed && !skippedRemote,
+  });
   return results;
 }
 

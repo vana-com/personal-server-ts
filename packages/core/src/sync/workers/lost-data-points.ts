@@ -50,10 +50,16 @@ const CONCURRENCY = 8;
 export async function requeueLostDataPoints(
   deps: LostDataPointDeps,
   onlyScopes?: readonly string[],
+  options?: {
+    /** Scopes to leave alone: no lookup, no requeue. */
+    skipScope?: (scope: string) => boolean;
+  },
 ): Promise<LostDataPointResult> {
+  const skip = options?.skipScope;
   const latest = [];
   if (onlyScopes) {
     for (const scope of onlyScopes) {
+      if (skip?.(scope)) continue;
       const entry = deps.storage.findEntry({ scope });
       if (entry?.dataPointId) latest.push(entry);
     }
@@ -61,6 +67,7 @@ export async function requeueLostDataPoints(
     for (let offset = 0; ; offset += SCOPE_PAGE) {
       const page = deps.storage.listScopes({ limit: SCOPE_PAGE, offset });
       for (const summary of page.scopes) {
+        if (skip?.(summary.scope)) continue;
         const entry = deps.storage.findEntry({ scope: summary.scope });
         if (entry?.dataPointId) latest.push(entry);
       }

@@ -56,13 +56,13 @@ function stubBrowserLocks() {
 }
 
 /** One unsynced legacy row, as the local index holds it. */
-async function legacyStorage() {
+async function legacyStorage(scope = "instagram.profile") {
   const storage = createMemoryPsLiteStorage();
   const envelope = createDataFileEnvelope(
-    "instagram.profile",
+    scope,
     "2026-05-08T00:00:00.000Z",
     { username: "composition" },
-    "https://schemas.example/instagram.profile.json",
+    `https://schemas.example/${scope}.json`,
     SCHEMA_ID,
   );
   const write = await storage.writeEnvelope(envelope);
@@ -349,7 +349,8 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
       await set(key, value);
     };
     vi.stubGlobal("fetch", uploadFetch(owner));
-    const { storage } = await legacyStorage();
+    // A scope the stream does not carry keeps uploading with the writer on.
+    const { storage } = await legacyStorage("acme.notes");
     const { identity, gateway } = await fixture(stateStore, owner);
     const config = ServerConfigSchema.parse({
       sync: { enabled: true },
@@ -363,11 +364,6 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
       config,
     });
     const writer = lite.streamSyncWriter!;
-    // Writer-on cycles pause legacy uploads, so the unsettled attempt comes
-    // from a cycle run with the switch off (the writer exists regardless).
-    config.streamSync.write = false;
-    await lite.syncManager.trigger();
-    config.streamSync.write = true;
     const realCycle = writer.cycle.bind(writer);
     let enteredWriter = false;
     let writerDone = false;
@@ -482,11 +478,12 @@ describe("PS Lite: legacy is read-only history while the stream writer is on", (
     cycles: Array<
       (config: ReturnType<typeof ServerConfigSchema.parse>) => void
     >,
+    scope?: string,
   ) {
     stubBrowserLocks();
     const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const stateStore = namedState(`indexeddb:${ns}/state`);
-    const { storage } = await legacyStorage();
+    const { storage } = await legacyStorage(scope);
     const fetchMock = uploadFetch(owner);
     vi.stubGlobal("fetch", fetchMock);
     const { identity, gateway } = await fixture(stateStore, owner);
@@ -531,6 +528,13 @@ describe("PS Lite: legacy is read-only history while the stream writer is on", (
   it("writer on: no legacy upload and no gateway register, and the stream publish still runs", async () => {
     const [cycle] = await run("gate-on", true, [() => {}]);
     expect(cycle).toEqual({ puts: 0, registered: 0, published: 1 });
+  });
+
+  it("writer on: a scope the stream does not carry still uploads and registers", async () => {
+    const [cycle] = await run("gate-uncarried", true, [() => {}], "acme.notes");
+    expect(cycle!.puts).toBeGreaterThan(0);
+    expect(cycle!.registered).toBeGreaterThan(0);
+    expect(cycle!.published).toBe(1);
   });
 
   it("writer off: the legacy row uploads and registers as before", async () => {

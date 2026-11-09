@@ -17,23 +17,54 @@ const GATEWAY = "https://gateway.local";
 const OWNER_KEY = `0x${"13".repeat(32)}` as const;
 const OWNER = privateKeyToAccount(OWNER_KEY);
 const SCHEMA_ID = `0x${"12".repeat(32)}`;
-const SHAPE = { primaryKey: ["id"], profile: { key: null, version: "1.0.0" } };
 const SWITCH = "2026-11-05T00:00:00.000Z";
-/** A logical stream-sync name doubles as a legacy scope name. */
-const SCOPES = ["pdpp.acme.items", "pdpp.acme.orders"];
+const HEAD_AT = Date.parse("2026-11-08T00:00:00Z");
+/**
+ * A scope with two read targets (the original connector and the browser
+ * connector's alternate binding): both must hold a complete head to cover it.
+ */
+const SCOPE = "strava.activities";
+const OTHER = "youtube.likes"; // no view at all
+const SCOPES = [OTHER, SCOPE].sort();
+
+const activityRow = (id: string) => ({
+  id,
+  activity_type: "Ride",
+  start_date: "2026-09-20",
+  start_date_local: "2026-09-20",
+  start_time: "2026-09-20T06:30:00-07:00",
+  start_time_basis: "local",
+  distance_m: 32150.4,
+  moving_time_s: 5400,
+  elapsed_time_s: 6120,
+  total_elevation_gain_m: 610,
+  average_heartrate: null,
+  max_heartrate: null,
+  calories_kcal: null,
+  gear: null,
+  freshness: "live",
+  exported_at: null,
+});
 
 type Config = {
   streamSync: { write: boolean; read: boolean; switchedAt?: string };
 };
 
 /** Legacy rows collected before the switch, as a device holds them. */
-async function legacyStorage(collectedAt = "2026-11-01T00:00:00.000Z") {
+async function legacyStorage(
+  collectedAt = "2026-11-01T00:00:00.000Z",
+  ids: readonly string[] = ["a"],
+) {
   const storage = createMemoryPsLiteStorage();
+  const bodies: Record<string, unknown> = {
+    [SCOPE]: { activities: ids.map((id) => ({ id })) },
+    [OTHER]: { likedVideos: [{ videoId: "v" }] },
+  };
   for (const scope of SCOPES) {
     const envelope = createDataFileEnvelope(
       scope,
       collectedAt,
-      { n: 1 },
+      bodies[scope] as Record<string, unknown>,
       `https://schemas.example/${scope}.json`,
       SCHEMA_ID,
     );
@@ -54,6 +85,8 @@ async function open(
   registry: ReturnType<typeof fakeRegistry>,
   streamSync: Config["streamSync"],
   storage = createMemoryPsLiteStorage(),
+  /** The gateway's registry row for the legacy scope, as the feed reads it. */
+  legacyRow: { addedAt: string } | null = null,
 ) {
   const config = ServerConfigSchema.parse({
     gateway: { url: GATEWAY },
@@ -84,7 +117,7 @@ async function open(
       getServer: vi.fn().mockResolvedValue({ id: "server-1" }),
     } as never,
     dataPointFeed: {
-      getDataPoint: async () => null,
+      getDataPoint: async () => (legacyRow ?? null) as never,
       listDataPointsByOwner: async () => ({
         dataPoints: registry.feed(),
         cursor: null,
@@ -97,24 +130,37 @@ async function open(
   return { lite, config, storage };
 }
 
-/** Publish a complete `acme.items` stream through the real writer. */
-async function publishItems(lite: Awaited<ReturnType<typeof open>>["lite"]) {
+/** Publish a complete `activities` stream of each target through the real writer. */
+async function publishActivities(
+  lite: Awaited<ReturnType<typeof open>>["lite"],
+  ids: readonly string[] = ["a"],
+) {
   const writer = lite.streamSyncWriter!;
   await writer.refreshControls();
-  await writer.beginRun({
-    runId: "run-1",
-    connector: "acme",
-    userConnect: false,
-    observedAt: Date.parse("2026-11-04T00:00:00Z"),
-    identity: "none",
-    checkpointUsed: null,
-  });
-  await writer.declareStream("run-1", "items", SHAPE);
-  await writer.append("run-1", "items", { id: "a", v: 1 });
-  await writer.finishRun("run-1", {
-    checkpointCandidate: { cursor: "run-1" },
-    coveredStreams: ["items"],
-  });
+  for (const [connector, key] of [
+    ["strava", null],
+    ["strava-browser", "strava-browser"],
+  ] as const) {
+    const runId = `run-${connector}`;
+    await writer.beginRun({
+      runId,
+      connector,
+      userConnect: false,
+      observedAt: HEAD_AT,
+      identity: "none",
+      checkpointUsed: null,
+    });
+    await writer.declareStream(runId, "activities", {
+      primaryKey: ["id"],
+      profile: { key, version: "2.0.0" },
+    });
+    for (const id of ids)
+      await writer.append(runId, "activities", activityRow(id));
+    await writer.finishRun(runId, {
+      checkpointCandidate: { cursor: runId },
+      coveredStreams: ["activities"],
+    });
+  }
   await writer.publishPending();
 }
 
@@ -136,18 +182,25 @@ async function cycle(o: Awaited<ReturnType<typeof open>>) {
 describe("PS Lite: retire legacy scopes after the switch (real reader and writer)", () => {
   async function switched(
     streamSync: Config["streamSync"],
-    collectedAt?: string,
+    opts: {
+      collectedAt?: string;
+      localIds?: readonly string[];
+      viewIds?: readonly string[];
+      legacyRow?: { addedAt: string } | null;
+    } = {},
   ) {
     const registry = fakeRegistry(OWNER.address);
     vi.stubGlobal("fetch", registry.fetchImpl);
     const o = await open(
       registry,
       streamSync,
-      await legacyStorage(collectedAt),
+      await legacyStorage(opts.collectedAt, opts.localIds),
+      opts.legacyRow ?? null,
     );
-    await publishItems(o.lite);
+    await publishActivities(o.lite, opts.viewIds);
     return { registry, ...o };
   }
+  const ON = { write: true, read: true, switchedAt: SWITCH };
 
   it("writer off: nothing is retired, whatever the views say", async () => {
     const registry = fakeRegistry(OWNER.address);
@@ -162,14 +215,19 @@ describe("PS Lite: retire legacy scopes after the switch (real reader and writer
     expect(scopesOf(o.storage)).toEqual(SCOPES);
   });
 
-  it("writer on, switch time set: the covered scope is retired, the uncovered one stays", async () => {
-    const o = await switched({ write: true, read: true, switchedAt: SWITCH });
-    // The real reader maps `pdpp.acme.items` to a complete head; `orders` has none.
+  it("writer on, switch time set, the view holds every key: the covered scope is retired, the uncovered one stays", async () => {
+    const o = await switched(ON, { viewIds: ["a", "b"] });
     await cycle(o);
-    expect(o.lite.streamSyncRead!.viewCoverage("pdpp.acme.items").kind).toBe(
-      "covered",
-    );
-    expect(scopesOf(o.storage)).toEqual(["pdpp.acme.orders"]);
+    expect(o.lite.streamSyncRead!.viewCoverage(SCOPE).kind).toBe("covered");
+    expect(scopesOf(o.storage)).toEqual([OTHER]);
+    await o.lite.syncManager.stop();
+  });
+
+  it("a complete head that lacks a key of the local file keeps the scope (membership, not time)", async () => {
+    // Head observed after the file was collected, so time alone would retire it.
+    const o = await switched(ON, { localIds: ["a", "b"], viewIds: ["a"] });
+    await cycle(o);
+    expect(scopesOf(o.storage)).toEqual(SCOPES);
     await o.lite.syncManager.stop();
   });
 
@@ -180,38 +238,46 @@ describe("PS Lite: retire legacy scopes after the switch (real reader and writer
     await o.lite.syncManager.stop();
   });
 
-  it("a legacy file collected at or after the switch keeps its scope", async () => {
-    const o = await switched(
-      { write: true, read: true, switchedAt: SWITCH },
-      "2026-11-06T00:00:00.000Z",
-    );
+  it("this device's own rows after the switch report 0 old-app writes and the scope still retires", async () => {
+    const o = await switched(ON, { collectedAt: "2026-11-06T00:00:00.000Z" });
+    await cycle(o);
+    expect(o.lite.syncManager.getStatus().streamSync).toEqual({
+      legacyWritesAfterSwitch: 0,
+    });
+    expect(scopesOf(o.storage)).toEqual([OTHER]);
+    await o.lite.syncManager.stop();
+  });
+
+  it("a gateway registration after the switch (another device) keeps the scope and counts 1", async () => {
+    const o = await switched(ON, {
+      legacyRow: { addedAt: "2026-11-07T00:00:00.000Z" },
+    });
     await cycle(o);
     expect(scopesOf(o.storage)).toEqual(SCOPES);
     expect(o.lite.syncManager.getStatus().streamSync).toEqual({
-      legacyWritesAfterSwitch: 2,
+      legacyWritesAfterSwitch: 1,
     });
     await o.lite.syncManager.stop();
   });
 
   it("a legacy file newer than the head keeps its scope", async () => {
-    // Collected before the switch but after the head was observed (Nov 4).
     const o = await switched(
-      { write: true, read: true, switchedAt: "2026-11-09T00:00:00.000Z" },
-      "2026-11-05T00:00:00.000Z",
+      { write: true, read: true, switchedAt: "2026-11-20T00:00:00.000Z" },
+      { collectedAt: "2026-11-09T00:00:00.000Z" }, // head observed Nov 8
     );
     await cycle(o);
-    expect(scopesOf(o.storage)).toContain("pdpp.acme.items");
+    expect(scopesOf(o.storage)).toContain(SCOPE);
     await o.lite.syncManager.stop();
   });
 
   it("turning the switch off mid-run stops retiring on the next cycle", async () => {
-    const o = await switched({ write: true, read: true, switchedAt: SWITCH });
+    const o = await switched(ON);
     o.config.streamSync.write = false;
     await cycle(o);
     expect(scopesOf(o.storage)).toEqual(SCOPES);
     o.config.streamSync.write = true;
     await cycle(o);
-    expect(scopesOf(o.storage)).toEqual(["pdpp.acme.orders"]);
+    expect(scopesOf(o.storage)).toEqual([OTHER]);
     await o.lite.syncManager.stop();
   });
 });

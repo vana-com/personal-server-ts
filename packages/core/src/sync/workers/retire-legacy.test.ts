@@ -11,6 +11,11 @@ import { deleteScope } from "./delete.js";
 import type { Logger } from "../../logger/index.js";
 import type { DeleteDataPort, DataStoragePort } from "../../ports/index.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
+import {
+  entityKeySets,
+  type EntityKeySets,
+} from "../../storage/legacy-entity-key-sets.js";
+import { LEGACY_SCOPE_ENTITY_KEYS } from "../../storage/legacy-scope-entity-keys.js";
 
 const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
 
@@ -45,10 +50,27 @@ const entryFor = (scope: string, row: Partial<Row> = {}) => ({
   ...row,
 });
 
+/** A legacy body holding one item per id, keyed as the reviewed table says. */
+function keyedBody(scope: string, ids: readonly string[]) {
+  const [path, fields] = Object.entries(LEGACY_SCOPE_ENTITY_KEYS[scope]!).find(
+    ([p]) => /^\$\.\w+$/.test(p),
+  )!;
+  return {
+    [path.slice(2)]: ids.map((id) =>
+      Object.fromEntries(fields.map((f) => [f, id])),
+    ),
+  };
+}
+
+/** What the served view holds, as key sets. */
+const viewOf = (scope: string, ids: readonly string[]): EntityKeySets | null =>
+  entityKeySets(scope, keyedBody(scope, ids));
+
 /** One device's local legacy storage. */
 function deviceStorage(
   local: Set<string>,
   rows: Record<string, Partial<Row>> = {},
+  bodies: Record<string, unknown> = {},
 ): DataStoragePort {
   return {
     listScopes: ({ limit = 100, offset = 0 }) => {
@@ -65,6 +87,9 @@ function deviceStorage(
     listVersions: (scope: string) =>
       local.has(scope) ? [entryFor(scope, rows[scope])] : [],
     deleteVersion: async (scope: string) => local.delete(scope),
+    readEnvelope: async (scope: string) => ({
+      data: scope in bodies ? bodies[scope] : keyedBody(scope, ["a"]),
+    }),
   } as unknown as DataStoragePort;
 }
 
@@ -97,13 +122,17 @@ function gateway(remote: Set<string>) {
   return { deleteData, tombstones };
 }
 
-function world(scopes: string[], rows: Record<string, Partial<Row>> = {}) {
+function world(
+  scopes: string[],
+  rows: Record<string, Partial<Row>> = {},
+  bodies: Record<string, unknown> = {},
+) {
   const local = new Set(scopes);
   const remote = new Set(scopes);
   return {
     local,
     remote,
-    storage: deviceStorage(local, rows),
+    storage: deviceStorage(local, rows, bodies),
     ...gateway(remote),
   };
 }
@@ -117,6 +146,8 @@ interface RunOptions {
   coverage?: (scope: string) => RetireCoverage;
   switchedAt?: string | undefined;
   registeredAt?: (scope: string) => Promise<string | null>;
+  viewKeys?: (scope: string) => Promise<EntityKeySets | null>;
+  stillOn?: () => boolean;
   log?: ReturnType<typeof logger>;
 }
 
@@ -127,6 +158,8 @@ function run(w: ReturnType<typeof world>, o: RunOptions = {}) {
     switchedAt: "switchedAt" in o ? o.switchedAt : SWITCH,
     coverage: o.coverage ?? (() => covered()),
     registeredAt: o.registeredAt ?? (async () => BEFORE),
+    viewKeys: o.viewKeys ?? (async (scope) => viewOf(scope, ["a"])),
+    ...(o.stillOn ? { stillOn: o.stillOn } : {}),
     deleteScope: (scope) =>
       deleteScope(
         {
@@ -144,21 +177,21 @@ function run(w: ReturnType<typeof world>, o: RunOptions = {}) {
 
 describe("retireLegacyScopes", () => {
   it("deletes the legacy files, remote and local, of covered scopes only", async () => {
-    const w = world(["acme.items", "acme.orders", "beta.things"]);
+    const w = world(["github.events", "youtube.likes", "youtube.history"]);
     const result = await run(w, {
       coverage: (s) =>
-        s === "acme.orders"
+        s === "youtube.likes"
           ? { kind: "skip", reason: "incomplete" }
           : covered(),
     });
     expect(result).toMatchObject({ considered: 3, deleted: 2 });
     expect(result.skipped.incomplete).toBe(1);
-    expect([...w.local]).toEqual(["acme.orders"]);
-    expect([...w.remote]).toEqual(["acme.orders"]);
+    expect([...w.local]).toEqual(["youtube.likes"]);
+    expect([...w.remote]).toEqual(["youtube.likes"]);
   });
 
   it("keeps every file when no view covers", async () => {
-    const w = world(["acme.items", "acme.orders"]);
+    const w = world(["github.events", "youtube.likes"]);
     const result = await run(w, {
       coverage: () => ({ kind: "skip", reason: "incomplete" }),
     });
@@ -168,7 +201,7 @@ describe("retireLegacyScopes", () => {
   });
 
   it("counts an ambiguous scope (more than one connection) and keeps it", async () => {
-    const w = world(["acme.items"]);
+    const w = world(["github.events"]);
     const result = await run(w, {
       coverage: () => ({ kind: "skip", reason: "ambiguous" }),
     });
@@ -182,45 +215,61 @@ describe("retireLegacyScopes", () => {
       ["unparsable", "not a time"],
       ["empty", ""],
     ])("%s: nothing is deleted", async (_name, switchedAt) => {
-      const w = world(["acme.items"]);
-      const result = await run(w, { switchedAt });
+      const w = world(["github.events"]);
+      // No gateway row either: nothing but the cutoff itself can keep it.
+      const result = await run(w, {
+        switchedAt,
+        registeredAt: async () => null,
+      });
       expect(result.deleted).toBe(0);
       expect(w.tombstones).toEqual([]);
       expect(w.local.size).toBe(1);
     });
 
-    it("a local file written after the switch keeps the whole scope and is counted", async () => {
-      const w = world(["acme.items", "acme.orders"], {
-        "acme.items": { collectedAt: AFTER },
+    it("a local row collected after the switch is this device's own: not counted, and the scope retires once membership holds", async () => {
+      const w = world(["github.events", "youtube.likes"], {
+        "github.events": { collectedAt: AFTER },
       });
       const result = await run(w, {
         coverage: () => covered(Date.parse(AFTER) + 1000),
       });
-      expect(result.deleted).toBe(1);
-      expect(result.skipped.afterSwitch).toBe(1);
-      expect(result.legacyWritesAfterSwitch).toBe(1);
-      expect([...w.local]).toEqual(["acme.items"]);
+      expect(result.legacyWritesAfterSwitch).toBe(0);
+      expect(result.deleted).toBe(2);
+      expect(w.local.size).toBe(0);
     });
 
-    it("a file written at exactly the switch time is after it", async () => {
-      const w = world(["acme.items"], {
-        "acme.items": { collectedAt: SWITCH },
+    it("a local row after the switch whose key the view lacks is kept, and still not counted", async () => {
+      const w = world(
+        ["github.events"],
+        { "github.events": { collectedAt: AFTER } },
+        { "github.events": keyedBody("github.events", ["a", "b"]) },
+      );
+      const result = await run(w, {
+        coverage: () => covered(Date.parse(AFTER) + 1000),
       });
-      const result = await run(w);
+      expect(result.deleted).toBe(0);
+      expect(result.skipped.notInView).toBe(1);
+      expect(result.legacyWritesAfterSwitch).toBe(0);
+    });
+
+    it("a file registered at exactly the switch time is after it", async () => {
+      const w = world(["github.events"]);
+      const result = await run(w, { registeredAt: async () => SWITCH });
       expect(result.deleted).toBe(0);
       expect(result.legacyWritesAfterSwitch).toBe(1);
     });
 
-    it("a remote head registered after the switch keeps the scope and is counted", async () => {
-      const w = world(["acme.items"]);
+    it("a gateway registration after the switch (another device) keeps the scope and counts 1", async () => {
+      const w = world(["github.events"]);
       const result = await run(w, { registeredAt: async () => AFTER });
       expect(result.deleted).toBe(0);
+      expect(result.skipped.afterSwitch).toBe(1);
       expect(result.legacyWritesAfterSwitch).toBe(1);
       expect(w.local.size).toBe(1);
     });
 
     it("an unreadable registry keeps the scope without counting a write", async () => {
-      const w = world(["acme.items"]);
+      const w = world(["github.events"]);
       const result = await run(w, {
         registeredAt: async () => {
           throw new Error("gateway down");
@@ -231,13 +280,13 @@ describe("retireLegacyScopes", () => {
     });
 
     it("a scope the gateway never saw is retired", async () => {
-      const w = world(["acme.items"]);
+      const w = world(["github.events"]);
       const result = await run(w, { registeredAt: async () => null });
       expect(result.deleted).toBe(1);
     });
 
     it("all files before the switch and covered: retired", async () => {
-      const w = world(["acme.items"]);
+      const w = world(["github.events"]);
       expect((await run(w)).deleted).toBe(1);
       expect(w.local.size).toBe(0);
       expect(w.remote.size).toBe(0);
@@ -246,8 +295,8 @@ describe("retireLegacyScopes", () => {
 
   describe("coverage", () => {
     it("a local row collected after the oldest head is kept", async () => {
-      const w = world(["acme.items"], {
-        "acme.items": { collectedAt: "2026-11-03T00:00:00.000Z" },
+      const w = world(["github.events"], {
+        "github.events": { collectedAt: "2026-11-03T00:00:00.000Z" },
       });
       const result = await run(w, {
         coverage: () => covered(Date.parse("2026-11-02T00:00:00.000Z")),
@@ -258,31 +307,150 @@ describe("retireLegacyScopes", () => {
     });
 
     it("a row with an unreadable time is kept", async () => {
-      const w = world(["acme.items"], {
-        "acme.items": { collectedAt: "garbage" },
+      const w = world(["github.events"], {
+        "github.events": { collectedAt: "garbage" },
       });
       const result = await run(w);
       expect(result.deleted).toBe(0);
     });
 
-    it("a row never uploaded is retired when a head covers it (uploads stop at the switch)", async () => {
-      const w = world(["acme.items"], { "acme.items": { dataPointId: null } });
+    it("a row on the boundary of the head (collected exactly at throughMs) is covered; one millisecond later is not", async () => {
+      const at = "2026-11-03T00:00:00.000Z";
+      const edge = Date.parse(at);
+      const on = world(["github.events"], {
+        "github.events": { collectedAt: at },
+      });
+      expect((await run(on, { coverage: () => covered(edge) })).deleted).toBe(
+        1,
+      );
+      const late = world(["github.events"], {
+        "github.events": { collectedAt: at },
+      });
+      const result = await run(late, { coverage: () => covered(edge - 1) });
+      expect(result.deleted).toBe(0);
+      expect(result.skipped.uncovered).toBe(1);
+    });
+  });
+
+  describe("membership: a complete head is not proof the view holds the file", () => {
+    it("head complete at T1 holds {a}; the local version at T0 < T1 holds {a, b}: kept", async () => {
+      const w = world(
+        ["github.events"],
+        {},
+        { "github.events": keyedBody("github.events", ["a", "b"]) },
+      );
+      const result = await run(w, {
+        coverage: () => covered(Date.parse(SWITCH)),
+        viewKeys: async (scope) => viewOf(scope, ["a"]),
+      });
+      expect(result.deleted).toBe(0);
+      expect(result.skipped.notInView).toBe(1);
+      expect(w.tombstones).toEqual([]);
+      expect(w.local.size).toBe(1);
+    });
+
+    it("a row never uploaded is retired when the view holds every key (uploads stop at the switch)", async () => {
+      const w = world(["github.events"], {
+        "github.events": { dataPointId: null },
+      });
       const result = await run(w, { registeredAt: async () => null });
       expect(result.deleted).toBe(1);
       expect(w.local.size).toBe(0);
     });
+
+    it("a row never uploaded whose key the view lacks is kept", async () => {
+      const w = world(
+        ["github.events"],
+        { "github.events": { dataPointId: null } },
+        { "github.events": keyedBody("github.events", ["a", "z"]) },
+      );
+      const result = await run(w, { registeredAt: async () => null });
+      expect(result.deleted).toBe(0);
+      expect(w.local.size).toBe(1);
+    });
+
+    it.each([
+      ["a view that cannot be read", async () => null],
+      [
+        "a view whose read throws",
+        async () => {
+          throw new Error("boom");
+        },
+      ],
+    ])("%s: kept", async (_name, viewKeys) => {
+      const w = world(["github.events"]);
+      const result = await run(w, { viewKeys });
+      expect(result.deleted).toBe(0);
+      expect(result.skipped.notInView).toBe(1);
+    });
+
+    it("a scope with no reviewed key is kept (membership unknown)", async () => {
+      const w = world(["acme.unkeyed"]);
+      const result = await run(w);
+      expect(result.deleted).toBe(0);
+      expect(result.skipped.notInView).toBe(1);
+    });
+
+    it("a body that is not keyed, or an item without its key, is kept", async () => {
+      for (const body of [
+        { events: "nope" },
+        { events: [{ noId: 1 }] },
+        null,
+      ]) {
+        const w = world(["github.events"], {}, { "github.events": body });
+        expect((await run(w)).deleted).toBe(0);
+      }
+    });
+
+    it("only the newest local version is compared; an older one holding extra keys is history", async () => {
+      const w = world(["github.events"]);
+      const versions = [
+        entryFor("github.events", { collectedAt: BEFORE }),
+        entryFor("github.events", { collectedAt: "2026-10-01T00:00:00.000Z" }),
+      ];
+      w.storage.listVersions = (() => versions) as never;
+      const reads: string[] = [];
+      w.storage.readEnvelope = (async (_scope: string, at: string) => {
+        reads.push(at);
+        return {
+          data: keyedBody(
+            "github.events",
+            at === BEFORE ? ["a"] : ["a", "old"],
+          ),
+        };
+      }) as never;
+      const result = await run(w);
+      expect(reads).toEqual([BEFORE]);
+      expect(result.deleted).toBe(1);
+    });
+  });
+
+  describe("the switch is re-read before each delete", () => {
+    it("turning it off mid-pass stops further deletes", async () => {
+      const w = world(["github.events", "youtube.likes", "youtube.history"]);
+      let on = true;
+      const original = w.deleteData.tombstone.bind(w.deleteData);
+      w.deleteData.tombstone = async (scope, fence) => {
+        on = false; // the account switches off while the first delete runs
+        return original(scope, fence);
+      };
+      const result = await run(w, { stillOn: () => on });
+      expect(result.deleted).toBe(1);
+      expect(w.tombstones.length).toBe(1);
+      expect(w.local.size).toBe(2);
+    });
   });
 
   it("is idempotent: a second pass finds nothing to do", async () => {
-    const w = world(["acme.items"]);
+    const w = world(["github.events"]);
     await run(w);
     const again = await run(w);
     expect(again.considered).toBe(0);
-    expect(w.tombstones).toEqual(["acme.items"]);
+    expect(w.tombstones).toEqual(["github.events"]);
   });
 
   it("two devices deleting at the same time both succeed", async () => {
-    const w = world(["acme.items", "acme.orders"]);
+    const w = world(["github.events", "youtube.likes"]);
     const localB = new Set(w.local);
     const b = { ...w, local: localB, storage: deviceStorage(localB) };
     const [ra, rb] = await Promise.all([run(w), run(b)]);
@@ -295,22 +463,22 @@ describe("retireLegacyScopes", () => {
 
   it("never touches stream-sync or reserved names", async () => {
     const w = world([
-      "acme.items",
+      "github.events",
       "pdpp.acme~0123456789abcdef.items",
       "pdpp.acme~0123456789abcdef",
       "vana.system.keys",
     ]);
     const asked: string[] = [];
     await run(w, { coverage: (s) => (asked.push(s), covered()) });
-    expect(asked).toEqual(["acme.items"]);
-    expect(w.tombstones).toEqual(["acme.items"]);
+    expect(asked).toEqual(["github.events"]);
+    expect(w.tombstones).toEqual(["github.events"]);
     expect(w.local.has("pdpp.acme~0123456789abcdef.items")).toBe(true);
     expect(w.local.has("pdpp.acme~0123456789abcdef")).toBe(true);
     expect(w.local.has("vana.system.keys")).toBe(true);
   });
 
   it("keeps the local copy when the gateway delete fails, and retries later", async () => {
-    const w = world(["acme.items"]);
+    const w = world(["github.events"]);
     let fail = true;
     const original = w.deleteData.tombstone.bind(w.deleteData);
     w.deleteData.tombstone = async (scope, fence) => {
@@ -320,17 +488,28 @@ describe("retireLegacyScopes", () => {
     const first = await run(w);
     expect(first.deleted).toBe(0);
     expect(first.skipped.failed).toBe(1);
-    expect(w.local.has("acme.items")).toBe(true);
+    expect(w.local.has("github.events")).toBe(true);
     fail = false;
     expect((await run(w)).deleted).toBe(1);
     expect(w.local.size).toBe(0);
   });
 
   it("limits the scopes deleted per cycle", async () => {
-    const names = Array.from(
-      { length: RETIRE_LEGACY_SCOPES_PER_CYCLE + 3 },
-      (_, i) => `acme.s${i}`,
-    );
+    const names = [
+      "github.events",
+      "youtube.likes",
+      "youtube.history",
+      "youtube.subscriptions",
+      "youtube.watchLater",
+      "youtube.playlists",
+      "strava.activities",
+      "shop.orders",
+      "amazon.orders",
+      "chatgpt.memories",
+      "claude.projects",
+      "icloud_notes.notes",
+      "icloud_notes.folders",
+    ].slice(0, RETIRE_LEGACY_SCOPES_PER_CYCLE + 3);
     const w = world(names);
     const result = await run(w);
     expect(result.deleted).toBe(RETIRE_LEGACY_SCOPES_PER_CYCLE);
@@ -338,10 +517,10 @@ describe("retireLegacyScopes", () => {
   });
 
   it("its own log carries counts only", async () => {
-    const w = world(["secret-connector.private-stream"]);
+    const w = world(["youtube.subscriptions"]);
     const log = logger();
     await run(w, { log });
-    expect(JSON.stringify(log.info.mock.calls)).not.toContain("secret");
+    expect(JSON.stringify(log.info.mock.calls)).not.toContain("youtube");
   });
 });
 

@@ -10,6 +10,8 @@ import type {
 import type { Logger } from "../../logger/index.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 import type { RetireLegacyOption } from "../workers/retire-legacy.js";
+import { entityKeySets } from "../../storage/legacy-entity-key-sets.js";
+import { LEGACY_SCOPE_ENTITY_KEYS } from "../../storage/legacy-scope-entity-keys.js";
 
 vi.mock("../workers/upload.js", () => ({ uploadAll: vi.fn(async () => []) }));
 vi.mock("../workers/download.js", () => ({
@@ -25,7 +27,7 @@ import { createSyncManager } from "./sync-manager.js";
 
 const BEFORE = "2026-11-01T00:00:00.000Z";
 const SWITCH = "2026-11-05T00:00:00.000Z";
-const SECRET = "acme.secret-scope";
+const SECRET = "youtube.history";
 
 const logger = () =>
   ({
@@ -45,7 +47,19 @@ function allLogged(...loggers: Logger[]): string {
   );
 }
 
-function rig(scopeNames = [SECRET, "acme.orders"]) {
+/** A legacy body holding one item, keyed as the reviewed table says. */
+function keyedBody(scope: string, ids: readonly string[] = ["a"]) {
+  const [path, fields] = Object.entries(LEGACY_SCOPE_ENTITY_KEYS[scope]!).find(
+    ([p]) => /^\$\.\w+$/.test(p),
+  )!;
+  return {
+    [path.slice(2)]: ids.map((id) =>
+      Object.fromEntries(fields.map((f) => [f, id])),
+    ),
+  };
+}
+
+function rig(scopeNames = [SECRET, "github.events"], addedAt = BEFORE) {
   const scopes = new Set(scopeNames);
   const storage = {
     findUnsynced: () => [],
@@ -74,6 +88,7 @@ function rig(scopeNames = [SECRET, "acme.orders"]) {
             },
           ]
         : [],
+    readEnvelope: async (scope: string) => ({ data: keyedBody(scope) }),
     deleteScope: async (scope: string) => (scopes.delete(scope) ? 1 : 0),
     deleteVersion: async (scope: string) => scopes.delete(scope),
   } as unknown as DataStoragePort;
@@ -99,7 +114,7 @@ function rig(scopeNames = [SECRET, "acme.orders"]) {
         : { deleted: versions, missing: [], failed: [] },
   };
   const feed: DataPointFeedPort = {
-    getDataPoint: async () => ({ addedAt: BEFORE }) as never,
+    getDataPoint: async () => ({ addedAt }) as never,
     listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
   };
   const upload = {
@@ -137,6 +152,7 @@ const on =
   ): (() => RetireLegacyOption) =>
   () => ({
     switchedAt: SWITCH,
+    viewKeys: async (scope) => entityKeySets(scope, keyedBody(scope)),
     coverage: (scope) =>
       covers(scope)
         ? { kind: "covered", throughMs: Date.parse(SWITCH) }
@@ -176,7 +192,7 @@ describe("sync manager: retire legacy scopes after the switch", () => {
       retireLegacy: on((s) => s === SECRET),
     });
     await manager.trigger();
-    expect([...r.scopes]).toEqual(["acme.orders"]);
+    expect([...r.scopes]).toEqual(["github.events"]);
     expect(r.tombstone).toHaveBeenCalledTimes(1);
   });
 
@@ -228,16 +244,16 @@ describe("sync manager: retire legacy scopes after the switch", () => {
     const r = rig();
     const manager = createSyncManager(r.upload, r.download, {
       deleteData: r.deleteData,
-      retireLegacy: on((s) => s === "acme.orders"),
+      retireLegacy: on((s) => s === "github.events"),
     });
-    await manager.trigger(); // good: retires acme.orders
+    await manager.trigger(); // good: retires github.events
     downloadReports(false);
     await manager.trigger(); // failed: must not retire the other one
     expect([...r.scopes]).toEqual([SECRET]);
   });
 
   it("the switch is read each cycle: turning it off stops retiring without a rebuild", async () => {
-    const r = rig(["acme.a", "acme.b", "acme.c"]);
+    const r = rig(["github.events", "youtube.likes", "strava.activities"]);
     let switched: RetireLegacyOption | null = null;
     const option = on();
     const manager = createSyncManager(r.upload, r.download, {
@@ -249,20 +265,18 @@ describe("sync manager: retire legacy scopes after the switch", () => {
     switched = option();
     await manager.trigger();
     expect(r.scopes.size).toBe(0);
-    r.scopes.add("acme.d");
+    r.scopes.add("shop.orders");
     switched = null;
     await manager.trigger();
-    expect([...r.scopes]).toEqual(["acme.d"]);
+    expect([...r.scopes]).toEqual(["shop.orders"]);
   });
 
-  it("reports the old-app write count in the sync status", async () => {
-    const r = rig();
+  it("reports another device's legacy registrations after the switch in the sync status, and keeps those scopes", async () => {
+    // Every scope's registry row is dated after the switch.
+    const r = rig([SECRET, "github.events"], "2026-11-06T00:00:00.000Z");
     const manager = createSyncManager(r.upload, r.download, {
       deleteData: r.deleteData,
-      retireLegacy: () => ({
-        switchedAt: "2026-10-01T00:00:00.000Z", // every row is after it
-        coverage: () => ({ kind: "covered", throughMs: Date.parse(SWITCH) }),
-      }),
+      retireLegacy: on(),
     });
     expect(manager.getStatus().streamSync).toEqual({
       legacyWritesAfterSwitch: 0,
@@ -272,13 +286,107 @@ describe("sync manager: retire legacy scopes after the switch", () => {
       legacyWritesAfterSwitch: 2,
     });
     expect(r.scopes.size).toBe(2);
+    expect(r.tombstone).not.toHaveBeenCalled();
+  });
+
+  it("this device's own rows after the switch report 0 and the scopes still retire", async () => {
+    const r = rig();
+    // Local rows dated after the switch (this device's current app).
+    r.upload.storage.listVersions = ((scope: string) => [
+      {
+        id: 1,
+        fileId: null,
+        schemaId: null,
+        path: `${scope}/x.json`,
+        scope,
+        collectedAt: "2026-11-06T00:00:00.000Z",
+        createdAt: "2026-11-06T00:00:00.000Z",
+        sizeBytes: 1,
+        version: 1,
+        dataPointId: "0xdp",
+      },
+    ]) as never;
+    const manager = createSyncManager(r.upload, r.download, {
+      deleteData: r.deleteData,
+      retireLegacy: () => ({
+        ...on()(),
+        coverage: () => ({
+          kind: "covered",
+          throughMs: Date.parse("2026-11-07T00:00:00.000Z"),
+        }),
+      }),
+    });
+    await manager.trigger();
+    expect(manager.getStatus().streamSync).toEqual({
+      legacyWritesAfterSwitch: 0,
+    });
+    expect(r.tombstone).toHaveBeenCalledTimes(2);
+  });
+
+  it("a good cycle then a thrown download: the second cycle deletes nothing (the outcome resets each cycle)", async () => {
+    const r = rig();
+    let covered = false;
+    const manager = createSyncManager(r.upload, r.download, {
+      deleteData: r.deleteData,
+      retireLegacy: on(() => covered),
+    });
+    await manager.trigger(); // good pass, nothing covered yet
+    expect(r.tombstone).not.toHaveBeenCalled();
+    covered = true;
+    vi.mocked(downloadAll).mockRejectedValue(new Error("gateway down"));
+    await manager.trigger(); // the pass threw: the earlier success must not carry
+    expect(r.tombstone).not.toHaveBeenCalled();
+    expect(r.scopes.size).toBe(2);
+  });
+
+  it("the registry wiring: a head registered after the switch keeps the scope (not read as 'never seen')", async () => {
+    const r = rig([SECRET], "2026-11-09T00:00:00.000Z");
+    const manager = createSyncManager(r.upload, r.download, {
+      deleteData: r.deleteData,
+      retireLegacy: on(),
+    });
+    await manager.trigger();
+    expect(r.tombstone).not.toHaveBeenCalled();
+    expect([...r.scopes]).toEqual([SECRET]);
+  });
+
+  it("no registry to read keeps every scope (it is not 'the gateway never saw it')", async () => {
+    const r = rig();
+    (r.upload as { dataPointFeed?: unknown }).dataPointFeed = undefined;
+    const manager = createSyncManager(r.upload, r.download, {
+      deleteData: r.deleteData,
+      retireLegacy: on(),
+    });
+    await manager.trigger();
+    expect(r.tombstone).not.toHaveBeenCalled();
+  });
+
+  it("turning the switch off mid-pass stops the next delete (read through the manager)", async () => {
+    const r = rig([SECRET, "github.events", "youtube.likes"]);
+    let option: RetireLegacyOption | null = on()();
+    r.tombstone.mockImplementation(async () => {
+      option = null; // the account switches off during the first delete
+      return {
+        status: "tombstoned" as const,
+        dataPointId: "0xsecret-id",
+        version: "2",
+        deletedAt: "2026-11-02T00:00:00.000Z",
+      };
+    });
+    const manager = createSyncManager(r.upload, r.download, {
+      deleteData: r.deleteData,
+      retireLegacy: () => option,
+    });
+    await manager.trigger();
+    expect(r.tombstone).toHaveBeenCalledTimes(1);
+    expect(r.scopes.size).toBe(2);
   });
 
   it("no log on the retire path carries a scope name, id, key or message text", async () => {
     const r = rig([SECRET]);
     // The first pass: the storage delete fails, leaving a retry marker; the
     // gateway then fails once in the next pass's retry.
-    r.failBlobsWith("secret-message acme.secret-scope");
+    r.failBlobsWith("secret-message youtube.history");
     const pending = createMemoryPendingBlobDeletionStore();
     const manager = createSyncManager(r.upload, r.download, {
       deleteData: r.deleteData,
@@ -288,10 +396,19 @@ describe("sync manager: retire legacy scopes after the switch", () => {
     await manager.trigger();
     await manager.trigger(); // retries the marker
     r.tombstone.mockRejectedValueOnce(new Error("secret-message " + SECRET));
-    r.scopes.add("acme.again");
+    r.scopes.add("amazon.orders");
     await manager.trigger();
     const logged = allLogged(r.upload.logger, r.download.logger);
-    for (const forbidden of ["acme", "secret", "0xsecret-id", "0xAbCd"]) {
+    for (const forbidden of [
+      "youtube",
+      "github",
+      "strava",
+      "shop",
+      "amazon",
+      "secret",
+      "0xsecret-id",
+      "0xAbCd",
+    ]) {
       expect(logged).not.toContain(forbidden);
     }
     expect(logged).toContain("Scope deletion finished");

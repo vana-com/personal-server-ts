@@ -130,7 +130,7 @@ describe("SyncManager", () => {
       await manager.stop();
     });
 
-    it("publishes instead of uploading legacy files when streamSync.write is on", async () => {
+    it("publishes after the upload worker, which skips stream-carried scopes, when streamSync.write is on", async () => {
       const order: string[] = [];
       (uploadAll as ReturnType<typeof vi.fn>).mockImplementation(async () => {
         order.push("legacy");
@@ -149,8 +149,14 @@ describe("SyncManager", () => {
       );
       manager.start();
       await vi.advanceTimersByTimeAsync(0);
-      // Legacy is read-only history once the writer is on: no legacy upload.
-      expect(order).toEqual(["stream-sync"]);
+      // The worker runs first and is told to leave stream-carried scopes alone
+      // (legacy is read-only history once the writer is on).
+      expect(order).toEqual(["legacy", "stream-sync"]);
+      expect(
+        (uploadAll as ReturnType<typeof vi.fn>).mock.calls
+          .at(-1)?.[1]
+          .skipEntry({ scope: "instagram.profile" }),
+      ).toBe(true);
       await manager.stop();
     });
 

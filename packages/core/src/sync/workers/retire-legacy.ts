@@ -2,6 +2,11 @@ import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import { isPhysicalScope } from "../../stream-sync/scope-routing.js";
+import {
+  entityKeySets,
+  keysHeld,
+  type EntityKeySets,
+} from "../../storage/legacy-entity-key-sets.js";
 import { isGatewayReservedScope } from "../delete-data-port.js";
 import type { DeleteScopeResult } from "./delete.js";
 
@@ -23,6 +28,13 @@ export type RetireCoverage =
 export interface RetireLegacyOption {
   /** Do the stream views cover this legacy scope, and up to when. */
   coverage(scope: string): RetireCoverage;
+  /**
+   * The entity keys the served view holds for the scope, or null when the
+   * view cannot be read or is not keyed. A complete head lets the view
+   * replace a file for reads; it does not prove the view holds every record
+   * of the file, so deleting needs the keys.
+   */
+  viewKeys(scope: string): Promise<EntityKeySets | null>;
   /** ISO time the Account switch was last turned on; absent retires nothing. */
   switchedAt: string | undefined;
 }
@@ -36,7 +48,13 @@ export interface RetireLegacyOption {
 export function liveRetireLegacy(input: {
   config: { streamSync: { write: boolean; switchedAt?: string | undefined } };
   writer: unknown;
-  reader: { viewCoverage(scope: string): RetireCoverage } | null | undefined;
+  reader:
+    | {
+        viewCoverage(scope: string): RetireCoverage;
+        viewKeys(scope: string): Promise<EntityKeySets | null>;
+      }
+    | null
+    | undefined;
 }): () => RetireLegacyOption | null {
   return () => {
     const { reader } = input;
@@ -45,13 +63,17 @@ export function liveRetireLegacy(input: {
     }
     return {
       coverage: (scope) => reader.viewCoverage(scope),
+      viewKeys: (scope) => reader.viewKeys(scope),
       switchedAt: input.config.streamSync.switchedAt,
     };
   };
 }
 
 export interface RetireLegacyDeps {
-  storage: Pick<DataStoragePort, "listScopes" | "listVersions">;
+  storage: Pick<
+    DataStoragePort,
+    "listScopes" | "listVersions" | "readEnvelope"
+  >;
   /**
    * ISO time the Account switch was last turned on. Absent or unparsable:
    * nothing is retired and no old-app write is counted.
@@ -59,10 +81,18 @@ export interface RetireLegacyDeps {
   switchedAt: string | undefined;
   /** Do the stream views cover this legacy scope, and up to when. */
   coverage(scope: string): RetireCoverage;
+  /** The keys the served view holds for the scope; see `RetireLegacyOption`. */
+  viewKeys(scope: string): Promise<EntityKeySets | null>;
+  /**
+   * Whether the switch is still on. Read before each scope's delete, so
+   * turning it off mid-pass stops further deletes. Absent: always on.
+   */
+  stillOn?: () => boolean;
   /**
    * When the gateway registered the scope's current head (the registry row's
-   * `addedAt`), or null when it has no row (no remote legacy file). Each older version was registered
-   * earlier, so this is the latest write time of the scope's legacy files.
+   * `addedAt`), or null when it has no row (no remote legacy file). Each older
+   * version was registered earlier, so this is the latest registration time of
+   * the scope's legacy files, from any device.
    */
   registeredAt(scope: string): Promise<string | null>;
   /** Durable scope deletion: gateway tombstone, storage blobs, local copy. */
@@ -83,14 +113,22 @@ export interface RetireLegacyResult {
     ambiguous: number;
     /** A local row is newer than the head, or has no usable time. */
     uncovered: number;
-    /** A legacy file was written at or after the switch, or its time is unknown. */
+    /**
+     * The newest local file holds a key the served view lacks, or membership
+     * cannot be proven (no reviewed key, a body that is not keyed, a view
+     * that cannot be read).
+     */
+    notInView: number;
+    /** A legacy file was registered at or after the switch, or its time is unknown. */
     afterSwitch: number;
     /** The delete did not reach the gateway; retried next cycle. */
     failed: number;
   };
   /**
-   * Legacy files written at or after the switch (old-app writes), counted
-   * over the scopes this pass looked at. A number only.
+   * Scopes whose legacy files reached the gateway registry at or after the
+   * switch (another device's old app), counted over the scopes this pass got
+   * as far as checking. This device's own local rows never count: its
+   * current app stops uploading legacy files at the switch. A number only.
    */
   legacyWritesAfterSwitch: number;
 }
@@ -103,6 +141,7 @@ function emptyResult(): RetireLegacyResult {
       incomplete: 0,
       ambiguous: 0,
       uncovered: 0,
+      notInView: 0,
       afterSwitch: 0,
       failed: 0,
     },
@@ -133,13 +172,15 @@ function localRows(
  * A scope is retired only when deleting it cannot lose data that no surface
  * can read. All of these hold, else the scope is skipped and counted:
  *   - every target of the scope has a complete live view, from one connection;
- *   - no local row was collected after the oldest head used (the heads cover
- *     the rows). A row not uploaded is fine when a complete head covers it:
- *     after the switch legacy is read-only history and uploads never finish;
- *   - every legacy file was written before the switch: the local rows by
- *     `collectedAt`, the scope's latest registration by the gateway's
- *     `addedAt`. A file written at or after the switch comes from an old app
- *     and is in no stream.
+ *   - no local row was collected after the oldest head used (a cheap
+ *     pre-filter: a newer row may hold data the head lacks);
+ *   - the gateway registered no legacy file of the scope at or after the
+ *     switch (`addedAt`): such a file comes from another device's old app and
+ *     is in no stream. Local rows are not judged by time: this device's own
+ *     current app writes none after the switch, and membership protects them;
+ *   - membership: every entity key of the newest local file is in the served
+ *     view. A complete head does not mean the view holds every record of a
+ *     file (a connector that exposes a window, a row from another device).
  *
  * Idempotent and safe between devices: a scope with no local files is not
  * listed again; a device racing another gets `already-deleted` and `missing`
@@ -169,10 +210,6 @@ export async function retireLegacyScopes(
   for (const scope of scopes) {
     const rows = localRows(deps.storage, scope);
     const times = rows.map((row) => Date.parse(row.collectedAt));
-    const writtenAfter = times.filter(
-      (t) => !Number.isFinite(t) || t >= switchedAtMs,
-    ).length;
-    result.legacyWritesAfterSwitch += writtenAfter;
 
     const coverage = deps.coverage(scope);
     if (coverage.kind === "skip") {
@@ -181,10 +218,6 @@ export async function retireLegacyScopes(
     }
     if (times.some((t) => !Number.isFinite(t) || t > coverage.throughMs)) {
       result.skipped.uncovered += 1;
-      continue;
-    }
-    if (writtenAfter > 0) {
-      result.skipped.afterSwitch += 1;
       continue;
     }
     // null: the gateway never saw the scope, so no remote legacy file exists.
@@ -196,12 +229,18 @@ export async function retireLegacyScopes(
       registered = NaN;
     }
     if (registered !== null && !(registered < switchedAtMs)) {
-      // A write made elsewhere, or a time we cannot read: keep the scope.
+      // A registration made elsewhere, or a time we cannot read: keep it.
       if (Number.isFinite(registered)) result.legacyWritesAfterSwitch += 1;
       result.skipped.afterSwitch += 1;
       continue;
     }
     if (budget === 0) continue; // next cycle
+    if (!(await newestFileIsHeld(deps, scope, rows))) {
+      result.skipped.notInView += 1;
+      continue;
+    }
+    // The switch may have been turned off while this pass ran.
+    if (deps.stillOn && !deps.stillOn()) break;
     budget -= 1;
     try {
       const outcome = await deps.deleteScope(scope);
@@ -215,6 +254,36 @@ export async function retireLegacyScopes(
     deps.logger.info({ ...result }, "Retire pass over legacy scopes");
   }
   return result;
+}
+
+/**
+ * Membership: every entity key of the scope's newest local file is in the
+ * served view. Unknown (no key table, unreadable file or view) is not held.
+ */
+async function newestFileIsHeld(
+  deps: Pick<RetireLegacyDeps, "storage" | "viewKeys">,
+  scope: string,
+  rows: readonly IndexEntry[],
+): Promise<boolean> {
+  if (rows.length === 0) return true; // nothing local to lose
+  const newest = rows.reduce((a, b) =>
+    Date.parse(b.collectedAt) > Date.parse(a.collectedAt) ? b : a,
+  );
+  let local: EntityKeySets | null;
+  try {
+    const envelope = await deps.storage.readEnvelope(scope, newest.collectedAt);
+    local = entityKeySets(scope, envelope.data);
+  } catch {
+    return false;
+  }
+  if (!local) return false;
+  let view: EntityKeySets | null;
+  try {
+    view = await deps.viewKeys(scope);
+  } catch {
+    return false;
+  }
+  return view !== null && keysHeld(local, view);
 }
 
 const STATUS_VALUES = new Set(["ok", "skipped", "failed", "deferred"]);

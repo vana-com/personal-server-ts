@@ -8,6 +8,7 @@ import {
   createUploadAttemptLedger,
   type UploadAttemptStore,
 } from "../upload-attempts.js";
+import { readTargets } from "../../stream-sync-read/service.js";
 import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
 import {
@@ -75,6 +76,12 @@ export interface SyncManagerOptions {
   streamSync?: {
     readonly write: boolean;
     readonly publisher: { cycle(): Promise<unknown> };
+    /**
+     * Whether the stream carries `scope`, so its legacy upload is off while
+     * `write` is on. Default: the scope has a read target
+     * (`readTargets(scope).length > 0`).
+     */
+    readonly carries?: (scope: string) => boolean;
   } | null;
   /**
    * Called at the end of every cycle. Returns the retire inputs while the
@@ -127,6 +134,10 @@ export interface SyncManager {
 }
 
 const MAX_ERRORS = 10;
+
+/** The stream carries a scope when a stream view can answer a read of it. */
+const defaultCarries = (scope: string): boolean =>
+  readTargets(scope).length > 0;
 
 export function createSyncManager(
   uploadDeps: UploadWorkerDeps,
@@ -262,8 +273,6 @@ export function createSyncManager(
         // DELETE did not. Cheap when nothing is pending; never blocks sync.
         if (transferMode === "upload-download") {
           if (
-            // Requeueing re-registers legacy files with the gateway.
-            !options?.streamSync?.write &&
             lostDataPointAttempts < MAX_LOST_DATA_POINT_ATTEMPTS &&
             // null: no full pass has completed yet (first cycle, or it threw).
             (lostDataPointRetryScopes === null ||
@@ -277,6 +286,9 @@ export function createSyncManager(
               const { failed } = await requeueLostDataPoints(
                 uploadDeps,
                 lostDataPointRetryScopes ?? undefined,
+                // Requeueing re-registers legacy files with the gateway: not
+                // for scopes the stream carries once the writer is on.
+                { skipScope: legacyUploadOff },
               );
               lostDataPointRetryScopes = failed;
             } catch (err) {
@@ -379,6 +391,17 @@ export function createSyncManager(
       });
   }
 
+  /**
+   * Whether a legacy upload of `scope` is off: the account has switched
+   * (read live from the host) and the stream carries the scope.
+   */
+  function legacyUploadOff(scope: string): boolean {
+    return (
+      options?.streamSync?.write === true &&
+      (options.streamSync.carries ?? defaultCarries)(scope)
+    );
+  }
+
   async function runUploadCycle(): Promise<void> {
     try {
       await retryPendingBlobDeletions({
@@ -428,16 +451,15 @@ export function createSyncManager(
       );
     }
 
-    // Switched account: legacy is read-only history, so nothing new is
-    // uploaded to storage or registered with the gateway. The collected file
-    // stays local and is published by the stream-sync writer below.
-    if (options?.streamSync?.write === true) {
-      await publishStreamSync();
-      return;
-    }
+    // Switched account: legacy is read-only history for the scopes the
+    // stream carries, so nothing new is uploaded to storage or registered
+    // with the gateway for them (the file stays local and the writer
+    // publishes it). Scopes the stream does not carry (agent memory, replica
+    // scopes) have no other path and still upload.
     try {
       const uploadResults = await uploadAll(workerUploadDeps, {
         batchSize: uploadBatchSize,
+        skipEntry: (entry) => legacyUploadOff(entry.scope),
         onError(entry, error) {
           pushError({
             fileId: entry.fileId,
@@ -501,8 +523,13 @@ export function createSyncManager(
         storage: uploadDeps.storage,
         switchedAt: retire.switchedAt,
         coverage: (scope) => retire.coverage(scope),
+        viewKeys: (scope) => retire.viewKeys(scope),
+        // Turning the switch off mid-pass stops the next delete.
+        stillOn: () => options.retireLegacy?.() != null,
         async registeredAt(scope) {
-          const row = await dataPointFeed?.getDataPoint({
+          // No registry to ask is not "the gateway never saw it": fail closed.
+          if (!dataPointFeed) throw new Error("no registry to read");
+          const row = await dataPointFeed.getDataPoint({
             ownerAddress: uploadDeps.serverOwner,
             scope,
           });

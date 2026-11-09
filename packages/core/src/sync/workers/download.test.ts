@@ -866,6 +866,77 @@ describe("download worker", () => {
       expect(deps.cursor.write).toHaveBeenCalledWith("opaque-cursor-2");
     });
 
+    describe("onCycleOutcome: only a pass that read everything is complete", () => {
+      async function outcomes(
+        setup: (deps: ReturnType<typeof makeMockDeps>) => void,
+        passes: number,
+        nowRef?: { ms: number },
+      ) {
+        const deps = makeMockDeps();
+        const seen: boolean[] = [];
+        (deps as { onCycleOutcome?: unknown }).onCycleOutcome = (o: {
+          complete: boolean;
+        }) => seen.push(o.complete);
+        const memory = createDownloadRetryMemory({
+          now: () => nowRef?.ms ?? 0,
+          backoffBaseMs: 0,
+          maxTransientAttempts: 1,
+        });
+        (
+          deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+        ).mockResolvedValue({
+          dataPoints: [makeDataPointRecord()],
+          cursor: null,
+        });
+        setup(deps);
+        for (let i = 0; i < passes; i++) {
+          if (nowRef) nowRef.ms += 1;
+          await downloadAll(deps, { retryMemory: memory });
+        }
+        return seen;
+      }
+
+      it("a clean pass is complete", async () => {
+        expect(await outcomes(() => {}, 1)).toEqual([true]);
+      });
+
+      it("a pass that quarantines a corrupt remote version (404) is not complete, now or later", async () => {
+        const seen = await outcomes((deps) => {
+          (
+            deps.storageAdapter.download as ReturnType<typeof vi.fn>
+          ).mockRejectedValue(STORAGE_404());
+        }, 3);
+        expect(seen).toEqual([false, false, false]);
+      });
+
+      it("a pass that gives up on a version after exhausted transient retries is not complete", async () => {
+        const seen = await outcomes(
+          (deps) => {
+            (
+              deps.storageAdapter.download as ReturnType<typeof vi.fn>
+            ).mockRejectedValue(STORAGE_503());
+          },
+          3,
+          { ms: 0 },
+        );
+        // Pass 1 fails (retryable), later passes give up: neither is complete.
+        expect(seen.every((c) => c === false)).toBe(true);
+      });
+
+      it("a pass whose stream-sync import fails is not complete", async () => {
+        const seen = await outcomes((deps) => {
+          (deps as { streamSync?: unknown }).streamSync = {
+            wantsListingFromStart: vi.fn(() => false),
+            observe: vi.fn(async () => {}),
+            importPending: vi.fn(async () => {
+              throw new Error("import down");
+            }),
+          };
+        }, 1);
+        expect(seen).toEqual([false]);
+      });
+    });
+
     it("clears the failure history when a retry succeeds", async () => {
       const deps = makeMockDeps();
       let nowMs = 0;
