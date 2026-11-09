@@ -35,6 +35,7 @@ import {
 import {
   documentDigest,
   manifestArtifactResolver,
+  manifestStreamLister,
   type StreamSyncWriter,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
@@ -272,6 +273,7 @@ async function main(): Promise<number> {
       streamSyncRead: {},
       // The host's declaration table: only this digest resolves.
       streamSyncDeclarations: manifestArtifactResolver([INTAKE_MANIFEST]),
+      streamSyncDeclaredStreams: manifestStreamLister([INTAKE_MANIFEST]),
     });
     const liteWriter = lite.streamSyncWriter;
     const liteIntake = lite.streamSyncIntake;

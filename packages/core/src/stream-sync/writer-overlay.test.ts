@@ -103,6 +103,7 @@ async function fixture(chunkBytes = 7) {
   });
   const make = (extra: Partial<StreamSyncWriterOptions> = {}) =>
     new StreamSyncWriter({
+      declaredStreams: () => [],
       ...extra,
       ownerAddress,
       home,

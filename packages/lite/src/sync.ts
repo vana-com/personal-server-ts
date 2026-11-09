@@ -135,10 +135,12 @@ export interface PsLiteSyncOptions {
   streamSyncDeclarations?: ResolveArtifact;
   /**
    * The stream names a connector declares, from the manifests the host
-   * verified. A connection delete posts a delete head on each declared stream
-   * that has no registry row. Without it only listed streams are erased.
+   * verified (`manifestStreamLister` over the same documents the host passes
+   * to `streamSyncDeclarations`). A connection delete posts a delete head on
+   * each declared stream that has no registry row. Required: a host that omits
+   * it lets a stale record of a rowless stream publish after a delete.
    */
-  streamSyncDeclaredStreams?: (connector: string) => readonly string[];
+  streamSyncDeclaredStreams: (connector: string) => readonly string[];
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;

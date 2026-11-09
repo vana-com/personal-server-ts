@@ -435,10 +435,12 @@ export interface StreamSyncWriterOptions {
    * The stream names `connector` declares, from the connector manifests the
    * host verified (never from a connector-id literal). A connection delete
    * posts a delete head on each of them that has no registry row yet, so a
-   * stale record for such a stream cannot publish after the delete. Absent
-   * means only the streams the registry lists are erased.
+   * stale record for such a stream cannot publish after the delete. Required:
+   * a host that does not pass it cannot know which streams a delete must
+   * fence, so the omission would show only as returned data. A host with no
+   * verified manifests passes `() => []` on purpose.
    */
-  readonly declaredStreams?: (connector: string) => readonly string[];
+  readonly declaredStreams: (connector: string) => readonly string[];
   /** Writer target per part (§2.2, at most 4 MiB). */
   readonly partTargetBytes?: number;
   /** Budget for one reduce pass and one shard compaction, in line bytes. */
@@ -603,6 +605,10 @@ export class StreamSyncWriter {
   private readonly coverage = new Map<string, StreamSyncImportedCoverage>();
 
   constructor(private readonly options: StreamSyncWriterOptions) {
+    // The type requires it; a caller that skips the type check is refused too.
+    if (typeof options.declaredStreams !== "function") {
+      throw new Error("StreamSyncWriter needs declaredStreams");
+    }
     if (
       options.home.ownerAddress.toLowerCase() !==
       options.ownerAddress.toLowerCase()
@@ -832,7 +838,7 @@ export class StreamSyncWriter {
         .filter((pin) => pin.ns === IDENTITYLESS_NS)
         .map((pin) => pin.stream),
     );
-    for (const stream of this.options.declaredStreams?.(connector) ?? []) {
+    for (const stream of this.options.declaredStreams(connector)) {
       if (listed.has(stream)) continue;
       listed.add(stream);
       streams.push({

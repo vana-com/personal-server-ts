@@ -12,6 +12,13 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { AmbiguousRegistryReplyError } from "./ports.js";
 import { ask } from "../stream-sync-read/service-fixture.js";
+import { manifestStreamLister } from "./artifacts.js";
+import {
+  bindStreamSyncHome,
+  createMemoryStreamSyncFiles,
+  createStreamSyncKeyPorts,
+  StreamSyncWriter,
+} from "./index.js";
 import {
   Rig,
   CONNECTOR,
@@ -385,4 +392,60 @@ it("a declared stream with no registry row gets a delete head, so an old record 
     kind: "discarded",
   });
   expect(await r.registeredHead("extra")).toMatchObject({ recordCount: 0 });
+});
+
+it("the rowless streams come from the verified manifest: an old record of one cannot publish after a delete (mutant: DECLARED_OMITTED)", async () => {
+  // The names are the host's `manifestStreamLister` over the manifest it
+  // verified, not a list typed into the test.
+  const manifest = JSON.stringify({
+    connector_key: CONNECTOR,
+    version: "1.0.0",
+    streams: [
+      { name: "items", primary_key: ["id"] },
+      { name: "extra", primary_key: ["id"] },
+    ],
+  });
+  const declared = manifestStreamLister([manifest])(CONNECTOR);
+  expect(declared).toEqual(["items", "extra"]);
+  const r = new Rig(undefined, CONNECTOR, declared);
+  await r.open();
+  await r.collect(spec("base"));
+  await r.publish();
+  // An unknown-start record of `extra`: a retained or imported one, which the
+  // registry has no row for.
+  await r.collect({ ...spec("legacy"), stream: "extra" });
+  expect(await r.registeredHead("extra")).toBeNull();
+  await r.deleteStreamHeadsOnly(r.other);
+  expect(await r.registeredHead("extra")).toMatchObject({
+    format: 3,
+    lastDeleteVersion: 1,
+  });
+  await r.sync();
+  const statuses = await r.publish();
+  expect(statuses.find((s) => s.runId === "legacy")?.outcome).toMatchObject({
+    kind: "discarded",
+  });
+  expect(await r.registeredHead("extra")).toMatchObject({ recordCount: 0 });
+});
+
+it("a writer built without declaredStreams is refused, so a host cannot forget the rowless streams (mutant: DECLARED_UNCHECKED)", () => {
+  const rig = new Rig();
+  const options = {
+    ownerAddress: `0x${"11".repeat(20)}` as const,
+    registry: rig.gateway,
+    blobs: { put: async () => {}, get: async () => null },
+    home: bindStreamSyncHome({
+      ownerAddress: `0x${"11".repeat(20)}`,
+      network: "test",
+      open: () => createMemoryStreamSyncFiles(),
+    }),
+    keys: createStreamSyncKeyPorts(`0x${"1f".repeat(32)}${"2a".repeat(32)}1b`),
+    signer: { signAddData: async () => `0x${"22".repeat(65)}` as const },
+  };
+  expect(() => new StreamSyncWriter(options as never)).toThrow(
+    "needs declaredStreams",
+  );
+  expect(
+    () => new StreamSyncWriter({ ...options, declaredStreams: () => [] }),
+  ).not.toThrow();
 });

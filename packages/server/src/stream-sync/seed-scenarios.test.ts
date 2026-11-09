@@ -160,6 +160,7 @@ async function fixture(generation = 1) {
     });
     const open = (source = seed, fault?: StreamSyncWriterOptions["fault"]) =>
       new StreamSyncWriter({
+        declaredStreams: () => [],
         ownerAddress: owner,
         home,
         registry,

@@ -224,6 +224,7 @@ class Device {
       get: async (key) => this.blobMap.get(key) ?? null,
     };
     this.writer = new StreamSyncWriter({
+      declaredStreams: () => [],
       ownerAddress: OWNER,
       registry: this.gateway,
       blobs,

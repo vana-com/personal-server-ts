@@ -102,6 +102,7 @@ export async function writeWorkload(args: unknown): Promise<BigPublished> {
     home: testStreamSyncHome(await writerFiles(a)),
     keys: createStreamSyncKeyPorts(OWNER_SIGNATURE),
     signer: accountSigner(a.surface === "node" ? SERVER_KEY : OWNER_KEY),
+    declaredStreams: () => [],
   });
   const runId = "run-1";
   const observedAt = Date.UTC(2026, 10, 1);

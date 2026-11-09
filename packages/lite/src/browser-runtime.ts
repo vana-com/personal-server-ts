@@ -129,7 +129,7 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    */
   streamSyncDeclarations?: PsLiteSyncOptions["streamSyncDeclarations"];
   /** Stream names per connector from verified manifests; see `PsLiteSyncOptions`. */
-  streamSyncDeclaredStreams?: PsLiteSyncOptions["streamSyncDeclaredStreams"];
+  streamSyncDeclaredStreams: PsLiteSyncOptions["streamSyncDeclaredStreams"];
   /**
    * Durable files for the stream-sync writer, used only when
    * `config.streamSync.write` is on. Default: one IndexedDB database. A host
