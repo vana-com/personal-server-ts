@@ -350,6 +350,8 @@ describe("viewCoverage: the edges a delete relies on", () => {
       fromStart: true,
       lastPage: false,
     });
+    // Even with the head imported, a partial listing may hide a tombstone.
+    await service.importPending();
     expect(service.viewCoverage("pdpp.acme.items")).toEqual({
       kind: "skip",
       reason: "incomplete",
