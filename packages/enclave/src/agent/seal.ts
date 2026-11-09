@@ -4,7 +4,8 @@ import {
   type MASTER_SIGNATURE_DELIVERY_VERSION,
   type MasterSignatureDelivery,
 } from "@opendatalabs/vana-sdk/protocol/identity";
-import { getAddress, hexToBytes, recoverMessageAddress, toHex } from "viem";
+import { getAddress, hexToBytes, toHex } from "viem";
+import { recoverOwnerAddress } from "@opendatalabs/personal-server-ts-core/keys";
 import type { DstackClient } from "../dstack/client.js";
 import { FIRST_EPOCH, userPsId } from "../identity/paths.js";
 import { deriveEnclaveKey } from "../identity/wallet.js";
@@ -19,8 +20,8 @@ import {
 } from "./errors.js";
 import type { SealRequestBody, SealResult } from "./types.js";
 
-/** = SDK crypto/keys/derive.ts MASTER_KEY_MESSAGE. */
-export const MASTER_KEY_MESSAGE = "vana-master-key-v1";
+/** The owner master-key message, owned by personal-server-ts-core. */
+export { OWNER_MASTER_KEY_MESSAGE as MASTER_KEY_MESSAGE } from "@opendatalabs/personal-server-ts-core/keys";
 
 const SIGNATURE_BYTES = 65;
 const HASH_ALGORITHM = "sha256";
@@ -71,10 +72,7 @@ export async function sealDelivery(
 
   let recoveredOwner: `0x${string}`;
   try {
-    recoveredOwner = await recoverMessageAddress({
-      message: MASTER_KEY_MESSAGE,
-      signature: delivery.masterSignature,
-    });
+    recoveredOwner = await recoverOwnerAddress(delivery.masterSignature);
   } catch {
     throw new DeliveryInvalid();
   }

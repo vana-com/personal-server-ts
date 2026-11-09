@@ -18,6 +18,10 @@ concurrency:
 jobs:
   publish-prerelease:
     name: Publish Canary
+    # Branches stacked on feat/stream-sync are unmerged PR heads; publishing
+    # them moved `canary` to unreviewed code. feat/stream-sync itself, develop,
+    # dev and every other feat/* branch still publish as before.
+    if: ${{ !startsWith(github.ref, 'refs/heads/feat/stream-sync-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

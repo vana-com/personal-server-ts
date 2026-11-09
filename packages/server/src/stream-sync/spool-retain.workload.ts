@@ -4,7 +4,7 @@
  * reducer keeps its winners. What the kept texts pin is what the peak measures.
  */
 
-import { stat, writeFile, open } from "node:fs/promises";
+import { stat, open } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import { readSpool } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createFsStreamSyncFiles } from "./fs-files.js";
