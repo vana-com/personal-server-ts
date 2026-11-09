@@ -130,6 +130,7 @@ import {
   spoolBodyDir,
 } from "./spool.js";
 import { spoolRecord } from "./record-intake.js";
+import { manifestStreamLister } from "./artifacts.js";
 
 import {
   pinnedWriterSnapshot,
@@ -170,7 +171,7 @@ export interface StreamSyncCheckpoint {
   readonly value: JsonValue | null;
 }
 
-export type SeedReceipt = "merged" | "skipped";
+export type SeedReceipt = "merged";
 
 /** A control row a delete pinned: tombstone it at `version + 1`, nothing else. */
 interface DeletePin {
@@ -203,11 +204,52 @@ interface StreamPin {
  * pending, so a stream delete that did not land is always re-issued.
  */
 interface DeleteIntent {
+  /** The id the owner route answered with. Absent in an intent from before ids. */
+  readonly id?: string;
   readonly pins: readonly DeletePin[];
   /** Absent in an intent from before streams were listed. */
   readonly streams?: readonly StreamPin[];
   /** Every stream delete landed: a resume never touches stream rows again. */
   readonly streamsLanded?: true;
+}
+
+/** What a delete of one connector would erase, read from the registry. */
+interface DeletePlan {
+  readonly pins: readonly DeletePin[];
+  readonly streams: StreamPin[];
+  /** Stream rows the registry lists (declared rowless streams not counted). */
+  readonly registered: number;
+}
+
+/**
+ * True when the registry lists nothing of the connector. An open intent then
+ * stays: its landing may be what emptied the registry, or may still be owed,
+ * and clearing it would drop that work and answer with an id of no delete.
+ */
+function planIsEmpty(plan: DeletePlan): boolean {
+  return plan.pins.length === 0 && plan.registered === 0;
+}
+
+/** True when `plan` erases the same rows, in the same control states, as `intent`. */
+function sameDeletePlan(intent: DeleteIntent, plan: DeletePlan): boolean {
+  const pinKey = (pin: DeletePin) => `${pin.ns}:${pin.version}`;
+  const sameSet = (a: readonly string[], b: readonly string[]) =>
+    a.length === b.length && a.every((key) => b.includes(key));
+  if (
+    !sameSet(intent.pins.map(pinKey), plan.pins.map(pinKey)) ||
+    intent.streams === undefined ||
+    intent.streams.length !== plan.streams.length
+  ) {
+    return false;
+  }
+  return plan.streams.every((planned) =>
+    intent.streams!.some(
+      (saved) =>
+        saved.ns === planned.ns &&
+        saved.stream === planned.stream &&
+        sameControl(saved.control, planned.control),
+    ),
+  );
 }
 
 interface WriterState {
@@ -236,8 +278,14 @@ interface WriterState {
   /** Monotone delete observations, scoped by this home to one owner. */
   lastDeletes?: Record<string, Record<string, number>>;
   seedTargets: Record<string, string>;
-  /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
+  /** `<installId>|<connector>|<ns>|<stream>` → receipt (merged). */
   receipts: Record<string, SeedReceipt>;
+  /**
+   * `<installId>|<connector>|<stream>` → the staged upload a delete retired.
+   * One rule decides which seed is skipped: the upload's identity. A later
+   * upload for the same stream has a new identity and still merges.
+   */
+  skippedSeeds?: Record<string, string>;
   /** The last three finished-run verdicts per connector, newest last. */
   recent?: Record<string, ("good" | "bad")[]>;
   /**
@@ -320,6 +368,12 @@ interface HostEntry {
   overlayRevision?: string;
   /** Seed streams this run must hold receipts for before its checkpoint. */
   seedStreams: string[];
+  /**
+   * The staged upload each seed stream had when this run was admitted. A
+   * settled stream is judged against this identity, never against a later
+   * upload that replaced it.
+   */
+  seedStaged?: Record<string, string>;
   /** Snapshot at beginRun; streams learned later never consult the live cache. */
   collectedAt?: Record<string, number>;
   /** M5: who the run writes for; checked again before it publishes. */
@@ -419,6 +473,8 @@ export interface StreamSyncStreamStatus {
   readonly complete?: boolean;
   readonly problem: StreamSyncHostProblem | null;
   readonly detail: string | null;
+  /** `seed_skipped`: a staged seed this run's generation refused; nothing published for it. */
+  readonly terminal?: "seed_skipped";
 }
 
 export interface StreamSyncRunStatus {
@@ -453,11 +509,20 @@ export interface StreamSyncWriterOptions {
    * posts a delete head on each of them that has no registry row yet, so a
    * stale record for such a stream cannot publish after the delete. Required:
    * a host that does not pass it cannot know which streams a delete must
-   * fence, so the omission would show only as returned data. An empty list
-   * for a connector that has registry rows makes its delete throw
-   * `ConnectorNotVerifiedError` before anything is written.
+   * fence, so the omission would show only as returned data. The names a
+   * delete fences are this option, the streams of `retainedManifests`, and the
+   * registry's own stream rows. If that union is empty while the registry holds
+   * pins of the connector, the delete throws `ConnectorNotVerifiedError`
+   * before anything is written.
    */
   readonly declaredStreams: (connector: string) => readonly string[];
+  /**
+   * Connector manifest documents this host still retains, read at delete time.
+   * Rows can only be stored under a declared connector, so a retained manifest
+   * names the streams a delete must fence even when the host passes no
+   * `declaredStreams` names for that connector. Default: none.
+   */
+  readonly retainedManifests?: () => readonly string[];
   /** Writer target per part (§2.2, at most 4 MiB). */
   readonly partTargetBytes?: number;
   /** Budget for one reduce pass and one shard compaction, in line bytes. */
@@ -790,61 +855,8 @@ export class StreamSyncWriter {
   deleteConnection(connector: string): Promise<void> {
     return this.publish(async () => {
       await this.finishDelete(connector);
-      const pins: DeletePin[] = [];
-      // The control state of each namespace as the pin loop read it. A stream
-      // pins this state, never a later read: a reconnect between the two reads
-      // would otherwise be recorded as the state the delete started from.
-      const controls = new Map<string, ControlState>();
-      for (const row of await this.options.registry.listControlRows()) {
-        const parsed = parseScope(row.scope);
-        if (parsed?.kind !== "control" || parsed.connector !== connector) {
-          continue;
-        }
-        const state = await this.readControl(connector, parsed.ns);
-        controls.set(parsed.ns, state);
-        if (state.kind === "active" || state.kind === "foreign") {
-          pins.push({
-            ns: parsed.ns,
-            version: state.kind === "active" ? state.generation : state.version,
-          });
-        }
-      }
-      const streams: StreamPin[] = [];
-      for (const row of await this.options.registry.listStreamRows(connector)) {
-        const parsed = parseScope(row.scope);
-        if (parsed?.kind !== "stream" || parsed.connector !== connector) {
-          continue;
-        }
-        streams.push({
-          ns: parsed.ns,
-          stream: parsed.stream,
-          control: controls.get(parsed.ns) ?? { kind: "absent" },
-        });
-      }
-      const registered = streams.length;
-      if (pins.length > 0 || registered > 0) {
-        // Nothing is persisted yet: refuse when no stream can be named.
-        if (this.options.declaredStreams(connector).length === 0) {
-          throw new ConnectorNotVerifiedError(connector);
-        }
-        this.addRowlessStreams(connector, streams, controls);
-      }
-      if (pins.length === 0 && registered === 0) {
-        // The registry lists nothing, so there is nothing to erase there. The
-        // device may still hold runs, results and a seed target for the
-        // connection (collected while the registry was out of reach): they
-        // must not publish later.
-        await this.purgeConnector(connector, []);
-        await this.withState((state) => {
-          delete state.seedTargets[connector];
-        });
-        return;
-      }
-      const intent: DeleteIntent = { pins, streams };
-      await this.withState((state) => {
-        (state.deletes ??= {})[connector] = intent;
-      });
-      await this.runDelete(connector, intent, true);
+      const intent = await this.persistDeleteIntent(connector);
+      if (intent) await this.runDelete(connector, intent, true);
     });
   }
 
@@ -857,7 +869,7 @@ export class StreamSyncWriter {
    * less namespace, where retained and imported records are published.
    */
   private addRowlessStreams(
-    connector: string,
+    declared: readonly string[],
     streams: StreamPin[],
     controls: ReadonlyMap<string, ControlState>,
   ): void {
@@ -866,7 +878,7 @@ export class StreamSyncWriter {
         .filter((pin) => pin.ns === IDENTITYLESS_NS)
         .map((pin) => pin.stream),
     );
-    for (const stream of this.options.declaredStreams(connector)) {
+    for (const stream of declared) {
       if (listed.has(stream)) continue;
       listed.add(stream);
       streams.push({
@@ -875,6 +887,217 @@ export class StreamSyncWriter {
         control: controls.get(IDENTITYLESS_NS) ?? { kind: "absent" },
       });
     }
+  }
+
+  /**
+   * The owner's connection delete, answered as soon as its intent is durable.
+   * The landing then runs on the publish queue after this resolves; if it
+   * fails, the intent stays and every later publish pass finishes it
+   * (`resumeDeletes`). An open intent of the connector is reused, not
+   * replaced while the registry still matches its plan, so the id names the
+   * delete that is actually in flight; once the registry has moved, a new
+   * intent replaces it (the old one's work is part of the new plan). When the
+   * registry lists nothing of the connector there is nothing to land: this
+   * device's local state is purged at once and the id names a delete that is
+   * already done.
+   */
+  async requestConnectionDelete(
+    connector: string,
+  ): Promise<{ readonly deleteId: string }> {
+    const intent = await this.publish(async () => {
+      const open = (await this.readState()).deletes?.[connector];
+      let plan: DeletePlan;
+      try {
+        plan = await this.planDelete(connector);
+      } catch (error) {
+        // A delete already in flight stays answerable when the host cannot
+        // name the streams now (a restart before its manifests verify): the
+        // open intent is durable and resumes on its own.
+        if (open && error instanceof ConnectorNotVerifiedError) return open;
+        throw error;
+      }
+      // The open intent stands only while the registry still matches the plan
+      // it was made from. If a reconnect (on any device) moved a control row
+      // or added a stream since, reusing it would erase nothing of what the
+      // owner now sees, and the answer would name a delete that is not theirs.
+      if (open && (planIsEmpty(plan) || sameDeletePlan(open, plan))) {
+        return open;
+      }
+      return this.persistDeleteIntent(connector, plan);
+    });
+    if (!intent) return { deleteId: globalThis.crypto.randomUUID() };
+    // A landing that fails here is not lost: the intent stays on disk and the
+    // next publish pass retries it. It re-reads the intent, so a landing that
+    // another request or a resume already finished is not repeated.
+    void this.publish(() => this.finishDelete(connector)).catch(
+      () => undefined,
+    );
+    return { deleteId: intent.id ?? connector };
+  }
+
+  /** Retire one staged upload, by identity. */
+  private retireUpload(
+    state: WriterState,
+    connector: string,
+    upload: { stream: string; upload: string },
+  ): void {
+    (state.skippedSeeds ??= {})[
+      `${this.options.seed!.installId}|${connector}|${upload.stream}`
+    ] = upload.upload;
+  }
+
+  /** Whether a delete retired this exact staged upload. */
+  private isRetired(
+    state: WriterState,
+    connector: string,
+    upload: { stream: string; upload: string },
+  ): boolean {
+    return (
+      state.skippedSeeds?.[
+        `${this.options.seed!.installId}|${connector}|${upload.stream}`
+      ] === upload.upload
+    );
+  }
+
+  /**
+   * A seed stream of this run is settled when it merged on the run's target,
+   * or the upload it was admitted with was retired.
+   */
+  private seedSettled(
+    state: WriterState,
+    host: HostEntry,
+    stream: string,
+  ): boolean {
+    const seed = this.options.seed!;
+    const { entry } = host;
+    if (
+      state.receipts[
+        `${seed.installId}|${entry.connector}|${entry.ns}|${stream}`
+      ] !== undefined
+    )
+      return true;
+    const upload = host.seedStaged?.[stream];
+    return (
+      upload !== undefined &&
+      this.isRetired(state, entry.connector, { stream, upload })
+    );
+  }
+
+  /**
+   * A seed the host staged for a connector the registry never listed is
+   * stored data with no row to fence, and writing a delete head there would
+   * add a row the connector never had. Each staged upload is retired by its
+   * identity, in state, before anything else in the delete: a crash after
+   * this write cannot publish it on restart. The staged pointers are then
+   * dropped. No registry write.
+   */
+  private async skipStagedSeed(connector: string): Promise<void> {
+    const seed = this.options.seed;
+    if (!seed) return;
+    const staged = await seed.streams(connector);
+    if (staged.length === 0) return;
+    await this.withState((state) => {
+      for (const entry of staged) this.retireUpload(state, connector, entry);
+    });
+    await seed.streams(connector);
+  }
+
+  /**
+   * Plan a fresh delete of `connector` from the registry listing, and persist
+   * it before any write. `null` when the registry lists nothing of the
+   * connector: this device's runs, results and seed target for it are purged
+   * then, so what was collected while the registry was out of reach cannot
+   * publish afterwards. Caller holds the publish queue.
+   */
+  private async persistDeleteIntent(
+    connector: string,
+    plan?: DeletePlan,
+  ): Promise<DeleteIntent | null> {
+    const { pins, streams, registered } =
+      plan ?? (await this.planDelete(connector));
+    // Every upload staged now predates this delete; none may publish after it.
+    await this.skipStagedSeed(connector);
+    if (planIsEmpty({ pins, streams, registered })) {
+      await this.purgeConnector(connector, []);
+      await this.withState((state) => {
+        delete state.seedTargets[connector];
+      });
+      return null;
+    }
+    const intent: DeleteIntent = {
+      id: globalThis.crypto.randomUUID(),
+      pins,
+      streams,
+    };
+    await this.withState((state) => {
+      (state.deletes ??= {})[connector] = intent;
+    });
+    return intent;
+  }
+
+  /**
+   * What a delete of `connector` would erase now, from the registry: the
+   * pinned control rows and every stream row (listed, or declared with no
+   * row yet). `registered` counts the listed stream rows only.
+   */
+  private async planDelete(connector: string): Promise<DeletePlan> {
+    const pins: DeletePin[] = [];
+    // The control state of each namespace as the pin loop read it. A stream
+    // pins this state, never a later read: a reconnect between the two reads
+    // would otherwise be recorded as the state the delete started from.
+    const controls = new Map<string, ControlState>();
+    for (const row of await this.options.registry.listControlRows()) {
+      const parsed = parseScope(row.scope);
+      if (parsed?.kind !== "control" || parsed.connector !== connector) {
+        continue;
+      }
+      const state = await this.readControl(connector, parsed.ns);
+      controls.set(parsed.ns, state);
+      if (state.kind === "active" || state.kind === "foreign") {
+        pins.push({
+          ns: parsed.ns,
+          version: state.kind === "active" ? state.generation : state.version,
+        });
+      }
+    }
+    const streams: StreamPin[] = [];
+    for (const row of await this.options.registry.listStreamRows(connector)) {
+      const parsed = parseScope(row.scope);
+      if (parsed?.kind !== "stream" || parsed.connector !== connector) {
+        continue;
+      }
+      streams.push({
+        ns: parsed.ns,
+        stream: parsed.stream,
+        control: controls.get(parsed.ns) ?? { kind: "absent" },
+      });
+    }
+    const registered = streams.length;
+    if (pins.length > 0 || registered > 0) {
+      const declared = await this.declaredNames(connector);
+      // Nothing is persisted yet. A registry-listed stream is already named by
+      // its scope, so refuse only when no stream at all can be named: pins
+      // with no stream rows and no declared names.
+      if (declared.length === 0 && registered === 0) {
+        throw new ConnectorNotVerifiedError(connector);
+      }
+      this.addRowlessStreams(declared, streams, controls);
+    }
+    return { pins, streams, registered };
+  }
+
+  /**
+   * The names a delete fences beyond the registry's own stream rows, each
+   * once: the host's declared names and the streams of every retained manifest.
+   * Both come from config at boot and may only add to what the registry lists.
+   */
+  private async declaredNames(connector: string): Promise<string[]> {
+    const names = new Set(this.options.declaredStreams(connector));
+    const retained = this.options.retainedManifests?.() ?? [];
+    for (const stream of manifestStreamLister(retained)(connector)) {
+      names.add(stream);
+    }
+    return [...names];
   }
 
   /**
@@ -1139,11 +1362,14 @@ export class StreamSyncWriter {
   async seedStatus(connector: string): Promise<{
     targetKnown: boolean;
     receipts: Readonly<Record<string, SeedReceipt>>;
+    /** Uploads a delete retired, by stream. Independent of the seed target. */
+    skipped: readonly { stream: string; upload: string }[];
   }> {
     const seed = this.options.seed;
     const state = await this.readState();
     const target = state.seedTargets[connector];
     const receipts: Record<string, SeedReceipt> = {};
+    const skipped: { stream: string; upload: string }[] = [];
     if (seed && target !== undefined) {
       const prefix = `${seed.installId}|${connector}|${target}|`;
       for (const [key, receipt] of Object.entries(state.receipts)) {
@@ -1151,7 +1377,14 @@ export class StreamSyncWriter {
           receipts[key.slice(prefix.length)] = receipt;
       }
     }
-    return { targetKnown: target !== undefined, receipts };
+    if (seed) {
+      const prefix = `${seed.installId}|${connector}|`;
+      for (const [key, upload] of Object.entries(state.skippedSeeds ?? {})) {
+        if (key.startsWith(prefix))
+          skipped.push({ stream: key.slice(prefix.length), upload });
+      }
+    }
+    return { targetKnown: target !== undefined, receipts, skipped };
   }
 
   /** The owner and key check a run is bound to (V2 §2.1, M5). */
@@ -1969,24 +2202,27 @@ export class StreamSyncWriter {
     const { entry } = host;
     const state = await this.readState();
     if (state.seedTargets[entry.connector] !== entry.ns) return;
-    const seedStreams = await seed.streams(entry.connector);
-    const receiptKey = (stream: string) =>
-      `${seed.installId}|${entry.connector}|${entry.ns}|${stream}`;
+    const staged = await seed.streams(entry.connector);
+    host.seedStaged = Object.fromEntries(
+      staged.map((s) => [s.stream, s.upload]),
+    );
+    const seedStreams = staged.filter(
+      (s) => !this.isRetired(state, entry.connector, s),
+    );
     if (host.target !== 1) {
       const open = seedStreams.filter(
-        (s) => state.receipts[receiptKey(s.stream)] === undefined,
+        (s) => !this.seedSettled(state, host, s.stream),
       );
       if (open.length > 0) {
         await this.withState((fresh) => {
-          for (const s of open) {
-            fresh.receipts[receiptKey(s.stream)] ??= "skipped";
-          }
+          for (const s of open) this.retireUpload(fresh, entry.connector, s);
         });
+        for (const s of open) this.markSeedSkipped(host, s);
       }
       return;
     }
     for (const s of seedStreams) {
-      if (state.receipts[receiptKey(s.stream)] !== undefined) continue;
+      if (this.seedSettled(state, host, s.stream)) continue;
       let stream = host.streams[s.stream];
       if (!stream) {
         stream = this.newStream(nextIndex(host), s);
@@ -2001,6 +2237,28 @@ export class StreamSyncWriter {
       stream.seedApplies = true;
       if (!host.seedStreams.includes(s.stream)) host.seedStreams.push(s.stream);
     }
+  }
+
+  /**
+   * A seed the target generation refuses ends `seed_skipped` in this run's
+   * status, so the owner can see it and nothing publishes for it. A stream the
+   * run writes keeps its own status: `seed_skipped` counts as coverage.
+   */
+  private markSeedSkipped(
+    host: HostEntry,
+    staged: Awaited<ReturnType<StreamSyncSeedSource["streams"]>>[number],
+  ): void {
+    if (host.streams[staged.stream]) return;
+    const stream = this.newStream(nextIndex(host), staged);
+    stream.shardBytes = emptyShardBytes();
+    stream.seedOnly = true;
+    stream.terminal = "seed_skipped";
+    host.streams[staged.stream] = stream;
+    this.setStream(host, staged.stream, {
+      state: "noop",
+      generation: host.target!,
+      complete: false,
+    });
   }
 
   private async spoolSeed(host: HostEntry, name: string): Promise<void> {
@@ -2190,11 +2448,45 @@ export class StreamSyncWriter {
     stream: string,
     version: number,
   ): Promise<void> {
+    const seed = this.options.seed;
+    const known =
+      (await this.readState()).lastDeletes?.[connector]?.[stream] ?? 0;
+    // A delete this writer first observes retires the seed uploads staged at
+    // that moment: they predate it. An upload staged later does not.
+    const staged =
+      seed && version > known
+        ? (await seed.streams(connector)).filter((s) => s.stream === stream)
+        : [];
     await this.withState((state) => {
       const cache = (state.lastDeletes ??= {});
       const streams = (cache[connector] ??= {});
       streams[stream] = Math.max(streams[stream] ?? 0, version);
+      for (const entry of staged) this.retireUpload(state, connector, entry);
     });
+  }
+
+  /**
+   * Whether the upload this run admitted for `name` was retired. The current
+   * staged upload is checked too: a replacement staged mid-run is not merged.
+   */
+  private async seedRetiredNow(
+    host: HostEntry,
+    name: string,
+  ): Promise<boolean> {
+    const seed = this.options.seed;
+    if (!seed) return false;
+    const { connector } = host.entry;
+    const state = await this.readState();
+    const admitted = host.seedStaged?.[name];
+    if (
+      admitted !== undefined &&
+      this.isRetired(state, connector, { stream: name, upload: admitted })
+    )
+      return true;
+    const current = (await seed.streams(connector)).find(
+      (s) => s.stream === name,
+    );
+    return current !== undefined && this.isRetired(state, connector, current);
   }
 
   /** §2.7 from "read control" to the POST. True when committed or no-op. */
@@ -2218,13 +2510,8 @@ export class StreamSyncWriter {
       ns,
       name,
     );
-    // Seed history was collected before stream deletes existed. It always has stamp zero.
-    if (stream.seedApplies && lastDeleteVersion > 0) {
-      await this.withState((state) => {
-        state.receipts[
-          `${this.options.seed!.installId}|${entry.connector}|${ns}|${name}`
-        ] = "skipped";
-      });
+    // A seed staged before a delete was retired when the delete was observed.
+    if (stream.seedApplies && (await this.seedRetiredNow(host, name))) {
       stream.seedApplies = false;
       stream.seedShardBytes = null;
       if (stream.seedOnly) {
@@ -2419,9 +2706,7 @@ export class StreamSyncWriter {
       entry.ns !== null &&
       host.target === null &&
       state.seedTargets[entry.connector] === entry.ns &&
-      state.receipts[
-        `${seed.installId}|${entry.connector}|${entry.ns}|${name}`
-      ] === undefined;
+      !this.seedSettled(state, host, name);
     const outbox = entry.streams[name];
     const executed: ExecutedStep | undefined =
       stream.executed ??
@@ -2549,10 +2834,7 @@ export class StreamSyncWriter {
         return { kind: "stale" as const };
       }
       const seedReceiptsPending = host.seedStreams.some(
-        (s) =>
-          seed !== undefined &&
-          state.receipts[`${seed.installId}|${entry.connector}|${ns}|${s}`] ===
-            undefined,
+        (s) => seed !== undefined && !this.seedSettled(state, host, s),
       );
       // Decide on the watermark as of this mutation, not on the read alone.
       const latest = state.observedControl?.[entry.connector]?.[ns] ?? control;
@@ -3326,6 +3608,7 @@ export class StreamSyncWriter {
         ...(outbox.complete !== undefined ? { complete: outbox.complete } : {}),
         problem: info?.problem ?? null,
         detail: info?.detail ?? null,
+        ...(info?.terminal ? { terminal: info.terminal } : {}),
       };
     }
     return {

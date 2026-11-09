@@ -625,7 +625,11 @@ export function fixedSeed(
   return {
     installId,
     async streams() {
-      return Object.keys(rows).map((stream) => ({ stream, ...SHAPE }));
+      return Object.keys(rows).map((stream) => ({
+        stream,
+        upload: `upload-${stream}`,
+        ...SHAPE,
+      }));
     },
     async *records(_connector, stream) {
       for (const row of rows[stream] ?? []) yield row;

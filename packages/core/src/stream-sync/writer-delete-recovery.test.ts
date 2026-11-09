@@ -76,9 +76,9 @@ it("P6 a delete by another device drops only seed records (mutant: keep seed wit
   await r.publish();
   await r.sync();
   expect((await read(r)).ids).toEqual(["live"]);
-  expect((await r.writer.seedStatus(CONNECTOR)).receipts).toEqual({
-    items: "skipped",
-  });
+  expect((await r.writer.seedStatus(CONNECTOR)).skipped).toEqual([
+    { stream: "items", upload: "upload-1" },
+  ]);
 });
 it("discard clears checkpoint and restarts full (mutants: no checkpoint clear; no restart callback)", async () => {
   const r = new Rig();

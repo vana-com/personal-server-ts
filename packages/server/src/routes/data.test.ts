@@ -2469,6 +2469,43 @@ describe("DELETE /v1/data/:scope", () => {
     expect(res.status).toBe(409);
   });
 
+  it("refuses a data-set DELETE with the update-required 426 once the account is switched, and deletes nothing", async () => {
+    const app = createApp({ accountMode: { read: () => "switched" } });
+    await ingestData("instagram.profile", { version: 1 }, app);
+    const res = await deleteWithAuth(app, "instagram.profile");
+    expect(res.status).toBe(426);
+    expect(await res.json()).toMatchObject({
+      errorCode: "update_required",
+      error: { code: 426, errorCode: "update_required" },
+    });
+    expect(indexManager.countByScope("instagram.profile")).toBe(1);
+  });
+
+  it("refuses a switched account's data-set DELETE even from a client that declares stream sync", async () => {
+    const app = createApp({ accountMode: { read: () => "switched" } });
+    await ingestData("instagram.profile", { version: 1 }, app);
+    const auth = await buildWeb3SignedHeader({
+      wallet: deleteOwnerWallet,
+      aud: SERVER_ORIGIN,
+      method: "DELETE",
+      uri: "/instagram.profile",
+    });
+    const res = await app.request("/instagram.profile", {
+      method: "DELETE",
+      headers: { authorization: auth, "vana-stream-sync-client": "1" },
+    });
+    expect(res.status).toBe(426);
+    expect(indexManager.countByScope("instagram.profile")).toBe(1);
+  });
+
+  it("deletes a data set as before while the account is not switched", async () => {
+    const app = createApp({ accountMode: { read: () => "unswitched" } });
+    await ingestData("instagram.profile", { version: 1 }, app);
+    const res = await deleteWithAuth(app, "instagram.profile");
+    expect(res.status).toBe(200);
+    expect(indexManager.countByScope("instagram.profile")).toBe(0);
+  });
+
   it("returns 502 DELETE_TOMBSTONE_FAILED and keeps local data when the gateway tombstone fails", async () => {
     const accessLogWriter = createMockAccessLogWriter();
     const app = createApp({

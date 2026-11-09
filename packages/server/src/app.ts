@@ -5,6 +5,7 @@ import {
 } from "./routes/stream-sync-seed.js";
 import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
 import { streamSyncReadStatusRoutes } from "./routes/stream-sync-read-status.js";
+import { ownerConnectorsRoutes } from "./routes/owner-connectors.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -26,6 +27,8 @@ import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import type {
+  ConnectionDeletePort,
+  StorageModeRead,
   PersonalServerReadFulfillmentReporter,
   StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -164,6 +167,14 @@ export interface AppDeps {
   streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
   /** Run intake (V2 §2); absent when stream sync writing is off. */
   streamSyncIntake?: StreamSyncIntake;
+  /** The stream-sync writer's connection delete (`DELETE /v1/owner/connectors/:id`). */
+  streamSyncConnectionDelete?: ConnectionDeletePort | null;
+  /**
+   * The account's storage mode (`AccountStorageMode`). Absent means unknown:
+   * the connector delete answers 503 `ACCOUNT_MODE_UNKNOWN`, never a guess from
+   * the config. A host that calls the route passes its one instance.
+   */
+  accountStorageMode?: StorageModeRead;
   /**
    * False once the host is shutting down: stream-sync requests then answer
    * 503 before they start a file operation, so the home can close and drain.
@@ -329,6 +340,9 @@ function streamSyncClosing(): ProtocolError {
 
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
+  const storageMode: StorageModeRead = deps.accountStorageMode ?? {
+    read: () => "unknown",
+  };
 
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
   // derivative question registration), and one replay guard for the proofs
@@ -539,6 +553,26 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   app.route(
+    "/v1/owner/connectors",
+    ownerConnectorsRoutes({
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      connectionDelete: deps.streamSyncConnectionDelete ?? null,
+      mode: storageMode,
+      // Checked by the route after owner authorization.
+      assertAdmitting: () => {
+        if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
+          throw streamSyncClosing();
+        }
+      },
+    }),
+  );
+
+  app.route(
     "/v1/stream-sync/seed",
     streamSyncSeedRoutes({
       serverOrigin: deps.serverOrigin,
@@ -607,6 +641,7 @@ export function createApp(deps: AppDeps): Hono {
       legacyWritesRefused: () =>
         deps.config?.streamSync.write === true &&
         deps.config.streamSync.refuseLegacyWrites === true,
+      accountMode: storageMode,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,

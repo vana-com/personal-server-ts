@@ -70,7 +70,11 @@ function retained(installId: string, rows: Record<string, readonly Row[]>) {
     installId,
     async streams(connector) {
       return connector === C
-        ? Object.keys(rows).map((stream) => ({ stream, ...SHAPE }))
+        ? Object.keys(rows).map((stream) => ({
+            stream,
+            upload: `upload-${stream}`,
+            ...SHAPE,
+          }))
         : [];
     },
     async *records(connector, stream) {
@@ -396,9 +400,9 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     expect((await f.reader().read("s"))?.ids).toEqual(["fresh"]);
     expect((await f.reader().read("s"))?.head.generation).toBe(2);
     const restarted = desktop.open();
-    expect((await restarted.status()).receipts[receipt("desktop", "s")]).toBe(
-      "skipped",
-    );
+    expect((await restarted.seedStatus(C)).skipped).toEqual([
+      { stream: "s", upload: "upload-s" },
+    ]);
     await collect(
       restarted,
       "generation-two-again",
@@ -408,9 +412,9 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     await restarted.publishPending();
     expect((await f.reader().read("s"))?.ids).toEqual(["fresh", "later"]);
     expect(seed.reads).toEqual([]);
-    expect(
-      (await desktop.open().status()).receipts[receipt("desktop", "s")],
-    ).toBe("skipped");
+    expect((await desktop.open().seedStatus(C)).skipped).toEqual([
+      { stream: "s", upload: "upload-s" },
+    ]);
   });
 
   it("e: foreign rows stay isolated and foreign-install receipts cannot suppress own seed", async () => {
@@ -427,7 +431,9 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
       const ownId = await own.installId();
       expect(await foreign.installId()).not.toBe(ownId);
       const f = await fixture();
-      const desktop = f.device(own.source(ownId, async () => ({}))).writer;
+      const desktop = f.device(
+        own.source(ownId, async () => ({ receipts: {}, skipped: [] })),
+      ).writer;
       await collect(desktop, "own-only", {});
       await desktop.publishPending();
       expect((await f.reader().read("s"))?.ids).toEqual(["own"]);
@@ -492,8 +498,7 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
     const desktop = f.device(
       after.source(
         installId,
-        async (connector) =>
-          (await desktop.writer.seedStatus(connector)).receipts,
+        async (connector) => await desktop.writer.seedStatus(connector),
       ),
       homeFiles,
     );
@@ -522,7 +527,9 @@ describe("U2 retained Desktop seed scenarios (no network)", () => {
       const staging = createSeedStaging(stagingFiles);
       await staging.installId();
       const source = staging.source(installId, async (connector) =>
-        writer ? (await writer.seedStatus(connector)).receipts : {},
+        writer
+          ? await writer.seedStatus(connector)
+          : { receipts: {}, skipped: [] },
       );
       const desktop = f.device(source, homeFiles);
       writer = desktop.open(source, (point) => {

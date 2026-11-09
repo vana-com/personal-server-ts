@@ -133,14 +133,16 @@ import {
   createWriterOverlaySource,
   createStreamSyncIntake,
   type StreamSyncIntake,
+  type StreamSyncBlobs,
+  type StreamSyncRegistry,
   createGatewayStreamSyncRegistry,
   manifestArtifactResolver,
-  manifestStreamLister,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
   streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openFsStreamSyncHome } from "./stream-sync/fs-home.js";
+import { eraseConnectorLeftovers } from "./stream-sync/erase-connector-leftovers.js";
 import {
   createSeedStaging,
   type SeedStaging,
@@ -253,6 +255,26 @@ export interface CreateServerOptions {
   mcpGrantTtlSeconds?: number;
   profile?: "standard" | "enclave";
   serverAccount?: ServerAccount;
+  /**
+   * Stream names a connection delete fences for a connector, beside the
+   * streams of the manifests this server retained. A host that no longer
+   * verifies a connector (uninstalled, manifest not retained) names its
+   * streams here; without it such a connector's delete refuses
+   * (CONNECTOR_NOT_VERIFIED). Read at delete time.
+   */
+  declaredStreams?: (connector: string) => readonly string[];
+  /**
+   * The stream-sync registry. Default: the gateway client at `gateway.url`. A
+   * test with no gateway passes its own (for example
+   * `createMemoryStreamSyncRegistry()`).
+   */
+  streamSyncRegistry?: StreamSyncRegistry;
+  /**
+   * The stream-sync blob store. Default: the storage service at `gateway.url`.
+   * A test with no storage service passes its own (for example
+   * `createMemoryStreamSyncBlobs()`).
+   */
+  streamSyncBlobs?: StreamSyncBlobs;
   /**
    * Rotate the replica writer identity before this boot writes anything
    * (host contract §3.2). A host sets it when this database may be a copy:
@@ -921,25 +943,38 @@ export async function createServer(
           await seedStaging.installId(),
           async (connector) =>
             writerForSeed
-              ? (await writerForSeed.seedStatus(connector)).receipts
-              : {},
+              ? await writerForSeed.seedStatus(connector)
+              : { receipts: {}, skipped: [] },
         );
         streamSyncWriter = new StreamSyncWriter({
           ownerAddress: serverOwner,
-          registry: createGatewayStreamSyncRegistry({
-            gatewayUrl: config.gateway.url,
-            ownerAddress: serverOwner,
-          }),
-          blobs: createStorageStreamSyncBlobs(storageAdapter),
+          registry:
+            options?.streamSyncRegistry ??
+            createGatewayStreamSyncRegistry({
+              gatewayUrl: config.gateway.url,
+              ownerAddress: serverOwner,
+            }),
+          blobs:
+            options?.streamSyncBlobs ??
+            createStorageStreamSyncBlobs(storageAdapter),
           home: streamSyncHome.home,
           keys: createStreamSyncKeyPorts(masterKeySignature),
           signer: serverSigner,
           seed: seedSource,
-          // Read at delete time: the pinned manifests are verified by then.
-          // Empty for a connector with no pinned manifest: the delete of a
-          // connector that has registry rows then refuses (CONNECTOR_NOT_VERIFIED).
-          declaredStreams: (connector) =>
-            manifestStreamLister(pdppAuth?.retainedManifests ?? [])(connector),
+          // The writer unions these with the retained manifests below, read at
+          // delete time. Empty for a connector with neither: the delete of a
+          // connector that has registry rows then refuses
+          // (CONNECTOR_NOT_VERIFIED).
+          declaredStreams: options?.declaredStreams ?? (() => []),
+          retainedManifests: () => pdppAuth?.retainedManifests ?? [],
+          // A connection delete also erases this device's legacy leftovers of
+          // the connector: its scope files and its pdpp_records rows. Read
+          // when the delete runs, after this block has set `pdppConnections`.
+          eraseLegacy: (connector) =>
+            eraseConnectorLeftovers(connector, {
+              storage: rawDataStorage,
+              pdpp: pdppConnections,
+            }),
         });
         writerForSeed = streamSyncWriter;
         streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
@@ -1359,6 +1394,8 @@ export async function createServer(
     syncManager,
     streamSyncSeed,
     streamSyncIntake,
+    streamSyncConnectionDelete:
+      streamSyncWriter && !isEnclave ? streamSyncWriter : null,
     // Shutdown stops stream-sync requests first; the home then drains.
     streamSyncAdmitting: () => !backgroundClosed,
     serverSigner,

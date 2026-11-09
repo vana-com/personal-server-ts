@@ -9,6 +9,7 @@ import {
   type StreamSyncReadPort,
   refuseLegacyWrite,
   type LegacyWriteSwitch,
+  type StorageModeRead,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -155,6 +156,8 @@ export interface DataRouteDeps {
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
   /** The account's stream-sync switch; true refuses undeclared legacy writes. */
   legacyWritesRefused?: LegacyWriteSwitch;
+  /** The account's storage mode: a switched account refuses a data-set DELETE. */
+  accountMode?: StorageModeRead;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
@@ -421,6 +424,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       {
         additions: deps.additions,
         legacyWritesRefused: deps.legacyWritesRefused,
+        accountMode: deps.accountMode,
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
         streamSyncRead: deps.streamSyncRead,

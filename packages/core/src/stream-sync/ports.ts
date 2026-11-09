@@ -140,6 +140,12 @@ export interface StreamSyncSeedSource {
   streams(connector: string): Promise<
     readonly {
       readonly stream: string;
+      /**
+       * Identity of the staged upload this stream comes from. It changes when
+       * the host stages a new upload for the stream, so a delete can skip the
+       * upload it saw and still merge a later one.
+       */
+      readonly upload: string;
       readonly primaryKey: readonly string[];
       readonly profile: {
         readonly key: string | null;

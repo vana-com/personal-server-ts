@@ -278,9 +278,9 @@ it("a seed with no registry row does not return after a reconnect (mutant: SEED_
   await r.collect({ ...spec("again"), userConnect: true });
   await r.publish();
   expect(await r.registeredHead("seed")).toBeNull();
-  expect((await r.writer.seedStatus(CONNECTOR)).receipts).toEqual({
-    seed: "skipped",
-  });
+  expect((await r.writer.seedStatus(CONNECTOR)).skipped).toEqual([
+    { stream: "seed", upload: "upload-1" },
+  ]);
 });
 
 it("a head that lands under the old generation after the listing is not served after a reconnect", async () => {
@@ -451,14 +451,16 @@ it("a writer built without declaredStreams is refused, so a host cannot forget t
   ).not.toThrow();
 });
 
-it("refuses a connector with rows and no declared names, and writes nothing (mutant: EMPTY_DECLARED_ACCEPTED)", async () => {
+it("refuses a pinned connector with no stream rows and no declared names, and writes nothing (mutant: EMPTY_DECLARED_ACCEPTED)", async () => {
   // The host verified no manifest for this connector, so it cannot name the
-  // streams a delete must fence. Deleting anyway would leave a rowless stream
-  // open to an old record after a reconnect.
+  // streams a delete must fence. With no stream row either, the pin alone
+  // names nothing: deleting anyway would leave a rowless stream open to an old
+  // record after a reconnect.
   const r = new Rig(undefined, CONNECTOR, []);
   await r.open();
-  await r.collect(spec("base"));
+  await r.collect({ ...spec("base"), otherDevice: true });
   await r.publish();
+  r.gateway.listStreamRows = async () => [];
   const posts = r.gateway.log.length;
   await expect(r.writer.deleteConnection(CONNECTOR)).rejects.toBeInstanceOf(
     ConnectorNotVerifiedError,

@@ -27,6 +27,9 @@ import {
   type DeviceSessionStore,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  handleOwnerConnectorDelete,
+  type ConnectionDeletePort,
+  type StorageModeRead,
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
@@ -145,6 +148,16 @@ export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
 }
 
 export interface PsLiteRuntimeOptions {
+  /**
+   * The stream-sync writer's connection delete. Absent = `DELETE
+   * /v1/owner/connectors/:id` answers 503, as the Node server does unwired.
+   */
+  streamSyncConnectionDelete?: ConnectionDeletePort | null;
+  /**
+   * The account's storage mode (`AccountStorageMode`). Absent means unknown:
+   * the connector delete answers 503 `ACCOUNT_MODE_UNKNOWN`.
+   */
+  accountStorageMode?: StorageModeRead;
   storage: PsLiteStorageAdapter | DataStoragePort;
   auth?: PsLiteAuthAdapter;
   active?: boolean;
@@ -1191,6 +1204,33 @@ export function createPsLiteRuntime(
           return unavailableResponse();
         }
 
+        const connectorPath = /^\/v1\/owner\/connectors\/([^/]+)$/.exec(
+          url.pathname,
+        );
+        if (connectorPath) {
+          if (request.method !== "DELETE") {
+            // Owner first: a caller who is not the owner learns nothing of the route.
+            await auth.authorizeOwner(request);
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          }
+          let connectorId: string | null;
+          try {
+            connectorId = decodeURIComponent(connectorPath[1]!);
+          } catch {
+            // A malformed percent-escape is a bad id (400 after authorization).
+            connectorId = null;
+          }
+          return handleOwnerConnectorDelete(request, connectorId, {
+            authorizeOwner: (req) => auth.authorizeOwner(req),
+            mode: options.accountStorageMode ?? { read: () => "unknown" },
+            connectionDelete: options.streamSyncConnectionDelete,
+          });
+        }
+
         if (url.pathname === "/v1/replication/sync") {
           if (request.method !== "POST")
             return errorResponse(
@@ -1276,6 +1316,7 @@ export function createPsLiteRuntime(
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
               streamSyncRead: options.streamSyncRead,
+              accountMode: options.accountStorageMode,
               scopeUploads,
               now,
               createLogId,

@@ -127,7 +127,7 @@ describe("stream-sync seed route", () => {
     let late: StreamSyncWriter | null = null;
     writer = await env.writer(`desktop-${root.slice(-6)}`, {
       seed: staging.source(await staging.installId(), async (c) =>
-        late ? (await late.seedStatus(c)).receipts : {},
+        late ? await late.seedStatus(c) : { receipts: {}, skipped: [] },
       ),
     });
     late = writer;
@@ -270,7 +270,10 @@ describe("stream-sync seed route", () => {
       streams: { s: { state: "staged", records: 2, invalid: 0 } },
     });
     const rowsRead = [];
-    const source = staging.source("x", async () => ({}));
+    const source = staging.source("x", async () => ({
+      receipts: {},
+      skipped: [],
+    }));
     expect(await source.streams("c")).toHaveLength(1);
     for await (const row of source.records("c", "s")) rowsRead.push(row);
     expect(rowsRead).toEqual([{ id: "a" }, { id: "b" }]);
