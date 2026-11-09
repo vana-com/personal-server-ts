@@ -852,26 +852,40 @@ export function createMcpDataReadClient(
         // blocks are paged from the body it served, so a view never pages
         // legacy bytes. Cursors are not pinned to a version: a cursor from an
         // older version fails validation here instead of reading history.
-        const read = await readWholeScope({
-          scope,
-          grantId,
-          payment,
-          read: {},
-        });
-        const built = await buildDataBlocksAsync({
-          scope,
-          collectedAt: read.collectedAt,
-          content: read.body,
-        });
+        const readPage = async (page: WholeScopeRead) =>
+          readBuiltScopeBlocks(
+            await buildDataBlocksAsync({
+              scope,
+              collectedAt: page.collectedAt,
+              content: page.body,
+            }),
+            {
+              cursor,
+              maxBytes: maxBytes ?? 16_384,
+              ...(blockIds?.length ? { blockIds } : {}),
+              cursorView: page.fromStreamView
+                ? STREAM_VIEW_CURSOR_VIEW
+                : undefined,
+            },
+          );
         try {
-          const result = await readBuiltScopeBlocks(built, {
-            cursor,
-            maxBytes: maxBytes ?? 16_384,
-            ...(blockIds?.length ? { blockIds } : {}),
-            cursorView: read.fromStreamView
-              ? STREAM_VIEW_CURSOR_VIEW
-              : undefined,
+          // A free, unlogged read validates the requested page first, so a
+          // refused page (a malformed or stale cursor) is never charged or
+          // logged. The paid read then serves it.
+          await readPage(
+            await readWholeScope({
+              scope,
+              grantId,
+              read: { metadataOnly: true, logAccess: false },
+            }),
+          );
+          const read = await readWholeScope({
+            scope,
+            grantId,
+            payment,
+            read: {},
           });
+          const result = await readPage(read);
           // One page of a scope completes it only when it is the uncursored,
           // unaddressed read that returned no further page. Each page is
           // charged where the handler charges it; only the completing read is

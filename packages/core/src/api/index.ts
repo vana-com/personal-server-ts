@@ -2902,7 +2902,11 @@ export async function handlePersonalServerDataRequest(
         const result = await readDataContract({
           storage: deps.storage,
           scopeParam: scopeResult.scope,
-          fileId: fileIdParam,
+          // An in-process read names the version it selected above, so the
+          // body served is the version the payment and fulfilment name.
+          fileId: inProcess
+            ? (fileIdParam ?? selectedEntry?.fileId ?? undefined)
+            : fileIdParam,
           at: atParam,
           ...(view === "stored" ? { view } : {}),
         });
@@ -2919,12 +2923,26 @@ export async function handlePersonalServerDataRequest(
         servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
       }
 
-      // Every refusal above has run; only a read that will be served pays.
-      await settle();
-
       const servedEnvelope = isOwnerView(authResult)
         ? envelope
         : redactEnvelopeForGrantee(envelope);
+      // An in-process raw read is refused, or decoded, before it pays or logs.
+      // HTTP keeps its order: the same checks run after the access log.
+      let rawBinary: ReturnType<typeof decodeBinaryEnvelope> | undefined;
+      if (inProcess && wantsRawContent) {
+        if (!isBinaryEnvelope(servedEnvelope)) {
+          return jsonResponse(
+            {
+              error: "NOT_BINARY_SCOPE",
+              message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
+            },
+            { status: 400, headers },
+          );
+        }
+        rawBinary = decodeBinaryEnvelope(servedEnvelope);
+      }
+      // Every refusal above has run; only a read that will be served pays.
+      await settle();
 
       const logId = deps.createLogId?.() ?? crypto.randomUUID();
       const timestamp = (deps.now ?? (() => new Date()))().toISOString();
@@ -2993,7 +3011,7 @@ export async function handlePersonalServerDataRequest(
             { status: 400, headers },
           );
         }
-        const decoded = decodeBinaryEnvelope(servedEnvelope);
+        const decoded = rawBinary ?? decodeBinaryEnvelope(servedEnvelope);
         headers["Content-Type"] = decoded.mimeType;
         headers["Content-Length"] = String(decoded.bytes.length);
         if (decoded.filename) {

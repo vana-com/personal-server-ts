@@ -71,6 +71,10 @@ interface HarnessOptions {
   legacy?: boolean;
   /** Tombstone the stream connector, so its name is deleted. */
   deleteStream?: boolean;
+  /** Scope the legacy file is stored under. Defaults to SCOPE. */
+  legacyScope?: string;
+  /** Items in the legacy file. Defaults to RECORDS. */
+  legacyItems?: unknown[];
 }
 
 async function harness(options: HarnessOptions = {}) {
@@ -114,16 +118,35 @@ async function harness(options: HarnessOptions = {}) {
       (await buildDataBlocksAsync({ scope, collectedAt, content: envelope }))
         .manifest,
   });
-  if (options.legacy ?? !options.stream) {
-    const written = await storage.writeEnvelope(envelope as never);
+  /** Adds a legacy version. The newest insert is the latest version. */
+  async function writeLegacyVersion(version: {
+    fileId: string;
+    scope: string;
+    collectedAt: string;
+    items: unknown[];
+  }) {
+    const written = await storage.writeEnvelope({
+      version: "1.0",
+      scope: version.scope,
+      collectedAt: version.collectedAt,
+      data: { items: version.items },
+    } as never);
     storage.insertEntry({
-      fileId: "file-1",
+      fileId: version.fileId,
       path: written.path,
-      scope: SCOPE,
-      collectedAt: COLLECTED_AT,
+      scope: version.scope,
+      collectedAt: version.collectedAt,
       sizeBytes: written.sizeBytes,
       dataPointId: null,
     } as never);
+  }
+  if (options.legacy ?? !options.stream) {
+    await writeLegacyVersion({
+      fileId: "file-1",
+      scope: options.legacyScope ?? SCOPE,
+      collectedAt: COLLECTED_AT,
+      items: options.legacyItems ?? RECORDS,
+    });
   }
 
   // Pass-through when no stream is wired: the scope has no stream view, so
@@ -240,6 +263,7 @@ async function harness(options: HarnessOptions = {}) {
   return {
     client,
     deps,
+    writeLegacyVersion,
     paymentFetch,
     accessLogWrite,
     readFulfillmentReport,
@@ -384,8 +408,15 @@ describe("mcp/read-client charges on a stream view", () => {
     });
   });
 
-  it("serves the view, not the legacy file, when both exist, under one settlement", async () => {
-    const h = await harness({ stream: true, legacy: true });
+  it("serves the view, not the legacy file, when both exist under the same scope, under one settlement", async () => {
+    // A stale legacy file under the stream's own name: the view must win, and
+    // the paid read must not pick or charge that file.
+    const h = await harness({
+      stream: true,
+      legacy: true,
+      legacyScope: STREAM_SCOPE,
+      legacyItems: [{ id: "stale-0", text: "stale legacy record" }],
+    });
     const page = await h.client.readScopeBlocks({
       scope: STREAM_SCOPE,
       grantId: GRANT_ID,
@@ -393,6 +424,8 @@ describe("mcp/read-client charges on a stream view", () => {
       tool: "read_scope",
     });
 
+    expect(JSON.stringify(page)).toContain("record 0 with a few words");
+    expect(JSON.stringify(page)).not.toContain("stale legacy record");
     expect(page.nextCursor).toBeUndefined();
     expect(h.paymentFetch).toHaveBeenCalledTimes(1);
     expect(h.accessLogWrite).toHaveBeenCalledTimes(1);
@@ -527,5 +560,117 @@ describe("HTTP reads ignore in-process markers", () => {
     expect(h.readFulfillmentReport.mock.calls[0]?.[0]).toMatchObject({
       source: "api",
     });
+  });
+});
+
+describe("mcp/read-client refusals before any charge or log", () => {
+  it("charges and serves one legacy version when the latest changes after the paid read selects it", async () => {
+    const h = await harness();
+    const realAuth = h.deps.auth;
+    let raced = false;
+    // Between the paid read's grant check and its body read, a newer version
+    // lands. The paid read must still charge, log and serve the version it
+    // selected.
+    h.deps.auth = {
+      ...realAuth,
+      authorizeBuilderRead: async (input: {
+        request: Request;
+        metadataOnly?: boolean;
+      }) => {
+        const result = await realAuth.authorizeBuilderRead(input as never);
+        if (
+          !raced &&
+          input.metadataOnly &&
+          input.request.headers.get("x-payment")
+        ) {
+          raced = true;
+          await h.writeLegacyVersion({
+            fileId: "file-2",
+            scope: SCOPE,
+            collectedAt: "2026-06-06T00:00:00Z",
+            items: [{ id: "newer-0", text: "newer version record" }],
+          });
+        }
+        return result;
+      },
+    } as never;
+
+    const page = await h.client.readScopeBlocks({
+      scope: SCOPE,
+      grantId: GRANT_ID,
+      payment: await h.proof(),
+      tool: "read_scope",
+    });
+
+    expect(raced).toBe(true);
+    expect(JSON.stringify(page)).not.toContain("newer version record");
+    expect(h.paymentFetch).toHaveBeenCalledTimes(1);
+    expect(h.readFulfillmentReport.mock.calls[0]?.[0]).toMatchObject({
+      fileId: "file-1",
+      source: "mcp",
+    });
+  });
+
+  it("refuses a malformed cursor before any charge or log", async () => {
+    const h = await harness();
+    const read = h.client.readScopeBlocks({
+      scope: SCOPE,
+      grantId: GRANT_ID,
+      cursor: "not-a-cursor",
+      payment: await h.proof(),
+      tool: "read_scope",
+    });
+
+    await expect(read).rejects.toMatchObject({ status: 400 });
+    expect(h.paymentFetch).not.toHaveBeenCalled();
+    expect(h.accessLogWrite).not.toHaveBeenCalled();
+    expect(h.readFulfillmentReport).not.toHaveBeenCalled();
+  });
+
+  it("refuses a cursor from an older version before any charge or log", async () => {
+    const h = await harness();
+    const first = await h.client.readScopeBlocks({
+      scope: SCOPE,
+      grantId: GRANT_ID,
+      maxBytes: PAGE_BYTES,
+      payment: await h.proof(),
+      tool: "read_scope",
+    });
+    expect(first.nextCursor).toBeDefined();
+    await h.writeLegacyVersion({
+      fileId: "file-2",
+      scope: SCOPE,
+      collectedAt: "2026-06-06T00:00:00Z",
+      items: [{ id: "newer-0", text: "newer version record" }],
+    });
+    h.paymentFetch.mockClear();
+    h.accessLogWrite.mockClear();
+
+    const stale = h.client.readScopeBlocks({
+      scope: SCOPE,
+      grantId: GRANT_ID,
+      cursor: first.nextCursor,
+      maxBytes: PAGE_BYTES,
+      payment: await h.proof(),
+      tool: "read_scope",
+    });
+
+    await expect(stale).rejects.toMatchObject({ status: 400 });
+    expect(h.paymentFetch).not.toHaveBeenCalled();
+    expect(h.accessLogWrite).not.toHaveBeenCalled();
+  });
+
+  it("refuses a paid raw read of a non-binary legacy file before any charge or log", async () => {
+    const h = await harness();
+    const raw = h.client.readRawScopeFile({
+      scope: SCOPE,
+      grantId: GRANT_ID,
+      payment: await h.proof(),
+    });
+
+    await expect(raw).rejects.toMatchObject({ status: 400 });
+    expect(h.paymentFetch).not.toHaveBeenCalled();
+    expect(h.accessLogWrite).not.toHaveBeenCalled();
+    expect(h.readFulfillmentReport).not.toHaveBeenCalled();
   });
 });
