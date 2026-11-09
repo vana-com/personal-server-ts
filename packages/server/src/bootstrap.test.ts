@@ -12,6 +12,7 @@ import { createServer as createHttpServer } from "node:http";
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer } from "./bootstrap.js";
+import { resolvePsLiteOwner } from "../../lite/src/owner-binding.js";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
@@ -477,6 +478,32 @@ describe("createServer", () => {
 
     await ctx.cleanup();
     vi.unstubAllEnvs();
+  });
+
+  it("the Node server and the PS-Lite ownerAddress check agree on one owner for one master-key signature", async () => {
+    const knownSig =
+      "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
+    const config = makeDefaultConfig();
+    const ctx = await createServer(config, {
+      serverDir: tempDir,
+      dataDir: join(tempDir, "data"),
+      ownerSignature: knownSig,
+    });
+
+    const body = await (await ctx.app.request("/health")).json();
+    const nodeOwner = body.owner as `0x${string}`;
+
+    // PS-Lite started with ownerAddress verifies the same signature.
+    const liteOwner = await resolvePsLiteOwner({
+      ownerAddress: nodeOwner,
+      ownerSignature: knownSig,
+    });
+    expect(liteOwner).toBe(nodeOwner);
+    expect(nodeOwner.toLowerCase()).toBe(
+      "0x2ac93684679a5bda03c6160def908cdb8d46792f",
+    );
+
+    await ctx.cleanup();
   });
 
   describe("sync manager wiring", () => {

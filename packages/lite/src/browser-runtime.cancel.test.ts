@@ -7,7 +7,7 @@ import http from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
-import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
+import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   ADD_DATA_TYPES,
   createDataFileEnvelope,
@@ -111,9 +111,7 @@ describe("default Lite composition cancels a hung registry write", () => {
 
   it("closes the socket at the deadline and uploads the next entry in the same cycle", async () => {
     const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
-    const ownerSignature = await owner.signMessage({
-      message: buildPersonalServerLiteOwnerBindingMessage(owner.address),
-    });
+    const ownerSignature = await signOwnerMasterKey(owner);
     const stub = await startStub("scope.hung");
     stop = stub.stop;
     const storage = createMemoryPsLiteStorage();

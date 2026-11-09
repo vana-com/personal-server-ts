@@ -4,7 +4,9 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main, develop]
+    # feat/stream-sync collects stacked PRs before it merges to main; without
+    # this, those PRs merged with no test run.
+    branches: [main, develop, feat/stream-sync]
 
 jobs:
   lint:

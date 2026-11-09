@@ -32,11 +32,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { privateKeyToAccount } from "viem/accounts";
-import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
+import { canonicalJson } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
-  canonicalJson,
-  streamMasterKeyFromSignature,
-} from "@opendatalabs/personal-server-ts-stream-sync";
+  signOwnerMasterKey,
+  streamMasterKey,
+} from "@opendatalabs/personal-server-ts-core/keys";
 import {
   StreamSyncWriter,
   createStreamSyncIntake,
@@ -84,12 +84,12 @@ import {
 } from "./oracle.test-utils.js";
 
 /**
- * The owner's signature over the owner-binding message: what every real host
- * (PS-Lite checks it) derives the stream master key from.
+ * The owner master-key signature: what every real host (Node and PS-Lite) derives
+ * the stream master key from.
  */
-const OWNER_SIGNATURE = await privateKeyToAccount(OWNER_KEY).signMessage({
-  message: buildPersonalServerLiteOwnerBindingMessage(OWNER),
-});
+const OWNER_SIGNATURE = await signOwnerMasterKey(
+  privateKeyToAccount(OWNER_KEY),
+);
 
 // A signed pin id such as `github-browser`: the key holds a hyphen, which the
 // SDK scope rule rejects as a category.
@@ -341,9 +341,7 @@ async function makeHost(input: {
     const reader = await StreamSyncReadService.open({
       files: await createFsStreamSyncReadFiles(join(input.root, "full-read")),
       blobs,
-      keys: await createStreamSyncReadKeys(
-        streamMasterKeyFromSignature(OWNER_SIGNATURE),
-      ),
+      keys: await createStreamSyncReadKeys(streamMasterKey(OWNER_SIGNATURE)),
       logger: silent,
     });
     return {
