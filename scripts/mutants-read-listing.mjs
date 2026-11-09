@@ -19,6 +19,8 @@ import { join } from "node:path";
 const API = "packages/core/src/api/index.ts";
 const OVL = "packages/core/src/stream-sync/writer-overlay.ts";
 const SVC = "packages/core/src/stream-sync-read/service.ts";
+const MIR = "packages/core/src/stream-sync-read/mirror.ts";
+const VST = "packages/core/src/stream-sync-read/view-store.ts";
 const T_API = "packages/core/src/api/stream-sync-read-listing.test.ts";
 const T_RS = "packages/core/src/stream-sync-read/readable-scopes.test.ts";
 const TESTS = [T_API, T_RS];
@@ -28,6 +30,8 @@ const SW = "switched listing and history > ";
 const BR = "readableScopes against the body read > ";
 const WB = "readableScopes work is bounded by the grant > ";
 const BUILD = "readableScopes against what a body read can build > ";
+const KEY = "readableScopes cache key covers every stream of the connector > ";
+const WRITES = "readableScopes cache misses after every write under the connector > ";
 const SURV = "readableScopes survives one connector's local failure > ";
 
 // [name, file, from, to, aimed test full name]
@@ -49,7 +53,12 @@ const MUTANTS = [
   ["RESOLVE_BEFORE_GRANT_AND_PAGE", SVC, "      if (input.isCovered && !input.isCovered(scope)) continue;\n      let newest: number | null;\n      try {\n        const found = await this.readable(scope, input.isOwnerView);\n        if (!found) continue;", "      let newest: number | null;\n      try {\n        const found = await this.readable(scope, input.isOwnerView);\n        if (!found) continue;\n        if (input.isCovered && !input.isCovered(scope)) continue;", `${WB}checks only the covered scope among 1000 candidates`],
   ["ABORT_LIST_ON_ONE_FAILURE", SVC, "      } catch (error) {\n        this.skipped(scope, error);\n        continue;\n      }", "      } catch (error) {\n        throw error;\n      }", `${WB}skips a covered broken scope, logs it, and still lists the others`],
   ["BODY_BUILT_FOR_LISTING", SVC, "        const found = await this.readable(scope, input.isOwnerView);", "        const decision = await this.resolve({ scope, connection: null, cursor: null, legacyFile: false, isOwnerView: input.isOwnerView });\n        if (\"body\" in decision) await decision.body.cancel();\n        const found = await this.readable(scope, input.isOwnerView);", `${BR}builds no view or body while deciding`],
-  ["PROJECTABLE_KEY_OMITS_CONTROL", SVC, "      this.mirror.revision(),\n      targets.map((t) => [", "      0,\n      targets.map((t) => [", `${BUILD}a control change that imports nothing changes the listing`],
+  ["KEY_OMITS_NONTARGET_IMPORT", SVC, "        this.revisions.of(t.connector),", "        t.streams.map((s) => this.views.revision(t.connector, s)),", `${KEY}an import into a non-target stream flips the selected namespace and the alias leaves the listing`],
+  ["KEY_OMITS_IMPORT", VST, "    this.revisions.bump(key.connector);", "    void this.revisions;", `${WRITES}misses after an import (ViewStore.commit)`],
+  ["KEY_OMITS_MIRROR_ROW", MIR, "      if (replaced) revised.add(parsed.connector);", '      if (replaced && parsed.kind === "control") revised.add(parsed.connector);', `${WRITES}misses after a stream row (RegistryMirror.observePage)`],
+  ["KEY_OMITS_CONTROL", MIR, "      if (replaced) revised.add(parsed.connector);", '      if (replaced && parsed.kind === "stream") revised.add(parsed.connector);', `${WRITES}misses after a control row (RegistryMirror.observePage)`],
+  ["KEY_OMITS_FLOOR", MIR, "      if (floorRaised) revised.add(parsed.connector);", "      if (false) revised.add(parsed.connector);", `${WRITES}misses after a deletion floor (RegistryMirror.observePage)`],
+  ["KEY_OMITS_OVERLAY", SVC, "        snapshots.get(t.connector)?.runs ?? [],", "        [],", `${WRITES}misses after an overlay run (overlay snapshot)`],
   ["PROJECTOR_REFUSAL_NOT_CACHED", SVC, "    this.projectability.set(key, ok);", "    if (ok) this.projectability.set(key, ok);", `${BUILD}a projector refusal is built once across listings with no version change`],
   ["OVERLAY_CONNECTORS_DROP_ALL", SVC, 'this.skipped("overlay connectors", error);', 'this.skipped("overlay connectors", error);\n        this.overlayConnectorsLastGood = [];', `${SURV}keeps the last good overlay connector set when connectors() fails`],
 ];
@@ -185,6 +194,6 @@ for (const [name, file, from, to, aimed] of HARNESS) {
   rows.push([name, caught ? "CAUGHT (import error rejected as a kill)" : `HARNESS-BROKEN (${verdict})`]);
   if (!caught) bad += 1;
 }
-execFileSync("git", ["diff", "--exit-code", "--", API, SVC, OVL], { stdio: "inherit" });
+execFileSync("git", ["diff", "--exit-code", "--", API, SVC, OVL, MIR, VST], { stdio: "inherit" });
 for (const [n, r] of rows) console.log(`${n.padEnd(36)} ${r}`);
 process.exit(bad === 0 ? 0 : 1);

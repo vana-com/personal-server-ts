@@ -40,6 +40,7 @@ import {
   type WithheldContribution,
   type WithheldReason,
 } from "./fold.js";
+import { ConnectorRevisions } from "./connector-revisions.js";
 import { StreamSyncImporter, type ImportIssue } from "./importer.js";
 import {
   NO_OVERLAY,
@@ -493,6 +494,7 @@ export class StreamSyncReadService {
     private readonly mirror: RegistryMirror,
     private readonly views: ViewStore,
     private readonly importer: StreamSyncImporter,
+    private readonly revisions: ConnectorRevisions,
     private changed: Set<string>,
   ) {}
 
@@ -503,11 +505,13 @@ export class StreamSyncReadService {
       options.keys.hashes.keccak256,
       options.keys.keyCheck,
     );
+    const revisions = new ConnectorRevisions();
     const mirror = await RegistryMirror.open(
       options.files,
       (row) => classifyStreamRow(toControlRead(row), hashes) === "tombstoned",
+      revisions,
     );
-    const views = await ViewStore.open(options.files);
+    const views = await ViewStore.open(options.files, revisions);
     await options.files.remove("spool");
     const importer = new StreamSyncImporter({
       mirror,
@@ -541,6 +545,7 @@ export class StreamSyncReadService {
       mirror,
       views,
       importer,
+      revisions,
       new Set(mirror.connectors()),
     );
     await service.forwardDeletes();
@@ -864,9 +869,10 @@ export class StreamSyncReadService {
   /**
    * Whether a legacy-named scope's body can be built at the current versions:
    * the body read's own answer (size budget, projector), kept per version so a
-   * listing does not rebuild it. The key names every input head revision and
-   * every overlay run and stream state the read would use; any import or run
-   * change makes a new key.
+   * listing does not rebuild it. The key is the scope, the owner view, and for
+   * every connector the alias touches: its write revision (every import, row,
+   * control, deletion floor under it) and its overlay runs. Selection reads
+   * all of a connector's streams, so the key does not name streams.
    */
   private async projectable(
     input: ResolveInput,
@@ -876,17 +882,10 @@ export class StreamSyncReadService {
     const key = JSON.stringify([
       input.scope,
       input.isOwnerView,
-      // Control and stream rows the decision reads (connectionViews, eligibility).
-      this.mirror.revision(),
       targets.map((t) => [
         t.connector,
-        t.streams.map((stream) => this.views.revision(t.connector, stream)),
-        (snapshots.get(t.connector)?.runs ?? []).map((run) => [
-          run.runId,
-          run.ns,
-          run.generation,
-          run.streams.map((st) => [st.name, st.contentRevision, st.state]),
-        ]),
+        this.revisions.of(t.connector),
+        snapshots.get(t.connector)?.runs ?? [],
       ]),
     ]);
     const known = this.projectability.get(key);

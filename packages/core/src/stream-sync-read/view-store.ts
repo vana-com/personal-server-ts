@@ -17,6 +17,7 @@ import {
   decodeHead,
   type Head,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { ConnectorRevisions } from "./connector-revisions.js";
 import type { StreamSyncReadFiles } from "./ports.js";
 
 export interface ViewKey {
@@ -113,7 +114,9 @@ export class ViewStore {
   /**
    * Per connector and stream: how many imports changed a current version of
    * it, whatever the namespace. A read records the revisions of the streams it
-   * touches and compares them when it has paired a base with a plan.
+   * touches and compares them when it has paired a base with a plan. Only
+   * these stream-scoped counts serve that basis: an import of a stream the
+   * read does not touch never restarts it.
    */
   private readonly importRevisions = new Map<string, number>();
   /** id → version → lease count. */
@@ -128,10 +131,16 @@ export class ViewStore {
    */
   private readonly locks = new Map<string, Promise<void>>();
 
-  private constructor(private readonly files: StreamSyncReadFiles) {}
+  private constructor(
+    private readonly files: StreamSyncReadFiles,
+    private readonly revisions: ConnectorRevisions,
+  ) {}
 
-  static async open(files: StreamSyncReadFiles): Promise<ViewStore> {
-    const store = new ViewStore(files);
+  static async open(
+    files: StreamSyncReadFiles,
+    revisions: ConnectorRevisions = new ConnectorRevisions(),
+  ): Promise<ViewStore> {
+    const store = new ViewStore(files, revisions);
     for (const path of await files.list("views")) {
       if (!path.endsWith("/current.json")) continue;
       const parts = path.split("/");
@@ -280,6 +289,7 @@ export class ViewStore {
       touched,
       (this.importRevisions.get(touched) ?? 0) + 1,
     );
+    this.revisions.bump(key.connector);
     if (previous && previous.version !== version) {
       let retained = this.retained.get(id);
       if (!retained) this.retained.set(id, (retained = new Map()));

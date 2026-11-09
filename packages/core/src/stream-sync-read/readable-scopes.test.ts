@@ -5,7 +5,12 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import type { Line } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  streamScope,
+  type Line,
+} from "@opendatalabs/personal-server-ts-stream-sync";
+import { deleteMetadataHash } from "../stream-sync/delete-metadata.js";
+import type { MirrorFeedRow } from "./mirror.js";
 import type { FakeRun } from "./service-fixture.js";
 import { ask, Fixture, masterKey } from "./service-fixture.js";
 import { testOwnerKey } from "./testing.js";
@@ -468,4 +473,292 @@ describe("readableScopes against what a body read can build", () => {
     );
     expect(logged).toHaveLength(1);
   });
+});
+
+/** A skills body over the 400-byte budget the tests below set. */
+const bigSkills = (n: number) =>
+  Array.from({ length: n }, (_, i) => ({
+    id: `s${i}`,
+    name: `a skill with a fairly long name number ${i}`,
+    endorsement_count: i,
+  }));
+
+/** Whether a body read serves `scope`; a refused projection counts as not served. */
+async function servable(
+  service: StreamSyncReadService,
+  scope: string,
+  isOwnerView: boolean,
+): Promise<boolean> {
+  try {
+    const decision = await service.resolve(ask(scope, { isOwnerView }));
+    if ("body" in decision) await decision.body.cancel();
+    return decision.kind === "view" || decision.kind === "local_pending";
+  } catch {
+    return false;
+  }
+}
+
+describe("readableScopes cache key covers every stream of the connector", () => {
+  // The listing caches "can this alias be built" per key. The key carries one
+  // write counter per connector, bumped by every write the store makes under
+  // it, so any import, mirror row, control row, deletion floor or overlay run
+  // of the connector misses the cache. Selection reads all of them.
+
+  // KEY_OMITS_IMPORT / reviewer probe (aimed by the mutant runner)
+  it("an import into a non-target stream flips the selected namespace and the alias leaves the listing", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(73)));
+    const large = await f.key.ns("linkedin", "account-1");
+    const small = await f.key.ns("linkedin", "account-2");
+    await f.activate("linkedin", large);
+    await f.activate("linkedin", small);
+    // Large is registered first; small is the newest head, so small serves.
+    await f.publish({
+      connector: "linkedin",
+      ns: large,
+      stream: "skills",
+      generation: 1,
+      records: bigSkills(60),
+      observedAt: T - 1000,
+    });
+    await f.publish({
+      connector: "linkedin",
+      ns: small,
+      stream: "skills",
+      generation: 1,
+      records: [{ id: "s", name: "x", endorsement_count: 1 }],
+      observedAt: T - 1000,
+    });
+    const service = await f.service({ arrayProjectionBudgetBytes: 400 });
+    await f.sync(service);
+    expect(await servable(service, "linkedin.skills", true)).toBe(true);
+    expect(await listed(service, true)).toContain("linkedin.skills");
+
+    // Large's profile is observed first, then imported: the listing between
+    // the two sees no import yet.
+    await f.publish({
+      connector: "linkedin",
+      ns: large,
+      stream: "profile",
+      generation: 1,
+      records: [{ id: "p", headline: "x" }],
+      observedAt: T - 1000,
+    });
+    await service.observe([...f.rows.values()], {
+      fromStart: true,
+      lastPage: true,
+    });
+    expect(await listed(service, true)).toContain("linkedin.skills");
+    await service.importPending();
+
+    // Large is now the selected namespace, and its skills body is too large.
+    expect(await servable(service, "linkedin.skills", true)).toBe(false);
+    expect(await listed(service, true)).not.toContain("linkedin.skills");
+  });
+
+  // REFUSAL_NOT_RECHECKED (aimed by the mutant runner)
+  it("a refusal cached under one selection is re-evaluated after an import changes the selection", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(74)));
+    const large = await f.key.ns("linkedin", "account-1");
+    const small = await f.key.ns("linkedin", "account-2");
+    await f.activate("linkedin", large);
+    await f.activate("linkedin", small);
+    await f.publish({
+      connector: "linkedin",
+      ns: small,
+      stream: "skills",
+      generation: 1,
+      records: [{ id: "s", name: "x", endorsement_count: 1 }],
+      observedAt: T - 1000,
+    });
+    await f.publish({
+      connector: "linkedin",
+      ns: large,
+      stream: "skills",
+      generation: 1,
+      records: bigSkills(60),
+      observedAt: T - 1000,
+    });
+    const service = await f.service({ arrayProjectionBudgetBytes: 400 });
+    await f.sync(service);
+    // Large is newest, so the refusal is what the listing caches.
+    expect(await listed(service, true)).not.toContain("linkedin.skills");
+
+    // Small's profile becomes the newest head once imported.
+    await f.publish({
+      connector: "linkedin",
+      ns: small,
+      stream: "profile",
+      generation: 1,
+      records: [{ id: "p", headline: "x" }],
+      observedAt: T - 1000,
+    });
+    await service.observe([...f.rows.values()], {
+      fromStart: true,
+      lastPage: true,
+    });
+    // The refusal is cached under the selection the observe leaves behind.
+    expect(await listed(service, true)).not.toContain("linkedin.skills");
+    await service.importPending();
+
+    expect(await servable(service, "linkedin.skills", true)).toBe(true);
+    expect(await listed(service, true)).toContain("linkedin.skills");
+  });
+});
+
+describe("readableScopes cache misses after every write under the connector", () => {
+  // The write paths of the read store, from the code:
+  //  - import: ViewStore.commit, reached by importer.importHead via withImport.
+  //  - stream row: RegistryMirror.observePage, a stream row that replaces the kept row.
+  //  - control row: RegistryMirror.observePage, a control row that replaces the kept row.
+  //  - deletion floor: RegistryMirror.observePage, a tombstone that raises the floor.
+  //    (RegistryMirror.recordDelete, the importer-driven floor, is not isolated here.)
+  //  - overlay: the owner's overlay runs for the connector. The overlay is an
+  //    external writer; a listing reads it pinned, so the key carries its runs.
+  type Write = {
+    /** Runs before the cache is warmed. */
+    prepare(
+      f: Fixture,
+      service: StreamSyncReadService,
+      ns: string,
+    ): Promise<void>;
+    /** Runs after the cache is warmed: the one write under test. */
+    write(
+      f: Fixture,
+      service: StreamSyncReadService,
+      ns: string,
+    ): Promise<void>;
+  };
+  const observe = (f: Fixture, service: StreamSyncReadService) =>
+    service.observe([...f.rows.values()], { fromStart: true, lastPage: true });
+  const paths: [string, Write][] = [
+    [
+      "an import (ViewStore.commit)",
+      {
+        prepare: async (f, service, ns) => {
+          await f.publish({
+            connector: "linkedin",
+            ns,
+            stream: "profile",
+            generation: 1,
+            records: [{ id: "p", headline: "v2" }],
+            observedAt: T - 500,
+          });
+          await observe(f, service);
+        },
+        write: async (_f, service) => {
+          await service.importPending();
+        },
+      },
+    ],
+    [
+      "a stream row (RegistryMirror.observePage)",
+      {
+        prepare: async () => {},
+        write: async (f, service, ns) => {
+          await f.publish({
+            connector: "linkedin",
+            ns,
+            stream: "profile",
+            generation: 1,
+            records: [{ id: "p", headline: "v2" }],
+            observedAt: T - 500,
+          });
+          await observe(f, service);
+        },
+      },
+    ],
+    [
+      "a control row (RegistryMirror.observePage)",
+      {
+        prepare: async () => {},
+        write: async (f, service) => {
+          const other = await f.key.ns("linkedin", "account-9");
+          await f.activate("linkedin", other);
+          await observe(f, service);
+        },
+      },
+    ],
+    [
+      "a deletion floor (RegistryMirror.observePage)",
+      {
+        // Version 2 is the kept live row, so a version-1 tombstone cannot replace it.
+        prepare: async (f, service, ns) => {
+          await f.publish({
+            connector: "linkedin",
+            ns,
+            stream: "profile",
+            generation: 1,
+            records: [{ id: "p", headline: "v2" }],
+            observedAt: T - 500,
+          });
+          await observe(f, service);
+        },
+        write: async (f, service, ns) => {
+          // A tombstone older than the kept live row: it raises the floor
+          // without replacing the row.
+          const scope = streamScope("linkedin", ns, "profile");
+          const row: MirrorFeedRow = {
+            scope,
+            dataHash: "00".repeat(32),
+            metadataHash: deleteMetadataHash(scope, 1),
+            expectedVersion: "1",
+            addedAt: new Date(T - 2000).toISOString(),
+            deletedAt: new Date(T - 2000).toISOString(),
+          };
+          await service.observe([row], { fromStart: false, lastPage: false });
+        },
+      },
+    ],
+    [
+      "an overlay run (overlay snapshot)",
+      {
+        prepare: async () => {},
+        write: async (f, _service, ns) => {
+          f.overlay.runs = [overlayRun(ns, ["profile"], "r-overlay")];
+        },
+      },
+    ],
+  ];
+
+  for (const [label, { prepare, write }] of paths) {
+    it(`misses after ${label}`, async () => {
+      const f = new Fixture(await testOwnerKey(masterKey(75)));
+      f.overlay.connector = "linkedin";
+      const ns = await f.key.ns("linkedin", "account-1");
+      await f.activate("linkedin", ns);
+      await f.publish({
+        connector: "linkedin",
+        ns,
+        stream: "skills",
+        generation: 1,
+        records: [{ id: "s", name: "x", endorsement_count: 1 }],
+        observedAt: T - 1000,
+      });
+      await f.publish({
+        connector: "linkedin",
+        ns,
+        stream: "profile",
+        generation: 1,
+        records: [{ id: "p", headline: "v1" }],
+        observedAt: T - 1000,
+      });
+      const service = await f.service({ arrayProjectionBudgetBytes: 400 });
+      await f.sync(service);
+      await prepare(f, service, ns);
+      const resolve = vi.spyOn(service, "resolve");
+      const builds = () =>
+        resolve.mock.calls.filter(
+          ([input]) => input.scope === "linkedin.skills",
+        ).length;
+
+      expect(await listed(service, true)).toContain("linkedin.skills");
+      expect(builds()).toBe(1);
+      expect(await listed(service, true)).toContain("linkedin.skills");
+      expect(builds()).toBe(1);
+
+      await write(f, service, ns);
+      expect(await listed(service, true)).toContain("linkedin.skills");
+      expect(builds()).toBe(2);
+    });
+  }
 });

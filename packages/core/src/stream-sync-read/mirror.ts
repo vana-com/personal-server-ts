@@ -15,6 +15,7 @@ import {
   type ControlRead,
   type ParsedScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { ConnectorRevisions } from "./connector-revisions.js";
 import type { StreamSyncReadFiles } from "./ports.js";
 
 /** One physical registry row as last listed. */
@@ -99,8 +100,6 @@ function replaces(next: MirrorRow, current: MirrorRow | undefined): boolean {
 
 export class RegistryMirror {
   private pending: Promise<void> = Promise.resolve();
-  /** Bumped on every persisted change to rows or deletion floors. */
-  private changes = 0;
 
   private constructor(
     private readonly files: StreamSyncReadFiles,
@@ -109,6 +108,7 @@ export class RegistryMirror {
     private fullListingStarted: boolean,
     private floors: Map<string, number>,
     private readonly isTombstone: TombstoneTest,
+    private readonly revisions: ConnectorRevisions,
   ) {}
 
   /**
@@ -119,6 +119,7 @@ export class RegistryMirror {
   static async open(
     files: StreamSyncReadFiles,
     isTombstone: TombstoneTest = (row) => row.deleted,
+    revisions: ConnectorRevisions = new ConnectorRevisions(),
   ): Promise<RegistryMirror> {
     const bytes = await files.read(PATH);
     if (!bytes) {
@@ -129,6 +130,7 @@ export class RegistryMirror {
         false,
         new Map(),
         isTombstone,
+        revisions,
       );
     }
     const parsed = JSON.parse(decoder.decode(bytes)) as MirrorFile;
@@ -142,6 +144,7 @@ export class RegistryMirror {
       false,
       new Map(Object.entries(parsed.deletionFloors ?? {})),
       isTombstone,
+      revisions,
     );
   }
 
@@ -162,7 +165,8 @@ export class RegistryMirror {
       floors.set(scope, version);
       await this.persist(this.rows, floors, this.listed);
       this.floors = floors;
-      this.changes++;
+      const parsed = parseScope(scope);
+      if (parsed) this.revisions.bump(parsed.connector);
     });
     this.pending = pass.catch(() => undefined);
     await pass;
@@ -179,14 +183,6 @@ export class RegistryMirror {
         ? [{ connector: parsed.connector, stream: parsed.stream, version }]
         : [];
     });
-  }
-
-  /**
-   * Changes every time a control or stream row, or a deletion floor, is
-   * persisted. Derived decisions that read the mirror key on it.
-   */
-  revision(): number {
-    return this.changes;
   }
 
   /** True until one listing from the start of the registry has completed. */
@@ -240,6 +236,8 @@ export class RegistryMirror {
     };
     const fullListingStarted = this.fullListingStarted || page.fromStart;
     const changed = new Set<string>();
+    // Connectors whose rows or floors changed: each gets a revision bump.
+    const revised = new Set<string>();
     for (const feed of rows) {
       const parsed = parseScope(feed.scope);
       if (!parsed) continue;
@@ -254,17 +252,19 @@ export class RegistryMirror {
       const replaced = replaces(row, current);
       if (replaced) nextRows.set(feed.scope, row);
       if (replaced || floorRaised) changed.add(parsed.connector);
+      if (replaced) revised.add(parsed.connector);
+      if (floorRaised) revised.add(parsed.connector);
     }
     const nowListed = !this.listed && fullListingStarted && page.lastPage;
     const listed = this.listed || nowListed;
     if (changed.size > 0 || nowListed) {
       await this.persist(nextRows, nextFloors, listed);
-      this.changes++;
     }
     this.rows = nextRows;
     this.floors = nextFloors;
     this.fullListingStarted = fullListingStarted;
     this.listed = listed;
+    for (const connector of revised) this.revisions.bump(connector);
     return [...changed];
   }
 
