@@ -190,7 +190,7 @@ export interface StreamSyncOverlaySnapshotSource {
    * reach the reader's per-connector counter, or a cached listing answer
    * outlives the state it was decided from.
    */
-  planInputs?(listener: (connector: string) => void): void;
+  planInputs?(listener: (connector: string) => void): () => void;
   /**
    * Every connector that may have an overlay run (a superset is fine: the
    * reader snapshots each). Required: the scope listing names the owner's

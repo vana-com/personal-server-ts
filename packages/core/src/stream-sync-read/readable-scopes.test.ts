@@ -15,6 +15,7 @@ import type { FakeRun } from "./service-fixture.js";
 import { ask, Fixture, masterKey } from "./service-fixture.js";
 import { testOwnerKey } from "./testing.js";
 import type { StreamSyncReadService } from "./service.js";
+import { ConnectorRevisions } from "./connector-revisions.js";
 import { Rig } from "./writer-rig.js";
 
 const T = Date.parse("2026-11-01T00:00:00Z");
@@ -792,10 +793,9 @@ describe("readableScopes cache misses after every write under the connector", ()
     });
   }
 
-  // KEY_OMITS_WRITER_INFLIGHT (aimed by the mutant runner)
-  it("misses after a writer selection change that alters no other input (publish selection)", async () => {
-    // A legacy-bound scope over the budget: the listing decides it by building
-    // the body, so its answer is cached under the connector's counter.
+  // A legacy-bound scope over the budget: the listing decides it by building
+  // the body, so its answer is cached under the connector's counter.
+  const legacyRig = async () => {
     const rig = new Rig(undefined, "linkedin");
     await rig.open({ arrayProjectionBudgetBytes: 400 });
     await rig.collect({
@@ -809,33 +809,117 @@ describe("readableScopes cache misses after every write under the connector", ()
       ],
       full: true,
     });
-    const scope = "linkedin.skills";
     const resolve = vi.spyOn(rig.service, "resolve");
     const builds = () =>
-      resolve.mock.calls.filter(([input]) => input.scope === scope).length;
-    const runsOf = async () => {
-      const snapshot = await rig.overlay.snapshot(rig.connector);
-      const runs = JSON.stringify(snapshot.runs);
-      snapshot.release();
-      return runs;
-    };
+      resolve.mock.calls.filter(([input]) => input.scope === "linkedin.skills")
+        .length;
+    return { rig, builds };
+  };
 
-    expect(await listed(rig.service, true)).toContain(scope);
+  // KEY_OMITS_WRITER_INFLIGHT / NOTIFY_SKIPPED_SELECTION (aimed by the mutant runner)
+  it("misses between a publish reservation and its release (writer selection)", async () => {
+    const rig = new Rig();
+    await rig.open();
+    await rig.collect({
+      runId: "first",
+      key: "id",
+      version: "1.0.0",
+      rows: [{ id: "a" }],
+      full: true,
+    });
+    const bumps = () =>
+      bump.mock.calls.filter(([connector]) => connector === rig.connector)
+        .length;
+    const bump = vi.spyOn(ConnectorRevisions.prototype, "bump");
+    try {
+      const before = bumps();
+      // The first registry read of the pass runs after the run is reserved and
+      // before the pass writes its entry, so only the reservation can have bumped.
+      const inWindow: { bumps?: number } = {};
+      rig.gateway.beforeRead = async () => {
+        rig.gateway.beforeRead = undefined;
+        inWindow.bumps = bumps();
+      };
+      await rig.writer.publishPending();
+      expect(inWindow.bumps).toBeGreaterThan(before);
+    } finally {
+      bump.mockRestore();
+    }
+  });
+
+  // NOTIFY_SKIPPED_WITH_STATE (aimed by the mutant runner)
+  it("misses after a receipt-only change to writer state, with nothing else changed (withState)", async () => {
+    const { rig, builds } = await legacyRig();
+    expect(await listed(rig.service, true)).toContain("linkedin.skills");
     expect(builds()).toBe(1);
-    expect(await listed(rig.service, true)).toContain(scope);
-    expect(builds()).toBe(1);
 
-    // The publish pass reserves the run's stream, then fails before it signs
-    // a request: no outbox state is written, so the overlay runs read the same.
-    const runsBefore = await runsOf();
-    rig.beforeSign = async () => {
-      throw new Error("signing refused");
-    };
-    await rig.writer.publishPending().catch(() => undefined);
-    rig.beforeSign = undefined;
-    expect(await runsOf()).toBe(runsBefore);
-
-    expect(await listed(rig.service, true)).toContain(scope);
+    // The seed receipt write (prepareSeed, and the seed-skip path) goes through withState.
+    await (
+      rig.writer as unknown as {
+        withState(
+          change: (state: { receipts: Record<string, string> }) => void,
+        ): Promise<void>;
+      }
+    ).withState((state) => {
+      state.receipts["install-1|linkedin||skills"] = "skipped";
+    });
+    expect(await listed(rig.service, true)).toContain("linkedin.skills");
     expect(builds()).toBe(2);
+  });
+
+  // NOTIFY_SKIPPED_WRITE_ENTRY (aimed by the mutant runner)
+  it("notifies the connector on every run-entry write", async () => {
+    const rig = new Rig();
+    await rig.open();
+    const seen: string[] = [];
+    rig.writer.onPlanInputs((connector) => seen.push(connector));
+    await rig.collect({
+      runId: "first",
+      key: "id",
+      version: "1.0.0",
+      rows: [{ id: "a" }],
+      full: true,
+    });
+    expect(seen).toContain(rig.connector);
+  });
+
+  // LISTENER_ERROR_PROPAGATES (aimed by the mutant runner)
+  it("a throwing listener does not fail the run or silence the other listeners", async () => {
+    const rig = new Rig();
+    await rig.open();
+    const seen: string[] = [];
+    rig.writer.onPlanInputs(() => {
+      throw new Error("listener broke");
+    });
+    rig.writer.onPlanInputs((connector) => seen.push(connector));
+    await rig.collect({
+      runId: "first",
+      key: "id",
+      version: "1.0.0",
+      rows: [{ id: "a" }],
+      full: true,
+    });
+    expect(seen).toContain(rig.connector);
+    expect(rig.files.paths()).toContain("runs/first/entry.json");
+  });
+
+  // UNSUBSCRIBE_NOT_CALLED (aimed by the mutant runner)
+  it("a closed read service stops receiving plan-input changes", async () => {
+    const rig = new Rig();
+    await rig.open();
+    rig.service.close();
+    const bump = vi.spyOn(ConnectorRevisions.prototype, "bump");
+    try {
+      await rig.collect({
+        runId: "after-close",
+        key: "id",
+        version: "1.0.0",
+        rows: [{ id: "a" }],
+        full: true,
+      });
+      expect(bump).not.toHaveBeenCalled();
+    } finally {
+      bump.mockRestore();
+    }
   });
 });

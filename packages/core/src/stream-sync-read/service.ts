@@ -488,6 +488,7 @@ export class StreamSyncReadService {
   private readonly projectability = new Map<string, boolean>();
   /** The overlay's connector set at the last listing that read it. */
   private overlayConnectorsLastGood: readonly string[] = [];
+  private unsubscribePlanInputs: (() => void) | null = null;
 
   private constructor(
     private readonly options: StreamSyncReadOptions,
@@ -506,7 +507,9 @@ export class StreamSyncReadService {
       options.keys.keyCheck,
     );
     const revisions = new ConnectorRevisions();
-    options.overlay?.planInputs?.((connector) => revisions.bump(connector));
+    const unsubscribe =
+      options.overlay?.planInputs?.((connector) => revisions.bump(connector)) ??
+      null;
     const mirror = await RegistryMirror.open(
       options.files,
       (row) => classifyStreamRow(toControlRead(row), hashes) === "tombstoned",
@@ -549,8 +552,15 @@ export class StreamSyncReadService {
       revisions,
       new Set(mirror.connectors()),
     );
+    service.unsubscribePlanInputs = unsubscribe;
     await service.forwardDeletes();
     return service;
+  }
+
+  /** Stop following the overlay's plan-input changes. */
+  close(): void {
+    this.unsubscribePlanInputs?.();
+    this.unsubscribePlanInputs = null;
   }
 
   /** True when the next listing must start from the registry's first page. */
