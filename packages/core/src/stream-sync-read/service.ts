@@ -814,7 +814,7 @@ export class StreamSyncReadService {
             target.connector,
             // Only the owner view reads local runs. A grant is answered from
             // the imported heads, as if no local run existed.
-            input.isOwnerView && !input.streamOnly
+            input.isOwnerView
               ? await this.snapshot(target.connector)
               : NO_SNAPSHOT,
           );
@@ -845,9 +845,18 @@ export class StreamSyncReadService {
   }): Promise<{ scope: string; collectedAt: string }[]> {
     const names = new Set<string>();
     for (const connector of this.mirror.connectors()) {
-      for (const view of this.connectionViews(connector)) {
-        for (const stream of Object.keys(view.streams))
-          names.add(`pdpp.${connector}.${stream}`);
+      // The owner also lists the streams of runs this device collected and has
+      // not published: the read below serves them.
+      const snapshot = input.isOwnerView
+        ? await this.snapshot(connector)
+        : NO_SNAPSHOT;
+      try {
+        for (const view of this.connectionViews(connector, snapshot)) {
+          for (const stream of Object.keys(view.streams))
+            names.add(`pdpp.${connector}.${stream}`);
+        }
+      } finally {
+        snapshot.release();
       }
       for (const name of legacyBindingsForProfile(connector).keys())
         names.add(name);
@@ -952,7 +961,7 @@ export class StreamSyncReadService {
     // else is shown. The owner never reads fewer rows than a grant: when a
     // grant would read the legacy body, the owner reads it too, with the notes.
     let notes: OwnerNotes = {};
-    if (input.isOwnerView && !input.streamOnly) {
+    if (input.isOwnerView) {
       const scan = this.pendingScan(
         input,
         [...targets, ...candidates],
@@ -970,6 +979,7 @@ export class StreamSyncReadService {
             snapshot,
             true,
             "pending",
+            input.streamOnly,
           );
         } catch (error) {
           // The projector refuses the partial input (a legacy name whose
@@ -1074,8 +1084,12 @@ export class StreamSyncReadService {
     stream: string,
     control: ControlState,
     row: MirrorRow | undefined,
+    completeOnly = false,
   ): ImportedVersion | null {
-    const imported = this.importer.servableView({ connector, ns, stream });
+    const imported = this.importer.servableView(
+      { connector, ns, stream },
+      completeOnly,
+    );
     const kind = row ? this.importer.streamRowKind(row) : null;
     return imported !== null &&
       kind !== null &&
@@ -1145,6 +1159,7 @@ export class StreamSyncReadService {
             stream,
             control,
             row,
+            input.streamOnly,
           );
           if (live !== null) {
             notReflected.add(JSON.stringify([target.connector, ns, stream]));
