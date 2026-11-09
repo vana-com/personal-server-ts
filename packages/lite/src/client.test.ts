@@ -14,7 +14,7 @@ import {
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
+import { createOpenPersistentPsLiteStorage as createPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import { createPsLiteRuntime, createWeb3SignedPsLiteAuth } from "./runtime.js";
 import { startPersonalServer } from "./client.js";
 

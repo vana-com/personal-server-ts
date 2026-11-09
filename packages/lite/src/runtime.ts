@@ -1,3 +1,4 @@
+import type { BindableLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import { importOuraBrowserRecords } from "./oura-import.js";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import {
@@ -31,7 +32,7 @@ import {
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
   handlePersonalServerScopeUploadAppend,
-  refuseLegacyWrite,
+  admitLegacyWrite,
   LegacyWriteRefusedError,
   type AccountStorageMode,
   createScopeUploadRegistry,
@@ -162,8 +163,9 @@ export interface PsLiteRuntimeOptions {
   /**
    * The account's storage mode, built once by the host (see
    * `createAccountStorageMode`). The legacy write gate, the data routes and
-   * the MCP engines consume this one instance. Absent = no legacy write is
-   * refused and reads are unchanged.
+   * the MCP engines consume this one instance. Absent = the mode is unknown:
+   * every legacy write is refused (503 `ACCOUNT_MODE_UNKNOWN`) and reads are
+   * unchanged.
    */
   accountStorageMode?: AccountStorageMode;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
@@ -823,6 +825,17 @@ export function createPsLiteRuntime(
   const dataStorage = withLegacyProjection(toDataStoragePort(options.storage), {
     onIssue: options.onLegacyProjectionIssue ?? warnLegacyProjectionIssue,
   });
+  // The storage's legacy-write seal answers for the mode this runtime was
+  // given. No mode wired leaves the seal unbound, which refuses (unknown): a
+  // host that did not say which mode applies gets no legacy write.
+  if (options.accountStorageMode) {
+    (
+      options.storage as { legacyWriteSeal?: BindableLegacyWriteSeal }
+    ).legacyWriteSeal?.bind({
+      mode: options.accountStorageMode,
+      owner: options.serverOwner,
+    });
+  }
   // Streamed scope writes need a file store that can append to an unindexed
   // file; without one the upload routes answer 501.
   const scopeUploads = dataStorage.openVersionWriter
@@ -1250,7 +1263,7 @@ export function createPsLiteRuntime(
               "Method not allowed",
             );
           // An Oura browser import is a legacy write: a switched account refuses it.
-          const refusal = refuseLegacyWrite(
+          const refusal = admitLegacyWrite(
             options.accountStorageMode,
             options.serverOwner,
           );
@@ -1497,6 +1510,15 @@ export function createPsLiteRuntime(
                 config !== null
               ) {
                 Object.assign(options.config, config);
+              }
+              // Once the account is switched, no new legacy write starts (the
+              // seal refuses it). Wait for the ones that started before the
+              // switch, so this response means no legacy write is landing.
+              if (
+                options.accountStorageMode?.read(options.serverOwner) ===
+                "switched"
+              ) {
+                await dataStorage.legacyWriteSeal?.drain();
               }
             },
           });

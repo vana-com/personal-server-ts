@@ -339,13 +339,19 @@ function streamSyncClosing(): ProtocolError {
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
   // One mode for every read and legacy write this server serves. The host
-  // passes its instance; the fallback reads the same config field the host
-  // reads (`streamSync.write`, the Account switch) and nothing else.
+  // passes its instance. Without one, the fallback reads the same config field
+  // the host reads (`streamSync.write`, the Account switch) and nothing else;
+  // with no config either, nobody told this server what the account chose, so
+  // the answer is `unknown` (the source cannot be read), never `unswitched`
+  // (DECISION-UNKNOWN-MODE: "the host gave no evidence" is unknown).
   const accountStorageMode =
     deps.accountStorageMode ??
     createAccountStorageMode({
       owner: deps.serverOwner,
-      source: () => deps.config?.streamSync.write === true,
+      source: () => {
+        if (!deps.config) throw new Error("no streamSync config was supplied");
+        return deps.config.streamSync.write === true;
+      },
     });
 
   // One store for mint (POST /v1/write/session) and redeem (data ingest and

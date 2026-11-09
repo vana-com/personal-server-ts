@@ -10,11 +10,14 @@
  * the only switch input: this module takes no flag of its own and keeps no
  * latch of its own.
  *
- * Two checks, one decision. Admission refuses early, before any body is read.
- * The commit fence (`fenceLegacyCommit`) asks again immediately before each
- * durable publication, with no `await` between the question and the call that
- * publishes, so a switch that lands while a request was parked on I/O refuses
- * that request with nothing stored.
+ * Two layers, one decision. The storage seal (`storage/legacy-write-seal.ts`)
+ * is the invariant: every storage asks it immediately before the final durable
+ * step, so no writer can publish a legacy file after the switch, whichever
+ * route, worker or replay reached storage. This module's admission
+ * (`admitLegacyWrite`) and route commit fence (`fenceLegacyCommit`) are early
+ * refusals that answer a clean 426/503 before a body is read or an upload is
+ * staged; correctness never depends on them. A route with no mode wired has no
+ * early opinion; the seal still decides, and an unwired seal refuses.
  *
  * Unknown: a mode that cannot be established (the host gave no evidence, or
  * the owner does not match) refuses legacy writes with a retryable 503
@@ -49,14 +52,16 @@ export const UPDATE_REQUIRED_MESSAGE =
 export type LegacyWriteVerdict = "allow" | "switched" | "unknown";
 
 /**
- * The one decision. No mode wired means no gate: `allow`. `requestOwner` is
- * the owner the write is for; a mode bound to another owner answers unknown.
+ * The one decision. No mode wired is `unknown`, never `allow`: a store that was
+ * not told what the account chose must not guess "legacy is fine".
+ * `requestOwner` is the owner the write is for; a mode bound to another owner
+ * answers unknown.
  */
 export function legacyWriteVerdict(
   mode: AccountStorageMode | undefined,
   requestOwner?: string,
 ): LegacyWriteVerdict {
-  if (mode === undefined) return "allow";
+  if (mode === undefined) return "unknown";
   switch (mode.read(requestOwner)) {
     case "switched":
       return "switched";
@@ -67,11 +72,38 @@ export function legacyWriteVerdict(
   }
 }
 
-/** Thrown by `fenceLegacyCommit` to hand a ready refusal back through a handler. */
+/**
+ * Hands a ready refusal back through a handler or a background caller. Thrown
+ * by the legacy-write seal (`storage/legacy-write-seal.ts`) at the final
+ * durable step and by the route-level early refusals. `verdict` says why:
+ * `switched` (426, do not retry) or `unknown` (503, retry).
+ */
 export class LegacyWriteRefusedError extends Error {
-  constructor(readonly response: Response) {
-    super("legacy write refused");
+  constructor(
+    readonly response: Response,
+    readonly verdict: "switched" | "unknown" = response.status === 426
+      ? "switched"
+      : "unknown",
+  ) {
+    super(
+      verdict === "switched"
+        ? "legacy write refused: the account has moved to stream sync"
+        : "legacy write refused: the account storage mode is unknown",
+    );
+    this.name = "LegacyWriteRefusedError";
   }
+}
+
+/**
+ * The early, route-level refusal: a clean 426 or 503 before a body is read. A
+ * route with no mode wired has no opinion here (`null`); the storage seal still
+ * refuses at the final durable step, so nothing relies on this answer.
+ */
+export function admitLegacyWrite(
+  mode: AccountStorageMode | undefined,
+  requestOwner?: string,
+): Response | null {
+  return mode === undefined ? null : refuseLegacyWrite(mode, requestOwner);
 }
 
 /**
@@ -85,7 +117,7 @@ export function fenceLegacyCommit(
   mode: AccountStorageMode | undefined,
   requestOwner?: string,
 ): void {
-  const refusal = refuseLegacyWrite(mode, requestOwner);
+  const refusal = admitLegacyWrite(mode, requestOwner);
   if (refusal) throw new LegacyWriteRefusedError(refusal);
 }
 

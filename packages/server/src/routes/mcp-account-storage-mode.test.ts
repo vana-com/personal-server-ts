@@ -39,6 +39,7 @@ import {
   mcpStreamableHttpRoutes,
   type McpRouteDeps,
 } from "./mcp.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const SCOPE = "instagram.profile";
@@ -127,7 +128,9 @@ describe("the MCP engines share the host's account storage mode", () => {
       gatewayConfig,
       accessLogWriter: { write: vi.fn(async () => undefined) },
       connectionStore: store,
-      indexManager: createIndexManager(initializeDatabase(":memory:")),
+      indexManager: createIndexManager(initializeDatabase(":memory:"), {
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      }),
       hierarchyOptions: { dataDir },
       streamSyncRead: emptyReader,
       accountStorageMode: mode,
@@ -191,7 +194,9 @@ describe("the MCP engines share the host's account storage mode", () => {
       logger,
       version: "0.0.1",
       startedAt: new Date(),
-      indexManager: createIndexManager(initializeDatabase(":memory:")),
+      indexManager: createIndexManager(initializeDatabase(":memory:"), {
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      }),
       hierarchyOptions: { dataDir },
       serverOrigin: SERVER_ORIGIN,
       serverOwner: ownerWallet.address,

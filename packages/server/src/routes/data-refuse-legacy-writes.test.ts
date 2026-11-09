@@ -18,6 +18,8 @@ import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "./data.js";
 import { SCOPE_IMPORT_CHUNK_BYTES } from "./chunked-scope-import.js";
+import { createLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const owner = "0x1111111111111111111111111111111111111111";
 const scope = "github.events";
@@ -91,7 +93,9 @@ describe("refuse legacy writes after the stream-sync switch", () => {
     gatewayTouched = [];
     writeHooks = [];
     root = await mkdtemp(join(tmpdir(), "refuse-legacy-"));
-    index = createIndexManager(initializeDatabase(join(root, "index.db")));
+    index = createIndexManager(initializeDatabase(join(root, "index.db")), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     app = dataRoutes({
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
@@ -359,7 +363,7 @@ describe("refuse legacy writes after the stream-sync switch", () => {
       ["no signature", {}],
       ["a forged signature", forged],
     ])(
-      "refuses begin, chunk and finalize with %s and stages nothing, even for a session opened before the switch",
+      "refuses begin, chunk and finalize with %s and leaves nothing, even for a session opened before the switch",
       async (_name, extra) => {
         // The session opens while the switch is off, as an old client's would.
         const opened = await begin();
@@ -377,16 +381,13 @@ describe("refuse legacy writes after the stream-sync switch", () => {
         const beginRefused = await begin(extra);
         expect(beginRefused.status).toBe(426);
 
-        await expectNothingTouched(stagedBeforeSwitch);
-
-        // Nothing was staged: with the switch off the refused chunk is still
-        // missing, and the session completes only once the chunk is re-sent.
+        // The refused session can never finish (the switch is one-way), so
+        // its chunks and metadata are removed with the refusal.
+        expect(stagedBeforeSwitch).not.toEqual([]);
+        await expectNothingTouched([]);
         switchedOn = false;
         expect((await finalize(importId)).status).not.toBe(201);
         expect(index.countByScope(scope)).toBe(0);
-        expect((await putChunk(importId)).status).toBe(200);
-        expect((await finalize(importId)).status).toBe(201);
-        expect(index.countByScope(scope)).toBe(1);
       },
     );
   });
@@ -394,11 +395,18 @@ describe("refuse legacy writes after the stream-sync switch", () => {
   describe("a chunked import whose finalize is parked while the account switches", () => {
     it("refuses at publication with 426 and leaves nothing staged, published or indexed", async () => {
       const state = { switched: false, onResolve: () => {} };
+      const parkedMode = {
+        read: () => (state.switched ? "switched" : "unswitched"),
+      } as const;
+      // The storage seal answers for the same account the routes do.
+      const parkedIndex = createIndexManager(initializeDatabase(":memory:"), {
+        legacyWriteSeal: createLegacyWriteSeal({ mode: parkedMode, owner }),
+      });
       const chunk = new Uint8Array(SCOPE_IMPORT_CHUNK_BYTES).fill(0x20);
       chunk.set(new TextEncoder().encode('{"data":[]}'));
       const chunkSha = createHash("sha256").update(chunk).digest("hex");
       const parkedApp = dataRoutes({
-        indexManager: index,
+        indexManager: parkedIndex,
         hierarchyOptions: { dataDir: join(root, "data") },
         logger: pino({ level: "silent" }),
         serverOrigin: "http://localhost:8080",
@@ -414,9 +422,7 @@ describe("refuse legacy writes after the stream-sync switch", () => {
             return { deleted: false, version: null };
           },
         } as unknown as ScopeDeletionTracker,
-        accountStorageMode: {
-          read: () => (state.switched ? "switched" : "unswitched"),
-        },
+        accountStorageMode: parkedMode,
       });
       const base = `/${scope}/imports`;
       const opened = await parkedApp.request(base, {
@@ -453,10 +459,138 @@ describe("refuse legacy writes after the stream-sync switch", () => {
       });
       expect(response.status).toBe(426);
       expect((await response.json()).errorCode).toBe("update_required");
-      expect(index.countByScope(scope)).toBe(0);
+      expect(parkedIndex.countByScope(scope)).toBe(0);
+      parkedIndex.close();
       const tree = await dataTree();
       expect(tree.filter((file) => file.includes(".pending."))).toEqual([]);
       expect(tree.filter((file) => file.includes(`/${scope}/`))).toEqual([]);
+      // CHUNK_REFUSAL_KEEPS_CHUNKS: the session's chunks and metadata go too.
+      expect(tree.filter((file) => file.includes(".scope-imports"))).toEqual(
+        [],
+      );
+    });
+  });
+
+  // RECOVER_AFTER_SWITCH: DELETE reaches storage.deleteScope, which first
+  // recovers prepared imports; on a switched account that must drop them.
+  it("does not publish a prepared import when a DELETE runs after the switch", async () => {
+    const state = { switched: false };
+    const mode = {
+      read: () => (state.switched ? "switched" : "unswitched"),
+    } as const;
+    const db = initializeDatabase(join(root, "recover.db"));
+    const recoverIndex = createIndexManager(db, {
+      legacyWriteSeal: createLegacyWriteSeal({ mode, owner }),
+    });
+    const dataDir = join(root, "recover-data");
+    const prepared = {
+      version: "1.0",
+      scope: "notes.documents",
+      collectedAt: "2026-11-09T00:00:00Z",
+      data: { value: "prepared" },
+    };
+    const preparedPath = "notes/documents/2026-11-09T00-00-00Z.json";
+    const recoverApp = dataRoutes({
+      indexManager: recoverIndex,
+      hierarchyOptions: { dataDir },
+      logger: pino({ level: "silent" }),
+      serverOrigin: "http://localhost:8080",
+      serverOwner: owner,
+      devToken: "refuse-legacy-test",
+      gateway: {} as GatewayClient,
+      accessLogWriter: { write: async () => undefined },
+      accountStorageMode: mode,
+    });
+    // An import prepared (acknowledged, not yet published) while the account
+    // was still unswitched; the switch lands before it publishes.
+    db.prepare(
+      `INSERT INTO owner_import_operations (authority, owner, scope, operation, body_sha256, state, collected_at, path, envelope_bytes, metadata_json)
+       VALUES ('local', 'owner', @scope, @operation, @sha, 'prepared', @collectedAt, @path, @bytes, '{}')`,
+    ).run({
+      scope: prepared.scope,
+      operation: "p".repeat(64),
+      sha: "p".repeat(64),
+      collectedAt: prepared.collectedAt,
+      path: preparedPath,
+      bytes: Buffer.from(JSON.stringify(prepared)),
+    });
+    state.switched = true;
+    const deleted = await recoverApp.request(`/${scope}`, {
+      method: "DELETE",
+      headers: bearer,
+    });
+    expect(deleted.status).not.toBe(426);
+    expect(recoverIndex.countByScope(prepared.scope)).toBe(0);
+    await expect(readdir(join(dataDir, "notes"))).rejects.toThrow();
+    expect(
+      db.prepare("SELECT COUNT(*) AS n FROM owner_import_operations").get(),
+    ).toEqual({ n: 0 });
+    recoverIndex.close();
+  });
+
+  // CHUNK_REFUSAL_KEEPS_CHUNKS: a session that can never finish is removed at
+  // each refusal point, not left to expire.
+  describe("a refused chunked import leaves no chunks or metadata", () => {
+    const chunk = new Uint8Array(SCOPE_IMPORT_CHUNK_BYTES).fill(0x20);
+    chunk.set(new TextEncoder().encode('{"data":[]}'));
+    const chunkSha = createHash("sha256").update(chunk).digest("hex");
+    const base = `/${scope}/imports`;
+
+    async function beginAndUploadOneChunk(): Promise<string> {
+      const opened = await app.request(base, {
+        method: "POST",
+        headers: { ...bearer, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          totalBytes: chunk.byteLength * 2,
+          totalChunks: 2,
+          sha256: chunkSha,
+        }),
+      });
+      expect(opened.status).toBeLessThan(300);
+      const { importId } = await opened.json();
+      const put = await app.request(`${base}/${importId}/chunks/0`, {
+        method: "PUT",
+        headers: {
+          ...bearer,
+          "Content-Type": "application/octet-stream",
+          "x-chunk-sha256": chunkSha,
+        },
+        body: chunk,
+      });
+      expect(put.status).toBe(200);
+      expect(
+        (await dataTree()).filter((file) => file.includes(importId)),
+      ).not.toEqual([]);
+      return importId as string;
+    }
+    const sessionFiles = async (importId: string) =>
+      (await dataTree()).filter((file) => file.includes(importId));
+
+    it("removes the session when the next chunk arrives after the switch", async () => {
+      const importId = await beginAndUploadOneChunk();
+      switchedOn = true;
+      const response = await app.request(`${base}/${importId}/chunks/1`, {
+        method: "PUT",
+        headers: {
+          ...bearer,
+          "Content-Type": "application/octet-stream",
+          "x-chunk-sha256": chunkSha,
+        },
+        body: chunk,
+      });
+      expect(response.status).toBe(426);
+      expect(await sessionFiles(importId)).toEqual([]);
+    });
+
+    it("removes the session when finalize arrives after the switch", async () => {
+      const importId = await beginAndUploadOneChunk();
+      switchedOn = true;
+      const response = await app.request(`${base}/${importId}/finalize`, {
+        method: "POST",
+        headers: bearer,
+      });
+      expect(response.status).toBe(426);
+      expect(await sessionFiles(importId)).toEqual([]);
     });
   });
 });

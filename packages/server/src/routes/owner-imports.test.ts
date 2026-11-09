@@ -10,6 +10,7 @@ import { readDataFile } from "../storage/hierarchy.js";
 import { dataRoutes } from "./data.js";
 import { DATA_INGEST_MAX_SIZE } from "../middleware/body-limit.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const owner = "0x1111111111111111111111111111111111111111";
 const operation = "a".repeat(64);
@@ -22,7 +23,9 @@ describe("owner import acceptance across restart", () => {
   const dataWritten = vi.fn();
 
   function openServer() {
-    index = createIndexManager(initializeDatabase(join(root, "index.db")));
+    index = createIndexManager(initializeDatabase(join(root, "index.db")), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     app = dataRoutes({
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },

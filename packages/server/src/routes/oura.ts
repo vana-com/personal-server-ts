@@ -6,7 +6,7 @@ import { Hono } from "hono";
 import {
   handleOuraCollectionRequirementsRequest,
   LegacyWriteRefusedError,
-  refuseLegacyWrite,
+  admitLegacyWrite,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   importOuraBrowserRecords,
@@ -120,10 +120,7 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
     }
     // An Oura browser import is a legacy write (it lands in the legacy scope
     // store), so a switched account refuses it on every path.
-    const refusal = refuseLegacyWrite(
-      deps.accountStorageMode,
-      deps.serverOwner,
-    );
+    const refusal = admitLegacyWrite(deps.accountStorageMode, deps.serverOwner);
     if (refusal) return refusal;
     if (
       deps.config?.pdpp.optInMethods.includes("oura-browser") &&

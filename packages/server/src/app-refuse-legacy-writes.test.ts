@@ -18,6 +18,7 @@ import {
   createIndexManager,
   type IndexManager,
 } from "./storage/index-manager.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const owner = "0x1111111111111111111111111111111111111111";
 const token = "refuse-legacy-app-token";
@@ -28,7 +29,9 @@ describe("createApp legacy-write refusal", () => {
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "app-refuse-legacy-"));
-    index = createIndexManager(initializeDatabase(":memory:"));
+    index = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
   });
   afterEach(async () => {
     index.close();

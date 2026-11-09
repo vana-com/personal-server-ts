@@ -361,8 +361,16 @@ async function importLocked(
   ) {
     return { ok: false, reason: "head_changed" };
   }
-  // Commit fence: the account may have switched while this import waited on
+  // Early refusal: the account may have switched while this import waited on
   // reads and the import lock. Nothing durable has been written yet.
+  //
+  // This is not the invariant, and the batch is NOT atomic. Each stream is its
+  // own legacy write through the data handler below, and the storage seal
+  // checks the account mode at every one of them. If the account switches
+  // part-way, the streams already committed stay (they were legal when
+  // written; the stream-sync import takes over from there) and the next
+  // stream throws `LegacyWriteRefusedError`, so no stream written after the
+  // switch is ever kept. The caller gets the refusal and no receipts.
   fenceLegacyCommit(options.accountStorageMode, options.serverOwner);
   const refused = await options.beforeCommit?.(input);
   if (refused) return refused;

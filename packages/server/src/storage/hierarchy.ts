@@ -53,6 +53,7 @@ import {
   type ReadScopeBlocksResponse,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { previewJsonEnvelopePrefix } from "@opendatalabs/personal-server-ts-core/storage/preview";
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
 const textEncoder = new TextEncoder();
@@ -77,8 +78,24 @@ export class PublishedDataFileError extends Error {
   }
 }
 
-/** Synchronous, no-replace publication inside the SQLite writer gate. */
+/**
+ * Synchronous, no-replace publication inside the SQLite writer gate. The seal
+ * is asked in the same tick as the first filesystem call, so a refused
+ * publication leaves nothing on disk.
+ */
 export function publishDataFile(
+  options: HierarchyManagerOptions,
+  envelope: DataFileEnvelope,
+  bytes: Uint8Array,
+  seal: LegacyWriteSeal,
+  operation?: string,
+): WriteResult {
+  return seal.commit(() =>
+    publishDataFileSealed(options, envelope, bytes, operation),
+  );
+}
+
+function publishDataFileSealed(
   options: HierarchyManagerOptions,
   envelope: DataFileEnvelope,
   bytes: Uint8Array,
@@ -225,9 +242,16 @@ export function deleteScopeFilesSync(
 export async function writeDataFile(
   options: HierarchyManagerOptions,
   envelope: DataFileEnvelope,
+  seal: LegacyWriteSeal,
 ): Promise<WriteResult> {
   const staged = await stageDataFile(options, envelope);
-  await publishStagedDataFile(staged.stagePath, staged.finalPath);
+  try {
+    await publishStagedDataFile(staged.stagePath, staged.finalPath, seal);
+  } catch (error) {
+    // A refused publication must not leave its stage behind.
+    await unlink(staged.stagePath).catch(() => undefined);
+    throw error;
+  }
   return {
     path: staged.finalPath,
     relativePath: staged.relativePath,
@@ -291,7 +315,20 @@ function collectDirectorySyncPaths(finalDir: string): string[] {
   }
 }
 
+/**
+ * Make a staged file the final one. The seal is asked in the same tick as the
+ * rename; a refusal throws before the rename and leaves the stage in place for
+ * the caller to remove.
+ */
 export async function publishStagedDataFile(
+  stagePath: string,
+  finalPath: string,
+  seal: LegacyWriteSeal,
+): Promise<void> {
+  return seal.commit(() => publishStagedDataFileSealed(stagePath, finalPath));
+}
+
+async function publishStagedDataFileSealed(
   stagePath: string,
   finalPath: string,
 ): Promise<void> {

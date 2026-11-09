@@ -27,6 +27,7 @@ import {
 } from "./pdpp-import.js";
 import type { Logger } from "../logger/index.js";
 import { createAccountStorageMode } from "../api/account-storage-mode.js";
+import { unswitchedAccountStorageModeForTests } from "../test-utils/legacy-write-seal.js";
 
 const SCOPE = "instagram.profile";
 const COLLECTED_AT = "2026-09-17T10:00:00.000Z";
@@ -84,6 +85,7 @@ function setup(overrides: Partial<RetainedDeclaration> = {}): {
 } {
   const store = createMemoryRecordStore();
   const importer = createPdppImporter({
+    accountStorageMode: unswitchedAccountStorageModeForTests(),
     store,
     declarations: [{ ...RETAINED, ...overrides }],
     instanceFor: (sourceId) => (sourceId === SOURCE_ID ? INSTANCE : undefined),
@@ -246,6 +248,7 @@ describe("retry classification", () => {
     const store = createMemoryRecordStore();
     // No instance derivable yet — the deployment is still coming up.
     const importer = createPdppImporter({
+      accountStorageMode: unswitchedAccountStorageModeForTests(),
       store,
       declarations: [RETAINED],
       instanceFor: () => undefined,
@@ -260,6 +263,7 @@ describe("retry classification", () => {
     const refusingWith = (reason: string) => {
       const store = createMemoryRecordStore();
       const importer = createPdppImporter({
+        accountStorageMode: unswitchedAccountStorageModeForTests(),
         store: {
           ...store,
           ingestBatch: (envelopes) => ({
@@ -601,6 +605,7 @@ describe("createPdppImporter", () => {
     it("rejects when no instance handle can be derived", () => {
       const store = createMemoryRecordStore();
       const importer = createPdppImporter({
+        accountStorageMode: unswitchedAccountStorageModeForTests(),
         store,
         declarations: [RETAINED],
         instanceFor: () => undefined,
@@ -690,6 +695,7 @@ describe("the stream-sync switch refuses canonical publishes", () => {
   function importerWith(source: () => boolean, owner?: string) {
     const store = createMemoryRecordStore();
     const importer = createPdppImporter({
+      accountStorageMode: unswitchedAccountStorageModeForTests(),
       store,
       declarations: [RETAINED],
       instanceFor: (sourceId) =>

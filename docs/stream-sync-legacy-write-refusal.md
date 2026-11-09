@@ -24,36 +24,71 @@ repository and says which ones the server can refuse.
   and nothing is latched, or the owner does not match), a legacy write is
   refused with a retryable `503 ACCOUNT_MODE_UNKNOWN`, like a read. A
   known-unswitched account is never refused.
-- **Two checks, one decision.** Admission refuses early, before a body is
-  read. The commit fence (`fenceLegacyCommit`) asks again immediately before
-  each durable publication, with no `await` between the question and the call
-  that publishes: upload commit, JSON and binary `POST`, durable import
-  (`core/src/contracts/data.ts`, `core/src/api/scope-uploads.ts`), chunked
-  finalize (`server/src/routes/chunked-scope-import.ts`) and the Oura import
-  (`core/src/oura/index.ts`). A write admitted before the switch and parked on
-  I/O is refused at the fence, stores nothing and discards what it staged.
-  The fence does not stop a write that already passed it and is publishing;
-  the host's switch step must wait for those, then delete the legacy files.
+- **The seal is the invariant.** One object, the legacy-write seal
+  (`packages/core/src/storage/legacy-write-seal.ts`), decides whether a legacy
+  version may become durable. Every storage that installs a legacy file or
+  index row holds a seal and wraps its last durable step in `seal.commit(step)`.
+  `commit` asks the account mode and runs `step` in the same tick, with no
+  `await` between. Switched or unknown mode throws `LegacyWriteRefusedError`
+  and runs nothing. A storage built without a seal does not compile
+  (`createIndexManager` and `publishDataFile` require one). A seal that nobody
+  bound to a mode answers unknown and refuses. It is modeled on the read-side
+  seal in `mcp/legacy-seal.ts`.
+  Callers that reach storage without a route (derivative compute and its
+  replay on start, the download worker, `recover()` of prepared imports, boot
+  recovery of staged files) are covered by the same seal, because the check is
+  in the storage and not in the caller.
+- **Route checks are early refusals only.** `admitLegacyWrite` and the route
+  commit fences (`fenceLegacyCommit`) give a clean 426 or 503 before a body is
+  read or a request is staged. Nothing depends on them. Tests remove them and
+  show the seal still refuses.
+- **No mode wired is unknown.** `legacyWriteVerdict(undefined)` is `unknown`,
+  never `allow`. A server with no `serverOwner` or no config cannot say which
+  account it holds, so a legacy write is refused with the retryable 503
+  (DECISION-UNKNOWN-MODE-1109). `createApp` without a config source builds a
+  mode whose source throws, which reads as unknown. The PDPP importer takes
+  `serverOwner` so an owner mismatch reads as unknown, like every other route.
+- **A refusal leaves nothing.** A refused write removes what it staged: the
+  blob, the staged file, the prepared import row. When a chunked finalize is
+  refused because the account switched (426), the session's chunks and
+  metadata go too, because the session can never finish. While the mode is only
+  unknown (503) the chunks stay so the retry can use them; they expire with the
+  session. `recover()` of a prepared import and boot recovery of a staged
+  file drop the work on switched and leave it in place on unknown.
+- **Drain.** After a host observes the switch it must know no legacy write is
+  still landing. `seal.drain()` resolves once every commit that started before
+  the call has settled. A commit that starts later is refused. The Lite config
+  update calls it after a `true` is seen. Node needs no drain: its mode is read
+  from the config file, which changes only by restart, so the mode is fixed for
+  the life of the process.
+- **Oura import is not atomic.** `POST /v1/import/oura-browser` writes one
+  legacy file per stream. Each is its own sealed commit. A switch part-way
+  through the batch keeps the streams already committed (they were legal when
+  written; the stream-sync import takes over from there), refuses the next one,
+  and the call fails with no receipts. No stream written after the switch is
+  kept.
+- **Sidecars are not sealed.** Block manifests and first-seen ledgers are
+  derived caches. They are removed with the scope delete, and a legacy version
+  is invisible without its index row, which is sealed.
+- **`createMemoryPsLiteStorage` has no seal.** It is test-only. Production Lite
+  uses `createPersistentPsLiteStorage`, which carries the seal and is bound by
+  the runtime.
 - **Who is refused.** Every legacy write of a switched account, from every
   caller. `Vana-Stream-Sync-Client: 1` earns nothing: a client built for stream
   sync must stop making legacy writes. The header chooses nothing about what a
   caller may read.
-- **One check, in the write operations.** `legacyWriteVerdict`
-  (`packages/core/src/api/legacy-write-gate.ts`) is the only place that decides.
-  It runs inside the operations that commit or stage legacy data, after real
-  authorization, and correctness rests on those calls alone:
-  `POST /:scope` (`core/src/api/index.ts`, `if (!writeAuth)`), the durable
-  `PUT …/imports/:operation` and the upload routes (same file, after
-  `authorizeOwner`; an upload abort stays allowed), and chunked import
-  begin/chunk/finalize (`server/src/routes/chunked-scope-import.ts`,
+- **Where the early refusals run.** `POST /:scope` (`core/src/api/index.ts`,
+  `if (!writeAuth)`), the durable `PUT …/imports/:operation` and the upload
+  routes (same file, after `authorizeOwner`; an upload abort stays allowed), and
+  chunked import begin/chunk/finalize (`server/src/routes/chunked-scope-import.ts`,
   `refuseIfLegacy`). They check the normalized path, so `/imports/<op>/` and
   doubled slashes reach the same gate. A session opened before the switch is
   refused at its next chunk or finalize. The only exemption is a delegated
   builder write whose `X-Vana-Write-Signature` proof was verified; every other
   route is owner-only and has none, so a signature header earns nothing there.
-  `dataRoutes` also refuses early, before any body is read, as an optimisation;
-  tests show the refusal holds with that layer removed. The commit fence above
-  asks the same `legacyWriteVerdict` again at each publication point.
+  `dataRoutes` also refuses before any body is read. The chunk and finalize
+  routes have no middleware refusal: `refuseIfLegacy` runs inside them because
+  it must know the session to remove it.
 - **Error.** HTTP `426 Upgrade Required`, code `update_required`, header
   `Upgrade: vana-stream-sync`:
 
@@ -70,6 +105,28 @@ repository and says which ones the server can refuse.
   client may retry or merge on it. 5xx invites a retry. 401 and 403 invite a
   sign-in loop. The body has the message under both error shapes this API
   uses, so an old client shows it from the field it already reads.
+
+## Durable legacy commits and the seal call that covers each
+
+Every place a legacy version becomes durable, and the one call that makes it
+refuse. A refusal leaves no file, no index row and no prepared row.
+
+| Commit                                                                             | Where                                                                                     | Seal call                                                                                             |
+| ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Node index row (`insert`, `insertIfCurrent`)                                       | `server/src/storage/index-manager.ts`                                                     | `legacyWriteSeal.commit` around the insert transaction                                                |
+| Node index row for a recovered file                                                | `index-manager.ts` `insertRecovered`                                                      | `legacyWriteSeal.commit`                                                                              |
+| Node data file (`writeEnvelopeAndIndex`, `commitEnvelope`, download `insertEntry`) | `server/src/storage/hierarchy.ts` `publishDataFile`, `node-data-storage.ts`               | `seal.commit` in `publishDataFile`; the index row above                                               |
+| Node staged file (chunked finalize, boot recovery)                                 | `hierarchy.ts` `publishStagedDataFile`; `chunked-scope-import.ts`; `node-data-storage.ts` | `seal.commit` in `publishStagedDataFile`                                                              |
+| Import operation: prepared row                                                     | `server/src/storage/import-operations.ts`                                                 | `seal.assertOpen()` before the INSERT                                                                 |
+| Import operation: publish by `recover()` (also reached by DELETE)                  | `import-operations.ts` `recoverRow`                                                       | `publishDataFile(..., seal, ...)`; switched drops the row, unknown keeps it                           |
+| Lite index row (`installEntry`)                                                    | `lite/src/storage.ts`                                                                     | `updateIndex(..., { legacyCommit: true })`, then `legacyWriteSeal.commit(() => publish(next))`        |
+| Lite blob (`writeEnvelope`)                                                        | `lite/src/storage.ts`                                                                     | `legacyWriteSeal.assertOpen()`; the blob is invisible until the sealed row install                    |
+| Derivative compute and its replay on start                                         | `core/src/derivatives/compute.ts`                                                         | `legacyWriteSeal.assertOpen()` before the grant check; the write below it is sealed too               |
+| Download worker                                                                    | `core/src/sync/workers/download.ts`                                                       | `legacyWriteSeal.assertOpen()` in `downloadAll` and in the per-scope loop; the commit below is sealed |
+| Oura import (one commit per stream)                                                | `core/src/oura/index.ts`, `server/src/routes/oura.ts`                                     | each stream is a sealed data write; the early fence is only an early refusal                          |
+
+Not sealed on purpose: delete and erase paths (a person must be able to remove
+data after the switch), Lite metadata updates, sidecars (see above).
 
 ## Census (this repository)
 

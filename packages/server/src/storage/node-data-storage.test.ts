@@ -11,19 +11,24 @@ import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataBlocks } from "@opendatalabs/personal-server-ts-core/storage/blocks/build";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 describe("owner import deletion ordering", () => {
   it("preserves a new import accepted after scope retirement committed", async () => {
     const root = await mkdtemp(join(tmpdir(), "import-scope-delete-"));
     const dataDir = join(root, "data");
     const db = initializeDatabase(join(root, "index.db"));
-    const index = createIndexManager(db);
+    const index = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const storage = createNodeDataStorage({
       indexManager: index,
       hierarchyOptions: { dataDir },
     });
     const db2 = initializeDatabase(join(root, "index.db"));
-    const index2 = createIndexManager(db2);
+    const index2 = createIndexManager(db2, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const concurrent = createNodeDataStorage({
       indexManager: index2,
       hierarchyOptions: { dataDir },
@@ -130,7 +135,9 @@ describe("owner imports beside the revision-guarded index", () => {
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "import-revision-index-"));
     db = initializeDatabase(join(root, "index.db"));
-    index = createIndexManager(db);
+    index = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     storage = createNodeDataStorage({
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
@@ -204,13 +211,17 @@ describe("scope deletion racing a replica at a retired import path", () => {
     const root = await mkdtemp(join(tmpdir(), "import-scope-replica-"));
     const dataDir = join(root, "data");
     const db = initializeDatabase(join(root, "index.db"));
-    const index = createIndexManager(db);
+    const index = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const storage = createNodeDataStorage({
       indexManager: index,
       hierarchyOptions: { dataDir },
     });
     const db2 = initializeDatabase(join(root, "index.db"));
-    const index2 = createIndexManager(db2);
+    const index2 = createIndexManager(db2, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const concurrent = createNodeDataStorage({
       indexManager: index2,
       hierarchyOptions: { dataDir },
@@ -289,7 +300,9 @@ describe("an unrecoverable prepared import", () => {
     const dataDir = join(root, "data");
     const dbPath = join(root, "index.db");
     const db = initializeDatabase(dbPath);
-    const index = createIndexManager(db);
+    const index = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const storage = createNodeDataStorage({
       indexManager: index,
       hierarchyOptions: { dataDir },
@@ -370,7 +383,9 @@ describe("an unrecoverable prepared import", () => {
         storage.commitVersion!(append("broken.scope", "p")),
       ).rejects.toThrow("conflicts with publication");
 
-      reopened = createIndexManager(initializeDatabase(dbPath));
+      reopened = createIndexManager(initializeDatabase(dbPath), {
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      });
       expect(() =>
         createNodeDataStorage({
           indexManager: reopened!,
@@ -390,7 +405,9 @@ describe("a replica beside interrupted import cleanup", () => {
     const root = await mkdtemp(join(tmpdir(), "import-cleanup-fence-"));
     const dataDir = join(root, "data");
     const db = initializeDatabase(join(root, "index.db"));
-    const index = createIndexManager(db);
+    const index = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const storage = createNodeDataStorage({
       indexManager: index,
       hierarchyOptions: { dataDir },
@@ -471,7 +488,9 @@ describe("createNodeDataStorage.deleteByFileId", () => {
     db = initializeDatabase(":memory:");
     dataDir = await mkdtemp(join(tmpdir(), "node-data-storage-test-"));
     storage = createNodeDataStorage({
-      indexManager: createIndexManager(db),
+      indexManager: createIndexManager(db, {
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      }),
       hierarchyOptions: { dataDir },
     });
   });
@@ -637,7 +656,9 @@ describe("createNodeDataStorage block sidecars", () => {
     db = initializeDatabase(":memory:");
     dataDir = await mkdtemp(join(tmpdir(), "node-data-storage-block-test-"));
     storage = createNodeDataStorage({
-      indexManager: createIndexManager(db),
+      indexManager: createIndexManager(db, {
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      }),
       hierarchyOptions: { dataDir },
     });
   });
@@ -747,7 +768,9 @@ describe("createNodeDataStorage.writeEnvelopeAndIndex", () => {
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "write-envelope-and-index-"));
-    index = createIndexManager(initializeDatabase(join(root, "index.db")));
+    index = createIndexManager(initializeDatabase(join(root, "index.db")), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     storage = createNodeDataStorage({
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
@@ -838,7 +861,9 @@ describe("createNodeDataStorage.deleteVersionIfEnvelopeMissing", () => {
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "delete-if-missing-"));
     dataDir = join(root, "data");
-    index = createIndexManager(initializeDatabase(join(root, "index.db")));
+    index = createIndexManager(initializeDatabase(join(root, "index.db")), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     storage = createNodeDataStorage({
       indexManager: index,
       hierarchyOptions: { dataDir },

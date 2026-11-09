@@ -63,6 +63,7 @@ import {
 import { createServerApiAuth } from "../api-auth.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import type { PersonalServerDataApiDeps } from "@opendatalabs/personal-server-ts-core/api";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const MAIN_PORT = 8080;
@@ -387,7 +388,9 @@ describe("MCP owner scope-request answers", () => {
       accessLogWriter: createMockAccessLogWriter(),
       connectionStore: store,
       activityRecorder,
-      indexManager: createIndexManager(initializeDatabase(":memory:")),
+      indexManager: createIndexManager(initializeDatabase(":memory:"), {
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      }),
       hierarchyOptions: { dataDir: "/tmp" },
       scopeRequestApprovalUrl: (id, context) => {
         hookContexts.push(context);
@@ -802,7 +805,9 @@ describe("MCP /mcp/:token route", () => {
         },
         accessLogWriter: createMockAccessLogWriter(),
         connectionStore: store,
-        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        indexManager: createIndexManager(initializeDatabase(":memory:"), {
+          legacyWriteSeal: openLegacyWriteSealForTests(),
+        }),
         hierarchyOptions: { dataDir: "/tmp" },
         oauthApprovalUrl: "https://app-dev.vana.org/mcp/connect/claude",
         localApprovalPort: LOOPBACK_PORT,
@@ -961,7 +966,9 @@ describe("MCP /mcp/:token route", () => {
         gateway,
         accessLogWriter: createMockAccessLogWriter(),
         connectionStore: createInMemoryMcpConnectionStore(),
-        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        indexManager: createIndexManager(initializeDatabase(":memory:"), {
+          legacyWriteSeal: openLegacyWriteSealForTests(),
+        }),
         hierarchyOptions: { dataDir: "/tmp" },
       },
     );
@@ -994,7 +1001,9 @@ describe("MCP /mcp/:token route", () => {
         gateway,
         accessLogWriter: createMockAccessLogWriter(),
         connectionStore: store,
-        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        indexManager: createIndexManager(initializeDatabase(":memory:"), {
+          legacyWriteSeal: openLegacyWriteSealForTests(),
+        }),
         hierarchyOptions: { dataDir: "/tmp" },
       }),
     );
@@ -1597,7 +1606,9 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "mcp-tool-test-"));
     hierarchyOptions = { dataDir };
-    indexManager = createIndexManager(initializeDatabase(":memory:"));
+    indexManager = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     store = createInMemoryMcpConnectionStore();
   });
 
@@ -2993,7 +3004,9 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
         gateway,
         gatewayConfig,
         accessLogWriter: createMockAccessLogWriter(),
-        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        indexManager: createIndexManager(initializeDatabase(":memory:"), {
+          legacyWriteSeal: openLegacyWriteSealForTests(),
+        }),
         hierarchyOptions: { dataDir: "/tmp" },
       }),
     );

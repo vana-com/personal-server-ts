@@ -21,6 +21,7 @@ import { createIndexManager } from "../storage/index-manager.js";
 import { listenHttpServer } from "../listen.js";
 import { dataRoutes } from "./data.js";
 import { SCOPE_IMPORT_CHUNK_BYTES } from "./chunked-scope-import.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const owner = createTestWallet(9);
 const logger = pino({ level: "silent" });
@@ -138,7 +139,9 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
   it("begins with Content-Length, accepts a signed chunk, and finalizes", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "scope-import-node-http-"));
     const db = initializeDatabase(":memory:");
-    const indexManager = createIndexManager(db);
+    const indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const hierarchyOptions: HierarchyManagerOptions = { dataDir };
     const app = new Hono();
     app.route(
@@ -232,7 +235,9 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
 
   it("begins a signed import without an explicit Content-Length", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "scope-import-node-http-"));
-    const indexManager = createIndexManager(initializeDatabase(":memory:"));
+    const indexManager = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const app = new Hono();
     app.route(
       "/v1/data",
@@ -307,7 +312,9 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
     "returns 413 for an oversized chunk with Content-Length: %s",
     async (withContentLength) => {
       const dataDir = await mkdtemp(join(tmpdir(), "scope-import-node-http-"));
-      const indexManager = createIndexManager(initializeDatabase(":memory:"));
+      const indexManager = createIndexManager(initializeDatabase(":memory:"), {
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      });
       const app = new Hono();
       app.route(
         "/v1/data",

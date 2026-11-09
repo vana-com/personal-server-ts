@@ -26,6 +26,7 @@ import { initializeDatabase } from "./index-schema.js";
 import { createIndexManager } from "./index-manager.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
 import { openRedactedEnvelopeStream } from "../jobs/raw-envelope-stream.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SCOPE = "notes.entries";
 const T1 = "2026-10-01T12:00:00Z";
@@ -43,7 +44,9 @@ describe("first-seen sidecar on the Node storage", () => {
     db = initializeDatabase(":memory:");
     dataDir = await mkdtemp(join(tmpdir(), "first-seen-sidecar-test-"));
     storage = createNodeDataStorage({
-      indexManager: createIndexManager(db),
+      indexManager: createIndexManager(db, {
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      }),
       hierarchyOptions: { dataDir },
     });
   });

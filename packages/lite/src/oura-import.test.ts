@@ -12,7 +12,7 @@ import {
   createMemoryPsLiteTokenStore,
   createMemoryPsLitePersistence,
 } from "./test-support/memory.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
+import { createOpenPersistentPsLiteStorage as createPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import {
   createBearerTokenPsLiteAuth,
   createPsLiteRuntime,

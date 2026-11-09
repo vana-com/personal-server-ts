@@ -4,6 +4,7 @@
  * source data points).
  */
 
+import { LegacyWriteRefusedError } from "../api/legacy-write-gate.js";
 import {
   DerivativeCycleError,
   DerivativeSourceNotGrantedError,
@@ -187,6 +188,11 @@ class ComputeFailure extends Error {
  */
 function classifyComputeError(err: unknown): QuestionErrorCode {
   if (err instanceof ComputeFailure) return err.code ?? "internal";
+  // Legacy storage is closed. While the mode is merely unknown that is
+  // transient (retry); once switched it is permanent for this account.
+  if (err instanceof LegacyWriteRefusedError) {
+    return err.verdict === "unknown" ? "inference_unavailable" : "internal";
+  }
   if (err instanceof InferenceRequestError) {
     return isRetryableInferenceError(err)
       ? "inference_unavailable"
@@ -205,6 +211,11 @@ function classifyComputeError(err: unknown): QuestionErrorCode {
 
 function shortError(err: unknown): string {
   if (err instanceof ComputeFailure) return err.message;
+  if (err instanceof LegacyWriteRefusedError) {
+    return err.verdict === "unknown"
+      ? "legacy storage is not available yet; retry"
+      : "legacy storage is closed: the account has moved to stream sync";
+  }
   if (err instanceof InferenceRequestError) return err.message;
   if (err instanceof ProtocolError) return `${err.errorCode}: ${err.message}`;
   // Unknown errors may quote data (a JSON parse error echoes its input);
@@ -525,6 +536,10 @@ export async function computeQuestion(
       throw new ComputeFailure("server owner is not configured");
     }
     const serverOwner = deps.serverOwner;
+    // A derived scope is a legacy version. Do not spend an inference call on an
+    // answer the storage will refuse to keep; the seal at the write below is
+    // what actually decides, this only avoids the wasted work.
+    deps.storage.legacyWriteSeal?.assertOpen();
     await assertGrantStillValid(deps, registration);
     // Defense in depth: the rule was checked at registration; a registration
     // row edited by hand must still not produce a leaking derivative.

@@ -7,6 +7,7 @@ import {
   findStuckScopes,
   detectStuckVersionLedger,
 } from "./detect-stuck-version-ledger.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 function countRows(db: Database.Database, scope: string): number {
   return (
@@ -39,7 +40,9 @@ describe("detect-stuck-version-ledger", () => {
 
   beforeEach(() => {
     db = initializeDatabase(":memory:");
-    index = createIndexManager(db);
+    index = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     path = 0;
   });
 

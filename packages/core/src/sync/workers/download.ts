@@ -1,3 +1,4 @@
+import { LegacyWriteRefusedError } from "../../api/legacy-write-gate.js";
 import { isReplicaScope } from "../../replication/namespace.js";
 import { isPhysicalScope } from "../../stream-sync/scope-routing.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
@@ -213,12 +214,18 @@ export async function downloadScopes(
       continue;
     }
     try {
+      // Skip the fetch and decrypt for a version the storage will refuse. The
+      // seal at the write is what decides; this only avoids the wasted work.
+      deps.storage.legacyWriteSeal?.assertOpen();
       const result = await downloadOne(deps, dataPoint);
       options.retryMemory?.recordSuccess(retryKey);
       if (result) {
         results.push(result);
       }
     } catch (err) {
+      // Legacy storage is closed: hand the refusal to the caller as is. It is
+      // neither a corrupt record nor a retry-budget failure.
+      if (err instanceof LegacyWriteRefusedError) throw err;
       const metadata = getSyncFailureMetadata(err);
       const classified = classifySyncFailure({
         error: err,
@@ -751,12 +758,27 @@ export async function downloadAll(
       continue;
     }
     try {
+      // Skip the fetch and decrypt for a version the storage will refuse. The
+      // seal at the write is what decides; this only avoids the wasted work.
+      deps.storage.legacyWriteSeal?.assertOpen();
       const result = await downloadOne(deps, dataPoint);
       options.retryMemory?.recordSuccess(retryKey);
       if (result) {
         results.push(result);
       }
     } catch (err) {
+      if (err instanceof LegacyWriteRefusedError) {
+        // Legacy storage is closed (account switched, or mode not known yet).
+        // Every later record would be refused the same way, so stop. Hold the
+        // cursor: an unknown mode retries, and a switched account never reads
+        // this legacy listing again. Not a record failure: no retry budget.
+        logger.info(
+          { verdict: err.verdict },
+          "Legacy download paused: legacy storage is not accepting writes",
+        );
+        failed = true;
+        break;
+      }
       const metadata = getSyncFailureMetadata(err);
       const classified = classifySyncFailure({
         error: err,

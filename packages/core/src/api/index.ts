@@ -109,9 +109,9 @@ import {
   type AccountStorageMode,
 } from "./account-storage-mode.js";
 import {
+  admitLegacyWrite,
   fenceLegacyCommit,
   LegacyWriteRefusedError,
-  refuseLegacyWrite,
 } from "./legacy-write-gate.js";
 
 /**
@@ -121,7 +121,7 @@ import {
 function refuseLegacyWriteFor(
   deps: Pick<PersonalServerDataApiDeps, "accountStorageMode" | "serverOwner">,
 ): Response | null {
-  return refuseLegacyWrite(deps.accountStorageMode, deps.serverOwner);
+  return admitLegacyWrite(deps.accountStorageMode, deps.serverOwner);
 }
 
 /**
@@ -2259,6 +2259,7 @@ export {
   UPDATE_REQUIRED_CODE,
   UPDATE_REQUIRED_MESSAGE,
   UPDATE_REQUIRED_STATUS,
+  admitLegacyWrite,
   fenceLegacyCommit,
   LegacyWriteRefusedError,
   legacyWriteVerdict,

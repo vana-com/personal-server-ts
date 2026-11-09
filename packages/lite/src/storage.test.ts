@@ -9,12 +9,10 @@ import {
   createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,
 } from "./test-support/memory.js";
-import {
-  createPersistentPsLiteStorage,
-  type PsLiteDataFileStore,
-} from "./storage.js";
+import { type PsLiteDataFileStore } from "./storage.js";
 import { previewEnvelopeValue } from "./storage-utils.js";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
+import { createOpenPersistentPsLiteStorage as createPersistentPsLiteStorage } from "./test-support/open-storage.js";
 
 describe("createPersistentPsLiteStorage", () => {
   it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {

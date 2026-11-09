@@ -39,6 +39,7 @@ import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "./data.js";
 import { mcpStreamableHttpRoutes } from "./mcp.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(9);
@@ -109,7 +110,9 @@ describe("MCP remember tool", () => {
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "mcp-remember-test-"));
     hierarchyOptions = { dataDir };
-    indexManager = createIndexManager(initializeDatabase(":memory:"));
+    indexManager = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     store = createInMemoryMcpConnectionStore();
   });
 

@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pino } from "pino";
@@ -39,6 +39,8 @@ import { createIndexManager } from "../storage/index-manager.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createSqliteQuestionStore } from "../storage/question-store.js";
 import { createApp, type AppDeps } from "../app.js";
+import { createAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
+import { createLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const DEV_TOKEN = "dev-token";
@@ -48,6 +50,8 @@ const BUILDER_ID = "0xbuilder1";
 const builderWallet = createTestWallet(0);
 const ownerWallet = createTestWallet(9);
 const logger = pino({ level: "silent" });
+/** The account's switch; tests flip it while the PS is running. */
+const account = { switched: false };
 
 function createMockGateway(
   scopes: string[] = ["write:coach.*", "oura.sleep"],
@@ -104,7 +108,17 @@ describe("/v1/derivatives/questions (composed app)", () => {
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "derivatives-route-test-"));
     const db = initializeDatabase(":memory:");
-    const indexManager = createIndexManager(db);
+    account.switched = false;
+    const accountMode = createAccountStorageMode({
+      owner: ownerWallet.address,
+      source: () => account.switched,
+    });
+    const indexManager = createIndexManager(db, {
+      legacyWriteSeal: createLegacyWriteSeal({
+        mode: accountMode,
+        owner: ownerWallet.address,
+      }),
+    });
     const hierarchyOptions = { dataDir };
     const dataStorage = createNodeDataStorage({
       indexManager,
@@ -138,6 +152,7 @@ describe("/v1/derivatives/questions (composed app)", () => {
       expiresAtMs: Date.now() + 60_000,
     });
     baseDeps = {
+      accountStorageMode: accountMode,
       logger,
       version: "test",
       startedAt: new Date(),
@@ -340,6 +355,79 @@ describe("/v1/derivatives/questions (composed app)", () => {
       (await app.request(`/v1/derivatives/questions/${id}`, { headers: owner }))
         .status,
     ).toBe(404);
+  });
+
+  // DERIV_UNFENCED: compute writes through no route, so no route fence can
+  // cover it; the storage seal does.
+  it("stores no derivative when the account switches while the answer is computed, and none on a later recompute", async () => {
+    await ownerIngest("oura.sleep", { nights: [{ score: 70 }] });
+    let reached!: () => void;
+    let release!: () => void;
+    const inCompute = new Promise<void>((resolve) => (reached = resolve));
+    const parked = new Promise<void>((resolve) => (release = resolve));
+    provider = createFakeInferenceProvider({
+      respond: async () => {
+        reached();
+        await parked;
+        return { content: '{"answer":"ok","evidence":"e"}' };
+      },
+    });
+    scheduler.stop();
+    const store = baseDeps.derivativeCompute!.store;
+    scheduler = createRecomputeScheduler({
+      store,
+      debounceMs: 0,
+      compute: (questionId) =>
+        computeQuestion(questionId, {
+          storage: baseDeps.dataStorage!,
+          store,
+          provider,
+          serverOwner: ownerWallet.address,
+        }),
+    });
+    app = createApp({ ...baseDeps, derivativeCompute: { store, scheduler } });
+
+    const registered = await app.request("/v1/derivatives/questions", {
+      method: "POST",
+      headers: { ...owner, "Content-Type": "application/json" },
+      body: JSON.stringify(question),
+    });
+    expect(registered.status).toBe(201);
+    const id = (await registered.json()).questionId as string;
+    await inCompute;
+    account.switched = true;
+    release();
+    await scheduler.whenIdle();
+
+    const failed = await (
+      await app.request(`/v1/derivatives/questions/${id}`, { headers: owner })
+    ).json();
+    expect(failed.status).toBe("failed");
+    expect(failed.error).toMatch(/legacy storage is closed/);
+    expect(
+      baseDeps.dataStorage!.findEntry({ scope: "coach.weekly" }),
+    ).toBeUndefined();
+
+    // A replay after the switch (restart, source change, owner recompute)
+    // does not even ask the provider again.
+    const calls = provider.calls.length;
+    const recompute = await app.request(
+      `/v1/derivatives/questions/${id}/recompute`,
+      { method: "POST", headers: owner },
+    );
+    expect(recompute.status).toBe(202);
+    await scheduler.whenIdle();
+    expect(provider.calls).toHaveLength(calls);
+    expect(
+      baseDeps.dataStorage!.findEntry({ scope: "coach.weekly" }),
+    ).toBeUndefined();
+    // No file of the derived scope, staged or published. (An empty directory
+    // may remain; it holds nothing.)
+    const entries = await readdir(dataDir, { recursive: true });
+    expect(
+      entries.filter((e) => e.startsWith("coach/") && e.includes(".")),
+    ).toEqual([]);
+    expect(entries.filter((e) => e.includes(".pending."))).toEqual([]);
   });
 
   it("marks the question failed (not the data) when the provider fails, and the owner can recompute", async () => {

@@ -18,6 +18,7 @@ import { createTestWallet } from "@opendatalabs/personal-server-ts-core/test-uti
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(0);
@@ -64,7 +65,9 @@ describe("createApp: PDPP routes are reachable through the real app", () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "app-pdpp-test-"));
     const db = initializeDatabase(":memory:");
-    indexManager = createIndexManager(db);
+    indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
   });
 
   afterEach(async () => {

@@ -46,6 +46,7 @@ import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/a
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { listenHttpServer } from "../listen.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
@@ -198,7 +199,9 @@ describe("POST /v1/data/:scope", () => {
     hierarchyOptions = { dataDir };
 
     const db = initializeDatabase(":memory:");
-    const indexManager = createIndexManager(db);
+    const indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
 
     app = dataRoutes({
       indexManager,
@@ -253,6 +256,7 @@ describe("POST /v1/data/:scope", () => {
     const sessionToken = "vana_ps_owner_session_token";
     const localIndexManager = createIndexManager(
       initializeDatabase(":memory:"),
+      { legacyWriteSeal: openLegacyWriteSealForTests() },
     );
     const localApp = dataRoutes({
       indexManager: localIndexManager,
@@ -281,6 +285,7 @@ describe("POST /v1/data/:scope", () => {
   it("rejects a PDPP owner token on legacy scope ingest without writing", async () => {
     const localIndexManager = createIndexManager(
       initializeDatabase(":memory:"),
+      { legacyWriteSeal: openLegacyWriteSealForTests() },
     );
     const localApp = dataRoutes({
       indexManager: localIndexManager,
@@ -345,7 +350,9 @@ describe("POST /v1/data/:scope", () => {
 
   it("SQLite index has matching row", async () => {
     const db = initializeDatabase(":memory:");
-    const indexManager = createIndexManager(db);
+    const indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const localApp = dataRoutes({
       indexManager,
       hierarchyOptions,
@@ -427,7 +434,9 @@ describe("POST /v1/data/:scope", () => {
     // DPv2 is scope-addressed: ingest never looks up a schema, so a scope
     // with no registered schema ingests fine and the entry's schemaId is null.
     const db2 = initializeDatabase(":memory:");
-    const indexManager2 = createIndexManager(db2);
+    const indexManager2 = createIndexManager(db2, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const gateway = createMockGateway({
       getSchemaForScope: vi.fn().mockResolvedValue(null),
     });
@@ -461,7 +470,9 @@ describe("POST /v1/data/:scope", () => {
 
   it("returns status 'syncing' when syncManager is provided", async () => {
     const db2 = initializeDatabase(":memory:");
-    const indexManager2 = createIndexManager(db2);
+    const indexManager2 = createIndexManager(db2, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const mockSyncManager = {
       start: vi.fn(),
       stop: vi.fn(),
@@ -495,7 +506,9 @@ describe("POST /v1/data/:scope", () => {
 
   it("returns status 'stored' when syncManager is null", async () => {
     const db2 = initializeDatabase(":memory:");
-    const indexManager2 = createIndexManager(db2);
+    const indexManager2 = createIndexManager(db2, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
 
     const localApp = dataRoutes({
       indexManager: indexManager2,
@@ -521,7 +534,9 @@ describe("POST /v1/data/:scope", () => {
 
   it("calls notifyNewData on syncManager when provided", async () => {
     const db2 = initializeDatabase(":memory:");
-    const indexManager2 = createIndexManager(db2);
+    const indexManager2 = createIndexManager(db2, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const mockSyncManager = {
       start: vi.fn(),
       stop: vi.fn(),
@@ -633,7 +648,9 @@ describe("GET /v1/data (list scopes)", () => {
     hierarchyOptions = { dataDir };
 
     const db = initializeDatabase(":memory:");
-    indexManager = createIndexManager(db);
+    indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
 
     cleanup = () => {
       indexManager.close();
@@ -795,7 +812,9 @@ describe("GET /v1/data listings are scoped to the builder's grants", () => {
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "data-route-list-grant-test-"));
     hierarchyOptions = { dataDir };
-    indexManager = createIndexManager(initializeDatabase(":memory:"));
+    indexManager = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const app = createApp();
     await postWithOwnerAuth(app, "instagram.profile", { username: "test" });
     await postWithOwnerAuth(app, "twitter.posts", { count: 10 });
@@ -1120,7 +1139,9 @@ describe("GET /v1/data/additions", () => {
     hierarchyOptions = { dataDir };
 
     const db = initializeDatabase(":memory:");
-    indexManager = createIndexManager(db);
+    indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
 
     cleanup = () => {
       indexManager.close();
@@ -1333,7 +1354,9 @@ describe("GET /v1/data/:scope/versions", () => {
     hierarchyOptions = { dataDir };
 
     const db = initializeDatabase(":memory:");
-    indexManager = createIndexManager(db);
+    indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
 
     cleanup = () => {
       indexManager.close();
@@ -1494,7 +1517,9 @@ describe("GET /v1/data/:scope", () => {
     hierarchyOptions = { dataDir };
 
     const db = initializeDatabase(":memory:");
-    indexManager = createIndexManager(db);
+    indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
 
     cleanup = () => {
       indexManager.close();
@@ -2310,7 +2335,9 @@ describe("DELETE /v1/data/:scope", () => {
     hierarchyOptions = { dataDir };
 
     const db = initializeDatabase(":memory:");
-    indexManager = createIndexManager(db);
+    indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
 
     cleanup = () => {
       indexManager.close();
@@ -3178,7 +3205,9 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     dataDir = await mkdtemp(join(tmpdir(), "x402-test-"));
     hierarchyOptions = { dataDir };
     const db = initializeDatabase(":memory:");
-    indexManager = createIndexManager(db);
+    indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     cleanup = () => {
       indexManager.close();
     };

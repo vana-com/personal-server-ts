@@ -553,6 +553,7 @@ export function createPdppSyncImporter(options: {
       return undefined;
     },
     accountStorageMode: options.accountStorageMode,
+    serverOwner,
     logger,
   });
 }

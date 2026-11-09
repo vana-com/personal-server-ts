@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { initializeDatabase } from "./index-schema.js";
 import { createIndexManager, type IndexManager } from "./index-manager.js";
 import type Database from "better-sqlite3";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 describe("IndexManager", () => {
   let db: Database.Database;
@@ -9,7 +10,9 @@ describe("IndexManager", () => {
 
   beforeEach(() => {
     db = initializeDatabase(":memory:");
-    manager = createIndexManager(db);
+    manager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
   });
 
   afterEach(() => {

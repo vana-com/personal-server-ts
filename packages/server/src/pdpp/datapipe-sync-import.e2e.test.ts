@@ -68,6 +68,7 @@ import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/port
 import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 import { buildDeclarationRegistry } from "./deployment.js";
 import { legacyTestConnectionId } from "./test-connections.js";
+import { unswitchedAccountStorageModeForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SCOPE = "instagram.profile";
 const SOURCE_ID = "https://registry.pdpp.dev/connectors/instagram";
@@ -372,6 +373,7 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
     expect(document).toBe(DECLARATION_DOCUMENT);
 
     return createPdppImporter({
+      accountStorageMode: unswitchedAccountStorageModeForTests(),
       store: target,
       declarations: [
         {

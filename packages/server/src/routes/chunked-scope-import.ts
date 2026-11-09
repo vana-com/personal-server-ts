@@ -16,6 +16,7 @@ import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-c
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { cacheRequestBodyBytes } from "@opendatalabs/personal-server-ts-core/auth";
 import { publishStagedDataFile } from "../storage/hierarchy.js";
+import { LegacyWriteRefusedError } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 export const SCOPE_IMPORT_CHUNK_BYTES = 8 * 1024 * 1024;
 export const SCOPE_IMPORT_MAX_BYTES = 256 * 1024 * 1024;
@@ -302,8 +303,10 @@ export interface ScopeImportDeps {
   /**
    * Returns the refusal response while the account's stream-sync switch is on.
    * Checked after owner authorization by every operation that writes: begin,
-   * chunk and finalize, and once more immediately before finalize publishes.
-   * A session opened before the switch is refused too.
+   * chunk and finalize. An early refusal only: finalize publishes through the
+   * index manager's legacy-write seal, which refuses even if this check is
+   * missing or the switch lands after it. A session opened before the switch
+   * is refused too.
    */
   refuseLegacyWrite?(): Response | null;
 }
@@ -315,9 +318,47 @@ export class LegacyWriteRefused extends Error {
   }
 }
 
-function refuseIfLegacy(deps: ScopeImportDeps): void {
+/**
+ * Early refusal. On a switched account (426) the session being refused can
+ * never finish, so its chunks and metadata go with it rather than waiting for
+ * the session to expire.
+ */
+async function refuseIfLegacy(
+  deps: ScopeImportDeps,
+  sessionId?: string,
+): Promise<void> {
   const refusal = deps.refuseLegacyWrite?.();
-  if (refusal) throw new LegacyWriteRefused(refusal);
+  if (!refusal) return;
+  if (
+    refusal.status === 426 &&
+    sessionId &&
+    IMPORT_ID_PATTERN.test(sessionId)
+  ) {
+    await rm(importPath(deps, sessionId), { recursive: true, force: true });
+  }
+  throw new LegacyWriteRefused(refusal);
+}
+
+const IMPORT_ID_PATTERN = /^[0-9a-f-]{36}$/i;
+
+/**
+ * A refused finalize leaves nothing behind: the staged file, an unindexed
+ * final file and, once the account has switched, the session's chunks and
+ * metadata. While the mode is merely unknown the refusal is retryable (503),
+ * so the chunks stay for the retry (they expire with the session otherwise).
+ */
+async function dropRefusedImport(
+  deps: Pick<ScopeImportDeps, "hierarchyOptions" | "indexManager">,
+  metadata: ImportMetadata,
+  error: unknown,
+): Promise<void> {
+  await removeImportArtifacts(deps, metadata);
+  if (
+    error instanceof LegacyWriteRefusedError &&
+    error.verdict === "switched"
+  ) {
+    await rm(importPath(deps, metadata.id), { recursive: true, force: true });
+  }
 }
 
 export class ScopeImportError extends Error {
@@ -511,7 +552,7 @@ export async function beginScopeImport(
   body: unknown,
 ): Promise<{ importId: string; chunkBytes: number; expiresAt: string }> {
   await deps.authorizeOwner(request, scope);
-  refuseIfLegacy(deps);
+  await refuseIfLegacy(deps);
   if (!deps.serverOwner) {
     throw new ScopeImportError(
       500,
@@ -671,7 +712,7 @@ export async function putScopeImportChunk(
   index: number,
 ): Promise<{ accepted: true; index: number; bytes: number; sha256: string }> {
   await deps.authorizeOwner(request, scope);
-  refuseIfLegacy(deps);
+  await refuseIfLegacy(deps, id);
   const bodyBytes = await cacheRequestBodyBytes(
     request,
     SCOPE_IMPORT_CHUNK_BYTES,
@@ -811,7 +852,7 @@ export async function finalizeScopeImport(
   id: string,
 ): Promise<Record<string, unknown>> {
   await deps.authorizeOwner(request, scope);
-  refuseIfLegacy(deps);
+  await refuseIfLegacy(deps, id);
   if (abortingImports.has(id)) {
     throw new ScopeImportError(
       409,
@@ -981,7 +1022,24 @@ async function finalizeScopeImportAuthorized(
     committedEntry.collectedAt === metadata.collectedAt
   ) {
     if (!(await pathExists(finalPath)) && (await pathExists(stagePath))) {
-      await publishStagedDataFile(stagePath, finalPath);
+      try {
+        await publishStagedDataFile(
+          stagePath,
+          finalPath,
+          deps.indexManager.legacyWriteSeal,
+        );
+      } catch (error) {
+        // Acknowledged before a crash, never published: on a switched account
+        // it is dropped with its row so it cannot come back.
+        if (
+          error instanceof LegacyWriteRefusedError &&
+          error.verdict === "switched"
+        ) {
+          deps.indexManager.deleteByPath(relativePath);
+        }
+        await dropRefusedImport(deps, metadata, error);
+        throw error;
+      }
     }
     if (await pathExists(finalPath)) {
       const receipt = {
@@ -1127,14 +1185,16 @@ async function finalizeScopeImportAuthorized(
         "Scope changed while the import was in progress; retry finalize",
       );
     }
-    // Commit fence: the account may have switched while the chunks were
-    // assembled. Asked again right here, with no await before the publish
-    // below; a refusal removes the staged file (the catch below) and leaves
-    // nothing published or indexed.
-    refuseIfLegacy(deps);
     // Publish the complete, fsynced envelope before swapping the SQLite index.
     // Readers continue to resolve the old entry until the new file is ready.
-    await publishStagedDataFile(stagePath, finalPath);
+    // The seal is asked in the same tick as the rename: the account may have
+    // switched while the chunks were assembled, and a refusal removes the
+    // stage and the session (the catch below) before anything is published.
+    await publishStagedDataFile(
+      stagePath,
+      finalPath,
+      deps.indexManager.legacyWriteSeal,
+    );
     let indexed: ReturnType<typeof deps.indexManager.insertIfCurrent>;
     try {
       indexed = deps.indexManager.insertIfCurrent(
@@ -1200,7 +1260,7 @@ async function finalizeScopeImportAuthorized(
     notifyCommittedScope(deps, scope, metadata.collectedAt);
     return receipt;
   } catch (error) {
-    await removeImportArtifacts(deps, metadata);
+    await dropRefusedImport(deps, metadata, error);
     throw error;
   }
 }

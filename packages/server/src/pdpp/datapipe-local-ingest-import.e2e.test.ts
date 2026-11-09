@@ -67,6 +67,8 @@ import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "../routes/data.js";
 import { buildDeclarationRegistry } from "./deployment.js";
 import { legacyTestConnectionId } from "./test-connections.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
+import { unswitchedAccountStorageModeForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const SCOPE = "github.profile";
@@ -163,6 +165,7 @@ function buildImporter(store: PdppRecordStore): PdppImporter {
   expect(document).toBe(DECLARATION_DOCUMENT);
 
   return createPdppImporter({
+    accountStorageMode: unswitchedAccountStorageModeForTests(),
     store,
     declarations: [
       {
@@ -205,7 +208,9 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
     importer = buildImporter(store);
 
     const indexDb = initializeDatabase(":memory:");
-    const indexManager = createIndexManager(indexDb);
+    const indexManager = createIndexManager(indexDb, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const hierarchyOptions: HierarchyManagerOptions = { dataDir };
     const accessLogWriter: AccessLogWriter = {
       write: vi.fn().mockResolvedValue(undefined),
@@ -371,7 +376,9 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
     // The absent-importer wiring must be inert rather than throwing: this is
     // every non-PDPP deployment.
     const indexDb = initializeDatabase(":memory:");
-    const indexManager = createIndexManager(indexDb);
+    const indexManager = createIndexManager(indexDb, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const bare = dataRoutes({
       indexManager,
       hierarchyOptions: { dataDir },

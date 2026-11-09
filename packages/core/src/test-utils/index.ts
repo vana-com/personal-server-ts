@@ -3,6 +3,7 @@ export {
   buildWeb3SignedHeader,
   type TestWallet,
 } from "./wallet.js";
+export { openLegacyWriteSealForTests } from "./legacy-write-seal.js";
 export {
   createMemoryDataStorage,
   type MemoryDataStorage,

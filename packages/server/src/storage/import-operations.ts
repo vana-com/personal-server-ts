@@ -13,6 +13,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
+import { LegacyWriteRefusedError } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   deleteDataFileSync,
@@ -47,6 +48,9 @@ export function createImportOperations(
   index: IndexManager,
   options: HierarchyManagerOptions,
 ) {
+  // The index's own seal: the same answer governs the row insert and the file
+  // publication below.
+  const seal = index.legacyWriteSeal;
   const immediate = <T>(run: () => T): T => db.transaction(run).immediate();
   const lookup = db.prepare(
     `SELECT * FROM owner_import_operations WHERE ${keyWhere}`,
@@ -125,7 +129,26 @@ export function createImportOperations(
       sizeBytes?: number;
       afterTombstoneVersion?: number | null;
     };
-    const written = publishDataFile(options, envelope, bytes, row.operation);
+    let written;
+    try {
+      written = publishDataFile(options, envelope, bytes, seal, row.operation);
+    } catch (error) {
+      // A prepared operation is an acknowledged-but-unpublished legacy write.
+      // On a switched account it must never publish: drop it, so it cannot
+      // come back on a later recover(). While the mode is unknown nothing is
+      // decided: the operation stays prepared and the error surfaces to its
+      // own caller (other callers' errors are not theirs to raise).
+      if (
+        error instanceof LegacyWriteRefusedError &&
+        error.verdict === "switched"
+      ) {
+        db.prepare(`DELETE FROM owner_import_operations WHERE ${keyWhere}`).run(
+          row,
+        );
+        return;
+      }
+      throw error;
+    }
     let entry = index.findByPath(row.path);
     if (!entry) {
       const inserted = index.insertIfCurrent({
@@ -207,6 +230,8 @@ export function createImportOperations(
         check(prior, intent);
         recover(key(command.envelope.scope, intent));
         if (prior) return false;
+        // A switched or unknown account journals no new legacy write.
+        seal.assertOpen();
         const envelope = reserve(command.envelope);
         const path = relative(
           options.dataDir,
@@ -260,6 +285,9 @@ export function createImportOperations(
         };
       });
       if (!published) {
+        // recover() dropped the operation because the account switched in the
+        // meantime: say so (426) rather than blaming the scope.
+        seal.assertOpen();
         throw new ProtocolError(
           409,
           "SCOPE_CLOSED_FOR_WRITES",
@@ -292,7 +320,7 @@ export function createImportOperations(
         const bytes = Buffer.from(JSON.stringify(envelope, null, 2));
         let writeResult;
         try {
-          writeResult = publishDataFile(options, envelope, bytes);
+          writeResult = publishDataFile(options, envelope, bytes, seal);
         } catch (err) {
           if (err instanceof PublishedDataFileError)
             publishedPath = err.relativePath;

@@ -36,6 +36,7 @@ import {
   type LineageView,
 } from "@opendatalabs/personal-server-ts-core/lineage";
 import { dataRoutes, type DataRouteDeps } from "./data.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const builderWallet = createTestWallet(0);
@@ -190,7 +191,9 @@ describe("derivative data routes", () => {
     dataDir = await mkdtemp(join(tmpdir(), "data-lineage-route-test-"));
     hierarchyOptions = { dataDir };
     const db = initializeDatabase(":memory:");
-    const indexManager = createIndexManager(db);
+    const indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     writeSessionStore = createInMemoryWriteSessionStore();
     await seedSession(writeSessionStore);
     accessLogWriter = { write: vi.fn().mockResolvedValue(undefined) };

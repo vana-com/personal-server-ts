@@ -31,6 +31,7 @@ import {
   type IndexManager,
 } from "./storage/index-manager.js";
 import type { TokenStore } from "./token-store.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const ownerWallet = createTestWallet(0);
 
@@ -99,7 +100,9 @@ describe("device login on real listeners", () => {
 
   beforeAll(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "device-login-listeners-"));
-    indexManager = createIndexManager(initializeDatabase(":memory:"));
+    indexManager = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     tokenStore = createMockTokenStore();
 
     // Bind first (ephemeral ports), build the app once the ports are known.

@@ -33,6 +33,7 @@ import {
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import { dataRoutes } from "./data.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const builderWallet = createTestWallet(0);
@@ -186,7 +187,9 @@ describe("POST /v1/data/:scope with a write session", () => {
     hierarchyOptions = { dataDir };
 
     const db = initializeDatabase(":memory:");
-    const indexManager = createIndexManager(db);
+    const indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
 
     writeSessionStore = createInMemoryWriteSessionStore();
     await seedSession(writeSessionStore);
@@ -378,7 +381,9 @@ describe("POST /v1/data/:scope with a write session", () => {
   it("a write that fails before commit does not burn its proof", async () => {
     // Storage that fails the first commit, then works: the same signed
     // request must be accepted on retry rather than rejected as a replay.
-    const flakyIndex = createIndexManager(initializeDatabase(":memory:"));
+    const flakyIndex = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const realStorage = createNodeDataStorage({
       indexManager: flakyIndex,
       hierarchyOptions,
@@ -442,7 +447,9 @@ describe("POST /v1/data/:scope with a write session", () => {
     // Partial storage failure after the durable boundary: the real storage
     // path has indexed/published the record, then reports an incomplete
     // post-commit step. Retrying with the same proof would duplicate it.
-    const partialIndex = createIndexManager(initializeDatabase(":memory:"));
+    const partialIndex = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const realStorage = createNodeDataStorage({
       indexManager: partialIndex,
       hierarchyOptions,
@@ -704,7 +711,9 @@ describe("POST /v1/data/:scope with a write session after the stream-sync switch
 
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "data-write-switch-test-"));
-    index = createIndexManager(initializeDatabase(":memory:"));
+    index = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     const writeSessionStore = createInMemoryWriteSessionStore();
     await seedSession(writeSessionStore);
     app = dataRoutes({

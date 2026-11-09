@@ -22,8 +22,9 @@ function source(initial: boolean | "unreachable") {
 }
 
 describe("legacyWriteVerdict", () => {
-  it("allows everything when no mode is wired", () => {
-    expect(legacyWriteVerdict(undefined)).toBe("allow");
+  it("treats an unwired mode as unknown, never as allow (UNWIRED_ALLOWS)", () => {
+    expect(legacyWriteVerdict(undefined)).toBe("unknown");
+    expect(refuseLegacyWrite(undefined)?.status).toBe(503);
   });
 
   it("follows the mode: unswitched allows, switched refuses, unknown refuses", () => {
@@ -135,7 +136,9 @@ describe("fenceLegacyCommit", () => {
     }
   });
 
-  it("passes when no mode is wired", () => {
+  it("leaves the decision to the storage seal when no mode is wired", () => {
+    // The route-level check has no opinion without a mode; the seal at the
+    // final durable step refuses (unknown), so nothing depends on this.
     expect(() => fenceLegacyCommit(undefined)).not.toThrow();
   });
 });

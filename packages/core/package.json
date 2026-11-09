@@ -80,6 +80,10 @@
       "types": "./dist/storage/canonical-legacy-projection.d.ts",
       "import": "./dist/storage/canonical-legacy-projection.js"
     },
+    "./storage/legacy-write-seal": {
+      "types": "./dist/storage/legacy-write-seal.d.ts",
+      "import": "./dist/storage/legacy-write-seal.js"
+    },
     "./storage/legacy-scope-view": {
       "types": "./dist/storage/legacy-scope-view.d.ts",
       "import": "./dist/storage/legacy-scope-view.js"
@@ -187,6 +191,10 @@
     "./storage/adapters": {
       "types": "./dist/storage/adapters/index.d.ts",
       "import": "./dist/storage/adapters/index.js"
+    },
+    "./test-utils/legacy-write-seal": {
+      "types": "./dist/test-utils/legacy-write-seal.d.ts",
+      "import": "./dist/test-utils/legacy-write-seal.js"
     },
     "./test-utils": {
       "types": "./dist/test-utils/index.d.ts",

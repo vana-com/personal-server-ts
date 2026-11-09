@@ -17,6 +17,7 @@ import {
 import { initializeDatabase } from "./index-schema.js";
 import { createIndexManager, type IndexManager } from "./index-manager.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const syncTrace = vi.hoisted(() => ({
   beforePublish: undefined as (() => Promise<void>) | undefined,
@@ -104,6 +105,7 @@ describe("sync download durability", () => {
     root = await mkdtemp(join(tmpdir(), "download-durability-"));
     db = initializeDatabase(join(root, "index.db"));
     indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       revisionJournalDir: join(root, "cas-revisions"),
     });
     vi.mocked(deriveScopeKey).mockReturnValue(new Uint8Array(32).fill(0xbb));

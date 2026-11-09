@@ -37,6 +37,7 @@ import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "./data.js";
 import { mcpStreamableHttpRoutes } from "./mcp.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const MAIN_PORT = 8080;
@@ -194,7 +195,9 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
 
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "mcp-stream-sync-read-"));
-    const indexManager = createIndexManager(initializeDatabase(":memory:"));
+    const indexManager = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     store = createInMemoryMcpConnectionStore();
     const view = await streamView();
     const created = await createMcpConnection(

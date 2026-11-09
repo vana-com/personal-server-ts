@@ -19,7 +19,6 @@ import {
   type PsLiteRuntime,
 } from "./runtime.js";
 import {
-  createPersistentPsLiteStorage,
   type PsLiteDataFileStore,
   type PsLitePersistenceAdapter,
 } from "./storage.js";
@@ -31,6 +30,7 @@ import {
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
+import { createOpenPersistentPsLiteStorage as createPersistentPsLiteStorage } from "./test-support/open-storage.js";
 
 const SCOPE = "notes.entries";
 const OWNER = { Authorization: "Bearer owner-token" };

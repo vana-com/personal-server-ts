@@ -17,8 +17,11 @@ import type {
   NewIndexEntry,
   ScopeSummary,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 export interface IndexManager {
+  /** The seal every row insert asks (see `createIndexManager`). */
+  readonly legacyWriteSeal: LegacyWriteSeal;
   insert(entry: NewIndexEntry): IndexEntry;
   insertIfCurrent(
     entry: NewIndexEntry,
@@ -134,12 +137,19 @@ function rowToEntry(row: RawRow): IndexEntry {
 
 export function createIndexManager(
   db: Database.Database,
-  options?: {
+  options: {
+    /**
+     * Every row insert asks this seal in the same tick, so no legacy version
+     * becomes visible on a switched or unknown account, whichever writer got
+     * here. Required: an index manager with no seal does not compile.
+     */
+    legacyWriteSeal: LegacyWriteSeal;
     revisionJournalDir?: string;
     historyUnknownPath?: string;
     allowOpenMarkerMigration?: boolean;
   },
 ): IndexManager {
+  const legacyWriteSeal = options.legacyWriteSeal;
   const revisionJournalDir = options?.revisionJournalDir;
   const historyUnknownPath = options?.historyUnknownPath;
   if (revisionJournalDir) {
@@ -445,7 +455,7 @@ export function createIndexManager(
       .get(result.lastInsertRowid) as RawRow;
     return rowToEntry(row);
   };
-  const insertIfCurrent = db.transaction(
+  const insertIfCurrentTransaction = db.transaction(
     (
       entry: NewIndexEntry,
       precondition?: { kind: "none" } | { kind: "match"; version: number },
@@ -493,7 +503,16 @@ export function createIndexManager(
     },
   );
 
+  const insertIfCurrent: IndexManager["insertIfCurrent"] = (
+    entry,
+    precondition,
+  ) =>
+    legacyWriteSeal.commit(() =>
+      insertIfCurrentTransaction(entry, precondition),
+    );
+
   const manager: IndexManager = {
+    legacyWriteSeal,
     insert(entry) {
       const result = insertIfCurrent(entry);
       if (!result.ok) throw new Error("Unconditional insert was rejected");
@@ -512,7 +531,7 @@ export function createIndexManager(
     },
     hasTrustedRevisionJournal,
     insertRecovered(entry) {
-      return insertRow(entry);
+      return legacyWriteSeal.commit(() => insertRow(entry));
     },
 
     findByPath(path) {

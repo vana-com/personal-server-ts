@@ -5,7 +5,15 @@ import type {
   ScopeSummary,
 } from "./types.js";
 
+import type { LegacyWriteSeal } from "../legacy-write-seal.js";
+
 export interface IndexManager {
+  /**
+   * The seal every row insert asks. Storage built over this index (file
+   * publishing, import operations, chunked finalize) uses this same seal, so
+   * the index and the files that belong to it can never disagree.
+   */
+  readonly legacyWriteSeal: LegacyWriteSeal;
   insert(entry: NewIndexEntry): IndexEntry;
   /** Check a legacy write and allocate its CAS revision in one SQLite transaction. */
   insertIfCurrent(

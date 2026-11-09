@@ -21,6 +21,11 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/storage/index";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import {
+  createLegacyWriteSeal,
+  LegacyWriteRefusedError,
+  type BindableLegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import {
   IngestPersistedError,
   VersionSupersededError,
 } from "@opendatalabs/personal-server-ts-core/contracts";
@@ -98,6 +103,12 @@ export interface PsLiteStorageCapabilities {
 /** Persistent Lite storage with its public backend capability report. */
 export interface PsLiteStoragePort extends DataStoragePort {
   readonly capabilities: PsLiteStorageCapabilities;
+  /**
+   * The one place that decides whether a legacy version may become durable.
+   * It starts unbound and refuses (unknown); the runtime binds it to the
+   * account mode. See `core/storage/legacy-write-seal.ts`.
+   */
+  readonly legacyWriteSeal: BindableLegacyWriteSeal;
 }
 
 export interface PsLitePersistenceAdapter {
@@ -577,6 +588,7 @@ export async function createPersistentPsLiteStorage(
   // call order. A snapshot is taken when its turn comes, so each write carries
   // the latest index, and index changes never interleave.
   let persistQueue: Promise<void> = Promise.resolve();
+  const legacyWriteSeal = createLegacyWriteSeal();
 
   function enqueue<T>(step: () => Promise<T>): Promise<T> {
     const run = persistQueue.then(step);
@@ -630,11 +642,18 @@ export async function createPersistentPsLiteStorage(
     change: (
       current: PsLitePersistedStorageState,
     ) => PsLitePersistedStorageState | null,
+    options: { legacyCommit?: boolean } = {},
   ): Promise<boolean> {
     return enqueue(async () => {
       const next = change(state);
       if (!next) return false;
-      await publish(next);
+      // A change that makes a legacy version visible goes through the seal:
+      // the account mode is asked in the same tick that the write starts, and
+      // `drain()` waits for it. Other changes (erase, metadata) are not legacy
+      // writes and stay open after a switch so the account can clean up.
+      await (options.legacyCommit
+        ? legacyWriteSeal.commit(() => publish(next))
+        : publish(next));
       return true;
     });
   }
@@ -680,42 +699,45 @@ export async function createPersistentPsLiteStorage(
     options: { onlyIfNewest?: boolean } = {},
   ): Promise<IndexEntry> {
     let indexed: IndexEntry | undefined;
-    await updateIndex((current) => {
-      if (
-        options.onlyIfNewest &&
-        current.entries.some(
-          (e) =>
-            e.scope === entry.scope &&
-            Date.parse(e.collectedAt) > Date.parse(entry.collectedAt),
-        )
-      ) {
-        throw new VersionSupersededError(entry.scope);
-      }
-      const version =
-        entry.version ??
-        current.entries.reduce(
-          (max, e) =>
-            e.scope === entry.scope && e.version > max ? e.version : max,
-          0,
-        ) + 1;
-      indexed = {
-        ...entry,
-        schemaId: entry.schemaId ?? null,
-        version,
-        dataPointId: entry.dataPointId ?? null,
-        afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
-        id: current.nextId,
-        createdAt: new Date().toISOString(),
-      };
-      return {
-        ...current,
-        nextId: current.nextId + 1,
-        entries: [
-          ...current.entries.filter((item) => item.path !== entry.path),
-          indexed,
-        ],
-      };
-    });
+    await updateIndex(
+      (current) => {
+        if (
+          options.onlyIfNewest &&
+          current.entries.some(
+            (e) =>
+              e.scope === entry.scope &&
+              Date.parse(e.collectedAt) > Date.parse(entry.collectedAt),
+          )
+        ) {
+          throw new VersionSupersededError(entry.scope);
+        }
+        const version =
+          entry.version ??
+          current.entries.reduce(
+            (max, e) =>
+              e.scope === entry.scope && e.version > max ? e.version : max,
+            0,
+          ) + 1;
+        indexed = {
+          ...entry,
+          schemaId: entry.schemaId ?? null,
+          version,
+          dataPointId: entry.dataPointId ?? null,
+          afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
+          id: current.nextId,
+          createdAt: new Date().toISOString(),
+        };
+        return {
+          ...current,
+          nextId: current.nextId + 1,
+          entries: [
+            ...current.entries.filter((item) => item.path !== entry.path),
+            indexed,
+          ],
+        };
+      },
+      { legacyCommit: true },
+    );
     return indexed!;
   }
 
@@ -739,6 +761,7 @@ export async function createPersistentPsLiteStorage(
   const storagePort: PsLiteStoragePort = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
+    legacyWriteSeal,
     ...createStorageReadMethods(() => state.entries, entriesForScope),
 
     findByFileId(fileId) {
@@ -791,6 +814,10 @@ export async function createPersistentPsLiteStorage(
     },
 
     async writeEnvelope(envelope): Promise<WriteResult> {
+      // A blob with no index row is invisible, so this is not the commit (that
+      // is the row install, sealed in `installEntry`). Refuse early so a
+      // closed account does not leave an orphan blob behind.
+      legacyWriteSeal.assertOpen();
       const path = envelopePath(envelope.scope, envelope.collectedAt);
       const sizeBytes = await withPathLock(path, async () => {
         const size = await fileStore.writeEnvelope(path, envelope);
@@ -825,6 +852,12 @@ export async function createPersistentPsLiteStorage(
             sizeBytes: entry.sizeBytes ?? size,
           });
         } catch (error) {
+          if (error instanceof LegacyWriteRefusedError) {
+            // The seal refused the row: nothing is visible. Remove the blob so
+            // a refused write leaves nothing, and surface the refusal as is.
+            await dropUnindexedEnvelope(path);
+            throw error;
+          }
           // The bytes are durable here; the caller's recovery depends on that.
           throw new IngestPersistedError(path, error);
         }

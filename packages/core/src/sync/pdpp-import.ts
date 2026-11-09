@@ -234,6 +234,11 @@ export interface PdppImporterDeps {
    * store. While it is unknown, the publish is refused too and retried later.
    */
   accountStorageMode?: AccountStorageMode;
+  /**
+   * The owner the importer writes for. The mode answers `unknown` for an owner
+   * it is not bound to, so a store wired to the wrong account refuses.
+   */
+  serverOwner?: string;
   logger: Logger;
 }
 
@@ -648,7 +653,10 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
 
     // A canonical publish is a legacy write: refuse it on a switched account
     // before anything is stored. This is the only gate on the publish path.
-    const verdict = legacyWriteVerdict(deps.accountStorageMode);
+    const verdict = legacyWriteVerdict(
+      deps.accountStorageMode,
+      deps.serverOwner,
+    );
     if (verdict === "switched") {
       return reject("legacy_write_refused", UPDATE_REQUIRED_MESSAGE);
     }

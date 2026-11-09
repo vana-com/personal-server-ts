@@ -27,6 +27,7 @@ import { createServer, type ServerContext } from "./bootstrap.js";
 import { createNodeDataStorage } from "./storage/node-data-storage.js";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createIndexManager } from "./storage/index-manager.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -627,6 +628,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await writeFile(join(root, "reindex-in-progress"), "interrupted\n");
     const interruptedDb = initializeDatabase(join(root, "index.db"));
     const interruptedIndex = createIndexManager(interruptedDb, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       revisionJournalDir: join(root, "cas-revisions"),
     });
     interruptedIndex.insert({
@@ -690,6 +692,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await writeFile(join(root, "reindex-in-progress"), "interrupted\n");
     const interruptedDb = initializeDatabase(join(root, "index.db"));
     const interruptedIndex = createIndexManager(interruptedDb, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       revisionJournalDir: join(root, "cas-revisions"),
     });
     interruptedIndex.insert({

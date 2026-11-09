@@ -20,7 +20,7 @@ import {
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
+import { createOpenPersistentPsLiteStorage as createPersistentPsLiteStorage } from "./test-support/open-storage.js";
 
 const SCOPE = "notes.entries";
 const items = (...ids: string[]) => ({ items: ids.map((id) => ({ id })) });

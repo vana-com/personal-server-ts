@@ -37,6 +37,7 @@ import {
   createAccountStorageMode,
   type PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
+import { createLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
 import { createLogger, type Logger } from "./logger/index.js";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -439,7 +440,30 @@ export async function createServer(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cas_open_marker_protocol'",
       )
       .get() !== undefined;
+  // The account's stream-sync switch is `config.streamSync.write` alone (the
+  // host sets it from the Account setting before launch). One mode per
+  // runtime, sampled when built. It is built before any storage so the
+  // legacy-write seal can be bound to it from the first byte: boot recovery,
+  // import-operation recovery and every later writer ask the same seal. The
+  // write gate, the read selector, the PDPP importer and every MCP engine of
+  // this server consume this same mode. `streamSync.refuseLegacyWrites` takes
+  // no part.
+  const masterKeySignature =
+    options?.ownerSignature ??
+    (process.env.VANA_MASTER_KEY_SIGNATURE as `0x${string}` | undefined);
+  const recoveredOwnerAddress = masterKeySignature
+    ? await recoverOwnerAddress(masterKeySignature)
+    : undefined;
+  const accountStorageMode = createAccountStorageMode({
+    owner: recoveredOwnerAddress,
+    source: () => config.streamSync.write === true,
+  });
+  const legacyWriteSeal = createLegacyWriteSeal({
+    mode: accountStorageMode,
+    owner: recoveredOwnerAddress,
+  });
   const indexManager = createIndexManager(db, {
+    legacyWriteSeal,
     revisionJournalDir,
     historyUnknownPath,
     // Existing databases predate open proofs. Later boots treat a missing
@@ -510,10 +534,8 @@ export async function createServer(
     logger.info("X402 payment enforcement enabled on data reads");
   }
 
-  // Derive server owner from VANA_MASTER_KEY_SIGNATURE env var
-  const masterKeySignature =
-    options?.ownerSignature ??
-    (process.env.VANA_MASTER_KEY_SIGNATURE as `0x${string}` | undefined);
+  // Derive server owner from VANA_MASTER_KEY_SIGNATURE env var (recovered
+  // before storage is built: see `masterKeySignature` above).
   const ownerPrivateKey = process.env.VANA_OWNER_PRIVATE_KEY as
     `0x${string}` | undefined;
   const ownerTunnelSigner = ownerPrivateKey
@@ -530,7 +552,7 @@ export async function createServer(
   let identity: IdentityInfo | undefined;
 
   if (masterKeySignature) {
-    const recoveredServerOwner = await recoverOwnerAddress(masterKeySignature);
+    const recoveredServerOwner = recoveredOwnerAddress!;
     serverOwner = recoveredServerOwner;
     legacyMasterKey(masterKeySignature); // validate signature format
     logger.info({ owner: serverOwner }, "Server owner derived from master key");
@@ -666,15 +688,6 @@ export async function createServer(
    * delegate reports every envelope as skipped — sync behaves exactly as it
    * did before this existed.
    */
-  // The account's stream-sync switch is `config.streamSync.write` alone (the
-  // host sets it from the Account setting before launch). One mode per
-  // runtime, sampled when built: the write gate and its commit fence, the read
-  // selector, the PDPP importer and every MCP engine of this server consume
-  // this same instance. `streamSync.refuseLegacyWrites` takes no part.
-  const accountStorageMode = createAccountStorageMode({
-    owner: serverOwner,
-    source: () => config.streamSync.write === true,
-  });
   let pdppImporterImpl: PdppImporter | null = null;
   const pdppImporter: PdppImporter = {
     importEnvelope: (envelope) =>

@@ -15,6 +15,7 @@ import {
 import { createIndexManager } from "./index-manager.js";
 import { initializeDatabase } from "./index-schema.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const owner = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
 const scope = "notes.items";
@@ -22,7 +23,9 @@ const logger = { debug() {}, info() {}, warn() {}, error() {} } as never;
 const DELETED_AT = "2026-10-02T00:00:00Z";
 
 function openServer(root: string) {
-  const index = createIndexManager(initializeDatabase(join(root, "index.db")));
+  const index = createIndexManager(initializeDatabase(join(root, "index.db")), {
+    legacyWriteSeal: openLegacyWriteSealForTests(),
+  });
   const storage = createNodeDataStorage({
     indexManager: index,
     hierarchyOptions: { dataDir: join(root, "data") },

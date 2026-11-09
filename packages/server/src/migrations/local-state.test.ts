@@ -6,6 +6,7 @@ import { migrateLocalState } from "./local-state.js";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { DETECT_STUCK_VERSION_LEDGER_ID } from "./detect-stuck-version-ledger.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 describe("migrateLocalState", () => {
   let tempDir: string;
@@ -128,7 +129,9 @@ describe("migrateLocalState", () => {
   it("runs the state-migration registry against index.db and records the detection non-destructively", async () => {
     // Seed a stuck scope: two pending (unsynced) rows.
     const db = initializeDatabase(join(storageRoot, "index.db"));
-    const index = createIndexManager(db);
+    const index = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     index.insert({
       fileId: null,
       path: "spotify.savedTracks/1.json",

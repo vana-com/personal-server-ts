@@ -34,16 +34,27 @@ import type {
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import { indexDatabase } from "./index-manager.js";
 import { createImportOperations } from "./import-operations.js";
+import { LegacyWriteRefusedError } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 export interface NodeDataStorageDeps {
   indexManager: IndexManager;
   hierarchyOptions: HierarchyManagerOptions;
 }
 
-/** Finish committed stages and discard stages that lost their index race. */
+/**
+ * Finish committed stages and discard stages that lost their index race.
+ *
+ * A stage whose row is already indexed is a legacy write that was acknowledged
+ * before the crash. Finishing it publishes a legacy file, so it follows the
+ * seal like any other publication: open publishes it; switched drops the stage
+ * and its row (the account's legacy files are deleted after the switch, and
+ * this one must not outlive it); unknown leaves both in place, because the
+ * answer to "may this publish?" is not known yet and a later boot decides.
+ */
 export async function recoverStagedDataFiles(
   deps: NodeDataStorageDeps,
 ): Promise<void> {
+  const seal = deps.indexManager.legacyWriteSeal;
   const visit = async (dir: string): Promise<void> => {
     for (const item of await readdir(dir, { withFileTypes: true })) {
       const path = join(dir, item.name);
@@ -56,9 +67,11 @@ export async function recoverStagedDataFiles(
           dir,
           item.name.slice(0, marker + ".json".length),
         );
-        const indexed = deps.indexManager.findByPath(
-          relative(deps.hierarchyOptions.dataDir, finalPath),
+        const relativeFinal = relative(
+          deps.hierarchyOptions.dataDir,
+          finalPath,
         );
+        const indexed = deps.indexManager.findByPath(relativeFinal);
         if (!indexed) {
           await unlink(path);
           continue;
@@ -71,7 +84,16 @@ export async function recoverStagedDataFiles(
           await unlink(path);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          await publishStagedDataFile(path, finalPath);
+          try {
+            await publishStagedDataFile(path, finalPath, seal);
+          } catch (refused) {
+            if (!(refused instanceof LegacyWriteRefusedError)) throw refused;
+            if (refused.verdict === "switched") {
+              await unlink(path);
+              deps.indexManager.deleteByPath(relativeFinal);
+            }
+            // unknown: leave the stage and its row for a later boot.
+          }
         }
       }
     }
@@ -122,27 +144,34 @@ export async function reindexLegacyDataFiles(
       const closeAfterInsert = await deps.closeRecoveredScopeForWrites?.(
         envelope.scope,
       );
-      deps.indexManager.insertRecovered({
-        fileId: null,
-        schemaId: envelope.schemaId ?? null,
-        path: relativePath,
-        scope: envelope.scope,
-        collectedAt: envelope.collectedAt,
-        sizeBytes: bytes,
-        producer:
-          envelope.producer === "pdpp-projector" ||
-          envelope.producer === "pdpp-import-projection"
-            ? envelope.producer
-            : null,
-        producerProvenance:
-          envelope.producer_provenance &&
-          typeof envelope.producer_provenance === "object"
-            ? JSON.stringify(envelope.producer_provenance)
-            : null,
-      });
-      if (closeAfterInsert && !recoveredScopes.has(envelope.scope)) {
-        deps.indexManager.closeScopeForWrites(envelope.scope);
-        recoveredScopes.add(envelope.scope);
+      // Rebuilding the index re-creates visible legacy rows: the seal decides
+      // like for any other row. A refused file stays on disk, unindexed.
+      try {
+        deps.indexManager.insertRecovered({
+          fileId: null,
+          schemaId: envelope.schemaId ?? null,
+          path: relativePath,
+          scope: envelope.scope,
+          collectedAt: envelope.collectedAt,
+          sizeBytes: bytes,
+          producer:
+            envelope.producer === "pdpp-projector" ||
+            envelope.producer === "pdpp-import-projection"
+              ? envelope.producer
+              : null,
+          producerProvenance:
+            envelope.producer_provenance &&
+            typeof envelope.producer_provenance === "object"
+              ? JSON.stringify(envelope.producer_provenance)
+              : null,
+        });
+        if (closeAfterInsert && !recoveredScopes.has(envelope.scope)) {
+          deps.indexManager.closeScopeForWrites(envelope.scope);
+          recoveredScopes.add(envelope.scope);
+        }
+      } catch (error) {
+        if (error instanceof LegacyWriteRefusedError) continue;
+        throw error;
       }
       recovered++;
     }
@@ -155,6 +184,9 @@ export function createNodeDataStorage(
   deps: NodeDataStorageDeps,
 ): DataStoragePort {
   const db = indexDatabase(deps.indexManager);
+  // The same seal the index asks on every row insert. File publishing and
+  // import operations ask it too, so a legacy file cannot appear without it.
+  const seal = deps.indexManager.legacyWriteSeal;
   const operations = db
     ? createImportOperations(db, deps.indexManager, deps.hierarchyOptions)
     : undefined;
@@ -165,6 +197,7 @@ export function createNodeDataStorage(
   }
 
   return {
+    legacyWriteSeal: seal,
     kind: "node-fs-sqlite",
     ...(operations ? { commitVersion: operations.commitVersion } : {}),
     listScopes(options: DataStorageScopeListOptions) {
@@ -232,14 +265,18 @@ export function createNodeDataStorage(
       return readScopeBlockManifest(deps.hierarchyOptions, scope, collectedAt);
     },
     writeEnvelope(envelope: DataFileEnvelope) {
-      return writeDataFile(deps.hierarchyOptions, envelope);
+      return writeDataFile(deps.hierarchyOptions, envelope, seal);
     },
     // The file is durable at its final path before its row exists, and the
     // scope lock keeps every erase of the scope (all of which take it) from
     // running between the two.
     writeEnvelopeAndIndex(envelope, entry) {
       return withScopeLock(envelope.scope, async () => {
-        const written = await writeDataFile(deps.hierarchyOptions, envelope);
+        const written = await writeDataFile(
+          deps.hierarchyOptions,
+          envelope,
+          seal,
+        );
         try {
           return deps.indexManager.insert({
             ...entry,
@@ -247,6 +284,13 @@ export function createNodeDataStorage(
             sizeBytes: entry.sizeBytes ?? written.sizeBytes,
           });
         } catch (err) {
+          if (err instanceof LegacyWriteRefusedError) {
+            // The account switched between the publish and the row: the file
+            // is not indexed and must not stay. Under the scope lock nothing
+            // else owns this path.
+            await unlink(written.path).catch(() => undefined);
+            throw err;
+          }
           throw new IngestPersistedError(written.relativePath, err);
         }
       });
@@ -255,6 +299,10 @@ export function createNodeDataStorage(
       const staged = await stageDataFile(deps.hierarchyOptions, envelope);
       let indexed = false;
       try {
+        // The row insert and the rename that follows it start in the same
+        // tick; the index asks the seal before it writes, and the publish
+        // asks it again. A refusal at the row leaves nothing behind but the
+        // stage, which the `finally` removes.
         const result = deps.indexManager.insertIfCurrent(
           {
             ...entry,
@@ -267,7 +315,7 @@ export function createNodeDataStorage(
           return result;
         }
         indexed = true;
-        await publishStagedDataFile(staged.stagePath, staged.finalPath);
+        await publishStagedDataFile(staged.stagePath, staged.finalPath, seal);
         return {
           ok: true as const,
           writeResult: {

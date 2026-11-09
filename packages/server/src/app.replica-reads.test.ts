@@ -16,6 +16,7 @@ import { initializeDatabase } from "./storage/index-schema.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
 import { createReplicaRecordStore } from "./storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./storage/pdpp-replication-receiver.js";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 // The host composes an enabled receiver with the real app. Every
 // canonical-derived HTTP response must come from the reader the token selects.
@@ -116,7 +117,9 @@ function host({
     // The host-owned reader capability, selected per authenticated token.
     reads: (reader: "owner" | "grant") => receiver.readStore({ reader }),
   };
-  const indexManager = createIndexManager(db);
+  const indexManager = createIndexManager(db, {
+    legacyWriteSeal: openLegacyWriteSealForTests(),
+  });
   const app = createApp({
     logger: pino({ level: "silent" }),
     version: "test",

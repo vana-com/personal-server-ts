@@ -4,7 +4,7 @@ import { listDataScopesContract } from "@opendatalabs/personal-server-ts-core/co
 import * as projections from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
-import { createPersistentPsLiteStorage } from "./storage.js";
+import { createOpenPersistentPsLiteStorage as createPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import {
   createMemoryPsLiteDataFileStore,
   createMemoryPsLitePersistence,

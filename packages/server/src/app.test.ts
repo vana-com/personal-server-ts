@@ -22,6 +22,10 @@ import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing
 import pino from "pino";
 import type { TokenStore } from "./token-store.js";
 import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
+import {
+  unswitchedAccountStorageModeForTests,
+  openLegacyWriteSealForTests,
+} from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(0);
@@ -110,7 +114,9 @@ describe("createApp", () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "app-test-"));
     const db = initializeDatabase(":memory:");
-    indexManager = createIndexManager(db);
+    indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
   });
 
   afterEach(async () => {
@@ -121,6 +127,7 @@ describe("createApp", () => {
   function makeApp() {
     const logger = pino({ level: "silent" });
     return createApp({
+      accountStorageMode: unswitchedAccountStorageModeForTests(),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -137,6 +144,7 @@ describe("createApp", () => {
   function makeAppWithControlPlaneToken() {
     const logger = pino({ level: "silent" });
     return createApp({
+      accountStorageMode: unswitchedAccountStorageModeForTests(),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -162,6 +170,7 @@ describe("createApp", () => {
   ) {
     const logger = pino({ level: "silent" });
     return createApp({
+      accountStorageMode: unswitchedAccountStorageModeForTests(),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -870,6 +879,7 @@ describe("createApp", () => {
     const mockSyncManager = createMockSyncManager();
     const logger = pino({ level: "silent" });
     const app = createApp({
+      accountStorageMode: unswitchedAccountStorageModeForTests(),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -1022,6 +1032,7 @@ describe("createApp", () => {
     );
 
     const app = createApp({
+      accountStorageMode: unswitchedAccountStorageModeForTests(),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -1295,7 +1306,9 @@ describe("dev UI loopback gate", () => {
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "app-ui-test-"));
-    indexManager = createIndexManager(initializeDatabase(":memory:"));
+    indexManager = createIndexManager(initializeDatabase(":memory:"), {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
   });
 
   afterEach(async () => {

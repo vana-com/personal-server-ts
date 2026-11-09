@@ -1,3 +1,4 @@
+import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import type {
   Builder,
   DataFileEnvelope,
@@ -157,6 +158,14 @@ export interface DataVersionWriter {
 }
 
 export interface DataStoragePort extends RuntimeStoragePort {
+  /**
+   * The seal this storage asks before it makes any legacy version durable
+   * (see `storage/legacy-write-seal.ts`). Node and Lite storage always have
+   * one. Background writers read it to stop early (`verdict()`) instead of
+   * doing work that would be refused; a host awaits `drain()` after it
+   * observes the switch. Absent on test doubles.
+   */
+  readonly legacyWriteSeal?: LegacyWriteSeal;
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
     total: number;

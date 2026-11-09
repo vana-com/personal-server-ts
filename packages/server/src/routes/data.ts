@@ -6,7 +6,8 @@ import {
   type PersonalServerApiDispatchOptions,
   type PersonalServerReadFulfillmentReporter,
   type StreamSyncReadPort,
-  refuseLegacyWrite,
+  admitLegacyWrite,
+  LegacyWriteRefusedError,
   type AccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -163,7 +164,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   const app = new Hono();
   // The account's one storage mode is the only switch input for the gate.
   const refuseLegacyNow = () =>
-    refuseLegacyWrite(deps.accountStorageMode, deps.serverOwner);
+    admitLegacyWrite(deps.accountStorageMode, deps.serverOwner);
   // These owner-scoped reads change after import and deletion; 410 is cacheable by default.
   app.use("*", async (c, next) => {
     await next();
@@ -203,8 +204,9 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   };
   app.post("/:scope", refuseLegacy);
   app.post("/:scope/imports", refuseLegacy);
-  app.put("/:scope/imports/:id/chunks/:index", refuseLegacy);
-  app.post("/:scope/imports/:id/finalize", refuseLegacy);
+  // The two chunked-import session routes refuse inside the import module
+  // (`refuseIfLegacy`), which knows the session and removes its chunks and
+  // metadata with the 426. Refusing here would leave them behind.
   app.put("/:scope/imports/:operation", refuseLegacy);
   app.post("/:scope/uploads", refuseLegacy);
   app.put("/:scope/uploads/:id/batches/:index", refuseLegacy);
@@ -239,6 +241,8 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       });
     } catch (error) {
       if (error instanceof LegacyWriteRefused) return error.response;
+      // The seal's refusal at the final publish (switch landed mid-finalize).
+      if (error instanceof LegacyWriteRefusedError) return error.response;
       if (error instanceof ScopeImportError) {
         return c.body(
           JSON.stringify({ error: error.code, message: error.message }),

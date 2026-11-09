@@ -5,7 +5,7 @@ import {
   deleteScope,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
+import { createOpenPersistentPsLiteStorage as createPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import type { PsLiteDataFileStore } from "./storage.js";
 import {
   createMemoryPsLiteAccessLogStore,

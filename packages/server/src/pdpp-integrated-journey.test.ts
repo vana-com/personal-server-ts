@@ -59,6 +59,7 @@ import { createTestWallet } from "@opendatalabs/personal-server-ts-core/test-uti
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
+import { openLegacyWriteSealForTests } from "@opendatalabs/personal-server-ts-core/test-utils/legacy-write-seal";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const SUBJECT = "sub_owner_1";
@@ -244,7 +245,9 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "pdpp-journey-"));
     const db = initializeDatabase(":memory:");
-    indexManager = createIndexManager(db);
+    indexManager = createIndexManager(db, {
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
     harness = makeHarness(tempDir, indexManager);
   });
 
