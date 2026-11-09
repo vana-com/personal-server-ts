@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 import type { DeclarationSnapshot } from "../../pdpp/types.js";
 import { createCanonicalImportSource } from "./canonical-source.js";
+import { createMemoryImportAuthority } from "./import-authority.js";
 import { CONNECTOR, flow, OWNER, raw, STREAM } from "./retire-rig.js";
 
 type Flow = Awaited<ReturnType<typeof flow>>;
@@ -147,8 +148,12 @@ describe("a staged connector that never runs again is still readable (SEED_WAITS
       owner: OWNER,
     });
     await f.importer.run();
-    expect(await f.rig.writer.publishSeed(CONNECTOR)).toBe("waiting");
-    expect(await f.rig.writer.publishSeed(CONNECTOR)).toBe("waiting");
+    expect(await f.rig.writer.publishSeed(CONNECTOR)).toEqual({
+      state: "waiting",
+    });
+    expect(await f.rig.writer.publishSeed(CONNECTOR)).toEqual({
+      state: "waiting",
+    });
     await f.rig.writer.refreshControls();
     expect(await f.rig.publish()).toHaveLength(1);
   });
@@ -263,16 +268,20 @@ describe("what the import left behind is one owner read (STATUS_HIDES_EXCLUDED)"
       connectors: [],
     });
     await f.importer.run();
+    await publish(f);
+    await f.importer.run();
     const status = await f.importer.status();
     expect(status).toEqual({
       complete: true,
       abandoned: false,
+      stayed: 3,
       connectors: [
         {
           connector: CONNECTOR,
-          state: "imported",
+          state: "published",
           attempts: 0,
           staged: 2,
+          stayed: 3,
           excluded: [
             { reason: "unkeyed_row", rows: 1 },
             { reason: "unmapped_stream", rows: 2 },
@@ -281,6 +290,200 @@ describe("what the import left behind is one owner read (STATUS_HIDES_EXCLUDED)"
       ],
     });
     expect(JSON.stringify(status)).not.toContain("no key at all");
+  });
+});
+
+describe("the status shows a stalled publish (STATUS_REPORTS_PUBLISHED_UNPUBLISHED)", () => {
+  it("reports imported, not published, and tells the authority nothing, until the writer merges the seed", async () => {
+    const f = await flow({
+      local: ["e0"],
+      source: sourceOf([raw("e0")]),
+      owner: OWNER,
+    });
+    await f.importer.run(); // staged; the publish is only queued
+    expect(await f.importer.status()).toMatchObject({
+      complete: false,
+      connectors: [{ connector: CONNECTOR, state: "imported", staged: 1 }],
+    });
+    expect(f.authority.doneCalls).toEqual([]);
+    await publish(f);
+    await f.importer.run(); // sees the receipt
+    expect(await f.importer.status()).toMatchObject({
+      complete: true,
+      connectors: [{ connector: CONNECTOR, state: "published" }],
+    });
+    expect(f.authority.doneCalls).toEqual([OWNER.toLowerCase()]);
+  });
+
+  it("does not tell the authority the import is done while the publish is held (DONE_BEFORE_PUBLISHED)", async () => {
+    const f = await flow({
+      local: ["e0"],
+      source: sourceOf([raw("e0")]),
+      owner: OWNER,
+      publishSeed: async () => ({ state: "waiting" }),
+    });
+    await f.importer.run();
+    await f.importer.run();
+    expect(f.authority.doneCalls).toEqual([]);
+    expect(await f.ledger.importPending()).toBe(true);
+    expect((await f.importer.status()).connectors[0]?.state).toBe("imported");
+  });
+});
+
+describe("rows that stayed in legacy are counted for a failed connector (FAILED_STAYED_NOT_COUNTED)", () => {
+  it("counts the connector's rows, with no row content, when its import is given up", async () => {
+    const f = await flow({
+      local: ["e0", "e1"],
+      source: sourceOf([raw("e0"), raw("e1")], 2),
+      owner: OWNER,
+      sinkThrows: STREAM,
+      maxAttempts: 2,
+    });
+    await f.importer.run();
+    expect(await f.importer.status()).toMatchObject({
+      stayed: 4,
+      connectors: [{ connector: CONNECTOR, state: "pending", stayed: 4 }],
+    });
+    await f.importer.run();
+    const status = await f.importer.status();
+    expect(status).toMatchObject({
+      stayed: 4,
+      connectors: [{ connector: CONNECTOR, state: "failed", stayed: 4 }],
+    });
+    // A source that cannot be listed leaves the count unknown, not zero.
+  });
+
+  it("leaves the count unknown, not zero, when the source was abandoned", async () => {
+    const f = await flow({
+      local: ["e0"],
+      source: {
+        owner: OWNER,
+        connectors: async () => {
+          throw new Error("the store is corrupt");
+        },
+        streams: async () => [],
+      },
+      owner: OWNER,
+      maxAttempts: 1,
+    });
+    await f.importer.run();
+    expect(await f.importer.status()).toMatchObject({
+      abandoned: true,
+      stayed: null,
+    });
+  });
+});
+
+describe("a seed the writer skipped is not published (SKIPPED_COUNTED_AS_PUBLISHED)", () => {
+  it("counts the streams as left behind, reports no publish, and keeps the legacy file", async () => {
+    const f = await flow({
+      local: ["e0", "e1"],
+      source: sourceOf([raw("e0"), raw("e1")]),
+      owner: OWNER,
+      publishSeed: async () => ({ state: "done", skipped: [STREAM] }),
+    });
+    await f.importer.run();
+    await f.importer.run();
+    const status = await f.importer.status();
+    expect(status.connectors[0]).toMatchObject({
+      state: "imported",
+      staged: 2,
+      stayed: 2,
+      excluded: [{ reason: "seed_skipped", rows: 2 }],
+    });
+    expect((await f.ledger.read()).imported[CONNECTOR]).not.toHaveProperty(
+      "published",
+    );
+    // Final: the authority is told; but the file is never retired.
+    expect(f.authority.doneCalls).toEqual([OWNER.toLowerCase()]);
+    expect(await f.ledger.importProven(CONNECTOR)).toBe(false);
+  });
+});
+
+describe("the import names the connection it chose (CHOICE_NOT_SURFACED, TIE_NOT_FLAGGED)", () => {
+  /** Two live connections of the connector, each with its own rows and latest write. */
+  const twoConnections = (latest: [string, string]) => {
+    const A = `${CONNECTOR}:${OWNER}:a`;
+    const B = `${CONNECTOR}:${OWNER}:b`;
+    const rows: Record<string, Record<string, unknown>[]> = {
+      [A]: [raw("a0"), raw("a1")],
+      [B]: [raw("b0")],
+    };
+    const stamp: Record<string, string> = { [A]: latest[0], [B]: latest[1] };
+    return createCanonicalImportSource({
+      owner: OWNER,
+      deps: () => ({
+        store: {
+          listConnections: () => [
+            { instance: A, deletedAt: null },
+            { instance: B, deletedAt: null },
+          ],
+          listStreams: (instances: string[]) =>
+            instances.flatMap((instance) => [
+              {
+                stream: STREAM,
+                recordCount: rows[instance]!.length,
+                lastUpdated: stamp[instance] ?? null,
+              },
+            ]),
+          listRecords: (
+            _stream: string,
+            options: { instanceIds: string[] },
+          ) => ({
+            data: rows[options.instanceIds[0]!]!.map((data) => ({ data })),
+            hasMore: false,
+          }),
+        },
+        declarations: DECLARED,
+      }),
+    });
+  };
+
+  it("surfaces which connection was chosen and how many were passed over, as truncated hashes", async () => {
+    const f = await flow({
+      local: ["a0", "a1"],
+      source: twoConnections(["2026-01-01T00:00:02Z", "2026-01-01T00:00:01Z"]),
+      owner: OWNER,
+    });
+    await f.importer.run();
+    const status = await f.importer.status();
+    const choice = status.connectors[0]?.connection;
+    expect(choice).toMatchObject({ passedOver: 1, tied: false });
+    expect(choice?.chosen).toMatch(/^[0-9a-f]{12}$/);
+    expect(JSON.stringify(status)).not.toContain(`${CONNECTOR}:${OWNER}`);
+    expect(status.connectors[0]).toMatchObject({
+      staged: 2,
+      excluded: [{ reason: "other_connection", rows: 1 }],
+    });
+  });
+
+  it("says so when the top two connections tie on their latest write", async () => {
+    const same = "2026-01-01T00:00:05Z";
+    const f = await flow({
+      local: ["a0", "a1"],
+      source: twoConnections([same, same]),
+      owner: OWNER,
+    });
+    await f.importer.run();
+    expect((await f.importer.status()).connectors[0]?.connection).toMatchObject(
+      { passedOver: 1, tied: true },
+    );
+  });
+});
+
+describe("the authority owns done (AUTHORITY_PENDING_IGNORED)", () => {
+  it("does nothing once the authority says the import is done", async () => {
+    const f = await flow({
+      local: ["e0"],
+      source: sourceOf([raw("e0")]),
+      owner: OWNER,
+      authority: createMemoryImportAuthority({ pending: false }),
+    });
+    expect(await f.importer.run()).toMatchObject({ ran: false });
+    expect(f.staged.size).toBe(0);
+    expect(f.authority.doneCalls).toEqual([]);
+    // The writer's gate is open for every connector.
+    expect(await f.importer.importDone(CONNECTOR)).toBe(true);
   });
 });
 

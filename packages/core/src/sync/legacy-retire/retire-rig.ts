@@ -6,7 +6,10 @@
 
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import { createMemoryStreamSyncFiles } from "../../stream-sync/memory-files.js";
-import type { StreamSyncSeedSource } from "../../stream-sync/index.js";
+import type {
+  SeedPublication,
+  StreamSyncSeedSource,
+} from "../../stream-sync/index.js";
 import { Rig } from "../../stream-sync-read/writer-rig.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
 import { createRetireHost } from "./host.js";
@@ -15,6 +18,10 @@ import {
   type ImportStream,
   type LegacyImportSource,
 } from "./import.js";
+import {
+  createMemoryImportAuthority,
+  type ImportAuthority,
+} from "./import-authority.js";
 import { RetireLedger } from "./ledger.js";
 import { retireLegacyFiles, type RetireHost } from "./retire.js";
 
@@ -71,13 +78,18 @@ export async function flow(options: {
   /** Failed attempts before a connector's import is given up (default: the importer's). */
   maxAttempts?: number;
   /** Publish the staged seed with no connector run (default on); or a replacement. */
-  publishSeed?: boolean | ((connector: string) => Promise<"done" | "waiting">);
+  publishSeed?: boolean | ((connector: string) => Promise<SeedPublication>);
+  /** The importer acts for this Account when it differs from the ledger's / source's. */
+  requestOwner?: string;
+  /** The authority that owns "the import is done"; default pending in memory. */
+  authority?: ImportAuthority;
 }) {
   let switched = options.switched ?? true;
   const staged = new Map<string, Record<string, unknown>[]>();
   const owner = options.owner ?? OWNER;
   const files = createMemoryStreamSyncFiles();
-  const ledger = new RetireLedger(files, owner);
+  const authority = options.authority ?? createMemoryImportAuthority();
+  const ledger = new RetireLedger(files, owner, authority);
   let stagings = 0;
   let crashed = false;
   const importStream: ImportStream = {
@@ -114,7 +126,8 @@ export async function flow(options: {
           return out.length;
         },
       },
-      ledger: new RetireLedger(files, own.owner),
+      ledger: new RetireLedger(files, own.owner, authority),
+      owner: options.requestOwner ?? own.owner,
       switched: () => switched,
       ...(options.maxAttempts ? { maxAttempts: options.maxAttempts } : {}),
       ...(options.publishSeed === false
@@ -213,6 +226,7 @@ export async function flow(options: {
     });
   return {
     rig,
+    authority,
     setSwitched(value: boolean) {
       switched = value;
     },

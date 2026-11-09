@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { createMemoryStreamSyncFiles } from "../../stream-sync/memory-files.js";
 import type { ImportStream, LegacyImportSink } from "./import.js";
 import { LegacyImporter } from "./import.js";
+import { createMemoryImportAuthority } from "./import-authority.js";
 import { RetireLedger } from "./ledger.js";
 import { createRetireHost } from "./host.js";
 import { retireLegacyFiles } from "./retire.js";
@@ -23,7 +24,11 @@ const listing = (storage: {
 
 async function run(fullRun: boolean) {
   const fx = await buildSyntheticFixture();
-  const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
+  const ledger = new RetireLedger(
+    createMemoryStreamSyncFiles(),
+    OWNER,
+    createMemoryImportAuthority(),
+  );
   const staged: Record<string, number> = {};
   const sink: LegacyImportSink = {
     async stage(connector: string, stream: ImportStream, rows) {
@@ -37,6 +42,7 @@ async function run(fullRun: boolean) {
     source: fx.source,
     sink,
     ledger,
+    owner: OWNER,
     switched: () => true,
   });
   const host = createRetireHost({

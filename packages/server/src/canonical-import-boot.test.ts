@@ -21,6 +21,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import {
+  createMemoryImportAuthority,
+  type AccountModeReader,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createTestBoundRecordStore } from "./__fixtures__/bound-record-store.js";
@@ -41,6 +45,12 @@ const DECLARATION = JSON.stringify({
       primary_key: ["id"],
     },
   ],
+});
+
+/** The account-mode authority says `switched` for this owner and knows no other. */
+const switchedFor = (owner: string): AccountModeReader => ({
+  read: (asked) =>
+    asked.toLowerCase() === owner.toLowerCase() ? "switched" : "unknown",
 });
 
 let tempDir: string;
@@ -118,11 +128,12 @@ describe("the legacy import in a real boot", () => {
     db.close();
     // The registry is not reachable in this test: the writer's own publish is
     // observed, not run (the core tests run it).
+    const authority = createMemoryImportAuthority();
     const published: string[] = [];
     vi.spyOn(StreamSyncWriter.prototype, "publishSeed").mockImplementation(
       async (connector: string) => {
         published.push(connector);
-        return "done";
+        return { state: "done" as const, skipped: [] };
       },
     );
 
@@ -143,7 +154,12 @@ describe("the legacy import in a real boot", () => {
           ],
         },
       }),
-      { serverDir: tempDir, dataDir: join(tempDir, "data") },
+      {
+        serverDir: tempDir,
+        dataDir: join(tempDir, "data"),
+        accountMode: switchedFor(owner),
+        importAuthority: authority,
+      },
     );
     // The pass runs in the background after the stores open. Its receipt is
     // in the stream-sync home; so are the staged rows.
@@ -154,7 +170,6 @@ describe("the legacy import in a real boot", () => {
       return found
         ? (JSON.parse(await readFile(join(tempDir, found), "utf8")) as {
             owner: string;
-            importComplete: boolean;
             imported: Record<
               string,
               { staged?: Record<string, number>; published?: true } | undefined
@@ -169,11 +184,15 @@ describe("the legacy import in a real boot", () => {
     }
     expect(ledger).toMatchObject({
       owner: owner.toLowerCase(),
-      importComplete: true,
       imported: { spotify: { staged: { top_artists: 3 }, published: true } },
     });
     // The staged rows are handed to the writer's own publish (BOOT_PUBLISH_NOT_WIRED).
     expect(published).toEqual(["spotify"]);
+    // Done is told to the authority once, for the server's owner (not kept in the ledger).
+    for (let i = 0; i < 100 && authority.doneCalls.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(authority.doneCalls).toEqual([owner.toLowerCase()]);
     // The owner can see what stayed behind (STATUS_ROUTE_UNAUTHENTICATED).
     const ask = (token?: string) =>
       ctx!.app.request("/v1/stream-sync/import-status", {
@@ -187,12 +206,14 @@ describe("the legacy import in a real boot", () => {
     expect(JSON.parse(text)).toEqual({
       complete: true,
       abandoned: false,
+      stayed: 1,
       connectors: [
         {
           connector: "spotify",
-          state: "imported",
+          state: "published",
           attempts: 0,
           staged: 3,
+          stayed: 1,
           excluded: [{ reason: "unmapped_stream", rows: 1 }],
         },
       ],
@@ -210,30 +231,54 @@ describe("the legacy import in a real boot", () => {
   }, 60_000);
 
   it("completes empty when PDPP is off, instead of holding every connector (PDPP_OFF_STALLS_IMPORT)", async () => {
+    const owner = await recoverServerOwner(KNOWN_SIG);
+    const authority = createMemoryImportAuthority();
     ctx = await createServer(
       ServerConfigSchema.parse({
         tunnel: { enabled: false },
         sync: { enabled: true },
         streamSync: { write: true },
       }),
-      { serverDir: tempDir, dataDir: join(tempDir, "data") },
+      {
+        serverDir: tempDir,
+        dataDir: join(tempDir, "data"),
+        accountMode: switchedFor(owner),
+        importAuthority: authority,
+      },
     );
     // Without a canonical store the import has nothing to read, and is done.
-    const complete = async () => {
-      const found = (await readdir(tempDir, { recursive: true })).find((path) =>
-        path.endsWith(join("legacy-retire", "ledger.json")),
-      );
-      if (!found) return false;
-      const ledger = JSON.parse(
-        await readFile(join(tempDir, found), "utf8"),
-      ) as { importComplete: boolean };
-      return ledger.importComplete;
-    };
-    let done = await complete();
-    for (let i = 0; i < 400 && !done; i += 1) {
+    for (let i = 0; i < 400 && authority.doneCalls.length === 0; i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 50));
-      done = await complete();
     }
-    expect(done).toBe(true);
+    expect(authority.doneCalls).toEqual([owner.toLowerCase()]);
+  }, 60_000);
+
+  it("does nothing until the account-mode authority says switched (BOOT_MODE_IGNORED)", async () => {
+    const owner = await recoverServerOwner(KNOWN_SIG);
+    const authority = createMemoryImportAuthority();
+    for (const accountMode of [
+      undefined, // no authority bound
+      { read: () => "unswitched" as const },
+      switchedFor(`0x${"cd".repeat(20)}`), // switched, but for another account
+    ]) {
+      ctx = await createServer(
+        ServerConfigSchema.parse({
+          tunnel: { enabled: false },
+          sync: { enabled: true },
+          streamSync: { write: true },
+        }),
+        {
+          serverDir: tempDir,
+          dataDir: join(tempDir, "data"),
+          ...(accountMode ? { accountMode } : {}),
+          importAuthority: authority,
+        },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(authority.doneCalls).toEqual([]);
+      expect(await authority.importPending(owner)).toBe(true);
+      await ctx.cleanup();
+      ctx = undefined;
+    }
   }, 60_000);
 });

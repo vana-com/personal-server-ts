@@ -26,6 +26,7 @@ import type { DeclarationSnapshot } from "../../pdpp/types.js";
 import { legacyConnectorKey } from "../../storage/canonical-legacy-projection.js";
 import {
   ImportSourceUnavailableError,
+  type ImportConnectionChoice,
   type ImportExclusion,
   type ImportStream,
   type LegacyImportSource,
@@ -106,6 +107,18 @@ const judge = (
 interface Scan {
   readonly streams: readonly ImportStream[];
   readonly excluded: readonly ImportExclusion[];
+  readonly connection: ImportConnectionChoice | null;
+}
+
+/** A truncated hash for the owner to tell connections apart, never the id. */
+async function shortHash(text: string): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(text),
+  );
+  return [...new Uint8Array(digest).slice(0, 6)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 export function createCanonicalImportSource(
@@ -174,7 +187,9 @@ export function createCanonicalImportSource(
       deps,
       sourcesOf(deps).get(connector) ?? [],
     );
-    if (live.length === 0) return { streams: [], excluded: [] };
+    if (live.length === 0) {
+      return { streams: [], excluded: [], connection: null };
+    }
     // The most recently active connection is the account this device shows.
     const looked = await Promise.all(
       live.map(async (connection) => {
@@ -202,6 +217,16 @@ export function createCanonicalImportSource(
       ...(typeof looked)[number][],
     ];
     const otherRows = others.reduce((sum, o) => sum + o.rows, 0);
+    // Which connection was chosen, and whether the choice was a tie broken
+    // by the instance name (nothing separated the top two).
+    const connection: ImportConnectionChoice | null =
+      others.length > 0
+        ? {
+            chosen: await shortHash(chosen.instance),
+            passedOver: others.length,
+            tied: others[0]!.latest === chosen.latest,
+          }
+        : null;
     const instance = chosen.instance;
     const listed = chosen.listed;
     const declared = new Map(
@@ -243,6 +268,7 @@ export function createCanonicalImportSource(
       streams.push({
         stream,
         primaryKey,
+        rows: counts.import,
         profile: { key: null, version: "0.0.0" },
         async *records() {
           for await (const row of pages(deps.store, instance, stream)) {
@@ -258,6 +284,7 @@ export function createCanonicalImportSource(
     return {
       streams,
       excluded: [...streamLevel, ...rowLevel, ...otherConnections],
+      connection,
     };
   }
 
@@ -280,6 +307,9 @@ export function createCanonicalImportSource(
     },
     async excluded(connector) {
       return scans.get(connector)?.excluded ?? [];
+    },
+    async connection(connector) {
+      return scans.get(connector)?.connection ?? null;
     },
   };
 }

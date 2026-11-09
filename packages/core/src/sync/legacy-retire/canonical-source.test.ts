@@ -284,7 +284,7 @@ describe("a switched device imports its canonical rows with no new run (IMPORT_S
     // The host has not bound its stores: pending, not empty, not complete.
     const early = await f.importer.run();
     expect(early).toMatchObject({ ran: true, pending: true });
-    expect((await f.ledger.read()).importComplete).toBe(false);
+    expect(await f.ledger.importPending()).toBe(true);
     expect(await f.importer.importDone(CONNECTOR)).toBe(false);
     await expect(f.run("early", ["e2"])).rejects.toBeInstanceOf(
       ImportPendingError,
@@ -339,6 +339,7 @@ describe("a re-run adds nothing (IMPORT_DUPLICATES_ON_RERUN)", () => {
       local: ["e0", "e1"],
       source: sourceOf({ store, declarations: declared }),
       owner: OWNER,
+      publishSeed: false,
       crashOnce: "more",
     });
     expect(await f.importer.run()).toEqual({
@@ -363,7 +364,7 @@ describe("a re-run adds nothing (IMPORT_DUPLICATES_ON_RERUN)", () => {
 });
 
 describe("rows are staged only for the owner the source was built for (IMPORT_WRONG_OWNER)", () => {
-  it("refuses a source of another owner and stages nothing", async () => {
+  it("refuses a source of another owner than the request owner and stages nothing (IMPORT_SOURCE_OWNER_UNCHECKED)", async () => {
     const store = canonical([raw("e0")]);
     const f = await flow({
       local: ["e0"],
@@ -376,7 +377,23 @@ describe("rows are staged only for the owner the source was built for (IMPORT_WR
     });
     expect(f.staged.size).toBe(0);
     expect(await f.importer.importDone(CONNECTOR)).toBe(false);
-    expect((await f.ledger.read()).importComplete).toBe(false);
+    expect(await f.ledger.importPending()).toBe(true);
+  });
+
+  it("refuses when the request owner differs from the owner the ledger was recorded for (IMPORT_LEDGER_OWNER_UNCHECKED)", async () => {
+    const store = canonical([raw("e0")]);
+    const f = await flow({
+      local: ["e0"],
+      source: sourceOf({ store, declarations: DECLARED }, OTHER),
+      owner: OWNER, // the ledger is A's
+      requestOwner: OTHER, // the source and the request are B's
+    });
+    expect(await f.importer.run()).toMatchObject({
+      ran: false,
+      refused: "owner_mismatch",
+    });
+    expect(f.staged.size).toBe(0);
+    expect((await f.ledger.read()).imported).toEqual({});
   });
 
   it("drops what another owner's pass recorded when the home changes hands and back (LEDGER_OWNER_IGNORED)", async () => {
@@ -388,10 +405,13 @@ describe("rows are staged only for the owner the source was built for (IMPORT_WR
     });
     await f.importer.run();
     expect(await f.importer.importDone(CONNECTOR)).toBe(true);
-    // The same ledger is opened by the other owner's importer (an empty
-    // source of its own): A's import state is not B's.
+    // The same home is opened by the other owner's importer (a source of its
+    // own, with a row to stage): A's import state is not B's.
     const asOther = f.importerFor({
-      source: sourceOf({ store: canonical([]), declarations: [] }, OTHER),
+      source: sourceOf(
+        { store: canonical([raw("o0")]), declarations: DECLARED },
+        OTHER,
+      ),
       owner: OTHER,
     });
     await asOther.run();

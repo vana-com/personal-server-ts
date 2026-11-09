@@ -657,7 +657,7 @@ export const MUTANTS = [
   {
     name: "IMPORT_LOSES_ON_RERUN",
     why: "a pass with a failed connector marks the import complete",
-    edits: edit(IMPORT, "if (waiting === 0) {", "if (true) {"),
+    edits: edit(IMPORT, "settled: waiting === 0,", "settled: true,"),
     tests: [IMPORT_SINK_TEST],
     mustFail: ["IMPORT_LOSES_ON_RERUN"],
     build: true,
@@ -668,10 +668,10 @@ export const MUTANTS = [
     edits: [
       {
         file: IMPORT,
-        find: `const result = (await ledger.read()).importComplete
-      ? { ran: false, connectorsStaged: 0, failed: 0 }
-      : await this.stage();`,
-        replace: "const result = await this.stage();",
+        find: `if (!(await ledger.importPending())) {
+      return { ran: false, connectorsStaged: 0, failed: 0 };
+    }`,
+        replace: "",
       },
       {
         file: IMPORT,
@@ -758,11 +758,7 @@ export const MUTANTS = [
   {
     name: "CONNECTOR_DROPPED_WHEN_AMBIGUOUS",
     why: "a connector with two live connections is left out whole",
-    edits: edit(
-      CANON,
-      "if (live.length === 0) return { streams: [], excluded: [] };",
-      "if (live.length !== 1) return { streams: [], excluded: [] };",
-    ),
+    edits: edit(CANON, "if (live.length === 0) {", "if (live.length !== 1) {"),
     tests: [CANON_TEST],
     mustFail: ["CONNECTOR_DROPPED_WHEN_AMBIGUOUS"],
   },
@@ -797,10 +793,10 @@ export const MUTANTS = [
     edits: [
       {
         file: IMPORT,
-        find: `const result = (await ledger.read()).importComplete
-      ? { ran: false, connectorsStaged: 0, failed: 0 }
-      : await this.stage();`,
-        replace: "const result = await this.stage();",
+        find: `if (!(await ledger.importPending())) {
+      return { ran: false, connectorsStaged: 0, failed: 0 };
+    }`,
+        replace: "",
       },
       {
         file: IMPORT,
@@ -816,7 +812,7 @@ export const MUTANTS = [
     why: "a source of another owner stages into this home",
     edits: edit(
       IMPORT,
-      "if (source.owner.toLowerCase() !== ledger.owner) {",
+      "if (source.owner.toLowerCase() !== owner || ledger.owner !== owner) {",
       "if (false) {",
     ),
     tests: [CANON_TEST],
@@ -886,8 +882,9 @@ export const MUTANTS = [
     why: "a publish that is still waiting is recorded as done and never asked again",
     edits: edit(
       IMPORT,
-      'if ((await publish(connector)) === "done") {',
-      "if ((await publish(connector), true)) {",
+      `if (outcome.state !== "done") continue;
+        const skipped = outcome.skipped;`,
+      `const skipped = outcome.state === "done" ? outcome.skipped : [];`,
     ),
     tests: [PUBLISH_TEST],
     mustFail: ["PUBLISH_NEVER_RETRIED"],
@@ -900,11 +897,11 @@ export const MUTANTS = [
       WRITER,
       `host.phase !== "done"
       ) {
-        return "waiting";`,
+        return { state: "waiting" };`,
       `host.phase !== "done" &&
         false
       ) {
-        return "waiting";`,
+        return { state: "waiting" };`,
     ),
     tests: [PUBLISH_TEST],
     mustFail: ["DUPLICATE_IMPORT_RUNS"],
@@ -1007,6 +1004,128 @@ export const MUTANTS = [
     ),
     tests: [BOOT_TEST],
     mustFail: ["BOOT_PUBLISH_NOT_WIRED"],
+    build: true,
+  },
+
+  // ---- round 3 (recheck of a0505e0b) ----
+  {
+    name: "STATUS_REPORTS_PUBLISHED_UNPUBLISHED",
+    why: "the status says published for a connector the writer has not merged",
+    edits: edit(IMPORT, "? imported.published === true", "? true"),
+    tests: [PUBLISH_TEST],
+    mustFail: ["STATUS_REPORTS_PUBLISHED_UNPUBLISHED"],
+  },
+  {
+    name: "FAILED_STAYED_NOT_COUNTED",
+    why: "a failed connector's rows that stayed in legacy are not counted",
+    edits: edit(
+      IMPORT,
+      "...(stayed === undefined ? {} : { stayed }),",
+      "...(true ? {} : { stayed }),",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["FAILED_STAYED_NOT_COUNTED"],
+  },
+  {
+    name: "SKIPPED_COUNTED_AS_PUBLISHED",
+    why: "a seed the writer skipped is recorded as published",
+    edits: edit(
+      IMPORT,
+      "...(lost.length === 0 ? { published: true as const } : {}),",
+      "published: true as const,",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["SKIPPED_COUNTED_AS_PUBLISHED"],
+  },
+  {
+    name: "CHOICE_NOT_SURFACED",
+    why: "the status omits which connection was imported",
+    edits: edit(
+      IMPORT,
+      "...(imported?.connection ? { connection: imported.connection } : {}),",
+      "...{},",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["CHOICE_NOT_SURFACED"],
+  },
+  {
+    name: "TIE_NOT_FLAGGED",
+    why: "a tie between the two latest connections is reported as a clear choice",
+    edits: edit(
+      CANON,
+      "tied: others[0]!.latest === chosen.latest,",
+      "tied: false,",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["TIE_NOT_FLAGGED"],
+  },
+  {
+    name: "IMPORT_SOURCE_OWNER_UNCHECKED",
+    why: "the source's owner is not compared with the request owner",
+    edits: edit(
+      IMPORT,
+      "if (source.owner.toLowerCase() !== owner || ledger.owner !== owner) {",
+      "if (ledger.owner !== owner) {",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["IMPORT_SOURCE_OWNER_UNCHECKED"],
+  },
+  {
+    name: "IMPORT_LEDGER_OWNER_UNCHECKED",
+    why: "the ledger's owner is not compared with the request owner",
+    edits: edit(
+      IMPORT,
+      "if (source.owner.toLowerCase() !== owner || ledger.owner !== owner) {",
+      "if (source.owner.toLowerCase() !== owner) {",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["IMPORT_LEDGER_OWNER_UNCHECKED"],
+  },
+  {
+    name: "AUTHORITY_PENDING_IGNORED",
+    why: "the import runs though the authority says it is done",
+    edits: edit(
+      IMPORT,
+      "if (!(await ledger.importPending())) {",
+      "if (false) {",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["AUTHORITY_PENDING_IGNORED"],
+  },
+  {
+    name: "DONE_BEFORE_PUBLISHED",
+    why: "the authority is told done while a publish is still held",
+    edits: edit(
+      IMPORT,
+      "if (settled && (await this.allSeedsFinal())) {",
+      "if (settled) {",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["DONE_BEFORE_PUBLISHED"],
+  },
+  {
+    name: "SWITCH_READS_FLAG",
+    why: "the switch ignores the account-mode authority",
+    edits: edit(
+      `${R}/switch.ts`,
+      'return mode.read(owner) === "switched";',
+      'return mode.read(owner) !== "unswitched";',
+    ),
+    tests: [`${R}/switch.test.ts`],
+    mustFail: ["SWITCH_READS_FLAG"],
+  },
+  {
+    name: "BOOT_MODE_IGNORED",
+    why: "the server imports for an account the authority has not switched",
+    edits: [
+      {
+        file: BOOTSTRAP,
+        find: "switched: () => legacyRetireSwitched(accountMode, serverOwner),",
+        replace: "switched: () => true,",
+      },
+    ],
+    tests: [BOOT_TEST],
+    mustFail: ["BOOT_MODE_IGNORED"],
     build: true,
   },
 ];

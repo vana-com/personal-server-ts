@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 import { entityHashes } from "../../storage/legacy-entity-key-sets.js";
 import { createMemoryStreamSyncFiles } from "../../stream-sync/memory-files.js";
 import { createRetireHost } from "./host.js";
+import { createMemoryImportAuthority } from "./import-authority.js";
 import { RetireLedger } from "./ledger.js";
 import { predatesEveryDelete, readbackVersion } from "./readback.js";
 import { retireLegacyFiles, type RetireHost } from "./retire.js";
@@ -762,7 +763,11 @@ describe("a scope with a connector the registry never saw is never fenced (UNKNO
 
 describe("host wiring", () => {
   it("does not expose a basis the host cannot name (a host without delete basis)", async () => {
-    const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
+    const ledger = new RetireLedger(
+      createMemoryStreamSyncFiles(),
+      OWNER,
+      createMemoryImportAuthority(),
+    );
     const host: RetireHost = createRetireHost({
       reader: { publishedBody: async () => null, retireBasis: () => null },
       writer: { fullRunSince: async () => true },

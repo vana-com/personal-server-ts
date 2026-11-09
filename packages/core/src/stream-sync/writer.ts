@@ -175,6 +175,16 @@ export interface StreamSyncCheckpoint {
 
 export type SeedReceipt = "merged";
 
+/**
+ * Where the publish of a connector's staged seed stands. `done` lists the
+ * streams whose seed was NOT merged (receipt "skipped", or the connection was
+ * stopped and published nothing): those rows are not readable from the stream
+ * store, so a caller must not report them as published.
+ */
+export type SeedPublication =
+  | { readonly state: "waiting" }
+  | { readonly state: "done"; readonly skipped: readonly string[] };
+
 /** A control row a delete pinned: tombstone it at `version + 1`, nothing else. */
 interface DeletePin {
   readonly ns: string;
@@ -1606,22 +1616,36 @@ export class StreamSyncWriter {
    * first publish of a connector run, so a connector that never runs again
    * would keep its imported rows unreadable. Answers `done` once every staged
    * stream has a receipt (or the connection is stopped, which publishes
-   * nothing), and `waiting` while the run it queued has not published. A
-   * queued run that was discarded leaves a stream without a receipt, so the
-   * next call queues another.
+   * nothing), naming the streams whose seed was skipped, and `waiting` while
+   * the run it queued has not published. A queued run that was discarded
+   * leaves a stream without a receipt, so the next call queues another.
    */
-  async publishSeed(connector: string): Promise<"done" | "waiting"> {
+  async publishSeed(connector: string): Promise<SeedPublication> {
     const seed = this.options.seed;
-    if (!seed) return "done";
+    if (!seed) return { state: "done", skipped: [] };
     const state = await this.readState();
     const streams = await seed.streams(connector);
-    const open = streams.filter(
-      (s) =>
-        state.receipts[
-          `${seed.installId}|${connector}|${IDENTITYLESS_NS}|${s.stream}`
-        ] === undefined,
-    );
-    if (open.length === 0 || isStoppedState(state, connector)) return "done";
+    const receiptOf = (stream: string) =>
+      state.receipts[
+        `${seed.installId}|${connector}|${IDENTITYLESS_NS}|${stream}`
+      ];
+    const open = streams.filter((s) => receiptOf(s.stream) === undefined);
+    if (isStoppedState(state, connector)) {
+      return {
+        state: "done",
+        skipped: streams
+          .filter((s) => receiptOf(s.stream) !== "merged")
+          .map((s) => s.stream),
+      };
+    }
+    if (open.length === 0) {
+      return {
+        state: "done",
+        skipped: streams
+          .filter((s) => receiptOf(s.stream) === "skipped")
+          .map((s) => s.stream),
+      };
+    }
     for (const runId of await this.runIds()) {
       const host = await this.readEntry(runId);
       if (
@@ -1629,7 +1653,7 @@ export class StreamSyncWriter {
         host.entry.connector === connector &&
         host.phase !== "done"
       ) {
-        return "waiting";
+        return { state: "waiting" };
       }
     }
     const runId = `import-${connector.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80)}-${globalThis.crypto.randomUUID().slice(0, 8)}`;
@@ -1643,7 +1667,7 @@ export class StreamSyncWriter {
       importOnly: true,
     });
     await this.finishRun(runId, { checkpointCandidate: null });
-    return "waiting";
+    return { state: "waiting" };
   }
 
   declareStream(

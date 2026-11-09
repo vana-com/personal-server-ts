@@ -77,13 +77,16 @@ import {
   createInventoryTombstoneFinality,
   createScopeDeletionTracker,
   createRetireHost,
+  createMemoryImportAuthority,
   legacyRetireSwitched,
   createSyncManager,
   LegacyImporter,
   RetireLedger,
   withCancellableRegistration,
   NO_CANONICAL_ROWS,
+  type AccountModeReader,
   type CanonicalImportDeps,
+  type ImportAuthority,
   type LegacyImportSource,
   type LegacyRetireOption,
   type PdppImporter,
@@ -225,6 +228,17 @@ export interface CreateServerOptions {
    * then the import is pending, never complete). Tests inject a source.
    */
   legacyImportSource?: LegacyImportSource;
+  /**
+   * The account-mode authority, read for this server's owner. The legacy
+   * import and retire act only when it says `switched`. Absent: the answer is
+   * `unknown`, so neither runs.
+   */
+  accountMode?: AccountModeReader;
+  /**
+   * The one owner of "the legacy import is done". Absent: an in-memory one
+   * that is pending until the import finishes in this process.
+   */
+  importAuthority?: ImportAuthority;
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible client on `config.inference` (env overrides:
@@ -964,7 +978,14 @@ export async function createServer(
         const seedStaging = createSeedStaging(streamSyncHome.seedFiles);
         // Import first (design §4): a run of a connector waits for its import,
         // so the seed is merged into the first publish, never skipped.
-        retireLedger = new RetireLedger(streamSyncHome.home.files, serverOwner);
+        const accountMode: AccountModeReader = options?.accountMode ?? {
+          read: () => "unknown",
+        };
+        retireLedger = new RetireLedger(
+          streamSyncHome.home.files,
+          serverOwner,
+          options?.importAuthority ?? createMemoryImportAuthority(),
+        );
         legacyImporter = new LegacyImporter({
           source:
             options?.legacyImportSource ??
@@ -975,7 +996,8 @@ export async function createServer(
             }),
           sink: createSeedImportSink(seedStaging),
           ledger: retireLedger,
-          switched: () => legacyRetireSwitched(config),
+          owner: serverOwner,
+          switched: () => legacyRetireSwitched(accountMode, serverOwner),
           deleted: async (connector) =>
             writerForSeed ? writerForSeed.connectionDeleted(connector) : false,
           // Staged rows are published by the writer's own run, so a connector
@@ -1078,7 +1100,10 @@ export async function createServer(
       // Import, readback and (only with `streamSync.retireLegacy`) retire of
       // local legacy files; read live, null while the account is unswitched.
       legacyRetire: (): LegacyRetireOption | null =>
-        legacyRetireSwitched(config) &&
+        legacyRetireSwitched(
+          options?.accountMode ?? { read: () => "unknown" },
+          serverOwner,
+        ) &&
         streamSyncWriter &&
         streamSyncRead &&
         retireLedger &&

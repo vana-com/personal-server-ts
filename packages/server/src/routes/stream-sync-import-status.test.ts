@@ -16,12 +16,14 @@ const granteeWallet = createTestWallet(2);
 const STATUS: ImportStatus = {
   complete: true,
   abandoned: false,
+  stayed: 2,
   connectors: [
     {
       connector: "conn-a",
       state: "failed",
       attempts: 5,
       staged: 0,
+      stayed: 2,
       excluded: [{ reason: "unmapped_stream", rows: 2 }],
     },
   ],

@@ -15,12 +15,15 @@
  */
 
 import type { HeadProfile } from "@opendatalabs/personal-server-ts-stream-sync";
+import type { SeedPublication } from "../../stream-sync/writer.js";
 import type { RetireLedger } from "./ledger.js";
 
 export interface ImportStream {
   readonly stream: string;
   readonly primaryKey: readonly string[];
   readonly profile: HeadProfile;
+  /** How many rows `records()` will yield, when the source counted them. */
+  readonly rows?: number;
   /** The device's current rows of the stream. */
   records(): AsyncIterable<Record<string, unknown>>;
 }
@@ -37,7 +40,13 @@ export interface ImportExclusion {
     | "no_primary_key"
     | "unkeyed_row"
     /** Rows of a live connection other than the one imported. */
-    | "other_connection";
+    | "other_connection"
+    /**
+     * Staged, but the writer did not merge the stream's seed (another device
+     * had already published generation 1, or a delete dropped it). Those rows
+     * are not readable from the stream store.
+     */
+    | "seed_skipped";
   readonly rows: number;
 }
 
@@ -51,6 +60,17 @@ export class ImportSourceUnavailableError extends Error {
     super("legacy import source is not available yet");
     this.name = "ImportSourceUnavailableError";
   }
+}
+
+/**
+ * Which of several live connections a connector imported. Counts and a
+ * truncated hash only: never the connection id.
+ */
+export interface ImportConnectionChoice {
+  readonly chosen: string;
+  readonly passedOver: number;
+  /** The top two connections had the same latest write. */
+  readonly tied: boolean;
 }
 
 export interface LegacyImportSource {
@@ -67,6 +87,11 @@ export interface LegacyImportSource {
   streams(connector: string): Promise<readonly ImportStream[]>;
   /** What `streams(connector)` left out; read right after it. */
   excluded?(connector: string): Promise<readonly ImportExclusion[]>;
+  /**
+   * Which connection `streams(connector)` imported, when the connector had
+   * more than one live; null otherwise. Read right after it.
+   */
+  connection?(connector: string): Promise<ImportConnectionChoice | null>;
 }
 
 export interface LegacyImportSink {
@@ -87,6 +112,11 @@ export interface LegacyImporterOptions {
   readonly source: LegacyImportSource;
   readonly sink: LegacyImportSink;
   readonly ledger: RetireLedger;
+  /**
+   * The Account this importer acts for: the owner the mode authority is asked
+   * about. The source and the ledger must both belong to it.
+   */
+  readonly owner: string;
   /** Whether the account is switched now; read on every call. */
   readonly switched: () => boolean;
   /**
@@ -98,10 +128,11 @@ export interface LegacyImporterOptions {
   /**
    * Ask the writer to publish the rows staged for a connector, so they are
    * readable with no connector run. Called on every pass until it answers
-   * `done`. Absent: staged rows wait for the connector's first run (a host
-   * with no writer of its own).
+   * `done`; it names the streams whose seed was not merged. Absent: staged
+   * rows wait for the connector's first run (a host with no writer of its
+   * own).
    */
-  readonly publish?: (connector: string) => Promise<"done" | "waiting">;
+  readonly publish?: (connector: string) => Promise<SeedPublication>;
   /** Failed passes before a connector (or the source listing) is given up. */
   readonly maxAttempts?: number;
   readonly now?: () => Date;
@@ -124,25 +155,41 @@ export interface ImportPassResult {
 export const DEFAULT_MAX_ATTEMPTS = 5;
 
 /**
- * What the import did, for the owner to see. Counts and names only: no row,
- * no stream name, no error text.
+ * What the import did, for the owner to see. Counts, names and truncated
+ * hashes only: no row, no stream name, no connection id, no error text.
  */
 export interface ImportStatus {
-  /** Every connector was imported or given up. */
+  /** The authority no longer waits for this account's import. */
   readonly complete: boolean;
   /** The source could not be listed within the bound; no file is retired. */
   readonly abandoned: boolean;
+  /**
+   * Rows that stayed only in a legacy file, over all connectors; null when
+   * some could not be counted (an unreadable source or connector).
+   */
+  readonly stayed: number | null;
   readonly connectors: readonly {
     readonly connector: string;
-    /** `pending` = tried and failed, will try again. */
-    readonly state: "imported" | "pending" | "failed";
+    /**
+     * `published`: the writer merged every staged stream. `imported`: staged,
+     * not (fully) published yet. `pending`: tried and failed, will try again.
+     * `failed`: given up.
+     */
+    readonly state: "published" | "imported" | "pending" | "failed";
     readonly attempts: number;
     /** Rows handed to the writer. */
     readonly staged: number;
+    /** Rows that stayed only in the legacy file; null when not countable. */
+    readonly stayed: number | null;
     /** Rows left in the legacy store, by reason. */
     readonly excluded: readonly { reason: string; rows: number }[];
+    /** Present when the connector had several live connections. */
+    readonly connection?: ImportConnectionChoice;
   }[];
 }
+
+const sumRows = (list: readonly { rows: number }[]): number =>
+  list.reduce((sum, e) => sum + e.rows, 0);
 
 export class LegacyImporter {
   private pass: Promise<ImportPassResult> | null = null;
@@ -150,8 +197,8 @@ export class LegacyImporter {
   constructor(private readonly options: LegacyImporterOptions) {}
 
   /**
-   * The writer's gate: true once this connector's rows are staged (or the
-   * whole pass finished). Not switched: nothing to wait for.
+   * The writer's gate: true once this connector's rows are staged, or the
+   * authority says the import is done. Not switched: nothing to wait for.
    */
   importDone = async (connector: string): Promise<boolean> => {
     if (!this.options.switched()) return true;
@@ -159,9 +206,9 @@ export class LegacyImporter {
   };
 
   /**
-   * One pass over the source. Safe to call on every boot and cycle: a
-   * finished pass returns at once, a failed one starts again from the
-   * connectors not yet staged.
+   * One pass over the source. Safe to call on every boot and cycle: once the
+   * authority says the import is done it returns at once, and a pass that
+   * failed starts again from the connectors not yet staged.
    */
   run(): Promise<ImportPassResult> {
     this.pass ??= this.runPass().finally(() => {
@@ -175,10 +222,13 @@ export class LegacyImporter {
     if (!this.options.switched()) {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }
-    if (source.owner.toLowerCase() !== ledger.owner) {
+    // The request owner (whom the mode is asked about) against the owner the
+    // source reads for and the owner the ledger was recorded for.
+    const owner = this.options.owner.toLowerCase();
+    if (source.owner.toLowerCase() !== owner || ledger.owner !== owner) {
       this.options.logger?.warn(
         {},
-        "Legacy import source belongs to another owner",
+        "Legacy import source or ledger belongs to another owner",
       );
       return {
         ran: false,
@@ -187,10 +237,22 @@ export class LegacyImporter {
         refused: "owner_mismatch",
       };
     }
-    const result = (await ledger.read()).importComplete
-      ? { ran: false, connectorsStaged: 0, failed: 0 }
-      : await this.stage();
+    // The authority owns "done": once it says so, the import never runs again.
+    if (!(await ledger.importPending())) {
+      return { ran: false, connectorsStaged: 0, failed: 0 };
+    }
+    const { result, settled } = await this.stage();
     await this.queueRuns();
+    if (settled && (await this.allSeedsFinal())) {
+      try {
+        await ledger.markImportDone();
+      } catch (error) {
+        this.options.logger?.warn(
+          { error: error instanceof Error ? error.name : "NonError" },
+          "Legacy import finished but the authority was not told; retried next cycle",
+        );
+      }
+    }
     return result;
   }
 
@@ -202,15 +264,25 @@ export class LegacyImporter {
     return (this.options.now?.() ?? new Date()).toISOString();
   }
 
-  /** Stage every connector the source lists that is not imported or given up. */
-  private async stage(): Promise<ImportPassResult> {
+  /**
+   * Stage every connector the source lists that is not imported or given up.
+   * `settled`: the listing worked (or was given up) and no connector is still
+   * waiting for a retry.
+   */
+  private async stage(): Promise<{
+    result: ImportPassResult;
+    settled: boolean;
+  }> {
     const { source, sink, ledger } = this.options;
     let connectors: readonly string[];
     try {
       connectors = await source.connectors();
     } catch (error) {
       if (error instanceof ImportSourceUnavailableError) {
-        return { ran: true, connectorsStaged: 0, failed: 0, pending: true };
+        return {
+          result: { ran: true, connectorsStaged: 0, failed: 0, pending: true },
+          settled: false,
+        };
       }
       this.options.logger?.warn(
         { error: error instanceof Error ? error.name : "NonError" },
@@ -218,14 +290,18 @@ export class LegacyImporter {
       );
       // A source that never lists would stall every connector's writes. After
       // the bound the import gives up: writes proceed, no file is retired.
+      let abandoned = false;
       await ledger.update((data) => {
         data.listAttempts += 1;
         if (data.listAttempts >= this.maxAttempts) {
           data.abandoned = true;
-          data.importComplete = true;
+          abandoned = true;
         }
       });
-      return { ran: true, connectorsStaged: 0, failed: 1 };
+      return {
+        result: { ran: true, connectorsStaged: 0, failed: 1 },
+        settled: abandoned,
+      };
     }
     let staged = 0;
     let failed = 0;
@@ -242,8 +318,16 @@ export class LegacyImporter {
         });
         continue;
       }
+      let stayed: number | undefined;
       try {
         const streams = await source.streams(connector);
+        const excluded = (await source.excluded?.(connector)) ?? [];
+        const connection = (await source.connection?.(connector)) ?? null;
+        // Should the staging fail, these rows stay in the legacy file.
+        if (streams.every((s) => s.rows !== undefined)) {
+          stayed = streams.reduce((sum, s) => sum + (s.rows ?? 0), 0);
+          stayed += sumRows(excluded);
+        }
         // The receipt: per stream, the rows the sink says it kept.
         const receipt: Record<string, number> = {};
         for (const stream of streams) {
@@ -253,13 +337,13 @@ export class LegacyImporter {
             stream.records(),
           );
         }
-        const excluded = (await source.excluded?.(connector)) ?? [];
         const at = this.now();
         await ledger.update((data) => {
           data.imported[connector] = {
             streams: streams.length,
             at,
             staged: receipt,
+            ...(connection ? { connection } : {}),
           };
           delete data.failures[connector];
           if (excluded.length > 0) data.excluded[connector] = [...excluded];
@@ -272,7 +356,12 @@ export class LegacyImporter {
         await ledger.update((data) => {
           const attempts = (data.failures[connector]?.attempts ?? 0) + 1;
           gaveUp = attempts >= this.maxAttempts;
-          data.failures[connector] = { attempts, at: this.now(), gaveUp };
+          data.failures[connector] = {
+            attempts,
+            at: this.now(),
+            gaveUp,
+            ...(stayed === undefined ? {} : { stayed }),
+          };
         });
         if (!gaveUp) waiting += 1;
         this.options.logger?.warn(
@@ -286,37 +375,51 @@ export class LegacyImporter {
         );
       }
     }
-    if (waiting === 0) {
-      await ledger.update((data) => {
-        data.importComplete = true;
-      });
-    }
-    return { ran: true, connectorsStaged: staged, failed };
+    return {
+      result: { ran: true, connectorsStaged: staged, failed },
+      settled: waiting === 0,
+    };
   }
 
   /**
    * Ask for the publish of each connector's staged rows until the writer
    * says it is done. A failure is retried on the next pass; the connector's
-   * own runs are not held for it.
+   * own runs are not held for it. Streams the writer did not merge are
+   * counted as left behind, never as published.
    */
   private async queueRuns(): Promise<void> {
     const { publish, ledger } = this.options;
     if (!publish) return;
     const { imported } = await ledger.read();
     for (const [connector, record] of Object.entries(imported)) {
-      if (record.published) continue;
-      const rows = Object.values(record.staged ?? {}).reduce(
-        (sum, n) => sum + n,
-        0,
-      );
-      if (rows === 0) continue;
+      if (record.published || record.seedDone) continue;
+      if (this.stagedRows(record) === 0) continue;
       try {
-        if ((await publish(connector)) === "done") {
-          await ledger.update((data) => {
-            const own = data.imported[connector];
-            if (own) data.imported[connector] = { ...own, published: true };
-          });
-        }
+        const outcome = await publish(connector);
+        if (outcome.state !== "done") continue;
+        const skipped = outcome.skipped;
+        await ledger.update((data) => {
+          const own = data.imported[connector];
+          if (!own) return;
+          const lost = skipped
+            .map((stream) => ({
+              stream,
+              reason: "seed_skipped" as const,
+              rows: own.staged?.[stream] ?? 0,
+            }))
+            .filter((e) => e.rows > 0);
+          data.imported[connector] = {
+            ...own,
+            seedDone: true,
+            ...(lost.length === 0 ? { published: true as const } : {}),
+          };
+          if (lost.length > 0) {
+            data.excluded[connector] = [
+              ...(data.excluded[connector] ?? []),
+              ...lost,
+            ];
+          }
+        });
       } catch (error) {
         this.options.logger?.warn(
           { error: error instanceof Error ? error.name : "NonError" },
@@ -324,6 +427,22 @@ export class LegacyImporter {
         );
       }
     }
+  }
+
+  private stagedRows(record: { staged?: Readonly<Record<string, number>> }) {
+    return Object.values(record.staged ?? {}).reduce((sum, n) => sum + n, 0);
+  }
+
+  /** Every staged connector has a final answer from the writer. */
+  private async allSeedsFinal(): Promise<boolean> {
+    if (!this.options.publish) return true;
+    const { imported } = await this.options.ledger.read();
+    return Object.values(imported).every(
+      (record) =>
+        record.published === true ||
+        record.seedDone === true ||
+        this.stagedRows(record) === 0,
+    );
   }
 
   /** What the import did, for the owner: counts per connector and reason. */
@@ -334,32 +453,40 @@ export class LegacyImporter {
       ...Object.keys(data.failures),
       ...Object.keys(data.excluded),
     ]);
+    const connectors = [...names].sort().map((connector) => {
+      const byReason = new Map<string, number>();
+      for (const e of data.excluded[connector] ?? []) {
+        byReason.set(e.reason, (byReason.get(e.reason) ?? 0) + e.rows);
+      }
+      const failure = data.failures[connector];
+      const imported = data.imported[connector];
+      const excludedRows = sumRows(data.excluded[connector] ?? []);
+      return {
+        connector,
+        state: imported
+          ? imported.published === true
+            ? ("published" as const)
+            : ("imported" as const)
+          : failure?.gaveUp
+            ? ("failed" as const)
+            : ("pending" as const),
+        attempts: failure?.attempts ?? 0,
+        staged: this.stagedRows(imported ?? {}),
+        stayed: imported ? excludedRows : (failure?.stayed ?? null),
+        excluded: [...byReason]
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([reason, rows]) => ({ reason, rows })),
+        ...(imported?.connection ? { connection: imported.connection } : {}),
+      };
+    });
+    const unknown = data.abandoned || connectors.some((c) => c.stayed === null);
     return {
-      complete: data.importComplete,
+      complete: !(await this.options.ledger.importPending()),
       abandoned: data.abandoned,
-      connectors: [...names].sort().map((connector) => {
-        const byReason = new Map<string, number>();
-        for (const e of data.excluded[connector] ?? []) {
-          byReason.set(e.reason, (byReason.get(e.reason) ?? 0) + e.rows);
-        }
-        const failure = data.failures[connector];
-        return {
-          connector,
-          state: data.imported[connector]
-            ? ("imported" as const)
-            : failure?.gaveUp
-              ? ("failed" as const)
-              : ("pending" as const),
-          attempts: failure?.attempts ?? 0,
-          staged: Object.values(data.imported[connector]?.staged ?? {}).reduce(
-            (sum, n) => sum + n,
-            0,
-          ),
-          excluded: [...byReason]
-            .sort(([a], [b]) => a.localeCompare(b))
-            .map(([reason, rows]) => ({ reason, rows })),
-        };
-      }),
+      stayed: unknown
+        ? null
+        : connectors.reduce((n, c) => n + (c.stayed ?? 0), 0),
+      connectors,
     };
   }
 }

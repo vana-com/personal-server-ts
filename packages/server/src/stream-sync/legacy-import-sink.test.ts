@@ -5,6 +5,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   LegacyImporter,
+  createMemoryImportAuthority,
   RetireLedger,
   type ImportStream,
   type LegacyImportSink,
@@ -48,7 +49,11 @@ async function staged(files: StreamSyncFiles, connector: string) {
 describe("importing through the real seed staging", () => {
   it("a crash mid-import then a re-run stages every stream exactly once (IMPORT_DUPLICATES, IMPORT_LOSES_ON_RERUN)", async () => {
     const files = createMemoryStreamSyncFiles(7);
-    const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
+    const ledger = new RetireLedger(
+      createMemoryStreamSyncFiles(),
+      OWNER,
+      createMemoryImportAuthority(),
+    );
     const sink = createSeedImportSink(createSeedStaging(files));
     let crashOnce = true;
     const flaky: LegacyImportSink = {
@@ -72,6 +77,7 @@ describe("importing through the real seed staging", () => {
       },
       sink: flaky,
       ledger,
+      owner: OWNER,
       switched: () => true,
     });
 
@@ -101,7 +107,11 @@ describe("importing through the real seed staging", () => {
 
   it("a source that changes while it is staged fails the import instead of staging a short copy", async () => {
     const files = createMemoryStreamSyncFiles(7);
-    const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
+    const ledger = new RetireLedger(
+      createMemoryStreamSyncFiles(),
+      OWNER,
+      createMemoryImportAuthority(),
+    );
     let calls = 0;
     const shifting: ImportStream = {
       stream: "s",
@@ -121,6 +131,7 @@ describe("importing through the real seed staging", () => {
       },
       sink: createSeedImportSink(createSeedStaging(files)),
       ledger,
+      owner: OWNER,
       switched: () => true,
     });
     expect(await importer.run()).toMatchObject({ failed: 1 });
@@ -130,7 +141,11 @@ describe("importing through the real seed staging", () => {
 
   it("receipts the rows the intake kept, not the rows it was handed (SINK_RETURNS_PULLED)", async () => {
     const files = createMemoryStreamSyncFiles(7);
-    const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
+    const ledger = new RetireLedger(
+      createMemoryStreamSyncFiles(),
+      OWNER,
+      createMemoryImportAuthority(),
+    );
     const unkeyed: ImportStream = {
       stream: "u",
       primaryKey: ["id"],
@@ -161,6 +176,7 @@ describe("importing through the real seed staging", () => {
       },
       sink,
       ledger,
+      owner: OWNER,
       switched: () => true,
     });
     await importer.run();

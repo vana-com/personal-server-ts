@@ -7,6 +7,7 @@
 
 import type { StreamSyncFiles } from "../../stream-sync/ports.js";
 import type { ImportExclusion } from "./import.js";
+import type { ImportAuthority } from "./import-authority.js";
 
 const PATH = "legacy-retire/ledger.json";
 
@@ -54,8 +55,6 @@ export interface LedgerData {
    * The Account owner (lowercase) every field below was recorded for.
    */
   owner: string;
-  /** A pass over the importable source finished with every stream staged. */
-  importComplete: boolean;
   /**
    * Connectors whose streams were all staged. `staged` is the receipt: each
    * stream this device handed to the writer, with how many rows. A record
@@ -67,8 +66,24 @@ export interface LedgerData {
       readonly streams: number;
       readonly at: string;
       readonly staged?: Readonly<Record<string, number>>;
-      /** The writer published the staged rows (each stream has a receipt). */
+      /** The writer merged every staged stream into the stream store. */
       readonly published?: true;
+      /**
+       * The writer's answer is final: every stream has a receipt. Streams it
+       * did NOT merge are counted in `excluded` as `seed_skipped`; they are
+       * not published.
+       */
+      readonly seedDone?: true;
+      /**
+       * Set only when the connector had several live connections: which one
+       * was imported (a truncated hash, never the id) and how many were
+       * passed over. `tied`: the top two had the same latest write.
+       */
+      readonly connection?: {
+        readonly chosen: string;
+        readonly passedOver: number;
+        readonly tied: boolean;
+      };
     }
   >;
   /**
@@ -78,7 +93,16 @@ export interface LedgerData {
    */
   failures: Record<
     string,
-    { readonly attempts: number; readonly at: string; readonly gaveUp: boolean }
+    {
+      readonly attempts: number;
+      readonly at: string;
+      readonly gaveUp: boolean;
+      /**
+       * Rows that stayed only in the legacy file because of the failure, when
+       * the source could be read to count them; absent when it could not.
+       */
+      readonly stayed?: number;
+    }
   >;
   /** Passes that could not list the source at all. */
   listAttempts: number;
@@ -94,7 +118,6 @@ export interface LedgerData {
 
 const empty = (owner: string): LedgerData => ({
   owner,
-  importComplete: false,
   imported: {},
   failures: {},
   listAttempts: 0,
@@ -112,9 +135,14 @@ export class RetireLedger {
   /** The Account owner this ledger is for, lowercase. */
   readonly owner: string;
 
+  /**
+   * `authority` is the one owner of "the import is done": the ledger reads
+   * `importPending` from it and tells it `importDone`; it keeps no flag.
+   */
   constructor(
     private readonly files: StreamSyncFiles,
     owner: string,
+    private readonly authority: ImportAuthority,
   ) {
     this.owner = owner.toLowerCase();
   }
@@ -132,7 +160,6 @@ export class RetireLedger {
       if (parsed.owner !== this.owner) return empty(this.owner);
       return {
         owner: this.owner,
-        importComplete: parsed.importComplete === true,
         imported: parsed.imported ?? {},
         failures: parsed.failures ?? {},
         listAttempts: parsed.listAttempts ?? 0,
@@ -156,14 +183,25 @@ export class RetireLedger {
     return next;
   }
 
+  /** Whether the authority still waits for this account's import. */
+  importPending(): Promise<boolean> {
+    return this.authority.importPending(this.owner);
+  }
+
+  /** Tell the authority this account's import is finished. */
+  markImportDone(): Promise<void> {
+    return this.authority.importDone(this.owner);
+  }
+
   /**
-   * Nothing is left to wait for on this connector: its rows are staged, the
-   * pass finished, or the import gave the connector up. The writer's gate.
+   * Nothing is left to wait for on this connector: the authority says the
+   * import is done, its rows are staged, or the import gave it up. The
+   * writer's gate.
    */
   async importDone(connector: string): Promise<boolean> {
+    if (!(await this.importPending())) return true;
     const data = await this.read();
     return (
-      data.importComplete ||
       data.imported[connector] !== undefined ||
       data.failures[connector]?.gaveUp === true
     );
@@ -180,12 +218,14 @@ export class RetireLedger {
       return false;
     }
     if ((data.excluded[connector] ?? []).some((e) => e.rows > 0)) return false;
-    return data.importComplete || data.imported[connector] !== undefined;
+    return (
+      data.imported[connector] !== undefined || !(await this.importPending())
+    );
   }
 
   /**
    * This device staged at least one row of this stream. Stricter than
-   * `importDone`: a pass over an EMPTY source sets `importComplete` for every
+   * `importDone`: a finished import over an EMPTY source is done for every
    * connector (nothing to wait for), and a source may list a connector with
    * no stream, or a stream with no row. None of those staged anything, so
    * none proves that a row of a file was ever delivered.
