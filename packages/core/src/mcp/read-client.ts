@@ -504,6 +504,21 @@ const STREAM_SYNC_SOURCE = "stream-sync";
 /** Binds block cursors minted from a stream view; a legacy cursor is refused there. */
 const STREAM_VIEW_CURSOR_VIEW = "stream-sync";
 
+/**
+ * The collection time of a body the handler is about to serve. The read is
+ * refused before it is charged when the body has none.
+ */
+function readCollectedAt(scope: string, body: unknown): string {
+  if (isPlainObject(body) && typeof body.collectedAt === "string") {
+    return body.collectedAt;
+  }
+  throw new ProtocolError(
+    502,
+    "BOUNDED_DATA_UNAVAILABLE",
+    `Scope "${scope}" was served without a collection time.`,
+  );
+}
+
 interface WholeScopeRead {
   scope: string;
   collectedAt: string;
@@ -584,7 +599,10 @@ export function createMcpDataReadClient(
     scope: string;
     grantId: string;
     payment?: string;
-    read: { metadataOnly?: boolean; logAccess?: boolean };
+    read: Pick<
+      PersonalServerInProcessRead,
+      "metadataOnly" | "logAccess" | "validateBody"
+    >;
   }): Promise<WholeScopeRead> {
     let served: PersonalServerServedRead | undefined;
     const response = await signedScopeRequest({
@@ -852,40 +870,53 @@ export function createMcpDataReadClient(
         // blocks are paged from the body it served, so a view never pages
         // legacy bytes. Cursors are not pinned to a version: a cursor from an
         // older version fails validation here instead of reading history.
-        const readPage = async (page: WholeScopeRead) =>
-          readBuiltScopeBlocks(
-            await buildDataBlocksAsync({
-              scope,
-              collectedAt: page.collectedAt,
-              content: page.body,
-            }),
-            {
-              cursor,
-              maxBytes: maxBytes ?? 16_384,
-              ...(blockIds?.length ? { blockIds } : {}),
-              cursorView: page.fromStreamView
-                ? STREAM_VIEW_CURSOR_VIEW
-                : undefined,
-            },
-          );
+        // The page is built from the body the handler checks and then serves,
+        // before it charges or logs. A cursor refused there costs nothing.
+        let checkedPage: Awaited<ReturnType<typeof readBuiltScopeBlocks>> | undefined;
+        let cursorRefused = false;
         try {
-          // A free, unlogged read validates the requested page first, so a
-          // refused page (a malformed or stale cursor) is never charged or
-          // logged. The paid read then serves it.
-          await readPage(
-            await readWholeScope({
-              scope,
-              grantId,
-              read: { metadataOnly: true, logAccess: false },
-            }),
-          );
           const read = await readWholeScope({
             scope,
             grantId,
             payment,
-            read: {},
+            read: {
+              validateBody: async (body, served) => {
+                const built = await buildDataBlocksAsync({
+                  scope,
+                  collectedAt: readCollectedAt(scope, body),
+                  content: body,
+                });
+                try {
+                  checkedPage = await readBuiltScopeBlocks(built, {
+                    cursor,
+                    maxBytes: maxBytes ?? 16_384,
+                    ...(blockIds?.length ? { blockIds } : {}),
+                    cursorView: served.fromStreamView
+                      ? STREAM_VIEW_CURSOR_VIEW
+                      : undefined,
+                  });
+                } catch (err) {
+                  if (
+                    err instanceof DataBlockStorageError &&
+                    err.code === "cursor_invalid"
+                  ) {
+                    cursorRefused = true;
+                    throw new ProtocolError(
+                      400,
+                      "INVALID_CURSOR",
+                      "The bounded read cursor is invalid for this scope.",
+                      { scope, reason: err.code },
+                    );
+                  }
+                  throw err;
+                }
+              },
+            },
           });
-          const result = await readPage(read);
+          if (!checkedPage) {
+            throw new Error("the served page was not checked before settlement");
+          }
+          const result = checkedPage;
           // One page of a scope completes it only when it is the uncursored,
           // unaddressed read that returned no further page. Each page is
           // charged where the handler charges it; only the completing read is
@@ -913,14 +944,15 @@ export function createMcpDataReadClient(
           return { status: 200, ...result };
         } catch (err) {
           if (
-            err instanceof DataBlockStorageError &&
-            err.code === "cursor_invalid"
+            cursorRefused ||
+            (err instanceof DataBlockStorageError &&
+              err.code === "cursor_invalid")
           ) {
             throw new McpDataReadError(400, {
               error: "INVALID_CURSOR",
               message: "The bounded read cursor is invalid for this scope.",
               scope,
-              reason: err.code,
+              reason: "cursor_invalid",
             });
           }
           throw err;
@@ -1153,11 +1185,21 @@ export function createMcpDataReadClient(
 
       // A raw read is never fulfilment, so the served-read callback is inert.
       // The handler refuses a view-served name (409 STREAM_VIEW_NOT_RAW)
-      // before it charges, logs or serves anything.
+      // before it charges, logs or serves anything. The file it selected is
+      // the file whose bytes it serves, and that is the identity reported.
+      let selected: { fileId?: string; collectedAt: string } | undefined;
       const response = await handlePersonalServerDataRequest(
         request,
         options.dataApiDeps,
-        { basePath, inProcess: { onServed: () => {} } },
+        {
+          basePath,
+          inProcess: {
+            onServed: () => {},
+            onRawSelected: (file) => {
+              selected = file;
+            },
+          },
+        },
       );
       if (!response.ok) {
         throw new McpDataReadError(
@@ -1178,18 +1220,11 @@ export function createMcpDataReadClient(
       const bytes = new Uint8Array(await response.arrayBuffer());
       const contentDisposition = response.headers.get("content-disposition");
       const metadataHeader = response.headers.get("x-vana-metadata");
-      // The legacy file the handler just served: the same entry the
-      // non-reader path gated on.
-      const servedEntry = options.dataApiDeps.storage.findEntry({
-        scope,
-        ...(fileId ? { fileId } : {}),
-        ...(at ? { at } : {}),
-      });
       return {
         status: response.status,
         scope,
-        collectedAt: servedEntry?.collectedAt ?? "",
-        fileId: servedEntry?.fileId ?? undefined,
+        collectedAt: selected?.collectedAt ?? "",
+        fileId: selected?.fileId,
         mimeType,
         filename: filenameFromContentDisposition(contentDisposition),
         sizeBytes: bytes.byteLength,

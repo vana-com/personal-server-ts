@@ -13,6 +13,7 @@ import { buildDataBlocksAsync } from "../storage/blocks/build.js";
 import { readBuiltScopeBlocks } from "../storage/blocks/page.js";
 import { Fixture, masterKey } from "../stream-sync-read/service-fixture.js";
 import { testOwnerKey } from "../stream-sync-read/testing.js";
+import { buildBinaryEnvelopeData } from "../contracts/binary.js";
 
 /**
  * What a paid MCP session charges, pinned at the counts the pre-handler storage
@@ -33,6 +34,7 @@ const OWNER = "0x0000000000000000000000000000000000000aaa";
 const SCOPE = "instagram.profile";
 const STREAM_SCOPE = "pdpp.acme.items";
 const MISSING_SCOPE = "instagram.missing";
+const BINARY_SCOPE = "instagram.media";
 const COLLECTED_AT = "2026-06-05T00:00:00Z";
 const GRANT_ID = `0x${"ab".repeat(32)}`;
 const ASSET = "0x0000000000000000000000000000000000000fee";
@@ -84,7 +86,7 @@ async function harness(options: HarnessOptions = {}) {
     id: GRANT_ID,
     grantorAddress: OWNER,
     granteeId: builder.address,
-    scopes: [SCOPE, STREAM_SCOPE, MISSING_SCOPE],
+    scopes: [SCOPE, STREAM_SCOPE, MISSING_SCOPE, BINARY_SCOPE],
     revokedAt: null,
     expiresAt: null,
     paymentStatus: "paid",
@@ -123,13 +125,14 @@ async function harness(options: HarnessOptions = {}) {
     fileId: string;
     scope: string;
     collectedAt: string;
-    items: unknown[];
+    items?: unknown[];
+    data?: Record<string, unknown>;
   }) {
     const written = await storage.writeEnvelope({
       version: "1.0",
       scope: version.scope,
       collectedAt: version.collectedAt,
-      data: { items: version.items },
+      data: version.data ?? { items: version.items ?? [] },
     } as never);
     storage.insertEntry({
       fileId: version.fileId,
@@ -672,5 +675,148 @@ describe("mcp/read-client refusals before any charge or log", () => {
     expect(h.paymentFetch).not.toHaveBeenCalled();
     expect(h.accessLogWrite).not.toHaveBeenCalled();
     expect(h.readFulfillmentReport).not.toHaveBeenCalled();
+  });
+});
+
+describe("mcp/read-client versions that change mid-request", () => {
+  it("serves a validated page or charges and logs nothing when a version lands between the cursor check and the paid read", async () => {
+    const h = await harness();
+    const first = await h.client.readScopeBlocks({
+      scope: SCOPE,
+      grantId: GRANT_ID,
+      maxBytes: PAGE_BYTES,
+      payment: await h.proof(),
+      tool: "read_scope",
+    });
+    expect(first.nextCursor).toBeDefined();
+    h.paymentFetch.mockClear();
+    h.accessLogWrite.mockClear();
+
+    // A newer version lands after the cursor was minted, between the cursor
+    // check (the first lookup of this page) and the paid read's own version
+    // selection (the lookup after it). The first lookup still sees the version
+    // the cursor was minted from.
+    const storage = h.deps.storage as unknown as {
+      findEntry: (query: { scope?: string }) => unknown;
+    };
+    const realFind = storage.findEntry.bind(h.deps.storage);
+    // Written now, so the insert below is synchronous.
+    const newer = await h.deps.storage.writeEnvelope({
+      version: "1.0",
+      scope: SCOPE,
+      collectedAt: "2026-06-06T00:00:00Z",
+      data: { items: [{ id: "newer-0", text: "newer version record" }] },
+    } as never);
+    let lookups = 0;
+    let raced = false;
+    storage.findEntry = (query) => {
+      const found = realFind(query);
+      if (query.scope === SCOPE && !raced) {
+        lookups += 1;
+        if (lookups === 1) {
+          raced = true;
+          h.deps.storage.insertEntry({
+            fileId: "file-2",
+            path: newer.path,
+            scope: SCOPE,
+            collectedAt: "2026-06-06T00:00:00Z",
+            sizeBytes: newer.sizeBytes,
+            dataPointId: null,
+          } as never);
+        }
+      }
+      return found;
+    };
+
+    const outcome = await h.client
+      .readScopeBlocks({
+        scope: SCOPE,
+        grantId: GRANT_ID,
+        cursor: first.nextCursor,
+        maxBytes: PAGE_BYTES,
+        payment: await h.proof(),
+        tool: "read_scope",
+      })
+      .then(
+        (page) => ({ served: true as const, page }),
+        (error: unknown) => ({ served: false as const, error }),
+      );
+
+    expect(raced).toBe(true);
+    if (outcome.served) {
+      // The page is for the version the cursor was checked against.
+      expect(JSON.stringify(outcome.page)).not.toContain(
+        "newer version record",
+      );
+      expect(h.paymentFetch).toHaveBeenCalledTimes(1);
+      expect(h.accessLogWrite).toHaveBeenCalledTimes(1);
+    } else {
+      // Refused: nothing was charged or logged for it.
+      expect(outcome.error).toMatchObject({ status: 400 });
+      expect(h.paymentFetch).not.toHaveBeenCalled();
+      expect(h.accessLogWrite).not.toHaveBeenCalled();
+    }
+    expect(h.readFulfillmentReport).not.toHaveBeenCalled();
+  });
+
+  it("returns the selected binary version's own fileId and collectedAt when a newer version lands after the bytes are selected", async () => {
+    const h = await harness();
+    const bytes1 = new TextEncoder().encode("first binary version");
+    const bytes2 = new TextEncoder().encode("second binary version");
+    const hash = `0x${"11".repeat(32)}` as const;
+    await h.writeLegacyVersion({
+      fileId: "bin-1",
+      scope: BINARY_SCOPE,
+      collectedAt: COLLECTED_AT,
+      data: buildBinaryEnvelopeData({
+        bytes: bytes1,
+        mimeType: "application/octet-stream",
+        contentHash: hash,
+      }) as unknown as Record<string, unknown>,
+    });
+
+    // The settlement authorization runs after the handler has selected and
+    // pinned the bytes. A newer binary version lands there.
+    const realAuth = h.deps.auth;
+    let raced = false;
+    h.deps.auth = {
+      ...realAuth,
+      authorizeBuilderRead: async (input: {
+        request: Request;
+        metadataOnly?: boolean;
+      }) => {
+        const result = await realAuth.authorizeBuilderRead(input as never);
+        if (
+          !raced &&
+          !input.metadataOnly &&
+          input.request.headers.get("x-payment")
+        ) {
+          raced = true;
+          await h.writeLegacyVersion({
+            fileId: "bin-2",
+            scope: BINARY_SCOPE,
+            collectedAt: "2026-06-06T00:00:00Z",
+            data: buildBinaryEnvelopeData({
+              bytes: bytes2,
+              mimeType: "application/octet-stream",
+              contentHash: hash,
+            }) as unknown as Record<string, unknown>,
+          });
+        }
+        return result;
+      },
+    } as never;
+
+    const raw = await h.client.readRawScopeFile({
+      scope: BINARY_SCOPE,
+      grantId: GRANT_ID,
+      payment: await h.proof(),
+    });
+
+    expect(raced).toBe(true);
+    expect(raw.contentBase64).toBe(Buffer.from(bytes1).toString("base64"));
+    expect(raw.fileId).toBe("bin-1");
+    expect(raw.collectedAt).toBe(COLLECTED_AT);
+    expect(h.paymentFetch).toHaveBeenCalledTimes(1);
   });
 });

@@ -561,6 +561,20 @@ export interface PersonalServerInProcessRead {
    * caller decides whether the read completes a scope.
    */
   onServed: (served: PersonalServerServedRead) => void;
+  /**
+   * Checks the body the handler is about to serve, before the read is charged
+   * or logged. Throwing refuses the read: nothing is charged, logged or served.
+   * `fromStreamView` says whether the body came from a stream view.
+   */
+  validateBody?: (
+    body: unknown,
+    served: { fromStreamView: boolean },
+  ) => Promise<void>;
+  /**
+   * Receives the legacy file a raw read selected, before the read is charged.
+   * The bytes served are that file's, so its identity is the one to report.
+   */
+  onRawSelected?: (selected: { fileId?: string; collectedAt: string }) => void;
 }
 
 type JsonStatus =
@@ -766,6 +780,30 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
     default:
       return null;
   }
+}
+
+/**
+ * An in-process stream read is checked against the body it will serve. The
+ * view is read in full first, so the check and the served bytes are one body.
+ * Without a check the stream passes through unchanged.
+ */
+async function validateStreamBody<
+  D extends Extract<ReadDecision, { kind: "view" | "local_pending" }>,
+>(decision: D, inProcess: PersonalServerInProcessRead | undefined): Promise<D> {
+  if (!inProcess?.validateBody) return decision;
+  const text = await new Response(decision.body).text();
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new ProtocolError(
+      422,
+      "NOT_BLOCK_READABLE",
+      "The stream view has no JSON body to read as blocks.",
+    );
+  }
+  await inProcess.validateBody(body, { fromStreamView: true });
+  return { ...decision, body: new Response(text).body as D["body"] };
 }
 
 /**
@@ -2766,13 +2804,14 @@ export async function handlePersonalServerDataRequest(
           if (decision.kind === "local_pending") {
             // Owner-only and unregistered: nothing to bill and no version to
             // bind in an access record.
+            const checked = await validateStreamBody(decision, inProcess);
             await settle();
             notifyDataRead(deps, { scope: scopeResult.scope });
             return serveStreamSyncView(deps, request, {
               scope: scopeResult.scope,
               grantId,
               authResult,
-              decision,
+              decision: checked,
               paymentResponseHeader: undefined,
               inProcess,
             });
@@ -2815,12 +2854,13 @@ export async function handlePersonalServerDataRequest(
                 paymentResponseHeader = paid.paymentResponseHeader;
               }
             }
+            const checked = await validateStreamBody(decision, inProcess);
             await settle();
             return serveStreamSyncView(deps, request, {
               scope: scopeResult.scope,
               grantId,
               authResult,
-              decision,
+              decision: checked,
               paymentResponseHeader,
               inProcess,
             });
@@ -2940,6 +2980,16 @@ export async function handlePersonalServerDataRequest(
           );
         }
         rawBinary = decodeBinaryEnvelope(servedEnvelope);
+        inProcess.onRawSelected?.({
+          fileId: servedFileId,
+          collectedAt: envelope.collectedAt,
+        });
+      }
+      // A JSON read is checked against the body it will serve, before it pays.
+      if (inProcess && !wantsRawContent) {
+        await inProcess.validateBody?.(withOwnerBody(servedEnvelope, ownerNotes), {
+          fromStreamView: false,
+        });
       }
       // Every refusal above has run; only a read that will be served pays.
       await settle();
