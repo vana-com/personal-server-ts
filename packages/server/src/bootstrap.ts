@@ -997,16 +997,16 @@ export async function createServer(
           sink: createSeedImportSink(seedStaging),
           ledger: retireLedger,
           owner: serverOwner,
-          switched: () => legacyRetireSwitched(accountMode, serverOwner),
+          mode: () => accountMode.read(serverOwner),
           deleted: async (connector) =>
             writerForSeed ? writerForSeed.connectionDeleted(connector) : false,
           // Staged rows are published by the writer's own run, so a connector
           // that never runs again is still readable (not by its next run).
-          publish: (connector) => {
+          publish: (connector, streams) => {
             if (!streamSyncWriter) {
               throw new Error("the stream-sync writer is not open");
             }
-            return streamSyncWriter.publishSeed(connector);
+            return streamSyncWriter.publishSeed(connector, streams);
           },
           logger,
         });

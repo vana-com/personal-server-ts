@@ -80,7 +80,9 @@ async function cycle(options: {
     },
     ledger,
     owner: OWNER,
-    switched: () => options.option === "switched",
+    mode: () =>
+      (options.option === "switched" ? "switched" : "unswitched") as
+        "switched" | "unswitched",
   });
   const host = createRetireHost({
     reader: fx.reader,
@@ -167,6 +169,7 @@ describe("sync cycle with legacy import and retire", () => {
       failures: {},
       imported: {},
       listAttempts: 0,
+      listed: false,
       readbacks: {},
     });
   });

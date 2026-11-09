@@ -43,7 +43,7 @@ async function run(fullRun: boolean) {
     sink,
     ledger,
     owner: OWNER,
-    switched: () => true,
+    mode: () => "switched" as const,
   });
   const host = createRetireHost({
     reader: fx.reader,

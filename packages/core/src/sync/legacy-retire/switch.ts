@@ -9,8 +9,14 @@
  * not heard of, or a caller that names the wrong one) never do.
  */
 export interface AccountModeReader {
-  read(requestOwner: string): "switched" | "unswitched" | "unknown";
+  read(requestOwner: string): AccountMode;
 }
+
+/**
+ * What the authority knows of an owner. `unknown` is NOT `unswitched`: it
+ * means no decision, so nothing acts on it and nothing is reported as zero.
+ */
+export type AccountMode = "switched" | "unswitched" | "unknown";
 
 export function legacyRetireSwitched(
   mode: AccountModeReader,

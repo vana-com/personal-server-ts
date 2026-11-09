@@ -98,7 +98,7 @@ describe("the canonical import source over a real record store (IMPORT_SOURCE_EM
       sink: createSeedImportSink(createSeedStaging(files)),
       ledger,
       owner: OWNER,
-      switched: () => true,
+      mode: () => "switched" as const,
     });
 
     // Boot order: the importer exists before the canonical reader opens.
@@ -134,7 +134,7 @@ describe("the canonical import source over a real record store (IMPORT_SOURCE_EM
       sink: createSeedImportSink(createSeedStaging(files)),
       ledger,
       owner: OWNER,
-      switched: () => true,
+      mode: () => "switched" as const,
     });
     expect(await again.run()).toMatchObject({ ran: false });
     expect(await staged(files, CONNECTOR)).toEqual({

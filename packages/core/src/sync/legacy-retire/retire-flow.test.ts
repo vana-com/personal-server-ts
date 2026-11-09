@@ -175,6 +175,7 @@ describe("unswitched accounts are unchanged (UNSWITCHED_CHANGED)", () => {
       excluded: {},
       failures: {},
       listAttempts: 0,
+      listed: false,
       abandoned: false,
       imported: {},
       readbacks: {},

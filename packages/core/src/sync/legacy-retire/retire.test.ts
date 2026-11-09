@@ -35,7 +35,7 @@ async function setup(
       sink: { stage: async (_c, _s, rows) => (await drain(rows)).length },
       ledger,
       owner: OWNER,
-      switched: () => true,
+      mode: () => "switched" as const,
     }).run();
   }
   const scopesLeft = () => fx.storage.entries.map((e) => e.scope).sort();

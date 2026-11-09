@@ -281,4 +281,73 @@ describe("the legacy import in a real boot", () => {
       ctx = undefined;
     }
   }, 60_000);
+
+  it("closes the stream writer's gate unless the mode says it may open (BOOT_UNKNOWN_OPENS_GATE)", async () => {
+    const boot = async (accountMode?: AccountModeReader) => {
+      ctx = await createServer(
+        ServerConfigSchema.parse({
+          tunnel: { enabled: false },
+          sync: { enabled: true },
+          streamSync: { write: true },
+        }),
+        {
+          serverDir: tempDir,
+          dataDir: join(tempDir, "data"),
+          ...(accountMode ? { accountMode } : {}),
+          importAuthority: createMemoryImportAuthority(),
+        },
+      );
+      const writer = ctx.streamSyncWriter!;
+      const attempt = writer.beginRun({
+        runId: "gate-probe",
+        connector: "spotify",
+        observedAt: 1,
+        identity: "none",
+        userConnect: false,
+        checkpointUsed: null,
+      });
+      return attempt.then(
+        () => "admitted",
+        (error: Error) => error.name,
+      );
+    };
+    // No port bound, and a port that does not know the owner: no decision.
+    expect(await boot()).toBe("ImportPendingError");
+    await ctx?.cleanup();
+    ctx = undefined;
+    expect(await boot({ read: () => "unknown" })).toBe("ImportPendingError");
+    await ctx?.cleanup();
+    ctx = undefined;
+    // The account is not switched: nothing to wait for.
+    expect(await boot({ read: () => "unswitched" })).not.toBe(
+      "ImportPendingError",
+    );
+  }, 60_000);
+
+  it("runs the legacy retire cycle only for a switched account (BOOT_RETIRE_MODE_IGNORED)", async () => {
+    const owner = await recoverServerOwner(KNOWN_SIG);
+    const report = async (accountMode?: AccountModeReader) => {
+      ctx = await createServer(
+        ServerConfigSchema.parse({
+          tunnel: { enabled: false },
+          sync: { enabled: true },
+          streamSync: { write: true, read: true },
+        }),
+        {
+          serverDir: tempDir,
+          dataDir: join(tempDir, "data"),
+          ...(accountMode ? { accountMode } : {}),
+          importAuthority: createMemoryImportAuthority(),
+        },
+      );
+      const result = await ctx.syncManager!.legacyRetireReport();
+      await ctx.cleanup();
+      ctx = undefined;
+      return result;
+    };
+    expect(await report()).toBeNull(); // no port: unknown
+    expect(await report({ read: () => "unknown" })).toBeNull();
+    expect(await report({ read: () => "unswitched" })).toBeNull();
+    expect(await report(switchedFor(owner))).not.toBeNull(); // the gate can open
+  }, 90_000);
 });

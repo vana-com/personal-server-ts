@@ -17,6 +17,7 @@
 import type { HeadProfile } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { SeedPublication } from "../../stream-sync/writer.js";
 import type { RetireLedger } from "./ledger.js";
+import type { AccountMode } from "./switch.js";
 
 export interface ImportStream {
   readonly stream: string;
@@ -117,8 +118,12 @@ export interface LegacyImporterOptions {
    * about. The source and the ledger must both belong to it.
    */
   readonly owner: string;
-  /** Whether the account is switched now; read on every call. */
-  readonly switched: () => boolean;
+  /**
+   * The account's mode now; read on every call. Only `switched` imports.
+   * `unswitched` has nothing to wait for; `unknown` is no decision: the
+   * writer's gate stays closed and the status reports no count.
+   */
+  readonly mode: () => AccountMode;
   /**
    * Whether the connection of `connector` was deleted (by any device). A
    * deleted connection's legacy rows are never staged: its import is recorded
@@ -132,7 +137,10 @@ export interface LegacyImporterOptions {
    * rows wait for the connector's first run (a host with no writer of its
    * own).
    */
-  readonly publish?: (connector: string) => Promise<SeedPublication>;
+  readonly publish?: (
+    connector: string,
+    streams: readonly string[],
+  ) => Promise<SeedPublication>;
   /** Failed passes before a connector (or the source listing) is given up. */
   readonly maxAttempts?: number;
   readonly now?: () => Date;
@@ -198,10 +206,13 @@ export class LegacyImporter {
 
   /**
    * The writer's gate: true once this connector's rows are staged, or the
-   * authority says the import is done. Not switched: nothing to wait for.
+   * authority says the import is done. Unswitched: nothing to wait for.
+   * Unknown: never done, so no run binds a generation on a guess.
    */
   importDone = async (connector: string): Promise<boolean> => {
-    if (!this.options.switched()) return true;
+    const mode = this.options.mode();
+    if (mode === "unknown") return false;
+    if (mode === "unswitched") return true;
     return this.options.ledger.importDone(connector);
   };
 
@@ -219,7 +230,7 @@ export class LegacyImporter {
 
   private async runPass(): Promise<ImportPassResult> {
     const { source, ledger } = this.options;
-    if (!this.options.switched()) {
+    if (this.options.mode() !== "switched") {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }
     // The request owner (whom the mode is asked about) against the owner the
@@ -237,8 +248,9 @@ export class LegacyImporter {
         refused: "owner_mismatch",
       };
     }
-    // The authority owns "done": once it says so, the import never runs again.
-    if (!(await ledger.importPending())) {
+    // The authority owns "done": once it says so, the import never runs
+    // again. An authority that does not know the owner is no decision either.
+    if ((await ledger.authorityState()) !== "pending") {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }
     const { result, settled } = await this.stage();
@@ -302,6 +314,12 @@ export class LegacyImporter {
         result: { ran: true, connectorsStaged: 0, failed: 1 },
         settled: abandoned,
       };
+    }
+    // From here the rows of the source are examined, so they can be counted.
+    if (!(await ledger.read()).listed) {
+      await ledger.update((data) => {
+        data.listed = true;
+      });
     }
     let staged = 0;
     let failed = 0;
@@ -395,7 +413,15 @@ export class LegacyImporter {
       if (record.published || record.seedDone) continue;
       if (this.stagedRows(record) === 0) continue;
       try {
-        const outcome = await publish(connector);
+        // While the import is pending, only the authority's seed path admits
+        // the publish; a refusal is retried on the next pass.
+        if (!ledger.admitSeedPublish(connector)) continue;
+        const outcome = await publish(
+          connector,
+          Object.entries(record.staged ?? {})
+            .filter(([, rows]) => rows > 0)
+            .map(([stream]) => stream),
+        );
         if (outcome.state !== "done") continue;
         const skipped = outcome.skipped;
         await ledger.update((data) => {
@@ -479,7 +505,13 @@ export class LegacyImporter {
         ...(imported?.connection ? { connection: imported.connection } : {}),
       };
     });
-    const unknown = data.abandoned || connectors.some((c) => c.stayed === null);
+    // Not counted: the mode is no decision, the source was never listed, it
+    // was given up, or a connector's rows could not be counted.
+    const unknown =
+      this.options.mode() === "unknown" ||
+      !data.listed ||
+      data.abandoned ||
+      connectors.some((c) => c.stayed === null);
     return {
       complete: !(await this.options.ledger.importPending()),
       abandoned: data.abandoned,

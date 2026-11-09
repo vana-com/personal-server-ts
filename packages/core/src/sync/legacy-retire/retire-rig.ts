@@ -24,6 +24,7 @@ import {
 } from "./import-authority.js";
 import { RetireLedger } from "./ledger.js";
 import { retireLegacyFiles, type RetireHost } from "./retire.js";
+import type { AccountMode } from "./switch.js";
 
 export const CONNECTOR = "chatgpt";
 export const SCOPE = "chatgpt.memories";
@@ -56,6 +57,8 @@ export async function flow(options: {
    */
   imported?: boolean;
   switched?: boolean;
+  /** The account mode instead of `switched`; `unknown` is no decision. */
+  mode?: AccountMode;
   local: string[];
   /** When the legacy file was collected; default `AT`. */
   collectedAt?: string;
@@ -78,13 +81,19 @@ export async function flow(options: {
   /** Failed attempts before a connector's import is given up (default: the importer's). */
   maxAttempts?: number;
   /** Publish the staged seed with no connector run (default on); or a replacement. */
-  publishSeed?: boolean | ((connector: string) => Promise<SeedPublication>);
+  publishSeed?:
+    | boolean
+    | ((
+        connector: string,
+        streams: readonly string[],
+      ) => Promise<SeedPublication>);
   /** The importer acts for this Account when it differs from the ledger's / source's. */
   requestOwner?: string;
   /** The authority that owns "the import is done"; default pending in memory. */
   authority?: ImportAuthority;
 }) {
-  let switched = options.switched ?? true;
+  let mode: AccountMode =
+    options.mode ?? (options.switched === false ? "unswitched" : "switched");
   const staged = new Map<string, Record<string, unknown>[]>();
   const owner = options.owner ?? OWNER;
   const files = createMemoryStreamSyncFiles();
@@ -128,7 +137,7 @@ export async function flow(options: {
       },
       ledger: new RetireLedger(files, own.owner, authority),
       owner: options.requestOwner ?? own.owner,
-      switched: () => switched,
+      mode: () => mode,
       ...(options.maxAttempts ? { maxAttempts: options.maxAttempts } : {}),
       ...(options.publishSeed === false
         ? {}
@@ -136,7 +145,8 @@ export async function flow(options: {
             publish:
               typeof options.publishSeed === "function"
                 ? options.publishSeed
-                : (connector: string) => rig.writer.publishSeed(connector),
+                : (connector: string, streams: readonly string[]) =>
+                    rig.writer.publishSeed(connector, streams),
           }),
       deleted: async (connector): Promise<boolean> =>
         rig.writer.connectionDeleted(connector),
@@ -228,7 +238,10 @@ export async function flow(options: {
     rig,
     authority,
     setSwitched(value: boolean) {
-      switched = value;
+      mode = value ? "switched" : "unswitched";
+    },
+    setMode(value: AccountMode) {
+      mode = value;
     },
     importer,
     importerFor,

@@ -374,7 +374,7 @@ describe("rows that stayed in legacy are counted for a failed connector (FAILED_
   });
 });
 
-describe("a seed the writer skipped is not published (SKIPPED_COUNTED_AS_PUBLISHED)", () => {
+describe("a seed the writer skipped is not published (SKIPPED_SEED_MARKED_PUBLISHED)", () => {
   it("counts the streams as left behind, reports no publish, and keeps the legacy file", async () => {
     const f = await flow({
       local: ["e0", "e1"],

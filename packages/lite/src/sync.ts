@@ -634,7 +634,7 @@ export async function createPsLiteSyncManager(
           },
           ledger: retireLedger,
           owner: serverOwner,
-          switched: () => legacyRetireSwitched(accountMode, serverOwner),
+          mode: () => accountMode.read(serverOwner),
           deleted: async (connector) =>
             streamSyncWriter
               ? streamSyncWriter.connectionDeleted(connector)

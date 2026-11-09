@@ -41,6 +41,8 @@ const CANON_TEST = `${R}/canonical-source.test.ts`;
 const CANON_STORE_TEST =
   "packages/server/src/stream-sync/canonical-import.test.ts";
 const BOOT_TEST = "packages/server/src/canonical-import-boot.test.ts";
+const REAL_TEST = "packages/server/src/stream-sync/import-real-writer.test.ts";
+const UNKNOWN_TEST = `${R}/import-unknown.test.ts`;
 
 const edit = (file, find, replace) => [{ file, find, replace }];
 
@@ -640,12 +642,12 @@ export const MUTANTS = [
     edits: [
       {
         file: IMPORT,
-        find: "if (!this.options.switched()) return true;",
+        find: 'if (mode === "unswitched") return true;',
         replace: "",
       },
       {
         file: IMPORT,
-        find: `if (!this.options.switched()) {
+        find: `if (this.options.mode() !== "switched") {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }`,
         replace: "",
@@ -668,7 +670,7 @@ export const MUTANTS = [
     edits: [
       {
         file: IMPORT,
-        find: `if (!(await ledger.importPending())) {
+        find: `if ((await ledger.authorityState()) !== "pending") {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }`,
         replace: "",
@@ -793,7 +795,7 @@ export const MUTANTS = [
     edits: [
       {
         file: IMPORT,
-        find: `if (!(await ledger.importPending())) {
+        find: `if ((await ledger.authorityState()) !== "pending") {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }`,
         replace: "",
@@ -999,8 +1001,8 @@ export const MUTANTS = [
     why: "boot never asks the writer to publish the staged rows",
     edits: edit(
       BOOTSTRAP,
-      "return streamSyncWriter.publishSeed(connector);",
-      'return Promise.resolve("done" as const);',
+      "return streamSyncWriter.publishSeed(connector, streams);",
+      'return Promise.resolve({ state: "done" as const, skipped: [] });',
     ),
     tests: [BOOT_TEST],
     mustFail: ["BOOT_PUBLISH_NOT_WIRED"],
@@ -1027,15 +1029,15 @@ export const MUTANTS = [
     mustFail: ["FAILED_STAYED_NOT_COUNTED"],
   },
   {
-    name: "SKIPPED_COUNTED_AS_PUBLISHED",
-    why: "a seed the writer skipped is recorded as published",
+    name: "SKIPPED_SEED_MARKED_PUBLISHED",
+    why: "the importer records a seed the writer reported skipped as published",
     edits: edit(
       IMPORT,
       "...(lost.length === 0 ? { published: true as const } : {}),",
       "published: true as const,",
     ),
     tests: [PUBLISH_TEST],
-    mustFail: ["SKIPPED_COUNTED_AS_PUBLISHED"],
+    mustFail: ["SKIPPED_SEED_MARKED_PUBLISHED"],
   },
   {
     name: "CHOICE_NOT_SURFACED",
@@ -1086,7 +1088,7 @@ export const MUTANTS = [
     why: "the import runs though the authority says it is done",
     edits: edit(
       IMPORT,
-      "if (!(await ledger.importPending())) {",
+      'if ((await ledger.authorityState()) !== "pending") {',
       "if (false) {",
     ),
     tests: [PUBLISH_TEST],
@@ -1120,12 +1122,156 @@ export const MUTANTS = [
     edits: [
       {
         file: BOOTSTRAP,
-        find: "switched: () => legacyRetireSwitched(accountMode, serverOwner),",
-        replace: "switched: () => true,",
+        find: "mode: () => accountMode.read(serverOwner),",
+        replace: 'mode: () => "switched" as const,',
       },
     ],
     tests: [BOOT_TEST],
     mustFail: ["BOOT_MODE_IGNORED"],
+    build: true,
+  },
+
+  // ---- round 4 (recheck of cc33e66b): the real writer and staging path ----
+  {
+    name: "SKIPPED_COUNTED_AS_PUBLISHED",
+    why: "publishSeed judges only the streams the staging source still lists, so a skipped stream is not named",
+    edits: edit(
+      WRITER,
+      "const all = [...new Set([...asked, ...streams.map((s) => s.stream)])];",
+      "const all = streams.map((s) => s.stream).concat(asked.slice(0, 0));",
+    ),
+    tests: [REAL_TEST],
+    mustFail: ["SKIPPED_COUNTED_AS_PUBLISHED"],
+    build: true,
+  },
+  {
+    name: "IMPORT_RERUN_RESTAGES_PUBLISHED",
+    why: "a repeated import stages a connector again though its rows were already staged",
+    edits: edit(
+      IMPORT,
+      "if (known.imported[connector] || known.failures[connector]?.gaveUp) {",
+      "if (known.failures[connector]?.gaveUp) {",
+    ),
+    tests: [REAL_TEST],
+    mustFail: ["IMPORT_RERUN_RESTAGES_PUBLISHED"],
+    build: true,
+  },
+  {
+    name: "IMPORT_GATE_OPEN_ON_UNKNOWN",
+    why: "the writer's gate reads an unknown mode as nothing to wait for",
+    edits: edit(
+      IMPORT,
+      'if (mode === "unknown") return false;',
+      'if (mode === "unknown") return true;',
+    ),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["IMPORT_GATE_OPEN_ON_UNKNOWN"],
+  },
+  {
+    name: "WRITER_BEGIN_RUN_GATE_REMOVED",
+    why: "beginRun does not consult the import gate",
+    edits: edit(
+      WRITER,
+      `this.options.importDone &&
+        !(await this.options.importDone(input.connector))`,
+      `false &&
+        !(await this.options.importDone!(input.connector))`,
+    ),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["WRITER_BEGIN_RUN_GATE_REMOVED"],
+  },
+  {
+    name: "UNKNOWN_PUBLISH_GATE_REMOVED",
+    why: "the publish that binds generation 1 does not consult the import gate",
+    edits: edit(
+      WRITER,
+      `this.options.importDone &&
+        !(await this.options.importDone(host.entry.connector))`,
+      `false &&
+        !(await this.options.importDone!(host.entry.connector))`,
+    ),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["UNKNOWN_PUBLISH_GATE_REMOVED"],
+  },
+  {
+    name: "STATUS_UNKNOWN_MODE_COUNTS_ZERO",
+    why: "the status counts rows under an unknown mode",
+    edits: edit(IMPORT, 'this.options.mode() === "unknown" ||', "false ||"),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["STATUS_UNKNOWN_MODE_COUNTS_ZERO"],
+  },
+  {
+    name: "STATUS_UNLISTED_COUNTS_ZERO",
+    why: "the status reports zero rows before the source was ever listed",
+    edits: edit(IMPORT, "!data.listed ||", "false ||"),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["STATUS_UNLISTED_COUNTS_ZERO"],
+  },
+  {
+    name: "AUTHORITY_REJECTION_READ_AS_DONE",
+    why: "an authority that rejects importPending is read as done",
+    edits: edit(
+      LEDGER,
+      `    } catch {
+      return "unknown";`,
+      `    } catch {
+      return "done";`,
+    ),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["AUTHORITY_REJECTION_READ_AS_DONE"],
+  },
+  {
+    name: "IMPORT_SEED_BYPASSES_AUTHORITY",
+    why: "the seed publish is not routed through the authority's commitImportSeed",
+    edits: edit(
+      IMPORT,
+      "if (!ledger.admitSeedPublish(connector)) continue;",
+      "",
+    ),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["IMPORT_SEED_BYPASSES_AUTHORITY"],
+  },
+  {
+    name: "IMPORT_DONE_NOT_AWAITED",
+    why: "the pass returns before the authority's importDone save landed",
+    edits: edit(
+      LEDGER,
+      "await this.authority.importDone(this.owner);",
+      "void this.authority.importDone(this.owner);",
+    ),
+    tests: [UNKNOWN_TEST],
+    mustFail: ["IMPORT_DONE_NOT_AWAITED"],
+  },
+  {
+    name: "BOOT_UNKNOWN_OPENS_GATE",
+    why: "the server's writer gate reads an unknown mode as unswitched",
+    edits: [
+      {
+        file: BOOTSTRAP,
+        find: "mode: () => accountMode.read(serverOwner),",
+        replace:
+          'mode: () => (accountMode.read(serverOwner) === "unknown" ? "unswitched" : accountMode.read(serverOwner)),',
+      },
+    ],
+    tests: [BOOT_TEST],
+    mustFail: ["BOOT_UNKNOWN_OPENS_GATE"],
+    build: true,
+  },
+  {
+    name: "BOOT_RETIRE_MODE_IGNORED",
+    why: "the server's retire cycle runs without the mode saying switched",
+    edits: [
+      {
+        file: BOOTSTRAP,
+        find: `legacyRetireSwitched(
+          options?.accountMode ?? { read: () => "unknown" },
+          serverOwner,
+        ) &&`,
+        replace: "true &&",
+      },
+    ],
+    tests: [BOOT_TEST],
+    mustFail: ["BOOT_RETIRE_MODE_IGNORED"],
     build: true,
   },
 ];

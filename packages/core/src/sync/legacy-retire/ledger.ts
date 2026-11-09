@@ -106,6 +106,11 @@ export interface LedgerData {
   >;
   /** Passes that could not list the source at all. */
   listAttempts: number;
+  /**
+   * The source was listed at least once. Until then no row was examined, so
+   * the count of rows left in legacy files is unknown, not zero.
+   */
+  listed: boolean;
   /** The source could not be listed within the bound; no file is retired. */
   abandoned: boolean;
   /**
@@ -121,6 +126,7 @@ const empty = (owner: string): LedgerData => ({
   imported: {},
   failures: {},
   listAttempts: 0,
+  listed: false,
   abandoned: false,
   excluded: {},
   readbacks: {},
@@ -163,6 +169,7 @@ export class RetireLedger {
         imported: parsed.imported ?? {},
         failures: parsed.failures ?? {},
         listAttempts: parsed.listAttempts ?? 0,
+        listed: parsed.listed === true,
         abandoned: parsed.abandoned === true,
         excluded: parsed.excluded ?? {},
         readbacks: parsed.readbacks ?? {},
@@ -183,14 +190,39 @@ export class RetireLedger {
     return next;
   }
 
-  /** Whether the authority still waits for this account's import. */
-  importPending(): Promise<boolean> {
-    return this.authority.importPending(this.owner);
+  /**
+   * What the authority says of this account's import. A rejection (the
+   * authority does not know the owner) is `unknown`, never `done`.
+   */
+  async authorityState(): Promise<"pending" | "done" | "unknown"> {
+    try {
+      return (await this.authority.importPending(this.owner))
+        ? "pending"
+        : "done";
+    } catch {
+      return "unknown";
+    }
   }
 
-  /** Tell the authority this account's import is finished. */
-  markImportDone(): Promise<void> {
-    return this.authority.importDone(this.owner);
+  /** Whether the authority still waits for this account's import (unknown: yes). */
+  async importPending(): Promise<boolean> {
+    return (await this.authorityState()) !== "done";
+  }
+
+  /** Tell the authority this account's import is finished, and wait for the save. */
+  async markImportDone(): Promise<void> {
+    await this.authority.importDone(this.owner);
+  }
+
+  /**
+   * Ask the authority to admit this connector's seed publish while the import
+   * is pending. True only when it admits it.
+   */
+  admitSeedPublish(connector: string): boolean {
+    return (
+      this.authority.commitImportSeed(this.owner, `import-seed:${connector}`)
+        .kind === "streams"
+    );
   }
 
   /**
@@ -199,7 +231,9 @@ export class RetireLedger {
    * writer's gate.
    */
   async importDone(connector: string): Promise<boolean> {
-    if (!(await this.importPending())) return true;
+    const state = await this.authorityState();
+    if (state === "done") return true;
+    if (state === "unknown") return false;
     const data = await this.read();
     return (
       data.imported[connector] !== undefined ||
@@ -219,7 +253,8 @@ export class RetireLedger {
     }
     if ((data.excluded[connector] ?? []).some((e) => e.rows > 0)) return false;
     return (
-      data.imported[connector] !== undefined || !(await this.importPending())
+      data.imported[connector] !== undefined ||
+      (await this.authorityState()) === "done"
     );
   }
 

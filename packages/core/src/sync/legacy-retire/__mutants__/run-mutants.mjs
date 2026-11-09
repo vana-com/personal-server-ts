@@ -245,10 +245,18 @@ try {
 }
 
 if (rows.length > 0) {
-  console.log("| Mutant | Edit | Result | Failing tests |");
-  console.log("| --- | --- | --- | --- |");
+  console.log("| Mutant | Edit | Result | Failing tests | Killed by |");
+  console.log("| --- | --- | --- | --- | --- |");
   for (const { m, verdict, failed } of rows) {
-    console.log(`| ${m.name} | ${m.why} | ${verdict} | ${failed.length} |`);
+    // The first failing test whose title names the mutant (what the verdict checked).
+    const killer =
+      failed.find((name) => m.mustFail.every((text) => name.includes(text))) ??
+      failed[0] ??
+      "";
+    const shown = killer.length > 90 ? `${killer.slice(0, 87)}...` : killer;
+    console.log(
+      `| ${m.name} | ${m.why} | ${verdict} | ${failed.length} | ${shown.replaceAll("|", "/")} |`,
+    );
   }
   console.log(`\n${rows.length - bad} of ${rows.length} mutants RED`);
 }

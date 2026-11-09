@@ -1614,13 +1614,21 @@ export class StreamSyncWriter {
    * Make sure the seed staged for `connector` (§2.9) gets published with no
    * connector run of its own. The seed is otherwise merged only into the
    * first publish of a connector run, so a connector that never runs again
-   * would keep its imported rows unreadable. Answers `done` once every staged
+   * would keep its imported rows unreadable. Answers `done` once every
    * stream has a receipt (or the connection is stopped, which publishes
    * nothing), naming the streams whose seed was skipped, and `waiting` while
    * the run it queued has not published. A queued run that was discarded
    * leaves a stream without a receipt, so the next call queues another.
+   *
+   * `asked` is every stream the caller staged. The seed source lists only
+   * streams without a receipt (a receipted stream's staged rows are dropped),
+   * so the answer is judged over `asked` and the source's list together: a
+   * stream that was skipped is named even though the source no longer lists it.
    */
-  async publishSeed(connector: string): Promise<SeedPublication> {
+  async publishSeed(
+    connector: string,
+    asked: readonly string[] = [],
+  ): Promise<SeedPublication> {
     const seed = this.options.seed;
     if (!seed) return { state: "done", skipped: [] };
     const state = await this.readState();
@@ -1630,20 +1638,17 @@ export class StreamSyncWriter {
         `${seed.installId}|${connector}|${IDENTITYLESS_NS}|${stream}`
       ];
     const open = streams.filter((s) => receiptOf(s.stream) === undefined);
+    const all = [...new Set([...asked, ...streams.map((s) => s.stream)])];
     if (isStoppedState(state, connector)) {
       return {
         state: "done",
-        skipped: streams
-          .filter((s) => receiptOf(s.stream) !== "merged")
-          .map((s) => s.stream),
+        skipped: all.filter((stream) => receiptOf(stream) !== "merged"),
       };
     }
     if (open.length === 0) {
       return {
         state: "done",
-        skipped: streams
-          .filter((s) => receiptOf(s.stream) === "skipped")
-          .map((s) => s.stream),
+        skipped: all.filter((stream) => receiptOf(stream) === "skipped"),
       };
     }
     for (const runId of await this.runIds()) {

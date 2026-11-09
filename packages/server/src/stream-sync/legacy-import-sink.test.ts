@@ -78,7 +78,7 @@ describe("importing through the real seed staging", () => {
       sink: flaky,
       ledger,
       owner: OWNER,
-      switched: () => true,
+      mode: () => "switched" as const,
     });
 
     const first = await importer.run();
@@ -132,7 +132,7 @@ describe("importing through the real seed staging", () => {
       sink: createSeedImportSink(createSeedStaging(files)),
       ledger,
       owner: OWNER,
-      switched: () => true,
+      mode: () => "switched" as const,
     });
     expect(await importer.run()).toMatchObject({ failed: 1 });
     expect(await importer.importDone("acme")).toBe(false);
@@ -177,7 +177,7 @@ describe("importing through the real seed staging", () => {
       sink,
       ledger,
       owner: OWNER,
-      switched: () => true,
+      mode: () => "switched" as const,
     });
     await importer.run();
     expect(await ledger.staged("acme", "u")).toBe(false);
