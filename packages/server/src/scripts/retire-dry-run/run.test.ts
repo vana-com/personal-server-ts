@@ -249,6 +249,43 @@ describe("NO_LOCAL_DELETES", () => {
     ).toEqual([]);
   });
 
+  it("aborts if the folder changes during the run (tripwire)", async () => {
+    const p = await fixture();
+    const actual = await vi.importActual<typeof CoreSync>(
+      "@opendatalabs/personal-server-ts-core/sync",
+    );
+    hooks.retire = async (...args) => {
+      await writeFile(join(p.dataDir, "data", "stray.json"), "{}");
+      return actual.retireLegacyFiles(
+        ...(args as Parameters<typeof actual.retireLegacyFiles>),
+      );
+    };
+    await expect(runLegacyRetireDryRun(optionsOf(p))).rejects.toThrow(
+      "data_folder_changed",
+    );
+    expect(JSON.parse(await readFile(p.outPath, "utf8"))).toMatchObject({
+      status: "aborted",
+      abortReason: "data_folder_changed",
+    });
+  });
+
+  it("gives the retire pass a store whose delete always fails", async () => {
+    const p = await fixture();
+    hooks.retire = async (deps) => {
+      const { storage } = deps as {
+        storage: { deleteVersion(s: string, c: string): Promise<boolean> };
+      };
+      return storage.deleteVersion(
+        "chatgpt.memories",
+        "2026-11-01T00:00:00.000Z",
+      );
+    };
+    await expect(runLegacyRetireDryRun(optionsOf(p))).rejects.toThrow(
+      "never deletes",
+    );
+    expect(await exists(join(p.dataDir, "data"))).toBe(true);
+  });
+
   it("opens a scratch copy of the database, removed at the end", async () => {
     const p = await fixture();
     await runLegacyRetireDryRun(optionsOf(p));
