@@ -228,7 +228,7 @@ async function boot(
   // eslint-disable-next-line prefer-const -- bound below; the callbacks read it late
   let writer: StreamSyncWriter | undefined;
   const source = staging.source(installId, async (connector) =>
-    writer ? (await writer.seedStatus(connector)).receipts : {},
+    writer ? await writer.seedStatus(connector) : { receipts: {}, skipped: [] },
   );
   const ledger = new RetireLedger(durable.ledger, OWNER);
   const stages: string[] = [];
@@ -277,13 +277,16 @@ describe("the import through the real seed staging and writer", () => {
     });
     await p.importer.run(); // stages, asks for the publish
     await p.writer.publishPending(); // the import run binds generation two
+    // A skipped seed has no receipt: the writer records the upload as skipped.
     expect((await p.writer.status()).receipts[receipt(p.installId, "s")]).toBe(
-      "skipped",
+      undefined,
     );
-    // The staging source drops a receipted stream from its list.
+    const seedState = await p.writer.seedStatus(CONNECTOR);
+    expect(seedState.skipped.map((s) => s.stream)).toEqual(["s"]);
+    // The staging source drops a stream the writer skipped from its list.
     expect(
       await createSeedStaging(durable.staging)
-        .source(p.installId, async () => ({ s: "skipped" as const }))
+        .source(p.installId, async () => seedState)
         .streams(CONNECTOR),
     ).toEqual([]);
     await p.importer.run(); // sees the receipt

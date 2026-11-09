@@ -20,7 +20,11 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
-import { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import {
+  createMemoryStreamSyncBlobs,
+  createMemoryStreamSyncRegistry,
+  StreamSyncWriter,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { type AccountStorageMode } from "@opendatalabs/personal-server-ts-core/sync";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -183,6 +187,9 @@ describe("the legacy import in a real boot", () => {
         serverDir: tempDir,
         dataDir: join(tempDir, "data"),
         accountMode: switchedFor(owner),
+        // An in-memory registry: the seed run lists it before it publishes.
+        streamSyncRegistry: createMemoryStreamSyncRegistry(),
+        streamSyncBlobs: createMemoryStreamSyncBlobs(),
       },
     );
     // The pass runs in the background after the stores open. Its receipt is

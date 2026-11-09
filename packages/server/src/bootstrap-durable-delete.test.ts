@@ -95,6 +95,8 @@ async function boot(
       dataDir: join(tempDir, "data"),
       streamSyncRegistry: registry,
       streamSyncBlobs: blobs,
+      // Unswitched: nothing to import, so a run is not held for an import.
+      accountMode: { read: () => "unswitched" },
       ...(declaredStreams ? { declaredStreams } : {}),
     },
   );
