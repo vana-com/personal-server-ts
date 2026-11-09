@@ -228,4 +228,55 @@ describe("stream-only owner plans a local run from the registry head", () => {
         : [],
     ).toEqual(["r1:registry_head_unimported"]);
   });
+
+  describe("after a re-activation, an older-generation head is not a newer registry head", () => {
+    async function reactivated(seed: number, importBefore: boolean) {
+      const f = new Fixture(await testOwnerKey(masterKey(seed)));
+      const ns = await f.key.ns("acme", "account-1");
+      await f.activate("acme", ns);
+      await f.publish({
+        connector: "acme",
+        ns,
+        stream: "items",
+        generation: 1,
+        complete: true,
+        records: [{ id: "old" }],
+      });
+      const service = await f.service();
+      if (importBefore) await f.sync(service);
+      await f.activate("acme", ns);
+      await service.observe([...f.rows.values()], {
+        fromStart: true,
+        lastPage: true,
+      });
+      await service.importPending();
+      f.overlay.runs = [
+        {
+          runId: "r2",
+          ns,
+          generation: 2,
+          full: true,
+          streams: [{ name: "items", rows: [line("R")], complete: true }],
+        },
+      ];
+      const decision = await service.resolve(
+        ask("pdpp.acme.items", { streamOnly: true }),
+      );
+      return decision.kind === "view" || decision.kind === "local_pending"
+        ? {
+            ids: (await body(decision)).data.records.map((r: any) => r.id),
+            withheld: (decision.withheld ?? []).map((w) => w.reason),
+          }
+        : { ids: decision.kind, withheld: [] };
+    }
+
+    it.each([
+      ["imported before the re-activation", true],
+      ["never imported on this device", false],
+    ])("shows the owner's own run (%s)", async (_label, importBefore) => {
+      const out = await reactivated(importBefore ? 116 : 117, importBefore);
+      expect(out.withheld).not.toContain("registry_head_unimported");
+      expect(out.ids).toContain("R");
+    });
+  });
 });

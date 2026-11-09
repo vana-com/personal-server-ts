@@ -1137,9 +1137,15 @@ export class StreamSyncReadService {
     const registry = this.liveImported(connector, ns, stream, control, row);
     const live =
       row !== undefined && this.importer.streamRowKind(row) === "present";
+    // Ahead of the newest head this device has read, whatever its generation:
+    // a head of an older generation is not live, but it is read, so the row is
+    // not newer than what this device holds.
     return {
       registry,
-      registryAhead: live && row.version > (registry?.version ?? 0),
+      registryAhead:
+        live &&
+        row.version >
+          this.importer.latestReadVersion({ connector, ns, stream }),
     };
   }
 

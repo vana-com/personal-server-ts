@@ -138,6 +138,20 @@ export class StreamSyncImporter {
   }
 
   /** Absent, present or tombstoned, by the rule the writer uses. */
+  /** Versions read and found not live (another generation), by stream. */
+  private readonly notLive = new Map<string, number>();
+
+  /**
+   * The newest registry version of the stream this device has read: imported,
+   * or read and found not live. A row above it is a head not yet read.
+   */
+  latestReadVersion(key: ViewKey): number {
+    return Math.max(
+      this.options.views.get(key)?.version ?? 0,
+      this.notLive.get(viewKeyId(key)) ?? 0,
+    );
+  }
+
   streamRowKind(row: MirrorRow): StreamRow {
     if (
       row.scope &&
@@ -313,7 +327,12 @@ export class StreamSyncImporter {
       head.lastDeleteVersion === row.version && head.recordCount === 0;
     if ((head.lastDeleteVersion ?? 0) > 0)
       await this.options.mirror.recordDelete(scope, head.lastDeleteVersion!);
-    if (!deleted && head.generation !== generation) return;
+    if (!deleted && head.generation !== generation) {
+      // Read and judged: this version is not live and never will be. Remember
+      // it, so a reader does not take the row for a head still to import.
+      this.notLive.set(viewKeyId(key), row.version);
+      return;
+    }
     let currentProblem: Problem | null = null;
     let fallbackProblem: Problem | null = null;
     await views.withImport(key, async (tx) => {

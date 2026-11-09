@@ -112,6 +112,20 @@ const MUTANTS = [
     to: "            row,\n          );\n          if (live !== null) {",
     tests: [`${READ}/one-store.test.ts`, `${READ}/latest-complete.test.ts`],
   },
+  {
+    name: "REGISTRY_AHEAD_STALE_GEN",
+    file: `${READ}/service.ts`,
+    from: "          this.importer.latestReadVersion({ connector, ns, stream }),",
+    to: "          (registry?.version ?? 0),",
+    tests: [`${READ}/stream-only-plan.test.ts`],
+  },
+  {
+    name: "NOT_LIVE_HEAD_NOT_REMEMBERED",
+    file: `${READ}/importer.ts`,
+    from: "      this.notLive.set(viewKeyId(key), row.version);\n",
+    to: "",
+    tests: [`${READ}/stream-only-plan.test.ts`],
+  },
 ];
 
 const wanted = process.argv.slice(2);
