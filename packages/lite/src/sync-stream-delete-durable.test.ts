@@ -49,6 +49,30 @@ function fakeLocks() {
   return { request, held };
 }
 
+/**
+ * The vana-storage blob paths the writer PUTs and reads back. The registry is
+ * in memory, so blobs are the only traffic left on `fetch`; without this stub
+ * every publish goes to the real storage host.
+ */
+function fakeBlobStorage() {
+  const blobs = new Map<string, Uint8Array>();
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const { pathname } = new URL(String(input));
+    if (init?.method === "PUT") {
+      const bytes = new Uint8Array(await new Response(init.body).arrayBuffer());
+      blobs.set(pathname, bytes);
+      return Response.json({
+        url: pathname,
+        key: pathname,
+        etag: `"${bytes.length}"`,
+        size: bytes.length,
+      });
+    }
+    const found = blobs.get(pathname);
+    return found ? new Response(found) : new Response(null, { status: 404 });
+  });
+}
+
 let factory: IDBFactory;
 
 beforeEach(() => {
@@ -56,6 +80,7 @@ beforeEach(() => {
   vi.stubGlobal("indexedDB", factory);
   vi.stubGlobal("IDBKeyRange", IDBKeyRange);
   vi.stubGlobal("navigator", { locks: fakeLocks() });
+  vi.stubGlobal("fetch", fakeBlobStorage());
 });
 
 afterEach(() => {
