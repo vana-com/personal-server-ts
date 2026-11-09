@@ -52,6 +52,10 @@ export {
   type StreamCommitResult,
 } from "./authority.js";
 export {
+  ReentrantAuthorityCall,
+  callbackGuardAvailable,
+} from "./reentrancy.js";
+export {
   createMemoryModeRecordStore,
   type MemoryModeRecordStore,
 } from "./memory-record-store.js";

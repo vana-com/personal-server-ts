@@ -38,8 +38,11 @@
  *   creates the authority gets it as a separate capability
  *   (`createModeAuthorityWithImporter`); everyone else holds only the authority.
  *
- * Do not call `submitEvidence` from inside a commit callback: evidence waits
- * for every in-flight commit, so the call would wait for itself.
+ * A commit callback must not call back into the authority that runs it, other
+ * than `read` and `admit` (which take no lock): the call would wait for the
+ * callback, and the callback for the call. Such a call rejects at once with
+ * `ReentrantAuthorityCall` (see `reentrancy.ts`; the guard is off where the host
+ * has no `AsyncLocalStorage`, such as a browser, and the call then waits).
  */
 
 import {
@@ -61,6 +64,7 @@ import {
   type ModeRecordStore,
   type ModeStoreLease,
 } from "./record-store.js";
+import { createCallbackGuard } from "./reentrancy.js";
 import { createRwLock, type RwLock } from "./rw-lock.js";
 
 export type RefuseDecision = Extract<ModeDecision, { kind: "refuse" }>;
@@ -300,6 +304,7 @@ export function createModeAuthorityWithImporter(
   const clock = options.clock ?? defaultAuthorityClock();
   const warn = options.onWarning ?? (() => {});
   const lock: RwLock = createRwLock();
+  const callbacks = createCallbackGuard();
   const records = new Map<string, AccountModeRecord>();
   /** What the store held for each owner when this authority last read or wrote it. */
   const stored = new Map<string, DurableModeRecord>();
@@ -528,6 +533,7 @@ export function createModeAuthorityWithImporter(
       fetchStartMono: number;
     },
   ): Promise<ModeDecision> {
+    callbacks.assertOutside("submitEvidence");
     const unavailable = await available();
     if (unavailable) return unavailable;
     const release = await lock.exclusive();
@@ -595,6 +601,9 @@ export function createModeAuthorityWithImporter(
     operationId: string,
     write: () => T | Promise<T>,
   ): Promise<StreamCommitResult<T>> {
+    callbacks.assertOutside(
+      sink === "stream" ? "commitStream" : "commitImportSeed",
+    );
     const event: ModeEvent = { type: "commit", owner, operationId, sink };
     const refuse = (decision: ModeDecision): StreamCommitResult<T> => ({
       ok: false,
@@ -608,7 +617,7 @@ export function createModeAuthorityWithImporter(
       if (decision.kind !== "streams") return refuse(decision);
       return {
         ok: true,
-        value: await write(),
+        value: await callbacks.run(write),
         importRequired: decision.importRequired,
       };
     } finally {
@@ -651,6 +660,7 @@ export function createModeAuthorityWithImporter(
       decide({ type: "admit", owner, operationId }),
 
     async commitLegacy(owner, operationId, write) {
+      callbacks.assertOutside("commitLegacy");
       // An early refusal needs no lock: refusing is always safe.
       const early = refusal(decide(commitEvent(owner, operationId)));
       if (early) return { ok: false, decision: early };
@@ -667,7 +677,7 @@ export function createModeAuthorityWithImporter(
         }
         const refused = refusal(decide(commitEvent(owner, operationId)));
         if (refused) return { ok: false, decision: refused };
-        return { ok: true, value: await write() };
+        return { ok: true, value: await callbacks.run(write) };
       } finally {
         release();
       }
@@ -677,6 +687,7 @@ export function createModeAuthorityWithImporter(
       sealStream("stream", owner, operationId, write),
 
     async importPending(owner) {
+      callbacks.assertOutside("importPending");
       const unavailable = await available();
       if (unavailable)
         throw new Error("account mode unknown: store unavailable");
@@ -687,6 +698,7 @@ export function createModeAuthorityWithImporter(
     },
 
     async importDone(owner) {
+      callbacks.assertOutside("importDone");
       const unavailable = await available();
       if (unavailable) return unavailable;
       const release = await lock.exclusive();
@@ -702,6 +714,12 @@ export function createModeAuthorityWithImporter(
     },
 
     close() {
+      try {
+        callbacks.assertOutside("close");
+      } catch (error) {
+        // Before anything is changed: a refused close leaves the authority open.
+        return Promise.reject(error);
+      }
       // Refuse new work before anything is awaited.
       closed = true;
       loaded = false;

@@ -52,6 +52,7 @@ const BROWSER_RUNTIME = "packages/lite/src/browser-runtime.ts";
 
 const AUTHORITY_TESTS = `${DIR}/authority.test.ts`;
 const LIFECYCLE_TESTS = `${DIR}/authority-lifecycle.test.ts`;
+const REENTRANCY_TESTS = `${DIR}/authority-reentrancy.test.ts`;
 const FLAG_TESTS = `${DIR}/flag-evidence.test.ts`;
 // Runs the shared vectors (vectors.json) and the policy's unit tests.
 const CORE_TESTS = `${DIR}/mode-machine.test.ts`;
@@ -90,6 +91,10 @@ const vector = (id) => ({
 const authority = (name) => ({ file: AUTHORITY_TESTS, name });
 const lifecycle = (name) => ({ file: LIFECYCLE_TESTS, name });
 const core = (name) => ({ file: CORE_TESTS, name });
+const reentrancy = (call, kind) => ({
+  file: REENTRANCY_TESTS,
+  name: `REENTRANT_CALL_WAITS: ${call} from inside ${kind} throws ReentrantAuthorityCall at once, and the outer commit completes`,
+});
 
 /**
  * name, edits [[file, old text (exactly once), new text]], aimed tests.
@@ -1304,6 +1309,60 @@ const MUTANTS = [
       ),
     ],
   },
+
+  // ---- Re-entrant call from a seal callback -----------------------------
+  {
+    name: "REENTRANT_CALL_WAITS",
+    files: [REENTRANCY_TESTS],
+    edits: [
+      [
+        `${DIR}/reentrancy.ts`,
+        "      if (local.getStore()?.active === true) {\n        throw new ReentrantAuthorityCall(call);\n      }\n",
+        "",
+      ],
+    ],
+    aimed: [
+      reentrancy("commitLegacy", "commitLegacy"),
+      reentrancy("commitStream", "commitStream"),
+      reentrancy("commitImportSeed", "commitImportSeed"),
+      reentrancy("submitEvidence", "commitStream"),
+      reentrancy("submitEvidenceMono", "commitLegacy"),
+      reentrancy("importDone", "commitImportSeed"),
+      reentrancy("importPending", "commitStream"),
+      reentrancy("close", "commitLegacy"),
+    ],
+  },
+
+  // One mutant per guarded call: the call that loses its check waits.
+  ...[
+    [
+      "commitLegacy",
+      'callbacks.assertOutside("commitLegacy");\n',
+      ["commitLegacy"],
+    ],
+    [
+      "commitStream and commitImportSeed",
+      'callbacks.assertOutside(\n      sink === "stream" ? "commitStream" : "commitImportSeed",\n    );\n',
+      ["commitStream", "commitImportSeed"],
+    ],
+    [
+      "submitEvidence",
+      'callbacks.assertOutside("submitEvidence");\n',
+      ["submitEvidence", "submitEvidenceMono"],
+    ],
+    ["importDone", 'callbacks.assertOutside("importDone");\n', ["importDone"]],
+    [
+      "importPending",
+      'callbacks.assertOutside("importPending");\n',
+      ["importPending"],
+    ],
+    ["close", 'callbacks.assertOutside("close");', ["close"]],
+  ].map(([label, anchor, calls]) => ({
+    name: `REENTRANT_CALL_WAITS (${label} unguarded)`,
+    files: [REENTRANCY_TESTS],
+    edits: [[AUTHORITY, anchor, ""]],
+    aimed: calls.map((call) => reentrancy(call, "commitStream")),
+  })),
 
   // ---- Node host: kernel-held owner lock, boot order, routes ------------
   {
