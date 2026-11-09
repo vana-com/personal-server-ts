@@ -25,7 +25,7 @@ const MUTANTS = [
   ["UNKNOWN_READS_LEGACY", API, '      if (storageSelection?.kind === "refuse") return storageSelection.response;\n      if (storageSelection?.kind === "streams") {\n        return listStreamSyncScopes', '      if (storageSelection?.kind === "streams") {\n        return listStreamSyncScopes'],
   ["UNSWITCHED_CHANGED", API, 'if (storageSelection?.kind === "streams") {\n        return listStreamSyncScopes', "if (storageSelection) {\n        return listStreamSyncScopes"],
   ["OVERLAY_CONNECTORS_EMPTY", OVL, "connectors: () => writer.overlayConnectors(),", "connectors: async () => [],"],
-  ["MIRROR_ONLY_CONNECTOR_DISCOVERY", SVC, "if (input.isOwnerView && this.options.overlay?.connectors) {", "if (false) {"],
+  ["MIRROR_ONLY_CONNECTOR_DISCOVERY", SVC, "if (input.isOwnerView && this.options.overlay) {", "if (false) {"],
   ["OMIT_OVERLAY_STREAM_NAMES", SVC, "        for (const run of snapshot.runs) {\n          for (const stream of run.streams) addLogical(connector, stream.name);\n        }", ""],
   ["RESOLVE_BEFORE_GRANT_AND_PAGE", SVC, "      if (input.isCovered && !input.isCovered(scope)) continue;\n      let newest: number | null;\n      try {\n        const found = await this.readable(scope, input.isOwnerView);\n        if (!found) continue;", "      let newest: number | null;\n      try {\n        const found = await this.readable(scope, input.isOwnerView);\n        if (!found) continue;\n        if (input.isCovered && !input.isCovered(scope)) continue;"],
   ["ABORT_LIST_ON_ONE_FAILURE", SVC, "      } catch (error) {\n        this.options.logger.warn(", "      } catch (error) {\n        throw error;\n        this.options.logger.warn("],
