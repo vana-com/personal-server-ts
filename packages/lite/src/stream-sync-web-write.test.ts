@@ -10,7 +10,7 @@
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
+import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import { computeDataPointId } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   createStreamSyncKeyPorts,
@@ -69,9 +69,8 @@ const logical = (stream: string) => `pdpp.${CONNECTOR}.${stream}`;
 
 /** Stateful exclusive-version gateway and ciphertext blob store; no real fetch. */
 async function network() {
-  const signature = await ACCOUNT.signMessage({
-    message: buildPersonalServerLiteOwnerBindingMessage(ACCOUNT.address),
-  });
+  // The owner master-key signature, the same one every runtime takes (#577).
+  const signature = await signOwnerMasterKey(ACCOUNT);
   const keys = createStreamSyncKeyPorts(signature);
   const rows = new Map<string, RegistryRow>();
   const blobs = new Map<string, Uint8Array>();
