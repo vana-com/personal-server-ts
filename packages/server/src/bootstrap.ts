@@ -75,8 +75,13 @@ import {
   createGatewayDeleteDataPort,
   createInventoryTombstoneFinality,
   createScopeDeletionTracker,
+  createRetireHost,
   createSyncManager,
+  LegacyImporter,
+  RetireLedger,
   withCancellableRegistration,
+  type LegacyImportSource,
+  type LegacyRetireOption,
   type PdppImporter,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -147,6 +152,7 @@ import {
   createSeedStaging,
   type SeedStaging,
 } from "./stream-sync/seed-staging.js";
+import { createSeedImportSink } from "./stream-sync/legacy-import-sink.js";
 import {
   computeQuestion,
   createOpenAiCompatibleInferenceProvider,
@@ -193,6 +199,11 @@ export interface ServerContext {
   replicaWriterRotation: ReplicaWriterRotation;
 }
 
+const NO_IMPORT_SOURCE: LegacyImportSource = {
+  connectors: async () => [],
+  streams: async () => [],
+};
+
 export interface CreateServerOptions {
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
@@ -208,6 +219,12 @@ export interface CreateServerOptions {
   rootPath?: string;
   /** Exact owner scopes to hydrate before the first full sync pass. */
   hydrateScopes?: string[];
+  /**
+   * This device's own stream-shaped rows to import into stream data when the
+   * account is switched. Default: none (nothing is imported, the import gate
+   * opens at once). The canonical record store has no adapter yet.
+   */
+  legacyImportSource?: LegacyImportSource;
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible client on `config.inference` (env overrides:
@@ -922,6 +939,8 @@ export async function createServer(
 
     // Whole-file stream sync publishes beside the legacy upload, only when
     // `streamSync.write` is on. Legacy uploads run unchanged either way.
+    let retireLedger: RetireLedger | null = null;
+    let legacyImporter: LegacyImporter | null = null;
     if (config.streamSync.write && !isEnclave) {
       let writerForSeed: StreamSyncWriter | null = null;
       const streamSyncHome = await openFsStreamSyncHome({
@@ -939,6 +958,16 @@ export async function createServer(
         // kept in this owner's home so another owner never merges them.
         // The receipts lookup binds late because the writer owns the receipts.
         const seedStaging = createSeedStaging(streamSyncHome.seedFiles);
+        // Import first (design §4): a run of a connector waits for its import,
+        // so the seed is merged into the first publish, never skipped.
+        retireLedger = new RetireLedger(streamSyncHome.home.files);
+        legacyImporter = new LegacyImporter({
+          source: options?.legacyImportSource ?? NO_IMPORT_SOURCE,
+          sink: createSeedImportSink(seedStaging),
+          ledger: retireLedger,
+          switched: () => config.streamSync.write,
+          logger,
+        });
         const seedSource = seedStaging.source(
           await seedStaging.installId(),
           async (connector) =>
@@ -975,9 +1004,17 @@ export async function createServer(
               storage: rawDataStorage,
               pdpp: pdppConnections,
             }),
+          importDone: legacyImporter.importDone,
         });
         writerForSeed = streamSyncWriter;
         streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };
+        // At boot, before any run is accepted; every sync cycle runs it again.
+        await legacyImporter.run().catch((error: unknown) => {
+          logger.warn(
+            { error: error instanceof Error ? error.name : "NonError" },
+            "Legacy import did not finish at boot; retried each cycle",
+          );
+        });
       }
     }
 
@@ -1024,6 +1061,25 @@ export async function createServer(
         ? { write: true, publisher: streamSyncWriter }
         : null,
       deleteData,
+      // Import, readback and (only with `streamSync.retireLegacy`) retire of
+      // local legacy files; read live, null while the account is unswitched.
+      legacyRetire: (): LegacyRetireOption | null =>
+        config.streamSync.write &&
+        streamSyncWriter &&
+        streamSyncRead &&
+        retireLedger &&
+        legacyImporter
+          ? {
+              importer: legacyImporter,
+              host: createRetireHost({
+                reader: streamSyncRead,
+                writer: streamSyncWriter,
+                ledger: retireLedger,
+              }),
+              ledger: retireLedger,
+              deleteEnabled: config.streamSync.retireLegacy,
+            }
+          : null,
       hydrateScopes: options?.hydrateScopes,
       pendingBlobDeletions,
       uploadAttemptStore: createFileUploadAttemptStore(uploadAttemptsPath),

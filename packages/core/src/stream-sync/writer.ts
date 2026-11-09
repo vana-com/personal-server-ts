@@ -277,6 +277,14 @@ interface WriterState {
   observedControl?: Record<string, Record<string, ControlState>>;
   /** Monotone delete observations, scoped by this home to one owner. */
   lastDeletes?: Record<string, Record<string, number>>;
+  /**
+   * Per connector and stream, the delete version a FULL run of this device
+   * committed after: `collectedAt` of the newest committed full run. The run
+   * could only commit with collectedAt at or above the row's last delete, so
+   * a value at or above a delete version proves this device re-collected the
+   * stream after that delete. Only moves forward.
+   */
+  fullSince?: Record<string, Record<string, number>>;
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt (merged). */
   receipts: Record<string, SeedReceipt>;
@@ -417,6 +425,14 @@ export interface StreamSyncRunStart {
  * A scheduled run of a connector this device has seen deleted (§2.4
  * `stopped`). Cleared by an explicit connect, or by observing a reconnect.
  */
+/** A run of a connector whose local import is not finished (retry later). */
+export class ImportPendingError extends Error {
+  constructor(readonly connector: string) {
+    super("local import of this connector is not finished");
+    this.name = "ImportPendingError";
+  }
+}
+
 export class ConnectionStoppedError extends Error {
   constructor(readonly connector: string) {
     super(
@@ -546,6 +562,14 @@ export interface StreamSyncWriterOptions {
    * open and the next publish pass runs it again. Default: none.
    */
   readonly eraseLegacy?: (connector: string) => Promise<void>;
+  /**
+   * Whether this device finished importing its local data for `connector`
+   * into stream data. A run of a connector whose import is not done is
+   * refused (`ImportPendingError`): the import must come first, or the
+   * device's own records are published as a later generation and never
+   * merged. Absent: no import step, no gate.
+   */
+  readonly importDone?: (connector: string) => boolean | Promise<boolean>;
 }
 
 export { compareConnectorVersions } from "./publish-plan.js";
@@ -1387,6 +1411,22 @@ export class StreamSyncWriter {
     return { targetKnown: target !== undefined, receipts, skipped };
   }
 
+  /**
+   * Whether a full run of `connector` committed `stream` on this device after
+   * the delete at `deleteVersion` (a registry version): the stream was
+   * re-collected, so a record the delete fence dropped is not device-only
+   * data any more. A delete this device has not yet re-collected answers false.
+   */
+  async fullRunSince(
+    connector: string,
+    stream: string,
+    deleteVersion: number,
+  ): Promise<boolean> {
+    const state = await this.readState();
+    const at = state.fullSince?.[connector]?.[stream];
+    return at !== undefined && at >= deleteVersion;
+  }
+
   /** The owner and key check a run is bound to (V2 §2.1, M5). */
   async binding(): Promise<{ owner: string; keyCheck: string }> {
     const { keyCheck } = await this.keys();
@@ -1440,6 +1480,12 @@ export class StreamSyncWriter {
       if (await this.readEntry(input.runId)) {
         if (!this.active.has(input.runId)) throw new RunGoneError(input.runId);
         throw new Error(`run ${input.runId} already exists`);
+      }
+      if (
+        this.options.importDone &&
+        !(await this.options.importDone(input.connector))
+      ) {
+        throw new ImportPendingError(input.connector);
       }
       // P2-1: an explicit connect finishes an open delete of this connector
       // first, so a later boot cannot tombstone what the connect creates.
@@ -2789,6 +2835,13 @@ export class StreamSyncWriter {
       state.needsFull = effect.needsFull;
       if (effect.clearCheckpoint) {
         invalidateCheckpoint(state, entry.connector, true);
+      }
+      if ((entry.full || stream.fullStream) && complete) {
+        const byStream = ((state.fullSince ??= {})[entry.connector] ??= {});
+        byStream[name] = Math.max(
+          byStream[name] ?? 0,
+          host.collectedAt?.[name] ?? 0,
+        );
       }
       if (stream.seedApplies && this.options.seed) {
         state.receipts[

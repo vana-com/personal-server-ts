@@ -12,6 +12,8 @@ import {
   StreamSyncWriter,
   type StreamSyncBlobs,
   type StreamSyncRunStatus,
+  type StreamSyncSeedSource,
+  type StreamSyncWriterOptions,
 } from "../stream-sync/index.js";
 import { streamSyncHashes } from "../stream-sync/crypto.js";
 import { MemoryStreamSyncRegistry } from "../stream-sync/memory-registry.js";
@@ -105,6 +107,14 @@ export interface SeedRows {
   rows: readonly Record<string, unknown>[];
 }
 
+/** Wiring the retire tests add to the main device. */
+export interface RigExtras {
+  /** A seed source instead of the static `seed` rows. */
+  readonly seedSource?: StreamSyncSeedSource;
+  /** More writer options for the main device (not `other`). */
+  readonly writer?: Partial<StreamSyncWriterOptions>;
+}
+
 export class Rig {
   readonly restarts: string[] = [];
   /** Test hook for the legacy erase a connection delete runs last. */
@@ -135,9 +145,10 @@ export class Rig {
     readonly connector: string = CONNECTOR,
     private declared: readonly string[] = ["items"],
     private retained: readonly string[] = [],
+    private readonly extras: RigExtras = {},
   ) {
     this.seed = seed;
-    this.writer = this.device(this.files, seed);
+    this.writer = this.device(this.files, seed, true);
     this.other = this.device(createMemoryStreamSyncFiles());
     this.bindOverlay();
   }
@@ -170,6 +181,7 @@ export class Rig {
   private device(
     files: ReturnType<typeof createMemoryStreamSyncFiles>,
     seed?: SeedRows,
+    main = false,
   ): StreamSyncWriter {
     const blobs: StreamSyncBlobs = {
       put: async (key, bytes) => void this.blobMap.set(key, bytes.slice()),
@@ -201,27 +213,30 @@ export class Rig {
       eraseLegacy: async (connector) => {
         await this.eraseLegacyHook?.(connector);
       },
-      ...(seed
-        ? {
-            seed: {
-              installId: "install-1",
-              streams: async () =>
-                seed.staged === false
-                  ? []
-                  : [
-                      {
-                        stream: seed.stream ?? "items",
-                        upload: seed.upload ?? "upload-1",
-                        primaryKey: [seed.key],
-                        profile: { key: null, version: seed.version },
-                      },
-                    ],
-              records: async function* () {
-                for (const row of seed.rows) yield row;
+      ...(main && this.extras.writer ? this.extras.writer : {}),
+      ...(main && this.extras.seedSource
+        ? { seed: this.extras.seedSource }
+        : seed
+          ? {
+              seed: {
+                installId: "install-1",
+                streams: async () =>
+                  seed.staged === false
+                    ? []
+                    : [
+                        {
+                          stream: seed.stream ?? "items",
+                          upload: seed.upload ?? "upload-1",
+                          primaryKey: [seed.key],
+                          profile: { key: null, version: seed.version },
+                        },
+                      ],
+                records: async function* () {
+                  for (const row of seed.rows) yield row;
+                },
               },
-            },
-          }
-        : {}),
+            }
+          : {}),
     });
   }
 
@@ -236,7 +251,7 @@ export class Rig {
   }
 
   async restart(): Promise<void> {
-    this.writer = this.device(this.files, this.seed);
+    this.writer = this.device(this.files, this.seed, true);
     this.bindOverlay();
     await this.open();
   }

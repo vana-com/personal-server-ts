@@ -43,10 +43,14 @@ import {
   createGatewayDeleteDataPort,
   createInventoryTombstoneFinality,
   createPendingBlobDeletionStore,
+  createRetireHost,
   createScopeDeletionTracker,
+  LegacyImporter,
+  RetireLedger,
   normalizePendingBlobDeletionPlanned,
   normalizePendingBlobDeletions,
   type PendingBlobDeletionPlanned,
+  type LegacyRetireOption,
   type ScopeDeletionTracker,
   type UploadAttemptStore,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -589,6 +593,27 @@ export async function createPsLiteSyncManager(
   // browser context cannot acquire the home and writes stay off until reload.
   let syncManager!: ReturnType<typeof createSyncManager>;
   try {
+    // Lite has no stream-shaped local rows to import (no canonical store, no
+    // seed intake), so its import step finds nothing. The writer is not gated
+    // on it: there is nothing to merge before a first run. The sync cycle runs
+    // the importer once, which the retire step requires, and the readback gate
+    // still decides every delete of a local legacy file.
+    const retireLedger = streamSyncHome
+      ? new RetireLedger(streamSyncHome.home.files)
+      : null;
+    const legacyImporter = retireLedger
+      ? new LegacyImporter({
+          source: { connectors: async () => [], streams: async () => [] },
+          sink: {
+            stage: async () => {
+              throw new Error("Lite stages no legacy rows");
+            },
+          },
+          ledger: retireLedger,
+          switched: () => Boolean(options.config.streamSync?.write),
+          logger,
+        })
+      : null;
     const streamSyncWriter = streamSyncHome
       ? new StreamSyncWriter({
           ownerAddress: serverOwner,
@@ -686,6 +711,23 @@ export async function createPsLiteSyncManager(
         streamSync: streamSyncWriter
           ? { write: true, publisher: streamSyncWriter }
           : null,
+        legacyRetire: (): LegacyRetireOption | null =>
+          options.config.streamSync?.write &&
+          streamSyncWriter &&
+          streamSyncRead &&
+          retireLedger &&
+          legacyImporter
+            ? {
+                importer: legacyImporter,
+                host: createRetireHost({
+                  reader: streamSyncRead,
+                  writer: streamSyncWriter,
+                  ledger: retireLedger,
+                }),
+                ledger: retireLedger,
+                deleteEnabled: Boolean(options.config.streamSync?.retireLegacy),
+              }
+            : null,
         deleteData,
         pendingBlobDeletions,
         uploadAttemptStore: uploadAttemptNamespace

@@ -14,6 +14,7 @@ export {
 export {
   createSyncManager,
   type SyncManager,
+  type LegacyRetireOption,
   type SyncManagerOptions,
 } from "./engine/sync-manager.js";
 export type {
@@ -123,3 +124,5 @@ export {
   withCancellableRegistration,
   type CancellableRegistration,
 } from "./cancellable-gateway.js";
+
+export * from "./legacy-retire/index.js";

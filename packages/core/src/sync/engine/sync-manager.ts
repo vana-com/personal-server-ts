@@ -15,6 +15,13 @@ import {
   retryPendingBlobDeletions,
   type DeleteScopeResult,
 } from "../workers/delete.js";
+import {
+  retireLegacyFiles,
+  type LegacyImporter,
+  type RetireHost,
+  type RetireLedger,
+  type RetireReport,
+} from "../legacy-retire/index.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
 import { createTombstoneResubmitTracker } from "../tombstone-resubmits.js";
 import type {
@@ -64,6 +71,23 @@ export interface SyncManagerOptions {
     readonly write: boolean;
     readonly publisher: { cycle(): Promise<unknown> };
   } | null;
+  /**
+   * Local legacy import, readback and retire, read live each cycle. Returns
+   * null while the account is not switched (nothing runs: unswitched accounts
+   * are unchanged). While switched, every cycle runs the import first (before
+   * any stream run can start) and, after the download, the readbacks.
+   * `deleteEnabled` is its own default-off switch: false means no legacy file
+   * is ever deleted. Absent: nothing runs.
+   */
+  legacyRetire?: (() => LegacyRetireOption | null) | null;
+}
+
+export interface LegacyRetireOption {
+  readonly importer: Pick<LegacyImporter, "run"> | null;
+  readonly host: RetireHost;
+  readonly ledger: RetireLedger;
+  /** The delete step's switch; default off in every host. */
+  readonly deleteEnabled: boolean;
 }
 
 export type SyncCanRunResult =
@@ -101,6 +125,15 @@ export interface SyncManager {
    * local copy in place and is reported as `steps.gateway.status = "failed"`.
    */
   deleteScope(scope: string): Promise<DeleteScopeResult>;
+
+  /**
+   * Dry run of the legacy retire: reads back every local legacy version
+   * (the readbacks are recorded) and reports per file whether the import is
+   * done, the readback result and whether it would delete. Deletes nothing,
+   * whatever the delete switch says. Resolves null while the account is not
+   * switched.
+   */
+  legacyRetireReport(): Promise<RetireReport | null>;
 
   /** Whether the sync manager is currently running */
   readonly running: boolean;
@@ -222,6 +255,8 @@ export function createSyncManager(
         }
         blocked = null;
 
+        await runLegacyImport();
+
         if (needsStartupHydration) {
           try {
             await hydrateScopesExclusive(startupHydrateScopes);
@@ -289,6 +324,8 @@ export function createSyncManager(
           );
         }
 
+        await runLegacyRetire(false);
+
         // Update cached cursor value
         try {
           lastProcessedTimestamp = await downloadDeps.cursor.read();
@@ -304,6 +341,46 @@ export function createSyncManager(
       await cycleInFlight;
     } finally {
       cycleInFlight = null;
+    }
+  }
+
+  /** Import first: no stream run of a connector starts before its import is done. */
+  async function runLegacyImport(): Promise<void> {
+    const retire = options?.legacyRetire?.();
+    if (!retire?.importer) return;
+    try {
+      await retire.importer.run();
+    } catch (err) {
+      uploadDeps.logger.warn(
+        { error: (err as Error).name },
+        "Legacy import failed; retried next cycle",
+      );
+    }
+  }
+
+  let lastRetire: RetireReport | null = null;
+
+  async function runLegacyRetire(
+    dryRun: boolean,
+  ): Promise<RetireReport | null> {
+    const retire = options?.legacyRetire?.();
+    if (!retire) return null;
+    try {
+      const report = await retireLegacyFiles({
+        storage: uploadDeps.storage,
+        host: retire.host,
+        ledger: retire.ledger,
+        deleteEnabled: retire.deleteEnabled,
+        dryRun,
+      });
+      lastRetire = report;
+      return report;
+    } catch (err) {
+      uploadDeps.logger.warn(
+        { error: (err as Error).name },
+        "Legacy retire pass failed; retried next cycle",
+      );
+      return null;
     }
   }
 
@@ -551,7 +628,21 @@ export function createSyncManager(
         errors: [...errors],
         deletions: tombstoneResubmits.snapshot(),
         uploads: uploadState.snapshot(),
+        ...(lastRetire
+          ? {
+              legacyRetire: {
+                mode: lastRetire.mode,
+                files: lastRetire.files.length,
+                ready: lastRetire.files.filter((f) => f.wouldDelete).length,
+                deleted: lastRetire.deleted,
+              },
+            }
+          : {}),
       };
+    },
+
+    legacyRetireReport() {
+      return exclusive(() => runLegacyRetire(true));
     },
 
     hydrateScopes(scopes) {
