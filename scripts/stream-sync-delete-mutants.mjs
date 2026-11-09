@@ -10,6 +10,9 @@
  *
  *   node scripts/stream-sync-delete-mutants.mjs [NAME ...]
  *
+ * A fresh clone has no compiled output: run `npx tsc --build` first, or the
+ * baseline fails with 500s (a safe abort).
+ *
  * A mutant in `packages/core` marks `build: true`, so the server and Lite
  * tests (which read core's compiled output) see it.
  */
@@ -94,6 +97,20 @@ const MUTANTS = [
     ],
     tests: REQUEST_TESTS,
     aim: "two requests for one delete land it once",
+  },
+  {
+    // The registry is planned before the open intent is read, so a delete in
+    // flight is refused when the manifest is not verified.
+    name: "PLAN_BEFORE_OPEN_INTENT",
+    edits: [
+      {
+        file: WRITER,
+        find: "if (open && error instanceof ConnectorNotVerifiedError) return open;",
+        replace: "if (false) return open;",
+      },
+    ],
+    tests: REQUEST_TESTS,
+    aim: "a repeated request for a delete in flight answers its id",
   },
   {
     // An empty plan (the registry lists nothing) clears the open intent.

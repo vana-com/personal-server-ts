@@ -215,3 +215,25 @@ it("refuses a connector with rows and no declared names, and persists no intent"
   ).rejects.toBeInstanceOf(ConnectorNotVerifiedError);
   expect((await persistedState(r)).deletes ?? {}).toEqual({});
 });
+
+it("a repeated request for a delete in flight answers its id even when the manifest is no longer verified (mutant: PLAN_BEFORE_OPEN_INTENT)", async () => {
+  const declared = ["items"];
+  const r = new Rig(undefined, CONNECTOR, declared);
+  await r.open();
+  await r.collect(spec("base"));
+  await r.publish();
+  r.gateway.beforePost = async (request) => {
+    if (parseScope(request.scope)?.kind === "stream") {
+      throw new Error("registry down");
+    }
+  };
+  const first = await r.writer.requestConnectionDelete(CONNECTOR);
+  await r.publish();
+  // The host restarts before its manifests verify: no names are declared.
+  declared.length = 0;
+  const second = await r.writer.requestConnectionDelete(CONNECTOR);
+  expect(second.deleteId).toBe(first.deleteId);
+  expect((await persistedState(r)).deletes?.[CONNECTOR]?.id).toBe(
+    first.deleteId,
+  );
+});

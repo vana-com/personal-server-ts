@@ -882,7 +882,16 @@ export class StreamSyncWriter {
   ): Promise<{ readonly deleteId: string }> {
     const intent = await this.publish(async () => {
       const open = (await this.readState()).deletes?.[connector];
-      const plan = await this.planDelete(connector);
+      let plan: DeletePlan;
+      try {
+        plan = await this.planDelete(connector);
+      } catch (error) {
+        // A delete already in flight stays answerable when the host cannot
+        // name the streams now (a restart before its manifests verify): the
+        // open intent is durable and resumes on its own.
+        if (open && error instanceof ConnectorNotVerifiedError) return open;
+        throw error;
+      }
       // The open intent stands only while the registry still matches the plan
       // it was made from. If a reconnect (on any device) moved a control row
       // or added a stream since, reusing it would erase nothing of what the

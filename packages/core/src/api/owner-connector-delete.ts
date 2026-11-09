@@ -16,7 +16,9 @@
  *                               in the writer and retries until it lands. When
  *                               the registry lists nothing of the connector,
  *                               the writer purges this device's local state
- *                               and the delete is already done
+ *                               and the delete is already done. A reconnect
+ *                               that lands before the delete keeps its data:
+ *                               the delete skips what the reconnect moved
  *   400 INVALID_CONNECTOR       the id is not a connector key
  *   409 NOT_SWITCHED            the account has not moved to stream sync
  *   503 ACCOUNT_MODE_UNKNOWN    the storage mode cannot be read yet; retry
