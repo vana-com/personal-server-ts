@@ -34,7 +34,7 @@ const dataPointId = ("0x" + "cd".repeat(32)) as `0x${string}`;
 const owner = "0x0000000000000000000000000000000000000aaa" as const;
 const scope = "instagram.profile";
 const paidAt = "2026-11-09T09:00:00.000Z";
-type Fault = "throw-after-commit" | "409-after-commit" | "500-after-commit" | "503-after-commit" | "400" | "402";
+type Fault = "throw-after-commit" | "409-after-commit" | "500-after-commit" | "503-after-commit" | "400" | "402" | "409-race";
 
 function fixture() {
   let time = Date.now();
@@ -70,6 +70,9 @@ function fixture() {
     }
     const next = fault;
     fault = undefined;
+    if (next === "409-race") {
+      return Response.json({ error: "Registration was paid by another payer between request and commit; refetch payment status and retry with the data-access-only amount" }, { status: 409 });
+    }
     if (next === "400" || next === "402") {
       return Response.json({ error: next === "400" ? "Payment amount does not match the canonical fee total for this op" : "insufficient balance" }, { status: Number(next) });
     }
@@ -193,19 +196,42 @@ describe("uncertain payment settlement", () => {
     },
   );
 
-  it.each(["fee", "version"] as const)(
-    "REVALIDATE_SETTLED_AS_NEW: exact retry after %s change is not charged again", async (change) => {
-      const f = fixture();
-      const { header } = await f.sign();
-      f.setFault("throw-after-commit");
-      await f.cycle(header);
-      if (change === "fee") f.grant.fee.totalDue = "20";
-      if (change === "version") f.advanceVersion();
-      // A reconstructed dependency object must not lose the retry proof.
-      expect(await f.cycle(header, { ...f.deps })).toEqual({ kind: "ok", payResponse: { paidAt } });
-      expect(f.counts()).toEqual({ nonces: 1, records: 1, debits: 1 });
-    },
-  );
+  it("REVALIDATE_SETTLED_AS_NEW: exact retry after fee change is not charged again", async () => {
+    const f = fixture();
+    const { header } = await f.sign();
+    f.setFault("throw-after-commit");
+    await f.cycle(header);
+    f.grant.fee.totalDue = "20";
+    // A reconstructed dependency object must not lose the retry proof.
+    expect(await f.cycle(header, { ...f.deps })).toEqual({ kind: "ok", payResponse: { paidAt } });
+    expect(f.counts()).toEqual({ nonces: 1, records: 1, debits: 1 });
+  });
+
+  it("a registration race 409 rolls back the debit, so it gets a fresh challenge", async () => {
+    const f = fixture();
+    const { header } = await f.sign();
+    f.setFault("409-race");
+    expect((await f.cycle(header)).kind).toBe("challenge");
+    expect(f.counts().debits).toBe(0);
+  });
+
+  it("a first payment for an older data version is refused before any debit", async () => {
+    const f = fixture();
+    const { header } = await f.sign();
+    f.advanceVersion();
+    expect((await f.cycle(header)).kind).toBe("challenge");
+    expect(f.counts().debits).toBe(0);
+  });
+
+  it("a retry after the data version changed is re-challenged (known residue)", async () => {
+    const f = fixture();
+    const { header } = await f.sign();
+    f.setFault("throw-after-commit");
+    await f.cycle(header);
+    f.advanceVersion();
+    expect((await f.cycle(header, { ...f.deps })).kind).toBe("challenge");
+    expect(f.counts().debits).toBe(1);
+  });
 
   it("a retry later than the freshness window after a lost response is re-challenged (known residue)", async () => {
     const f = fixture();

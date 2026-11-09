@@ -84,6 +84,14 @@ const mutations = [
       '  if (msg.amount !== grant.fee.totalDue) return { ok: false, reason: "amount differs from current fee" };\n\n  // Stateless freshness check: extract the issue-time from the high 32 bits'),
   },
   {
+    name: "VERSION_ANY_FIRST_PAYMENT", aimed: "a first payment for an older data version is refused before any debit",
+    apply: () => mutate(paymentPath, "if (ar.version !== String(input.entry.version)) {", "if (false) {"),
+  },
+  {
+    name: "RACE_409_TRAPS_BUYER", aimed: "a registration race 409 rolls back the debit",
+    apply: () => mutate(apiPath, '    "Registration was paid by another payer between request and commit; refetch payment status and retry with the data-access-only amount",\n', ""),
+  },
+  {
     name: "SERVE_ON_UNKNOWN", aimed: "SERVE_ON_UNKNOWN",
     apply: () => mutate(apiPath, 'return jsonResponse(x402Result.body, { status: x402Result.status });', 'return jsonResponse({ ok: true }, { status: 200 });'),
   },

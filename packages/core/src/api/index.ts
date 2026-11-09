@@ -985,6 +985,7 @@ export async function handleX402Cycle(
   const knownNoDebit409 = new Set([
     "accessRecord.recordId is already paid for a different payer, op, asset, data version, accessor, or signature; use a fresh accessRecord for a new read",
     "paymentNonce already used by this payer — pick a higher nonce and re-sign",
+    "Registration was paid by another payer between request and commit; refetch payment status and retry with the data-access-only amount",
   ]);
   const revokedOrExpired409 = new Set([
     "Grant has been revoked and cannot be paid for",

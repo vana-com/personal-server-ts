@@ -547,6 +547,11 @@ export async function verifyPayment(
         reason: "accessRecord.dataPointId does not match entry",
       };
     }
+    // The gateway records but does not check the version, so a first
+    // payment for an older version must be stopped here, before any debit.
+    if (ar.version !== String(input.entry.version)) {
+      return { ok: false, reason: "accessRecord.version does not match entry" };
+    }
     if (ar.accessor.toLowerCase() !== builder.toLowerCase()) {
       return {
         ok: false,
