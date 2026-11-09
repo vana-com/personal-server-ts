@@ -52,6 +52,7 @@ async function startManager(accountMode: AccountStorageMode) {
     },
     autoStartSync: false,
     streamSyncFiles: () => createMemoryStreamSyncFiles(),
+    streamSyncDeclaredStreams: () => [],
     streamSyncRead: {},
     accountMode,
   });

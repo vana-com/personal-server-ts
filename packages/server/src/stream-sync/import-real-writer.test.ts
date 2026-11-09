@@ -140,6 +140,7 @@ async function fixture(generation = 1) {
           decrypt: async (_s, b) => b,
         },
         signer: { signAddData: async () => "0x00" },
+        declaredStreams: () => [],
       });
     return { writer: open(), open, files };
   };
