@@ -21,6 +21,10 @@ const KEYS = "packages/core/src/storage/legacy-entity-key-sets.ts";
 const WRITER = "packages/core/src/stream-sync/writer.ts";
 const CANON = `${R}/canonical-source.ts`;
 const BOOTSTRAP = "packages/server/src/bootstrap.ts";
+const STATUS_ROUTE = "packages/server/src/routes/stream-sync-import-status.ts";
+const STATUS_ROUTE_TEST =
+  "packages/server/src/routes/stream-sync-import-status.test.ts";
+const PUBLISH_TEST = `${R}/import-publish.test.ts`;
 
 const ROUND2 = `${R}/retire-round2.test.ts`;
 const GATES = `${R}/retire.test.ts`;
@@ -653,7 +657,7 @@ export const MUTANTS = [
   {
     name: "IMPORT_LOSES_ON_RERUN",
     why: "a pass with a failed connector marks the import complete",
-    edits: edit(IMPORT, "if (failed === 0) {", "if (true) {"),
+    edits: edit(IMPORT, "if (waiting === 0) {", "if (true) {"),
     tests: [IMPORT_SINK_TEST],
     mustFail: ["IMPORT_LOSES_ON_RERUN"],
     build: true,
@@ -661,13 +665,20 @@ export const MUTANTS = [
   {
     name: "IMPORT_DUPLICATES",
     why: "a re-run stages a connector again after its pass finished",
-    edits: edit(
-      IMPORT,
-      `if ((await ledger.read()).importComplete) {
-      return { ran: false, connectorsStaged: 0, failed: 0 };
-    }`,
-      "",
-    ),
+    edits: [
+      {
+        file: IMPORT,
+        find: `const result = (await ledger.read()).importComplete
+      ? { ran: false, connectorsStaged: 0, failed: 0 }
+      : await this.stage();`,
+        replace: "const result = await this.stage();",
+      },
+      {
+        file: IMPORT,
+        find: "if (known.imported[connector] || known.failures[connector]?.gaveUp) {",
+        replace: "if (false) {",
+      },
+    ],
     tests: [IMPORT_SINK_TEST],
     mustFail: ["IMPORT_DUPLICATES"],
     build: true,
@@ -729,48 +740,74 @@ export const MUTANTS = [
     mustFail: ["UNKEYED_ROW_IMPORTED"],
   },
   {
-    name: "BLOB_ROW_IMPORTED",
-    why: "a row that points at a blob is staged though the blob cannot travel",
+    name: "BLOB_ROW_EXCLUDED",
+    why: "a row that points at a blob is left behind though its reference is plain data",
     edits: edit(
       CANON,
-      'return pointsAtBlob(row) ? "blob_reference" : "import";',
-      'return "import";',
+      `    return "unkeyed_row";
+  }
+  return "import";`,
+      `    return "unkeyed_row";
+  }
+  if (JSON.stringify(row).includes("blob_id")) return "unkeyed_row";
+  return "import";`,
     ),
     tests: [CANON_TEST],
-    mustFail: ["BLOB_ROW_IMPORTED"],
+    mustFail: ["BLOB_ROW_EXCLUDED"],
   },
   {
-    name: "AMBIGUOUS_CONNECTION_IMPORTED",
-    why: "a connector with two live connections is imported as one",
+    name: "CONNECTOR_DROPPED_WHEN_AMBIGUOUS",
+    why: "a connector with two live connections is left out whole",
     edits: edit(
       CANON,
-      "if (declarations.length !== 1 || instances.length !== 1) {",
-      "if (false) {",
+      "if (live.length === 0) return { streams: [], excluded: [] };",
+      "if (live.length !== 1) return { streams: [], excluded: [] };",
     ),
     tests: [CANON_TEST],
-    mustFail: ["AMBIGUOUS_CONNECTION_IMPORTED"],
+    mustFail: ["CONNECTOR_DROPPED_WHEN_AMBIGUOUS"],
+  },
+  {
+    name: "OLDEST_CONNECTION_CHOSEN",
+    why: "the least recently active connection is imported",
+    edits: edit(
+      CANON,
+      "b.latest.localeCompare(a.latest) ||",
+      "a.latest.localeCompare(b.latest) ||",
+    ),
+    tests: [CANON_TEST],
+    mustFail: ["OLDEST_CONNECTION_CHOSEN"],
+  },
+  {
+    name: "OTHER_CONNECTION_NOT_COUNTED",
+    why: "the rows of the connections not imported are not counted",
+    edits: edit(CANON, "otherRows > 0\n        ?", "false\n        ?"),
+    tests: [CANON_TEST],
+    mustFail: ["OTHER_CONNECTION_NOT_COUNTED"],
   },
   {
     name: "DELETED_CONNECTION_IMPORTED",
     why: "rows of a connection the owner deleted are imported",
-    edits: edit(
-      CANON,
-      "if (connection.deletedAt === null) instances.push(connection.instance);",
-      "instances.push(connection.instance);",
-    ),
+    edits: edit(CANON, "if (connection.deletedAt === null) {", "if (true) {"),
     tests: [CANON_TEST],
     mustFail: ["DELETED_CONNECTION_IMPORTED"],
   },
   {
     name: "IMPORT_DUPLICATES_ON_RERUN",
     why: "a finished pass stages its connectors again on the next call",
-    edits: edit(
-      IMPORT,
-      `if ((await ledger.read()).importComplete) {
-      return { ran: false, connectorsStaged: 0, failed: 0 };
-    }`,
-      "",
-    ),
+    edits: [
+      {
+        file: IMPORT,
+        find: `const result = (await ledger.read()).importComplete
+      ? { ran: false, connectorsStaged: 0, failed: 0 }
+      : await this.stage();`,
+        replace: "const result = await this.stage();",
+      },
+      {
+        file: IMPORT,
+        find: "if (known.imported[connector] || known.failures[connector]?.gaveUp) {",
+        replace: "if (false) {",
+      },
+    ],
     tests: [CANON_TEST],
     mustFail: ["IMPORT_DUPLICATES_ON_RERUN"],
   },
@@ -801,11 +838,175 @@ export const MUTANTS = [
     why: "boot never hands the canonical store to the import source",
     edits: edit(
       BOOTSTRAP,
-      "    canonicalImportDeps = {",
-      "    const unboundImportDeps = {",
+      "canonicalImportDeps =\n    pdppConnections && pdppAuth",
+      "const unboundImportDeps =\n    pdppConnections && pdppAuth",
     ),
     tests: [BOOT_TEST],
     mustFail: ["BOOT_IMPORT_NEVER_BOUND"],
+    build: true,
+  },
+
+  // ---- round 2 of the import source: readable, bounded, visible ----
+  {
+    name: "SEED_WAITS_FOR_CONNECTOR_RUN",
+    why: "staged rows are published only by the connector's next run",
+    edits: edit(IMPORT, "    await this.queueRuns();\n", ""),
+    tests: [PUBLISH_TEST, BOOT_TEST],
+    mustFail: ["SEED_WAITS_FOR_CONNECTOR_RUN"],
+    build: true,
+  },
+  {
+    name: "SEED_BOUND_BEFORE_IMPORT",
+    why: "a run admitted before the switch binds generation 1 though the import is not done",
+    edits: edit(
+      WRITER,
+      `this.options.importDone &&
+        !(await this.options.importDone(host.entry.connector))`,
+      `false &&
+        !(await this.options.importDone!(host.entry.connector))`,
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["SEED_BOUND_BEFORE_IMPORT"],
+    build: true,
+  },
+  {
+    name: "IMPORT_RUN_SAVES_CHECKPOINT",
+    why: "the import's own run saves a checkpoint, so the first real run is incremental",
+    edits: edit(
+      WRITER,
+      "if (host.importOnly) {\n      await this.finish(host, {",
+      "if (false) {\n      await this.finish(host, {",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["IMPORT_RUN_SAVES_CHECKPOINT"],
+    build: true,
+  },
+  {
+    name: "PUBLISH_NEVER_RETRIED",
+    why: "a publish that is still waiting is recorded as done and never asked again",
+    edits: edit(
+      IMPORT,
+      'if ((await publish(connector)) === "done") {',
+      "if ((await publish(connector), true)) {",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["PUBLISH_NEVER_RETRIED"],
+    build: true,
+  },
+  {
+    name: "DUPLICATE_IMPORT_RUNS",
+    why: "every ask queues another import run while the first one waits",
+    edits: edit(
+      WRITER,
+      `host.phase !== "done"
+      ) {
+        return "waiting";`,
+      `host.phase !== "done" &&
+        false
+      ) {
+        return "waiting";`,
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["DUPLICATE_IMPORT_RUNS"],
+    build: true,
+  },
+  {
+    name: "PERMANENT_FAILURE_STALLS_WRITES",
+    why: "a connector whose import keeps failing is never given up",
+    edits: edit(
+      IMPORT,
+      "gaveUp = attempts >= this.maxAttempts;",
+      "gaveUp = false;",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["PERMANENT_FAILURE_STALLS_WRITES"],
+    build: true,
+  },
+  {
+    name: "LISTING_FAILURE_STALLS_FOR_EVER",
+    why: "a source that never lists is never given up",
+    edits: edit(
+      IMPORT,
+      "if (data.listAttempts >= this.maxAttempts) {",
+      "if (false) {",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["LISTING_FAILURE_STALLS_FOR_EVER"],
+    build: true,
+  },
+  {
+    name: "FAILED_IMPORT_RETIRES",
+    why: "the legacy file of a connector whose import was given up is retired",
+    edits: edit(
+      LEDGER,
+      "if (data.abandoned || data.failures[connector]?.gaveUp === true) {",
+      "if (data.abandoned) {",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["FAILED_IMPORT_RETIRES"],
+    build: true,
+  },
+  {
+    name: "ABANDONED_SOURCE_RETIRES",
+    why: "the legacy files are retired though the source was given up unread",
+    edits: edit(
+      LEDGER,
+      "if (data.abandoned || data.failures[connector]?.gaveUp === true) {",
+      "if (data.failures[connector]?.gaveUp === true) {",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["ABANDONED_SOURCE_RETIRES"],
+    build: true,
+  },
+  {
+    name: "EXCLUDED_ROWS_RETIRE",
+    why: "a connector with rows left behind has its legacy file retired",
+    edits: edit(
+      LEDGER,
+      "if ((data.excluded[connector] ?? []).some((e) => e.rows > 0)) return false;",
+      "",
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["EXCLUDED_ROWS_RETIRE"],
+    build: true,
+  },
+  {
+    name: "STATUS_HIDES_EXCLUDED",
+    why: "the owner read leaves out the rows that stayed behind",
+    edits: edit(
+      IMPORT,
+      ".map(([reason, rows]) => ({ reason, rows })),",
+      ".map(([reason, rows]) => ({ reason, rows }))\n            .slice(0, 0),",
+    ),
+    tests: [PUBLISH_TEST, BOOT_TEST],
+    mustFail: ["STATUS_HIDES_EXCLUDED"],
+    build: true,
+  },
+  {
+    name: "STATUS_ROUTE_UNAUTHENTICATED",
+    why: "anyone can read the import status",
+    edits: edit(STATUS_ROUTE, "await auth.authorizeOwner(c.req.raw);", ""),
+    tests: [STATUS_ROUTE_TEST, BOOT_TEST],
+    mustFail: ["STATUS_ROUTE_UNAUTHENTICATED"],
+  },
+  {
+    name: "PDPP_OFF_STALLS_IMPORT",
+    why: "a host without PDPP leaves the import source 'not available' for ever",
+    edits: edit(BOOTSTRAP, ": NO_CANONICAL_ROWS;", ": null;"),
+    tests: [BOOT_TEST],
+    mustFail: ["PDPP_OFF_STALLS_IMPORT"],
+    build: true,
+  },
+  {
+    name: "BOOT_PUBLISH_NOT_WIRED",
+    why: "boot never asks the writer to publish the staged rows",
+    edits: edit(
+      BOOTSTRAP,
+      "return streamSyncWriter.publishSeed(connector);",
+      'return Promise.resolve("done" as const);',
+    ),
+    tests: [BOOT_TEST],
+    mustFail: ["BOOT_PUBLISH_NOT_WIRED"],
     build: true,
   },
 ];

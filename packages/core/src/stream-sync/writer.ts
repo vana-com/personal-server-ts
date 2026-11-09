@@ -163,7 +163,9 @@ export type StreamSyncHostProblem =
   /** An older run than the newest commit on the stream; it never commits (commit order). */
   | "out_of_order"
   /** An earlier run of the stream did not commit in this pass; commits stay in order. */
-  | "earlier_run_pending";
+  | "earlier_run_pending"
+  /** The account switched after this run began; its import is not done. */
+  | "import_pending";
 
 export interface StreamSyncCheckpoint {
   readonly ns: string;
@@ -343,7 +345,10 @@ export type RunOutcome =
   | {
       readonly kind: "no_checkpoint";
       readonly generation: number;
-      readonly reason: Extract<CheckpointDecision, { kind: "skip" }>["reason"];
+      readonly reason:
+        | Extract<CheckpointDecision, { kind: "skip" }>["reason"]
+        /** A run that only publishes the staged seed saves no cursors. */
+        | "import_only";
     }
   | {
       readonly kind: "discarded";
@@ -386,6 +391,8 @@ interface HostEntry {
   collectedAt?: Record<string, number>;
   /** M5: who the run writes for; checked again before it publishes. */
   binding?: { owner: string; keyCheck: string; leaseId: string | null };
+  /** A run with no records that only publishes the staged seed (`enqueueSeedRun`). */
+  importOnly?: true;
 }
 
 /** The START the writer issued to a run (V2 §2.1). */
@@ -419,6 +426,12 @@ export interface StreamSyncRunStart {
   readonly issue?: { readonly wantFull: boolean };
   /** The write lease the run is bound to; `null` on hosts with no lease. */
   readonly leaseId?: string | null;
+  /**
+   * A run with no records whose only job is to publish the staged seed. It
+   * saves no checkpoint, so the connector's first real run is still a full
+   * run, and it is not counted in the connector's run health.
+   */
+  readonly importOnly?: boolean;
 }
 
 /**
@@ -1561,6 +1574,7 @@ export class StreamSyncWriter {
           keyCheck,
           leaseId: input.leaseId ?? null,
         },
+        ...(input.importOnly ? { importOnly: true as const } : {}),
       };
       // Active before the entry exists, so a recovery pass on the publish
       // queue never mistakes this run for one a dead process left behind.
@@ -1584,6 +1598,52 @@ export class StreamSyncWriter {
         }
       );
     });
+  }
+
+  /**
+   * Make sure the seed staged for `connector` (§2.9) gets published with no
+   * connector run of its own. The seed is otherwise merged only into the
+   * first publish of a connector run, so a connector that never runs again
+   * would keep its imported rows unreadable. Answers `done` once every staged
+   * stream has a receipt (or the connection is stopped, which publishes
+   * nothing), and `waiting` while the run it queued has not published. A
+   * queued run that was discarded leaves a stream without a receipt, so the
+   * next call queues another.
+   */
+  async publishSeed(connector: string): Promise<"done" | "waiting"> {
+    const seed = this.options.seed;
+    if (!seed) return "done";
+    const state = await this.readState();
+    const streams = await seed.streams(connector);
+    const open = streams.filter(
+      (s) =>
+        state.receipts[
+          `${seed.installId}|${connector}|${IDENTITYLESS_NS}|${s.stream}`
+        ] === undefined,
+    );
+    if (open.length === 0 || isStoppedState(state, connector)) return "done";
+    for (const runId of await this.runIds()) {
+      const host = await this.readEntry(runId);
+      if (
+        host?.importOnly &&
+        host.entry.connector === connector &&
+        host.phase !== "done"
+      ) {
+        return "waiting";
+      }
+    }
+    const runId = `import-${connector.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80)}-${globalThis.crypto.randomUUID().slice(0, 8)}`;
+    // The run needs the controls listing like every run (a first publish
+    // discards without it).
+    await this.refreshControls();
+    await this.beginRun({
+      runId,
+      connector,
+      userConnect: false,
+      importOnly: true,
+    });
+    await this.finishRun(runId, { checkpointCandidate: null });
+    return "waiting";
   }
 
   declareStream(
@@ -2179,6 +2239,18 @@ export class StreamSyncWriter {
           });
           return;
         }
+      }
+      // A run admitted before the account switched passed the gate at
+      // `beginRun`. It must not bind the first generation before the import
+      // is done, or the seed is skipped for good (§2.9).
+      if (
+        this.options.importDone &&
+        !(await this.options.importDone(host.entry.connector))
+      ) {
+        throw new PendingStream(
+          "import_pending",
+          "the local import of this connector is not finished",
+        );
       }
       const target = await this.admit(host, "first");
       if (host.target !== null && host.target !== target) {
@@ -2887,6 +2959,14 @@ export class StreamSyncWriter {
   private async checkpoint(host: HostEntry): Promise<void> {
     const { entry } = host;
     const ns = entry.ns!;
+    if (host.importOnly) {
+      await this.finish(host, {
+        kind: "no_checkpoint",
+        generation: host.target!,
+        reason: "import_only",
+      });
+      return;
+    }
     // Snapshot before the control read: an invalidation that lands after it
     // makes that read stale, and the save below refuses to use it.
     const epoch =
@@ -2999,7 +3079,10 @@ export class StreamSyncWriter {
       json(this.statusOf(host)),
     );
     await this.reclaim(host);
-    if (!(outcome.kind === "aborted" && outcome.reason === "cancelled")) {
+    if (
+      !host.importOnly &&
+      !(outcome.kind === "aborted" && outcome.reason === "cancelled")
+    ) {
       const bad =
         outcome.kind === "failed" ||
         outcome.kind === "discarded" ||

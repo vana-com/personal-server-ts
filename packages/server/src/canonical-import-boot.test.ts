@@ -20,6 +20,7 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
+import { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createTestBoundRecordStore } from "./__fixtures__/bound-record-store.js";
@@ -58,7 +59,7 @@ afterEach(async () => {
 });
 
 describe("the legacy import in a real boot", () => {
-  it("stages the device's canonical rows at boot, with no connector run (BOOT_IMPORT_NEVER_BOUND)", async () => {
+  it("stages the device's canonical rows at boot, with no connector run (BOOT_IMPORT_NEVER_BOUND, BOOT_PUBLISH_NOT_WIRED, STATUS_HIDES_EXCLUDED, STATUS_ROUTE_UNAUTHENTICATED)", async () => {
     const owner = await recoverServerOwner(KNOWN_SIG);
     // The device's legacy data: one index row for the scope (so the
     // declaration is trusted) and canonical rows under its connection.
@@ -99,7 +100,31 @@ describe("the legacy import in a real boot", () => {
         { method: "spotify", generation: 1 },
       );
     }
+    // A row of a stream no declaration names: it stays in the legacy file.
+    store.ingestBatch(
+      [
+        {
+          instance,
+          stream: "ghost",
+          key: "g1",
+          data: { id: "g1" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "spotify", generation: 1 },
+    );
     db.close();
+    // The registry is not reachable in this test: the writer's own publish is
+    // observed, not run (the core tests run it).
+    const published: string[] = [];
+    vi.spyOn(StreamSyncWriter.prototype, "publishSeed").mockImplementation(
+      async (connector: string) => {
+        published.push(connector);
+        return "done";
+      },
+    );
 
     await mkdir(join(tempDir, "declarations"), { recursive: true });
     const declarationPath = join(tempDir, "declarations", "spotify.json");
@@ -109,6 +134,7 @@ describe("the legacy import in a real boot", () => {
         tunnel: { enabled: false },
         sync: { enabled: true },
         streamSync: { write: true },
+        devUi: { enabled: true },
         pdpp: {
           enabled: true,
           declarationPaths: [declarationPath],
@@ -131,21 +157,47 @@ describe("the legacy import in a real boot", () => {
             importComplete: boolean;
             imported: Record<
               string,
-              { staged?: Record<string, number> } | undefined
+              { staged?: Record<string, number>; published?: true } | undefined
             >;
           })
         : null;
     };
     let ledger = await ledgerFile();
-    for (let i = 0; i < 400 && !ledger?.imported.spotify; i += 1) {
+    for (let i = 0; i < 400 && !ledger?.imported.spotify?.published; i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 50));
       ledger = await ledgerFile();
     }
     expect(ledger).toMatchObject({
       owner: owner.toLowerCase(),
       importComplete: true,
-      imported: { spotify: { staged: { top_artists: 3 } } },
+      imported: { spotify: { staged: { top_artists: 3 }, published: true } },
     });
+    // The staged rows are handed to the writer's own publish (BOOT_PUBLISH_NOT_WIRED).
+    expect(published).toEqual(["spotify"]);
+    // The owner can see what stayed behind (STATUS_ROUTE_UNAUTHENTICATED).
+    const ask = (token?: string) =>
+      ctx!.app.request("/v1/stream-sync/import-status", {
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+      });
+    expect((await ask()).status).toBe(401);
+    expect((await ask("not-the-token")).status).toBe(401);
+    const status = await ask(ctx!.devToken);
+    expect(status.status).toBe(200);
+    const text = await status.text();
+    expect(JSON.parse(text)).toEqual({
+      complete: true,
+      abandoned: false,
+      connectors: [
+        {
+          connector: "spotify",
+          state: "imported",
+          attempts: 0,
+          staged: 3,
+          excluded: [{ reason: "unmapped_stream", rows: 1 }],
+        },
+      ],
+    });
+    expect(text).not.toContain("ghost");
     const rows = (await readdir(tempDir, { recursive: true })).filter((path) =>
       path.endsWith("rows.ndjson"),
     );
@@ -155,5 +207,33 @@ describe("the legacy import in a real boot", () => {
       .filter(Boolean)
       .map((line) => (JSON.parse(line) as { id: string }).id);
     expect(lines.sort()).toEqual(["a1", "a2", "a3"]);
+  }, 60_000);
+
+  it("completes empty when PDPP is off, instead of holding every connector (PDPP_OFF_STALLS_IMPORT)", async () => {
+    ctx = await createServer(
+      ServerConfigSchema.parse({
+        tunnel: { enabled: false },
+        sync: { enabled: true },
+        streamSync: { write: true },
+      }),
+      { serverDir: tempDir, dataDir: join(tempDir, "data") },
+    );
+    // Without a canonical store the import has nothing to read, and is done.
+    const complete = async () => {
+      const found = (await readdir(tempDir, { recursive: true })).find((path) =>
+        path.endsWith(join("legacy-retire", "ledger.json")),
+      );
+      if (!found) return false;
+      const ledger = JSON.parse(
+        await readFile(join(tempDir, found), "utf8"),
+      ) as { importComplete: boolean };
+      return ledger.importComplete;
+    };
+    let done = await complete();
+    for (let i = 0; i < 400 && !done; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      done = await complete();
+    }
+    expect(done).toBe(true);
   }, 60_000);
 });

@@ -4,11 +4,22 @@
  * declarations.
  *
  * What it imports is decided by the data, not by a table of connector names:
- * a connector is the key of a declared source with exactly one live
- * connection, a stream is a declared stream with a primary key, and a row is
- * a row whose every key field holds a value and that points at no blob (blob
- * bytes cannot travel in a seed). Everything else stays in the legacy file,
- * and `excluded()` counts it by reason so the ledger can show why.
+ * a connector is the key of a declared source with a live connection, a
+ * stream is a declared stream with a primary key, and a row is a row whose
+ * every key field holds a value. A row that points at a blob is imported as
+ * data; the blob bytes stay in this device's blob store and do not travel.
+ *
+ * A stream holds one account's data (R23: no connection dimension), and a
+ * legacy body "is one account's data" (`resolveCanonicalConnection`), so a
+ * connector with several live connections imports the most recently active
+ * one and counts the rest as `other_connection`. Everything the import leaves
+ * behind is counted by reason in `excluded()`, and the ledger keeps it.
+ *
+ * Owner: the record store is this server's own (`bootstrap.ts` opens
+ * `index.db` under the server's storage root, and `pdpp-connections.ts`
+ * refuses any subject but the one owner), and a connection id is not
+ * guaranteed to name its owner (`isConnectionId`), so the source does not
+ * filter by owner. `owner` binds the pass to the ledger of the same Account.
  */
 
 import type { DeclarationSnapshot } from "../../pdpp/types.js";
@@ -27,9 +38,13 @@ export interface CanonicalImportStore {
   listConnections(
     sourceId: string,
   ): MaybeAsync<readonly { instance: string; deletedAt: string | null }[]>;
-  listStreams(
-    instanceIds: string[],
-  ): MaybeAsync<readonly { stream: string; recordCount: number }[]>;
+  listStreams(instanceIds: string[]): MaybeAsync<
+    readonly {
+      stream: string;
+      recordCount: number;
+      lastUpdated?: string | null;
+    }[]
+  >;
   listRecords(
     stream: string,
     options: {
@@ -50,6 +65,19 @@ export interface CanonicalImportDeps {
   readonly declarations: readonly DeclarationSnapshot[];
 }
 
+/**
+ * A host with no canonical record store (PDPP is off): it holds no
+ * stream-shaped rows, so the import completes with nothing to stage.
+ */
+export const NO_CANONICAL_ROWS: CanonicalImportDeps = {
+  store: {
+    listConnections: () => [],
+    listStreams: () => [],
+    listRecords: () => ({ data: [], hasMore: false }),
+  },
+  declarations: [],
+};
+
 export interface CanonicalImportSourceOptions {
   readonly owner: string;
   /** The host's stores, or null while it has not opened them yet. */
@@ -58,27 +86,12 @@ export interface CanonicalImportSourceOptions {
 }
 
 const DEFAULT_PAGE_SIZE = 500;
-const MAX_BLOB_DEPTH = 8;
 
 const isKeyValue = (value: unknown): boolean =>
   (typeof value === "string" && value !== "") ||
   (typeof value === "number" && Number.isFinite(value));
 
-function pointsAtBlob(value: unknown, depth = 0): boolean {
-  if (depth > MAX_BLOB_DEPTH || typeof value !== "object" || value === null) {
-    return false;
-  }
-  const record = value as Record<string, unknown>;
-  if (
-    typeof record.blob_id === "string" &&
-    record.blob_id.startsWith("sha256:")
-  ) {
-    return true;
-  }
-  return Object.values(record).some((child) => pointsAtBlob(child, depth + 1));
-}
-
-type RowVerdict = "import" | "unkeyed_row" | "blob_reference";
+type RowVerdict = "import" | "unkeyed_row";
 
 const judge = (
   row: Record<string, unknown>,
@@ -87,7 +100,7 @@ const judge = (
   if (!primaryKey.every((field) => isKeyValue(row[field]))) {
     return "unkeyed_row";
   }
-  return pointsAtBlob(row) ? "blob_reference" : "import";
+  return "import";
 };
 
 interface Scan {
@@ -118,19 +131,22 @@ export function createCanonicalImportSource(
     return byKey;
   };
 
-  const liveInstances = async (
+  /** Every live connection of the connector, with the declaration of its source. */
+  const liveConnections = async (
     deps: CanonicalImportDeps,
     declarations: readonly DeclarationSnapshot[],
-  ): Promise<string[]> => {
-    const instances: string[] = [];
+  ): Promise<{ instance: string; declaration: DeclarationSnapshot }[]> => {
+    const found: { instance: string; declaration: DeclarationSnapshot }[] = [];
     for (const declaration of declarations) {
       for (const connection of await deps.store.listConnections(
         declaration.source_id,
       )) {
-        if (connection.deletedAt === null) instances.push(connection.instance);
+        if (connection.deletedAt === null) {
+          found.push({ instance: connection.instance, declaration });
+        }
       }
     }
-    return instances;
+    return found;
   };
 
   async function* pages(
@@ -154,20 +170,42 @@ export function createCanonicalImportSource(
 
   async function scan(connector: string): Promise<Scan> {
     const deps = need();
-    const declarations = sourcesOf(deps).get(connector) ?? [];
-    const instances = await liveInstances(deps, declarations);
-    if (instances.length === 0) return { streams: [], excluded: [] };
-    const listed = await deps.store.listStreams(instances);
-    if (declarations.length !== 1 || instances.length !== 1) {
-      const rows = listed.reduce((sum, s) => sum + s.recordCount, 0);
-      return {
-        streams: [],
-        excluded: [{ stream: null, reason: "ambiguous_connection", rows }],
-      };
-    }
-    const instance = instances[0]!;
+    const live = await liveConnections(
+      deps,
+      sourcesOf(deps).get(connector) ?? [],
+    );
+    if (live.length === 0) return { streams: [], excluded: [] };
+    // The most recently active connection is the account this device shows.
+    const looked = await Promise.all(
+      live.map(async (connection) => {
+        const listed = await deps.store.listStreams([connection.instance]);
+        const latest = listed.reduce(
+          (max, s) =>
+            (s.lastUpdated ?? "") > max ? (s.lastUpdated ?? "") : max,
+          "",
+        );
+        return {
+          ...connection,
+          listed,
+          latest,
+          rows: listed.reduce((sum, s) => sum + s.recordCount, 0),
+        };
+      }),
+    );
+    looked.sort(
+      (a, b) =>
+        b.latest.localeCompare(a.latest) ||
+        a.instance.localeCompare(b.instance),
+    );
+    const [chosen, ...others] = looked as [
+      (typeof looked)[number],
+      ...(typeof looked)[number][],
+    ];
+    const otherRows = others.reduce((sum, o) => sum + o.rows, 0);
+    const instance = chosen.instance;
+    const listed = chosen.listed;
     const declared = new Map(
-      declarations[0]!.streams.map((s) => [s.name, s.primary_key]),
+      chosen.declaration.streams.map((s) => [s.name, s.primary_key]),
     );
     const streamLevel: ImportExclusion[] = [];
     const rowLevel: ImportExclusion[] = [];
@@ -190,14 +228,16 @@ export function createCanonicalImportSource(
         });
         continue;
       }
-      const counts = { import: 0, unkeyed_row: 0, blob_reference: 0 };
+      const counts = { import: 0, unkeyed_row: 0 };
       for await (const row of pages(deps.store, instance, stream)) {
         counts[judge(row, primaryKey)] += 1;
       }
-      for (const reason of ["unkeyed_row", "blob_reference"] as const) {
-        if (counts[reason] > 0) {
-          rowLevel.push({ stream, reason, rows: counts[reason] });
-        }
+      if (counts.unkeyed_row > 0) {
+        rowLevel.push({
+          stream,
+          reason: "unkeyed_row",
+          rows: counts.unkeyed_row,
+        });
       }
       if (counts.import === 0) continue;
       streams.push({
@@ -211,7 +251,14 @@ export function createCanonicalImportSource(
         },
       });
     }
-    return { streams, excluded: [...streamLevel, ...rowLevel] };
+    const otherConnections: ImportExclusion[] =
+      otherRows > 0
+        ? [{ stream: null, reason: "other_connection", rows: otherRows }]
+        : [];
+    return {
+      streams,
+      excluded: [...streamLevel, ...rowLevel, ...otherConnections],
+    };
   }
 
   return {
@@ -220,7 +267,7 @@ export function createCanonicalImportSource(
       const deps = need();
       const connectors: string[] = [];
       for (const [key, declarations] of sourcesOf(deps)) {
-        if ((await liveInstances(deps, declarations)).length > 0) {
+        if ((await liveConnections(deps, declarations)).length > 0) {
           connectors.push(key);
         }
       }

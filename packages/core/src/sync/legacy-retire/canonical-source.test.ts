@@ -49,6 +49,8 @@ type Connection = {
 function fakeStore(options: {
   connections: Record<string, Connection[]>;
   rows: Record<string, Record<string, unknown>[]>;
+  /** When each instance last had a row arrive. */
+  updated?: Record<string, string>;
 }): CanonicalImportStore & { reads: number } {
   const store = {
     reads: 0,
@@ -59,6 +61,7 @@ function fakeStore(options: {
         .map(([key, rows]) => ({
           stream: key.split("|")[1]!,
           recordCount: rows.length,
+          lastUpdated: options.updated?.[key.split("|")[0]!] ?? null,
         })),
     listRecords: (
       stream: string,
@@ -171,13 +174,12 @@ describe("the canonical import source maps through verified declarations", () =>
 });
 
 describe("what the source cannot import stays, with a reason and a count (UNMAPPED_SCOPE_DROPPED_SILENTLY)", () => {
-  it("counts an undeclared stream, an unkeyed row (UNKEYED_ROW_IMPORTED), a blob reference (BLOB_ROW_IMPORTED) and a keyless declaration", async () => {
+  it("counts an undeclared stream, an unkeyed row (UNKEYED_ROW_IMPORTED) and a keyless declaration", async () => {
     const store = canonical(
       [
         raw("e0"),
         { content: "no key" }, // unkeyed
         { id: "", content: "empty key" }, // unkeyed
-        { id: "e9", file: { blob_id: "sha256:abc" } }, // blob reference
       ],
       {
         extras: [{ id: "x1" }, { id: "x2" }], // no declaration names it
@@ -200,22 +202,42 @@ describe("what the source cannot import stays, with a reason and a count (UNMAPP
       { stream: "extras", reason: "unmapped_stream", rows: 2 },
       { stream: "keyless", reason: "no_primary_key", rows: 1 },
       { stream: STREAM, reason: "unkeyed_row", rows: 2 },
-      { stream: STREAM, reason: "blob_reference", rows: 1 },
     ]);
   });
 
-  it("keeps a connector with two live connections out and says so (AMBIGUOUS_CONNECTION_IMPORTED)", async () => {
+  it("imports the most recently active of two live connections and counts the other (CONNECTOR_DROPPED_WHEN_AMBIGUOUS, OLDEST_CONNECTION_CHOSEN, OTHER_CONNECTION_NOT_COUNTED)", async () => {
     const second = { ...ACTIVE, instance: `${CONNECTOR}:second` };
     const store = fakeStore({
       connections: { [SOURCE_ID]: [ACTIVE, second] },
-      rows: { [`${INSTANCE}|${STREAM}`]: [raw("e0")] },
+      rows: {
+        [`${INSTANCE}|${STREAM}`]: [raw("old1"), raw("old2")],
+        [`${CONNECTOR}:second|${STREAM}`]: [raw("new1")],
+      },
+      updated: {
+        [INSTANCE]: "2026-01-01T00:00:00Z",
+        [`${CONNECTOR}:second`]: "2026-06-01T00:00:00Z",
+      },
     });
     const source = sourceOf({ store, declarations: DECLARED });
     expect(await source.connectors()).toEqual([CONNECTOR]);
-    expect(await source.streams(CONNECTOR)).toEqual([]);
+    const streams = await source.streams(CONNECTOR);
+    // The newer connection's rows are the ones imported (OLDEST_CONNECTION_CHOSEN).
+    expect((await rowsOf(streams[0]!)).map((r) => r.id)).toEqual(["new1"]);
+    // The other connection's rows are counted, never silent (OTHER_CONNECTION_NOT_COUNTED).
     expect(await source.excluded!(CONNECTOR)).toEqual([
-      { stream: null, reason: "ambiguous_connection", rows: 1 },
+      { stream: null, reason: "other_connection", rows: 2 },
     ]);
+  });
+
+  it("imports a row that points at a blob, since the reference is plain data (BLOB_ROW_EXCLUDED)", async () => {
+    const store = canonical([
+      raw("e0"),
+      { id: "e9", file: { blob_id: "sha256:abc" } },
+    ]);
+    const source = sourceOf({ store, declarations: DECLARED });
+    const streams = await source.streams(CONNECTOR);
+    expect((await rowsOf(streams[0]!)).map((r) => r.id)).toEqual(["e0", "e9"]);
+    expect(await source.excluded!(CONNECTOR)).toEqual([]);
   });
 
   it("ignores a deleted connection and a source nobody connected (DELETED_CONNECTION_IMPORTED)", async () => {
@@ -293,7 +315,12 @@ describe("a switched device imports its canonical rows with no new run (IMPORT_S
     ]);
     await f.run("a", ["e0", "e1"]);
     await f.rig.publish();
-    expect((await f.retire()).deleted).toBe(1); // the published view holds them
+    // The published view holds the file, but the connector still has rows in
+    // the legacy store that the import left there: no file of it is retired
+    // (EXCLUDED_ROWS_RETIRE).
+    const report = await f.retire();
+    expect(report.deleted).toBe(0);
+    expect(report.files[0]?.decision).toBe("no_import");
   });
 });
 

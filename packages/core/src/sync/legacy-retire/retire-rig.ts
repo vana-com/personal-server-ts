@@ -66,7 +66,14 @@ export async function flow(options: {
   owner?: string;
   /** The sink throws the first time it is handed this stream. */
   crashOnce?: string;
+  /** The sink throws every time it is handed this stream. */
+  sinkThrows?: string;
+  /** Failed attempts before a connector's import is given up (default: the importer's). */
+  maxAttempts?: number;
+  /** Publish the staged seed with no connector run (default on); or a replacement. */
+  publishSeed?: boolean | ((connector: string) => Promise<"done" | "waiting">);
 }) {
+  let switched = options.switched ?? true;
   const staged = new Map<string, Record<string, unknown>[]>();
   const owner = options.owner ?? OWNER;
   const files = createMemoryStreamSyncFiles();
@@ -93,6 +100,9 @@ export async function flow(options: {
       sink: {
         async stage(_connector, stream, rows) {
           stagings += 1;
+          if (options.sinkThrows === stream.stream) {
+            throw new Error("the sink cannot take this stream");
+          }
           if (options.crashOnce === stream.stream && !crashed) {
             crashed = true;
             throw new Error("crash while staging");
@@ -105,10 +115,21 @@ export async function flow(options: {
         },
       },
       ledger: new RetireLedger(files, own.owner),
-      switched: () => options.switched ?? true,
+      switched: () => switched,
+      ...(options.maxAttempts ? { maxAttempts: options.maxAttempts } : {}),
+      ...(options.publishSeed === false
+        ? {}
+        : {
+            publish:
+              typeof options.publishSeed === "function"
+                ? options.publishSeed
+                : (connector: string) => rig.writer.publishSeed(connector),
+          }),
       deleted: async (connector): Promise<boolean> =>
         rig.writer.connectionDeleted(connector),
     });
+  // eslint-disable-next-line prefer-const -- bound below; the importer reads it late
+  let rig: Rig;
   const importer = importerFor({
     source: options.source ?? defaultSource,
     owner,
@@ -128,7 +149,7 @@ export async function flow(options: {
       for (const row of staged.get(stream) ?? []) yield row;
     },
   };
-  const rig = new Rig(undefined, CONNECTOR, ["items"], [], {
+  rig = new Rig(undefined, CONNECTOR, ["items"], [], {
     seedSource,
     writer: { importDone: importer.importDone },
   });
@@ -192,6 +213,9 @@ export async function flow(options: {
     });
   return {
     rig,
+    setSwitched(value: boolean) {
+      switched = value;
+    },
     importer,
     importerFor,
     ledger,

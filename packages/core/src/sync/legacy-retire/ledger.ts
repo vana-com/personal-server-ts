@@ -67,8 +67,23 @@ export interface LedgerData {
       readonly streams: number;
       readonly at: string;
       readonly staged?: Readonly<Record<string, number>>;
+      /** The writer published the staged rows (each stream has a receipt). */
+      readonly published?: true;
     }
   >;
+  /**
+   * Connectors whose import failed, with how many passes tried. After the
+   * bound the connector is given up: its writes proceed, and its legacy file
+   * is never retired.
+   */
+  failures: Record<
+    string,
+    { readonly attempts: number; readonly at: string; readonly gaveUp: boolean }
+  >;
+  /** Passes that could not list the source at all. */
+  listAttempts: number;
+  /** The source could not be listed within the bound; no file is retired. */
+  abandoned: boolean;
   /**
    * Rows of each connector the import left in the legacy file, by reason.
    * Counts only. A connector with an entry here keeps those rows' file.
@@ -81,6 +96,9 @@ const empty = (owner: string): LedgerData => ({
   owner,
   importComplete: false,
   imported: {},
+  failures: {},
+  listAttempts: 0,
+  abandoned: false,
   excluded: {},
   readbacks: {},
 });
@@ -116,6 +134,9 @@ export class RetireLedger {
         owner: this.owner,
         importComplete: parsed.importComplete === true,
         imported: parsed.imported ?? {},
+        failures: parsed.failures ?? {},
+        listAttempts: parsed.listAttempts ?? 0,
+        abandoned: parsed.abandoned === true,
         excluded: parsed.excluded ?? {},
         readbacks: parsed.readbacks ?? {},
       };
@@ -135,9 +156,30 @@ export class RetireLedger {
     return next;
   }
 
-  /** Import is done for this connector (a ledger of any other owner is empty). */
+  /**
+   * Nothing is left to wait for on this connector: its rows are staged, the
+   * pass finished, or the import gave the connector up. The writer's gate.
+   */
   async importDone(connector: string): Promise<boolean> {
     const data = await this.read();
+    return (
+      data.importComplete ||
+      data.imported[connector] !== undefined ||
+      data.failures[connector]?.gaveUp === true
+    );
+  }
+
+  /**
+   * Import is done AND left nothing behind: no row stayed in the legacy
+   * store, the connector was not given up, and the source was listed. Only
+   * then may a legacy file of the connector be retired.
+   */
+  async importProven(connector: string): Promise<boolean> {
+    const data = await this.read();
+    if (data.abandoned || data.failures[connector]?.gaveUp === true) {
+      return false;
+    }
+    if ((data.excluded[connector] ?? []).some((e) => e.rows > 0)) return false;
     return data.importComplete || data.imported[connector] !== undefined;
   }
 

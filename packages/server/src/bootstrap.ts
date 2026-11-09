@@ -82,6 +82,7 @@ import {
   LegacyImporter,
   RetireLedger,
   withCancellableRegistration,
+  NO_CANONICAL_ROWS,
   type CanonicalImportDeps,
   type LegacyImportSource,
   type LegacyRetireOption,
@@ -977,6 +978,14 @@ export async function createServer(
           switched: () => legacyRetireSwitched(config),
           deleted: async (connector) =>
             writerForSeed ? writerForSeed.connectionDeleted(connector) : false,
+          // Staged rows are published by the writer's own run, so a connector
+          // that never runs again is still readable (not by its next run).
+          publish: (connector) => {
+            if (!streamSyncWriter) {
+              throw new Error("the stream-sync writer is not open");
+            }
+            return streamSyncWriter.publishSeed(connector);
+          },
           logger,
         });
         bootLegacyImporter = legacyImporter;
@@ -1324,12 +1333,16 @@ export async function createServer(
   // The canonical readers are open: the import source can read them now. Until
   // this line it answered "not available", so no pass could finish empty.
   // Starts at once, and a sync cycle joins the pass in flight.
-  if (pdppConnections && pdppAuth) {
-    canonicalImportDeps = {
-      store: pdppConnections.store,
-      declarations: pdppAuth.retainedDeclarations,
-    };
-  }
+  // Without PDPP there is no canonical store, so there are no stream-shaped
+  // rows to import: say so (an empty source), rather than leave the source
+  // "not available", which would hold every connector's writes for ever.
+  canonicalImportDeps =
+    pdppConnections && pdppAuth
+      ? {
+          store: pdppConnections.store,
+          declarations: pdppAuth.retainedDeclarations,
+        }
+      : NO_CANONICAL_ROWS;
   void bootLegacyImporter?.run().catch((error: unknown) => {
     logger.warn(
       { error: error instanceof Error ? error.name : "NonError" },
@@ -1392,6 +1405,9 @@ export async function createServer(
       : undefined,
     pdpp: pdppRecords,
     pdppConnections,
+    legacyImportStatus: bootLegacyImporter
+      ? () => bootLegacyImporter!.status()
+      : undefined,
     // The SAME stable delegate the download worker was given above, not a
     // second importer: both arrival routes must resolve to one importer over
     // one store, and this one is already late-bound to `pdppImporterImpl`.

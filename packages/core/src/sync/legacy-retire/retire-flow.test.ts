@@ -173,6 +173,9 @@ describe("unswitched accounts are unchanged (UNSWITCHED_CHANGED)", () => {
     expect(await f.ledger.read()).toEqual({
       owner: OWNER,
       excluded: {},
+      failures: {},
+      listAttempts: 0,
+      abandoned: false,
       importComplete: false,
       imported: {},
       readbacks: {},

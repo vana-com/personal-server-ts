@@ -1377,6 +1377,11 @@ export async function createPersistentPsLiteStorage(
     if (found === "moved") return "moved";
     return withScopeLock(found.scope, async () => {
       const blob = envelopePath(found.scope, found.collectedAt);
+      // The block tree holds nothing the envelope does not: it is built from
+      // the envelope alone (`writeBlockSidecars`, core/src/contracts/data.ts)
+      // and rebuilt from it when missing (`repairLocalMissingBlockSidecars`,
+      // core/src/sync/workers/download.ts). So the retire fence hash of the
+      // envelope covers the tree's content too.
       const tree = blockTreePath(found.scope, found.collectedAt);
       const parts = await Promise.allSettled([
         fileStore.deleteEnvelope(blob),

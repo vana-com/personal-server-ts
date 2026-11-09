@@ -6,6 +6,7 @@ import {
 import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
 import { streamSyncReadStatusRoutes } from "./routes/stream-sync-read-status.js";
 import { ownerConnectorsRoutes } from "./routes/owner-connectors.js";
+import { streamSyncImportStatusRoutes } from "./routes/stream-sync-import-status.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -86,6 +87,7 @@ import {
 import { pdppDeclarationRoutes } from "./routes/pdpp-declarations.js";
 import type { MutableDeclarationRegistry } from "./pdpp/declaration-registry.js";
 import type {
+  ImportStatus,
   PdppImporter,
   ScopeDeletionTracker,
   SyncManager,
@@ -190,6 +192,8 @@ export interface AppDeps {
   legacyScopeView?: LegacyScopeViewPort;
   /** Stream-sync reads (`streamSync.read`); absent = reads as before. */
   streamSyncRead?: StreamSyncReadPort;
+  /** What the one-time legacy import left behind; absent = no importer runs. */
+  legacyImportStatus?: () => Promise<ImportStatus>;
   /**
    * Gateway base URL — wired into the data route so the GET handler can
    * forward validated X-PAYMENTs to POST /v1/escrow/pay via direct fetch.
@@ -595,6 +599,19 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       streamSyncRead: deps.streamSyncRead,
+    }),
+  );
+
+  app.route(
+    "/v1/stream-sync/import-status",
+    streamSyncImportStatusRoutes({
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      importStatus: deps.legacyImportStatus,
     }),
   );
 

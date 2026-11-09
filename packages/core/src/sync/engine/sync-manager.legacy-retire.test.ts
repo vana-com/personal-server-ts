@@ -156,9 +156,12 @@ describe("sync cycle with legacy import and retire", () => {
     expect(remote).toEqual([]);
     expect(await ledger.read()).toEqual({
       owner: OWNER,
+      abandoned: false,
       excluded: {},
+      failures: {},
       importComplete: false,
       imported: {},
+      listAttempts: 0,
       readbacks: {},
     });
   });

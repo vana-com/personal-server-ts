@@ -29,7 +29,7 @@ export function createRetireHost(input: {
         allTargetsKnown: basis.allTargetsKnown,
       };
     },
-    importDone: (connector) => input.ledger.importDone(connector),
+    importDone: (connector) => input.ledger.importProven(connector),
     importStaged: (connector, stream) => input.ledger.staged(connector, stream),
     fullRunSince: (connector, stream, deleteVersion) =>
       input.writer.fullRunSince(connector, stream, deleteVersion),
