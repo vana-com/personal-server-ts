@@ -124,6 +124,7 @@ export class Fixture {
     encryptWith?: TestOwnerKey;
     withholdBlobs?: boolean;
     lastComplete?: { version: number; dataHash: string };
+    lastDeleteVersion?: number;
   }) {
     const built = await buildTestHead({
       key: input.key ?? this.key,
@@ -142,6 +143,9 @@ export class Fixture {
       prefixes: input.prefixes,
       encryptWith: input.encryptWith,
       ...(input.lastComplete ? { lastComplete: input.lastComplete } : {}),
+      ...(input.lastDeleteVersion !== undefined
+        ? { lastDeleteVersion: input.lastDeleteVersion }
+        : {}),
     });
     if (!input.withholdBlobs) {
       for (const [k, v] of built.blobs) this.blobs.set(k, v);

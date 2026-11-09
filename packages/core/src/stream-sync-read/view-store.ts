@@ -66,6 +66,12 @@ export interface ImportTransaction {
     head: Head,
     lastComplete?: LastCompleteHead,
   ): Promise<void>;
+  /**
+   * Keep `lastComplete` as the complete head when the current head cannot be
+   * imported. Its parts must be stored first. It becomes current only when
+   * this store has no current view; nothing is acknowledged for the unread one.
+   */
+  commitComplete(lastComplete: LastCompleteHead): Promise<void>;
 }
 
 export interface LastCompleteHead {
@@ -292,6 +298,8 @@ export class ViewStore {
         putPart: (sha256, clear) => this.putPart(key, sha256, clear),
         commit: (version, dataHash, headBytes, head, lastComplete) =>
           this.commit(key, version, dataHash, headBytes, head, lastComplete),
+        commitComplete: (lastComplete) =>
+          this.commitComplete(key, lastComplete),
       }),
     );
   }
@@ -302,6 +310,46 @@ export class ViewStore {
     clear: Uint8Array,
   ): Promise<void> {
     await this.files.write(`${dir(key)}/parts/${sha256}`, clear);
+  }
+
+  /** Install a complete head without a newer current view (see `ImportTransaction`). */
+  private async commitComplete(
+    key: ViewKey,
+    lastComplete: LastCompleteHead,
+  ): Promise<void> {
+    const known = this.getComplete(key);
+    if (known && known.version >= lastComplete.version) return;
+    const id = viewKeyId(key);
+    const base = dir(key);
+    await this.files.write(
+      `${base}/heads/${lastComplete.version}.json`,
+      lastComplete.headBytes,
+    );
+    const complete: ImportedVersion = {
+      version: lastComplete.version,
+      dataHash: lastComplete.dataHash,
+      head: lastComplete.head,
+    };
+    const current = this.current.get(id) ?? complete;
+    const pointer: CurrentFile = {
+      version: current.version,
+      dataHash: current.dataHash,
+      completeVersion: complete.version,
+      completeDataHash: complete.dataHash,
+    };
+    await this.files.write(
+      `${base}/current.json`,
+      encoder.encode(JSON.stringify(pointer)),
+    );
+    this.keys.set(id, key);
+    this.current.set(id, current);
+    this.complete.set(id, complete);
+    const touched = `${key.connector}\n${key.stream}`;
+    this.importRevisions.set(
+      touched,
+      (this.importRevisions.get(touched) ?? 0) + 1,
+    );
+    await this.collectLocked(key);
   }
 
   /** Make `version` current. Every part of `head` must be stored first. */

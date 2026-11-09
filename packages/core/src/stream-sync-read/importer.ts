@@ -236,7 +236,7 @@ export class StreamSyncImporter {
         if (
           imported &&
           imported.version >= row.version &&
-          !this.missesLastComplete(key, imported.head)
+          !this.missesLastComplete(key, imported.head, imported.version)
         ) {
           this.issues.delete(id);
           continue;
@@ -314,6 +314,7 @@ export class StreamSyncImporter {
     if ((head.lastDeleteVersion ?? 0) > 0)
       await this.options.mirror.recordDelete(scope, head.lastDeleteVersion!);
     if (!deleted && head.generation !== generation) return;
+    let currentProblem: Problem | null = null;
     let fallbackProblem: Problem | null = null;
     await views.withImport(key, async (tx) => {
       const storeParts = async (h: Head) => {
@@ -344,17 +345,32 @@ export class StreamSyncImporter {
           await tx.putPart(part.hash, partClear);
         }
       };
-      await storeParts(head);
+      const asProblem = (error: unknown) =>
+        error instanceof Problem
+          ? error
+          : new Problem("transient", (error as Error).message);
+      try {
+        await storeParts(head);
+      } catch (error) {
+        currentProblem = asProblem(error);
+      }
       // This device may never have seen the complete head an incomplete one
-      // replaced. Fetch it by the name the head records. A failure never
-      // blocks the current head; it is reported and the next pass retries.
+      // replaced. Fetch it by the name the head records, whether or not the
+      // incomplete head's own parts are readable: the complete head stands on
+      // its own. A failure here never blocks the current head; it is reported
+      // and the next pass retries.
       let lastComplete: LastCompleteHead | undefined;
-      if (this.missesLastComplete(key, head) && head.lastComplete) {
+      if (
+        this.missesLastComplete(key, head, row.version) &&
+        head.lastComplete
+      ) {
         try {
           const found = await this.fetchLastComplete(
             scope,
             key,
+            head,
             head.lastComplete,
+            row.version,
             generation,
           );
           if (found) {
@@ -362,14 +378,17 @@ export class StreamSyncImporter {
             lastComplete = found;
           }
         } catch (error) {
-          fallbackProblem =
-            error instanceof Problem
-              ? error
-              : new Problem("transient", (error as Error).message);
+          fallbackProblem = asProblem(error);
         }
       }
-      await tx.commit(row.version, row.dataHash, clear, head, lastComplete);
+      if (!currentProblem) {
+        await tx.commit(row.version, row.dataHash, clear, head, lastComplete);
+      } else if (lastComplete) {
+        // The current view is unreadable; keep the complete head it replaced.
+        await tx.commitComplete(lastComplete);
+      }
     });
+    if (currentProblem) throw currentProblem;
     // The current pointer is durable: tell the overlay source what it holds.
     await this.acknowledge(key, {
       version: row.version,
@@ -380,12 +399,19 @@ export class StreamSyncImporter {
   }
 
   /**
-   * An incomplete head names the complete head it replaced; true while this
-   * store holds no complete head at or after it that is still servable.
+   * An incomplete head at registry `version` names the complete head it
+   * replaced; true while this store holds no complete head at or after it that
+   * is still servable. A name at or after `version` is not a replaced head: it
+   * can collide with this store's own versions, so it is never followed.
    */
-  private missesLastComplete(key: ViewKey, head: Head): boolean {
+  private missesLastComplete(
+    key: ViewKey,
+    head: Head,
+    version: number,
+  ): boolean {
     const last = head.lastComplete;
     if (head.complete || !last) return false;
+    if (last.version >= version) return false;
     const scope = streamScope(key.connector, key.ns, key.stream);
     if (last.version <= this.options.mirror.deletionFloor(scope)) return false;
     return (this.options.views.getComplete(key)?.version ?? 0) < last.version;
@@ -395,9 +421,12 @@ export class StreamSyncImporter {
   private async fetchLastComplete(
     scope: string,
     key: ViewKey,
+    current: Head,
     last: LastComplete,
+    currentVersion: number,
     generation: number | null,
   ): Promise<LastCompleteHead | null> {
+    if (!(last.version > 0 && last.version < currentVersion)) return null;
     const { blobs, keys } = this.options;
     const cipher = await blobs.get(`${scope}/${headBlobName(last.dataHash)}`);
     if (!cipher)
@@ -414,6 +443,11 @@ export class StreamSyncImporter {
       throw new Problem("corrupt", `last complete head ${verified.kind}`);
     const head = verified.head;
     if (!head.complete || head.generation !== generation) return null;
+    // The complete head must not predate the deletion the current head
+    // records: its bytes may hold records that deletion removed, and the
+    // version the current head claims for it is not authenticated.
+    if ((head.lastDeleteVersion ?? 0) < (current.lastDeleteVersion ?? 0))
+      return null;
     return {
       version: last.version,
       dataHash: last.dataHash,

@@ -93,6 +93,8 @@ export interface TestHeadInput {
   readonly encryptWith?: TestOwnerKey;
   /** Write a format 3 head that names the complete head it replaced. */
   readonly lastComplete?: { version: number; dataHash: string };
+  /** The head's delete watermark (format 3). Default 0 when `lastComplete` is set. */
+  readonly lastDeleteVersion?: number;
 }
 
 export interface TestHead {
@@ -135,10 +137,11 @@ export async function buildTestHead(input: TestHeadInput): Promise<TestHead> {
   const head: Head = {
     complete: input.complete ?? true,
     connector: input.connector,
-    format: input.lastComplete ? 3 : 1,
-    ...(input.lastComplete
-      ? { lastDeleteVersion: 0, lastComplete: input.lastComplete }
+    format: input.lastComplete || input.lastDeleteVersion !== undefined ? 3 : 1,
+    ...(input.lastComplete || input.lastDeleteVersion !== undefined
+      ? { lastDeleteVersion: input.lastDeleteVersion ?? 0 }
       : {}),
+    ...(input.lastComplete ? { lastComplete: input.lastComplete } : {}),
     generation: input.generation,
     keyCheck: encryptor.keyCheck,
     ns: input.ns,

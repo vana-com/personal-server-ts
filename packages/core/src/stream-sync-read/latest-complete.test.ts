@@ -4,6 +4,7 @@
  * and across restarts. Accounts that have not switched read as they did before.
  */
 
+import { partBlobName } from "@opendatalabs/personal-server-ts-stream-sync";
 import { describe, expect, it } from "vitest";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import { ask, body, Fixture, masterKey } from "./service-fixture.js";
@@ -135,5 +136,142 @@ describe("latest complete head", () => {
     expect(
       await ids(await service.resolve(ask("pdpp.acme.items", { cursor }))),
     ).toBe("cursor_stale");
+  });
+
+  describe("a fallback the current head names is checked before it is trusted", () => {
+    const publishNaming = (
+      f: Fixture,
+      ns: string,
+      lastComplete: { version: number; dataHash: string },
+      lastDeleteVersion = 0,
+    ) =>
+      f.publish({
+        connector: "acme",
+        ns,
+        stream: "items",
+        generation: 1,
+        complete: false,
+        records: [{ id: "partial" }],
+        lastComplete,
+        lastDeleteVersion,
+      });
+
+    async function readsOn(
+      f: Fixture,
+      files = createMemoryStreamSyncReadFiles(),
+    ) {
+      const service = await f.service({ files });
+      await f.sync(service);
+      return {
+        service,
+        outcome: await service.resolve(
+          ask("pdpp.acme.items", { streamOnly: true }),
+        ),
+      };
+    }
+
+    it("never serves a complete head that predates a delete, whatever version the current head claims", async () => {
+      const { f, ns, complete } = await setup(95);
+      // v2 deletes the stream, v3 is a later publish, v4 is incomplete and
+      // claims that v3 is the hash of the pre-delete v1.
+      await f.publish({
+        connector: "acme",
+        ns,
+        stream: "items",
+        generation: 1,
+        complete: false,
+        records: [],
+        lastDeleteVersion: 2,
+      });
+      await f.publish({
+        connector: "acme",
+        ns,
+        stream: "items",
+        generation: 1,
+        complete: true,
+        records: [{ id: "later" }],
+      });
+      await publishNaming(
+        f,
+        ns,
+        { version: 3, dataHash: complete.dataHash },
+        2,
+      );
+      const files = createMemoryStreamSyncReadFiles();
+      const first = await readsOn(f, files);
+      expect(await ids(first.outcome)).not.toContain("complete");
+      expect(first.outcome.kind).toBe("unavailable");
+      // After a restart over the same files nothing has been resurrected.
+      const second = await readsOn(f, files);
+      expect(second.outcome.kind).toBe("unavailable");
+      expect(
+        await second.service.listScopes({
+          streamOnly: true,
+          isOwnerView: true,
+        }),
+      ).not.toContainEqual(
+        expect.objectContaining({ scope: "pdpp.acme.items" }),
+      );
+    });
+
+    it.each([
+      ["the current version", 2],
+      ["a later version", 9],
+    ])("does not follow a name at %s", async (_label, version) => {
+      const { f, ns, complete } = await setup(96);
+      await publishNaming(f, ns, { version, dataHash: complete.dataHash });
+      const { outcome } = await readsOn(f);
+      expect(outcome).toMatchObject({ kind: "unavailable", reason: "no_data" });
+    });
+  });
+
+  describe("an incomplete head whose own parts cannot be read", () => {
+    const damage = {
+      missing: (f: Fixture, keys: string[]) => {
+        for (const k of keys) f.blobs.delete(k);
+      },
+      corrupt: (f: Fixture, keys: string[]) => {
+        for (const k of keys) f.blobs.set(k, new Uint8Array([1, 2, 3]));
+      },
+    };
+
+    it.each(["missing", "corrupt"] as const)(
+      "still lists and serves the complete head on a cold and a warm device (%s parts)",
+      async (how) => {
+        const { f, ns, complete } = await setup(97);
+        const warm = await f.service();
+        await f.sync(warm);
+        const partial = await publishIncomplete(f, ns, complete);
+        damage[how](
+          f,
+          partial.head.parts.map(
+            (p) => `${partial.scope}/${partBlobName(1, p.hash)}`,
+          ),
+        );
+        await f.sync(warm);
+        const cold = await f.service({
+          files: createMemoryStreamSyncReadFiles(),
+        });
+        await f.sync(cold);
+        for (const isOwnerView of [true, false]) {
+          const query = { streamOnly: true, isOwnerView };
+          expect(
+            await ids(await cold.resolve(ask("pdpp.acme.items", query))),
+          ).toEqual(["complete"]);
+          expect(
+            await ids(await warm.resolve(ask("pdpp.acme.items", query))),
+          ).toEqual(["complete"]);
+          expect(await cold.listScopes(query)).toEqual(
+            await warm.listScopes(query),
+          );
+          expect(await cold.listScopes(query)).toContainEqual(
+            expect.objectContaining({ scope: "pdpp.acme.items" }),
+          );
+        }
+        // The unread current view is never acknowledged, so the overlay keeps
+        // what it holds for it; the next pass retries the import.
+        expect(f.overlay.acks.every((a) => a.version !== 2)).toBe(true);
+      },
+    );
   });
 });
