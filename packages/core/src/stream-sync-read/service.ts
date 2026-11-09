@@ -833,27 +833,28 @@ export class StreamSyncReadService {
 
   /**
    * The legacy body the PUBLISHED view of `scope` serves, as a grant would
-   * read it: imported heads only, never an unpublished local run. `null` when
-   * no complete view serves it or the read fails. A readback compares a local
-   * legacy file with this body.
+   * read it: imported heads only, never an unpublished local run. `null` only
+   * when the read decided that no complete view serves it. A failed read
+   * (storage error, wrong key, a body that does not parse) THROWS: it is not
+   * the answer "no view". A readback compares a local legacy file with this
+   * body.
    */
   async publishedBody(scope: string): Promise<unknown | null> {
-    try {
-      const decision = await this.resolve({
-        scope,
-        connection: null,
-        cursor: null,
-        legacyFile: true,
-        isOwnerView: false,
-      });
-      if (decision.kind !== "view") return null;
-      const parsed = JSON.parse(await new Response(decision.body).text()) as {
-        data?: unknown;
-      };
-      return parsed.data ?? null;
-    } catch {
+    const decision = await this.resolve({
+      scope,
+      connection: null,
+      cursor: null,
+      legacyFile: true,
+      isOwnerView: false,
+    });
+    if (decision.kind !== "view") {
+      if ("body" in decision) await decision.body.cancel();
       return null;
     }
+    const parsed = JSON.parse(await new Response(decision.body).text()) as {
+      data?: unknown;
+    };
+    return parsed.data ?? null;
   }
 
   /** Changes whenever an imported view of one of the scope's streams changes. */
