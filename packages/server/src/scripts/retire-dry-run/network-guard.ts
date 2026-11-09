@@ -33,8 +33,9 @@
  *   on an agent object whose own `addRequest` does not come from
  *   `http.Agent.prototype`.
  * - A `fetch` reference taken before install, which still calls the real `fetch`.
- *   The dry run never allows this: `run.ts` installs the guard before it loads
- *   any package module (`run-entry-order.test.ts`).
+ *   The dry run loads its package modules after install: the static imports of
+ *   the shipped entry are checked by `entry-static-imports.test.ts`, and a
+ *   `fetch` captured at load by `run-entry-order.test.ts`.
  * - A `dispatcher` in a `fetch` init (undici), and raw `net`/`tls` sockets or
  *   other HTTP clients that bypass `http`/`https`.
  * - The IP addresses a host name resolves to: only the names are checked.

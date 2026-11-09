@@ -9,9 +9,10 @@
  *
  * Load order: this module imports only Node built-ins, the guard, and pure
  * helpers. The guard installs before any package module or the SQLite store is
- * loaded (dynamic `import()` below), so a module that keeps a reference to
- * `fetch` from its load time gets the guarded one. `run-entry-order.test.ts`
- * checks that.
+ * loaded (dynamic `import()` below). `entry-static-imports.test.ts` checks the
+ * static imports of this module and of the entry; `run-entry-order.test.ts`
+ * checks that a module which keeps a reference to `fetch` from its load time
+ * gets the guarded one.
  */
 
 import { randomBytes } from "node:crypto";
@@ -61,17 +62,30 @@ interface ConfigJson {
   storage?: { config?: { vana?: { apiUrl?: unknown } } };
 }
 
-async function readConfigJson(rootDir: string): Promise<ConfigJson> {
-  try {
-    const parsed: unknown = JSON.parse(
-      await readFile(join(rootDir, "config.json"), "utf8"),
-    );
-    return typeof parsed === "object" && parsed !== null
-      ? (parsed as ConfigJson)
-      : {};
-  } catch {
-    return {}; // No config in the copy: the Dev hosts are the defaults.
+// The file the runtime reads at boot. Desktop starts the runtime on server.json
+// (apps/desktop/personal-server/index.js, loadConfig with configPath) and the
+// sidecar writes the app's gateway and storage into it, so it is the effective
+// config. config.json is read only when the copy has no server.json (the
+// non-Desktop boot, packages/server/src/bootstrap.ts). Neither is merged.
+async function readRuntimeConfig(rootDir: string): Promise<ConfigJson> {
+  for (const name of ["server.json", "config.json"]) {
+    let text: string;
+    try {
+      text = await readFile(join(rootDir, name), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return {};
+    }
+    try {
+      const parsed: unknown = JSON.parse(text);
+      return typeof parsed === "object" && parsed !== null
+        ? (parsed as ConfigJson)
+        : {};
+    } catch {
+      return {};
+    }
   }
+  return {}; // No config in the copy: the Dev hosts are the defaults.
 }
 
 const stringOrUndefined = (value: unknown): string | undefined =>
@@ -101,8 +115,8 @@ export async function runLegacyRetireDryRun(
     );
   }
   // Flags and the copy's config only select among the pinned Dev hosts
-  // (hosts.ts). The config is parsed after the guard is in place (below).
-  const raw = await readConfigJson(dataDir);
+  // (hosts.ts). The schema parse runs after the guard is in place (below).
+  const raw = await readRuntimeConfig(dataDir);
   const pinned = pinHosts({
     gatewayUrl: options.gatewayUrl ?? stringOrUndefined(raw.gateway?.url),
     storageUrl:
@@ -139,7 +153,10 @@ export async function runLegacyRetireDryRun(
     try {
       deviceConfig = parseConfig(raw);
     } catch {
-      throw new DryRunSetupError("bad_config", "config.json does not parse");
+      throw new DryRunSetupError(
+        "bad_config",
+        "the copy's runtime config does not parse",
+      );
     }
     const config = parseConfig({
       ...raw,

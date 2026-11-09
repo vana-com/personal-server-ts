@@ -9,7 +9,7 @@ describe("pinned Dev hosts", () => {
     expect(pinned.gatewayUrl).toBe(DEV_GATEWAY_URL);
     expect(pinned.storageUrl).toBe(DEV_STORAGE_URL);
     expect(pinned.allowed).toEqual([
-      "data-gateway-env-dev-opendatalabs.vercel.app",
+      "dp-rpc.moksha.vana.org",
       "storage-dev.vana.org",
     ]);
   });
@@ -17,10 +17,12 @@ describe("pinned Dev hosts", () => {
   it("refuses every other host, scheme, port and userinfo", () => {
     for (const gatewayUrl of [
       "https://gateway.evil.test",
-      "http://data-gateway-env-dev-opendatalabs.vercel.app",
-      "https://data-gateway-env-dev-opendatalabs.vercel.app:8443",
-      "https://user:pw@data-gateway-env-dev-opendatalabs.vercel.app",
-      "https://data-gateway-env-dev-opendatalabs.vercel.app.evil.test",
+      "http://dp-rpc.moksha.vana.org",
+      "https://dp-rpc.moksha.vana.org:8443",
+      "https://user:pw@dp-rpc.moksha.vana.org",
+      "https://dp-rpc.moksha.vana.org.evil.test",
+      "https://data-gateway-env-dev-opendatalabs.vercel.app",
+      "https://dp-rpc.vana.org",
       "not a url",
     ]) {
       expect(

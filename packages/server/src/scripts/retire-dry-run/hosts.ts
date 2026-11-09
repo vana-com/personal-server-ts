@@ -1,8 +1,9 @@
 /**
  * NO_REMOTE_WRITES, the host half: the tool talks to the Dev gateway and the
  * Dev storage host and to nothing else. The two are constants of the tool.
- * `config.json` (part of a copy a person made) and the command-line flags may
- * only select among them; a value outside the list is refused, not trusted.
+ * The copy's runtime config (`server.json`, else `config.json`; see run.ts) and
+ * the command-line flags may only select among them; a value outside the list
+ * is refused, not trusted.
  *
  * The schema default for storage is the production host, so storage is never
  * taken from a missing config: the tool names the Dev host itself.
@@ -13,9 +14,10 @@
 
 import { DryRunSetupError } from "./setup-error.js";
 
-export const DEV_GATEWAY_HOSTS: readonly string[] = [
-  "data-gateway-env-dev-opendatalabs.vercel.app",
-];
+// The Dev product environment: `dev` in
+// packages/app-runtime/src/personal-server/environments.json (gatewayUrl,
+// storageApiUrl), the same values the Desktop sidecar passes to the runtime.
+export const DEV_GATEWAY_HOSTS: readonly string[] = ["dp-rpc.moksha.vana.org"];
 export const DEV_STORAGE_HOSTS: readonly string[] = ["storage-dev.vana.org"];
 export const DEV_GATEWAY_URL = `https://${DEV_GATEWAY_HOSTS[0]}`;
 export const DEV_STORAGE_URL = `https://${DEV_STORAGE_HOSTS[0]}`;

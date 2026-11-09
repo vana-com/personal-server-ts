@@ -23,7 +23,7 @@ const hooks = vi.hoisted(() => ({
 vi.mock("./legacy-store.js", async (importOriginal) => {
   const actual = await importOriginal<typeof LegacyStoreModule>();
   const early = globalThis.fetch;
-  hooks.early = early("https://other.test/x").then(
+  hooks.early = early("http://127.0.0.1:9/x").then(
     () => "answered",
     (error: unknown) => error,
   );

@@ -778,6 +778,31 @@ describe("the pinned Dev hosts", () => {
     expect(await exists(p.outPath)).toBe(false);
   });
 
+  it("takes the hosts from server.json, the file the Desktop runtime reads, not from a stale config.json", async () => {
+    const p = await fixture();
+    await writeConfig(p, {
+      gateway: { url: "https://data-gateway-env-dev-opendatalabs.vercel.app" },
+      storage: { config: { vana: { apiUrl: "https://storage.vana.org" } } },
+    });
+    await writeFile(
+      join(p.dataDir, "server.json"),
+      JSON.stringify({
+        gateway: { url: `https://${DEV_GATEWAY_HOSTS[0]}` },
+        storage: {
+          config: { vana: { apiUrl: `https://${DEV_STORAGE_HOSTS[0]}` } },
+        },
+      }),
+    );
+    const report = await runLegacyRetireDryRun(optionsOf(p));
+    expect(report.hosts).toEqual({
+      gateway: DEV_GATEWAY_HOSTS[0],
+      storage: DEV_STORAGE_HOSTS[0],
+    });
+    expect(new Set(p.requests.map((r) => r.host))).toEqual(
+      new Set([DEV_GATEWAY_HOSTS[0], DEV_STORAGE_HOSTS[0]]),
+    );
+  });
+
   it("refuses the production storage host, from the config and from a flag", async () => {
     const p = await fixture();
     await writeConfig(p, {

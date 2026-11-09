@@ -49,6 +49,7 @@ const T = {
   run: `${dir}/run.test.ts`,
   guard: `${dir}/network-guard.test.ts`,
   entryOrder: `${dir}/run-entry-order.test.ts`,
+  closure: `${dir}/entry-static-imports.test.ts`,
   hosts: `${dir}/hosts.test.ts`,
   recheck: `${dir}/recheck.test.ts`,
   changed: `${dir}/run-changed.test.ts`,
@@ -292,6 +293,19 @@ const MUTANTS = [
     ],
     files: [T.run],
     pattern: "gateway from the copy's config",
+  },
+  {
+    id: "DRY_RUN_READS_CONFIG_JSON_ONLY",
+    what: "the dry run reads config.json only, not the server.json the Desktop runtime reads",
+    edits: [
+      [
+        F.run,
+        'for (const name of ["server.json", "config.json"])',
+        'for (const name of ["config.json"])',
+      ],
+    ],
+    files: [T.run],
+    pattern: "takes the hosts from server.json",
   },
   {
     id: "P2.6a",
@@ -576,6 +590,32 @@ const MUTANTS = [
     pattern: "refuses a fetch captured at module load",
   },
   {
+    id: "ENTRY_STATIC_CORE_IMPORT",
+    what: "the shipped entry statically imports a package (core) module",
+    edits: [
+      [
+        F.cli,
+        'import { CopyOnlyError } from "./retire-dry-run/copy-only.js";',
+        'import "@opendatalabs/personal-server-ts-core/sync";\nimport { CopyOnlyError } from "./retire-dry-run/copy-only.js";',
+      ],
+    ],
+    files: [T.closure],
+    pattern: "allowlisted local files",
+  },
+  {
+    id: "RUN_STATIC_CORE_IMPORT",
+    what: "run.ts statically imports a package (core) module",
+    edits: [
+      [
+        F.run,
+        'import { randomBytes } from "node:crypto";',
+        'import "@opendatalabs/personal-server-ts-core/sync";\nimport { randomBytes } from "node:crypto";',
+      ],
+    ],
+    files: [T.closure],
+    pattern: "allowlisted local files",
+  },
+  {
     id: "ENTRY_IMPORTS_BEFORE_GUARD",
     what: "the shipped entry statically loads the SQLite store before the guard installs",
     edits: [
@@ -718,11 +758,12 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-/** Core tests import `@opendatalabs/personal-server-ts-core` from its dist. */
-function buildCoreIfNeeded(mutant) {
-  const touchesCore = mutant.edits.some(([file]) =>
-    file.startsWith("packages/core/"),
-  );
+/**
+ * Core tests and server tests import `@opendatalabs/personal-server-ts-core` from
+ * its dist. Called with the files a run edits (mutants) or runs (baselines).
+ */
+function buildCoreIfNeeded(paths) {
+  const touchesCore = paths.some((file) => file.startsWith("packages/core/"));
   if (!touchesCore) return;
   const build = spawnSync(
     "nice",
@@ -786,6 +827,7 @@ if (!check) {
     const key = mutant.files.join(",");
     if (seen.has(key)) continue;
     seen.add(key);
+    buildCoreIfNeeded(mutant.files);
     const base = await runVitest(mutant.files, null);
     const verdict = classify({
       status: base.status,
@@ -818,10 +860,10 @@ for (const mutant of selected) {
     rows.push({ ...mutant, result: "applies" });
     continue;
   }
-  buildCoreIfNeeded(mutant);
+  buildCoreIfNeeded(mutant.edits.map(([file]) => file));
   const run = await runVitest(mutant.files, mutant.pattern);
   restore();
-  buildCoreIfNeeded(mutant);
+  buildCoreIfNeeded(mutant.edits.map(([file]) => file));
   const verdict = classify({
     status: run.status,
     out: run.out,
