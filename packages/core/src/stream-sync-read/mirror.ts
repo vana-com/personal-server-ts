@@ -55,6 +55,12 @@ interface MirrorFile {
    * written before the floor existed.
    */
   readonly deletionFloors?: Record<string, number>;
+  /**
+   * Stream scope → registry time (ms) of the version in `deletionFloors`, when
+   * a listed tombstone row gave it. Absent = unknown (a floor learned from a
+   * verified head carries no time).
+   */
+  readonly deletionTimes?: Record<string, number>;
 }
 
 /** True when the row marks its stream deleted, by either encoding. */
@@ -107,6 +113,7 @@ export class RegistryMirror {
     private fullListingStarted: boolean,
     private floors: Map<string, number>,
     private readonly isTombstone: TombstoneTest,
+    private times: Map<string, number> = new Map(),
   ) {}
 
   /**
@@ -140,6 +147,7 @@ export class RegistryMirror {
       false,
       new Map(Object.entries(parsed.deletionFloors ?? {})),
       isTombstone,
+      new Map(Object.entries(parsed.deletionTimes ?? {})),
     );
   }
 
@@ -152,14 +160,26 @@ export class RegistryMirror {
     return this.floors.get(scope) ?? 0;
   }
 
+  /**
+   * Registry time (ms since the epoch) of the delete at `deletionFloor`, or
+   * null when no listed tombstone row gave it. Unknown is not "old": a caller
+   * that orders a local write against the delete must treat null as unknown.
+   */
+  deletionTime(scope: string): number | null {
+    return this.times.get(scope) ?? null;
+  }
+
   /** Delete history learned from a verified live or delete head. */
   async recordDelete(scope: string, version: number): Promise<void> {
     const pass = this.pending.then(async () => {
       if (version <= this.deletionFloor(scope)) return;
       const floors = new Map(this.floors);
       floors.set(scope, version);
-      await this.persist(this.rows, floors, this.listed);
+      const times = new Map(this.times);
+      times.delete(scope); // a head carries the version, not the time
+      await this.persist(this.rows, floors, this.listed, times);
       this.floors = floors;
+      this.times = times;
     });
     this.pending = pass.catch(() => undefined);
     await pass;
@@ -212,6 +232,7 @@ export class RegistryMirror {
   ): Promise<string[]> {
     const nextRows = new Map(this.rows);
     const nextFloors = new Map(this.floors);
+    const nextTimes = new Map(this.times);
     const raise = (row: MirrorRow): boolean => {
       if (
         parseScope(row.scope)?.kind !== "stream" ||
@@ -219,12 +240,22 @@ export class RegistryMirror {
           this.isTombstone(row) ||
           row.metadataHash.toLowerCase() ===
             deleteMetadataHash(row.scope, row.version)
-        ) ||
-        row.version <= (nextFloors.get(row.scope) ?? 0)
+        )
       ) {
         return false;
       }
+      const floor = nextFloors.get(row.scope) ?? 0;
+      if (row.version === floor) {
+        // The floor came from a head (no time); a listed tombstone row of the
+        // same version supplies it.
+        if (row.addedAtMs === null || nextTimes.has(row.scope)) return false;
+        nextTimes.set(row.scope, row.addedAtMs);
+        return true;
+      }
+      if (row.version < floor) return false;
       nextFloors.set(row.scope, row.version);
+      if (row.addedAtMs === null) nextTimes.delete(row.scope);
+      else nextTimes.set(row.scope, row.addedAtMs);
       return true;
     };
     const fullListingStarted = this.fullListingStarted || page.fromStart;
@@ -247,10 +278,11 @@ export class RegistryMirror {
     const nowListed = !this.listed && fullListingStarted && page.lastPage;
     const listed = this.listed || nowListed;
     if (changed.size > 0 || nowListed) {
-      await this.persist(nextRows, nextFloors, listed);
+      await this.persist(nextRows, nextFloors, listed, nextTimes);
     }
     this.rows = nextRows;
     this.floors = nextFloors;
+    this.times = nextTimes;
     this.fullListingStarted = fullListingStarted;
     this.listed = listed;
     return [...changed];
@@ -286,12 +318,14 @@ export class RegistryMirror {
     rows: Map<string, MirrorRow>,
     floors: Map<string, number>,
     listed: boolean,
+    times: Map<string, number> = this.times,
   ): Promise<void> {
     const file: MirrorFile = {
       format: 1,
       listed,
       rows: Object.fromEntries(rows),
       deletionFloors: Object.fromEntries(floors),
+      deletionTimes: Object.fromEntries(times),
     };
     await this.files.write(PATH, encoder.encode(JSON.stringify(file)));
   }

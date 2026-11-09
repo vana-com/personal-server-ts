@@ -18,16 +18,35 @@ import type { IndexEntry } from "../../storage/index/types.js";
 import type { ReadbackRecord, RetireLedger } from "./ledger.js";
 import { versionKey } from "./ledger.js";
 
+/** One target stream of a scope and its last delete. */
+export interface StreamDelete {
+  readonly connector: string;
+  readonly stream: string;
+  /** Version of the stream's last delete; 0 = never deleted. */
+  readonly deleteVersion: number;
+  /** Registry time (ms) of the earliest delete; null = unknown. */
+  readonly deleteAtMs: number | null;
+}
+
+/**
+ * The registry's word on a scope, only when it is authoritative for this
+ * owner: covered by live complete heads or deleted whole, and not ambiguous.
+ */
+export interface DeleteBasis {
+  readonly streams: readonly StreamDelete[];
+  /**
+   * No view is served because every target stream is deleted and none was
+   * re-collected (a whole-source delete), not because data is missing.
+   */
+  readonly viewDeleted: boolean;
+}
+
 /** What a readback needs from the stream read side. */
 export interface ReadbackView {
   /** The legacy body of the PUBLISHED view, or null when none serves it. */
   publishedBody(scope: string): Promise<unknown | null>;
-  /** Target streams of the scope with the version of their last delete. */
-  streamDeletes(
-    scope: string,
-  ):
-    | readonly { connector: string; stream: string; deleteVersion: number }[]
-    | null;
+  /** The scope's delete basis, or null when the registry is no authority. */
+  deleteBasis(scope: string): DeleteBasis | null;
 }
 
 const hex = (bytes: Uint8Array): string =>
@@ -69,9 +88,11 @@ export function compareEntities(
   if (unmatched === 0) {
     return { pass: true, reason: "ok", counts, fenced: 0, aggregate };
   }
-  // Fence: every target stream of the scope has seen a delete, so the
-  // publish may have dropped these records on purpose. The retire step still
-  // requires a full re-collect on this device before it deletes the file.
+  // Fence: this file version predates an authoritative delete of every target
+  // stream of the scope, so the publish may have dropped these records on
+  // purpose (the owner deleted the source). The retire step still requires a
+  // full re-collect on this device before it deletes the file, unless the
+  // whole source is deleted and nothing is left to re-collect.
   if (fenceOpen) {
     return {
       pass: true,
@@ -94,6 +115,8 @@ export async function readbackVersion(
     view: ReadbackView;
     ledger: RetireLedger;
     now?: () => Date;
+    /** Mark the stored record dry: a report, never a basis for a delete. */
+    dry?: boolean;
   },
   scope: string,
   row: IndexEntry,
@@ -110,7 +133,11 @@ export async function readbackVersion(
   const store = async (
     record: Pick<ReadbackRecord, "pass" | "reason"> & Partial<ReadbackRecord>,
   ): Promise<ReadbackRecord> => {
-    const full: ReadbackRecord = { ...base, ...record };
+    const full: ReadbackRecord = {
+      ...base,
+      ...record,
+      ...(deps.dry ? { dry: true } : {}),
+    };
     await deps.ledger.update((data) => {
       data.readbacks[`${scope}|${full.version}`] = full;
     });
@@ -127,15 +154,39 @@ export async function readbackVersion(
   if (!local) return store({ pass: false, reason: "unkeyed" });
 
   const body = await deps.view.publishedBody(scope).catch(() => null);
-  const deletes = deps.view.streamDeletes(scope);
-  const fenceOpen =
-    deletes !== null &&
-    deletes.length > 0 &&
-    deletes.every((s) => s.deleteVersion > 0);
+  const basis = deps.view.deleteBasis(scope);
+  const fenceOpen = basis !== null && predatesEveryDelete(basis, row);
   let published: EntityHashes | null = null;
   if (body !== null) published = entityHashes(scope, body);
-  if (published === null && !fenceOpen) {
+  // No usable published view passes only when the registry says the whole
+  // source is deleted. A failed or unkeyed read is never that: it would excuse
+  // every entity.
+  const viewGone = basis !== null && fenceOpen && basis.viewDeleted;
+  if (published === null && !viewGone) {
     return store({ pass: false, reason: "no_published_view" });
   }
   return store(compareEntities(local, published, fenceOpen));
+}
+
+/**
+ * The fence applies to a file version only if it was written before the
+ * delete of EVERY target stream: both its `collectedAt` (when the data was
+ * collected) and its `createdAt` (when this device stored it) precede the
+ * earliest registry time of each delete, and each stream has a known delete
+ * with a version above 0. A version written after the delete, an unknown
+ * delete time or an unreadable timestamp is never excused.
+ */
+export function predatesEveryDelete(
+  basis: DeleteBasis,
+  row: Pick<IndexEntry, "collectedAt" | "createdAt">,
+): boolean {
+  if (basis.streams.length === 0) return false;
+  const collected = Date.parse(row.collectedAt);
+  const stored = Date.parse(row.createdAt);
+  if (!Number.isFinite(collected) || !Number.isFinite(stored)) return false;
+  const writtenAt = Math.max(collected, stored);
+  return basis.streams.every(
+    (s) =>
+      s.deleteVersion > 0 && s.deleteAtMs !== null && writtenAt < s.deleteAtMs,
+  );
 }

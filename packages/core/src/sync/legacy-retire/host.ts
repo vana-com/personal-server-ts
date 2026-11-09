@@ -14,7 +14,17 @@ export function createRetireHost(input: {
 }): RetireHost {
   return {
     publishedBody: (scope) => input.reader.publishedBody(scope),
-    streamDeletes: (scope) => input.reader.retireBasis(scope)?.streams ?? null,
+    deleteBasis: (scope) => {
+      const basis = input.reader.retireBasis(scope);
+      // Authority: the registry for this owner says the scope is either
+      // covered by live complete heads or deleted whole, and no second active
+      // connection makes the answer ambiguous. Anything else is no basis, and
+      // the scope is neither fenced nor passed.
+      if (!basis || basis.ambiguous || !(basis.covered || basis.deleted)) {
+        return null;
+      }
+      return { streams: basis.streams, viewDeleted: basis.deleted };
+    },
     importDone: (connector) => input.ledger.importDone(connector),
     fullRunSince: (connector, stream, deleteVersion) =>
       input.writer.fullRunSince(connector, stream, deleteVersion),

@@ -212,12 +212,23 @@ export type ReadDecision =
 export interface RetireBasis {
   readonly covered: boolean;
   readonly ambiguous: boolean;
+  /**
+   * Every read target of the scope is deleted right now and none was
+   * re-collected: the published side serves no view because the owner deleted
+   * the source, not because data is missing. `covered` is false then.
+   */
+  readonly deleted: boolean;
   readonly throughMs: number;
   readonly streams: readonly {
     readonly connector: string;
     readonly stream: string;
     /** Version of the stream's last delete; 0 = never deleted. */
     readonly deleteVersion: number;
+    /**
+     * Registry time (ms) of that delete, or null when unknown (a delete
+     * learned from a head, not from a listed tombstone row).
+     */
+    readonly deleteAtMs: number | null;
   }[];
 }
 
@@ -714,17 +725,22 @@ export class StreamSyncReadService {
   /**
    * What a legacy delete asks about `scope`, from the PUBLISHED side only
    * (imported heads; this device's spool and overlay never count).
-   * `null` when the mirror does not hold a whole listing or the scope has no
-   * read target. `covered` is false while any target stream lacks a live,
+   * `null` when the mirror does not hold a whole listing or no read target of
+   * the scope is a connector the mirror knows. `covered` is false while any target stream lacks a live,
    * complete head in the one active connection of its connector (more than
    * one active connection is `ambiguous`). `throughMs` is the oldest
    * `observedAt` of the heads used: a legacy row collected after it may hold
    * data the views lack. `streams` lists every target stream with the
-   * version of its last delete (0 = never deleted), read from the mirror's
-   * deletion floor.
+   * version and registry time of its last delete (0 = never deleted), read
+   * from the mirror's deletion floor. `deleted` holds when every target is
+   * deleted and none was re-collected.
    */
   retireBasis(scope: string): RetireBasis | null {
-    const targets = readTargets(scope);
+    // As `resolve` does: a connector the registry mirror has never seen is no
+    // target. A scope may be served by alternate connectors; one that was
+    // never connected holds nothing and must not leave the scope "uncovered".
+    const known = new Set(this.mirror.connectors());
+    const targets = readTargets(scope).filter((t) => known.has(t.connector));
     if (targets.length === 0 || this.mirror.needsFullListing()) return null;
     const streams: RetireBasis["streams"][number][] = [];
     for (const target of targets) {
@@ -732,13 +748,14 @@ export class StreamSyncReadService {
         streams.push({
           connector: target.connector,
           stream,
-          deleteVersion: this.lastDeleteVersion(target.connector, stream),
+          ...this.lastDelete(target.connector, stream),
         });
       }
     }
     let throughMs = Infinity;
     let covered = true;
     let ambiguous = false;
+    let deletedTargets = 0;
     for (const target of targets) {
       const connections = this.connectionViews(target.connector);
       if (connections.filter((c) => c.control.kind === "active").length > 1) {
@@ -753,6 +770,12 @@ export class StreamSyncReadService {
       });
       if (eligibility.kind !== "view") {
         covered = false;
+        if (
+          eligibility.kind === "unavailable" &&
+          eligibility.reason === "deleted"
+        ) {
+          deletedTargets += 1;
+        }
         continue;
       }
       for (const stream of target.streams) {
@@ -771,27 +794,41 @@ export class StreamSyncReadService {
     return {
       covered: covered && Number.isFinite(throughMs),
       ambiguous,
+      deleted: !ambiguous && deletedTargets === targets.length,
       throughMs: Number.isFinite(throughMs) ? throughMs : 0,
       streams,
     };
   }
 
-  /** The highest delete version the mirror holds for a stream, in any namespace. */
-  private lastDeleteVersion(connector: string, stream: string): number {
+  /**
+   * The highest delete version the mirror holds for a stream, in any
+   * namespace, and the registry time of the EARLIEST such delete (null when
+   * any of them has no known time). A local write is "before the delete" only
+   * if it predates every delete of the stream.
+   */
+  private lastDelete(
+    connector: string,
+    stream: string,
+  ): { deleteVersion: number; deleteAtMs: number | null } {
     const rows = this.mirror.rowsFor(connector);
     const namespaces = new Set([
       IDENTITYLESS_NS,
       ...rows.controls.keys(),
       ...rows.streams.keys(),
     ]);
-    let floor = 0;
+    let deleteVersion = 0;
+    let deleteAtMs: number | null = null;
+    let unknown = false;
     for (const ns of namespaces) {
-      floor = Math.max(
-        floor,
-        this.mirror.deletionFloor(streamScope(connector, ns, stream)),
-      );
+      const scope = streamScope(connector, ns, stream);
+      const floor = this.mirror.deletionFloor(scope);
+      if (floor === 0) continue;
+      deleteVersion = Math.max(deleteVersion, floor);
+      const at = this.mirror.deletionTime(scope);
+      if (at === null) unknown = true;
+      else deleteAtMs = deleteAtMs === null ? at : Math.min(deleteAtMs, at);
     }
-    return floor;
+    return { deleteVersion, deleteAtMs: unknown ? null : deleteAtMs };
   }
 
   /**
