@@ -8,6 +8,11 @@
  * (`assertNoViolations`).
  *
  * Install it before anything else starts. Only `GET` to an allowed host passes.
+ * The host is the one Node connects to (options `hostname`, else `host`, over
+ * the URL; a `socketPath` is refused), and the port must be a default port
+ * unless the allowed entry names it. `fetch` never follows a redirect, so a
+ * reply from an allowed host cannot send the request to another one.
+ * (`http` and `https` never follow redirects on their own.)
  */
 
 import http from "node:http";
@@ -38,30 +43,68 @@ export interface NetworkGuard {
 
 type HttpModule = typeof http | typeof https;
 
-function hostOf(input: unknown, options: unknown): string {
-  const parts = [input, options];
-  for (const part of parts) {
-    if (part instanceof URL) return part.hostname;
-    if (typeof part === "string") {
-      try {
-        return new URL(part).hostname;
-      } catch {
-        continue;
-      }
-    }
-    if (part && typeof part === "object") {
-      const o = part as { hostname?: unknown; host?: unknown };
-      const host = o.hostname ?? o.host;
-      if (typeof host === "string") return host.split(":")[0]!;
+interface Target {
+  readonly host: string;
+  /** Empty when the request uses the scheme's default port. */
+  readonly port: string;
+}
+
+const isUrlLike = (value: unknown): value is string | URL =>
+  typeof value === "string" || value instanceof URL;
+
+function isOptions(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !(value instanceof URL);
+}
+
+/** The first non-empty string of a list, as `validateHost` in Node takes it. */
+function firstHost(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value !== "") return value;
+    if (value !== undefined && value !== null && typeof value !== "string") {
+      return ""; // Node throws for these; the guard refuses.
     }
   }
-  return "";
+  return "localhost";
+}
+
+/**
+ * The host Node connects to for `http.request(input, options)`. Node turns a
+ * URL into options and merges the options argument over it (its keys win),
+ * then connects to `hostname`, else `host`, else `localhost`.
+ */
+function targetOf(input: unknown, options: unknown): Target {
+  let base: Record<string, unknown> = {};
+  if (isUrlLike(input)) {
+    try {
+      const url = new URL(input);
+      base = {
+        hostname: url.hostname.replace(/^\[|\]$/g, ""),
+        port: url.port,
+      };
+    } catch {
+      return { host: "", port: "" };
+    }
+  }
+  const given = isUrlLike(input)
+    ? isOptions(options)
+      ? options
+      : {}
+    : isOptions(input)
+      ? input
+      : {};
+  const merged = { ...base, ...given };
+  if (merged.socketPath !== undefined) return { host: "(socket)", port: "" };
+  const port = merged.port;
+  return {
+    host: firstHost(merged.hostname, merged.host),
+    port: port === undefined || port === null ? "" : String(port),
+  };
 }
 
 function methodOf(input: unknown, options: unknown): string {
   for (const part of [options, input]) {
-    if (part && typeof part === "object" && !(part instanceof URL)) {
-      const m = (part as { method?: unknown }).method;
+    if (isOptions(part)) {
+      const m = part.method;
       if (typeof m === "string") return m.toUpperCase();
     }
   }
@@ -69,20 +112,29 @@ function methodOf(input: unknown, options: unknown): string {
 }
 
 export function installNetworkGuard(input: {
+  /** `host` (default ports only) or `host:port`. */
   readonly allowedHosts: readonly string[];
 }): NetworkGuard {
   const allowed = new Set(input.allowedHosts.map((h) => h.toLowerCase()));
   const violations: GuardViolation[] = [];
 
-  const check = (method: string, host: string): void => {
+  const hostAllowed = ({ host, port }: Target): boolean => {
+    const name = host.toLowerCase();
+    if (port === "" || port === "80" || port === "443") {
+      if (allowed.has(name)) return true;
+    }
+    return port !== "" && allowed.has(`${name}:${port}`);
+  };
+
+  const check = (method: string, target: Target): void => {
     const reason =
       method !== "GET"
         ? "method_not_get"
-        : !allowed.has(host.toLowerCase())
+        : !hostAllowed(target)
           ? "host_not_allowed"
           : null;
     if (reason === null) return;
-    const violation: GuardViolation = { method, host, reason };
+    const violation: GuardViolation = { method, host: target.host, reason };
     violations.push(violation);
     throw new NetworkGuardError(violation);
   };
@@ -97,14 +149,15 @@ export function installNetworkGuard(input: {
           : target instanceof URL
             ? target
             : new URL(request!.url);
-      check(
-        (init?.method ?? request?.method ?? "GET").toUpperCase(),
-        url.hostname,
-      );
+      check((init?.method ?? request?.method ?? "GET").toUpperCase(), {
+        host: url.hostname,
+        port: url.port,
+      });
     } catch (error) {
       return Promise.reject(error);
     }
-    return realFetch(target, init);
+    // A redirect would leave the checked host unchecked: never follow one.
+    return realFetch(target, { ...init, redirect: "error" });
   }) as typeof fetch;
 
   const restores: (() => void)[] = [() => void (globalThis.fetch = realFetch)];
@@ -118,7 +171,7 @@ export function installNetworkGuard(input: {
       ) => {
         check(
           name === "get" ? "GET" : methodOf(first, second),
-          hostOf(first, second),
+          targetOf(first, second),
         );
         return real.call(mod, first, second, ...rest);
       };

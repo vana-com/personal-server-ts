@@ -1,7 +1,7 @@
 /**
  * The command line: arguments, exit codes, and a real loopback HTTP gateway
- * and storage (the host guard allows 127.0.0.1 only because the test passes it
- * as the Dev gateway and storage URL).
+ * and storage (the host guard allows 127.0.0.1:<port> only because the test
+ * passes the test-only switch with it as the gateway and storage URL).
  */
 
 import { createServer, type Server } from "node:http";
@@ -17,6 +17,7 @@ let server: Server | null = null;
 const cleanup: string[] = [];
 afterEach(async () => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   await new Promise((r) => (server ? server.close(r) : r(null)));
   server = null;
@@ -57,6 +58,7 @@ describe("legacy-retire-dry-run command", () => {
       base,
       "--storage-url",
       base,
+      "--test-only-allow-loopback",
     ]);
 
     expect(code).toBe(0);
@@ -70,12 +72,46 @@ describe("legacy-retire-dry-run command", () => {
     expect(new Set(methods)).toEqual(new Set(["GET"]));
   });
 
+  it("refuses a loopback URL without the test-only switch", async () => {
+    const p = await persistFixture({ importDone: true, fullRun: true });
+    cleanup.push(p.home);
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", p.signature);
+    const code = await main([
+      "--data-dir",
+      p.dataDir,
+      "--out",
+      p.outPath,
+      "--gateway-url",
+      "http://127.0.0.1:9",
+    ]);
+    expect(code).toBe(2);
+    expect(stderr.mock.calls.join("")).toMatch(/pinned Dev host/);
+  });
+
+  it("prints no hex from a wrong but valid-looking owner signature", async () => {
+    const p = await persistFixture({ importDone: true, fullRun: true });
+    cleanup.push(p.home);
+    const wrong = `0x${"ab".repeat(65)}`;
+    // Whatever the signature does, no request may leave this test.
+    vi.stubGlobal("fetch", () => Promise.reject(new Error("no network")));
+    vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", wrong);
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const code = await main(["--data-dir", p.dataDir, "--out", p.outPath]);
+    const text = stderr.mock.calls.join("");
+    expect(code).toBe(2);
+    expect(text).toMatch(/not a valid owner signature/);
+    expect(text).not.toMatch(/abab/i);
+    expect(text).not.toMatch(/[0-9a-f]{8}/i);
+    expect(await readFile(p.outPath, "utf8")).not.toMatch(/abab/i);
+  });
+
   it("exits 2 and writes nothing for a folder that is not a copy under ~/.tmp", async () => {
     const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
     vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", "0x00");
     const code = await main(["--data-dir", "/", "--out", "/nope.json"]);
     expect(code).toBe(2);
-    expect(stderr.mock.calls.join("")).toMatch(/Refusing/);
+    expect(stderr.mock.calls.join("")).toMatch(/Refused/);
   });
 
   it("exits 2 with usage when an argument is missing", async () => {

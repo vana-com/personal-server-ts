@@ -20,10 +20,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/keys";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import {
-  createVanaSyncStorageAdapter,
-  resolveVanaStorageEndpoint,
-} from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import { DryRunSetupError } from "./setup-error.js";
 import { createGatewayDataPointFeed } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   createMemoryStreamSyncReadFiles,
@@ -49,7 +47,6 @@ export interface PublishedHeadsInput {
 export interface PublishedHeads {
   readonly reader: StreamSyncReadService;
   readonly ownerAddress: `0x${string}`;
-  readonly hosts: { readonly gateway: string; readonly storage: string };
   readonly listing: {
     readonly pages: number;
     readonly rows: number;
@@ -62,17 +59,6 @@ export const MIRROR_PATH = "mirror.json";
 
 const noop = { info() {}, warn() {}, error() {} };
 
-/** The hosts a run may talk to, from the (copied) config. */
-export function allowedHostsOf(config: ServerConfig): {
-  gateway: string;
-  storage: string;
-} {
-  return {
-    gateway: new URL(config.gateway.url).hostname,
-    storage: new URL(resolveVanaStorageEndpoint(config)).hostname,
-  };
-}
-
 export function parseConfig(raw: unknown): ServerConfig {
   return ServerConfigSchema.parse(raw ?? {});
 }
@@ -81,8 +67,18 @@ export async function loadPublishedHeads(
   input: PublishedHeadsInput,
 ): Promise<PublishedHeads> {
   const { config } = input;
-  const ownerAddress = await recoverOwnerAddress(input.masterKeySignature);
-  const masterKey = legacyMasterKey(input.masterKeySignature);
+  // A library error here can quote the signature; none of it is passed on.
+  let ownerAddress: `0x${string}`;
+  let masterKey: ReturnType<typeof legacyMasterKey>;
+  try {
+    ownerAddress = await recoverOwnerAddress(input.masterKeySignature);
+    masterKey = legacyMasterKey(input.masterKeySignature);
+  } catch {
+    throw new DryRunSetupError(
+      "bad_owner_signature",
+      "VANA_MASTER_KEY_SIGNATURE is not a valid owner signature.",
+    );
+  }
 
   const storageAdapter = createVanaSyncStorageAdapter({
     config,
@@ -99,7 +95,12 @@ export async function loadPublishedHeads(
   const reader = await StreamSyncReadService.open({
     files,
     blobs: createStorageBlobReader(storageAdapter),
-    keys: await createStreamSyncReadKeys(masterKey),
+    keys: await createStreamSyncReadKeys(masterKey).catch(() => {
+      throw new DryRunSetupError(
+        "bad_owner_signature",
+        "VANA_MASTER_KEY_SIGNATURE is not a valid owner signature.",
+      );
+    }),
     logger: noop,
     durable: false,
   });
@@ -128,7 +129,6 @@ export async function loadPublishedHeads(
   return {
     reader,
     ownerAddress,
-    hosts: allowedHostsOf(config),
     listing: { pages, rows, deviceMirror: input.mirrorBytes !== null },
   };
 }

@@ -20,12 +20,15 @@ import {
   buildSyntheticFixture,
   type SyntheticFixture,
 } from "../../../../core/src/sync/legacy-retire/synthetic-fixture.js";
+import { DEV_GATEWAY_URL, DEV_STORAGE_URL } from "./hosts.js";
 import { initializeDatabase } from "../../storage/index-schema.js";
 import { createIndexManager } from "../../storage/index-manager.js";
 import { createNodeDataStorage } from "../../storage/node-data-storage.js";
 
-export const GATEWAY_URL = "https://gateway.test";
-export const STORAGE_URL = "https://storage.test";
+// The fake network answers to the tool's pinned Dev hosts: the tool refuses
+// any other, so the fixture cannot name its own.
+export const GATEWAY_URL = DEV_GATEWAY_URL;
+export const STORAGE_URL = DEV_STORAGE_URL;
 export const CHAIN_ID = 14800;
 
 /** A throwaway "home" under the real ~/.tmp (disk-backed), with `.tmp` in it. */

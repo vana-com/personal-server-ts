@@ -5,12 +5,14 @@
  * SQLite cannot be opened read-only on a WAL database without making a `-shm`
  * file beside it, so the tool never opens the copy's database in place. It
  * copies `index.db` and `index.db-wal` (never `-shm`) into a scratch folder of
- * its own, under the folder of `--out`, and opens that. The legacy files are
+ * its own (new and empty, made by the caller) and opens that. A scratch folder
+ * that already holds anything is refused: a stale `-wal` there would be
+ * replayed over the copy. The legacy files are
  * read in place with plain reads. `deleteVersion` is the one write the stack
  * has; here it throws.
  */
 
-import { copyFile, mkdir } from "node:fs/promises";
+import { copyFile, mkdir, readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { RetireDeps } from "@opendatalabs/personal-server-ts-core/sync";
@@ -48,6 +50,9 @@ export async function openLegacyStore(input: {
 }): Promise<LegacyStore> {
   const dataDir = join(input.rootDir, "data");
   await mkdir(input.scratchDir, { recursive: true });
+  if ((await readdir(input.scratchDir)).length > 0) {
+    throw new LegacyStoreError("The scratch folder is not empty.");
+  }
   for (const name of DB_FILES) {
     try {
       await copyFile(join(input.rootDir, name), join(input.scratchDir, name));

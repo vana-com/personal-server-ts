@@ -8,7 +8,8 @@
  * runs, no `createServer`. See `run.test.ts` for the checks that keep it so.
  */
 
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
   createRetireHost,
@@ -22,11 +23,12 @@ import {
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import { assertCopyOnly } from "./copy-only.js";
-import { fingerprintTree } from "./fingerprint.js";
+import { copyAge, fingerprintTree } from "./fingerprint.js";
+import { pinHosts } from "./hosts.js";
+import { DryRunSetupError } from "./setup-error.js";
 import { openLegacyStore } from "./legacy-store.js";
 import { installNetworkGuard, NetworkGuardError } from "./network-guard.js";
 import {
-  allowedHostsOf,
   loadPublishedHeads,
   MIRROR_PATH,
   parseConfig,
@@ -36,15 +38,7 @@ import { abortedReport, buildReport, type RedactedReport } from "./report.js";
 
 const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
 
-export class DryRunSetupError extends Error {
-  constructor(
-    readonly code: "no_owner_signature" | "bad_owner_signature" | "bad_config",
-    message: string,
-  ) {
-    super(message);
-    this.name = "DryRunSetupError";
-  }
-}
+export { DryRunSetupError };
 
 export interface DryRunOptions {
   /** The copy of the Personal Server root (holds `index.db`, `data/`). */
@@ -53,8 +47,11 @@ export interface DryRunOptions {
   readonly home: string;
   /** Owner master-key signature; the tool reads it from the environment. */
   readonly masterKeySignature: string | undefined;
+  /** Select a pinned Dev host (see `hosts.ts`); any other value is refused. */
   readonly gatewayUrl?: string;
   readonly storageUrl?: string;
+  /** For tests only: also allow the exact loopback `host:port` given above. */
+  readonly testOnlyAllowLoopback?: boolean;
   readonly now?: () => Date;
   readonly log?: (line: string) => void;
 }
@@ -68,50 +65,33 @@ async function readOptional(path: string): Promise<Uint8Array | null> {
   }
 }
 
-/** The few config.json fields the tool overrides; the schema checks the rest. */
 interface ConfigJson {
   gateway?: Record<string, unknown>;
-  storage?: { config?: Record<string, unknown> } & Record<string, unknown>;
+  storage?: { config?: { vana?: { apiUrl?: unknown } } };
 }
 
-async function readConfig(
-  rootDir: string,
-  override: Pick<DryRunOptions, "gatewayUrl" | "storageUrl">,
-): Promise<ServerConfig> {
-  let raw: ConfigJson = {};
+async function readConfigJson(rootDir: string): Promise<ConfigJson> {
   try {
-    raw = JSON.parse(await readFile(join(rootDir, "config.json"), "utf8"));
+    const parsed: unknown = JSON.parse(
+      await readFile(join(rootDir, "config.json"), "utf8"),
+    );
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as ConfigJson)
+      : {};
   } catch {
-    // No config in the copy: the schema defaults name the Dev hosts.
-  }
-  if (override.gatewayUrl) {
-    raw = { ...raw, gateway: { ...raw.gateway, url: override.gatewayUrl } };
-  }
-  if (override.storageUrl) {
-    raw = {
-      ...raw,
-      storage: {
-        ...raw.storage,
-        config: {
-          ...raw.storage?.config,
-          vana: { apiUrl: override.storageUrl },
-        },
-      },
-    };
-  }
-  try {
-    return parseConfig(raw);
-  } catch {
-    throw new DryRunSetupError("bad_config", "config.json does not parse");
+    return {}; // No config in the copy: the Dev hosts are the defaults.
   }
 }
+
+const stringOrUndefined = (value: unknown): string | undefined =>
+  typeof value === "string" ? value : undefined;
 
 export async function runLegacyRetireDryRun(
   options: DryRunOptions,
 ): Promise<RedactedReport> {
   const log = options.log ?? (() => undefined);
   const now = options.now ?? (() => new Date());
-  const { dataDir, outPath } = await assertCopyOnly({
+  const { dataDir, outPath, tmpRoot } = await assertCopyOnly({
     dataDir: options.dataDir,
     outPath: options.outPath,
     home: options.home,
@@ -129,18 +109,39 @@ export async function runLegacyRetireDryRun(
       "VANA_MASTER_KEY_SIGNATURE is not a 65-byte hex signature.",
     );
   }
-  // The device's own network names its stream-sync home; flags only change
-  // where requests go (for a local test server), never which home is read.
-  const deviceConfig = await readConfig(dataDir, {});
-  const config = await readConfig(dataDir, options);
-  const hosts = allowedHostsOf(config);
+  // The device's own network names its stream-sync home. Flags and the
+  // copy's config only select among the pinned Dev hosts (hosts.ts).
+  const raw = await readConfigJson(dataDir);
+  let deviceConfig: ServerConfig;
+  try {
+    deviceConfig = parseConfig(raw);
+  } catch {
+    throw new DryRunSetupError("bad_config", "config.json does not parse");
+  }
+  const pinned = pinHosts({
+    gatewayUrl: options.gatewayUrl ?? stringOrUndefined(raw.gateway?.url),
+    storageUrl:
+      options.storageUrl ??
+      stringOrUndefined(raw.storage?.config?.vana?.apiUrl),
+    testOnlyAllowLoopback: options.testOnlyAllowLoopback === true,
+  });
+  const config = parseConfig({
+    ...raw,
+    gateway: { ...raw.gateway, url: pinned.gatewayUrl },
+    storage: {
+      ...raw.storage,
+      config: { ...raw.storage?.config, vana: { apiUrl: pinned.storageUrl } },
+    },
+  });
+  const hosts = pinned.hosts;
   log(`Allowed hosts (GET only): ${hosts.gateway}, ${hosts.storage}`);
 
   const before = await fingerprintTree(dataDir);
-  const scratchDir = join(dirname(outPath), `${basename(outPath)}.work`);
-  const guard = installNetworkGuard({
-    allowedHosts: [hosts.gateway, hosts.storage],
-  });
+  const copy = await copyAge(dataDir);
+  // A new, empty folder of the tool's own, never derived from `--out`: no
+  // path the person gives can name it, so it cannot be the copy.
+  const scratchDir = await mkdtemp(join(tmpRoot, "retire-dry-run-"));
+  const guard = installNetworkGuard({ allowedHosts: pinned.allowed });
   let store: Awaited<ReturnType<typeof openLegacyStore>> | null = null;
   let retire: RetireReport | null = null;
   let report: RedactedReport;
@@ -195,6 +196,7 @@ export async function runLegacyRetireDryRun(
       retire,
       records,
       hosts,
+      copy,
       deviceImport: {
         complete: home.importComplete,
         connectors: Object.keys(home.imported).length,
@@ -213,18 +215,13 @@ export async function runLegacyRetireDryRun(
             : "unknown";
     // A guard violation may have been swallowed on the way here.
     const violated = guard.violations.length > 0;
-    await mkdir(dirname(outPath), { recursive: true });
-    await writeFile(
+    await writeReport(
       outPath,
-      JSON.stringify(
-        abortedReport({
-          generatedAt: now().toISOString(),
-          abortReason: violated ? "network_guard" : reason,
-          hosts,
-        }),
-        null,
-        2,
-      ),
+      abortedReport({
+        generatedAt: now().toISOString(),
+        abortReason: violated ? "network_guard" : reason,
+        hosts,
+      }),
     );
     throw error;
   } finally {
@@ -232,6 +229,28 @@ export async function runLegacyRetireDryRun(
     store?.close();
     await rm(scratchDir, { recursive: true, force: true });
   }
-  await writeFile(outPath, JSON.stringify(report, null, 2));
+  await writeReport(outPath, report);
   return report;
+}
+
+/**
+ * Write to a new file beside `--out` and rename it over `--out`. A rename
+ * replaces the path itself, so a link put there after the check is replaced
+ * and never followed.
+ */
+async function writeReport(
+  outPath: string,
+  report: RedactedReport,
+): Promise<void> {
+  const temp = join(
+    dirname(outPath),
+    `.${basename(outPath)}.${randomBytes(6).toString("hex")}.tmp`,
+  );
+  try {
+    await writeFile(temp, JSON.stringify(report, null, 2), { flag: "wx" });
+    await rename(temp, outPath);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
 }

@@ -15,7 +15,14 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/sync";
 
 export interface RedactedFile {
-  readonly scope: string;
+  /**
+   * The connector name only: the scope's text before its first dot, if that
+   * is a plain name. A scope can carry more than a stream name, so the rest
+   * is never printed.
+   */
+  readonly connector: string;
+  /** 8 hex of a hash over the whole scope; ties a row to a scope you know. */
+  readonly scopeHash: string;
   /** 8 hex of a hash over the local version key; tells two versions apart. */
   readonly version: string;
   readonly importDone: boolean;
@@ -42,6 +49,16 @@ export interface RedactedReport {
   readonly generatedAt: string;
   readonly mode: RetireReport["mode"] | null;
   readonly hosts: { readonly gateway: string; readonly storage: string };
+  /**
+   * How old the copy is: the newest modification time of any file in it. The
+   * device's full-run proofs and import state are read from the copy, so the
+   * report is true as of this time and no later. Null when the run aborted
+   * before the copy was read.
+   */
+  readonly copy: {
+    readonly newestFileModified: string;
+    readonly files: number;
+  } | null;
   readonly deviceImport: {
     readonly complete: boolean;
     readonly connectors: number;
@@ -74,6 +91,14 @@ export interface RedactedReport {
 const hex8 = (text: string): string =>
   createHash("sha256").update(text).digest("hex").slice(0, 8);
 
+/** The 8-hex hash that stands for a scope in the report. */
+export const scopeHash = hex8;
+
+export function connectorLabel(scope: string): string {
+  const name = scope.split(".")[0] ?? "";
+  return /^[a-z0-9_-]{1,40}$/.test(name) ? name : "unknown";
+}
+
 const ZERO = { local: 0, matched: 0, missing: 0, changed: 0, fenced: 0 };
 
 export function redactFile(
@@ -81,7 +106,8 @@ export function redactFile(
   record: ReadbackRecord | null,
 ): RedactedFile {
   return {
-    scope: file.scope,
+    connector: connectorLabel(file.scope),
+    scopeHash: scopeHash(file.scope),
     version: hex8(file.version),
     importDone: file.importDone,
     readback: file.readback,
@@ -98,6 +124,7 @@ export function buildReport(input: {
   readonly retire: RetireReport;
   readonly records: ReadonlyMap<string, ReadbackRecord>;
   readonly hosts: RedactedReport["hosts"];
+  readonly copy: RedactedReport["copy"];
   readonly deviceImport: RedactedReport["deviceImport"];
   readonly publishedListing: RedactedReport["publishedListing"];
   readonly store: { readonly scopes: number; readonly versions: number };
@@ -121,6 +148,7 @@ export function buildReport(input: {
     generatedAt: input.generatedAt,
     mode: input.retire.mode,
     hosts: input.hosts,
+    copy: input.copy,
     deviceImport: input.deviceImport,
     publishedListing: input.publishedListing,
     files,
@@ -148,6 +176,7 @@ export function abortedReport(input: {
     generatedAt: input.generatedAt,
     mode: null,
     hosts: input.hosts,
+    copy: null,
     deviceImport: { complete: false, connectors: 0 },
     publishedListing: { pages: 0, rows: 0, deviceMirror: false },
     files: [],

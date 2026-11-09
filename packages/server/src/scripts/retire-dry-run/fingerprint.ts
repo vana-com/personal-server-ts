@@ -24,3 +24,28 @@ export async function fingerprintTree(root: string): Promise<string> {
   }
   return lines.sort().join("\n");
 }
+
+/** The newest file modification time in the folder, and how many files it holds. */
+export async function copyAge(
+  root: string,
+): Promise<{ newestFileModified: string; files: number }> {
+  let newest = 0;
+  let files = 0;
+  const pending = [root];
+  while (pending.length > 0) {
+    const dir = pending.pop()!;
+    for (const item of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, item.name);
+      if (item.isDirectory()) {
+        pending.push(path);
+        continue;
+      }
+      files += 1;
+      newest = Math.max(newest, (await lstat(path)).mtimeMs);
+    }
+  }
+  return {
+    newestFileModified: new Date(Math.trunc(newest)).toISOString(),
+    files,
+  };
+}
