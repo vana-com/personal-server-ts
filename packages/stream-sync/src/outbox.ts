@@ -38,8 +38,6 @@ export interface OutboxStream {
   /** `complete` of the committed or unchanged head. */
   readonly complete?: boolean;
   readonly problem?: OutboxProblem;
-  /** §2.2: records not published because their line is over 8 MiB. */
-  readonly recordTooLarge?: number;
 }
 
 export interface OutboxEntry {

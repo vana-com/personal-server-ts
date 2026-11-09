@@ -8,6 +8,17 @@ import { InvalidArgumentError } from "./errors.js";
 /** SHA-256 of the exact bytes, as the 32-byte digest. */
 export type Sha256 = (data: Uint8Array) => Promise<Uint8Array>;
 
+/**
+ * Incremental SHA-256: feed pieces with `update`, then read the 32-byte
+ * digest once. Needed for bodies that are never held as one buffer (WebCrypto
+ * has no incremental digest, so hosts supply a JavaScript implementation).
+ */
+export interface Sha256Stream {
+  update(data: Uint8Array): void;
+  digest(): Uint8Array;
+}
+export type Sha256StreamFactory = () => Sha256Stream;
+
 /** Keccak-256 (Ethereum, not SHA3-256) of the exact bytes, as the 32-byte digest. */
 export type Keccak256 = (data: Uint8Array) => Promise<Uint8Array>;
 
@@ -84,8 +95,6 @@ export const REGISTRY_HASH = /^0x[0-9a-f]{64}$/;
 
 const MiB = 1024 * 1024;
 
-/** §2.2: a record whose canonical line exceeds this is not published. */
-export const RECORD_LINE_LIMIT_BYTES = 8 * MiB;
 /** §2.2: default writer target per part. Hosts with less memory pass a smaller target. */
 export const DEFAULT_PART_TARGET_BYTES = 4 * MiB;
 /** §2.2: decoder limit for a clear head. */
@@ -116,3 +125,8 @@ export function canonicalBytes32(value: string): `0x${string}` {
   }
   return `0x${match[1]!.toLowerCase()}`;
 }
+
+/** Frames at most this large are held whole in memory by a reducer; larger ones are located, not held. */
+export const FRAME_SMALL_BYTES = 1 * MiB;
+/** Piece size for a frame longer than {@link FRAME_SMALL_BYTES}: each piece is its own part. */
+export const FRAME_PIECE_BYTES = DEFAULT_PART_TARGET_BYTES;

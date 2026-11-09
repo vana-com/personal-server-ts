@@ -11,7 +11,6 @@ import {
   decodeLine,
   encodeLine,
   inPrefix,
-  lineSize,
   pkHash,
   pkHashBits,
   shardOf,
@@ -139,20 +138,6 @@ describe("records", () => {
     const key = await pkHash(sha256, { id: "x" }, ["id"]);
     expect(pkHashBits(key, 8)).toBe(shardOf(key).toString(2).padStart(8, "0"));
     expect(inPrefix(key, "")).toBe(true);
-  });
-
-  it("flags only lines over 8 MiB", () => {
-    const shell = encodeLine({ o: 0, r: "r", v: { x: "" } }).length;
-    const at = encodeLine({
-      o: 0,
-      r: "r",
-      v: { x: "a".repeat(8 * 1024 * 1024 - shell) },
-    });
-    expect(lineSize(at).fits).toBe(true);
-    expect(lineSize(`${at}a`)).toMatchObject({
-      fits: false,
-      reason: "record_too_large",
-    });
   });
 });
 

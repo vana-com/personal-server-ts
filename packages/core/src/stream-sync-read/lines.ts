@@ -4,12 +4,16 @@
  *
  * The base is the leased imported view, or nothing when the stream has no
  * imported head (an overlay-only view). Without overlay rows a read holds one
- * part at a time. Overlay winners are held in memory: they are the rows of
- * local runs the imported view does not cover yet.
+ * part at a time. Overlay winners are held in memory, whole and parsed: they
+ * are the rows of local runs the imported view does not cover yet, so an
+ * overlay record costs a multiple of its size.
  */
 
 import {
+  canonicalJsonChunks,
   compareStamp,
+  framesOfParts,
+  linesOfParts,
   pkHash,
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -74,12 +78,23 @@ export async function overlayWinners(
 
 async function* partLines(
   views: ViewStore,
+  keys: StreamSyncReadKeys,
   lease: ViewLease,
-): AsyncGenerator<{ readonly text: string; readonly line: Line }> {
-  for (const part of lease.version.head.parts) {
-    const text = decoder.decode(
-      await views.readPart(lease.key, part.hash, part.bytes),
-    );
+): AsyncGenerator<{ readonly line: Line }> {
+  const head = lease.version.head;
+  const read = (part: { hash: string; bytes: number }) =>
+    views.readPart(lease.key, part.hash, part.bytes);
+  if (head.format === 2) {
+    // The store verified each part; frame structure is checked as it is read.
+    for await (const line of linesOfParts(keys.hashes.sha256, head, read, {
+      verify: false,
+    })) {
+      yield { line };
+    }
+    return;
+  }
+  for (const part of head.parts) {
+    const text = decoder.decode(await read(part));
     let start = 0;
     while (start < text.length) {
       const end = text.indexOf("\n", start);
@@ -89,7 +104,7 @@ async function* partLines(
       const lineText = text.slice(start, end);
       start = end + 1;
       // Verified at import (`decodePart`); parsed, not re-verified.
-      yield { text: lineText, line: JSON.parse(lineText) as Line };
+      yield { line: JSON.parse(lineText) as Line };
     }
   }
 }
@@ -113,12 +128,12 @@ export async function* viewLines(
     return;
   }
   if (overlay.winners.size === 0) {
-    for await (const { line } of partLines(views, base)) yield line;
+    for await (const { line } of partLines(views, keys, base)) yield line;
     return;
   }
   const pending = [...overlay.winners.keys()].sort();
   let next = 0;
-  for await (const { line } of partLines(views, base)) {
+  for await (const { line } of partLines(views, keys, base)) {
     const hash = await pkHash(keys.hashes.sha256, line.v, primaryKey);
     while (next < pending.length && pending[next]! < hash) {
       yield overlay.winners.get(pending[next++]!)!;
@@ -133,5 +148,99 @@ export async function* viewLines(
   }
   while (next < pending.length) {
     yield overlay.winners.get(pending[next++]!)!;
+  }
+}
+
+/** One record of a view as its stamp and key plus the body in pieces. */
+export interface ViewBody {
+  /** pkHash of the record's primary key. */
+  readonly k: string;
+  readonly o: number;
+  readonly r: string;
+  /** Canonical JSON of the record, one bounded piece at a time. */
+  body(): AsyncGenerator<Uint8Array>;
+}
+
+const encoder = new TextEncoder();
+
+async function* chunksOfValue(value: unknown): AsyncGenerator<Uint8Array> {
+  for (const text of canonicalJsonChunks(value)) yield encoder.encode(text);
+}
+
+async function* partBodies(
+  views: ViewStore,
+  keys: StreamSyncReadKeys,
+  lease: ViewLease,
+  primaryKey: readonly string[],
+): AsyncGenerator<ViewBody> {
+  const head = lease.version.head;
+  const read = (part: { hash: string; bytes: number }) =>
+    views.readPart(lease.key, part.hash, part.bytes);
+  if (head.format === 2) {
+    for await (const frame of framesOfParts(
+      keys.hashes.sha256,
+      head.parts,
+      (part) => read(part),
+      { verify: false },
+    )) {
+      yield {
+        k: frame.envelope.k,
+        o: frame.envelope.o,
+        r: frame.envelope.r,
+        body: () => frame.body(),
+      };
+    }
+    return;
+  }
+  for await (const { line } of partLines(views, keys, lease)) {
+    yield {
+      k: await pkHash(keys.hashes.sha256, line.v, primaryKey),
+      o: line.o,
+      r: line.r,
+      body: () => chunksOfValue(line.v),
+    };
+  }
+}
+
+/**
+ * The same records and order as `viewLines`, but each body stays unparsed:
+ * the caller reads it in pieces and forwards or hashes it. Merge decisions use
+ * the key and stamp only. A base body costs one part in memory at a time; an
+ * overlay body is already held as an object.
+ */
+export async function* viewBodies(
+  views: ViewStore,
+  keys: StreamSyncReadKeys,
+  base: ViewLease | null,
+  overlay: OverlayWinners,
+  primaryKey: readonly string[],
+): AsyncGenerator<ViewBody> {
+  const fromLine = (hash: string, line: Line): ViewBody => ({
+    k: hash,
+    o: line.o,
+    r: line.r,
+    body: () => chunksOfValue(line.v),
+  });
+  const pending = [...overlay.winners.keys()].sort();
+  let next = 0;
+  if (base) {
+    for await (const body of partBodies(views, keys, base, primaryKey)) {
+      while (next < pending.length && pending[next]! < body.k) {
+        const hash = pending[next++]!;
+        yield fromLine(hash, overlay.winners.get(hash)!);
+      }
+      if (next < pending.length && pending[next] === body.k) {
+        const hash = pending[next++]!;
+        const local = overlay.winners.get(hash)!;
+        // The overlay is fed after the base: it wins ties.
+        yield compareStamp(local, body) >= 0 ? fromLine(hash, local) : body;
+        continue;
+      }
+      yield body;
+    }
+  }
+  while (next < pending.length) {
+    const hash = pending[next++]!;
+    yield fromLine(hash, overlay.winners.get(hash)!);
   }
 }

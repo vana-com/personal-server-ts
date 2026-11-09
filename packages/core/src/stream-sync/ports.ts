@@ -103,8 +103,11 @@ export interface StreamSyncFiles {
 export interface StreamSyncKeyPorts {
   /** HMAC-SHA256 keyed with `K_ns` (§2.1). */
   namespaceHmac(message: Uint8Array): Promise<Uint8Array>;
-  /** Per-object encryption with the per-scope key of `scope`. */
+  /** Per-object encryption with the per-scope key of `scope` (heads). */
   encrypt(scope: string, clear: Uint8Array): Promise<Uint8Array>;
+  /** Format-2 part encryption: the age STREAM AEAD over 64 KiB chunks. */
+  encryptPart(scope: string, clear: Uint8Array): Promise<Uint8Array>;
+  /** Opens a head, a format-1 part (OpenPGP) or a format-2 part (STREAM). */
   decrypt(scope: string, cipher: Uint8Array): Promise<Uint8Array>;
 }
 

@@ -26,7 +26,7 @@ describe("spool read path retains only the kept lines", () => {
         module: WORKLOAD,
         exportName: "retainWinners",
         args: {
-          path: `${DATA}/spool-retain-192.spool`,
+          path: `${DATA}/spool-retain-v2-192.spool`,
           mib: 192,
           keepEvery: 100,
         },

@@ -114,7 +114,7 @@ describe("head", () => {
     expect(() => encodeHead({ ...head, recordCount: 2 })).toThrow(
       InvalidArgumentError,
     );
-    expect(() => encodeHead({ ...head, format: 2 as 1 })).toThrow(
+    expect(() => encodeHead({ ...head, format: 3 as 1 })).toThrow(
       InvalidArgumentError,
     );
   });

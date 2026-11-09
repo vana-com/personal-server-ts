@@ -30,7 +30,12 @@ import { headBlobName } from "./names.js";
 import type { HeadPart } from "./parts.js";
 import type { ControlState } from "./control.js";
 
-export const HEAD_FORMAT = 1;
+/** The format new writers write. Readers also accept {@link HEAD_FORMAT_PREVIOUS}. */
+export const HEAD_FORMAT = 2;
+/** Parts are NDJSON lines (§2.2). Readers still accept it; writers no longer write it. */
+export const HEAD_FORMAT_PREVIOUS = 1;
+
+export type HeadFormat = 1 | 2;
 
 export interface HeadProfile {
   /** The legacy projector's profile key, or `null`. */
@@ -42,7 +47,7 @@ export interface HeadProfile {
 export interface Head {
   readonly complete: boolean;
   readonly connector: string;
-  readonly format: 1;
+  readonly format: HeadFormat;
   /** Positive integer; written as a decimal string. */
   readonly generation: number;
   readonly keyCheck: string;
@@ -86,8 +91,11 @@ function isCount(value: unknown, min: number): value is number {
   );
 }
 
-/** Why a head is malformed, or `null` when it is a valid format-1 head. */
-function headProblem(value: Record<string, unknown>): string | null {
+/** Why a head is malformed, or `null` when it is valid. Fields are checked for `format`. */
+function headProblem(
+  value: Record<string, unknown>,
+  format: HeadFormat,
+): string | null {
   if (!exactKeys(value, HEAD_FIELDS)) {
     return `fields must be exactly: ${HEAD_FIELDS.join(", ")}`;
   }
@@ -152,7 +160,12 @@ function headProblem(value: Record<string, unknown>): string | null {
       return `part ${i} must have exactly ${PART_FIELDS.join(", ")}`;
     }
     const { bytes, count, hash, prefix } = part;
-    if (!isCount(count, 1)) return `part ${i} count must be a positive integer`;
+    // Format 2: a part that only continues a frame started in the part before
+    // it starts no frame, so its count is 0.
+    const minCount = format === 2 ? 0 : 1;
+    if (!isCount(count, minCount)) {
+      return `part ${i} count must be an integer of at least ${minCount}`;
+    }
     if (!isCount(bytes, 1) || bytes > PART_LIMIT_BYTES) {
       return `part ${i} bytes must be in [1, ${PART_LIMIT_BYTES}]`;
     }
@@ -167,9 +180,14 @@ function headProblem(value: Record<string, unknown>): string | null {
       return `part ${i} prefix must be at most 16 bits of 0 and 1`;
     }
     if (previous !== null) {
-      if (prefix <= previous) return "parts must be sorted by prefix";
-      if (prefix.startsWith(previous))
-        return "part prefixes must be prefix-free";
+      // Format 2: one prefix may hold several parts (frames longer than a
+      // part, and the small frames around them), listed in key order.
+      const same = format === 2 && prefix === previous;
+      if (!same) {
+        if (prefix <= previous) return "parts must be sorted by prefix";
+        if (prefix.startsWith(previous))
+          return "part prefixes must be prefix-free";
+      }
     }
     previous = prefix;
     total += count;
@@ -203,8 +221,8 @@ function toWire(head: Head): Record<string, unknown> {
 
 /** Canonical clear head bytes. Throws on a head this package would reject. */
 export function encodeHead(head: Head): Uint8Array {
-  if (head.format !== HEAD_FORMAT) {
-    throw new InvalidArgumentError("only format 1 heads can be written");
+  if (head.format !== 1 && head.format !== 2) {
+    throw new InvalidArgumentError("only format 1 and 2 heads can be written");
   }
   if (!Number.isSafeInteger(head.generation) || head.generation < 1) {
     throw new InvalidArgumentError(
@@ -212,7 +230,7 @@ export function encodeHead(head: Head): Uint8Array {
     );
   }
   const wire = toWire(head);
-  const problem = headProblem(wire);
+  const problem = headProblem(wire, head.format);
   if (problem) throw new InvalidArgumentError(`invalid head: ${problem}`);
   const bytes = utf8(canonicalJson(wire));
   if (bytes.length > HEAD_LIMIT_BYTES) {
@@ -244,8 +262,8 @@ export type DecodedHead =
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 /**
- * Parse clear head bytes. Any `format` other than 1 is `unsupported_format`.
- * A format-1 head must be canonical, so every host derives the same hash.
+ * Parse clear head bytes. Any `format` other than 1 or 2 is `unsupported_format`.
+ * A head must be canonical, so every host derives the same hash.
  */
 export function decodeHead(bytes: Uint8Array): DecodedHead {
   if (bytes.length > HEAD_LIMIT_BYTES) {
@@ -265,8 +283,10 @@ export function decodeHead(bytes: Uint8Array): DecodedHead {
   if (!isPlainObject(parsed))
     return { kind: "malformed", reason: "head is not an object" };
   const format = hasOwn(parsed, "format") ? parsed["format"] : undefined;
-  if (format !== HEAD_FORMAT) return { kind: "unsupported_format", format };
-  const problem = headProblem(parsed);
+  if (format !== 1 && format !== 2) {
+    return { kind: "unsupported_format", format };
+  }
+  const problem = headProblem(parsed, format);
   if (problem) return { kind: "malformed", reason: problem };
   if (canonicalJson(parsed) !== text) {
     return { kind: "malformed", reason: "head is not canonical JSON" };
@@ -280,7 +300,7 @@ export function decodeHead(bytes: Uint8Array): DecodedHead {
     head: {
       complete: p["complete"] as boolean,
       connector: p["connector"] as string,
-      format: HEAD_FORMAT,
+      format,
       generation: Number(p["generation"]),
       keyCheck: p["keyCheck"] as string,
       ns: p["ns"] as string,

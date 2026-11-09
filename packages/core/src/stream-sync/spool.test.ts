@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { shardOf } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createMemoryStreamSyncFiles } from "./memory-files.js";
 import {
+  inlineSpoolLine,
   SpoolWriter,
   deriveShards,
   readSpool,
@@ -11,12 +12,29 @@ import {
 
 const hashOf = (n: number) => n.toString(16).padStart(64, "0");
 
+/** One spool line for key `n` with body `body`. */
+function lineOf(n: number, body: string): string {
+  return inlineSpoolLine(
+    {
+      h: "0".repeat(64),
+      k: hashOf(n),
+      n: new TextEncoder().encode(body).length,
+      o: 0,
+      r: "r",
+    },
+    body,
+  );
+}
+
 async function lines(
   files: ReturnType<typeof createMemoryStreamSyncFiles>,
   path: string,
 ) {
   const out: { pkHash: string; text: string }[] = [];
-  for await (const line of readSpool(files, path)) out.push(line);
+  for await (const entry of readSpool(files, path)) {
+    if (entry.body.kind !== "inline") throw new Error("expected inline body");
+    out.push({ pkHash: entry.envelope.k, text: entry.body.text });
+  }
   return out;
 }
 
@@ -28,8 +46,8 @@ describe("deriveShards", () => {
     const log = spoolLogPath(dir);
     // Two keys, each written three times; log order must survive.
     for (let i = 0; i < 3; i++) {
-      await writer.add(log, hashOf(1), `a${i}`, 2);
-      await writer.add(log, hashOf(2), `b${i}`, 2);
+      await writer.add(log, lineOf(1, `a${i}`));
+      await writer.add(log, lineOf(2, `b${i}`));
     }
     await writer.flush();
 
@@ -49,7 +67,7 @@ describe("deriveShards", () => {
     const dir = "runs/r/spool/s0";
     const writer = new SpoolWriter(files);
     const log = spoolLogPath(dir);
-    for (let i = 0; i < 50; i++) await writer.add(log, hashOf(i), `v${i}`, 3);
+    for (let i = 0; i < 50; i++) await writer.add(log, lineOf(i, `v${i}`));
     await writer.flush();
     await deriveShards(files, dir);
     const first = new Map<string, string>();
@@ -90,14 +108,41 @@ describe("SpoolWriter.flush", () => {
     };
     const log = spoolLogPath("runs/r/spool/s0");
     const writer = new SpoolWriter(failing);
-    await writer.add(log, hashOf(1), "early", 2);
+    await writer.add(log, lineOf(1, "early"));
     // The second add crosses the flush threshold, so its flush fails and
     // takes the earlier line down with it.
     await expect(
-      writer.add(log, hashOf(2), "late", 9 * 1024 * 1024),
+      writer.add(log, lineOf(2, "x".repeat(9 * 1024 * 1024))),
     ).rejects.toThrow("disk full");
     fail = false;
     // The run must not be able to end as if every line were durable.
     await expect(writer.flush()).rejects.toThrow();
+  });
+});
+
+describe("a log with base-version lines", () => {
+  it("reads a base line and a current line from one file, in order, with the base size measure", async () => {
+    const files = createMemoryStreamSyncFiles();
+    const dir = "runs/r/spool/s0";
+    const log = spoolLogPath(dir);
+    const base = `{"o":5,"r":"r","v":{"id":"é"}}`;
+    await files.appendMany([
+      {
+        path: log,
+        bytes: new TextEncoder().encode(
+          `${hashOf(1)} ${base}\n${lineOf(2, `{"id":"b"}`)}\n`,
+        ),
+      },
+    ]);
+    const out = [];
+    for await (const entry of readSpool(files, log)) out.push(entry);
+    expect(out.map((e) => e.envelope.k)).toEqual([hashOf(1), hashOf(2)]);
+    expect(out[0]!.body).toEqual({ kind: "inline", text: `{"id":"é"}` });
+    expect(out[0]!.envelope).toMatchObject({ o: 5, r: "r", n: 11 });
+    expect(out[0]!.size).toBe(new TextEncoder().encode(base).length + 1);
+    // Shards derived from the mixed log keep both lines readable.
+    await deriveShards(files, dir);
+    const shard = await lines(files, shardPath(dir, shardOf(hashOf(1))));
+    expect(shard.map((l) => l.text)).toContain(`{"id":"é"}`);
   });
 });

@@ -3,16 +3,17 @@
  * Production must not: observe the encoder and append port, not V8 heap usage.
  *
  * Mutants: RESTORE_FLUSH_JOIN, RESTORE_COMPACTION_JOIN, SPLIT_SURROGATE_PAIR,
- * UTF16_DERIVE_BUDGET, ALLOCATING_COUNT, PER_PATH_BUDGET and RESTORE_EXCLUDED_JOIN.
+ * UTF16_DERIVE_BUDGET, ALLOCATING_COUNT, PER_PATH_BUDGET, LAST_SEEN_COMPACTION,
+ * FLIP_COMPACTION_OBSERVED_AT, FIXED_STEP_GROWTH.
  */
 import assert from "node:assert/strict";
 import v8 from "node:v8";
 import vm from "node:vm";
 import { describe, it } from "vitest";
 import {
-  RECORD_LINE_LIMIT_BYTES,
+  ENVELOPE_LIMIT_BYTES,
   encodeLine,
-  pkHash,
+  frameBytes,
   utf8Length,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createMemoryStreamSyncFiles } from "./memory-files.js";
@@ -22,10 +23,11 @@ import {
   compactShard,
   countShard,
   deriveShards,
+  inlineSpoolLine,
   readSpool,
   shardPath,
   spoolLogPath,
-  type SpoolLine,
+  type SpoolEntry,
 } from "./spool.js";
 
 const encoder = new TextEncoder();
@@ -44,10 +46,25 @@ const corpus = [
   "\udc00",
   "",
 ];
-const line = (value: string, o = 2, r = "run") =>
+const body = (value: string, o = 2, r = "run") =>
   encodeLine({ o, r, v: { value } });
-const wire = (rows: readonly { key: string; text: string }[]) =>
-  encoder.encode(rows.map(({ key, text }) => `${key} ${text}\n`).join(""));
+/** A format-2 spool line: key, envelope and inline body. */
+const spoolLine = (key: string, text: string, o = 2, r = "run") =>
+  inlineSpoolLine(
+    { h: "0".repeat(64), k: key, n: utf8Length(text), o, r },
+    text,
+  );
+const frameSize = (key: string, text: string, o = 2, r = "run") =>
+  frameBytes({ h: "0".repeat(64), k: key, n: utf8Length(text), o, r });
+type Row = { key: string; text: string; o?: number; r?: string };
+const wire = (rows: readonly Row[]) =>
+  encoder.encode(
+    rows
+      .map(({ key, text, o, r }) => `${spoolLine(key, text, o, r)}\n`)
+      .join(""),
+  );
+const lineBytes = (key: string, text: string, o?: number, r?: string) =>
+  utf8Length(spoolLine(key, text, o, r)) + 1;
 
 function filesWithWrites(chunkBytes = 7) {
   const files = createMemoryStreamSyncFiles(chunkBytes);
@@ -114,7 +131,13 @@ function assertBound(
   longestLine: number,
 ) {
   // Kills RESTORE_*_JOIN even when the joined batch happens to fit the bound.
-  assert.equal(calls.filter((c) => c.kind === "encode").length, 0);
+  // A line's envelope is parsed or built by `encode`; it is a few hundred
+  // bytes. No payload or batch may go through it.
+  assert.equal(
+    calls.filter((c) => c.kind === "encode" && c.input > ENVELOPE_LIMIT_BYTES)
+      .length,
+    0,
+  );
   for (const call of calls) {
     assert.ok(
       call.input <= longestLine,
@@ -166,8 +189,7 @@ describe("spool allocation chunks", () => {
   it("keeps a long line fed in one-byte chunks near its own size", async () => {
     const LINE_BYTES = 256 * 1024;
     const text = "t".repeat(LINE_BYTES);
-    const line = `${hash(7)} ${text}\n`;
-    const bytes = encoder.encode(line);
+    const bytes = encoder.encode(`${spoolLine(hash(7), text)}\n`);
     let retained = -1;
     const source: StreamSyncFiles = {
       ...createMemoryStreamSyncFiles(),
@@ -181,11 +203,11 @@ describe("spool allocation chunks", () => {
         yield bytes.slice(bytes.length - 1);
       },
     };
-    const read: SpoolLine[] = [];
+    const read: SpoolEntry[] = [];
     for await (const row of readSpool(source, "long.log")) read.push(row);
     assert.equal(read.length, 1);
-    assert.equal(read[0]!.pkHash, hash(7));
-    assert.equal(read[0]!.text, text);
+    assert.equal(read[0]!.envelope.k, hash(7));
+    assert.deepEqual(read[0]!.body, { kind: "inline", text });
     // Capacity is at most twice the line, so 3 x the line is a loose bound
     // for the reader's own state. Fragment lists measure tens of MB here.
     assert.ok(
@@ -194,25 +216,46 @@ describe("spool allocation chunks", () => {
     );
   });
 
+  // A pre-format-2 line (space at offset 64) read through the growable open
+  // line buffer keeps its old size measure: line bytes + 1 of the text after
+  // the key, and an envelope derived from the body.
+  it("parses a legacy line assembled from one-byte chunks with its legacy size", async () => {
+    const text = body("中🐟".repeat(40));
+    const legacy = `${hash(3)} ${text}\n`;
+    const bytes = encoder.encode(legacy);
+    const source: StreamSyncFiles = {
+      ...createMemoryStreamSyncFiles(),
+      async *readChunks() {
+        for (let i = 0; i < bytes.length; i += 1) yield bytes.slice(i, i + 1);
+      },
+    };
+    const read: SpoolEntry[] = [];
+    for await (const row of readSpool(source, "legacy.log")) read.push(row);
+    assert.equal(read.length, 1);
+    assert.equal(read[0]!.envelope.k, hash(3));
+    assert.equal(read[0]!.size, utf8Length(text) + 1);
+  });
+
   it("flush bytes match the joined reference across UTF-8 widths and surrogate boundaries", async () => {
     const { files, writes } = filesWithWrites(1);
     const rows = corpus.map((value, i) => ({
       key: hash(i),
-      text: line(value),
+      text: body(value),
     }));
     const expected = wire(rows);
     const chunkBytes = 113;
-    const longest = Math.max(...rows.map((r) => utf8Length(r.text) + 66));
+    const longest = Math.max(...rows.map((r) => lineBytes(r.key, r.text)));
     const writer = new SpoolWriter(files, chunkBytes);
     const { calls } = await observeEncoding(async () => {
       for (const row of rows)
-        await writer.add("run.log", row.key, row.text, utf8Length(row.text));
+        await writer.add("run.log", spoolLine(row.key, row.text));
       await writer.flush();
     });
     assert.deepEqual(await files.read("run.log"), expected);
     assertBound(calls, writes, chunkBytes, longest);
     const read = [];
-    for await (const row of readSpool(files, "run.log")) read.push(row.text);
+    for await (const row of readSpool(files, "run.log"))
+      read.push(row.body.kind === "inline" ? row.body.text : "");
     assert.deepEqual(
       read,
       rows.map((r) => r.text),
@@ -226,15 +269,15 @@ describe("spool allocation chunks", () => {
     const { files, writes } = filesWithWrites(3);
     const rows = Array.from({ length: 60 }, (_, i) => ({
       key: hash(i),
-      text: line("中🐟".repeat(12)),
+      text: body("中🐟".repeat(12)),
       path: `run${i % 6}.log`,
     }));
     const chunkBytes = 900;
-    const longest = Math.max(...rows.map((r) => utf8Length(r.text) + 66));
+    const longest = Math.max(...rows.map((r) => lineBytes(r.key, r.text)));
     const writer = new SpoolWriter(files, chunkBytes);
     const { calls } = await observeEncoding(async () => {
       for (const row of rows)
-        await writer.add(row.path, row.key, row.text, utf8Length(row.text));
+        await writer.add(row.path, spoolLine(row.key, row.text));
       await writer.flush();
     });
     for (const path of new Set(rows.map((row) => row.path)))
@@ -248,14 +291,18 @@ describe("spool allocation chunks", () => {
   it("derivation bounds UTF-8 bytes rather than UTF-16 code units", async () => {
     const { files, writes } = filesWithWrites(3);
     const dir = "spool";
+    // 3 UTF-8 bytes per CJK code unit. A line is ~833 bytes but ~467 UTF-16
+    // units. A UTF-16 counter would flush three lines (~2.5 KB) where the
+    // bound allows one chunk plus one line (~1.8 KB). The old 80-character
+    // payload had a ratio low enough for that overshoot to fit the bound.
     const rows = Array.from({ length: 30 }, (_, i) => ({
       key: hash(i),
-      text: line("中".repeat(80)),
+      text: body("中".repeat(200)),
     }));
     const expected = wire(rows);
     await files.write(spoolLogPath(dir), expected);
     const chunkBytes = 1024;
-    const longest = Math.max(...rows.map((r) => utf8Length(r.text) + 66));
+    const longest = Math.max(...rows.map((r) => lineBytes(r.key, r.text)));
     const { calls } = await observeEncoding(() =>
       deriveShards(files, dir, chunkBytes),
     );
@@ -266,29 +313,49 @@ describe("spool allocation chunks", () => {
   it("compaction writes bounded sorted winners identical to the old joined shard", async () => {
     const { files, writes } = filesWithWrites(1);
     const path = shardPath("spool", 0);
-    const winners = corpus.map((value, i) => ({
+    // Each winner has a distinct observedAt (o) and run (r) stamp. Its losers
+    // are: an equal-stamp loser that comes earlier in input, and an OLDER
+    // candidate that comes AFTER the winner. The older candidate has a larger
+    // run string, so run-before-observedAt ordering would also pick it. Each
+    // one only wins if compaction keeps the last-seen line or compares the
+    // stamps the wrong way round.
+    const winners: Row[] = corpus.map((value, i) => ({
       key: hash(i),
-      text: line(value),
+      text: body(value, 100 + i, "run-b"),
+      o: 100 + i,
+      r: "run-b",
     }));
-    // Reverse input order and include a losing older value and an equal-stamp
-    // loser. The later equal stamp wins, exactly as before this cut.
-    const input = [...winners]
+    const input: Row[] = corpus
+      .map((_, i) => i)
       .reverse()
-      .flatMap((w) => [
-        { key: w.key, text: line("older", 1) },
-        { key: w.key, text: line("tie loser") },
-        w,
-      ]);
+      .flatMap((i) => {
+        const key = hash(i);
+        const tie = {
+          key,
+          text: body("tie loser", 100 + i, "run-b"),
+          o: 100 + i,
+          r: "run-b",
+        };
+        const older = {
+          key,
+          text: body("older", 50 + i, "run-z"),
+          o: 50 + i,
+          r: "run-z",
+        };
+        return [tie, winners[i]!, older];
+      });
     await files.write(path, wire(input));
     const expected = wire(winners);
     const chunkBytes = 113;
-    const longest = Math.max(...winners.map((w) => utf8Length(w.text) + 66));
+    const longest = Math.max(
+      ...winners.map((w) => lineBytes(w.key, w.text, w.o, w.r)),
+    );
     const { result, calls } = await observeEncoding(() =>
       compactShard(files, path, 0, 1_000_000, chunkBytes),
     );
     assert.equal(
       result,
-      winners.reduce((n, w) => n + utf8Length(w.text) + 1, 0),
+      winners.reduce((n, w) => n + frameSize(w.key, w.text, w.o, w.r), 0),
     );
     assert.deepEqual(await files.read(path), expected);
     assert.ok(
@@ -298,136 +365,70 @@ describe("spool allocation chunks", () => {
     assertBound(calls, writes, chunkBytes, longest);
   });
 
-  it("excluded-record text lines use bounded encoding without a joined batch", async () => {
-    const { files, writes } = filesWithWrites();
-    const rows = corpus.map((value) =>
-      JSON.stringify({ stream: value, pkHash: hash(1), bytes: 9_000_000 }),
-    );
-    const expected = encoder.encode(rows.map((r) => r + "\n").join(""));
-    const chunkBytes = 113;
-    const longest = Math.max(...rows.map((r) => utf8Length(r) + 1));
-    const writer = new SpoolWriter(files, chunkBytes);
-    const { calls } = await observeEncoding(async () => {
-      for (const row of rows)
-        await writer.addLine("excluded.ndjson", row, utf8Length(row));
-      await writer.flush();
-    });
-    assert.deepEqual(await files.read("excluded.ndjson"), expected);
-    assertBound(calls, writes, chunkBytes, longest);
-  });
-
-  it("finishRun flushes excluded records in configured bounded batches", async () => {
-    const { StreamSyncWriter } = await import("./writer.js");
-    const { bindStreamSyncHome } = await import("./home.js");
-    const { streamSyncHashes } = await import("./crypto.js");
-    const memory = createMemoryStreamSyncFiles();
-    const runId = "excluded-chunks";
-    const stream = "rows-漢🐟";
-    const path = `runs/${runId}/excluded.ndjson`;
-    const threshold = 128;
-    const batches: number[] = [];
-    const events: string[] = [];
-    const files: StreamSyncFiles = {
-      ...memory,
-      async appendMany(entries) {
-        const bytes = entries
-          .filter((entry) => entry.path === path)
-          .reduce((sum, entry) => sum + entry.bytes.length, 0);
-        if (bytes > 0) {
-          batches.push(bytes);
-          events.push("append");
+  it("copies only linear bytes while assembling a long line from small chunks", async () => {
+    // A line that spans many 64-byte chunks is assembled in OpenLine. Growth by
+    // doubling copies each byte O(1) times. Growth by a fixed step copies
+    // O(n^2 / step) bytes, far over this budget.
+    const text = "t".repeat(256 * 1024);
+    const line = spoolLine(hash(7), text);
+    const bytes = encoder.encode(`${line}\n`);
+    const lineLength = bytes.length - 1;
+    const chunkBytes = 64;
+    const source: StreamSyncFiles = {
+      ...createMemoryStreamSyncFiles(),
+      async *readChunks() {
+        for (let i = 0; i < lineLength; i += chunkBytes) {
+          // Views keep input preparation out of the observed copy budget.
+          yield bytes.subarray(i, Math.min(i + chunkBytes, lineLength));
         }
-        await memory.appendMany(entries);
-      },
-      async sync(prefix) {
-        events.push(`sync:${prefix}`);
-        await memory.sync(prefix);
+        yield bytes.subarray(lineLength);
       },
     };
-    const unexpected = async (): Promise<never> => {
-      throw new Error("intake-only test unexpectedly invoked publication");
+    const set = Uint8Array.prototype.set;
+    let copiedBytes = 0;
+    const read: string[] = [];
+    Uint8Array.prototype.set = function (this: Uint8Array, array, offset) {
+      copiedBytes += array.length;
+      return set.call(this, array, offset);
     };
-    const ownerAddress = "0x1111111111111111111111111111111111111111";
-    const writer = new StreamSyncWriter({
-      ownerAddress,
-      home: bindStreamSyncHome({
-        ownerAddress,
-        network: "test",
-        open: () => files,
-      }),
-      registry: {
-        // declareStream reads the stream's control row (not a publication).
-        read: async () => ({ found: false }),
-        post: unexpected,
-        listControlRows: unexpected,
-      },
-      blobs: { get: unexpected, put: unexpected },
-      keys: {
-        namespaceHmac: async () => new Uint8Array(32),
-        encrypt: unexpected,
-        decrypt: unexpected,
-      },
-      signer: { signAddData: unexpected },
-      spoolFlushBytes: threshold,
-      now: () => 1,
-    });
-    await writer.beginRun({
-      runId,
-      connector: "test",
-      userConnect: false,
-      observedAt: 1,
-    });
-    await writer.declareStream(runId, stream, {
-      primaryKey: ["id"],
-      profile: { key: null, version: "1" },
-    });
-
-    const payload = "x".repeat(RECORD_LINE_LIMIT_BYTES);
-    let expected = "";
-    let largestLine = 0;
-    for (let id = 0; id < 5; id += 1) {
-      const record = { id, payload };
-      const bytes =
-        payload.length +
-        utf8Length(encodeLine({ o: 1, r: runId, v: { id, payload: "" } }));
-      const digest = await pkHash(streamSyncHashes.sha256, record, ["id"]);
-      const excluded = `${JSON.stringify({ stream, pkHash: digest, bytes })}\n`;
-      expected += excluded;
-      largestLine = Math.max(largestLine, utf8Length(excluded));
-      assert.equal(await writer.append(runId, stream, record), "too_large");
+    try {
+      for await (const entry of readSpool(source, "long.log"))
+        read.push(entry.line);
+    } finally {
+      Uint8Array.prototype.set = set;
     }
-
-    assert.deepEqual(batches, []);
-    const status = await writer.finishRun(runId, { checkpointCandidate: null });
-    assert.equal(status.phase, "ready");
-    assert.equal(status.streams[stream]?.recordTooLarge, 5);
-    assert.ok(utf8Length(expected) > threshold + largestLine);
-    assert.ok(batches.length > 1); // Kills RESTORE_EXCLUDED_JOIN in the writer.
-    for (const bytes of batches) assert.ok(bytes <= threshold + largestLine);
-    assert.deepEqual(await memory.read(path), encoder.encode(expected));
-    assert.deepEqual(events, [
-      ...batches.map(() => "append"),
-      `sync:runs/${runId}`,
-    ]);
+    assert.deepEqual(read, [line]);
+    // Count both input appends (1 x the line) and growth copies (< 2 x).
+    assert.ok(
+      copiedBytes <= 3 * lineLength,
+      `reader copied ${copiedBytes} bytes for a ${lineLength}-byte line`,
+    );
   });
 
   it("countShard counts exact UTF-8 bytes without encoding payloads", async () => {
     const { files } = filesWithWrites(1);
     const rows = corpus.map((value, i) => ({
       key: hash(i, i % 2),
-      text: line(value),
+      text: body(value),
     }));
     await files.write("a", wire(rows.slice(0, 4)));
     await files.write("b", wire(rows.slice(4)));
     const expected = new Array<number>(256).fill(0);
     for (const row of rows)
-      expected[parseInt(row.key.slice(2, 4), 16)]! +=
-        encoder.encode(row.text).length + 1;
+      expected[parseInt(row.key.slice(2, 4), 16)]! += frameSize(
+        row.key,
+        row.text,
+      );
     const { result, calls } = await observeEncoding(() =>
       countShard(files, ["a", "b"]),
     );
     assert.deepEqual(result, expected);
-    assert.deepEqual(calls, []); // Kills ALLOCATING_COUNT.
+    // Only envelopes are decoded; no payload is encoded (kills ALLOCATING_COUNT).
+    assert.ok(
+      calls.every(
+        (c) => c.kind === "encode" && c.input <= ENVELOPE_LIMIT_BYTES,
+      ),
+    );
   });
 
   it("empty flush, derivation, compaction and counting allocate no output buffers", async () => {
@@ -451,7 +452,7 @@ describe("spool allocation chunks", () => {
     for (const budget of [0, 1_000_000]) {
       const { files, writes } = filesWithWrites();
       const path = shardPath("spool", 0);
-      const expected = wire([{ key: hash(1), text: line("中🐟") }]);
+      const expected = wire([{ key: hash(1), text: body("中🐟") }]);
       await files.write(path, expected);
       assert.equal(await compactShard(files, path, 0, budget, 113), null);
       assert.deepEqual(await files.read(path), expected);

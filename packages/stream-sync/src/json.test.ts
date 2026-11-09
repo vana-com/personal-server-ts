@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { canonicalJson } from "./json.js";
+import {
+  canonicalJson,
+  canonicalJsonChunks,
+  JSON_CHUNK_UNITS,
+} from "./json.js";
 import { NonCanonicalValueError } from "./errors.js";
 
 describe("canonicalJson", () => {
@@ -44,5 +48,32 @@ describe("canonicalJson", () => {
     );
     expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
     expect(({} as Record<string, unknown>)["p"]).toBeUndefined();
+  });
+});
+
+describe("canonicalJsonChunks", () => {
+  const samples: unknown[] = [
+    null,
+    true,
+    -0,
+    1e21,
+    "a b\ud800c😀",
+    { b: [1, { z: null, a: "x" }], a: "y" },
+    { k: "𝟘".repeat(40_000), j: ["é".repeat(70_000)] },
+    { pad: "\u0001😀".repeat(30_000) },
+  ];
+  it.each(samples.map((s, i) => [i, s] as const))(
+    "joins to canonicalJson (sample %i)",
+    (_i, value) => {
+      const chunks = [...canonicalJsonChunks(value)];
+      expect(chunks.join("")).toBe(canonicalJson(value));
+      for (const c of chunks) {
+        expect(c.length).toBeLessThan(JSON_CHUNK_UNITS * 8);
+      }
+    },
+  );
+  it("rejects what canonicalJson rejects", () => {
+    expect(() => [...canonicalJsonChunks({ a: Number.NaN })]).toThrow();
+    expect(() => [...canonicalJsonChunks(new Date())]).toThrow();
   });
 });

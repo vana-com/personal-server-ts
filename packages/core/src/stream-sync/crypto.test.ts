@@ -33,6 +33,17 @@ describe("createStreamSyncKeyPorts", () => {
     expect(hex(back)).toBe(hex(clear));
   });
 
+  it("opens both part encodings and scopes the STREAM key per scope", async () => {
+    const keys = createStreamSyncKeyPorts(SIGNATURE);
+    const clear = new Uint8Array(200_000).map((_, i) => i % 251);
+    const stream = await keys.encryptPart("pdpp.c~.s", clear);
+    expect(stream[0]).toBe(0x56);
+    expect(hex(await keys.decrypt("pdpp.c~.s", stream))).toBe(hex(clear));
+    const pgp = await keys.encrypt("pdpp.c~.s", clear);
+    expect(hex(await keys.decrypt("pdpp.c~.s", pgp))).toBe(hex(clear));
+    await expect(keys.decrypt("pdpp.c~.other", stream)).rejects.toThrow();
+  });
+
   it("leaves the legacy master key on the raw signature bytes", () => {
     // Legacy keys are out of scope for normalization: encodings still differ.
     expect(hex(deriveMasterKey(HIGH_S))).not.toBe(

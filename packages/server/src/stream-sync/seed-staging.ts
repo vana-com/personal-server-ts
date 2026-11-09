@@ -25,7 +25,6 @@
  */
 
 import {
-  RECORD_LINE_LIMIT_BYTES,
   isPlainObject,
   pkHash,
   streamScope,
@@ -62,8 +61,6 @@ export interface StagedSeed {
   readonly records: number;
   /** Lines that were not a JSON object with every primary-key field. */
   readonly invalid: number;
-  /** Lines over the record limit (§2.2); never staged. */
-  readonly tooLarge: number;
 }
 
 export class SeedUploadError extends Error {
@@ -175,16 +172,15 @@ function parseDescriptor(text: string): SeedDescriptor {
 }
 
 /**
- * Split a byte stream into lines without holding more than `limit` bytes of
- * one line. A longer line is reported as `null` once its end arrives.
+ * Split a byte stream into lines. A line is held whole while it is parsed, so
+ * a very large record costs about its size here; the rows file is the only
+ * other place the seed keeps it.
  */
 async function* lines(
   body: AsyncIterable<Uint8Array>,
-  limit: number,
-): AsyncGenerator<Uint8Array | null> {
+): AsyncGenerator<Uint8Array> {
   let pending: Uint8Array[] = [];
   let pendingBytes = 0;
-  let skipping = false;
   const take = (tail: Uint8Array): Uint8Array => {
     const out = new Uint8Array(pendingBytes + tail.length);
     let at = 0;
@@ -202,31 +198,16 @@ async function* lines(
     for (;;) {
       const end = chunk.indexOf(NEWLINE, start);
       if (end < 0) break;
-      const tail = chunk.subarray(start, end);
-      if (skipping || pendingBytes + tail.length > limit) {
-        pending = [];
-        pendingBytes = 0;
-        skipping = false;
-        yield null;
-      } else {
-        yield take(tail);
-      }
+      yield take(chunk.subarray(start, end));
       start = end + 1;
     }
-    if (start < chunk.length && !skipping) {
+    if (start < chunk.length) {
       const rest = chunk.subarray(start);
-      if (pendingBytes + rest.length > limit) {
-        pending = [];
-        pendingBytes = 0;
-        skipping = true;
-      } else {
-        pending.push(rest.slice());
-        pendingBytes += rest.length;
-      }
+      pending.push(rest.slice());
+      pendingBytes += rest.length;
     }
   }
-  if (skipping) yield null;
-  else if (pendingBytes > 0) yield take(new Uint8Array());
+  if (pendingBytes > 0) yield take(new Uint8Array());
 }
 
 function randomId(): string {
@@ -321,8 +302,8 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
           const chunks = files.readChunks(
             `uploads/${pointer.upload}/rows.ndjson`,
           );
-          for await (const line of lines(chunks, Number.MAX_SAFE_INTEGER)) {
-            if (line === null || line.length === 0) continue;
+          for await (const line of lines(chunks)) {
+            if (line.length === 0) continue;
             yield JSON.parse(decoder.decode(line)) as Record<string, unknown>;
           }
         },
@@ -339,7 +320,6 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
         let seen = 0;
         let records = 0;
         let invalid = 0;
-        let tooLarge = 0;
         let batch: string[] = [];
         let batchBytes = 0;
         const flush = async () => {
@@ -350,23 +330,13 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
           batch = [];
           batchBytes = 0;
         };
-        for await (const line of lines(body, RECORD_LINE_LIMIT_BYTES)) {
+        for await (const line of lines(body)) {
           if (descriptor === null) {
-            if (line === null) {
-              throw new SeedUploadError(
-                "SEED_BAD_DESCRIPTOR",
-                "the first line is too long",
-              );
-            }
             descriptor = parseDescriptor(decoder.decode(line));
             continue;
           }
-          if (line !== null && line.length === 0) continue;
+          if (line.length === 0) continue;
           seen += 1;
-          if (line === null) {
-            tooLarge += 1;
-            continue;
-          }
           const text = decoder.decode(line);
           let value: unknown;
           try {
@@ -404,7 +374,6 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
           profile: descriptor.profile,
           records,
           invalid,
-          tooLarge,
         };
         await files.write(
           pointerPath(connector, stream),

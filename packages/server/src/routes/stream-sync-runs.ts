@@ -24,9 +24,17 @@ import {
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { TokenStore } from "../token-store.js";
 import { createServerApiAuth } from "../api-auth.js";
+import {
+  createBodyLimit,
+  DATA_INGEST_MAX_SIZE,
+} from "../middleware/body-limit.js";
 
-/** The same cap as one spool line (§2.2): a batch is at most 8 MiB. */
-export const MAX_BATCH_BYTES = 8 * 1024 * 1024;
+/**
+ * Ceiling on one batch request: the 512 MiB the legacy ingest routes allow. It
+ * guards the server against an unbounded upload; it is not a record limit.
+ * The body is read whole and parsed, so a batch costs a few times its size.
+ */
+export const MAX_BATCH_REQUEST_BYTES = DATA_INGEST_MAX_SIZE;
 
 export interface StreamSyncRunsRouteDeps {
   serverOrigin: string | (() => string);
@@ -41,11 +49,11 @@ export interface StreamSyncRunsRouteDeps {
 async function body(c: Context, limit: number): Promise<unknown> {
   const declared = Number(c.req.header("content-length") ?? 0);
   if (declared > limit) {
-    throw new RunIntakeError("invalid_request", "the body is over 8 MiB");
+    throw new RunIntakeError("invalid_request", "the body is too large");
   }
   const text = await c.req.text();
   if (text.length > limit) {
-    throw new RunIntakeError("invalid_request", "the body is over 8 MiB");
+    throw new RunIntakeError("invalid_request", "the body is too large");
   }
   try {
     return JSON.parse(text);
@@ -95,11 +103,13 @@ export function streamSyncRunsRoutes(deps: StreamSyncRunsRouteDeps): Hono {
       ),
     ),
   );
-  app.post("/:runId/batches", (c) =>
+  app.post("/:runId/batches", createBodyLimit(MAX_BATCH_REQUEST_BYTES), (c) =>
     answer(c, async () =>
       intake.batch(
         c.req.param("runId"),
-        (await body(c, MAX_BATCH_BYTES)) as Parameters<typeof intake.batch>[1],
+        (await body(c, MAX_BATCH_REQUEST_BYTES)) as Parameters<
+          typeof intake.batch
+        >[1],
       ),
     ),
   );

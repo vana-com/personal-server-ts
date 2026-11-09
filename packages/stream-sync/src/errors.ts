@@ -4,7 +4,7 @@
  *
  * Errors are for inputs a caller must never pass (a malformed name, a value
  * outside JSON). Expected outcomes of the protocol (`key_mismatch`,
- * `record_too_large`, `unsupported_format`, ...) are returned as values.
+ * `unsupported_format`, ...) are returned as values.
  */
 
 export type StreamSyncErrorCode =

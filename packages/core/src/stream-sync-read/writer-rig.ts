@@ -20,7 +20,7 @@ import { streamSyncHashes } from "../stream-sync/crypto.js";
 import { createWriterOverlaySource } from "../stream-sync/writer.js";
 import {
   decodeHead,
-  decodePart,
+  linesOfParts,
   headBlobName,
   partBlobName,
   parseScope,
@@ -361,19 +361,18 @@ export class Rig {
       if (decoded.kind !== "ok") throw new Error(`head: ${decoded.kind}`);
       const { head } = decoded;
       const lines: Line[] = [];
-      for (const part of head.parts) {
-        const blob = this.blobMap.get(
-          `${entry.scope}/${partBlobName(head.generation, part.hash)}`,
-        );
-        if (!blob) throw new Error("part blob is missing");
-        const clear = await ports.decrypt(entry.scope, blob);
-        const decodedPart = await decodePart(
-          streamSyncHashes.sha256,
-          clear,
-          part,
-          head.primaryKey,
-        );
-        lines.push(...decodedPart.map((d) => d.line));
+      for await (const line of linesOfParts(
+        streamSyncHashes.sha256,
+        head,
+        async (part) => {
+          const blob = this.blobMap.get(
+            `${entry.scope}/${partBlobName(head.generation, part.hash)}`,
+          );
+          if (!blob) throw new Error("part blob is missing");
+          return ports.decrypt(entry.scope, blob);
+        },
+      )) {
+        lines.push(line);
       }
       out.push({
         stream: parsed.stream,

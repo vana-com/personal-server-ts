@@ -16,6 +16,7 @@ import {
   NAMESPACE_KEY_LABEL,
   type HashPorts,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { isStreamAead, openBytes } from "../stream-sync/stream-aead.js";
 import { streamMasterKey } from "../keys/owner-master-key.js";
 import type { StorageAdapter } from "../storage/adapters/interface.js";
 import type { StreamSyncBlobReader, StreamSyncReadKeys } from "./ports.js";
@@ -45,7 +46,10 @@ export async function createStreamSyncReadKeys(
     hashes: streamSyncReadHashes,
     keyCheck,
     async decrypt(scope, cipher) {
-      return decryptWithPassword(cipher, hex(deriveScopeKey(masterKey, scope)));
+      const key = deriveScopeKey(masterKey, scope);
+      return isStreamAead(cipher)
+        ? openBytes(key, cipher)
+        : decryptWithPassword(cipher, hex(key));
     },
   };
 }

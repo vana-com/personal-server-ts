@@ -23,12 +23,16 @@ const LITE_DIR = join(here, "..");
 const CHILD = join(here, "test-support", "stream-sync-heap-child.ts");
 
 /**
- * Ratchet, not the target. Pre-cut baseline at 2k records: uniform 30,345 B/record,
- * skewed 103,826 B/record. After the cuts: ~27,100 and ~90,900. Budgets sit between the
- * two, so restoring the pre-cut writer path fails them.
+ * Ratchet, not the target. Format-1 (one NDJSON line per record) baseline at
+ * 2k records: pre-cut uniform 30,345 B/record, skewed 103,826 B/record; after
+ * the cuts ~27,100 and ~90,900. Format 2 frames every record (envelope, body
+ * hash, frame copy, STREAM encryption), so its measured cost is higher:
+ * ~61,000 uniform and ~120,500 skewed (stable to 1% over repeated runs).
+ * Budgets sit about 8% above those numbers, so a writer that keeps another
+ * copy of each record fails them.
  */
-const UNIFORM_BYTES_PER_RECORD_BUDGET = 29_000;
-const SKEWED_BYTES_PER_RECORD_BUDGET = 98_000;
+const UNIFORM_BYTES_PER_RECORD_BUDGET = 66_000;
+const SKEWED_BYTES_PER_RECORD_BUDGET = 130_000;
 
 async function allocPerRecord(spec: ScenarioSpec): Promise<RunReport> {
   const root = join(homedir(), ".tmp", "p3-oracle");

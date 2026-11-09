@@ -83,7 +83,7 @@ async function runChild(spec: ScenarioSpec, tag: string): Promise<RunReport> {
 /** Output checks that must pass before any memory number means anything. */
 function assertCorrect(report: RunReport): void {
   expect(report.outcome).toBe("committed");
-  expect(report.tooLargeSpooled).toBe(report.spec.kind === "big8" ? 1 : 0);
+  expect(report.tooLargeSpooled).toBe(0);
   expect(report.countOk).toBe(true);
   expect(report.digestOk).toBe(true);
   expect(report.outputCount).toBe(expectedCount(report.spec));
@@ -112,7 +112,7 @@ describe("stream-sync bounded writer (small twin, always)", () => {
     120_000,
   );
 
-  it("big8 twin: one 8 MiB record accepted, 9 MiB excluded", async () => {
+  it("big8 twin: 8 MiB and 9 MiB records both accepted", async () => {
     assertBounded(
       await runChild({ kind: "big8", records: 3 }, "big8-twin"),
       BIG8_BUDGET_BYTES,

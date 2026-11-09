@@ -26,7 +26,7 @@ import {
 import {
   PART_LIMIT_BYTES,
   decodeHead,
-  decodePart,
+  linesOfParts,
   partBlobName,
   streamScope,
   type Head,
@@ -230,20 +230,24 @@ export async function verifyPublished(
   const seen = new Uint8Array(c.distinct);
   let seenCount = 0;
   let maxPartBytes = 0;
+  const sizes = new Map<string, number>();
   for (const part of head.parts) {
     if (part.bytes > P) throw new Error(`part ${part.hash} exceeds P`);
     maxPartBytes = Math.max(maxPartBytes, part.bytes);
+    sizes.set(part.hash, part.bytes);
+  }
+  const loadPart = async (part: Head["parts"][number]) => {
     const name = `${out.scope}/${partBlobName(out.generation, part.hash)}`;
     const cipher = await blobs.get(name);
     if (!cipher) throw new Error(`part ${part.hash} is missing`);
-    const clear = await keys.decrypt(out.scope, cipher);
-    const lines = await decodePart(
+    return keys.decrypt(out.scope, cipher);
+  };
+  {
+    for await (const line of linesOfParts(
       streamSyncHashes.sha256,
-      clear,
-      part,
-      SHAPE.primaryKey,
-    );
-    for (const { line } of lines) {
+      head,
+      loadPart,
+    )) {
       const id = line.v.id;
       if (typeof id !== "string" || !/^k\d{8}$/.test(id)) {
         throw new Error(`record id ${JSON.stringify(id)} is not a key`);

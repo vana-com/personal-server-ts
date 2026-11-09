@@ -1,5 +1,9 @@
 /**
- * Run spool (§2.6). A spool line is `<pkHash> <canonical line>\n`.
+ * Run spool (§2.6). A spool line is `<k>\t<envelope>\t<body>\n`: the key hash,
+ * the frame's canonical envelope, and then either the body itself (canonical
+ * JSON) or `@<path>`, the file that holds a body too long to keep on a line.
+ * Canonical JSON escapes control characters, so neither the TAB nor the LF
+ * can occur inside an envelope or a body.
  *
  * Intake appends every line of a stream to one intake log, `<dir>.log`, in
  * bounded batches, so intake memory does not grow with the stream. The log
@@ -7,23 +11,31 @@
  * (`StreamSyncFiles.sync`). One file per stream means one fsync per stream,
  * not one per shard.
  *
- * The 256 shard files of `<dir>/<hh>`, keyed by the first pkHash byte, are
+ * The 256 shard files of `<dir>/<hh>`, keyed by the first key-hash byte, are
  * derived from the log (`deriveShards`) when a run is planned. They are
  * never synced and can be derived again at any time. The byte count of a
- * shard counts each canonical line plus its terminator, the same measure as
- * part bytes, so the planner can sum shard counts as run bytes.
+ * shard counts each frame (envelope, body and their two terminators), the
+ * same measure as part bytes, so the planner can sum shard counts as run
+ * bytes. A body file stays where intake wrote it; shards copy the line, not
+ * the body.
  */
 
 import {
-  BucketReducer,
+  decodeEnvelope,
+  encodeEnvelope,
+  frameBytes,
+  FrameReducer,
   SHARD_COUNT,
   shardOf,
+  type Envelope,
   utf8Length,
-  type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { sha256 } from "@noble/hashes/sha2";
+import { bytesToHex } from "@noble/hashes/utils";
 import type { StreamSyncFiles } from "./ports.js";
 
 const encoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 /**
  * The UTF-8 bytes of `lines` in one buffer. Joining them first would hold the
@@ -40,6 +52,8 @@ function encodeLines(lines: readonly string[]): Uint8Array {
 }
 /** Default spool flush threshold: buffered lines written per append batch. */
 export const FLUSH_BYTES = 8 * 1024 * 1024;
+/** A body longer than this goes to its own file instead of onto its line. */
+export const INLINE_BODY_BYTES = 1024 * 1024;
 
 export function shardName(shard: number): string {
   return shard.toString(16).padStart(2, "0");
@@ -54,8 +68,97 @@ export function spoolLogPath(dir: string): string {
   return `${dir}.log`;
 }
 
+/** Directory of the body files of the spool whose shards live under `dir`. */
+export function spoolBodyDir(dir: string): string {
+  return `${dir}.bodies`;
+}
+
 export function emptyShardBytes(): number[] {
   return new Array<number>(SHARD_COUNT).fill(0);
+}
+
+/** One spool line, parsed. A body kept in a file is not read. */
+export interface SpoolEntry {
+  readonly envelope: Envelope;
+  /** Frame size: envelope, LF, body, LF. */
+  readonly size: number;
+  /** The raw line without its terminator, for copying between files. */
+  readonly line: string;
+  readonly body:
+    | { readonly kind: "inline"; readonly text: string }
+    | { readonly kind: "file"; readonly path: string };
+}
+
+function envelopeText(envelope: Envelope): string {
+  return textDecoder.decode(encodeEnvelope(envelope));
+}
+
+/** The spool line of a frame whose body is held on the line. */
+export function inlineSpoolLine(envelope: Envelope, bodyText: string): string {
+  return `${envelope.k}\t${envelopeText(envelope)}\t${bodyText}`;
+}
+
+/** The spool line of a frame whose body is in the file at `path`. */
+export function fileSpoolLine(envelope: Envelope, path: string): string {
+  return `${envelope.k}\t${envelopeText(envelope)}\t@${path}`;
+}
+
+/**
+ * A line written before format 2: `<k> <canonical {"o":..,"r":..,"v":BODY}>`
+ * (a space at offset 64, not a TAB). A run that was durable and ready before
+ * the upgrade holds such lines, and the upgrade must still publish and
+ * overlay it. The envelope is derived from the line, as `frameOfLine` does
+ * for a format-1 part. `size` keeps the old measure (line bytes + 1), the
+ * one the persisted shard totals and the overlay log byte count were written
+ * in, so those totals stay true. The planner tolerates the few bytes by which
+ * this differs from the frame size.
+ */
+function parseLegacySpoolLine(line: string): SpoolEntry {
+  const k = line.slice(0, 64);
+  const text = line.slice(65);
+  const at = text.indexOf(',"v":');
+  if (at === -1 || !text.endsWith("}")) throw new Error("malformed spool line");
+  const head = JSON.parse(text) as { o: number; r: string };
+  const bodyText = text.slice(at + 5, -1);
+  const body = encoder.encode(bodyText);
+  const envelope: Envelope = {
+    h: bytesToHex(sha256(body)),
+    k,
+    n: body.length,
+    o: head.o,
+    r: head.r,
+  };
+  return {
+    envelope,
+    size: encoder.encode(text).length + 1,
+    line,
+    body: { kind: "inline", text: bodyText },
+  };
+}
+
+/** Parse one spool line (no terminator). Reads the legacy form too. */
+export function parseSpoolLine(line: string): SpoolEntry {
+  const first = line.indexOf("\t");
+  if (first !== 64 && line.charCodeAt(64) === 0x20 && line.indexOf("\t") < 0) {
+    return parseLegacySpoolLine(line);
+  }
+  const second = line.indexOf("\t", first + 1);
+  if (first !== 64 || second === -1) throw new Error("malformed spool line");
+  const envelope = decodeEnvelope(
+    encoder.encode(line.slice(first + 1, second)),
+  );
+  if (envelope.k !== line.slice(0, 64)) {
+    throw new Error("spool line key does not match its envelope");
+  }
+  const rest = line.slice(second + 1);
+  return {
+    envelope,
+    size: frameBytes(envelope),
+    line,
+    body: rest.startsWith("@")
+      ? { kind: "file", path: rest.slice(1) }
+      : { kind: "inline", text: rest },
+  };
 }
 
 /** Buffered appender for the intake logs of a run. */
@@ -69,25 +172,15 @@ export class SpoolWriter {
     private readonly flushBytes: number = FLUSH_BYTES,
   ) {}
 
-  /** Queue one line. `bytes` is the canonical line's UTF-8 length. */
-  async add(
-    logPath: string,
-    pkHash: string,
-    text: string,
-    bytes: number,
-  ): Promise<void> {
-    await this.addLine(logPath, `${pkHash} ${text}`, bytes + 65);
-  }
-
-  /** Queue a text line without a key prefix. `bytes` excludes its terminator. */
-  async addLine(logPath: string, text: string, bytes: number): Promise<void> {
+  /** Queue one spool line (no terminator). */
+  async add(logPath: string, line: string): Promise<void> {
     let buffer = this.buffers.get(logPath);
     if (!buffer) {
       buffer = [];
       this.buffers.set(logPath, buffer);
     }
-    buffer.push(`${text}\n`);
-    this.buffered += bytes + 1;
+    buffer.push(`${line}\n`);
+    this.buffered += utf8Length(line) + 1;
     if (this.buffered >= this.flushBytes) await this.flush();
   }
 
@@ -144,31 +237,25 @@ export async function deriveShards(
       })),
     );
   };
-  for await (const line of readSpool(files, spoolLogPath(dir))) {
-    const shard = shardOf(line.pkHash);
+  for await (const entry of readSpool(files, spoolLogPath(dir))) {
+    const shard = shardOf(entry.envelope.k);
     let buffer = buffers.get(shard);
     if (!buffer) {
       buffer = [];
       buffers.set(shard, buffer);
     }
-    buffer.push(`${line.pkHash} ${line.text}\n`);
-    buffered += utf8Length(line.text) + 66;
+    buffer.push(`${entry.line}\n`);
+    buffered += utf8Length(entry.line) + 1;
     if (buffered >= flushBytes) await flush();
   }
   await flush();
 }
 
-export interface SpoolLine {
-  readonly pkHash: string;
-  /** Canonical line text, no terminator. */
-  readonly text: string;
-}
-
-/** The lines of one spool shard file, in file order. */
+/** The entries of one spool file, in file order. */
 export async function* readSpool(
   files: StreamSyncFiles,
   path: string,
-): AsyncGenerator<SpoolLine> {
+): AsyncGenerator<SpoolEntry> {
   // ignoreBOM keeps a U+FEFF in the decoded text. A decoder strips a BOM at the
   // start of every decode call, so a per-line decode would strip one from every
   // line. The whole-file decoder strips only the file's first BOM; match that.
@@ -252,35 +339,14 @@ class OpenLine {
   }
 }
 
-function parseSpoolLine(raw: string): SpoolLine {
-  const space = raw.indexOf(" ");
-  if (space !== 64) throw new Error("malformed spool line");
-  return { pkHash: raw.slice(0, 64), text: raw.slice(65) };
-}
-
-const STAMP = /^\{"o":(\d+),"r":("(?:[^"\\]|\\.)*"),"v":/;
-
-/**
- * The `(o, r)` stamp of a canonical line, read from its fixed prefix so the
- * record itself is not parsed. The reducer compares stamps only.
- */
-export function lineStamp(text: string): Line {
-  const match = STAMP.exec(text);
-  if (!match) throw new Error("spool line is not a canonical line");
-  return {
-    o: Number(match[1]),
-    r: JSON.parse(match[2]!) as string,
-    v: {},
-  };
-}
-
 /**
  * Rewrite one shard with its winning lines only, so the planner's estimate
- * stops counting repeated keys. The reduce uses the package reducer. It
- * gives up and keeps the shard as it is once the winners would pass
- * `budgetBytes`, so compaction memory stays bounded.
+ * stops counting repeated keys. The reduce uses the package reducer, which
+ * reads envelopes only. It gives up and keeps the shard as it is once the
+ * winners' lines would pass `budgetBytes`, so compaction memory stays
+ * bounded.
  *
- * Returns the new byte count, or `null` when the shard was kept.
+ * Returns the new byte count (frame bytes), or `null` when the shard was kept.
  */
 export async function compactShard(
   files: StreamSyncFiles,
@@ -290,40 +356,48 @@ export async function compactShard(
   flushBytes: number = FLUSH_BYTES,
 ): Promise<number | null> {
   const prefix = shard.toString(2).padStart(8, "0");
-  const reducer = new BucketReducer(prefix);
-  let seenBytes = 0;
+  const reducer = new FrameReducer<string>(prefix);
+  let seenChars = 0;
   let seenLines = 0;
-  for await (const line of readSpool(files, path)) {
+  for await (const entry of readSpool(files, path)) {
     seenLines += 1;
-    seenBytes += line.text.length + 1;
-    reducer.add(line.pkHash, lineStamp(line.text), line.text);
+    seenChars += entry.line.length + 1;
+    reducer.add({
+      k: entry.envelope.k,
+      o: entry.envelope.o,
+      r: entry.envelope.r,
+      size: entry.size,
+      held: true,
+      ref: entry.line,
+    });
     // Average line size times distinct keys: an estimate of winner bytes.
-    if ((reducer.size * seenBytes) / seenLines > budgetBytes) return null;
+    if ((reducer.size * seenChars) / seenLines > budgetBytes) return null;
   }
   const result = reducer.finish(Number.MAX_SAFE_INTEGER);
   if (result.kind !== "ok") return null;
   if (result.winners.length === seenLines) return null;
+  let bytes = 0;
+  for (const w of result.winners) bytes += w.size;
   // Replace the shard without a durable write per file: the run is still
   // collecting, and its one `sync` follows the last compaction (§2.6). A stop
   // between the two calls fails the run, as any stop while collecting does.
   await files.remove(path);
   const writer = new SpoolWriter(files, flushBytes);
-  for (const winner of result.winners)
-    await writer.add(path, winner.pkHash, winner.text, utf8Length(winner.text));
+  for (const winner of result.winners) await writer.add(path, winner.ref);
   await writer.flush();
-  return result.bytes;
+  return bytes;
 }
 
-/** Bytes per second pkHash byte for one shard: the planner's counting pass. */
+/** Bytes per second key-hash byte for one shard: the planner's counting pass. */
 export async function countShard(
   files: StreamSyncFiles,
   paths: readonly string[],
 ): Promise<number[]> {
   const counts = emptyShardBytes();
   for (const path of paths) {
-    for await (const line of readSpool(files, path)) {
-      const second = parseInt(line.pkHash.slice(2, 4), 16);
-      counts[second]! += utf8Length(line.text) + 1;
+    for await (const entry of readSpool(files, path)) {
+      const second = parseInt(entry.envelope.k.slice(2, 4), 16);
+      counts[second]! += entry.size;
     }
   }
   return counts;

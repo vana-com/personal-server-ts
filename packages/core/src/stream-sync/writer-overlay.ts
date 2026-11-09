@@ -1,7 +1,9 @@
 /** Pinned intake logs from the existing, exclusively owned writer home. */
 import {
-  decodeLine,
   pkHash,
+  sha256Hex,
+  type JsonObject,
+  type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type {
   StreamSyncOverlayRun,
@@ -16,7 +18,7 @@ import {
   type StreamFloor,
 } from "./publish-plan.js";
 import type { StreamSyncFiles } from "./ports.js";
-import { readSpool } from "./spool.js";
+import { readSpool, type SpoolEntry } from "./spool.js";
 import type { StreamSyncWriter } from "./writer.js";
 
 export function createWriterOverlaySource(
@@ -78,18 +80,23 @@ export function pinnedWriterSnapshot(
       if (released || !log)
         throw new Error("stream is not in this live overlay snapshot");
       let bytes = 0;
-      for await (const raw of readSpool(files, log.path)) {
+      for await (const entry of readSpool(files, log.path)) {
         if (released) throw new Error("overlay snapshot was released");
-        const line = decodeLine(raw.text);
+        const { envelope } = entry;
+        // This consumer needs an object, so it holds a whole body: the
+        // spool chunks, their join, the decoded text and the parsed value are
+        // alive together (about 3x the record). It is not a streaming path.
+        const v = await parseBody(files, entry);
+        const line: Line = { o: envelope.o, r: envelope.r, v };
         if (
           line.o !== run.observedAt ||
           line.r !== run.runId ||
           (await pkHash(streamSyncHashes.sha256, line.v, log.primaryKey)) !==
-            raw.pkHash
+            envelope.k
         ) {
           throw new Error("overlay spool integrity mismatch");
         }
-        bytes += new TextEncoder().encode(raw.text).length + 1;
+        bytes += entry.size;
         yield line;
       }
       if (bytes !== log.bytes)
@@ -101,4 +108,45 @@ export function pinnedWriterSnapshot(
       unpin();
     },
   });
+}
+
+/**
+ * The body the entry's envelope describes. The envelope names the body's
+ * length (`n`) and SHA-256 (`h`); a body that differs, whether the file was
+ * damaged or replaced, fails the read before any record is built from it.
+ */
+async function parseBody(
+  files: StreamSyncFiles,
+  entry: SpoolEntry,
+): Promise<JsonObject> {
+  let bytes: Uint8Array;
+  if (entry.body.kind === "inline") {
+    bytes = new TextEncoder().encode(entry.body.text);
+  } else {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of files.readChunks(entry.body.path)) {
+      chunks.push(chunk);
+    }
+    bytes = await joinChunks(chunks);
+  }
+  const { envelope } = entry;
+  if (
+    bytes.length !== envelope.n ||
+    (await sha256Hex(streamSyncHashes.sha256, bytes)) !== envelope.h
+  ) {
+    throw new Error("overlay spool integrity mismatch");
+  }
+  return JSON.parse(new TextDecoder().decode(bytes)) as JsonObject;
+}
+
+async function joinChunks(chunks: readonly Uint8Array[]): Promise<Uint8Array> {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
 }

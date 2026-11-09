@@ -14,6 +14,7 @@ import {
   canonicalBytes32,
   classifyControl,
   classifyStreamRow,
+  checkPartBytes,
   decodePart,
   headBlobName,
   partBlobName,
@@ -265,7 +266,7 @@ export class StreamSyncImporter {
       case "key_mismatch":
         throw new Problem("key_mismatch", "head was written with another key");
       case "unsupported_format":
-        throw new Problem("unsupported_format", "head format is not 1");
+        throw new Problem("unsupported_format", "head format is not 1 or 2");
       default:
         throw new Problem("corrupt", `head ${verified.kind}`);
     }
@@ -282,12 +283,18 @@ export class StreamSyncImporter {
           throw new Problem("blob_missing", "part blob not found");
         const partClear = await decrypt(keys, scope, partCipher);
         try {
-          await decodePart(
-            keys.hashes.sha256,
-            partClear,
-            part,
-            head.primaryKey,
-          );
+          if (head.format === 1) {
+            await decodePart(
+              keys.hashes.sha256,
+              partClear,
+              part,
+              head.primaryKey,
+            );
+          } else {
+            // Format 2: the part hash commits to the bytes. Frame structure
+            // spans parts, so it is checked as the view is read.
+            await checkPartBytes(keys.hashes.sha256, partClear, part);
+          }
         } catch (error) {
           throw new Problem("corrupt", `part: ${(error as Error).message}`);
         }

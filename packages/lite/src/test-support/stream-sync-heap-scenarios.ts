@@ -26,7 +26,7 @@ export type ScenarioKind =
   | "repeated"
   /** Unique keys, ~70-byte lines: the entry-count stress. */
   | "tiny"
-  /** One record just under the 8 MiB line limit, one just over (excluded). */
+  /** One record just under 8 MiB and one of 9 MiB (a long frame, accepted). */
   | "big8";
 
 export const REPEATED_KEYS = 1000;
@@ -117,14 +117,12 @@ export function isWinner(spec: ScenarioSpec, seq: number): boolean {
   if (spec.kind === "repeated") {
     return seq >= spec.records - REPEATED_KEYS;
   }
-  if (spec.kind === "big8") return seq !== 1;
   return true;
 }
 
 /** How many lines the output holds. */
 export function expectedCount(spec: ScenarioSpec): number {
   if (spec.kind === "repeated") return Math.min(REPEATED_KEYS, spec.records);
-  if (spec.kind === "big8") return spec.records - 1;
   return spec.records;
 }
 

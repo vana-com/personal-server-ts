@@ -46,7 +46,7 @@ import {
   classifyStreamRow,
   controlHashes,
   controlScope,
-  decodePart,
+  linesOfParts,
   deriveKeyCheck,
   isHeadLive,
   partBlobName,
@@ -493,6 +493,11 @@ export async function runScenario(
       sampler.sample("keys.encrypt"); // clear part and cipher both alive
       return cipher;
     },
+    async encryptPart(scope, clear) {
+      const cipher = await baseKeys.encryptPart(scope, clear);
+      sampler.sample("keys.encrypt"); // clear part and cipher both alive
+      return cipher;
+    },
   };
   const account = privateKeyToAccount(OWNER_KEY);
   const signer = createServerSigner(
@@ -594,7 +599,7 @@ export async function runScenario(
  * Verify the published stream the way a real reader does: the head is the one
  * the registry's dataHash names, checked by verifyHead; the head is live (the
  * control row is active at the head's generation and the stream row is not
- * tombstoned, by isHeadLive); every part is checked by decodePart (SHA-256,
+ * tombstoned, by isHeadLive); every part is checked by linesOfParts (SHA-256,
  * byte length, line count, primary-key placement); and the verified line total
  * must equal the head's recordCount. Any failure throws, so a wrong published
  * state fails the run instead of reporting expected totals.
@@ -649,20 +654,22 @@ async function verify(
   for (const part of head.parts) {
     parts += 1;
     partBytesMax = Math.max(partBytesMax, part.bytes);
-    const cipher = await blobs.get(
-      `${scope}/${partBlobName(head.generation, part.hash)}`,
-    );
-    if (!cipher) throw new Error(`oracle: part ${part.hash} is missing`);
-    const lines = await decodePart(
-      streamSyncHashes.sha256,
-      await keys.decrypt(scope, cipher),
-      part,
-      head.primaryKey,
-    );
-    for (const { line } of lines) {
-      digest.add(outputLine(line.o, line.r, line.v));
-      outputCount += 1;
-    }
+  }
+  // linesOfParts reads format 1 and format 2 parts alike and checks size,
+  // SHA-256, key order, prefix and frame counts of every part it loads.
+  for await (const line of linesOfParts(
+    streamSyncHashes.sha256,
+    head,
+    async (part) => {
+      const cipher = await blobs.get(
+        `${scope}/${partBlobName(head.generation, part.hash)}`,
+      );
+      if (!cipher) throw new Error(`oracle: part ${part.hash} is missing`);
+      return keys.decrypt(scope, cipher);
+    },
+  )) {
+    digest.add(outputLine(line.o, line.r, line.v));
+    outputCount += 1;
   }
   if (outputCount !== head.recordCount) {
     throw new Error(

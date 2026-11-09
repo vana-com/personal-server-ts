@@ -2,7 +2,6 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { RECORD_LINE_LIMIT_BYTES } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createFsStreamSyncFiles } from "./fs-files.js";
 import { createSeedStaging, type SeedStaging } from "./seed-staging.js";
 
@@ -42,18 +41,23 @@ describe("seed staging", () => {
     ).toBe(id);
   });
 
-  it("skips a line over the record limit without holding it, across chunk borders", async () => {
+  it("stages a 9 MiB record like any other, across chunk borders", async () => {
     const big = JSON.stringify({
       id: "big",
-      pad: "x".repeat(RECORD_LINE_LIMIT_BYTES),
+      pad: "x".repeat(9 * 1024 * 1024),
     });
     const text = [DESCRIPTOR, '{"id":"a"}', big, '{"id":"b"}'].join("\n");
     const seed = await staging.stage("c", "s", pieces(text, 64 * 1024 + 7));
-    expect(seed).toMatchObject({ records: 2, invalid: 0, tooLarge: 1 });
+    expect(seed).toMatchObject({ records: 3, invalid: 0 });
     const source = staging.source("install", async () => ({}));
     const rows = [];
     for await (const row of source.records("c", "s")) rows.push(row);
-    expect(rows).toEqual([{ id: "a" }, { id: "b" }]);
+    expect(rows.map((r) => (r as { id: string }).id)).toEqual([
+      "a",
+      "big",
+      "b",
+    ]);
+    expect((rows[1] as { pad: string }).pad.length).toBe(9 * 1024 * 1024);
     expect(await source.streams("c")).toEqual([
       {
         stream: "s",
