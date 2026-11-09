@@ -6,6 +6,7 @@
  */
 import { expect, it } from "vitest";
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { ask } from "../stream-sync-read/service-fixture.js";
 import {
   Rig,
   CONNECTOR,
@@ -149,4 +150,34 @@ it("a delete that lists nothing clears the saved cursor, so the next import star
   expect(answered.deleteId).toEqual(expect.any(String));
   expect((await r.writer.runPlan(CONNECTOR)).checkpoint).toBeNull();
   expect((await persistedState(r)).deletes ?? {}).toEqual({});
+});
+
+it("a second delete after a reconnect deletes the reconnect, not the old plan (mutant: REUSE_OPEN_INTENT)", async () => {
+  const r = await publishedBase();
+  // The first delete reaches the registry never: A is offline, its intent stays.
+  r.gateway.beforePost = async () => {
+    throw new Error("registry down");
+  };
+  const first = await r.writer.requestConnectionDelete(CONNECTOR);
+  await r.publish();
+  expect((await persistedState(r)).deletes?.[CONNECTOR]?.id).toBe(
+    first.deleteId,
+  );
+  r.gateway.beforePost = undefined;
+  // Meanwhile another device deletes the connection, reconnects and syncs.
+  await r.other.deleteConnection(CONNECTOR);
+  const onB = { otherDevice: true, userConnect: true };
+  await r.collect({ ...spec("learn", true), ...onB });
+  await r.collect({ ...spec("reborn", true), ...onB });
+  expect(await r.registeredHead()).toMatchObject({ recordCount: 2 });
+  // A is back; the user deletes again. The registry has moved since the first
+  // intent, so this delete is a new one and must erase what is there now.
+  const second = await r.writer.requestConnectionDelete(CONNECTOR);
+  await r.publish();
+  expect(await r.registeredHead()).toMatchObject({ recordCount: 0 });
+  await r.sync();
+  const served = await r.service.resolve(ask("pdpp.acme.items"));
+  expect(["view", "local_pending"]).not.toContain(served.kind);
+  expect((await persistedState(r)).deletes ?? {}).toEqual({});
+  expect(second.deleteId).not.toBe(first.deleteId);
 });

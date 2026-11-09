@@ -212,6 +212,36 @@ interface DeleteIntent {
   readonly streamsLanded?: true;
 }
 
+/** What a delete of one connector would erase, read from the registry. */
+interface DeletePlan {
+  readonly pins: readonly DeletePin[];
+  readonly streams: StreamPin[];
+  /** Stream rows the registry lists (declared rowless streams not counted). */
+  readonly registered: number;
+}
+
+/** True when `plan` erases the same rows, in the same control states, as `intent`. */
+function sameDeletePlan(intent: DeleteIntent, plan: DeletePlan): boolean {
+  const pinKey = (pin: DeletePin) => `${pin.ns}:${pin.version}`;
+  const sameSet = (a: readonly string[], b: readonly string[]) =>
+    a.length === b.length && a.every((key) => b.includes(key));
+  if (
+    !sameSet(intent.pins.map(pinKey), plan.pins.map(pinKey)) ||
+    intent.streams === undefined ||
+    intent.streams.length !== plan.streams.length
+  ) {
+    return false;
+  }
+  return plan.streams.every((planned) =>
+    intent.streams!.some(
+      (saved) =>
+        saved.ns === planned.ns &&
+        saved.stream === planned.stream &&
+        sameControl(saved.control, planned.control),
+    ),
+  );
+}
+
 interface WriterState {
   version: 1;
   needsFull: NeedsFull;
@@ -831,7 +861,9 @@ export class StreamSyncWriter {
    * The landing then runs on the publish queue after this resolves; if it
    * fails, the intent stays and every later publish pass finishes it
    * (`resumeDeletes`). An open intent of the connector is reused, not
-   * replaced, so the id names the delete that is actually in flight. When the
+   * replaced while the registry still matches its plan, so the id names the
+   * delete that is actually in flight; once the registry has moved, a new
+   * intent replaces it (the old one's work is part of the new plan). When the
    * registry lists nothing of the connector there is nothing to land: this
    * device's local state is purged at once and the id names a delete that is
    * already done.
@@ -841,7 +873,13 @@ export class StreamSyncWriter {
   ): Promise<{ readonly deleteId: string }> {
     const intent = await this.publish(async () => {
       const open = (await this.readState()).deletes?.[connector];
-      return open ?? (await this.persistDeleteIntent(connector));
+      const plan = await this.planDelete(connector);
+      // The open intent stands only while the registry still matches the plan
+      // it was made from. If a reconnect (on any device) moved a control row
+      // or added a stream since, reusing it would erase nothing of what the
+      // owner now sees, and the answer would name a delete that is not theirs.
+      if (open && sameDeletePlan(open, plan)) return open;
+      return this.persistDeleteIntent(connector, plan);
     });
     if (!intent) return { deleteId: globalThis.crypto.randomUUID() };
     // A landing that fails here is not lost: the intent stays on disk and the
@@ -862,7 +900,36 @@ export class StreamSyncWriter {
    */
   private async persistDeleteIntent(
     connector: string,
+    plan?: DeletePlan,
   ): Promise<DeleteIntent | null> {
+    const { pins, streams, registered } =
+      plan ?? (await this.planDelete(connector));
+    if (pins.length === 0 && registered === 0) {
+      await this.purgeConnector(connector, []);
+      await this.withState((state) => {
+        delete state.seedTargets[connector];
+        // An open intent of an earlier plan is void: nothing is left to erase.
+        delete state.deletes?.[connector];
+      });
+      return null;
+    }
+    const intent: DeleteIntent = {
+      id: globalThis.crypto.randomUUID(),
+      pins,
+      streams,
+    };
+    await this.withState((state) => {
+      (state.deletes ??= {})[connector] = intent;
+    });
+    return intent;
+  }
+
+  /**
+   * What a delete of `connector` would erase now, from the registry: the
+   * pinned control rows and every stream row (listed, or declared with no
+   * row yet). `registered` counts the listed stream rows only.
+   */
+  private async planDelete(connector: string): Promise<DeletePlan> {
     const pins: DeletePin[] = [];
     // The control state of each namespace as the pin loop read it. A stream
     // pins this state, never a later read: a reconnect between the two reads
@@ -902,22 +969,7 @@ export class StreamSyncWriter {
       }
       this.addRowlessStreams(connector, streams, controls);
     }
-    if (pins.length === 0 && registered === 0) {
-      await this.purgeConnector(connector, []);
-      await this.withState((state) => {
-        delete state.seedTargets[connector];
-      });
-      return null;
-    }
-    const intent: DeleteIntent = {
-      id: globalThis.crypto.randomUUID(),
-      pins,
-      streams,
-    };
-    await this.withState((state) => {
-      (state.deletes ??= {})[connector] = intent;
-    });
-    return intent;
+    return { pins, streams, registered };
   }
 
   /**
