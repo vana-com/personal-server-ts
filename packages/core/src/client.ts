@@ -1,5 +1,9 @@
 import type { ReplicationDoorStatus } from "./replication/door.js";
 import type { ReplicaWriterRotation } from "./replication/writer-identity.js";
+import type {
+  ModeDecision,
+  ModeEvidenceInput,
+} from "./sync/account-mode/index.js";
 import {
   buildWeb3SignedHeader,
   type DataFileEnvelope,
@@ -249,6 +253,13 @@ export interface PersonalServerHandle {
     status(): ReplicationDoorStatus;
     writerRotation?(): ReplicaWriterRotation;
   };
+  /**
+   * Give the account-mode module the Account's answer for this server's
+   * owner, as a host does after sign-in and at every launch. Until a fresh
+   * explicit answer arrives the server refuses legacy reads and writes with a
+   * retryable 503. Absent on a runtime that takes evidence another way.
+   */
+  submitAccountModeEvidence?(input: ModeEvidenceInput): Promise<ModeDecision>;
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
   info(): Promise<PersonalServerInfo>;
   prepareRegistration(

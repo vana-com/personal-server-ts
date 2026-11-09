@@ -27,12 +27,16 @@ import {
   type DeviceSessionStore,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  decisionBody,
+  parseEvidenceBody,
+  type ModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import {
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
   handlePersonalServerScopeUploadAppend,
   refuseLegacyWrite,
-  legacyWriteSwitchOf,
   type AccountStorageMode,
   type OwnedAccountStorageMode,
   accountStorageModeFor,
@@ -162,12 +166,18 @@ export interface PsLiteRuntimeOptions {
   };
   saveConfig?: (config: unknown) => Promise<void>;
   /**
-   * The account's storage mode, built once by the host (see
-   * `createAccountStorageMode`). The legacy write gate, the data routes and
-   * the MCP engines consume this one instance. Absent = no legacy write is
-   * refused and reads are unchanged.
+   * The account's storage mode: the port over the account-mode module (see
+   * `accountStorageModeOf`). The legacy write gate, the data routes and the
+   * MCP engines consume this one instance. Absent = unknown: every legacy
+   * write answers a retryable 503.
    */
   accountStorageMode?: AccountStorageMode;
+  /**
+   * The account-mode module behind `accountStorageMode`. When wired, the
+   * owner-authenticated `POST /v1/account-mode/evidence` route answers and the
+   * host gives the module the Account's answers through it.
+   */
+  accountModeAuthority?: ModeAuthority;
   identity?: { address: `0x${string}`; publicKey: `0x${string}` };
   gateway?: GatewayClient;
   serverOwner?: `0x${string}`;
@@ -918,10 +928,10 @@ export function createPsLiteRuntime(
   // this bound view, which cannot be asked about another account. The mode
   // answers `unknown` when it is bound to a different owner or this runtime
   // has none.
-  const accountStorageMode: OwnedAccountStorageMode | undefined =
-    options.accountStorageMode
-      ? accountStorageModeFor(options.accountStorageMode, ownerAddress())
-      : undefined;
+  const accountStorageMode: OwnedAccountStorageMode = accountStorageModeFor(
+    options.accountStorageMode ?? { read: () => "unknown" },
+    ownerAddress(),
+  );
 
   async function handleAuthDevice(request: Request, url: URL) {
     if (url.pathname === "/auth/device") {
@@ -1246,6 +1256,35 @@ export function createPsLiteRuntime(
           return jsonResponse({ accepted: true, status }, { status: 202 });
         }
 
+        if (
+          url.pathname === "/v1/account-mode/evidence" &&
+          options.accountModeAuthority
+        ) {
+          if (request.method !== "POST")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          await auth.authorizeOwner(request);
+          const body = parseEvidenceBody(
+            await request.json().catch(() => null),
+          );
+          if (!body) {
+            return errorResponse(
+              400,
+              "INVALID_ACCOUNT_MODE_EVIDENCE",
+              "Body must be {owner, state, fetchStartedAt, rawStatus}",
+            );
+          }
+          // authorizeOwner succeeded, so the caller is this runtime's owner.
+          const decision = await options.accountModeAuthority.submitEvidence({
+            ...body,
+            authOwner: ownerAddress() ?? "",
+          });
+          return jsonResponse(decisionBody(decision));
+        }
+
         if (url.pathname === "/v1/import/oura-browser/requirements") {
           return handleOuraCollectionRequirementsRequest(request, {
             auth,
@@ -1262,11 +1301,7 @@ export function createPsLiteRuntime(
               "Method not allowed",
             );
           // An Oura browser import is a legacy write: a switched account refuses it.
-          const refusal = refuseLegacyWrite(
-            accountStorageMode
-              ? legacyWriteSwitchOf(accountStorageMode)
-              : undefined,
-          );
+          const refusal = refuseLegacyWrite(accountStorageMode);
           if (refusal) return refusal;
           let body;
           try {
@@ -1278,6 +1313,7 @@ export function createPsLiteRuntime(
             toDataStoragePort(options.storage),
             body,
             {
+              accountStorageMode,
               additions: options.additions,
               scopeDeletions: options.scopeDeletions,
               syncManager: options.syncManager ?? null,

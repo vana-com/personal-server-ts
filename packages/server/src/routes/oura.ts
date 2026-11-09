@@ -5,7 +5,6 @@ import {
 import { Hono } from "hono";
 import {
   handleOuraCollectionRequirementsRequest,
-  legacyWriteSwitchOf,
   refuseLegacyWrite,
   type OwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -123,11 +122,7 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
     }
     // An Oura browser import is a legacy write (it lands in the legacy scope
     // store), so a switched account refuses it on every path.
-    const refusal = refuseLegacyWrite(
-      deps.accountStorageMode
-        ? legacyWriteSwitchOf(deps.accountStorageMode)
-        : undefined,
-    );
+    const refusal = refuseLegacyWrite(deps.accountStorageMode);
     if (refusal) return refusal;
     if (
       deps.config?.pdpp.optInMethods.includes("oura-browser") &&
@@ -145,6 +140,7 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
     // history is read under the import lock, so the boundary check sees current rows.
     const expectedCanonicalEpoch = canonicalEpoch(deps);
     const result = await importOuraBrowserRecords(storage, body, {
+      accountStorageMode: deps.accountStorageMode,
       legacyScopeView: deps.legacyScopeView,
       retainedCanonicalHistory: () =>
         deps.pdpp?.bindingStore.readSnapshot(() =>

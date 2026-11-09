@@ -22,6 +22,7 @@ import { testOwnerKey } from "@opendatalabs/personal-server-ts-core/stream-sync-
 import {
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type {
   GatewayClient,
@@ -206,6 +207,7 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
     const hierarchyOptions = { dataDir };
 
     http = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,

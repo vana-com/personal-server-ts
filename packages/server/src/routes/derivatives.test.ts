@@ -19,6 +19,7 @@ import type {
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITE_SIGNATURE_HEADER,
@@ -138,6 +139,7 @@ describe("/v1/derivatives/questions (composed app)", () => {
       expiresAtMs: Date.now() + 60_000,
     });
     baseDeps = {
+      accountStorageMode: fixedAccountStorageMode("unswitched"),
       logger,
       version: "test",
       startedAt: new Date(),

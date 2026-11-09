@@ -12,6 +12,7 @@ import {
 } from "./index.js";
 import type { ScopeUploadRegistry } from "./scope-uploads.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
+import { fixedOwnedAccountStorageMode } from "../test-utils/account-mode.js";
 
 const scope = "notes.entries";
 const operation = "b".repeat(64);
@@ -34,7 +35,9 @@ function fixture(switchedOn: { value: boolean }) {
     storage: Object.assign(storage, { commitVersion }),
     scopeUploads: uploads,
     serverOwner: "0x1111111111111111111111111111111111111111",
-    legacyWritesRefused: () => switchedOn.value,
+    accountStorageMode: fixedOwnedAccountStorageMode(
+      switchedOn.value ? "switched" : "unswitched",
+    ),
     auth: {
       authorizeOwner: vi.fn(async () => undefined),
       authorizeBuilderList: vi.fn(async () => undefined),

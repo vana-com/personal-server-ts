@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "id": "commit-rechecks-after-admission",
+  "description": "A legacy write admitted under Off, paused, and resumed after On was latched is refused at commit; nothing is written later.",
+  "policy": { "offTtlMs": 604800000 },
+  "owners": {
+    "A": "0x1111111111111111111111111111111111111111",
+    "B": "0x2222222222222222222222222222222222222222",
+    "C": "0x3333333333333333333333333333333333333333",
+    "D": "0x4444444444444444444444444444444444444444",
+    "E": "0x5555555555555555555555555555555555555555",
+    "F": "0x6666666666666666666666666666666666666666"
+  },
+  "initial": {},
+  "events": [
+    {
+      "id": "f1",
+      "op": "fetchStart",
+      "owner": "A",
+      "requestId": "r1",
+      "clock": { "boot": "b1", "monoMs": 0, "wallMs": 1000000 }
+    },
+    {
+      "id": "e1",
+      "op": "accountResult",
+      "authOwner": "A",
+      "requestId": "r1",
+      "rawFixture": "explicit-off",
+      "evidence": { "owner": "A", "state": "off" }
+    },
+    { "id": "e2", "op": "admit", "owner": "A", "operationId": "w1" },
+    {
+      "id": "f2",
+      "op": "fetchStart",
+      "owner": "A",
+      "requestId": "r2",
+      "clock": { "boot": "b1", "monoMs": 1, "wallMs": 1000001 }
+    },
+    {
+      "id": "e3",
+      "op": "accountResult",
+      "authOwner": "A",
+      "requestId": "r2",
+      "rawFixture": "explicit-on",
+      "evidence": { "owner": "A", "state": "on" }
+    },
+    {
+      "id": "e5",
+      "op": "commit",
+      "owner": "A",
+      "operationId": "w1",
+      "sink": "legacy"
+    },
+    {
+      "id": "e6",
+      "op": "commit",
+      "owner": "A",
+      "operationId": "w1",
+      "sink": "legacy"
+    }
+  ],
+  "expect": [
+    { "after": "e2", "decision": "legacy" },
+    { "after": "e3", "decision": "streams" },
+    {
+      "after": "e5",
+      "decision": "refuse",
+      "code": "LEGACY_REFUSED_SWITCHED",
+      "status": 426,
+      "legacyMutations": 0
+    },
+    {
+      "after": "e6",
+      "decision": "refuse",
+      "code": "LEGACY_REFUSED_SWITCHED",
+      "status": 426,
+      "legacyMutations": 0
+    }
+  ]
+}

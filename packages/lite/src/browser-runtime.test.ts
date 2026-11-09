@@ -5,6 +5,7 @@
  * environment. Browser defaults remain exercised by the existing suite.
  */
 
+import { createUnswitchedIndexedDbPsLiteRuntime } from "./test-support/unswitched-runtime.js";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
@@ -61,7 +62,7 @@ function memoryBundle(): PsLitePersistenceBundle {
 }
 
 function build(bundle: PsLitePersistenceBundle) {
-  return createIndexedDbPsLiteRuntime({
+  return createUnswitchedIndexedDbPsLiteRuntime({
     ownerAddress,
     ownerSignature,
     persistence: bundle,
@@ -199,7 +200,7 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
       },
     };
 
-    const first = await createIndexedDbPsLiteRuntime(options);
+    const first = await createUnswitchedIndexedDbPsLiteRuntime(options);
     const write = await first.runtime.fetch(
       new Request("https://ps.local/v1/data/instagram.profile", {
         method: "POST",
@@ -212,7 +213,7 @@ describe("createIndexedDbPsLiteRuntime browser defaults", () => {
     );
     expect(write.status).toBe(201);
 
-    const restarted = await createIndexedDbPsLiteRuntime(options);
+    const restarted = await createUnswitchedIndexedDbPsLiteRuntime(options);
     const list = await restarted.runtime.fetch(
       new Request("https://ps.local/v1/data", {
         headers: { Authorization: "Bearer owner-token" },
@@ -262,7 +263,7 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
     const resolve = vi.fn((d: string) =>
       d === digest ? { connector: "c", version: "1", streams: [] } : null,
     );
-    const { streamSyncIntake } = await createIndexedDbPsLiteRuntime(
+    const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
       options({
         streamSyncDeclarations: resolve,
         streamSyncFiles: () =>
@@ -288,7 +289,7 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
 
   it("is null with streamSync.write off", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
-    const { streamSyncIntake } = await createIndexedDbPsLiteRuntime(
+    const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
       options({
         configDefaults: {
           gateway: { url: "https://gateway.local" },
@@ -319,29 +320,30 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
       }),
     );
     const dbName = `ps-lite-own-reads-${Math.random()}`;
-    const { runtime, streamSyncWriter } = await createIndexedDbPsLiteRuntime({
-      ownerAddress,
-      ownerSignature,
-      dbName,
-      storageDbName: `${dbName}-storage`,
-      gateway: createMockPsLiteGateway(),
-      auth: createBearerTokenPsLiteAuth({
-        ownerToken: "owner-token",
-        builderToken: "builder-token",
-      }),
-      active: true,
-      streamSyncFiles: () =>
-        createIndexedDbStreamSyncFiles({
-          dbName: `${dbName}-streams`,
-          factory: new IDBFactory(),
-          keyRange: IDBKeyRange,
+    const { runtime, streamSyncWriter } =
+      await createUnswitchedIndexedDbPsLiteRuntime({
+        ownerAddress,
+        ownerSignature,
+        dbName,
+        storageDbName: `${dbName}-storage`,
+        gateway: createMockPsLiteGateway(),
+        auth: createBearerTokenPsLiteAuth({
+          ownerToken: "owner-token",
+          builderToken: "builder-token",
         }),
-      configDefaults: {
-        gateway: { url: "https://gateway.local" },
-        sync: { enabled: true },
-        streamSync: { write: true, read: true },
-      },
-    });
+        active: true,
+        streamSyncFiles: () =>
+          createIndexedDbStreamSyncFiles({
+            dbName: `${dbName}-streams`,
+            factory: new IDBFactory(),
+            keyRange: IDBKeyRange,
+          }),
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: true },
+          streamSync: { write: true, read: true },
+        },
+      });
     const writer = streamSyncWriter!;
     await writer.refreshControls();
     await writer.beginRun({
@@ -395,7 +397,7 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
 
     // Default wiring: the route exists, and refuses an unauthenticated
     // handshake rather than 404ing as if delegated writes were unsupported.
-    const withDefaults = await createIndexedDbPsLiteRuntime({
+    const withDefaults = await createUnswitchedIndexedDbPsLiteRuntime({
       ...base,
       dbName: "ps-lite-write-default",
       storageDbName: "ps-lite-write-default-storage",
@@ -404,7 +406,7 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
 
     // A caller that brings its own auth adapter owns the wiring: we must not
     // mint tokens that adapter has never heard of.
-    const withOwnAuth = await createIndexedDbPsLiteRuntime({
+    const withOwnAuth = await createUnswitchedIndexedDbPsLiteRuntime({
       ...base,
       dbName: "ps-lite-write-own-auth",
       storageDbName: "ps-lite-write-own-auth-storage",
@@ -453,7 +455,7 @@ describe("createIndexedDbPsLiteRuntime data listings", () => {
       grant({ id: "grant-other", granteeId: "builder-2", scopes: ["*"] }),
     ]);
     const getGrant = vi.fn(async () => null);
-    const { runtime } = await createIndexedDbPsLiteRuntime({
+    const { runtime } = await createUnswitchedIndexedDbPsLiteRuntime({
       ownerAddress,
       ownerSignature,
       persistence: memoryBundle(),

@@ -61,8 +61,7 @@ import type {
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { Logger } from "../logger/index.js";
 import {
-  legacyWritesRefused,
-  type LegacyWriteSwitch,
+  type LegacyWriteMode,
   UPDATE_REQUIRED_MESSAGE,
 } from "../api/legacy-write-gate.js";
 
@@ -128,7 +127,8 @@ export type PdppImportRejectionCode =
   | "no_instance"
   | "method_authority"
   | "store_rejected"
-  | "legacy_write_refused";
+  | "legacy_write_refused"
+  | "account_mode_unknown";
 
 export interface PdppImportRejection {
   code: PdppImportRejectionCode;
@@ -226,10 +226,12 @@ export interface PdppImporterDeps {
    */
   instanceFor: (sourceId: string) => string | undefined;
   /**
-   * The account's stream-sync switch (see `legacy-write-gate.ts`). While it
-   * is on, a canonical publish is refused: the stream store is the only store.
+   * The account's storage mode (see `legacy-write-gate.ts`). While it is
+   * switched, a canonical publish is refused: the stream store is the only
+   * store. While it is unknown, or not wired, the publish waits: the envelope
+   * is not settled and a later cycle offers it again.
    */
-  legacyWritesRefused?: LegacyWriteSwitch;
+  accountStorageMode?: LegacyWriteMode;
   logger: Logger;
 }
 
@@ -644,8 +646,17 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
 
     // A canonical publish is a legacy write: refuse it on a switched account
     // before anything is stored. This is the only gate on the publish path.
-    if (legacyWritesRefused(deps.legacyWritesRefused)) {
+    const mode = deps.accountStorageMode?.read() ?? "unknown";
+    if (mode === "switched") {
       return reject("legacy_write_refused", UPDATE_REQUIRED_MESSAGE);
+    }
+    if (mode === "unknown") {
+      // Not a permanent verdict: the mode is unknown now and a later cycle may
+      // find it unswitched. Nothing is stored in the meantime.
+      return reject(
+        "account_mode_unknown",
+        "The account storage mode is not known yet",
+      );
     }
 
     // One envelope per call, but through the batch API so the store's own

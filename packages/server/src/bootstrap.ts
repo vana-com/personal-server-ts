@@ -35,10 +35,16 @@ function takeoverLimit(name: string, fallback: number): number {
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
   accountStorageModeFor,
-  createAccountStorageMode,
-  legacyWriteSwitchOf,
   type PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  accountStorageModeOf,
+  createModeAuthority,
+  legacyFlagEvidence,
+  type ModeAuthority,
+  type ModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { createFileModeRecordStore } from "./account-mode/file-record-store.js";
 import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
 import { createLogger, type Logger } from "./logger/index.js";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -193,9 +199,21 @@ export interface ServerContext {
   replication?: NodeReplication;
   /** What this boot did with `rotateReplicaWriterIdentity`. */
   replicaWriterRotation: ReplicaWriterRotation;
+  /**
+   * The account-mode module: an in-process host gives it the Account's answer
+   * with `submitEvidence`. HTTP hosts use `POST /v1/account-mode/evidence`.
+   */
+  accountModeAuthority: ModeAuthority;
+  /** The owner this server acts for; the owner name in account-mode evidence. */
+  serverOwner?: string;
 }
 
 export interface CreateServerOptions {
+  /**
+   * Where the account-mode module keeps its per-owner records. Default: files
+   * under the storage root, outside the data database. Tests inject a store.
+   */
+  accountModeStore?: ModeRecordStore;
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
   /** Inventory-route-only signer; never used by the owner-only scope feed. */
@@ -668,18 +686,43 @@ export async function createServer(
    * delegate reports every envelope as skipped — sync behaves exactly as it
    * did before this existed.
    */
-  // The account's stream-sync switch, latched once for this server. The PDPP
-  // importer and every legacy route read this one value (see app.ts).
-  // One mode per runtime: the write gate, the read selector and every MCP
-  // engine of this server consume this same instance.
-  const accountStorageMode = createAccountStorageMode({
-    owner: serverOwner ?? "",
-    source: () =>
-      config.streamSync.write === true &&
-      config.streamSync.refuseLegacyWrites === true,
+  // One mode per runtime, from one place: the shared account-mode module.
+  // The write gate, the read selector, the PDPP importer and every MCP engine
+  // consume the bound view of the same authority. The records load before any
+  // reader or writer starts. Hosts feed it the Account's answers through
+  // `POST /v1/account-mode/evidence` (or `context.accountModeAuthority`).
+  const accountModeAuthority = createModeAuthority({
+    store:
+      options?.accountModeStore ??
+      createFileModeRecordStore(join(storageRoot, "account-mode"), {
+        onCorrupt: (file, reason) =>
+          logger.warn({ file, reason }, "account mode record moved aside"),
+      }),
+    bootId: randomUUID(),
+    // A first On reports an import when the legacy index holds anything.
+    hasLegacyFiles: () => indexManager.listIndexedScopes().length > 0,
+    onWarning: (message, detail) => logger.warn({ detail }, message),
   });
-  const legacyWritesRefused = legacyWriteSwitchOf(
-    accountStorageModeFor(accountStorageMode, serverOwner),
+  // A store that cannot be read does not stop the runtime: the module fails
+  // closed (every legacy read and write is refused with a retryable 503) and
+  // loads again on the next evidence.
+  await accountModeAuthority.ready
+    .then(() =>
+      // The old spawn-time flag is evidence of nothing: it can never mint Off.
+      accountModeAuthority.submitEvidence(
+        legacyFlagEvidence(config.streamSync, serverOwner ?? "", Date.now()),
+      ),
+    )
+    .catch((err: unknown) => {
+      logger.warn(
+        { err },
+        "account mode records could not be loaded; refusing legacy work until they can",
+      );
+    });
+  const accountStorageMode = accountStorageModeOf(accountModeAuthority);
+  const boundAccountStorageMode = accountStorageModeFor(
+    accountStorageMode,
+    serverOwner,
   );
   let pdppImporterImpl: PdppImporter | null = null;
   const pdppImporter: PdppImporter = {
@@ -1247,7 +1290,7 @@ export async function createServer(
       declarations: pdppAuth?.retainedDeclarations ?? [],
       documents: pdppAuth?.retainedDocuments ?? new Map(),
       serverOwner,
-      legacyWritesRefused,
+      accountStorageMode: boundAccountStorageMode,
       logger,
     }) ?? null;
 
@@ -1277,6 +1320,7 @@ export async function createServer(
 
   const app = createApp({
     accountStorageMode,
+    accountModeAuthority,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
     // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).
@@ -1435,6 +1479,8 @@ export async function createServer(
     replicationStatus: replication.status,
     replication: nodeReplication,
     replicaWriterRotation,
+    accountModeAuthority,
+    serverOwner,
     startBackgroundServices: async () => {
       // Steps once now, then follows the coordinator's next wake.
       if (!backgroundClosed) replicaHost?.driver.start();

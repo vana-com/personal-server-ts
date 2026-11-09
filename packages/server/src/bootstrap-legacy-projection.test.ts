@@ -3,6 +3,7 @@
  * sync keeps moving the stored PDPP records unchanged.
  */
 
+import { createUnswitchedServer } from "./account-mode/unswitched-server.test-utils.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -10,7 +11,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import * as sync from "@opendatalabs/personal-server-ts-core/sync";
-import { createServer } from "./bootstrap.js";
 
 vi.mock(
   "@opendatalabs/personal-server-ts-core/sync",
@@ -51,7 +51,7 @@ describe("createServer legacy projection wiring", () => {
   });
 
   it("serves the projection over HTTP and gives sync the raw stored records", async () => {
-    const ctx = await createServer(
+    const ctx = await createUnswitchedServer(
       ServerConfigSchema.parse({
         sync: { enabled: true },
         tunnel: { enabled: false },

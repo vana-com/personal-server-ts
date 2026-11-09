@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createUnswitchedServer } from "./account-mode/unswitched-server.test-utils.js";
 import {
   mkdtemp,
   readFile,
@@ -23,7 +24,7 @@ import {
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
-import { createServer, type ServerContext } from "./bootstrap.js";
+import type { ServerContext } from "./bootstrap.js";
 import { createNodeDataStorage } from "./storage/node-data-storage.js";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createIndexManager } from "./storage/index-manager.js";
@@ -101,7 +102,7 @@ function rows(scope = SCOPE) {
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "pdpp-legacy-cas-"));
   vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", KNOWN_SIG);
-  server = await createServer(
+  server = await createUnswitchedServer(
     ServerConfigSchema.parse({ tunnel: { enabled: false } }),
     { serverDir: root, dataDir: join(root, "data") },
   );
@@ -341,7 +342,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
       getGrant: vi.fn().mockResolvedValue(grant),
     } as unknown as GatewayClient;
     await server!.cleanup();
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data"), gatewayClient: gateway },
     );
@@ -413,7 +414,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     );
     await writeFile(lostStage, "{}", "utf8");
     await server!.cleanup();
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -437,7 +438,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await writeFile(stagePath, JSON.stringify(staged));
 
     await server!.cleanup();
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -493,7 +494,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     ).toBe(201);
     await server!.cleanup();
     await unlink(join(root, "index.db"));
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -512,7 +513,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     expect((await post({ id: "manual" })).status).toBe(201);
     await server!.cleanup();
     await unlink(join(root, "index.db"));
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -533,7 +534,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await server!.cleanup();
     await unlink(join(root, "index.db"));
     await rm(join(root, "cas-revisions"), { recursive: true, force: true });
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -564,7 +565,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     expect((await afterRefusal.json()).data).toEqual({ id: "manual" });
 
     await server!.cleanup();
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -589,7 +590,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await server!.cleanup();
     await unlink(join(root, "index.db"));
     await unlink(revisionJournalPath(SCOPE));
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -638,7 +639,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     });
     interruptedIndex.close();
 
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -701,7 +702,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     });
     interruptedIndex.close();
 
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -734,7 +735,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await server!.cleanup();
     await unlink(join(root, "index.db"));
     await rm(join(root, "cas-revisions"), { recursive: true, force: true });
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -744,7 +745,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
 
     await server!.cleanup();
     await unlink(join(root, "index.db"));
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -780,7 +781,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     expect((await post({ id: "manual" })).status).toBe(201);
 
     const restart = async () => {
-      server = await createServer(
+      server = await createUnswitchedServer(
         ServerConfigSchema.parse({ tunnel: { enabled: false } }),
         { serverDir: root, dataDir: join(root, "data") },
       );
@@ -829,7 +830,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
 
     await server!.cleanup();
     await rm(join(root, "cas-revisions"), { recursive: true, force: true });
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -839,7 +840,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
 
     await server!.cleanup();
     await unlink(join(root, "index.db"));
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -855,7 +856,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await server!.cleanup();
     await unlink(`${revisionJournalPath(SCOPE)}.closed`);
     await unlink(join(root, "index.db"));
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -869,7 +870,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     expect((await post({ id: "manual" })).status).toBe(201);
     await server!.cleanup();
     await unlink(`${revisionJournalPath(SCOPE)}.open`);
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -886,7 +887,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await server!.cleanup();
     await unlink(`${revisionJournalPath(SCOPE)}.open`);
     await unlink(join(root, "cas-metadata-initialized"));
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -902,7 +903,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await server!.cleanup();
     await unlink(join(root, "index.db"));
     await rm(join(root, "cas-revisions"), { recursive: true, force: true });
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );
@@ -920,7 +921,7 @@ describe("P9: conditional attributed legacy writes on a real server", () => {
     await unlink(join(root, "index.db"));
     await unlink(revisionJournalPath(SCOPE));
     await unlink(`${revisionJournalPath(SCOPE)}.closed`);
-    server = await createServer(
+    server = await createUnswitchedServer(
       ServerConfigSchema.parse({ tunnel: { enabled: false } }),
       { serverDir: root, dataDir: join(root, "data") },
     );

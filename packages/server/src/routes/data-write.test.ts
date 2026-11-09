@@ -19,12 +19,9 @@ import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
-  accountStorageModeFor,
-  createAccountStorageMode,
-} from "@opendatalabs/personal-server-ts-core/api";
-import {
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITE_SIGNATURE_HEADER,
@@ -199,6 +196,7 @@ describe("POST /v1/data/:scope with a write session", () => {
     });
 
     app = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -388,6 +386,7 @@ describe("POST /v1/data/:scope with a write session", () => {
     });
     let failures = 1;
     const flakyApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: flakyIndex,
       hierarchyOptions,
       logger,
@@ -452,6 +451,7 @@ describe("POST /v1/data/:scope with a write session", () => {
     });
     let indexFailures = 1;
     const partialApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: partialIndex,
       hierarchyOptions,
       logger,
@@ -721,11 +721,8 @@ describe("POST /v1/data/:scope with a write session after the stream-sync switch
       }),
       accessLogWriter: { write: vi.fn().mockResolvedValue(undefined) },
       writeSessionStore,
-      accountStorageMode: accountStorageModeFor(
-        createAccountStorageMode({
-          owner: ownerWallet.address,
-          source: () => true,
-        }),
+      accountStorageMode: fixedOwnedAccountStorageMode(
+        "switched",
         ownerWallet.address,
       ),
     });

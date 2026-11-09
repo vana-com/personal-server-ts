@@ -1,39 +1,33 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
-  latchLegacyWriteSwitch,
   legacyWritesRefused,
   refuseLegacyWrite,
   UPDATE_REQUIRED_MESSAGE,
 } from "./legacy-write-gate.js";
+import type { AccountStorageModeValue } from "./account-storage-mode.js";
 
-/** A switch source whose answer a test can change between writes. */
-function source(initial: boolean | "unreachable") {
-  const state = { value: initial };
-  const read = vi.fn(() => {
-    if (state.value === "unreachable") throw new Error("Account unreachable");
-    return state.value;
-  });
-  return { state, read };
-}
+const mode = (value: AccountStorageModeValue) => ({ read: () => value });
 
 describe("legacyWritesRefused", () => {
-  it("refuses nothing when no switch is wired", () => {
-    expect(legacyWritesRefused(undefined)).toBe(false);
+  // UNKNOWN_AS_OFF
+  it("refuses when no mode is wired: a missing mode is never permission", () => {
+    expect(legacyWritesRefused(undefined)).toBe(true);
   });
 
-  it("refuses exactly while the switch reads true", () => {
-    expect(legacyWritesRefused(() => true)).toBe(true);
-    expect(legacyWritesRefused(() => false)).toBe(false);
+  it("refuses unless the account is unswitched", () => {
+    expect(legacyWritesRefused(mode("unswitched"))).toBe(false);
+    expect(legacyWritesRefused(mode("switched"))).toBe(true);
+    expect(legacyWritesRefused(mode("unknown"))).toBe(true);
   });
 });
 
 describe("refuseLegacyWrite", () => {
   it("returns null for an unswitched account", () => {
-    expect(refuseLegacyWrite(() => false)).toBeNull();
+    expect(refuseLegacyWrite(mode("unswitched"))).toBeNull();
   });
 
   it("returns the 426 update_required body for a switched account", async () => {
-    const response = refuseLegacyWrite(() => true);
+    const response = refuseLegacyWrite(mode("switched"));
     expect(response?.status).toBe(426);
     expect(response?.headers.get("upgrade")).toBe("vana-stream-sync");
     const body = await response!.json();
@@ -41,45 +35,15 @@ describe("refuseLegacyWrite", () => {
     expect(body.error.errorCode).toBe("update_required");
     expect(body.message).toBe(UPDATE_REQUIRED_MESSAGE);
   });
-});
 
-describe("latchLegacyWriteSwitch", () => {
-  it("stays switched after the source says true, even when it later says false", () => {
-    const { state, read } = source(true);
-    const latched = latchLegacyWriteSwitch(read);
-    expect(latched()).toBe(true);
-    state.value = false;
-    expect(latched()).toBe(true);
-    expect(latched()).toBe(true);
-    // Once latched the source is not consulted again.
-    expect(read).toHaveBeenCalledTimes(1);
-  });
-
-  it("stays switched after the source becomes unreachable", () => {
-    const { state, read } = source(true);
-    const latched = latchLegacyWriteSwitch(read);
-    expect(latched()).toBe(true);
-    state.value = "unreachable";
-    expect(latched()).toBe(true);
-  });
-
-  it("fails open: an unreachable source before any true answer is not switched", () => {
-    const { state, read } = source("unreachable");
-    const latched = latchLegacyWriteSwitch(read);
-    expect(latched()).toBe(false);
-    expect(refuseLegacyWrite(latched)).toBeNull();
-    // Once the source is reachable and says true, the latch sets and holds.
-    state.value = true;
-    expect(latched()).toBe(true);
-    state.value = false;
-    expect(latched()).toBe(true);
-  });
-
-  it("follows a source that has never said true, in both directions", () => {
-    const { state, read } = source(false);
-    const latched = latchLegacyWriteSwitch(read);
-    expect(latched()).toBe(false);
-    state.value = true;
-    expect(latched()).toBe(true);
+  // UNKNOWN_AS_OFF
+  it("returns a retryable 503 ACCOUNT_MODE_UNKNOWN when the mode is unknown", async () => {
+    for (const unknown of [mode("unknown"), undefined]) {
+      const response = refuseLegacyWrite(unknown);
+      expect(response?.status).toBe(503);
+      expect(response?.headers.get("retry-after")).toBe("5");
+      const body = await response!.json();
+      expect(body.error.errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
+    }
   });
 });

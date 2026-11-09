@@ -28,11 +28,12 @@ import type {
 } from "@opendatalabs/vana-sdk/node";
 import {
   accountStorageModeFor,
-  createAccountStorageMode,
   type AccountStorageMode,
   type AccountStorageModeValue,
   type StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
+import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { authorityHearing } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createApp } from "../app.js";
 import { initializeDatabase } from "../storage/index-schema.js";
@@ -124,8 +125,8 @@ function spyOn(inner: AccountStorageMode): ModeSpy {
 }
 
 /** A mode bound to `owner` that has already latched switched. */
-function latchedSwitchedFor(owner: string): AccountStorageMode {
-  const mode = createAccountStorageMode({ owner, source: () => true });
+async function latchedSwitchedFor(owner: string): Promise<AccountStorageMode> {
+  const mode = accountStorageModeOf(await authorityHearing(owner, "on"));
   expect(mode.read(owner)).toBe("switched");
   return mode;
 }
@@ -157,7 +158,7 @@ describe.each([
 
     beforeEach(async () => {
       dataDir = await mkdtemp(join(tmpdir(), "mcp-account-mode-"));
-      mode = spyOn(latchedSwitchedFor(bound));
+      mode = spyOn(await latchedSwitchedFor(bound));
       store = createInMemoryMcpConnectionStore();
     });
 

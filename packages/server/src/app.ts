@@ -5,6 +5,7 @@ import {
 } from "./routes/stream-sync-seed.js";
 import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
 import { streamSyncReadStatusRoutes } from "./routes/stream-sync-read-status.js";
+import { accountModeRoutes } from "./routes/account-mode.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
@@ -30,10 +31,8 @@ import type {
   PersonalServerReadFulfillmentReporter,
   StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
-import {
-  accountStorageModeFor,
-  createAccountStorageMode,
-} from "@opendatalabs/personal-server-ts-core/api";
+import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
+import type { ModeAuthority } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import {
@@ -220,12 +219,18 @@ export interface AppDeps {
    */
   pdppImporter?: PdppImporter;
   /**
-   * The account's storage mode, built once per server by the host (see
-   * `createAccountStorageMode`). The legacy write gate, the data routes and
-   * every MCP engine consume this one instance. Absent = built here from
-   * `config`.
+   * The account's storage mode: the port over the account-mode module (see
+   * `accountStorageModeOf`). The legacy write gate, the data routes and every
+   * MCP engine consume this one instance. Absent = unknown: every legacy
+   * write answers a retryable 503.
    */
   accountStorageMode?: AccountStorageMode;
+  /**
+   * The account-mode module itself. When wired, the owner-authenticated
+   * `POST /v1/account-mode/evidence` route mounts and hosts give the module
+   * the Account's answers through it.
+   */
+  accountModeAuthority?: ModeAuthority;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
    * Invoked when the /ui/api registration route confirms the server is
@@ -342,18 +347,11 @@ function streamSyncClosing(): ProtocolError {
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
   // One mode for every read and legacy write this server serves. The host
-  // passes its instance; the fallback reads the same config fields the host
-  // reads.
-  // Bound to this server's owner once, here: every consumer below receives
-  // the bound view, which cannot be asked about another account.
+  // passes its instance; with none, the mode is unknown and legacy writes
+  // refuse. Bound to this server's owner once, here: every consumer below
+  // receives the bound view, which cannot be asked about another account.
   const accountStorageMode = accountStorageModeFor(
-    deps.accountStorageMode ??
-      createAccountStorageMode({
-        owner: deps.serverOwner ?? "",
-        source: () =>
-          deps.config?.streamSync.write === true &&
-          deps.config.streamSync.refuseLegacyWrites === true,
-      }),
+    deps.accountStorageMode ?? { read: () => "unknown" },
     deps.serverOwner,
   );
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
@@ -559,6 +557,21 @@ export function createApp(deps: AppDeps): Hono {
     "/v1/import/oura-browser",
     ouraRoutes({ ...deps, accountStorageMode }),
   );
+
+  if (deps.accountModeAuthority) {
+    app.route(
+      "/v1/account-mode",
+      accountModeRoutes({
+        serverOrigin: deps.serverOrigin,
+        serverOwner: deps.serverOwner,
+        gateway: deps.gateway,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
+        tokenStore: deps.tokenStore,
+        accountModeAuthority: deps.accountModeAuthority,
+      }),
+    );
+  }
 
   app.use("/v1/stream-sync/*", async (_c, next) => {
     if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {

@@ -18,16 +18,17 @@ import {
   createMcpConnection,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import {
+  authorityHearing,
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
+import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import type {
   Builder,
   GatewayClient,
   GatewayGrantResponse,
 } from "@opendatalabs/vana-sdk/browser";
 import {
-  createAccountStorageMode,
   type AccountStorageMode,
   type AccountStorageModeValue,
   type StreamSyncReadPort,
@@ -112,11 +113,10 @@ async function harness(bound: string, latched: boolean) {
   );
   const gateway = gatewayFor(created.granteeAddress);
   const calls: Call[] = [];
-  const inner = createAccountStorageMode({
-    owner: bound,
-    source: () => latched,
-  });
-  if (latched) expect(inner.read(bound)).toBe("switched");
+  const inner = accountStorageModeOf(
+    await authorityHearing(bound, latched ? "on" : "off"),
+  );
+  expect(inner.read(bound)).toBe(latched ? "switched" : "unswitched");
   const mode: AccountStorageMode = {
     read: (requestOwner) => {
       const answer = inner.read(requestOwner);

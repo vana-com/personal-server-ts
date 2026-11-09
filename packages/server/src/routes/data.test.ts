@@ -22,6 +22,7 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import {
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   createScopeDeletionTracker,
@@ -201,6 +202,7 @@ describe("POST /v1/data/:scope", () => {
     const indexManager = createIndexManager(db);
 
     app = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -255,6 +257,7 @@ describe("POST /v1/data/:scope", () => {
       initializeDatabase(":memory:"),
     );
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: localIndexManager,
       hierarchyOptions,
       logger,
@@ -283,6 +286,7 @@ describe("POST /v1/data/:scope", () => {
       initializeDatabase(":memory:"),
     );
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: localIndexManager,
       hierarchyOptions,
       logger,
@@ -347,6 +351,7 @@ describe("POST /v1/data/:scope", () => {
     const db = initializeDatabase(":memory:");
     const indexManager = createIndexManager(db);
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -432,6 +437,7 @@ describe("POST /v1/data/:scope", () => {
       getSchemaForScope: vi.fn().mockResolvedValue(null),
     });
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -472,6 +478,7 @@ describe("POST /v1/data/:scope", () => {
     } satisfies SyncManager;
 
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -498,6 +505,7 @@ describe("POST /v1/data/:scope", () => {
     const indexManager2 = createIndexManager(db2);
 
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -532,6 +540,7 @@ describe("POST /v1/data/:scope", () => {
     } satisfies SyncManager;
 
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -591,6 +600,7 @@ describe("GET /v1/data (list scopes)", () => {
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -761,6 +771,7 @@ describe("GET /v1/data listings are scoped to the builder's grants", () => {
     depsOverrides: Partial<DataRouteDeps> = {},
   ) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1087,6 +1098,7 @@ describe("GET /v1/data/additions", () => {
       getGrant: vi.fn().mockResolvedValue(makeGrant({ scopes: ["notes.*"] })),
     });
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1290,6 +1302,7 @@ describe("GET /v1/data/:scope/versions", () => {
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1447,6 +1460,7 @@ describe("GET /v1/data/:scope", () => {
     });
 
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -2267,6 +2281,7 @@ describe("DELETE /v1/data/:scope", () => {
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -3036,6 +3051,7 @@ describe("X402 payment on GET /v1/data/:scope", () => {
       getGrant: vi.fn().mockResolvedValue(grant),
     });
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,

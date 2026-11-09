@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "id": "off-save-fails",
+  "description": "An Off is saved before it is used, as an On is. When the save fails, the answer is unknown: nothing is admitted, read or committed on the strength of an Off that never reached the disk. A later Off that saves restores normal legacy work.",
+  "policy": { "offTtlMs": 604800000 },
+  "owners": {
+    "A": "0x1111111111111111111111111111111111111111"
+  },
+  "initial": {},
+  "events": [
+    { "id": "x1", "op": "failDurableSave", "fail": true },
+    {
+      "id": "f1",
+      "op": "fetchStart",
+      "owner": "A",
+      "requestId": "r1",
+      "clock": { "boot": "b1", "monoMs": 0, "wallMs": 1000000 }
+    },
+    {
+      "id": "e1",
+      "op": "accountResult",
+      "authOwner": "A",
+      "requestId": "r1",
+      "rawFixture": "explicit-off",
+      "evidence": { "owner": "A", "state": "off" }
+    },
+    { "id": "e2", "op": "admit", "owner": "A", "operationId": "w1" },
+    { "id": "e3", "op": "read", "owner": "A" },
+    {
+      "id": "e4",
+      "op": "commit",
+      "owner": "A",
+      "operationId": "w1",
+      "sink": "legacy"
+    },
+    { "id": "x2", "op": "failDurableSave", "fail": false },
+    {
+      "id": "f2",
+      "op": "fetchStart",
+      "owner": "A",
+      "requestId": "r2",
+      "clock": { "boot": "b1", "monoMs": 1000, "wallMs": 1001000 }
+    },
+    {
+      "id": "e5",
+      "op": "accountResult",
+      "authOwner": "A",
+      "requestId": "r2",
+      "rawFixture": "explicit-off",
+      "evidence": { "owner": "A", "state": "off" }
+    },
+    { "id": "e6", "op": "admit", "owner": "A", "operationId": "w2" },
+    {
+      "id": "e7",
+      "op": "commit",
+      "owner": "A",
+      "operationId": "w2",
+      "sink": "legacy"
+    }
+  ],
+  "expect": [
+    {
+      "after": "e1",
+      "decision": "refuse",
+      "code": "ACCOUNT_MODE_UNKNOWN",
+      "status": 503
+    },
+    {
+      "after": "e2",
+      "decision": "refuse",
+      "code": "ACCOUNT_MODE_UNKNOWN",
+      "status": 503
+    },
+    {
+      "after": "e3",
+      "decision": "refuse",
+      "code": "ACCOUNT_MODE_UNKNOWN",
+      "status": 503
+    },
+    {
+      "after": "e4",
+      "decision": "refuse",
+      "code": "ACCOUNT_MODE_UNKNOWN",
+      "status": 503,
+      "legacyMutations": 0
+    },
+    { "after": "e5", "decision": "legacy" },
+    { "after": "e6", "decision": "legacy" },
+    { "after": "e7", "decision": "legacy", "legacyMutations": 1 }
+  ]
+}

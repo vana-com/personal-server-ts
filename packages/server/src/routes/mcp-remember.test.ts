@@ -29,6 +29,7 @@ import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage
 import {
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITER_ATTRIBUTION_KEY,
@@ -140,6 +141,7 @@ describe("MCP remember tool", () => {
     root.route(
       "/v1/data",
       dataRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         indexManager,
         hierarchyOptions,
         logger,

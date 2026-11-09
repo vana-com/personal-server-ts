@@ -44,6 +44,7 @@ import {
 import {
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createWeb3SignedPsLiteAuth } from "./runtime.js";
 import type {
@@ -186,6 +187,7 @@ function buildRuntime(
   const storage = createMemoryPsLiteStorage();
   const store = createInMemoryMcpConnectionStore();
   const runtime = createPsLiteRuntime({
+    accountStorageMode: fixedAccountStorageMode("unswitched"),
     active: true,
     storage,
     config: { gateway: gatewayConfig },
@@ -835,6 +837,7 @@ describe("MCP read_scope tool through Lite runtime", () => {
     bundle = {
       ...bundle,
       runtime: createPsLiteRuntime({
+        accountStorageMode: fixedAccountStorageMode("unswitched"),
         active: true,
         storage: bundle.storage,
         gateway: bundle.gateway,

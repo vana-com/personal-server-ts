@@ -164,6 +164,10 @@
       "types": "./dist/publication/publish.d.ts",
       "import": "./dist/publication/publish.js"
     },
+    "./sync/account-mode": {
+      "types": "./dist/sync/account-mode/index.d.ts",
+      "import": "./dist/sync/account-mode/index.js"
+    },
     "./sync": {
       "types": "./dist/sync/index.d.ts",
       "import": "./dist/sync/index.js"

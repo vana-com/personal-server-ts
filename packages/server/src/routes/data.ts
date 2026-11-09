@@ -7,9 +7,7 @@ import {
   type PersonalServerReadFulfillmentReporter,
   type StreamSyncReadPort,
   refuseLegacyWrite,
-  legacyWriteSwitchOf,
   type OwnedAccountStorageMode,
-  type LegacyWriteSwitch,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -106,7 +104,8 @@ export interface DataRouteDeps {
   streamSyncRead?: StreamSyncReadPort;
   /**
    * The account's storage mode: the one answer the legacy write gate and the
-   * read selector share. A switched account refuses legacy writes.
+   * read selector share. A switched account refuses legacy writes with 426;
+   * an unknown one, or none wired, with a retryable 503.
    */
   accountStorageMode?: OwnedAccountStorageMode;
   runtimeAvailability?: RuntimeAvailabilityPort;
@@ -163,9 +162,6 @@ export interface DataRouteDeps {
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
   const app = new Hono();
-  const writeSwitch: LegacyWriteSwitch | undefined = deps.accountStorageMode
-    ? legacyWriteSwitchOf(deps.accountStorageMode)
-    : undefined;
   // These owner-scoped reads change after import and deletion; 410 is cacheable by default.
   app.use("*", async (c, next) => {
     await next();
@@ -199,7 +195,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   // authorization, so the refusal holds even for a request that skips this
   // layer. No route has an exemption: not a header, not a verified builder.
   const refuseLegacy: MiddlewareHandler = async (c, next) => {
-    const refusal = refuseLegacyWrite(writeSwitch);
+    const refusal = refuseLegacyWrite(deps.accountStorageMode);
     if (refusal) return refusal;
     await next();
   };
@@ -220,7 +216,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       auth.authorizeOwnerScope({ request, scope }),
     syncManager: deps.syncManager,
     onDataWritten: deps.onDataWritten,
-    refuseLegacyWrite: () => refuseLegacyWrite(writeSwitch),
+    refuseLegacyWrite: () => refuseLegacyWrite(deps.accountStorageMode),
     afterTombstoneVersion: async (scope) => {
       if (!deps.scopeDeletions) return null;
       const verdict = await deps.scopeDeletions.resolve(scope);

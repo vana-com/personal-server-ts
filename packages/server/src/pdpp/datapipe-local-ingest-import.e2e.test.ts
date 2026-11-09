@@ -61,6 +61,7 @@ import {
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
@@ -163,6 +164,7 @@ function buildImporter(store: PdppRecordStore): PdppImporter {
   expect(document).toBe(DECLARATION_DOCUMENT);
 
   return createPdppImporter({
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
     store,
     declarations: [
       {
@@ -212,6 +214,7 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
     };
 
     app = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -373,6 +376,7 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
     const indexDb = initializeDatabase(":memory:");
     const indexManager = createIndexManager(indexDb);
     const bare = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions: { dataDir },
       logger,

@@ -105,26 +105,10 @@ import type {
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
-  legacyWriteSwitchOf,
   selectAccountStorageMode,
   type OwnedAccountStorageMode,
 } from "./account-storage-mode.js";
-import {
-  refuseLegacyWrite,
-  type LegacyWriteSwitch,
-} from "./legacy-write-gate.js";
-
-/** The write gate's switch: the shared mode when wired, else the plain switch. */
-function writeSwitchOf(
-  deps: Pick<
-    PersonalServerDataApiDeps,
-    "accountStorageMode" | "legacyWritesRefused"
-  >,
-): LegacyWriteSwitch | undefined {
-  return deps.accountStorageMode
-    ? legacyWriteSwitchOf(deps.accountStorageMode)
-    : deps.legacyWritesRefused;
-}
+import { refuseLegacyWrite } from "./legacy-write-gate.js";
 import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
@@ -363,15 +347,9 @@ export interface StreamSyncReadPort {
 
 export interface PersonalServerDataApiDeps {
   /**
-   * Whether an undeclared legacy write is refused (see
-   * `legacy-write-gate.ts`). Absent = never refuse.
-   */
-  legacyWritesRefused?: LegacyWriteSwitch;
-  /**
    * The account's storage mode: the one answer the write gate and the read
-   * selector share (see `account-storage-mode.ts`). When wired it supplies the
-   * write gate's switch too, so `legacyWritesRefused` is ignored. Absent =
-   * every read and write behaves as before the switch existed.
+   * selector share (see `account-storage-mode.ts`). Absent = unknown: every
+   * legacy write is refused with a retryable 503.
    */
   accountStorageMode?: OwnedAccountStorageMode;
   additions?: DurableAdditionsService;
@@ -2240,13 +2218,11 @@ export {
   ACCOUNT_MODE_RETRY_AFTER_SECONDS,
   ACCOUNT_MODE_UNKNOWN_CODE,
   ACCOUNT_MODE_UNKNOWN_STATUS,
+  accountModeUnknownResponse,
   accountStorageModeFor,
-  createAccountStorageMode,
-  legacyWriteSwitchOf,
   selectAccountStorageMode,
   type AccountStorageMode,
   type AccountStorageModeValue,
-  type CreateAccountStorageModeInput,
   type OwnedAccountStorageMode,
   type StorageSelection,
   type StorageSelectionDeps,
@@ -2256,10 +2232,9 @@ export {
   UPDATE_REQUIRED_CODE,
   UPDATE_REQUIRED_MESSAGE,
   UPDATE_REQUIRED_STATUS,
-  latchLegacyWriteSwitch,
   legacyWritesRefused,
   refuseLegacyWrite,
-  type LegacyWriteSwitch,
+  type LegacyWriteMode,
 } from "./legacy-write-gate.js";
 
 /**
@@ -2290,7 +2265,7 @@ async function handleScopeUploadRequest(
   // An upload is owner-only: no delegated builder writes through it, so there
   // is no exemption. Aborting only discards staged data and stays allowed.
   if (route.kind !== "abort") {
-    const refusal = refuseLegacyWrite(writeSwitchOf(deps));
+    const refusal = refuseLegacyWrite(deps.accountStorageMode);
     if (refusal) return refusal;
   }
   const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
@@ -2557,7 +2532,7 @@ export async function handlePersonalServerDataRequest(
       // Owner-only: a builder has no durable-import route, so a signature
       // header earns no exemption here. This runs on the normalized path, so
       // `/imports/<op>/` and repeated slashes land here too.
-      const refusal = refuseLegacyWrite(writeSwitchOf(deps));
+      const refusal = refuseLegacyWrite(deps.accountStorageMode);
       if (refusal) return refusal;
       const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
@@ -3201,7 +3176,7 @@ export async function handlePersonalServerDataRequest(
       }
       // A switched account refuses every legacy write here, verified builder
       // or not: a delegated write is a legacy write too.
-      const refusal = refuseLegacyWrite(writeSwitchOf(deps));
+      const refusal = refuseLegacyWrite(deps.accountStorageMode);
       if (refusal) {
         await writeAuth?.releaseProof?.();
         return refusal;

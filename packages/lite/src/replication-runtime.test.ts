@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { fixedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import type { ReplicationTimers } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import { sha256 } from "viem";
@@ -271,6 +272,7 @@ describe("PS-Lite replication routes", () => {
   ) {
     const logs = createMemoryPsLiteAccessLogStore();
     return createPsLiteRuntime({
+      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       gateway: createMockPsLiteGateway(),
       accessLogReader: logs,

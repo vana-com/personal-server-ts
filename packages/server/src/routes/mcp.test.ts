@@ -42,6 +42,7 @@ import {
 import {
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type {
   Builder,
@@ -205,6 +206,7 @@ async function ingestScope(opts: {
   accessLogWriter: AccessLogWriter;
 }) {
   const subApp = dataRoutes({
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
     indexManager: opts.indexManager,
     hierarchyOptions: opts.hierarchyOptions,
     logger,
@@ -1730,6 +1732,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     );
 
     const dataApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,

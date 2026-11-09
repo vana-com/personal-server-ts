@@ -1,6 +1,10 @@
 import {
-  reduceAccountMode, validModeOwner,
-  type AccountModeRecord, type ModeClock, type ModeEvent, type ModeReduction,
+  reduceAccountMode,
+  validModeOwner,
+  type AccountModeRecord,
+  type ModeClock,
+  type ModeEvent,
+  type ModeReduction,
 } from "./mode-machine.js";
 
 /**
@@ -16,23 +20,33 @@ import {
  */
 export interface AccountModeRecordStore {
   read(owner: string): Promise<AccountModeRecord | null>;
-  transact(owner: string, transition: (record: AccountModeRecord | null) => ModeReduction): Promise<ModeReduction>;
+  transact(
+    owner: string,
+    transition: (record: AccountModeRecord | null) => ModeReduction,
+  ): Promise<ModeReduction>;
 }
 
 /** Always reloads through transact, including commit; never caches admission. */
 export function reduceStoredAccountMode(
-  store: AccountModeRecordStore, event: ModeEvent, clock: ModeClock,
+  store: AccountModeRecordStore,
+  event: ModeEvent,
+  clock: ModeClock,
 ): Promise<ModeReduction> {
   if (!event || !validModeOwner(event.owner)) {
     return Promise.resolve(reduceAccountMode(null, event, clock));
   }
-  return store.transact(event.owner, record => reduceAccountMode(record, event, clock));
+  return store.transact(event.owner, (record) =>
+    reduceAccountMode(record, event, clock),
+  );
 }
 
-const copyRecord = (record: AccountModeRecord | null): AccountModeRecord | null =>
-  record === null ? null : { ...record };
-const copyResult = (result: ModeReduction): ModeReduction =>
-  ({ record: copyRecord(result.record), decision: { ...result.decision } });
+const copyRecord = (
+  record: AccountModeRecord | null,
+): AccountModeRecord | null => (record === null ? null : { ...record });
+const copyResult = (result: ModeReduction): ModeReduction => ({
+  record: copyRecord(result.record),
+  decision: { ...result.decision },
+});
 
 /** Test double only. This is NOT a disk store and provides no restart durability. */
 export class MemoryAccountModeRecordStore implements AccountModeRecordStore {
@@ -54,8 +68,12 @@ export class MemoryAccountModeRecordStore implements AccountModeRecordStore {
     return copyRecord(this.records.get(owner) ?? null);
   }
 
-  transact(owner: string, transition: (record: AccountModeRecord | null) => ModeReduction): Promise<ModeReduction> {
-    if (!validModeOwner(owner)) return Promise.reject(new Error("Missing account mode owner."));
+  transact(
+    owner: string,
+    transition: (record: AccountModeRecord | null) => ModeReduction,
+  ): Promise<ModeReduction> {
+    if (!validModeOwner(owner))
+      return Promise.reject(new Error("Missing account mode owner."));
     const previous = this.tails.get(owner) ?? Promise.resolve();
     const work = previous.then(() => {
       const result = transition(copyRecord(this.records.get(owner) ?? null));
@@ -67,9 +85,14 @@ export class MemoryAccountModeRecordStore implements AccountModeRecordStore {
       else this.records.set(owner, { ...result.record });
       return copyResult(result);
     });
-    const tail = work.then(() => undefined, () => undefined);
+    const tail = work.then(
+      () => undefined,
+      () => undefined,
+    );
     this.tails.set(owner, tail);
-    void tail.then(() => { if (this.tails.get(owner) === tail) this.tails.delete(owner); });
+    void tail.then(() => {
+      if (this.tails.get(owner) === tail) this.tails.delete(owner);
+    });
     return work;
   }
 }

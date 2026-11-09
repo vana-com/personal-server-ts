@@ -3,6 +3,7 @@
  * gateway itself. Its registry write must still be closed at the attempt
  * deadline, or one hung request holds its entry for the rest of the session.
  */
+import { createUnswitchedIndexedDbPsLiteRuntime } from "./test-support/unswitched-runtime.js";
 import http from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,7 +15,6 @@ import {
   dataRegistryDomain,
   type AddDataMessage,
 } from "@opendatalabs/vana-sdk/browser";
-import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
 import type { PsLitePersistenceBundle } from "./persistence.js";
 import {
@@ -160,7 +160,7 @@ describe("default Lite composition cancels a hung registry write", () => {
       storage: { backend: "vana", config: { vana: { apiUrl: stub.url } } },
       sync: { enabled: true },
     } as const;
-    const runtime = await createIndexedDbPsLiteRuntime({
+    const runtime = await createUnswitchedIndexedDbPsLiteRuntime({
       ownerAddress: owner.address,
       ownerSignature,
       persistence: bundle,

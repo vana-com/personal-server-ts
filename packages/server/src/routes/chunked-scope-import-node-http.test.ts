@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   authenticateRequest,
@@ -144,6 +145,7 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
     app.route(
       "/v1/data",
       dataRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         indexManager,
         hierarchyOptions,
         logger,
@@ -237,6 +239,7 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
     app.route(
       "/v1/data",
       dataRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         indexManager,
         hierarchyOptions: { dataDir },
         logger,
@@ -312,6 +315,7 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
       app.route(
         "/v1/data",
         dataRoutes({
+          accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
           indexManager,
           hierarchyOptions: { dataDir },
           logger,

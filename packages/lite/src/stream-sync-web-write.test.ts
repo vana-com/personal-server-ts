@@ -7,6 +7,7 @@
  *
  * Known fixture limits are listed in the PR body under "Not proven".
  */
+import { createUnswitchedIndexedDbPsLiteRuntime } from "./test-support/unswitched-runtime.js";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -23,7 +24,7 @@ import {
   parseScope,
   partBlobName,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
+import type { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
 import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
@@ -203,7 +204,7 @@ async function boot(net: Network, browser: Browser, write?: boolean) {
   // Passthrough spy only: capture the real service the browser factory wires.
   const opened = vi.spyOn(StreamSyncReadService, "open");
   const before = opened.mock.results.length;
-  const built = await createIndexedDbPsLiteRuntime({
+  const built = await createUnswitchedIndexedDbPsLiteRuntime({
     ownerAddress: ACCOUNT.address,
     ownerSignature: net.signature,
     ownerSyncSigner: {

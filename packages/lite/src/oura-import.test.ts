@@ -1,4 +1,8 @@
 import ouraProfileProvenance from "../../core/src/legacy-projection/declarations/oura-browser.provenance.json";
+import {
+  fixedAccountStorageMode,
+  fixedOwnedAccountStorageMode,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import { describe, expect, it, vi } from "vitest";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
@@ -12,7 +16,7 @@ import { createPersistentPsLiteStorage } from "./storage.js";
 import {
   createBearerTokenPsLiteAuth,
   createPsLiteRuntime,
-  importOuraBrowserRecords,
+  importOuraBrowserRecords as importOuraBrowserRecordsWithMode,
   type OuraBrowserImportInput,
 } from "./index.js";
 
@@ -155,6 +159,7 @@ function runtimeFor(
 ) {
   const accessLogs = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
+    accountStorageMode: fixedAccountStorageMode("unswitched"),
     storage,
     active: true,
     accessLogReader: accessLogs,
@@ -180,6 +185,17 @@ function runtimeFor(
     );
   return { post, runtime };
 }
+
+/** The import as an unswitched account runs it; a test may pass its own mode. */
+const importOuraBrowserRecords: typeof importOuraBrowserRecordsWithMode = (
+  storage,
+  input,
+  options = {},
+) =>
+  importOuraBrowserRecordsWithMode(storage, input, {
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+    ...options,
+  });
 
 describe("Lite Oura browser takeover", () => {
   it("refuses a restricted all-stream batch even when it covers every retained ID", async () => {
@@ -411,6 +427,7 @@ describe("Lite Oura browser takeover", () => {
     );
     const accessLogs = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
+      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: reloaded,
       active: true,
       auth: createBearerTokenPsLiteAuth({

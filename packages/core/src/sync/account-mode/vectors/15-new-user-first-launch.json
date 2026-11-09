@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "id": "new-user-first-launch",
+  "description": "A new user's first launch: boot, the sign-in answer arrives as an explicit Off, and the first collection runs. Nothing is refused anywhere in the trace: the Off is saved before it is used, and with a working disk that save costs the user nothing.",
+  "policy": { "offTtlMs": 604800000 },
+  "owners": {
+    "A": "0x1111111111111111111111111111111111111111",
+    "B": "0x2222222222222222222222222222222222222222"
+  },
+  "initial": {},
+  "events": [
+    {
+      "id": "f1",
+      "op": "fetchStart",
+      "owner": "A",
+      "requestId": "r1",
+      "clock": { "boot": "b1", "monoMs": 0, "wallMs": 1000000 }
+    },
+    {
+      "id": "e1",
+      "op": "accountResult",
+      "authOwner": "A",
+      "requestId": "r1",
+      "rawFixture": "explicit-off",
+      "evidence": { "owner": "A", "state": "off" }
+    },
+    { "id": "e2", "op": "admit", "owner": "A", "operationId": "w1" },
+    {
+      "id": "e3",
+      "op": "commit",
+      "owner": "A",
+      "operationId": "w1",
+      "sink": "legacy"
+    },
+    { "id": "e4", "op": "read", "owner": "A" }
+  ],
+  "expect": [
+    { "after": "e1", "decision": "legacy" },
+    { "after": "e2", "decision": "legacy" },
+    { "after": "e3", "decision": "legacy", "legacyMutations": 1 },
+    { "after": "e4", "decision": "legacy" }
+  ]
+}

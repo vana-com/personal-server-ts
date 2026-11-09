@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { fixedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   createScopeDeletionTracker,
@@ -154,6 +155,7 @@ describe("persistent Lite owner POST during a covered delete", () => {
     const scopeDeletions = createScopeDeletionTracker();
     const accessLog = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
+      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage,
       auth: createBearerTokenPsLiteAuth({
         ownerToken: OWNER_TOKEN,

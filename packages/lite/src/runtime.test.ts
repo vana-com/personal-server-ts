@@ -14,6 +14,7 @@ import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-cor
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   createDataFileEnvelope,
@@ -36,6 +37,7 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
     stateCapabilities: { config: "memory" },
   };
   return createPsLiteRuntime({
+    accountStorageMode: fixedAccountStorageMode("unswitched"),
     ...defaults,
     ...options,
     storage: options.storage ?? defaults.storage,
@@ -195,7 +197,10 @@ async function setupX402Fixture() {
 describe("createPsLiteRuntime", () => {
   it("rejects storage adapters instead of falling back to memory", () => {
     expect(() =>
-      createPsLiteRuntime({ storage: { kind: "indexeddb" } }),
+      createPsLiteRuntime({
+        accountStorageMode: fixedAccountStorageMode("unswitched"),
+        storage: { kind: "indexeddb" },
+      }),
     ).toThrow(
       "PS Lite runtime requires a persistent DataStoragePort. Use createIndexedDbPsLiteRuntime() or createPersistentPsLiteStorage().",
     );
@@ -205,13 +210,17 @@ describe("createPsLiteRuntime", () => {
     const accessLogStore = createMemoryPsLiteAccessLogStore();
 
     expect(() =>
-      createPsLiteRuntime({ storage: createMemoryPsLiteStorage() }),
+      createPsLiteRuntime({
+        accountStorageMode: fixedAccountStorageMode("unswitched"),
+        storage: createMemoryPsLiteStorage(),
+      }),
     ).toThrow(
       "IndexedDB is required for default PS Lite access log persistence.",
     );
 
     expect(() =>
       createPsLiteRuntime({
+        accountStorageMode: fixedAccountStorageMode("unswitched"),
         storage: createMemoryPsLiteStorage(),
         accessLogReader: accessLogStore,
         accessLogWriter: accessLogStore,
@@ -220,6 +229,7 @@ describe("createPsLiteRuntime", () => {
 
     expect(() =>
       createPsLiteRuntime({
+        accountStorageMode: fixedAccountStorageMode("unswitched"),
         storage: createMemoryPsLiteStorage(),
         accessLogReader: accessLogStore,
         accessLogWriter: accessLogStore,

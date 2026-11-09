@@ -6,10 +6,7 @@
       "offTtlMs": 604800000,
       "description": "Authenticated fresh Off allows ordinary legacy access."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -117,10 +114,7 @@
       "offTtlMs": 604800000,
       "description": "Each failed/malformed/missing answer invalidates a previous clean Off."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -548,10 +542,7 @@
       "offTtlMs": 604800000,
       "description": "A fresh owner refuses during outage and until On is saved."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -695,10 +686,7 @@
       "offTtlMs": 604800000,
       "description": "Stale Off, outage and unauthenticated/sign-out evidence cannot lower saved On."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -887,10 +875,7 @@
       "offTtlMs": 604800000,
       "description": "A's On and B's clean Off are independent records."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -1028,10 +1013,7 @@
       "offTtlMs": 604800000,
       "description": "Missing/mismatched evidence, read and commit refuse without changing the bound record."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -1298,10 +1280,7 @@
       "offTtlMs": 604800000,
       "description": "On between admission and commit refuses the old operation at commit."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -1490,10 +1469,7 @@
       "offTtlMs": 604800000,
       "description": "Untrusted clocks and a new boot expire Off, never the On latch."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -1628,10 +1604,7 @@
       "offTtlMs": 604800000,
       "description": "On cannot serve streams or legacy until a matching durable save completes."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -1869,10 +1842,7 @@
       "offTtlMs": 604800000,
       "description": "TTL is measured from fetch start, not response time; equality and untrusted/cross-domain boots expire it."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -2131,10 +2101,7 @@
       "offTtlMs": 604800000,
       "description": "Accepted migration-only window: remote On not yet delivered here does not invalidate fresh Off; first local On requests import once."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null
@@ -2315,10 +2282,7 @@
       "offTtlMs": 604800000,
       "description": "Never-seen is unknown; first explicit Off has no post-evidence 503, while first explicit On needs no import."
     },
-    "owners": [
-      "A",
-      "B"
-    ],
+    "owners": ["A", "B"],
     "initial": {
       "A": null,
       "B": null

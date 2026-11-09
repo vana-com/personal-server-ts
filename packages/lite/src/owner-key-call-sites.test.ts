@@ -11,6 +11,7 @@
  * module. The signature is the high-s vector (v = 0x1c).
  */
 
+import { createUnswitchedIndexedDbPsLiteRuntime } from "./test-support/unswitched-runtime.js";
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
@@ -20,7 +21,6 @@ import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schema
 import * as SyncManagerModule from "@opendatalabs/personal-server-ts-core/sync/manager";
 import * as HostPortsModule from "@opendatalabs/personal-server-ts-core/replication/host-ports";
 import * as ReplicationHostModule from "./replication-host.js";
-import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
 import { createPsLiteSyncManager } from "./sync.js";
 import { createIndexedDbPsLiteStateStore } from "./state.js";
 import { recoverOwnerAddress } from "@opendatalabs/personal-server-ts-core/keys";
@@ -117,7 +117,7 @@ it("gives the Lite replication network ports the legacy master key", async () =>
     mcpOAuthAuthorizations: createInMemoryMcpOAuthAuthorizationStore(),
     relayTlsIdentity: { read: () => null, write: () => {} },
   };
-  await createIndexedDbPsLiteRuntime({
+  await createUnswitchedIndexedDbPsLiteRuntime({
     ownerAddress: owner,
     ownerSignature: HIGH_S_SIGNATURE,
     persistence: memory,

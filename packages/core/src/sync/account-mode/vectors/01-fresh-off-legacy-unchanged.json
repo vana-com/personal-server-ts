@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "id": "fresh-off-legacy-unchanged",
+  "description": "A fresh explicit Off lets legacy work proceed exactly as before the module existed.",
+  "policy": { "offTtlMs": 604800000 },
+  "owners": {
+    "A": "0x1111111111111111111111111111111111111111",
+    "B": "0x2222222222222222222222222222222222222222",
+    "C": "0x3333333333333333333333333333333333333333",
+    "D": "0x4444444444444444444444444444444444444444",
+    "E": "0x5555555555555555555555555555555555555555",
+    "F": "0x6666666666666666666666666666666666666666"
+  },
+  "initial": {},
+  "events": [
+    {
+      "id": "f1",
+      "op": "fetchStart",
+      "owner": "A",
+      "requestId": "r1",
+      "clock": { "boot": "b1", "monoMs": 0, "wallMs": 1000000 }
+    },
+    {
+      "id": "e1",
+      "op": "accountResult",
+      "authOwner": "A",
+      "requestId": "r1",
+      "rawFixture": "explicit-off",
+      "evidence": { "owner": "A", "state": "off" }
+    },
+    { "id": "e2", "op": "admit", "owner": "A", "operationId": "w1" },
+    {
+      "id": "e3",
+      "op": "commit",
+      "owner": "A",
+      "operationId": "w1",
+      "sink": "legacy"
+    },
+    { "id": "e4", "op": "read", "owner": "A" }
+  ],
+  "expect": [
+    {
+      "after": "e1",
+      "decision": "legacy",
+      "durable": { "A": { "switched": false } }
+    },
+    { "after": "e2", "decision": "legacy" },
+    { "after": "e3", "decision": "legacy", "legacyMutations": 1 },
+    { "after": "e4", "decision": "legacy" }
+  ]
+}

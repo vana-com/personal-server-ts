@@ -12,6 +12,7 @@ import {
 import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
 import Database from "better-sqlite3";
 import { startPersonalServer } from "./client.js";
+import type { PersonalServerHandle } from "@opendatalabs/personal-server-ts-core/client";
 import {
   enableReplicaTestIdentity,
   replicaTestAuthority,
@@ -80,7 +81,10 @@ async function getFreePort(): Promise<number> {
   return address.port;
 }
 
-async function startTestServer(gateway = createGateway()) {
+async function startTestServer(
+  gateway = createGateway(),
+  declareUnswitched = true,
+) {
   const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
   const port = await getFreePort();
   const config = ServerConfigSchema.parse({
@@ -102,7 +106,21 @@ async function startTestServer(gateway = createGateway()) {
     await ps.stop();
     await rm(rootPath, { recursive: true, force: true });
   });
+  if (declareUnswitched) await declareOff(ps);
   return { ps, gateway, port };
+}
+
+/** The Account's explicit Off for this server's owner, as a host forwards it. */
+async function declareOff(ps: PersonalServerHandle) {
+  const owner = (await ps.info()).ownerAddress;
+  if (!owner) throw new Error("the test server has no owner");
+  await ps.submitAccountModeEvidence?.({
+    owner,
+    authOwner: owner,
+    state: "off",
+    fetchStartedAt: Date.now(),
+    rawStatus: 200,
+  });
 }
 
 describe("startPersonalServer node handle", () => {
@@ -231,6 +249,21 @@ describe("startPersonalServer node handle", () => {
       scope: "instagram.profile",
       status: "stored",
     });
+  });
+
+  // UNKNOWN_AS_OFF, NEVER_SEEN_OWNER_ADMITS
+  it("refuses a legacy write with a retryable 503 until the host forwards the Account's answer", async () => {
+    const { ps } = await startTestServer(createGateway(), false);
+    const write = () =>
+      ps.postData(
+        "instagram.profile",
+        { username: "vana_debug" },
+        { signMessage: ownerWallet.signMessage },
+      );
+
+    await expect(write()).rejects.toMatchObject({ status: 503 });
+    await declareOff(ps);
+    await expect(write()).resolves.toMatchObject({ status: "stored" });
   });
 
   it("exposes typed data and sync helpers through the public handle", async () => {

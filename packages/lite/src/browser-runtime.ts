@@ -23,7 +23,15 @@ import type {
 } from "./replication-ports.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import { createAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  accountStorageModeOf,
+  createMemoryModeRecordStore,
+  createModeAuthority,
+  legacyFlagEvidence,
+  type ModeAuthority,
+  type ModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { createIndexedDbModeRecordStore } from "./account-mode-store.js";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import type { InferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
 import {
@@ -93,6 +101,12 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   | "tokenStore"
 > {
   ownerAddress?: `0x${string}`;
+  /**
+   * Where the account-mode module keeps its per-owner records. Default: its
+   * own IndexedDB database next to the data store's. A host with another
+   * durable place (a native bundle) injects a store.
+   */
+  accountModeStore?: ModeRecordStore;
   /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible fetch client on `config.inference`; tests inject a
@@ -182,6 +196,11 @@ export interface IndexedDbPsLiteRuntime {
   replication: ReplicationDoorStatus;
   /** Replication built over `replicaHost`, when the host passed it. */
   replicationHost?: LiteReplication;
+  /**
+   * The account-mode module. Web code gives it the Account's answer with
+   * `submitEvidence` before it starts the first collection.
+   */
+  accountModeAuthority: ModeAuthority;
 }
 
 export async function createIndexedDbPsLiteRuntime(
@@ -425,16 +444,44 @@ export async function createIndexedDbPsLiteRuntime(
           }
         : {}),
     });
-  // The account's stream-sync switch, read from the live config on each write.
-  const accountStorageMode = createAccountStorageMode({
-    owner: serverOwner ?? "",
-    source: () =>
-      config.streamSync.write === true &&
-      config.streamSync.refuseLegacyWrites === true,
+  // One mode, from one place: the account-mode module. Its records live in
+  // their own IndexedDB database, never in the data store, and load before the
+  // runtime serves anything.
+  const accountModeAuthority = createModeAuthority({
+    // A host that injects its own persistence has not offered browser
+    // IndexedDB, so the module does not open it either. Without a store from
+    // that host the records are held in memory: no On survives a restart, and
+    // the module refuses legacy work until the Account answers again.
+    store:
+      options.accountModeStore ??
+      (options.persistence
+        ? createMemoryModeRecordStore()
+        : createIndexedDbModeRecordStore(`${dbName}-account-mode`)),
+    bootId: crypto.randomUUID(),
+    // A first On reports an import when the legacy store holds any scope.
+    hasLegacyFiles: () => storage.listScopes({ limit: 1, offset: 0 }).total > 0,
   });
+  // A store that cannot be read does not stop the runtime: the module fails
+  // closed (every legacy read and write is refused with a retryable 503) and
+  // loads again on the next evidence.
+  await accountModeAuthority.ready
+    .then(() =>
+      // The old spawn-time flag is evidence of nothing: it can never mint Off.
+      accountModeAuthority.submitEvidence(
+        legacyFlagEvidence(config.streamSync, serverOwner ?? "", Date.now()),
+      ),
+    )
+    .catch((err: unknown) => {
+      console.warn(
+        "account mode records could not be loaded; refusing legacy work until they can",
+        err,
+      );
+    });
+  const accountStorageMode = accountStorageModeOf(accountModeAuthority);
   const runtime = createPsLiteRuntime({
     ...options,
     accountStorageMode,
+    accountModeAuthority,
     replication: replicationHost?.runtime ?? options.replication,
     auth,
     serverOrigin,
@@ -486,5 +533,6 @@ export async function createIndexedDbPsLiteRuntime(
     derivatives,
     replication,
     replicationHost,
+    accountModeAuthority,
   };
 }

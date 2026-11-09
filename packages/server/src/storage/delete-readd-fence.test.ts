@@ -12,6 +12,7 @@ import {
   createScopeDeletionTracker,
   deleteScope,
 } from "@opendatalabs/personal-server-ts-core/sync";
+import { fixedOwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createIndexManager } from "./index-manager.js";
 import { initializeDatabase } from "./index-schema.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
@@ -64,6 +65,7 @@ function routeDeps(
   return {
     storage,
     serverOwner: owner,
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched", owner),
     scopeDeletions,
     auth: {
       authorizeOwner: async () => undefined,

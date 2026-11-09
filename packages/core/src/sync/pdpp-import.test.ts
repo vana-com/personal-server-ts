@@ -26,6 +26,8 @@ import {
   type RetainedDeclaration,
 } from "./pdpp-import.js";
 import type { Logger } from "../logger/index.js";
+import type { AccountStorageModeValue } from "../api/account-storage-mode.js";
+import { fixedOwnedAccountStorageMode } from "../test-utils/account-mode.js";
 
 const SCOPE = "instagram.profile";
 const COLLECTED_AT = "2026-09-17T10:00:00.000Z";
@@ -83,6 +85,7 @@ function setup(overrides: Partial<RetainedDeclaration> = {}): {
 } {
   const store = createMemoryRecordStore();
   const importer = createPdppImporter({
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
     store,
     declarations: [{ ...RETAINED, ...overrides }],
     instanceFor: (sourceId) => (sourceId === SOURCE_ID ? INSTANCE : undefined),
@@ -245,6 +248,7 @@ describe("retry classification", () => {
     const store = createMemoryRecordStore();
     // No instance derivable yet — the deployment is still coming up.
     const importer = createPdppImporter({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       store,
       declarations: [RETAINED],
       instanceFor: () => undefined,
@@ -259,6 +263,7 @@ describe("retry classification", () => {
     const refusingWith = (reason: string) => {
       const store = createMemoryRecordStore();
       const importer = createPdppImporter({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         store: {
           ...store,
           ingestBatch: (envelopes) => ({
@@ -600,6 +605,7 @@ describe("createPdppImporter", () => {
     it("rejects when no instance handle can be derived", () => {
       const store = createMemoryRecordStore();
       const importer = createPdppImporter({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
         store,
         declarations: [RETAINED],
         instanceFor: () => undefined,
@@ -686,21 +692,21 @@ describe("createPdppImporter", () => {
 });
 
 describe("the stream-sync switch refuses canonical publishes", () => {
-  function importerWith(legacyWritesRefused: () => boolean) {
+  function importerWith(mode: AccountStorageModeValue) {
     const store = createMemoryRecordStore();
     const importer = createPdppImporter({
       store,
       declarations: [RETAINED],
       instanceFor: (sourceId) =>
         sourceId === SOURCE_ID ? INSTANCE : undefined,
-      legacyWritesRefused,
+      accountStorageMode: fixedOwnedAccountStorageMode(mode),
       logger: silentLogger(),
     });
     return { importer, store };
   }
 
   it("refuses a publish on a switched account, stores nothing, and does not retry it", () => {
-    const { importer, store } = importerWith(() => true);
+    const { importer, store } = importerWith("switched");
     const ingest = vi.spyOn(store, "ingestBatch");
     const outcome = importer.importEnvelope(envelope());
     expect(outcome).toMatchObject({
@@ -712,8 +718,36 @@ describe("the stream-sync switch refuses canonical publishes", () => {
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
   });
 
+  // UNKNOWN_AS_OFF
+  it("defers a publish while the mode is unknown, and asks for a retry", () => {
+    const { importer, store } = importerWith("unknown");
+    const ingest = vi.spyOn(store, "ingestBatch");
+    const outcome = importer.importEnvelope(envelope());
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      rejection: { code: "account_mode_unknown" },
+    });
+    expect(ingest).not.toHaveBeenCalled();
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
+  });
+
+  it("defers a publish when no mode is wired", () => {
+    const store = createMemoryRecordStore();
+    const importer = createPdppImporter({
+      store,
+      declarations: [RETAINED],
+      instanceFor: (sourceId) =>
+        sourceId === SOURCE_ID ? INSTANCE : undefined,
+      logger: silentLogger(),
+    });
+    expect(importer.importEnvelope(envelope())).toMatchObject({
+      status: "rejected",
+      rejection: { code: "account_mode_unknown" },
+    });
+  });
+
   it("imports the same publish on an unswitched account", () => {
-    const { importer, store } = importerWith(() => false);
+    const { importer, store } = importerWith("unswitched");
     expect(importer.importEnvelope(envelope()).status).toBe("imported");
     expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeDefined();
   });

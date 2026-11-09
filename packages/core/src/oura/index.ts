@@ -47,6 +47,7 @@ export type OuraBrowserImportOptions = Pick<
   | "additions"
   | "onDataWritten"
   | "legacyScopeView"
+  | "accountStorageMode"
 > & {
   /** Read once by the importer under its import lock, never before it. */
   retainedCanonicalHistory?: () => OuraRetainedHistory | undefined;

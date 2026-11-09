@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fixedOwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,7 @@ describe("owner import acceptance across restart", () => {
   function openServer() {
     index = createIndexManager(initializeDatabase(join(root, "index.db")));
     app = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
       logger: pino({ level: "silent" }),
@@ -149,6 +151,7 @@ describe("owner import acceptance across restart", () => {
       hierarchyOptions: { dataDir: join(root, "data") },
     });
     const unsupported = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
       dataStorage: { ...raw, kind: "custom", commitVersion: undefined },

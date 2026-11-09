@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "id": "first-launch-account-mode-outage",
+  "description": "Sign-in worked but the mode read failed on first launch: unknown is refused with a retryable 503. When the next answer is an explicit Off, the same owner proceeds.",
+  "policy": { "offTtlMs": 604800000 },
+  "owners": {
+    "A": "0x1111111111111111111111111111111111111111",
+    "B": "0x2222222222222222222222222222222222222222"
+  },
+  "initial": {},
+  "events": [
+    {
+      "id": "f1",
+      "op": "fetchStart",
+      "owner": "A",
+      "requestId": "r1",
+      "clock": { "boot": "b1", "monoMs": 0, "wallMs": 1000000 }
+    },
+    {
+      "id": "e1",
+      "op": "accountResult",
+      "authOwner": "A",
+      "requestId": "r1",
+      "rawFixture": "http-503",
+      "evidence": { "owner": "A", "state": "unknown" }
+    },
+    { "id": "e2", "op": "admit", "owner": "A", "operationId": "w1" },
+    {
+      "id": "f2",
+      "op": "fetchStart",
+      "owner": "B",
+      "requestId": "r2",
+      "clock": { "boot": "b1", "monoMs": 1, "wallMs": 1000001 }
+    },
+    {
+      "id": "e3",
+      "op": "accountResult",
+      "authOwner": "B",
+      "requestId": "r2",
+      "rawFixture": "timeout",
+      "evidence": { "owner": "B", "state": "unknown" }
+    },
+    { "id": "e4", "op": "admit", "owner": "B", "operationId": "w2" },
+    {
+      "id": "f3",
+      "op": "fetchStart",
+      "owner": "A",
+      "requestId": "r3",
+      "clock": { "boot": "b1", "monoMs": 2000, "wallMs": 1002000 }
+    },
+    {
+      "id": "e5",
+      "op": "accountResult",
+      "authOwner": "A",
+      "requestId": "r3",
+      "rawFixture": "explicit-off",
+      "evidence": { "owner": "A", "state": "off" }
+    },
+    { "id": "e6", "op": "admit", "owner": "A", "operationId": "w3" },
+    {
+      "id": "e7",
+      "op": "commit",
+      "owner": "A",
+      "operationId": "w3",
+      "sink": "legacy"
+    }
+  ],
+  "expect": [
+    {
+      "after": "e1",
+      "decision": "refuse",
+      "code": "ACCOUNT_MODE_UNKNOWN",
+      "status": 503
+    },
+    {
+      "after": "e2",
+      "decision": "refuse",
+      "code": "ACCOUNT_MODE_UNKNOWN",
+      "status": 503
+    },
+    {
+      "after": "e3",
+      "decision": "refuse",
+      "code": "ACCOUNT_MODE_UNKNOWN",
+      "status": 503
+    },
+    {
+      "after": "e4",
+      "decision": "refuse",
+      "code": "ACCOUNT_MODE_UNKNOWN",
+      "status": 503
+    },
+    { "after": "e6", "decision": "legacy" },
+    { "after": "e7", "decision": "legacy", "legacyMutations": 1 }
+  ]
+}

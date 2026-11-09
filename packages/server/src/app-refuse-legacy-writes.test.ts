@@ -1,7 +1,9 @@
 /**
- * The mounted app reads the stream-sync switch from the server's own config
- * (`streamSync.write`, set by the host from the Account setting) and refuses
- * an undeclared legacy write on `/v1/data` only when it is on.
+ * The mounted app takes the account's storage mode from the host's one mode
+ * module and nothing else. The spawn-time `streamSync` config flags no longer
+ * decide it: a write is refused with 426 after the Account said On, refused
+ * with a retryable 503 while the mode is unknown, and accepted as before only
+ * after a fresh explicit Off.
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -11,11 +13,20 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
-  createAccountStorageMode,
   STREAM_SYNC_CLIENT_HEADER,
   type AccountStorageMode,
   type AccountStorageModeValue,
 } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  accountStorageModeOf,
+  createMemoryModeRecordStore,
+  createModeAuthority,
+  legacyFlagEvidence,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import {
+  authorityHearing,
+  fixedAccountStorageMode,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createApp } from "./app.js";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -25,6 +36,7 @@ import {
 } from "./storage/index-manager.js";
 
 const owner = "0x1111111111111111111111111111111111111111";
+const other = "0x2222222222222222222222222222222222222222";
 const token = "refuse-legacy-app-token";
 
 describe("createApp legacy-write refusal", () => {
@@ -40,10 +52,10 @@ describe("createApp legacy-write refusal", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  function makeApp(streamSync: {
-    write?: boolean;
-    refuseLegacyWrites?: boolean;
-  }) {
+  function makeApp(
+    accountStorageMode?: AccountStorageMode,
+    streamSync: { write?: boolean; refuseLegacyWrites?: boolean } = {},
+  ) {
     return createApp({
       logger: pino({ level: "silent" }),
       version: "0.0.1",
@@ -55,11 +67,13 @@ describe("createApp legacy-write refusal", () => {
       gateway: {} as GatewayClient,
       accessLogWriter: { write: async () => undefined },
       devToken: token,
-      config: ServerConfigSchema.parse({
-        streamSync,
-      }),
+      config: ServerConfigSchema.parse({ streamSync }),
+      accountStorageMode,
     });
   }
+
+  const modeApp = (value: AccountStorageModeValue) =>
+    makeApp(fixedAccountStorageMode(value));
 
   function post(app: ReturnType<typeof makeApp>, headers = {}) {
     return app.request("/v1/data/github.events", {
@@ -73,30 +87,8 @@ describe("createApp legacy-write refusal", () => {
     });
   }
 
-  it("accepts an old client's write by default, even with streamSync.write on", async () => {
-    expect((await post(makeApp({ write: true }))).status).toBe(201);
-  });
-
-  it("refuses an old client's write only when both flags are on", async () => {
-    const response = await post(
-      makeApp({ write: true, refuseLegacyWrites: true }),
-    );
-    expect(response.status).toBe(426);
-    expect((await response.json()).errorCode).toBe("update_required");
-  });
-
-  it("refuses a declaring client's write when both flags are on: a header is no exemption", async () => {
-    const response = await post(
-      makeApp({ write: true, refuseLegacyWrites: true }),
-      { [STREAM_SYNC_CLIENT_HEADER]: "1" },
-    );
-    expect(response.status).toBe(426);
-    expect(index.countByScope("github.events")).toBe(0);
-  });
-
-  it("refuses an Oura browser import when both flags are on, and stores nothing", async () => {
-    const app = makeApp({ write: true, refuseLegacyWrites: true });
-    const response = await app.request("/v1/import/oura-browser", {
+  const ouraImport = (app: ReturnType<typeof makeApp>) =>
+    app.request("/v1/import/oura-browser", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -104,74 +96,113 @@ describe("createApp legacy-write refusal", () => {
       },
       body: JSON.stringify({ streams: [] }),
     });
+
+  // UNSWITCHED_CHANGED
+  it("accepts an old client's write on an unswitched account", async () => {
+    expect((await post(modeApp("unswitched"))).status).toBe(201);
+  });
+
+  it("refuses an old client's write on a switched account", async () => {
+    const response = await post(modeApp("switched"));
+    expect(response.status).toBe(426);
+    expect((await response.json()).errorCode).toBe("update_required");
+  });
+
+  it("refuses a declaring client's write on a switched account: a header is no exemption", async () => {
+    const response = await post(modeApp("switched"), {
+      [STREAM_SYNC_CLIENT_HEADER]: "1",
+    });
+    expect(response.status).toBe(426);
+    expect(index.countByScope("github.events")).toBe(0);
+  });
+
+  it("refuses an Oura browser import on a switched account, and stores nothing", async () => {
+    const response = await ouraImport(modeApp("switched"));
     expect(response.status).toBe(426);
     expect((await response.json()).errorCode).toBe("update_required");
     expect(index.countByScope("oura.sleep")).toBe(0);
   });
 
-  it("lets an Oura browser import through when the switch is off", async () => {
-    const app = makeApp({ write: true, refuseLegacyWrites: false });
-    const response = await app.request("/v1/import/oura-browser", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ streams: [] }),
-    });
-    expect(response.status).not.toBe(426);
+  it("lets an Oura browser import through on an unswitched account", async () => {
+    const response = await ouraImport(modeApp("unswitched"));
+    expect([426, 503]).not.toContain(response.status);
   });
 
-  it("accepts an old client's write when streamSync.write is off", async () => {
-    expect(
-      (await post(makeApp({ write: false, refuseLegacyWrites: true }))).status,
-    ).toBe(201);
-  });
-  it("uses the host's one mode instance for the write gate, not a second one built from config", async () => {
-    const reads: Array<string | undefined> = [];
-    const app = createApp({
-      logger: pino({ level: "silent" }),
-      version: "0.0.1",
-      startedAt: new Date(),
-      indexManager: index,
-      hierarchyOptions: { dataDir: join(dir, "data") },
-      serverOrigin: "http://localhost:8080",
-      serverOwner: owner,
-      gateway: {} as GatewayClient,
-      accessLogWriter: { write: async () => undefined },
-      devToken: token,
-      // Config says the account is unswitched; the host's mode says switched.
-      config: ServerConfigSchema.parse({ streamSync: {} }),
-      accountStorageMode: {
-        read: (requestOwner) => {
-          reads.push(requestOwner);
-          return "switched";
-        },
-      },
-    });
-    expect((await post(app)).status).toBe(426);
-    expect(reads.length).toBeGreaterThan(0);
-    expect(new Set(reads)).toEqual(new Set([owner]));
+  // UNKNOWN_AS_OFF
+  it("refuses with a retryable 503 while the mode is unknown, and stores nothing", async () => {
+    for (const app of [modeApp("unknown"), makeApp(undefined)]) {
+      const write = await post(app);
+      expect(write.status).toBe(503);
+      expect((await write.json()).error.errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
+      expect((await ouraImport(app)).status).toBe(503);
+    }
     expect(index.countByScope("github.events")).toBe(0);
   });
 
+  // FLAG_MINTS_OFF
+  it("does not read the old spawn-time flags as an Off", async () => {
+    const authority = await authorityHearing(owner, "off");
+    // A fresh authority told only what the flags say has no Off to give.
+    const flagOnly = createModeAuthority({
+      store: createMemoryModeRecordStore(),
+      bootId: "flag-only",
+    });
+    await flagOnly.ready;
+    await flagOnly.submitEvidence(
+      legacyFlagEvidence(
+        { write: false, refuseLegacyWrites: false },
+        owner,
+        Date.now(),
+      ),
+    );
+    const app = makeApp(accountStorageModeOf(flagOnly), {
+      write: false,
+      refuseLegacyWrites: false,
+    });
+    expect((await post(app)).status).toBe(503);
+    // The same flags with a real Off from the Account do accept.
+    expect(
+      (
+        await post(
+          makeApp(accountStorageModeOf(authority), {
+            write: true,
+            refuseLegacyWrites: true,
+          }),
+        )
+      ).status,
+    ).toBe(201);
+  });
+
+  // UNSWITCHED_CHANGED
+  it("takes the answer from the host's module: a fresh Off writes, a later On refuses", async () => {
+    const authority = await authorityHearing(owner, "off");
+    const app = makeApp(accountStorageModeOf(authority));
+    expect((await post(app)).status).toBe(201);
+    await authority.submitEvidence({
+      owner,
+      authOwner: owner,
+      state: "on",
+      fetchStartedAt: Date.now(),
+      rawStatus: 200,
+    });
+    expect((await post(app)).status).toBe(426);
+    expect(index.countByScope("github.events")).toBe(1);
+  });
+
   describe.each([
-    { name: "own mode", bound: owner, expected: "switched", refused: true },
+    { name: "own mode", bound: owner, expected: "switched", refused: 426 },
     {
       name: "mode of another account",
-      bound: "0x2222222222222222222222222222222222222222",
+      bound: other,
       expected: "unknown",
-      refused: false,
+      refused: 503,
     },
   ] as const)("a latched switched $name in this server", (c) => {
     const calls: Array<{ owner: string; answer: AccountStorageModeValue }> = [];
 
-    function makeSpiedApp() {
+    async function makeSpiedApp() {
       calls.length = 0;
-      const inner = createAccountStorageMode({
-        owner: c.bound,
-        source: () => true,
-      });
+      const inner = accountStorageModeOf(await authorityHearing(c.bound, "on"));
       expect(inner.read(c.bound)).toBe("switched");
       const spy: AccountStorageMode = {
         read: (requestOwner) => {
@@ -180,20 +211,7 @@ describe("createApp legacy-write refusal", () => {
           return answer;
         },
       };
-      return createApp({
-        logger: pino({ level: "silent" }),
-        version: "0.0.1",
-        startedAt: new Date(),
-        indexManager: index,
-        hierarchyOptions: { dataDir: join(dir, "data") },
-        serverOrigin: "http://localhost:8080",
-        serverOwner: owner,
-        gateway: {} as GatewayClient,
-        accessLogWriter: { write: async () => undefined },
-        devToken: token,
-        config: ServerConfigSchema.parse({ streamSync: {} }),
-        accountStorageMode: spy,
-      });
+      return makeApp(spy);
     }
 
     function expectOnlyThisServersOwnerWasAsked() {
@@ -204,30 +222,25 @@ describe("createApp legacy-write refusal", () => {
       );
     }
 
-    // DROP_REQUEST_OWNER
+    // OWNERLESS_READ_ANSWERS
     it("answers the legacy data write for this server's owner only", async () => {
-      const response = await post(makeSpiedApp());
-      expect(response.status === 426).toBe(c.refused);
+      const response = await post(await makeSpiedApp());
+      expect(response.status).toBe(c.refused);
       expectOnlyThisServersOwnerWasAsked();
     });
 
-    // DROP_REQUEST_OWNER
+    // OWNERLESS_READ_ANSWERS
     it("answers the Oura browser import for this server's owner only", async () => {
-      const response = await makeSpiedApp().request("/v1/import/oura-browser", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ streams: [] }),
-      });
-      expect(response.status === 426).toBe(c.refused);
+      const response = await ouraImport(await makeSpiedApp());
+      expect(response.status).toBe(c.refused);
       expectOnlyThisServersOwnerWasAsked();
     });
 
-    // DROP_REQUEST_OWNER
+    // OWNERLESS_READ_ANSWERS
     it("answers a read's selector for this server's owner only", async () => {
-      const response = await makeSpiedApp().request("/v1/data/github.events", {
+      const response = await (
+        await makeSpiedApp()
+      ).request("/v1/data/github.events", {
         headers: { Authorization: `Bearer ${token}` },
       });
       expect(response.status).not.toBe(426);

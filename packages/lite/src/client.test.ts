@@ -3,6 +3,7 @@ import type { Builder, GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
@@ -56,6 +57,7 @@ function createRuntime(
 ) {
   const accessLogs = createMemoryPsLiteAccessLogStore();
   return createPsLiteRuntime({
+    accountStorageMode: fixedAccountStorageMode("unswitched"),
     active: true,
     storage,
     accessLogReader: accessLogs,

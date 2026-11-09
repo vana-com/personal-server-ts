@@ -4,6 +4,7 @@
  * written is invisible at its path until it is committed.
  */
 
+import { fixedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
@@ -46,6 +47,7 @@ async function createRuntime(
 ): Promise<PsLiteRuntime> {
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   return createPsLiteRuntime({
+    accountStorageMode: fixedAccountStorageMode("unswitched"),
     storage: await createPersistentPsLiteStorage(
       { kind: "custom" },
       persistence,
@@ -473,6 +475,7 @@ describe("streamed scope uploads", () => {
 
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const plainStore = createPsLiteRuntime({
+      accountStorageMode: fixedAccountStorageMode("unswitched"),
       storage: createMemoryPsLiteStorage(),
       gateway: createMockPsLiteGateway(),
       accessLogReader: accessLogStore,

@@ -436,6 +436,8 @@ export async function startPersonalServer(
   const { replicationStatus, replicaWriterRotation } = context;
   return {
     kind: "node",
+    submitAccountModeEvidence: (input) =>
+      context.accountModeAuthority.submitEvidence(input),
     replication: {
       status: () => replicationStatus,
       writerRotation: () => replicaWriterRotation,
