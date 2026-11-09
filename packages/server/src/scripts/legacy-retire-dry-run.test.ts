@@ -124,6 +124,20 @@ describe("legacy-retire-dry-run command", () => {
     expect(stderr.mock.calls.join("")).toMatch(/Usage/);
   });
 
+  it("exits 2 with usage, and no stack, for an unknown flag or a flag without its value", async () => {
+    for (const argv of [
+      ["--data-dir", "/x", "--out", "/y", "--bogus"],
+      ["--data-dir", "/x", "--out", "/y", "--config"],
+    ]) {
+      const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+      await expect(main(argv)).resolves.toBe(2);
+      const text = stderr.mock.calls.join("");
+      expect(text).toMatch(/Usage/);
+      expect(text).not.toMatch(/\bat .*\(|ERR_PARSE_ARGS/);
+      stderr.mockRestore();
+    }
+  });
+
   it("exits 2 with usage for a --config that is neither runtime config file", async () => {
     const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
     expect(

@@ -32,18 +32,25 @@ const USAGE =
   "Set VANA_MASTER_KEY_SIGNATURE in the environment.";
 
 export async function main(argv: readonly string[]): Promise<number> {
-  const { values } = parseArgs({
-    args: [...argv],
-    options: {
-      "data-dir": { type: "string" },
-      out: { type: "string" },
-      config: { type: "string" },
-      "gateway-url": { type: "string" },
-      "storage-url": { type: "string" },
-      "test-only-allow-loopback": { type: "boolean" },
-    },
-    strict: true,
-  });
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args: [...argv],
+      options: {
+        "data-dir": { type: "string" },
+        out: { type: "string" },
+        config: { type: "string" },
+        "gateway-url": { type: "string" },
+        "storage-url": { type: "string" },
+        "test-only-allow-loopback": { type: "boolean" },
+      },
+      strict: true,
+    }));
+  } catch {
+    // An unknown flag or a flag without its value: say how to call, no stack.
+    process.stderr.write(`${USAGE}\n`);
+    return 2;
+  }
   if (!values["data-dir"] || !values.out) {
     process.stderr.write(`${USAGE}\n`);
     return 2;

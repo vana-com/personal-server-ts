@@ -654,6 +654,19 @@ const MUTANTS = [
     files: [T.entryOrder],
     pattern: "refuses a fetch captured at module load",
   },
+  {
+    id: "DRY_RUN_ARGS_ESCAPE",
+    what: "an unknown flag or a flag without its value escapes as a thrown parse error, not usage and exit 2",
+    edits: [
+      [
+        F.cli,
+        "    // An unknown flag or a flag without its value: say how to call, no stack.\n    process.stderr.write(`${USAGE}\\n`);\n    return 2;\n",
+        '    throw new Error("argument parse failed");\n',
+      ],
+    ],
+    files: [T.cli],
+    pattern: "unknown flag or a flag without its value",
+  },
 ];
 
 /** Output that means the run did not test the mutant at all. */
