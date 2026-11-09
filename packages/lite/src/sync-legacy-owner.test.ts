@@ -63,7 +63,7 @@ afterEach(() => {
 });
 
 describe("PS Lite asks the mode authority for the lowercase owner (OWNER_NOT_LOWERCASED)", () => {
-  it("reads switched for an exact-match authority, in the retire step and the import step", async () => {
+  it("reads switched for an exact-match authority, in the retire step and the import step (LITE_IMPORTER_OWNER_NOT_LOWERCASED)", async () => {
     expect(owner.address).not.toBe(owner.address.toLowerCase()); // checksum-cased
     const asked: string[] = [];
     const accountMode: AccountModeReader = {

@@ -25,6 +25,7 @@ const STATUS_ROUTE = "packages/server/src/routes/stream-sync-import-status.ts";
 const STATUS_ROUTE_TEST =
   "packages/server/src/routes/stream-sync-import-status.test.ts";
 const PUBLISH_TEST = `${R}/import-publish.test.ts`;
+const ROUND6_TEST = `${R}/import-round6.test.ts`;
 
 const ROUND2 = `${R}/retire-round2.test.ts`;
 const GATES = `${R}/retire.test.ts`;
@@ -1309,13 +1310,16 @@ export const MUTANTS = [
     why: "the seed publish runs after the authority's seal returns, not inside it",
     edits: edit(
       IMPORT,
-      `const sealed = await ledger.sealSeedPublish(connector, () =>
-          publish(connector, stagedStreams),
-        );`,
-      `const gate = await ledger.sealSeedPublish(connector, async () => undefined);
-        const sealed = gate.admitted
-          ? { admitted: true as const, value: await publish(connector, stagedStreams) }
-          : gate;`,
+      `? await ledger.sealSeedPublish(connector, () =>
+              publish(connector, stagedStreams),
+            )`,
+      `? await ledger
+              .sealSeedPublish(connector, async () => undefined)
+              .then(async (gate) =>
+                gate.admitted
+                  ? { admitted: true as const, value: await publish(connector, stagedStreams) }
+                  : gate,
+              )`,
     ),
     tests: [UNKNOWN_TEST],
     mustFail: ["IMPORT_SEED_PUBLISHED_OUTSIDE_SEAL"],
@@ -1331,5 +1335,97 @@ export const MUTANTS = [
     ),
     tests: [UNKNOWN_TEST],
     mustFail: ["IMPORT_DONE_WITHOUT_PUBLISH"],
+  },
+  // ---- round 6 (recheck of 64af352e) ----
+  {
+    name: "NESTED_AUTHORITY_IN_SEAL",
+    why: "the seed run asks the authority from inside the seal (a serializing authority never answers)",
+    edits: edit(
+      WRITER,
+      `      },
+      false,
+    );
+    await this.finishRun(runId, { checkpointCandidate: null });`,
+      `      },
+      true,
+    );
+    await this.finishRun(runId, { checkpointCandidate: null });`,
+    ),
+    tests: [ROUND6_TEST],
+    mustFail: ["NESTED_AUTHORITY_IN_SEAL"],
+    build: true,
+  },
+  {
+    name: "BOOT_IMPORTER_OWNER_NOT_LOWERCASED",
+    why: "the server's importer asks the mode authority for the checksum-cased owner",
+    edits: edit(
+      BOOTSTRAP,
+      `          mode: () => accountModeOf(accountMode, serverOwner),
+          // Staged rows`,
+      `          mode: () => accountMode.read(serverOwner),
+          // Staged rows`,
+    ),
+    tests: [BOOT_TEST],
+    mustFail: ["BOOT_IMPORTER_OWNER_NOT_LOWERCASED"],
+  },
+  {
+    name: "LITE_IMPORTER_OWNER_NOT_LOWERCASED",
+    why: "Lite's importer asks the mode authority for the checksum-cased owner",
+    edits: edit(
+      "packages/lite/src/sync.ts",
+      `          ledger: retireLedger,
+          owner: serverOwner,
+          mode: () => accountModeOf(accountMode, serverOwner),
+          logger,
+        })
+      : null;`,
+      `          ledger: retireLedger,
+          owner: serverOwner,
+          mode: () => accountMode.read(serverOwner),
+          logger,
+        })
+      : null;`,
+    ),
+    tests: [LITE_OWNER_TEST],
+    mustFail: ["LITE_IMPORTER_OWNER_NOT_LOWERCASED"],
+    build: true,
+  },
+  {
+    name: "ABANDONED_NEVER_RETRIED",
+    why: "what the import gave up is never tried again on a later boot",
+    edits: edit(
+      IMPORT,
+      'if (state === "done") return this.retryGivenUp();',
+      'if (state === "done") return { ran: false, connectorsStaged: 0, failed: 0 };',
+    ),
+    tests: [ROUND6_TEST],
+    mustFail: ["ABANDONED_NEVER_RETRIED"],
+    build: true,
+  },
+  {
+    name: "RETRY_REOPENS_GATE",
+    why: "a retry on a later boot closes the writer's gate for the connector again",
+    edits: edit(
+      IMPORT,
+      '    if (mode === "unswitched") return true;\n    return this.options.ledger.importDone(connector);',
+      '    if (mode === "unswitched") return true;\n    return (await this.options.ledger.read()).failures[connector] === undefined && this.options.ledger.importDone(connector);',
+    ),
+    tests: [ROUND6_TEST],
+    mustFail: ["ABANDONED_NEVER_RETRIED"],
+    build: true,
+  },
+  {
+    name: "STAYED_ZERO_WHILE_PENDING",
+    why: "a staged connector the writer has not answered for reports zero rows left behind",
+    edits: edit(
+      IMPORT,
+      `            ? excludedRows
+            : null`,
+      `            ? excludedRows
+            : excludedRows`,
+    ),
+    tests: [PUBLISH_TEST],
+    mustFail: ["STATUS_REPORTS_PUBLISHED_UNPUBLISHED"],
+    build: true,
   },
 ];

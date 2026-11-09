@@ -1504,6 +1504,19 @@ export class StreamSyncWriter {
    * entry this process does not drive (a restart), answers `RunGoneError`.
    */
   beginRun(input: StreamSyncRunStart): Promise<IssuedStart> {
+    return this.startRun(input, true);
+  }
+
+  /**
+   * `gated`: ask `importDone` before the run starts. Only the importer's own
+   * seed run (`publishSeed`) passes false: it runs inside the authority's seal,
+   * and a seal's write must never call the authority (the authority holds its
+   * lock for the whole seal, so a nested read waits for itself).
+   */
+  private startRun(
+    input: StreamSyncRunStart,
+    gated: boolean,
+  ): Promise<IssuedStart> {
     return this.intake(async () => {
       if (!RUN_ID.test(input.runId))
         throw new Error(`bad runId ${input.runId}`);
@@ -1515,6 +1528,7 @@ export class StreamSyncWriter {
         throw new Error(`run ${input.runId} already exists`);
       }
       if (
+        gated &&
         this.options.importDone &&
         !(await this.options.importDone(input.connector))
       ) {
@@ -1665,12 +1679,25 @@ export class StreamSyncWriter {
     // The run needs the controls listing like every run (a first publish
     // discards without it).
     await this.refreshControls();
-    await this.beginRun({
-      runId,
-      connector,
-      userConnect: false,
-      importOnly: true,
-    });
+    // This runs inside the authority's seal (the importer calls it there), so
+    // it asks the authority nothing: `startRun(…, false)` skips the
+    // `importDone` gate that `beginRun` applies. The run only QUEUES the seed
+    // publish; the registry POST happens later in `publishPending`, outside the
+    // seal. That is safe because the gate is not what keeps an account from
+    // returning to legacy between the queue and the POST: Account refuses Off
+    // after On and the personal server latches On, so an owner admitted at the
+    // seal cannot become unswitched before the POST. `publishPending` still
+    // asks `importDone` at the publish that binds generation 1 (below), where
+    // no seal is held.
+    await this.startRun(
+      {
+        runId,
+        connector,
+        userConnect: false,
+        importOnly: true,
+      },
+      false,
+    );
     await this.finishRun(runId, { checkpointCandidate: null });
     return { state: "waiting" };
   }

@@ -169,11 +169,20 @@ export const DEFAULT_MAX_ATTEMPTS = 5;
 export interface ImportStatus {
   /** The authority no longer waits for this account's import. */
   readonly complete: boolean;
-  /** The source could not be listed within the bound; no file is retired. */
+  /**
+   * The source could not be listed within the bound; no file is retired. It is
+   * listed again on the next boot.
+   */
   readonly abandoned: boolean;
   /**
-   * Rows that stayed only in a legacy file, over all connectors; null when
-   * some could not be counted (an unreadable source or connector).
+   * Connectors given up after the bound. Each is tried again on the next boot,
+   * and its legacy file is kept until a retry proves it.
+   */
+  readonly givenUp: number;
+  /**
+   * Rows that stayed only in a legacy file, over all connectors; null while
+   * pending or when some could not be counted (an unreadable source or
+   * connector, a staged connector the writer has not answered for).
    */
   readonly stayed: number | null;
   readonly connectors: readonly {
@@ -187,7 +196,10 @@ export interface ImportStatus {
     readonly attempts: number;
     /** Rows handed to the writer. */
     readonly staged: number;
-    /** Rows that stayed only in the legacy file; null when not countable. */
+    /**
+     * Rows that stayed only in the legacy file; null when not countable, and
+     * while the writer has not answered for the staged rows (pending).
+     */
     readonly stayed: number | null;
     /** Rows left in the legacy store, by reason. */
     readonly excluded: readonly { reason: string; rows: number }[];
@@ -248,13 +260,18 @@ export class LegacyImporter {
         refused: "owner_mismatch",
       };
     }
-    // The authority owns "done": once it says so, the import never runs
-    // again. An authority that does not know the owner is no decision either.
-    if ((await ledger.authorityState()) !== "pending") {
+    // The authority owns "done": once it says so, the first import never runs
+    // again, but what was given up is tried again on a later boot. An
+    // authority that does not know the owner is no decision.
+    const state = await ledger.authorityState();
+    if (state === "done") return this.retryGivenUp();
+    if (state !== "pending") {
       return { ran: false, connectorsStaged: 0, failed: 0 };
     }
-    const { result, settled } = await this.stage();
-    await this.queueRuns();
+    // This boot carried the first import: what it gave up waits for the next.
+    this.retriedGivenUp = true;
+    const { result, settled } = await this.stage(null);
+    await this.queueRuns(true);
     if (settled && (await this.allSeedsFinal())) {
       try {
         await ledger.markImportDone();
@@ -268,6 +285,44 @@ export class LegacyImporter {
     return result;
   }
 
+  /** Set once the given-up work was tried on this boot (or the boot carried the import). */
+  private retriedGivenUp = false;
+
+  /**
+   * ABANDONED_NEVER_RETRIED: a connector (or the whole listing) given up is
+   * not forgotten. The ledger keeps it; on a later boot, once, the import is
+   * tried again in the background. The authority already said done, so the
+   * gate is not touched and no run waits for it. The connector's file is kept
+   * until a retry proves it (`importProven`).
+   */
+  private async retryGivenUp(): Promise<ImportPassResult> {
+    let result: ImportPassResult = {
+      ran: false,
+      connectorsStaged: 0,
+      failed: 0,
+    };
+    if (!this.retriedGivenUp) {
+      const data = await this.options.ledger.read();
+      const gaveUp = Object.entries(data.failures)
+        .filter(([connector, f]) => f.gaveUp && !data.imported[connector])
+        .map(([connector]) => connector);
+      if (data.abandoned || gaveUp.length > 0) {
+        this.retriedGivenUp = true;
+        // An abandoned listing examined nothing, so every connector is still
+        // to do; otherwise only the connectors given up.
+        ({ result } = await this.stage(
+          data.abandoned ? null : new Set(gaveUp),
+        ));
+        // A source that is not open yet is no attempt: ask again next call.
+        if (result.pending) this.retriedGivenUp = false;
+      }
+    }
+    // Rows a retry staged are published and finalized without the seal: the
+    // authority is done, so ordinary commits are open.
+    await this.queueRuns(false);
+    return result;
+  }
+
   private get maxAttempts(): number {
     return this.options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   }
@@ -278,10 +333,12 @@ export class LegacyImporter {
 
   /**
    * Stage every connector the source lists that is not imported or given up.
+   * `retry`: a later boot's retry; it tries only the connectors named (given
+   * up before), or all of them when null and the listing had been given up.
    * `settled`: the listing worked (or was given up) and no connector is still
    * waiting for a retry.
    */
-  private async stage(): Promise<{
+  private async stage(retry: ReadonlySet<string> | null): Promise<{
     result: ImportPassResult;
     settled: boolean;
   }> {
@@ -300,6 +357,14 @@ export class LegacyImporter {
         { error: error instanceof Error ? error.name : "NonError" },
         "Legacy import source could not be listed; retried next cycle",
       );
+      // A retry of given-up connectors: the listing worked before. Its failure
+      // changes nothing; the next boot tries again.
+      if (retry !== null) {
+        return {
+          result: { ran: true, connectorsStaged: 0, failed: 1 },
+          settled: false,
+        };
+      }
       // A source that never lists would stall every connector's writes. After
       // the bound the import gives up: writes proceed, no file is retired.
       let abandoned = false;
@@ -316,9 +381,12 @@ export class LegacyImporter {
       };
     }
     // From here the rows of the source are examined, so they can be counted.
-    if (!(await ledger.read()).listed) {
+    if (!(await ledger.read()).listed || (await ledger.read()).abandoned) {
       await ledger.update((data) => {
         data.listed = true;
+        // A listing given up earlier works now: the bound is lifted.
+        data.abandoned = false;
+        data.listAttempts = 0;
       });
     }
     let staged = 0;
@@ -326,7 +394,14 @@ export class LegacyImporter {
     let waiting = 0;
     for (const connector of connectors) {
       const known = await ledger.read();
-      if (known.imported[connector] || known.failures[connector]?.gaveUp) {
+      if (known.imported[connector]) continue;
+      if (
+        retry === null
+          ? known.failures[connector]?.gaveUp
+          : !retry.has(connector)
+      ) {
+        // First import: a given-up connector waits for a later boot. A retry
+        // tries only what was given up.
         continue;
       }
       if (await this.options.deleted?.(connector)) {
@@ -405,7 +480,7 @@ export class LegacyImporter {
    * own runs are not held for it. Streams the writer did not merge are
    * counted as left behind, never as published.
    */
-  private async queueRuns(): Promise<void> {
+  private async queueRuns(sealed: boolean): Promise<void> {
     const { publish, ledger } = this.options;
     if (!publish) return;
     const { imported } = await ledger.read();
@@ -419,11 +494,18 @@ export class LegacyImporter {
         const stagedStreams = Object.entries(record.staged ?? {})
           .filter(([, rows]) => rows > 0)
           .map(([stream]) => stream);
-        const sealed = await ledger.sealSeedPublish(connector, () =>
-          publish(connector, stagedStreams),
-        );
-        if (!sealed.admitted) continue;
-        const outcome = sealed.value;
+        // After the authority said done, ordinary commits are open and the
+        // publish needs no seal (a retry on a later boot).
+        const result = sealed
+          ? await ledger.sealSeedPublish(connector, () =>
+              publish(connector, stagedStreams),
+            )
+          : ({
+              admitted: true,
+              value: await publish(connector, stagedStreams),
+            } as const);
+        if (!result.admitted) continue;
+        const outcome = result.value;
         if (outcome.state !== "done") continue;
         const skipped = outcome.skipped;
         await ledger.update((data) => {
@@ -493,6 +575,13 @@ export class LegacyImporter {
       const failure = data.failures[connector];
       const imported = data.imported[connector];
       const excludedRows = sumRows(data.excluded[connector] ?? []);
+      // What stayed is known only once the writer answered for the staged
+      // rows (a skipped seed adds to it). Until then it is pending: null.
+      const final =
+        imported !== undefined &&
+        (imported.published === true ||
+          imported.seedDone === true ||
+          this.stagedRows(imported) === 0);
       return {
         connector,
         state: imported
@@ -504,7 +593,11 @@ export class LegacyImporter {
             : ("pending" as const),
         attempts: failure?.attempts ?? 0,
         staged: this.stagedRows(imported ?? {}),
-        stayed: imported ? excludedRows : (failure?.stayed ?? null),
+        stayed: imported
+          ? final
+            ? excludedRows
+            : null
+          : (failure?.stayed ?? null),
         excluded: [...byReason]
           .sort(([a], [b]) => a.localeCompare(b))
           .map(([reason, rows]) => ({ reason, rows })),
@@ -521,6 +614,7 @@ export class LegacyImporter {
     return {
       complete: !(await this.options.ledger.importPending()),
       abandoned: data.abandoned,
+      givenUp: connectors.filter((c) => c.state === "failed").length,
       stayed: unknown
         ? null
         : connectors.reduce((n, c) => n + (c.stayed ?? 0), 0),

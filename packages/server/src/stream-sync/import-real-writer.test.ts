@@ -341,6 +341,7 @@ describe("the import through the real seed staging and writer", () => {
     expect(await second.importer.status()).toEqual({
       complete: true,
       abandoned: false,
+      givenUp: 0,
       stayed: 0,
       connectors: [
         {

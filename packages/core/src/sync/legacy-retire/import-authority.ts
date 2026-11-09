@@ -40,9 +40,16 @@ export interface ImportAuthority {
    * pending (ordinary commits answer IMPORT_PENDING). A seal, not a check:
    * the authority runs `write` inside its own lock and answers `streams` with
    * its result, or answers `refuse` and runs nothing when it cannot admit the
-   * write. The publish therefore happens inside the call, never after it
-   * returns. A repeat of the same `operationId` (a re-run after a crash) is
-   * admitted again. A `write` that throws rejects the call.
+   * write. The importer queues its seed publish inside the call. (The registry
+   * write that follows is made later by the writer's `publishPending`; the
+   * writer's own `importDone` gate stands at the publish that binds
+   * generation 1.) A repeat of the same `operationId` (a re-run after a crash)
+   * is admitted again. A `write` that throws rejects the call.
+   *
+   * `write` must NEVER call this authority (`importPending`, `importDone` or
+   * `commitImportSeed`): the authority holds its lock for the whole seal, so a
+   * nested call waits for the very call it is part of and never returns. Ask
+   * the authority only after `commitImportSeed` returns.
    */
   commitImportSeed<T>(
     owner: string,
@@ -64,22 +71,53 @@ export function createMemoryImportAuthority(
     readonly pending?: boolean;
     /** The authority does not know the owner: `importPending` rejects. */
     readonly unknown?: boolean;
+    /**
+     * How long a call may wait behind an open seal before the fake gives it up
+     * as a nested call and rejects. A real authority would wait forever; the
+     * fake turns that hang into an error a test can see. Default 3000 ms.
+     */
+    readonly deadlockMs?: number;
   } = {},
 ): MemoryImportAuthority {
   const initial = options.pending ?? true;
   const done = new Set<string>();
   const doneCalls: string[] = [];
   const seedCommits: { owner: string; operationId: string }[] = [];
-  // The fake's lock: one sealed write at a time, as the authority does.
+  // The fake's lock: one sealed write at a time, as the authority does. Every
+  // method waits for it, so a call made from inside a sealed write (a nested
+  // call) can never return, exactly as under the real authority. The fake
+  // rejects such a call after `deadlockMs` instead of hanging the test.
   let lock: Promise<unknown> = Promise.resolve();
+  const deadlockMs = options.deadlockMs ?? 3000;
+  const behindSeal = async (): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const blocked = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              "authority call blocked by an open seal: a sealed write called the authority",
+            ),
+          ),
+        deadlockMs,
+      );
+    });
+    try {
+      await Promise.race([lock, blocked]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   return {
     doneCalls,
     seedCommits,
     importPending: async (owner) => {
+      await behindSeal();
       if (options.unknown) throw new Error("account mode unknown");
       return initial && !done.has(owner.toLowerCase());
     },
     importDone: async (owner) => {
+      await behindSeal();
       done.add(owner.toLowerCase());
       doneCalls.push(owner.toLowerCase());
       return { kind: "streams" };

@@ -96,6 +96,7 @@ describe("the status never reports zero for rows it did not count (STATUS_UNKNOW
     expect(await f.importer.status()).toEqual({
       complete: false,
       abandoned: false,
+      givenUp: 0,
       stayed: null,
       connectors: [],
     });
@@ -106,8 +107,9 @@ describe("the status never reports zero for rows it did not count (STATUS_UNKNOW
       local: ["e0", "e1"],
       source: twoRows(),
       owner: OWNER,
-      publishSeed: false,
     });
+    await f.importer.run();
+    await publish(f);
     await f.importer.run();
     expect((await f.importer.status()).stayed).toBe(0);
     f.setMode("unknown");
@@ -121,6 +123,9 @@ describe("the status never reports zero for rows it did not count (STATUS_UNKNOW
       owner: OWNER,
     });
     expect((await f.importer.status()).stayed).toBeNull();
+    await f.importer.run();
+    expect((await f.importer.status()).stayed).toBeNull(); // staged, pending
+    await publish(f);
     await f.importer.run();
     expect((await f.importer.status()).stayed).toBe(0);
   });

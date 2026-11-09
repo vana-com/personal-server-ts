@@ -72,7 +72,7 @@ afterEach(async () => {
 });
 
 describe("the legacy import in a real boot", () => {
-  it("stages the device's canonical rows at boot, with no connector run (OWNER_NOT_LOWERCASED, BOOT_IMPORT_NEVER_BOUND, BOOT_PUBLISH_NOT_WIRED, STATUS_HIDES_EXCLUDED, STATUS_ROUTE_UNAUTHENTICATED)", async () => {
+  it("stages the device's canonical rows at boot, with no connector run (OWNER_NOT_LOWERCASED, BOOT_IMPORTER_OWNER_NOT_LOWERCASED, BOOT_IMPORT_NEVER_BOUND, BOOT_PUBLISH_NOT_WIRED, STATUS_HIDES_EXCLUDED, STATUS_ROUTE_UNAUTHENTICATED)", async () => {
     const owner = await recoverServerOwner(KNOWN_SIG);
     // The device's legacy data: one index row for the scope (so the
     // declaration is trusted) and canonical rows under its connection.
@@ -209,6 +209,7 @@ describe("the legacy import in a real boot", () => {
     expect(JSON.parse(text)).toEqual({
       complete: true,
       abandoned: false,
+      givenUp: 0,
       stayed: 1,
       connectors: [
         {

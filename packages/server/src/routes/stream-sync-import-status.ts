@@ -2,7 +2,7 @@
  * What the one-time legacy import left behind, for the owner.
  *
  *   GET /v1/stream-sync/import-status
- *     -> 200 {complete, abandoned, connectors: [{connector, state, attempts,
+ *     -> 200 {complete, abandoned, givenUp, stayed, connectors: [{connector, state, attempts,
  *             staged, excluded: [{reason, rows}]}]}
  *
  * Counts per connector and reason only: never a row, a stream name or a key.

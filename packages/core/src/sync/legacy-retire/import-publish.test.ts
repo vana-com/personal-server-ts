@@ -289,6 +289,7 @@ describe("what the import left behind is one owner read (STATUS_HIDES_EXCLUDED)"
     expect(status).toEqual({
       complete: true,
       abandoned: false,
+      givenUp: 0,
       stayed: 3,
       connectors: [
         {
@@ -318,7 +319,11 @@ describe("the status shows a stalled publish (STATUS_REPORTS_PUBLISHED_UNPUBLISH
     await f.importer.run(); // staged; the publish is only queued
     expect(await f.importer.status()).toMatchObject({
       complete: false,
-      connectors: [{ connector: CONNECTOR, state: "imported", staged: 1 }],
+      // What stayed is pending until the writer answers for the staged rows.
+      stayed: null,
+      connectors: [
+        { connector: CONNECTOR, state: "imported", staged: 1, stayed: null },
+      ],
     });
     expect(f.authority.doneCalls).toEqual([]);
     await publish(f);
