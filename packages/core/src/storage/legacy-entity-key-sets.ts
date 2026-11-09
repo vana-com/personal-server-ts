@@ -10,6 +10,8 @@ import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
  */
 export type EntityHashes = ReadonlyMap<string, ReadonlyMap<string, string>>;
 
+/** Pseudo-path of an uncovered top-level scalar: `$scalar.<key>`. */
+export const SCALAR_PREFIX = "$scalar.";
 const TOP_LEVEL_PATH = /^\$\.([A-Za-z0-9_]+)$/;
 /** The top-level key a table path starts at (`$.a` and `$.a[].b` both: `a`). */
 const PATH_ROOT = /^\$\.([A-Za-z0-9_]+)/;
@@ -29,8 +31,14 @@ export function contentHash(value: unknown): string {
  * object, a collection is not an array, an item lacks a key field, two
  * items share a key, or the body holds a top-level array or object that no
  * table path covers (data the comparison would never see). A top-level
- * scalar (`total`) holds no entity and is ignored. `null` means "unknown", and a caller that deletes must
- * treat unknown as not held.
+ * scalar or null that no table path covers (`totalContributionsLastYear`,
+ * `fetchedAt`, `userName`) is NOT ignored: it is compared as one
+ * pseudo-entity under `SCALAR_PREFIX`, so a value the stream data does not
+ * hold equal fails the readback. The one exception is `total` when it equals
+ * the length of a keyed collection of the same body: a count derived from
+ * entities that are compared holds nothing else, and it differs between two
+ * snapshots whenever the collection grew. `null` means "unknown", and a
+ * caller that deletes must treat unknown as not held.
  */
 export function entityHashes(
   scope: string,
@@ -45,10 +53,22 @@ export function entityHashes(
       return root ? [root[1]!] : [];
     }),
   );
+  const scalars = new Map<string, Map<string, string>>();
+  const record = body as Record<string, unknown>;
+  const derivedCount = (key: string, value: unknown): boolean =>
+    key === "total" &&
+    [...covered].some((c) => {
+      const items = record[c];
+      return Array.isArray(items) && items.length === value;
+    });
   for (const [key, value] of Object.entries(body)) {
-    if (!covered.has(key) && value !== null && typeof value === "object") {
-      return null;
-    }
+    if (covered.has(key) || value === undefined) continue;
+    if (value !== null && typeof value === "object") return null;
+    if (derivedCount(key, value)) continue;
+    scalars.set(
+      `${SCALAR_PREFIX}${key}`,
+      new Map([["[]", contentHash(value)]]),
+    );
   }
   const sets = new Map<string, Map<string, string>>();
   for (const [path, fields] of Object.entries(paths)) {
@@ -79,5 +99,7 @@ export function entityHashes(
     }
     sets.set(path, entities);
   }
-  return sets.size > 0 ? sets : null;
+  if (sets.size === 0) return null;
+  for (const [path, entities] of scalars) sets.set(path, entities);
+  return sets;
 }

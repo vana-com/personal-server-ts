@@ -34,6 +34,8 @@ export interface ReadbackRecord {
   /** SHA-256 over the matched `path|key|hash` lines, sorted. */
   readonly aggregate: string;
   readonly at: string;
+  /** SHA-256 of the canonical JSON of the whole local file this was proved for. */
+  readonly fileHash?: string;
   /**
    * Made by a dry run. A report, never a basis: a real pass ignores it and
    * reads the version back again.
@@ -97,6 +99,15 @@ export class RetireLedger {
   async importDone(connector: string): Promise<boolean> {
     const data = await this.read();
     return data.importComplete || data.imported[connector] !== undefined;
+  }
+
+  /**
+   * This device staged rows for the connector. Stricter than `importDone`:
+   * a pass over an EMPTY source sets `importComplete` for every connector
+   * (nothing to wait for), but it staged nothing.
+   */
+  async staged(connector: string): Promise<boolean> {
+    return (await this.read()).imported[connector] !== undefined;
   }
 
   /** The stored readback of this version, or null (a dry or pre-import record is none). */

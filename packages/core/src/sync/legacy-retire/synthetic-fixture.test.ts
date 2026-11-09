@@ -82,9 +82,12 @@ describe("dry run on a synthetic legacy store", () => {
         case "pass":
           expect(file.readback).toBe("pass");
           expect(file.wouldDelete).toBe(true);
+          // Every entity matched. A body's uncovered scalars (a fetch
+          // time, a window) are compared too and count as entities.
+          expect(rb.counts.local).toBeGreaterThanOrEqual(s.localEntities);
           expect(rb.counts).toEqual({
-            local: s.localEntities,
-            matched: s.localEntities,
+            local: rb.counts.local,
+            matched: rb.counts.local,
             missing: 0,
             changed: 0,
           });

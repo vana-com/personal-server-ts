@@ -10,7 +10,9 @@
 
 import { sha256 } from "@noble/hashes/sha2";
 import {
+  contentHash,
   entityHashes,
+  SCALAR_PREFIX,
   type EntityHashes,
 } from "../../storage/legacy-entity-key-sets.js";
 import type { DataStoragePort } from "../../ports/index.js";
@@ -39,6 +41,12 @@ export interface DeleteBasis {
    * re-collected (a whole-source delete), not because data is missing.
    */
   readonly viewDeleted: boolean;
+  /**
+   * Every connector that can serve the scope is known to the registry. When
+   * false, no delete of the registry explains a missing entity: an unknown
+   * alternate may hold data nobody published.
+   */
+  readonly allTargetsKnown: boolean;
 }
 
 /** What a readback needs from the stream read side. */
@@ -62,6 +70,7 @@ export function compareEntities(
   fenceOpen: boolean,
 ): Pick<ReadbackRecord, "pass" | "reason" | "counts" | "fenced" | "aggregate"> {
   let total = 0;
+  let collectionTotal = 0;
   let matchedCount = 0;
   let missing = 0;
   let changed = 0;
@@ -70,6 +79,7 @@ export function compareEntities(
     const held = published?.get(path);
     for (const [key, hash] of entities) {
       total += 1;
+      if (!path.startsWith(SCALAR_PREFIX)) collectionTotal += 1;
       const other = held?.get(key);
       if (other === undefined) missing += 1;
       else if (other !== hash) changed += 1;
@@ -82,7 +92,8 @@ export function compareEntities(
   const unmatched = missing + changed;
   const counts = { local: total, matched: matchedCount, missing, changed };
   const aggregate = aggregateOf(matched);
-  if (total === 0) {
+  // A file that holds no entity is empty, whatever scalars it carries.
+  if (collectionTotal === 0) {
     return { pass: false, reason: "empty", counts, fenced: 0, aggregate };
   }
   if (unmatched === 0) {
@@ -151,9 +162,11 @@ export async function readbackVersion(
   };
 
   let local: EntityHashes | null;
+  let fileHash: string;
   try {
     const envelope = await deps.storage.readEnvelope(scope, row.collectedAt);
     local = entityHashes(scope, envelope.data);
+    fileHash = contentHash(envelope.data);
   } catch {
     return store({ pass: false, reason: "unreadable" });
   }
@@ -171,29 +184,34 @@ export async function readbackVersion(
   const fenceOpen = basis !== null && predatesEveryDelete(basis, row);
   let published: EntityHashes | null = null;
   if (body !== null) published = entityHashes(scope, body);
-  // No usable published view passes only when the registry says the whole
-  // source is deleted. A failed or unkeyed read is never that: it would excuse
+  // No view passes only when the read decided that none serves the scope
+  // (`body === null`) and the registry says the whole source is deleted. A
+  // view that was served but cannot be keyed is never that: it would excuse
   // every entity.
-  const viewGone = basis !== null && fenceOpen && basis.viewDeleted;
+  const viewGone =
+    body === null && basis !== null && fenceOpen && basis.viewDeleted;
   if (published === null && !viewGone) {
     return store({ pass: false, reason: "no_published_view" });
   }
-  return store(compareEntities(local, published, fenceOpen));
+  return store({ ...compareEntities(local, published, fenceOpen), fileHash });
 }
 
 /**
  * The fence applies to a file version only if it was written before the
- * delete of EVERY target stream: both its `collectedAt` (when the data was
- * collected) and its `createdAt` (when this device stored it) precede the
- * earliest registry time of each delete, and each stream has a known delete
- * with a version above 0. A version written after the delete, an unknown
- * delete time or an unreadable timestamp is never excused.
+ * LATEST delete of EVERY target stream: both its `collectedAt` (when the data
+ * was collected) and its `createdAt` (when this device stored it) precede the
+ * registry time of the stream's highest-version delete (the earliest such
+ * time over the stream's namespaces), and each stream has a known delete with
+ * a version above 0. A file written between two deletes is excused by the
+ * later one: the owner deleted again after it existed. A version written
+ * after the latest delete, an unknown delete time, an unreadable timestamp or
+ * a scope with an unknown alternate connector is never excused.
  */
 export function predatesEveryDelete(
   basis: DeleteBasis,
   row: Pick<IndexEntry, "collectedAt" | "createdAt">,
 ): boolean {
-  if (basis.streams.length === 0) return false;
+  if (basis.streams.length === 0 || !basis.allTargetsKnown) return false;
   const collected = Date.parse(row.collectedAt);
   const stored = Date.parse(row.createdAt);
   if (!Number.isFinite(collected) || !Number.isFinite(stored)) return false;

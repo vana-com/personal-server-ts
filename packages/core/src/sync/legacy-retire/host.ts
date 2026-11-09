@@ -23,9 +23,14 @@ export function createRetireHost(input: {
       if (!basis || basis.ambiguous || !(basis.covered || basis.deleted)) {
         return null;
       }
-      return { streams: basis.streams, viewDeleted: basis.deleted };
+      return {
+        streams: basis.streams,
+        viewDeleted: basis.deleted,
+        allTargetsKnown: basis.allTargetsKnown,
+      };
     },
     importDone: (connector) => input.ledger.importDone(connector),
+    importStaged: (connector) => input.ledger.staged(connector),
     fullRunSince: (connector, stream, deleteVersion) =>
       input.writer.fullRunSince(connector, stream, deleteVersion),
   };
