@@ -34,8 +34,20 @@ async function persistedState(r: Rig) {
   return bytes ? JSON.parse(new TextDecoder().decode(bytes)) : {};
 }
 
+/** Every write of `state.json` lands after a delay, so an unawaited write is visible. */
+function slowStateWrites(r: Rig) {
+  const write = r.files.write.bind(r.files);
+  r.files.write = async (name, bytes) => {
+    if (name === "state.json") {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    return write(name, bytes);
+  };
+}
+
 it("the delete id is returned only once its intent is durable (mutant: NO_INTENT_BEFORE_202)", async () => {
   const r = await publishedBase();
+  slowStateWrites(r);
   const answered = await r.writer.requestConnectionDelete(CONNECTOR);
   expect(answered).not.toBeNull();
   // The answer exists, so the intent it names must already be on disk.

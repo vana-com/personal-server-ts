@@ -1225,15 +1225,11 @@ export function createPsLiteRuntime(
               "connectorId is not a connector key",
             );
           }
-          return handleOwnerConnectorDelete(
-            request,
-            connectorId,
-            {
-              authorizeOwner: (req) => auth.authorizeOwner(req),
-              switched: options.legacyWritesSwitched ?? (() => false),
-              connectionDelete: options.streamSyncConnectionDelete,
-            },
-          );
+          return handleOwnerConnectorDelete(request, connectorId, {
+            authorizeOwner: (req) => auth.authorizeOwner(req),
+            switched: options.legacyWritesSwitched ?? (() => false),
+            connectionDelete: options.streamSyncConnectionDelete,
+          });
         }
 
         if (url.pathname === "/v1/replication/sync") {
