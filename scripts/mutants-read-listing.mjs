@@ -65,7 +65,10 @@ const MUTANTS = [
   ["NOTIFY_SKIPPED_SELECTION", WRT, "    this.selected.add(key);\n    this.planInputsChanged(connector);\n  }\n\n  /** A publish pass releases a run's stream. */\n  private unselect(connector: string, key: string): void {\n    this.selected.delete(key);\n    this.planInputsChanged(connector);", "    this.selected.add(key);\n    void connector;\n  }\n\n  /** A publish pass releases a run's stream. */\n  private unselect(connector: string, key: string): void {\n    this.selected.delete(key);\n    void connector;", `${WRITES}misses between a publish reservation and its release (writer selection)`],
   ["LISTENER_ERROR_PROPAGATES", WRT, "      } catch (error) {\n        // Reporting is best effort too: a throwing logger or `message` getter\n        // must not stop the other listeners.\n", "      } catch (error) {\n        if (error) throw error;\n        // Reporting is best effort too: a throwing logger or `message` getter\n        // must not stop the other listeners.\n", `${WRITES}a throwing listener does not fail the run or silence the other listeners`],
   ["LISTENER_LOGGER_ESCAPE", WRT, "        try {\n          settled(\n            this.options.logger?.warn(\n              {\n                connector,\n                error: error instanceof Error ? error.message : \"unknown\",\n              },\n              \"stream-sync writer: a plan-input listener failed\",\n            ),\n          );\n        } catch {\n          // Nothing left to report to.\n        }", "        this.options.logger?.warn(\n            {\n              connector,\n              error: error instanceof Error ? error.message : \"unknown\",\n            },\n            \"stream-sync writer: a plan-input listener failed\",\n          );", `${WRITES}a throwing listener and a throwing logger do not fail the run or silence later listeners`],
-  ["LISTENER_ASYNC_REJECTION_ESCAPES", WRT, "function settled(result: unknown): void {\n  Promise.resolve(result).catch(() => {});\n}", "function settled(result: unknown): void {\n  void result;\n}", `${WRITES}an async listener that rejects neither reaches unhandledRejection nor silences later listeners`],
+  ["LISTENER_ASYNC_REJECTION_ESCAPES", WRT, "function settled(result: unknown): void {\n  try {\n    if (result instanceof Promise) {\n      Reflect.apply(promiseThen, result, [undefined, ignoreRejection]);\n      return;\n    }\n    Promise.resolve(result).catch(ignoreRejection);\n  } catch {\n    // Only the limit above reaches here.\n  }\n}\n", "function settled(result: unknown): void {\n  void result;\n}\n", `${WRITES}an async listener that rejects neither reaches unhandledRejection nor silences later listeners`],
+  ["NATIVE_THEN_OVERRIDE_ESCAPES", WRT, "    if (result instanceof Promise) {\n      Reflect.apply(promiseThen, result, [undefined, ignoreRejection]);\n      return;\n    }\n", "", `${WRITES}a listener that returns a rejected native promise with a throwing then getter neither reaches unhandledRejection nor silences later listeners`],
+  ["DISPOSE_LEAVES_CALLBACK_LIVE", SVC, "      closed = true;\n      try {\n        unsubscribe?.();", "      closed = false;\n      try {\n        unsubscribe?.();", `${WRITES}a failed open whose disposer throws rethrows the open error and leaves the callback inert`],
+  ["DISPOSER_ERROR_REPLACES_OPEN_ERROR", SVC, "      } catch {\n        // The callback is already inert; report the open error below.\n      }", "      } catch (disposerError) {\n        throw disposerError;\n      }", `${WRITES}a failed open whose disposer throws rethrows the open error and leaves the callback inert`],
   ["MESSAGE_FORMAT_OUTSIDE_GUARD", WRT, "        try {\n          settled(\n            this.options.logger?.warn(\n              {\n                connector,\n                error: error instanceof Error ? error.message : \"unknown\",", "        const message = error instanceof Error ? error.message : \"unknown\";\n        try {\n          settled(\n            this.options.logger?.warn(\n              {\n                connector,\n                error: message,", `${WRITES}a listener error whose message getter throws does not fail the run or silence later listeners`],
   ["UNSUBSCRIBE_NOT_CALLED", SVC, "    this.unsubscribePlanInputs?.();", "    void this.unsubscribePlanInputs;", `${WRITES}a closed read service stops receiving plan-input changes`],
   ["OPEN_FAILURE_KEEPS_SUBSCRIPTION", SVC, "        unsubscribe?.();\n      } catch {", "        void unsubscribe;\n      } catch {", `${WRITES}a failed open leaves no plan-input callback behind`],
@@ -132,6 +135,17 @@ async function runTests() {
   return { status, report };
 }
 
+function failureHead(report, aimed) {
+  for (const file of report?.testResults ?? []) {
+    for (const test of file.assertionResults ?? []) {
+      if ([...(test.ancestorTitles ?? []), test.title].join(" > ") === aimed) {
+        return String(test.failureMessages?.[0] ?? "").split("\n")[0].slice(0, 160);
+      }
+    }
+  }
+  return "no message";
+}
+
 function outcomes(report) {
   const results = new Map();
   let loadErrors = 0;
@@ -155,7 +169,11 @@ function judge(run, baselineTotal, aimed) {
   if (total !== baselineTotal) return `INVALID (ran ${total} tests, baseline ran ${baselineTotal})`;
   const aimedStatus = results.get(aimed);
   if (aimedStatus === undefined) return "INVALID (aimed test not found)";
-  if (aimedStatus === "failed") return "KILLED";
+  if (aimedStatus === "failed") {
+    // Informational: an expect() failure, or the aimed code throwing on its own.
+    const head = failureHead(run.report, aimed);
+    return /expected|instead of resolving|AssertionError/.test(head) ? "KILLED (assertion)" : "KILLED (thrown)";
+  }
   return "SURVIVED";
 }
 
@@ -191,7 +209,7 @@ for (const [name, file, from, to, aimed] of MUTANTS) {
   }
   const verdict = judge(run, base.total, aimed);
   rows.push([name, verdict]);
-  if (verdict !== "KILLED") bad += 1;
+  if (!verdict.startsWith("KILLED")) bad += 1;
 }
 for (const [name, file, from, to, aimed] of HARNESS) {
   const run = await applyAndRun(file, from, to);

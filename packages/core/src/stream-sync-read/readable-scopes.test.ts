@@ -58,6 +58,17 @@ async function listed(
     .sort();
 }
 
+/** A rejected native promise whose own `then` getter throws. Create it inside the callback. */
+function rejectedNativeWithThrowingThen(): Promise<never> {
+  const promise = Promise.reject(new Error("native rejection"));
+  Object.defineProperty(promise, "then", {
+    get() {
+      throw new Error("then getter broke");
+    },
+  });
+  return promise;
+}
+
 describe("readableScopes against the body read", () => {
   // MIRROR_ONLY_CONNECTOR_DISCOVERY
   it("lists an owner's first run of a connector the mirror has never seen", async () => {
@@ -964,13 +975,15 @@ describe("readableScopes cache misses after every write under the connector", ()
     await rig.open();
     const bump = vi.spyOn(ConnectorRevisions.prototype, "bump");
     try {
-      await rig.collect({
-        runId: "first",
-        key: "id",
-        version: "1.0.0",
-        rows: [{ id: "a" }],
-        full: true,
-      });
+      await expect(
+        rig.collect({
+          runId: "first",
+          key: "id",
+          version: "1.0.0",
+          rows: [{ id: "a" }],
+          full: true,
+        }),
+      ).resolves.toBeUndefined();
       expect(bump).toHaveBeenCalledWith(rig.connector);
       expect(rig.files.paths()).toContain("runs/first/entry.json");
     } finally {
@@ -1029,6 +1042,70 @@ describe("readableScopes cache misses after every write under the connector", ()
           rows: [{ id: "a" }],
           full: true,
         });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(bump).toHaveBeenCalledWith(rig.connector);
+        expect(rig.files.paths()).toContain("runs/first/entry.json");
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        bump.mockRestore();
+      }
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
+
+  // NATIVE_THEN_OVERRIDE_ESCAPES (aimed by the mutant runner)
+  it("a listener that returns a rejected native promise with a throwing then getter neither reaches unhandledRejection nor silences later listeners", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const rig = new Rig();
+      await rig.open();
+      const seen: string[] = [];
+      rig.writer.onPlanInputs(() => rejectedNativeWithThrowingThen());
+      rig.writer.onPlanInputs((connector) => seen.push(connector));
+      await expect(
+        rig.collect({
+          runId: "first",
+          key: "id",
+          version: "1.0.0",
+          rows: [{ id: "a" }],
+          full: true,
+        }),
+      ).resolves.toBeUndefined();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(seen).toContain(rig.connector);
+      expect(rig.files.paths()).toContain("runs/first/entry.json");
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
+
+  it("a logger that returns a rejected native promise with a throwing then getter neither reaches unhandledRejection nor silences later listeners", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const rig = new Rig(undefined, CONNECTOR, {
+        warn() {
+          return rejectedNativeWithThrowingThen();
+        },
+      });
+      await rig.open();
+      const bump = vi.spyOn(ConnectorRevisions.prototype, "bump");
+      rig.writer.onPlanInputs(() => {
+        throw new Error("listener broke");
+      });
+      try {
+        await expect(
+          rig.collect({
+            runId: "first",
+            key: "id",
+            version: "1.0.0",
+            rows: [{ id: "a" }],
+            full: true,
+          }),
+        ).resolves.toBeUndefined();
         await new Promise((resolve) => setTimeout(resolve, 10));
         expect(bump).toHaveBeenCalledWith(rig.connector);
         expect(rig.files.paths()).toContain("runs/first/entry.json");

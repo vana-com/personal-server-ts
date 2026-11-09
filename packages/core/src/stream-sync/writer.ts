@@ -443,13 +443,32 @@ function copyPlanInputs(state: WriterState): PlanInputs {
   return JSON.parse(JSON.stringify(planInputsOf(state))) as PlanInputs;
 }
 
+/** The intrinsic `then`, read once at load: a later override cannot change it. */
+const promiseThen = Promise.prototype.then;
+const ignoreRejection = (): void => {};
+
 /**
  * A void callback may still return a promise. Attach a rejection handler so a
- * rejected return cannot reach `unhandledRejection`. Never throws: a thenable
- * whose `then` throws becomes a rejection, and that is handled too.
+ * rejected return cannot reach `unhandledRejection`.
+ *
+ * A native promise gets the intrinsic `then`, so an own `then` or `catch` that
+ * throws cannot stop the handler from attaching. Other thenables are assimilated
+ * by `Promise.resolve`. Limit: the intrinsic `then` still reads the promise's
+ * `constructor` for its species lookup, so a native promise whose `constructor`
+ * getter throws, or whose prototype is a Proxy that throws, is not handled and
+ * its rejection can still reach `unhandledRejection`. Nothing else is left
+ * unhandled, and this helper never throws to its caller.
  */
 function settled(result: unknown): void {
-  Promise.resolve(result).catch(() => {});
+  try {
+    if (result instanceof Promise) {
+      Reflect.apply(promiseThen, result, [undefined, ignoreRejection]);
+      return;
+    }
+    Promise.resolve(result).catch(ignoreRejection);
+  } catch {
+    // Only the limit above reaches here.
+  }
 }
 
 /**
