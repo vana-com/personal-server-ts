@@ -2987,9 +2987,12 @@ export async function handlePersonalServerDataRequest(
       }
       // A JSON read is checked against the body it will serve, before it pays.
       if (inProcess && !wantsRawContent) {
-        await inProcess.validateBody?.(withOwnerBody(servedEnvelope, ownerNotes), {
-          fromStreamView: false,
-        });
+        await inProcess.validateBody?.(
+          withOwnerBody(servedEnvelope, ownerNotes),
+          {
+            fromStreamView: false,
+          },
+        );
       }
       // Every refusal above has run; only a read that will be served pays.
       await settle();

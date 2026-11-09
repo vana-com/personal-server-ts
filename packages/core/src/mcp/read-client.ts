@@ -872,7 +872,8 @@ export function createMcpDataReadClient(
         // older version fails validation here instead of reading history.
         // The page is built from the body the handler checks and then serves,
         // before it charges or logs. A cursor refused there costs nothing.
-        let checkedPage: Awaited<ReturnType<typeof readBuiltScopeBlocks>> | undefined;
+        let checkedPage:
+          Awaited<ReturnType<typeof readBuiltScopeBlocks>> | undefined;
         let cursorRefused = false;
         try {
           const read = await readWholeScope({
@@ -914,7 +915,9 @@ export function createMcpDataReadClient(
             },
           });
           if (!checkedPage) {
-            throw new Error("the served page was not checked before settlement");
+            throw new Error(
+              "the served page was not checked before settlement",
+            );
           }
           const result = checkedPage;
           // One page of a scope completes it only when it is the uncursored,
