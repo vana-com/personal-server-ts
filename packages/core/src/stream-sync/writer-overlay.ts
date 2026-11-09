@@ -82,8 +82,9 @@ export function pinnedWriterSnapshot(
       for await (const entry of readSpool(files, log.path)) {
         if (released) throw new Error("overlay snapshot was released");
         const { envelope } = entry;
-        // This consumer needs an object, so it is the one place that holds
-        // a whole body: the parsed record, once.
+        // This consumer needs an object, so it holds a whole body: the
+        // spool chunks, their join, the decoded text and the parsed value are
+        // alive together (about 3x the record). It is not a streaming path.
         const v = await parseBody(files, entry);
         const line: Line = { o: envelope.o, r: envelope.r, v };
         if (

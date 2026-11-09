@@ -5,6 +5,7 @@ import {
   controlHashes,
   controlScope,
   deriveKeyCheck,
+  shardOf,
   streamScope,
   type ControlRead,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -1098,5 +1099,63 @@ describe("writer recovery exclusions", () => {
     const snap = await source.snapshot(connector);
     expect(snap.runs).toEqual([]);
     snap.release();
+  });
+});
+
+/**
+ * Rewrite a run's intake log as the base version wrote it
+ * (`<k> <canonical {"o","r","v"}>`) and its persisted byte counts in the base
+ * measure (line bytes + 1 per record), as a device that was ready before the
+ * upgrade holds them.
+ */
+async function downgradeToBaseFormat(
+  f: Awaited<ReturnType<typeof fixture>>,
+  id = "r1",
+): Promise<void> {
+  const logPath = `runs/${id}/spool/s0.log`;
+  const text = decoder.decode((await f.files.read(logPath))!);
+  const counts = new Array<number>(256).fill(0);
+  const out: string[] = [];
+  for (const line of text.split("\n").filter((l) => l !== "")) {
+    const [k, envelope, body] = line.split("\t") as [string, string, string];
+    const { o, r } = JSON.parse(envelope) as { o: number; r: string };
+    const old = `{"o":${o},"r":${JSON.stringify(r)},"v":${body}}`;
+    out.push(`${k} ${old}\n`);
+    counts[shardOf(k)]! += encoder.encode(old).length + 1;
+  }
+  await f.files.write(logPath, encoder.encode(out.join("")));
+  await f.files.remove(`runs/${id}/spool/s0`);
+  await f.edit((e) => {
+    e.streams.s.shardBytes = counts;
+  }, id);
+}
+
+describe("a run made ready before the upgrade", () => {
+  const records = [{ id: "one" }, { id: "two", note: "é" }, { id: "one" }];
+  it("is read by the local overlay", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await collect(w, "r1", records);
+    await downgradeToBaseFormat(f);
+    const source = createWriterOverlaySource(f.make());
+    const snapshot = await source.snapshot(connector);
+    expect(
+      await Array.fromAsync(snapshot.lines(snapshot.runs[0]!, "s")),
+    ).toEqual(records.map((v) => ({ o: 1000, r: "r1", v })));
+    snapshot.release();
+  });
+  it("is published, keeping every record", async () => {
+    const f = await fixture();
+    const w = f.make();
+    await w.refreshControls();
+    await collect(w, "r1", records);
+    await downgradeToBaseFormat(f);
+    const restarted = f.make();
+    await restarted.refreshControls();
+    await restarted.publishPending();
+    expect((await f.read()).phase).toBe("done");
+    expect(f.posts()).toBe(1);
+    const row = f.rows.get(streamScope(connector, "", "s"));
+    expect(row).toMatchObject({ found: true, version: 1 });
   });
 });

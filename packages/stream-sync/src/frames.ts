@@ -150,11 +150,14 @@ export async function measureBody(
 export interface Frame {
   readonly envelope: Envelope;
   /**
-   * The body, in pieces. Drain it before asking for the next frame; if you do
-   * not, the reader drains it for you. When `makeSha256` was given, the last
-   * piece is followed by a hash check that throws on a mismatch.
+   * The body, in pieces. Read as much as you need, then ask for the next
+   * frame: the reader drains what is left, and the hash check still runs, so
+   * a corrupt remainder throws from the next step. Leaving a `for await` loop
+   * early does not close the body; it is not a generator you can close. When
+   * `makeSha256` was given, the last piece is followed by a hash check that
+   * throws on a mismatch.
    */
-  readonly body: AsyncGenerator<Uint8Array>;
+  readonly body: AsyncIterable<Uint8Array>;
 }
 
 /** A pull reader over a byte stream that never joins pieces beyond one line. */
@@ -220,8 +223,10 @@ export async function* readFrames(
   const input = new ByteSource(source);
   while (!(await input.atEnd())) {
     const envelope = decodeEnvelope(await input.line(ENVELOPE_LIMIT_BYTES));
-    let drained = false;
-    const body = (async function* (): AsyncGenerator<Uint8Array> {
+    // The reader owns this generator. The consumer sees only a handle whose
+    // `return` does nothing, so leaving a loop early cannot end the body and
+    // leave the next frame to start inside it.
+    const run = (async function* (): AsyncGenerator<Uint8Array> {
       const hash = makeSha256?.();
       let left = envelope.n;
       while (left > 0) {
@@ -236,9 +241,29 @@ export async function* readFrames(
       if (hash !== undefined && toHex(hash.digest()) !== envelope.h) {
         throw new InvalidPartError("body SHA-256 does not match its envelope");
       }
-      drained = true;
     })();
+    let failure: unknown = null;
+    const body: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        async next() {
+          try {
+            return await run.next();
+          } catch (error) {
+            failure = error;
+            throw error;
+          }
+        },
+        async return() {
+          return { done: true as const, value: undefined };
+        },
+      }),
+    };
     yield { envelope, body };
-    if (!drained) for await (const piece of body) void piece;
+    // A failed body leaves the input at an unknown place: stop, do not go on.
+    if (failure !== null) throw failure;
+    for (;;) {
+      const next = await run.next();
+      if (next.done === true) break;
+    }
   }
 }

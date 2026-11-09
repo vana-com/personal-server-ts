@@ -119,3 +119,30 @@ describe("SpoolWriter.flush", () => {
     await expect(writer.flush()).rejects.toThrow();
   });
 });
+
+describe("a log with base-version lines", () => {
+  it("reads a base line and a current line from one file, in order, with the base size measure", async () => {
+    const files = createMemoryStreamSyncFiles();
+    const dir = "runs/r/spool/s0";
+    const log = spoolLogPath(dir);
+    const base = `{"o":5,"r":"r","v":{"id":"é"}}`;
+    await files.appendMany([
+      {
+        path: log,
+        bytes: new TextEncoder().encode(
+          `${hashOf(1)} ${base}\n${lineOf(2, `{"id":"b"}`)}\n`,
+        ),
+      },
+    ]);
+    const out = [];
+    for await (const entry of readSpool(files, log)) out.push(entry);
+    expect(out.map((e) => e.envelope.k)).toEqual([hashOf(1), hashOf(2)]);
+    expect(out[0]!.body).toEqual({ kind: "inline", text: `{"id":"é"}` });
+    expect(out[0]!.envelope).toMatchObject({ o: 5, r: "r", n: 11 });
+    expect(out[0]!.size).toBe(new TextEncoder().encode(base).length + 1);
+    // Shards derived from the mixed log keep both lines readable.
+    await deriveShards(files, dir);
+    const shard = await lines(files, shardPath(dir, shardOf(hashOf(1))));
+    expect(shard.map((l) => l.text)).toContain(`{"id":"é"}`);
+  });
+});

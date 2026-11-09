@@ -527,7 +527,11 @@ describe.each(matrix)(
       120_000,
     );
 
-    it.each(["after_parts_upload", "after_head_upload"] as const)(
+    it.each([
+      "after_parts_upload",
+      "after_head_upload",
+      "after_post_reply",
+    ] as const)(
       "crash at %s with a long record, then resume: it is published once, byte-exact",
       async (point) => {
         const c = freshConnector(`crash-long-${point.replaceAll("_", "-")}`);

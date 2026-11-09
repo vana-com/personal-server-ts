@@ -145,6 +145,35 @@ describe("format-2 parts", () => {
   });
 });
 
+describe("a frame at the piece boundary", () => {
+  // A frame of exactly one piece is one part (count 1). One byte more adds a
+  // second part that starts no frame (count 0), never an empty terminal part.
+  it.each([
+    [0, [FRAME_PIECE_BYTES], [1]],
+    [1, [FRAME_PIECE_BYTES, 1], [1, 0]],
+  ])("a frame %i bytes over the piece size", async (over, sizes, counts) => {
+    // The envelope's own length depends on n: settle the body size by retry.
+    let bodyLength = FRAME_PIECE_BYTES + over;
+    const make = (n: number) => {
+      const body = new Uint8Array(n).fill(0x61);
+      body[0] = 0x22;
+      body[n - 1] = 0x22;
+      return { body, f: frame(key(1), body) };
+    };
+    let made = make(bodyLength);
+    while (made.f.bytes.length !== FRAME_PIECE_BYTES + over) {
+      bodyLength -= made.f.bytes.length - (FRAME_PIECE_BYTES + over);
+      made = make(bodyLength);
+    }
+    const { body, f } = made;
+    const encoded = await partsOf([f], FRAME_PIECE_BYTES);
+    expect(encoded.map((e) => e.entry.bytes)).toEqual(sizes);
+    expect(encoded.map((e) => e.entry.count)).toEqual(counts);
+    const [read] = await readAll(encoded);
+    expect(read!.body.length).toBe(body.length);
+  });
+});
+
 describe("FrameReducer", () => {
   it("keeps the greatest stamp, the later add on a tie, and splits on small bytes only", () => {
     const r = new FrameReducer<string>("");

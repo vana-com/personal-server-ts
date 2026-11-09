@@ -5,9 +5,13 @@ draft of this note ("fragment parts with a `span` field").
 
 ## Goal
 
-Peak memory of a write or a read is bounded by the **part size** (4 MiB
-target, 16 MiB limit), not by the record size, on Node, in a browser and in a
-phone WebView. No record is dropped for size.
+No record is dropped for size. The design aim is a peak memory bounded by the
+**part size** (4 MiB target, 16 MiB limit) instead of the record size. That
+holds today for the **forward read of an imported base** (`viewBodies` with
+no overlay body). It does **not** hold for the write path (the record
+object, and in the spool path one body at a time) or for any read that
+needs an object, or for an overlay row. The measured numbers are in
+"Measured memory" below; this note claims nothing past them.
 
 ## What is wrong today
 
@@ -52,8 +56,8 @@ while it spools it. The caller vouches that the body contains the key fields.
 ### 3. Parts hold frames; a long frame spans parts
 
 A part is a byte string of whole frames. A frame of at most the inline limit
-(8 MiB) sits inside one part, as today's lines do, sorted by `k`. A longer
-frame is cut into 4 MiB pieces, each its own part, placed alone between the
+(1 MiB, `INLINE_BODY_BYTES`) sits inside one part, as today's lines do,
+sorted by `k`. A longer frame is cut into 4 MiB pieces, each its own part, placed alone between the
 inline parts of its bucket. Nothing marks a piece in the head: the parts of
 one prefix, read in order, are one byte stream of frames, and the first
 envelope says how long its frame is. The head lists parts as before:
@@ -89,9 +93,19 @@ blob, so it cannot report a misleading `key_mismatch`.
 
 The reader parses frames from the decrypted parts of a prefix, one part in
 memory at a time, and hands the consumer `{envelope, body: AsyncIterable}`.
-The server forwards body chunks to the HTTP response, or to the Lite bridge,
-unparsed. Only a consumer that needs an object (field projection, filters,
-the legacy projection) parses, and only then does it hold the body once.
+For a base body the server can forward body chunks to the HTTP response, or
+to the Lite bridge, unparsed (`viewBodies`). A consumer that needs an object
+(field projection, filters, the legacy projection) parses the whole body:
+it holds the chunks, their join, the decoded string and the parsed value at
+once, about 3 times the record.
+
+**Overlay rows are not streamed.** The local overlay reads its spool bodies
+whole (`writer-overlay.ts` `parseBody`), `overlayWinners` keeps every winning
+parsed record in memory, and `viewBodies` re-serializes an overlay value with
+`chunksOfValue`. A record of 100 MiB that is a local overlay winner costs the
+parse-read figure below, not the forward-read figure. Locators for overlay
+bodies (envelope plus spool body file, read lazily) would remove this; they
+are not built.
 
 ### 6. One code path for small records
 
@@ -102,14 +116,14 @@ format. Packing many frames into one part keeps tiny records cheap.
 
 `format` becomes **2** for every head a new writer writes.
 
-| Piece           | Change                                                                                         |
-| --------------- | ---------------------------------------------------------------------------------------------- |
-| Head            | `format: 2`; part `count >= 0`; equal prefixes may repeat; `recordCount` is the sum of counts. |
-| Part bytes      | frames (`E LF B LF`) instead of NDJSON lines `{"o","r","v"}`.                                  |
-| Spool log       | frames instead of `<pkHash> <line>`.                                                           |
-| Blob encryption | STREAM AEAD instead of OpenPGP SEIPD for format 2.                                             |
-| Ports           | `Sha256Stream` added. `Sha256`, `Keccak256`, `NamespaceHmac` unchanged.                        |
-| Names           | unchanged (`h-<keccak>`, `g<gen>-p-<sha256>`).                                                 |
+| Piece           | Change                                                                                                                                                                     |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Head            | `format: 2`; part `count >= 0`; equal prefixes may repeat; `recordCount` is the sum of counts.                                                                             |
+| Part bytes      | frames (`E LF B LF`) instead of NDJSON lines `{"o","r","v"}`.                                                                                                              |
+| Spool log       | `<k> TAB <envelope> TAB <body>` instead of `<pkHash> <line>`. The reader also reads the old line: a run that was ready before the upgrade is still published and overlaid. |
+| Blob encryption | STREAM AEAD instead of OpenPGP SEIPD for format 2.                                                                                                                         |
+| Ports           | `Sha256Stream` added. `Sha256`, `Keccak256`, `NamespaceHmac` unchanged.                                                                                                    |
+| Names           | unchanged (`h-<keccak>`, `g<gen>-p-<sha256>`).                                                                                                                             |
 
 Readers accept 1 and 2 (the current and the previous version). A reader that
 knows only format 1 gets `unsupported_format` and refuses; it cannot misread
@@ -131,10 +145,25 @@ rule Tim set.
 - Content addressing of parts (`g<gen>-p-<sha256>`) is unchanged, so the head
   still commits to every byte through the part hashes.
 
+## Measured memory (100 MiB record)
+
+Each step in its own child process, net of the process baseline (see
+`big-record-memory.test.ts`).
+
+| Step                      | Node (RSS delta) | Lite (fake-indexeddb heap, upper bound) |
+| ------------------------- | ---------------- | --------------------------------------- |
+| Write (spool and publish) | 115-123 MiB      | 222-224 MiB (GC on), 290-304 MiB (off)  |
+| Forward read (flat path)  | 22-30 MiB        | 165-166 MiB (GC on), 213-223 MiB (off)  |
+| Parse read (object)       | 314-317 MiB      | 437-438 MiB (GC on), 465-471 MiB (off)  |
+
+The write is not part-bounded: the record object itself is in memory (the
+caller gave it to us), and the body is serialized twice from it. The forward
+read is the one flat path.
+
 ## Not in this change
 
-The Desktop client and the run-intake route still cap one batch body at
-8 MiB. An oversized record needs a chunked body upload from Desktop before it
-can reach a Personal Server. The seed upload route accepts long lines.
-The existing list and query reads still parse a record to project or filter
-it; only the streaming read primitive is flat.
+The Desktop client still caps one batch body at 8 MiB. The Personal Server
+batch route takes up to the legacy ingest ceiling (`DATA_INGEST_MAX_SIZE`) and
+parses the body whole, so its peak is about 3 times the batch. The existing
+list and query reads still parse a record to project or filter it; only the
+streaming read primitive is flat, and only for base bodies.

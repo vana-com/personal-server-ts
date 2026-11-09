@@ -88,6 +88,39 @@ describe("stream AEAD (age STREAM)", () => {
     await expect(open(cut)).rejects.toBeInstanceOf(StreamAeadError);
   });
 
+  it.each([1, 15, 16])(
+    "refuses a blob whose last %i bytes are missing",
+    async (cut) => {
+      const blob = await seal(bytesOf(STREAM_CHUNK_BYTES + 10));
+      await expect(
+        open(blob.subarray(0, blob.length - cut)),
+      ).rejects.toBeInstanceOf(StreamAeadError);
+    },
+  );
+
+  it("refuses a final chunk that was authenticated as not final", async () => {
+    const plain = bytesOf(STREAM_CHUNK_BYTES + 10);
+    const payloadKey = Buffer.from(
+      hkdfSync("sha256", key, nonce, "payload", 32),
+    );
+    const chunkAt = (i: number, last: boolean, data: Uint8Array) => {
+      const iv = Buffer.alloc(12);
+      iv.writeUIntBE(i, 5, 6);
+      iv[11] = last ? 1 : 0;
+      const c = createCipheriv("chacha20-poly1305", payloadKey, iv, {
+        authTagLength: 16,
+      });
+      return Buffer.concat([c.update(data), c.final(), c.getAuthTag()]);
+    };
+    const blob = Buffer.concat([
+      Buffer.from([0x56, 0x53, 0x41, 0x01]),
+      Buffer.from(nonce),
+      chunkAt(0, false, plain.subarray(0, STREAM_CHUNK_BYTES)),
+      chunkAt(1, false, plain.subarray(STREAM_CHUNK_BYTES)),
+    ]);
+    await expect(open(blob)).rejects.toBeInstanceOf(StreamAeadError);
+  });
+
   it("detects reordered chunks", async () => {
     const blob = await seal(bytesOf(3 * STREAM_CHUNK_BYTES));
     const size = STREAM_CHUNK_BYTES + 16;

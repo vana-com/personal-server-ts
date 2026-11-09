@@ -29,6 +29,8 @@ import {
   shardOf,
   type Envelope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { sha256 } from "@noble/hashes/sha2";
+import { bytesToHex } from "@noble/hashes/utils";
 import type { StreamSyncFiles } from "./ports.js";
 
 const encoder = new TextEncoder();
@@ -86,9 +88,45 @@ export function fileSpoolLine(envelope: Envelope, path: string): string {
   return `${envelope.k}\t${envelopeText(envelope)}\t@${path}`;
 }
 
-/** Parse one spool line (no terminator). */
+/**
+ * A line written before format 2: `<k> <canonical {"o":..,"r":..,"v":BODY}>`
+ * (a space at offset 64, not a TAB). A run that was durable and ready before
+ * the upgrade holds such lines, and the upgrade must still publish and
+ * overlay it. The envelope is derived from the line, as `frameOfLine` does
+ * for a format-1 part. `size` keeps the old measure (line bytes + 1), the
+ * one the persisted shard totals and the overlay log byte count were written
+ * in, so those totals stay true. The planner tolerates the few bytes by which
+ * this differs from the frame size.
+ */
+function parseLegacySpoolLine(line: string): SpoolEntry {
+  const k = line.slice(0, 64);
+  const text = line.slice(65);
+  const at = text.indexOf(',"v":');
+  if (at === -1 || !text.endsWith("}")) throw new Error("malformed spool line");
+  const head = JSON.parse(text) as { o: number; r: string };
+  const bodyText = text.slice(at + 5, -1);
+  const body = encoder.encode(bodyText);
+  const envelope: Envelope = {
+    h: bytesToHex(sha256(body)),
+    k,
+    n: body.length,
+    o: head.o,
+    r: head.r,
+  };
+  return {
+    envelope,
+    size: encoder.encode(text).length + 1,
+    line,
+    body: { kind: "inline", text: bodyText },
+  };
+}
+
+/** Parse one spool line (no terminator). Reads the legacy form too. */
 export function parseSpoolLine(line: string): SpoolEntry {
   const first = line.indexOf("\t");
+  if (first !== 64 && line.charCodeAt(64) === 0x20 && line.indexOf("\t") < 0) {
+    return parseLegacySpoolLine(line);
+  }
   const second = line.indexOf("\t", first + 1);
   if (first !== 64 || second === -1) throw new Error("malformed spool line");
   const envelope = decodeEnvelope(

@@ -4,8 +4,9 @@
  *
  * The base is the leased imported view, or nothing when the stream has no
  * imported head (an overlay-only view). Without overlay rows a read holds one
- * part at a time. Overlay winners are held in memory: they are the rows of
- * local runs the imported view does not cover yet.
+ * part at a time. Overlay winners are held in memory, whole and parsed: they
+ * are the rows of local runs the imported view does not cover yet, so an
+ * overlay record costs a multiple of its size.
  */
 
 import {

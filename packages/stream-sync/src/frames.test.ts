@@ -115,6 +115,76 @@ describe("frames", () => {
     expect(os).toEqual([5, 6]);
   });
 
+  it("keeps the next frame whole when a consumer leaves a body early", async () => {
+    const a = utf8('{"a":"0123456789"}');
+    const b = utf8('{"b":2}');
+    const wire = join([
+      ...(await collect(frameChunks(await envelopeFor([a]), [a]))),
+      ...(await collect(frameChunks(await envelopeFor([b], 6), [b]))),
+    ]);
+    const seen: { o: number; body: Uint8Array }[] = [];
+    for await (const f of readFrames(asyncOf(resplit(wire, 3)), makeSha256)) {
+      if (f.envelope.o === 5) {
+        for await (const piece of f.body) {
+          void piece;
+          break;
+        }
+        continue;
+      }
+      seen.push({ o: f.envelope.o, body: join(await collect(f.body)) });
+    }
+    expect(seen.map((x) => x.o)).toEqual([6]);
+    expect(seen[0]!.body).toEqual(b);
+  });
+
+  it("still checks the hash of a body left early", async () => {
+    const a = utf8('{"a":"0123456789"}');
+    const e = await envelopeFor([a]);
+    const wire = join(await collect(frameChunks(e, [a])));
+    wire[wire.length - 4] ^= 1;
+    const frames = readFrames(asyncOf(resplit(wire, 3)), makeSha256);
+    await expect(
+      (async () => {
+        for await (const f of frames) {
+          for await (const piece of f.body) {
+            void piece;
+            break;
+          }
+        }
+      })(),
+    ).rejects.toThrow(InvalidPartError);
+  });
+
+  it.each([-1, 1])(
+    "refuses a body whose hash matches but whose length is off by %i",
+    async (off) => {
+      const body = utf8('{"id":"abcdef"}');
+      const e = await envelopeFor([body]);
+      const next = utf8('{"z":0}');
+      const lying = { ...e, n: e.n + off };
+      const wire = join([
+        encodeEnvelope(lying),
+        Uint8Array.of(10),
+        body,
+        Uint8Array.of(10),
+        ...(await collect(frameChunks(await envelopeFor([next], 6), [next]))),
+      ]);
+      const emitted: number[] = [];
+      await expect(
+        (async () => {
+          for await (const f of readFrames(
+            asyncOf(resplit(wire, 4)),
+            makeSha256,
+          )) {
+            for await (const piece of f.body) void piece;
+            emitted.push(f.envelope.o);
+          }
+        })(),
+      ).rejects.toThrow(InvalidPartError);
+      expect(emitted).not.toContain(6);
+    },
+  );
+
   it("detects a flipped body byte, a short body and a missing LF", async () => {
     const body = utf8('{"id":"abc"}');
     const e = await envelopeFor([body]);
