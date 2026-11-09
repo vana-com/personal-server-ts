@@ -23,8 +23,8 @@ export interface OlderVersionCounts {
  * Deleting the feature later = this file, the flag and the call; the 410
  * remains. Current-version reads never come here.
  *
- * Open for r5.2: the `/additions`, `/versions` and `/lineage` routes on the
- * database ("history-phase1") add methods to this interface. Not pinned yet.
+ * The `/additions`, `/versions` and `/lineage` routes on the database live in
+ * `history.ts` (r5.2 1.4), not here; this interface is unchanged by them.
  *
  * Flag on: versions come from `stream_versions` of the connection's CURRENT
  * generation; head and parts are fetched on demand, decrypted, projected, and

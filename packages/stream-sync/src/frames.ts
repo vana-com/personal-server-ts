@@ -26,6 +26,11 @@ export interface Envelope {
   readonly o: number;
   /** Run id. */
   readonly r: string;
+  /**
+   * v3 frames only: `first_o` as an integer, or `null`. Type only until the
+   * v3 frame slice makes it part of the envelope. Spec: r5.2 1.3.
+   */
+  readonly f?: number | null;
 }
 
 const LF = 0x0a;

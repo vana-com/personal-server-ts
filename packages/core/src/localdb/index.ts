@@ -59,3 +59,17 @@ export {
   type LocalListing,
 } from "./listing.js";
 export { createLocalSync, type LocalSync } from "./sync.js";
+export {
+  createLocalHistory,
+  type HistoryLineage,
+  type HistoryResult,
+  type HistoryVersionItem,
+  type HistoryVersionsPage,
+  type LocalHistory,
+} from "./history.js";
+export {
+  createLocalRequirements,
+  type LocalRequirements,
+  type RequirementsAnswer,
+  type SinceFieldSource,
+} from "./requirements.js";
