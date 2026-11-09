@@ -14,7 +14,6 @@ import type { UploadWorkerDeps } from "../workers/upload.js";
 import { createMemoryStreamSyncFiles } from "../../stream-sync/memory-files.js";
 import { createRetireHost } from "../legacy-retire/host.js";
 import { LegacyImporter } from "../legacy-retire/import.js";
-import { createMemoryImportAuthority } from "../legacy-retire/import-authority.js";
 import { RetireLedger } from "../legacy-retire/ledger.js";
 import { buildSyntheticFixture } from "../legacy-retire/synthetic-fixture.js";
 
@@ -61,11 +60,7 @@ async function cycle(options: {
   option: "switched" | "unswitched";
 }) {
   const fx = await buildSyntheticFixture();
-  const ledger = new RetireLedger(
-    createMemoryStreamSyncFiles(),
-    OWNER,
-    createMemoryImportAuthority(),
-  );
+  const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
   const staged: string[] = [];
   const importer = new LegacyImporter({
     source: fx.source,
@@ -80,9 +75,9 @@ async function cycle(options: {
     },
     ledger,
     owner: OWNER,
-    mode: () =>
-      (options.option === "switched" ? "switched" : "unswitched") as
-        "switched" | "unswitched",
+    mode: {
+      read: () => (options.option === "switched" ? "switched" : "unswitched"),
+    },
   });
   const host = createRetireHost({
     reader: fx.reader,
@@ -171,6 +166,7 @@ describe("sync cycle with legacy import and retire", () => {
       listAttempts: 0,
       listed: false,
       readbacks: {},
+      importComplete: false,
     });
   });
 });

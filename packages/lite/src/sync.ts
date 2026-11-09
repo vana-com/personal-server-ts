@@ -46,15 +46,11 @@ import {
   createRetireHost,
   createScopeDeletionTracker,
   LegacyImporter,
-  createMemoryImportAuthority,
-  accountModeOf,
-  legacyRetireSwitched,
   RetireLedger,
   normalizePendingBlobDeletionPlanned,
   normalizePendingBlobDeletions,
   type PendingBlobDeletionPlanned,
-  type AccountModeReader,
-  type ImportAuthority,
+  type AccountStorageMode,
   type LegacyRetireOption,
   type ScopeDeletionTracker,
   type UploadAttemptStore,
@@ -131,13 +127,10 @@ export interface PsLiteOwnerSyncSigner
 export interface PsLiteSyncOptions {
   config: ServerConfig;
   /**
-   * The account-mode authority, read for the server's owner. The legacy
-   * import and retire act only when it says `switched`. Absent: `unknown`, so
-   * neither runs.
+   * The shared account-mode port. The legacy import and retire act only when
+   * it says `switched`. Absent: `unknown`, so neither runs.
    */
-  accountMode?: AccountModeReader;
-  /** The one owner of "the legacy import is done"; default in memory. */
-  importAuthority?: ImportAuthority;
+  accountMode?: AccountStorageMode;
   /**
    * Durable files for whole-file stream sync, used only when
    * `config.streamSync.write` is on. Given the home id of the (owner,
@@ -607,19 +600,16 @@ export async function createPsLiteSyncManager(
   let syncManager!: ReturnType<typeof createSyncManager>;
   try {
     // Lite has no stream-shaped local rows to import (no canonical store, no
-    // seed intake), so its import step finds nothing. The writer is not gated
-    // on it: there is nothing to merge before a first run. The sync cycle runs
-    // the importer once, which the retire step requires, and the readback gate
-    // still decides every delete of a local legacy file.
-    const accountMode: AccountModeReader = options.accountMode ?? {
+    // seed intake), so its import step finds nothing and completes at once.
+    // The writer is not gated on it. A legacy file goes only once its
+    // connector has re-collected a complete stream (the readback gate and the
+    // fence rule in `retire.ts`); history the source no longer serves is
+    // accepted migration loss (I5).
+    const accountMode: AccountStorageMode = options.accountMode ?? {
       read: () => "unknown",
     };
     const retireLedger = streamSyncHome
-      ? new RetireLedger(
-          streamSyncHome.home.files,
-          serverOwner,
-          options.importAuthority ?? createMemoryImportAuthority(),
-        )
+      ? new RetireLedger(streamSyncHome.home.files, serverOwner)
       : null;
     const legacyImporter = retireLedger
       ? new LegacyImporter({
@@ -635,7 +625,7 @@ export async function createPsLiteSyncManager(
           },
           ledger: retireLedger,
           owner: serverOwner,
-          mode: () => accountModeOf(accountMode, serverOwner),
+          mode: accountMode,
           deleted: async (connector) =>
             streamSyncWriter
               ? streamSyncWriter.connectionDeleted(connector)
@@ -741,7 +731,7 @@ export async function createPsLiteSyncManager(
           ? { write: true, publisher: streamSyncWriter }
           : null,
         legacyRetire: (): LegacyRetireOption | null =>
-          legacyRetireSwitched(accountMode, serverOwner) &&
+          legacyImporter?.switched() &&
           streamSyncWriter &&
           streamSyncRead &&
           retireLedger &&
@@ -754,7 +744,7 @@ export async function createPsLiteSyncManager(
                   ledger: retireLedger,
                 }),
                 ledger: retireLedger,
-                deleteEnabled: Boolean(options.config.streamSync?.retireLegacy),
+                deleteEnabled: true,
               }
             : null,
         deleteData,

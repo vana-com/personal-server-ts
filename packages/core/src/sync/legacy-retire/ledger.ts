@@ -7,7 +7,6 @@
 
 import type { StreamSyncFiles } from "../../stream-sync/ports.js";
 import type { ImportExclusion } from "./import.js";
-import type { ImportAuthority } from "./import-authority.js";
 
 const PATH = "legacy-retire/ledger.json";
 
@@ -119,6 +118,12 @@ export interface LedgerData {
    */
   excluded: Record<string, ImportExclusion[]>;
   readbacks: Record<string, ReadbackRecord>;
+  /**
+   * This device's first import finished: every staged stream has the writer's
+   * final answer. The one place "import done" is kept; the writer's gate and
+   * the retire pass both read it here.
+   */
+  importComplete: boolean;
 }
 
 const empty = (owner: string): LedgerData => ({
@@ -130,6 +135,7 @@ const empty = (owner: string): LedgerData => ({
   abandoned: false,
   excluded: {},
   readbacks: {},
+  importComplete: false,
 });
 
 const decoder = new TextDecoder();
@@ -141,14 +147,9 @@ export class RetireLedger {
   /** The Account owner this ledger is for, lowercase. */
   readonly owner: string;
 
-  /**
-   * `authority` is the one owner of "the import is done": the ledger reads
-   * `importPending` from it and tells it `importDone`; it keeps no flag.
-   */
   constructor(
     private readonly files: StreamSyncFiles,
     owner: string,
-    private readonly authority: ImportAuthority,
   ) {
     this.owner = owner.toLowerCase();
   }
@@ -173,6 +174,7 @@ export class RetireLedger {
         abandoned: parsed.abandoned === true,
         excluded: parsed.excluded ?? {},
         readbacks: parsed.readbacks ?? {},
+        importComplete: parsed.importComplete === true,
       };
     } catch {
       return empty(this.owner); // unreadable = nothing proved
@@ -190,60 +192,26 @@ export class RetireLedger {
     return next;
   }
 
-  /**
-   * What the authority says of this account's import. A rejection (the
-   * authority does not know the owner) is `unknown`, never `done`.
-   */
-  async authorityState(): Promise<"pending" | "done" | "unknown"> {
-    try {
-      return (await this.authority.importPending(this.owner))
-        ? "pending"
-        : "done";
-    } catch {
-      return "unknown";
-    }
-  }
-
-  /** Whether the authority still waits for this account's import (unknown: yes). */
+  /** Whether this account's import is still to finish. */
   async importPending(): Promise<boolean> {
-    return (await this.authorityState()) !== "done";
+    return !(await this.read()).importComplete;
   }
 
-  /** Tell the authority this account's import is finished, and wait for the save. */
+  /** Record that this account's import is finished. */
   async markImportDone(): Promise<void> {
-    await this.authority.importDone(this.owner);
+    await this.update((data) => {
+      data.importComplete = true;
+    });
   }
 
   /**
-   * Run this connector's seed publish inside the authority's seal while the
-   * import is pending. The authority runs `write` itself and answers with its
-   * result, or refuses and runs nothing: nothing publishes outside the call.
-   */
-  async sealSeedPublish<T>(
-    connector: string,
-    write: () => Promise<T>,
-  ): Promise<{ admitted: false } | { admitted: true; value: T }> {
-    const sealed = await this.authority.commitImportSeed(
-      this.owner,
-      `import-seed:${connector}`,
-      write,
-    );
-    return sealed.kind === "streams"
-      ? { admitted: true, value: sealed.value }
-      : { admitted: false };
-  }
-
-  /**
-   * Nothing is left to wait for on this connector: the authority says the
-   * import is done, its rows are staged, or the import gave it up. The
-   * writer's gate.
+   * Nothing is left to wait for on this connector: the import is complete,
+   * its rows are staged, or the import gave it up. The writer's gate.
    */
   async importDone(connector: string): Promise<boolean> {
-    const state = await this.authorityState();
-    if (state === "done") return true;
-    if (state === "unknown") return false;
     const data = await this.read();
     return (
+      data.importComplete ||
       data.imported[connector] !== undefined ||
       data.failures[connector]?.gaveUp === true
     );
@@ -260,10 +228,7 @@ export class RetireLedger {
       return false;
     }
     if ((data.excluded[connector] ?? []).some((e) => e.rows > 0)) return false;
-    return (
-      data.imported[connector] !== undefined ||
-      (await this.authorityState()) === "done"
-    );
+    return data.imported[connector] !== undefined || data.importComplete;
   }
 
   /**

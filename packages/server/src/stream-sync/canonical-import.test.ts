@@ -13,7 +13,6 @@ import {
 import {
   createCanonicalImportSource,
   LegacyImporter,
-  createMemoryImportAuthority,
   RetireLedger,
   type CanonicalImportDeps,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -84,11 +83,7 @@ describe("the canonical import source over a real record store (IMPORT_SOURCE_EM
     const store = seedStore(5);
     let deps: CanonicalImportDeps | null = null;
     const files = createMemoryStreamSyncFiles(7);
-    const ledger = new RetireLedger(
-      createMemoryStreamSyncFiles(),
-      OWNER,
-      createMemoryImportAuthority(),
-    );
+    const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
     const importer = new LegacyImporter({
       source: createCanonicalImportSource({
         owner: OWNER,
@@ -98,7 +93,7 @@ describe("the canonical import source over a real record store (IMPORT_SOURCE_EM
       sink: createSeedImportSink(createSeedStaging(files)),
       ledger,
       owner: OWNER,
-      mode: () => "switched" as const,
+      mode: { read: () => "switched" as const },
       publish: async () => ({ state: "done", skipped: [] }), // staging only
     });
 
@@ -135,7 +130,7 @@ describe("the canonical import source over a real record store (IMPORT_SOURCE_EM
       sink: createSeedImportSink(createSeedStaging(files)),
       ledger,
       owner: OWNER,
-      mode: () => "switched" as const,
+      mode: { read: () => "switched" as const },
       publish: async () => ({ state: "done", skipped: [] }), // staging only
     });
     expect(await again.run()).toMatchObject({ ran: false });

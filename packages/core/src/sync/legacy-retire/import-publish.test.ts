@@ -8,7 +8,6 @@
 import { describe, expect, it } from "vitest";
 import type { DeclarationSnapshot } from "../../pdpp/types.js";
 import { createCanonicalImportSource } from "./canonical-source.js";
-import { createMemoryImportAuthority } from "./import-authority.js";
 import { CONNECTOR, flow, OWNER, raw, STREAM } from "./retire-rig.js";
 
 type Flow = Awaited<ReturnType<typeof flow>>;
@@ -310,7 +309,7 @@ describe("what the import left behind is one owner read (STATUS_HIDES_EXCLUDED)"
 });
 
 describe("the status shows a stalled publish (STATUS_REPORTS_PUBLISHED_UNPUBLISHED)", () => {
-  it("reports imported, not published, and tells the authority nothing, until the writer merges the seed", async () => {
+  it("reports imported, not published, and is not complete, until the writer merges the seed", async () => {
     const f = await flow({
       local: ["e0"],
       source: sourceOf([raw("e0")]),
@@ -325,17 +324,17 @@ describe("the status shows a stalled publish (STATUS_REPORTS_PUBLISHED_UNPUBLISH
         { connector: CONNECTOR, state: "imported", staged: 1, stayed: null },
       ],
     });
-    expect(f.authority.doneCalls).toEqual([]);
+    expect(await f.ledger.importPending()).toBe(true);
     await publish(f);
     await f.importer.run(); // sees the receipt
     expect(await f.importer.status()).toMatchObject({
       complete: true,
       connectors: [{ connector: CONNECTOR, state: "published" }],
     });
-    expect(f.authority.doneCalls).toEqual([OWNER.toLowerCase()]);
+    expect(await f.ledger.importPending()).toBe(false);
   });
 
-  it("does not tell the authority the import is done while the publish is held (DONE_BEFORE_PUBLISHED)", async () => {
+  it("does not complete the import while the publish is held (DONE_BEFORE_PUBLISHED)", async () => {
     const f = await flow({
       local: ["e0"],
       source: sourceOf([raw("e0")]),
@@ -344,7 +343,6 @@ describe("the status shows a stalled publish (STATUS_REPORTS_PUBLISHED_UNPUBLISH
     });
     await f.importer.run();
     await f.importer.run();
-    expect(f.authority.doneCalls).toEqual([]);
     expect(await f.ledger.importPending()).toBe(true);
     expect((await f.importer.status()).connectors[0]?.state).toBe("imported");
   });
@@ -414,8 +412,8 @@ describe("a seed the writer skipped is not published (SKIPPED_SEED_MARKED_PUBLIS
     expect((await f.ledger.read()).imported[CONNECTOR]).not.toHaveProperty(
       "published",
     );
-    // Final: the authority is told; but the file is never retired.
-    expect(f.authority.doneCalls).toEqual([OWNER.toLowerCase()]);
+    // Final: the import is complete; but the file is never retired.
+    expect(await f.ledger.importPending()).toBe(false);
     expect(await f.ledger.importProven(CONNECTOR)).toBe(false);
   });
 });
@@ -491,18 +489,20 @@ describe("the import names the connection it chose (CHOICE_NOT_SURFACED, TIE_NOT
   });
 });
 
-describe("the authority owns done (AUTHORITY_PENDING_IGNORED)", () => {
-  it("does nothing once the authority says the import is done", async () => {
+describe("a finished import never runs again (IMPORT_RERUNS_WHEN_COMPLETE)", () => {
+  it("does nothing on a second start, and the writer's gate stays open", async () => {
     const f = await flow({
       local: ["e0"],
       source: sourceOf([raw("e0")]),
       owner: OWNER,
-      authority: createMemoryImportAuthority({ pending: false }),
     });
+    await f.importer.run();
+    await publish(f);
+    await f.importer.run();
+    expect(await f.ledger.importPending()).toBe(false);
+    const stagings = f.stagings;
     expect(await f.importer.run()).toMatchObject({ ran: false });
-    expect(f.staged.size).toBe(0);
-    expect(f.authority.doneCalls).toEqual([]);
-    // The writer's gate is open for every connector.
+    expect(f.stagings).toBe(stagings);
     expect(await f.importer.importDone(CONNECTOR)).toBe(true);
   });
 });

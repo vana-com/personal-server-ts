@@ -15,9 +15,10 @@
  */
 
 import type { HeadProfile } from "@opendatalabs/personal-server-ts-stream-sync";
+import type { AccountStorageModeValue } from "./account-storage-mode.js";
 import type { SeedPublication } from "../../stream-sync/writer.js";
 import type { RetireLedger } from "./ledger.js";
-import type { AccountMode } from "./switch.js";
+import type { AccountStorageMode } from "./account-storage-mode.js";
 
 export interface ImportStream {
   readonly stream: string;
@@ -114,16 +115,16 @@ export interface LegacyImporterOptions {
   readonly sink: LegacyImportSink;
   readonly ledger: RetireLedger;
   /**
-   * The Account this importer acts for: the owner the mode authority is asked
-   * about. The source and the ledger must both belong to it.
+   * The Account this importer acts for: the owner the mode is asked about.
+   * The source and the ledger must both belong to it.
    */
   readonly owner: string;
   /**
-   * The account's mode now; read on every call. Only `switched` imports.
-   * `unswitched` has nothing to wait for; `unknown` is no decision: the
-   * writer's gate stays closed and the status reports no count.
+   * The shared account-mode port, read on every call. Only `switched`
+   * imports. `unswitched` has nothing to wait for; `unknown` is no decision:
+   * the writer's gate stays closed and the status reports no count.
    */
-  readonly mode: () => AccountMode;
+  readonly mode: AccountStorageMode;
   /**
    * Whether the connection of `connector` was deleted (by any device). A
    * deleted connection's legacy rows are never staged: its import is recorded
@@ -167,7 +168,7 @@ export const DEFAULT_MAX_ATTEMPTS = 5;
  * hashes only: no row, no stream name, no connection id, no error text.
  */
 export interface ImportStatus {
-  /** The authority no longer waits for this account's import. */
+  /** This account's import is finished. */
   readonly complete: boolean;
   /**
    * The source could not be listed within the bound; no file is retired. It is
@@ -216,35 +217,51 @@ export class LegacyImporter {
 
   constructor(private readonly options: LegacyImporterOptions) {}
 
+  /** The account's mode now, asked for the one owner (lowercase). */
+  private mode(): AccountStorageModeValue {
+    return this.options.mode.read(this.options.owner.toLowerCase());
+  }
+
+  /** Whether the Account has switched; hosts ask here, never read a flag. */
+  switched(): boolean {
+    return this.mode() === "switched";
+  }
+
   /**
-   * The writer's gate: true once this connector's rows are staged, or the
-   * authority says the import is done. Unswitched: nothing to wait for.
-   * Unknown: never done, so no run binds a generation on a guess.
+   * The writer's gate, and the one owner of "import owed": true once this
+   * connector's rows are staged or the import is complete. Unswitched:
+   * nothing to wait for. Unknown: never done, so no run binds a generation on
+   * a guess.
    */
   importDone = async (connector: string): Promise<boolean> => {
-    const mode = this.options.mode();
+    const mode = this.mode();
     if (mode === "unknown") return false;
     if (mode === "unswitched") return true;
     return this.options.ledger.importDone(connector);
   };
 
   /**
-   * One pass over the source. Safe to call on every boot and cycle: once the
-   * authority says the import is done it returns at once, and a pass that
-   * failed starts again from the connectors not yet staged.
+   * One pass over the source. Safe to call on every boot, wake and cycle:
+   * once the import is complete it only retries what was given up, and a
+   * pass that failed starts again from the connectors not yet staged. A
+   * `signal` that aborts ends the pass before its next step; what is staged
+   * stays recorded, so a later pass resumes without a duplicate.
    */
-  run(): Promise<ImportPassResult> {
-    this.pass ??= this.runPass().finally(() => {
+  run(signal?: AbortSignal): Promise<ImportPassResult> {
+    this.pass ??= this.runPass(signal).finally(() => {
       this.pass = null;
     });
     return this.pass;
   }
 
-  private async runPass(): Promise<ImportPassResult> {
+  private async runPass(signal?: AbortSignal): Promise<ImportPassResult> {
     const { source, ledger } = this.options;
-    if (this.options.mode() !== "switched") {
-      return { ran: false, connectorsStaged: 0, failed: 0 };
-    }
+    const idle: ImportPassResult = {
+      ran: false,
+      connectorsStaged: 0,
+      failed: 0,
+    };
+    if (this.mode() !== "switched" || signal?.aborted) return idle;
     // The request owner (whom the mode is asked about) against the owner the
     // source reads for and the owner the ledger was recorded for.
     const owner = this.options.owner.toLowerCase();
@@ -260,27 +277,15 @@ export class LegacyImporter {
         refused: "owner_mismatch",
       };
     }
-    // The authority owns "done": once it says so, the first import never runs
-    // again, but what was given up is tried again on a later boot. An
-    // authority that does not know the owner is no decision.
-    const state = await ledger.authorityState();
-    if (state === "done") return this.retryGivenUp();
-    if (state !== "pending") {
-      return { ran: false, connectorsStaged: 0, failed: 0 };
-    }
+    // The ledger owns "done": once set, the first import never runs again,
+    // but what was given up is tried again on a later boot.
+    if ((await ledger.read()).importComplete) return this.retryGivenUp(signal);
     // This boot carried the first import: what it gave up waits for the next.
     this.retriedGivenUp = true;
-    const { result, settled } = await this.stage(null);
-    await this.queueRuns(true);
-    if (settled && (await this.allSeedsFinal())) {
-      try {
-        await ledger.markImportDone();
-      } catch (error) {
-        this.options.logger?.warn(
-          { error: error instanceof Error ? error.name : "NonError" },
-          "Legacy import finished but the authority was not told; retried next cycle",
-        );
-      }
+    const { result, settled } = await this.stage(null, signal);
+    await this.queueRuns(signal);
+    if (settled && !signal?.aborted && (await this.allSeedsFinal())) {
+      await ledger.markImportDone();
     }
     return result;
   }
@@ -291,11 +296,11 @@ export class LegacyImporter {
   /**
    * ABANDONED_NEVER_RETRIED: a connector (or the whole listing) given up is
    * not forgotten. The ledger keeps it; on a later boot, once, the import is
-   * tried again in the background. The authority already said done, so the
+   * tried again in the background. The import is already complete, so the
    * gate is not touched and no run waits for it. The connector's file is kept
    * until a retry proves it (`importProven`).
    */
-  private async retryGivenUp(): Promise<ImportPassResult> {
+  private async retryGivenUp(signal?: AbortSignal): Promise<ImportPassResult> {
     let result: ImportPassResult = {
       ran: false,
       connectorsStaged: 0,
@@ -312,14 +317,14 @@ export class LegacyImporter {
         // to do; otherwise only the connectors given up.
         ({ result } = await this.stage(
           data.abandoned ? null : new Set(gaveUp),
+          signal,
         ));
         // A source that is not open yet is no attempt: ask again next call.
         if (result.pending) this.retriedGivenUp = false;
       }
     }
-    // Rows a retry staged are published and finalized without the seal: the
-    // authority is done, so ordinary commits are open.
-    await this.queueRuns(false);
+    // Rows a retry staged are published and finalized.
+    await this.queueRuns(signal);
     return result;
   }
 
@@ -338,7 +343,10 @@ export class LegacyImporter {
    * `settled`: the listing worked (or was given up) and no connector is still
    * waiting for a retry.
    */
-  private async stage(retry: ReadonlySet<string> | null): Promise<{
+  private async stage(
+    retry: ReadonlySet<string> | null,
+    signal?: AbortSignal,
+  ): Promise<{
     result: ImportPassResult;
     settled: boolean;
   }> {
@@ -393,6 +401,13 @@ export class LegacyImporter {
     let failed = 0;
     let waiting = 0;
     for (const connector of connectors) {
+      // An abort ends the pass between connectors: nothing half-staged is
+      // recorded, and the connector is staged again by the next pass.
+      if (signal?.aborted)
+        return {
+          result: { ran: true, connectorsStaged: staged, failed },
+          settled: false,
+        };
       const known = await ledger.read();
       if (known.imported[connector]) continue;
       if (
@@ -480,32 +495,19 @@ export class LegacyImporter {
    * own runs are not held for it. Streams the writer did not merge are
    * counted as left behind, never as published.
    */
-  private async queueRuns(sealed: boolean): Promise<void> {
+  private async queueRuns(signal?: AbortSignal): Promise<void> {
     const { publish, ledger } = this.options;
     if (!publish) return;
     const { imported } = await ledger.read();
     for (const [connector, record] of Object.entries(imported)) {
+      if (signal?.aborted) return;
       if (record.published || record.seedDone) continue;
       if (this.stagedRows(record) === 0) continue;
       try {
-        // While the import is pending, only the authority's seed seal admits
-        // the publish, and it runs inside the seal; a refusal is retried on
-        // the next pass.
         const stagedStreams = Object.entries(record.staged ?? {})
           .filter(([, rows]) => rows > 0)
           .map(([stream]) => stream);
-        // After the authority said done, ordinary commits are open and the
-        // publish needs no seal (a retry on a later boot).
-        const result = sealed
-          ? await ledger.sealSeedPublish(connector, () =>
-              publish(connector, stagedStreams),
-            )
-          : ({
-              admitted: true,
-              value: await publish(connector, stagedStreams),
-            } as const);
-        if (!result.admitted) continue;
-        const outcome = result.value;
+        const outcome = await publish(connector, stagedStreams);
         if (outcome.state !== "done") continue;
         const skipped = outcome.skipped;
         await ledger.update((data) => {
@@ -607,7 +609,7 @@ export class LegacyImporter {
     // Not counted: the mode is no decision, the source was never listed, it
     // was given up, or a connector's rows could not be counted.
     const unknown =
-      this.options.mode() === "unknown" ||
+      this.mode() === "unknown" ||
       !data.listed ||
       data.abandoned ||
       connectors.some((c) => c.stayed === null);

@@ -247,6 +247,9 @@ export function createSyncManager(
     cycleInFlight = exclusive(async () => {
       do {
         rerunRequested = false;
+        // The import needs no gateway registration, so it never waits for
+        // the canSync check below.
+        await runLegacyImport();
         const canRun = await (options?.canSync?.() ?? { ok: true });
         if (!canRun.ok) {
           blocked = { reason: canRun.reason, message: canRun.message };
@@ -254,8 +257,6 @@ export function createSyncManager(
           continue;
         }
         blocked = null;
-
-        await runLegacyImport();
 
         if (needsStartupHydration) {
           try {

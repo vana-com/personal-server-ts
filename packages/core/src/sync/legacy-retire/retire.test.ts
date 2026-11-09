@@ -9,7 +9,6 @@ import { describe, expect, it } from "vitest";
 import { createMemoryStreamSyncFiles } from "../../stream-sync/memory-files.js";
 import { createRetireHost } from "./host.js";
 import { LegacyImporter } from "./import.js";
-import { createMemoryImportAuthority } from "./import-authority.js";
 import { RetireLedger } from "./ledger.js";
 import { readbackVersion } from "./readback.js";
 import { retireLegacyFiles } from "./retire.js";
@@ -19,11 +18,7 @@ async function setup(
   options: { importFirst?: boolean; fullRun?: boolean } = {},
 ) {
   const fx = await buildSyntheticFixture();
-  const ledger = new RetireLedger(
-    createMemoryStreamSyncFiles(),
-    OWNER,
-    createMemoryImportAuthority(),
-  );
+  const ledger = new RetireLedger(createMemoryStreamSyncFiles(), OWNER);
   const host = createRetireHost({
     reader: fx.reader,
     writer: { fullRunSince: async () => options.fullRun ?? true },
@@ -35,7 +30,7 @@ async function setup(
       sink: { stage: async (_c, _s, rows) => (await drain(rows)).length },
       ledger,
       owner: OWNER,
-      mode: () => "switched" as const,
+      mode: { read: () => "switched" as const },
     }).run();
   }
   const scopesLeft = () => fx.storage.entries.map((e) => e.scope).sort();

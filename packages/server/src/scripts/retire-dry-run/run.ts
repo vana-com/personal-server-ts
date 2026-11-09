@@ -18,10 +18,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import type {
-  ImportAuthority,
-  RetireReport,
-} from "@opendatalabs/personal-server-ts-core/sync";
+import type { RetireReport } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { openLegacyStore as OpenLegacyStore } from "./legacy-store.js";
 import { assertCopyOnly } from "./copy-only.js";
@@ -220,24 +217,14 @@ export async function runLegacyRetireDryRun(
 
     // The ledger lives in memory and starts with this device's import state
     // only; every readback is made fresh and nothing is persisted.
-    // "Is the import done" belongs to the account-mode authority, which the
-    // tool cannot ask. The copy's ledger file keeps a marker of it (written by
-    // the import run); this read-only authority answers from that marker, and
-    // refuses every write.
-    const authority: ImportAuthority = {
-      importPending: async () => !home.importComplete,
-      importDone: async () => {
-        throw new Error("the dry run never tells the authority anything");
-      },
-      commitImportSeed: async () => ({ kind: "refuse" }),
-    };
+    // "Is the import done" is the copy's own ledger marker, read here.
     const ledger = new RetireLedger(
       createMemoryStreamSyncFiles(),
       heads.ownerAddress,
-      authority,
     );
     await ledger.update((data) => {
       data.imported = home.imported;
+      data.importComplete = home.importComplete;
     });
     const host = createRetireHost({
       reader: heads.reader,

@@ -18,13 +18,9 @@ import {
   type ImportStream,
   type LegacyImportSource,
 } from "./import.js";
-import {
-  createMemoryImportAuthority,
-  type ImportAuthority,
-} from "./import-authority.js";
 import { RetireLedger } from "./ledger.js";
 import { retireLegacyFiles, type RetireHost } from "./retire.js";
-import type { AccountMode } from "./switch.js";
+import type { AccountStorageModeValue as AccountMode } from "./account-storage-mode.js";
 
 export const CONNECTOR = "chatgpt";
 export const SCOPE = "chatgpt.memories";
@@ -89,16 +85,13 @@ export async function flow(options: {
       ) => Promise<SeedPublication>);
   /** The importer acts for this Account when it differs from the ledger's / source's. */
   requestOwner?: string;
-  /** The authority that owns "the import is done"; default pending in memory. */
-  authority?: ImportAuthority;
 }) {
   let mode: AccountMode =
     options.mode ?? (options.switched === false ? "unswitched" : "switched");
   const staged = new Map<string, Record<string, unknown>[]>();
   const owner = options.owner ?? OWNER;
   const files = createMemoryStreamSyncFiles();
-  const authority = options.authority ?? createMemoryImportAuthority();
-  const ledger = new RetireLedger(files, owner, authority);
+  const ledger = new RetireLedger(files, owner);
   let stagings = 0;
   let crashed = false;
   const importStream: ImportStream = {
@@ -135,9 +128,9 @@ export async function flow(options: {
           return out.length;
         },
       },
-      ledger: new RetireLedger(files, own.owner, authority),
+      ledger: new RetireLedger(files, own.owner),
       owner: options.requestOwner ?? own.owner,
-      mode: () => mode,
+      mode: { read: () => mode },
       ...(options.maxAttempts ? { maxAttempts: options.maxAttempts } : {}),
       ...(options.publishSeed === false
         ? {}
@@ -236,7 +229,6 @@ export async function flow(options: {
     });
   return {
     rig,
-    authority,
     setSwitched(value: boolean) {
       mode = value ? "switched" : "unswitched";
     },

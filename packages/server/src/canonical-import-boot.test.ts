@@ -21,10 +21,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { StreamSyncWriter } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import {
-  createMemoryImportAuthority,
-  type AccountModeReader,
-} from "@opendatalabs/personal-server-ts-core/sync";
+import { type AccountStorageMode } from "@opendatalabs/personal-server-ts-core/sync";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createTestBoundRecordStore } from "./__fixtures__/bound-record-store.js";
@@ -52,12 +49,38 @@ const DECLARATION = JSON.stringify({
  * other. It matches the owner exactly and keys it in lowercase, as the real
  * authority does: a checksum-cased owner reads `unknown`.
  */
-const switchedFor = (owner: string): AccountModeReader => ({
+const switchedFor = (owner: string): AccountStorageMode => ({
   read: (asked) => (asked === owner.toLowerCase() ? "switched" : "unknown"),
 });
 
 let tempDir: string;
 let ctx: ServerContext | undefined;
+
+/** The import ledger this boot wrote, or null before it wrote one. */
+const ledgerFile = async () => {
+  const found = (await readdir(tempDir, { recursive: true })).find((path) =>
+    path.endsWith(join("legacy-retire", "ledger.json")),
+  );
+  return found
+    ? (JSON.parse(await readFile(join(tempDir, found), "utf8")) as {
+        owner: string;
+        importComplete?: boolean;
+        imported: Record<
+          string,
+          { staged?: Record<string, number>; published?: true } | undefined
+        >;
+      })
+    : null;
+};
+
+/** Wait (bounded) until the ledger shows the import complete. */
+const importCompleted = async (): Promise<boolean> => {
+  for (let i = 0; i < 400; i += 1) {
+    if ((await ledgerFile())?.importComplete === true) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+};
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "canonical-import-boot-"));
@@ -131,7 +154,6 @@ describe("the legacy import in a real boot", () => {
     db.close();
     // The registry is not reachable in this test: the writer's own publish is
     // observed, not run (the core tests run it).
-    const authority = createMemoryImportAuthority();
     const published: string[] = [];
     vi.spyOn(StreamSyncWriter.prototype, "publishSeed").mockImplementation(
       async (connector: string) => {
@@ -161,25 +183,10 @@ describe("the legacy import in a real boot", () => {
         serverDir: tempDir,
         dataDir: join(tempDir, "data"),
         accountMode: switchedFor(owner),
-        importAuthority: authority,
       },
     );
     // The pass runs in the background after the stores open. Its receipt is
     // in the stream-sync home; so are the staged rows.
-    const ledgerFile = async () => {
-      const found = (await readdir(tempDir, { recursive: true })).find((path) =>
-        path.endsWith(join("legacy-retire", "ledger.json")),
-      );
-      return found
-        ? (JSON.parse(await readFile(join(tempDir, found), "utf8")) as {
-            owner: string;
-            imported: Record<
-              string,
-              { staged?: Record<string, number>; published?: true } | undefined
-            >;
-          })
-        : null;
-    };
     let ledger = await ledgerFile();
     for (let i = 0; i < 400 && !ledger?.imported.spotify?.published; i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -191,11 +198,8 @@ describe("the legacy import in a real boot", () => {
     });
     // The staged rows are handed to the writer's own publish (BOOT_PUBLISH_NOT_WIRED).
     expect(published).toEqual(["spotify"]);
-    // Done is told to the authority once, for the server's owner (not kept in the ledger).
-    for (let i = 0; i < 100 && authority.doneCalls.length === 0; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    expect(authority.doneCalls).toEqual([owner.toLowerCase()]);
+    // The ledger records the import complete, for the server's owner.
+    expect(await importCompleted()).toBe(true);
     // The owner can see what stayed behind (STATUS_ROUTE_UNAUTHENTICATED).
     const ask = (token?: string) =>
       ctx!.app.request("/v1/stream-sync/import-status", {
@@ -236,7 +240,6 @@ describe("the legacy import in a real boot", () => {
 
   it("completes empty when PDPP is off, instead of holding every connector (PDPP_OFF_STALLS_IMPORT)", async () => {
     const owner = await recoverServerOwner(KNOWN_SIG);
-    const authority = createMemoryImportAuthority();
     ctx = await createServer(
       ServerConfigSchema.parse({
         tunnel: { enabled: false },
@@ -247,19 +250,13 @@ describe("the legacy import in a real boot", () => {
         serverDir: tempDir,
         dataDir: join(tempDir, "data"),
         accountMode: switchedFor(owner),
-        importAuthority: authority,
       },
     );
     // Without a canonical store the import has nothing to read, and is done.
-    for (let i = 0; i < 400 && authority.doneCalls.length === 0; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    expect(authority.doneCalls).toEqual([owner.toLowerCase()]);
+    expect(await importCompleted()).toBe(true);
   }, 60_000);
 
   it("does nothing until the account-mode authority says switched (BOOT_MODE_IGNORED)", async () => {
-    const owner = await recoverServerOwner(KNOWN_SIG);
-    const authority = createMemoryImportAuthority();
     for (const accountMode of [
       undefined, // no authority bound
       { read: () => "unswitched" as const },
@@ -275,19 +272,17 @@ describe("the legacy import in a real boot", () => {
           serverDir: tempDir,
           dataDir: join(tempDir, "data"),
           ...(accountMode ? { accountMode } : {}),
-          importAuthority: authority,
         },
       );
       await new Promise((resolve) => setTimeout(resolve, 400));
-      expect(authority.doneCalls).toEqual([]);
-      expect(await authority.importPending(owner)).toBe(true);
+      expect((await ledgerFile())?.importComplete ?? false).toBe(false);
       await ctx.cleanup();
       ctx = undefined;
     }
   }, 60_000);
 
   it("closes the stream writer's gate unless the mode says it may open (BOOT_UNKNOWN_OPENS_GATE)", async () => {
-    const boot = async (accountMode?: AccountModeReader) => {
+    const boot = async (accountMode?: AccountStorageMode) => {
       ctx = await createServer(
         ServerConfigSchema.parse({
           tunnel: { enabled: false },
@@ -298,7 +293,6 @@ describe("the legacy import in a real boot", () => {
           serverDir: tempDir,
           dataDir: join(tempDir, "data"),
           ...(accountMode ? { accountMode } : {}),
-          importAuthority: createMemoryImportAuthority(),
         },
       );
       const writer = ctx.streamSyncWriter!;
@@ -330,7 +324,7 @@ describe("the legacy import in a real boot", () => {
 
   it("runs the legacy retire cycle only for a switched account (BOOT_RETIRE_MODE_IGNORED)", async () => {
     const owner = await recoverServerOwner(KNOWN_SIG);
-    const report = async (accountMode?: AccountModeReader) => {
+    const report = async (accountMode?: AccountStorageMode) => {
       ctx = await createServer(
         ServerConfigSchema.parse({
           tunnel: { enabled: false },
@@ -341,7 +335,6 @@ describe("the legacy import in a real boot", () => {
           serverDir: tempDir,
           dataDir: join(tempDir, "data"),
           ...(accountMode ? { accountMode } : {}),
-          importAuthority: createMemoryImportAuthority(),
         },
       );
       const result = await ctx.syncManager!.legacyRetireReport();

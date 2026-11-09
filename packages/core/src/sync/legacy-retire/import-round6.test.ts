@@ -1,16 +1,10 @@
 /**
- * Round 6: a sealed write never calls the authority (NESTED_AUTHORITY_IN_SEAL),
- * and what the import gave up is not forgotten (ABANDONED_NEVER_RETRIED). The
- * titles name the mutants `__mutants__/run-mutants.mjs` applies.
+ * What the import gave up is not forgotten (ABANDONED_NEVER_RETRIED).
  */
 
 import { describe, expect, it } from "vitest";
 import type { DeclarationSnapshot } from "../../pdpp/types.js";
 import { createCanonicalImportSource } from "./canonical-source.js";
-import {
-  createMemoryImportAuthority,
-  type ImportAuthority,
-} from "./import-authority.js";
 import type { LegacyImportSource } from "./import.js";
 import { CONNECTOR, flow, OWNER, raw, STREAM } from "./retire-rig.js";
 
@@ -58,73 +52,6 @@ const sourceOf = (rows: Record<string, unknown>[]): LegacyImportSource =>
     }),
   });
 
-describe("the seal's write never calls the authority (NESTED_AUTHORITY_IN_SEAL)", () => {
-  it("queues the seed run inside the seal and asks the authority only after it returns", async () => {
-    const inner = createMemoryImportAuthority({ deadlockMs: 300 });
-    let inSeal = false;
-    const nested: string[] = [];
-    const authority: ImportAuthority = {
-      importPending: (owner) => {
-        if (inSeal) nested.push("importPending");
-        return inner.importPending(owner);
-      },
-      importDone: (owner) => {
-        if (inSeal) nested.push("importDone");
-        return inner.importDone(owner);
-      },
-      commitImportSeed: (owner, operationId, write) =>
-        inner.commitImportSeed(owner, operationId, async () => {
-          inSeal = true;
-          try {
-            return await write();
-          } finally {
-            inSeal = false;
-          }
-        }),
-    };
-    const f = await flow({
-      local: ["e0"],
-      source: sourceOf([raw("e0")]),
-      owner: OWNER,
-      authority,
-    });
-    await f.importer.run();
-    expect(nested).toEqual([]);
-    expect(inner.seedCommits).toHaveLength(1);
-    // The queued run publishes: the head is readable.
-    await publish(f);
-    expect((await f.rig.registeredHead(STREAM))?.recordCount).toBe(1);
-  });
-
-  it("a serializing authority does not hang the import: a nested call would never return", async () => {
-    const authority = createMemoryImportAuthority({ deadlockMs: 300 });
-    const f = await flow({
-      local: ["e0"],
-      source: sourceOf([raw("e0")]),
-      owner: OWNER,
-      authority,
-    });
-    const started = Date.now();
-    await f.importer.run();
-    expect(Date.now() - started).toBeLessThan(250);
-    await publish(f);
-    await f.importer.run();
-    expect(await f.importer.status()).toMatchObject({
-      complete: true,
-      connectors: [{ state: "published" }],
-    });
-  });
-
-  it("the memory authority rejects a call made from inside a sealed write", async () => {
-    const authority = createMemoryImportAuthority({ deadlockMs: 100 });
-    await expect(
-      authority.commitImportSeed("0xabc", "op", () =>
-        authority.importPending("0xabc"),
-      ),
-    ).rejects.toThrow(/blocked by an open seal/);
-  });
-});
-
 describe("what the import gave up is tried again on a later boot (ABANDONED_NEVER_RETRIED)", () => {
   const rows = [raw("e0"), raw("e1")];
 
@@ -138,8 +65,8 @@ describe("what the import gave up is tried again on a later boot (ABANDONED_NEVE
     };
     const f = await flow(options);
     await f.importer.run();
-    await f.importer.run(); // given up; the authority is told (writes proceed)
-    expect(f.authority.doneCalls).toHaveLength(1);
+    await f.importer.run(); // given up; the import is complete (writes proceed)
+    expect(await f.ledger.importPending()).toBe(false);
     expect(await f.ledger.importProven(CONNECTOR)).toBe(false);
     expect(await f.importer.status()).toMatchObject({
       complete: true,
@@ -175,7 +102,7 @@ describe("what the import gave up is tried again on a later boot (ABANDONED_NEVE
     expect((await f.ledger.read()).failures[CONNECTOR]).toBeUndefined();
     expect(await f.ledger.importProven(CONNECTOR)).toBe(true);
     // Done is not told twice.
-    expect(f.authority.doneCalls).toHaveLength(1);
+    expect(await f.ledger.importPending()).toBe(false);
   });
 
   it("keeps the file while the connector is still failing, and retires nothing it did not prove", async () => {
@@ -252,7 +179,7 @@ describe("what the import gave up is tried again on a later boot (ABANDONED_NEVE
       owner: OWNER,
     });
     await f.importer.run();
-    expect(f.authority.doneCalls).toHaveLength(1);
+    expect(await f.ledger.importPending()).toBe(false);
     const boot2 = f.importerFor({ source: sourceOf(rows), owner: OWNER });
     expect(await boot2.run()).toMatchObject({ ran: false });
     expect(f.stagings).toBe(0);

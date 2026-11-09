@@ -24,11 +24,9 @@ import {
   type StreamSyncWriterOptions,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
-  createMemoryImportAuthority,
   LegacyImporter,
   RetireLedger,
   type ImportStream,
-  type MemoryImportAuthority,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import { createSeedImportSink } from "./legacy-import-sink.js";
 import { createSeedStaging } from "./seed-staging.js";
@@ -209,7 +207,6 @@ const durableFiles = () => ({
   staging: createMemoryStreamSyncFiles(7),
   home: createMemoryStreamSyncFiles(7),
   ledger: createMemoryStreamSyncFiles(7),
-  authority: createMemoryImportAuthority() as MemoryImportAuthority,
 });
 
 /**
@@ -232,7 +229,7 @@ async function boot(
   const source = staging.source(installId, async (connector) =>
     writer ? (await writer.seedStatus(connector)).receipts : {},
   );
-  const ledger = new RetireLedger(durable.ledger, OWNER, durable.authority);
+  const ledger = new RetireLedger(durable.ledger, OWNER);
   const stages: string[] = [];
   const sink = createSeedImportSink(staging);
   const importer = new LegacyImporter({
@@ -249,7 +246,7 @@ async function boot(
     },
     ledger,
     owner: OWNER,
-    mode: () => "switched" as const,
+    mode: { read: () => "switched" as const },
     publish: (connector, streams) => {
       if (!writer) throw new Error("the writer is not open");
       return writer.publishSeed(connector, streams);
@@ -318,7 +315,7 @@ describe("the import through the real seed staging and writer", () => {
     expect(first.stages).toEqual(["s1", "s2"]);
     await first.writer.publishPending().catch(() => undefined);
     expect(crash.fired).toBe(true);
-    expect(durable.authority.doneCalls).toEqual([]);
+    expect((await first.importer.status()).complete).toBe(false);
     // The crash sits between "the registry accepted the head" and "the
     // receipt was saved": s1 is already readable, and no receipt exists.
     expect((await f.reader().read("s1"))?.ids).toEqual(["a", "b"]);
@@ -354,9 +351,9 @@ describe("the import through the real seed staging and writer", () => {
         },
       ],
     });
-    expect(durable.authority.doneCalls).toEqual([OWNER.toLowerCase()]);
+    expect((await second.importer.status()).complete).toBe(true);
 
-    // A third process: the authority says done, so nothing runs again.
+    // A third process: the ledger says complete, so nothing runs again.
     let posts = 0;
     f.beforePost(async () => {
       posts += 1;
@@ -368,6 +365,6 @@ describe("the import through the real seed staging and writer", () => {
     expect(posts).toBe(0); // the registry is not written again
     expect(await rows("s1")).toEqual(["a", "b"]);
     expect(await rows("s2")).toEqual(["c"]);
-    expect(durable.authority.doneCalls).toEqual([OWNER.toLowerCase()]);
+    expect((await third.importer.status()).complete).toBe(true);
   });
 });

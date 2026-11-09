@@ -28,6 +28,35 @@ describe("a stream run of a connector waits for its import (RUN_BEFORE_IMPORT)",
   });
 });
 
+describe("a fresh owner is done at once (FRESH_OWNER_WAITS)", () => {
+  it("completes on the first wake with nothing to import, and opens every connector's gate", async () => {
+    const f = await flow({ local: [] });
+    expect(await f.importer.importDone(CONNECTOR)).toBe(false);
+    await f.importer.run(); // the coordinator's wake: no sync cycle involved
+    expect(await f.ledger.importPending()).toBe(false);
+    expect(await f.importer.importDone(CONNECTOR)).toBe(true);
+    expect(await f.importer.importDone("another-connector")).toBe(true);
+    await f.run("first", ["e0"]);
+  });
+});
+
+describe("a wake that is aborted stops before its next step (RUN_IGNORES_SIGNAL)", () => {
+  it("does nothing for an aborted signal, and a later wake resumes", async () => {
+    const f = await flow({ seed: ["e0", "e1"], local: ["e0", "e1"] });
+    const stopped = new AbortController();
+    stopped.abort();
+    expect(await f.importer.run(stopped.signal)).toMatchObject({ ran: false });
+    expect(f.stagings).toBe(0);
+    expect(await f.ledger.importPending()).toBe(true);
+    await f.importer.run();
+    await f.rig.writer.refreshControls();
+    await f.rig.publish();
+    await f.importer.run();
+    expect(await f.ledger.importPending()).toBe(false);
+    expect(f.staged.get(STREAM)).toHaveLength(2);
+  });
+});
+
 describe("retire reads the published heads only (RETIRE_ON_SPOOL, READBACK_ON_SPOOL)", () => {
   it("keeps the file while the stream copy exists only in this device's unpublished run", async () => {
     const f = await flow({ local: ["e0", "e1"] });
@@ -179,6 +208,7 @@ describe("unswitched accounts are unchanged (UNSWITCHED_CHANGED)", () => {
       abandoned: false,
       imported: {},
       readbacks: {},
+      importComplete: false,
     });
   });
 });

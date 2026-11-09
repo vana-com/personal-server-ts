@@ -9,7 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMemoryStreamSyncFiles } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import type { AccountModeReader } from "@opendatalabs/personal-server-ts-core/sync";
+import type { AccountStorageMode } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   createMemoryPsLiteStateStore,
   createMemoryPsLiteStorage,
@@ -20,7 +20,7 @@ import { createPsLiteSyncManager } from "./sync.js";
 const OWNER_KEY = `0x${"13".repeat(32)}` as const;
 const owner = privateKeyToAccount(OWNER_KEY);
 
-async function startManager(accountMode: AccountModeReader) {
+async function startManager(accountMode: AccountStorageMode) {
   const ownerSignature = await owner.signMessage({
     message: "vana-master-key-v1",
   });
@@ -66,7 +66,7 @@ describe("PS Lite asks the mode authority for the lowercase owner (OWNER_NOT_LOW
   it("reads switched for an exact-match authority, in the retire step and the import step (LITE_IMPORTER_OWNER_NOT_LOWERCASED)", async () => {
     expect(owner.address).not.toBe(owner.address.toLowerCase()); // checksum-cased
     const asked: string[] = [];
-    const accountMode: AccountModeReader = {
+    const accountMode: AccountStorageMode = {
       read: (requestOwner) => {
         asked.push(requestOwner);
         return requestOwner === owner.address.toLowerCase()
