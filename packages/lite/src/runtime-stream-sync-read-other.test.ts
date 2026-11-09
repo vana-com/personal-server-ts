@@ -161,3 +161,32 @@ describe("Lite passes the account mode to the group D entry points", () => {
     expect(await res.text()).not.toContain("USE_CONNECTOR_DELETE");
   });
 });
+
+describe("Lite mode refusals come after owner auth", () => {
+  it.each([
+    ["POST", "/v1/sync/file/x"],
+    ["DELETE", "/v1/data/instagram.profile"],
+    ["GET", "/v1/import/oura-browser/requirements"],
+    ["POST", "/v1/import/oura-browser"],
+  ] as const)(
+    "an unauthenticated %s %s gets 401 whatever the mode",
+    async (method, path) => {
+      for (const v of ["switched", "unswitched"] as const) {
+        const h = harness(v, owner.address);
+        const res = await h.runtime.fetch(
+          new Request(`${ORIGIN}${path}`, { method }),
+        );
+        expect(res.status, `${v}`).toBe(401);
+      }
+      // An unknown mode (owner mismatch) is also hidden from the caller.
+      const h = harness(
+        "switched",
+        "0x0000000000000000000000000000000000000001",
+      );
+      const res = await h.runtime.fetch(
+        new Request(`${ORIGIN}${path}`, { method }),
+      );
+      expect(res.status).toBe(401);
+    },
+  );
+});

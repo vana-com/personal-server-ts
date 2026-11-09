@@ -352,10 +352,13 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     ),
   );
   app.delete("/:scope/imports/:id", (c) =>
-    importRoute(c, () => {
+    importRoute(c, async () => {
       // Aborting a legacy chunked import is a legacy-store operation: a
       // switched account refuses it like the rest of the import routes, and
       // an unknown mode answers the retryable 503.
+      // Authorize first: a mode refusal must not tell an unauthenticated
+      // caller which mode the account is in.
+      await importDeps.authorizeOwner(c.req.raw, c.req.param("scope"));
       const selection = selectAccountStorageMode({
         accountStorageMode: deps.accountStorageMode,
         serverOwner: deps.serverOwner,
@@ -443,12 +446,25 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   // When the account is not unswitched (switched, or the mode is unknown),
   // the core delete answers first, so a control scope gets the same
   // USE_CONNECTOR_DELETE / retryable 503 as any other scope, after auth.
-  app.delete("/:scope", (c, next) =>
-    parseScope(c.req.param("scope"))?.kind === "control" &&
-    selectAccountStorageMode({
-      accountStorageMode: deps.accountStorageMode,
-      serverOwner: deps.serverOwner,
-    }).kind === "legacy"
+  app.delete("/:scope", async (c, next) => {
+    const scope = c.req.param("scope");
+    if (parseScope(scope)?.kind !== "control") return next();
+    // Authorize before reading the mode, so the answer for a caller who is not
+    // the owner does not depend on the account's mode.
+    let mode: "legacy" | "other" | undefined;
+    const authFailure = await importRoute(c, async () => {
+      await auth.authorizeOwnerScope({ request: c.req.raw, scope });
+      mode =
+        selectAccountStorageMode({
+          accountStorageMode: deps.accountStorageMode,
+          serverOwner: deps.serverOwner,
+        }).kind === "legacy"
+          ? "legacy"
+          : "other";
+      return {};
+    });
+    if (mode === undefined) return authFailure;
+    return mode === "legacy"
       ? c.json(
           {
             error: "STREAM_SYNC_CONTROL_SCOPE",
@@ -457,8 +473,8 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
           },
           409,
         )
-      : next(),
-  );
+      : next();
+  });
   app.all("*", (c) =>
     handlePersonalServerDataRequest(
       c.req.raw,

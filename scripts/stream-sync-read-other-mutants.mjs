@@ -218,6 +218,18 @@ const MUTANTS = [
     "      config,\n      stateStore,",
   ],
   [
+    "IMPORT_ABORT_GATE_BEFORE_AUTH",
+    DATA,
+    'await importDeps.authorizeOwner(c.req.raw, c.req.param("scope"));\n',
+    "",
+  ],
+  [
+    "CONTROL_SCOPE_GATE_BEFORE_AUTH",
+    DATA,
+    "await auth.authorizeOwnerScope({ request: c.req.raw, scope });\n      mode =",
+    "mode =",
+  ],
+  [
     "NODE_SYNC_MANAGER_MODE_DROPPED",
     "packages/server/src/bootstrap.ts",
     "      accountStorageMode,\n      serverOwner,\n      async canSync() {",

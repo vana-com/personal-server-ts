@@ -203,6 +203,94 @@ describe("Node server group D routes", () => {
     });
   });
 
+  describe("mode refusals come after owner auth", () => {
+    const control = "pdpp.acme~0123456789abcdef";
+    const cases: Array<[string, string, string]> = [
+      [
+        "IMPORT_ABORT_GATE_BEFORE_AUTH",
+        "/claude.conversations/imports/abc",
+        "DELETE",
+      ],
+      ["CONTROL_SCOPE_GATE_BEFORE_AUTH", `/${control}`, "DELETE"],
+      [
+        "TAKEOVER_GET_GATE_BEFORE_AUTH",
+        "/claude.conversations/takeover",
+        "GET",
+      ],
+      [
+        "TAKEOVER_DELETE_GATE_BEFORE_AUTH",
+        "/claude.conversations/takeover",
+        "DELETE",
+      ],
+    ];
+    it.each(cases)(
+      "%s: an unauthenticated caller gets 401 whatever the mode",
+      async (_name, path, method) => {
+        for (const v of ["switched", "unknown", "unswitched"] as const) {
+          value = v;
+          const res = await dataApp().request(path, { method });
+          expect(res.status, `${method} ${path} (${v})`).toBe(401);
+        }
+        expect(touched).toEqual([]);
+      },
+    );
+
+    it("an unauthenticated Oura import or requirements read gets 401 whatever the mode", async () => {
+      for (const v of ["switched", "unknown"] as const) {
+        value = v;
+        const app = createApp({
+          logger: pino({ level: "silent" }),
+          version: "0.0.1",
+          startedAt: new Date(),
+          indexManager: index,
+          hierarchyOptions: { dataDir: join(root, "data") },
+          serverOrigin: "http://localhost:8080",
+          serverOwner: owner,
+          devToken: "read-other-test",
+          gateway,
+          accessLogWriter: { write: async () => undefined },
+          accountStorageMode: mode(),
+          config: ServerConfigSchema.parse({}),
+        });
+        expect(
+          (await app.request("/v1/import/oura-browser/requirements")).status,
+        ).toBe(401);
+        expect(
+          (
+            await app.request("/v1/import/oura-browser", {
+              method: "POST",
+              body: "{}",
+            })
+          ).status,
+        ).toBe(401);
+      }
+    });
+
+    it("an unauthenticated sync file or delete gets 401 whatever the mode", async () => {
+      for (const v of ["switched", "unknown"] as const) {
+        value = v;
+        const trigger = vi.fn(async () => undefined);
+        const sync = syncRoutes({
+          logger: pino({ level: "silent" }),
+          serverOrigin: "http://localhost:8080",
+          serverOwner: owner,
+          gateway,
+          devToken: "read-other-test",
+          syncManager: { trigger, getStatus: vi.fn() } as never,
+          accountStorageMode: mode(),
+        });
+        expect(
+          (await sync.request("/file/abc", { method: "POST" })).status,
+        ).toBe(401);
+        expect(
+          (await dataApp().request("/instagram.profile", { method: "DELETE" }))
+            .status,
+        ).toBe(401);
+        expect(trigger).not.toHaveBeenCalled();
+      }
+    });
+  });
+
   describe("DELETE of a control scope", () => {
     const control = "pdpp.acme~0123456789abcdef";
     const del = () =>
