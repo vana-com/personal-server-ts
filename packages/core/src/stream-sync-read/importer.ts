@@ -10,6 +10,8 @@
  * when the registry row changes.
  */
 
+import { deleteMetadataHash } from "../stream-sync/delete-metadata.js";
+
 import {
   canonicalBytes32,
   classifyControl,
@@ -134,6 +136,12 @@ export class StreamSyncImporter {
 
   /** Absent, present or tombstoned, by the rule the writer uses. */
   streamRowKind(row: MirrorRow): StreamRow {
+    if (
+      row.scope &&
+      row.metadataHash.toLowerCase() ===
+        deleteMetadataHash(row.scope, row.version)
+    )
+      return "tombstoned";
     const parsed = row.scope ? parseScope(row.scope) : null;
     const imported =
       parsed?.kind === "stream"

@@ -174,7 +174,13 @@ it("delete resumes only unfinished streams after a committed ambiguous reply", a
   await r.restart();
   await r.publish();
   expect(await r.registeredVersion()).toBe(1);
-  expect(await r.registeredHead("second")).toMatchObject({ recordCount: 0 });
+  expect(await r.registeredHead("second")).toMatchObject({
+    recordCount: 0,
+    lastDeleteVersion: 1,
+  });
+  expect(
+    await r.gateway.read(streamScope(CONNECTOR, "", "second")),
+  ).toMatchObject({ version: 1 });
   const pending = JSON.parse(
     new TextDecoder().decode((await r.files.read("state.json"))!),
   ).streamDeletes;

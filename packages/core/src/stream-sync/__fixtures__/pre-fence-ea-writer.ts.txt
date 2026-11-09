@@ -1,0 +1,228 @@
+// Verbatim: ea9c5bec535b7842eb320d36055328ce906ea49b packages/core/src/stream-sync/writer.ts:340
+class PendingStream extends Error {
+  constructor(
+    readonly problem: StreamSyncHostProblem,
+    detail: string,
+  ) {
+    super(detail);
+  }
+}
+
+class Discard extends Error {
+  constructor(
+    readonly decision: Extract<Decision, { kind: "discard" }>,
+    readonly why: string,
+  ) {
+    super(why);
+  }
+}
+
+class FrozenWriter {
+// Verbatim: ea9c5bec535b7842eb320d36055328ce906ea49b packages/core/src/stream-sync/writer.ts:1367
+  private async resend(host: HostEntry, name: string): Promise<boolean> {
+    const runId = host.entry.runId;
+    const outbox = host.entry.streams[name]!;
+    const request = JSON.parse(
+      decoder.decode((await this.options.home.files.read(outbox.requestRef!))!),
+    ) as SignedRegistryPost;
+    const cipher = await this.options.home.files.read(outbox.headCipherRef!);
+    const head = parseHeadKey(request);
+    if (cipher) await this.options.blobs.put(head, cipher);
+    const result = await this.options.registry.post(request);
+    this.fault("after_post_reply", runId, name);
+    if (result.kind === "committed") {
+      await this.committed(
+        host,
+        name,
+        outbox.generation!,
+        outbox.complete!,
+        "committed",
+      );
+      return true;
+    }
+    this.setStream(host, name, { state: "planned" });
+    await this.writeEntry(host);
+    return false;
+  }
+
+// Verbatim: ea9c5bec535b7842eb320d36055328ce906ea49b packages/core/src/stream-sync/writer.ts:1394
+  private async planAndPost(host: HostEntry, name: string): Promise<boolean> {
+    const { entry } = host;
+    const runId = entry.runId;
+    const ns = entry.ns!;
+    const stream = host.streams[name]!;
+    const target = await this.admit(host, "first");
+    if (target !== host.target) {
+      throw new PendingStream(
+        "registry_inconsistent",
+        `admitted at ${target}, run is bound to ${host.target}`,
+      );
+    }
+    const scope = streamScope(entry.connector, ns, name);
+    const { keyCheck } = await this.keys();
+
+    const row = await this.options.registry.read(scope);
+    const rowKind = classifyStreamRow(row, this.control!);
+    let head: Head | null = null;
+    if (rowKind === "present" && row.found) {
+      head = await this.loadHead(scope, row.dataHash, {
+        connector: entry.connector,
+        ns,
+        stream: name,
+        keyCheck,
+      });
+    }
+    const choice = chooseBase(rowKind, head, target);
+    if (choice.kind === "stale_generation") {
+      // F1: the stream holds a newer generation than this run's target.
+      try {
+        await this.admit(host, "stale_base");
+      } catch (error) {
+        if (error instanceof Discard) {
+          throw new Discard(error.decision, `stale_generation: ${error.why}`);
+        }
+        if (error instanceof PendingStream) {
+          throw new PendingStream(
+            error.problem,
+            `stale_generation: ${error.message}`,
+          );
+        }
+        throw error;
+      }
+      throw new PendingStream(
+        "registry_inconsistent",
+        "stale_generation: control still admits the target",
+      );
+    }
+    let base = choice.kind === "base" ? choice.head : null;
+    if (base) {
+      const compat = writerCompatibility(
+        base,
+        stream.primaryKey,
+        compareConnectorVersions(stream.profile.version, base.profile.version),
+      );
+      if (compat.kind === "connector_update_required") {
+        throw new PendingStream(
+          "connector_update_required",
+          `base primary key ${JSON.stringify(base.primaryKey)} needs a newer connector`,
+        );
+      }
+      if (compat.kind === "empty_base") base = null;
+    }
+    if (stream.seedApplies) await this.spoolSeed(host, name);
+
+    let complete = headComplete({
+      full: entry.full || stream.fullStream,
+      baseComplete: base?.complete ?? false,
+      seedMerged: stream.seedApplies,
+    });
+    // §2.12: a run resumed from another namespace's checkpoint is incomplete.
+    if (host.checkpointUsed && host.checkpointUsed.ns !== ns) complete = false;
+
+    const built = await this.buildParts(host, name, scope, target, base);
+    if (isNoop(base, built.parts, complete)) {
+      await this.committed(host, name, target, complete, "noop");
+      return true;
+    }
+    const clear = encodeHead({
+      complete,
+      connector: entry.connector,
+      format: 1,
+      generation: target,
+      keyCheck,
+      ns,
+      observedAt: entry.observedAt,
+      parts: built.parts,
+      primaryKey: stream.primaryKey,
+      profile: stream.profile,
+      recordCount: built.parts.reduce((n, p) => n + p.count, 0),
+      stream: name,
+    });
+    const digest = await digestHead(this.hashes.keccak256, clear);
+    const cipher = await this.options.keys.encrypt(scope, clear);
+    await this.options.blobs.put(`${scope}/${digest.blobName}`, cipher);
+    this.fault("after_head_upload", runId, name);
+
+    const version = row.found ? row.version + 1 : 1;
+    const request = await this.sign(
+      scope,
+      digest.dataHash,
+      publicationMetadataHash(
+        scope,
+        new Date(entry.observedAt).toISOString(),
+        clear.length,
+      ),
+      version,
+    );
+    const requestRef = `runs/${runId}/request-s${stream.index}.json`;
+    const headCipherRef = `runs/${runId}/head-s${stream.index}.bin`;
+    await this.options.home.files.write(headCipherRef, cipher);
+    await this.options.home.files.write(requestRef, json(request));
+    this.setStream(host, name, {
+      state: "request_persisted",
+      requestRef,
+      headCipherRef,
+      generation: target,
+      complete,
+    });
+    await this.writeEntry(host);
+    this.fault("after_request_persisted", runId, name);
+
+    const result = await this.options.registry.post(request);
+    this.fault("after_post_reply", runId, name);
+    if (result.kind === "committed") {
+      await this.committed(host, name, target, complete, "committed");
+      return true;
+    }
+    this.setStream(host, name, { state: "planned" });
+    await this.writeEntry(host);
+    return false;
+  }
+
+// Verbatim: ea9c5bec535b7842eb320d36055328ce906ea49b packages/core/src/stream-sync/writer.ts:1698
+  private async loadHead(
+    scope: string,
+    dataHash: string,
+    expected: {
+      connector: string;
+      ns: string;
+      stream: string;
+      keyCheck: string;
+    },
+  ): Promise<Head> {
+    const name = `h-${dataHash.toLowerCase().replace(/^0x/, "")}`;
+    const cipher = await this.options.blobs.get(`${scope}/${name}`);
+    if (!cipher)
+      throw new PendingStream("base_unreadable", `head ${name} is missing`);
+    let clear: Uint8Array;
+    try {
+      clear = await this.options.keys.decrypt(scope, cipher);
+    } catch {
+      throw new PendingStream("key_mismatch", `head ${name} does not decrypt`);
+    }
+    const verified = await verifyHead(this.hashes.keccak256, clear, {
+      dataHash,
+      ...expected,
+    });
+    switch (verified.kind) {
+      case "ok":
+        return verified.head;
+      case "key_mismatch":
+        throw new PendingStream(
+          "key_mismatch",
+          `head ${name} has another keyCheck`,
+        );
+      case "unsupported_format":
+        throw new PendingStream(
+          "unsupported_format",
+          `head ${name} format ${String(verified.format)}`,
+        );
+      default:
+        throw new PendingStream(
+          "base_unreadable",
+          `head ${name}: ${verified.kind}`,
+        );
+    }
+  }
+
+}

@@ -9,6 +9,7 @@
  * (`needsFullListing`).
  */
 
+import { deleteMetadataHash } from "../stream-sync/delete-metadata.js";
 import {
   parseScope,
   type ControlRead,
@@ -214,7 +215,11 @@ export class RegistryMirror {
     const raise = (row: MirrorRow): boolean => {
       if (
         parseScope(row.scope)?.kind !== "stream" ||
-        !this.isTombstone(row) ||
+        !(
+          this.isTombstone(row) ||
+          row.metadataHash.toLowerCase() ===
+            deleteMetadataHash(row.scope, row.version)
+        ) ||
         row.version <= (nextFloors.get(row.scope) ?? 0)
       ) {
         return false;

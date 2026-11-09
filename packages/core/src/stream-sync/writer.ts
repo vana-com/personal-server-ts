@@ -26,7 +26,10 @@
  * publishing a partial run under the run's checkpoint.
  */
 
+import { legacyBindingsForProfile } from "../legacy-projection/index.js";
+import { deleteMetadataHash } from "./delete-metadata.js";
 import {
+  type ControlRead,
   IDENTITYLESS_NS,
   PART_LIMIT_BYTES,
   DEFAULT_PART_TARGET_BYTES,
@@ -743,9 +746,21 @@ export class StreamSyncWriter {
   /** Persist intent before any network write; every pass resumes unfinished streams. */
   deleteStreams(connector: string, streams: readonly string[]): Promise<void> {
     return this.publish(async () => {
+      // Until deleting multiple scopes is supported, shared aliases are indivisible.
+      const bindings = legacyBindingsForProfile(connector);
+      for (const stream of streams) {
+        const owners = [...bindings.values()].filter((binding) =>
+          binding.pdppStreams.includes(stream),
+        );
+        if (owners.length > 1)
+          throw new Error(
+            `stream ${stream} is shared by scopes ${owners.map((binding) => binding.scope).join(", ")}`,
+          );
+      }
       await this.withState((state) => {
         const pending = ((state.streamDeletes ??= {})[connector] ??= {});
-        for (const stream of new Set(streams)) pending[stream] ??= {};
+        // This API is a new user delete; background recovery retains existing pins.
+        for (const stream of new Set(streams)) pending[stream] = {};
       });
       await this.finishStreamDeletes(connector);
     });
@@ -761,13 +776,41 @@ export class StreamSyncWriter {
         let request = (await this.readState()).streamDeletes?.[connector]?.[
           stream
         ]?.request;
-        if (!request) {
+        let observedRow: ControlRead | null = null;
+        if (request) {
           const { row } = await this.readStreamRow(
             connector,
             IDENTITYLESS_NS,
             stream,
             true,
           );
+          observedRow = row;
+          const pin = Number(request.expectedVersion);
+          const committed =
+            row.found &&
+            row.version === pin &&
+            row.dataHash.toLowerCase() === request.dataHash.toLowerCase();
+          if (committed || (row.found && row.version > pin)) {
+            if (committed) await this.observeDelete(connector, stream, pin);
+            await this.withState((state) => {
+              delete state.streamDeletes![connector]![stream];
+            });
+            break;
+          }
+          if (row.found && row.version === pin) {
+            // Another write won this CAS. Only this exact pin may be retried.
+            await this.withState((state) => {
+              delete state.streamDeletes![connector]![stream]!.request;
+            });
+            request = undefined;
+          }
+        }
+        if (!request) {
+          // Use the checked row for this CAS; a second read could advance past the pin.
+          const row =
+            observedRow ??
+            (await this.readStreamRow(connector, IDENTITYLESS_NS, stream, true))
+              .row;
           const version = row.found ? row.version + 1 : 1;
           // A delete head requires no old head, schema, or control-generation lookup.
           const clear = encodeHead({
@@ -793,11 +836,7 @@ export class StreamSyncWriter {
           request = await this.sign(
             scope,
             digest.dataHash,
-            publicationMetadataHash(
-              scope,
-              new Date(this.now()).toISOString(),
-              clear.length,
-            ),
+            deleteMetadataHash(scope, version),
             version,
           );
           await this.withState((state) => {
@@ -825,9 +864,6 @@ export class StreamSyncWriter {
           });
           break;
         }
-        await this.withState((state) => {
-          delete state.streamDeletes![connector]![stream]!.request;
-        });
         await new Promise<void>((resolve) =>
           setTimeout(resolve, Math.min(10 * 2 ** attempt, 1000)),
         );
@@ -1990,6 +2026,9 @@ export class StreamSyncWriter {
     const scope = streamScope(connector, ns, stream);
     const row = await this.options.registry.read(scope);
     let rowKind = classifyStreamRow(row, control);
+    const deleteMarker =
+      row.found &&
+      row.metadataHash.toLowerCase() === deleteMetadataHash(scope, row.version);
     let head: Head | null = null;
     if (rowKind === "present" && row.found) {
       try {
@@ -2000,14 +2039,15 @@ export class StreamSyncWriter {
           keyCheck,
         });
       } catch (error) {
-        if (!bestEffort) throw error;
+        if (!bestEffort && !deleteMarker) throw error;
       }
     }
     if (
-      row.found &&
-      head &&
-      head.lastDeleteVersion === row.version &&
-      head.recordCount === 0
+      deleteMarker ||
+      (row.found &&
+        head &&
+        head.lastDeleteVersion === row.version &&
+        head.recordCount === 0)
     )
       rowKind = "tombstoned";
     // Pre-fence heads have no delete history. Deletes use format 3 heads so an
@@ -2124,7 +2164,7 @@ export class StreamSyncWriter {
     // executes it: the parts, the head upload and the POST.
     const decision = planStreamStep(
       {
-        head: head && planHeadOf(head),
+        head: rowKind === "present" && head ? planHeadOf(head) : null,
         floor: floorOf(await this.readState(), entry.connector, ns, name),
       },
       this.planRun(host, name, await this.readState(), true),

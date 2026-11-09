@@ -29,20 +29,24 @@ function frozenModule(name: string, require: (id: string) => unknown) {
   new Function("require", "exports", js)(require, exports);
   return exports;
 }
-const head = frozenModule(
-  "head",
-  (id) =>
-    ({
-      "./bytes.js": bytes,
-      "./errors.js": errors,
-      "./json.js": jsonPorts,
-      "./names.js": names,
-    })[id],
-);
-const classify = frozenModule("classify", () => undefined);
-const plan = frozenModule("plan", () => ({ ...protocol, ...head }));
-
-async function device(r: Rig) {
+function family(prefix: string) {
+  const head = frozenModule(
+    `${prefix}head`,
+    (id) =>
+      ({
+        "./bytes.js": bytes,
+        "./errors.js": errors,
+        "./json.js": jsonPorts,
+        "./names.js": names,
+      })[id],
+  );
+  const classify = frozenModule(`${prefix}classify`, () => undefined);
+  const plan = frozenModule(`${prefix}plan`, () => ({ ...protocol, ...head }));
+  return { head, classify, plan, prefix };
+}
+const families = { fde: family(""), ea: family("ea-") };
+async function device(r: Rig, snapshot: keyof typeof families) {
+  const { head, classify, plan, prefix } = families[snapshot];
   const keys = createStreamSyncKeyPorts(
     `0x${"1f".repeat(32)}${"2a".repeat(32)}1b`,
   );
@@ -53,7 +57,7 @@ async function device(r: Rig) {
   const binding = await r.writer.binding();
   const scope = protocol.streamScope(CONNECTOR, "", "items");
   const text = readFileSync(
-    new URL("__fixtures__/pre-fence-writer.ts.txt", import.meta.url),
+    new URL(`__fixtures__/pre-fence-${prefix}writer.ts.txt`, import.meta.url),
     "utf8",
   );
   const js = ts.transpileModule(text, {
@@ -155,80 +159,92 @@ async function device(r: Rig) {
       },
     },
   };
-  return { writer, host, scope, control };
+  return { writer, host, scope, control, classify: classify.classifyStreamRow };
 }
 
-it("verbatim pre-fence plan refuses a delete head before POST (mutant: old tombstone hashes)", async () => {
-  const r = new Rig();
-  await r.open();
-  // Second-delete witness: the historical boolean fence admits tombstone ->
-  // tombstone, so only the format barrier prevents stale records returning.
-  const control = await protocol.controlHashes(
-    streamSyncHashes.keccak256,
-    "0000000000000000",
-  );
-  const scope = protocol.streamScope(CONNECTOR, "", "items");
-  await r.collect({
-    runId: "base",
-    key: "id",
-    version: "1.0.0",
-    full: true,
-    rows: [{ id: "base" }],
-  });
-  await r.publish();
-  await r.gateway.post({
-    scope,
-    ownerAddress: `0x${"11".repeat(20)}`,
-    dataHash: control.tombstoneData,
-    metadataHash: control.tombstoneMetadata,
-    expectedVersion: "2",
-    signature: "0x00",
-  });
-  const old = await device(r);
-  await r.writer.deleteStreams(CONNECTOR, ["items"]);
-  const commits = r.gateway.log.length;
-  let failure: any;
-  try {
-    await old.writer.planAndPost(old.host, "items");
-  } catch (error) {
-    failure = error;
-  }
-  await r.sync();
-  const decision = await r.service.resolve(ask("pdpp.acme.items"));
-  const observed =
-    decision.kind === "view" || decision.kind === "local_pending"
-      ? (await body(decision)).data.records
-      : decision;
-  expect(observed).toMatchObject({ kind: "unavailable", reason: "deleted" });
-  expect(failure?.problem).toBe("unsupported_format");
-  expect(r.gateway.log).toHaveLength(commits);
-  expect(await r.registeredHead()).toMatchObject({
-    format: 3,
-    lastDeleteVersion: 3,
-    recordCount: 0,
-  });
-});
+it.each(["fde", "ea"] as const)(
+  "verbatim %s plan refuses a delete head before POST (mutant: old tombstone hashes; EA_DELETE_ROW_AS_TOMBSTONE)",
+  async (snapshot) => {
+    const r = new Rig();
+    await r.open();
+    // Second-delete witness: the historical boolean fence admits tombstone ->
+    // tombstone, so only the format barrier prevents stale records returning.
+    const control = await protocol.controlHashes(
+      streamSyncHashes.keccak256,
+      "0000000000000000",
+    );
+    const scope = protocol.streamScope(CONNECTOR, "", "items");
+    await r.collect({
+      runId: "base",
+      key: "id",
+      version: "1.0.0",
+      full: true,
+      rows: [{ id: "base" }],
+    });
+    await r.publish();
+    await r.gateway.post({
+      scope,
+      ownerAddress: `0x${"11".repeat(20)}`,
+      dataHash: control.tombstoneData,
+      metadataHash: control.tombstoneMetadata,
+      expectedVersion: "2",
+      signature: "0x00",
+    });
+    const old = await device(r, snapshot);
+    await r.writer.deleteStreams(CONNECTOR, ["items"]);
+    expect(old.classify(await r.gateway.read(old.scope), old.control)).toBe(
+      "present",
+    );
+    const commits = r.gateway.log.length;
+    let failure: any;
+    try {
+      await old.writer.planAndPost(old.host, "items");
+    } catch (error) {
+      failure = error;
+    }
+    await r.sync();
+    const decision = await r.service.resolve(ask("pdpp.acme.items"));
+    const observed =
+      decision.kind === "view" || decision.kind === "local_pending"
+        ? (await body(decision)).data.records
+        : decision;
+    expect(observed).toMatchObject({ kind: "unavailable", reason: "deleted" });
+    expect(failure?.problem).toBe("unsupported_format");
+    expect(r.gateway.log).toHaveLength(commits);
+    expect(await r.registeredHead()).toMatchObject({
+      format: 3,
+      lastDeleteVersion: 3,
+      recordCount: 0,
+    });
+  },
+);
 
-it("verbatim pre-fence resend conflicts at its persisted version", async () => {
-  const r = new Rig();
-  await r.open();
-  const old = await device(r);
-  old.writer.fault = (point: string) => {
-    if (point === "after_request_persisted")
-      throw new Error("stop before POST");
-  };
-  await expect(old.writer.planAndPost(old.host, "items")).rejects.toThrow(
-    "stop before POST",
-  );
-  old.writer.fault = () => {};
-  // Capture the signed request, then advance the row with the new delete head.
-  await r.writer.deleteStreams(CONNECTOR, ["items"]);
-  const commits = r.gateway.log.length;
-  expect(await old.writer.resend(old.host, "items")).toBe(false);
-  expect(r.gateway.log).toHaveLength(commits);
-  expect(await r.registeredHead()).toMatchObject({
-    format: 3,
-    lastDeleteVersion: 1,
-    recordCount: 0,
-  });
-});
+it.each(["fde", "ea"] as const)(
+  "verbatim %s resend conflicts at its persisted version",
+  async (snapshot) => {
+    const r = new Rig();
+    await r.open();
+    const old = await device(r, snapshot);
+    old.writer.fault = (point: string) => {
+      if (point === "after_request_persisted")
+        throw new Error("stop before POST");
+    };
+    await expect(old.writer.planAndPost(old.host, "items")).rejects.toThrow(
+      "stop before POST",
+    );
+    old.writer.fault = () => {};
+    // Capture the signed request, then advance the row with the new delete head.
+    await r.writer.deleteStreams(CONNECTOR, ["items"]);
+    expect(old.classify(await r.gateway.read(old.scope), old.control)).toBe(
+      "present",
+    );
+    const commits = r.gateway.log.length;
+    expect(await old.writer.resend(old.host, "items")).toBe(false);
+    expect(r.gateway.log).toHaveLength(commits);
+    expect(await r.registeredHead()).toMatchObject({
+      format: 3,
+      lastDeleteVersion: 1,
+      recordCount: 0,
+    });
+  },
+);

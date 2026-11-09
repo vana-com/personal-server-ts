@@ -95,6 +95,16 @@ for (const checkout of checkouts) {
   await warm.importPending();
   await collect("stale");
   await rig.writer.deleteStreams(CONNECTOR, ["items"]);
+  const crypto = await import(
+    pathToFileURL(`${path}/packages/core/dist/stream-sync/crypto.js`).href
+  );
+  const row = await rig.gateway.read(`pdpp.${CONNECTOR}~.items`);
+  const hashes = await keys.controlHashes(
+    crypto.streamSyncHashes.keccak256,
+    (await rig.writer.binding()).keyCheck,
+  );
+  const classification = keys.classifyStreamRow(row, hashes);
+  assert.equal(classification, "present");
   const before = rig.gateway.log.length;
   const report = await writer.publishPending();
   assert.equal(
@@ -130,6 +140,7 @@ for (const checkout of checkouts) {
   console.log(
     JSON.stringify({
       commit,
+      classification,
       committedPosts: rig.gateway.log.length - before,
       problem: pending.streams.items.problem,
       readers,
