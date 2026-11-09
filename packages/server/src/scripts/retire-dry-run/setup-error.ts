@@ -9,6 +9,8 @@ export type DryRunSetupCode =
   | "no_owner_signature"
   | "bad_owner_signature"
   | "bad_config"
+  | "config_ambiguous"
+  | "config_missing"
   | "host_not_pinned";
 
 export class DryRunSetupError extends Error {

@@ -14,7 +14,11 @@ import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { CopyOnlyError } from "./retire-dry-run/copy-only.js";
 import { NetworkGuardError } from "./retire-dry-run/network-guard.js";
-import { runLegacyRetireDryRun } from "./retire-dry-run/run.js";
+import {
+  RUNTIME_CONFIG_FILES,
+  runLegacyRetireDryRun,
+  type RuntimeConfigFile,
+} from "./retire-dry-run/run.js";
 import {
   DryRunSetupError,
   LegacyStoreError,
@@ -22,7 +26,8 @@ import {
 
 const USAGE =
   "Usage: legacy-retire-dry-run --data-dir <copy under ~/.tmp> --out <report.json> " +
-  "[--gateway-url <url>] [--storage-url <url>]\n" +
+  "[--config server.json|config.json] [--gateway-url <url>] [--storage-url <url>]\n" +
+  "--config names the runtime config file; it is required when the folder holds both.\n" +
   "The URLs may only select a pinned Dev host. Use cp -p so the report shows the copy's age.\n" +
   "Set VANA_MASTER_KEY_SIGNATURE in the environment.";
 
@@ -32,6 +37,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     options: {
       "data-dir": { type: "string" },
       out: { type: "string" },
+      config: { type: "string" },
       "gateway-url": { type: "string" },
       "storage-url": { type: "string" },
       "test-only-allow-loopback": { type: "boolean" },
@@ -42,12 +48,21 @@ export async function main(argv: readonly string[]): Promise<number> {
     process.stderr.write(`${USAGE}\n`);
     return 2;
   }
+  const configFile = values.config;
+  if (
+    configFile !== undefined &&
+    !(RUNTIME_CONFIG_FILES as readonly string[]).includes(configFile)
+  ) {
+    process.stderr.write(`${USAGE}\n`);
+    return 2;
+  }
   try {
     const report = await runLegacyRetireDryRun({
       dataDir: values["data-dir"],
       outPath: values.out,
       home: homedir(),
       masterKeySignature: process.env.VANA_MASTER_KEY_SIGNATURE,
+      ...(configFile ? { configFile: configFile as RuntimeConfigFile } : {}),
       ...(values["gateway-url"] ? { gatewayUrl: values["gateway-url"] } : {}),
       ...(values["storage-url"] ? { storageUrl: values["storage-url"] } : {}),
       testOnlyAllowLoopback: values["test-only-allow-loopback"] === true,

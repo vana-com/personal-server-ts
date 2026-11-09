@@ -2,8 +2,11 @@
  * The shipped entry's static import closure, walked from its source. The entry
  * installs the network guard before any package module loads, which only holds
  * if nothing reached from the entry through a static import is a package module
- * or the SQLite store. Dynamic `import()` is not followed: run.ts runs it after
- * the guard installs. `run-entry-order.test.ts` covers a module that captures
+ * or the SQLite store. Dynamic `import()` is not followed: run.ts runs it inside
+ * a function, after the guard installs. A dynamic `import()` outside any
+ * function body runs at load, so this file refuses it in every file it reaches.
+ * `import x = require()` is not parsed here; tsc rejects it (TS1471), which the
+ * lint gate runs. `run-entry-order.test.ts` covers a module that captures
  * `fetch` at load; this file covers which modules can load at all.
  */
 
@@ -74,16 +77,49 @@ function staticSpecifiers(file: string): string[] {
   return out;
 }
 
+/**
+ * Dynamic `import()` calls that are not inside any function body. Those run
+ * when the module is evaluated, before any code the entry calls.
+ */
+function moduleScopeDynamicImports(file: string): number {
+  const source = ts.createSourceFile(
+    file,
+    readFileSync(file, "utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  let count = 0;
+  const visit = (node: ts.Node, inFunction: boolean): void => {
+    if (
+      !inFunction &&
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword
+    ) {
+      count += 1;
+    }
+    const nested = inFunction || ts.isFunctionLike(node);
+    ts.forEachChild(node, (child) => {
+      visit(child, nested);
+    });
+  };
+  visit(source, false);
+  return count;
+}
+
 describe("the shipped entry's static imports", () => {
-  it("statically imports only Node built-ins and the allowlisted local files", () => {
+  it("statically imports only Node built-ins and the allowlisted local files, and no module-scope dynamic import", () => {
     const reached = new Set<string>();
     const bare = new Set<string>();
     const unlisted = new Set<string>();
+    const loadTimeImports = new Set<string>();
     const pending = [ENTRY];
     while (pending.length > 0) {
       const file = pending.pop()!;
       if (reached.has(file)) continue;
       reached.add(file);
+      if (moduleScopeDynamicImports(file) > 0) {
+        loadTimeImports.add(relative(scripts, file));
+      }
       for (const spec of staticSpecifiers(file)) {
         if (spec.startsWith("node:")) continue;
         if (!spec.startsWith(".")) {
@@ -98,6 +134,7 @@ describe("the shipped entry's static imports", () => {
     }
     expect([...bare]).toEqual([]);
     expect([...unlisted]).toEqual([]);
+    expect([...loadTimeImports]).toEqual([]);
     // The allowlist names exactly what the walk reaches.
     expect([...reached].map((f) => relative(scripts, f)).sort()).toEqual(
       [...ALLOWED_LOCAL].sort(),

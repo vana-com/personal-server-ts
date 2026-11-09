@@ -14,9 +14,9 @@
 
 import { DryRunSetupError } from "./setup-error.js";
 
-// The Dev product environment: `dev` in
-// packages/app-runtime/src/personal-server/environments.json (gatewayUrl,
-// storageApiUrl), the same values the Desktop sidecar passes to the runtime.
+// The Dev product environment: the gateway and storage the Desktop app passes
+// to its runtime in the dev build (the public Dev hosts; prod hosts are never
+// pinned here).
 export const DEV_GATEWAY_HOSTS: readonly string[] = ["dp-rpc.moksha.vana.org"];
 export const DEV_STORAGE_HOSTS: readonly string[] = ["storage-dev.vana.org"];
 export const DEV_GATEWAY_URL = `https://${DEV_GATEWAY_HOSTS[0]}`;

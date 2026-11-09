@@ -300,12 +300,38 @@ const MUTANTS = [
     edits: [
       [
         F.run,
-        'for (const name of ["server.json", "config.json"])',
-        'for (const name of ["config.json"])',
+        'RUNTIME_CONFIG_FILES = ["server.json", "config.json"] as const;',
+        'RUNTIME_CONFIG_FILES = ["config.json"] as const;',
       ],
     ],
     files: [T.run],
     pattern: "takes the hosts from server.json",
+  },
+  {
+    id: "BOTH_FILES_PICKS_SILENTLY",
+    what: "a folder with both config files picks server.json silently instead of refusing",
+    edits: [
+      [
+        F.run,
+        "} else if (texts.size > 1) {",
+        "} else if (texts.size > 1 && false) {",
+      ],
+    ],
+    files: [T.run],
+    pattern: "refuses a folder that holds both server.json and config.json",
+  },
+  {
+    id: "ENTRY_TOPLEVEL_DYNAMIC_IMPORT",
+    what: "the shipped entry loads a package module at module scope, before main and before the guard",
+    edits: [
+      [
+        F.cli,
+        "export async function main(argv: readonly string[]): Promise<number> {",
+        'await import("@opendatalabs/personal-server-ts-core/sync");\n\nexport async function main(argv: readonly string[]): Promise<number> {',
+      ],
+    ],
+    files: [T.closure],
+    pattern: "no module-scope dynamic import",
   },
   {
     id: "P2.6a",
@@ -759,12 +785,11 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 }
 
 /**
- * Core tests and server tests import `@opendatalabs/personal-server-ts-core` from
- * its dist. Called with the files a run edits (mutants) or runs (baselines).
+ * Server tests import `@opendatalabs/personal-server-ts-core` from its dist, so
+ * the dist must exist before any run. `tsc -b` is incremental: a second call on
+ * an unchanged core is cheap.
  */
-function buildCoreIfNeeded(paths) {
-  const touchesCore = paths.some((file) => file.startsWith("packages/core/"));
-  if (!touchesCore) return;
+function buildCore() {
   const build = spawnSync(
     "nice",
     ["-n", "19", "npx", "tsc", "-b", "packages/core/tsconfig.json"],
@@ -772,6 +797,11 @@ function buildCoreIfNeeded(paths) {
   );
   if (build.status !== 0)
     throw new Error(`core build failed: ${build.stdout}${build.stderr}`);
+}
+
+/** A mutant that edits core must rebuild core before and after its run. */
+function buildCoreIfNeeded(paths) {
+  if (paths.some((file) => file.startsWith("packages/core/"))) buildCore();
 }
 
 function runVitest(files, pattern) {
@@ -821,13 +851,14 @@ const selected = MUTANTS.filter((m) => !only || only.has(m.id));
 const rows = [];
 let baselineFailed = false;
 if (!check) {
-  // The unmutated baseline of every file set, before any edit.
+  // The unmutated baseline of every file set, before any edit. Core is built
+  // once, unconditionally, so a fresh clone needs no manual build.
+  buildCore();
   const seen = new Set();
   for (const mutant of selected) {
     const key = mutant.files.join(",");
     if (seen.has(key)) continue;
     seen.add(key);
-    buildCoreIfNeeded(mutant.files);
     const base = await runVitest(mutant.files, null);
     const verdict = classify({
       status: base.status,

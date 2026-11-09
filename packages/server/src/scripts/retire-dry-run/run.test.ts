@@ -793,7 +793,10 @@ describe("the pinned Dev hosts", () => {
         },
       }),
     );
-    const report = await runLegacyRetireDryRun(optionsOf(p));
+    const report = await runLegacyRetireDryRun({
+      ...optionsOf(p),
+      configFile: "server.json",
+    });
     expect(report.hosts).toEqual({
       gateway: DEV_GATEWAY_HOSTS[0],
       storage: DEV_STORAGE_HOSTS[0],
@@ -801,6 +804,47 @@ describe("the pinned Dev hosts", () => {
     expect(new Set(p.requests.map((r) => r.host))).toEqual(
       new Set([DEV_GATEWAY_HOSTS[0], DEV_STORAGE_HOSTS[0]]),
     );
+  });
+
+  it("refuses a folder that holds both server.json and config.json unless --config names one, before any request", async () => {
+    const p = await fixture();
+    await writeFile(
+      join(p.dataDir, "server.json"),
+      JSON.stringify({ gateway: { url: GATEWAY_URL } }),
+    );
+    await expect(runLegacyRetireDryRun(optionsOf(p))).rejects.toMatchObject({
+      code: "config_ambiguous",
+    });
+    expect(p.requests).toEqual([]);
+    expect(await exists(p.outPath)).toBe(false);
+  });
+
+  it("reads the file --config names when the folder holds both", async () => {
+    const p = await fixture();
+    await writeConfig(p, {
+      gateway: { url: "https://data-gateway-env-dev-opendatalabs.vercel.app" },
+    });
+    await writeFile(
+      join(p.dataDir, "server.json"),
+      JSON.stringify({ gateway: { url: GATEWAY_URL } }),
+    );
+    await expect(
+      runLegacyRetireDryRun({ ...optionsOf(p), configFile: "config.json" }),
+    ).rejects.toMatchObject({ code: "host_not_pinned" });
+    expect(p.requests).toEqual([]);
+    const report = await runLegacyRetireDryRun({
+      ...optionsOf(p),
+      configFile: "server.json",
+    });
+    expect(report.hosts.gateway).toBe(DEV_GATEWAY_HOSTS[0]);
+  });
+
+  it("refuses a --config file the folder does not hold, before any request", async () => {
+    const p = await fixture();
+    await expect(
+      runLegacyRetireDryRun({ ...optionsOf(p), configFile: "server.json" }),
+    ).rejects.toMatchObject({ code: "config_missing" });
+    expect(p.requests).toEqual([]);
   });
 
   it("refuses the production storage host, from the config and from a flag", async () => {

@@ -39,6 +39,8 @@ export interface DryRunOptions {
   readonly home: string;
   /** Owner master-key signature; the tool reads it from the environment. */
   readonly masterKeySignature: string | undefined;
+  /** Which runtime config file to read; required when the folder has both. */
+  readonly configFile?: RuntimeConfigFile;
   /** Select a pinned Dev host (see `hosts.ts`); any other value is refused. */
   readonly gatewayUrl?: string;
   readonly storageUrl?: string;
@@ -62,30 +64,62 @@ interface ConfigJson {
   storage?: { config?: { vana?: { apiUrl?: unknown } } };
 }
 
-// The file the runtime reads at boot. Desktop starts the runtime on server.json
-// (apps/desktop/personal-server/index.js, loadConfig with configPath) and the
-// sidecar writes the app's gateway and storage into it, so it is the effective
-// config. config.json is read only when the copy has no server.json (the
-// non-Desktop boot, packages/server/src/bootstrap.ts). Neither is merged.
-async function readRuntimeConfig(rootDir: string): Promise<ConfigJson> {
-  for (const name of ["server.json", "config.json"]) {
-    let text: string;
-    try {
-      text = await readFile(join(rootDir, name), "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      return {};
-    }
-    try {
-      const parsed: unknown = JSON.parse(text);
-      return typeof parsed === "object" && parsed !== null
-        ? (parsed as ConfigJson)
-        : {};
-    } catch {
-      return {};
-    }
+/** The two files a runtime reads its config from. */
+export const RUNTIME_CONFIG_FILES = ["server.json", "config.json"] as const;
+export type RuntimeConfigFile = (typeof RUNTIME_CONFIG_FILES)[number];
+
+async function readTextOrNull(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
   }
-  return {}; // No config in the copy: the Dev hosts are the defaults.
+}
+
+/**
+ * The copy's runtime config. A Desktop folder holds `server.json`: the app
+ * writes its gateway and storage into it and boots the runtime on it, and it
+ * also overlays derived defaults at boot. A self-hosted runtime boots on
+ * `config.json` (packages/server/src/bootstrap.ts). With one file in the folder
+ * that file is used. With both, the folder does not say which runtime owns it,
+ * so the caller must name the file (`--config`). Nothing is merged.
+ */
+async function readRuntimeConfig(
+  rootDir: string,
+  choice: RuntimeConfigFile | undefined,
+): Promise<ConfigJson> {
+  const texts = new Map<RuntimeConfigFile, string>();
+  for (const name of RUNTIME_CONFIG_FILES) {
+    const text = await readTextOrNull(join(rootDir, name));
+    if (text !== null) texts.set(name, text);
+  }
+  let name: RuntimeConfigFile | undefined;
+  if (choice !== undefined) {
+    if (!texts.has(choice)) {
+      throw new DryRunSetupError(
+        "config_missing",
+        "The file named by --config is not in the copy.",
+      );
+    }
+    name = choice;
+  } else if (texts.size > 1) {
+    throw new DryRunSetupError(
+      "config_ambiguous",
+      "The copy holds both server.json and config.json. Pass --config server.json or --config config.json to name the file the runtime boots on.",
+    );
+  } else {
+    name = [...texts.keys()][0];
+  }
+  if (name === undefined) return {}; // No config in the copy: the Dev hosts are the defaults.
+  try {
+    const parsed: unknown = JSON.parse(texts.get(name)!);
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as ConfigJson)
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 const stringOrUndefined = (value: unknown): string | undefined =>
@@ -116,7 +150,7 @@ export async function runLegacyRetireDryRun(
   }
   // Flags and the copy's config only select among the pinned Dev hosts
   // (hosts.ts). The schema parse runs after the guard is in place (below).
-  const raw = await readRuntimeConfig(dataDir);
+  const raw = await readRuntimeConfig(dataDir, options.configFile);
   const pinned = pinHosts({
     gatewayUrl: options.gatewayUrl ?? stringOrUndefined(raw.gateway?.url),
     storageUrl:

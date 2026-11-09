@@ -123,4 +123,19 @@ describe("legacy-retire-dry-run command", () => {
     expect(await main([])).toBe(2);
     expect(stderr.mock.calls.join("")).toMatch(/Usage/);
   });
+
+  it("exits 2 with usage for a --config that is neither runtime config file", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    expect(
+      await main([
+        "--data-dir",
+        "/nonexistent",
+        "--out",
+        "/nonexistent/out.json",
+        "--config",
+        "settings.json",
+      ]),
+    ).toBe(2);
+    expect(stderr.mock.calls.join("")).toMatch(/Usage/);
+  });
 });
