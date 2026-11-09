@@ -14,9 +14,9 @@ import {
 import {
   deriveKeyCheck,
   NAMESPACE_KEY_LABEL,
-  streamMasterKeyFromSignature,
   type HashPorts,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { streamMasterKey } from "../keys/owner-master-key.js";
 import type { StorageAdapter } from "../storage/adapters/interface.js";
 import type { StreamSyncBlobReader, StreamSyncReadKeys } from "./ports.js";
 
@@ -36,7 +36,7 @@ function hex(bytes: Uint8Array): string {
 export async function createStreamSyncReadKeys(
   ownerSignature: Uint8Array,
 ): Promise<StreamSyncReadKeys> {
-  const masterKey = streamMasterKeyFromSignature(ownerSignature);
+  const masterKey = streamMasterKey(ownerSignature);
   const kNs = deriveScopeKey(masterKey, NAMESPACE_KEY_LABEL);
   const keyCheck = await deriveKeyCheck(async (message) =>
     hmac(nobleSha256, kNs, message),

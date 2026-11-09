@@ -36,10 +36,8 @@ import type {
   DataPointFeedPort,
   DataStoragePort,
 } from "@opendatalabs/personal-server-ts-core/ports";
-import {
-  createGatewayClient,
-  deriveMasterKey,
-} from "@opendatalabs/vana-sdk/browser";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/browser";
+import { legacyMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   createInMemoryWriteProofReplayStore,
   createInMemoryWriteSessionStore,
@@ -364,7 +362,7 @@ export async function createIndexedDbPsLiteRuntime(
           createReplicationNetworkPorts({
             config,
             owner,
-            masterKey: deriveMasterKey(options.ownerSignature),
+            masterKey: legacyMasterKey(options.ownerSignature),
             storage: objectStorage,
             gateway,
             feed:

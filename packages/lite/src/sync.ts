@@ -67,9 +67,9 @@ import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   buildWeb3SignedHeader,
   createGatewayClient,
-  deriveMasterKey,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
+import { legacyMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import {
   withCancellableRegistration,
   type DownloadDiagnosticsHook,
@@ -415,7 +415,7 @@ export async function createPsLiteSyncManager(
   ) {
     throw new Error("Owner sync signer must match the verified data owner");
   }
-  const masterKey = deriveMasterKey(options.ownerSignature);
+  const masterKey = legacyMasterKey(options.ownerSignature);
   const gateway =
     options.gateway ??
     withCancellableRegistration(
