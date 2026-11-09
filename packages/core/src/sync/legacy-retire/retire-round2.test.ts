@@ -16,6 +16,7 @@ import { entityHashes } from "../../storage/legacy-entity-key-sets.js";
 import { createMemoryStreamSyncFiles } from "../../stream-sync/memory-files.js";
 import { createRetireHost } from "./host.js";
 import { RetireLedger } from "./ledger.js";
+import { readbackVersion } from "./readback.js";
 import { retireLegacyFiles, type RetireHost } from "./retire.js";
 import { CONNECTOR, flow, legacy, raw, STREAM } from "./retire-rig.js";
 
@@ -100,6 +101,34 @@ describe("a dry run stores no readback a real pass trusts (DRYRUN_READBACK_USABL
   });
 });
 
+describe("a readback made before the import finished is never trusted (PREIMPORT_READBACK_USABLE)", () => {
+  it("is stored tagged, and the next real pass reads the version back again", async () => {
+    const f = await flow({ local: ["e0", "e1"] });
+    await f.importer.run();
+    await f.run("a", ["e0", "e1"]);
+    await f.rig.publish();
+    await f.rig.sync();
+    const row = f.storage.entries[0]!;
+    const host = createRetireHost({
+      reader: f.rig.service,
+      writer: f.rig.writer,
+      ledger: f.ledger,
+    });
+    const made = await readbackVersion(
+      { storage: f.storage, view: host, ledger: f.ledger, preImport: true },
+      row.scope,
+      row,
+    );
+    expect(made).toMatchObject({ pass: true, preImport: true });
+    expect(await f.ledger.readback(row.scope, made.version)).toBe(null);
+
+    await f.runRows("b", [raw("e0"), { ...raw("e1"), content: "edited" }]);
+    await f.rig.publish();
+    const real = await f.retire(false);
+    expect(real.files[0]).toMatchObject({ readback: "fail" });
+  });
+});
+
 describe("the delete fence excuses only a file written before the delete (FENCE_AFTER_DELETE_WRITE)", () => {
   it("allowed: a pre-delete file after a whole-source delete passes its readback, and stays until the source is reconnected and re-collected", async () => {
     const f = await flow({ local: ["e0", "e1"] });
@@ -168,6 +197,33 @@ describe("the delete fence excuses only a file written before the delete (FENCE_
     });
     expect(report.deleted).toBe(0);
   });
+
+  it.each([
+    ["the source is deleted whole", false],
+    ["the source was reconnected", true],
+  ])(
+    "a throwing read of the published view passes nothing when %s (FENCE_PASSES_WITHOUT_VIEW)",
+    async (_n, reconnect) => {
+      const f = await flow({
+        local: ["e0", "e1"],
+        wrapHost: (host) => ({
+          ...host,
+          publishedBody: async () => {
+            throw new Error("storage 503");
+          },
+        }),
+      });
+      await deleted(f);
+      if (reconnect) await reconnected(f, ["e5"]);
+      const report = await f.retire();
+      expect(report.files[0]).toMatchObject({
+        readback: "fail",
+        readbackReason: "no_published_view",
+      });
+      expect(report.deleted).toBe(0);
+      expect(f.storage.entries).toHaveLength(1);
+    },
+  );
 
   it("never excuses a changed entity of a file collected after the delete", async () => {
     const f = await flow({

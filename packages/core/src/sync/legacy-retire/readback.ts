@@ -117,6 +117,11 @@ export async function readbackVersion(
     now?: () => Date;
     /** Mark the stored record dry: a report, never a basis for a delete. */
     dry?: boolean;
+    /**
+     * Mark the stored record as made before this device's import finished: a
+     * report, never trusted by a real pass (the import may change the answer).
+     */
+    preImport?: boolean;
   },
   scope: string,
   row: IndexEntry,
@@ -137,6 +142,7 @@ export async function readbackVersion(
       ...base,
       ...record,
       ...(deps.dry ? { dry: true } : {}),
+      ...(deps.preImport ? { preImport: true } : {}),
     };
     await deps.ledger.update((data) => {
       data.readbacks[`${scope}|${full.version}`] = full;
@@ -153,7 +159,14 @@ export async function readbackVersion(
   }
   if (!local) return store({ pass: false, reason: "unkeyed" });
 
-  const body = await deps.view.publishedBody(scope).catch(() => null);
+  // A failed read of the published view is never "no view": it passes
+  // nothing, whatever the fence says.
+  let body: unknown | null;
+  try {
+    body = await deps.view.publishedBody(scope);
+  } catch {
+    return store({ pass: false, reason: "no_published_view" });
+  }
   const basis = deps.view.deleteBasis(scope);
   const fenceOpen = basis !== null && predatesEveryDelete(basis, row);
   let published: EntityHashes | null = null;

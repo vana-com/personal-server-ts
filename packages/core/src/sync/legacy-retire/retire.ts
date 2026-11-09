@@ -205,7 +205,13 @@ export async function retireLegacyFiles(
         if (!(await deps.host.importDone(connector))) importReady = false;
       }
       if (importReady && (dry || record === null || !record.pass)) {
-        record = await readbackVersion(readbackDeps, scope, row);
+        // A readback taken before the import finished is tagged: no real
+        // pass reuses it.
+        record = await readbackVersion(
+          { ...readbackDeps, preImport: !importReady },
+          scope,
+          row,
+        );
       }
       let report = await decide(deps, scope, row, basis, record);
       if (report.wouldDelete && mayDelete) {

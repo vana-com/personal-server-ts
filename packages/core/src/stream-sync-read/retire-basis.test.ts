@@ -4,7 +4,7 @@
  * and when each delete happened. Real service, registry mirror and heads.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Fixture, masterKey } from "./service-fixture.js";
 import { testOwnerKey } from "./testing.js";
 
@@ -81,5 +81,19 @@ describe("retireBasis", () => {
       deleteVersion: 2,
       deleteAtMs: at,
     });
+  });
+
+  it("publishedBody answers null for a decision that is no view, and throws when the read fails (FENCE_PASSES_WITHOUT_VIEW)", async () => {
+    const { fixture, publish } = await setup(["chatgpt"]);
+    await publish("chatgpt", "memories", ["m0"]);
+    const service = await fixture.service();
+    await fixture.sync(service);
+    expect(await service.publishedBody("chatgpt.memories")).not.toBeNull();
+    expect(await service.publishedBody("nobody.nothing")).toBeNull();
+
+    vi.spyOn(service, "resolve").mockRejectedValue(new Error("storage 503"));
+    await expect(service.publishedBody("chatgpt.memories")).rejects.toThrow(
+      "storage 503",
+    );
   });
 });

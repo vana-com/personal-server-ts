@@ -54,8 +54,8 @@ export const MUTANTS = [
     why: "a dry run's stored readback counts as a stored pass",
     edits: edit(
       LEDGER,
-      "return found && found.dry !== true ? found : null;",
-      "return found ?? null;",
+      "found && found.dry !== true && found.preImport !== true",
+      "found && found.preImport !== true",
     ),
     tests: [ROUND2],
     mustFail: ["DRYRUN_READBACK_USABLE"],
@@ -103,6 +103,57 @@ export const MUTANTS = [
     ),
     tests: [ROUND2],
     mustFail: ["FENCE_NULL_VIEW_PASSES"],
+  },
+  {
+    name: "PREIMPORT_READBACK_USABLE",
+    why: "a readback made before the import finished counts as a stored pass",
+    edits: edit(
+      LEDGER,
+      "found && found.dry !== true && found.preImport !== true",
+      "found && found.dry !== true",
+    ),
+    tests: [ROUND2],
+    mustFail: ["PREIMPORT_READBACK_USABLE"],
+  },
+  {
+    name: "FENCE_PASSES_WITHOUT_VIEW",
+    why: "a throwing read of the published view counts as no view and passes under the fence",
+    edits: edit(
+      READBACK,
+      `  } catch {
+    return store({ pass: false, reason: "no_published_view" });
+  }`,
+      `  } catch {
+    body = null;
+  }`,
+    ),
+    tests: [ROUND2],
+    mustFail: ["FENCE_PASSES_WITHOUT_VIEW"],
+  },
+  {
+    name: "FENCE_PASSES_WITHOUT_VIEW_SERVICE",
+    why: "publishedBody turns a failed read into no view",
+    edits: edit(
+      SERVICE,
+      `    const decision = await this.resolve({
+      scope,
+      connection: null,
+      cursor: null,
+      legacyFile: true,
+      isOwnerView: false,
+    });
+    if (decision.kind !== "view") {`,
+      `    const decision = await this.resolve({
+      scope,
+      connection: null,
+      cursor: null,
+      legacyFile: true,
+      isOwnerView: false,
+    }).catch(() => ({ kind: "pass" as const }));
+    if (decision.kind !== "view") {`,
+    ),
+    tests: [BASIS],
+    mustFail: ["FENCE_PASSES_WITHOUT_VIEW"],
   },
   {
     name: "UNCOVERED_RETIRES",
@@ -268,13 +319,13 @@ export const MUTANTS = [
     edits: edit(
       SERVICE,
       `legacyFile: true,
-        isOwnerView: false,
-      });
-      if (decision.kind !== "view") return null;`,
+      isOwnerView: false,
+    });
+    if (decision.kind !== "view") {`,
       `legacyFile: true,
-        isOwnerView: true,
-      });
-      if (decision.kind !== "view") return null;`,
+      isOwnerView: true,
+    });
+    if (decision.kind !== "view") {`,
     ),
     tests: [FLOW],
     mustFail: ["RETIRE_ON_SPOOL"],

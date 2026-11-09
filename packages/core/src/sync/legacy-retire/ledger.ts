@@ -39,6 +39,11 @@ export interface ReadbackRecord {
    * reads the version back again.
    */
   readonly dry?: true;
+  /**
+   * Made before this device's import finished. A report, never a basis: a
+   * real pass ignores it and reads the version back again.
+   */
+  readonly preImport?: true;
 }
 
 export interface LedgerData {
@@ -94,13 +99,15 @@ export class RetireLedger {
     return data.importComplete || data.imported[connector] !== undefined;
   }
 
-  /** The stored readback of this version, or null (a dry record is none). */
+  /** The stored readback of this version, or null (a dry or pre-import record is none). */
   async readback(
     scope: string,
     version: string,
   ): Promise<ReadbackRecord | null> {
     const found = (await this.read()).readbacks[`${scope}|${version}`];
-    return found && found.dry !== true ? found : null;
+    return found && found.dry !== true && found.preImport !== true
+      ? found
+      : null;
   }
 }
 
