@@ -42,6 +42,11 @@ export interface PublishedHeadsInput {
    * back as a mismatch (the safe side).
    */
   readonly mirrorBytes: Uint8Array | null;
+  /**
+   * The clock the read service stamps views with (`fetchedAt`). The default
+   * is the real one; a test passes the fixture's.
+   */
+  readonly now?: () => Date;
 }
 
 export interface PublishedHeads {
@@ -103,6 +108,7 @@ export async function loadPublishedHeads(
     }),
     logger: noop,
     durable: false,
+    ...(input.now ? { now: input.now } : {}),
   });
 
   const feed = createGatewayDataPointFeed({ gatewayUrl: config.gateway.url });

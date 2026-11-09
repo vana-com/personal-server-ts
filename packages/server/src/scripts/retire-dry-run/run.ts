@@ -150,6 +150,7 @@ export async function runLegacyRetireDryRun(
     const heads = await loadPublishedHeads({
       config,
       masterKeySignature: options.masterKeySignature as `0x${string}`,
+      now,
       mirrorBytes: await readOptional(
         join(dataDir, "stream-sync-read", MIRROR_PATH),
       ),

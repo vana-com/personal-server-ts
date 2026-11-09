@@ -372,6 +372,37 @@ const MUTANTS = [
     pattern: "names no file",
   },
   {
+    id: "P-dec",
+    what: "decisions counted only when present",
+    edits: [
+      [
+        F.report,
+        "const byDecision = emptyDecisions();",
+        "const byDecision = {} as ReturnType<typeof emptyDecisions>;",
+      ],
+      [
+        F.report,
+        "byDecision[f.decision] += 1;",
+        "byDecision[f.decision] = (byDecision[f.decision] ?? 0) + 1;",
+      ],
+    ],
+    files: [T.run],
+    pattern: "counts every decision",
+  },
+  {
+    id: "P-staged",
+    what: "the staged record of the import is dropped",
+    edits: [
+      [
+        F.run,
+        "data.imported = home.imported;",
+        'data.imported = Object.fromEntries(Object.keys(home.fullSince).map((k) => [k, { streams: 1, at: "x" }]));',
+      ],
+    ],
+    files: [T.run],
+    pattern: "staged no rows",
+  },
+  {
     id: "P3.9",
     what: "copy time missing from the report",
     edits: [

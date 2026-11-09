@@ -87,7 +87,9 @@ const optionsOf = (p: PersistedFixture): DryRunOptions => ({
   outPath: p.outPath,
   home: p.home,
   masterKeySignature: p.signature,
-  now: () => new Date("2026-11-09T00:00:00Z"),
+  // The fixture's clock: views carry `fetchedAt` from it, and the readback
+  // compares that scalar with the legacy file's.
+  now: () => new Date("2026-11-02T00:00:00Z"),
 });
 
 /** sha256 of every file under a folder, keyed by relative path. */
@@ -411,7 +413,11 @@ describe("the synthetic fixture, in memory and persisted", () => {
 
     // The in-memory dry run of #595, on the same fixture.
     const ledger = new RetireLedger(createMemoryStreamSyncFiles());
-    await ledger.update((d) => void (d.importComplete = true));
+    await ledger.update((d) => {
+      d.importComplete = true;
+      for (const scope of fx.scopes)
+        d.imported[scope.connector] = { streams: 1, at: "x" };
+    });
     const memory = await retireLegacyFiles({
       storage: fx.storage,
       host: createRetireHost({
@@ -494,6 +500,43 @@ describe("a failed published read", () => {
       readbackReason: "no_published_view",
       wouldDelete: false,
     });
+    expect(report.totals.wouldDelete).toBe(2);
+  });
+});
+
+describe("the decisions in the report", () => {
+  const ALL = [
+    "fence_not_imported",
+    "fence_not_recollected",
+    "file_changed",
+    "no_import",
+    "no_readback",
+    "readback_failed",
+    "ready",
+  ];
+
+  it("counts every decision, zero or not, and never deletes", async () => {
+    const p = await fixture();
+    const report = await runLegacyRetireDryRun(optionsOf(p));
+    expect(Object.keys(report.totals.byDecision).sort()).toEqual(ALL);
+    expect(report.totals.byDecision).toMatchObject({
+      ready: 3,
+      readback_failed: 2,
+      fence_not_imported: 0,
+      file_changed: 0,
+    });
+    expect(report.mode).toBe("dry-run");
+  });
+
+  it("holds a fenced file when the device staged no rows (an empty import)", async () => {
+    const p = await fixture({ importDone: true, fullRun: true, staged: false });
+    const report = await runLegacyRetireDryRun(optionsOf(p));
+    expect(
+      report.files.find(
+        (f) => f.scopeHash === scopeHash("instagram.following"),
+      ),
+    ).toMatchObject({ decision: "fence_not_imported", wouldDelete: false });
+    expect(report.totals.byDecision.fence_not_imported).toBe(1);
     expect(report.totals.wouldDelete).toBe(2);
   });
 });

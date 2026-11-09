@@ -61,6 +61,12 @@ export async function persistFixture(
     home?: string;
     /** Write `legacy-retire/ledger.json` with the import done. */
     importDone?: boolean;
+    /**
+     * With `importDone`: the device also staged rows for every connector
+     * (default true). False is an import over an empty source: done, but
+     * nothing staged.
+     */
+    staged?: boolean;
     /** Make the full-run proof of every deleted stream true. */
     fullRun?: boolean;
     /** Write the device's registry mirror (default true). */
@@ -136,10 +142,18 @@ export async function persistFixture(
   });
   const homeDir = join(live, "stream-sync-homes", homeId);
   if (options.importDone) {
+    const imported: Record<string, { streams: number; at: string }> = {};
+    if (options.staged !== false) {
+      for (const scope of fx.scopes) {
+        for (const s of fx.reader.retireBasis(scope.scope)?.streams ?? []) {
+          imported[s.connector] = { streams: 1, at: "2026-10-30T00:00:00Z" };
+        }
+      }
+    }
     await mkdir(join(homeDir, "legacy-retire"), { recursive: true });
     await writeFile(
       join(homeDir, "legacy-retire", "ledger.json"),
-      JSON.stringify({ importComplete: true, imported: {}, readbacks: {} }),
+      JSON.stringify({ importComplete: true, imported, readbacks: {} }),
     );
   }
   if (options.fullRun) {

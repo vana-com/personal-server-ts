@@ -10,6 +10,7 @@
 import { createHash } from "node:crypto";
 import type {
   ReadbackRecord,
+  RetireDecision,
   RetireFileReport,
   RetireReport,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -77,7 +78,8 @@ export interface RedactedReport {
     /** Local versions the pass did not report (no read target, or reserved). */
     readonly notReported: number;
     readonly wouldDelete: number;
-    readonly byDecision: Readonly<Record<string, number>>;
+    /** Every decision the retire pass has, zero when none: a new one fails the type. */
+    readonly byDecision: Readonly<Record<RetireDecision, number>>;
     readonly counts: {
       readonly local: number;
       readonly matched: number;
@@ -98,6 +100,16 @@ export function connectorLabel(scope: string): string {
   const name = scope.split(".")[0] ?? "";
   return /^[a-z0-9_-]{1,40}$/.test(name) ? name : "unknown";
 }
+
+const emptyDecisions = (): Record<RetireDecision, number> => ({
+  no_import: 0,
+  no_readback: 0,
+  readback_failed: 0,
+  fence_not_imported: 0,
+  fence_not_recollected: 0,
+  file_changed: 0,
+  ready: 0,
+});
 
 const ZERO = { local: 0, matched: 0, missing: 0, changed: 0, fenced: 0 };
 
@@ -132,10 +144,10 @@ export function buildReport(input: {
   const files = input.retire.files.map((f) =>
     redactFile(f, input.records.get(`${f.scope}|${f.version}`) ?? null),
   );
-  const byDecision: Record<string, number> = {};
+  const byDecision = emptyDecisions();
   const counts = { ...ZERO };
   for (const f of files) {
-    byDecision[f.decision] = (byDecision[f.decision] ?? 0) + 1;
+    byDecision[f.decision] += 1;
     counts.local += f.counts.local;
     counts.matched += f.counts.matched;
     counts.missing += f.counts.missing;
@@ -186,7 +198,7 @@ export function abortedReport(input: {
       reported: 0,
       notReported: 0,
       wouldDelete: 0,
-      byDecision: {},
+      byDecision: emptyDecisions(),
       counts: { ...ZERO },
     },
   };
