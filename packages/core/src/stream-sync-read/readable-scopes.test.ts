@@ -201,3 +201,162 @@ describe("readableScopes with the real writer overlay", () => {
     expect(await listed(rig.service, true)).toEqual(read);
   });
 });
+
+describe("readableScopes survives one connector's local failure", () => {
+  async function twoConnectors() {
+    const f = new Fixture(await testOwnerKey(masterKey(66)));
+    for (const connector of ["acme", "bee"]) {
+      const ns = await f.key.ns(connector, "account-1");
+      await f.activate(connector, ns);
+      await f.publish({
+        connector,
+        ns,
+        stream: "items",
+        generation: 1,
+        records: [{ id: "a" }],
+        observedAt: T - 1000,
+      });
+    }
+    // Connector `bee`'s local state cannot be read (a retained run with
+    // missing byte counts): its snapshot rejects, `acme`'s works.
+    const overlay = {
+      observeDeletes: f.overlay.observeDeletes?.bind(f.overlay),
+      acknowledge: f.overlay.acknowledge.bind(f.overlay),
+      connectors: async () => ["acme", "bee"],
+      snapshot: async (connector: string) => {
+        if (connector === "bee") throw new Error("ready stream has no counts");
+        return f.overlay.snapshot(connector);
+      },
+    };
+    const service = await f.service({ overlay });
+    await f.sync(service);
+    return service;
+  }
+
+  // ABORT_CANDIDATE_DISCOVERY
+  it("lists A when B's overlay fails, covered or not, and A's body still reads", async () => {
+    const service = await twoConnectors();
+    expect(await bodyReadable(service, ["pdpp.acme.items"], true)).toEqual([
+      "pdpp.acme.items",
+    ]);
+    await expect(
+      listed(service, true, { isCovered: (s) => s === "pdpp.acme.items" }),
+    ).resolves.toEqual(["pdpp.acme.items"]);
+    await expect(
+      listed(service, true, {
+        isCovered: (s) => s === "pdpp.acme.items" || s === "pdpp.bee.items",
+      }),
+    ).resolves.toEqual(["pdpp.acme.items"]);
+    // Nothing is covered but B's own scope: B fails, A is not asked.
+    await expect(
+      listed(service, true, { isCovered: (s) => s === "pdpp.bee.items" }),
+    ).resolves.toEqual([]);
+  });
+});
+
+describe("readableScopes against what a body read can build", () => {
+  const readOk = async (
+    service: StreamSyncReadService,
+    scope: string,
+    isOwnerView: boolean,
+  ) => {
+    const decision = await service.resolve(ask(scope, { isOwnerView }));
+    if (decision.kind !== "view" && decision.kind !== "local_pending") {
+      return false;
+    }
+    JSON.parse(await new Response(decision.body).text());
+    return true;
+  };
+
+  // LIST_UNSERVABLE_PROJECTION
+  it("omits an alias over the size budget and keeps the control alias", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(67)));
+    const ns = await f.key.ns("linkedin", "account-1");
+    await f.activate("linkedin", ns);
+    await f.publish({
+      connector: "linkedin",
+      ns,
+      stream: "skills",
+      generation: 1,
+      records: Array.from({ length: 60 }, (_, i) => ({
+        id: `s${i}`,
+        name: `a skill with a fairly long name number ${i}`,
+        endorsement_count: i,
+      })),
+      observedAt: T - 1000,
+    });
+    await f.publish({
+      connector: "linkedin",
+      ns,
+      stream: "languages",
+      generation: 1,
+      records: [{ id: "l", name: "en", proficiency: "native" }],
+      observedAt: T - 1000,
+    });
+    const service = await f.service({ arrayProjectionBudgetBytes: 400 });
+    await f.sync(service);
+    const universe = [
+      "linkedin.skills",
+      "linkedin.languages",
+      "pdpp.linkedin.skills",
+      "pdpp.linkedin.languages",
+    ];
+    for (const isOwnerView of [true, false]) {
+      const served: string[] = [];
+      for (const scope of universe) {
+        if (await readOk(service, scope, isOwnerView)) served.push(scope);
+      }
+      expect(served.sort()).toEqual([
+        "linkedin.languages",
+        "pdpp.linkedin.languages",
+        "pdpp.linkedin.skills",
+      ]);
+      const names = (await listed(service, isOwnerView)).filter((n) =>
+        universe.includes(n),
+      );
+      expect(names).toEqual([...served].sort());
+    }
+  });
+
+  it("omits an owner alias whose partial view cannot be projected", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(68)));
+    f.overlay.connector = "strava-browser";
+    const ns = await f.key.ns("strava-browser", "account-1");
+    await f.activate("strava-browser", ns);
+    await f.publish({
+      connector: "strava-browser",
+      ns,
+      stream: "activities",
+      generation: 1,
+      records: [{ id: "old" }],
+      observedAt: T - 1000,
+      profileKey: "unmapped",
+      profileVersion: "1.0.0",
+      complete: false,
+    });
+    f.overlay.runs = [
+      {
+        runId: "r1",
+        ns,
+        generation: 1,
+        observedAt: T,
+        streams: [
+          {
+            name: "activities",
+            complete: false,
+            primaryKey: ["id"],
+            version: "1.0.0",
+            profileKey: "unmapped",
+            rows: [{ o: T, r: "r1", v: { id: "new" } } as Line],
+          },
+        ],
+      },
+    ];
+    const service = await f.service();
+    await f.sync(service);
+    expect(await readOk(service, "strava.activities", true)).toBe(false);
+    const names = await listed(service, true);
+    expect(names).not.toContain("strava.activities");
+    expect(names).toContain("pdpp.strava-browser.activities");
+  });
+});

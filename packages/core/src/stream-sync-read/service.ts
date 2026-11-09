@@ -484,6 +484,7 @@ const BUSY_RETRY_AFTER_SECONDS = 1;
 
 export class StreamSyncReadService {
   private spoolCounter = 0;
+  private readonly projectability = new Map<string, boolean>();
 
   private constructor(
     private readonly options: StreamSyncReadOptions,
@@ -762,14 +763,15 @@ export class StreamSyncReadService {
   /**
    * The scopes this caller can read from stream data, for the scope listing of
    * a switched account. A name is listed if and only if the body read would
-   * serve this caller a view of it with no legacy file. That is decided from
-   * metadata alone (`readable`: the same `eligible()` rule and owner pending
-   * scan `decide` uses), so no view, projection or body is built. A runtime
-   * failure of the body itself (a projection that cannot be built) is a read
-   * error, not a lack of eligibility.
+   * serve this caller a view of it with no legacy file. Eligibility is decided
+   * from metadata (`readable`: the same `eligible()` rule and owner pending
+   * scan `decide` uses). A legacy-named alias is also asked whether its body
+   * can be built at the current versions (size budget, projector): that is the
+   * body read's own answer, kept per version in `projectable`, so a listing
+   * builds it at most once per version and never for a logical record scope.
    *
    * Candidates are the retained legacy names, the logical names of every
-   * mirrored stream, and, for the owner, every stream of the overlay's runs
+   * mirrored stream (from registry rows alone), and, for the owner, every stream of the overlay's runs
    * (a known connector's new stream, and a connector the mirror has never seen).
    *
    * `isCovered` runs before any check, so a grantee pays only for the scopes
@@ -788,27 +790,39 @@ export class StreamSyncReadService {
       const name = `pdpp.${connector}.${stream}`;
       if (logicalStreamScopeParts(name)) names.add(name);
     };
+    // Mirrored names come from the registry rows alone: no view, plan or
+    // snapshot, so nothing here can fail on one connector's local state.
     const connectors = new Set(this.mirror.connectors());
-    if (input.isOwnerView && this.options.overlay) {
-      for (const connector of await this.options.overlay.connectors()) {
-        connectors.add(connector);
+    for (const connector of connectors) {
+      for (const byStream of this.mirror.rowsFor(connector).streams.values()) {
+        for (const stream of byStream.keys()) addLogical(connector, stream);
       }
     }
-    for (const connector of connectors) {
-      const snapshot = input.isOwnerView
-        ? await this.snapshot(connector)
-        : NO_SNAPSHOT;
+    // The owner's local-only names come from the overlay. A connector whose
+    // overlay cannot be read is logged and skipped; the others are kept.
+    if (input.isOwnerView && this.options.overlay) {
       try {
-        for (const view of this.connectionViews(connector, snapshot)) {
-          for (const stream of Object.keys(view.streams)) {
-            addLogical(connector, stream);
+        for (const connector of await this.options.overlay.connectors()) {
+          connectors.add(connector);
+        }
+      } catch (error) {
+        this.skipped("overlay connectors", error);
+      }
+      for (const connector of connectors) {
+        try {
+          const snapshot = await this.snapshot(connector);
+          try {
+            for (const run of snapshot.runs) {
+              for (const stream of run.streams) {
+                addLogical(connector, stream.name);
+              }
+            }
+          } finally {
+            snapshot.release();
           }
+        } catch (error) {
+          this.skipped(connector, error);
         }
-        for (const run of snapshot.runs) {
-          for (const stream of run.streams) addLogical(connector, stream.name);
-        }
-      } finally {
-        snapshot.release();
       }
     }
     const listed: ReadableScope[] = [];
@@ -821,10 +835,7 @@ export class StreamSyncReadService {
         if (!found) continue;
         newest = found.newest;
       } catch (error) {
-        this.options.logger.warn(
-          { scope, error: error instanceof Error ? error.message : "unknown" },
-          "stream-sync read: scope skipped in the listing",
-        );
+        this.skipped(scope, error);
         continue;
       }
       listed.push({
@@ -837,6 +848,51 @@ export class StreamSyncReadService {
       });
     }
     return listed;
+  }
+
+  private skipped(what: string, error: unknown): void {
+    this.options.logger.warn(
+      { what, error: error instanceof Error ? error.message : "unknown" },
+      "stream-sync read: skipped in the listing",
+    );
+  }
+
+  /**
+   * Whether a legacy-named scope's body can be built at the current versions:
+   * the body read's own answer (size budget, projector), kept per version so a
+   * listing does not rebuild it. The key names every input head revision and
+   * every overlay run and stream state the read would use; any import or run
+   * change makes a new key.
+   */
+  private async projectable(
+    input: ResolveInput,
+    targets: readonly Target[],
+    snapshots: ReadonlyMap<string, StreamSyncOverlaySnapshot>,
+  ): Promise<boolean> {
+    const key = JSON.stringify([
+      input.scope,
+      input.isOwnerView,
+      targets.map((t) => [
+        t.connector,
+        t.streams.map((stream) => this.views.revision(t.connector, stream)),
+        (snapshots.get(t.connector)?.runs ?? []).map((run) => [
+          run.runId,
+          run.ns,
+          run.generation,
+          run.streams.map((st) => [st.name, st.contentRevision, st.state]),
+        ]),
+      ]),
+    ]);
+    const known = this.projectability.get(key);
+    if (known !== undefined) return known;
+    const decision = await this.resolve(input);
+    if ("body" in decision) await decision.body.cancel();
+    const ok = decision.kind === "view" || decision.kind === "local_pending";
+    if (this.projectability.size >= 1024) {
+      this.projectability.delete(this.projectability.keys().next().value!);
+    }
+    this.projectability.set(key, ok);
+    return ok;
   }
 
   /**
@@ -883,6 +939,13 @@ export class StreamSyncReadService {
           this.pendingScan(input, [...targets, ...candidates], snapshots)
             .best !== null);
       if (!served) return null;
+      const all2 = [...targets, ...candidates];
+      if (
+        all2.some((target) => target.binding !== undefined) &&
+        !(await this.projectable(input, all2, snapshots))
+      ) {
+        return null;
+      }
       let newest: number | null = null;
       for (const target of [...targets, ...candidates]) {
         for (const view of this.connectionViews(target.connector)) {
