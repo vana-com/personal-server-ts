@@ -611,9 +611,11 @@ describe("readableScopes cache misses after every write under the connector", ()
   //  - stream row: RegistryMirror.observePage, a stream row that replaces the kept row.
   //  - control row: RegistryMirror.observePage, a control row that replaces the kept row.
   //  - deletion floor: RegistryMirror.observePage, a tombstone that raises the floor.
-  //    (RegistryMirror.recordDelete, the importer-driven floor, is not isolated here.)
+  //  - deletion floor: RegistryMirror.recordDelete, the importer's floor (importer.ts:306).
   //  - overlay: the owner's overlay runs for the connector. The overlay is an
   //    external writer; a listing reads it pinned, so the key carries its runs.
+  //  - writer selection: the publish pass reserves and releases a run's streams
+  //    (inFlight in the publish plan). Its own test follows the loop.
   type Write = {
     /** Runs before the cache is warmed. */
     prepare(
@@ -710,6 +712,34 @@ describe("readableScopes cache misses after every write under the connector", ()
       },
     ],
     [
+      "a deletion floor (RegistryMirror.recordDelete, importer-driven)",
+      {
+        prepare: async (f, service, ns) => {
+          await f.publish({
+            connector: "linkedin",
+            ns,
+            stream: "profile",
+            generation: 1,
+            records: [{ id: "p", headline: "v2" }],
+            observedAt: T - 500,
+          });
+          await observe(f, service);
+        },
+        write: async (_f, service, ns) => {
+          // A delete head of version 2 under the live row of version 1: the
+          // importer raises the floor and writes nothing else.
+          const mirror = (
+            service as unknown as {
+              mirror: {
+                recordDelete(scope: string, version: number): Promise<void>;
+              };
+            }
+          ).mirror;
+          await mirror.recordDelete(streamScope("linkedin", ns, "profile"), 2);
+        },
+      },
+    ],
+    [
       "an overlay run (overlay snapshot)",
       {
         prepare: async () => {},
@@ -761,4 +791,51 @@ describe("readableScopes cache misses after every write under the connector", ()
       expect(builds()).toBe(2);
     });
   }
+
+  // KEY_OMITS_WRITER_INFLIGHT (aimed by the mutant runner)
+  it("misses after a writer selection change that alters no other input (publish selection)", async () => {
+    // A legacy-bound scope over the budget: the listing decides it by building
+    // the body, so its answer is cached under the connector's counter.
+    const rig = new Rig(undefined, "linkedin");
+    await rig.open({ arrayProjectionBudgetBytes: 400 });
+    await rig.collect({
+      runId: "first",
+      stream: "skills",
+      key: "id",
+      profileKey: "linkedin",
+      version: "1.0.0",
+      rows: [
+        { id: "a", name: "x", endorsement_count: 1, text: "x".repeat(600) },
+      ],
+      full: true,
+    });
+    const scope = "linkedin.skills";
+    const resolve = vi.spyOn(rig.service, "resolve");
+    const builds = () =>
+      resolve.mock.calls.filter(([input]) => input.scope === scope).length;
+    const runsOf = async () => {
+      const snapshot = await rig.overlay.snapshot(rig.connector);
+      const runs = JSON.stringify(snapshot.runs);
+      snapshot.release();
+      return runs;
+    };
+
+    expect(await listed(rig.service, true)).toContain(scope);
+    expect(builds()).toBe(1);
+    expect(await listed(rig.service, true)).toContain(scope);
+    expect(builds()).toBe(1);
+
+    // The publish pass reserves the run's stream, then fails before it signs
+    // a request: no outbox state is written, so the overlay runs read the same.
+    const runsBefore = await runsOf();
+    rig.beforeSign = async () => {
+      throw new Error("signing refused");
+    };
+    await rig.writer.publishPending().catch(() => undefined);
+    rig.beforeSign = undefined;
+    expect(await runsOf()).toBe(runsBefore);
+
+    expect(await listed(rig.service, true)).toContain(scope);
+    expect(builds()).toBe(2);
+  });
 });

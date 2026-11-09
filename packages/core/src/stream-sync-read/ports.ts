@@ -186,6 +186,12 @@ export interface StreamSyncOverlaySnapshotSource {
    */
   snapshot(connector: string): Promise<StreamSyncOverlaySnapshot>;
   /**
+   * Subscribe to every change of a connector's plan inputs. Each one must
+   * reach the reader's per-connector counter, or a cached listing answer
+   * outlives the state it was decided from.
+   */
+  planInputs?(listener: (connector: string) => void): void;
+  /**
    * Every connector that may have an overlay run (a superset is fine: the
    * reader snapshots each). Required: the scope listing names the owner's
    * local-only scopes of a connector the registry mirror has never seen from

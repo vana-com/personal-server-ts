@@ -202,6 +202,7 @@ export class Rig {
         return snapshot;
       },
       connectors: () => source.connectors(),
+      planInputs: (listener) => source.planInputs!(listener),
       acknowledge: (coverage) => source.acknowledge(coverage),
     };
   }
@@ -268,8 +269,11 @@ export class Rig {
     await this.open();
   }
 
-  async open(): Promise<void> {
+  async open(
+    options: { arrayProjectionBudgetBytes?: number } = {},
+  ): Promise<void> {
     this.service = await StreamSyncReadService.open({
+      ...options,
       files: this.readFiles,
       blobs: { get: async (key) => this.blobMap.get(key) ?? null },
       keys: await createStreamSyncReadKeys(streamMasterKey(SIGNATURE)),

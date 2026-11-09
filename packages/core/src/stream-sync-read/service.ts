@@ -506,6 +506,7 @@ export class StreamSyncReadService {
       options.keys.keyCheck,
     );
     const revisions = new ConnectorRevisions();
+    options.overlay?.planInputs?.((connector) => revisions.bump(connector));
     const mirror = await RegistryMirror.open(
       options.files,
       (row) => classifyStreamRow(toControlRead(row), hashes) === "tombstoned",

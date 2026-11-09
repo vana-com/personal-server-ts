@@ -549,6 +549,8 @@ export class StreamSyncWriter {
    * publication; `request_persisted` stays the durable form.
    */
   private readonly selected = new Set<string>();
+  /** Receivers of plan-input changes (the read side's per-connector counter). */
+  private readonly planInputListeners = new Set<(connector: string) => void>();
   private lifecycleQueue: Promise<unknown> = Promise.resolve();
   /**
    * Runs whose removal failed. They stay on disk, already covered and hidden
@@ -624,6 +626,9 @@ export class StreamSyncWriter {
   }
 
   private writeEntry(host: HostEntry): Promise<void> {
+    // Every run-entry field planRun reads (stream state, executed step, seed
+    // flags, target) changes through here, after it is set in memory.
+    this.planInputsChanged(host.entry.connector);
     return this.lifecycle(() =>
       this.options.home.files.write(
         `runs/${host.entry.runId}/entry.json`,
@@ -1346,6 +1351,7 @@ export class StreamSyncWriter {
           await this.withState((state) => {
             state.seedTargets[connector] ??= ns;
           });
+          this.planInputsChanged(connector);
         }
         // Intake appends are not durable one by one. The run becomes `ready`
         // only after one sync of its intake logs (§2.6).
@@ -1552,6 +1558,7 @@ export class StreamSyncWriter {
             await this.publishEntry(host, heldStreams);
           } finally {
             for (const key of reserved.get(host)!) this.selected.delete(key);
+            this.selectionChanged(host.entry.connector);
           }
           runs.push(this.statusOf(host));
           if (host.phase === "done" || host.entry.ns === null) continue;
@@ -1574,8 +1581,10 @@ export class StreamSyncWriter {
           }
         }
       } finally {
-        for (const keys of reserved.values())
+        for (const [host, keys] of reserved) {
           for (const key of keys) this.selected.delete(key);
+          this.selectionChanged(host.entry.connector);
+        }
       }
       return { runs, deletesPending };
     });
@@ -1756,9 +1765,28 @@ export class StreamSyncWriter {
       if (outbox.state === "committed" || outbox.state === "noop") continue;
       const key = `${host.entry.runId}|${name}`;
       this.selected.add(key);
+      this.selectionChanged(host.entry.connector);
       keys.push(key);
     }
     return keys;
+  }
+
+  /** Subscribe to every change of a connector's plan inputs. */
+  onPlanInputs(listener: (connector: string) => void): void {
+    this.planInputListeners.add(listener);
+  }
+
+  /**
+   * Call after the new plan input is in memory. A reader keys its cached
+   * answers on the connector's counter, so each change must bump it.
+   */
+  private planInputsChanged(connector: string): void {
+    for (const listener of this.planInputListeners) listener(connector);
+  }
+
+  /** `selected` is planRun's inFlight input, so its changes are plan-input changes. */
+  private selectionChanged(connector: string): void {
+    this.planInputsChanged(connector);
   }
 
   private async publishEntry(
@@ -2112,6 +2140,7 @@ export class StreamSyncWriter {
           `${this.options.seed!.installId}|${entry.connector}|${ns}|${name}`
         ] = "skipped";
       });
+      this.planInputsChanged(entry.connector);
       stream.seedApplies = false;
       stream.seedShardBytes = null;
       if (stream.seedOnly) {

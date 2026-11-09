@@ -27,6 +27,7 @@ export function createWriterOverlaySource(
   return {
     observeDeletes: (observations) => writer.observeDeletes(observations),
     snapshot: (connector) => writer.snapshotOverlay(connector),
+    planInputs: (listener) => writer.onPlanInputs(listener),
     connectors: () => writer.overlayConnectors(),
     acknowledge: (coverage) => writer.acknowledgeOverlay(coverage),
   };

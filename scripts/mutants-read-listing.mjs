@@ -21,6 +21,7 @@ const OVL = "packages/core/src/stream-sync/writer-overlay.ts";
 const SVC = "packages/core/src/stream-sync-read/service.ts";
 const MIR = "packages/core/src/stream-sync-read/mirror.ts";
 const VST = "packages/core/src/stream-sync-read/view-store.ts";
+const WRT = "packages/core/src/stream-sync/writer.ts";
 const T_API = "packages/core/src/api/stream-sync-read-listing.test.ts";
 const T_RS = "packages/core/src/stream-sync-read/readable-scopes.test.ts";
 const TESTS = [T_API, T_RS];
@@ -58,6 +59,8 @@ const MUTANTS = [
   ["KEY_OMITS_MIRROR_ROW", MIR, "      if (replaced) revised.add(parsed.connector);", '      if (replaced && parsed.kind === "control") revised.add(parsed.connector);', `${WRITES}misses after a stream row (RegistryMirror.observePage)`],
   ["KEY_OMITS_CONTROL", MIR, "      if (replaced) revised.add(parsed.connector);", '      if (replaced && parsed.kind === "stream") revised.add(parsed.connector);', `${WRITES}misses after a control row (RegistryMirror.observePage)`],
   ["KEY_OMITS_FLOOR", MIR, "      if (floorRaised) revised.add(parsed.connector);", "      if (false) revised.add(parsed.connector);", `${WRITES}misses after a deletion floor (RegistryMirror.observePage)`],
+  ["KEY_OMITS_RECORD_DELETE", MIR, "      if (parsed) this.revisions.bump(parsed.connector);", "      if (parsed) void this.revisions;", `${WRITES}misses after a deletion floor (RegistryMirror.recordDelete, importer-driven)`],
+  ["KEY_OMITS_WRITER_INFLIGHT", WRT, "  private selectionChanged(connector: string): void {\n    this.planInputsChanged(connector);\n  }", "  private selectionChanged(connector: string): void {\n    void connector;\n  }", `${WRITES}misses after a writer selection change that alters no other input (publish selection)`],
   ["KEY_OMITS_OVERLAY", SVC, "        snapshots.get(t.connector)?.runs ?? [],", "        [],", `${WRITES}misses after an overlay run (overlay snapshot)`],
   ["PROJECTOR_REFUSAL_NOT_CACHED", SVC, "    this.projectability.set(key, ok);", "    if (ok) this.projectability.set(key, ok);", `${BUILD}a projector refusal is built once across listings with no version change`],
   ["OVERLAY_CONNECTORS_DROP_ALL", SVC, 'this.skipped("overlay connectors", error);', 'this.skipped("overlay connectors", error);\n        this.overlayConnectorsLastGood = [];', `${SURV}keeps the last good overlay connector set when connectors() fails`],
@@ -194,6 +197,6 @@ for (const [name, file, from, to, aimed] of HARNESS) {
   rows.push([name, caught ? "CAUGHT (import error rejected as a kill)" : `HARNESS-BROKEN (${verdict})`]);
   if (!caught) bad += 1;
 }
-execFileSync("git", ["diff", "--exit-code", "--", API, SVC, OVL, MIR, VST], { stdio: "inherit" });
+execFileSync("git", ["diff", "--exit-code", "--", API, SVC, OVL, MIR, VST, WRT], { stdio: "inherit" });
 for (const [n, r] of rows) console.log(`${n.padEnd(36)} ${r}`);
 process.exit(bad === 0 ? 0 : 1);
