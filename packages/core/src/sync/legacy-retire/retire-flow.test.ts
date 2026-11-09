@@ -82,6 +82,16 @@ describe("the delete fence (IMPORT_IGNORES_FENCE, DEVICE_ONLY_RETIRED_EARLY)", (
     expect(lines).toEqual(["e9"]);
   });
 
+  it("import after deleteConnection must not bring the connection's rows back", async () => {
+    const f = await flow({ seed: ["e0", "e1"], local: ["e0", "e1"] });
+    await f.run("pre", ["e0"], true, true);
+    await f.rig.other.deleteConnection(CONNECTOR);
+    await f.importer.run();
+    expect(f.staged.size).toBe(0);
+    await f.rig.publish();
+    expect((await f.rig.registeredHead(STREAM))?.recordCount ?? 0).toBe(0);
+  });
+
   it("crash after the delete tombstones but before eraseLegacy, then import: nothing comes back", async () => {
     // The legacy erase is the last step of a connection delete. A crash before
     // it leaves the legacy rows on the device; the import must not stage them,
