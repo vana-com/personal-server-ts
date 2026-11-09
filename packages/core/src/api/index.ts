@@ -105,6 +105,10 @@ import type {
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
+  refuseLegacyWrite,
+  type LegacyWriteSwitch,
+} from "./legacy-write-gate.js";
+import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
   type LegacyScopeViewPort,
@@ -333,6 +337,11 @@ export interface StreamSyncReadPort {
 }
 
 export interface PersonalServerDataApiDeps {
+  /**
+   * Whether an undeclared legacy write is refused (see
+   * `legacy-write-gate.ts`). Absent = never refuse.
+   */
+  legacyWritesRefused?: LegacyWriteSwitch;
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
   /**
@@ -2195,6 +2204,15 @@ export function redactEnvelopeForGrantee(
 }
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
+export {
+  STREAM_SYNC_CLIENT_HEADER,
+  UPDATE_REQUIRED_CODE,
+  UPDATE_REQUIRED_MESSAGE,
+  UPDATE_REQUIRED_STATUS,
+  declaresStreamSyncClient,
+  refuseLegacyWrite,
+  type LegacyWriteSwitch,
+} from "./legacy-write-gate.js";
 
 /**
  * `/v1/data/:scope/uploads...`: an owner writes one new version of a scope as
@@ -2221,6 +2239,12 @@ async function handleScopeUploadRequest(
   }
   if (request.method !== route.method) return methodNotAllowed();
   await deps.auth.authorizeOwner(request);
+  // An upload is owner-only: no delegated builder writes through it, so there
+  // is no exemption. Aborting only discards staged data and stays allowed.
+  if (route.kind !== "abort") {
+    const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+    if (refusal) return refusal;
+  }
   const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
   if (!scopeResult.ok) return contractErrorResponse(scopeResult);
   const scope = scopeResult.scope;
@@ -2472,6 +2496,11 @@ export async function handlePersonalServerDataRequest(
     if (parts.length === 3 && parts[1] === "imports") {
       if (request.method !== "PUT") return methodNotAllowed();
       await deps.auth.authorizeOwner(request);
+      // Owner-only: a builder has no durable-import route, so a signature
+      // header earns no exemption here. This runs on the normalized path, so
+      // `/imports/<op>/` and repeated slashes land here too.
+      const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+      if (refusal) return refusal;
       const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       const operation = decodePathPart(parts[2]);
@@ -3101,6 +3130,12 @@ export async function handlePersonalServerDataRequest(
           undefined;
       } else {
         await deps.auth.authorizeOwner(request);
+      }
+      // `writeAuth` exists only after the builder's session and write
+      // signature verified, so only a verified builder skips the refusal.
+      if (!writeAuth) {
+        const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+        if (refusal) return refusal;
       }
       // `?supersede=legacy`: once this write commits, delete the scope's
       // older legacy-form versions (see supersedeLegacyVersions). It deletes

@@ -1,11 +1,14 @@
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
-import { Hono, type Context } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
+import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerApiDispatchOptions,
   type PersonalServerReadFulfillmentReporter,
   type StreamSyncReadPort,
+  refuseLegacyWrite,
+  type LegacyWriteSwitch,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -51,6 +54,7 @@ import {
   beginScopeImport,
   finalizeScopeImport,
   putScopeImportChunk,
+  LegacyWriteRefused,
   ScopeImportError,
   type ScopeImportDeps,
   SCOPE_IMPORT_CHUNK_BYTES,
@@ -149,6 +153,8 @@ export interface DataRouteDeps {
    */
   pdppImporter?: PdppImporter;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
+  /** The account's stream-sync switch; true refuses undeclared legacy writes. */
+  legacyWritesRefused?: LegacyWriteSwitch;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
@@ -181,6 +187,33 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     pdppOwnerBearer: deps.pdppOwnerBearer,
   });
 
+  // Early 426 for a clean request, before any body is read. This is only an
+  // optimisation: the core write operations refuse again after real
+  // authorization, and that is what makes the refusal hold. Only plain
+  // `POST /:scope` can be a delegated builder write, so only it defers when a
+  // write signature is present (this layer cannot verify it: it signs the
+  // body); the core exempts it only if the proof verified. Every other route
+  // is owner-only and has no exemption.
+  const refuseLegacy: MiddlewareHandler = async (c, next) => {
+    const refusal = refuseLegacyWrite(c.req.raw, deps.legacyWritesRefused);
+    if (refusal) return refusal;
+    await next();
+  };
+  const refuseLegacyUnlessProofPresent: MiddlewareHandler = async (c, next) => {
+    if (c.req.header(WRITE_SIGNATURE_HEADER) === undefined) {
+      return refuseLegacy(c, next);
+    }
+    await next();
+  };
+  app.post("/:scope", refuseLegacyUnlessProofPresent);
+  app.post("/:scope/imports", refuseLegacy);
+  app.put("/:scope/imports/:id/chunks/:index", refuseLegacy);
+  app.post("/:scope/imports/:id/finalize", refuseLegacy);
+  app.put("/:scope/imports/:operation", refuseLegacy);
+  app.post("/:scope/uploads", refuseLegacy);
+  app.put("/:scope/uploads/:id/batches/:index", refuseLegacy);
+  app.post("/:scope/uploads/:id/commit", refuseLegacy);
+
   const importDeps: ScopeImportDeps = {
     hierarchyOptions: deps.hierarchyOptions,
     indexManager: deps.indexManager,
@@ -189,6 +222,8 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       auth.authorizeOwnerScope({ request, scope }),
     syncManager: deps.syncManager,
     onDataWritten: deps.onDataWritten,
+    refuseLegacyWrite: (request) =>
+      refuseLegacyWrite(request, deps.legacyWritesRefused),
     afterTombstoneVersion: async (scope) => {
       if (!deps.scopeDeletions) return null;
       const verdict = await deps.scopeDeletions.resolve(scope);
@@ -208,6 +243,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         "content-type": "application/json",
       });
     } catch (error) {
+      if (error instanceof LegacyWriteRefused) return error.response;
       if (error instanceof ScopeImportError) {
         return c.body(
           JSON.stringify({ error: error.code, message: error.message }),
@@ -384,6 +420,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       c.req.raw,
       {
         additions: deps.additions,
+        legacyWritesRefused: deps.legacyWritesRefused,
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
         streamSyncRead: deps.streamSyncRead,
