@@ -1,30 +1,43 @@
 /**
- * NO_REMOTE_WRITES: a guard on every route out of the process that the Personal
- * Server stack uses: global `fetch`, `http`/`https` `request`/`get`, and a
- * `ClientRequest` built directly.
+ * NO_REMOTE_WRITES: a guard on the routes out of the process that the Personal
+ * Server stack uses: global `fetch`, `http`/`https` `request`/`get`, and the
+ * agent queue that every `http`/`https` request passes through.
  *
  * Any request that is not a GET, and any request to a host outside the allowed
  * list, throws at once. The guard also records the violation, so a caller that
  * swallows the error still finds it afterwards and aborts the run
- * (`assertNoViolations`).
+ * (`assertNoViolations`). Only `GET` to an allowed host passes.
  *
- * Install it before anything else starts. Only `GET` to an allowed host passes.
- * The host is the one Node connects to (options `hostname`, else `host`, over
- * the URL; a `socketPath` is refused), and the port must be a default port
- * unless the allowed entry names it. A request's own `agent` may name another
- * host or port that Node connects to instead, so the agent's `host`, `hostname`
- * and `port` are checked too.
- * Every `http`/`https` request, including a `ClientRequest` built directly or
- * by a subclass declared before the guard installed, is checked when it is
- * queued on its agent (`Agent.prototype.addRequest`), which Node calls for
- * every request it creates. `fetch` never follows a redirect, so a reply from
- * an allowed host cannot send the request to another one. (`http` and `https`
- * never follow redirects on their own.)
+ * Install it before anything else starts. The host is the one Node connects to
+ * (options `hostname`, else `host`, over the URL; a `socketPath` or a
+ * `createConnection` is refused, as its host is not known). The port must be a
+ * default port unless the allowed entry names it. A request's own `agent` may
+ * name another host or port that Node connects to instead, so the agent's
+ * `host`, `hostname` and `port` are checked too.
  *
- * Known limits: the check is on host names, not the IP addresses they resolve
- * to; an agent's `createConnection` picks the socket and is not inspected; raw
- * `net`/`tls` sockets and HTTP clients that bypass `http`/`https` (for example
- * a direct `undici` dispatcher) are not covered.
+ * What is checked, and where:
+ * - `fetch`: each call, through `globalThis.fetch` as it is when called. Its
+ *   redirects are never followed (the init sets the error mode), so a reply
+ *   from an allowed host cannot send the request to another one.
+ * - `http.request`, `http.get`, `https.request`, `https.get`: the target above.
+ * - Every request queued on an agent (`Agent.prototype.addRequest`): the target
+ *   above and the agent's own host and port. This covers a `ClientRequest` built
+ *   directly, and a subclass declared before install, when the request has an
+ *   agent (`agent: null` and the default agent both queue, unless a
+ *   `createConnection` is given).
+ *
+ * Not checked:
+ * - A `ClientRequest` built directly with `createConnection`: Node opens the
+ *   socket without queuing, so only the `http.request`/`get` wrappers see it.
+ * - An agent's `createConnection` (it picks the socket), and a `createConnection`
+ *   on an agent object whose own `addRequest` does not come from
+ *   `http.Agent.prototype`.
+ * - A `fetch` reference taken before install, which still calls the real `fetch`.
+ *   The dry run never allows this: `run.ts` installs the guard before it loads
+ *   any package module (`run-entry-order.test.ts`).
+ * - A `dispatcher` in a `fetch` init (undici), and raw `net`/`tls` sockets or
+ *   other HTTP clients that bypass `http`/`https`.
+ * - The IP addresses a host name resolves to: only the names are checked.
  */
 
 import http from "node:http";
@@ -109,6 +122,12 @@ function targetOf(input: unknown, options: unknown): Target {
 
 function targetOfOptions(merged: Record<string, unknown>): Target {
   if (merged.socketPath !== undefined) return { host: "(socket)", port: "" };
+  // createConnection makes the socket itself, so no host is connected to that
+  // the guard can read. Refusing it here also covers the queue check: a
+  // request that carries one is refused whether or not it has an agent.
+  if (merged.createConnection !== undefined) {
+    return { host: "(createConnection)", port: "" };
+  }
   const port = merged.port;
   return {
     host: firstHost(merged.hostname, merged.host),
@@ -216,11 +235,13 @@ export function installNetworkGuard(input: {
       });
     }
   }
-  // Every request Node makes is queued on an agent, and the queue call takes
-  // the same options the request was built with. Checking there covers a
-  // `ClientRequest` built directly, one built by a subclass declared before the
-  // guard installed, and an agent that names another host (it is checked as
-  // well). https uses the same method (it inherits it from `http.Agent`).
+  // Every request that has an agent is queued through this method, with the
+  // options it was built with. Checking here covers a `ClientRequest` built
+  // directly, a subclass declared before install, and an agent that names
+  // another host or port (checked as well). https inherits the method from
+  // `http.Agent`. A request with `createConnection` is refused by
+  // `targetOfOptions` here as well (it is shared), and a request without an
+  // agent is not queued at all.
   const agentProto = http.Agent.prototype as unknown as Record<string, unknown>;
   const RealAddRequest = agentProto.addRequest as (
     this: unknown,

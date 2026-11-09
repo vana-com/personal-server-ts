@@ -48,6 +48,7 @@ const F = {
 const T = {
   run: `${dir}/run.test.ts`,
   guard: `${dir}/network-guard.test.ts`,
+  entryOrder: `${dir}/run-entry-order.test.ts`,
   hosts: `${dir}/hosts.test.ts`,
   recheck: `${dir}/recheck.test.ts`,
   changed: `${dir}/run-changed.test.ts`,
@@ -546,6 +547,33 @@ const MUTANTS = [
     ],
     files: [T.guard],
     pattern: "checks the agent's own host and port",
+  },
+  // --- round 6 ---
+  {
+    id: "CREATE_CONNECTION_UNCHECKED",
+    what: "a request that carries createConnection is not refused",
+    edits: [
+      [
+        F.guard,
+        '  if (merged.createConnection !== undefined) {\n    return { host: "(createConnection)", port: "" };\n  }\n',
+        "",
+      ],
+    ],
+    files: [T.guard],
+    pattern: "refuses a request with createConnection",
+  },
+  {
+    id: "GUARD_INSTALLED_AFTER_IMPORTS",
+    what: "a package module loads before the guard installs (it can capture fetch)",
+    edits: [
+      [
+        F.run,
+        'import { randomBytes } from "node:crypto";',
+        'import "./published-heads.js";\nimport { randomBytes } from "node:crypto";',
+      ],
+    ],
+    files: [T.entryOrder],
+    pattern: "refuses a fetch captured at module load",
   },
 ];
 

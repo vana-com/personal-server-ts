@@ -5,6 +5,10 @@
  * record body, title, message text, key, token, owner address or database id.
  * Hashes are cut to 8 hex characters. Everything here is built from the
  * retire report and the ledger's counts; no record value reaches this module.
+ *
+ * This is a dry run: a snapshot on a copy. The real pass re-reads and
+ * re-decides before every delete, so it is never looser than this report, and
+ * this report can only over-predict deletions.
  */
 
 import { createHash } from "node:crypto";

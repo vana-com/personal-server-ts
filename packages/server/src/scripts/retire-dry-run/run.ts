@@ -6,35 +6,25 @@
  * store, the published-head reader, the retire pass) and none of its writers:
  * no `StreamSyncWriter`, no `LegacyImporter`, no sync manager, no connector
  * runs, no `createServer`. See `run.test.ts` for the checks that keep it so.
+ *
+ * Load order: this module imports only Node built-ins, the guard, and pure
+ * helpers. The guard installs before any package module or the SQLite store is
+ * loaded (dynamic `import()` below), so a module that keeps a reference to
+ * `fetch` from its load time gets the guarded one. `run-entry-order.test.ts`
+ * checks that.
  */
 
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import {
-  createRetireHost,
-  retireLegacyFiles,
-  RetireLedger,
-  type RetireReport,
-} from "@opendatalabs/personal-server-ts-core/sync";
-import {
-  createMemoryStreamSyncFiles,
-  streamSyncNetwork,
-} from "@opendatalabs/personal-server-ts-core/stream-sync";
+import type { RetireReport } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import type { openLegacyStore as OpenLegacyStore } from "./legacy-store.js";
 import { assertCopyOnly } from "./copy-only.js";
 import { copyAge, fingerprintTree } from "./fingerprint.js";
 import { pinHosts } from "./hosts.js";
 import { DryRunSetupError } from "./setup-error.js";
-import { openLegacyStore } from "./legacy-store.js";
 import { installNetworkGuard, NetworkGuardError } from "./network-guard.js";
-import {
-  loadPublishedHeads,
-  MIRROR_PATH,
-  parseConfig,
-} from "./published-heads.js";
-import { readHomeState } from "./home-state.js";
-import { recheckReadyFiles } from "./recheck.js";
 import { abortedReport, buildReport, type RedactedReport } from "./report.js";
 
 const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
@@ -110,29 +100,15 @@ export async function runLegacyRetireDryRun(
       "VANA_MASTER_KEY_SIGNATURE is not a 65-byte hex signature.",
     );
   }
-  // The device's own network names its stream-sync home. Flags and the
-  // copy's config only select among the pinned Dev hosts (hosts.ts).
+  // Flags and the copy's config only select among the pinned Dev hosts
+  // (hosts.ts). The config is parsed after the guard is in place (below).
   const raw = await readConfigJson(dataDir);
-  let deviceConfig: ServerConfig;
-  try {
-    deviceConfig = parseConfig(raw);
-  } catch {
-    throw new DryRunSetupError("bad_config", "config.json does not parse");
-  }
   const pinned = pinHosts({
     gatewayUrl: options.gatewayUrl ?? stringOrUndefined(raw.gateway?.url),
     storageUrl:
       options.storageUrl ??
       stringOrUndefined(raw.storage?.config?.vana?.apiUrl),
     testOnlyAllowLoopback: options.testOnlyAllowLoopback === true,
-  });
-  const config = parseConfig({
-    ...raw,
-    gateway: { ...raw.gateway, url: pinned.gatewayUrl },
-    storage: {
-      ...raw.storage,
-      config: { ...raw.storage?.config, vana: { apiUrl: pinned.storageUrl } },
-    },
   });
   const hosts = pinned.hosts;
   log(`Allowed hosts (GET only): ${hosts.gateway}, ${hosts.storage}`);
@@ -143,10 +119,36 @@ export async function runLegacyRetireDryRun(
   // path the person gives can name it, so it cannot be the copy.
   const scratchDir = await mkdtemp(join(tmpRoot, "retire-dry-run-"));
   const guard = installNetworkGuard({ allowedHosts: pinned.allowed });
-  let store: Awaited<ReturnType<typeof openLegacyStore>> | null = null;
+  let store: Awaited<ReturnType<typeof OpenLegacyStore>> | null = null;
   let retire: RetireReport | null = null;
   let report: RedactedReport;
   try {
+    // Loaded only now, with the guard in place (see the header).
+    const { createRetireHost, retireLegacyFiles, RetireLedger } =
+      await import("@opendatalabs/personal-server-ts-core/sync");
+    const { createMemoryStreamSyncFiles, streamSyncNetwork } =
+      await import("@opendatalabs/personal-server-ts-core/stream-sync");
+    const { openLegacyStore } = await import("./legacy-store.js");
+    const { loadPublishedHeads, MIRROR_PATH, parseConfig } =
+      await import("./published-heads.js");
+    const { readHomeState } = await import("./home-state.js");
+    const { recheckReadyFiles } = await import("./recheck.js");
+
+    // The device's own network names its stream-sync home.
+    let deviceConfig: ServerConfig;
+    try {
+      deviceConfig = parseConfig(raw);
+    } catch {
+      throw new DryRunSetupError("bad_config", "config.json does not parse");
+    }
+    const config = parseConfig({
+      ...raw,
+      gateway: { ...raw.gateway, url: pinned.gatewayUrl },
+      storage: {
+        ...raw.storage,
+        config: { ...raw.storage?.config, vana: { apiUrl: pinned.storageUrl } },
+      },
+    });
     store = await openLegacyStore({ rootDir: dataDir, scratchDir });
     const heads = await loadPublishedHeads({
       config,

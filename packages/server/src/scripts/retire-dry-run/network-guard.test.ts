@@ -1,5 +1,5 @@
 import http, { ClientRequest, createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { Socket, type AddressInfo } from "node:net";
 import https from "node:https";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { installNetworkGuard, NetworkGuardError } from "./network-guard.js";
@@ -95,6 +95,34 @@ describe("network guard", () => {
       http.get({ hostname: "gateway.test", socketPath: "/tmp/x.sock" }),
     ).toThrow(NetworkGuardError);
     expect(guard.violations).toHaveLength(6);
+  });
+
+  it("refuses a request with createConnection to an allowed host before any socket opens", () => {
+    guard = installNetworkGuard({ allowedHosts: ["gateway.test"] });
+    let opened = 0;
+    // An idle socket: if the request got past the guard it would never reach
+    // a server, and the count below would show the socket was made.
+    const createConnection = () => {
+      opened += 1;
+      return new Socket();
+    };
+    // No agent: Node calls createConnection itself and never queues the request.
+    expect(() =>
+      http.request({ hostname: "gateway.test", port: 80, createConnection }),
+    ).toThrow(NetworkGuardError);
+    expect(() =>
+      http.get({ hostname: "gateway.test", agent: null, createConnection }),
+    ).toThrow(NetworkGuardError);
+    // With an agent, the request is queued, and the same refusal applies there.
+    expect(() =>
+      http.request({
+        hostname: "gateway.test",
+        agent: http.globalAgent,
+        createConnection,
+      }),
+    ).toThrow(NetworkGuardError);
+    expect(opened).toBe(0);
+    expect(guard.violations).toHaveLength(3);
   });
 
   it("covers a ClientRequest built directly (http, and https through its agent)", async () => {
