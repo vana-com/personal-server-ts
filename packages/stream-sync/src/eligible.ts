@@ -93,7 +93,16 @@ export function eligible(input: EligibilityInput): Eligibility {
           (c) => c.ns === target.ns && c.control.kind === "active",
         ) ?? null)
       : selectConnection(connections);
-  if (selected && target.streams.some((s) => selected.streams[s]?.tombstoned)) {
+  const deletionViews = selected
+    ? [selected]
+    : connections.filter(
+        (c) => target.kind === "logical" || c.ns === target.ns,
+      );
+  if (
+    deletionViews.some((c) =>
+      target.streams.some((s) => c.streams[s]?.tombstoned),
+    )
+  ) {
     return { kind: "unavailable", reason: "deleted" };
   }
   if (

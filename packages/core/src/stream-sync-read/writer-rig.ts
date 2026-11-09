@@ -155,6 +155,7 @@ export interface SeedRows {
 }
 
 export class Rig {
+  readonly restarts: string[] = [];
   readonly gateway = new Gateway();
   readonly blobMap = new Map<string, Uint8Array>();
   readonly files = createMemoryStreamSyncFiles();
@@ -191,6 +192,7 @@ export class Rig {
   private bindOverlay(): void {
     const source = createWriterOverlaySource(this.writer);
     this.overlay = {
+      observeDeletes: (observations) => source.observeDeletes!(observations),
       snapshot: async (connector) => {
         const snapshot = await source.snapshot(connector);
         const hook = this.afterSnapshot;
@@ -235,6 +237,9 @@ export class Rig {
         },
       },
       now: () => T0 + 3_600_000,
+      onRestartFull: (connector) => {
+        this.restarts.push(connector);
+      },
       ...(seed
         ? {
             seed: {

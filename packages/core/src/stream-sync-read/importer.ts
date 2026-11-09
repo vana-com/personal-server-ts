@@ -14,6 +14,7 @@ import {
   canonicalBytes32,
   classifyControl,
   classifyStreamRow,
+  parseScope,
   checkPartBytes,
   decodePart,
   headBlobName,
@@ -133,6 +134,21 @@ export class StreamSyncImporter {
 
   /** Absent, present or tombstoned, by the rule the writer uses. */
   streamRowKind(row: MirrorRow): StreamRow {
+    const parsed = row.scope ? parseScope(row.scope) : null;
+    const imported =
+      parsed?.kind === "stream"
+        ? this.options.views.get({
+            connector: parsed.connector,
+            ns: parsed.ns,
+            stream: parsed.stream,
+          })
+        : null;
+    if (
+      imported?.version === row.version &&
+      imported.head.lastDeleteVersion === row.version &&
+      imported.head.recordCount === 0
+    )
+      return "tombstoned";
     return classifyStreamRow(toControlRead(row), this.options.controlHashes);
   }
 
@@ -195,7 +211,7 @@ export class StreamSyncImporter {
         continue;
       }
       this.issues.delete(connectionId);
-      if (control.kind !== "active") continue;
+      if (control.kind !== "active" && control.kind !== "absent") continue;
       for (const [stream, row] of rows.streams.get(ns) ?? []) {
         const key: ViewKey = { connector, ns, stream };
         const id = issueId(connector, ns, stream);
@@ -217,7 +233,11 @@ export class StreamSyncImporter {
           continue;
         }
         try {
-          await this.importHead(key, row, control.generation);
+          await this.importHead(
+            key,
+            row,
+            control.kind === "active" ? control.generation : null,
+          );
           this.issues.delete(id);
         } catch (error) {
           const problem =
@@ -243,7 +263,7 @@ export class StreamSyncImporter {
   private async importHead(
     key: ViewKey,
     row: MirrorRow,
-    generation: number,
+    generation: number | null,
   ): Promise<void> {
     if (!isUsableViewKey(key)) {
       throw new Problem("invalid_name", "name is not usable as a path");
@@ -266,13 +286,17 @@ export class StreamSyncImporter {
       case "key_mismatch":
         throw new Problem("key_mismatch", "head was written with another key");
       case "unsupported_format":
-        throw new Problem("unsupported_format", "head format is not 1 or 2");
+        throw new Problem("unsupported_format", "unsupported head format");
       default:
         throw new Problem("corrupt", `head ${verified.kind}`);
     }
     const head = verified.head;
     // A head of another generation is not live (§2.4); nothing to import.
-    if (head.generation !== generation) return;
+    const deleted =
+      head.lastDeleteVersion === row.version && head.recordCount === 0;
+    if ((head.lastDeleteVersion ?? 0) > 0)
+      await this.options.mirror.recordDelete(scope, head.lastDeleteVersion!);
+    if (!deleted && head.generation !== generation) return;
     await views.withImport(key, async (tx) => {
       for (const part of head.parts) {
         if (await tx.hasPart(part.hash, part.bytes)) continue;

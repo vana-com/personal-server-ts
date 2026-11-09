@@ -66,6 +66,8 @@ export interface StreamSyncPublishReceipt {
 }
 
 export interface StreamSyncOverlayStream {
+  /** Delete history known when collection began; older entries default to zero. */
+  readonly collectedAt?: number;
   readonly name: string;
   readonly primaryKey: readonly string[];
   /** The writer's head profile: projector key and connector version. */
@@ -168,6 +170,14 @@ export interface StreamSyncImportedCoverage {
 }
 
 export interface StreamSyncOverlaySnapshotSource {
+  /** Persist read-side delete observations before later collection starts. */
+  observeDeletes?(
+    observations: readonly {
+      connector: string;
+      stream: string;
+      version: number;
+    }[],
+  ): Promise<void>;
   /**
    * Pinned snapshot of every overlay run of `connector`. Acquire it BEFORE
    * leasing imported views, once per read, shared by all input streams.

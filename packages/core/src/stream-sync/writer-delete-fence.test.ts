@@ -194,14 +194,11 @@ it("delete retries a CAS lost to a publish (mutant: Superseded swallowed)", asyn
   };
   await r.writer.deleteStreams(CONNECTOR, ["items"]);
   const row = await r.gateway.read(streamScope(CONNECTOR, "", "items"));
-  const hashes = await controlHashes(
-    streamSyncHashes.keccak256,
-    "0000000000000000",
-  );
-  expect(row).toMatchObject({
-    found: true,
-    version: 4,
-    dataHash: hashes.tombstoneData,
+  expect(row).toMatchObject({ found: true, version: 4 });
+  expect(await r.registeredHead()).toMatchObject({
+    format: 3,
+    lastDeleteVersion: 4,
+    recordCount: 0,
   });
 });
 it("seed-only refusal is skipped and next run publishes (mutant: discard whole run)", async () => {

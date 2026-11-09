@@ -185,6 +185,10 @@ interface WriterState {
    * the first tombstone, so a crash resumes the same pins on the next boot.
    */
   deletes?: Record<string, { readonly pins: readonly DeletePin[] }>;
+  streamDeletes?: Record<
+    string,
+    Record<string, { request?: SignedRegistryPost }>
+  >;
   /**
    * Per connector, how many times its checkpoint was invalidated: a control
    * change seen, or a deliberate clear. It only grows and outlives the
@@ -233,6 +237,8 @@ interface HostStream {
   seedShardBytes: number[] | null;
   /** A seed stream added at publish (§2.9), with no run records. */
   seedOnly: boolean;
+  /** No publish receipt is needed for a seed that was terminally skipped. */
+  terminal?: "seed_skipped";
   /** Declared `incremental: false`: every run of it is a full read (§3.0). */
   fullStream: boolean;
   /** The seed is merged into this stream's publish. */
@@ -734,31 +740,103 @@ export class StreamSyncWriter {
     });
   }
 
-  /** Delete stream rows, including absent rows. A CAS loss retries the person's delete. */
+  /** Persist intent before any network write; every pass resumes unfinished streams. */
   deleteStreams(connector: string, streams: readonly string[]): Promise<void> {
     return this.publish(async () => {
-      const { control } = await this.keys();
-      for (const stream of new Set(streams)) {
-        const scope = streamScope(connector, IDENTITYLESS_NS, stream);
-        for (;;) {
+      await this.withState((state) => {
+        const pending = ((state.streamDeletes ??= {})[connector] ??= {});
+        for (const stream of new Set(streams)) pending[stream] ??= {};
+      });
+      await this.finishStreamDeletes(connector);
+    });
+  }
+
+  private async finishStreamDeletes(connector: string): Promise<void> {
+    const { keyCheck } = await this.keys();
+    for (const stream of Object.keys(
+      (await this.readState()).streamDeletes?.[connector] ?? {},
+    )) {
+      const scope = streamScope(connector, IDENTITYLESS_NS, stream);
+      for (let attempt = 0; attempt < CONFLICTS_PER_PASS; attempt += 1) {
+        let request = (await this.readState()).streamDeletes?.[connector]?.[
+          stream
+        ]?.request;
+        if (!request) {
           const { row } = await this.readStreamRow(
             connector,
             IDENTITYLESS_NS,
             stream,
+            true,
           );
           const version = row.found ? row.version + 1 : 1;
-          const request = await this.sign(
+          // A delete head requires no old head, schema, or control-generation lookup.
+          const clear = encodeHead({
+            format: HEAD_FORMAT,
+            connector,
+            ns: IDENTITYLESS_NS,
+            stream,
+            generation: 1,
+            keyCheck,
+            lastDeleteVersion: version,
+            complete: false,
+            observedAt: this.now(),
+            parts: [],
+            primaryKey: ["id"],
+            profile: { key: null, version: "0.0.0" },
+            recordCount: 0,
+          });
+          const digest = await digestHead(this.hashes.keccak256, clear);
+          await this.options.blobs.put(
+            `${scope}/${digest.blobName}`,
+            await this.options.keys.encrypt(scope, clear),
+          );
+          request = await this.sign(
             scope,
-            control.tombstoneData,
-            control.tombstoneMetadata,
+            digest.dataHash,
+            publicationMetadataHash(
+              scope,
+              new Date(this.now()).toISOString(),
+              clear.length,
+            ),
             version,
           );
-          const result = await this.options.registry.post(request);
-          if (result.kind !== "committed") continue;
-          await this.observeDelete(connector, stream, version);
+          await this.withState((state) => {
+            state.streamDeletes![connector]![stream]!.request = request;
+          });
+        }
+        let conflict = false;
+        try {
+          conflict =
+            (await this.options.registry.post(request)).kind === "conflict";
+        } catch (error) {
+          // Ambiguous replies retain the exact signed request for replay after restart.
+          if (!(error instanceof RegistryRefusedError && error.status === 409))
+            throw error;
+          conflict = true;
+        }
+        if (!conflict) {
+          await this.observeDelete(
+            connector,
+            stream,
+            Number(request.expectedVersion),
+          );
+          await this.withState((state) => {
+            delete state.streamDeletes![connector]![stream];
+          });
           break;
         }
+        await this.withState((state) => {
+          delete state.streamDeletes![connector]![stream]!.request;
+        });
+        await new Promise<void>((resolve) =>
+          setTimeout(resolve, Math.min(10 * 2 ** attempt, 1000)),
+        );
+        if (attempt === CONFLICTS_PER_PASS - 1)
+          throw new Error("stream delete pending after version conflicts");
       }
+    }
+    await this.withState((state) => {
+      delete state.streamDeletes?.[connector];
     });
   }
 
@@ -869,11 +947,13 @@ export class StreamSyncWriter {
    */
   private async resumeDeletes(): Promise<PendingDelete[]> {
     const pending: PendingDelete[] = [];
-    for (const connector of Object.keys(
-      (await this.readState()).deletes ?? {},
-    )) {
+    for (const connector of Object.keys({
+      ...(await this.readState()).deletes,
+      ...(await this.readState()).streamDeletes,
+    })) {
       try {
         await this.finishDelete(connector);
+        await this.finishStreamDeletes(connector);
       } catch (error) {
         pending.push({
           connector,
@@ -1084,7 +1164,12 @@ export class StreamSyncWriter {
       host.streams[stream] = this.newStream(nextIndex(host), shape);
       // Every run publishes under the identity-less name (R23), so the scope
       // is known at collection even though `entry.ns` is set at finish.
-      await this.readStreamRow(host.entry.connector, IDENTITYLESS_NS, stream);
+      await this.readStreamRow(
+        host.entry.connector,
+        IDENTITYLESS_NS,
+        stream,
+        true,
+      );
       host.entry = {
         ...host.entry,
         streams: { ...host.entry.streams, [stream]: { state: "planned" } },
@@ -1895,26 +1980,56 @@ export class StreamSyncWriter {
   }
 
   /** Observe delete history independently of whether this head can be a merge base. */
-  private async readStreamRow(connector: string, ns: string, stream: string) {
+  private async readStreamRow(
+    connector: string,
+    ns: string,
+    stream: string,
+    bestEffort = false,
+  ) {
     const { keyCheck, control } = await this.keys();
     const scope = streamScope(connector, ns, stream);
     const row = await this.options.registry.read(scope);
-    const rowKind = classifyStreamRow(row, control);
-    const head =
-      rowKind === "present" && row.found
-        ? await this.loadHead(scope, row.dataHash, {
-            connector,
-            ns,
-            stream,
-            keyCheck,
-          })
-        : null;
+    let rowKind = classifyStreamRow(row, control);
+    let head: Head | null = null;
+    if (rowKind === "present" && row.found) {
+      try {
+        head = await this.loadHead(scope, row.dataHash, {
+          connector,
+          ns,
+          stream,
+          keyCheck,
+        });
+      } catch (error) {
+        if (!bestEffort) throw error;
+      }
+    }
+    if (
+      row.found &&
+      head &&
+      head.lastDeleteVersion === row.version &&
+      head.recordCount === 0
+    )
+      rowKind = "tombstoned";
+    // Pre-fence heads have no delete history. Deletes use format 3 heads so an
+    // older writer refuses the base instead of overwriting a headless tombstone.
     const lastDeleteVersion =
       rowKind === "tombstoned" && row.found
         ? row.version
         : (head?.lastDeleteVersion ?? 0);
     await this.observeDelete(connector, stream, lastDeleteVersion);
     return { row, rowKind, head, lastDeleteVersion };
+  }
+
+  /** Called after the read mirror durably observes delete history, before collection can start. */
+  async observeDeletes(
+    observations: readonly {
+      connector: string;
+      stream: string;
+      version: number;
+    }[],
+  ): Promise<void> {
+    for (const row of observations)
+      await this.observeDelete(row.connector, row.stream, row.version);
   }
 
   private async observeDelete(
@@ -1960,6 +2075,7 @@ export class StreamSyncWriter {
       stream.seedApplies = false;
       stream.seedShardBytes = null;
       if (stream.seedOnly) {
+        stream.terminal = "seed_skipped";
         // No live contribution remains, and the registry row must stay untouched.
         this.setStream(host, name, {
           state: "noop",
@@ -2398,6 +2514,7 @@ export class StreamSyncWriter {
    * Never treat a missing pre-upgrade receipt as proof of read coverage.
    */
   private isCovered(host: HostEntry, name: string): boolean {
+    if (host.streams[name]?.terminal === "seed_skipped") return true;
     const receipt = host.streams[name]?.receipt;
     if (
       !receipt ||
@@ -2527,6 +2644,7 @@ export class StreamSyncWriter {
             throw new Error("ready stream has no intake byte counts");
           const descriptor = {
             name,
+            collectedAt: host.collectedAt?.[name] ?? 0,
             primaryKey: Object.freeze([...stream.primaryKey]),
             profile: Object.freeze({ ...stream.profile }),
             complete:
