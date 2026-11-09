@@ -1,22 +1,31 @@
-#!/usr/bin/env node
 /**
  * Mutant runner for the legacy-retire dry run.
  *
  * Each mutant is a small source edit that breaks one guarantee of the tool.
- * The runner applies it, runs the focused tests that guard that guarantee, and
- * records RED (the tests fail: the guarantee is tested) or SURVIVED (they pass:
- * the test is too weak). The source is always restored from the text read
- * before the edit, also on Ctrl-C. Exit code 1 if any mutant survived or its
- * edit no longer matches the source.
+ * The runner applies it and runs the focused tests that guard that guarantee.
+ * Before any mutant runs, the unmutated baseline of every file set is run once;
+ * a red baseline aborts the run (exit 2).
+ *
+ * Each mutant ends in one of four results:
+ *   RED       the aimed test (its name matches `pattern`) fails: killed.
+ *   SURVIVED  the tests pass: the test is too weak.
+ *   MISS      tests fail, but none of them is the aimed test: not a kill.
+ *   ERROR     the run did not load or ran no tests (for example a native
+ *             module that did not self-register, or a file that did not
+ *             load): not a kill.
+ * Only RED counts as a kill. The source is restored from the text read before
+ * the edit, also on SIGINT/SIGTERM. Exit 1 if any mutant is not RED.
  *
  *   node packages/server/mutants/retire-dry-run/run-mutants.mjs            # all
  *   node packages/server/mutants/retire-dry-run/run-mutants.mjs --only M2a,P2.4
  *   node packages/server/mutants/retire-dry-run/run-mutants.mjs --check    # edits apply?
+ *   node packages/server/mutants/retire-dry-run/run-mutants.mjs --self-test # classifier
  *
- * Run from anywhere; it works from the repository root. Foreground only.
+ * Run from anywhere; it works from the repository root. Use Node 22 (the
+ * repository's pinned version; better-sqlite3 is built for it).
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +42,7 @@ const F = {
   hosts: `${dir}/hosts.ts`,
   home: `${dir}/home-state.ts`,
   recheck: `${dir}/recheck.ts`,
+  retire: "packages/core/src/sync/legacy-retire/retire.ts",
   cli: "packages/server/src/scripts/legacy-retire-dry-run.ts",
 };
 const T = {
@@ -210,19 +220,9 @@ const MUTANTS = [
     files: [T.run],
     pattern: "exact pair|already sits at",
   },
-  {
-    id: "P2.3a",
-    what: "URL host wins over options.hostname",
-    edits: [
-      [
-        F.guard,
-        "const merged = { ...base, ...given };",
-        "const merged = { ...given, ...base };",
-      ],
-    ],
-    files: [T.guard],
-    pattern: "checks the host Node connects to",
-  },
+  // P2.3a (the URL host wins over options.hostname) is retired: the check at
+  // the agent queue refuses the same host, so the mutant changes nothing
+  // observable (the guard has two layers; see the PR body).
   {
     id: "P2.3b",
     what: "port not checked",
@@ -451,9 +451,9 @@ const MUTANTS = [
     what: "an unreadable file counts as unchanged",
     edits: [
       [
-        F.recheck,
-        "holds = false; // unreadable is not a match",
-        "holds = true;",
+        F.retire,
+        "    return contentHash(envelope.data) === fileHash;\n  } catch {\n    return false;",
+        "    return contentHash(envelope.data) === fileHash;\n  } catch {\n    return true;",
       ],
     ],
     files: [T.recheck],
@@ -463,7 +463,11 @@ const MUTANTS = [
     id: "R4-nohash-holds",
     what: "a readback with no recorded hash counts as unchanged",
     edits: [
-      [F.recheck, "let holds = false;", "let holds = readHash === undefined;"],
+      [
+        F.retire,
+        "if (fileHash === undefined) return false;",
+        "if (fileHash === undefined) return true;",
+      ],
     ],
     files: [T.recheck],
     pattern: "recorded no hash",
@@ -483,46 +487,236 @@ const MUTANTS = [
   },
   {
     id: "R4-clientrequest",
-    what: "a ClientRequest built directly is not checked",
+    what: "a ClientRequest built directly (or a subclass) is not checked",
     edits: [
-      [
-        F.guard,
-        "check(methodOf(args[0], args[1]), targetOf(args[0], args[1]));\n        return Reflect.construct",
-        "return Reflect.construct",
-      ],
+      [F.guard, 'check(request.method ?? "GET", target);', "void target;"],
     ],
     files: [T.guard, T.run],
     pattern: "ClientRequest",
   },
   {
     id: "R4-clientrequest-restore",
-    what: "the original ClientRequest is not put back",
+    what: "the original Agent.addRequest is not put back",
     edits: [
       [
         F.guard,
-        "(http as unknown as Record<string, unknown>).ClientRequest =\n      RealClientRequest;",
-        "void RealClientRequest;",
+        "    agentProto.addRequest = RealAddRequest;",
+        "    void RealAddRequest;",
       ],
     ],
     files: [T.guard],
     pattern: "uninstall restores",
   },
+  // --- round 5 ---
+  {
+    id: "R5-fileholds-true",
+    what: "the shared hash check holds every file (retire and dry run)",
+    edits: [
+      [
+        F.retire,
+        "return contentHash(envelope.data) === fileHash;",
+        "return true;",
+      ],
+    ],
+    files: [T.recheck, T.changed],
+    pattern: "reports file_changed|holds a ready file",
+  },
+  {
+    id: "R5-agent-check-off",
+    what: "an agent's own host is not checked",
+    edits: [
+      [
+        F.guard,
+        "for (const target of agentTargets(requested, this)) {",
+        "for (const target of [requested]) {",
+      ],
+    ],
+    files: [T.guard],
+    pattern: "checks the agent's own host and port",
+  },
+  {
+    id: "R5-agent-port-off",
+    what: "an agent's own port is not checked",
+    edits: [
+      [
+        F.guard,
+        "if (own.port !== undefined) targets.push({ host: request.host, port });",
+        "",
+      ],
+    ],
+    files: [T.guard],
+    pattern: "checks the agent's own host and port",
+  },
 ];
 
+/** Output that means the run did not test the mutant at all. */
+const ENVIRONMENT_MARKERS = [
+  "did not self-register",
+  "ERR_DLOPEN_FAILED",
+  "Failed to load url",
+  "Failed to load",
+  "Failed to resolve import",
+  "Cannot find module",
+  "ERR_MODULE_NOT_FOUND",
+  "SyntaxError",
+  "No test found",
+];
+
+/** Failed test names: verbose reporter lines that start with a cross. */
+function failedTestNames(out) {
+  const names = [];
+  for (const line of out.split("\n")) {
+    const m = /^\s*×\s+(.+?)(?:\s+\d+ms)?\s*$/.exec(line);
+    if (m) names.push(m[1]);
+  }
+  return names;
+}
+
+/**
+ * Classify one vitest run of a mutant (or of a baseline with `pattern` null).
+ * Pure: the self-test feeds it canned output.
+ */
+export function classify({ status, out, pattern }) {
+  const env = ENVIRONMENT_MARKERS.find((m) => out.includes(m));
+  if (env) return { result: "ERROR", why: `environment or load error: ${env}` };
+  if (status === 0) {
+    const passed = /(\d+) passed/.exec(out)?.[1] ?? "0";
+    return { result: `SURVIVED (${passed} passed)`, why: "" };
+  }
+  const failed = failedTestNames(out);
+  if (failed.length === 0) {
+    return { result: `ERROR (exit ${status}, no test failed)`, why: "" };
+  }
+  if (pattern !== null && failed.some((n) => new RegExp(pattern).test(n))) {
+    return { result: `RED (${failed.length} failed)`, why: "" };
+  }
+  return {
+    result: `MISS (${failed.length} failed, none aimed)`,
+    why: failed[0],
+  };
+}
+
+function selfTest() {
+  const fail = (name) => `× packages/x.test.ts > suite > ${name} 12ms`;
+  const cases = [
+    [
+      "aimed test fails",
+      {
+        status: 1,
+        pattern: "refuses a folder",
+        out: `${fail("refuses a folder outside")}\n Tests 1 failed`,
+      },
+      "RED",
+    ],
+    [
+      "other test fails",
+      {
+        status: 1,
+        pattern: "refuses a folder",
+        out: `${fail("accepts a folder")}\n Tests 1 failed`,
+      },
+      "MISS",
+    ],
+    [
+      "module did not self-register",
+      {
+        status: 1,
+        pattern: "refuses a folder",
+        out: `${fail("refuses a folder outside")}\nError: Module did not self-register: x.node`,
+      },
+      "ERROR",
+    ],
+    [
+      "file did not load",
+      {
+        status: 1,
+        pattern: "refuses a folder",
+        out: " FAIL  x.test.ts [ x.test.ts ]\nSyntaxError: Unexpected token",
+      },
+      "ERROR",
+    ],
+    [
+      "no test matched the pattern",
+      { status: 1, pattern: "nothing", out: "No test found in 1 test file" },
+      "ERROR",
+    ],
+    [
+      "all pass",
+      { status: 0, pattern: "refuses a folder", out: " Tests 3 passed (3)" },
+      "SURVIVED",
+    ],
+  ];
+  let bad = 0;
+  for (const [name, input, want] of cases) {
+    const got = classify(input).result.split(" ")[0];
+    const ok = got === want;
+    if (!ok) bad += 1;
+    console.log(`${ok ? "ok  " : "FAIL"} ${name}: ${got} (want ${want})`);
+  }
+  process.exit(bad === 0 ? 0 : 1);
+}
+
 const args = process.argv.slice(2);
+if (args.includes("--self-test")) selfTest();
 const check = args.includes("--check");
 const onlyArg = args.indexOf("--only");
 const only = onlyArg >= 0 ? new Set(args[onlyArg + 1].split(",")) : null;
 
 const originals = new Map();
+let current = null;
 function restore() {
   for (const [file, text] of originals) writeFileSync(join(root, file), text);
   originals.clear();
 }
+process.on("exit", restore);
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
+    current?.kill("SIGTERM");
     restore();
     process.exit(130);
+  });
+}
+
+/** Core tests import `@opendatalabs/personal-server-ts-core` from its dist. */
+function buildCoreIfNeeded(mutant) {
+  const touchesCore = mutant.edits.some(([file]) =>
+    file.startsWith("packages/core/"),
+  );
+  if (!touchesCore) return;
+  const build = spawnSync(
+    "nice",
+    ["-n", "19", "npx", "tsc", "-b", "packages/core/tsconfig.json"],
+    { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+  if (build.status !== 0)
+    throw new Error(`core build failed: ${build.stdout}${build.stderr}`);
+}
+
+function runVitest(files, pattern) {
+  const vitestArgs = [
+    "-n",
+    "19",
+    "npx",
+    "vitest",
+    "run",
+    "--maxWorkers=4",
+    "--reporter=verbose",
+    ...files,
+  ];
+  if (pattern !== null) vitestArgs.push("-t", pattern);
+  return new Promise((resolve) => {
+    const child = spawn("nice", vitestArgs, {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    current = child;
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (out += d));
+    child.on("close", (status) => {
+      current = null;
+      resolve({ status, out });
+    });
   });
 }
 
@@ -541,54 +735,63 @@ function apply(mutant) {
   return null;
 }
 
+const selected = MUTANTS.filter((m) => !only || only.has(m.id));
 const rows = [];
-try {
-  for (const mutant of MUTANTS) {
-    if (only && !only.has(mutant.id)) continue;
-    const problem = apply(mutant);
-    if (problem) {
-      restore();
-      rows.push({ ...mutant, result: `INVALID (${problem})` });
-      continue;
-    }
-    if (check) {
-      restore();
-      rows.push({ ...mutant, result: "applies" });
-      continue;
-    }
-    const run = spawnSync(
-      "nice",
-      [
-        "-n",
-        "19",
-        "npx",
-        "vitest",
-        "run",
-        "--maxWorkers=4",
-        ...mutant.files,
-        "-t",
-        mutant.pattern,
-      ],
-      { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-    );
-    restore();
-    const out = `${run.stdout}${run.stderr}`;
-    const failed = /Tests\s+(\d+) failed/.exec(out)?.[1];
-    const passed = /(\d+) passed/.exec(out)?.[1] ?? "0";
-    rows.push({
-      ...mutant,
-      result:
-        run.status === 0
-          ? `SURVIVED (${passed} passed)`
-          : failed
-            ? `RED (${failed} failed)`
-            : `ERROR (exit ${run.status}, no test result)`,
+let baselineFailed = false;
+if (!check) {
+  // The unmutated baseline of every file set, before any edit.
+  const seen = new Set();
+  for (const mutant of selected) {
+    const key = mutant.files.join(",");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const base = await runVitest(mutant.files, null);
+    const verdict = classify({
+      status: base.status,
+      out: base.out,
+      pattern: null,
     });
-    console.error(`${mutant.id}: ${rows.at(-1).result}`);
+    if (base.status !== 0) {
+      baselineFailed = true;
+      console.error(`BASELINE RED for [${key}]: ${verdict.result}`);
+      console.error(base.out.split("\n").slice(-25).join("\n"));
+    } else {
+      console.error(`baseline ok: [${key}]`);
+    }
   }
-} finally {
-  restore();
+  if (baselineFailed) {
+    console.error("Aborted: the unmutated baseline is not green.");
+    process.exit(2);
+  }
 }
+
+for (const mutant of selected) {
+  const problem = apply(mutant);
+  if (problem) {
+    restore();
+    rows.push({ ...mutant, result: `INVALID (${problem})` });
+    continue;
+  }
+  if (check) {
+    restore();
+    rows.push({ ...mutant, result: "applies" });
+    continue;
+  }
+  buildCoreIfNeeded(mutant);
+  const run = await runVitest(mutant.files, mutant.pattern);
+  restore();
+  buildCoreIfNeeded(mutant);
+  const verdict = classify({
+    status: run.status,
+    out: run.out,
+    pattern: mutant.pattern,
+  });
+  rows.push({ ...mutant, result: verdict.result });
+  console.error(
+    `${mutant.id}: ${verdict.result}${verdict.why ? ` [${verdict.why}]` : ""}`,
+  );
+}
+restore();
 
 console.log("\n| Mutant | Breaks | Result |\n|---|---|---|");
 for (const row of rows)
