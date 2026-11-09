@@ -35,6 +35,13 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - name: Build the SQLite 3.22.0 shell for the local database conformance row
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -sSfL -o sqlite.zip https://www.sqlite.org/2018/sqlite-amalgamation-3220000.zip
+          unzip -q sqlite.zip
+          gcc -O1 -DSQLITE_THREADSAFE=0 sqlite-amalgamation-3220000/shell.c sqlite-amalgamation-3220000/sqlite3.c -lm -ldl -o sqlite3-3.22.0
+          echo "LOCALDB_SQLITE3_CLI=$RUNNER_TEMP/sqlite3-3.22.0" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npm run build
       - run: npm test
