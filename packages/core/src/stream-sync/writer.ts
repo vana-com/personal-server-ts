@@ -474,6 +474,13 @@ export interface StreamSyncWriterOptions {
   ) => void;
   /** Called when a discarded `userConnect` run asks for a fresh full run (§2.4). */
   readonly onRestartFull?: (connector: string) => void;
+  /**
+   * Erases this device's legacy scope files of `connector`. The purge of a
+   * connection delete calls it last, so nothing of the connector stays on the
+   * device once its tombstones landed. Idempotent: a throw leaves the delete
+   * open and the next publish pass runs it again. Default: none.
+   */
+  readonly eraseLegacy?: (connector: string) => Promise<void>;
 }
 
 export { compareConnectorVersions } from "./publish-plan.js";
@@ -1025,8 +1032,8 @@ export class StreamSyncWriter {
    * Remove this device's local copies of the connector's data once its
    * tombstones landed: the runs (in flight or finished) that started under a
    * generation the delete ended, their results, and the connector's checkpoint
-   * and `needsFull` entries. A run that started after a reconnect (a higher
-   * generation than the pin) is kept. A run in flight that is removed is gone:
+   * and `needsFull` entries, then the legacy scope files (`eraseLegacy`). A run
+   * that started after a reconnect (a higher generation than the pin) is kept. A run in flight that is removed is gone:
    * its later calls are refused and nothing of it publishes.
    */
   private async purgeConnector(
@@ -1067,6 +1074,7 @@ export class StreamSyncWriter {
         (entry) => entry.connector !== connector,
       );
     });
+    await this.options.eraseLegacy?.(connector);
   }
 
   /**

@@ -169,6 +169,8 @@ export interface SeedRows {
 
 export class Rig {
   readonly restarts: string[] = [];
+  /** Test hook for the legacy erase a connection delete runs last. */
+  eraseLegacyHook?: (connector: string) => Promise<void>;
   readonly gateway = new Gateway();
   readonly blobMap = new Map<string, Uint8Array>();
   readonly files = createMemoryStreamSyncFiles();
@@ -255,6 +257,9 @@ export class Rig {
         connector === this.connector ? this.declared : [],
       onRestartFull: (connector) => {
         this.restarts.push(connector);
+      },
+      eraseLegacy: async (connector) => {
+        await this.eraseLegacyHook?.(connector);
       },
       ...(seed
         ? {
