@@ -7,6 +7,7 @@ import {
   handleOuraCollectionRequirementsRequest,
   legacyWriteSwitchOf,
   refuseLegacyWrite,
+  type OwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   importOuraBrowserRecords,
@@ -38,8 +39,10 @@ type OuraRouteDeps = Pick<
   | "scopeDeletions"
   | "additions"
   | "derivativeCompute"
-  | "accountStorageMode"
->;
+> & {
+  /** Bound to this server's owner by createApp. */
+  accountStorageMode?: OwnedAccountStorageMode;
+};
 const SCOPES = ["oura.sleep", "oura.readiness", "oura.activity"];
 
 export function ouraRoutes(deps: OuraRouteDeps): Hono {

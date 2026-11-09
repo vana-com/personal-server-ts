@@ -1,7 +1,9 @@
 /**
  * The Lite runtime hands one account storage mode to every consumer: the
- * legacy write gate, the data handler and the MCP engine. The mode is a
- * counting stand-in that reports a switched account, and the requests go
+ * legacy write gate, scope-upload append, Oura, the data handler and the MCP
+ * engine. It binds the mode to its own owner once, so each consumer asks about
+ * that owner and no other. The mode is a real latched mode wrapped in a spy,
+ * bound to this runtime's owner or to another account, and the requests go
  * through the real runtime.
  */
 import { describe, it, expect, vi } from "vitest";
@@ -24,10 +26,11 @@ import type {
   GatewayClient,
   GatewayGrantResponse,
 } from "@opendatalabs/vana-sdk/browser";
-import type {
-  AccountStorageMode,
-  AccountStorageModeValue,
-  StreamSyncReadPort,
+import {
+  createAccountStorageMode,
+  type AccountStorageMode,
+  type AccountStorageModeValue,
+  type StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
 
 const SERVER_ORIGIN = "https://ps-lite.local";
@@ -94,15 +97,32 @@ async function ownerSigned(
   });
 }
 
-async function harness(value: AccountStorageModeValue) {
+const OTHER = "0x2222222222222222222222222222222222222222";
+
+interface Call {
+  owner: string;
+  answer: AccountStorageModeValue;
+}
+
+async function harness(bound: string, latched: boolean) {
   const store = createInMemoryMcpConnectionStore();
   const created = await createMcpConnection(
     { displayName: "Claude" },
     { store, publicOrigin: SERVER_ORIGIN },
   );
   const gateway = gatewayFor(created.granteeAddress);
-  const mode: AccountStorageMode & { read: ReturnType<typeof vi.fn> } = {
-    read: vi.fn(() => value),
+  const calls: Call[] = [];
+  const inner = createAccountStorageMode({
+    owner: bound,
+    source: () => latched,
+  });
+  if (latched) expect(inner.read(bound)).toBe("switched");
+  const mode: AccountStorageMode = {
+    read: (requestOwner) => {
+      const answer = inner.read(requestOwner);
+      calls.push({ owner: requestOwner, answer });
+      return answer;
+    },
   };
   const sink = {
     async write() {},
@@ -139,49 +159,119 @@ async function harness(value: AccountStorageModeValue) {
     },
     { store },
   );
-  return { runtime, mode, token: created.connectionToken };
+  return { runtime, calls, token: created.connectionToken };
 }
 
-describe("Lite consumes one account storage mode", () => {
-  it("the data handler reads it", async () => {
-    const h = await harness("unswitched");
+function expectOnlyThisRuntimesOwnerWasAsked(
+  calls: Call[],
+  answer: AccountStorageModeValue,
+) {
+  expect(calls.length).toBeGreaterThan(0);
+  expect(new Set(calls.map((c) => c.owner))).toEqual(new Set([owner.address]));
+  expect(new Set(calls.map((c) => c.answer))).toEqual(new Set([answer]));
+}
+
+const mcpReadScope = (token: string) =>
+  new Request(`${SERVER_ORIGIN}/mcp/${encodeURIComponent(token)}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "call",
+      method: "tools/call",
+      params: { name: "read_scope", arguments: { scope: SCOPE } },
+    }),
+  });
+
+describe.each([
+  {
+    name: "own latched switched mode",
+    bound: owner.address,
+    answer: "switched",
+    refused: true,
+  },
+  {
+    name: "latched switched mode of another account",
+    bound: OTHER,
+    answer: "unknown",
+    refused: false,
+  },
+] as const)("Lite binds $name to its own owner", (c) => {
+  // DROP_REQUEST_OWNER
+  it("the data handler asks about this owner only", async () => {
+    const h = await harness(c.bound, true);
     await h.runtime.fetch(await ownerSigned("GET", `/v1/data/${SCOPE}`));
-    expect(h.mode.read).toHaveBeenCalled();
+    expectOnlyThisRuntimesOwnerWasAsked(h.calls, c.answer);
   });
 
-  it("the MCP engine reads it", async () => {
-    const h = await harness("unswitched");
-    const res = await h.runtime.fetch(
-      new Request(`${SERVER_ORIGIN}/mcp/${encodeURIComponent(h.token)}`, {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/event-stream",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "call",
-          method: "tools/call",
-          params: { name: "read_scope", arguments: { scope: SCOPE } },
-        }),
-      }),
-    );
+  // MCP_REQUEST_OWNER_DROPPED
+  it("the MCP engine asks about this owner only", async () => {
+    const h = await harness(c.bound, true);
+    const res = await h.runtime.fetch(mcpReadScope(h.token));
     expect(res.status).toBe(200);
-    expect(h.mode.read).toHaveBeenCalled();
+    expectOnlyThisRuntimesOwnerWasAsked(h.calls, c.answer);
   });
 
-  it("the legacy write gate refuses a switched account and lets an unswitched one write", async () => {
-    const switched = await harness("switched");
-    const refused = await switched.runtime.fetch(
+  // DROP_REQUEST_OWNER
+  it("the legacy write gate asks about this owner only", async () => {
+    const h = await harness(c.bound, true);
+    const res = await h.runtime.fetch(
       await ownerSigned("POST", `/v1/data/${SCOPE}`, { records: [] }),
     );
-    expect(refused.status).toBe(426);
-    expect(switched.mode.read).toHaveBeenCalled();
+    expect(res.status === 426).toBe(c.refused);
+    expectOnlyThisRuntimesOwnerWasAsked(h.calls, c.answer);
+  });
 
-    const unswitched = await harness("unswitched");
-    const accepted = await unswitched.runtime.fetch(
+  // DROP_REQUEST_OWNER
+  it("the Oura import asks about this owner only", async () => {
+    const h = await harness(c.bound, true);
+    const res = await h.runtime.fetch(
+      await ownerSigned("POST", "/v1/import/oura-browser", { streams: [] }),
+    );
+    expect(res.status === 426).toBe(c.refused);
+    expectOnlyThisRuntimesOwnerWasAsked(h.calls, c.answer);
+  });
+
+  // LITE_APPEND_OWNER_DROPPED
+  it("scope-upload append asks about this owner only", async () => {
+    const h = await harness(c.bound, true);
+    const path = `/v1/data/${SCOPE}/uploads/u1/batches/0`;
+    const authorization = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: SERVER_ORIGIN,
+      method: "PUT",
+      uri: path,
+      body: new TextEncoder().encode("{}"),
+    });
+    const res = await h.runtime.appendScopeUpload!(
+      new Request(`${SERVER_ORIGIN}${path}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: authorization,
+        },
+        body: "{}",
+      }),
+      // A refused append never reads the batch. An unknown mode lets it
+      // through, and the placeholder batch then fails: only the gate's
+      // question is under test here.
+      {} as never,
+    ).catch(() => undefined);
+    if (c.refused) expect(res?.status).toBe(426);
+    expectOnlyThisRuntimesOwnerWasAsked(h.calls, c.answer);
+  });
+});
+
+describe("Lite with an unswitched account", () => {
+  it("lets legacy writes through and never refuses them", async () => {
+    const h = await harness(owner.address, false);
+    const res = await h.runtime.fetch(
       await ownerSigned("POST", `/v1/data/${SCOPE}`, { records: [] }),
     );
-    expect(accepted.status).not.toBe(426);
+    expect(res.status).not.toBe(426);
+    expectOnlyThisRuntimesOwnerWasAsked(h.calls, "unswitched");
   });
 });

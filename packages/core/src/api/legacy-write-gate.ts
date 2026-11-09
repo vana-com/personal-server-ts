@@ -18,6 +18,7 @@
  */
 
 import {
+  accountStorageModeFor,
   createAccountStorageMode,
   legacyWriteSwitchOf,
 } from "./account-storage-mode.js";
@@ -49,7 +50,12 @@ export type LegacyWriteSwitch = () => boolean;
 export function latchLegacyWriteSwitch(
   source: LegacyWriteSwitch,
 ): LegacyWriteSwitch {
-  return legacyWriteSwitchOf(createAccountStorageMode({ source }));
+  // The latch has one holder and no second account to confuse it with: bind
+  // the mode to a private owner and ask it about that same owner.
+  const owner = "legacy-write-latch";
+  return legacyWriteSwitchOf(
+    accountStorageModeFor(createAccountStorageMode({ owner, source }), owner),
+  );
 }
 
 /**

@@ -10,7 +10,12 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import { STREAM_SYNC_CLIENT_HEADER } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  createAccountStorageMode,
+  STREAM_SYNC_CLIENT_HEADER,
+  type AccountStorageMode,
+  type AccountStorageModeValue,
+} from "@opendatalabs/personal-server-ts-core/api";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { createApp } from "./app.js";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -146,6 +151,87 @@ describe("createApp legacy-write refusal", () => {
     });
     expect((await post(app)).status).toBe(426);
     expect(reads.length).toBeGreaterThan(0);
+    expect(new Set(reads)).toEqual(new Set([owner]));
     expect(index.countByScope("github.events")).toBe(0);
+  });
+
+  describe.each([
+    { name: "own mode", bound: owner, expected: "switched", refused: true },
+    {
+      name: "mode of another account",
+      bound: "0x2222222222222222222222222222222222222222",
+      expected: "unknown",
+      refused: false,
+    },
+  ] as const)("a latched switched $name in this server", (c) => {
+    const calls: Array<{ owner: string; answer: AccountStorageModeValue }> = [];
+
+    function makeSpiedApp() {
+      calls.length = 0;
+      const inner = createAccountStorageMode({
+        owner: c.bound,
+        source: () => true,
+      });
+      expect(inner.read(c.bound)).toBe("switched");
+      const spy: AccountStorageMode = {
+        read: (requestOwner) => {
+          const answer = inner.read(requestOwner);
+          calls.push({ owner: requestOwner, answer });
+          return answer;
+        },
+      };
+      return createApp({
+        logger: pino({ level: "silent" }),
+        version: "0.0.1",
+        startedAt: new Date(),
+        indexManager: index,
+        hierarchyOptions: { dataDir: join(dir, "data") },
+        serverOrigin: "http://localhost:8080",
+        serverOwner: owner,
+        gateway: {} as GatewayClient,
+        accessLogWriter: { write: async () => undefined },
+        devToken: token,
+        config: ServerConfigSchema.parse({ streamSync: {} }),
+        accountStorageMode: spy,
+      });
+    }
+
+    function expectOnlyThisServersOwnerWasAsked() {
+      expect(calls.length).toBeGreaterThan(0);
+      expect(new Set(calls.map((x) => x.owner))).toEqual(new Set([owner]));
+      expect(new Set(calls.map((x) => x.answer))).toEqual(
+        new Set([c.expected]),
+      );
+    }
+
+    // DROP_REQUEST_OWNER
+    it("answers the legacy data write for this server's owner only", async () => {
+      const response = await post(makeSpiedApp());
+      expect(response.status === 426).toBe(c.refused);
+      expectOnlyThisServersOwnerWasAsked();
+    });
+
+    // DROP_REQUEST_OWNER
+    it("answers the Oura browser import for this server's owner only", async () => {
+      const response = await makeSpiedApp().request("/v1/import/oura-browser", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ streams: [] }),
+      });
+      expect(response.status === 426).toBe(c.refused);
+      expectOnlyThisServersOwnerWasAsked();
+    });
+
+    // DROP_REQUEST_OWNER
+    it("answers a read's selector for this server's owner only", async () => {
+      const response = await makeSpiedApp().request("/v1/data/github.events", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      expect(response.status).not.toBe(426);
+      expectOnlyThisServersOwnerWasAsked();
+    });
   });
 });

@@ -26,9 +26,12 @@ import type {
   GatewayClient,
   GatewayGrantResponse,
 } from "@opendatalabs/vana-sdk/node";
-import type {
-  AccountStorageMode,
-  StreamSyncReadPort,
+import {
+  accountStorageModeFor,
+  createAccountStorageMode,
+  type AccountStorageMode,
+  type AccountStorageModeValue,
+  type StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createApp } from "../app.js";
@@ -103,154 +106,202 @@ const readScope = JSON.stringify({
   params: { name: "read_scope", arguments: { scope: SCOPE } },
 });
 
-describe("the MCP engines share the host's account storage mode", () => {
-  let dataDir: string;
-  let mode: AccountStorageMode & { read: ReturnType<typeof vi.fn> };
-  let store: McpConnectionStore;
+/** What the mode was asked and what it answered, across every call. */
+interface ModeSpy extends AccountStorageMode {
+  calls: Array<{ owner: string; answer: AccountStorageModeValue }>;
+}
 
-  beforeEach(async () => {
-    dataDir = await mkdtemp(join(tmpdir(), "mcp-account-mode-"));
-    mode = { read: vi.fn(() => "unswitched" as const) };
-    store = createInMemoryMcpConnectionStore();
-  });
-
-  afterEach(async () => {
-    await rm(dataDir, { recursive: true, force: true });
-  });
-
-  function routeDeps(gateway: GatewayClient): McpRouteDeps {
-    return {
-      logger,
-      serverOrigin: SERVER_ORIGIN,
-      serverOwner: ownerWallet.address,
-      gateway,
-      gatewayConfig,
-      accessLogWriter: { write: vi.fn(async () => undefined) },
-      connectionStore: store,
-      indexManager: createIndexManager(initializeDatabase(":memory:")),
-      hierarchyOptions: { dataDir },
-      streamSyncRead: emptyReader,
-      accountStorageMode: mode,
-    } as McpRouteDeps;
-  }
-
-  async function approvedConnection() {
-    const created = await createMcpConnection(
-      { displayName: "Claude" },
-      { store, publicOrigin: SERVER_ORIGIN },
-    );
-    await approveMcpConnection(
-      {
-        connectionId: created.connectionId,
-        grants: [{ grantId: GRANT_ID, scopes: [SCOPE] }],
-      },
-      { store },
-    );
-    return created;
-  }
-
-  const headers = {
-    Accept: "application/json, text/event-stream",
-    "Content-Type": "application/json",
+function spyOn(inner: AccountStorageMode): ModeSpy {
+  const calls: ModeSpy["calls"] = [];
+  return {
+    calls,
+    read(requestOwner) {
+      const answer = inner.read(requestOwner);
+      calls.push({ owner: requestOwner, answer });
+      return answer;
+    },
   };
+}
 
-  it("the connection path reads it", async () => {
-    const created = await approvedConnection();
-    const app = new Hono();
-    app.route(
-      "/mcp",
-      mcpStreamableHttpRoutes(routeDeps(gatewayFor(created.granteeAddress))),
-    );
-    const res = await app.request(
-      `/mcp/${encodeURIComponent(created.connectionToken)}`,
-      { method: "POST", headers, body: readScope },
-    );
-    expect(res.status).toBe(200);
-    expect(mode.read).toHaveBeenCalled();
-  });
+/** A mode bound to `owner` that has already latched switched. */
+function latchedSwitchedFor(owner: string): AccountStorageMode {
+  const mode = createAccountStorageMode({ owner, source: () => true });
+  expect(mode.read(owner)).toBe("switched");
+  return mode;
+}
 
-  it("TEE dispatch reads it", async () => {
-    const created = await approvedConnection();
-    const connection = await store.getById(created.connectionId);
-    const res = await executeMcpConnectionRequest(
-      new Request("https://worker.local/mcp", {
-        method: "POST",
-        headers,
-        body: readScope,
-      }),
-      connection!,
-      routeDeps(gatewayFor(created.granteeAddress)),
-    );
-    expect(res.status).toBe(200);
-    expect(mode.read).toHaveBeenCalled();
-  });
+describe.each([
+  { name: "own mode", bound: ownerWallet.address, expected: "switched" },
+  {
+    name: "mode of another account",
+    bound: appWallet.address,
+    expected: "unknown",
+  },
+] as const)(
+  "the MCP engines share the host's account storage mode ($name)",
+  ({ bound, expected }) => {
+    let dataDir: string;
+    let mode: ModeSpy;
+    let store: McpConnectionStore;
 
-  it("the mounted app hands its mode to the MCP engine", async () => {
-    const created = await approvedConnection();
-    const app = createApp({
-      logger,
-      version: "0.0.1",
-      startedAt: new Date(),
-      indexManager: createIndexManager(initializeDatabase(":memory:")),
-      hierarchyOptions: { dataDir },
-      serverOrigin: SERVER_ORIGIN,
-      serverOwner: ownerWallet.address,
-      gateway: gatewayFor(created.granteeAddress),
-      gatewayConfig,
-      accessLogWriter: { write: vi.fn(async () => undefined) },
-      mcpConnectionStore: store,
-      streamSyncRead: emptyReader,
-      accountStorageMode: mode,
-      config: ServerConfigSchema.parse({}),
+    /** Every engine asked about this server's owner, and got the account's answer. */
+    function expectAskedAboutThisServerOnly(): void {
+      expect(mode.calls.length).toBeGreaterThan(0);
+      expect(new Set(mode.calls.map((c) => c.owner))).toEqual(
+        new Set([ownerWallet.address]),
+      );
+      expect(new Set(mode.calls.map((c) => c.answer))).toEqual(
+        new Set([expected]),
+      );
+    }
+
+    beforeEach(async () => {
+      dataDir = await mkdtemp(join(tmpdir(), "mcp-account-mode-"));
+      mode = spyOn(latchedSwitchedFor(bound));
+      store = createInMemoryMcpConnectionStore();
     });
-    const res = await app.request(
-      `/mcp/${encodeURIComponent(created.connectionToken)}`,
-      { method: "POST", headers, body: readScope },
-    );
-    expect(res.status).toBe(200);
-    expect(mode.read).toHaveBeenCalled();
-  });
 
-  for (const paid of [false, true]) {
-    it(`a ${paid ? "paid" : "free"} self-signing session reads it`, async () => {
+    afterEach(async () => {
+      await rm(dataDir, { recursive: true, force: true });
+    });
+
+    function routeDeps(gateway: GatewayClient): McpRouteDeps {
+      return {
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+        accessLogWriter: { write: vi.fn(async () => undefined) },
+        connectionStore: store,
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir },
+        streamSyncRead: emptyReader,
+        accountStorageMode: accountStorageModeFor(mode, ownerWallet.address),
+      } as McpRouteDeps;
+    }
+
+    async function approvedConnection() {
+      const created = await createMcpConnection(
+        { displayName: "Claude" },
+        { store, publicOrigin: SERVER_ORIGIN },
+      );
+      await approveMcpConnection(
+        {
+          connectionId: created.connectionId,
+          grants: [{ grantId: GRANT_ID, scopes: [SCOPE] }],
+        },
+        { store },
+      );
+      return created;
+    }
+
+    const headers = {
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+    };
+
+    it("the connection path reads it", async () => {
+      const created = await approvedConnection();
       const app = new Hono();
       app.route(
         "/mcp",
-        mcpStreamableHttpRoutes({
-          ...routeDeps(gatewayFor(appWallet.address)),
-          ...(paid
-            ? {
-                paymentEnabled: true,
-                serverAddress: ownerWallet.address,
-                serverSigner: {
-                  signGrantRegistration: vi.fn(),
-                  signRecordDataAccess: vi.fn(),
-                },
-              }
-            : {}),
-        } as McpRouteDeps),
+        mcpStreamableHttpRoutes(routeDeps(gatewayFor(created.granteeAddress))),
       );
-      const minted = (await (
-        await app.request("/mcp/session", {
+      const res = await app.request(
+        `/mcp/${encodeURIComponent(created.connectionToken)}`,
+        { method: "POST", headers, body: readScope },
+      );
+      expect(res.status).toBe(200);
+      expectAskedAboutThisServerOnly();
+    });
+
+    it("TEE dispatch reads it", async () => {
+      const created = await approvedConnection();
+      const connection = await store.getById(created.connectionId);
+      const res = await executeMcpConnectionRequest(
+        new Request("https://worker.local/mcp", {
+          method: "POST",
+          headers,
+          body: readScope,
+        }),
+        connection!,
+        routeDeps(gatewayFor(created.granteeAddress)),
+      );
+      expect(res.status).toBe(200);
+      expectAskedAboutThisServerOnly();
+    });
+
+    it("the mounted app hands its mode to the MCP engine", async () => {
+      const created = await approvedConnection();
+      const app = createApp({
+        logger,
+        version: "0.0.1",
+        startedAt: new Date(),
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir },
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway: gatewayFor(created.granteeAddress),
+        gatewayConfig,
+        accessLogWriter: { write: vi.fn(async () => undefined) },
+        mcpConnectionStore: store,
+        streamSyncRead: emptyReader,
+        accountStorageMode: mode,
+        config: ServerConfigSchema.parse({}),
+      });
+      const res = await app.request(
+        `/mcp/${encodeURIComponent(created.connectionToken)}`,
+        { method: "POST", headers, body: readScope },
+      );
+      expect(res.status).toBe(200);
+      expectAskedAboutThisServerOnly();
+    });
+
+    for (const paid of [false, true]) {
+      it(`a ${paid ? "paid" : "free"} self-signing session reads it`, async () => {
+        const app = new Hono();
+        app.route(
+          "/mcp",
+          mcpStreamableHttpRoutes({
+            ...routeDeps(gatewayFor(appWallet.address)),
+            ...(paid
+              ? {
+                  paymentEnabled: true,
+                  serverAddress: ownerWallet.address,
+                  serverSigner: {
+                    signGrantRegistration: vi.fn(),
+                    signRecordDataAccess: vi.fn(),
+                  },
+                }
+              : {}),
+          } as McpRouteDeps),
+        );
+        const minted = (await (
+          await app.request("/mcp/session", {
+            method: "POST",
+            headers: {
+              Authorization: await buildWeb3SignedHeader({
+                wallet: appWallet,
+                aud: SERVER_ORIGIN,
+                method: "POST",
+                uri: "/mcp/session",
+                grantId: GRANT_ID,
+              }),
+            },
+          })
+        ).json()) as { access_token: string };
+        expect(minted.access_token).toBeTruthy();
+        await app.request("/mcp", {
           method: "POST",
           headers: {
-            Authorization: await buildWeb3SignedHeader({
-              wallet: appWallet,
-              aud: SERVER_ORIGIN,
-              method: "POST",
-              uri: "/mcp/session",
-              grantId: GRANT_ID,
-            }),
+            ...headers,
+            Authorization: `Bearer ${minted.access_token}`,
           },
-        })
-      ).json()) as { access_token: string };
-      expect(minted.access_token).toBeTruthy();
-      await app.request("/mcp", {
-        method: "POST",
-        headers: { ...headers, Authorization: `Bearer ${minted.access_token}` },
-        body: readScope,
+          body: readScope,
+        });
+        expectAskedAboutThisServerOnly();
       });
-      expect(mode.read).toHaveBeenCalled();
-    });
-  }
-});
+    }
+  },
+);

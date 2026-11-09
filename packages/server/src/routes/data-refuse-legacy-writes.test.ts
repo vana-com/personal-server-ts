@@ -119,6 +119,7 @@ describe("refuse legacy writes after the stream-sync switch", () => {
       // A test stand-in that follows the flag in both directions (the real
       // mode latches once switched).
       accountStorageMode: {
+        owner,
         read: () => (switchedOn ? "switched" : "unswitched"),
       },
     });

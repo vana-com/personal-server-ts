@@ -18,7 +18,10 @@ import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
-import { createAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  accountStorageModeFor,
+  createAccountStorageMode,
+} from "@opendatalabs/personal-server-ts-core/api";
 import {
   createTestWallet,
   buildWeb3SignedHeader,
@@ -718,7 +721,13 @@ describe("POST /v1/data/:scope with a write session after the stream-sync switch
       }),
       accessLogWriter: { write: vi.fn().mockResolvedValue(undefined) },
       writeSessionStore,
-      accountStorageMode: createAccountStorageMode({ source: () => true }),
+      accountStorageMode: accountStorageModeFor(
+        createAccountStorageMode({
+          owner: ownerWallet.address,
+          source: () => true,
+        }),
+        ownerWallet.address,
+      ),
     });
   });
 

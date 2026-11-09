@@ -8,7 +8,7 @@ import {
   type StreamSyncReadPort,
   refuseLegacyWrite,
   legacyWriteSwitchOf,
-  type AccountStorageMode,
+  type OwnedAccountStorageMode,
   type LegacyWriteSwitch,
 } from "@opendatalabs/personal-server-ts-core/api";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -108,7 +108,7 @@ export interface DataRouteDeps {
    * The account's storage mode: the one answer the legacy write gate and the
    * read selector share. A switched account refuses legacy writes.
    */
-  accountStorageMode?: AccountStorageMode;
+  accountStorageMode?: OwnedAccountStorageMode;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /**
    * Write API sessions (POST /v1/write/session). When present, the ingest

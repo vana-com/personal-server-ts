@@ -4,11 +4,13 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import {
+  accountStorageModeFor,
   createAccountStorageMode,
   handlePersonalServerDataRequest,
   legacyWriteSwitchOf,
   selectAccountStorageMode,
   type AccountStorageMode,
+  type OwnedAccountStorageMode,
   type PersonalServerDataApiDeps,
 } from "./index.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
@@ -24,6 +26,17 @@ function source(initial: boolean | "unreachable") {
     return state.value;
   });
   return { state, read };
+}
+
+/** A mode bound to OWNER_A, viewed as the runtime of OWNER_A. */
+function ownedBy(
+  read: () => boolean,
+  owner = OWNER_A,
+): OwnedAccountStorageMode {
+  return accountStorageModeFor(
+    createAccountStorageMode({ owner: OWNER_A, source: read }),
+    owner,
+  );
 }
 
 function dataDeps(
@@ -54,40 +67,40 @@ const post = () =>
 describe("createAccountStorageMode", () => {
   it("reads unswitched while the source says false", () => {
     const { read } = source(false);
-    expect(createAccountStorageMode({ source: read }).read()).toBe(
-      "unswitched",
-    );
+    expect(
+      createAccountStorageMode({ owner: OWNER_A, source: read }).read(OWNER_A),
+    ).toBe("unswitched");
   });
 
   it("reads switched once the source says true, and stays switched", () => {
     const { state, read } = source(true);
-    const mode = createAccountStorageMode({ source: read });
-    expect(mode.read()).toBe("switched");
+    const mode = createAccountStorageMode({ owner: OWNER_A, source: read });
+    expect(mode.read(OWNER_A)).toBe("switched");
     state.value = false;
-    expect(mode.read()).toBe("switched");
+    expect(mode.read(OWNER_A)).toBe("switched");
     state.value = "unreachable";
-    expect(mode.read()).toBe("switched");
+    expect(mode.read(OWNER_A)).toBe("switched");
     // Once latched the source is not consulted again.
     expect(read).toHaveBeenCalledTimes(1);
   });
 
   it("reads unknown, not unswitched, while the source is unreachable and nothing is latched", () => {
     const { state, read } = source("unreachable");
-    const mode = createAccountStorageMode({ source: read });
-    expect(mode.read()).toBe("unknown");
+    const mode = createAccountStorageMode({ owner: OWNER_A, source: read });
+    expect(mode.read(OWNER_A)).toBe("unknown");
     state.value = false;
-    expect(mode.read()).toBe("unswitched");
+    expect(mode.read(OWNER_A)).toBe("unswitched");
     state.value = true;
-    expect(mode.read()).toBe("switched");
+    expect(mode.read(OWNER_A)).toBe("switched");
   });
 
   // LATCH_CROSSES_ACCOUNTS
   it("keeps the latch inside the instance: another account's mode is not switched by it", () => {
     const a = createAccountStorageMode({ owner: OWNER_A, source: () => true });
     const b = createAccountStorageMode({ owner: OWNER_B, source: () => false });
-    expect(a.read()).toBe("switched");
-    expect(b.read()).toBe("unswitched");
-    expect(a.read()).toBe("switched");
+    expect(a.read(OWNER_A)).toBe("switched");
+    expect(b.read(OWNER_B)).toBe("unswitched");
+    expect(a.read(OWNER_A)).toBe("switched");
   });
 
   // LATCH_CROSSES_ACCOUNTS
@@ -105,11 +118,71 @@ describe("createAccountStorageMode", () => {
     expect(mode.read(OWNER_A)).toBe("switched");
   });
 
+  // DROP_REQUEST_OWNER
+  it("answers unknown, never the latch, when the owner is empty or missing", () => {
+    const mode = createAccountStorageMode({
+      owner: OWNER_A,
+      source: () => true,
+    });
+    expect(mode.read(OWNER_A)).toBe("switched");
+    expect(mode.read("")).toBe("unknown");
+    expect(mode.read(undefined as unknown as string)).toBe("unknown");
+    // A mode bound to no owner answers nobody.
+    const unbound = createAccountStorageMode({ owner: "", source: () => true });
+    expect(unbound.read("")).toBe("unknown");
+    expect(unbound.read(OWNER_A)).toBe("unknown");
+  });
+
   it("does not consult the source for an owner it is not bound to", () => {
     const { read } = source(true);
     const mode = createAccountStorageMode({ owner: OWNER_A, source: read });
     expect(mode.read(OWNER_B)).toBe("unknown");
+    expect(mode.read("")).toBe("unknown");
     expect(read).not.toHaveBeenCalled();
+  });
+});
+
+describe("accountStorageModeFor", () => {
+  // DROP_REQUEST_OWNER
+  it("asks the mode about the owner it was bound to, every time", () => {
+    const asked: string[] = [];
+    const mode: AccountStorageMode = {
+      read: (requestOwner) => {
+        asked.push(requestOwner);
+        return "unswitched";
+      },
+    };
+    const view = accountStorageModeFor(mode, OWNER_B);
+    view.read();
+    view.read();
+    expect(asked).toEqual([OWNER_B, OWNER_B]);
+    expect(view.owner).toBe(OWNER_B);
+  });
+
+  // DROP_REQUEST_OWNER
+  it("binds a runtime with no owner to the empty owner, which is unknown", () => {
+    const asked: string[] = [];
+    const view = accountStorageModeFor(
+      {
+        read: (requestOwner) => {
+          asked.push(requestOwner);
+          return "switched";
+        },
+      },
+      undefined,
+    );
+    view.read();
+    expect(asked).toEqual([""]);
+  });
+
+  // LATCH_CROSSES_ACCOUNTS
+  it("answers unknown to a runtime of another owner, though the mode is latched switched", () => {
+    const mode = createAccountStorageMode({
+      owner: OWNER_A,
+      source: () => true,
+    });
+    expect(accountStorageModeFor(mode, OWNER_A).read()).toBe("switched");
+    expect(accountStorageModeFor(mode, OWNER_B).read()).toBe("unknown");
   });
 });
 
@@ -120,24 +193,22 @@ describe("selectAccountStorageMode", () => {
 
   // UNSWITCHED_CHANGED
   it("selects legacy for an unswitched account", () => {
-    const mode = createAccountStorageMode({ source: () => false });
-    expect(selectAccountStorageMode({ accountStorageMode: mode })).toEqual({
-      kind: "legacy",
-    });
+    expect(
+      selectAccountStorageMode({ accountStorageMode: ownedBy(() => false) }),
+    ).toEqual({ kind: "legacy" });
   });
 
   it("selects streams for a switched account", () => {
-    const mode = createAccountStorageMode({ source: () => true });
-    expect(selectAccountStorageMode({ accountStorageMode: mode })).toEqual({
-      kind: "streams",
-    });
+    expect(
+      selectAccountStorageMode({ accountStorageMode: ownedBy(() => true) }),
+    ).toEqual({ kind: "streams" });
   });
 
   // UNKNOWN_READS_LEGACY
   it("refuses with a retryable 503 when the mode is unknown and nothing is latched, never legacy", async () => {
     const { read } = source("unreachable");
     const selection = selectAccountStorageMode({
-      accountStorageMode: createAccountStorageMode({ source: read }),
+      accountStorageMode: ownedBy(read),
     });
     expect(selection.kind).toBe("refuse");
     if (selection.kind !== "refuse") throw new Error("unreachable");
@@ -150,30 +221,26 @@ describe("selectAccountStorageMode", () => {
   });
 
   // UNKNOWN_READS_LEGACY
-  it("refuses a foreign owner instead of answering from this instance's latch", () => {
-    const mode = createAccountStorageMode({
+  it("refuses a runtime of another owner instead of answering from this instance's latch", () => {
+    const latched = createAccountStorageMode({
       owner: OWNER_A,
-      source: () => false,
+      source: () => true,
     });
+    expect(latched.read(OWNER_A)).toBe("switched");
+    const selection = selectAccountStorageMode({
+      accountStorageMode: accountStorageModeFor(latched, OWNER_B),
+    });
+    expect(selection.kind).toBe("refuse");
     expect(
       selectAccountStorageMode({
-        accountStorageMode: mode,
-        serverOwner: OWNER_B,
+        accountStorageMode: accountStorageModeFor(latched, OWNER_A),
       }).kind,
-    ).toBe("refuse");
-    expect(
-      selectAccountStorageMode({
-        accountStorageMode: mode,
-        serverOwner: OWNER_A,
-      }).kind,
-    ).toBe("legacy");
+    ).toBe("streams");
   });
 
   it("uses the latch when the source later becomes unreachable", () => {
     const { state, read } = source(true);
-    const deps = {
-      accountStorageMode: createAccountStorageMode({ source: read }),
-    };
+    const deps = { accountStorageMode: ownedBy(read) };
     expect(selectAccountStorageMode(deps).kind).toBe("streams");
     state.value = "unreachable";
     expect(selectAccountStorageMode(deps).kind).toBe("streams");
@@ -183,12 +250,12 @@ describe("selectAccountStorageMode", () => {
   it("does not take a wired stream reader as the mode", () => {
     const reader = { resolve: vi.fn() };
     const unswitched = selectAccountStorageMode({
-      accountStorageMode: createAccountStorageMode({ source: () => false }),
+      accountStorageMode: ownedBy(() => false),
       streamSyncRead: reader,
     } as never);
     expect(unswitched.kind).toBe("legacy");
     const switchedWithoutReader = selectAccountStorageMode({
-      accountStorageMode: createAccountStorageMode({ source: () => true }),
+      accountStorageMode: ownedBy(() => true),
     });
     expect(switchedWithoutReader.kind).toBe("streams");
     const noModeWithReader = selectAccountStorageMode({
@@ -203,7 +270,7 @@ describe("the write gate and the read selector share one answer", () => {
   // GATE_AND_SELECTOR_DISAGREE
   it("refuse a legacy write exactly when the selector says streams, through every transition", async () => {
     const { state, read } = source(false);
-    const mode = createAccountStorageMode({ owner: OWNER_A, source: read });
+    const mode = ownedBy(read);
     const deps = dataDeps({ accountStorageMode: mode });
     const sweep: Array<boolean | "unreachable"> = [
       false,
@@ -226,9 +293,8 @@ describe("the write gate and the read selector share one answer", () => {
 
   // GATE_AND_SELECTOR_DISAGREE
   it("takes the gate's answer from the mode, not from a separate switch", async () => {
-    const mode = createAccountStorageMode({ source: () => false });
     const deps = dataDeps({
-      accountStorageMode: mode,
+      accountStorageMode: ownedBy(() => false),
       // A stale plain switch that disagrees with the mode must not win.
       legacyWritesRefused: () => true,
     });
@@ -236,7 +302,7 @@ describe("the write gate and the read selector share one answer", () => {
     expect(write.status).not.toBe(426);
 
     const switched = dataDeps({
-      accountStorageMode: createAccountStorageMode({ source: () => true }),
+      accountStorageMode: ownedBy(() => true),
       legacyWritesRefused: () => false,
     });
     expect(
@@ -247,17 +313,45 @@ describe("the write gate and the read selector share one answer", () => {
   // GATE_AND_SELECTOR_DISAGREE
   it("lets an unknown mode through the write gate (fail open) while reads refuse", async () => {
     const { read } = source("unreachable");
-    const mode = createAccountStorageMode({ source: read });
+    const mode = ownedBy(read);
     expect(legacyWriteSwitchOf(mode)()).toBe(false);
     expect(selectAccountStorageMode({ accountStorageMode: mode }).kind).toBe(
       "refuse",
     );
   });
+
+  // LATCH_CROSSES_ACCOUNTS
+  it("gives a runtime of another owner unknown at the gate and the selector alike", async () => {
+    const latched = createAccountStorageMode({
+      owner: OWNER_A,
+      source: () => true,
+    });
+    expect(latched.read(OWNER_A)).toBe("switched");
+    const asked: string[] = [];
+    const spy: AccountStorageMode = {
+      read: (requestOwner) => {
+        asked.push(requestOwner);
+        return latched.read(requestOwner);
+      },
+    };
+    const deps = dataDeps({
+      serverOwner: OWNER_B,
+      accountStorageMode: accountStorageModeFor(spy, OWNER_B),
+    });
+    expect(selectAccountStorageMode(deps).kind).toBe("refuse");
+    // Unknown is no refusal for writes: the write is not turned away as
+    // switched, because B is not switched.
+    expect(
+      (await handlePersonalServerDataRequest(post(), deps)).status,
+    ).not.toBe(426);
+    expect(asked.length).toBeGreaterThan(0);
+    expect(new Set(asked)).toEqual(new Set([OWNER_B]));
+  });
 });
 
 describe("a read of an unswitched account is unchanged", () => {
   /** The same requests against deps with and without a mode wired. */
-  async function transcript(accountStorageMode?: AccountStorageMode) {
+  async function transcript(accountStorageMode?: OwnedAccountStorageMode) {
     const storage = createMemoryDataStorage();
     const deps = dataDeps({ storage, accountStorageMode });
     // An unswitched account writes legacy data and reads it back.
@@ -281,9 +375,7 @@ describe("a read of an unswitched account is unchanged", () => {
   it("answers list, read and versions exactly as with no mode wired", async () => {
     const baseline = await transcript(undefined);
     expect(baseline.map((r) => r.status)).toEqual([201, 200, 200, 200]);
-    const unswitched = await transcript(
-      createAccountStorageMode({ owner: OWNER_A, source: () => false }),
-    );
+    const unswitched = await transcript(ownedBy(() => false));
     expect(unswitched).toEqual(baseline);
   });
 });

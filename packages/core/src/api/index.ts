@@ -107,7 +107,7 @@ import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
   legacyWriteSwitchOf,
   selectAccountStorageMode,
-  type AccountStorageMode,
+  type OwnedAccountStorageMode,
 } from "./account-storage-mode.js";
 import {
   refuseLegacyWrite,
@@ -373,7 +373,7 @@ export interface PersonalServerDataApiDeps {
    * write gate's switch too, so `legacyWritesRefused` is ignored. Absent =
    * every read and write behaves as before the switch existed.
    */
-  accountStorageMode?: AccountStorageMode;
+  accountStorageMode?: OwnedAccountStorageMode;
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
   /**
@@ -2240,12 +2240,14 @@ export {
   ACCOUNT_MODE_RETRY_AFTER_SECONDS,
   ACCOUNT_MODE_UNKNOWN_CODE,
   ACCOUNT_MODE_UNKNOWN_STATUS,
+  accountStorageModeFor,
   createAccountStorageMode,
   legacyWriteSwitchOf,
   selectAccountStorageMode,
   type AccountStorageMode,
   type AccountStorageModeValue,
   type CreateAccountStorageModeInput,
+  type OwnedAccountStorageMode,
   type StorageSelection,
   type StorageSelectionDeps,
 } from "./account-storage-mode.js";

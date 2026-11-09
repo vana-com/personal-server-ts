@@ -34,6 +34,7 @@ function takeoverLimit(name: string, fallback: number): number {
 }
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
+  accountStorageModeFor,
   createAccountStorageMode,
   legacyWriteSwitchOf,
   type PersonalServerReadFulfillmentReporter,
@@ -672,12 +673,14 @@ export async function createServer(
   // One mode per runtime: the write gate, the read selector and every MCP
   // engine of this server consume this same instance.
   const accountStorageMode = createAccountStorageMode({
-    owner: serverOwner,
+    owner: serverOwner ?? "",
     source: () =>
       config.streamSync.write === true &&
       config.streamSync.refuseLegacyWrites === true,
   });
-  const legacyWritesRefused = legacyWriteSwitchOf(accountStorageMode);
+  const legacyWritesRefused = legacyWriteSwitchOf(
+    accountStorageModeFor(accountStorageMode, serverOwner),
+  );
   let pdppImporterImpl: PdppImporter | null = null;
   const pdppImporter: PdppImporter = {
     importEnvelope: (envelope) =>

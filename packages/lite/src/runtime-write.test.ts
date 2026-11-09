@@ -133,7 +133,10 @@ function setup(
     storage,
     gateway,
     accountStorageMode: options.legacyWritesRefused
-      ? createAccountStorageMode({ source: options.legacyWritesRefused })
+      ? createAccountStorageMode({
+          owner: ownerWallet.address,
+          source: options.legacyWritesRefused,
+        })
       : undefined,
     serverOwner: ownerWallet.address,
     serverOrigin: PS_ORIGIN,

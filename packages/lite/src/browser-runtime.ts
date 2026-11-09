@@ -427,7 +427,7 @@ export async function createIndexedDbPsLiteRuntime(
     });
   // The account's stream-sync switch, read from the live config on each write.
   const accountStorageMode = createAccountStorageMode({
-    owner: serverOwner,
+    owner: serverOwner ?? "",
     source: () =>
       config.streamSync.write === true &&
       config.streamSync.refuseLegacyWrites === true,

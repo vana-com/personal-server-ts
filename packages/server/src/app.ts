@@ -30,7 +30,10 @@ import type {
   PersonalServerReadFulfillmentReporter,
   StreamSyncReadPort,
 } from "@opendatalabs/personal-server-ts-core/api";
-import { createAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  accountStorageModeFor,
+  createAccountStorageMode,
+} from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import {
@@ -341,15 +344,18 @@ export function createApp(deps: AppDeps): Hono {
   // One mode for every read and legacy write this server serves. The host
   // passes its instance; the fallback reads the same config fields the host
   // reads.
-  const accountStorageMode =
+  // Bound to this server's owner once, here: every consumer below receives
+  // the bound view, which cannot be asked about another account.
+  const accountStorageMode = accountStorageModeFor(
     deps.accountStorageMode ??
-    createAccountStorageMode({
-      owner: deps.serverOwner,
-      source: () =>
-        deps.config?.streamSync.write === true &&
-        deps.config.streamSync.refuseLegacyWrites === true,
-    });
-
+      createAccountStorageMode({
+        owner: deps.serverOwner ?? "",
+        source: () =>
+          deps.config?.streamSync.write === true &&
+          deps.config.streamSync.refuseLegacyWrites === true,
+      }),
+    deps.serverOwner,
+  );
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
   // derivative question registration), and one replay guard for the proofs
   // both redeeming routes verify.
