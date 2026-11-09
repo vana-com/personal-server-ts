@@ -3,7 +3,8 @@
  * Production must not: observe the encoder and append port, not V8 heap usage.
  *
  * Mutants: RESTORE_FLUSH_JOIN, RESTORE_COMPACTION_JOIN, SPLIT_SURROGATE_PAIR,
- * UTF16_DERIVE_BUDGET, ALLOCATING_COUNT, PER_PATH_BUDGET.
+ * UTF16_DERIVE_BUDGET, ALLOCATING_COUNT, PER_PATH_BUDGET, LAST_SEEN_COMPACTION,
+ * FLIP_COMPACTION_OBSERVED_AT, FIXED_STEP_GROWTH.
  */
 import assert from "node:assert/strict";
 import v8 from "node:v8";
@@ -55,12 +56,15 @@ const spoolLine = (key: string, text: string, o = 2, r = "run") =>
   );
 const frameSize = (key: string, text: string, o = 2, r = "run") =>
   frameBytes({ h: "0".repeat(64), k: key, n: utf8Length(text), o, r });
-const wire = (rows: readonly { key: string; text: string }[]) =>
+type Row = { key: string; text: string; o?: number; r?: string };
+const wire = (rows: readonly Row[]) =>
   encoder.encode(
-    rows.map(({ key, text }) => `${spoolLine(key, text)}\n`).join(""),
+    rows
+      .map(({ key, text, o, r }) => `${spoolLine(key, text, o, r)}\n`)
+      .join(""),
   );
-const lineBytes = (key: string, text: string) =>
-  utf8Length(spoolLine(key, text)) + 1;
+const lineBytes = (key: string, text: string, o?: number, r?: string) =>
+  utf8Length(spoolLine(key, text, o, r)) + 1;
 
 function filesWithWrites(chunkBytes = 7) {
   const files = createMemoryStreamSyncFiles(chunkBytes);
@@ -287,9 +291,13 @@ describe("spool allocation chunks", () => {
   it("derivation bounds UTF-8 bytes rather than UTF-16 code units", async () => {
     const { files, writes } = filesWithWrites(3);
     const dir = "spool";
+    // 3 UTF-8 bytes per CJK code unit. A line is ~833 bytes but ~467 UTF-16
+    // units. A UTF-16 counter would flush three lines (~2.5 KB) where the
+    // bound allows one chunk plus one line (~1.8 KB). The old 80-character
+    // payload had a ratio low enough for that overshoot to fit the bound.
     const rows = Array.from({ length: 30 }, (_, i) => ({
       key: hash(i),
-      text: body("中".repeat(80)),
+      text: body("中".repeat(200)),
     }));
     const expected = wire(rows);
     await files.write(spoolLogPath(dir), expected);
@@ -305,29 +313,49 @@ describe("spool allocation chunks", () => {
   it("compaction writes bounded sorted winners identical to the old joined shard", async () => {
     const { files, writes } = filesWithWrites(1);
     const path = shardPath("spool", 0);
-    const winners = corpus.map((value, i) => ({
+    // Each winner has a distinct observedAt (o) and run (r) stamp. Its losers
+    // are: an equal-stamp loser that comes earlier in input, and an OLDER
+    // candidate that comes AFTER the winner. The older candidate has a larger
+    // run string, so run-before-observedAt ordering would also pick it. Each
+    // one only wins if compaction keeps the last-seen line or compares the
+    // stamps the wrong way round.
+    const winners: Row[] = corpus.map((value, i) => ({
       key: hash(i),
-      text: body(value),
+      text: body(value, 100 + i, "run-b"),
+      o: 100 + i,
+      r: "run-b",
     }));
-    // Reverse input order and include a losing older value and an equal-stamp
-    // loser. The later equal stamp wins, exactly as before this cut.
-    const input = [...winners]
+    const input: Row[] = corpus
+      .map((_, i) => i)
       .reverse()
-      .flatMap((w) => [
-        { key: w.key, text: body("older", 1) },
-        { key: w.key, text: body("tie loser") },
-        w,
-      ]);
+      .flatMap((i) => {
+        const key = hash(i);
+        const tie = {
+          key,
+          text: body("tie loser", 100 + i, "run-b"),
+          o: 100 + i,
+          r: "run-b",
+        };
+        const older = {
+          key,
+          text: body("older", 50 + i, "run-z"),
+          o: 50 + i,
+          r: "run-z",
+        };
+        return [tie, winners[i]!, older];
+      });
     await files.write(path, wire(input));
     const expected = wire(winners);
     const chunkBytes = 113;
-    const longest = Math.max(...winners.map((w) => lineBytes(w.key, w.text)));
+    const longest = Math.max(
+      ...winners.map((w) => lineBytes(w.key, w.text, w.o, w.r)),
+    );
     const { result, calls } = await observeEncoding(() =>
       compactShard(files, path, 0, 1_000_000, chunkBytes),
     );
     assert.equal(
       result,
-      winners.reduce((n, w) => n + frameSize(w.key, w.text), 0),
+      winners.reduce((n, w) => n + frameSize(w.key, w.text, w.o, w.r), 0),
     );
     assert.deepEqual(await files.read(path), expected);
     assert.ok(
@@ -335,6 +363,46 @@ describe("spool allocation chunks", () => {
       "winner shard must be appended in bounded batches",
     );
     assertBound(calls, writes, chunkBytes, longest);
+  });
+
+  it("copies only linear bytes while assembling a long line from small chunks", async () => {
+    // A line that spans many 64-byte chunks is assembled in OpenLine. Growth by
+    // doubling copies each byte O(1) times. Growth by a fixed step copies
+    // O(n^2 / step) bytes, far over this budget.
+    const text = "t".repeat(256 * 1024);
+    const line = spoolLine(hash(7), text);
+    const bytes = encoder.encode(`${line}\n`);
+    const lineLength = bytes.length - 1;
+    const chunkBytes = 64;
+    const source: StreamSyncFiles = {
+      ...createMemoryStreamSyncFiles(),
+      async *readChunks() {
+        for (let i = 0; i < lineLength; i += chunkBytes) {
+          // Views keep input preparation out of the observed copy budget.
+          yield bytes.subarray(i, Math.min(i + chunkBytes, lineLength));
+        }
+        yield bytes.subarray(lineLength);
+      },
+    };
+    const set = Uint8Array.prototype.set;
+    let copiedBytes = 0;
+    const read: string[] = [];
+    Uint8Array.prototype.set = function (this: Uint8Array, array, offset) {
+      copiedBytes += array.length;
+      return set.call(this, array, offset);
+    };
+    try {
+      for await (const entry of readSpool(source, "long.log"))
+        read.push(entry.line);
+    } finally {
+      Uint8Array.prototype.set = set;
+    }
+    assert.deepEqual(read, [line]);
+    // Count both input appends (1 x the line) and growth copies (< 2 x).
+    assert.ok(
+      copiedBytes <= 3 * lineLength,
+      `reader copied ${copiedBytes} bytes for a ${lineLength}-byte line`,
+    );
   });
 
   it("countShard counts exact UTF-8 bytes without encoding payloads", async () => {
