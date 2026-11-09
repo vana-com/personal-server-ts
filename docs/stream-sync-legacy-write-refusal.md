@@ -7,21 +7,38 @@ repository and says which ones the server can refuse.
 
 ## The check
 
-- **Enforcement ships off.** The refusal applies only when `streamSync.write`
-  **and** `streamSync.refuseLegacyWrites` are on. `refuseLegacyWrites` defaults
-  to `false`. Turn it on only after the clients that send
-  `Vana-Stream-Sync-Client` are released. The Account stream-sync switch stays
-  limited to the internal test allowlist until then.
+- **One switch input.** The refusal applies while `streamSync.write` is on.
+  Nothing else takes part in the decision. `streamSync.refuseLegacyWrites`
+  stays in the config schema so stored configs still parse, but no code reads
+  it. Hosts build one `AccountStorageMode` from `streamSync.write`
+  (`packages/server/src/bootstrap.ts`, `packages/server/src/app.ts`,
+  `packages/lite/src/browser-runtime.ts`) and pass that same instance to the
+  write gate, the read selector and the MCP engines. It is the only latch.
 - **Switch state.** The account owns the switch. A host reads it from the
   Account setting (`GET /api/v1/me/stream-sync`) before it launches the server
-  and passes it as `streamSync.write`. The server reads only that local value,
-  at the moment of each write (`packages/server/src/app.ts`, `legacyWritesRefused`).
-  The server never calls the Account.
-- **Who is refused.** A legacy write that does not send
-  `Vana-Stream-Sync-Client: 1`. A client built for stream sync sends it on every
-  legacy write it still makes. An old client cannot send it. The header chooses
-  the message, never what a caller may read.
-- **One check, in the write operations.** `refuseLegacyWrite`
+  and passes it as `streamSync.write`. The server reads only that local value
+  and never calls the Account. The mode samples it when it is built, and Lite
+  samples it again before any config update, so a `true` seen at startup is
+  not lost before the first write. Once `true`, it stays `true`.
+- **Unknown.** If the mode cannot be established (the source cannot be read
+  and nothing is latched, or the owner does not match), a legacy write is
+  refused with a retryable `503 ACCOUNT_MODE_UNKNOWN`, like a read. A
+  known-unswitched account is never refused.
+- **Two checks, one decision.** Admission refuses early, before a body is
+  read. The commit fence (`fenceLegacyCommit`) asks again immediately before
+  each durable publication, with no `await` between the question and the call
+  that publishes: upload commit, JSON and binary `POST`, durable import
+  (`core/src/contracts/data.ts`, `core/src/api/scope-uploads.ts`), chunked
+  finalize (`server/src/routes/chunked-scope-import.ts`) and the Oura import
+  (`core/src/oura/index.ts`). A write admitted before the switch and parked on
+  I/O is refused at the fence, stores nothing and discards what it staged.
+  The fence does not stop a write that already passed it and is publishing;
+  the host's switch step must wait for those, then delete the legacy files.
+- **Who is refused.** Every legacy write of a switched account, from every
+  caller. `Vana-Stream-Sync-Client: 1` earns nothing: a client built for stream
+  sync must stop making legacy writes. The header chooses nothing about what a
+  caller may read.
+- **One check, in the write operations.** `legacyWriteVerdict`
   (`packages/core/src/api/legacy-write-gate.ts`) is the only place that decides.
   It runs inside the operations that commit or stage legacy data, after real
   authorization, and correctness rests on those calls alone:
@@ -35,7 +52,8 @@ repository and says which ones the server can refuse.
   builder write whose `X-Vana-Write-Signature` proof was verified; every other
   route is owner-only and has none, so a signature header earns nothing there.
   `dataRoutes` also refuses early, before any body is read, as an optimisation;
-  tests show the refusal holds with that layer removed.
+  tests show the refusal holds with that layer removed. The commit fence above
+  asks the same `legacyWriteVerdict` again at each publication point.
 - **Error.** HTTP `426 Upgrade Required`, code `update_required`, header
   `Upgrade: vana-stream-sync`:
 

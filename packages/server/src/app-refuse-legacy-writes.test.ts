@@ -160,4 +160,81 @@ describe("createApp legacy-write refusal", () => {
     expect(reads.length).toBeGreaterThan(0);
     expect(index.countByScope("github.events")).toBe(0);
   });
+  function appWithMode(read: () => "switched" | "unswitched" | "unknown") {
+    return createApp({
+      logger: pino({ level: "silent" }),
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager: index,
+      hierarchyOptions: { dataDir: join(dir, "data") },
+      serverOrigin: "http://localhost:8080",
+      serverOwner: owner,
+      gateway: {} as GatewayClient,
+      accessLogWriter: { write: async () => undefined },
+      devToken: token,
+      config: ServerConfigSchema.parse({ streamSync: {} }),
+      accountStorageMode: { read },
+    });
+  }
+
+  const ouraStreams = ["sleep", "readiness", "activity"] as const;
+  /** A complete, valid batch: it reaches the importer's first durable write. */
+  const validOuraBatch = {
+    selection: { streams: ouraStreams.map((name) => ({ name })) },
+    collectedAt: "2026-10-15T00:00:00.000Z",
+    records: ouraStreams.map((stream) => ({
+      stream,
+      data: {
+        id: `${stream}-1`,
+        day: "2026-10-13",
+        score: 80,
+        ...(stream === "sleep"
+          ? { record_type: "daily_score", sleep_score: 80 }
+          : {}),
+      },
+    })),
+    completion: {
+      streams: ouraStreams.map((stream) => ({
+        stream,
+        status: "complete",
+        recordCount: 1,
+      })),
+    },
+  };
+  const ouraImport = (app: ReturnType<typeof makeApp>) =>
+    app.request("/v1/import/oura-browser", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(validOuraBatch),
+    });
+
+  // UNKNOWN_WRITES_PASS
+  it("refuses a legacy write with a retryable 503 while the account mode is unknown", async () => {
+    const app = appWithMode(() => "unknown");
+    const response = await post(app);
+    expect(response.status).toBe(503);
+    expect((await response.json()).error.errorCode).toBe(
+      "ACCOUNT_MODE_UNKNOWN",
+    );
+    expect(index.countByScope("github.events")).toBe(0);
+  });
+
+  // UNKNOWN_WRITES_PASS
+  it("refuses an Oura browser import with a retryable 503 while the account mode is unknown", async () => {
+    const response = await ouraImport(appWithMode(() => "unknown"));
+    expect(response.status).toBe(503);
+    expect(index.countByScope("oura.sleep")).toBe(0);
+  });
+
+  // ADMISSION_ONLY_GATE
+  it("answers an Oura import 426 when the account switches after the route admitted it", async () => {
+    let reads = 0;
+    const app = appWithMode(() => (++reads > 1 ? "switched" : "unswitched"));
+    const response = await ouraImport(app);
+    expect(response.status).toBe(426);
+    expect(index.countByScope("oura.sleep")).toBe(0);
+  });
 });

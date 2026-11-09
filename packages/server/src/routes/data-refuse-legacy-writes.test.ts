@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { pino } from "pino";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { STREAM_SYNC_CLIENT_HEADER } from "@opendatalabs/personal-server-ts-core/api";
+import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "./data.js";
@@ -388,5 +389,74 @@ describe("refuse legacy writes after the stream-sync switch", () => {
         expect(index.countByScope(scope)).toBe(1);
       },
     );
+  });
+  // ADMISSION_ONLY_GATE: Node chunked finalize
+  describe("a chunked import whose finalize is parked while the account switches", () => {
+    it("refuses at publication with 426 and leaves nothing staged, published or indexed", async () => {
+      const state = { switched: false, onResolve: () => {} };
+      const chunk = new Uint8Array(SCOPE_IMPORT_CHUNK_BYTES).fill(0x20);
+      chunk.set(new TextEncoder().encode('{"data":[]}'));
+      const chunkSha = createHash("sha256").update(chunk).digest("hex");
+      const parkedApp = dataRoutes({
+        indexManager: index,
+        hierarchyOptions: { dataDir: join(root, "data") },
+        logger: pino({ level: "silent" }),
+        serverOrigin: "http://localhost:8080",
+        serverOwner: owner,
+        devToken: "refuse-legacy-test",
+        gateway: {} as GatewayClient,
+        accessLogWriter: { write: async () => undefined },
+        // Finalize asks for the scope's deletion marker after it has admitted
+        // the request and assembled the chunks, just before it publishes.
+        scopeDeletions: {
+          resolve: async () => {
+            state.onResolve();
+            return { deleted: false, version: null };
+          },
+        } as unknown as ScopeDeletionTracker,
+        accountStorageMode: {
+          read: () => (state.switched ? "switched" : "unswitched"),
+        },
+      });
+      const base = `/${scope}/imports`;
+      const opened = await parkedApp.request(base, {
+        method: "POST",
+        headers: { ...bearer, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          totalBytes: chunk.byteLength,
+          totalChunks: 1,
+          sha256: chunkSha,
+        }),
+      });
+      const { importId } = await opened.json();
+      expect(
+        (
+          await parkedApp.request(`${base}/${importId}/chunks/0`, {
+            method: "PUT",
+            headers: {
+              ...bearer,
+              "Content-Type": "application/octet-stream",
+              "x-chunk-sha256": chunkSha,
+            },
+            body: chunk,
+          })
+        ).status,
+      ).toBe(200);
+
+      // The account switches while finalize is between admission and publish.
+      state.onResolve = () => {
+        state.switched = true;
+      };
+      const response = await parkedApp.request(`${base}/${importId}/finalize`, {
+        method: "POST",
+        headers: bearer,
+      });
+      expect(response.status).toBe(426);
+      expect((await response.json()).errorCode).toBe("update_required");
+      expect(index.countByScope(scope)).toBe(0);
+      const tree = await dataTree();
+      expect(tree.filter((file) => file.includes(".pending."))).toEqual([]);
+      expect(tree.filter((file) => file.includes(`/${scope}/`))).toEqual([]);
+    });
   });
 });

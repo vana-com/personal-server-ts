@@ -59,9 +59,8 @@ export const DEFAULTS = {
     // serves logical reads from complete stream views (§2.10). When false,
     // reads are exactly as before.
     read: false,
-    // Off by default. With `write` also on, a legacy write that does not
-    // declare a stream-sync client is refused with `update_required`. Turn it
-    // on only after the clients that send `Vana-Stream-Sync-Client` ship.
+    // No longer read by any code. A legacy write is refused while `write` is
+    // on (the Account switch); this key is kept so stored configs still parse.
     refuseLegacyWrites: false,
   },
   replication: {

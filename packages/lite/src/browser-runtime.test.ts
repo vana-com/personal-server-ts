@@ -533,3 +533,103 @@ describe("createIndexedDbPsLiteRuntime data listings", () => {
     expect(listGrantsByUser).not.toHaveBeenCalled();
   });
 });
+
+describe("createIndexedDbPsLiteRuntime legacy writes follow the Account switch alone", () => {
+  const post = (runtime: { fetch(request: Request): Promise<Response> }) =>
+    runtime.fetch(
+      new Request("https://ps.local/v1/data/instagram.profile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: "browser_user" }),
+      }),
+    );
+  const switched = (streamSync: Record<string, unknown>) =>
+    createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+        streamSync,
+      },
+    });
+
+  // SWITCH_REQUIRES_SECOND_FLAG
+  it.each([
+    ["the refuse flag absent", { write: true }],
+    ["the refuse flag false", { write: true, refuseLegacyWrites: false }],
+  ])(
+    "refuses a legacy write on a switched account with %s",
+    async (_n, flags) => {
+      const { runtime } = await switched(flags);
+      const response = await post(runtime);
+      expect(response.status).toBe(426);
+    },
+  );
+
+  it("accepts a legacy write when the account is not switched, whatever the refuse flag says", async () => {
+    const { runtime } = await switched({
+      write: false,
+      refuseLegacyWrites: true,
+    });
+    expect((await post(runtime)).status).toBe(201);
+  });
+
+  // LAZY_LATCH
+  it("still refuses the first write after a config update turned the switch off", async () => {
+    const { runtime } = await switched({ write: true });
+    const auth = { Authorization: "Bearer owner-token" };
+    const current = await (
+      await runtime.fetch(
+        new Request("https://ps.local/ui/api/config", { headers: auth }),
+      )
+    ).json();
+    const update = await runtime.fetch(
+      new Request("https://ps.local/ui/api/config", {
+        method: "PUT",
+        headers: { ...auth, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...current,
+          streamSync: { ...current.streamSync, write: false },
+        }),
+      }),
+    );
+    expect(update.status).toBe(200);
+    // No write was attempted before the update: the first one must refuse.
+    expect((await post(runtime)).status).toBe(426);
+  });
+  // LAZY_LATCH
+  it("latches a switch that a config update turned on and a second update turned off before any write", async () => {
+    const { runtime } = await switched({ write: false });
+    const auth = { Authorization: "Bearer owner-token" };
+    const current = await (
+      await runtime.fetch(
+        new Request("https://ps.local/ui/api/config", { headers: auth }),
+      )
+    ).json();
+    const put = (write: boolean) =>
+      runtime.fetch(
+        new Request("https://ps.local/ui/api/config", {
+          method: "PUT",
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...current,
+            streamSync: { ...current.streamSync, write },
+          }),
+        }),
+      );
+    expect((await put(true)).status).toBe(200);
+    expect((await put(false)).status).toBe(200);
+    expect((await post(runtime)).status).toBe(426);
+  });
+});

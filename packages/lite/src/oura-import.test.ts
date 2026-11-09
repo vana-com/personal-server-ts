@@ -1,5 +1,9 @@
 import ouraProfileProvenance from "../../core/src/legacy-projection/declarations/oura-browser.provenance.json";
 import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  createAccountStorageMode,
+  LegacyWriteRefusedError,
+} from "@opendatalabs/personal-server-ts-core/api";
 import { describe, expect, it, vi } from "vitest";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
@@ -1051,5 +1055,64 @@ describe("Oura required history boundary", () => {
     expect(storage.countVersions("oura.activity")).toBe(2);
     expect(storage.countVersions("oura.sleep")).toBe(2);
     expect(storage.countVersions("oura.readiness")).toBe(2);
+  });
+});
+
+describe("Oura import commit fence", () => {
+  // A mode that reads unswitched for the route's admission check and switched
+  // for every later read: the account switches while the import is running.
+  function switchesAfterAdmission() {
+    let reads = 0;
+    return {
+      read: () =>
+        ++reads > 1 ? ("switched" as const) : ("unswitched" as const),
+    };
+  }
+
+  // ADMISSION_ONLY_GATE: Oura
+  it("refuses at the first durable write when the account switches under the import lock", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const state = { switched: false };
+    const mode = createAccountStorageMode({
+      source: () => state.switched,
+    });
+    const beforeCommit = vi.fn(async () => undefined);
+    await expect(
+      importOuraBrowserRecords(storage, input(), {
+        accountStorageMode: mode,
+        // Read under the import lock, after the batch was admitted.
+        retainedCanonicalHistory: () => {
+          state.switched = true;
+          return undefined;
+        },
+        beforeCommit,
+      }),
+    ).rejects.toBeInstanceOf(LegacyWriteRefusedError);
+    expect(beforeCommit).not.toHaveBeenCalled();
+    for (const stream of streams) {
+      expect(storage.countVersions(`oura.${stream}`)).toBe(0);
+    }
+  });
+
+  it("answers 426 on the Lite route and stores nothing", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const { post } = runtimeFor(storage, {
+      accountStorageMode: switchesAfterAdmission(),
+    });
+    const response = await post(input());
+    expect(response.status).toBe(426);
+    expect((await response.json()).errorCode).toBe("update_required");
+    for (const stream of streams) {
+      expect(storage.countVersions(`oura.${stream}`)).toBe(0);
+    }
+  });
+
+  it("imports normally while the account stays unswitched", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const { post } = runtimeFor(storage, {
+      accountStorageMode: createAccountStorageMode({ source: () => false }),
+    });
+    expect((await post(input())).status).toBe(200);
+    expect(storage.countVersions("oura.sleep")).toBe(1);
   });
 });
