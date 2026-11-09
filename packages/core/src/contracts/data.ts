@@ -217,7 +217,11 @@ async function commitWrittenEnvelope(
   envelope: DataFileEnvelope,
   entry: Omit<NewIndexEntry, "path" | "sizeBytes"> & { sizeBytes?: number },
   precondition?: LegacyPrecondition,
+  fence?: () => void,
 ): Promise<{ ok: true; writeResult: WriteResult } | DataContractError> {
+  // The last statement before the first storage call: nothing awaits between
+  // this question and the write below.
+  fence?.();
   if (storage.commitEnvelope) {
     const result = await storage.commitEnvelope(envelope, entry, precondition);
     if (!result.ok) {
@@ -283,6 +287,13 @@ export interface IngestDataContractInput {
   producer?: LegacyProducer;
   producerProvenance?: LegacyProducerProvenance;
   import?: ImportIntent;
+  /**
+   * Called synchronously immediately before the storage call that makes this
+   * write durable, after every `await` of the ingest. A throw stops the write
+   * with nothing stored (the legacy-write commit fence; see
+   * `api/legacy-write-gate.ts`). Absent = no fence.
+   */
+  fence?: () => void;
 }
 
 export interface IngestDataContractResult {
@@ -323,6 +334,13 @@ export interface IngestBinaryDataContractInput {
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
   precondition?: LegacyPrecondition;
+  /**
+   * Called synchronously immediately before the storage call that makes this
+   * write durable, after every `await` of the ingest. A throw stops the write
+   * with nothing stored (the legacy-write commit fence; see
+   * `api/legacy-write-gate.ts`). Absent = no fence.
+   */
+  fence?: () => void;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -779,6 +797,7 @@ export async function ingestDataContract(
         "This storage backend does not support durable owner imports",
       );
     }
+    input.fence?.();
     const imported = await input.storage.commitVersion({
       kind: "append",
       envelope,
@@ -820,6 +839,7 @@ export async function ingestDataContract(
           : null,
       },
       input.precondition,
+      input.fence,
     );
     if (!committed.ok) return committed;
     writeResult = committed.writeResult;
@@ -949,6 +969,7 @@ export async function ingestBinaryDataContract(
       afterTombstoneVersion: input.afterTombstoneVersion ?? null,
     },
     input.precondition,
+    input.fence,
   );
   if (!committed.ok) return committed;
   const { writeResult } = committed;

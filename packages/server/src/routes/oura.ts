@@ -5,7 +5,7 @@ import {
 import { Hono } from "hono";
 import {
   handleOuraCollectionRequirementsRequest,
-  legacyWriteSwitchOf,
+  LegacyWriteRefusedError,
   refuseLegacyWrite,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
@@ -121,9 +121,8 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
     // An Oura browser import is a legacy write (it lands in the legacy scope
     // store), so a switched account refuses it on every path.
     const refusal = refuseLegacyWrite(
-      deps.accountStorageMode
-        ? legacyWriteSwitchOf(deps.accountStorageMode)
-        : undefined,
+      deps.accountStorageMode,
+      deps.serverOwner,
     );
     if (refusal) return refusal;
     if (
@@ -141,32 +140,44 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
     // The writer fences on this epoch, captured before the lock. The retained
     // history is read under the import lock, so the boundary check sees current rows.
     const expectedCanonicalEpoch = canonicalEpoch(deps);
-    const result = await importOuraBrowserRecords(storage, body, {
-      legacyScopeView: deps.legacyScopeView,
-      retainedCanonicalHistory: () =>
-        deps.pdpp?.bindingStore.readSnapshot(() =>
-          retainedCanonicalHistory(deps),
-        ),
-      scopeDeletions: deps.scopeDeletions,
-      syncManager: deps.syncManager,
-      additions: deps.additions,
-      onDataWritten: deps.derivativeCompute
-        ? (event) =>
-            deps.derivativeCompute?.scheduler.markSourceChanged(event.scope, {
-              lineageSources: event.lineageSources,
-            })
-        : undefined,
-      beforeCommit: (input) =>
-        commitCanonicalBatch(deps, input, () => {
-          if (canonicalEpoch(deps) !== expectedCanonicalEpoch)
-            return { ok: false as const, reason: "canonical_history_changed" };
-          if (
-            body.native !== undefined &&
-            !validNativePublication(deps, body.native)
-          )
-            return { ok: false as const, reason: "native_binding_mismatch" };
-        }),
-    });
+    // The importer fences again right before its first durable write.
+    let result: Awaited<ReturnType<typeof importOuraBrowserRecords>>;
+    try {
+      result = await importOuraBrowserRecords(storage, body, {
+        accountStorageMode: deps.accountStorageMode,
+        serverOwner: deps.serverOwner,
+        legacyScopeView: deps.legacyScopeView,
+        retainedCanonicalHistory: () =>
+          deps.pdpp?.bindingStore.readSnapshot(() =>
+            retainedCanonicalHistory(deps),
+          ),
+        scopeDeletions: deps.scopeDeletions,
+        syncManager: deps.syncManager,
+        additions: deps.additions,
+        onDataWritten: deps.derivativeCompute
+          ? (event) =>
+              deps.derivativeCompute?.scheduler.markSourceChanged(event.scope, {
+                lineageSources: event.lineageSources,
+              })
+          : undefined,
+        beforeCommit: (input) =>
+          commitCanonicalBatch(deps, input, () => {
+            if (canonicalEpoch(deps) !== expectedCanonicalEpoch)
+              return {
+                ok: false as const,
+                reason: "canonical_history_changed",
+              };
+            if (
+              body.native !== undefined &&
+              !validNativePublication(deps, body.native)
+            )
+              return { ok: false as const, reason: "native_binding_mismatch" };
+          }),
+      });
+    } catch (error) {
+      if (error instanceof LegacyWriteRefusedError) return error.response;
+      throw error;
+    }
     return c.json(result, result.ok ? 200 : 409);
   });
   return app;

@@ -105,25 +105,33 @@ import type {
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
-  legacyWriteSwitchOf,
   selectAccountStorageMode,
   type AccountStorageMode,
 } from "./account-storage-mode.js";
 import {
+  fenceLegacyCommit,
+  LegacyWriteRefusedError,
   refuseLegacyWrite,
-  type LegacyWriteSwitch,
 } from "./legacy-write-gate.js";
 
-/** The write gate's switch: the shared mode when wired, else the plain switch. */
-function writeSwitchOf(
-  deps: Pick<
-    PersonalServerDataApiDeps,
-    "accountStorageMode" | "legacyWritesRefused"
-  >,
-): LegacyWriteSwitch | undefined {
-  return deps.accountStorageMode
-    ? legacyWriteSwitchOf(deps.accountStorageMode)
-    : deps.legacyWritesRefused;
+/**
+ * Admission: the early refusal for a legacy write, from the account's one
+ * storage mode (a switched account gets 426, an unknown mode 503).
+ */
+function refuseLegacyWriteFor(
+  deps: Pick<PersonalServerDataApiDeps, "accountStorageMode" | "serverOwner">,
+): Response | null {
+  return refuseLegacyWrite(deps.accountStorageMode, deps.serverOwner);
+}
+
+/**
+ * The commit fence for this request: called immediately before the call that
+ * makes a legacy write durable (see `fenceLegacyCommit`).
+ */
+function commitFenceFor(
+  deps: Pick<PersonalServerDataApiDeps, "accountStorageMode" | "serverOwner">,
+): () => void {
+  return () => fenceLegacyCommit(deps.accountStorageMode, deps.serverOwner);
 }
 import {
   deletionHistoryOf,
@@ -363,15 +371,10 @@ export interface StreamSyncReadPort {
 
 export interface PersonalServerDataApiDeps {
   /**
-   * Whether an undeclared legacy write is refused (see
-   * `legacy-write-gate.ts`). Absent = never refuse.
-   */
-  legacyWritesRefused?: LegacyWriteSwitch;
-  /**
-   * The account's storage mode: the one answer the write gate and the read
-   * selector share (see `account-storage-mode.ts`). When wired it supplies the
-   * write gate's switch too, so `legacyWritesRefused` is ignored. Absent =
-   * every read and write behaves as before the switch existed.
+   * The account's storage mode: the one answer the write gate (admission and
+   * commit fence) and the read selector share (see `account-storage-mode.ts`).
+   * It is the only switch input. Absent = every read and write behaves as
+   * before the switch existed.
    */
   accountStorageMode?: AccountStorageMode;
   additions?: DurableAdditionsService;
@@ -1005,6 +1008,8 @@ async function withApiErrors(
     if (err instanceof ProtocolError) {
       return protocolErrorResponse(err);
     }
+    // A commit fence refused the write: the account switched while it waited.
+    if (err instanceof LegacyWriteRefusedError) return err.response;
     if (context) {
       context.logger?.error?.(
         {
@@ -2241,7 +2246,7 @@ export {
   ACCOUNT_MODE_UNKNOWN_CODE,
   ACCOUNT_MODE_UNKNOWN_STATUS,
   createAccountStorageMode,
-  legacyWriteSwitchOf,
+  accountModeUnknownResponse,
   selectAccountStorageMode,
   type AccountStorageMode,
   type AccountStorageModeValue,
@@ -2254,10 +2259,11 @@ export {
   UPDATE_REQUIRED_CODE,
   UPDATE_REQUIRED_MESSAGE,
   UPDATE_REQUIRED_STATUS,
-  latchLegacyWriteSwitch,
-  legacyWritesRefused,
+  fenceLegacyCommit,
+  LegacyWriteRefusedError,
+  legacyWriteVerdict,
   refuseLegacyWrite,
-  type LegacyWriteSwitch,
+  type LegacyWriteVerdict,
 } from "./legacy-write-gate.js";
 
 /**
@@ -2288,7 +2294,7 @@ async function handleScopeUploadRequest(
   // An upload is owner-only: no delegated builder writes through it, so there
   // is no exemption. Aborting only discards staged data and stays allowed.
   if (route.kind !== "abort") {
-    const refusal = refuseLegacyWrite(writeSwitchOf(deps));
+    const refusal = refuseLegacyWriteFor(deps);
     if (refusal) return refusal;
   }
   const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
@@ -2398,6 +2404,7 @@ async function handleScopeUploadRequest(
           uploadId: decodePathPart(parts[2]),
           body,
           afterTombstoneVersion: await ingestTombstoneMarker(deps, scope),
+          fence: commitFenceFor(deps),
         });
         deps.logger?.info?.(
           {
@@ -2555,7 +2562,7 @@ export async function handlePersonalServerDataRequest(
       // Owner-only: a builder has no durable-import route, so a signature
       // header earns no exemption here. This runs on the normalized path, so
       // `/imports/<op>/` and repeated slashes land here too.
-      const refusal = refuseLegacyWrite(writeSwitchOf(deps));
+      const refusal = refuseLegacyWriteFor(deps);
       if (refusal) return refusal;
       const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
@@ -2607,6 +2614,7 @@ export async function handlePersonalServerDataRequest(
         body: parsed.body,
         collectedAt: (deps.now ?? (() => new Date()))().toISOString(),
         status: deps.syncManager ? "syncing" : "stored",
+        fence: commitFenceFor(deps),
         afterTombstoneVersion: await ingestTombstoneMarker(
           deps,
           scopeResult.scope,
@@ -3199,7 +3207,7 @@ export async function handlePersonalServerDataRequest(
       }
       // A switched account refuses every legacy write here, verified builder
       // or not: a delegated write is a legacy write too.
-      const refusal = refuseLegacyWrite(writeSwitchOf(deps));
+      const refusal = refuseLegacyWriteFor(deps);
       if (refusal) {
         await writeAuth?.releaseProof?.();
         return refusal;
@@ -3355,6 +3363,7 @@ export async function handlePersonalServerDataRequest(
             lineage,
             afterTombstoneVersion,
             precondition: parsedPrecondition,
+            fence: commitFenceFor(deps),
           });
           if (!result.ok) return failWrite(contractErrorResponse(result));
           committed = true;
@@ -3410,6 +3419,7 @@ export async function handlePersonalServerDataRequest(
           precondition: parsedPrecondition,
           producer: producerHeader.producer,
           producerProvenance: provenance,
+          fence: commitFenceFor(deps),
         });
         if (!result.ok) return failWrite(contractErrorResponse(result));
         if (result.replay)

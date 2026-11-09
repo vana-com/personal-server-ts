@@ -68,11 +68,23 @@ describe("createApp legacy-write refusal", () => {
     });
   }
 
-  it("accepts an old client's write by default, even with streamSync.write on", async () => {
-    expect((await post(makeApp({ write: true }))).status).toBe(201);
+  // SWITCH_REQUIRES_SECOND_FLAG
+  it("refuses an old client's write when streamSync.write is on and refuseLegacyWrites is left at its default", async () => {
+    const response = await post(makeApp({ write: true }));
+    expect(response.status).toBe(426);
+    expect(index.countByScope("github.events")).toBe(0);
   });
 
-  it("refuses an old client's write only when both flags are on", async () => {
+  // SWITCH_REQUIRES_SECOND_FLAG
+  it("refuses an old client's write when streamSync.write is on and refuseLegacyWrites is false", async () => {
+    const response = await post(
+      makeApp({ write: true, refuseLegacyWrites: false }),
+    );
+    expect(response.status).toBe(426);
+    expect(index.countByScope("github.events")).toBe(0);
+  });
+
+  it("refuses an old client's write when streamSync.write is on", async () => {
     const response = await post(
       makeApp({ write: true, refuseLegacyWrites: true }),
     );
@@ -80,7 +92,7 @@ describe("createApp legacy-write refusal", () => {
     expect((await response.json()).errorCode).toBe("update_required");
   });
 
-  it("refuses a declaring client's write when both flags are on: a header is no exemption", async () => {
+  it("refuses a declaring client's write when the account is switched: a header is no exemption", async () => {
     const response = await post(
       makeApp({ write: true, refuseLegacyWrites: true }),
       { [STREAM_SYNC_CLIENT_HEADER]: "1" },
@@ -89,7 +101,7 @@ describe("createApp legacy-write refusal", () => {
     expect(index.countByScope("github.events")).toBe(0);
   });
 
-  it("refuses an Oura browser import when both flags are on, and stores nothing", async () => {
+  it("refuses an Oura browser import when the account is switched, and stores nothing", async () => {
     const app = makeApp({ write: true, refuseLegacyWrites: true });
     const response = await app.request("/v1/import/oura-browser", {
       method: "POST",
@@ -105,7 +117,7 @@ describe("createApp legacy-write refusal", () => {
   });
 
   it("lets an Oura browser import through when the switch is off", async () => {
-    const app = makeApp({ write: true, refuseLegacyWrites: false });
+    const app = makeApp({ write: false });
     const response = await app.request("/v1/import/oura-browser", {
       method: "POST",
       headers: {
@@ -117,7 +129,7 @@ describe("createApp legacy-write refusal", () => {
     expect(response.status).not.toBe(426);
   });
 
-  it("accepts an old client's write when streamSync.write is off", async () => {
+  it("accepts an old client's write when streamSync.write is off, whatever refuseLegacyWrites says", async () => {
     expect(
       (await post(makeApp({ write: false, refuseLegacyWrites: true }))).status,
     ).toBe(201);

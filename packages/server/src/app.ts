@@ -339,15 +339,13 @@ function streamSyncClosing(): ProtocolError {
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
   // One mode for every read and legacy write this server serves. The host
-  // passes its instance; the fallback reads the same config fields the host
-  // reads.
+  // passes its instance; the fallback reads the same config field the host
+  // reads (`streamSync.write`, the Account switch) and nothing else.
   const accountStorageMode =
     deps.accountStorageMode ??
     createAccountStorageMode({
       owner: deps.serverOwner,
-      source: () =>
-        deps.config?.streamSync.write === true &&
-        deps.config.streamSync.refuseLegacyWrites === true,
+      source: () => deps.config?.streamSync.write === true,
     });
 
   // One store for mint (POST /v1/write/session) and redeem (data ingest and

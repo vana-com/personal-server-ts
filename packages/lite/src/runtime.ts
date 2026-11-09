@@ -32,7 +32,7 @@ import {
   handlePersonalServerDataRequest,
   handlePersonalServerScopeUploadAppend,
   refuseLegacyWrite,
-  legacyWriteSwitchOf,
+  LegacyWriteRefusedError,
   type AccountStorageMode,
   createScopeUploadRegistry,
   handleOuraCollectionRequirementsRequest,
@@ -1251,9 +1251,8 @@ export function createPsLiteRuntime(
             );
           // An Oura browser import is a legacy write: a switched account refuses it.
           const refusal = refuseLegacyWrite(
-            options.accountStorageMode
-              ? legacyWriteSwitchOf(options.accountStorageMode)
-              : undefined,
+            options.accountStorageMode,
+            options.serverOwner,
           );
           if (refusal) return refusal;
           let body;
@@ -1262,23 +1261,31 @@ export function createPsLiteRuntime(
           } catch {
             return errorResponse(400, "INVALID_BODY", "Body must be JSON");
           }
-          const result = await importOuraBrowserRecords(
-            toDataStoragePort(options.storage),
-            body,
-            {
-              additions: options.additions,
-              scopeDeletions: options.scopeDeletions,
-              syncManager: options.syncManager ?? null,
-              onDataWritten: options.derivatives
-                ? (event) =>
-                    options.derivatives?.scheduler.markSourceChanged(
-                      event.scope,
-                      { lineageSources: event.lineageSources },
-                    )
-                : undefined,
-            },
-          );
-          return jsonResponse(result, { status: result.ok ? 200 : 409 });
+          // The importer fences again right before its first durable write.
+          try {
+            const result = await importOuraBrowserRecords(
+              toDataStoragePort(options.storage),
+              body,
+              {
+                accountStorageMode: options.accountStorageMode,
+                serverOwner: options.serverOwner,
+                additions: options.additions,
+                scopeDeletions: options.scopeDeletions,
+                syncManager: options.syncManager ?? null,
+                onDataWritten: options.derivatives
+                  ? (event) =>
+                      options.derivatives?.scheduler.markSourceChanged(
+                        event.scope,
+                        { lineageSources: event.lineageSources },
+                      )
+                  : undefined,
+              },
+            );
+            return jsonResponse(result, { status: result.ok ? 200 : 409 });
+          } catch (error) {
+            if (error instanceof LegacyWriteRefusedError) return error.response;
+            throw error;
+          }
         }
 
         const dataPrefix = "/v1/data";
@@ -1476,6 +1483,9 @@ export function createPsLiteRuntime(
                 config as PsLiteRuntimeOptions["config"],
                 boundGatewayConfig,
               );
+              // Sample the account mode while the live config still holds the
+              // switch, so a `true` is latched before this write can reset it.
+              options.accountStorageMode?.read(options.serverOwner);
               await saveConfig(config);
               // Reflect the persisted config in memory so reads (and
               // GET /ui/api/config) stop serving the pre-write snapshot. The

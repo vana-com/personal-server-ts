@@ -302,7 +302,8 @@ export interface ScopeImportDeps {
   /**
    * Returns the refusal response while the account's stream-sync switch is on.
    * Checked after owner authorization by every operation that writes: begin,
-   * chunk and finalize. A session opened before the switch is refused too.
+   * chunk and finalize, and once more immediately before finalize publishes.
+   * A session opened before the switch is refused too.
    */
   refuseLegacyWrite?(): Response | null;
 }
@@ -1126,6 +1127,11 @@ async function finalizeScopeImportAuthorized(
         "Scope changed while the import was in progress; retry finalize",
       );
     }
+    // Commit fence: the account may have switched while the chunks were
+    // assembled. Asked again right here, with no await before the publish
+    // below; a refusal removes the staged file (the catch below) and leaves
+    // nothing published or indexed.
+    refuseIfLegacy(deps);
     // Publish the complete, fsynced envelope before swapping the SQLite index.
     // Readers continue to resolve the old entry until the new file is ready.
     await publishStagedDataFile(stagePath, finalPath);

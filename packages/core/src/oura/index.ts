@@ -5,6 +5,12 @@ import {
 } from "../api/index.js";
 import { canonicalJsonBytes, sha256Hex } from "../contracts/index.js";
 import { withScopeLock } from "../additions/index.js";
+import {
+  fenceLegacyCommit,
+  LegacyWriteRefusedError,
+  UPDATE_REQUIRED_STATUS,
+} from "../api/legacy-write-gate.js";
+import { ACCOUNT_MODE_UNKNOWN_STATUS } from "../api/account-storage-mode.js";
 import type { DataStoragePort } from "../ports/index.js";
 import {
   projectPdppRecordsToLegacyPayload,
@@ -47,6 +53,8 @@ export type OuraBrowserImportOptions = Pick<
   | "additions"
   | "onDataWritten"
   | "legacyScopeView"
+  | "accountStorageMode"
+  | "serverOwner"
 > & {
   /** Read once by the importer under its import lock, never before it. */
   retainedCanonicalHistory?: () => OuraRetainedHistory | undefined;
@@ -353,6 +361,9 @@ async function importLocked(
   ) {
     return { ok: false, reason: "head_changed" };
   }
+  // Commit fence: the account may have switched while this import waited on
+  // reads and the import lock. Nothing durable has been written yet.
+  fenceLegacyCommit(options.accountStorageMode, options.serverOwner);
   const refused = await options.beforeCommit?.(input);
   if (refused) return refused;
   for (const { scope, collectedAt, payload, head } of plans) {
@@ -404,6 +415,14 @@ async function importLocked(
       },
       { basePath: "/v1/data" },
     );
+    // The account switched (or its mode became unknown) after the fence above:
+    // the data handler refused this write. Hand its response back unchanged.
+    if (
+      response.status === UPDATE_REQUIRED_STATUS ||
+      response.status === ACCOUNT_MODE_UNKNOWN_STATUS
+    ) {
+      throw new LegacyWriteRefusedError(response);
+    }
     if (!response.ok) {
       const failure = (await response.json()) as { error?: string };
       return { ok: false, reason: failure.error ?? "ingest_failed", scope };

@@ -115,6 +115,12 @@ export interface ScopeUploadRegistry {
     /** Parsed commit body: `{ data?: object }`. */
     body: unknown;
     afterTombstoneVersion: number | null;
+    /**
+     * The legacy-write commit fence, called synchronously immediately before
+     * the version is published. A throw discards the staged upload and
+     * publishes nothing.
+     */
+    fence?: () => void;
   }): Promise<ScopeUploadCommitted>;
   abort(input: { scope: string; uploadId: string }): Promise<void>;
 }
@@ -447,6 +453,14 @@ export function createScopeUploadRegistry(
         // A version committed since begin is newer than this one: becoming
         // visible now would not make this upload the scope's latest. Storage
         // checks that in the same step that publishes the version.
+        try {
+          input.fence?.();
+        } catch (refused) {
+          // The account switched while this upload was open: drop the staged
+          // bytes and publish nothing.
+          await end(upload, "aborted");
+          throw refused;
+        }
         let writeResult: WriteResult;
         try {
           writeResult = await upload.writer.commit(

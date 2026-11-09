@@ -425,12 +425,12 @@ export async function createIndexedDbPsLiteRuntime(
           }
         : {}),
     });
-  // The account's stream-sync switch, read from the live config on each write.
+  // The account's stream-sync switch is `config.streamSync.write` alone,
+  // sampled when the mode is built and again before every config update (see
+  // `saveConfig` below), so a startup `true` is latched before any write.
   const accountStorageMode = createAccountStorageMode({
     owner: serverOwner,
-    source: () =>
-      config.streamSync.write === true &&
-      config.streamSync.refuseLegacyWrites === true,
+    source: () => config.streamSync.write === true,
   });
   const runtime = createPsLiteRuntime({
     ...options,
@@ -457,6 +457,8 @@ export async function createIndexedDbPsLiteRuntime(
     lineageGateway,
     derivatives,
     saveConfig: async (nextConfig) => {
+      // Latch a `true` the live config still holds before this write replaces it.
+      accountStorageMode.read(serverOwner);
       const saved = await savePsLiteConfig(stateStore, nextConfig);
       Object.assign(config, saved);
     },

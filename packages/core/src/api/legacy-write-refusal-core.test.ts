@@ -5,6 +5,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import {
+  createAccountStorageMode,
   handlePersonalServerDataRequest,
   STREAM_SYNC_CLIENT_HEADER,
   type PersonalServerDataApiDeps,
@@ -34,7 +35,10 @@ function fixture(switchedOn: { value: boolean }) {
     storage: Object.assign(storage, { commitVersion }),
     scopeUploads: uploads,
     serverOwner: "0x1111111111111111111111111111111111111111",
-    legacyWritesRefused: () => switchedOn.value,
+    accountStorageMode: createAccountStorageMode({
+      owner: "0x1111111111111111111111111111111111111111",
+      source: () => switchedOn.value,
+    }),
     auth: {
       authorizeOwner: vi.fn(async () => undefined),
       authorizeBuilderList: vi.fn(async () => undefined),

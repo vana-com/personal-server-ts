@@ -4,11 +4,22 @@
  *
  * Switch state: the server already holds it locally as `streamSync.write`,
  * which its host sets from the Account setting (`GET /api/v1/me/stream-sync`)
- * before each launch. A caller passes that state in; this module never reads
- * config or the network. Each host builds one `AccountStorageMode` from its
- * source and derives this gate's switch with `legacyWriteSwitchOf`, so the
- * state it reads cannot fall back once seen and cannot differ from the
- * answer the read selector gets.
+ * before each launch. A host builds one `AccountStorageMode` from that source
+ * and passes the same instance here and to the read selector, so the state
+ * cannot fall back once seen and cannot differ between the two. That mode is
+ * the only switch input: this module takes no flag of its own and keeps no
+ * latch of its own.
+ *
+ * Two checks, one decision. Admission refuses early, before any body is read.
+ * The commit fence (`fenceLegacyCommit`) asks again immediately before each
+ * durable publication, with no `await` between the question and the call that
+ * publishes, so a switch that lands while a request was parked on I/O refuses
+ * that request with nothing stored.
+ *
+ * Unknown: a mode that cannot be established (the host gave no evidence, or
+ * the owner does not match) refuses legacy writes with a retryable 503
+ * `ACCOUNT_MODE_UNKNOWN`, like reads. A known-unswitched account is never
+ * refused.
  *
  * Who is refused: every legacy write for a switched account, from every
  * caller. No request header and no delegated builder signature exempts a
@@ -18,8 +29,8 @@
  */
 
 import {
-  createAccountStorageMode,
-  legacyWriteSwitchOf,
+  accountModeUnknownResponse,
+  type AccountStorageMode,
 } from "./account-storage-mode.js";
 
 export const UPDATE_REQUIRED_CODE = "update_required";
@@ -34,42 +45,61 @@ export const STREAM_SYNC_CLIENT_HEADER = "vana-stream-sync-client";
 export const UPDATE_REQUIRED_MESSAGE =
   "This account has moved to stream sync. Update the Vana app to keep syncing. The data already on this device is untouched.";
 
-/** The switch state a server reads at the moment of the write. */
-export type LegacyWriteSwitch = () => boolean;
+/** What a legacy write may do right now. */
+export type LegacyWriteVerdict = "allow" | "switched" | "unknown";
 
 /**
- * A one-way latch over the switch source, as the write gate's view of an
- * `AccountStorageMode` (see `account-storage-mode.ts`, which owns the latch).
- * Hosts build the mode once and pass that instance to the gate and to the read
- * selector; this wrapper remains for a caller that has only a raw source.
- * Before the source has ever said true, a source that throws reads as not
- * switched, so an unreachable source never blocks an unswitched account's
- * writes (fail open).
+ * The one decision. No mode wired means no gate: `allow`. `requestOwner` is
+ * the owner the write is for; a mode bound to another owner answers unknown.
  */
-export function latchLegacyWriteSwitch(
-  source: LegacyWriteSwitch,
-): LegacyWriteSwitch {
-  return legacyWriteSwitchOf(createAccountStorageMode({ source }));
+export function legacyWriteVerdict(
+  mode: AccountStorageMode | undefined,
+  requestOwner?: string,
+): LegacyWriteVerdict {
+  if (mode === undefined) return "allow";
+  switch (mode.read(requestOwner)) {
+    case "switched":
+      return "switched";
+    case "unknown":
+      return "unknown";
+    case "unswitched":
+      return "allow";
+  }
+}
+
+/** Thrown by `fenceLegacyCommit` to hand a ready refusal back through a handler. */
+export class LegacyWriteRefusedError extends Error {
+  constructor(readonly response: Response) {
+    super("legacy write refused");
+  }
 }
 
 /**
- * The one decision: whether a legacy write must be refused right now.
- * `switchedOn` absent means no gate was wired: nothing is refused.
+ * The commit fence. Call it immediately before the call that makes a legacy
+ * write durable, after every `await` that precedes it. It re-reads the mode,
+ * so a switch seen since admission refuses the write before anything is
+ * stored. Throws `LegacyWriteRefusedError`; the caller's surrounding handler
+ * turns it into the response and discards anything it staged.
  */
-export function legacyWritesRefused(
-  switchedOn: LegacyWriteSwitch | undefined,
-): boolean {
-  return switchedOn !== undefined && switchedOn() === true;
+export function fenceLegacyCommit(
+  mode: AccountStorageMode | undefined,
+  requestOwner?: string,
+): void {
+  const refusal = refuseLegacyWrite(mode, requestOwner);
+  if (refusal) throw new LegacyWriteRefusedError(refusal);
 }
 
 /**
  * The refusal for a legacy write, or `null` when the write may proceed.
- * HTTP entries return this response; the decision is `legacyWritesRefused`.
+ * HTTP entries return this response; the decision is `legacyWriteVerdict`.
  */
 export function refuseLegacyWrite(
-  switchedOn: LegacyWriteSwitch | undefined,
+  mode: AccountStorageMode | undefined,
+  requestOwner?: string,
 ): Response | null {
-  if (!legacyWritesRefused(switchedOn)) return null;
+  const verdict = legacyWriteVerdict(mode, requestOwner);
+  if (verdict === "allow") return null;
+  if (verdict === "unknown") return accountModeUnknownResponse();
   // Both error shapes the legacy surface uses, so an old client reads the
   // message from whichever field it already knows.
   return new Response(

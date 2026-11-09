@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
+import { createAccountStorageMode } from "./account-storage-mode.js";
 import {
-  latchLegacyWriteSwitch,
-  legacyWritesRefused,
+  fenceLegacyCommit,
+  LegacyWriteRefusedError,
+  legacyWriteVerdict,
   refuseLegacyWrite,
   UPDATE_REQUIRED_MESSAGE,
 } from "./legacy-write-gate.js";
+
+const OWNER_A = "0x1111111111111111111111111111111111111111";
+const OWNER_B = "0x2222222222222222222222222222222222222222";
 
 /** A switch source whose answer a test can change between writes. */
 function source(initial: boolean | "unreachable") {
@@ -16,24 +21,50 @@ function source(initial: boolean | "unreachable") {
   return { state, read };
 }
 
-describe("legacyWritesRefused", () => {
-  it("refuses nothing when no switch is wired", () => {
-    expect(legacyWritesRefused(undefined)).toBe(false);
+describe("legacyWriteVerdict", () => {
+  it("allows everything when no mode is wired", () => {
+    expect(legacyWriteVerdict(undefined)).toBe("allow");
   });
 
-  it("refuses exactly while the switch reads true", () => {
-    expect(legacyWritesRefused(() => true)).toBe(true);
-    expect(legacyWritesRefused(() => false)).toBe(false);
+  it("follows the mode: unswitched allows, switched refuses, unknown refuses", () => {
+    expect(
+      legacyWriteVerdict(createAccountStorageMode({ source: () => false })),
+    ).toBe("allow");
+    expect(
+      legacyWriteVerdict(createAccountStorageMode({ source: () => true })),
+    ).toBe("switched");
+    expect(
+      legacyWriteVerdict(
+        createAccountStorageMode({
+          source: () => {
+            throw new Error("Account unreachable");
+          },
+        }),
+      ),
+    ).toBe("unknown");
+  });
+
+  it("answers unknown for an owner the mode is not bound to", () => {
+    const mode = createAccountStorageMode({
+      owner: OWNER_A,
+      source: () => false,
+    });
+    expect(legacyWriteVerdict(mode, OWNER_A)).toBe("allow");
+    expect(legacyWriteVerdict(mode, OWNER_B)).toBe("unknown");
   });
 });
 
 describe("refuseLegacyWrite", () => {
   it("returns null for an unswitched account", () => {
-    expect(refuseLegacyWrite(() => false)).toBeNull();
+    expect(
+      refuseLegacyWrite(createAccountStorageMode({ source: () => false })),
+    ).toBeNull();
   });
 
   it("returns the 426 update_required body for a switched account", async () => {
-    const response = refuseLegacyWrite(() => true);
+    const response = refuseLegacyWrite(
+      createAccountStorageMode({ source: () => true }),
+    );
     expect(response?.status).toBe(426);
     expect(response?.headers.get("upgrade")).toBe("vana-stream-sync");
     const body = await response!.json();
@@ -41,45 +72,70 @@ describe("refuseLegacyWrite", () => {
     expect(body.error.errorCode).toBe("update_required");
     expect(body.message).toBe(UPDATE_REQUIRED_MESSAGE);
   });
+
+  it("returns a retryable 503 ACCOUNT_MODE_UNKNOWN while the mode is unknown", async () => {
+    const { read } = source("unreachable");
+    const response = refuseLegacyWrite(
+      createAccountStorageMode({ source: read }),
+    );
+    expect(response?.status).toBe(503);
+    expect(response?.headers.get("retry-after")).toBe("5");
+    expect((await response!.json()).error.errorCode).toBe(
+      "ACCOUNT_MODE_UNKNOWN",
+    );
+  });
+
+  it("stays switched after the source says true, then false, then unreachable", () => {
+    const { state, read } = source(true);
+    const mode = createAccountStorageMode({ source: read });
+    expect(refuseLegacyWrite(mode)?.status).toBe(426);
+    state.value = false;
+    expect(refuseLegacyWrite(mode)?.status).toBe(426);
+    state.value = "unreachable";
+    expect(refuseLegacyWrite(mode)?.status).toBe(426);
+  });
+
+  it("allows once an unreachable source recovers to false, and refuses once it says true", () => {
+    const { state, read } = source("unreachable");
+    const mode = createAccountStorageMode({ source: read });
+    expect(refuseLegacyWrite(mode)?.status).toBe(503);
+    state.value = false;
+    expect(refuseLegacyWrite(mode)).toBeNull();
+    state.value = true;
+    expect(refuseLegacyWrite(mode)?.status).toBe(426);
+  });
 });
 
-describe("latchLegacyWriteSwitch", () => {
-  it("stays switched after the source says true, even when it later says false", () => {
-    const { state, read } = source(true);
-    const latched = latchLegacyWriteSwitch(read);
-    expect(latched()).toBe(true);
-    state.value = false;
-    expect(latched()).toBe(true);
-    expect(latched()).toBe(true);
-    // Once latched the source is not consulted again.
-    expect(read).toHaveBeenCalledTimes(1);
-  });
-
-  it("stays switched after the source becomes unreachable", () => {
-    const { state, read } = source(true);
-    const latched = latchLegacyWriteSwitch(read);
-    expect(latched()).toBe(true);
-    state.value = "unreachable";
-    expect(latched()).toBe(true);
-  });
-
-  it("fails open: an unreachable source before any true answer is not switched", () => {
-    const { state, read } = source("unreachable");
-    const latched = latchLegacyWriteSwitch(read);
-    expect(latched()).toBe(false);
-    expect(refuseLegacyWrite(latched)).toBeNull();
-    // Once the source is reachable and says true, the latch sets and holds.
-    state.value = true;
-    expect(latched()).toBe(true);
-    state.value = false;
-    expect(latched()).toBe(true);
-  });
-
-  it("follows a source that has never said true, in both directions", () => {
+describe("fenceLegacyCommit", () => {
+  it("passes while the account is unswitched and re-reads the mode on every call", () => {
     const { state, read } = source(false);
-    const latched = latchLegacyWriteSwitch(read);
-    expect(latched()).toBe(false);
+    const mode = createAccountStorageMode({ source: read });
+    expect(() => fenceLegacyCommit(mode)).not.toThrow();
     state.value = true;
-    expect(latched()).toBe(true);
+    expect(() => fenceLegacyCommit(mode)).toThrow(LegacyWriteRefusedError);
+  });
+
+  it("carries the 426 response when switched and the 503 when unknown", () => {
+    const switched = createAccountStorageMode({ source: () => true });
+    try {
+      fenceLegacyCommit(switched);
+      throw new Error("expected a refusal");
+    } catch (error) {
+      expect((error as LegacyWriteRefusedError).response.status).toBe(426);
+    }
+    const unknown = createAccountStorageMode({
+      source: () => true,
+      owner: OWNER_A,
+    });
+    try {
+      fenceLegacyCommit(unknown, OWNER_B);
+      throw new Error("expected a refusal");
+    } catch (error) {
+      expect((error as LegacyWriteRefusedError).response.status).toBe(503);
+    }
+  });
+
+  it("passes when no mode is wired", () => {
+    expect(() => fenceLegacyCommit(undefined)).not.toThrow();
   });
 });

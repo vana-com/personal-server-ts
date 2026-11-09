@@ -35,7 +35,6 @@ function takeoverLimit(name: string, fallback: number): number {
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
   createAccountStorageMode,
-  legacyWriteSwitchOf,
   type PersonalServerReadFulfillmentReporter,
 } from "@opendatalabs/personal-server-ts-core/api";
 import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
@@ -667,17 +666,15 @@ export async function createServer(
    * delegate reports every envelope as skipped — sync behaves exactly as it
    * did before this existed.
    */
-  // The account's stream-sync switch, latched once for this server. The PDPP
-  // importer and every legacy route read this one value (see app.ts).
-  // One mode per runtime: the write gate, the read selector and every MCP
-  // engine of this server consume this same instance.
+  // The account's stream-sync switch is `config.streamSync.write` alone (the
+  // host sets it from the Account setting before launch). One mode per
+  // runtime, sampled when built: the write gate and its commit fence, the read
+  // selector, the PDPP importer and every MCP engine of this server consume
+  // this same instance. `streamSync.refuseLegacyWrites` takes no part.
   const accountStorageMode = createAccountStorageMode({
     owner: serverOwner,
-    source: () =>
-      config.streamSync.write === true &&
-      config.streamSync.refuseLegacyWrites === true,
+    source: () => config.streamSync.write === true,
   });
-  const legacyWritesRefused = legacyWriteSwitchOf(accountStorageMode);
   let pdppImporterImpl: PdppImporter | null = null;
   const pdppImporter: PdppImporter = {
     importEnvelope: (envelope) =>
@@ -1244,7 +1241,7 @@ export async function createServer(
       declarations: pdppAuth?.retainedDeclarations ?? [],
       documents: pdppAuth?.retainedDocuments ?? new Map(),
       serverOwner,
-      legacyWritesRefused,
+      accountStorageMode,
       logger,
     }) ?? null;
 

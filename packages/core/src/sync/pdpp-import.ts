@@ -61,10 +61,10 @@ import type {
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { Logger } from "../logger/index.js";
 import {
-  legacyWritesRefused,
-  type LegacyWriteSwitch,
+  legacyWriteVerdict,
   UPDATE_REQUIRED_MESSAGE,
 } from "../api/legacy-write-gate.js";
+import type { AccountStorageMode } from "../api/account-storage-mode.js";
 
 /** The reserved key carrying PDPP import metadata inside `data`. */
 export const PDPP_METADATA_KEY = "$pdpp";
@@ -128,7 +128,8 @@ export type PdppImportRejectionCode =
   | "no_instance"
   | "method_authority"
   | "store_rejected"
-  | "legacy_write_refused";
+  | "legacy_write_refused"
+  | "account_mode_unknown";
 
 export interface PdppImportRejection {
   code: PdppImportRejectionCode;
@@ -153,6 +154,8 @@ export interface PdppImportRejection {
  * `legacy_write_refused` IS here as well, although it reads deployment state:
  * the stream-sync switch is one-way, so once the latch has set, no later cycle
  * on this account can accept a legacy publish.
+ * `account_mode_unknown` is NOT here: it is a local fault that clears once the
+ * host gives the mode evidence, so a later cycle may accept the publish.
  */
 const PERMANENT_REJECTION_CODES: ReadonlySet<PdppImportRejectionCode> = new Set(
   [
@@ -226,10 +229,11 @@ export interface PdppImporterDeps {
    */
   instanceFor: (sourceId: string) => string | undefined;
   /**
-   * The account's stream-sync switch (see `legacy-write-gate.ts`). While it
-   * is on, a canonical publish is refused: the stream store is the only store.
+   * The account's storage mode (see `legacy-write-gate.ts`). While it is
+   * switched, a canonical publish is refused: the stream store is the only
+   * store. While it is unknown, the publish is refused too and retried later.
    */
-  legacyWritesRefused?: LegacyWriteSwitch;
+  accountStorageMode?: AccountStorageMode;
   logger: Logger;
 }
 
@@ -644,8 +648,15 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
 
     // A canonical publish is a legacy write: refuse it on a switched account
     // before anything is stored. This is the only gate on the publish path.
-    if (legacyWritesRefused(deps.legacyWritesRefused)) {
+    const verdict = legacyWriteVerdict(deps.accountStorageMode);
+    if (verdict === "switched") {
       return reject("legacy_write_refused", UPDATE_REQUIRED_MESSAGE);
+    }
+    if (verdict === "unknown") {
+      return reject(
+        "account_mode_unknown",
+        "The account storage mode is unknown; retry shortly",
+      );
     }
 
     // One envelope per call, but through the batch API so the store's own

@@ -5,8 +5,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createAccountStorageMode,
+  refuseLegacyWrite,
   handlePersonalServerDataRequest,
-  legacyWriteSwitchOf,
   selectAccountStorageMode,
   type AccountStorageMode,
   type PersonalServerDataApiDeps,
@@ -105,11 +105,21 @@ describe("createAccountStorageMode", () => {
     expect(mode.read(OWNER_A)).toBe("switched");
   });
 
-  it("does not consult the source for an owner it is not bound to", () => {
-    const { read } = source(true);
+  it("does not consult the source again for an owner it is not bound to", () => {
+    const { read } = source(false);
     const mode = createAccountStorageMode({ owner: OWNER_A, source: read });
+    // Built eagerly: one sample at construction, none for a foreign question.
+    expect(read).toHaveBeenCalledTimes(1);
     expect(mode.read(OWNER_B)).toBe("unknown");
-    expect(read).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  // LAZY_LATCH
+  it("latches a startup true before any caller reads it", () => {
+    const { state, read } = source(true);
+    const mode = createAccountStorageMode({ source: read });
+    state.value = false;
+    expect(mode.read()).toBe("switched");
   });
 });
 
@@ -220,35 +230,22 @@ describe("the write gate and the read selector share one answer", () => {
       expect(write.status === 426, `source ${String(value)}`).toBe(
         selection === "streams",
       );
-      expect(legacyWriteSwitchOf(mode)()).toBe(selection === "streams");
+      expect(refuseLegacyWrite(mode, OWNER_A)?.status === 426).toBe(
+        selection === "streams",
+      );
     }
   });
 
   // GATE_AND_SELECTOR_DISAGREE
-  it("takes the gate's answer from the mode, not from a separate switch", async () => {
-    const mode = createAccountStorageMode({ source: () => false });
-    const deps = dataDeps({
-      accountStorageMode: mode,
-      // A stale plain switch that disagrees with the mode must not win.
-      legacyWritesRefused: () => true,
-    });
-    const write = await handlePersonalServerDataRequest(post(), deps);
-    expect(write.status).not.toBe(426);
-
-    const switched = dataDeps({
-      accountStorageMode: createAccountStorageMode({ source: () => true }),
-      legacyWritesRefused: () => false,
-    });
-    expect(
-      (await handlePersonalServerDataRequest(post(), switched)).status,
-    ).toBe(426);
-  });
-
-  // GATE_AND_SELECTOR_DISAGREE
-  it("lets an unknown mode through the write gate (fail open) while reads refuse", async () => {
+  it("refuses a legacy write with a retryable 503 while the mode is unknown, as reads do", async () => {
     const { read } = source("unreachable");
     const mode = createAccountStorageMode({ source: read });
-    expect(legacyWriteSwitchOf(mode)()).toBe(false);
+    const write = await handlePersonalServerDataRequest(
+      post(),
+      dataDeps({ accountStorageMode: mode }),
+    );
+    expect(write.status).toBe(503);
+    expect((await write.json()).error.errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
     expect(selectAccountStorageMode({ accountStorageMode: mode }).kind).toBe(
       "refuse",
     );

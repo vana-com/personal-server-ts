@@ -26,6 +26,7 @@ import {
   type RetainedDeclaration,
 } from "./pdpp-import.js";
 import type { Logger } from "../logger/index.js";
+import { createAccountStorageMode } from "../api/account-storage-mode.js";
 
 const SCOPE = "instagram.profile";
 const COLLECTED_AT = "2026-09-17T10:00:00.000Z";
@@ -686,14 +687,14 @@ describe("createPdppImporter", () => {
 });
 
 describe("the stream-sync switch refuses canonical publishes", () => {
-  function importerWith(legacyWritesRefused: () => boolean) {
+  function importerWith(source: () => boolean, owner?: string) {
     const store = createMemoryRecordStore();
     const importer = createPdppImporter({
       store,
       declarations: [RETAINED],
       instanceFor: (sourceId) =>
         sourceId === SOURCE_ID ? INSTANCE : undefined,
-      legacyWritesRefused,
+      accountStorageMode: createAccountStorageMode({ owner, source }),
       logger: silentLogger(),
     });
     return { importer, store };
@@ -710,6 +711,20 @@ describe("the stream-sync switch refuses canonical publishes", () => {
     expect(ingest).not.toHaveBeenCalled();
     expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
     expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(false);
+  });
+
+  it("refuses a publish while the account mode is unknown, retryably", () => {
+    const { importer, store } = importerWith(() => {
+      throw new Error("Account unreachable");
+    });
+    const ingest = vi.spyOn(store, "ingestBatch");
+    const outcome = importer.importEnvelope(envelope());
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      rejection: { code: "account_mode_unknown" },
+    });
+    expect(ingest).not.toHaveBeenCalled();
+    expect(importer.needsRetry(SCOPE, COLLECTED_AT)).toBe(true);
   });
 
   it("imports the same publish on an unswitched account", () => {

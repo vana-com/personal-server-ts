@@ -12,10 +12,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
-import {
-  createAccountStorageMode,
-  type LegacyWriteSwitch,
-} from "@opendatalabs/personal-server-ts-core/api";
+import { createAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   buildWeb3SignedHeader,
@@ -117,7 +114,7 @@ function setup(
     /** Omit the whole write-session wiring (owner-only ingest). */
     writeSessions?: false;
     /** The stream-sync switch the host wires (see `legacy-write-gate.ts`). */
-    legacyWritesRefused?: LegacyWriteSwitch;
+    legacyWritesRefused?: () => boolean;
   } = {},
 ): Harness {
   const gateway = createWriteGateway(
@@ -760,7 +757,7 @@ describe("PS-Lite write sessions on the bearer-token auth adapter", () => {
 });
 
 describe("the stream-sync switch refuses every legacy write on the browser runtime", () => {
-  const switchedOn: LegacyWriteSwitch = () => true;
+  const switchedOn: () => boolean = () => true;
 
   /** An owner-signed request: the owner's own client, no builder session. */
   async function ownerSigned(
