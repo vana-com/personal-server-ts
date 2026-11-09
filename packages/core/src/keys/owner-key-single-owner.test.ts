@@ -166,8 +166,9 @@ describe("owner key derivation has one owner", () => {
     }
 
     expect(violations).toEqual([]);
-    // Parsing every source file in the monorepo takes a few seconds; under a
-    // loaded CI runner it passed the 5 s default and failed with a timeout.
+    // This parses every source file in the monorepo. On a loaded CI runner it
+    // exceeded the 5 s default and timed out; 60 s is a margin, not a measured
+    // duration.
   }, 60_000);
 
   describe("the detector reads code, not text", () => {
