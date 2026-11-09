@@ -5,6 +5,8 @@ import {
   controlHashes,
   controlScope,
   deriveKeyCheck,
+  PART_LIMIT_BYTES,
+  pkHash,
   shardOf,
   streamScope,
   type ControlRead,
@@ -30,8 +32,8 @@ const shape = {
   profile: { key: "sample", version: "1.0.0" },
 };
 
-async function fixture() {
-  const files = createMemoryStreamSyncFiles(7);
+async function fixture(chunkBytes = 7) {
+  const files = createMemoryStreamSyncFiles(chunkBytes);
   const rows = new Map<string, ControlRead>();
   const blobs = new Map<string, Uint8Array>();
   let posts = 0;
@@ -148,6 +150,7 @@ async function fixture() {
   };
   return {
     files,
+    blobs,
     rows,
     registry,
     make,
@@ -575,6 +578,62 @@ describe("writer snapshot provenance", () => {
     // The seed-only stream exposes no rows.
     await expect(
       Array.fromAsync(snap.lines(snap.runs[0]!, "seed")),
+    ).rejects.toThrow();
+    snap.release();
+  });
+});
+
+describe("overlay body integrity", () => {
+  const long = { id: "same", text: "x".repeat(10 * 1024 * 1024) };
+  async function snapshotOf(
+    f: Awaited<ReturnType<typeof fixture>>,
+    record: { id: string; text: string },
+  ) {
+    const w = f.make();
+    await collect(w, "r1", [record]);
+    const snap = await createWriterOverlaySource(f.make()).snapshot(connector);
+    return snap;
+  }
+  it("yields an unmodified long body from its file", async () => {
+    const f = await fixture(1024 * 1024);
+    const snap = await snapshotOf(f, long);
+    expect(f.files.paths().some((p) => p.includes(".bodies/"))).toBe(true);
+    expect(await Array.fromAsync(snap.lines(snap.runs[0]!, "s"))).toEqual([
+      { o: 1000, r: "r1", v: long },
+    ]);
+    snap.release();
+  });
+  it("fails, yielding nothing, when a long body file was replaced", async () => {
+    const f = await fixture(1024 * 1024);
+    const snap = await snapshotOf(f, long);
+    const body = f.files.paths().find((p) => p.includes(".bodies/"))!;
+    await f.files.write(
+      body,
+      encoder.encode(JSON.stringify({ id: "same", text: "short" })),
+    );
+    const yielded: unknown[] = [];
+    await expect(
+      (async () => {
+        for await (const line of snap.lines(snap.runs[0]!, "s")) {
+          yielded.push(line);
+        }
+      })(),
+    ).rejects.toThrow();
+    expect(yielded).toEqual([]);
+    snap.release();
+  });
+  it("fails when an inline body changed but kept its length and key", async () => {
+    const f = await fixture(1024 * 1024);
+    const snap = await snapshotOf(f, { id: "same", text: "aaaa" });
+    const log = "runs/r1/spool/s0.log";
+    const text = decoder.decode((await f.files.read(log))!);
+    expect(text).toContain('"text":"aaaa"');
+    await f.files.write(
+      log,
+      encoder.encode(text.replace('"text":"aaaa"', '"text":"bbbb"')),
+    );
+    await expect(
+      Array.fromAsync(snap.lines(snap.runs[0]!, "s")),
     ).rejects.toThrow();
     snap.release();
   });
@@ -1157,5 +1216,70 @@ describe("a run made ready before the upgrade", () => {
     expect(f.posts()).toBe(1);
     const row = f.rows.get(streamScope(connector, "", "s"));
     expect(row).toMatchObject({ found: true, version: 1 });
+  });
+});
+
+/** Two ids whose key hashes share their first 16 bits (one planner leaf). */
+async function idsSharing16Bits(): Promise<[string, string]> {
+  const seen = new Map<string, string>();
+  for (let i = 0; ; i += 1) {
+    const id = `k${i}`;
+    const hash = await pkHash(streamSyncHashes.sha256, { id }, ["id"]);
+    const other = seen.get(hash.slice(0, 4));
+    if (other !== undefined) return [other, id];
+    seen.set(hash.slice(0, 4), id);
+  }
+}
+
+describe("a near-limit run made ready before the upgrade", () => {
+  it("publishes two old 8 MiB records that share a planner leaf, in parts within the limit", async () => {
+    // Large reads: the 7-byte default would take hours on 8 MiB lines.
+    const f = await fixture(1024 * 1024);
+    const w = f.make();
+    await w.refreshControls();
+    const ids = await idsSharing16Bits();
+    await collect(
+      w,
+      "r1",
+      ids.map((id) => ({ id })),
+    );
+    // Each old line is 8,388,557 bytes; both persisted 8,388,558 (+ LF).
+    const oldLine = (id: string) => {
+      const head = `{"o":1000,"r":"r1","v":{"id":"${id}","pad":"`;
+      const tail = `"}}`;
+      const fill = 8_388_557 - encoder.encode(head + tail).length;
+      // Counting text with the id in it: no two pieces hash alike, so the
+      // uploaded blobs can be summed.
+      let pad = `${id}:`;
+      for (let n = 0; pad.length < fill; n += 1)
+        pad += `${n.toString(36)}${id},`;
+      return head + pad.slice(0, fill) + tail;
+    };
+    const keys = await Promise.all(
+      ids.map((id) => pkHash(streamSyncHashes.sha256, { id }, ["id"])),
+    );
+    const lines = ids.map((id, i) => `${keys[i]} ${oldLine(id)}\n`);
+    expect(encoder.encode(lines[0]!.slice(65)).length).toBe(8_388_558);
+    await f.files.write("runs/r1/spool/s0.log", encoder.encode(lines.join("")));
+    await f.files.remove("runs/r1/spool/s0");
+    const counts = new Array<number>(256).fill(0);
+    counts[shardOf(keys[0]!)]! += 2 * 8_388_558;
+    await f.edit((e) => {
+      e.streams.s.shardBytes = counts;
+    });
+    const restarted = f.make();
+    await restarted.refreshControls();
+    await restarted.publishPending();
+    expect((await f.read()).phase).toBe("done");
+    expect(f.posts()).toBe(1);
+    // Every uploaded blob is a head or a part: none passes the part limit.
+    expect(f.blobs.size).toBeGreaterThan(0);
+    let total = 0;
+    for (const data of f.blobs.values()) {
+      expect(data.length).toBeLessThanOrEqual(PART_LIMIT_BYTES);
+      total += data.length;
+    }
+    // No record dropped for size: both bodies are in the published parts.
+    expect(total).toBeGreaterThan(2 * 8_388_000);
   });
 });

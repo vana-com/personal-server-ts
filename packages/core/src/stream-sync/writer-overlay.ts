@@ -1,6 +1,7 @@
 /** Pinned intake logs from the existing, exclusively owned writer home. */
 import {
   pkHash,
+  sha256Hex,
   type JsonObject,
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -109,20 +110,33 @@ export function pinnedWriterSnapshot(
   });
 }
 
+/**
+ * The body the entry's envelope describes. The envelope names the body's
+ * length (`n`) and SHA-256 (`h`); a body that differs, whether the file was
+ * damaged or replaced, fails the read before any record is built from it.
+ */
 async function parseBody(
   files: StreamSyncFiles,
   entry: SpoolEntry,
 ): Promise<JsonObject> {
+  let bytes: Uint8Array;
   if (entry.body.kind === "inline") {
-    return JSON.parse(entry.body.text) as JsonObject;
+    bytes = new TextEncoder().encode(entry.body.text);
+  } else {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of files.readChunks(entry.body.path)) {
+      chunks.push(chunk);
+    }
+    bytes = await joinChunks(chunks);
   }
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of files.readChunks(entry.body.path)) {
-    chunks.push(chunk);
+  const { envelope } = entry;
+  if (
+    bytes.length !== envelope.n ||
+    (await sha256Hex(streamSyncHashes.sha256, bytes)) !== envelope.h
+  ) {
+    throw new Error("overlay spool integrity mismatch");
   }
-  return JSON.parse(
-    new TextDecoder().decode(await joinChunks(chunks)),
-  ) as JsonObject;
+  return JSON.parse(new TextDecoder().decode(bytes)) as JsonObject;
 }
 
 async function joinChunks(chunks: readonly Uint8Array[]): Promise<Uint8Array> {

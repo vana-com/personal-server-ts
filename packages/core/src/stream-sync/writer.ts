@@ -46,6 +46,7 @@ import {
   encodeFramePart,
   encodePiece,
   FRAME_PIECE_BYTES,
+  FRAME_SMALL_BYTES,
   frameChunks,
   frameOfBody,
   frameOfLine,
@@ -2787,11 +2788,17 @@ export class StreamSyncWriter {
         };
         for (const winner of result.winners) {
           const ref = winner.ref;
-          if (ref.kind === "held") {
+          if (ref.kind === "held" && winner.held) {
             segment.push({ k: winner.k, bytes: ref.bytes });
             continue;
           }
           await flush();
+          if (ref.kind === "held") {
+            // A long frame converted from an old line: it is alone in its own
+            // parts, cut into pieces, as a long frame from a body file is.
+            await this.storePieces(ref.bytes, result.prefix, store);
+            continue;
+          }
           if (ref.kind === "run") {
             // Unchanged long frame: keep its parts, under the bucket prefix.
             for (const entry of ref.parts) {
@@ -2799,22 +2806,14 @@ export class StreamSyncWriter {
             }
             continue;
           }
-          let first = true;
-          const frame = frameChunks(
-            ref.envelope,
-            this.options.home.files.readChunks(ref.path),
+          await this.storePieces(
+            frameChunks(
+              ref.envelope,
+              this.options.home.files.readChunks(ref.path),
+            ),
+            result.prefix,
+            store,
           );
-          for await (const piece of cutPieces(frame, FRAME_PIECE_BYTES)) {
-            await store(
-              await encodePiece(
-                this.hashes.sha256,
-                result.prefix,
-                piece,
-                first,
-              ),
-            );
-            first = false;
-          }
         }
         await flush();
       }
@@ -2825,6 +2824,25 @@ export class StreamSyncWriter {
       a.prefix < b.prefix ? -1 : a.prefix > b.prefix ? 1 : 0,
     );
     return { parts };
+  }
+
+  /** Store one long frame as pieces, each its own part; the first starts it. */
+  private async storePieces(
+    frame: Uint8Array | AsyncIterable<Uint8Array>,
+    prefix: string,
+    store: (encoded: EncodedPart) => Promise<void>,
+  ): Promise<void> {
+    const source =
+      frame instanceof Uint8Array
+        ? (async function* () {
+            yield frame;
+          })()
+        : frame;
+    let first = true;
+    for await (const piece of cutPieces(source, FRAME_PIECE_BYTES)) {
+      await store(await encodePiece(this.hashes.sha256, prefix, piece, first));
+      first = false;
+    }
   }
 
   private async reduceGroup(
@@ -2884,7 +2902,7 @@ export class StreamSyncWriter {
             o: line.o,
             r: line.r,
             size: frame.bytes.length,
-            held: true,
+            held: frame.bytes.length <= FRAME_SMALL_BYTES,
             ref: { kind: "held", bytes: frame.bytes },
           });
         }
@@ -2931,28 +2949,31 @@ export class StreamSyncWriter {
           const { k, o, r } = entry.envelope;
           const reducer = route(k);
           if (reducer === null) continue;
-          reducer.add({
-            k,
-            o,
-            r,
-            size: entry.size,
-            ...(entry.body.kind === "inline"
-              ? {
-                  held: true,
-                  ref: {
-                    kind: "held" as const,
-                    bytes: frameOfInline(entry.envelope, entry.body.text),
-                  },
-                }
-              : {
-                  held: false,
-                  ref: {
-                    kind: "file" as const,
-                    path: entry.body.path,
-                    envelope: entry.envelope,
-                  },
-                }),
-          });
+          // An old line is budgeted by the frame it becomes, not by its old
+          // line size (`entry.size`, which only the overlay log count uses).
+          // A frame past the small limit is a long frame, whatever its
+          // origin: not held for the split, and alone in its own parts.
+          const { body } = entry;
+          if (body.kind === "inline") {
+            const bytes = frameOfInline(entry.envelope, body.text);
+            reducer.add({
+              k,
+              o,
+              r,
+              size: bytes.length,
+              held: bytes.length <= FRAME_SMALL_BYTES,
+              ref: { kind: "held", bytes },
+            });
+          } else {
+            reducer.add({
+              k,
+              o,
+              r,
+              size: entry.size,
+              held: false,
+              ref: { kind: "file", path: body.path, envelope: entry.envelope },
+            });
+          }
         }
       }
     }
