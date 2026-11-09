@@ -39,6 +39,25 @@ describe("retireBasis", () => {
     expect(basis.streams.map((s) => s.connector)).toEqual(["github"]);
   });
 
+  it("says when a connector that can serve the scope was never seen: no delete of the registry explains its data (UNKNOWN_ALTERNATE_DELETES)", async () => {
+    const { fixture, publish } = await setup(["github"]);
+    await publish("github", "events", ["a"]);
+    const service = await fixture.service();
+    await fixture.sync(service);
+    expect(service.retireBasis("github.events")).toMatchObject({
+      covered: true,
+      allTargetsKnown: false,
+    });
+    // A scope with one connector is known whole.
+    const solo = await setup(["chatgpt"]);
+    await solo.publish("chatgpt", "memories", ["m0"]);
+    const one = await solo.fixture.service();
+    await solo.fixture.sync(one);
+    expect(one.retireBasis("chatgpt.memories")).toMatchObject({
+      allTargetsKnown: true,
+    });
+  });
+
   it("says deleted, not covered, when every target is deleted and none came back, with the registry time of the delete (WHOLE_DELETE_BASIS)", async () => {
     const { fixture, publish } = await setup(["chatgpt"]);
     const head = await publish("chatgpt", "memories", ["m0"]);

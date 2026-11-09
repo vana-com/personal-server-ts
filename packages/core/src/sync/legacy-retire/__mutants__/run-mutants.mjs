@@ -183,6 +183,8 @@ function applyEdits(edits) {
 const rows = [];
 let bad = 0;
 try {
+  // Every edit still applies exactly once (fails fast on a stale edit).
+  for (const m of selected) applyEdits(m.edits)();
   // Baseline: every test any mutant relies on is green without a mutation.
   const baselineTests = [...new Set(selected.flatMap((m) => m.tests))];
   const baseline = vitest(baselineTests);

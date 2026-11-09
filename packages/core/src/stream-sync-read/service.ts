@@ -218,6 +218,13 @@ export interface RetireBasis {
    * the source, not because data is missing. `covered` is false then.
    */
   readonly deleted: boolean;
+  /**
+   * Every connector that can serve the scope (`readTargets`) is one the
+   * registry mirror has seen. False when an alternate was never connected:
+   * it may hold local data nobody published, so no delete of the registry
+   * can explain a missing entity.
+   */
+  readonly allTargetsKnown: boolean;
   readonly throughMs: number;
   readonly streams: readonly {
     readonly connector: string;
@@ -740,7 +747,8 @@ export class StreamSyncReadService {
     // target. A scope may be served by alternate connectors; one that was
     // never connected holds nothing and must not leave the scope "uncovered".
     const known = new Set(this.mirror.connectors());
-    const targets = readTargets(scope).filter((t) => known.has(t.connector));
+    const allTargets = readTargets(scope);
+    const targets = allTargets.filter((t) => known.has(t.connector));
     if (targets.length === 0 || this.mirror.needsFullListing()) return null;
     const streams: RetireBasis["streams"][number][] = [];
     for (const target of targets) {
@@ -795,6 +803,7 @@ export class StreamSyncReadService {
       covered: covered && Number.isFinite(throughMs),
       ambiguous,
       deleted: !ambiguous && deletedTargets === targets.length,
+      allTargetsKnown: targets.length === allTargets.length,
       throughMs: Number.isFinite(throughMs) ? throughMs : 0,
       streams,
     };

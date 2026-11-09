@@ -62,7 +62,7 @@ export const MUTANTS = [
   },
   {
     name: "FENCE_AFTER_DELETE_WRITE",
-    why: "the fence ignores when the file was written (also EMPTY_IMPORT_FENCE_DELETES and FENCE_CHANGED_PASSES)",
+    why: "the fence ignores when the file was written",
     edits: edit(READBACK, "writtenAt < s.deleteAtMs", "true"),
     tests: [ROUND2],
     mustFail: [
@@ -98,8 +98,8 @@ export const MUTANTS = [
     why: "a failed or unkeyed published read excuses every entity",
     edits: edit(
       READBACK,
-      "const viewGone = basis !== null && fenceOpen && basis.viewDeleted;",
-      "const viewGone = fenceOpen;",
+      "body === null && basis !== null && fenceOpen && basis.viewDeleted;",
+      "fenceOpen;",
     ),
     tests: [ROUND2],
     mustFail: ["FENCE_NULL_VIEW_PASSES"],
@@ -155,6 +155,105 @@ export const MUTANTS = [
     tests: [BASIS],
     mustFail: ["FENCE_PASSES_WITHOUT_VIEW"],
   },
+  // ---- round 3 (review of e6992b5d) ----
+  {
+    name: "VACUOUS_IMPORT_FENCE_DELETES",
+    why: "a fenced file retires although this device staged no rows (an empty import source marks every connector done)",
+    edits: edit(
+      RETIRE,
+      "if (!(await deps.host.importStaged(connector))) {",
+      "if (false) {",
+    ),
+    tests: [ROUND2],
+    mustFail: ["VACUOUS_IMPORT_FENCE_DELETES"],
+  },
+  {
+    name: "EMPTY_IMPORT_FENCE_DELETES",
+    why: "round-1 bug whole: the fence ignores when the file was written AND an empty import counts as staged",
+    edits: [
+      ...edit(READBACK, "writtenAt < s.deleteAtMs", "true"),
+      ...edit(
+        RETIRE,
+        "if (!(await deps.host.importStaged(connector))) {",
+        "if (false) {",
+      ),
+    ],
+    tests: [ROUND2],
+    mustFail: ["EMPTY_IMPORT_FENCE_DELETES"],
+  },
+  {
+    name: "FENCE_CHANGED_PASSES",
+    why: "a changed entity of a file written after the delete is excused",
+    edits: edit(
+      READBACK,
+      "  if (fenceOpen) {\n    return {",
+      "  if (fenceOpen || (missing === 0 && changed > 0)) {\n    return {",
+    ),
+    tests: [ROUND2],
+    mustFail: ["FENCE_CHANGED_PASSES"],
+  },
+  {
+    name: "UNLISTED_SCALAR_IGNORED",
+    why: "an uncovered top-level scalar is skipped, not compared",
+    edits: edit(KEYS, "if (derivedCount(key, value)) continue;", "continue;"),
+    tests: [ROUND2],
+    mustFail: ["UNLISTED_SCALAR_IGNORED"],
+  },
+  {
+    name: "DERIVED_TOTAL_COMPARED",
+    why: "a `total` derived from a compared collection is compared too: an older snapshot never retires once the collection grew",
+    edits: edit(
+      KEYS,
+      "if (derivedCount(key, value)) continue;",
+      "if (false) continue;",
+    ),
+    tests: [ROUND2],
+    mustFail: ["still retires an older snapshot whose derived total"],
+  },
+  {
+    name: "UNKNOWN_ALTERNATE_DELETES",
+    why: "retireBasis says every target is known although an alternate connector was never seen",
+    edits: edit(
+      SERVICE,
+      "allTargetsKnown: targets.length === allTargets.length,",
+      "allTargetsKnown: true,",
+    ),
+    tests: [BASIS],
+    mustFail: ["UNKNOWN_ALTERNATE_DELETES"],
+  },
+  {
+    name: "UNKNOWN_ALTERNATE_FENCES",
+    why: "the fence opens for a scope with a connector the registry never saw",
+    edits: edit(
+      READBACK,
+      "basis.streams.length === 0 || !basis.allTargetsKnown",
+      "basis.streams.length === 0",
+    ),
+    tests: [ROUND2],
+    mustFail: ["UNKNOWN_ALTERNATE_FENCES"],
+  },
+  {
+    name: "VIEWGONE_WITHOUT_NULL_BODY",
+    why: "a served body that cannot be keyed counts as a deleted source",
+    edits: edit(
+      READBACK,
+      "body === null && basis !== null && fenceOpen && basis.viewDeleted",
+      "basis !== null && fenceOpen && basis.viewDeleted",
+    ),
+    tests: [ROUND2],
+    mustFail: ["VIEWGONE_WITHOUT_NULL_BODY"],
+  },
+  {
+    name: "FILE_CHANGED_BEFORE_DELETE",
+    why: "the file is not hashed again right before the delete",
+    edits: edit(
+      RETIRE,
+      "if (report.wouldDelete && !(await holds(deps, scope, row, fresh))) {",
+      "if (false) {",
+    ),
+    tests: [ROUND2],
+    mustFail: ["FILE_CHANGED_BEFORE_DELETE"],
+  },
   {
     name: "UNCOVERED_RETIRES",
     why: "the host gives a basis for a scope the registry does not cover",
@@ -182,8 +281,8 @@ export const MUTANTS = [
     why: "a top-level array or object no table path covers is not compared",
     edits: edit(
       KEYS,
-      'if (!covered.has(key) && value !== null && typeof value === "object") {',
-      "if (false) {",
+      'if (value !== null && typeof value === "object") return null;',
+      "if (false) return null;",
     ),
     tests: [ROUND2],
     mustFail: ["UNLISTED_TOP_LEVEL_IGNORED"],
@@ -193,8 +292,8 @@ export const MUTANTS = [
     why: "retireBasis counts connectors the registry never saw",
     edits: edit(
       SERVICE,
-      "readTargets(scope).filter((t) => known.has(t.connector));",
-      "readTargets(scope);",
+      "allTargets.filter((t) => known.has(t.connector));",
+      "allTargets;",
     ),
     tests: [BASIS],
     mustFail: ["UNKNOWN_ALTERNATE_UNCOVERS"],
@@ -266,7 +365,7 @@ export const MUTANTS = [
   {
     name: "VACUOUS_RETIRE",
     why: "a file that holds nothing passes its readback",
-    edits: edit(READBACK, "if (total === 0) {", "if (false) {"),
+    edits: edit(READBACK, "if (collectionTotal === 0) {", "if (false) {"),
     tests: [GATES],
     mustFail: ["VACUOUS_RETIRE"],
   },

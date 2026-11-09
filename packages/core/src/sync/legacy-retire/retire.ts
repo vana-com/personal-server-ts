@@ -13,12 +13,17 @@
  *      FRESH readback taken in the same pass, immediately before the delete,
  *      passes too: the published view can change after an earlier pass was
  *      stored, so a stored pass never deletes on its own;
- *   4. when the readback relied on the delete fence, every target stream of
- *      the scope that has seen a delete has since been re-collected by a full
- *      run on this device (a record the fence dropped must not be retired
- *      before the device could collect it again). After a whole-source delete
- *      the readback passes (the file predates the delete) but the file stays
- *      until the source is reconnected and a full run commits.
+ *   4. when the readback relied on the delete fence, this device STAGED rows
+ *      for every connector of the scope (`importStaged`: an empty import
+ *      source sets `importDone` for all, but stages nothing, so it proves no
+ *      row of the file was ever delivered), and every target stream of the
+ *      scope that has seen a delete has since been re-collected by a full run
+ *      on this device (a record the fence dropped must not be retired before
+ *      the device could collect it again). After a whole-source delete the
+ *      readback passes (the file predates the delete) but the file stays
+ *      until the source is reconnected and a full run commits;
+ *   5. the file still hashes to what the fresh readback read, right before
+ *      the delete.
  *
  * The registry must be an authority for the scope (`deleteBasis`): covered by
  * live complete heads, or deleted whole, and not ambiguous. Otherwise the
@@ -31,6 +36,7 @@
  */
 
 import type { DataStoragePort } from "../../ports/index.js";
+import { contentHash } from "../../storage/legacy-entity-key-sets.js";
 import type { IndexEntry } from "../../storage/index/types.js";
 import { isPhysicalScope } from "../../stream-sync/scope-routing.js";
 import { isGatewayReservedScope } from "../delete-data-port.js";
@@ -52,7 +58,9 @@ export type RetireDecision =
   | "no_import"
   | "no_readback"
   | "readback_failed"
+  | "fence_not_imported"
   | "fence_not_recollected"
+  | "file_changed"
   | "ready";
 
 export interface RetireFileReport {
@@ -76,6 +84,8 @@ export interface RetireReport {
 export interface RetireHost extends ReadbackView {
   /** Whether this device finished importing for the connector. */
   importDone(connector: string): Promise<boolean>;
+  /** Whether this device staged rows for the connector (not a vacuous pass). */
+  importStaged(connector: string): Promise<boolean>;
   /** A full run of the connector committed the stream after this delete version. */
   fullRunSince(
     connector: string,
@@ -128,6 +138,22 @@ function legacyScopes(storage: RetireDeps["storage"]): string[] {
   }
 }
 
+/** The local file still hashes to what the readback read. */
+async function holds(
+  deps: RetireDeps,
+  scope: string,
+  row: IndexEntry,
+  readback: ReadbackRecord,
+): Promise<boolean> {
+  if (readback.fileHash === undefined) return false;
+  try {
+    const envelope = await deps.storage.readEnvelope(scope, row.collectedAt);
+    return contentHash(envelope.data) === readback.fileHash;
+  } catch {
+    return false;
+  }
+}
+
 async function decide(
   deps: RetireDeps,
   scope: string,
@@ -155,6 +181,11 @@ async function decide(
   if (stored === null) return report("no_readback");
   if (!stored.pass) return report("readback_failed");
   if (stored.fenced > 0) {
+    for (const connector of new Set(streams.map((s) => s.connector))) {
+      if (!(await deps.host.importStaged(connector))) {
+        return report("fence_not_imported");
+      }
+    }
     for (const s of streams) {
       if (s.deleteVersion === 0) continue;
       if (
@@ -205,13 +236,7 @@ export async function retireLegacyFiles(
         if (!(await deps.host.importDone(connector))) importReady = false;
       }
       if (importReady && (dry || record === null || !record.pass)) {
-        // A readback taken before the import finished is tagged: no real
-        // pass reuses it.
-        record = await readbackVersion(
-          { ...readbackDeps, preImport: !importReady },
-          scope,
-          row,
-        );
+        record = await readbackVersion(readbackDeps, scope, row);
       }
       let report = await decide(deps, scope, row, basis, record);
       if (report.wouldDelete && mayDelete) {
@@ -223,6 +248,10 @@ export async function retireLegacyFiles(
           freshBasis === null
             ? { ...report, decision: "no_readback", wouldDelete: false }
             : await decide(deps, scope, row, freshBasis, fresh);
+        // The file read back is the file deleted: hash it once more.
+        if (report.wouldDelete && !(await holds(deps, scope, row, fresh))) {
+          report = { ...report, decision: "file_changed", wouldDelete: false };
+        }
       }
       files.push(report);
       if (!report.wouldDelete || !mayDelete) continue;

@@ -36,6 +36,11 @@ export const legacy = (id: string) => ({
 
 export async function flow(options: {
   seed?: string[];
+  /**
+   * The import source lists the connector (and stages `seed`, if any). The
+   * default is production's: an empty source that stages nothing.
+   */
+  imported?: boolean;
   switched?: boolean;
   local: string[];
   /** When the legacy file was collected; default `AT`. */
@@ -61,8 +66,9 @@ export async function flow(options: {
   };
   const importer = new LegacyImporter({
     source: {
-      connectors: async () => (options.seed ? [CONNECTOR] : []),
-      streams: async () => [importStream],
+      connectors: async () =>
+        options.seed || options.imported ? [CONNECTOR] : [],
+      streams: async () => (options.seed ? [importStream] : []),
     },
     sink: {
       async stage(_connector, stream, rows) {
