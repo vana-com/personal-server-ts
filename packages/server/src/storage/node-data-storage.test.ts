@@ -899,3 +899,90 @@ describe("createNodeDataStorage.deleteVersionIfEnvelopeMissing", () => {
     ).resolves.toMatchObject({ data: { value: "a" } });
   });
 });
+
+describe.each([
+  ["with import operations", true],
+  ["without import operations", false],
+])("createNodeDataStorage.deleteVersion content fence (%s)", (_name, ops) => {
+  const scope = "github.events";
+  const collectedAt = "2026-10-11T00:00:00.000Z";
+  let root: string;
+  let storage: DataStoragePort;
+  let index: ReturnType<typeof createIndexManager>;
+
+  const envelopeOf = (value: string) =>
+    createDataFileEnvelope(scope, collectedAt, { value });
+
+  async function store(value: string) {
+    const written = await storage.writeEnvelope(envelopeOf(value));
+    const entry = await storage.insertEntry({
+      fileId: null,
+      schemaId: null,
+      path: written.relativePath,
+      scope,
+      collectedAt,
+      sizeBytes: written.sizeBytes,
+      afterTombstoneVersion: null,
+    });
+    return { id: entry.id, path: entry.path };
+  }
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "delete-content-fence-"));
+    index = createIndexManager(initializeDatabase(join(root, "index.db")));
+    storage = createNodeDataStorage({
+      // A copy of the manager is not the one the import operations key on.
+      indexManager: ops ? index : { ...index },
+      hierarchyOptions: { dataDir: join(root, "data") },
+    });
+  });
+
+  afterEach(async () => {
+    index.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("erases the row while the file still hashes to the fence", async () => {
+    const fence = await store("a");
+    const { contentHash } =
+      await import("@opendatalabs/personal-server-ts-core/storage/legacy-entity-key-sets");
+    await expect(
+      storage.deleteVersion(scope, collectedAt, {
+        ...fence,
+        contentHash: contentHash({ value: "a" }),
+      }),
+    ).resolves.toBe(true);
+    expect(index.findByPath(fence.path)).toBeUndefined();
+  });
+
+  it("keeps the row when the file was rewritten after the fence hash was taken", async () => {
+    const fence = await store("a");
+    const { contentHash } =
+      await import("@opendatalabs/personal-server-ts-core/storage/legacy-entity-key-sets");
+    const hash = contentHash({ value: "a" });
+    // Same path and row id, other content.
+    await writeFile(
+      buildDataFilePath(join(root, "data"), scope, collectedAt),
+      JSON.stringify(envelopeOf("b")),
+    );
+    await expect(
+      storage.deleteVersion(scope, collectedAt, {
+        ...fence,
+        contentHash: hash,
+      }),
+    ).resolves.toBe(false);
+    expect(index.findByPath(fence.path)).toBeDefined();
+  });
+
+  it("keeps the row when the file cannot be read, which is not a match", async () => {
+    const fence = await store("a");
+    await rm(buildDataFilePath(join(root, "data"), scope, collectedAt));
+    await expect(
+      storage.deleteVersion(scope, collectedAt, {
+        ...fence,
+        contentHash: "0".repeat(64),
+      }),
+    ).resolves.toBe(false);
+    expect(index.findByPath(fence.path)).toBeDefined();
+  });
+});

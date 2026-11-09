@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import type Database from "better-sqlite3";
 import type {
   ImportIntent,
@@ -24,6 +24,7 @@ import {
 } from "./hierarchy.js";
 import { relative, resolve } from "node:path";
 import type { VersionFence } from "@opendatalabs/personal-server-ts-core/ports";
+import { fenceContentMatches } from "@opendatalabs/personal-server-ts-core/storage/legacy-entity-key-sets";
 
 interface OperationRow {
   authority: string;
@@ -400,6 +401,21 @@ export function createImportOperations(
           row.collectedAt !== collectedAt
         ) {
           return false;
+        }
+        // Inside the immediate transaction a replica write publishes in: a
+        // rewrite of this path cannot land between this read and the erase.
+        if (fence.contentHash !== undefined) {
+          try {
+            const stored = JSON.parse(
+              readFileSync(
+                buildDataFilePath(options.dataDir, scope, collectedAt),
+                "utf-8",
+              ),
+            ) as { data?: unknown };
+            if (!fenceContentMatches(fence, stored.data)) return false;
+          } catch {
+            return false; // unreadable is not a match
+          }
         }
         retire("path = @path", { path: fence.path });
         deleteDataFileSync(options, scope, collectedAt);

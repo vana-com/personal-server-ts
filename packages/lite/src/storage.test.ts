@@ -14,6 +14,7 @@ import {
   type PsLiteDataFileStore,
 } from "./storage.js";
 import { previewEnvelopeValue } from "./storage-utils.js";
+import { contentHash } from "@opendatalabs/personal-server-ts-core/storage/legacy-entity-key-sets";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 
 describe("createPersistentPsLiteStorage", () => {
@@ -486,6 +487,57 @@ describe("createPersistentPsLiteStorage", () => {
       const envelope = await reloaded.readEnvelope(scope, collectedAt);
       expect(JSON.stringify(envelope)).toContain("new");
       expect(JSON.stringify(envelope)).not.toContain("old");
+    });
+  });
+
+  describe("an erase fenced by content", () => {
+    const scope = "instagram.profile";
+    const collectedAt = "2026-05-08T00:00:00.000Z";
+
+    async function writeIndexed(
+      storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+      value: string,
+    ) {
+      const write = await storage.writeEnvelope(
+        createDataFileEnvelope(scope, collectedAt, { username: value }),
+      );
+      const entry = await storage.insertEntry({
+        fileId: null,
+        path: write.relativePath,
+        scope,
+        collectedAt,
+        sizeBytes: write.sizeBytes,
+      });
+      return { entry, path: write.relativePath };
+    }
+
+    it("erases while the stored data still hashes to the fence, and keeps a rewrite of the same path", async () => {
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        createMemoryPsLitePersistence(),
+      );
+      const old = await writeIndexed(storage, "old");
+      const hash = contentHash({ username: "old" });
+      // Same path and row id, other content, after the hash was taken.
+      await storage.writeEnvelope(
+        createDataFileEnvelope(scope, collectedAt, { username: "new" }),
+      );
+      await expect(
+        storage.deleteVersion(scope, collectedAt, {
+          id: old.entry.id,
+          path: old.path,
+          contentHash: hash,
+        }),
+      ).resolves.toBe(false);
+      expect(storage.countVersions(scope)).toBe(1);
+      await expect(
+        storage.deleteVersion(scope, collectedAt, {
+          id: old.entry.id,
+          path: old.path,
+          contentHash: contentHash({ username: "new" }),
+        }),
+      ).resolves.toBe(true);
+      expect(storage.countVersions(scope)).toBe(0);
     });
   });
 

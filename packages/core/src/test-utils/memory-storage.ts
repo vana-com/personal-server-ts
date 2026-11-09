@@ -4,7 +4,8 @@
  */
 
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
-import type { DataStoragePort } from "../ports/index.js";
+import type { DataStoragePort, VersionFence } from "../ports/index.js";
+import { fenceContentMatches } from "../storage/legacy-entity-key-sets.js";
 import type { IndexEntry } from "../storage/index/types.js";
 import { withScopeLock } from "../additions/scope-lock.js";
 
@@ -22,6 +23,16 @@ export function createMemoryDataStorage(): MemoryDataStorage {
 
   const key = (scope: string, collectedAt: string) =>
     `${scope}\n${collectedAt}`;
+  /** The stored envelope still holds the data the fence was decided for. */
+  const holdsContent = (
+    fence: VersionFence,
+    scope: string,
+    collectedAt: string,
+  ) => {
+    if (fence.contentHash === undefined) return true;
+    const envelope = envelopes.get(key(scope, collectedAt));
+    return envelope !== undefined && fenceContentMatches(fence, envelope.data);
+  };
   const byPath = (path: string) => entries.find((entry) => entry.path === path);
   const forScope = (scope: string) =>
     entries
@@ -216,7 +227,9 @@ export function createMemoryDataStorage(): MemoryDataStorage {
               entry.scope === scope &&
               entry.collectedAt === collectedAt &&
               (fence === undefined ||
-                (entry.id === fence.id && entry.path === fence.path)),
+                (entry.id === fence.id &&
+                  entry.path === fence.path &&
+                  holdsContent(fence, scope, collectedAt))),
           ) > 0;
         dropEmptyLedger(scope);
         return removed;

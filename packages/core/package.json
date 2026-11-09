@@ -80,6 +80,10 @@
       "types": "./dist/storage/canonical-legacy-projection.d.ts",
       "import": "./dist/storage/canonical-legacy-projection.js"
     },
+    "./storage/legacy-entity-key-sets": {
+      "types": "./dist/storage/legacy-entity-key-sets.d.ts",
+      "import": "./dist/storage/legacy-entity-key-sets.js"
+    },
     "./storage/legacy-scope-view": {
       "types": "./dist/storage/legacy-scope-view.d.ts",
       "import": "./dist/storage/legacy-scope-view.js"

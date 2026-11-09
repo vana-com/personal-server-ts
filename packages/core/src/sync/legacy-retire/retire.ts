@@ -14,16 +14,20 @@
  *      passes too: the published view can change after an earlier pass was
  *      stored, so a stored pass never deletes on its own;
  *   4. when the readback relied on the delete fence, this device STAGED rows
- *      for every connector of the scope (`importStaged`: an empty import
- *      source sets `importDone` for all, but stages nothing, so it proves no
- *      row of the file was ever delivered), and every target stream of the
+ *      of every target stream of the scope (`importStaged`, from the
+ *      per-stream receipt: an empty source, a connector with no stream and a
+ *      stream with no row all set `importDone` but stage nothing, so none
+ *      proves that a row of the file was ever delivered), and every target stream of the
  *      scope that has seen a delete has since been re-collected by a full run
  *      on this device (a record the fence dropped must not be retired before
  *      the device could collect it again). After a whole-source delete the
  *      readback passes (the file predates the delete) but the file stays
  *      until the source is reconnected and a full run commits;
  *   5. the file still hashes to what the fresh readback read, right before
- *      the delete.
+ *      the delete, and the erase itself carries that hash (`VersionFence.
+ *      contentHash`): the storage compares it under its own lock, so a
+ *      rewrite of the same path in the gap between the recheck and the erase
+ *      is not erased.
  *
  * The registry must be an authority for the scope (`deleteBasis`): covered by
  * live complete heads, or deleted whole, and not ambiguous. Otherwise the
@@ -31,8 +35,8 @@
  *
  * Retire writes nothing to the gateway: no tombstone of the legacy name and
  * no remote blob delete. It erases only this device's checked local versions,
- * each fenced by its local id and path, so a version that landed since the
- * readback survives.
+ * each fenced by its local id, path and content hash, so a version that
+ * landed since the readback survives.
  */
 
 import type { DataStoragePort } from "../../ports/index.js";
@@ -84,8 +88,8 @@ export interface RetireReport {
 export interface RetireHost extends ReadbackView {
   /** Whether this device finished importing for the connector. */
   importDone(connector: string): Promise<boolean>;
-  /** Whether this device staged rows for the connector (not a vacuous pass). */
-  importStaged(connector: string): Promise<boolean>;
+  /** Whether this device staged rows of this stream (not a vacuous pass). */
+  importStaged(connector: string, stream: string): Promise<boolean>;
   /** A full run of the connector committed the stream after this delete version. */
   fullRunSince(
     connector: string,
@@ -181,8 +185,8 @@ async function decide(
   if (stored === null) return report("no_readback");
   if (!stored.pass) return report("readback_failed");
   if (stored.fenced > 0) {
-    for (const connector of new Set(streams.map((s) => s.connector))) {
-      if (!(await deps.host.importStaged(connector))) {
+    for (const s of streams) {
+      if (!(await deps.host.importStaged(s.connector, s.stream))) {
         return report("fence_not_imported");
       }
     }
@@ -239,6 +243,7 @@ export async function retireLegacyFiles(
         record = await readbackVersion(readbackDeps, scope, row);
       }
       let report = await decide(deps, scope, row, basis, record);
+      let readHash: string | undefined;
       if (report.wouldDelete && mayDelete) {
         // The stored pass may be stale: take the readback again now, and
         // decide on that one. The basis is read again with it.
@@ -252,12 +257,20 @@ export async function retireLegacyFiles(
         if (report.wouldDelete && !(await holds(deps, scope, row, fresh))) {
           report = { ...report, decision: "file_changed", wouldDelete: false };
         }
+        readHash = fresh.fileHash;
+        // No hash of the file read back: nothing to hold the erase to.
+        if (report.wouldDelete && readHash === undefined) {
+          report = { ...report, decision: "file_changed", wouldDelete: false };
+        }
       }
       files.push(report);
       if (!report.wouldDelete || !mayDelete) continue;
+      // The erase re-checks the hash under the storage's own lock: a rewrite
+      // of the same path since the readback is not erased.
       const removed = await deps.storage.deleteVersion(scope, row.collectedAt, {
         id: row.id,
         path: row.path,
+        ...(readHash === undefined ? {} : { contentHash: readHash }),
       });
       if (removed) deleted += 1;
     }

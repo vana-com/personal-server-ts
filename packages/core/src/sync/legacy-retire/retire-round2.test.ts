@@ -11,6 +11,7 @@
  * dated the next day.
  */
 
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import { describe, expect, it } from "vitest";
 import { entityHashes } from "../../storage/legacy-entity-key-sets.js";
 import { createMemoryStreamSyncFiles } from "../../stream-sync/memory-files.js";
@@ -131,7 +132,7 @@ describe("a readback made before the import finished is never trusted (PREIMPORT
 
 describe("the delete fence excuses only a file written before the delete (FENCE_AFTER_DELETE_WRITE)", () => {
   it("allowed: a pre-delete file after a whole-source delete passes its readback, and stays until the source is reconnected and re-collected", async () => {
-    const f = await flow({ local: ["e0", "e1"], imported: true });
+    const f = await flow({ local: ["e0", "e1"], seed: ["e0", "e1"] });
     await deleted(f);
     const early = await f.retire();
     expect(early.files[0]).toMatchObject({
@@ -153,7 +154,7 @@ describe("the delete fence excuses only a file written before the delete (FENCE_
     const f = await flow({
       local: [],
       localRows: [legacy("e0"), { ...legacy("e1"), content: "older text" }],
-      imported: true,
+      seed: ["e0", "e1"],
     });
     await deleted(f);
     await reconnected(f, ["e0", "e1"]);
@@ -308,7 +309,7 @@ describe("the delete fence excuses only a file written before the delete (FENCE_
   });
 
   it("keeps a file after a delete that was not followed by a full run, whatever the readback says", async () => {
-    const f = await flow({ local: ["e0", "e1"], imported: true });
+    const f = await flow({ local: ["e0", "e1"], seed: ["e0", "e1"] });
     await deleted(f);
     // A run that resumes from a checkpoint is no re-collect.
     await f.rig.collect({
@@ -408,18 +409,99 @@ describe("a body with data the key table does not cover is never proven (UNLISTE
     ).toBeNull();
   });
 
-  it("compares an unlisted scalar or null instead of ignoring it, and skips only a count derived from a compared collection", () => {
+  it("compares an unlisted scalar or null instead of ignoring it", () => {
     const keys = (b: Record<string, unknown>) =>
       [...entityHashes("chatgpt.memories", b)!.keys()].sort();
-    expect(keys(body({}))).toEqual(["$.memories"]); // `total` equals the length
-    expect(keys(body({ note: "x" }))).toEqual(["$.memories", "$scalar.note"]);
-    expect(keys(body({ gone: null }))).toEqual(["$.memories", "$scalar.gone"]);
-    expect(keys(body({ total: 7 }))).toEqual(["$.memories", "$scalar.total"]);
+    expect(keys(body({ note: "x" }))).toEqual([
+      "$.memories",
+      "$scalar.note",
+      "$scalar.total",
+    ]);
+    expect(keys(body({ gone: null }))).toContain("$scalar.gone");
     expect(
       entityHashes("chatgpt.memories", body({ n: 1 }))!.get("$scalar.n"),
     ).not.toEqual(
       entityHashes("chatgpt.memories", body({ n: 2 }))!.get("$scalar.n"),
     );
+  });
+
+  it("holds a count equal to its own collection as a marker, so two snapshots of a growing collection agree", () => {
+    const total = (b: Record<string, unknown>) =>
+      entityHashes("chatgpt.memories", b)!.get("$scalar.total");
+    const two = { memories: [legacy("a"), legacy("b")] };
+    const three = { memories: [legacy("a"), legacy("b"), legacy("c")] };
+    expect(total({ ...two, total: 2 })).toEqual(total({ ...three, total: 3 }));
+    // Not derived: the value itself is compared.
+    expect(total({ ...two, total: 7 })).not.toEqual(
+      total({ ...three, total: 3 }),
+    );
+    expect(total({ ...two, total: 7 })).not.toEqual(
+      total({ ...two, total: 8 }),
+    );
+  });
+
+  it("is one-sided no more: a derived local total does not match a published total that is not derived (PUBLISHED_TOTAL_IGNORED)", async () => {
+    const f = await flow({ local: ["e0", "e1"] });
+    await f.importer.run();
+    await f.run("a", ["e0", "e1"]);
+    await f.rig.publish();
+    const wrongTotal = (host: RetireHost): RetireHost => ({
+      ...host,
+      publishedBody: async (scope) => {
+        const body = (await host.publishedBody(scope)) as Record<
+          string,
+          unknown
+        >;
+        return { ...body, total: 99 }; // published count is not its collection's length
+      },
+    });
+    const kept = await flow({
+      local: ["e0", "e1"],
+      wrapHost: wrongTotal,
+    });
+    await kept.importer.run();
+    await kept.run("a", ["e0", "e1"]);
+    await kept.rig.publish();
+    const report = await kept.retire();
+    expect(report.files[0]).toMatchObject({
+      readback: "fail",
+      readbackReason: "mismatch",
+    });
+    expect(report.deleted).toBe(0);
+    expect((await f.retire()).deleted).toBe(1); // control: derived on both sides
+  });
+
+  it("does not compare values the reader stamps itself, and still compares every other scalar (FETCHED_AT_COMPARED)", () => {
+    const keys = (b: Record<string, unknown>) =>
+      [...entityHashes("chatgpt.memories", b)!.keys()].sort();
+    expect(keys(body({ fetchedAt: "2026-01-01T00:00:00Z" }))).toEqual(
+      keys(body({})),
+    );
+    expect(keys(body({ fetchedBy: "x" }))).toContain("$scalar.fetchedBy");
+    expect(keys(body({ fetched_at: "x" }))).toContain("$scalar.fetched_at");
+    // A conversation's own stamp is dropped from its hash; its content is not.
+    const convo = (extra: Record<string, unknown>) =>
+      entityHashes("chatgpt.conversations", {
+        conversations: [{ id: "c1", title: "t", messages: [], ...extra }],
+        total: 1,
+      })!.get("$.conversations");
+    expect(convo({ fetched_at: "2026-01-01T00:00:00Z" })).toEqual(
+      convo({ fetched_at: "2026-11-09T12:00:00Z" }),
+    );
+    expect(convo({ title2: "x" })).not.toEqual(convo({}));
+  });
+
+  it("reads back as a match when the legacy body differs from the published one only by its fetchedAt", async () => {
+    const f = await flow({
+      local: ["e0", "e1"],
+      extraBody: { fetchedAt: "2020-01-01T00:00:00.000Z" }, // the old run's clock
+    });
+    await f.importer.run();
+    await f.run("a", ["e0", "e1"]); // read at the real clock: another time
+    await f.rig.publish();
+    const report = await f.retire();
+    expect(report.files[0]).toMatchObject({ readback: "pass" });
+    expect(report.deleted).toBe(1);
   });
 
   it("keeps a file whose entities all match but whose unlisted scalar the stream data does not hold", async () => {
@@ -465,13 +547,38 @@ describe("a body with data the key table does not cover is never proven (UNLISTE
 });
 
 describe("a fence needs rows this device staged (VACUOUS_IMPORT_FENCE_DELETES)", () => {
-  it("retires a pre-delete file once the import staged the connector", async () => {
-    const f = await flow({ local: ["e0", "e1"], imported: true });
+  it("retires a pre-delete file once the import staged rows of its stream", async () => {
+    const f = await flow({
+      local: ["e0", "e1"],
+      seed: ["e0", "e1"],
+    });
     await deleted(f);
     await reconnected(f, ["e5"]);
     const report = await f.retire();
     expect(report.files[0]).toMatchObject({ decision: "ready" });
     expect(report.deleted).toBe(1);
+  });
+
+  it("keeps a pre-delete file when the source listed the connector with no stream (ZERO_STREAM_IMPORT_FENCES)", async () => {
+    const f = await flow({ local: ["e0", "e1"], imported: true });
+    await deleted(f);
+    await reconnected(f, ["e5"]);
+    const report = await f.retire();
+    expect(report.files[0]).toMatchObject({
+      readback: "pass",
+      decision: "fence_not_imported",
+    });
+    expect(report.deleted).toBe(0);
+    expect(f.storage.entries).toHaveLength(1);
+  });
+
+  it("keeps a pre-delete file when the stream staged zero rows", async () => {
+    const f = await flow({ local: ["e0", "e1"], seed: [] });
+    await deleted(f);
+    await reconnected(f, ["e5"]);
+    const report = await f.retire();
+    expect(report.files[0]).toMatchObject({ decision: "fence_not_imported" });
+    expect(report.deleted).toBe(0);
   });
 
   it("names the missing import when the source staged nothing", async () => {
@@ -517,6 +624,32 @@ describe("the file read back is the file deleted (FILE_CHANGED_BEFORE_DELETE)", 
       decision: "file_changed",
       wouldDelete: false,
     });
+    expect(report.deleted).toBe(0);
+    expect(f.storage.entries).toHaveLength(1);
+  });
+
+  it("keeps a file rewritten at the same path after the recheck, because the erase carries the content hash (HASH_NOT_PASSED_TO_ERASE)", async () => {
+    const f = await flow({ local: ["e0", "e1"] });
+    await f.importer.run();
+    await f.run("a", ["e0", "e1"]);
+    await f.rig.publish();
+    // The recheck passed. In the gap before the erase, the same path is
+    // rewritten with other content (same row id, same path).
+    const erase = f.storage.deleteVersion.bind(f.storage);
+    const fences: unknown[] = [];
+    f.storage.deleteVersion = async (scope, collectedAt, fence) => {
+      fences.push(fence);
+      await f.storage.writeEnvelope(
+        createDataFileEnvelope(scope, collectedAt, {
+          memories: [legacy("e0"), legacy("e1"), legacy("late")],
+          total: 3,
+        }),
+      );
+      return erase(scope, collectedAt, fence);
+    };
+    const report = await f.retire();
+    expect(fences).toHaveLength(1);
+    expect(fences[0]).toMatchObject({ contentHash: expect.any(String) });
     expect(report.deleted).toBe(0);
     expect(f.storage.entries).toHaveLength(1);
   });

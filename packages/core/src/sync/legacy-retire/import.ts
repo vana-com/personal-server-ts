@@ -61,6 +61,16 @@ export interface ImportPassResult {
   readonly failed: number;
 }
 
+async function* counted<T>(
+  rows: AsyncIterable<T>,
+  onRow: () => void,
+): AsyncIterable<T> {
+  for await (const row of rows) {
+    onRow();
+    yield row;
+  }
+}
+
 export class LegacyImporter {
   private pass: Promise<ImportPassResult> | null = null;
 
@@ -101,12 +111,25 @@ export class LegacyImporter {
       if ((await ledger.read()).imported[connector]) continue;
       try {
         const streams = await source.streams(connector);
+        // The receipt: per stream, the rows the sink actually consumed.
+        const receipt: Record<string, number> = {};
         for (const stream of streams) {
-          await sink.stage(connector, stream, stream.records());
+          receipt[stream.stream] = 0;
+          await sink.stage(
+            connector,
+            stream,
+            counted(stream.records(), () => {
+              receipt[stream.stream] = (receipt[stream.stream] ?? 0) + 1;
+            }),
+          );
         }
         const at = (this.options.now?.() ?? new Date()).toISOString();
         await ledger.update((data) => {
-          data.imported[connector] = { streams: streams.length, at };
+          data.imported[connector] = {
+            streams: streams.length,
+            at,
+            staged: receipt,
+          };
         });
         staged += 1;
       } catch (error) {

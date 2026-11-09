@@ -30,7 +30,7 @@ export function createRetireHost(input: {
       };
     },
     importDone: (connector) => input.ledger.importDone(connector),
-    importStaged: (connector) => input.ledger.staged(connector),
+    importStaged: (connector, stream) => input.ledger.staged(connector, stream),
     fullRunSince: (connector, stream, deleteVersion) =>
       input.writer.fullRunSince(connector, stream, deleteVersion),
   };

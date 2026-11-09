@@ -63,7 +63,13 @@ async function cycle(options: {
   const staged: string[] = [];
   const importer = new LegacyImporter({
     source: fx.source,
-    sink: { stage: async (c, s) => void staged.push(`${c}/${s.stream}`) },
+    sink: {
+      // A sink stages the rows it consumes; the receipt counts them.
+      stage: async (c, s, rows) => {
+        for await (const _row of rows) void _row;
+        staged.push(`${c}/${s.stream}`);
+      },
+    },
     ledger,
     switched: () => options.option === "switched",
   });

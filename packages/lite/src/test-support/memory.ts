@@ -1,4 +1,8 @@
-import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type {
+  DataStoragePort,
+  VersionFence,
+} from "@opendatalabs/personal-server-ts-core/ports";
+import { fenceContentMatches } from "@opendatalabs/personal-server-ts-core/storage/legacy-entity-key-sets";
 import type {
   DataBlockManifest,
   DataScopeBlock,
@@ -118,6 +122,17 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
   const blockPayloads = new Map<string, DataScopeBlock>();
   const firstSeenLedgers = new Map<string, unknown>();
   let nextId = 1;
+
+  /** The stored envelope still holds the data the fence was decided for. */
+  function holdsContent(
+    fence: VersionFence,
+    scope: string,
+    collectedAt: string,
+  ): boolean {
+    if (fence.contentHash === undefined) return true;
+    const envelope = envelopes.get(envelopeKey(scope, collectedAt));
+    return envelope !== undefined && fenceContentMatches(fence, envelope.data);
+  }
 
   function dropEmptyLedger(scope: string): void {
     for (const entry of entries.values()) {
@@ -411,7 +426,9 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
           entry.scope === scope &&
           entry.collectedAt === collectedAt &&
           (fence === undefined ||
-            (entry.id === fence.id && entry.path === fence.path))
+            (entry.id === fence.id &&
+              entry.path === fence.path &&
+              holdsContent(fence, entry.scope, entry.collectedAt)))
         ) {
           entries.delete(path);
           envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
