@@ -1316,6 +1316,7 @@ export function createPsLiteRuntime(
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
               streamSyncRead: options.streamSyncRead,
+              accountMode: options.accountStorageMode,
               scopeUploads,
               now,
               createLogId,

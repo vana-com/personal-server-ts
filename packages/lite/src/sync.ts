@@ -71,6 +71,7 @@ import {
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import { legacyMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
+import { eraseLegacyScopesOf } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import {
   withCancellableRegistration,
   type DownloadDiagnosticsHook,
@@ -603,6 +604,9 @@ export async function createPsLiteSyncManager(
           signer,
           declaredStreams: options.streamSyncDeclaredStreams,
           retainedManifests: options.streamSyncRetainedManifests,
+          // A connection delete erases this device's legacy scope files too.
+          eraseLegacy: (connector) =>
+            eraseLegacyScopesOf(connector, options.storage),
           partTargetBytes: LITE_PART_TARGET_BYTES,
           reduceBudgetBytes: LITE_REDUCE_BUDGET_BYTES,
           spoolFlushBytes: LITE_SPOOL_FLUSH_BYTES,

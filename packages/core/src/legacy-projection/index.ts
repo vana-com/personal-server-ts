@@ -33,6 +33,10 @@ export {
 export { STRAVA_BROWSER_BINDINGS } from "./strava-browser-bindings.js";
 export type { LegacyScopeBindingProvenance } from "./provenance.js";
 export { classifyAsTestDebris } from "./test-debris.js";
+export {
+  eraseLegacyScopesOf,
+  legacyScopesOfConnector,
+} from "./erase-connector.js";
 export type {
   LegacyProjectionWindow,
   LegacyScopeBinding,

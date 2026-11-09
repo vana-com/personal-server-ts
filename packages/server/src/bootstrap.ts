@@ -142,6 +142,7 @@ import {
   streamSyncNetwork,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { openFsStreamSyncHome } from "./stream-sync/fs-home.js";
+import { eraseConnectorLeftovers } from "./stream-sync/erase-connector-leftovers.js";
 import {
   createSeedStaging,
   type SeedStaging,
@@ -966,6 +967,14 @@ export async function createServer(
           // (CONNECTOR_NOT_VERIFIED).
           declaredStreams: options?.declaredStreams ?? (() => []),
           retainedManifests: () => pdppAuth?.retainedManifests ?? [],
+          // A connection delete also erases this device's legacy leftovers of
+          // the connector: its scope files and its pdpp_records rows. Read
+          // when the delete runs, after this block has set `pdppConnections`.
+          eraseLegacy: (connector) =>
+            eraseConnectorLeftovers(connector, {
+              storage: rawDataStorage,
+              pdpp: pdppConnections,
+            }),
         });
         writerForSeed = streamSyncWriter;
         streamSyncSeed = { writer: streamSyncWriter, staging: seedStaging };

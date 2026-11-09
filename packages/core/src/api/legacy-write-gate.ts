@@ -38,8 +38,15 @@ export function refuseLegacyWrite(
 ): Response | null {
   if (!switchedOn || !switchedOn()) return null;
   if (declaresStreamSyncClient(request)) return null;
-  // Both error shapes the legacy surface uses, so an old client reads the
-  // message from whichever field it already knows.
+  return updateRequiredResponse();
+}
+
+/**
+ * The 426 that refuses a legacy write (or a data-set delete) once the account
+ * has moved to stream sync. Both error shapes the legacy surface uses, so an
+ * old client reads the message from whichever field it already knows.
+ */
+export function updateRequiredResponse(): Response {
   return new Response(
     JSON.stringify({
       error: {

@@ -106,8 +106,10 @@ import type {
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
   refuseLegacyWrite,
+  updateRequiredResponse,
   type LegacyWriteSwitch,
 } from "./legacy-write-gate.js";
+import type { StorageModeRead } from "./owner-connector-delete.js";
 import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
@@ -350,6 +352,12 @@ export interface PersonalServerDataApiDeps {
    * `legacy-write-gate.ts`). Absent = never refuse.
    */
   legacyWritesRefused?: LegacyWriteSwitch;
+  /**
+   * The account's storage mode. A data-set DELETE on a switched account is
+   * refused with the update-required 426; the connection delete erases the
+   * data instead. Absent = never refuse for the switch.
+   */
+  accountMode?: StorageModeRead;
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
   /**
@@ -2219,6 +2227,7 @@ export {
   UPDATE_REQUIRED_STATUS,
   declaresStreamSyncClient,
   refuseLegacyWrite,
+  updateRequiredResponse,
   type LegacyWriteSwitch,
 } from "./legacy-write-gate.js";
 
@@ -3442,6 +3451,13 @@ export async function handlePersonalServerDataRequest(
 
     if (request.method === "DELETE") {
       await deps.auth.authorizeOwner(request);
+      // A data set is not a connection, and mapping one to streams needs the
+      // bindings (C2). Once the account is switched the connection delete is
+      // the way to erase data, so this refuses every client, one that declares
+      // stream sync included.
+      if (deps.accountMode?.read(deps.serverOwner) === "switched") {
+        return updateRequiredResponse();
+      }
       const cascade = url.searchParams.get("cascade");
       if (cascade !== null && cascade !== "lineage") {
         throw new InvalidCascadeError({ cascade });

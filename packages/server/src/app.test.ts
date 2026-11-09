@@ -489,6 +489,35 @@ describe("createApp", () => {
     });
   });
 
+  it("DELETE /v1/data/:scope on a switched account → 426 through the app's storage-mode port", async () => {
+    const logger = pino({ level: "silent" });
+    const app = createApp({
+      logger,
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accountStorageMode: { read: () => "switched" },
+    });
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "DELETE",
+      uri: "/v1/data/test.scope",
+    });
+    const res = await app.request("/v1/data/test.scope", {
+      method: "DELETE",
+      headers: { authorization: auth },
+    });
+    expect(res.status).toBe(426);
+    expect((await res.json()).errorCode).toBe("update_required");
+  });
+
   it("GET /v1/grants without auth → 401", async () => {
     const app = makeApp();
     const res = await app.request("/v1/grants");

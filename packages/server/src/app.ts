@@ -641,6 +641,7 @@ export function createApp(deps: AppDeps): Hono {
       legacyWritesRefused: () =>
         deps.config?.streamSync.write === true &&
         deps.config.streamSync.refuseLegacyWrites === true,
+      accountMode: storageMode,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,
