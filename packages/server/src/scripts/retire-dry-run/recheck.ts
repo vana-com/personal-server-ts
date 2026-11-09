@@ -11,13 +11,13 @@
  * real pass decides. It only reads.
  */
 
-import type {
-  ReadbackRecord,
-  RetireDeps,
-  RetireFileReport,
-  RetireReport,
+import {
+  fileHolds,
+  type ReadbackRecord,
+  type RetireDeps,
+  type RetireFileReport,
+  type RetireReport,
 } from "@opendatalabs/personal-server-ts-core/sync";
-import { contentHash } from "@opendatalabs/personal-server-ts-core/storage/legacy-entity-key-sets";
 
 /** `<id>|<path>|<collectedAt>` (`versionKey`): the time is after the last bar. */
 const collectedAtOf = (version: string): string =>
@@ -37,18 +37,12 @@ export async function recheckReadyFiles(input: {
     const readHash = input.records.get(
       `${file.scope}|${file.version}`,
     )?.fileHash;
-    let holds = false;
-    if (readHash !== undefined) {
-      try {
-        const envelope = await input.storage.readEnvelope(
-          file.scope,
-          collectedAtOf(file.version),
-        );
-        holds = contentHash(envelope.data) === readHash;
-      } catch {
-        holds = false; // unreadable is not a match
-      }
-    }
+    const holds = await fileHolds(
+      input.storage,
+      file.scope,
+      collectedAtOf(file.version),
+      readHash,
+    );
     files.push(
       holds ? file : { ...file, decision: "file_changed", wouldDelete: false },
     );
