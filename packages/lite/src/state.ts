@@ -4,10 +4,8 @@ import {
   ServerConfigSchema,
   withCurrentInferenceModel,
 } from "@opendatalabs/personal-server-ts-core/schemas";
-import {
-  deriveMasterKey,
-  deriveScopeKey,
-} from "@opendatalabs/vana-sdk/browser";
+import { deriveScopeKey } from "@opendatalabs/vana-sdk/browser";
+import { legacyMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import type {
   ServerAccount,
   SignTypedDataParams,
@@ -156,7 +154,7 @@ async function encryptPrivateKey(
   ownerSignature: `0x${string}`,
 ): Promise<PsLiteEncryptedPrivateKey> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await importAesKey(deriveMasterKey(ownerSignature));
+  const key = await importAesKey(legacyMasterKey(ownerSignature));
   const plaintext = new TextEncoder().encode(privateKey);
   const ciphertext = new Uint8Array(
     await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext),
@@ -172,7 +170,7 @@ async function decryptPrivateKey(
   encrypted: PsLiteEncryptedPrivateKey,
   ownerSignature: `0x${string}`,
 ): Promise<`0x${string}`> {
-  const key = await importAesKey(deriveMasterKey(ownerSignature));
+  const key = await importAesKey(legacyMasterKey(ownerSignature));
   const iv = base64ToBytes(encrypted.iv);
   const ciphertext = base64ToBytes(encrypted.ciphertext);
   const plaintext = await crypto.subtle.decrypt(

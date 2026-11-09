@@ -24,12 +24,12 @@ import {
   headBlobName,
   partBlobName,
   parseScope,
-  streamMasterKeyFromSignature,
   streamScope,
   type ControlRead,
   type Head,
   type Line,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { streamMasterKey } from "../keys/owner-master-key.js";
 import { createStreamSyncReadKeys } from "./keys.js";
 import { createMemoryStreamSyncReadFiles } from "./memory-files.js";
 import type { MirrorFeedRow } from "./mirror.js";
@@ -266,9 +266,7 @@ export class Rig {
     this.service = await StreamSyncReadService.open({
       files: this.readFiles,
       blobs: { get: async (key) => this.blobMap.get(key) ?? null },
-      keys: await createStreamSyncReadKeys(
-        streamMasterKeyFromSignature(SIGNATURE),
-      ),
+      keys: await createStreamSyncReadKeys(streamMasterKey(SIGNATURE)),
       logger: silent,
       overlay: this.overlay,
       durable: true,
