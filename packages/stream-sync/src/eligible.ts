@@ -3,7 +3,7 @@
  * memory totals.
  *
  * For connector c and a requested name:
- *   1. If every stream the name needs is live and `complete` in the selected
+ *   1. If every stream the name needs has a live, complete head in the selected
  *      connection → serve the stream view. A legacy file is never compared
  *      with a complete view (one-way).
  *   2. Else, if any connection of c is deleted and not since reconnected →
@@ -36,6 +36,11 @@ export interface ConnectionView {
    * head (larger is more recent), or `null` when it has none.
    */
   readonly latestHeadRegistration: number | null;
+  /**
+   * Per-stream read candidates. A stream-only reader supplies each stream's
+   * latest complete imported head, even while a newer publish is incomplete.
+   * Missing candidates remain missing; tombstones must never be filtered out.
+   */
   readonly streams: Readonly<Record<string, StreamHeadView>>;
 }
 

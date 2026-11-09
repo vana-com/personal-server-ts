@@ -1,3 +1,9 @@
+import {
+  Fixture,
+  masterKey,
+} from "../../core/src/stream-sync-read/service-fixture.js";
+import { testOwnerKey } from "../../core/src/stream-sync-read/testing.js";
+import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { describe, expect, it, vi } from "vitest";
 import {
   createBearerTokenPsLiteAuth,
@@ -542,6 +548,61 @@ describe("createPsLiteRuntime", () => {
     const body = await res.json();
     expect(body.error.errorCode).toBe("GRANT_REQUIRED");
   });
+
+  it.each([true, false])(
+    "one-store list equals read for stream-only and tombstoned scopes (owner=%s)",
+    async (owner) => {
+      const f = new Fixture(await testOwnerKey(masterKey(5)));
+      const ns = await f.key.ns("acme", "account-1");
+      await f.activate("acme", ns);
+      for (const stream of ["items", "deleted"])
+        await f.publish({
+          connector: "acme",
+          ns,
+          stream,
+          generation: 1,
+          complete: true,
+          records: [{ id: stream }],
+        });
+      const service = await f.service();
+      await f.sync(service);
+      const hashes = (await f.key.control()).tombstone;
+      f.rows.set(streamScope("acme", ns, "deleted"), {
+        scope: streamScope("acme", ns, "deleted"),
+        ...hashes,
+        expectedVersion: "2",
+        addedAt: null,
+        deletedAt: new Date().toISOString(),
+      });
+      await f.sync(service);
+      const runtime = createTestRuntime({
+        active: true,
+        streamSyncRead: service,
+        config: { streamSync: { write: true } },
+        auth: {
+          authorizeOwner: async () => undefined,
+          authorizeBuilderList: async () =>
+            owner ? undefined : { grantedScopes: ["pdpp.acme.*"] },
+          authorizeBuilderRead: async () =>
+            owner
+              ? undefined
+              : {
+                  builder: "0x000000000000000000000000000000000000bEEF",
+                  grantId: "grant-1",
+                },
+        } as never,
+      });
+      const get = (path: string) =>
+        runtime.fetch(new Request(`https://ps.local/v1/data${path}`));
+      const list = await get("");
+      expect(list.status).toBe(200);
+      expect(
+        (await list.json()).scopes.map((s: { scope: string }) => s.scope),
+      ).toEqual(["pdpp.acme.items"]);
+      expect((await get("/pdpp.acme.items")).status).toBe(200);
+      expect((await get("/pdpp.acme.deleted")).status).toBe(410);
+    },
+  );
 
   it("lists scopes and versions from browser-local storage", async () => {
     const runtime = createTestRuntime({

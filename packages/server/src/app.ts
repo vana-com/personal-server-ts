@@ -604,6 +604,7 @@ export function createApp(deps: AppDeps): Hono {
       // The account's stream-sync switch as this server holds it: its host
       // sets `streamSync.write` from the Account setting before launch.
       // Enforcement is its own flag and ships off.
+      streamSyncSwitched: () => deps.config?.streamSync.write === true,
       legacyWritesRefused: () =>
         deps.config?.streamSync.write === true &&
         deps.config.streamSync.refuseLegacyWrites === true,

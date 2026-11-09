@@ -30,6 +30,7 @@ import {
 import {
   alternateLegacyBindingsForScope,
   LEGACY_SCOPE_BINDINGS,
+  legacyBindingsForProfile,
   type LegacyScopeBinding,
 } from "../legacy-projection/index.js";
 import {
@@ -92,6 +93,8 @@ export interface StreamSyncReadOptions {
 
 export interface ResolveInput {
   readonly scope: string;
+  /** Account uses stream heads exclusively. */
+  readonly streamOnly?: boolean;
   /** `connection=<ns>`; `null` when absent. */
   readonly connection: string | null;
   /** `cursor=` of an earlier response; `null` when absent. */
@@ -176,6 +179,7 @@ export type ReadDecision =
    */
   | {
       readonly kind: "local_pending";
+      readonly collectedAt: string;
       readonly connector: string;
       readonly ns: string;
       readonly cursor: string;
@@ -187,6 +191,7 @@ export type ReadDecision =
     }
   | {
       readonly kind: "view";
+      readonly collectedAt: string;
       readonly connector: string;
       readonly ns: string;
       /** Pins `(stream → head version)` of every input head. */
@@ -701,6 +706,7 @@ export class StreamSyncReadService {
   connectionViews(
     connector: string,
     snapshot?: StreamSyncOverlaySnapshot,
+    completeOnly = false,
   ): ConnectionView[] {
     const rows = this.mirror.rowsFor(connector);
     const namespaces = new Set([
@@ -720,7 +726,10 @@ export class StreamSyncReadService {
       }
       for (const stream of [...names].sort()) {
         const row = mirrored.get(stream);
-        const imported = this.importer.servableView({ connector, ns, stream });
+        const imported = this.importer.servableView(
+          { connector, ns, stream },
+          completeOnly,
+        );
         const kind = row ? this.importer.streamRowKind(row) : null;
         const live =
           imported !== null &&
@@ -772,7 +781,9 @@ export class StreamSyncReadService {
     if (targets.length === 0 && candidates.length === 0) {
       return input.connection !== null
         ? { kind: "unavailable", reason: "connection_not_found" }
-        : { kind: "pass" };
+        : input.streamOnly
+          ? { kind: "unavailable", reason: "no_data" }
+          : { kind: "pass" };
     }
     // One pinned snapshot per connector, taken BEFORE any imported view is
     // leased: whatever an import retires after this point stays readable
@@ -803,7 +814,7 @@ export class StreamSyncReadService {
             target.connector,
             // Only the owner view reads local runs. A grant is answered from
             // the imported heads, as if no local run existed.
-            input.isOwnerView
+            input.isOwnerView && !input.streamOnly
               ? await this.snapshot(target.connector)
               : NO_SNAPSHOT,
           );
@@ -826,6 +837,39 @@ export class StreamSyncReadService {
     }
   }
 
+  /** Enumerate the same logical and legacy alias names as stream reads. */
+  async listScopes(input: {
+    isOwnerView: boolean;
+    streamOnly?: boolean;
+    scopePrefix?: string;
+  }): Promise<{ scope: string; collectedAt: string }[]> {
+    const names = new Set<string>();
+    for (const connector of this.mirror.connectors()) {
+      for (const view of this.connectionViews(connector)) {
+        for (const stream of Object.keys(view.streams))
+          names.add(`pdpp.${connector}.${stream}`);
+      }
+      for (const name of legacyBindingsForProfile(connector).keys())
+        names.add(name);
+    }
+    const listed: { scope: string; collectedAt: string }[] = [];
+    for (const scope of [...names].sort()) {
+      if (input.scopePrefix && !scope.startsWith(input.scopePrefix)) continue;
+      const decision = await this.resolve({
+        ...input,
+        scope,
+        connection: null,
+        cursor: null,
+        legacyFile: false,
+      });
+      if (decision.kind === "view" || decision.kind === "local_pending") {
+        await decision.body.cancel();
+        listed.push({ scope, collectedAt: decision.collectedAt });
+      }
+    }
+    return listed;
+  }
+
   private snapshot(connector: string): Promise<StreamSyncOverlaySnapshot> {
     return this.options.overlay
       ? this.options.overlay.snapshot(connector)
@@ -843,6 +887,7 @@ export class StreamSyncReadService {
       const connections = this.connectionViews(
         target.connector,
         snapshots.get(target.connector),
+        input.streamOnly,
       );
       const eligibility = this.eligibility(input, target, connections);
       return { target, connections, eligibility };
@@ -893,6 +938,8 @@ export class StreamSyncReadService {
         cursor,
         snapshot,
         input.isOwnerView,
+        "view",
+        input.streamOnly,
       );
     }
     const deleted = evaluated.some(
@@ -905,7 +952,7 @@ export class StreamSyncReadService {
     // else is shown. The owner never reads fewer rows than a grant: when a
     // grant would read the legacy body, the owner reads it too, with the notes.
     let notes: OwnerNotes = {};
-    if (input.isOwnerView) {
+    if (input.isOwnerView && !input.streamOnly) {
       const scan = this.pendingScan(
         input,
         [...targets, ...candidates],
@@ -995,7 +1042,9 @@ export class StreamSyncReadService {
     ) {
       return { kind: "key_mismatch", ...notes };
     }
-    return { kind: "pass", ...notes };
+    return input.streamOnly
+      ? { kind: "unavailable", reason: "no_data", ...notes }
+      : { kind: "pass", ...notes };
   }
 
   /** §2.10 for one target over `connections`. */
@@ -1171,6 +1220,7 @@ export class StreamSyncReadService {
     snapshot: StreamSyncOverlaySnapshot,
     isOwnerView: boolean,
     mode: "view" | "pending" = "view",
+    completeOnly = false,
   ): Promise<ReadDecision> {
     const pending = mode === "pending";
     const leases: ViewLease[] = [];
@@ -1199,7 +1249,7 @@ export class StreamSyncReadService {
         }
         const row = rows.streams.get(ns)?.get(stream);
         const kind = row ? this.importer.streamRowKind(row) : null;
-        const current = this.importer.servableView(key);
+        const current = this.importer.servableView(key, completeOnly);
         const currentLive =
           current !== null &&
           kind !== null &&
@@ -1222,9 +1272,23 @@ export class StreamSyncReadService {
             }
           }
         } else if (currentLive) {
-          lease = this.views.lease(key);
+          lease = this.views.lease(key, current!.version);
         }
         if (lease) leases.push(lease);
+        if (
+          completeOnly &&
+          lease &&
+          (!lease.version.head.complete ||
+            lease.version.version <=
+              this.mirror.deletionFloor(
+                streamScope(target.connector, ns, stream),
+              ) ||
+            kind === null ||
+            !isHeadLive(control, kind, lease.version.head.generation))
+        ) {
+          releaseAll();
+          return { kind: "cursor_stale" };
+        }
         // Replay the plan a cursor recorded: a retired or changed run makes
         // the cursor stale, and a new run does not join. A cursor from before
         // fold pins recorded the shown members alone.
@@ -1355,6 +1419,7 @@ export class StreamSyncReadService {
       if (pending) {
         return {
           kind: "local_pending",
+          collectedAt: new Date(observedAt).toISOString(),
           connector: target.connector,
           ns,
           cursor: nextCursor,
@@ -1365,6 +1430,7 @@ export class StreamSyncReadService {
       }
       return {
         kind: "view",
+        collectedAt: new Date(observedAt).toISOString(),
         connector: target.connector,
         ns,
         cursor: nextCursor,

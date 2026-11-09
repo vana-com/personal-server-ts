@@ -166,8 +166,10 @@ export class StreamSyncImporter {
    * still holds records the owner deleted. Every read of an imported view goes
    * through here, whether or not the mirror still has a row for the stream.
    */
-  servableView(key: ViewKey) {
-    const imported = this.options.views.get(key);
+  servableView(key: ViewKey, completeOnly = false) {
+    const imported = completeOnly
+      ? this.options.views.getComplete(key)
+      : this.options.views.get(key);
     const scope = streamScope(key.connector, key.ns, key.stream);
     return imported &&
       imported.version > this.options.mirror.deletionFloor(scope)

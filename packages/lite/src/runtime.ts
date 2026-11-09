@@ -151,6 +151,7 @@ export interface PsLiteRuntimeOptions {
   now?: () => Date;
   config?: {
     server?: { origin?: string };
+    streamSync?: { write?: boolean };
     gateway?: Partial<DataPortabilityGatewayConfig> & { url?: string };
     /** X402 read enforcement. Off by default in the browser runtime. */
     payment?: { enabled?: boolean };
@@ -1276,6 +1277,8 @@ export function createPsLiteRuntime(
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
               streamSyncRead: options.streamSyncRead,
+              streamSyncSwitched: () =>
+                options.config?.streamSync?.write === true,
               scopeUploads,
               now,
               createLogId,

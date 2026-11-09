@@ -5,8 +5,9 @@
  * A new version replaces the current one atomically: its head and any new
  * parts are written first, then the `current` pointer. Reads lease the
  * versions they read (§2.9 pinned joins), so an import never removes a
- * version under a running read; a version is retired once it is neither
- * current nor leased. A request that names a retired version is stale.
+ * version under a running read. Retain the latest complete head as well as
+ * the current head and leased versions, so an incomplete publish cannot hide
+ * previously complete data. A request that names a retired version is stale.
  *
  * Parts are stored by their SHA-256, shared between versions of a stream,
  * so an import fetches only the parts it does not hold yet.
@@ -41,6 +42,8 @@ export interface ViewLease {
 interface CurrentFile {
   readonly version: number;
   readonly dataHash: string;
+  readonly completeVersion?: number;
+  readonly completeDataHash?: string;
 }
 
 /** What an import may do while it holds the stream's lock. */
@@ -110,6 +113,7 @@ export function isUsableViewKey(key: ViewKey): boolean {
 
 export class ViewStore {
   private readonly current = new Map<string, ImportedVersion>();
+  private readonly complete = new Map<string, ImportedVersion>();
   /**
    * Per connector and stream: how many imports changed a current version of
    * it, whatever the namespace. A read records the revisions of the streams it
@@ -173,6 +177,31 @@ export class ViewStore {
         dataHash: pointer.dataHash,
         head: decoded.head,
       });
+      if (decoded.head.complete) store.complete.set(id, store.current.get(id)!);
+      else if (pointer.completeVersion !== undefined) {
+        const bytes = await files.read(
+          `${dir(key)}/heads/${pointer.completeVersion}.json`,
+        );
+        if (bytes) {
+          const prior = decodeHead(bytes);
+          if (
+            prior.kind === "ok" &&
+            prior.head.complete &&
+            (
+              await Promise.all(
+                prior.head.parts.map((p) => store.partExists(key, p.hash)),
+              )
+            ).every(Boolean)
+          ) {
+            if (pointer.completeDataHash)
+              store.complete.set(id, {
+                version: pointer.completeVersion,
+                dataHash: pointer.completeDataHash,
+                head: prior.head,
+              });
+          }
+        }
+      }
       // Versions left behind by a crash between pointer write and cleanup.
       await store.collect(key);
     }
@@ -186,6 +215,10 @@ export class ViewStore {
 
   get(key: ViewKey): ImportedVersion | null {
     return this.current.get(viewKeyId(key)) ?? null;
+  }
+
+  getComplete(key: ViewKey): ImportedVersion | null {
+    return this.complete.get(viewKeyId(key)) ?? null;
   }
 
   views(): { key: ViewKey; version: ImportedVersion }[] {
@@ -266,7 +299,19 @@ export class ViewStore {
   ): Promise<void> {
     const base = dir(key);
     await this.files.write(`${base}/heads/${version}.json`, headBytes);
-    const pointer: CurrentFile = { version, dataHash };
+    const complete = head.complete
+      ? { version, dataHash, head }
+      : this.getComplete(key);
+    const pointer: CurrentFile = {
+      version,
+      dataHash,
+      ...(complete
+        ? {
+            completeVersion: complete.version,
+            completeDataHash: complete.dataHash,
+          }
+        : {}),
+    };
     await this.files.write(
       `${base}/current.json`,
       encoder.encode(JSON.stringify(pointer)),
@@ -275,6 +320,7 @@ export class ViewStore {
     const previous = this.current.get(id);
     this.keys.set(id, key);
     this.current.set(id, { version, dataHash, head });
+    if (complete) this.complete.set(id, complete);
     const touched = `${key.connector}\n${key.stream}`;
     this.importRevisions.set(
       touched,
@@ -297,7 +343,11 @@ export class ViewStore {
     const current = this.current.get(id);
     let version: ImportedVersion | undefined;
     if (at === undefined || current?.version === at) version = current;
-    else version = this.retained.get(id)?.get(at);
+    else
+      version =
+        this.complete.get(id)?.version === at
+          ? this.complete.get(id)
+          : this.retained.get(id)?.get(at);
     if (!version) return null;
     let counts = this.leases.get(id);
     if (!counts) this.leases.set(id, (counts = new Map()));
@@ -350,10 +400,16 @@ export class ViewStore {
     }
     const keep = new Set<number>(retained.keys());
     if (current) keep.add(current.version);
+    const complete = this.complete.get(id);
+    if (complete) keep.add(complete.version);
     const referenced = new Set<string>();
     for (const version of keep) {
       const imported =
-        version === current?.version ? current : retained.get(version)!;
+        version === current?.version
+          ? current
+          : version === complete?.version
+            ? complete
+            : retained.get(version)!;
       for (const part of imported.head.parts) referenced.add(part.hash);
     }
     for (const path of await this.files.list(`${base}/heads`)) {

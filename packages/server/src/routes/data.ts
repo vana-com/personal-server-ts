@@ -155,6 +155,7 @@ export interface DataRouteDeps {
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
   /** The account's stream-sync switch; true refuses undeclared legacy writes. */
   legacyWritesRefused?: LegacyWriteSwitch;
+  streamSyncSwitched?: () => boolean;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
@@ -421,6 +422,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       {
         additions: deps.additions,
         legacyWritesRefused: deps.legacyWritesRefused,
+        streamSyncSwitched: deps.streamSyncSwitched,
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
         streamSyncRead: deps.streamSyncRead,

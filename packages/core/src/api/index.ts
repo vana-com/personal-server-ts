@@ -339,12 +339,19 @@ export interface PersonalServerIngestSyncManager {
 
 /** The read side of stream sync, as the data API uses it. */
 export interface StreamSyncReadPort {
+  listScopes?(input: {
+    isOwnerView: boolean;
+    streamOnly?: boolean;
+    scopePrefix?: string;
+  }): Promise<{ scope: string; collectedAt: string }[]>;
   resolve(input: ResolveInput): Promise<ReadDecision>;
   /** Per-stream counts and open import problems, for owner diagnostics. */
   status?(): StreamSyncReadStatus;
 }
 
 export interface PersonalServerDataApiDeps {
+  /** Reads the existing account streamSync.write setting. */
+  streamSyncSwitched?: () => boolean;
   /**
    * Whether an undeclared legacy write is refused (see
    * `legacy-write-gate.ts`). Absent = never refuse.
@@ -2451,6 +2458,33 @@ export async function handlePersonalServerDataRequest(
       const listAuth = await deps.auth.authorizeBuilderList(request, {
         grantId: selectedGrantId(request, url),
       });
+      if (deps.streamSyncSwitched?.()) {
+        const limit = normalizeLimit(url.searchParams.get("limit"), 20);
+        const offset = normalizeLimit(url.searchParams.get("offset"), 0);
+        const scopes = (
+          (await deps.streamSyncRead?.listScopes?.({
+            isOwnerView: listAuth === undefined,
+            streamOnly: true,
+            scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
+          })) ?? []
+        )
+          .filter(
+            ({ scope }) =>
+              !isSystemScope(scope) &&
+              (!listAuth || listAuthCovers(listAuth, scope)),
+          )
+          .map(({ scope, collectedAt }) => ({
+            scope,
+            latestCollectedAt: collectedAt,
+            versionCount: 0,
+          }));
+        return jsonResponse({
+          scopes: scopes.slice(offset, offset + limit),
+          total: scopes.length,
+          limit,
+          offset,
+        });
+      }
       // One budget for every stored and canonical-only scope, not per row.
       const deletionDeadlineAtMs = Date.now() + 250;
       const result = await listDataScopesContract({
@@ -2795,8 +2829,12 @@ export async function handlePersonalServerDataRequest(
       // version and re-add marker authorize that file, not canonical rows.
       // `?view=stored` asks for the stored file's body, so it never reads the
       // canonical view either.
+      const streamOnly = deps.streamSyncSwitched?.() === true;
       const latest =
-        fileIdParam === undefined && atParam === undefined && view === null
+        !streamOnly &&
+        fileIdParam === undefined &&
+        atParam === undefined &&
+        view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
       // Stream-sync (§2.10): the one eligibility rule decides between the
@@ -2804,6 +2842,8 @@ export async function handlePersonalServerDataRequest(
       // legacy history, but a deleted connector serves nothing at all.
       const latestRead =
         fileIdParam === undefined && atParam === undefined && view === null;
+      if (streamOnly && (!latestRead || !deps.streamSyncRead))
+        return notFound();
       // What only the owner is told when the existing path answers a stream
       // read: local runs the writer will not publish.
       let ownerNotes: OwnerNotes | undefined;
@@ -2812,7 +2852,10 @@ export async function handlePersonalServerDataRequest(
           scope: scopeResult.scope,
           connection: latestRead ? url.searchParams.get("connection") : null,
           cursor: latestRead ? url.searchParams.get("cursor") : null,
-          legacyFile: Boolean(selectedEntry) || latest?.kind === "canonical",
+          streamOnly,
+          legacyFile:
+            !streamOnly &&
+            (Boolean(selectedEntry) || latest?.kind === "canonical"),
           isOwnerView: isOwnerView(authResult),
         });
         if (decision.kind === "unavailable" && decision.reason === "deleted") {
@@ -2828,6 +2871,11 @@ export async function handlePersonalServerDataRequest(
           }
           const refusal = streamSyncRefusal(decision);
           if (refusal) return refusal;
+          if (
+            streamOnly &&
+            (decision.kind === "pass" || decision.kind === "legacy")
+          )
+            return notFound();
           if (
             inProcess &&
             wantsRawContent &&

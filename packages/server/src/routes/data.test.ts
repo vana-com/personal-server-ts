@@ -1,3 +1,9 @@
+import {
+  Fixture,
+  masterKey,
+} from "../../../core/src/stream-sync-read/service-fixture.js";
+import { testOwnerKey } from "../../../core/src/stream-sync-read/testing.js";
+import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -824,6 +830,51 @@ describe("GET /v1/data listings are scoped to the builder's grants", () => {
     expect(json.scopes).toEqual([]);
     expect(json.total).toBe(0);
   });
+
+  it.each([true, false])(
+    "one-store list equals read for stream-only and tombstoned scopes (owner=%s)",
+    async (owner) => {
+      const f = new Fixture(await testOwnerKey(masterKey(5)));
+      const ns = await f.key.ns("acme", "account-1");
+      await f.activate("acme", ns);
+      for (const stream of ["items", "deleted"])
+        await f.publish({
+          connector: "acme",
+          ns,
+          stream,
+          generation: 1,
+          complete: true,
+          records: [{ id: stream }],
+        });
+      const service = await f.service();
+      await f.sync(service);
+      const hashes = (await f.key.control()).tombstone;
+      f.rows.set(streamScope("acme", ns, "deleted"), {
+        scope: streamScope("acme", ns, "deleted"),
+        ...hashes,
+        expectedVersion: "2",
+        addedAt: null,
+        deletedAt: new Date().toISOString(),
+      });
+      await f.sync(service);
+      const app = createApp(
+        {
+          getGrant: vi
+            .fn()
+            .mockResolvedValue(makeGrant({ scopes: ["pdpp.acme.*"] })),
+        },
+        { streamSyncRead: service, streamSyncSwitched: () => true },
+      );
+      const opts = owner ? { signer: ownerWallet } : { grantId: "grant-123" };
+      const list = await signedGet(app, "/", opts);
+      expect(list.status).toBe(200);
+      expect(await listedScopes(list)).toEqual(["pdpp.acme.items"]);
+      expect((await signedGet(app, "/pdpp.acme.items", opts)).status).toBe(200);
+      expect((await signedGet(app, "/pdpp.acme.deleted", opts)).status).toBe(
+        410,
+      );
+    },
+  );
 
   it("lists only the scopes the signed grant covers", async () => {
     const getGrant = vi
