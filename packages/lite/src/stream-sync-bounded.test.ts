@@ -45,7 +45,8 @@ const SMALL_BUDGET_BYTES = 12 * MiB;
 /**
  * One 8 MiB record cannot be split below its size. Measured peak above
  * baseline after the spool fix (10 runs each, big8 n=3, 2 MiB part target):
- *   Node 22 (CI): 35.96-35.98 MB = 34.3 MiB; before the fix 42.25-42.27 MB.
+ *   Node 22 (CI): 34.06-34.08 MB = 32.5 MiB; before the fix 42.25-42.27 MB.
+ *   (Intermediate: 35.96-35.98 MB with a per-chunk fragment list.)
  *   Node 24:      33.61-33.65 MB = 32.1 MiB; before the fix 33.81-33.85 MB.
  * Copies of the 8 MiB line live at the peak (the file append of the spool
  * flush): the record body held by the caller (8 MiB), the flat line text
@@ -53,7 +54,7 @@ const SMALL_BUDGET_BYTES = 12 * MiB;
  * bytes handed to the append (8 MiB): 32 MiB, plus small state. The
  * shard-derivation pass held a fourth copy (the chunk-joined line bytes)
  * across its yield; removing that copy is what moved Node 22 from 40.3 to
- * 34.3 MiB. The 40 MiB budget keeps ~5.7 MiB of headroom on Node 22 and fails
+ * 32.5 MiB. The 40 MiB budget keeps ~7.5 MiB of headroom on Node 22 and fails
  * a writer that keeps one more 8 MiB copy until flush (mutant: 50.4 MB on
  * both runtimes).
  */

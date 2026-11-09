@@ -6,6 +6,8 @@
  * UTF16_DERIVE_BUDGET, ALLOCATING_COUNT, PER_PATH_BUDGET and RESTORE_EXCLUDED_JOIN.
  */
 import assert from "node:assert/strict";
+import v8 from "node:v8";
+import vm from "node:vm";
 import { describe, it } from "vitest";
 import {
   RECORD_LINE_LIMIT_BYTES,
@@ -23,6 +25,7 @@ import {
   readSpool,
   shardPath,
   spoolLogPath,
+  type SpoolLine,
 } from "./spool.js";
 
 const encoder = new TextEncoder();
@@ -138,7 +141,59 @@ function assertBound(
   }
 }
 
+/** Live heap plus ArrayBuffer stores, after GC has settled. */
+function settledLiveBytes(): number {
+  // `gc` is not a global in a vitest worker; expose it for this process only.
+  v8.setFlagsFromString("--expose-gc");
+  const gc = vm.runInNewContext("gc") as () => void;
+  let prev = Infinity;
+  let cur = Infinity;
+  for (let i = 0; i < 8; i += 1) {
+    gc();
+    const m = process.memoryUsage();
+    prev = cur;
+    cur = m.heapUsed + m.arrayBuffers;
+    if (cur >= prev) break;
+  }
+  return cur;
+}
+
 describe("spool allocation chunks", () => {
+  // One valid line of 256 KiB, delivered one byte per chunk, read by a reader
+  // that holds the open line until its newline. The reader must hold about
+  // the line's size, not one allocation per chunk. Mutant it kills: an open
+  // line kept as a list of per-chunk fragments (the head before this test).
+  it("keeps a long line fed in one-byte chunks near its own size", async () => {
+    const LINE_BYTES = 256 * 1024;
+    const text = "t".repeat(LINE_BYTES);
+    const line = `${hash(7)} ${text}\n`;
+    const bytes = encoder.encode(line);
+    let retained = -1;
+    const source: StreamSyncFiles = {
+      ...createMemoryStreamSyncFiles(),
+      async *readChunks() {
+        const baseline = settledLiveBytes();
+        for (let i = 0; i < bytes.length - 1; i += 1) {
+          yield bytes.slice(i, i + 1);
+        }
+        // Every byte but the newline is now held by the reader.
+        retained = settledLiveBytes() - baseline;
+        yield bytes.slice(bytes.length - 1);
+      },
+    };
+    const read: SpoolLine[] = [];
+    for await (const row of readSpool(source, "long.log")) read.push(row);
+    assert.equal(read.length, 1);
+    assert.equal(read[0]!.pkHash, hash(7));
+    assert.equal(read[0]!.text, text);
+    // Capacity is at most twice the line, so 3 x the line is a loose bound
+    // for the reader's own state. Fragment lists measure tens of MB here.
+    assert.ok(
+      retained < 3 * LINE_BYTES,
+      `reader held ${retained} bytes for a ${LINE_BYTES}-byte line`,
+    );
+  });
+
   it("flush bytes match the joined reference across UTF-8 widths and surrogate boundaries", async () => {
     const { files, writes } = filesWithWrites(1);
     const rows = corpus.map((value, i) => ({

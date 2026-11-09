@@ -177,31 +177,24 @@ export async function* readSpool(
   // whole chunk and slicing lines out of it would make every line a view that
   // pins its 1 MiB chunk for as long as any caller keeps the line's text.
   // 0x0a cannot occur inside a multi-byte UTF-8 sequence, so the split is safe.
-  // Bytes of the line still open at the end of the last chunk, as pieces. A
-  // long line is copied once, when its newline arrives, not once per chunk.
-  // The line's bytes are not referenced while the parsed line is yielded, so
-  // a caller that holds the line holds one copy of its text, not its bytes too.
-  let open: Uint8Array[] = [];
-  let openBytes = 0;
+  // The line still open at the end of the last chunk lives in one growable
+  // buffer. Retained memory then tracks the line's size, not the number of
+  // chunks it arrived in, and doubling keeps the copying linear. The line's
+  // bytes are dropped before the parsed line is yielded, so a caller that
+  // holds the line holds one copy of its text, not its bytes too.
+  let open: OpenLine | null = null;
   let firstLine = true;
   for await (const chunk of files.readChunks(path)) {
     let start = 0;
     let newline = chunk.indexOf(0x0a, start);
     while (newline !== -1) {
       let raw: string;
-      if (open.length === 0) {
+      if (open === null) {
         raw = decoder.decode(chunk.subarray(start, newline));
       } else {
-        const line = new Uint8Array(openBytes + (newline - start));
-        let at = 0;
-        for (const piece of open) {
-          line.set(piece, at);
-          at += piece.length;
-        }
-        line.set(chunk.subarray(start, newline), at);
-        raw = decoder.decode(line);
-        open = [];
-        openBytes = 0;
+        open.append(chunk.subarray(start, newline));
+        raw = decoder.decode(open.view());
+        open = null;
       }
       if (firstLine && raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
       firstLine = false;
@@ -210,19 +203,13 @@ export async function* readSpool(
       newline = chunk.indexOf(0x0a, start);
     }
     if (start < chunk.length) {
-      const tail = chunk.slice(start);
-      open.push(tail);
-      openBytes += tail.length;
+      open ??= new OpenLine();
+      open.append(chunk.subarray(start));
     }
   }
-  if (openBytes !== 0) {
+  if (open !== null && open.size > 0) {
     // A file that holds only a BOM has no lines, as the whole-file decoder gives.
-    const rest = new Uint8Array(openBytes);
-    let at = 0;
-    for (const piece of open) {
-      rest.set(piece, at);
-      at += piece.length;
-    }
+    const rest = open.view();
     const bomOnly =
       firstLine &&
       rest.length === 3 &&
@@ -231,6 +218,37 @@ export async function* readSpool(
       rest[2] === 0xbf;
     if (bomOnly) return;
     throw new Error(`spool file ${path} ends mid-line`);
+  }
+}
+
+/**
+ * Bytes of one spool line that has not reached its newline yet. Appends go
+ * into one buffer that doubles when full, so a line in any number of chunks
+ * is one allocation chain with at most twice its size in capacity.
+ */
+class OpenLine {
+  private buffer = new Uint8Array(0);
+  private length = 0;
+
+  get size(): number {
+    return this.length;
+  }
+
+  append(bytes: Uint8Array): void {
+    const need = this.length + bytes.length;
+    if (need > this.buffer.length) {
+      const grown = new Uint8Array(
+        Math.max(need, this.buffer.length * 2, 4096),
+      );
+      grown.set(this.buffer.subarray(0, this.length));
+      this.buffer = grown;
+    }
+    this.buffer.set(bytes, this.length);
+    this.length = need;
+  }
+
+  view(): Uint8Array {
+    return this.buffer.subarray(0, this.length);
   }
 }
 
