@@ -2648,8 +2648,10 @@ export class StreamSyncWriter {
     }
   }
 
-  /** Called only by the home-bound overlay adapter. Does no network I/O. */
-  /** Connectors that have a run a snapshot would expose, in sorted order. */
+  /**
+   * Connectors that have a run a snapshot would expose, in sorted order.
+   * Called only by the home-bound overlay adapter. Does no network I/O.
+   */
   async overlayConnectors(): Promise<string[]> {
     await this.recover();
     const bound = await this.binding();
@@ -2675,6 +2677,7 @@ export class StreamSyncWriter {
     });
   }
 
+  /** Called only by the home-bound overlay adapter. Does no network I/O. */
   async snapshotOverlay(connector: string): Promise<StreamSyncOverlaySnapshot> {
     await this.recover();
     const bound = await this.binding();

@@ -193,6 +193,7 @@ export class Rig {
     const source = createWriterOverlaySource(this.writer);
     this.overlay = {
       observeDeletes: (observations) => source.observeDeletes!(observations),
+      connectors: () => source.connectors(),
       snapshot: async (connector) => {
         const snapshot = await source.snapshot(connector);
         const hook = this.afterSnapshot;

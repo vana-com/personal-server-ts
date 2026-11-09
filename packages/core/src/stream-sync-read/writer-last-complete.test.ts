@@ -44,4 +44,25 @@ describe("writer-emitted lastComplete", () => {
     const records = (await body(decision)).data.records;
     expect(records.map((r: any) => r.id)).toEqual(["a"]);
   });
+
+  it("lists a connector only the real writer's overlay knows", async () => {
+    const rig = new Rig();
+    await rig.open();
+    // A first run on this device: nothing is published or observed yet.
+    await rig.collect({
+      runId: "first",
+      key: "id",
+      version: "1.0.0",
+      rows: [{ id: "a", v: 1 }],
+      full: true,
+    });
+    expect(
+      (
+        await rig.service.listScopes({ isOwnerView: true, streamOnly: true })
+      ).map((s) => s.scope),
+    ).toContain("pdpp.acme.items");
+    expect(
+      await rig.service.listScopes({ isOwnerView: false, streamOnly: true }),
+    ).toEqual([]);
+  });
 });

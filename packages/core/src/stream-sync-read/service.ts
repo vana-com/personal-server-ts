@@ -639,10 +639,17 @@ export class StreamSyncReadService {
       /**
        * The live registry head, when `base` is the complete head the rows come
        * from (stream-only reads). The writer plans a run from the registry
-       * head, so completeness and any refusal come from it; the rows stay on
-       * `base`.
+       * head, so the completeness of a view that shows a run, and any refusal
+       * of a run, come from it; the rows stay on `base`. With no run shown,
+       * completeness comes from the rows head, as a grant reads it.
        */
       readonly registry?: ImportedVersion | null;
+      /**
+       * The registry row is newer than `registry`: the head the writer plans
+       * over is not imported, so every local run is withheld and the view is
+       * incomplete.
+       */
+      readonly registryAhead?: boolean;
     } = {},
   ): Fold {
     const { pending = false, steps } = options;
@@ -661,6 +668,18 @@ export class StreamSyncReadService {
         if (local) held.push({ run, stream: local, reason: "key_mismatch" });
       }
       return { ...none, withheld: held };
+    }
+    if (options.registryAhead) {
+      const held: WithheldContribution[] = [];
+      for (const run of snapshot.runs) {
+        if (run.connector !== connector || run.ns !== ns) continue;
+        const local = run.streams.find((s) => s.name === stream);
+        if (local)
+          held.push({ run, stream: local, reason: "registry_head_unimported" });
+      }
+      return held.length > 0
+        ? { ...none, complete: false, withheld: held }
+        : none;
     }
     // A receipt at or below the stream's deletion floor was published before
     // the owner deleted the stream: the same rule servableView applies to
@@ -754,15 +773,7 @@ export class StreamSyncReadService {
           kind === "tombstoned",
           live ? imported : null,
           completeOnly
-            ? {
-                registry: this.liveImported(
-                  connector,
-                  ns,
-                  stream,
-                  control,
-                  row,
-                ),
-              }
+            ? this.registryPlan(connector, ns, stream, control, row)
             : {},
         );
         streams[stream] = {
@@ -1110,6 +1121,28 @@ export class StreamSyncReadService {
   }
 
   /** The imported view of a stream while its head is live, else null. */
+  /**
+   * What a stream-only read plans a local run against: the live registry head
+   * (see `contributions`), and whether the registry has moved past it. A row
+   * newer than the latest imported head means the head the writer plans over
+   * is not here yet, so no local run can be judged.
+   */
+  private registryPlan(
+    connector: string,
+    ns: string,
+    stream: string,
+    control: ControlState,
+    row: MirrorRow | undefined,
+  ): { registry: ImportedVersion | null; registryAhead: boolean } {
+    const registry = this.liveImported(connector, ns, stream, control, row);
+    const live =
+      row !== undefined && this.importer.streamRowKind(row) === "present";
+    return {
+      registry,
+      registryAhead: live && row.version > (registry?.version ?? 0),
+    };
+  }
+
   private liveImported(
     connector: string,
     ns: string,
@@ -1208,15 +1241,7 @@ export class StreamSyncReadService {
             {
               pending: true,
               ...(input.streamOnly
-                ? {
-                    registry: this.liveImported(
-                      target.connector,
-                      ns,
-                      stream,
-                      control,
-                      row,
-                    ),
-                  }
+                ? this.registryPlan(target.connector, ns, stream, control, row)
                 : {}),
             },
           );
@@ -1365,15 +1390,7 @@ export class StreamSyncReadService {
             pending,
             ...(steps ? { steps } : {}),
             ...(completeOnly
-              ? {
-                  registry: this.liveImported(
-                    target.connector,
-                    ns,
-                    stream,
-                    control,
-                    row,
-                  ),
-                }
+              ? this.registryPlan(target.connector, ns, stream, control, row)
               : {}),
           },
         );

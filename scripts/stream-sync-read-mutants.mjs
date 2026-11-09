@@ -70,6 +70,48 @@ const MUTANTS = [
     to: "false",
     tests: [`${READ}/latest-complete.test.ts`],
   },
+  {
+    name: "REGISTRY_AHEAD_ADMITS_LOCAL_RUNS",
+    file: `${READ}/service.ts`,
+    from: "if (options.registryAhead) {",
+    to: "if (false as boolean) {",
+    tests: [`${READ}/stream-only-plan.test.ts`],
+  },
+  {
+    name: "PLAN_HEAD_DROPS_PROFILE",
+    file: `${READ}/fold.ts`,
+    from: "    profile: head.profile,\n    complete: head.complete,",
+    to: '    profile: { key: null, version: "0.0.0" },\n    complete: head.complete,',
+    tests: [`${READ}/stream-only-plan.test.ts`],
+  },
+  {
+    name: "STALE_GENERATION_NOT_DISCARDED",
+    file: `${READ}/service.ts`,
+    from: 'if (verdict === "discard" || (verdict === "wait" && !pending)) continue;',
+    to: 'if (verdict === "wait" && !pending) continue;',
+    tests: [`${READ}/stream-only-plan.test.ts`],
+  },
+  {
+    name: "OVERLAY_OMITS_CONNECTORS",
+    file: `${READ}/writer-rig.ts`,
+    from: "      connectors: () => source.connectors(),\n",
+    to: "      connectors: async () => [],\n",
+    tests: [`${READ}/writer-last-complete.test.ts`],
+  },
+  {
+    name: "NO_RUN_COMPLETE_FROM_REGISTRY_HEAD",
+    file: `${READ}/service.ts`,
+    from: "const none = foldPlan(rowsHead, [], []);",
+    to: "const none = foldPlan(head, [], []);",
+    tests: [`${READ}/stream-only-plan.test.ts`],
+  },
+  {
+    name: "SCAN_USES_INCOMPLETE_HEADS",
+    file: `${READ}/service.ts`,
+    from: "            row,\n            input.streamOnly,\n          );\n          if (live !== null) {",
+    to: "            row,\n          );\n          if (live !== null) {",
+    tests: [`${READ}/one-store.test.ts`, `${READ}/latest-complete.test.ts`],
+  },
 ];
 
 const wanted = process.argv.slice(2);

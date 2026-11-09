@@ -13,7 +13,12 @@ const T = Date.parse("2026-11-01T00:00:00Z");
 const line = (id: string): Line => ({ o: T, r: "r1", v: { id } });
 
 /** v1 complete (key id, row a); v2 incomplete (key `v2Key`) naming v1; a non-full local run R. */
-async function setup(seed: number, v2Key: string) {
+async function setup(
+  seed: number,
+  v2Key: string,
+  v2: { profileVersion?: string; generation?: number } = {},
+  runGeneration = 1,
+) {
   const f = new Fixture(await testOwnerKey(masterKey(seed)));
   const ns = await f.key.ns("acme", "account-1");
   await f.activate("acme", ns);
@@ -29,9 +34,10 @@ async function setup(seed: number, v2Key: string) {
     connector: "acme",
     ns,
     stream: "items",
-    generation: 1,
+    generation: v2.generation ?? 1,
     complete: false,
     primaryKey: [v2Key],
+    ...(v2.profileVersion ? { profileVersion: v2.profileVersion } : {}),
     records: [{ [v2Key]: "p" }],
     lastComplete: { version: 1, dataHash: v1.dataHash },
   });
@@ -39,7 +45,7 @@ async function setup(seed: number, v2Key: string) {
     {
       runId: "r1",
       ns,
-      generation: 1,
+      generation: runGeneration,
       full: false,
       streams: [{ name: "items", rows: [line("R")], complete: false }],
     },
@@ -76,5 +82,150 @@ describe("stream-only owner plans a local run from the registry head", () => {
     const { records, withheld } = await setup(111, "uid");
     expect(records).toEqual(["a"]);
     expect(withheld).toEqual(["r1:connector_update_required"]);
+  });
+
+  it("does not show a run below the registry head's connector version", async () => {
+    const { records, withheld } = await setup(112, "id", {
+      profileVersion: "2.0.0",
+    });
+    expect(records).toEqual(["a"]);
+    expect(withheld).toEqual(["r1:connector_update_required"]);
+  });
+
+  it("does not show a run of an older generation than the registry head", async () => {
+    // The control row is at generation 2 (two activations), and so are both
+    // heads. A run recorded under generation 1 is discarded by admission, not
+    // planned over the generation 2 head; stale generations are never planned.
+    const f = new Fixture(await testOwnerKey(masterKey(113)));
+    const ns = await f.key.ns("acme", "account-1");
+    await f.activate("acme", ns);
+    await f.activate("acme", ns);
+    const v1 = await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 2,
+      complete: true,
+      records: [{ id: "a" }],
+    });
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 2,
+      complete: false,
+      records: [{ id: "p" }],
+      lastComplete: { version: 1, dataHash: v1.dataHash },
+    });
+    f.overlay.runs = [
+      {
+        runId: "r1",
+        ns,
+        generation: 1,
+        full: false,
+        streams: [{ name: "items", rows: [line("R")], complete: false }],
+      },
+    ];
+    const service = await f.service();
+    await f.sync(service);
+    const decision = await service.resolve(
+      ask("pdpp.acme.items", { streamOnly: true }),
+    );
+    expect(decision.kind).toBe("view");
+    expect((await body(decision)).data.records.map((r: any) => r.id)).toEqual([
+      "a",
+    ]);
+  });
+
+  it("with no local run, completeness comes from the rows head, as a grant reads it", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(114)));
+    const ns = await f.key.ns("acme", "account-1");
+    await f.activate("acme", ns);
+    const v1 = await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      complete: true,
+      records: [{ id: "a" }],
+    });
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      complete: false,
+      records: [{ id: "p" }],
+      lastComplete: { version: 1, dataHash: v1.dataHash },
+    });
+    const service = await f.service();
+    await f.sync(service);
+    const stream = () =>
+      service.connectionViews("acme", undefined, true).find((c) => c.ns === ns)
+        ?.streams["items"];
+    expect(stream()?.complete).toBe(true);
+    const decision = await service.resolve(
+      ask("pdpp.acme.items", { streamOnly: true }),
+    );
+    expect(decision.kind).toBe("view");
+  });
+
+  it("withholds every local run while the registry head is observed but not imported", async () => {
+    const f = new Fixture(await testOwnerKey(masterKey(115)));
+    const ns = await f.key.ns("acme", "account-1");
+    await f.activate("acme", ns);
+    const v1 = await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      complete: true,
+      records: [{ id: "a" }],
+    });
+    const service = await f.service();
+    await f.sync(service);
+    await f.publish({
+      connector: "acme",
+      ns,
+      stream: "items",
+      generation: 1,
+      complete: false,
+      primaryKey: ["uid"],
+      records: [{ uid: "p" }],
+      lastComplete: { version: 1, dataHash: v1.dataHash },
+    });
+    // v2 is observed and not imported: no importPending.
+    await service.observe([...f.rows.values()], {
+      fromStart: true,
+      lastPage: true,
+    });
+    f.overlay.runs = [
+      {
+        runId: "r1",
+        ns,
+        generation: 1,
+        full: true,
+        streams: [{ name: "items", rows: [line("R")], complete: true }],
+      },
+    ];
+    const snapshot = await f.overlay.snapshot("acme");
+    const view = service
+      .connectionViews("acme", snapshot, true)
+      .find((c) => c.ns === ns)?.streams["items"];
+    snapshot.release();
+    expect(view?.complete).toBe(false);
+    const decision = await service.resolve(
+      ask("pdpp.acme.items", { streamOnly: true }),
+    );
+    expect(
+      decision.kind === "view" || decision.kind === "local_pending"
+        ? (await body(decision)).data.records.map((r: any) => r.id)
+        : decision.kind,
+    ).toEqual(["a"]);
+    expect(
+      decision.kind === "view" || decision.kind === "local_pending"
+        ? (decision.withheld ?? []).map((w) => `${w.runId}:${w.reason}`)
+        : [],
+    ).toEqual(["r1:registry_head_unimported"]);
   });
 });

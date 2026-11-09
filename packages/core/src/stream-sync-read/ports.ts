@@ -183,7 +183,7 @@ export interface StreamSyncOverlaySnapshotSource {
    * owner's listing names the streams of connectors the registry mirror has
    * never seen, as a read of them does.
    */
-  connectors?(): Promise<readonly string[]>;
+  connectors(): Promise<readonly string[]>;
   /**
    * Pinned snapshot of every overlay run of `connector`. Acquire it BEFORE
    * leasing imported views, once per read, shared by all input streams.

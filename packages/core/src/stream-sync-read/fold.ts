@@ -43,7 +43,9 @@ export type WithheldReason =
   /** The writer will publish the run, but the projector cannot project it to the requested name. */
   | "projection_unavailable"
   /** A foreign control key holds the connection: the writer keeps the run pending. */
-  | "key_mismatch";
+  | "key_mismatch"
+  /** The registry head the writer plans over is newer than the imported one. */
+  | "registry_head_unimported";
 
 export interface WithheldContribution extends Contribution {
   readonly reason: WithheldReason;
