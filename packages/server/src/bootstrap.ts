@@ -929,8 +929,8 @@ export async function createServer(
           await seedStaging.installId(),
           async (connector) =>
             writerForSeed
-              ? (await writerForSeed.seedStatus(connector)).receipts
-              : {},
+              ? await writerForSeed.seedStatus(connector)
+              : { receipts: {}, skipped: [] },
         );
         streamSyncWriter = new StreamSyncWriter({
           ownerAddress: serverOwner,

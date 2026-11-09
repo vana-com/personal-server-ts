@@ -37,6 +37,10 @@ const DECLARED_HOOK_TESTS = [
 const DECLARED_TESTS = [
   "packages/core/src/stream-sync/writer-delete-declared.test.ts",
 ];
+const BOOTSTRAP = "packages/server/src/bootstrap.ts";
+const BOOTSTRAP_TESTS = [
+  "packages/server/src/bootstrap-declared-streams.test.ts",
+];
 
 /** @type {Array<{name: string, edits: Array<{file: string, find: string, replace: string}>, tests: string[], aim: string, build?: boolean}>} */
 const MUTANTS = [
@@ -130,9 +134,9 @@ const MUTANTS = [
       },
       {
         file: WRITER,
-        find: "        delete state.seedTargets[connector];\n      });\n      await this.skipStagedSeed(connector);\n      return null;",
+        find: "        delete state.seedTargets[connector];\n      });\n      return null;",
         replace:
-          "        delete state.seedTargets[connector];\n        delete state.deletes?.[connector];\n      });\n      await this.skipStagedSeed(connector);\n      return null;",
+          "        delete state.seedTargets[connector];\n        delete state.deletes?.[connector];\n      });\n      return null;",
       },
     ],
     tests: REQUEST_TESTS,
@@ -242,12 +246,56 @@ const MUTANTS = [
     edits: [
       {
         file: WRITER,
-        find: "      await this.skipStagedSeed(connector);\n      return null;",
-        replace: "      return null;",
+        find: "      await this.skipStagedSeed(connector);\n      await this.purgeConnector(connector, []);",
+        replace: "      await this.purgeConnector(connector, []);",
       },
     ],
     tests: DECLARED_TESTS,
     aim: "a staged seed of a connector with no registry rows does not return",
+  },
+  {
+    // The purge commits before the staged uploads are retired. A crash between
+    // the two leaves the seed target set and the uploads unretired.
+    name: "SKIP_AFTER_PURGE",
+    edits: [
+      {
+        file: WRITER,
+        find: "      await this.skipStagedSeed(connector);\n      await this.purgeConnector(connector, []);",
+        replace:
+          "      await this.purgeConnector(connector, []);\n      await this.skipStagedSeed(connector);",
+      },
+    ],
+    build: true,
+    tests: DECLARED_TESTS,
+    aim: "does not publish the staged seed after restart",
+  },
+  {
+    // The retired record is keyed by stream only: a later upload of the same
+    // stream is dropped with the old one.
+    name: "SKIP_BY_STREAM",
+    edits: [
+      {
+        file: WRITER,
+        find: "      ] === s.upload;",
+        replace: "      ] !== undefined;",
+      },
+    ],
+    build: true,
+    tests: DECLARED_TESTS,
+    aim: "a new seed staged after a delete publishes on reconnect",
+  },
+  {
+    // The host's declaredStreams option is not passed to the writer's hook.
+    name: "BOOTSTRAP_OPTION_DROPPED",
+    edits: [
+      {
+        file: BOOTSTRAP,
+        find: "options?.declaredStreams,",
+        replace: "undefined,",
+      },
+    ],
+    tests: BOOTSTRAP_TESTS,
+    aim: "the host's declaredStreams option names an uninstalled connector's streams to the writer",
   },
 ];
 

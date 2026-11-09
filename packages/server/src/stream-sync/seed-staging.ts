@@ -82,9 +82,19 @@ export type SeedStreamState =
     >);
 
 /** Receipts of the writer for `connector` on this install. */
+export interface SeedReceiptLookupResult {
+  /** Receipt per stream for the current seed target. */
+  readonly receipts: Readonly<Record<string, SeedReceipt>>;
+  /** Staged uploads a delete retired. A new upload for the stream is not one. */
+  readonly skipped: readonly {
+    readonly stream: string;
+    readonly upload: string;
+  }[];
+}
+
 export type SeedReceiptLookup = (
   connector: string,
-) => Promise<Readonly<Record<string, SeedReceipt>>>;
+) => Promise<SeedReceiptLookupResult>;
 
 export interface SeedStaging {
   /** The stable id of this install, created on first use. */
@@ -278,17 +288,23 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
       return {
         installId,
         async streams(connector) {
-          const done = await receipts(connector);
+          const { receipts: done, skipped } = await receipts(connector);
           const out = [];
           for (const [stream, seed] of Object.entries(
             await staged(connector),
           )) {
-            if (done[stream] !== undefined) {
+            if (
+              done[stream] !== undefined ||
+              skipped.some(
+                (s) => s.stream === stream && s.upload === seed.upload,
+              )
+            ) {
               await files.remove(pointerPath(connector, stream));
               continue;
             }
             out.push({
               stream,
+              upload: seed.upload,
               primaryKey: seed.primaryKey,
               profile: seed.profile,
             });

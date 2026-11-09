@@ -20,6 +20,8 @@ async function* pieces(text: string, size: number): AsyncGenerator<Uint8Array> {
   }
 }
 
+const NONE = { receipts: {}, skipped: [] };
+
 describe("seed staging", () => {
   let root: string;
   let staging: SeedStaging;
@@ -49,7 +51,7 @@ describe("seed staging", () => {
     const text = [DESCRIPTOR, '{"id":"a"}', big, '{"id":"b"}'].join("\n");
     const seed = await staging.stage("c", "s", pieces(text, 64 * 1024 + 7));
     expect(seed).toMatchObject({ records: 3, invalid: 0 });
-    const source = staging.source("install", async () => ({}));
+    const source = staging.source("install", async () => NONE);
     const rows = [];
     for await (const row of source.records("c", "s")) rows.push(row);
     expect(rows.map((r) => (r as { id: string }).id)).toEqual([
@@ -61,6 +63,7 @@ describe("seed staging", () => {
     expect(await source.streams("c")).toEqual([
       {
         stream: "s",
+        upload: expect.any(String),
         primaryKey: ["id"],
         profile: { key: "p", version: "2.0.0" },
       },
@@ -73,10 +76,34 @@ describe("seed staging", () => {
     );
     await staging.stage("c", "s", pieces(text, 5));
     await staging.stage("c", "t", pieces(text, 5));
-    const source = staging.source("install", async () => ({ s: "skipped" }));
+    const source = staging.source("install", async () => ({
+      receipts: { s: "skipped" },
+      skipped: [],
+    }));
     expect((await source.streams("c")).map((s) => s.stream)).toEqual(["t"]);
     expect(Object.keys(await staging.staged("c"))).toEqual(["t"]);
     expect(await readdir(join(root, "uploads"))).toHaveLength(1);
+  });
+
+  it("drops a retired upload, and offers a later upload of the same stream", async () => {
+    const text = [DESCRIPTOR, '{"id":"a"}', '{"id":"b"}', '{"id":"c"}'].join(
+      "\n",
+    );
+    await staging.stage("c", "s", pieces(text, 5));
+    const retired = (await staging.staged("c")).s!.upload;
+    const retiredSource = staging.source("install", async () => ({
+      receipts: {},
+      skipped: [{ stream: "s", upload: retired }],
+    }));
+    expect(await retiredSource.streams("c")).toEqual([]);
+    expect(Object.keys(await staging.staged("c"))).toEqual([]);
+
+    await staging.stage("c", "s", pieces(text, 5));
+    const source = staging.source("install", async () => ({
+      receipts: {},
+      skipped: [{ stream: "s", upload: retired }],
+    }));
+    expect((await source.streams("c")).map((s) => s.stream)).toEqual(["s"]);
   });
 
   it("removes an upload that failed", async () => {

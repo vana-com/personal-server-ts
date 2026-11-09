@@ -86,10 +86,10 @@ describe("full-server stream-sync home", () => {
       ownerAddress: B,
       network: NET,
     });
-    const sourceB = createSeedStaging(b!.seedFiles).source(
-      "i",
-      async () => ({}),
-    );
+    const sourceB = createSeedStaging(b!.seedFiles).source("i", async () => ({
+      receipts: {},
+      skipped: [],
+    }));
     expect(await sourceB.streams("c")).toEqual([]);
     await b!.close();
     const again = await openFsStreamSyncHome({
@@ -99,7 +99,7 @@ describe("full-server stream-sync home", () => {
     });
     const sourceA = createSeedStaging(again!.seedFiles).source(
       "i",
-      async () => ({}),
+      async () => ({ receipts: {}, skipped: [] }),
     );
     expect((await sourceA.streams("c")).length).toBe(1);
   });

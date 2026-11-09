@@ -162,9 +162,11 @@ export interface RunSpec extends StreamSpec {
 export interface SeedRows {
   /** Default `items`. */
   readonly stream?: string;
+  /** Identity of the staged upload. Default `upload-1`; change it to stage a new one. */
+  upload?: string;
   readonly key: string;
   readonly version: string;
-  readonly rows: readonly Record<string, unknown>[];
+  rows: readonly Record<string, unknown>[];
 }
 
 export class Rig {
@@ -268,6 +270,7 @@ export class Rig {
               streams: async () => [
                 {
                   stream: seed.stream ?? "items",
+                  upload: seed.upload ?? "upload-1",
                   primaryKey: [seed.key],
                   profile: { key: null, version: seed.version },
                 },

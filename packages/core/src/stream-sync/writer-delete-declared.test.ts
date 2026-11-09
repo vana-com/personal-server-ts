@@ -6,11 +6,13 @@
  * cannot return after a reconnect.
  */
 import { expect, it } from "vitest";
+import type { StreamSyncWriter } from "./writer.js";
 import { ConnectorNotVerifiedError } from "./writer.js";
 import {
   Rig,
   CONNECTOR,
   type RunSpec,
+  type SeedRows,
 } from "../stream-sync-read/writer-rig.js";
 
 const spec = (runId: string, otherDevice = false): RunSpec => ({
@@ -79,4 +81,61 @@ it("a staged seed of a connector with no registry rows does not return after a d
 
   // The staged seed is not published: no row for `seed` exists.
   expect(await r.registeredHead("seed")).toBeNull();
+});
+
+const staleSeed = (): SeedRows => ({
+  stream: "seed",
+  key: "id",
+  version: "1.0.0",
+  rows: [{ id: "old" }],
+  upload: "upload-1",
+});
+
+/**
+ * Crash the writer right after its `n`th state write, so the delete throws at
+ * that point and the driver is abandoned, as a process crash would leave it.
+ */
+function crashAfterStateWrite(writer: StreamSyncWriter, n: number) {
+  const target = writer as unknown as {
+    withState: (...args: unknown[]) => Promise<unknown>;
+  };
+  const original = target.withState.bind(writer);
+  let writes = 0;
+  target.withState = async (...args: unknown[]) => {
+    const result = await original(...args);
+    writes += 1;
+    if (writes === n) throw new Error(`crash after state write ${n}`);
+    return result;
+  };
+}
+
+it.each([1, 2, 3])(
+  "a crash after state write %s of a rowless delete does not publish the staged seed after restart (mutant: SKIP_AFTER_PURGE)",
+  async (n) => {
+    const r = new Rig(staleSeed());
+    await r.open();
+    await r.collect({ ...spec("unpublished"), userConnect: true });
+    crashAfterStateWrite(r.writer, n);
+    await expect(r.writer.requestConnectionDelete(CONNECTOR)).rejects.toThrow(
+      `crash after state write ${n}`,
+    );
+    await r.restart();
+    await r.collect({ ...spec("learn"), userConnect: true });
+    await r.publish();
+    expect(await r.registeredHead("seed")).toBeNull();
+  },
+);
+
+it("a new seed staged after a delete publishes on reconnect (mutant: SKIP_BY_STREAM)", async () => {
+  const seed = staleSeed();
+  const r = new Rig(seed);
+  await r.open();
+  await r.collect({ ...spec("unpublished"), userConnect: true });
+  await r.writer.deleteConnection(CONNECTOR);
+  // The host stages a new upload for the same stream.
+  seed.upload = "upload-2";
+  seed.rows = [{ id: "new" }];
+  await r.collect({ ...spec("learn"), userConnect: true });
+  await r.publish();
+  expect(await r.registeredHead("seed")).toMatchObject({ recordCount: 1 });
 });

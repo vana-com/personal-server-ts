@@ -279,6 +279,12 @@ interface WriterState {
   seedTargets: Record<string, string>;
   /** `<installId>|<connector>|<ns>|<stream>` → receipt. */
   receipts: Record<string, SeedReceipt>;
+  /**
+   * `<installId>|<connector>|<stream>` → the staged upload a delete retired.
+   * A retired upload is never published; a later upload for the same stream
+   * has a new identity and still merges.
+   */
+  skippedSeeds?: Record<string, string>;
   /** The last three finished-run verdicts per connector, newest last. */
   recent?: Record<string, ("good" | "bad")[]>;
   /**
@@ -914,10 +920,10 @@ export class StreamSyncWriter {
   /**
    * A seed the host staged for a connector the registry never listed is
    * stored data with no row to fence, and writing a delete head there would
-   * add a row the connector never had. Each staged stream gets the receipt a
-   * seed gets once the connector's generation has moved on: `skipped`. The
-   * next identified run of the connector then does not seed it back. No
-   * registry write.
+   * add a row the connector never had. Each staged upload is retired by its
+   * identity, in state, before anything else in the delete: a crash after
+   * this write cannot publish it on restart. The staged pointers are then
+   * dropped. No registry write.
    */
   private async skipStagedSeed(connector: string): Promise<void> {
     const seed = this.options.seed;
@@ -926,11 +932,12 @@ export class StreamSyncWriter {
     if (staged.length === 0) return;
     await this.withState((state) => {
       for (const entry of staged) {
-        state.receipts[
-          `${seed.installId}|${connector}|${IDENTITYLESS_NS}|${entry.stream}`
-        ] ??= "skipped";
+        (state.skippedSeeds ??= {})[
+          `${seed.installId}|${connector}|${entry.stream}`
+        ] = entry.upload;
       }
     });
+    await seed.streams(connector);
   }
 
   /**
@@ -947,11 +954,11 @@ export class StreamSyncWriter {
     const { pins, streams, registered } =
       plan ?? (await this.planDelete(connector));
     if (planIsEmpty({ pins, streams, registered })) {
+      await this.skipStagedSeed(connector);
       await this.purgeConnector(connector, []);
       await this.withState((state) => {
         delete state.seedTargets[connector];
       });
-      await this.skipStagedSeed(connector);
       return null;
     }
     const intent: DeleteIntent = {
@@ -1275,11 +1282,14 @@ export class StreamSyncWriter {
   async seedStatus(connector: string): Promise<{
     targetKnown: boolean;
     receipts: Readonly<Record<string, SeedReceipt>>;
+    /** Uploads a delete retired, by stream. Independent of the seed target. */
+    skipped: readonly { stream: string; upload: string }[];
   }> {
     const seed = this.options.seed;
     const state = await this.readState();
     const target = state.seedTargets[connector];
     const receipts: Record<string, SeedReceipt> = {};
+    const skipped: { stream: string; upload: string }[] = [];
     if (seed && target !== undefined) {
       const prefix = `${seed.installId}|${connector}|${target}|`;
       for (const [key, receipt] of Object.entries(state.receipts)) {
@@ -1287,7 +1297,14 @@ export class StreamSyncWriter {
           receipts[key.slice(prefix.length)] = receipt;
       }
     }
-    return { targetKnown: target !== undefined, receipts };
+    if (seed) {
+      const prefix = `${seed.installId}|${connector}|`;
+      for (const [key, upload] of Object.entries(state.skippedSeeds ?? {})) {
+        if (key.startsWith(prefix))
+          skipped.push({ stream: key.slice(prefix.length), upload });
+      }
+    }
+    return { targetKnown: target !== undefined, receipts, skipped };
   }
 
   /** The owner and key check a run is bound to (V2 §2.1, M5). */
@@ -2105,7 +2122,15 @@ export class StreamSyncWriter {
     const { entry } = host;
     const state = await this.readState();
     if (state.seedTargets[entry.connector] !== entry.ns) return;
-    const seedStreams = await seed.streams(entry.connector);
+    // A retired upload is never seeded, whatever the adapter still lists; a
+    // later upload of the same stream has another identity and is seeded.
+    const retired = (s: { stream: string; upload: string }) =>
+      state.skippedSeeds?.[
+        `${seed.installId}|${entry.connector}|${s.stream}`
+      ] === s.upload;
+    const seedStreams = (await seed.streams(entry.connector)).filter(
+      (s) => !retired(s),
+    );
     const receiptKey = (stream: string) =>
       `${seed.installId}|${entry.connector}|${entry.ns}|${stream}`;
     if (host.target !== 1) {
