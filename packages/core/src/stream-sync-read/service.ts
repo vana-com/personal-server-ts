@@ -789,7 +789,7 @@ export class StreamSyncReadService {
       if (logicalStreamScopeParts(name)) names.add(name);
     };
     const connectors = new Set(this.mirror.connectors());
-    if (input.isOwnerView && this.options.overlay?.connectors) {
+    if (input.isOwnerView && this.options.overlay) {
       for (const connector of await this.options.overlay.connectors()) {
         connectors.add(connector);
       }

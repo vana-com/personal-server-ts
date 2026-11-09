@@ -186,11 +186,12 @@ export interface StreamSyncOverlaySnapshotSource {
    */
   snapshot(connector: string): Promise<StreamSyncOverlaySnapshot>;
   /**
-   * Every connector that has an overlay run. Lets the reader list scopes of a
-   * connector the registry mirror has never seen (a first run made offline).
-   * Absent = such a connector is readable by name but cannot be listed.
+   * Every connector that may have an overlay run (a superset is fine: the
+   * reader snapshots each). Required: the scope listing names the owner's
+   * local-only scopes of a connector the registry mirror has never seen from
+   * this list, so an overlay that cannot answer would hide readable scopes.
    */
-  connectors?(): Promise<readonly string[]>;
+  connectors(): Promise<readonly string[]>;
   /**
    * Called after a durable ViewStore commit and for every durable current
    * view at startup. Idempotent. A published stream retires only when

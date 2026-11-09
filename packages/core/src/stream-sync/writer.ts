@@ -2639,6 +2639,24 @@ export class StreamSyncWriter {
     }
   }
 
+  /**
+   * Every connector with a run in this home. A superset of the connectors whose
+   * snapshot holds runs (that filter also checks readiness and binding), which
+   * is enough: the reader snapshots each name it gets. Reads one `entry.json`
+   * per retained run and no spool bytes. Does no network I/O.
+   */
+  async overlayConnectors(): Promise<readonly string[]> {
+    await this.recover();
+    return this.lifecycle(async () => {
+      const connectors = new Set<string>();
+      for (const runId of await this.runIds()) {
+        const host = await this.readEntry(runId);
+        if (host) connectors.add(host.entry.connector);
+      }
+      return [...connectors].sort();
+    });
+  }
+
   /** Called only by the home-bound overlay adapter. Does no network I/O. */
   async snapshotOverlay(connector: string): Promise<StreamSyncOverlaySnapshot> {
     await this.recover();

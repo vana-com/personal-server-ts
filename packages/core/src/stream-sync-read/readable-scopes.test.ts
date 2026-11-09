@@ -10,6 +10,7 @@ import type { FakeRun } from "./service-fixture.js";
 import { ask, Fixture, masterKey } from "./service-fixture.js";
 import { testOwnerKey } from "./testing.js";
 import type { StreamSyncReadService } from "./service.js";
+import { Rig } from "./writer-rig.js";
 
 const T = Date.parse("2026-11-01T00:00:00Z");
 const row = (id: string): Line => ({ o: T, r: "r1", v: { id } });
@@ -178,5 +179,25 @@ describe("readableScopes work is bounded by the grant", () => {
     expect(await listed(service, true)).toEqual(["pdpp.acme.s2"]);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(warn.mock.calls[0])).toContain("pdpp.acme.s1");
+  });
+});
+
+describe("readableScopes with the real writer overlay", () => {
+  // OVERLAY_CONNECTORS_EMPTY
+  it("lists an owner's first run, collected and not yet published, of an unseen connector", async () => {
+    const rig = new Rig();
+    await rig.open();
+    await rig.collect({
+      runId: "first",
+      key: "id",
+      version: "1.0.0",
+      rows: [{ id: "a" }],
+      full: true,
+    });
+    expect(await rig.overlay.connectors()).toEqual([rig.connector]);
+    const scope = `pdpp.${rig.connector}.items`;
+    const read = await bodyReadable(rig.service, [scope], true);
+    expect(read).toEqual([scope]);
+    expect(await listed(rig.service, true)).toEqual(read);
   });
 });

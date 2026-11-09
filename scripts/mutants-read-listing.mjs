@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 
 const API = "packages/core/src/api/index.ts";
+const OVL = "packages/core/src/stream-sync/writer-overlay.ts";
 const SVC = "packages/core/src/stream-sync-read/service.ts";
 const TESTS = [
   "packages/core/src/api/stream-sync-read-listing.test.ts",
@@ -23,6 +24,7 @@ const MUTANTS = [
   ["READER_PRESENCE_AS_MODE", API, 'if (storageSelection?.kind === "streams") {\n        return listStreamSyncScopes', 'if (storageSelection?.kind === "streams" && deps.streamSyncRead) {\n        return listStreamSyncScopes'],
   ["UNKNOWN_READS_LEGACY", API, '      if (storageSelection?.kind === "refuse") return storageSelection.response;\n      if (storageSelection?.kind === "streams") {\n        return listStreamSyncScopes', '      if (storageSelection?.kind === "streams") {\n        return listStreamSyncScopes'],
   ["UNSWITCHED_CHANGED", API, 'if (storageSelection?.kind === "streams") {\n        return listStreamSyncScopes', "if (storageSelection) {\n        return listStreamSyncScopes"],
+  ["OVERLAY_CONNECTORS_EMPTY", OVL, "connectors: () => writer.overlayConnectors(),", "connectors: async () => [],"],
   ["MIRROR_ONLY_CONNECTOR_DISCOVERY", SVC, "if (input.isOwnerView && this.options.overlay?.connectors) {", "if (false) {"],
   ["OMIT_OVERLAY_STREAM_NAMES", SVC, "        for (const run of snapshot.runs) {\n          for (const stream of run.streams) addLogical(connector, stream.name);\n        }", ""],
   ["RESOLVE_BEFORE_GRANT_AND_PAGE", SVC, "      if (input.isCovered && !input.isCovered(scope)) continue;\n      let newest: number | null;\n      try {\n        const found = await this.readable(scope, input.isOwnerView);\n        if (!found) continue;", "      let newest: number | null;\n      try {\n        const found = await this.readable(scope, input.isOwnerView);\n        if (!found) continue;\n        if (input.isCovered && !input.isCovered(scope)) continue;"],
@@ -50,6 +52,6 @@ for (const [name, file, from, to] of MUTANTS) {
     writeFileSync(file, original);
   }
 }
-execFileSync("git", ["diff", "--exit-code", "--", API, SVC], { stdio: "inherit" });
+execFileSync("git", ["diff", "--exit-code", "--", API, SVC, OVL], { stdio: "inherit" });
 for (const [n, r] of rows) console.log(`${n.padEnd(36)} ${r}`);
 process.exit(survived === 0 ? 0 : 1);

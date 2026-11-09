@@ -201,6 +201,7 @@ export class Rig {
         await this.onSnapshot?.();
         return snapshot;
       },
+      connectors: () => source.connectors(),
       acknowledge: (coverage) => source.acknowledge(coverage),
     };
   }
