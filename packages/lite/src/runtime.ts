@@ -1238,6 +1238,8 @@ export function createPsLiteRuntime(
           return handleOuraCollectionRequirementsRequest(request, {
             auth,
             storage: toDataStoragePort(options.storage),
+            accountStorageMode: options.accountStorageMode,
+            serverOwner: options.serverOwner,
           });
         }
 
@@ -1457,7 +1459,12 @@ export function createPsLiteRuntime(
         ) {
           return handlePersonalServerSyncRequest(
             request,
-            { auth, syncManager: options.syncManager ?? null },
+            {
+              auth,
+              syncManager: options.syncManager ?? null,
+              accountStorageMode: options.accountStorageMode,
+              serverOwner: options.serverOwner,
+            },
             { basePath: syncPrefix },
           );
         }

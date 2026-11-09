@@ -751,6 +751,7 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
+      accountStorageMode,
       mountPath: "/v1/sync",
     }),
   );

@@ -8,6 +8,11 @@ import type { DataStoragePort } from "../ports/index.js";
 import type { LegacyScopeViewPort } from "../storage/legacy-scope-view.js";
 import type { PersonalServerApiAuthPort } from "./index.js";
 import {
+  selectAccountStorageMode,
+  type AccountStorageMode,
+} from "./account-storage-mode.js";
+import { streamSyncLegacyReadUnavailableResponse } from "./switched-read-refusal.js";
+import {
   projectPdppRecordsToLegacyPayload,
   type PdppRecord,
 } from "../legacy-projection/index.js";
@@ -84,6 +89,9 @@ export async function handleOuraCollectionRequirementsRequest(
     legacyScopeView?: LegacyScopeViewPort;
     /** Node-only retained constraints, including tombstoned IDs; never a served body. */
     retainedCanonicalRecords?: () => PdppRecord[] | undefined;
+    /** The shared account mode. A switched account has no legacy history to plan from. */
+    accountStorageMode?: AccountStorageMode;
+    serverOwner?: string;
   },
 ): Promise<Response> {
   await deps.auth.authorizeOwner(request);
@@ -96,6 +104,13 @@ export async function handleOuraCollectionRequirementsRequest(
       { error: "METHOD_NOT_ALLOWED" },
       { status: 405, headers },
     );
+  const selection = selectAccountStorageMode(deps);
+  if (selection.kind === "refuse") return selection.response;
+  if (selection.kind === "streams") {
+    return streamSyncLegacyReadUnavailableResponse(
+      "This account stores its data as streams; Oura legacy history is not read.",
+    );
+  }
   try {
     const result = await readOuraCollectionRequirements(
       deps.storage,

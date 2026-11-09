@@ -72,6 +72,8 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
         },
       },
       legacyScopeView: deps.legacyScopeView,
+      accountStorageMode: deps.accountStorageMode,
+      serverOwner: deps.serverOwner,
       retainedCanonicalRecords: () =>
         deps.pdpp?.bindingStore.readSnapshot(
           () => retainedCanonicalHistory(deps)?.records,

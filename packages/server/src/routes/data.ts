@@ -8,6 +8,8 @@ import {
   type StreamSyncReadPort,
   refuseLegacyWrite,
   legacyWriteSwitchOf,
+  selectAccountStorageMode,
+  streamSyncLegacyReadUnavailableResponse,
   type AccountStorageMode,
   type LegacyWriteSwitch,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -368,6 +370,20 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         request: c.req.raw,
         scope: parsed.scope,
       });
+      // The takeover verdicts and reset flag are legacy-view (canonical store)
+      // state. A switched account has no such state to report.
+      const selection = selectAccountStorageMode({
+        accountStorageMode: deps.accountStorageMode,
+        serverOwner: deps.serverOwner,
+      });
+      if (selection.kind === "refuse")
+        throw new LegacyWriteRefused(selection.response);
+      if (selection.kind === "streams")
+        throw new LegacyWriteRefused(
+          streamSyncLegacyReadUnavailableResponse(
+            `Scope "${parsed.scope}" has no legacy takeover state because this account stores its data as streams.`,
+          ),
+        );
       return {
         scope: parsed.scope,
         reset: deps.legacyScopeView?.isReset(parsed.scope) ?? false,

@@ -10,6 +10,7 @@ import {
   handlePersonalServerSyncRequest,
   type PersonalServerApiDispatchOptions,
 } from "@opendatalabs/personal-server-ts-core/api";
+import type { AccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import type { TokenStore } from "../token-store.js";
 import { createServerApiAuth } from "../api-auth.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
@@ -23,6 +24,7 @@ export interface SyncRouteDeps {
   accessToken?: string;
   tokenStore?: TokenStore;
   syncManager: SyncManager | null; // null when sync disabled
+  accountStorageMode?: AccountStorageMode;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
@@ -44,6 +46,8 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
       {
         auth,
         syncManager: deps.syncManager,
+        accountStorageMode: deps.accountStorageMode,
+        serverOwner: deps.serverOwner,
         logger: deps.logger,
       },
       { basePath: deps.mountPath },
