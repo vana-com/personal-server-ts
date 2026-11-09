@@ -193,28 +193,29 @@ describe("uncertain payment settlement", () => {
     },
   );
 
-  it.each(["fee", "age", "version"] as const)(
-    (change) => change === "age"
-      ? "a retry later than the freshness window after a lost response is re-challenged (known residue)"
-      : `REVALIDATE_SETTLED_AS_NEW: exact retry after ${change} change is not charged again`, async (change) => {
+  it.each(["fee", "version"] as const)(
+    "REVALIDATE_SETTLED_AS_NEW: exact retry after %s change is not charged again", async (change) => {
       const f = fixture();
       const { header } = await f.sign();
       f.setFault("throw-after-commit");
       await f.cycle(header);
       if (change === "fee") f.grant.fee.totalDue = "20";
-      if (change === "age") f.age();
       if (change === "version") f.advanceVersion();
       // A reconstructed dependency object must not lose the retry proof.
-      const result = await f.cycle(header, { ...f.deps });
-      if (change === "age") {
-        expect(result.kind).toBe("challenge");
-        expect(f.counts()).toEqual({ nonces: 2, records: 2, debits: 1 });
-        return;
-      }
-      expect(result).toEqual({ kind: "ok", payResponse: { paidAt } });
+      expect(await f.cycle(header, { ...f.deps })).toEqual({ kind: "ok", payResponse: { paidAt } });
       expect(f.counts()).toEqual({ nonces: 1, records: 1, debits: 1 });
     },
   );
+
+  it("a retry later than the freshness window after a lost response is re-challenged (known residue)", async () => {
+    const f = fixture();
+    const { header } = await f.sign();
+    f.setFault("throw-after-commit");
+    await f.cycle(header);
+    f.age();
+    expect((await f.cycle(header, { ...f.deps })).kind).toBe("challenge");
+    expect(f.counts()).toEqual({ nonces: 2, records: 2, debits: 1 });
+  });
 
   it("SERVE_ON_UNKNOWN: the real HTTP dispatcher stops before reading data", async () => {
     const f = fixture();
