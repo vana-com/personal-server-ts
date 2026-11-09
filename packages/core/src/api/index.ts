@@ -2153,6 +2153,12 @@ async function handleScopeUploadRequest(
   }
   if (request.method !== route.method) return methodNotAllowed();
   await deps.auth.authorizeOwner(request);
+  // An upload is owner-only: no delegated builder writes through it, so there
+  // is no exemption. Aborting only discards staged data and stays allowed.
+  if (route.kind !== "abort") {
+    const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+    if (refusal) return refusal;
+  }
   const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
   if (!scopeResult.ok) return contractErrorResponse(scopeResult);
   const scope = scopeResult.scope;
@@ -2404,6 +2410,11 @@ export async function handlePersonalServerDataRequest(
     if (parts.length === 3 && parts[1] === "imports") {
       if (request.method !== "PUT") return methodNotAllowed();
       await deps.auth.authorizeOwner(request);
+      // Owner-only: a builder has no durable-import route, so a signature
+      // header earns no exemption here. This runs on the normalized path, so
+      // `/imports/<op>/` and repeated slashes land here too.
+      const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+      if (refusal) return refusal;
       const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       const operation = decodePathPart(parts[2]);
