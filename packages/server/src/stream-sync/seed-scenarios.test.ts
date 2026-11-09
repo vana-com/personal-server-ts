@@ -5,8 +5,8 @@ import {
   controlHashes,
   controlScope,
   decodeHead,
-  decodePart,
   deriveKeyCheck,
+  linesOfParts,
   parseScope,
   partBlobName,
   streamScope,
@@ -162,6 +162,7 @@ async function fixture(generation = 1) {
         keys: {
           namespaceHmac: mac,
           encrypt: async (_s, b) => b,
+          encryptPart: async (_s, b) => b,
           decrypt: async (_s, b) => b,
         },
         signer: { signAddData: async () => "0x00" },
@@ -183,19 +184,20 @@ async function fixture(generation = 1) {
       if (decoded.kind !== "ok")
         throw new Error(`invalid head: ${decoded.kind}`);
       const lines = [];
-      for (const part of decoded.head.parts) {
-        const body = await blobs.get(
-          `${scope}/${partBlobName(decoded.head.generation, part.hash)}`,
-        );
-        if (!body) throw new Error("published part missing");
-        for (const { line } of await decodePart(
-          streamSyncHashes.sha256,
-          body,
-          part,
-          decoded.head.primaryKey,
-        )) {
-          lines.push(line);
-        }
+      // linesOfParts reads format 1 and format 2 parts alike and checks size,
+      // SHA-256, key order, prefix and frame counts of every part it loads.
+      for await (const line of linesOfParts(
+        streamSyncHashes.sha256,
+        decoded.head,
+        async (part) => {
+          const body = await blobs.get(
+            `${scope}/${partBlobName(decoded.head.generation, part.hash)}`,
+          );
+          if (!body) throw new Error("published part missing");
+          return body;
+        },
+      )) {
+        lines.push(line);
       }
       const values = lines.map((line) => line.v as Row).sort(byId);
       return {
