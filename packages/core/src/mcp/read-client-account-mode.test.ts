@@ -260,13 +260,61 @@ describe("LEGACY_ON_SWITCH_MCP: a switched account never reads legacy storage", 
     });
   }
 
+  describe("STREAM_LIST: a switched account's scope listing is never an empty success", () => {
+    it("listScopes is the stream listing or a retryable refusal, never an empty answer", async () => {
+      // The stream reader here has no listing contract, so the only honest
+      // answer is a refusal the caller can retry.
+      const h = await harness({ mode: "switched", reader: "stream" });
+      const result = await outcome(() =>
+        h.client.listScopes({ grantId: GRANT_ID }),
+      );
+      expect(result).toMatch(/^503 /);
+      expect(result).toContain("STREAM_LIST_UNAVAILABLE");
+      expect(h.calls).toEqual([]);
+    });
+
+    it("a wildcard search over readable stream data finds it or says why not, never nothing", async () => {
+      const h = await harness({ mode: "switched", reader: "stream" });
+      const text = textOf(
+        (await tool("search_personal_context").handler(
+          { query: "stream record 1", scopes: ["pdpp.*"] },
+          {
+            connection: connection(["pdpp.*"]),
+            readClient: h.client,
+          },
+        )) as never,
+      );
+      const found =
+        text.includes("stream record 1") && text.includes(STREAM_SCOPE);
+      const explained = text.includes("scope_list_failed");
+      expect(found || explained).toBe(true);
+      expect(h.calls).toEqual([]);
+    });
+
+    it("a named scope is still found: discovery by name does not need the listing", async () => {
+      const h = await harness({ mode: "switched", reader: "stream" });
+      const text = textOf(
+        (await tool("search_personal_context").handler(
+          { query: "stream record 1", scopes: [STREAM_SCOPE] },
+          { connection: connection(["pdpp.*"]), readClient: h.client },
+        )) as never,
+      );
+      expect(text).toContain("stream record 1");
+    });
+  });
+
   it("a legacy-only scope is absent from discovery and from the listing", async () => {
     const h = await harness({ mode: "switched", reader: "pass" });
     await expect(
       h.client.getScopeMetadata(LEGACY_SCOPE, GRANT_ID),
     ).resolves.toBeNull();
-    const listed = await h.client.listScopes({ grantId: GRANT_ID });
-    expect(listed.scopes.map((s) => s.scope)).not.toContain(LEGACY_SCOPE);
+    // The listing is refused, not answered from legacy and not answered empty.
+    const error = await h.client.listScopes({ grantId: GRANT_ID }).then(
+      () => undefined,
+      (e) => e,
+    );
+    expect(error).toBeInstanceOf(McpDataReadError);
+    expect((error as McpDataReadError).status).toBe(503);
     expect(h.calls).toEqual([]);
   });
 
@@ -420,6 +468,21 @@ describe("LEGACY_ON_SWITCH_MCP: a switched account never reads legacy storage", 
           grantId: GRANT_ID,
         } as never)
         .catch((e) => e);
+      expect((error as ProtocolError).errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
+      expect(h.calls).toEqual([]);
+    });
+
+    it("an unknown mode refuses even a settlement that names a served head", async () => {
+      const { h, port, request } = await session("unknown");
+      const error = await port
+        .authorizeBuilderRead({
+          request,
+          scope: STREAM_SCOPE,
+          grantId: GRANT_ID,
+          servedEntry: { scope: STREAM_SCOPE, version: 3 },
+        } as never)
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(ProtocolError);
       expect((error as ProtocolError).errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
       expect(h.calls).toEqual([]);
     });

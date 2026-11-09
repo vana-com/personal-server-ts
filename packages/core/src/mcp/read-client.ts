@@ -822,6 +822,24 @@ export function createMcpDataReadClient(
     storageSelection: () => selectAccountStorageMode(options.dataApiDeps),
     async listScopes({ scopePrefix, limit, offset, grantId } = {}) {
       const route = await readRoute();
+      // A switched account's scope list comes from the stream reader's own
+      // listing. A reader without one cannot answer, and an empty answer
+      // would tell the caller there is nothing to read: refuse, retryable.
+      if (
+        route.kind === "streams" &&
+        typeof (
+          route.deps.streamSyncRead as { readableScopes?: unknown } | undefined
+        )?.readableScopes !== "function"
+      ) {
+        throw new McpDataReadError(503, {
+          error: {
+            code: 503,
+            errorCode: "STREAM_LIST_UNAVAILABLE",
+            message:
+              "This server cannot list stream scopes for this account yet. Retry shortly, or name a scope.",
+          },
+        });
+      }
       const params = new URLSearchParams();
       if (scopePrefix) params.set("scopePrefix", scopePrefix);
       if (limit !== undefined) params.set("limit", String(limit));

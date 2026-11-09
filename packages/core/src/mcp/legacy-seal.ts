@@ -21,9 +21,6 @@ const EMPTY_ANSWERS: Record<string, () => unknown> = {
   findEntry: () => undefined,
   findByFileId: () => undefined,
   findByDataPointId: () => undefined,
-  listVersions: () => [],
-  countVersions: () => 0,
-  listScopes: () => ({ scopes: [], total: 0 }),
 };
 
 export class LegacyStorageSealedError extends Error {
