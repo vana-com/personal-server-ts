@@ -3,6 +3,7 @@
  * All endpoints require owner authentication.
  */
 
+import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import { Hono } from "hono";
 import type { Logger } from "pino";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
@@ -23,6 +24,11 @@ export interface SyncRouteDeps {
   accessToken?: string;
   tokenStore?: TokenStore;
   syncManager: SyncManager | null; // null when sync disabled
+  localSync?: LocalSync;
+  /** Resolve a file selector without reading its body until its connection synced. */
+  localFile?: (
+    id: string,
+  ) => Promise<{ connectionId: string; read: () => Promise<Response> } | null>;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
@@ -36,6 +42,27 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     devToken: deps.devToken,
     accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
+  });
+
+  app.post("/trigger", async (c, next) => {
+    if (!deps.localSync) return next();
+    await auth.authorizeOwner(c.req.raw);
+    await deps.localSync.cycle();
+    return c.json({ status: "started", message: "Sync triggered" }, 202);
+  });
+  app.get("/status", async (c, next) => {
+    if (!deps.localSync) return next();
+    await auth.authorizeOwner(c.req.raw);
+    return c.json(await deps.localSync.listing.status());
+  });
+  app.post("/file/:id", async (c, next) => {
+    if (!deps.localSync) return next();
+    await auth.authorizeOwner(c.req.raw);
+    const file = await deps.localFile?.(c.req.param("id"));
+    if (!file)
+      return c.json({ error: { errorCode: "STREAM_DATA_NOT_FOUND" } }, 404);
+    await deps.localSync.syncConnection(file.connectionId);
+    return file.read();
   });
 
   app.all("*", (c) =>

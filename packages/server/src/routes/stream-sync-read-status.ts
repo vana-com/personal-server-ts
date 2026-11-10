@@ -15,6 +15,7 @@
  * Only the owner may call it. With `streamSync.read` off the route answers 404.
  */
 
+import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import { Hono } from "hono";
 import { liveStreamCounts } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/api";
@@ -30,6 +31,7 @@ export interface StreamSyncReadStatusRouteDeps {
   accessToken?: string;
   tokenStore?: TokenStore;
   /** Absent when `streamSync.read` is off: every call answers 404. */
+  localSync?: LocalSync;
   streamSyncRead: StreamSyncReadPort | undefined;
 }
 
@@ -48,7 +50,9 @@ export function streamSyncReadStatusRoutes(
 
   app.get("/", async (c) => {
     await auth.authorizeOwner(c.req.raw);
-    const status = deps.streamSyncRead?.status?.();
+    const status = deps.localSync
+      ? await deps.localSync.listing.status()
+      : deps.streamSyncRead?.status?.();
     if (!status) {
       // An expected state while a diagnostic polls: answered here, not thrown,
       // so the global error handler does not log a warning per request.
@@ -68,6 +72,9 @@ export function streamSyncReadStatusRoutes(
       listed: status.listed,
       streams,
       issues: status.issues.length,
+      ...(deps.localSync && {
+        olderVersionReads: deps.localSync.olderVersions.counts(),
+      }),
     });
   });
 
