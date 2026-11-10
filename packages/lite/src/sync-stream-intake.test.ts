@@ -1,226 +1,201 @@
-import { deriveMasterKey } from "@opendatalabs/vana-sdk/browser";
-import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
-import {
-  buildTestHead,
-  testOwnerKey,
-} from "../../core/src/stream-sync-read/testing.js";
-import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
-import { describe, expect, it, vi } from "vitest";
+import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import {
-  StreamSyncReadService,
-  createMemoryStreamSyncReadFiles,
-} from "@opendatalabs/personal-server-ts-core/stream-sync-read";
+  createLocalSync,
+  openLocalDb,
+  connectionQueue,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import {
+  createMemoryStreamSyncRegistry,
+  createMemoryStreamSyncBlobs,
+  createStreamSyncKeyPorts,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
 import {
   createMemoryPsLiteStateStore,
   createMemoryPsLiteStorage,
 } from "./test-support/memory.js";
 import { loadOrCreatePsLiteServerIdentity } from "./state.js";
-import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
 import { createPsLiteSyncManager } from "./sync.js";
-
-/** PS-Lite hands a run intake to its host only when `streamSync.write` is on. */
-const factory = new IDBFactory();
-async function manager(
-  streamSync: { write?: boolean; read?: boolean } | undefined,
-  read?: { files?: ReturnType<typeof createMemoryStreamSyncReadFiles> },
-  ownerByte = "12",
-  gatewayUrl?: string,
+const account = privateKeyToAccount(`0x${"12".repeat(32)}`);
+let signature: `0x${string}`;
+beforeAll(async () => {
+  signature = await signOwnerMasterKey(account);
+});
+const managers: Awaited<ReturnType<typeof createPsLiteSyncManager>>[] = [];
+const drivers: SqlDriver[] = [];
+afterEach(async () => {
+  for (const manager of managers.splice(0)) {
+    await manager.syncManager.stop();
+    await manager.closeStreamSync();
+  }
+  for (const db of drivers.splice(0)) await db.close();
+  vi.unstubAllGlobals();
+});
+const declaration = {
+  connector: "fixture",
+  version: "1",
+  streams: [
+    { name: "items", semantics: "mutable_state" as const, primaryKey: ["id"] },
+  ],
+};
+const id = "pdpp.fixture~";
+async function fixture(
+  mode: () => "unknown" | "unswitched" | "switched" = () => "switched",
+  available = true,
 ) {
-  const owner = privateKeyToAccount(`0x${ownerByte.repeat(32)}`);
-  const OWNER_SIGNATURE = await owner.signMessage({
-    message: "vana-master-key-v1",
-  });
+  const registry = createMemoryStreamSyncRegistry(),
+    blobs = createMemoryStreamSyncBlobs();
   const stateStore = createMemoryPsLiteStateStore();
   const identity = await loadOrCreatePsLiteServerIdentity({
     store: stateStore,
-    ownerSignature: OWNER_SIGNATURE,
+    ownerSignature: signature,
   });
-  const result = await createPsLiteSyncManager({
-    streamSyncDeclaredStreams: () => [],
+  const openDriver = vi.fn(async () =>
+    available ? openBetterSqlite3(":memory:") : null,
+  );
+  const lite = await createPsLiteSyncManager({
     config: ServerConfigSchema.parse({
-      sync: { enabled: true },
-      ...(gatewayUrl ? { gateway: { url: gatewayUrl } } : {}),
-      ...(streamSync ? { streamSync } : {}),
+      streamSync: { write: false, read: false },
     }),
-    storage: createMemoryPsLiteStorage(),
+    autoStartSync: false,
+    localDb: { openDriver },
+    accountStorageMode: { owner: account.address, read: mode },
+    streamSyncRegistry: registry,
+    streamSyncBlobs: blobs,
+    streamSyncDeclarations: () => declaration,
+    streamSyncDeclaredStreams: () => ["items"],
     stateStore,
-    ownerSignature: OWNER_SIGNATURE,
+    storage: createMemoryPsLiteStorage(),
+    ownerSignature: signature,
     serverAccount: identity.account,
     ownerSyncSigner: {
-      address: owner.address,
-      signMessage: (message: string) => owner.signMessage({ message }),
-      signAddData: vi.fn(),
-      signLineageAttestation: vi.fn(),
+      address: account.address,
+      signMessage: (message) => account.signMessage({ message }),
+      signAddData: async () => "0x00",
+      signLineageAttestation: async () => "0x00",
     },
-    gateway: { getServer: vi.fn().mockResolvedValue(null) } as never,
+    gateway: { getServer: vi.fn() } as never,
     dataPointFeed: {
       getDataPoint: async () => null,
       listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
     },
-    ...(read ? { streamSyncRead: read } : {}),
-    streamSyncFiles: (id) =>
-      createIndexedDbStreamSyncFiles({
-        dbName: id,
-        factory,
-        keyRange: IDBKeyRange,
-      }),
   });
-  await result.syncManager.stop();
-  return { ...result, owner: owner.address };
+  managers.push(lite);
+  const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+    owner: account.address,
+    network: "test",
+    deviceId: "node",
+  });
+  drivers.push(db);
+  const node = createLocalSync(
+    {
+      db,
+      queue: connectionQueue(),
+      ownerAddress: account.address,
+      registry,
+      blobs,
+      keys: createStreamSyncKeyPorts(signature),
+      signer: { signAddData: async () => "0x00" },
+      logger: { info: vi.fn(), warn: vi.fn() },
+      now: () => 2000,
+      newOp: () => crypto.randomUUID(),
+    },
+    {
+      resolveArtifact: () => declaration,
+      declaredStreams: () => ["items"],
+      olderVersionReads: () => true,
+    },
+  );
+  return { lite, node, openDriver };
 }
-
-describe("PS Lite run intake", () => {
-  it("is absent with streamSync.write off", async () => {
-    expect((await manager(undefined)).streamSyncIntake).toBeNull();
-    expect((await manager({ write: false })).streamSyncIntake).toBeNull();
-  });
-
-  it("is the in-process API when streamSync.write is on", async () => {
-    const result = await manager({ write: true });
-    expect(result.streamSyncWriter).not.toBeNull();
-    // No connector artifact is resolvable by default: begin says so.
-    await expect(
-      result.streamSyncIntake!.begin("r1", {
-        connector: "c",
-        artifactDigest: "sha256:" + "ab".repeat(32),
-        owner: { address: result.owner, leaseId: null },
-        observedAt: Date.now(),
-      } as never),
-    ).rejects.toMatchObject({ code: "unknown_artifact" });
-  });
+const request = (observedAt: number) => ({
+  connector: "fixture",
+  artifactDigest: "fixture",
+  owner: { address: account.address, leaseId: null },
+  observedAt,
 });
-
-describe("PS Lite stream-sync reader", () => {
-  it("keeps its default read files across a restart", async () => {
-    const open = vi.spyOn(StreamSyncReadService, "open");
-    try {
-      const first = await manager({ write: true, read: true }, {});
-      const probe = new TextEncoder().encode("imported view");
-      await open.mock.calls[0]![0].files.write("views/probe", probe);
-      await first.closeStreamSync();
-      const second = await manager({ write: true, read: true }, {});
-      expect(await open.mock.calls[1]![0].files.read("views/probe")).toEqual(
-        probe,
-      );
-      await second.closeStreamSync();
-    } finally {
-      open.mockRestore();
-    }
+async function collect(
+  intake: NonNullable<
+    Awaited<ReturnType<typeof createPsLiteSyncManager>>["streamSyncIntake"]
+  >,
+  run: string,
+  key: string,
+  o: number,
+) {
+  await intake.begin(run, request(o));
+  await intake.batch(run, {
+    batch: 0,
+    records: [{ stream: "items", data: { id: key, value: o } }],
   });
-});
-
-it("serves an imported head after an offline restart", async () => {
-  const owner = privateKeyToAccount(`0x${"12".repeat(32)}`);
-  const signature = await owner.signMessage({ message: "vana-master-key-v1" });
-  const key = await testOwnerKey(deriveMasterKey(signature));
-  const ns = await key.ns("acme", "fixture");
-  const built = await buildTestHead({
-    key,
-    connector: "acme",
-    ns,
-    stream: "items",
-    generation: 1,
-    primaryKey: ["id"],
-    records: [{ id: "one" }],
-    observedAt: Date.now(),
+  await intake.end(run, {
+    outcome: "succeeded",
+    coveredStreams: ["items"],
+    provenFullStreams: ["items"],
+    lastBatch: 0,
   });
-  const control = await key.control();
-  const original = StreamSyncReadService.open;
-  const open = vi
-    .spyOn(StreamSyncReadService, "open")
-    .mockImplementation((options) =>
-      original({
-        ...options,
-        blobs: { get: async (name) => built.blobs.get(name) ?? null },
+}
+describe("Lite database intake", () => {
+  it("uses the same model in both directions across Lite and Node", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        throw new Error("unexpected legacy or gateway fetch");
       }),
     );
-  try {
-    const first = await manager({ write: true, read: true }, {});
-    const row = {
-      expectedVersion: "1",
-      addedAt: new Date().toISOString(),
-      deletedAt: null,
-    };
-    await first.streamSyncRead!.observe(
-      [
-        {
-          ...row,
-          scope: controlScope("acme", ns),
-          dataHash: control.active.dataHash,
-          metadataHash: control.active.metadataHash,
-        },
-        {
-          ...row,
-          scope: built.scope,
-          dataHash: built.dataHash,
-          metadataHash: `0x${"ab".repeat(32)}`,
-        },
-      ],
-      { fromStart: true, lastPage: true },
-    );
-    await first.streamSyncRead!.importPending();
-    await first.closeStreamSync();
-    open.mockImplementation((options) =>
-      original({ ...options, blobs: { get: async () => null } }),
-    );
-    const second = await manager({ write: true, read: true }, {});
-    const decision = await second.streamSyncRead!.resolve({
-      scope: "pdpp.acme.items",
+    const { lite, node } = await fixture();
+    await collect(lite.streamSyncIntake!, "lite-run", "from-lite", 1000);
+    await lite.syncManager.trigger();
+    await node.apply();
+    expect(
+      (
+        await node.query.listRecords({ connectionId: id, stream: "items" })
+      ).records.map((r) => JSON.parse(r.body)),
+    ).toEqual([{ id: "from-lite", value: 1000 }]);
+    await collect(node.intake, "node-run", "from-node", 2000);
+    await node.cycle();
+    await (await lite.getLocalSync()).apply();
+    const decision = await lite.streamSyncRead!.resolve({
+      scope: "pdpp.fixture.items",
       connection: null,
       cursor: null,
       legacyFile: false,
-    });
+      isOwnerView: true,
+    } as never);
     expect(decision.kind).toBe("view");
-    if (decision.kind === "view")
-      expect((await new Response(decision.body).json()).data.records).toEqual([
-        { id: "one" },
-      ]);
-    await second.closeStreamSync();
-  } finally {
-    open.mockRestore();
-  }
-});
-
-it("isolates owners and networks, honors injected files, and uses memory for read-only mode", async () => {
-  const open = vi.spyOn(StreamSyncReadService, "open");
-  try {
-    const first = await manager({ write: true, read: true }, {});
-    const probe = new TextEncoder().encode("probe");
-    await open.mock.calls.at(-1)![0].files.write("views/isolation", probe);
-    await first.closeStreamSync();
-    const otherOwner = await manager({ write: true, read: true }, {}, "34");
     expect(
-      await open.mock.calls.at(-1)![0].files.read("views/isolation"),
-    ).toBeNull();
-    await otherOwner.closeStreamSync();
-    const otherNetwork = await manager(
-      { write: true, read: true },
-      {},
-      "12",
-      "https://other.example",
-    );
-    expect(
-      await open.mock.calls.at(-1)![0].files.read("views/isolation"),
-    ).toBeNull();
-    await otherNetwork.closeStreamSync();
-    const injected = createMemoryStreamSyncReadFiles();
-    const custom = await manager(
-      { write: true, read: true },
-      { files: injected },
-    );
-    expect(open.mock.calls.at(-1)![0].files).toBe(injected);
-    await custom.closeStreamSync();
-    const readonly = await manager({ write: false, read: true }, {});
-    await open.mock.calls.at(-1)![0].files.write("views/read-only", probe);
-    await readonly.closeStreamSync();
-    const restarted = await manager({ write: false, read: true }, {});
-    expect(
-      await open.mock.calls.at(-1)![0].files.read("views/read-only"),
-    ).toBeNull();
-    await restarted.closeStreamSync();
-  } finally {
-    open.mockRestore();
-  }
+      (
+        await (
+          await lite.getLocalSync()
+        ).query.listRecords({ connectionId: id, stream: "items" })
+      ).records.map((r) => JSON.parse(r.body)),
+    ).toEqual([{ id: "from-node", value: 2000 }]);
+  });
+  it("unknown and explicit Off never open a database or fall back to writer files", async () => {
+    let mode: "unknown" | "unswitched" | "switched" = "unknown";
+    const { lite, openDriver } = await fixture(() => mode);
+    await expect(
+      lite.streamSyncIntake!.begin("blocked", request(1000)),
+    ).rejects.toMatchObject({ errorCode: "ACCOUNT_MODE_UNKNOWN" });
+    expect(openDriver).not.toHaveBeenCalled();
+    mode = "unswitched";
+    await expect(lite.getLocalSync()).rejects.toMatchObject({
+      errorCode: "STREAM_SYNC_NOT_ENABLED",
+    });
+    expect(openDriver).not.toHaveBeenCalled();
+    mode = "switched";
+    await expect(lite.getLocalSync()).resolves.toBeDefined();
+    expect(openDriver).toHaveBeenCalledTimes(1);
+    expect("streamSyncWriter" in lite).toBe(false);
+  });
+  it("fails closed when the host has no SQLite driver", async () => {
+    const { lite, openDriver } = await fixture(() => "switched", false);
+    expect(openDriver).toHaveBeenCalledTimes(1);
+    await expect(
+      lite.streamSyncRead!.resolve({} as never),
+    ).rejects.toMatchObject({ errorCode: "STREAM_READ_UNAVAILABLE" });
+  });
 });

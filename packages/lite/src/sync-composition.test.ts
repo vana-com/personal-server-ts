@@ -11,8 +11,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { openLiteLocalDb, type LiteLocalDbOptions } from "./localdb-port.js";
 
-// The local facade is a declared stub at this base. Test Lite composition,
-// while leaving the real database module contracts available to the adapter.
+// These composition tests isolate the host factory. Real database intake and
+// cross-surface reads are covered by sync-stream-intake.test.ts.
 vi.mock(
   "@opendatalabs/personal-server-ts-core/localdb",
   async (importOriginal) => {
@@ -26,7 +26,6 @@ vi.mock(
 );
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { uploadAttemptKey } from "@opendatalabs/personal-server-ts-core/sync";
-import { createMemoryStreamSyncReadFiles } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import {
   createDataFileEnvelope,
   recoverServerOwner,
@@ -43,7 +42,6 @@ const OWNER_SIGNATURE =
 const SCHEMA_ID =
   "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 const UPLOAD_ATTEMPTS_KEY = "upload-attempts-v1";
-const SYNC_CURSOR_KEY = "sync-cursor-v1";
 /** A physical stream-sync name (`pdpp.<connector>~<16 hex ns>.<stream>`). */
 const PHYSICAL_SCOPE = "pdpp.chatgpt~0123456789abcdef.messages";
 
@@ -148,7 +146,7 @@ async function fixture(stateStore: StateStore, owner: string) {
   return { identity, gateway };
 }
 
-/** The real factory, stream sync on, read files injectable for a fault. */
+/** The real manager factory; tests explicitly choose Account mode. */
 async function openLite(opts: {
   stateStore: StateStore;
   storage: ReturnType<typeof createMemoryPsLiteStorage>;
@@ -158,7 +156,6 @@ async function openLite(opts: {
     dataPoints: unknown[];
     cursor: string | null;
   };
-  readFiles?: ReturnType<typeof createMemoryStreamSyncReadFiles>;
   localDb?: LiteLocalDbOptions;
   accountStorageMode?: OwnedAccountStorageMode;
 }) {
@@ -169,16 +166,16 @@ async function openLite(opts: {
       streamSync: { read: true, write: true },
     }),
     localDb: opts.localDb,
-    accountStorageMode: opts.accountStorageMode,
+    accountStorageMode: opts.accountStorageMode ?? {
+      owner: opts.identity.account.address,
+      read: () => "unswitched",
+    },
     stateStore: opts.stateStore,
     storage: opts.storage,
     ownerSignature: OWNER_SIGNATURE,
     serverAccount: opts.identity.account,
     gateway: opts.gateway as never,
     autoStartSync: false,
-    streamSyncRead: {
-      files: opts.readFiles ?? createMemoryStreamSyncReadFiles(),
-    },
     dataPointFeed: {
       getDataPoint: async () => null,
       listDataPointsByOwner: async () =>
@@ -203,7 +200,7 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
     vi.restoreAllMocks();
   });
 
-  it("(a) skips the body of a quarantined legacy row while publish and read still run in the cycle", async () => {
+  it("explicit Off preserves a quarantined legacy row without opening database sync", async () => {
     stubBrowserLocks();
     const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const stateStore = namedState("indexeddb:composition-a/state");
@@ -242,9 +239,7 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
       gateway,
       feed: { dataPoints: [physicalRow], cursor: null },
     });
-    expect(lite.streamSyncWriter).not.toBeNull();
-    const publish = vi.spyOn(lite.streamSyncWriter!, "cycle");
-    const observe = vi.spyOn(lite.streamSyncRead!, "observe");
+    expect(lite.localSync).toBeNull();
     try {
       await lite.syncManager.trigger();
     } finally {
@@ -263,12 +258,8 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
       expect.objectContaining({ method: "PUT" }),
     );
     expect(gateway.registerDataPoint).not.toHaveBeenCalled();
-    // The same cycle still publishes the stream and reads the physical row.
-    expect(publish).toHaveBeenCalledTimes(1);
-    expect(observe).toHaveBeenCalledWith(
-      [expect.objectContaining({ scope: PHYSICAL_SCOPE })],
-      expect.objectContaining({ fromStart: true, lastPage: true }),
-    );
+    // Explicit Off keeps database sync unopened.
+    expect(lite.localSync).toBeNull();
     // The quarantine itself is kept, not reset by the cycle.
     expect(
       (
@@ -279,7 +270,7 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
     ).toEqual([expect.objectContaining({ quarantined: true })]);
   });
 
-  it("(b) two managers over one state namespace exclude each other on the attempt store and the stream home; another namespace only shares the home", async () => {
+  it("explicit Off shares the attempt-store lock only within its state namespace", async () => {
     const requested = stubBrowserLocks();
     const fetchMock = uploadFetch("0x0");
     vi.stubGlobal("fetch", fetchMock);
@@ -292,7 +283,7 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
       identity: first.identity,
       gateway: first.gateway,
     });
-    expect(holder.streamSyncWriter).not.toBeNull();
+    expect(holder.localSync).toBeNull();
     await holder.syncManager.trigger(); // the holder recovers and owns its store
 
     try {
@@ -304,8 +295,8 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
         identity: first.identity,
         gateway: first.gateway,
       });
-      // The stream home is keyed by owner and network, so it is excluded too.
-      expect(rival.streamSyncWriter).toBeNull();
+      // Explicit Off has no stream database.
+      expect(rival.localSync).toBeNull();
       const putsBefore = fetchMock.mock.calls.length;
       await rival.syncManager.trigger();
       await rival.syncManager.stop();
@@ -315,8 +306,7 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
           .filter(([, init]) => init?.method === "PUT"),
       ).toEqual([]);
 
-      // Another namespace, same owner: the attempt store is not excluded, so
-      // its legacy row uploads, while the stream home stays excluded.
+      // Another namespace has its own attempt store, so its legacy row uploads.
       const other = namedState("indexeddb:composition-b-other/state");
       const otherFixture = await fixture(other, owner);
       const elsewhere = await openLite({
@@ -325,7 +315,7 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
         identity: otherFixture.identity,
         gateway: otherFixture.gateway,
       });
-      expect(elsewhere.streamSyncWriter).toBeNull();
+      expect(elsewhere.localSync).toBeNull();
       const before = fetchMock.mock.calls.length;
       await elsewhere.syncManager.trigger();
       await elsewhere.syncManager.stop();
@@ -340,134 +330,15 @@ describe("PS Lite composition: durable attempt store with stream sync on", () =>
       await holder.syncManager.stop();
       await holder.closeStreamSync();
     }
-    // The attempt store and the stream home take distinct lock names.
+    // Explicit Off takes the attempt lock and never a retired stream-home lock.
     const attemptLock =
       "upload-attempts:indexeddb:composition-b/state/upload-attempts-v1";
     const homeLocks = requested.filter((name) =>
       name.startsWith("ps-lite-stream-sync-"),
     );
     expect(requested).toContain(attemptLock);
-    expect(homeLocks.length).toBeGreaterThan(0);
+    expect(homeLocks).toEqual([]);
     expect(homeLocks).not.toContain(attemptLock);
-  });
-
-  it("(c) a stop repairs the attempt ledger while the stream writer is in flight, and the repair is persisted before the writer is released", async () => {
-    stubBrowserLocks();
-    const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
-    const stateStore = namedState("indexeddb:composition-c/state");
-    // The settle of the upload's successful attempt fails once: the in-memory
-    // ledger is clean, storage still holds the in-flight marker.
-    let attemptWrites = 0;
-    const set = stateStore.set.bind(stateStore);
-    stateStore.set = async (key, value) => {
-      if (key === UPLOAD_ATTEMPTS_KEY && ++attemptWrites === 2)
-        throw new Error("storage refused the settle");
-      await set(key, value);
-    };
-    vi.stubGlobal("fetch", uploadFetch(owner));
-    const { storage } = await legacyStorage();
-    const { identity, gateway } = await fixture(stateStore, owner);
-    const lite = await openLite({ stateStore, storage, identity, gateway });
-    const writer = lite.streamSyncWriter!;
-    const realCycle = writer.cycle.bind(writer);
-    let enteredWriter = false;
-    let writerDone = false;
-    let releaseWriter!: () => void;
-    const gate = new Promise<void>((resolve) => (releaseWriter = resolve));
-    vi.spyOn(writer, "cycle").mockImplementation(async () => {
-      enteredWriter = true;
-      await gate;
-      try {
-        return await realCycle();
-      } finally {
-        writerDone = true;
-      }
-    });
-
-    const cycle = lite.syncManager.trigger();
-    await vi.waitFor(
-      () => {
-        if (!enteredWriter) throw new Error("stream writer never entered");
-      },
-      { timeout: 4000 },
-    );
-    // Before the stop: storage still shows the marker of the unsettled attempt.
-    expect(
-      (
-        (await stateStore.get(UPLOAD_ATTEMPTS_KEY)) as {
-          records: Array<{ inFlight: boolean }>;
-        }
-      ).records,
-    ).toEqual([expect.objectContaining({ inFlight: true })]);
-
-    const stopping = lite.syncManager.stop();
-    await vi.waitFor(
-      async () => {
-        const state = (await stateStore.get(UPLOAD_ATTEMPTS_KEY)) as {
-          records: unknown[];
-        };
-        if (state.records.length !== 0)
-          throw new Error("the stop has not repaired the ledger yet");
-      },
-      { timeout: 4000 },
-    );
-    // The repair reached storage while the writer was still held.
-    expect(writerDone).toBe(false);
-    expect(attemptWrites).toBeGreaterThanOrEqual(3);
-
-    releaseWriter();
-    await stopping;
-    await cycle;
-    await lite.closeStreamSync();
-    expect(writerDone).toBe(true);
-  });
-
-  it("(d) a failed stream observation leaves the legacy download cursor unset; a clean one sets it", async () => {
-    stubBrowserLocks();
-    const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
-    vi.stubGlobal("fetch", uploadFetch(owner));
-    const readFiles = createMemoryStreamSyncReadFiles();
-    let armed = false;
-    let refused = 0;
-    const flakyFiles = {
-      ...readFiles,
-      async write(path: string, bytes: Uint8Array) {
-        if (armed) {
-          refused += 1;
-          throw new Error("read-side storage refused the write");
-        }
-        return readFiles.write(path, bytes);
-      },
-    };
-    const stateStore = namedState("indexeddb:composition-d/state");
-    const { identity, gateway } = await fixture(stateStore, owner);
-    const { storage } = await legacyStorage();
-    // A two-page listing: the cursor would move to "page-2" if nothing failed.
-    const lite = await openLite({
-      stateStore,
-      storage,
-      identity,
-      gateway,
-      readFiles: flakyFiles as never,
-      feed: { dataPoints: [physicalRow], cursor: "page-2" },
-    });
-    try {
-      armed = true;
-      await lite.syncManager.trigger();
-      // The injected write failure fired, and the cursor did not move.
-      expect(refused).toBeGreaterThan(0);
-      expect(await stateStore.get(SYNC_CURSOR_KEY)).toBeNull();
-
-      // The same listing with the stream side healthy moves the cursor.
-      armed = false;
-      await lite.syncManager.trigger();
-      expect(await stateStore.get(SYNC_CURSOR_KEY)).toEqual({
-        lastProcessedTimestamp: "page-2",
-      });
-    } finally {
-      await lite.syncManager.stop();
-      await lite.closeStreamSync();
-    }
   });
 });
 
@@ -562,7 +433,7 @@ describe("PS Lite local database composition", () => {
       expect(createLocalSync).not.toHaveBeenCalled();
       expect(lite.localSync).toBeNull();
       expect(lite.streamSyncIntake).not.toBeNull();
-      expect(lite.streamSyncWriter).toBeNull();
+      expect("streamSyncWriter" in lite).toBe(false);
       await expect(
         lite.streamSyncRead!.resolve({} as never),
       ).rejects.toMatchObject({

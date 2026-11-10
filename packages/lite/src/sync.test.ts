@@ -101,6 +101,7 @@ describe("PS Lite sync", () => {
       storage,
       stateStore,
       ownerSignature,
+      accountStorageMode: { owner: owner.address, read: () => "unswitched" },
       serverAccount: identity.account,
       ownerSyncSigner: {
         address: owner.address,
@@ -173,6 +174,10 @@ describe("PS Lite sync", () => {
     const identity = await loadOrCreatePsLiteServerIdentity({
       store: stateStore,
       ownerSignature: OWNER_SIGNATURE,
+      accountStorageMode: {
+        owner: await recoverServerOwner(OWNER_SIGNATURE),
+        read: () => "unswitched",
+      },
     });
     await expect(
       createPsLiteSyncManager({
@@ -180,6 +185,10 @@ describe("PS Lite sync", () => {
         stateStore,
         storage: createMemoryPsLiteStorage(),
         ownerSignature: OWNER_SIGNATURE,
+        accountStorageMode: {
+          owner: await recoverServerOwner(OWNER_SIGNATURE),
+          read: () => "unswitched",
+        },
         serverAccount: identity.account,
         ownerSyncSigner: {
           address: identity.account.address,
@@ -213,6 +222,10 @@ describe("PS Lite sync", () => {
     const identity = await loadOrCreatePsLiteServerIdentity({
       store: stateStore,
       ownerSignature: OWNER_SIGNATURE,
+      accountStorageMode: {
+        owner: await recoverServerOwner(OWNER_SIGNATURE),
+        read: () => "unswitched",
+      },
     });
     const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const gateway = {
@@ -275,6 +288,10 @@ describe("PS Lite sync", () => {
       stateStore,
       storage,
       ownerSignature: OWNER_SIGNATURE,
+      accountStorageMode: {
+        owner: await recoverServerOwner(OWNER_SIGNATURE),
+        read: () => "unswitched",
+      },
       serverAccount: identity.account,
       gateway: gateway as never,
       // The deletion-aware feed is a separate REST client; stub it so the
@@ -313,6 +330,10 @@ describe("PS Lite sync", () => {
     const identity = await loadOrCreatePsLiteServerIdentity({
       store: stateStore,
       ownerSignature: OWNER_SIGNATURE,
+      accountStorageMode: {
+        owner: await recoverServerOwner(OWNER_SIGNATURE),
+        read: () => "unswitched",
+      },
     });
     const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const gateway = {
@@ -340,6 +361,10 @@ describe("PS Lite sync", () => {
       stateStore,
       storage,
       ownerSignature: OWNER_SIGNATURE,
+      accountStorageMode: {
+        owner: await recoverServerOwner(OWNER_SIGNATURE),
+        read: () => "unswitched",
+      },
       serverAccount: identity.account,
       gateway: gateway as never,
       // The deletion-aware feed is a separate REST client; stub it so the
@@ -408,6 +433,10 @@ describe("PS Lite read-side deletion memory", () => {
     const identity = await loadOrCreatePsLiteServerIdentity({
       store: stateStore,
       ownerSignature: OWNER_SIGNATURE,
+      accountStorageMode: {
+        owner: await recoverServerOwner(OWNER_SIGNATURE),
+        read: () => "unswitched",
+      },
     });
     const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const gateway = {
@@ -427,6 +456,10 @@ describe("PS Lite read-side deletion memory", () => {
       stateStore,
       storage,
       ownerSignature: OWNER_SIGNATURE,
+      accountStorageMode: {
+        owner: await recoverServerOwner(OWNER_SIGNATURE),
+        read: () => "unswitched",
+      },
       serverAccount: identity.account,
       gateway: gateway as never,
       dataPointFeed: {
