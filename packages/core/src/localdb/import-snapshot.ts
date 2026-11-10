@@ -35,27 +35,7 @@ export async function stageImportSnapshot(
     },
   ]);
   for await (const record of source.records()) {
-    let row: ImportRow;
-    try {
-      const body = canonicalJson(record);
-      row = {
-        record_key: computeRecordKeyFromData(record, [
-          ...source.target.primaryKey,
-        ]),
-        pk_hash: await pkHash(
-          async (bytes) => sha256(bytes),
-          record as JsonObject,
-          source.target.primaryKey,
-        ),
-        body,
-        body_sha256: bytesToHex(sha256(utf8ToBytes(body))),
-      };
-      // Include the staged row metadata and parameter envelope, not just body.
-      if (utf8ToBytes(JSON.stringify(row)).length > IMPORT_BATCH_BYTES)
-        throw new Error();
-    } catch {
-      throw new Error("invalid_record");
-    }
+    const row = await canonicalImportRow(record, source.target.primaryKey);
     const [prior] = await db.query<{ body_sha256: string }>(
       "SELECT body_sha256 FROM import_snapshot WHERE op = ? AND pk_hash = ?",
       [op, row.pk_hash],
@@ -115,4 +95,30 @@ export function boundedImportBatch(
   if (utf8ToBytes(JSON.stringify(statements)).length > IMPORT_BATCH_BYTES)
     throw new Error("invalid_record");
   return statements;
+}
+
+/** The shared composition used by import staging and committed-row validation. */
+export async function canonicalImportRow(
+  record: Record<string, unknown>,
+  primaryKey: readonly string[],
+): Promise<ImportRow> {
+  try {
+    const body = canonicalJson(record);
+    const row = {
+      record_key: computeRecordKeyFromData(record, [...primaryKey]),
+      pk_hash: await pkHash(
+        async (bytes) => sha256(bytes),
+        record as JsonObject,
+        primaryKey,
+      ),
+      body,
+      body_sha256: bytesToHex(sha256(utf8ToBytes(body))),
+    };
+    // Include the staged row metadata and parameter envelope, not just body.
+    if (utf8ToBytes(JSON.stringify(row)).length > IMPORT_BATCH_BYTES)
+      throw new Error();
+    return row;
+  } catch {
+    throw new Error("invalid_record");
+  }
 }

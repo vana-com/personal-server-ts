@@ -109,9 +109,10 @@ export interface ImportExclusion {
   readonly rows: number;
 }
 export type ImportInventoryEntry = ImportSource | ImportExclusion;
-/** Reads the complete legacy payload as stored (not projected PDPP entities).
+/** Yields exactly one complete stored legacy payload object (the envelope's
+ * data, not its scope/time metadata and not individual projected entities).
  * Host rechecks id/path/raw hash before reading and at EOF; mutation refuses.
- * Missing reader means copy_unreadable. */
+ * Missing, oversized or unparseable payload fails copy_unreadable. */
 export type CopyRecords = (
   copy: LegacyCopy,
 ) => AsyncIterable<Record<string, unknown>>;
