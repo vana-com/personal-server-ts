@@ -1,16 +1,16 @@
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
-import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
 import {
   handlePersonalServerDataRequest,
   type PersonalServerApiDispatchOptions,
   type PersonalServerReadFulfillmentReporter,
   type StreamSyncReadPort,
   refuseLegacyWrite,
-  type LegacyWriteSwitch,
-  type StorageModeRead,
+  LegacyWriteRefusedError,
+  type OwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/api";
+import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
@@ -48,6 +48,7 @@ import {
 } from "../middleware/body-limit.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
+import { unwiredLegacyWriteSeal } from "../storage/unwired-legacy-write-seal.js";
 import { createServerApiAuth } from "../api-auth.js";
 import { parseDataScopeContract } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
@@ -65,6 +66,13 @@ export interface DataRouteDeps {
   additions?: DurableAdditionsService;
   indexManager: IndexManager;
   hierarchyOptions: HierarchyManagerOptions;
+  /**
+   * The seal legacy writes through these routes become durable behind (the
+   * chunked import finalizes through it; so does the storage this builds when
+   * no `dataStorage` is given). Defaults to the storage's own seal, then to a
+   * seal that refuses every legacy write as unknown.
+   */
+  legacyWriteSeal?: LegacyWriteSeal;
   logger: Logger;
   serverOrigin: string | (() => string);
   serverOwner?: `0x${string}`;
@@ -104,6 +112,12 @@ export interface DataRouteDeps {
   legacyScopeView?: LegacyScopeViewPort;
   /** See `PersonalServerDataApiDeps.streamSyncRead`. Absent = reads as before. */
   streamSyncRead?: StreamSyncReadPort;
+  /**
+   * The account's storage mode: the one answer the legacy write gate and the
+   * read selector share. A switched account refuses legacy writes with 426;
+   * an unknown one, or none wired, with a retryable 503.
+   */
+  accountStorageMode?: OwnedAccountStorageMode;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /**
    * Write API sessions (POST /v1/write/session). When present, the ingest
@@ -154,10 +168,6 @@ export interface DataRouteDeps {
    */
   pdppImporter?: PdppImporter;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
-  /** The account's stream-sync switch; true refuses undeclared legacy writes. */
-  legacyWritesRefused?: LegacyWriteSwitch;
-  /** The account's storage mode: a switched account refuses a data-set DELETE. */
-  accountMode?: StorageModeRead;
 }
 
 export function dataRoutes(deps: DataRouteDeps): Hono {
@@ -174,8 +184,15 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       createNodeDataStorage({
         indexManager: deps.indexManager,
         hierarchyOptions: deps.hierarchyOptions,
+        legacyWriteSeal: deps.legacyWriteSeal ?? unwiredLegacyWriteSeal(),
       }),
     );
+  // The seal the chunked import finalizes through is the storage's own, so a
+  // write through either path asks the same one.
+  const legacyWriteSeal =
+    deps.legacyWriteSeal ??
+    dataStorage.legacyWriteSeal ??
+    unwiredLegacyWriteSeal();
   const auth = createServerApiAuth({
     serverOrigin: deps.serverOrigin,
     serverOwner: deps.serverOwner,
@@ -190,28 +207,20 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     pdppOwnerBearer: deps.pdppOwnerBearer,
   });
 
-  // Early 426 for a clean request, before any body is read. This is only an
-  // optimisation: the core write operations refuse again after real
-  // authorization, and that is what makes the refusal hold. Only plain
-  // `POST /:scope` can be a delegated builder write, so only it defers when a
-  // write signature is present (this layer cannot verify it: it signs the
-  // body); the core exempts it only if the proof verified. Every other route
-  // is owner-only and has no exemption.
+  // Early 426 for a clean request, before any body is read. Every legacy
+  // write route refuses here and again in the core write operations after
+  // authorization, so the refusal holds even for a request that skips this
+  // layer. No route has an exemption: not a header, not a verified builder.
   const refuseLegacy: MiddlewareHandler = async (c, next) => {
-    const refusal = refuseLegacyWrite(c.req.raw, deps.legacyWritesRefused);
+    const refusal = refuseLegacyWrite(deps.accountStorageMode);
     if (refusal) return refusal;
     await next();
   };
-  const refuseLegacyUnlessProofPresent: MiddlewareHandler = async (c, next) => {
-    if (c.req.header(WRITE_SIGNATURE_HEADER) === undefined) {
-      return refuseLegacy(c, next);
-    }
-    await next();
-  };
-  app.post("/:scope", refuseLegacyUnlessProofPresent);
+  app.post("/:scope", refuseLegacy);
   app.post("/:scope/imports", refuseLegacy);
-  app.put("/:scope/imports/:id/chunks/:index", refuseLegacy);
-  app.post("/:scope/imports/:id/finalize", refuseLegacy);
+  // The two chunked-import session routes refuse inside the import module
+  // (`refuseIfLegacy`), which knows the session and removes its chunks and
+  // metadata with the 426. Refusing here would leave them behind.
   app.put("/:scope/imports/:operation", refuseLegacy);
   app.post("/:scope/uploads", refuseLegacy);
   app.put("/:scope/uploads/:id/batches/:index", refuseLegacy);
@@ -220,13 +229,13 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   const importDeps: ScopeImportDeps = {
     hierarchyOptions: deps.hierarchyOptions,
     indexManager: deps.indexManager,
+    legacyWriteSeal,
     serverOwner: deps.serverOwner,
     authorizeOwner: (request, scope) =>
       auth.authorizeOwnerScope({ request, scope }),
     syncManager: deps.syncManager,
     onDataWritten: deps.onDataWritten,
-    refuseLegacyWrite: (request) =>
-      refuseLegacyWrite(request, deps.legacyWritesRefused),
+    refuseLegacyWrite: () => refuseLegacyWrite(deps.accountStorageMode),
     afterTombstoneVersion: async (scope) => {
       if (!deps.scopeDeletions) return null;
       const verdict = await deps.scopeDeletions.resolve(scope);
@@ -247,6 +256,8 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       });
     } catch (error) {
       if (error instanceof LegacyWriteRefused) return error.response;
+      // The seal's refusal at the final publish (the switch landed mid-finalize).
+      if (error instanceof LegacyWriteRefusedError) return error.response;
       if (error instanceof ScopeImportError) {
         return c.body(
           JSON.stringify({ error: error.code, message: error.message }),
@@ -423,11 +434,10 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       c.req.raw,
       {
         additions: deps.additions,
-        legacyWritesRefused: deps.legacyWritesRefused,
-        accountMode: deps.accountMode,
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
         streamSyncRead: deps.streamSyncRead,
+        accountStorageMode: deps.accountStorageMode,
         auth,
         accessLogWriter: deps.accessLogWriter,
         readFulfillmentReporter: deps.readFulfillmentReporter,

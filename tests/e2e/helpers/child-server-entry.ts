@@ -1,7 +1,7 @@
 import { serve } from "@hono/node-server";
 import { join } from "node:path";
 import { ServerConfigSchema } from "../../../packages/core/src/schemas/server-config.js";
-import { createServer } from "../../../packages/server/src/bootstrap.js";
+import { createUnswitchedServer } from "../../../packages/server/src/account-mode/unswitched-server.test-utils.js";
 
 const rootPath = process.env.PS_E2E_ROOT_PATH;
 const port = Number(process.env.PS_E2E_PORT);
@@ -18,7 +18,7 @@ const config = ServerConfigSchema.parse({
   gateway: { url: "http://127.0.0.1:9999" },
   logging: { level: "fatal" },
 });
-const context = await createServer(config, {
+const context = await createUnswitchedServer(config, {
   serverDir: rootPath,
   dataDir: join(rootPath, "data"),
   ownerSignature,

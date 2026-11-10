@@ -22,3 +22,16 @@ export {
   LIVE_ACI_ATTESTATION_REPORT,
   LIVE_ACI_X25519_PUBLIC_KEY_HEX,
 } from "./e2ee-fixtures.js";
+export {
+  authorityHearing,
+  fixedAccountStorageMode,
+  fixedModeAuthority,
+  fixedOwnedAccountStorageMode,
+  spyOnModeAuthority,
+  type ModeAsked,
+} from "./account-mode.js";
+export {
+  HOLD_FOR_TESTS,
+  fixedLegacyWriteSeal,
+  openLegacyWriteSealForTests,
+} from "./legacy-write-seal.js";

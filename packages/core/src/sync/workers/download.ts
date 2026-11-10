@@ -1,3 +1,7 @@
+import {
+  LegacyWriteRefusedError,
+  legacyWriteRefusedErrorFor,
+} from "../../api/legacy-write-gate.js";
 import { isReplicaScope } from "../../replication/namespace.js";
 import { isPhysicalScope } from "../../stream-sync/scope-routing.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
@@ -213,12 +217,16 @@ export async function downloadScopes(
       continue;
     }
     try {
+      assertLegacyStorageOpen(deps.storage);
       const result = await downloadOne(deps, dataPoint);
       options.retryMemory?.recordSuccess(retryKey);
       if (result) {
         results.push(result);
       }
     } catch (err) {
+      // Legacy storage is closed: hand the refusal to the caller as is. It is
+      // neither a corrupt record nor a retry-budget failure.
+      if (err instanceof LegacyWriteRefusedError) throw err;
       const metadata = getSyncFailureMetadata(err);
       const classified = classifySyncFailure({
         error: err,
@@ -249,6 +257,19 @@ export async function downloadScopes(
   }
 
   return results;
+}
+
+/**
+ * Skip the fetch and decrypt of a version the storage will refuse. The seal at
+ * the write is what decides; this only avoids the wasted work, and never
+ * permits anything.
+ */
+function assertLegacyStorageOpen(
+  storage: Pick<DataStoragePort, "legacyWriteSeal">,
+): void {
+  const verdict = storage.legacyWriteSeal?.verdict();
+  if (verdict === undefined || verdict === "allow") return;
+  throw legacyWriteRefusedErrorFor(verdict);
 }
 
 interface SyncFailureMetadata {
@@ -445,7 +466,7 @@ export async function downloadOne(
       // Same version already stored locally. The envelope is decrypted and in
       // hand, so offer it to the importer directly — no local re-read needed.
       // Same stranding risk as the dataPointId dedup above.
-      importIntoPdpp(deps, envelope, record.id);
+      await importIntoPdpp(deps, envelope, record.id);
       logger.debug(
         {
           dataPointId: record.id,
@@ -525,8 +546,14 @@ export async function downloadOne(
       diagnostics,
     );
   } catch (err) {
-    const detail = (err as Error).message;
-    diagnostics?.onIndexError(record.id, envelope.scope, detail);
+    // A refusal is the seal doing its job, not an indexing fault.
+    if (!(err instanceof LegacyWriteRefusedError)) {
+      diagnostics?.onIndexError(
+        record.id,
+        envelope.scope,
+        (err as Error).message,
+      );
+    }
     throw err;
   }
 
@@ -544,8 +571,14 @@ export async function downloadOne(
       });
     }
   } catch (err) {
-    const detail = (err as Error).message;
-    diagnostics?.onIndexError(record.id, envelope.scope, detail);
+    // A refusal is the seal doing its job, not an indexing fault.
+    if (!(err instanceof LegacyWriteRefusedError)) {
+      diagnostics?.onIndexError(
+        record.id,
+        envelope.scope,
+        (err as Error).message,
+      );
+    }
     throw err;
   }
   diagnostics?.onIndexEnd(record.id, envelope.scope);
@@ -555,7 +588,7 @@ export async function downloadOne(
   ) {
     // Preserve the existing-version skip contract after the atomic port has
     // verified the bytes and safely adopted the registered metadata.
-    importIntoPdpp(deps, envelope, record.id);
+    await importIntoPdpp(deps, envelope, record.id);
     return null;
   }
 
@@ -572,7 +605,7 @@ export async function downloadOne(
     "Downloaded and indexed data point",
   );
 
-  importIntoPdpp(deps, envelope, record.id);
+  await importIntoPdpp(deps, envelope, record.id);
 
   if (deps.onDataPointIndexed) {
     try {
@@ -751,12 +784,26 @@ export async function downloadAll(
       continue;
     }
     try {
+      assertLegacyStorageOpen(deps.storage);
       const result = await downloadOne(deps, dataPoint);
       options.retryMemory?.recordSuccess(retryKey);
       if (result) {
         results.push(result);
       }
     } catch (err) {
+      if (err instanceof LegacyWriteRefusedError) {
+        // Legacy storage is closed (the account switched, or its mode is not
+        // known yet). Every later record would be refused the same way, so
+        // stop. Hold the cursor: an unknown mode retries, and a switched
+        // account never lists this legacy registry again. Not a record
+        // failure: it spends no retry budget and quarantines nothing.
+        logger.info(
+          { verdict: err.verdict },
+          "Legacy download paused: legacy storage is not accepting writes",
+        );
+        failed = true;
+        break;
+      }
       const metadata = getSyncFailureMetadata(err);
       const classified = classifySyncFailure({
         error: err,
@@ -966,14 +1013,14 @@ export async function repairLocalMissingBlockSidecars(
  * this sync cycle, and not a reason to re-download a blob that arrived
  * intact. `skipped` is the ordinary legacy case and stays silent.
  */
-function importIntoPdpp(
+async function importIntoPdpp(
   deps: Pick<DownloadWorkerDeps, "pdppImporter" | "logger">,
   envelope: { scope: string; collectedAt: string; data: unknown },
   dataPointId: string,
-): void {
+): Promise<void> {
   if (!deps.pdppImporter) return;
   try {
-    const outcome = deps.pdppImporter.importEnvelope({
+    const outcome = await deps.pdppImporter.importEnvelope({
       scope: envelope.scope,
       collectedAt: envelope.collectedAt,
       data: envelope.data,
@@ -1056,7 +1103,7 @@ async function retryPdppImportFromLocal(
     return;
   }
 
-  importIntoPdpp(deps, envelope, `${entry.scope}@${entry.collectedAt}`);
+  await importIntoPdpp(deps, envelope, `${entry.scope}@${entry.collectedAt}`);
 }
 
 function createSyncRunId(): string {

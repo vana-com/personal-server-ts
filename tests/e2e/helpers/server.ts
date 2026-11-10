@@ -9,6 +9,7 @@ import { vi } from "vitest";
 import { ServerConfigSchema } from "../../../packages/core/src/schemas/server-config.js";
 import type { GatewayConfig } from "../../../packages/core/src/schemas/server-config.js";
 import { createServer } from "../../../packages/server/src/bootstrap.js";
+import { declareAccountMode } from "../../../packages/server/src/account-mode/unswitched-server.test-utils.js";
 
 export interface TestServer {
   url: string;
@@ -68,6 +69,9 @@ export async function startTestServer(options?: {
   const config = ServerConfigSchema.parse(configInput);
 
   const context = await createServer(config, { serverDir, dataDir });
+  // A server with an owner hears an explicit Off, as a host sends after
+  // sign-in; a server with no owner has no account to hear from.
+  if (context.serverOwner) await declareAccountMode(context, "off");
 
   const server: ServerType = serve({
     fetch: context.app.fetch,

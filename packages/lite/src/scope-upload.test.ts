@@ -4,6 +4,8 @@
  * written is invisible at its path until it is committed.
  */
 
+import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
@@ -19,7 +21,6 @@ import {
   type PsLiteRuntime,
 } from "./runtime.js";
 import {
-  createPersistentPsLiteStorage,
   type PsLiteDataFileStore,
   type PsLitePersistenceAdapter,
 } from "./storage.js";
@@ -46,7 +47,8 @@ async function createRuntime(
 ): Promise<PsLiteRuntime> {
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   return createPsLiteRuntime({
-    storage: await createPersistentPsLiteStorage(
+    accountModeAuthority: fixedModeAuthority("unswitched"),
+    storage: await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       persistence,
       fileStore,
@@ -473,6 +475,7 @@ describe("streamed scope uploads", () => {
 
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const plainStore = createPsLiteRuntime({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       storage: createMemoryPsLiteStorage(),
       gateway: createMockPsLiteGateway(),
       accessLogReader: accessLogStore,
@@ -492,7 +495,7 @@ describe("streamed scope uploads", () => {
 
   it("aborts an upload left idle and frees the scope", async () => {
     const files = new Map<string, string>();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       createMemoryPsLiteStagedFileStore(files),
@@ -526,7 +529,7 @@ describe("streamed scope uploads", () => {
 
   it("lets only one of two overlapping begins keep a writer", async () => {
     const files = new Map<string, string>();
-    const base = await createPersistentPsLiteStorage(
+    const base = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       createMemoryPsLiteStagedFileStore(files),
@@ -596,7 +599,7 @@ describe("streamed scope uploads", () => {
 
   it("does not expire an upload while its commit is still writing", async () => {
     const files = new Map<string, string>();
-    const base = await createPersistentPsLiteStorage(
+    const base = await createOpenPersistentPsLiteStorage(
       { kind: "custom" },
       createMemoryPsLitePersistence(),
       createMemoryPsLiteStagedFileStore(files),

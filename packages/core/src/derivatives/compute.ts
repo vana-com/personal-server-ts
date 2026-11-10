@@ -15,6 +15,10 @@ import {
   readStoredLineage,
 } from "../lineage/lineage.js";
 import { uncoveredSourceScopes } from "./registration.js";
+import {
+  LegacyWriteRefusedError,
+  legacyWriteRefusedErrorFor,
+} from "../api/legacy-write-gate.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import { assertDerivedScopeNaming } from "../lineage/lineage.js";
@@ -187,6 +191,12 @@ class ComputeFailure extends Error {
  */
 function classifyComputeError(err: unknown): QuestionErrorCode {
   if (err instanceof ComputeFailure) return err.code ?? "internal";
+  // The derivative is a legacy write. While the account's mode is unknown the
+  // refusal clears on its own, which is the one class the scheduler retries.
+  // Once the account has switched it never clears.
+  if (err instanceof LegacyWriteRefusedError) {
+    return err.verdict === "unknown" ? "inference_unavailable" : "internal";
+  }
   if (err instanceof InferenceRequestError) {
     return isRetryableInferenceError(err)
       ? "inference_unavailable"
@@ -205,6 +215,11 @@ function classifyComputeError(err: unknown): QuestionErrorCode {
 
 function shortError(err: unknown): string {
   if (err instanceof ComputeFailure) return err.message;
+  if (err instanceof LegacyWriteRefusedError) {
+    return err.verdict === "unknown"
+      ? "the account storage mode is not known yet"
+      : "the account has moved to stream sync; derivatives are not written to legacy storage";
+  }
   if (err instanceof InferenceRequestError) return err.message;
   if (err instanceof ProtocolError) return `${err.errorCode}: ${err.message}`;
   // Unknown errors may quote data (a JSON parse error echoes its input);
@@ -532,6 +547,14 @@ export async function computeQuestion(
       registration.derivedScope,
       registration.sourceScopes,
     );
+
+    // The derivative is a legacy write. Do not spend an inference call on an
+    // answer the seal will refuse to store. The write is still sealed at its
+    // durable step; this only avoids the wasted call.
+    const sealVerdict = deps.storage.legacyWriteSeal?.verdict();
+    if (sealVerdict && sealVerdict !== "allow") {
+      throw legacyWriteRefusedErrorFor(sealVerdict);
+    }
 
     const sources: PromptSource[] = [];
     const sourceLineage = new Map<string, readonly string[]>();

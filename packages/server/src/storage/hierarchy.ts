@@ -53,6 +53,7 @@ import {
   type ReadScopeBlocksResponse,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { previewJsonEnvelopePrefix } from "@opendatalabs/personal-server-ts-core/storage/preview";
+import type { LegacyWriteHold } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
 
 const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
 const textEncoder = new TextEncoder();
@@ -77,8 +78,13 @@ export class PublishedDataFileError extends Error {
   }
 }
 
-/** Synchronous, no-replace publication inside the SQLite writer gate. */
+/**
+ * Synchronous, no-replace publication inside the SQLite writer gate. It makes
+ * a legacy file durable, so it takes the `hold` that only exists inside
+ * `LegacyWriteSeal.commit`.
+ */
 export function publishDataFile(
+  _hold: LegacyWriteHold,
   options: HierarchyManagerOptions,
   envelope: DataFileEnvelope,
   bytes: Uint8Array,
@@ -221,13 +227,18 @@ export function deleteScopeFilesSync(
   }
 }
 
-/** Publish a durable envelope before callers make it visible in the index. */
+/**
+ * Publish a durable envelope before callers make it visible in the index. The
+ * stage is written inside the caller's seal; a caller that wants a small
+ * sealed region stages first and publishes the stage with its `hold`.
+ */
 export async function writeDataFile(
+  hold: LegacyWriteHold,
   options: HierarchyManagerOptions,
   envelope: DataFileEnvelope,
 ): Promise<WriteResult> {
   const staged = await stageDataFile(options, envelope);
-  await publishStagedDataFile(staged.stagePath, staged.finalPath);
+  await publishStagedDataFile(hold, staged.stagePath, staged.finalPath);
   return {
     path: staged.finalPath,
     relativePath: staged.relativePath,
@@ -291,7 +302,9 @@ function collectDirectorySyncPaths(finalDir: string): string[] {
   }
 }
 
+/** Make a staged file the final one. Needs the `hold` of a sealed commit. */
 export async function publishStagedDataFile(
+  _hold: LegacyWriteHold,
   stagePath: string,
   finalPath: string,
 ): Promise<void> {

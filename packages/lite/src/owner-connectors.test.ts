@@ -13,10 +13,14 @@ import {
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
+import {
+  createMemoryModeRecordStore,
+  createModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 
 const ownerAuth = { Authorization: "Bearer owner-token" };
 
-function runtimeWith(opts: {
+async function runtimeWith(opts: {
   switched: boolean;
   mode?: "switched" | "unswitched" | "unknown";
   /** No mode is handed to the runtime. */
@@ -42,10 +46,10 @@ function runtimeWith(opts: {
     ...(opts.unwired
       ? {}
       : {
-          accountStorageMode: {
-            read: () =>
-              opts.mode ?? (opts.switched ? "switched" : "unswitched"),
-          },
+          accountModeAuthority: await modeAuthorityAnswering(
+            "",
+            opts.mode ?? (opts.switched ? "switched" : "unswitched"),
+          ),
         }),
     streamSyncConnectionDelete:
       opts.connectionDelete === undefined
@@ -57,7 +61,7 @@ function runtimeWith(opts: {
 }
 
 const del = (
-  runtime: ReturnType<typeof runtimeWith>,
+  runtime: Awaited<ReturnType<typeof runtimeWith>>,
   path: string,
   headers: Record<string, string> = ownerAuth,
 ) =>
@@ -65,10 +69,28 @@ const del = (
     new Request(`http://localhost${path}`, { method: "DELETE", headers }),
   );
 
+async function modeAuthorityAnswering(
+  owner: string,
+  answer: "switched" | "unswitched" | "unknown",
+) {
+  const authority = createModeAuthority({
+    store: createMemoryModeRecordStore(),
+    onWarning: () => undefined,
+  });
+  await authority.ready;
+  if (answer !== "unknown") {
+    await authority.submitEvidence({
+      owner,
+      state: answer === "switched" ? "on" : "off",
+    });
+  }
+  return authority;
+}
+
 describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
   it("refuses anyone but the owner", async () => {
     const response = await del(
-      runtimeWith({ switched: true }),
+      await runtimeWith({ switched: true }),
       "/v1/owner/connectors/github",
       {},
     );
@@ -78,7 +100,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("refuses an unswitched account", async () => {
     const response = await del(
-      runtimeWith({ switched: false }),
+      await runtimeWith({ switched: false }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(409);
@@ -87,7 +109,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 202 with the delete id on a switched account", async () => {
     const response = await del(
-      runtimeWith({ switched: true }),
+      await runtimeWith({ switched: true }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(202);
@@ -96,7 +118,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 503 when no stream-sync writer is wired (LITE_UNWIRED)", async () => {
     const response = await del(
-      runtimeWith({ switched: true, connectionDelete: null }),
+      await runtimeWith({ switched: true, connectionDelete: null }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
@@ -107,7 +129,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 503, not 409, when no mode is wired (mutant: UNWIRED_MODE_FROM_CONFIG)", async () => {
     const response = await del(
-      runtimeWith({ switched: false, unwired: true }),
+      await runtimeWith({ switched: false, unwired: true }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
@@ -118,7 +140,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 503 while the mode is unknown (mutant: UNKNOWN_MODE_NOT_SWITCHED)", async () => {
     const response = await del(
-      runtimeWith({ switched: true, mode: "unknown" }),
+      await runtimeWith({ switched: true, mode: "unknown" }),
       "/v1/owner/connectors/github",
     );
     expect(response.status).toBe(503);
@@ -129,7 +151,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 400, not 500, for a malformed percent-escape in the id (mutant: DECODE_THROWS_500)", async () => {
     const response = await del(
-      runtimeWith({ switched: true }),
+      await runtimeWith({ switched: true }),
       "/v1/owner/connectors/%E0%A4%A",
     );
     expect(response.status).toBe(400);
@@ -138,7 +160,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("asks a bad escape of the owner only", async () => {
     const response = await del(
-      runtimeWith({ switched: true }),
+      await runtimeWith({ switched: true }),
       "/v1/owner/connectors/%E0%A4%A",
       {},
     );
@@ -147,7 +169,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
   });
 
   it("answers a wrong method only to the owner (mutant: PRE_AUTH_REFUSAL)", async () => {
-    const runtime = runtimeWith({ switched: true });
+    const runtime = await runtimeWith({ switched: true });
     const request = (headers: Record<string, string>) =>
       runtime.fetch(
         new Request("http://localhost/v1/owner/connectors/github", {
@@ -166,13 +188,16 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
       [
         400,
         "INVALID_CONNECTOR",
-        await del(runtimeWith({ switched: true }), "/v1/owner/connectors/a~b"),
+        await del(
+          await runtimeWith({ switched: true }),
+          "/v1/owner/connectors/a~b",
+        ),
       ],
       [
         409,
         "NOT_SWITCHED",
         await del(
-          runtimeWith({ switched: false }),
+          await runtimeWith({ switched: false }),
           "/v1/owner/connectors/github",
         ),
       ],
@@ -180,14 +205,16 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
         503,
         "ACCOUNT_MODE_UNKNOWN",
         await del(
-          runtimeWith({ switched: true, mode: "unknown" }),
+          await runtimeWith({ switched: true, mode: "unknown" }),
           "/v1/owner/connectors/github",
         ),
       ],
       [
         405,
         "METHOD_NOT_ALLOWED",
-        await runtimeWith({ switched: true }).fetch(
+        await (
+          await runtimeWith({ switched: true })
+        ).fetch(
           new Request("http://localhost/v1/owner/connectors/github", {
             method: "GET",
             headers: ownerAuth,
@@ -205,7 +232,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
 
   it("answers 503 CONNECTOR_NOT_VERIFIED when the writer cannot name the streams", async () => {
     const response = await del(
-      runtimeWith({
+      await runtimeWith({
         switched: true,
         connectionDelete: {
           requestConnectionDelete: async (connector) => {

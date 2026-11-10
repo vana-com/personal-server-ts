@@ -27,8 +27,10 @@ import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logg
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITER_ATTRIBUTION_KEY,
@@ -140,6 +142,8 @@ describe("MCP remember tool", () => {
     root.route(
       "/v1/data",
       dataRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
         indexManager,
         hierarchyOptions,
         logger,

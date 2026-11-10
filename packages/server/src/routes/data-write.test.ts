@@ -19,8 +19,11 @@ import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
+  openLegacyWriteSealForTests,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITE_SIGNATURE_HEADER,
@@ -195,6 +198,8 @@ describe("POST /v1/data/:scope with a write session", () => {
     });
 
     app = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -379,11 +384,14 @@ describe("POST /v1/data/:scope with a write session", () => {
     // request must be accepted on retry rather than rejected as a replay.
     const flakyIndex = createIndexManager(initializeDatabase(":memory:"));
     const realStorage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: flakyIndex,
       hierarchyOptions,
     });
     let failures = 1;
     const flakyApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: flakyIndex,
       hierarchyOptions,
       logger,
@@ -443,11 +451,14 @@ describe("POST /v1/data/:scope with a write session", () => {
     // post-commit step. Retrying with the same proof would duplicate it.
     const partialIndex = createIndexManager(initializeDatabase(":memory:"));
     const realStorage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: partialIndex,
       hierarchyOptions,
     });
     let indexFailures = 1;
     const partialApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: partialIndex,
       hierarchyOptions,
       logger,
@@ -717,7 +728,11 @@ describe("POST /v1/data/:scope with a write session after the stream-sync switch
       }),
       accessLogWriter: { write: vi.fn().mockResolvedValue(undefined) },
       writeSessionStore,
-      legacyWritesRefused: () => true,
+      accountStorageMode: fixedOwnedAccountStorageMode(
+        "switched",
+        ownerWallet.address,
+      ),
+      legacyWriteSeal: fixedLegacyWriteSeal("switched", ownerWallet.address),
     });
   });
 
@@ -726,10 +741,10 @@ describe("POST /v1/data/:scope with a write session after the stream-sync switch
     await rm(dataDir, { recursive: true, force: true });
   });
 
-  it("still accepts a builder write whose signature verifies", async () => {
+  it("refuses a builder write whose signature verifies: no delegated builder is exempt", async () => {
     const res = await sessionWrite(app, SCOPE, { note: "builder" });
-    expect(res.status).toBe(201);
-    expect(index.countByScope(SCOPE)).toBe(1);
+    expect(res.status).toBe(426);
+    expect(index.countByScope(SCOPE)).toBe(0);
   });
 
   it("stores nothing from a builder write whose signature does not verify", async () => {

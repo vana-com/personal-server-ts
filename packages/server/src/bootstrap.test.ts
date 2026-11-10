@@ -6,6 +6,10 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import {
+  createUnswitchedServer,
+  declareAccountMode,
+} from "./account-mode/unswitched-server.test-utils.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer as createHttpServer } from "node:http";
@@ -19,6 +23,11 @@ import { createSqliteQuestionStore } from "./storage/question-store.js";
 
 function makeDefaultConfig() {
   return ServerConfigSchema.parse({ tunnel: { enabled: false } });
+}
+
+async function testOwnerSignature() {
+  const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
+  return owner.signMessage({ message: "Disposably authorize Node" });
 }
 
 describe("createServer", () => {
@@ -212,7 +221,8 @@ describe("createServer", () => {
 
   it("POST /v1/data/test.scope returns 401 when owner auth is missing", async () => {
     const config = makeDefaultConfig();
-    const ctx = await createServer(config, {
+    const ctx = await createUnswitchedServer(config, {
+      ownerSignature: await testOwnerSignature(),
       serverDir: tempDir,
       dataDir: join(tempDir, "data"),
     });
@@ -226,6 +236,87 @@ describe("createServer", () => {
     const body = await res.json();
     expect(body.error.errorCode).toBe("MISSING_AUTH");
     await ctx.cleanup();
+  });
+
+  describe("the account storage mode", () => {
+    const write = (ctx: Awaited<ReturnType<typeof createServer>>) =>
+      ctx.app.request("/v1/data/test.scope", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ctx.devToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ hello: "world" }),
+      });
+
+    // FLAG_MINTS_OFF
+    it("is unknown at boot whatever the old streamSync flags say", async () => {
+      for (const streamSync of [
+        {},
+        { write: true },
+        { write: true, refuseLegacyWrites: true },
+      ]) {
+        const ctx = await createServer(
+          ServerConfigSchema.parse({
+            ...makeDefaultConfig(),
+            streamSync,
+          }),
+          {
+            serverDir: tempDir,
+            dataDir: join(tempDir, "data"),
+            ownerSignature: await testOwnerSignature(),
+          },
+        );
+        expect((await write(ctx)).status, JSON.stringify(streamSync)).toBe(503);
+        await ctx.cleanup();
+      }
+    });
+
+    // NEVER_SEEN_OWNER_ADMITS
+    it("lets an explicit Off from the Account open legacy work at once", async () => {
+      const ctx = await createUnswitchedServer(makeDefaultConfig(), {
+        serverDir: tempDir,
+        dataDir: join(tempDir, "data"),
+        ownerSignature: await testOwnerSignature(),
+      });
+      expect((await write(ctx)).status).toBe(201);
+      await ctx.cleanup();
+    });
+
+    // LATCH_NOT_DURABLE
+    it("keeps an On across a restart, with the Off forgotten", async () => {
+      const options = {
+        serverDir: tempDir,
+        dataDir: join(tempDir, "data"),
+        ownerSignature: await testOwnerSignature(),
+      };
+      const first = await createUnswitchedServer(makeDefaultConfig(), options);
+      await declareAccountMode(first, "on");
+      expect((await write(first)).status).toBe(426);
+      await first.cleanup();
+
+      const second = await createServer(makeDefaultConfig(), options);
+      expect((await write(second)).status).toBe(426);
+      // A stale Off after the restart does not lower it.
+      await declareAccountMode(second, "off");
+      expect((await write(second)).status).toBe(426);
+      await second.cleanup();
+    });
+
+    it("keeps an Off across a restart, with no new answer", async () => {
+      const options = {
+        serverDir: tempDir,
+        dataDir: join(tempDir, "data"),
+        ownerSignature: await testOwnerSignature(),
+      };
+      const first = await createUnswitchedServer(makeDefaultConfig(), options);
+      expect((await write(first)).status).toBe(201);
+      await first.cleanup();
+
+      const second = await createServer(makeDefaultConfig(), options);
+      expect((await write(second)).status).toBe(201);
+      await second.cleanup();
+    });
   });
 
   it("cleanup() can be called without error", async () => {
@@ -298,7 +389,8 @@ describe("createServer", () => {
 
   it("POST /v1/data/:scope requires owner auth", async () => {
     const config = makeDefaultConfig();
-    const ctx = await createServer(config, {
+    const ctx = await createUnswitchedServer(config, {
+      ownerSignature: await testOwnerSignature(),
       serverDir: tempDir,
       dataDir: join(tempDir, "data"),
     });

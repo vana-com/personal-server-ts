@@ -20,8 +20,10 @@ import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   createScopeDeletionTracker,
@@ -201,6 +203,8 @@ describe("POST /v1/data/:scope", () => {
     const indexManager = createIndexManager(db);
 
     app = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -255,6 +259,8 @@ describe("POST /v1/data/:scope", () => {
       initializeDatabase(":memory:"),
     );
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: localIndexManager,
       hierarchyOptions,
       logger,
@@ -283,6 +289,8 @@ describe("POST /v1/data/:scope", () => {
       initializeDatabase(":memory:"),
     );
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: localIndexManager,
       hierarchyOptions,
       logger,
@@ -347,6 +355,8 @@ describe("POST /v1/data/:scope", () => {
     const db = initializeDatabase(":memory:");
     const indexManager = createIndexManager(db);
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -432,6 +442,8 @@ describe("POST /v1/data/:scope", () => {
       getSchemaForScope: vi.fn().mockResolvedValue(null),
     });
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -472,6 +484,8 @@ describe("POST /v1/data/:scope", () => {
     } satisfies SyncManager;
 
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -498,6 +512,8 @@ describe("POST /v1/data/:scope", () => {
     const indexManager2 = createIndexManager(db2);
 
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -532,6 +548,8 @@ describe("POST /v1/data/:scope", () => {
     } satisfies SyncManager;
 
     const localApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: indexManager2,
       hierarchyOptions,
       logger,
@@ -591,6 +609,8 @@ describe("GET /v1/data (list scopes)", () => {
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -761,6 +781,8 @@ describe("GET /v1/data listings are scoped to the builder's grants", () => {
     depsOverrides: Partial<DataRouteDeps> = {},
   ) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1087,6 +1109,8 @@ describe("GET /v1/data/additions", () => {
       getGrant: vi.fn().mockResolvedValue(makeGrant({ scopes: ["notes.*"] })),
     });
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1290,6 +1314,8 @@ describe("GET /v1/data/:scope/versions", () => {
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -1447,6 +1473,8 @@ describe("GET /v1/data/:scope", () => {
     });
 
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -2267,6 +2295,8 @@ describe("DELETE /v1/data/:scope", () => {
 
   function createApp(overrides: Partial<DataRouteDeps> = {}) {
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -2391,7 +2421,12 @@ describe("DELETE /v1/data/:scope", () => {
     const res = await deleteWithAuth(app, "instagram.profile");
 
     expect(res.status).toBe(200);
-    expect(deleteScope).toHaveBeenCalledWith("instagram.profile");
+    // The route hands the sync manager the seal's commit, so the mode decision
+    // and the local delete happen under one lock.
+    expect(deleteScope).toHaveBeenCalledWith(
+      "instagram.profile",
+      expect.any(Function),
+    );
     expect(await res.json()).toMatchObject({
       durable: true,
       steps: { gateway: { status: "ok", version: "3" } },
@@ -2469,21 +2504,34 @@ describe("DELETE /v1/data/:scope", () => {
     expect(res.status).toBe(409);
   });
 
-  it("refuses a data-set DELETE with the update-required 426 once the account is switched, and deletes nothing", async () => {
-    const app = createApp({ accountMode: { read: () => "switched" } });
+  it("refuses a data-set DELETE with 409 USE_CONNECTOR_DELETE once the account is switched, and deletes nothing", async () => {
+    let switchedNow = false;
+    const app = createApp({
+      accountStorageMode: {
+        owner: "",
+        read: () => (switchedNow ? "switched" : "unswitched"),
+      },
+    });
     await ingestData("instagram.profile", { version: 1 }, app);
+    switchedNow = true;
     const res = await deleteWithAuth(app, "instagram.profile");
-    expect(res.status).toBe(426);
+    expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({
-      errorCode: "update_required",
-      error: { code: 426, errorCode: "update_required" },
+      error: { code: 409, errorCode: "USE_CONNECTOR_DELETE" },
     });
     expect(indexManager.countByScope("instagram.profile")).toBe(1);
   });
 
-  it("refuses a switched account's data-set DELETE even from a client that declares stream sync", async () => {
-    const app = createApp({ accountMode: { read: () => "switched" } });
+  it("refuses a switched account's data-set DELETE with 409 even from a client that declares stream sync", async () => {
+    let switchedNow = false;
+    const app = createApp({
+      accountStorageMode: {
+        owner: "",
+        read: () => (switchedNow ? "switched" : "unswitched"),
+      },
+    });
     await ingestData("instagram.profile", { version: 1 }, app);
+    switchedNow = true;
     const auth = await buildWeb3SignedHeader({
       wallet: deleteOwnerWallet,
       aud: SERVER_ORIGIN,
@@ -2494,12 +2542,14 @@ describe("DELETE /v1/data/:scope", () => {
       method: "DELETE",
       headers: { authorization: auth, "vana-stream-sync-client": "1" },
     });
-    expect(res.status).toBe(426);
+    expect(res.status).toBe(409);
     expect(indexManager.countByScope("instagram.profile")).toBe(1);
   });
 
   it("deletes a data set as before while the account is not switched", async () => {
-    const app = createApp({ accountMode: { read: () => "unswitched" } });
+    const app = createApp({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+    });
     await ingestData("instagram.profile", { version: 1 }, app);
     const res = await deleteWithAuth(app, "instagram.profile");
     expect(res.status).toBe(200);
@@ -3073,6 +3123,8 @@ describe("X402 payment on GET /v1/data/:scope", () => {
       getGrant: vi.fn().mockResolvedValue(grant),
     });
     return dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,

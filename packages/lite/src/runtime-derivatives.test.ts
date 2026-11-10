@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   createFakeInferenceProvider,
   type QuestionRegistration,
@@ -52,6 +53,7 @@ async function setup(
   });
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     storage,
     gateway: createMockPsLiteGateway(),
     accessLogReader: accessLogStore,
@@ -272,6 +274,7 @@ describe("PS-Lite derivative compute", () => {
 
     const accessLogStore = createMemoryPsLiteAccessLogStore();
     const bare = createPsLiteRuntime({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       storage: createMemoryPsLiteStorage(),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",

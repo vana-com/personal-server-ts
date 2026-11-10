@@ -1,4 +1,8 @@
 import type {
+  LegacyWriteHold,
+  LegacyWriteSeal,
+} from "../storage/legacy-write-seal.js";
+import type {
   Builder,
   DataFileEnvelope,
   DataPointListResult,
@@ -157,6 +161,15 @@ export interface DataVersionWriter {
 }
 
 export interface DataStoragePort extends RuntimeStoragePort {
+  /**
+   * The seal this storage asks before it makes any legacy version durable
+   * (see `storage/legacy-write-seal.ts`). Node and Lite storage always have
+   * one, and every sealed write below runs inside its `commit`. A caller that
+   * writes through other means reads it to refuse early (`admit`) or stop a
+   * worker (`verdict`). Absent on test doubles; an absent seal answers
+   * nothing and a route treats that as unknown.
+   */
+  readonly legacyWriteSeal?: LegacyWriteSeal;
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
     total: number;
@@ -320,13 +333,19 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * the local row must follow the registered one.
    */
   updateEntryVersion(path: string, version: number): boolean | Promise<boolean>;
-  deleteScope(scope: string): Promise<number>;
+  /**
+   * Every removal below runs under the seal's lock in every mode
+   * (`LegacyWriteSeal.remove`). A caller that is already inside
+   * `LegacyWriteSeal.commit` passes its `hold`: the removal then runs inside
+   * that lock and does not take it again (the lock is not re-entrant).
+   */
+  deleteScope(scope: string, hold?: LegacyWriteHold): Promise<number>;
   /**
    * Delete a single version (index entry + its local blob) by its gateway fileId.
    * Returns true if a local copy existed and was removed, false if none was present (no-op).
    * Used by sync delete-reconciliation to drop a copy the gateway reports as deleted.
    */
-  deleteByFileId(fileId: string): Promise<boolean>;
+  deleteByFileId(fileId: string, hold?: LegacyWriteHold): Promise<boolean>;
   /**
    * Delete a single version (index entry + its local blob + block sidecars)
    * by its DPv2 identity (scope, collectedAt). Returns true if a local copy
@@ -344,6 +363,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
     scope: string,
     collectedAt: string,
     fence?: VersionFence,
+    hold?: LegacyWriteHold,
   ): Promise<boolean>;
   /**
    * Erases one version (index row + local blob) only while its envelope is
@@ -358,6 +378,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
     scope: string,
     collectedAt: string,
     fence: VersionFence,
+    hold?: LegacyWriteHold,
   ): Promise<boolean>;
   /**
    * Drop a single unsynced index entry by path, WITHOUT touching any blob.
@@ -366,7 +387,10 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * never upload, so retrying it head-blocks the scope forever. Returns true
    * if a row was removed. No-op-safe when the path is unknown.
    */
-  dropUnsyncedEntry?(path: string): boolean | Promise<boolean>;
+  dropUnsyncedEntry?(
+    path: string,
+    hold?: LegacyWriteHold,
+  ): boolean | Promise<boolean>;
 }
 
 export interface RuntimeAvailabilityPort {

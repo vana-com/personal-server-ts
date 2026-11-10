@@ -14,6 +14,8 @@ import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-cor
 import {
   buildWeb3SignedHeader,
   createTestWallet,
+  fixedModeAuthority,
+  openLegacyWriteSealForTests,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   createDataFileEnvelope,
@@ -36,6 +38,7 @@ function createTestRuntime(options: Partial<PsLiteRuntimeOptions> = {}) {
     stateCapabilities: { config: "memory" },
   };
   return createPsLiteRuntime({
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     ...defaults,
     ...options,
     storage: options.storage ?? defaults.storage,
@@ -195,7 +198,10 @@ async function setupX402Fixture() {
 describe("createPsLiteRuntime", () => {
   it("rejects storage adapters instead of falling back to memory", () => {
     expect(() =>
-      createPsLiteRuntime({ storage: { kind: "indexeddb" } }),
+      createPsLiteRuntime({
+        accountModeAuthority: fixedModeAuthority("unswitched"),
+        storage: { kind: "indexeddb" },
+      }),
     ).toThrow(
       "PS Lite runtime requires a persistent DataStoragePort. Use createIndexedDbPsLiteRuntime() or createPersistentPsLiteStorage().",
     );
@@ -205,13 +211,17 @@ describe("createPsLiteRuntime", () => {
     const accessLogStore = createMemoryPsLiteAccessLogStore();
 
     expect(() =>
-      createPsLiteRuntime({ storage: createMemoryPsLiteStorage() }),
+      createPsLiteRuntime({
+        accountModeAuthority: fixedModeAuthority("unswitched"),
+        storage: createMemoryPsLiteStorage(),
+      }),
     ).toThrow(
       "IndexedDB is required for default PS Lite access log persistence.",
     );
 
     expect(() =>
       createPsLiteRuntime({
+        accountModeAuthority: fixedModeAuthority("unswitched"),
         storage: createMemoryPsLiteStorage(),
         accessLogReader: accessLogStore,
         accessLogWriter: accessLogStore,
@@ -220,6 +230,7 @@ describe("createPsLiteRuntime", () => {
 
     expect(() =>
       createPsLiteRuntime({
+        accountModeAuthority: fixedModeAuthority("unswitched"),
         storage: createMemoryPsLiteStorage(),
         accessLogReader: accessLogStore,
         accessLogWriter: accessLogStore,
@@ -658,7 +669,10 @@ describe("createPsLiteRuntime", () => {
 
   it("deletes a scope with owner auth", async () => {
     const runtime = createTestRuntime({
-      storage: createMemoryPsLiteStorage(),
+      // The delete route commits through the storage's seal.
+      storage: createMemoryPsLiteStorage({
+        legacyWriteSeal: openLegacyWriteSealForTests(),
+      }),
       auth: createBearerTokenPsLiteAuth({
         ownerToken: "owner-token",
         builderToken: "builder-token",

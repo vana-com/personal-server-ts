@@ -105,11 +105,16 @@ import type {
 } from "../stream-sync-read/service.js";
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
+  accountModeUnknownResponse,
+  selectAccountStorageMode,
+  type OwnedAccountStorageMode,
+} from "./account-storage-mode.js";
+import {
+  LegacyWriteRefusedError,
   refuseLegacyWrite,
-  updateRequiredResponse,
-  type LegacyWriteSwitch,
 } from "./legacy-write-gate.js";
-import type { StorageModeRead } from "./owner-connector-delete.js";
+import { switchedDeleteRefusalResponse } from "./switched-delete-refusal.js";
+import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
@@ -335,8 +340,17 @@ export interface PersonalServerIngestSyncManager {
    * Durable scope deletion (gateway tombstone -> storage blobs -> local).
    * When absent the DELETE route deletes the local copy only and reports
    * `durable: false`.
+   *
+   * `within` is the legacy-write seal's `commit`. The manager runs its delete
+   * inside it, AFTER it has taken its own mutation queue: the seal must be the
+   * innermost lock (a sync cycle holds the queue and asks for the seal, so
+   * asking for the seal first would wait on a cycle that waits on the seal).
+   * Pass it on every call that must refuse on a switched account.
    */
-  deleteScope?(scope: string): Promise<DeleteScopeResult>;
+  deleteScope?(
+    scope: string,
+    within?: LegacyWriteSeal["commit"],
+  ): Promise<DeleteScopeResult>;
 }
 
 /** The read side of stream sync, as the data API uses it. */
@@ -348,16 +362,11 @@ export interface StreamSyncReadPort {
 
 export interface PersonalServerDataApiDeps {
   /**
-   * Whether an undeclared legacy write is refused (see
-   * `legacy-write-gate.ts`). Absent = never refuse.
+   * The account's storage mode: the one answer the write gate and the read
+   * selector share (see `account-storage-mode.ts`). Absent = unknown: every
+   * legacy write is refused with a retryable 503.
    */
-  legacyWritesRefused?: LegacyWriteSwitch;
-  /**
-   * The account's storage mode. A data-set DELETE on a switched account is
-   * refused with the update-required 426; the connection delete erases the
-   * data instead. Absent = never refuse for the switch.
-   */
-  accountMode?: StorageModeRead;
+  accountStorageMode?: OwnedAccountStorageMode;
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
   /**
@@ -988,6 +997,12 @@ async function withApiErrors(
   } catch (err) {
     if (err instanceof ProtocolError) {
       return protocolErrorResponse(err);
+    }
+    // A durable step refused by the legacy-write seal (the account switched,
+    // or its mode is not known) after the route's early check passed. The
+    // answer is the same 426 or 503 the early check gives, never a 500.
+    if (err instanceof LegacyWriteRefusedError) {
+      return err.response;
     }
     if (context) {
       context.logger?.error?.(
@@ -1967,13 +1982,13 @@ function notifyDataWritten(
  * something this deployment could not verify — actionable, but not a failure
  * of the write, which has already committed.
  */
-function importIngestedIntoPdpp(
+async function importIngestedIntoPdpp(
   deps: Pick<PersonalServerDataApiDeps, "pdppImporter" | "logger">,
   envelope: { scope: string; collectedAt: string; data: unknown },
-): void {
+): Promise<void> {
   if (!deps.pdppImporter) return;
   try {
-    const outcome = deps.pdppImporter.importEnvelope(envelope);
+    const outcome = await deps.pdppImporter.importEnvelope(envelope);
     if (outcome.status === "rejected") {
       const permanent = isPermanentRejection(outcome.rejection);
       deps.logger?.warn?.(
@@ -2221,14 +2236,35 @@ export function redactEnvelopeForGrantee(
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
 export {
+  ACCOUNT_MODE_RETRY_AFTER_SECONDS,
+  ACCOUNT_MODE_UNKNOWN_CODE,
+  ACCOUNT_MODE_UNKNOWN_STATUS,
+  accountModeUnknownResponse,
+  accountStorageModeFor,
+  selectAccountStorageMode,
+  type AccountStorageMode,
+  type AccountStorageModeValue,
+  type OwnedAccountStorageMode,
+  type StorageSelection,
+  type StorageSelectionDeps,
+} from "./account-storage-mode.js";
+export {
+  USE_CONNECTOR_DELETE_CODE,
+  USE_CONNECTOR_DELETE_MESSAGE,
+  USE_CONNECTOR_DELETE_STATUS,
+  switchedDeleteRefusalResponse,
+} from "./switched-delete-refusal.js";
+export {
   STREAM_SYNC_CLIENT_HEADER,
   UPDATE_REQUIRED_CODE,
   UPDATE_REQUIRED_MESSAGE,
   UPDATE_REQUIRED_STATUS,
-  declaresStreamSyncClient,
+  LegacyWriteRefusedError,
+  legacyWriteRefusedErrorFor,
   refuseLegacyWrite,
   updateRequiredResponse,
-  type LegacyWriteSwitch,
+  type LegacyWriteMode,
+  type LegacyWriteVerdict,
 } from "./legacy-write-gate.js";
 
 export {
@@ -2267,7 +2303,7 @@ async function handleScopeUploadRequest(
   // An upload is owner-only: no delegated builder writes through it, so there
   // is no exemption. Aborting only discards staged data and stays allowed.
   if (route.kind !== "abort") {
-    const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+    const refusal = refuseLegacyWrite(deps.accountStorageMode);
     if (refusal) return refusal;
   }
   const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
@@ -2463,6 +2499,16 @@ export async function handlePersonalServerDataRequest(
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
 
+    // The account's storage mode, decided once before any list, version,
+    // lineage or body branch. No read site acts on the decision yet (they are
+    // routed through it one by one), so a switched account still reads as
+    // before; it is recorded with every error this request logs.
+    if (request.method === "GET") {
+      logContext.detail = {
+        storageSelection: selectAccountStorageMode(deps).kind,
+      };
+    }
+
     if (pathname === "/" || pathname === "") {
       if (request.method !== "GET") return methodNotAllowed();
       const listAuth = await deps.auth.authorizeBuilderList(request, {
@@ -2524,7 +2570,7 @@ export async function handlePersonalServerDataRequest(
       // Owner-only: a builder has no durable-import route, so a signature
       // header earns no exemption here. This runs on the normalized path, so
       // `/imports/<op>/` and repeated slashes land here too.
-      const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
+      const refusal = refuseLegacyWrite(deps.accountStorageMode);
       if (refusal) return refusal;
       const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
@@ -2754,7 +2800,10 @@ export async function handlePersonalServerDataRequest(
         ? parseDataReadScopeContract(scopeParam)
         : parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
-      logContext.detail = { scope: scopeResult.scope };
+      logContext.detail = {
+        ...logContext.detail,
+        scope: scopeResult.scope,
+      };
       // An empty `fileId=` or `at=` selects no version: it is the latest
       // read, as storage already treats it.
       const fileIdParam = url.searchParams.get("fileId") || undefined;
@@ -3163,11 +3212,12 @@ export async function handlePersonalServerDataRequest(
       } else {
         await deps.auth.authorizeOwner(request);
       }
-      // `writeAuth` exists only after the builder's session and write
-      // signature verified, so only a verified builder skips the refusal.
-      if (!writeAuth) {
-        const refusal = refuseLegacyWrite(request, deps.legacyWritesRefused);
-        if (refusal) return refusal;
+      // A switched account refuses every legacy write here, verified builder
+      // or not: a delegated write is a legacy write too.
+      const refusal = refuseLegacyWrite(deps.accountStorageMode);
+      if (refusal) {
+        await writeAuth?.releaseProof?.();
+        return refusal;
       }
       // `?supersede=legacy`: once this write commits, delete the scope's
       // older legacy-form versions (see supersedeLegacyVersions). It deletes
@@ -3402,7 +3452,7 @@ export async function handlePersonalServerDataRequest(
         // The parsed body is the envelope's `data`, which is where a producer
         // stamps `$pdpp`. Offered here rather than inside the ingest contract
         // so the import stays strictly after the record is durable.
-        importIngestedIntoPdpp(deps, {
+        await importIngestedIntoPdpp(deps, {
           scope: scopeResult.scope,
           collectedAt: collectedAtValue,
           data: parsed.body,
@@ -3451,13 +3501,12 @@ export async function handlePersonalServerDataRequest(
 
     if (request.method === "DELETE") {
       await deps.auth.authorizeOwner(request);
-      // A data set is not a connection, and mapping one to streams needs the
-      // bindings (C2). Once the account is switched the connection delete is
-      // the way to erase data, so this refuses every client, one that declares
-      // stream sync included.
-      if (deps.accountMode?.read(deps.serverOwner) === "switched") {
-        return updateRequiredResponse();
-      }
+      // A switched account's stream rows are the data: a legacy scope delete
+      // would leave them readable, so it is refused before any change (409,
+      // point to the connection delete). An unanswered account is 503.
+      const mode = deps.accountStorageMode?.read() ?? "unknown";
+      if (mode === "switched") return switchedDeleteRefusalResponse();
+      if (mode === "unknown") return accountModeUnknownResponse();
       const cascade = url.searchParams.get("cascade");
       if (cascade !== null && cascade !== "lineage") {
         throw new InvalidCascadeError({ cascade });
@@ -3496,17 +3545,41 @@ export async function handlePersonalServerDataRequest(
       // sync manager owns the remote ports; without one (sync disabled or
       // no owner key material) only the local copy goes and the result says
       // so (`durable: false`) rather than pretending.
-      const result = deps.syncManager?.deleteScope
-        ? await deps.syncManager.deleteScope(parsed.scope)
-        : await deleteScopeLocally(
-            {
-              storage: deps.storage,
-              serverOwner: deps.serverOwner,
-              deleteData: null,
-              logger: apiLoggerAsLogger(deps.logger),
-            },
-            parsed.scope,
-          );
+      //
+      // The mode decision and the delete are one `commit`: on a switched
+      // account a legacy-only delete would report "deleted" while the stream
+      // rows stay readable, so it is refused (409) and the connector delete is
+      // the way to erase. An unknown mode (or a storage with no seal) is a
+      // retryable 503. An On cannot land between the decision and the delete.
+      const seal = deps.storage.legacyWriteSeal;
+      if (!seal) return accountModeUnknownResponse();
+      let result: DeleteScopeResult;
+      try {
+        result = deps.syncManager?.deleteScope
+          ? await deps.syncManager.deleteScope(
+              parsed.scope,
+              seal.commit.bind(seal),
+            )
+          : await seal.commit((hold) =>
+              deleteScopeLocally(
+                {
+                  storage: deps.storage,
+                  serverOwner: deps.serverOwner,
+                  deleteData: null,
+                  logger: apiLoggerAsLogger(deps.logger),
+                },
+                parsed.scope,
+                { hold },
+              ),
+            );
+      } catch (err) {
+        if (err instanceof LegacyWriteRefusedError) {
+          return err.verdict === "switched"
+            ? switchedDeleteRefusalResponse()
+            : err.response;
+        }
+        throw err;
+      }
 
       if (result.steps.gateway.status === "failed") {
         // Nothing was deleted: the local copy is kept on purpose so sync

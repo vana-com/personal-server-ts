@@ -23,6 +23,17 @@ import type {
 } from "./replication-ports.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  createImportWaker,
+  createMemoryModeRecordStore,
+  createModeAuthority,
+  type ImportRunner,
+  type ImportWaker,
+  type ModeAuthority,
+  type ModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { createLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { createIndexedDbModeRecordStore } from "./account-mode-store.js";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import type { InferenceProvider } from "@opendatalabs/personal-server-ts-core/derivatives";
 import {
@@ -93,6 +104,18 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
 > {
   ownerAddress?: `0x${string}`;
   /**
+   * Where the account-mode module keeps its per-owner records. Default: its
+   * own IndexedDB database next to the data store's. A host with another
+   * durable place (a native bundle) injects a store.
+   */
+  accountModeStore?: ModeRecordStore;
+  /**
+   * The host's legacy importer. The runtime runs it when the Account says On
+   * and once at boot when the owner is already switched; what is owed and when
+   * it is done is the importer's own record. Without one no import starts.
+   */
+  legacyImporter?: ImportRunner;
+  /**
    * Inference provider for the derivative compute layer. Defaults to the
    * OpenAI-compatible fetch client on `config.inference`; tests inject a
    * fake. Pass `derivatives` (the runtime option) to bypass this wiring.
@@ -159,6 +182,10 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    * identity/config/sync/auth/signer composition. This is all-or-nothing:
    * either omit it for the default Web IndexedDB/OPFS path, or provide every
    * port for a host-owned persistence implementation.
+   *
+   * The seal over the account-mode module is built here and given only to the
+   * default storage. An injected `storage` is the host's own and must seal its
+   * own legacy writes: this factory cannot reach into it.
    */
   persistence?: PsLitePersistenceBundle;
 }
@@ -185,6 +212,14 @@ export interface IndexedDbPsLiteRuntime {
   replication: ReplicationDoorStatus;
   /** Replication built over `replicaHost`, when the host passed it. */
   replicationHost?: LiteReplication;
+  /**
+   * The account-mode module. Web code gives it the Account's answer with
+   * `submitEvidence` before it starts the first collection. On teardown call
+   * `importWaker.stop()` first, then close the storage, then `close()`.
+   */
+  accountModeAuthority: ModeAuthority;
+  /** Wakes the host's importer; present when the host passed `legacyImporter`. */
+  importWaker?: ImportWaker;
 }
 
 export async function createIndexedDbPsLiteRuntime(
@@ -226,6 +261,43 @@ export async function createIndexedDbPsLiteRuntime(
       dbName,
       storeName: "accessLogs",
     });
+  const serverOwner = await resolvePsLiteOwner({
+    ownerAddress: options.ownerAddress,
+    ownerSignature: options.ownerSignature,
+  });
+  // One mode, from one place: the account-mode module. Its records live in
+  // their own IndexedDB database, never in the data store. Boot does not wait
+  // for the Account: before the first answer reads stay legacy and legacy
+  // writes pause. A host that injects its own persistence has not offered
+  // browser IndexedDB, so without an `accountModeStore` the records are in
+  // memory and the Account's answer at the next launch restores them.
+  let importWaker: ImportWaker | undefined;
+  const accountModeAuthority = createModeAuthority({
+    store:
+      options.accountModeStore ??
+      (options.persistence
+        ? createMemoryModeRecordStore()
+        : createIndexedDbModeRecordStore(`${dbName}-account-mode`)),
+    // An answer that leaves the owner On wakes the import.
+    onOn: () => void importWaker?.wake(),
+    onWarning: (message, detail) => console.warn(message, detail),
+  });
+  await accountModeAuthority.ready;
+  if (options.legacyImporter && serverOwner) {
+    importWaker = createImportWaker({
+      authority: accountModeAuthority,
+      owner: serverOwner,
+      importer: options.legacyImporter,
+      onWarning: (message, detail) => console.warn(message, detail),
+    });
+  }
+  // The one seal over that module. The storage makes a legacy version durable
+  // only inside it, so the lock that answers an On is the lock every legacy
+  // write holds. A runtime without an owner gets a seal that answers unknown.
+  const legacyWriteSeal = createLegacyWriteSeal({
+    authority: accountModeAuthority,
+    owner: serverOwner,
+  });
   const storage =
     injected?.storage ??
     (await createPersistentPsLiteStorage(
@@ -236,6 +308,7 @@ export async function createIndexedDbPsLiteRuntime(
         key: options.storageKey ?? "data-storage-v1",
       }),
       options.dataFileStore,
+      legacyWriteSeal,
     ));
   const gateway =
     options.gateway ??
@@ -243,10 +316,6 @@ export async function createIndexedDbPsLiteRuntime(
       createGatewayClient(config.gateway.url),
       config.gateway.url,
     );
-  const serverOwner = await resolvePsLiteOwner({
-    ownerAddress: options.ownerAddress,
-    ownerSignature: options.ownerSignature,
-  });
   const serverSigner =
     options.serverSigner ??
     createServerSigner(identity.account, {
@@ -432,6 +501,7 @@ export async function createIndexedDbPsLiteRuntime(
     });
   const runtime = createPsLiteRuntime({
     ...options,
+    accountModeAuthority,
     replication: replicationHost?.runtime ?? options.replication,
     auth,
     serverOrigin,
@@ -451,7 +521,6 @@ export async function createIndexedDbPsLiteRuntime(
     scopeDeletions,
     streamSyncRead,
     streamSyncConnectionDelete: streamSyncWriter,
-    accountStorageMode: options.accountStorageMode,
     diagnostics,
     lineageGateway,
     derivatives,
@@ -470,6 +539,8 @@ export async function createIndexedDbPsLiteRuntime(
       injected?.mcpOAuthAuthorizations ?? options.mcpOAuthAuthorizationStore,
   });
   runtimeRef = runtime;
+  // An import owed from a saved On needs no new answer from the Account.
+  void importWaker?.wake();
 
   return {
     runtime,
@@ -485,5 +556,7 @@ export async function createIndexedDbPsLiteRuntime(
     derivatives,
     replication,
     replicationHost,
+    accountModeAuthority,
+    importWaker,
   };
 }

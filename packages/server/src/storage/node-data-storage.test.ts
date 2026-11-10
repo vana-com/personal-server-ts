@@ -11,6 +11,10 @@ import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataBlocks } from "@opendatalabs/personal-server-ts-core/storage/blocks/build";
+import {
+  HOLD_FOR_TESTS,
+  openLegacyWriteSealForTests,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 
 describe("owner import deletion ordering", () => {
   it("preserves a new import accepted after scope retirement committed", async () => {
@@ -19,12 +23,14 @@ describe("owner import deletion ordering", () => {
     const db = initializeDatabase(join(root, "index.db"));
     const index = createIndexManager(db);
     const storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index,
       hierarchyOptions: { dataDir },
     });
     const db2 = initializeDatabase(join(root, "index.db"));
     const index2 = createIndexManager(db2);
     const concurrent = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index2,
       hierarchyOptions: { dataDir },
     });
@@ -132,6 +138,7 @@ describe("owner imports beside the revision-guarded index", () => {
     db = initializeDatabase(join(root, "index.db"));
     index = createIndexManager(db);
     storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
     });
@@ -147,7 +154,7 @@ describe("owner imports beside the revision-guarded index", () => {
       value: "head",
     });
     const written = await storage.writeEnvelope(head);
-    index.insert({
+    index.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: written.relativePath,
       scope,
@@ -171,7 +178,7 @@ describe("owner imports beside the revision-guarded index", () => {
   });
 
   it("refuses a scope the index closed for writes and keeps no operation", async () => {
-    index.insert({
+    index.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "github/events/seed.json",
       scope,
@@ -206,12 +213,14 @@ describe("scope deletion racing a replica at a retired import path", () => {
     const db = initializeDatabase(join(root, "index.db"));
     const index = createIndexManager(db);
     const storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index,
       hierarchyOptions: { dataDir },
     });
     const db2 = initializeDatabase(join(root, "index.db"));
     const index2 = createIndexManager(db2);
     const concurrent = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index2,
       hierarchyOptions: { dataDir },
     });
@@ -291,6 +300,7 @@ describe("an unrecoverable prepared import", () => {
     const db = initializeDatabase(dbPath);
     const index = createIndexManager(db);
     const storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index,
       hierarchyOptions: { dataDir },
     });
@@ -373,6 +383,7 @@ describe("an unrecoverable prepared import", () => {
       reopened = createIndexManager(initializeDatabase(dbPath));
       expect(() =>
         createNodeDataStorage({
+          legacyWriteSeal: openLegacyWriteSealForTests(),
           indexManager: reopened!,
           hierarchyOptions: { dataDir },
         }),
@@ -392,6 +403,7 @@ describe("a replica beside interrupted import cleanup", () => {
     const db = initializeDatabase(join(root, "index.db"));
     const index = createIndexManager(db);
     const storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index,
       hierarchyOptions: { dataDir },
     });
@@ -471,6 +483,7 @@ describe("createNodeDataStorage.deleteByFileId", () => {
     db = initializeDatabase(":memory:");
     dataDir = await mkdtemp(join(tmpdir(), "node-data-storage-test-"));
     storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: createIndexManager(db),
       hierarchyOptions: { dataDir },
     });
@@ -637,6 +650,7 @@ describe("createNodeDataStorage block sidecars", () => {
     db = initializeDatabase(":memory:");
     dataDir = await mkdtemp(join(tmpdir(), "node-data-storage-block-test-"));
     storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: createIndexManager(db),
       hierarchyOptions: { dataDir },
     });
@@ -749,6 +763,7 @@ describe("createNodeDataStorage.writeEnvelopeAndIndex", () => {
     root = await mkdtemp(join(tmpdir(), "write-envelope-and-index-"));
     index = createIndexManager(initializeDatabase(join(root, "index.db")));
     storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
     });
@@ -840,6 +855,7 @@ describe("createNodeDataStorage.deleteVersionIfEnvelopeMissing", () => {
     dataDir = join(root, "data");
     index = createIndexManager(initializeDatabase(join(root, "index.db")));
     storage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: index,
       hierarchyOptions: { dataDir },
     });

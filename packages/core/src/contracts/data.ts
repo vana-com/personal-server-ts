@@ -1,3 +1,4 @@
+import { LegacyWriteRefusedError } from "../api/legacy-write-gate.js";
 import { isPhysicalScope } from "../stream-sync/scope-routing.js";
 import { streamReadScope } from "../stream-sync-read/routing.js";
 import { isReplicaScope } from "../replication/namespace.js";
@@ -208,6 +209,10 @@ async function indexWrittenEnvelope(
   try {
     await storage.insertEntry(entry);
   } catch (err) {
+    // The seal closed between the blob and its row. That is a refusal the
+    // caller answers (426/503), not a half-finished write to repair; a
+    // recovery pass indexes the blob later through the sealed recover path.
+    if (err instanceof LegacyWriteRefusedError) throw err;
     throw new IngestPersistedError(entry.path, err);
   }
 }
