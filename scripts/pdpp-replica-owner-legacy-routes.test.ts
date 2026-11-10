@@ -15,6 +15,7 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
   fixedLegacyWriteSeal,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createServerSigner } from "../packages/core/src/signing/signer.js";
 import { createAccessLogWriter } from "../packages/server/src/logging/access-log.js";
@@ -81,6 +82,10 @@ function setup() {
   });
   vi.stubGlobal("fetch", fetch);
   const deps = {
+    accountStorageMode: fixedOwnedAccountStorageMode(
+      "unswitched",
+      owner.address,
+    ),
     logger: pino({ level: "silent" }),
     serverOwner: owner.address,
     serverOrigin: origin,
@@ -270,4 +275,18 @@ it("serves an actual normal retained envelope from the filesystem, using determi
   expect(response.status, await response.clone().text()).toBe(200);
   expect(await response.json()).toMatchObject({ data });
   expect(fetch).not.toHaveBeenCalled();
+});
+
+it("keeps missing account mode fail-closed even with retained legacy storage", async () => {
+  const { deps } = setup();
+  const app = createReplicaOwnerLegacyRoutes({
+    ...deps,
+    accountStorageMode: undefined,
+  });
+  const path = "/v1/data/strava.activities";
+  const response = await app.request(path, {
+    headers: { Authorization: await signed(owner, "GET", path) },
+  });
+  expect(response.status).toBe(503);
+  expect((await response.json()).error.errorCode).toBe("ACCOUNT_MODE_UNKNOWN");
 });

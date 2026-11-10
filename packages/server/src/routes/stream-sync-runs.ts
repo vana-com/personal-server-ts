@@ -15,11 +15,12 @@
  * status of the name (V2 §2.6).
  */
 
+import type { BlobStore } from "@opendatalabs/personal-server-ts-core/localdb";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import {
   RunIntakeError,
-  type StreamSyncIntake,
+  type RunIntake,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import type { TokenStore } from "../token-store.js";
@@ -43,7 +44,8 @@ export interface StreamSyncRunsRouteDeps {
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
-  intake: StreamSyncIntake;
+  intake: RunIntake;
+  blobs?: BlobStore;
 }
 
 async function body(c: Context, limit: number): Promise<unknown> {
@@ -94,6 +96,46 @@ export function streamSyncRunsRoutes(deps: StreamSyncRunsRouteDeps): Hono {
       throw error;
     }
   };
+
+  app.put("/:runId/blobs/:sha256", async (c) => {
+    await auth.authorizeOwner(c.req.raw);
+    if (!deps.blobs) return c.json({ error: "unavailable" }, 503);
+    const limit = 32 * 1024 * 1024;
+    if (Number(c.req.header("content-length") ?? 0) > limit)
+      return c.json({ error: "too_large" }, 413);
+    const reader = c.req.raw.body?.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    if (reader) {
+      try {
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          size += part.value.byteLength;
+          if (size > limit) {
+            await reader.cancel();
+            return c.json({ error: "too_large" }, 413);
+          }
+          chunks.push(part.value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    await deps.blobs.put({
+      runId: c.req.param("runId"),
+      sha256: c.req.param("sha256"),
+      mimeType: c.req.header("content-type") ?? "application/octet-stream",
+      bytes,
+    });
+    return c.json({});
+  });
 
   app.put("/:runId", (c) =>
     answer(c, async () =>

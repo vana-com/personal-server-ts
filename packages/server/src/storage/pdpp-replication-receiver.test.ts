@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -639,6 +640,7 @@ it("serves imported canonical records through the existing grant-relative HTTP r
     streams: [{ name: "messages", instance_ids: ["conn_a"], fields: ["text"] }],
   };
   const app = pdppRecordsRoutes({
+    accountStorageMode: explicitLegacyStorageMode("unswitched"),
     store: d.store,
     auth: createFixtureAuthorizationService({
       client: {
@@ -670,6 +672,7 @@ it("serves imported canonical records through the existing grant-relative HTTP r
   const denied = await app.request("/streams/messages/records");
   expect(denied.status).toBe(401);
   const restricted = pdppRecordsRoutes({
+    accountStorageMode: explicitLegacyStorageMode("unswitched"),
     store: d.store,
     auth: createFixtureAuthorizationService({
       client: {

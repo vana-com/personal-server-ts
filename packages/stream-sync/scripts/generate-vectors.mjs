@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Writes vectors/v1.json. Byte outputs (HMAC, SHA-256, Keccak-256, canonical
+ * Writes vectors/v1.json (frozen: format 4 heads are unsupported) and
+ * vectors/v2.json (current: head format 4 is supported, format 5 is not). Byte outputs (HMAC, SHA-256, Keccak-256, canonical
  * text) are computed here with node:crypto and @noble/hashes, independently of
  * the package code. Logic expectations (decide, checkpoint, needsFull,
  * eligible, ...) are written by hand from the design tables, not computed
@@ -18,6 +19,7 @@ import { keccak_256 } from "@noble/hashes/sha3";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const out = join(here, "..", "vectors", "v1.json");
+const outV2 = join(here, "..", "vectors", "v2.json");
 
 // ---------- independent primitives ----------
 
@@ -2025,15 +2027,232 @@ const vectors = {
   eligible: eligibleCases,
 };
 
-const text = JSON.stringify(vectors, null, 2) + "\n";
+// ---------- v2: head format 4 ----------
+// Every v1 case is kept. Only the two format-4 head cases change (format 5 is
+// now the unsupported one), and one format-4 head is added to encode and verify.
+const f4 = { ...baseHead, format: 4, lastDeleteVersion: 2 };
+const f4Text = cj(f4);
+const f5Text = mutate({ format: 5, lastDeleteVersion: 2 });
+// v3 frames (head format 4): the envelope adds `f`, the record's first-seen
+// checkpoint (an integer, or null when unknown).
+const frameCaseV3 = (name, primaryKey, record, o, r, f) => {
+  const body = cj(record);
+  const k = sha(cj(primaryKey.map((field) => record[field])));
+  const envelope = cj({
+    f,
+    h: shaBytes(body),
+    k,
+    n: Buffer.byteLength(body),
+    o,
+    r,
+  });
+  return {
+    name,
+    primaryKey,
+    record,
+    o,
+    r,
+    f,
+    bodyBytes: Buffer.byteLength(body),
+    envelope,
+    frame: `${envelope}\n${body}\n`,
+  };
+};
+const frameCasesV3 = [
+  frameCaseV3(
+    "first seen",
+    ["id"],
+    { id: "a", body: 1 },
+    1700000000000,
+    "run-1",
+    1699999990000,
+  ),
+  frameCaseV3(
+    "unknown first seen",
+    ["id"],
+    { id: "é", t: "日本語" },
+    5,
+    "r",
+    null,
+  ),
+  frameCaseV3(
+    "zero first seen",
+    ["a", "b"],
+    { b: 2, a: "x", c: true },
+    0,
+    "run-2",
+    0,
+  ),
+].sort((x, y) =>
+  JSON.parse(x.envelope).k < JSON.parse(y.envelope).k ? -1 : 1,
+);
+const partOf = (text) => ({
+  text,
+  bytes: Buffer.byteLength(text),
+  hash: sha(text),
+});
+const v3PartText = frameCasesV3.map((c) => c.frame).join("");
+const v2PartText = frameCases.map((c) => c.frame).join("");
+const v3Part = partOf(v3PartText);
+const v3Head = {
+  ...baseHead,
+  format: 4,
+  lastDeleteVersion: 2,
+  parts: [
+    {
+      bytes: v3Part.bytes,
+      count: frameCasesV3.length,
+      hash: v3Part.hash,
+      prefix: "",
+    },
+  ],
+  recordCount: frameCasesV3.length,
+};
+const v3HeadText = cj(v3Head);
+const zero = "0".repeat(64);
+const framesV3 = {
+  description:
+    "Format 4 head parts hold v3 frames: envelope {f,h,k,n,o,r}, f = first-seen checkpoint (integer) or null. A reader picks the frame generation from the head format: format 4 reads v3, formats 2 and 3 read v2. Format 1-3 lines read with f null. A v2 frame in a format 4 head, or a v3 frame in a format 2 or 3 head, is refused.",
+  cases: frameCasesV3,
+  part: {
+    prefix: "",
+    frames: frameCasesV3.map((c) => c.name),
+    ...v3Part,
+    count: frameCasesV3.length,
+  },
+  envelopeErrors: [
+    {
+      text: `{"h":"${zero}","k":"${zero}","n":1,"o":1,"r":"r"}`,
+      why: "v2 envelope under v3",
+    },
+    {
+      text: `{"f":"1","h":"${zero}","k":"${zero}","n":1,"o":1,"r":"r"}`,
+      why: "f is a string",
+    },
+    {
+      text: `{"f":1.5,"h":"${zero}","k":"${zero}","n":1,"o":1,"r":"r"}`,
+      why: "f is not an integer",
+    },
+    {
+      text: `{"h":"${zero}","k":"${zero}","n":1,"o":1,"r":"r","f":null}`,
+      why: "f out of canonical order",
+    },
+  ],
+  readCases: [
+    {
+      name: "format 4 reads v3 frames",
+      headFormat: 4,
+      primaryKey: ["id"],
+      part: { ...v3Part, count: frameCasesV3.length },
+      expected: frameCasesV3.map((c) => ({
+        o: c.o,
+        r: c.r,
+        f: c.f,
+        v: c.record,
+      })),
+    },
+    {
+      name: "format 3 reads unknown first seen",
+      headFormat: 3,
+      primaryKey: ["id"],
+      part: { ...partOf(v2PartText), count: frameCases.length },
+      expected: frameCases.map((c) => ({
+        o: c.o,
+        r: c.r,
+        f: null,
+        v: c.record,
+      })),
+    },
+    {
+      name: "format 4 refuses a v2 frame",
+      headFormat: 4,
+      primaryKey: ["id"],
+      part: { ...partOf(v2PartText), count: frameCases.length },
+      error: true,
+    },
+    {
+      name: "format 3 refuses a v3 frame",
+      headFormat: 3,
+      primaryKey: ["id"],
+      part: { ...v3Part, count: frameCasesV3.length },
+      error: true,
+    },
+  ],
+};
+
+const vectorsV2 = {
+  ...vectors,
+  version: 2,
+  framesV3,
+  heads: {
+    ...vectors.heads,
+    encode: [
+      ...vectors.heads.encode,
+      {
+        name: "format 4 with delete version",
+        head: f4,
+        text: f4Text,
+        dataHash: keccak(f4Text),
+        blobName: `h-${keccak(f4Text).slice(2)}`,
+      },
+      {
+        name: "format 4 head with v3 part hashes",
+        head: v3Head,
+        text: v3HeadText,
+        dataHash: keccak(v3HeadText),
+        blobName: `h-${keccak(v3HeadText).slice(2)}`,
+      },
+    ],
+    decode: [
+      ...vectors.heads.decode.map((c) =>
+        c.name === "format 4"
+          ? { name: "format 4", text: f4Text, expected: "ok" }
+          : c,
+      ),
+      { name: "format 5", text: f5Text, expected: "unsupported_format" },
+      {
+        name: "format 4 missing delete version",
+        text: mutate({ format: 4 }),
+        expected: "malformed",
+      },
+    ],
+    verify: [
+      ...vectors.heads.verify.map((c) =>
+        c.name === "unsupported format is reported before name and key"
+          ? {
+              ...c,
+              text: f5Text,
+              expect: { ...c.expect, dataHash: keccak(f5Text) },
+            }
+          : c,
+      ),
+      {
+        name: "format 4 head verifies",
+        text: f4Text,
+        expect: { ...verifyExpect, dataHash: keccak(f4Text) },
+        result: "ok",
+      },
+    ],
+  },
+};
+
+const files = [
+  [out, vectors, "v1"],
+  [outV2, vectorsV2, "v2"],
+];
 if (process.argv.includes("--check")) {
-  const current = readFileSync(out, "utf8");
-  if (JSON.stringify(JSON.parse(current)) !== JSON.stringify(vectors)) {
-    console.error("vectors/v1.json is stale: run generate-vectors.mjs");
-    process.exit(1);
+  let stale = false;
+  for (const [file, v, name] of files) {
+    const current = readFileSync(file, "utf8");
+    if (JSON.stringify(JSON.parse(current)) !== JSON.stringify(v)) {
+      console.error(`vectors/${name}.json is stale: run generate-vectors.mjs`);
+      stale = true;
+    } else console.log(`vectors/${name}.json is current`);
   }
-  console.log("vectors/v1.json is current");
+  if (stale) process.exit(1);
 } else {
-  writeFileSync(out, text);
-  console.log(`wrote ${out}`);
+  // v1.json is frozen: it is only ever checked, never rewritten. Format the
+  // output with prettier to match the checked-in style.
+  writeFileSync(outV2, JSON.stringify(vectorsV2, null, 2) + "\n");
+  console.log(`wrote ${outV2} (v1.json is frozen and was not touched)`);
 }

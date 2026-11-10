@@ -2,50 +2,56 @@ import { describe, expect, it, vi } from "vitest";
 import { handlePersonalServerDataRequest } from "./index.js";
 import type { PersonalServerDataApiDeps } from "./index.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
-import { Fixture, masterKey } from "../stream-sync-read/service-fixture.js";
-import { testOwnerKey } from "../stream-sync-read/testing.js";
 
 /**
- * A local run the writer will not publish (an older connector met a changed
- * primary key) is reported to the owner and never to a grantee.
+ * The API carries withheld status from its read port to the owner only.
+ * Database eligibility is verified in localdb tests; these tests pin the header/body contract.
  */
 
 const BUILDER = "0x000000000000000000000000000000000000bEEF";
-const T = Date.parse("2026-11-01T00:00:00Z");
 
-async function setup(seed: number) {
-  const f = new Fixture(await testOwnerKey(masterKey(seed)));
-  const ns = await f.key.ns("acme", "account-1");
-  await f.activate("acme", ns);
-  await f.publish({
-    connector: "acme",
-    ns,
-    stream: "items",
-    generation: 1,
-    records: [{ id: "a", v: 1 }],
-    observedAt: T - 1000,
-    profileVersion: "2.0.0",
-  });
-  f.overlay.runs = [
-    {
-      runId: "r1",
-      ns,
-      generation: 1,
-      observedAt: T,
-      streams: [
-        {
-          name: "items",
-          complete: true,
-          primaryKey: ["uid"],
-          version: "1.0.0",
-          rows: [{ o: T, r: "r1", v: { uid: "u1" } }],
-        },
-      ],
+function readPort(
+  incomplete: boolean,
+): NonNullable<PersonalServerDataApiDeps["streamSyncRead"]> {
+  return {
+    resolve: async (input) => {
+      const withheld = input.isOwnerView
+        ? [
+            {
+              runId: "r1",
+              stream: "items",
+              reason: "connector_update_required" as const,
+            },
+          ]
+        : undefined;
+      if (incomplete)
+        return { kind: "unavailable", reason: "no_data", withheld };
+      return {
+        kind: "view",
+        connector: "acme",
+        ns: "",
+        cursor: "fixture",
+        served: { scope: "pdpp.acme~.items", version: 1 },
+        withheld,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                JSON.stringify({
+                  data: { records: [{ id: "a", v: 1 }] },
+                  ...(withheld && { withheld }),
+                }),
+              ),
+            );
+            controller.close();
+          },
+        }),
+      };
     },
-  ];
-  const service = await f.service();
-  await f.sync(service);
-  return setupDeps(service, createMemoryDataStorage());
+  };
+}
+async function setup(_seed: number) {
+  return setupDeps(readPort(false), createMemoryDataStorage());
 }
 
 async function setupDeps(
@@ -54,6 +60,7 @@ async function setupDeps(
 ) {
   const deps: PersonalServerDataApiDeps = {
     storage,
+    accountStorageMode: { owner: "fixture", read: () => "switched" },
     streamSyncRead: service,
     auth: {
       authorizeOwner: vi.fn(async () => undefined),
@@ -107,41 +114,10 @@ describe("data reads with a withheld local run", () => {
   });
 });
 
-describe("data reads whose answer is the existing body", () => {
+describe("switched incomplete reads refuse legacy fallback", () => {
   /** An incomplete base and a withheld run: no view can be served. */
-  async function legacyOnly(seed: number) {
-    const f = new Fixture(await testOwnerKey(masterKey(seed)));
-    const ns = await f.key.ns("acme", "account-1");
-    await f.activate("acme", ns);
-    await f.publish({
-      connector: "acme",
-      ns,
-      stream: "items",
-      generation: 1,
-      records: [{ id: "a", v: 1 }],
-      observedAt: T - 1000,
-      profileVersion: "2.0.0",
-      complete: false,
-    });
-    f.overlay.runs = [
-      {
-        runId: "r1",
-        ns,
-        generation: 1,
-        observedAt: T,
-        streams: [
-          {
-            name: "items",
-            complete: true,
-            primaryKey: ["uid"],
-            version: "1.0.0",
-            rows: [{ o: T, r: "r1", v: { uid: "u1" } }],
-          },
-        ],
-      },
-    ];
-    const service = await f.service();
-    await f.sync(service);
+  async function legacyOnly(_seed: number) {
+    const service = readPort(true);
     const storage = createMemoryDataStorage();
     const envelope = {
       version: "1.0" as const,
@@ -163,20 +139,47 @@ describe("data reads whose answer is the existing body", () => {
 
   it("tells the owner of the withheld run in the header and the body", async () => {
     const read = await get(await legacyOnly(323), false);
-    expect(read.status).toBe(200);
-    expect(read.source).toBe("legacy");
+    expect(read.status).toBe(404);
+    expect(read.source).toBeNull();
     expect(read.withheld).toBe("connector_update_required");
     expect(read.body.withheld).toEqual([
       { runId: "r1", stream: "items", reason: "connector_update_required" },
     ]);
-    expect(read.body.data.records).toEqual([{ id: "stored" }]);
+    expect(read.body.error.errorCode).toBe("STREAM_DATA_NOT_FOUND");
   });
 
   it("tells a grantee nothing", async () => {
     const read = await get(await legacyOnly(324), true);
-    expect(read.status).toBe(200);
-    expect(read.source).toBe("legacy");
+    expect(read.status).toBe(404);
+    expect(read.source).toBeNull();
     expect(read.withheld).toBeNull();
     expect(read.body.withheld).toBeUndefined();
+  });
+});
+
+describe("retired mixed HTTP response", () => {
+  it("cancels a device-local partial body without serving it or touching legacy storage", async () => {
+    const cancel = vi.fn();
+    const storage = createMemoryDataStorage();
+    const find = vi.spyOn(storage, "findEntry");
+    const deps = await setupDeps(
+      {
+        resolve: async () => ({
+          kind: "local_pending",
+          connector: "fixture",
+          ns: "",
+          cursor: "fixture",
+          complete: false,
+          body: new ReadableStream<Uint8Array>({ cancel }),
+        }),
+      },
+      storage,
+    );
+    const read = await get(deps, false);
+    expect(read.status).toBe(404);
+    expect(read.source).toBeNull();
+    expect(read.body.error.errorCode).toBe("STREAM_DATA_NOT_FOUND");
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(find).not.toHaveBeenCalled();
   });
 });

@@ -61,6 +61,27 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
       expect.arrayContaining([`spotify:${SERVER_OWNER}`, connectionId]),
     );
     expect(deps!.instancesForSubject!(SERVER_OWNER)).toHaveLength(2);
+    expect(deps!.connectionLink!(connectionId, "top_artists")).toEqual({
+      connector: "spotify",
+      namespace: "",
+    });
+    expect(
+      deps!.connectionLink!(`spotify:${SERVER_OWNER}`, "top_artists"),
+    ).toEqual(deps!.connectionLink!(connectionId, "top_artists"));
+    expect(deps!.connectionLink!(connectionId, "unselected")).toBeNull();
+    deps!.bindingStore.deleteConnection(connectionId);
+    expect(deps!.connectionLink!(connectionId, "top_artists")).toBeNull();
+    expect(() =>
+      deps!.bindingStore.registerConnection({
+        instance: connectionId,
+        sourceId: DECLARATION.source_id,
+        method: "spotify",
+        label: "again",
+      }),
+    ).toThrow();
+    expect(
+      deps!.connectionLink!(`spotify:${SERVER_OWNER}`, "top_artists"),
+    ).toEqual({ connector: "spotify", namespace: "" });
   });
 
   it("normalizes the server owner's address casing the same way subjectId is derived", () => {

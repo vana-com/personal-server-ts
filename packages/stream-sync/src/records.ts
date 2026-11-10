@@ -32,6 +32,12 @@ export interface Line {
   readonly r: string;
   /** The record exactly as the source gave it. */
   readonly v: JsonObject;
+  /**
+   * First-seen checkpoint (`first_o`): milliseconds of the first run that
+   * collected the record; `null` or absent = unknown. Type only until the
+   * v3 frame slice reads and writes it. Spec: r5.2 1.2-1.3.
+   */
+  readonly f?: number | null;
 }
 
 function checkLineFields(o: unknown, r: unknown, v: unknown): void {

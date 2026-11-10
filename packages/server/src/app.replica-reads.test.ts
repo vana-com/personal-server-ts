@@ -1,3 +1,4 @@
+import { fixedModeAuthority as explicitLegacyAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
@@ -118,6 +119,7 @@ function host({
   };
   const indexManager = createIndexManager(db);
   const app = createApp({
+    accountModeAuthority: explicitLegacyAuthority("unswitched"),
     logger: pino({ level: "silent" }),
     version: "test",
     startedAt: new Date(),

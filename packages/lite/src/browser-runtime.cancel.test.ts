@@ -191,6 +191,11 @@ describe("default Lite composition cancels a hung registry write", () => {
       active: true,
       configDefaults: config as never,
     });
+    await runtime.accountModeAuthority.submitEvidence({
+      owner: owner.address,
+      state: "off",
+    });
+    const cycle = runtime.syncManager!.trigger();
     try {
       await realWait(
         () => stub.posts.includes("scope.hung"),
@@ -209,6 +214,8 @@ describe("default Lite composition cancels a hung registry write", () => {
       expect(stub.posts).toContain("scope.ok");
     } finally {
       await runtime.syncManager?.stop();
+      await cycle;
+      await runtime.closeStreamSync?.();
     }
   }, 20_000);
 });

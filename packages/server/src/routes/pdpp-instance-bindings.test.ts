@@ -1,3 +1,4 @@
+import type { AccountStorageModeValue } from "@opendatalabs/personal-server-ts-core/api";
 import { describe, expect, it, vi } from "vitest";
 import { pdppInstanceBindingRoutes } from "./pdpp-instance-bindings.js";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
@@ -9,13 +10,19 @@ function binding(instance: string): PdppInstanceBinding {
   return { instance, method: "m1", generation: 1, resetClock: 0 };
 }
 
-function buildApp() {
+function buildApp(
+  options: { mode?: AccountStorageModeValue } = { mode: "unswitched" },
+) {
   const resetInstanceBinding = vi.fn((input: { instance: string }) => ({
     binding: { ...binding(input.instance), method: "m2", generation: 2 },
     alreadyReset: false,
   }));
   const getInstanceBinding = vi.fn((instance: string) => binding(instance));
   const app = pdppInstanceBindingRoutes({
+    accountStorageMode:
+      options.mode === undefined
+        ? undefined
+        : { owner: OWNER, read: () => options.mode! },
     store: { getInstanceBinding, resetInstanceBinding },
     auth: {
       async resolveToken(token: string) {
@@ -96,4 +103,43 @@ describe("pdpp instance binding routes", () => {
       nextMethod: "m2",
     });
   });
+});
+
+describe("reset admission by account mode", () => {
+  it.each(["switched", "unknown", undefined] as const)(
+    "refuses reset without writes in mode %s",
+    async (mode) => {
+      const { app, resetInstanceBinding, getInstanceBinding } = buildApp({
+        mode,
+      });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await app.request("/pdpp/instances/inst_1/reset", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer owner-token",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            expected_method: "m1",
+            expected_generation: 1,
+            next_method: "m1",
+          }),
+        });
+        expect(response.status).toBe(mode === "switched" ? 409 : 503);
+        expect((await response.json()).error).toEqual(
+          mode === "switched"
+            ? {
+                code: "RESET_NOT_AVAILABLE",
+                message: "Reset is not available for this connection yet",
+              }
+            : {
+                code: "ACCOUNT_MODE_UNKNOWN",
+                message: "The account mode is not known yet",
+              },
+        );
+      }
+      expect(resetInstanceBinding).not.toHaveBeenCalled();
+      expect(getInstanceBinding).not.toHaveBeenCalled();
+    },
+  );
 });

@@ -1,37 +1,35 @@
-import { createStreamSyncReadCacheFiles } from "./stream-sync-read-cache-files.js";
 import {
-  StreamSyncWriter,
-  createWriterOverlaySource,
-  createStreamSyncIntake,
+  LEGACY_SCOPE_BINDINGS,
+  legacyAliasScopes,
+} from "@opendatalabs/personal-server-ts-core/legacy-projection";
+import type {
+  OwnedAccountStorageMode,
+  StreamSyncReadPort,
+} from "@opendatalabs/personal-server-ts-core/api";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import {
+  connectionQueue,
+  createLocalSync,
+  type LocalSync,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { openLiteLocalDb, type LiteLocalDbOptions } from "./localdb-port.js";
+import {
   type ResolveArtifact,
   type RunIntake,
   type StreamSyncRegistry,
+  type StreamSyncBlobs,
   createGatewayStreamSyncRegistry,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
-  bindStreamSyncHome,
   streamSyncNetwork,
-  type StreamSyncFiles,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import {
-  LITE_PART_TARGET_BYTES,
-  LITE_REDUCE_BUDGET_BYTES,
-  LITE_SPOOL_FLUSH_BYTES,
-} from "./stream-sync-budget.js";
-import { openIndexedDbStreamSyncHome } from "./stream-sync-files.js";
+import { LITE_PART_TARGET_BYTES } from "./stream-sync-budget.js";
 import {
   createVersionInventoryClient,
   type DurableAdditionsService,
 } from "@opendatalabs/personal-server-ts-core/additions";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
-import {
-  createMemoryStreamSyncReadFiles,
-  createStorageBlobReader,
-  createStreamSyncReadKeys,
-  StreamSyncReadService,
-  type StreamSyncOverlaySnapshotSource,
-  type StreamSyncReadFiles,
-} from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
 import {
@@ -120,15 +118,14 @@ export interface PsLiteOwnerSyncSigner
 }
 
 export interface PsLiteSyncOptions {
+  accountStorageMode?: OwnedAccountStorageMode;
   config: ServerConfig;
-  /**
-   * Durable files for whole-file stream sync, used only when
-   * `config.streamSync.write` is on. Given the home id of the (owner,
-   * network), it returns files stored at a location derived from that id. The
-   * host then owns "one live writer per home". Defaults to IndexedDB named by
-   * the home id, held under an exclusive Web Lock.
-   */
-  streamSyncFiles?: (homeId: string) => StreamSyncFiles;
+  /** Host-owned SQLite database; a missing driver makes switched sync unavailable. */
+  localDb?: LiteLocalDbOptions;
+  /** Stable host device identity; defaults to this server account. */
+  localDbDeviceId?: string;
+  /** Whether the local database may fetch historical versions. */
+  olderVersionReads?: () => boolean;
   /**
    * Resolves a run's `artifactDigest` to declarations the host verified
    * (run-intake contract v2 §6). Without it every run answers
@@ -158,6 +155,8 @@ export interface PsLiteSyncOptions {
    * `createMemoryStreamSyncRegistry()`).
    */
   streamSyncRegistry?: StreamSyncRegistry;
+  /** Host transport for encrypted parts, heads and run blobs. */
+  streamSyncBlobs?: StreamSyncBlobs;
   stateStore: PsLiteStateStore;
   storage: DataStoragePort;
   ownerAddress?: `0x${string}`;
@@ -206,18 +205,6 @@ export interface PsLiteSyncOptions {
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   /** Post-index download hook (marks derivative questions stale). */
   onDataPointIndexed?: DownloadWorkerDeps["onDataPointIndexed"];
-  /**
-   * Stream-sync reads (`streamSync.read`). Present = on: the sync loop
-   * imports stream heads, and the returned `streamSyncRead` answers reads.
-   * Without `files`, the reader uses the writer home when available;
-   * otherwise it uses memory and rebuilds on each start. An `overlay` needs
-   * `files`: caller files never acknowledge, so the reader cannot acknowledge
-   * into a source it does not own.
-   */
-  streamSyncRead?: {
-    readonly files?: StreamSyncReadFiles;
-    readonly overlay?: StreamSyncOverlaySnapshotSource;
-  };
 }
 
 function createBrowserLogger(logger?: Logger): Logger {
@@ -395,21 +382,18 @@ export async function createPsLiteSyncManager(
   options: PsLiteSyncOptions,
 ): Promise<{
   syncManager: SyncManager;
+  /** Database-backed facade, or null when the host cannot open it. */
+  localSync?: LocalSync | null;
   additions?: DurableAdditionsService;
   serverOwner: `0x${string}`;
   dataPointFeed: DataPointFeedPort;
   scopeDeletions: ScopeDeletionTracker;
-  /**
-   * Null when writing is off, or when another instance holds this owner's
-   * stream-sync home (or the runtime has no `navigator.locks`): stream sync
-   * does not run here; legacy sync does.
-   */
-  streamSyncWriter: StreamSyncWriter | null;
-  /** Releases the stream-sync home's lock and database. */
+  /** Releases the owner/network database after the manager has stopped. */
   closeStreamSync(): Promise<void>;
-  /** In-process run intake for the host's own connector runs; null when writing is off. */
+  /** In-process database intake, admitted only after Account says On. */
   streamSyncIntake: RunIntake | null;
-  streamSyncRead?: StreamSyncReadService;
+  streamSyncRead?: StreamSyncReadPort;
+  getLocalSync(): Promise<LocalSync>;
 }> {
   const additionsTimeBudgetMs = options.additionsTimeBudgetMs ?? 10_000;
   const additionsByteBudget = options.additionsByteBudget ?? 8 * 1024 * 1024;
@@ -482,7 +466,7 @@ export async function createPsLiteSyncManager(
     ownerSigner && boundedSigner && options.stateStore.bounded
       ? createPsLiteAdditionsSession({
           init: {
-            ownerAddress: serverOwner,
+            ownerAddress: serverOwner.toLowerCase() as `0x${string}`,
             network: `vana:${options.config.gateway.chainId}:${new URL(options.config.gateway.url).origin}`,
             gatewayUrl: options.config.gateway.url,
             storageEndpoint: resolveVanaStorageEndpoint(options.config),
@@ -560,100 +544,112 @@ export async function createPsLiteSyncManager(
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
-  // Whole-file stream sync publishes beside the legacy upload, only when
-  // `streamSync.write` is on. Legacy uploads run unchanged either way.
+  // Account mode selects the database or the explicit legacy sync path.
   const streamSyncNet = streamSyncNetwork(options.config.gateway);
-  const streamSyncHome = options.config.streamSync?.write
-    ? options.streamSyncFiles
-      ? {
-          home: bindStreamSyncHome({
-            ownerAddress: serverOwner,
-            network: streamSyncNet,
-            open: options.streamSyncFiles,
-          }),
-          close: async () => {},
-        }
-      : await openIndexedDbStreamSyncHome({
-          ownerAddress: serverOwner,
-          network: streamSyncNet,
-        })
-    : null;
-  if (options.config.streamSync?.write && !streamSyncHome) {
-    logger.info(
-      {},
-      "Stream sync is off in this instance: its storage is held by another instance, or Web Locks are unavailable",
-    );
+  const mode = options.accountStorageMode ?? {
+    owner: serverOwner,
+    read: () => "unknown" as const,
+  };
+  let localDb: SqlDriver | null = null;
+  let localSync: LocalSync | null = null;
+  async function closeDatabase() {
+    if (localSync) await localSync.close();
+    else await localDb?.close();
   }
-  // The home (and its Web Lock) belongs to this function until the manager
-  // is returned. A failure before that must release it, or a retry in this
-  // browser context cannot acquire the home and writes stay off until reload.
+
   let syncManager!: ReturnType<typeof createSyncManager>;
   try {
-    const streamSyncWriter = streamSyncHome
-      ? new StreamSyncWriter({
-          ownerAddress: serverOwner,
-          registry:
-            options.streamSyncRegistry ??
-            createGatewayStreamSyncRegistry({
-              gatewayUrl: options.config.gateway.url,
-              ownerAddress: serverOwner,
-            }),
-          blobs: createStorageStreamSyncBlobs(storageAdapter),
-          home: streamSyncHome.home,
-          keys: createStreamSyncKeyPorts(options.ownerSignature),
-          signer,
-          declaredStreams: options.streamSyncDeclaredStreams,
-          retainedManifests: options.streamSyncRetainedManifests,
-          // A connection delete erases this device's legacy scope files too.
-          eraseLegacy: (connector) =>
-            eraseLegacyScopesOf(connector, options.storage),
-          partTargetBytes: LITE_PART_TARGET_BYTES,
-          reduceBudgetBytes: LITE_REDUCE_BUDGET_BYTES,
-          spoolFlushBytes: LITE_SPOOL_FLUSH_BYTES,
-        })
-      : null;
-    // A caller overlay is the caller's own source. The writer-home cache would
-    // acknowledge installs into it, so a caller overlay must come with caller
-    // files, which never acknowledge.
-    if (options.streamSyncRead?.overlay && !options.streamSyncRead.files) {
-      throw new Error(
-        "streamSyncRead.overlay needs streamSyncRead.files: the writer-home read cache only acknowledges into the writer's own overlay",
-      );
+    let closed = false;
+    let opening: Promise<LocalSync | null> | undefined;
+    async function openDatabase(): Promise<LocalSync | null> {
+      if (!options.localDb) return null;
+      localDb = await openLiteLocalDb(options.localDb, {
+        owner: serverOwner,
+        network: streamSyncNet,
+        deviceId: options.localDbDeviceId ?? options.serverAccount.address,
+      });
+      if (localDb) {
+        localSync = createLocalSync(
+          {
+            db: localDb,
+            queue: connectionQueue(),
+            ownerAddress: serverOwner.toLowerCase() as `0x${string}`,
+            registry:
+              options.streamSyncRegistry ??
+              createGatewayStreamSyncRegistry({
+                gatewayUrl: options.config.gateway.url,
+                ownerAddress: serverOwner,
+              }),
+            blobs:
+              options.streamSyncBlobs ??
+              createStorageStreamSyncBlobs(storageAdapter),
+            keys: createStreamSyncKeyPorts(options.ownerSignature),
+            signer,
+            logger,
+            now: Date.now,
+            newOp: () => globalThis.crypto.randomUUID(),
+            partTargetBytes: LITE_PART_TARGET_BYTES,
+          },
+          {
+            aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
+            aliasTargets: legacyAliasScopes,
+            resolveArtifact: options.streamSyncDeclarations ?? (() => null),
+            declaredStreams: options.streamSyncDeclaredStreams,
+            retainedManifests: options.streamSyncRetainedManifests,
+            eraseLegacy: (connector) =>
+              eraseLegacyScopesOf(connector, options.storage),
+            olderVersionReads:
+              options.olderVersionReads ??
+              (() => options.config.olderVersionReads),
+          },
+        );
+      }
+      return localSync;
     }
-    // Opened after the writer: the writer's own publications overlay this
-    // reader. The writer-home cache is durable, so the reader acknowledges what
-    // it installs and the writer can reclaim its spool. Caller-supplied files
-    // stay non-durable (no acknowledgment) because their durability is unknown.
-    const readKeys = options.streamSyncRead
-      ? await createStreamSyncReadKeys(masterKey)
-      : undefined;
-    const streamSyncRead = options.streamSyncRead
-      ? await StreamSyncReadService.open({
-          files:
-            options.streamSyncRead.files ??
-            (streamSyncHome
-              ? createStreamSyncReadCacheFiles(
-                  streamSyncHome.home.files,
-                  readKeys!.keyCheck,
-                )
-              : createMemoryStreamSyncReadFiles()),
-          blobs: createStorageBlobReader(storageAdapter),
-          keys: readKeys!,
-          logger: logger as never,
-          durable: !options.streamSyncRead.files && Boolean(streamSyncHome),
-          ...(options.streamSyncRead.overlay
-            ? { overlay: options.streamSyncRead.overlay }
-            : streamSyncWriter
-              ? { overlay: createWriterOverlaySource(streamSyncWriter) }
-              : {}),
-        })
-      : undefined;
-    const streamSyncIntake = streamSyncWriter
-      ? createStreamSyncIntake({
-          writer: streamSyncWriter,
-          resolveArtifact: options.streamSyncDeclarations ?? (() => null),
-        })
-      : null;
+    function requireDatabaseMode() {
+      if (closed)
+        throw new ProtocolError(
+          503,
+          "STREAM_READ_UNAVAILABLE",
+          "Stream sync is unavailable",
+        );
+      const state = mode.read();
+      if (state === "unknown")
+        throw new ProtocolError(
+          503,
+          "ACCOUNT_MODE_UNKNOWN",
+          "Waiting for the account storage mode",
+        );
+      if (state !== "switched")
+        throw new ProtocolError(
+          409,
+          "STREAM_SYNC_NOT_ENABLED",
+          "Stream sync is not enabled for this account",
+        );
+    }
+    async function getLocalSync(): Promise<LocalSync> {
+      requireDatabaseMode();
+      if (localSync) return localSync;
+      opening ??= openDatabase().finally(() => {
+        opening = undefined;
+      });
+      const sync = await opening;
+      if (!sync)
+        throw new ProtocolError(
+          503,
+          "STREAM_READ_UNAVAILABLE",
+          "The stream database is unavailable",
+        );
+      requireDatabaseMode();
+      return sync;
+    }
+    if (mode.read() === "switched") await openDatabase();
+    const streamSyncIntake: RunIntake = {
+      begin: async (...args) => (await getLocalSync()).intake.begin(...args),
+      batch: async (...args) => (await getLocalSync()).intake.batch(...args),
+      end: async (...args) => (await getLocalSync()).intake.end(...args),
+      abort: async (...args) => (await getLocalSync()).intake.abort(...args),
+    };
     syncManager = createSyncManager(
       {
         additions,
@@ -680,12 +676,11 @@ export async function createPsLiteSyncManager(
         dataPointFeed,
         scopeDeletions,
         onDataPointIndexed: options.onDataPointIndexed,
-        streamSync: streamSyncRead,
+        localSync: { apply: async () => (await getLocalSync()).apply() },
       },
       {
-        streamSync: streamSyncWriter
-          ? { write: true, publisher: streamSyncWriter }
-          : null,
+        accountStorageMode: mode,
+        localSync: { cycle: async () => (await getLocalSync()).cycle() },
         deleteData,
         pendingBlobDeletions,
         uploadAttemptStore: uploadAttemptNamespace
@@ -723,20 +718,42 @@ export async function createPsLiteSyncManager(
     if (options.autoStartSync !== false) syncManager.start();
     return {
       syncManager,
+      get localSync() {
+        return localSync;
+      },
+      getLocalSync,
       additions,
       serverOwner,
       dataPointFeed,
       scopeDeletions,
-      streamSyncWriter,
       closeStreamSync: async () => {
-        await streamSyncHome?.close();
+        closed = true;
+        await opening;
+        await closeDatabase();
       },
       streamSyncIntake,
-      streamSyncRead,
+      streamSyncRead: {
+        resolve: async (input) =>
+          (await getLocalSync()).resolver.resolve(input),
+        listScopes: async (input) =>
+          (await getLocalSync()).listing.listScopes(input),
+        olderVersions: {
+          read: async (...args) =>
+            (await getLocalSync()).olderVersions.read(...args),
+          list: async (...args) =>
+            (await getLocalSync()).olderVersions.list(...args),
+          counts: () =>
+            localSync?.olderVersions.counts() ?? {
+              served: 0,
+              gone: 0,
+              off: 0,
+            },
+        },
+      },
     };
   } catch (error) {
     try {
-      await streamSyncHome?.close();
+      await closeDatabase();
     } catch (closeError) {
       logger.warn(
         {

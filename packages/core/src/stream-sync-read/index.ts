@@ -3,33 +3,15 @@ export {
   logicalStreamScopeParts,
   streamReadScope,
 } from "./routing.js";
+export { liveStreamCounts } from "./service.js";
 export type {
-  StreamSyncBlobReader,
-  StreamSyncImportedCoverage,
-  StreamSyncOverlayRun,
-  StreamSyncOverlaySnapshot,
-  StreamSyncOverlaySnapshotSource,
-  StreamSyncOverlayStream,
-  StreamSyncPublishReceipt,
-  StreamSyncReadFiles,
-  StreamSyncReadKeys,
-  StreamSyncReadLogger,
-} from "./ports.js";
-export { createMemoryStreamSyncReadFiles } from "./memory-files.js";
-export {
-  createStorageBlobReader,
-  createStreamSyncReadKeys,
-  streamSyncReadHashes,
-} from "./keys.js";
-export type { MirrorFeedRow } from "./mirror.js";
-export type { ImportIssue, ImportProblem } from "./importer.js";
-export {
-  liveStreamCounts,
-  readTargets,
-  StreamSyncReadService,
-  type ReadDecision,
-  type ResolveInput,
-  type StreamSyncConnectionStatus,
-  type StreamSyncReadOptions,
-  type StreamSyncReadStatus,
+  ReadDecision,
+  ResolveInput,
+  StreamSyncConnectionStatus,
+  StreamSyncReadStatus,
+  WithheldReason,
+  WithheldRun,
+  OwnerNotes,
+  ImportIssue,
+  ImportProblem,
 } from "./service.js";

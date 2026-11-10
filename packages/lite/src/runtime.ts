@@ -1,3 +1,8 @@
+import type {
+  LocalSync,
+  LocalHistory,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { liveStreamCounts } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import { importOuraBrowserRecords } from "./oura-import.js";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import {
@@ -102,6 +107,7 @@ import {
   createMcpConnection,
   createMcpOAuthAuthorization,
   createMcpDataReadClient,
+  McpDataWriteError,
   denyMcpScopeAccessRequest,
   handleMcpStreamableHttpRequest,
   hashConnectionToken,
@@ -159,6 +165,9 @@ export interface PsLiteAuthAdapter extends PersonalServerApiAuthPort {
 }
 
 export interface PsLiteRuntimeOptions {
+  localSync?: () => Promise<LocalSync>;
+  history?: LocalHistory;
+
   /**
    * The stream-sync writer's connection delete. Absent = `DELETE
    * /v1/owner/connectors/:id` answers 503, as the Node server does unwired.
@@ -1515,6 +1524,7 @@ export function createPsLiteRuntime(
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
               streamSyncRead: options.streamSyncRead,
+              history: options.history,
               scopeUploads,
               now,
               createLogId,
@@ -1664,7 +1674,43 @@ export function createPsLiteRuntime(
           );
         }
 
+        if (
+          url.pathname === "/v1/stream-sync/read-status" &&
+          options.localSync
+        ) {
+          await auth.authorizeOwner(request);
+          if (request.method !== "GET")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          const local = await options.localSync();
+          const status = await local.listing.status();
+          return jsonResponse({
+            listed: status.listed,
+            streams: liveStreamCounts(status),
+            issues: status.issues.length,
+            olderVersionReads: local.olderVersions.counts(),
+          });
+        }
         const syncPrefix = "/v1/sync";
+        if (
+          url.pathname === `${syncPrefix}/status` &&
+          options.localSync &&
+          accountStorageMode.read() !== "unswitched"
+        ) {
+          await auth.authorizeOwner(request);
+          if (request.method !== "GET")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          return jsonResponse(
+            await (await options.localSync()).listing.status(),
+          );
+        }
         if (
           url.pathname === `${syncPrefix}/trigger` ||
           url.pathname === `${syncPrefix}/status` ||
@@ -2351,13 +2397,31 @@ async function handleMcpRoute(input: {
       publicKey: record.granteePublicKey,
       encryptedPrivateKey: record.encryptedGranteePrivateKey,
     });
+    const mode = input.accountStorageMode?.read() ?? "unknown";
+    const storage =
+      mode === "unswitched"
+        ? input.dataStorage
+        : new Proxy({} as DataStoragePort, {
+            get() {
+              return () => {
+                throw new ProtocolError(
+                  503,
+                  "STREAM_SYNC_LEGACY_STORAGE",
+                  "Legacy storage is sealed for this account mode",
+                );
+              };
+            },
+          });
     const readClient = createMcpDataReadClient({
       serverOrigin: input.serverOrigin,
       granteeAccount,
       dataApiDeps: {
-        storage: input.dataStorage,
-        streamSyncRead: input.streamSyncRead,
-        accountStorageMode: input.accountStorageMode,
+        storage,
+        streamSyncRead: mode === "switched" ? input.streamSyncRead : undefined,
+        accountStorageMode: {
+          owner: input.accountStorageMode?.owner ?? input.serverOwner ?? "",
+          read: () => mode,
+        },
         auth: input.auth,
         accessLogWriter: input.accessLogWriter,
         readFulfillmentReporter: input.readFulfillmentReporter,
@@ -2369,6 +2433,21 @@ async function handleMcpRoute(input: {
     const response = await handleMcpStreamableHttpRequest(input.request, {
       connection: record,
       readClient,
+      writeClient:
+        mode === "switched"
+          ? {
+              async updateScope() {
+                throw new McpDataWriteError(409, {
+                  error: {
+                    code: 409,
+                    errorCode: "STREAM_SYNC_WRITE_UNAVAILABLE",
+                    message:
+                      "Memory writes are not available through stream sync",
+                  },
+                });
+              },
+            }
+          : undefined,
       activityRecorder: input.activityRecorder,
       requestScopeAccess: async (request) => {
         return requestMcpScopeAccess(

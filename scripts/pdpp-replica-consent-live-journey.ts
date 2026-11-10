@@ -1,4 +1,5 @@
 /** Dev-only single-issuer consent over the real 8a replica workers. No env/config files. */
+import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -173,6 +174,7 @@ export async function openReplicaResourceServer(
   store: ReturnType<typeof createReplicaRecordStore>,
   options: {
     owner: string;
+    accountStorageMode?: OwnedAccountStorageMode;
     issuerOrigin: string;
     credential: string;
     source?: ReplicaRuntimeSource;
@@ -230,6 +232,7 @@ export async function openReplicaResourceServer(
       auth,
       declarations,
       ownerSubjectId: options.owner,
+      accountStorageMode: options.accountStorageMode,
       reads: options.reads,
     }),
   );

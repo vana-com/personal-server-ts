@@ -304,6 +304,8 @@ const nodePort: Port<NodeDriver> = {
   },
 };
 
+// A case reopens durable stores at every crash point. Allow its I/O to
+// finish before the next case resets the shared deterministic-id fixture.
 function matrix<D extends ReplicaPortDriver>(name: string, port: Port<D>) {
   async function prepared() {
     uuids.count = 0;
@@ -313,88 +315,92 @@ function matrix<D extends ReplicaPortDriver>(name: string, port: Port<D>) {
   }
   describe(`${name} crash matrix`, () => {
     for (const scenario of scenarios)
-      it(scenario.name, async () => {
-        const clean = await prepared();
-        let reference: { dump: unknown; receipt: unknown; before: unknown };
-        let referenceRepeat: unknown;
-        try {
-          const before = port.dump(clean);
-          const result = await outcome(() => scenario.act(clean));
-          expect(result.error).toBeUndefined();
-          // Imported operations never echo into the importer's own journal.
-          if (scenario.name === "import")
-            expect(
-              (await clean.localOperations()).some(
-                (op) => op.revision.writerId === "w-remote",
-              ),
-            ).toBe(false);
-          await clean.reopen();
-          reference = {
-            dump: port.dump(clean),
-            receipt: result.receipt,
-            before,
-          };
-          referenceRepeat = port.repeatDump(clean);
-          expect(reference.dump).not.toEqual(before);
-          // Lost acknowledgement: the same request again returns the same
-          // receipt and changes nothing.
-          const repeated = port.repeatDump(clean);
-          const again = await outcome(() => scenario.act(clean));
-          expect(again.error).toBeUndefined();
-          if (port.stableReceipts.includes(scenario.name))
-            expect(again.receipt).toEqual(reference.receipt);
-          expect(port.repeatDump(clean)).toEqual(repeated);
-          if (scenario.conflicting && port.requestIds) {
-            expect(
-              (await outcome(() => scenario.conflicting!(clean))).error,
-            ).toBeDefined();
-            expect(port.repeatDump(clean)).toEqual(repeated);
-          }
-        } finally {
-          clean.close();
-        }
-        const fired: string[] = [];
-        for (const point of port.points(reference.before, reference.dump)) {
-          const driver = await prepared();
+      it(
+        scenario.name,
+        async () => {
+          const clean = await prepared();
+          let reference: { dump: unknown; receipt: unknown; before: unknown };
+          let referenceRepeat: unknown;
           try {
-            const before = port.dump(driver);
-            expect(before).toEqual(reference.before);
-            const ids = port.ids(driver);
-            port.arm(driver, point);
-            const crashed = await outcome(() => scenario.act(driver));
-            const committed = port.afterCommit(point);
-            await driver.reopen();
-            if (crashed.error === undefined) {
-              // The entry point never reached this point; the run was clean.
-              expect(port.dump(driver), point).toEqual(reference.dump);
-              continue;
+            const before = port.dump(clean);
+            const result = await outcome(() => scenario.act(clean));
+            expect(result.error).toBeUndefined();
+            // Imported operations never echo into the importer's own journal.
+            if (scenario.name === "import")
+              expect(
+                (await clean.localOperations()).some(
+                  (op) => op.revision.writerId === "w-remote",
+                ),
+              ).toBe(false);
+            await clean.reopen();
+            reference = {
+              dump: port.dump(clean),
+              receipt: result.receipt,
+              before,
+            };
+            referenceRepeat = port.repeatDump(clean);
+            expect(reference.dump).not.toEqual(before);
+            // Lost acknowledgement: the same request again returns the same
+            // receipt and changes nothing.
+            const repeated = port.repeatDump(clean);
+            const again = await outcome(() => scenario.act(clean));
+            expect(again.error).toBeUndefined();
+            if (port.stableReceipts.includes(scenario.name))
+              expect(again.receipt).toEqual(reference.receipt);
+            expect(port.repeatDump(clean)).toEqual(repeated);
+            if (scenario.conflicting && port.requestIds) {
+              expect(
+                (await outcome(() => scenario.conflicting!(clean))).error,
+              ).toBeDefined();
+              expect(port.repeatDump(clean)).toEqual(repeated);
             }
-            expect(crashed.error, point).toBe(`interrupted:${point}`);
-            fired.push(point);
-            if (!committed) {
-              expect(port.acrossReopen(port.dump(driver)), point).toEqual(
-                port.acrossReopen(before),
-              );
-              port.ids(driver, ids);
-            }
-            // Retrying the same request after reopen reaches the reference.
-            const retried = await outcome(() => scenario.act(driver));
-            expect(retried.error, point).toBeUndefined();
-            if (!committed || port.stableReceipts.includes(scenario.name))
-              expect(retried.receipt, point).toEqual(reference.receipt);
-            if (committed)
-              expect(port.repeatDump(driver), point).toEqual(referenceRepeat);
-            else expect(port.dump(driver), point).toEqual(reference.dump);
           } finally {
-            driver.close();
+            clean.close();
           }
-        }
-        // Every changed table (Node) or both sides of a commit (Lite) fire.
-        const points = port.points(reference.before, reference.dump);
-        if (points.includes("after-commit"))
-          expect(fired).toContain("after-commit");
-        expect(fired.length).toBeGreaterThan(1);
-      });
+          const fired: string[] = [];
+          for (const point of port.points(reference.before, reference.dump)) {
+            const driver = await prepared();
+            try {
+              const before = port.dump(driver);
+              expect(before).toEqual(reference.before);
+              const ids = port.ids(driver);
+              port.arm(driver, point);
+              const crashed = await outcome(() => scenario.act(driver));
+              const committed = port.afterCommit(point);
+              await driver.reopen();
+              if (crashed.error === undefined) {
+                // The entry point never reached this point; the run was clean.
+                expect(port.dump(driver), point).toEqual(reference.dump);
+                continue;
+              }
+              expect(crashed.error, point).toBe(`interrupted:${point}`);
+              fired.push(point);
+              if (!committed) {
+                expect(port.acrossReopen(port.dump(driver)), point).toEqual(
+                  port.acrossReopen(before),
+                );
+                port.ids(driver, ids);
+              }
+              // Retrying the same request after reopen reaches the reference.
+              const retried = await outcome(() => scenario.act(driver));
+              expect(retried.error, point).toBeUndefined();
+              if (!committed || port.stableReceipts.includes(scenario.name))
+                expect(retried.receipt, point).toEqual(reference.receipt);
+              if (committed)
+                expect(port.repeatDump(driver), point).toEqual(referenceRepeat);
+              else expect(port.dump(driver), point).toEqual(reference.dump);
+            } finally {
+              driver.close();
+            }
+          }
+          // Every changed table (Node) or both sides of a commit (Lite) fire.
+          const points = port.points(reference.before, reference.dump);
+          if (points.includes("after-commit"))
+            expect(fired).toContain("after-commit");
+          expect(fired.length).toBeGreaterThan(1);
+        },
+        120_000,
+      );
   });
 }
 

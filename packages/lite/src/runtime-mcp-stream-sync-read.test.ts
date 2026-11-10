@@ -1,13 +1,17 @@
+import {
+  createModeAuthority,
+  createMemoryModeRecordStore,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 /**
  * The MCP read and the HTTP data read serve the same stream-sync view in the
  * Lite runtime (the browser Personal Server).
  *
  * Real: the Lite runtime (`createPsLiteRuntime`), its `/v1/data` and `/mcp/:token`
- * routes, the connection store, grant checks, and the stream-sync read service
- * (core `Fixture`: real publish, heads, parts, import and view). Stubbed: the
+ * routes, the connection store, grant checks, and the database composition
+ * (real heads, parts, SQLite apply and resolver). Stubbed: the
  * gateway (grant and builder lookup only) and the access-log sink.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createPsLiteRuntime } from "./runtime.js";
 import {
   createMemoryPsLiteStorage,
@@ -19,11 +23,9 @@ import {
   createMcpConnection,
   type McpConnectionStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
-import { testOwnerKey } from "@opendatalabs/personal-server-ts-core/stream-sync-read/testing";
 import {
   createTestWallet,
   buildWeb3SignedHeader,
-  fixedModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type {
   Builder,
@@ -33,9 +35,17 @@ import type {
 import type { AccessLogEntry } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/api";
 import {
-  Fixture,
-  masterKey,
-} from "../../core/src/stream-sync-read/service-fixture.js";
+  openLocalDb,
+  connectionQueue,
+  type SqlDriver,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
+import { remoteFixture } from "../../server/src/localdb/apply-fixture.js";
+import { createServerLocalSync } from "../../server/src/localdb/sync.js";
+const drivers: SqlDriver[] = [];
+afterEach(async () => {
+  for (const db of drivers.splice(0)) await db.close();
+});
 import { createWeb3SignedPsLiteAuth } from "./runtime.js";
 
 const SERVER_ORIGIN = "https://ps-lite.local";
@@ -99,19 +109,19 @@ function gatewayFor(granteeAddress: `0x${string}`): GatewayClient {
 
 /**
  * The stream view for SCOPE: a completed `posts` row with one post, `p1`,
- * and its `post_likes` row, read through the real service.
+ * and its `post_likes` row, read through the real database resolver.
  */
 async function streamView(): Promise<StreamSyncReadPort> {
-  const fx = new Fixture(await testOwnerKey(masterKey(33)));
-  fx.overlay.connector = "meta";
-  const ns = await fx.key.ns("meta", "account-1");
-  await fx.activate("meta", ns);
-  await fx.publish({
-    connector: "meta",
-    ns,
-    stream: "posts",
-    generation: 1,
-    records: [
+  const keys = {
+    namespaceHmac: async () => new Uint8Array(32),
+    encrypt: async (_s: string, b: Uint8Array) => b,
+    encryptPart: async (_s: string, b: Uint8Array) => b,
+    decrypt: async (_s: string, b: Uint8Array) => b,
+  };
+  const remote = await remoteFixture(keys, "meta");
+  await remote.head(
+    "posts",
+    [
       {
         id: "p1",
         media_url: "https://media.test/p1.jpg",
@@ -120,23 +130,48 @@ async function streamView(): Promise<StreamSyncReadPort> {
         taken_at: "2026-11-01T00:00:00Z",
       },
     ],
-    primaryKey: ["id"],
-    complete: true,
+    { profile: { key: "meta", version: "1" } },
+  );
+  await remote.head(
+    "post_likes",
+    [{ post_id: "p1", liker_ordinal: 0, user_id: "u1", username: "liker" }],
+    {
+      profile: { key: "meta", version: "1" },
+      primaryKey: ["post_id", "liker_ordinal"],
+    },
+  );
+  const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+    owner: owner.address,
+    network: "test",
+    deviceId: "lite-mcp",
   });
-  await fx.publish({
-    connector: "meta",
-    ns,
-    stream: "post_likes",
-    generation: 1,
-    records: [
-      { post_id: "p1", liker_ordinal: 0, user_id: "u1", username: "liker" },
-    ],
-    primaryKey: ["post_id", "liker_ordinal"],
-    complete: true,
-  });
-  const service = await fx.service();
-  await fx.sync(service);
-  return service;
+  drivers.push(db);
+  let op = 0;
+  const local = createServerLocalSync(
+    {
+      db,
+      queue: connectionQueue(),
+      ownerAddress: owner.address,
+      registry: remote.registry,
+      blobs: remote.storage,
+      keys,
+      signer: { signAddData: async () => "0x00" },
+      logger: { info() {}, warn() {} },
+      now: () => 100,
+      newOp: () => String(++op),
+    },
+    {
+      resolveArtifact: () => undefined,
+      declaredStreams: () => ["posts", "post_likes"],
+      olderVersionReads: () => true,
+    },
+  );
+  await local.apply();
+  return {
+    resolve: (input) => local.resolver.resolve(input),
+    listScopes: (input) => local.listing.listScopes(input),
+    olderVersions: local.olderVersions,
+  };
 }
 
 function ownerSigned(
@@ -184,8 +219,12 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
   let runtime: ReturnType<typeof createPsLiteRuntime>;
   let accessLog: AccessLogEntry[];
   let token: string;
+  let authority: ReturnType<typeof createModeAuthority>;
 
   beforeEach(async () => {
+    authority = createModeAuthority({ store: createMemoryModeRecordStore() });
+    await authority.ready;
+    await authority.submitEvidence({ owner: owner.address, state: "off" });
     store = createInMemoryMcpConnectionStore();
     const created = await createMcpConnection(
       { displayName: "Claude" },
@@ -212,7 +251,7 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
       grantVerifier: gateway,
     };
     runtime = createPsLiteRuntime({
-      accountModeAuthority: fixedModeAuthority("unswitched"),
+      accountModeAuthority: authority,
       active: true,
       storage: createMemoryPsLiteStorage(),
       config: { gateway: gatewayConfig },
@@ -246,6 +285,7 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
   });
 
   async function httpRead(): Promise<unknown> {
+    await authority.submitEvidence({ owner: owner.address, state: "on" });
     const res = await runtime.fetch(
       await ownerSigned("GET", `/v1/data/${SCOPE}`),
     );
@@ -258,6 +298,7 @@ describe("Lite MCP and HTTP reads serve the same stream-sync view", () => {
     name: string,
     args: Record<string, unknown>,
   ): Promise<{ text: string; isError: boolean }> {
+    await authority.submitEvidence({ owner: owner.address, state: "on" });
     const res = await runtime.fetch(
       new Request(`${SERVER_ORIGIN}/mcp/${encodeURIComponent(token)}`, {
         method: "POST",

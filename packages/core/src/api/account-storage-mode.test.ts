@@ -93,8 +93,8 @@ describe("accountStorageModeFor", () => {
 });
 
 describe("selectAccountStorageMode", () => {
-  it("keeps reads on the legacy path when no mode is wired", () => {
-    expect(selectAccountStorageMode({})).toEqual({ kind: "legacy" });
+  it("refuses to select legacy when no mode is wired", () => {
+    expect(selectAccountStorageMode({})).toEqual({ kind: "unknown" });
   });
 
   // UNSWITCHED_CHANGED
@@ -114,12 +114,12 @@ describe("selectAccountStorageMode", () => {
     ).toEqual({ kind: "streams" });
   });
 
-  it("keeps reads open before the owner's first answer", () => {
+  it("selects unknown before the owner's first answer", () => {
     expect(
       selectAccountStorageMode({
         accountStorageMode: fixedOwnedAccountStorageMode("unknown"),
       }),
-    ).toEqual({ kind: "legacy" });
+    ).toEqual({ kind: "unknown" });
   });
 
   // READER_PRESENCE_AS_MODE
@@ -133,7 +133,7 @@ describe("selectAccountStorageMode", () => {
     const noModeWithReader = selectAccountStorageMode({
       streamSyncRead: reader,
     } as never);
-    expect(noModeWithReader.kind).toBe("legacy");
+    expect(noModeWithReader.kind).toBe("unknown");
     expect(reader.resolve).not.toHaveBeenCalled();
   });
 });
@@ -186,7 +186,7 @@ describe("the write gate and the read selector share one answer", () => {
   });
 
   // OWNERLESS_READ_ANSWERS
-  it("gives a runtime of another owner a paused write and a legacy read", async () => {
+  it("gives a runtime of another owner a paused write and an unknown read", async () => {
     const authority = await authorityHearing(OWNER_A, "on");
     const deps = dataDeps({
       serverOwner: OWNER_B,
@@ -195,7 +195,7 @@ describe("the write gate and the read selector share one answer", () => {
         OWNER_B,
       ),
     });
-    expect(selectAccountStorageMode(deps).kind).toBe("legacy");
+    expect(selectAccountStorageMode(deps).kind).toBe("unknown");
     expect((await handlePersonalServerDataRequest(post(), deps)).status).toBe(
       503,
     );

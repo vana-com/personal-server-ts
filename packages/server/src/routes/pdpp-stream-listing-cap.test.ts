@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * Client-token stream listings must not scan without bound.
  *
@@ -109,6 +110,7 @@ function app(count: number) {
   a.route(
     "/v1",
     pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store: seed(count),
       auth: clientAuth,
       declarations,
@@ -183,6 +185,7 @@ describe("client stream listing bounds its count", () => {
     a.route(
       "/v1",
       pdppRecordsRoutes({
+        accountStorageMode: explicitLegacyStorageMode("unswitched"),
         store,
         auth: clientAuth,
         declarations,

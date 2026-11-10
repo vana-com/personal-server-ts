@@ -12,12 +12,16 @@ import { int, pick, rng } from "./test-support/ports.js";
 
 const ALPHABET = ["a", "z", "0", ".", "_", "-", "~", "é", "😀", "A"];
 
-function word(random: () => number, min: number, allowTilde: boolean): string {
+function word(
+  random: () => number,
+  min: number,
+  allowSeparators: boolean,
+): string {
   let out = "";
   const len = min + int(random, 12);
   while (out.length < len) {
     const c = pick(random, ALPHABET);
-    if (c === "~" && !allowTilde) continue;
+    if ((c === "~" || c === ".") && !allowSeparators) continue;
     out += c;
   }
   return out;
@@ -47,6 +51,29 @@ describe("scope names", () => {
         ns,
       });
     }
+  });
+
+  it("rejects dotted connector keys in builders", () => {
+    for (const connector of [".", "a.b", ".a", "a.", "a..b"]) {
+      for (const ns of ["", "0123456789abcdef"]) {
+        expect(() => controlScope(connector, ns)).toThrow(InvalidNameError);
+        expect(() => streamScope(connector, ns, "s")).toThrow(InvalidNameError);
+      }
+    }
+    expect(parseScope(streamScope("a", "", "b.s"))).toEqual({
+      kind: "stream",
+      connector: "a",
+      ns: "",
+      stream: "b.s",
+    });
+  });
+
+  it("still parses a stored name with a dotted connector (vectors/v1.json)", () => {
+    expect(parseScope("pdpp.a.b~")).toEqual({
+      kind: "control",
+      connector: "a.b",
+      ns: "",
+    });
   });
 
   it("never parses an old raw name", () => {

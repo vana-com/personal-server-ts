@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- vectors are untyped JSON */
 /**
- * Conformance runner for `vectors/v1.json`. A host loads the JSON itself and
+ * Conformance runner for `vectors/v2.json`. A host loads the JSON itself and
  * passes its own crypto ports, so the same file checks this package and each
  * host's adapters (for example an HMAC port that keeps `K_ns` in a closure).
  * The runner does no I/O.
@@ -41,7 +41,7 @@ import { controlHashes, deriveKeyCheck, deriveNs } from "./namespace.js";
 import { streamMasterKeyFromSignature } from "./master-key.js";
 import { afterCommit, runMustBeFull, type NeedsFull } from "./needs-full.js";
 import { decodeEnvelope, encodeEnvelope, frameOfBody } from "./frames.js";
-import { encodeFramePart } from "./part-frames.js";
+import { encodeFramePart, linesOfParts } from "./part-frames.js";
 import { decodePart, encodePart } from "./parts.js";
 import { planBuckets } from "./planner.js";
 import {
@@ -103,8 +103,8 @@ export async function runVectors(
     }
   };
 
-  if (vectors?.format !== "pdpp-stream-sync-vectors" || vectors.version !== 1) {
-    return { checks: 1, failures: ["not a version-1 stream-sync vector file"] };
+  if (vectors?.format !== "pdpp-stream-sync-vectors" || vectors.version !== 2) {
+    return { checks: 1, failures: ["not a version-2 stream-sync vector file"] };
   }
 
   // namespace
@@ -272,6 +272,86 @@ export async function runVectors(
   }
   for (const c of vectors.frames.envelopeErrors) {
     await throws(`decodeEnvelope ${c.why}`, () => decodeEnvelope(utf8(c.text)));
+  }
+
+  // v3 frames (head format 4)
+  for (const c of vectors.framesV3?.cases ?? []) {
+    const body = utf8(canonicalJson(c.record));
+    const envelope = {
+      f: c.f,
+      h: toHex(await ports.sha256(body)),
+      k: await pkHash(ports.sha256, c.record, c.primaryKey),
+      n: body.length,
+      o: c.o,
+      r: c.r,
+    };
+    eq(
+      `v3 envelope ${c.name}`,
+      new TextDecoder().decode(encodeEnvelope(envelope)),
+      c.envelope,
+    );
+    eq(
+      `v3 decodeEnvelope ${c.name}`,
+      decodeEnvelope(utf8(c.envelope), "v3"),
+      envelope,
+    );
+    eq(
+      `v3 frame ${c.name}`,
+      new TextDecoder().decode(frameOfBody(envelope, body)),
+      c.frame,
+    );
+  }
+  if (vectors.framesV3) {
+    const part = vectors.framesV3.part;
+    const framed = vectors.framesV3.cases.map((c: any) => ({
+      k: JSON.parse(c.envelope).k as string,
+      bytes: utf8(c.frame),
+    }));
+    const encoded = await encodeFramePart(ports.sha256, part.prefix, framed);
+    eq(
+      "v3 frame part",
+      encoded && new TextDecoder().decode(encoded.data),
+      part.text,
+    );
+    eq("v3 frame part entry", encoded?.entry, {
+      bytes: part.bytes,
+      count: part.count,
+      hash: part.hash,
+      prefix: part.prefix,
+    });
+    for (const c of vectors.framesV3.envelopeErrors) {
+      await throws(`v3 decodeEnvelope ${c.why}`, () =>
+        decodeEnvelope(utf8(c.text), "v3"),
+      );
+    }
+    for (const c of vectors.framesV3.readCases) {
+      const entry = {
+        bytes: c.part.bytes,
+        count: c.part.count,
+        hash: c.part.hash,
+        prefix: "",
+      };
+      const read = async () => {
+        const lines = [];
+        for await (const line of linesOfParts(
+          ports.sha256,
+          { format: c.headFormat, parts: [entry], primaryKey: c.primaryKey },
+          async () => utf8(c.part.text),
+        )) {
+          lines.push({ o: line.o, r: line.r, f: line.f, v: line.v });
+        }
+        return lines;
+      };
+      if (c.error) await throws(`v3 read ${c.name}`, read);
+      else {
+        try {
+          eq(`v3 read ${c.name}`, await read(), c.expected);
+        } catch (error) {
+          // A wrong hash port fails the part check.
+          eq(`v3 read ${c.name}`, (error as Error).message, "no error");
+        }
+      }
+    }
   }
 
   // merge and parts

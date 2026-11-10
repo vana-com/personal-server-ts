@@ -6,6 +6,8 @@ import {
   decodeHead,
   digestHead,
   encodeHead,
+  framesCarryFirstSeen,
+  HEAD_FORMAT,
   isHeadLive,
   verifyHead,
   writerCompatibility,
@@ -16,7 +18,8 @@ import { int, keccak256, pick, rng } from "./test-support/ports.js";
 const head: Head = {
   complete: true,
   connector: "c",
-  format: 1,
+  format: HEAD_FORMAT,
+  lastDeleteVersion: 0,
   generation: 2,
   keyCheck: "0123456789abcdef",
   ns: "fedcba9876543210",
@@ -60,6 +63,57 @@ function randomHead(random: () => number): Head {
 }
 
 describe("head", () => {
+  it("head-format-4-emitted-and-1-to-4-accepted", () => {
+    expect(HEAD_FORMAT).toBe(4);
+    const encoded = encodeHead(head);
+    expect(JSON.parse(new TextDecoder().decode(encoded)).format).toBe(4);
+
+    // Build legacy wire fixtures without the writer, which emits format 4.
+    const legacy = { ...head };
+    delete legacy.lastDeleteVersion;
+    for (const format of [1, 2, 3, 4] as const) {
+      const expected: Head = {
+        ...legacy,
+        format,
+        ...(format >= 3 ? { lastDeleteVersion: 7 } : {}),
+      };
+      const wire = JSON.stringify({
+        complete: expected.complete,
+        connector: expected.connector,
+        format,
+        generation: String(expected.generation),
+        keyCheck: expected.keyCheck,
+        ...(format >= 3 ? { lastDeleteVersion: 7 } : {}),
+        ns: expected.ns,
+        observedAt: expected.observedAt,
+        parts: expected.parts,
+        primaryKey: expected.primaryKey,
+        profile: expected.profile,
+        recordCount: expected.recordCount,
+        stream: expected.stream,
+      });
+      expect(decodeHead(utf8(wire))).toEqual({ kind: "ok", head: expected });
+      // Each format round-trips byte for byte; format 3 is the frozen v1 form.
+      expect(encodeHead(expected)).toEqual(utf8(wire));
+    }
+    expect(() => encodeHead({ ...head, format: 5 as never })).toThrow(
+      InvalidArgumentError,
+    );
+    expect(decodeHead(utf8('{"format":5}'))).toEqual({
+      kind: "unsupported_format",
+      format: 5,
+    });
+  });
+
+  it("framesCarryFirstSeen(format) is true only for format 4 and more", () => {
+    for (const format of [-1, 0, 1, 2, 3]) {
+      expect(framesCarryFirstSeen(format)).toBe(false);
+    }
+    for (const format of [4, 5, 6, Number.MAX_SAFE_INTEGER]) {
+      expect(framesCarryFirstSeen(format)).toBe(true);
+    }
+  });
+
   it("round-trips canonical bytes (property)", () => {
     const random = rng(21);
     for (let i = 0; i < 300; i += 1) {
@@ -114,7 +168,7 @@ describe("head", () => {
     expect(() => encodeHead({ ...head, recordCount: 2 })).toThrow(
       InvalidArgumentError,
     );
-    expect(() => encodeHead({ ...head, format: 3 as 1 })).toThrow(
+    expect(() => encodeHead({ ...head, format: 5 as 4 })).toThrow(
       InvalidArgumentError,
     );
   });

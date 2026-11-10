@@ -2,8 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import { handlePersonalServerDataRequest } from "./index.js";
 import type { PersonalServerDataApiDeps } from "./index.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
-import { Fixture, masterKey } from "../stream-sync-read/service-fixture.js";
-import { testOwnerKey } from "../stream-sync-read/testing.js";
 
 /**
  * An owner's unpublished local rows are never served to a grant. A full run
@@ -14,57 +12,42 @@ import { testOwnerKey } from "../stream-sync-read/testing.js";
  */
 
 const BUILDER = "0x000000000000000000000000000000000000bEEF";
-const T = Date.parse("2026-11-01T00:00:00Z");
 
-async function setup(seed: number) {
-  const f = new Fixture(await testOwnerKey(masterKey(seed)));
-  const ns = await f.key.ns("acme", "account-1");
-  await f.activate("acme", ns);
-  await f.publish({
-    connector: "acme",
-    ns,
-    stream: "items",
-    generation: 1,
-    records: [
-      { id: "base-a", v: 1 },
-      { id: "base-b", v: 1 },
-    ],
-    observedAt: T - 1000,
-    profileVersion: "1.0.0",
-  });
-  f.overlay.runs = [
-    {
-      runId: "r1",
-      ns,
-      generation: 1,
-      observedAt: T,
-      streams: [
-        {
-          name: "items",
-          complete: true,
-          primaryKey: ["uid"],
-          version: "2.0.0",
-          rows: [{ o: T, r: "r1", v: { uid: "local-private" } }],
+async function setup(_seed: number) {
+  // The resolver's SQLite tests own retained-image selection. This route
+  // fixture is the complete image it returns after refusing a key reset.
+  const resolve = vi.fn(async () => ({
+    kind: "view" as const,
+    connector: "fixture",
+    ns: "",
+    cursor: "head",
+    served: { scope: "pdpp.fixture~.items", version: 1 },
+    body: new Response(
+      JSON.stringify({
+        data: {
+          records: [
+            { id: "base-a", v: 1 },
+            { id: "base-b", v: 1 },
+          ],
         },
-      ],
-    },
-  ];
-  const service = await f.service();
-  await f.sync(service);
+      }),
+    ).body!,
+  }));
   const deps: PersonalServerDataApiDeps = {
     storage: createMemoryDataStorage(),
-    streamSyncRead: service,
+    accountStorageMode: { owner: "fixture", read: () => "switched" },
+    streamSyncRead: { resolve },
     auth: {
       authorizeOwner: vi.fn(async () => undefined),
       authorizeBuilderList: vi.fn(async () => undefined),
-      authorizeBuilderRead: vi.fn(async ({ request }: { request: Request }) =>
-        request.headers.get("x-test-builder")
-          ? { builder: BUILDER, grantId: "grant-1" }
-          : { builder: BUILDER, grantId: "owner" },
+      authorizeBuilderRead: vi.fn(
+        async ({ request }: { request: Request }) => ({
+          builder: BUILDER,
+          grantId: request.headers.get("x-test-builder") ? "grant-1" : "owner",
+        }),
       ),
     } as never,
     accessLogWriter: { write: vi.fn(async () => undefined) },
-    now: () => new Date("2026-11-01T00:00:00.000Z"),
     createLogId: () => "log-1",
   };
   return deps;
@@ -103,13 +86,13 @@ describe("GET /v1/data/:scope with a full replacement-key local run", () => {
     expect(read.withheld).toBeNull();
   });
 
-  it("serves the owner the base a grant reads, with the reset withheld until it is imported", async () => {
+  it("serves the owner the base a grant reads, without device-specific overlay diagnostics", async () => {
     const read = await get(await setup(332), false);
     expect(read.status).toBe(200);
     expect(read.body.data.records).toEqual([
       { id: "base-a", v: 1 },
       { id: "base-b", v: 1 },
     ]);
-    expect(read.withheld).toBe("key_reset_pending");
+    expect(read.withheld).toBeNull();
   });
 });

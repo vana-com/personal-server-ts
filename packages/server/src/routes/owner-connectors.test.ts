@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import { ConnectorNotVerifiedError } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import { ConnectorNotVerifiedError } from "@opendatalabs/personal-server-ts-core/localdb";
 import type {
   ConnectionDeletePort,
   StorageModeRead,

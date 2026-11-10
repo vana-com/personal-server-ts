@@ -14,7 +14,7 @@
  *   at the same generation does not reopen legacy storage.
  * - `unswitched`: the Account said Off and has never said On. No expiry.
  * - `unknown`: no answer yet for this owner (a new owner, or another owner).
- *   Reads stay on the legacy path and never wait; legacy writes pause with a
+ *   Reads and legacy writes pause with a
  *   retryable 503 until the first answer. It is never permission to write.
  *
  * Reader presence is never the mode. Whether a stream reader is wired says what
@@ -63,8 +63,9 @@ export function accountStorageModeFor(
 export type StorageSelection =
   /** The account is switched: every read is answered from stream data only. */
   | { readonly kind: "streams" }
-  /** Off, or no answer yet: reads behave as before the switch. */
-  | { readonly kind: "legacy" };
+  /** Explicit Off: reads behave as before the switch. */
+  | { readonly kind: "legacy" }
+  | { readonly kind: "unknown" };
 
 export const ACCOUNT_MODE_UNKNOWN_CODE = "ACCOUNT_MODE_UNKNOWN";
 export const ACCOUNT_MODE_UNKNOWN_STATUS = 503;
@@ -100,13 +101,18 @@ export interface StorageSelectionDeps {
 
 /**
  * The one decision a read makes before it touches any store. Only a switched
- * account reads streams; everything else, including an owner with no answer
- * yet, reads as before. Depends only on the account mode.
+ * account reads streams; only explicit Off reads legacy. Unknown is refused. Depends only on the account mode.
  */
 export function selectAccountStorageMode(
   deps: StorageSelectionDeps,
 ): StorageSelection {
-  return deps.accountStorageMode?.read() === "switched"
-    ? { kind: "streams" }
-    : { kind: "legacy" };
+  const mode = deps.accountStorageMode?.read() ?? "unknown";
+  return {
+    kind:
+      mode === "switched"
+        ? "streams"
+        : mode === "unswitched"
+          ? "legacy"
+          : "unknown",
+  };
 }

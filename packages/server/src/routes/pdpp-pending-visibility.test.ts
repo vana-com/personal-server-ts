@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import { expect, it } from "vitest";
@@ -83,6 +84,7 @@ it("serves owner pending markers while the same grant sees nothing until promoti
       },
     });
     const deps = {
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       auth,
       declarations,
@@ -353,6 +355,7 @@ it("keeps the visible row's instance when rebinding a multi-connection page curs
       },
     ]);
     const app = pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       auth,
       declarations,
@@ -524,6 +527,7 @@ it("uses local journal values for conflicted owners and hides the whole connecti
       },
     ]);
     const deps = {
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       auth,
       declarations,

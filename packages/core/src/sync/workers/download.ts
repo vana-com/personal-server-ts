@@ -122,25 +122,7 @@ export interface DownloadWorkerDeps {
    * the newer one.
    */
   pdppImporter?: PdppImporter;
-  /**
-   * Stream-sync read side (`streamSync.read`). Physical stream-sync rows
-   * (`pdpp.<c>~<ns>…`) are never legacy data points: with or without this
-   * port they are routed away from every legacy step. With it, each listed
-   * page's physical rows are handed over before the cursor moves, and the
-   * import runs after the page; an import failure never blocks the cursor.
-   */
-  streamSync?: StreamSyncListingObserver;
-}
-
-export interface StreamSyncListingObserver {
-  /** The next listing must start at the registry's first page. */
-  wantsListingFromStart(): boolean;
-  /** Persist a listed page's physical rows. Throws if they were not persisted. */
-  observe(
-    rows: readonly DataPointFeedRecord[],
-    page: { readonly fromStart: boolean; readonly lastPage: boolean },
-  ): Promise<void>;
-  importPending(): Promise<void>;
+  localSync?: { apply(): Promise<void> };
 }
 
 export interface DeletionReconcileResult {
@@ -187,6 +169,10 @@ export async function downloadScopes(
   scopes: string[],
   options: DownloadScopesOptions = {},
 ): Promise<DownloadResult[]> {
+  if (deps.localSync) {
+    await deps.localSync.apply();
+    return [];
+  }
   const feed = deps.dataPointFeed ?? feedFromGatewayClient(deps.gateway);
   const results: DownloadResult[] = [];
 
@@ -649,6 +635,10 @@ export async function downloadAll(
   deps: DownloadWorkerDeps,
   options: DownloadAllOptions = {},
 ): Promise<DownloadResult[]> {
+  if (deps.localSync) {
+    await deps.localSync.apply();
+    return [];
+  }
   const { gateway, cursor, serverOwner, logger } = deps;
   const syncRunId = createSyncRunId();
 
@@ -656,9 +646,7 @@ export async function downloadAll(
 
   // 1. Read cursor (opaque pagination cursor persisted across runs)
   const lastCursor =
-    options.fullReconcile ||
-    repairSummary.missingEnvelopeEntries > 0 ||
-    deps.streamSync?.wantsListingFromStart()
+    options.fullReconcile || repairSummary.missingEnvelopeEntries > 0
       ? null
       : await cursor.read();
   if (options.fullReconcile) {
@@ -696,22 +684,6 @@ export async function downloadAll(
     (dataPoint) => !isPhysicalScope(dataPoint.scope),
   );
   let failed = false;
-  if (deps.streamSync) {
-    try {
-      await deps.streamSync.observe(
-        listed.dataPoints.filter((dataPoint) =>
-          isPhysicalScope(dataPoint.scope),
-        ),
-        { fromStart: lastCursor === null, lastPage: nextCursor === null },
-      );
-    } catch (err) {
-      logger.error(
-        { error: (err as Error).message },
-        "Failed to record stream-sync registry rows",
-      );
-      failed = true;
-    }
-  }
 
   // Feed the read-side deletion memory before any per-record work so a
   // tombstone is refused by reads even if its local reconcile below fails.
@@ -850,17 +822,6 @@ export async function downloadAll(
       { nextCursor },
       "Download cursor not advanced because one or more data points failed",
     );
-  }
-
-  if (deps.streamSync) {
-    try {
-      await deps.streamSync.importPending();
-    } catch (err) {
-      logger.warn(
-        { error: (err as Error).message },
-        "Stream-sync import did not complete; retried next cycle",
-      );
-    }
   }
 
   return results;

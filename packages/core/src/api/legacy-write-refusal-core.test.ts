@@ -162,13 +162,13 @@ describe("the core refuses legacy writes after owner authorization", () => {
     });
   });
 
-  it("lets an old client abort an upload it opened before the switch", async () => {
+  it("refuses an old client abort after the account switches", async () => {
     const f = fixture({ value: true });
     const response = await handlePersonalServerDataRequest(
       request("DELETE", `/${scope}/uploads/u1`),
       f.deps,
     );
-    expect(response.status).toBe(204);
-    expect(f.uploads.abort).toHaveBeenCalledOnce();
+    expect(response.status).toBe(426);
+    expect(f.uploads.abort).not.toHaveBeenCalled();
   });
 });

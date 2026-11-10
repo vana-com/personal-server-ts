@@ -1,3 +1,4 @@
+import type { LocalHistory } from "@opendatalabs/personal-server-ts-core/localdb";
 import { parseScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
@@ -112,6 +113,7 @@ export interface DataRouteDeps {
   legacyScopeView?: LegacyScopeViewPort;
   /** See `PersonalServerDataApiDeps.streamSyncRead`. Absent = reads as before. */
   streamSyncRead?: StreamSyncReadPort;
+  history?: LocalHistory;
   /**
    * The account's storage mode: the one answer the legacy write gate and the
    * read selector share. A switched account refuses legacy writes with 426;
@@ -437,6 +439,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
         streamSyncRead: deps.streamSyncRead,
+        history: deps.history,
         accountStorageMode: deps.accountStorageMode,
         auth,
         accessLogWriter: deps.accessLogWriter,

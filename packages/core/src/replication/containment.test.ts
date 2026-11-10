@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode } from "../test-utils/account-mode.js";
 import { expect, it, vi } from "vitest";
 import {
   ScopeSchema,
@@ -113,6 +114,7 @@ it("omits internal transport addresses from the actual inventory API even with w
   const response = await handlePersonalServerDataRequest(
     new Request("http://ps/"),
     {
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       storage,
       auth: {
         authorizeOwner: vi.fn(),
@@ -142,6 +144,7 @@ it("rejects ordinary owner writes into a reserved replica address before indexin
       body: JSON.stringify({ poison: true }),
     }),
     {
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       storage,
       auth: {
         authorizeOwner: vi.fn(),

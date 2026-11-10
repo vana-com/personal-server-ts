@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode } from "../test-utils/account-mode.js";
 /**
  * The read side of demand-driven recompute: GET /v1/data/:scope is what
  * pays for a stale derivative, and only when the caller was allowed to read
@@ -83,6 +84,7 @@ function harness(
     debounceMs: 0,
   });
   const deps: PersonalServerDataApiDeps = {
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
     storage,
     auth: {
       async authorizeOwner(request) {

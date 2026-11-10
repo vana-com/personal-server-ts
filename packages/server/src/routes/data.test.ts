@@ -2081,6 +2081,7 @@ describe("GET /v1/data/:scope", () => {
 
   it("reads a stream-sync stream by a connector key the SDK scope rule rejects", async () => {
     const app = createApp({
+      accountStorageMode: fixedOwnedAccountStorageMode("switched"),
       streamSyncRead: { resolve: async () => ({ kind: "pass" }) },
     });
     // `pdpp.github-browser~.repositories` is the identity-less physical
@@ -2267,7 +2268,10 @@ describe("GET /v1/data/:scope", () => {
       ["after a delay", 20],
     ] as const) {
       it(`aborts the connection when the body fails ${label}`, async () => {
-        const app = createApp({ streamSyncRead: failingView(failAfterMs) });
+        const app = createApp({
+          accountStorageMode: fixedOwnedAccountStorageMode("switched"),
+          streamSyncRead: failingView(failAfterMs),
+        });
         const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
         try {
           const res = await readOverHttp(app, "instagram.posts");
@@ -3562,7 +3566,11 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     );
     vi.stubGlobal("fetch", gatewayFetch);
 
-    const app = createX402App({ streamSyncRead });
+    let mode: "unswitched" | "switched" = "unswitched";
+    const app = createX402App({
+      streamSyncRead,
+      accountStorageMode: { owner: ownerForX402.address, read: () => mode },
+    });
     expect(
       (await ingest(app, "instagram.saved_items", { records })).status,
     ).toBe(201);
@@ -3609,6 +3617,7 @@ describe("X402 payment on GET /v1/data/:scope", () => {
       };
     };
     const legacy = await payFor("instagram.saved_items");
+    mode = "switched";
     const view = await payFor("instagram.posts");
 
     const comparable = (accept: Record<string, any>) => ({

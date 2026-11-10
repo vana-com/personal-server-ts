@@ -21,9 +21,10 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
     `CREATE TABLE records (
   connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
   record_key TEXT NOT NULL, stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL,
-  body TEXT NOT NULL, body_sha256 TEXT NOT NULL,
+  body TEXT NOT NULL, body_sha256 TEXT NOT NULL, first_o INTEGER,
   PRIMARY KEY (connection_id, stream, pk_hash)) WITHOUT ROWID;`,
     `CREATE INDEX records_by_key ON records(connection_id, stream, record_key);`,
+    `CREATE INDEX records_by_first ON records(first_o) WHERE first_o IS NOT NULL;`,
     `CREATE TABLE record_changes (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL, record_key TEXT NOT NULL,

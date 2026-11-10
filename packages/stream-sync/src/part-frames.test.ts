@@ -9,9 +9,11 @@ import {
   encodeFramePart,
   encodePiece,
   framesOfParts,
+  linesOfParts,
   type FrameBytes,
 } from "./part-frames.js";
 import type { EncodedPart } from "./parts.js";
+import { HEAD_FORMAT } from "./head.js";
 
 const sha256: Sha256 = async (d) =>
   new Uint8Array(createHash("sha256").update(d).digest());
@@ -22,13 +24,15 @@ function frame(
   body: Uint8Array,
   o = 1,
   r = "run",
+  f?: number | null,
 ): FrameBytes & { envelope: Envelope } {
-  const envelope = {
+  const envelope: Envelope = {
     h: toHex(createHash("sha256").update(body).digest()),
     k,
     n: body.length,
     o,
     r,
+    ...(f === undefined ? {} : { f }),
   };
   const head = encodeEnvelope(envelope);
   const bytes = new Uint8Array(head.length + 1 + body.length + 1);
@@ -200,7 +204,65 @@ describe("FrameReducer", () => {
     tight.add({ k: key(2), o: 1, r: "a", size: 600, held: true, ref: "b" });
     expect(tight.finish(1000).kind).toBe("split");
   });
+});
 
+describe("v3 parts", () => {
+  const body = utf8('{"a":1}');
+  const lines = async (
+    format: 1 | 2 | 3 | 4,
+    encoded: EncodedPart[],
+  ): Promise<unknown[]> => {
+    const out: unknown[] = [];
+    for await (const line of linesOfParts(
+      sha256,
+      {
+        format,
+        parts: encoded.map((e) => e.entry),
+        primaryKey: ["id"],
+      },
+      loader(encoded),
+    )) {
+      out.push(line);
+    }
+    return out;
+  };
+
+  it("head-4-parses-and-rejects-v2-frames", async () => {
+    const v3 = await partsOf([frame(key(1), body, 5, "run-1", 3)]);
+    expect(await lines(4, v3)).toEqual([
+      { o: 5, r: "run-1", v: { a: 1 }, f: 3 },
+    ]);
+    const v2 = await partsOf([frame(key(1), body, 5, "run-1")]);
+    await expect(lines(4, v2)).rejects.toThrow(InvalidPartError);
+    // The other direction: a v3 frame in a format 3 head.
+    await expect(lines(3, v3)).rejects.toThrow(InvalidPartError);
+  });
+
+  it("head-3-reads-unknown-first-seen", async () => {
+    const v2 = await partsOf([frame(key(1), body, 5, "run-1")]);
+    for (const format of [2, 3] as const) {
+      expect(await lines(format, v2)).toEqual([
+        { o: 5, r: "run-1", v: { a: 1 }, f: null },
+      ]);
+    }
+  });
+
+  it("a published format 4 head reads back through the v3 reader", async () => {
+    const big = utf8('{"big":"' + "z".repeat(5000) + '"}');
+    const frames = [
+      frame(key(1), body, 5, "run-1", 3),
+      frame(key(2), big, 6, "run-2", null),
+      frame(key(3), body, 7, "run-3", 0),
+    ];
+    const encoded = await partsOf(frames);
+    expect(HEAD_FORMAT).toBe(4);
+    const read = await lines(HEAD_FORMAT, encoded);
+    expect(read).toEqual([
+      { o: 5, r: "run-1", v: { a: 1 }, f: 3 },
+      { o: 6, r: "run-2", v: JSON.parse(Buffer.from(big).toString()), f: null },
+      { o: 7, r: "run-3", v: { a: 1 }, f: 0 },
+    ]);
+  });
   void FRAME_PIECE_BYTES;
   void hex;
 });

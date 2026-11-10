@@ -3,8 +3,11 @@ import { describe, expect, it } from "vitest";
 import { toHex, utf8, type Sha256StreamFactory } from "./bytes.js";
 import {
   decodeEnvelope,
+  ENVELOPE_LIMIT_BYTES,
   encodeEnvelope,
   frameChunks,
+  frameBytes,
+  frameOfBody,
   measureBody,
   readFrames,
   type Envelope,
@@ -236,5 +239,117 @@ describe("frames", () => {
       for await (const p of f.body) max = Math.max(max, p.length);
     }
     expect(max).toBeLessThanOrEqual(65_536);
+  });
+});
+
+describe("frame v3", () => {
+  it("frame-v3-round-trip", async () => {
+    const body = utf8('{"id":1}');
+    const v2 = await envelopeFor([body]);
+    const v2Bytes = encodeEnvelope(v2);
+    expect(decodeEnvelope(v2Bytes)).toEqual(v2);
+    expect(JSON.parse(new TextDecoder().decode(v2Bytes))).not.toHaveProperty(
+      "f",
+    );
+
+    for (const f of [0, -1, Number.MAX_SAFE_INTEGER, null]) {
+      const envelope: Envelope = { ...v2, f };
+      const encoded = encodeEnvelope(envelope);
+      const expected = `{"f":${f},"h":"${envelope.h}","k":"${K}","n":${body.length},"o":5,"r":"run-1"}`;
+      expect(new TextDecoder().decode(encoded)).toBe(expected);
+      expect(decodeEnvelope(encoded, "v3")).toEqual(envelope);
+
+      const wire = frameOfBody(envelope, body);
+      expect(wire.length).toBe(frameBytes(envelope));
+      expect(wire.subarray(0, encoded.length)).toEqual(encoded);
+      const seen: { envelope: Envelope; body: Uint8Array }[] = [];
+      for await (const frame of readFrames(
+        asyncOf(resplit(wire, 3)),
+        makeSha256,
+        "v3",
+      )) {
+        seen.push({
+          envelope: frame.envelope,
+          body: join(await collect(frame.body)),
+        });
+      }
+      expect(seen).toEqual([{ envelope, body }]);
+    }
+
+    const bounded: Envelope = { ...v2, f: null, r: "" };
+    const overhead = encodeEnvelope({ ...bounded, r: "x" }).length - 1;
+    const atLimit = {
+      ...bounded,
+      r: "x".repeat(ENVELOPE_LIMIT_BYTES - overhead),
+    };
+    const atLimitBytes = encodeEnvelope(atLimit);
+    expect(atLimitBytes.length).toBe(ENVELOPE_LIMIT_BYTES);
+    expect(decodeEnvelope(atLimitBytes, "v3")).toEqual(atLimit);
+    const overLimit = { ...atLimit, r: atLimit.r + "x" };
+    expect(() => encodeEnvelope(overLimit)).toThrow(InvalidPartError);
+    const overLimitBytes = utf8(
+      new TextDecoder().decode(atLimitBytes).replace(/"}$/, 'x"}'),
+    );
+    expect(() => decodeEnvelope(overLimitBytes, "v3")).toThrow(
+      InvalidPartError,
+    );
+    const oversizedWire = join([
+      overLimitBytes,
+      Uint8Array.of(10),
+      body,
+      Uint8Array.of(10),
+    ]);
+    await expect(
+      readFrames(asyncOf(resplit(oversizedWire, 3)), makeSha256, "v3").next(),
+    ).rejects.toThrow(InvalidPartError);
+  });
+
+  it("frame versions never mix", async () => {
+    const body = utf8('{"id":1}');
+    const v2 = await envelopeFor([body]);
+    const v3: Envelope = { ...v2, f: null };
+    const v2Bytes = encodeEnvelope(v2);
+    const v3Bytes = encodeEnvelope(v3);
+    expect(() => decodeEnvelope(v3Bytes)).toThrow(InvalidPartError);
+    expect(() => decodeEnvelope(v3Bytes, "v2")).toThrow(InvalidPartError);
+    expect(() => decodeEnvelope(v2Bytes, "v3")).toThrow(InvalidPartError);
+    await expect(
+      readFrames(asyncOf([frameOfBody(v3, body)]), makeSha256).next(),
+    ).rejects.toThrow(InvalidPartError);
+    await expect(
+      readFrames(asyncOf([frameOfBody(v2, body)]), makeSha256, "v3").next(),
+    ).rejects.toThrow(InvalidPartError);
+
+    const text = new TextDecoder().decode(v3Bytes);
+    for (const invalid of [
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+      "1",
+      false,
+      {},
+      [],
+    ]) {
+      const invalidBytes = utf8(
+        text.replace('"f":null', `"f":${JSON.stringify(invalid)}`),
+      );
+      expect(() => decodeEnvelope(invalidBytes, "v3")).toThrow(
+        InvalidPartError,
+      );
+      expect(() => encodeEnvelope({ ...v2, f: invalid } as Envelope)).toThrow(
+        InvalidPartError,
+      );
+    }
+    expect(() =>
+      encodeEnvelope({ ...v2, f: undefined } as unknown as Envelope),
+    ).toThrow(InvalidPartError);
+    for (const malformed of [
+      text.replace('"f":null,', ""),
+      text.replace('"f":null', '"f":null,"extra":0'),
+      text.replace('"f":null,', '"f":null, '),
+    ]) {
+      expect(() => decodeEnvelope(utf8(malformed), "v3")).toThrow(
+        InvalidPartError,
+      );
+    }
   });
 });

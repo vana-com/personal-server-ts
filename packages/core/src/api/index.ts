@@ -1,5 +1,8 @@
+import type { LocalListing } from "../localdb/listing.js";
+import type { OlderVersions } from "../localdb/older-versions.js";
 import { isOwnAppRead } from "../payment/own-app.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
+import { HISTORY_PAGE_LIMIT, type LocalHistory } from "../localdb/history.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
   DataDeletedError,
@@ -106,13 +109,14 @@ import type {
 import type { PreparedScopeUploadBatch } from "./scope-upload-batches.js";
 import {
   accountModeUnknownResponse,
-  selectAccountStorageMode,
   type OwnedAccountStorageMode,
 } from "./account-storage-mode.js";
 import {
   LegacyWriteRefusedError,
   refuseLegacyWrite,
+  updateRequiredResponse,
 } from "./legacy-write-gate.js";
+import type { StorageModeRead } from "./owner-connector-delete.js";
 import { switchedDeleteRefusalResponse } from "./switched-delete-refusal.js";
 import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import {
@@ -358,6 +362,8 @@ export interface StreamSyncReadPort {
   resolve(input: ResolveInput): Promise<ReadDecision>;
   /** Per-stream counts and open import problems, for owner diagnostics. */
   status?(): StreamSyncReadStatus;
+  listScopes?: LocalListing["listScopes"];
+  olderVersions?: OlderVersions;
 }
 
 export interface PersonalServerDataApiDeps {
@@ -367,7 +373,14 @@ export interface PersonalServerDataApiDeps {
    * legacy write is refused with a retryable 503.
    */
   accountStorageMode?: OwnedAccountStorageMode;
+  /**
+   * The account's storage mode, sampled once per data request. Switched
+   * accounts read stream data from the database. Absent preserves the legacy path.
+   */
+  accountMode?: StorageModeRead;
   additions?: DurableAdditionsService;
+  /** Database history, constructed by the host for this owner and network. */
+  history?: LocalHistory;
   storage: DataStoragePort;
   /**
    * Latest bodies of connector scopes the owner collects into the canonical
@@ -759,6 +772,14 @@ function errorResponse(
   );
 }
 
+type AccountMode = ReturnType<StorageModeRead["read"]>;
+
+function legacyMutationRefusal(mode: AccountMode): Response | undefined {
+  if (mode === "unknown") return accountModeUnknownResponse();
+  if (mode === "switched") return updateRequiredResponse();
+  return undefined;
+}
+
 /** The response for a stream-sync decision that serves nothing; `null` otherwise. */
 function streamSyncRefusal(decision: ReadDecision): Response | null {
   switch (decision.kind) {
@@ -822,7 +843,7 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
  * Without a check the stream passes through unchanged.
  */
 async function validateStreamBody<
-  D extends Extract<ReadDecision, { kind: "view" | "local_pending" }>,
+  D extends Extract<ReadDecision, { kind: "view" }>,
 >(decision: D, inProcess: PersonalServerInProcessRead | undefined): Promise<D> {
   if (!inProcess?.validateBody) return decision;
   const text = await new Response(decision.body).text();
@@ -853,7 +874,7 @@ async function serveStreamSyncView(
     authResult: Awaited<
       ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
     >;
-    decision: Extract<ReadDecision, { kind: "view" | "local_pending" }>;
+    decision: Extract<ReadDecision, { kind: "view" }>;
     paymentResponseHeader: string | undefined;
     inProcess: PersonalServerInProcessRead | undefined;
   },
@@ -924,13 +945,6 @@ async function serveStreamSyncView(
       "Transfer-Encoding": "chunked",
       "X-Vana-Data-Source": "stream-sync",
       "X-Stream-Sync-Cursor": decision.cursor,
-      // An owner-only view built on this device; it may be partial.
-      ...(decision.kind === "local_pending"
-        ? {
-            "X-Stream-Sync-Origin": "local-pending",
-            "X-Stream-Sync-Complete": String(decision.complete),
-          }
-        : {}),
       // Owner only: the service attaches this to no other audience.
       ...(decision.withheld?.length
         ? { "X-Stream-Sync-Withheld": withheldReasons(decision.withheld) }
@@ -2285,6 +2299,9 @@ async function handleScopeUploadRequest(
   deps: PersonalServerDataApiDeps,
   parts: string[],
   prepared?: PreparedScopeUploadBatch,
+  mode: AccountMode = deps.accountStorageMode?.read() ??
+    deps.accountMode?.read(deps.serverOwner) ??
+    "unknown",
 ): Promise<Response> {
   const route = (() => {
     if (parts.length === 2) return { kind: "begin", method: "POST" } as const;
@@ -2300,8 +2317,9 @@ async function handleScopeUploadRequest(
   }
   if (request.method !== route.method) return methodNotAllowed();
   await deps.auth.authorizeOwner(request);
-  // An upload is owner-only: no delegated builder writes through it, so there
-  // is no exemption. Aborting only discards staged data and stays allowed.
+  // A switched account cannot mutate legacy import state, including abort.
+  const modeRefusal = legacyMutationRefusal(mode);
+  if (modeRefusal) return modeRefusal;
   if (route.kind !== "abort") {
     const refusal = refuseLegacyWrite(deps.accountStorageMode);
     if (refusal) return refusal;
@@ -2481,6 +2499,23 @@ export async function handlePersonalServerScopeUploadAppend(
   });
 }
 
+function historyInteger(
+  value: string | null,
+  fallback: number,
+  name: string,
+): number {
+  if (value === null) return fallback;
+  const parsed = /^\d+$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new ProtocolError(
+      400,
+      "invalid_request",
+      name + " must be a safe non-negative decimal integer",
+    );
+  }
+  return parsed;
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -2496,6 +2531,11 @@ export async function handlePersonalServerDataRequest(
     requestId: crypto.randomUUID(),
   };
   return withApiErrors(async () => {
+    // Freeze the routing decision before consulting any data source.
+    const mode =
+      deps.accountStorageMode?.read() ??
+      deps.accountMode?.read(deps.serverOwner) ??
+      "unknown";
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
 
@@ -2505,7 +2545,7 @@ export async function handlePersonalServerDataRequest(
     // before; it is recorded with every error this request logs.
     if (request.method === "GET") {
       logContext.detail = {
-        storageSelection: selectAccountStorageMode(deps).kind,
+        storageSelection: mode,
       };
     }
 
@@ -2514,6 +2554,30 @@ export async function handlePersonalServerDataRequest(
       const listAuth = await deps.auth.authorizeBuilderList(request, {
         grantId: selectedGrantId(request, url),
       });
+      if (mode === "unknown") return accountModeUnknownResponse();
+      if (mode === "switched") {
+        if (!deps.streamSyncRead?.listScopes)
+          return errorResponse(
+            503,
+            "STREAM_LIST_UNAVAILABLE",
+            "Stream scope listing is not available",
+          );
+        const scopes = await deps.streamSyncRead.listScopes({
+          canRead: (scope) =>
+            !isSystemScope(scope) &&
+            (!listAuth || listAuthCovers(listAuth, scope)),
+        });
+        const prefix = url.searchParams.get("scopePrefix") ?? "";
+        const filtered = scopes.filter((row) => row.scope.startsWith(prefix));
+        const offset = normalizeLimit(url.searchParams.get("offset"), 0);
+        const limit = normalizeLimit(url.searchParams.get("limit"), 20);
+        return jsonResponse({
+          scopes: filtered.slice(offset, offset + limit),
+          total: filtered.length,
+          limit,
+          offset,
+        });
+      }
       // One budget for every stored and canonical-only scope, not per row.
       const deletionDeadlineAtMs = Date.now() + 250;
       const result = await listDataScopesContract({
@@ -2541,32 +2605,71 @@ export async function handlePersonalServerDataRequest(
       if (request.method !== "GET") return methodNotAllowed();
       // The counts span every scope, so only the owner may read them.
       await deps.auth.authorizeOwner(request);
+      if (mode === "unknown") return accountModeUnknownResponse();
+
       const daysRaw = url.searchParams.get("days");
-      const result = await summarizeDataAdditionsContract({
-        additions: deps.additions,
-        storage: deps.storage,
-        isVisible: discoveryVisibility(deps),
-        timezone: url.searchParams.get("tz") ?? "UTC",
-        // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
-        days:
-          daysRaw === null
-            ? 7
-            : /^\d{1,3}$/.test(daysRaw)
-              ? Number(daysRaw)
-              : Number.NaN,
-        now: (deps.now ?? (() => new Date()))(),
-      });
-      if ("ok" in result) return contractErrorResponse(result);
-      return jsonResponse(result);
+      const timezone = url.searchParams.get("tz") ?? "UTC";
+      // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
+      const days =
+        daysRaw === null
+          ? 7
+          : /^\d{1,3}$/.test(daysRaw)
+            ? Number(daysRaw)
+            : Number.NaN;
+      if (!Number.isInteger(days) || days < 1 || days > 31) {
+        if (mode === "unswitched")
+          return contractErrorResponse({
+            ok: false,
+            status: 400,
+            body: {
+              error: "INVALID_QUERY",
+              message: "days must be an integer between 1 and 31",
+            },
+          });
+        return errorResponse(
+          400,
+          "invalid_request",
+          "days must be an integer from 1 to 31",
+        );
+      }
+      if (mode === "unswitched") {
+        // Preserve the legacy query error contract before any storage access.
+        const result = await summarizeDataAdditionsContract({
+          additions: deps.additions,
+          storage: deps.storage,
+          isVisible: discoveryVisibility(deps),
+          timezone,
+          days,
+          now: (deps.now ?? (() => new Date()))(),
+        });
+        if ("ok" in result) return contractErrorResponse(result);
+        return jsonResponse(result);
+      }
+      if (!deps.history) {
+        return errorResponse(
+          503,
+          "STREAM_SYNC_UNAVAILABLE",
+          "Local history is not available on this server.",
+        );
+      }
+      return jsonResponse(await deps.history.additions({ timezone, days }));
     }
 
     const parts = pathname.split("/").filter(Boolean);
     if (parts.length >= 2 && parts[1] === "uploads") {
-      return await handleScopeUploadRequest(request, deps, parts);
+      return await handleScopeUploadRequest(
+        request,
+        deps,
+        parts,
+        undefined,
+        mode,
+      );
     }
     if (parts.length === 3 && parts[1] === "imports") {
       if (request.method !== "PUT") return methodNotAllowed();
       await deps.auth.authorizeOwner(request);
+      const modeRefusal = legacyMutationRefusal(mode);
+      if (modeRefusal) return modeRefusal;
       // Owner-only: a builder has no durable-import route, so a signature
       // header earns no exemption here. This runs on the normalized path, so
       // `/imports/<op>/` and repeated slashes land here too.
@@ -2670,11 +2773,65 @@ export async function handlePersonalServerDataRequest(
           requestedScope: scopeResult.scope,
         });
       }
+      if (mode !== "switched" && mode !== "unswitched") {
+        return accountModeUnknownResponse();
+      }
+      const limit = Math.min(
+        historyInteger(url.searchParams.get("limit"), 20, "limit"),
+        HISTORY_PAGE_LIMIT,
+      );
+      const offset = historyInteger(
+        url.searchParams.get("offset"),
+        0,
+        "offset",
+      );
+      const cursorRaw = url.searchParams.get("cursor");
+      const cursor =
+        cursorRaw === null ? undefined : historyInteger(cursorRaw, 0, "cursor");
+      if (
+        limit < 1 ||
+        cursor === 0 ||
+        (mode === "switched" && offset !== 0) ||
+        (mode === "unswitched" && cursor !== undefined)
+      ) {
+        return errorResponse(
+          400,
+          "invalid_request",
+          "Use a positive limit; switched history continues with cursor, not offset",
+        );
+      }
+      if (mode === "switched") {
+        if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+        if (!deps.history) {
+          return errorResponse(
+            503,
+            "STREAM_SYNC_UNAVAILABLE",
+            "Local history is not available on this server.",
+          );
+        }
+        const result = await deps.history.versions({
+          scope: scopeResult.scope,
+          limit,
+          offset,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        if (!result.ok) {
+          if (result.reason === "deleted") {
+            throw new DataDeletedError({ scope: scopeResult.scope });
+          }
+          return errorResponse(
+            404,
+            "NOT_FOUND",
+            `Scope "${scopeResult.scope}" has no history`,
+          );
+        }
+        return jsonResponse(result.value);
+      }
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),
-        limit: normalizeLimit(url.searchParams.get("limit"), 20),
-        offset: normalizeLimit(url.searchParams.get("offset"), 0),
+        limit,
+        offset,
         isVisible: discoveryVisibility(deps),
       });
       if (!result.ok) return contractErrorResponse(result);
@@ -2725,6 +2882,60 @@ export async function handlePersonalServerDataRequest(
         scope: scopeResult.scope,
         grantId: selectedGrantId(request, url),
       });
+      if (mode !== "switched" && mode !== "unswitched") {
+        return accountModeUnknownResponse();
+      }
+      if (mode === "switched") {
+        resolveLineageGrantView(authResult);
+        const historyVersion =
+          version === undefined ? undefined : Number(version);
+        if (
+          historyVersion !== undefined &&
+          !Number.isSafeInteger(historyVersion)
+        ) {
+          return errorResponse(
+            400,
+            "INVALID_VERSION",
+            "version must be a safe positive decimal integer",
+          );
+        }
+        if (!deps.history) {
+          return errorResponse(
+            503,
+            "STREAM_SYNC_UNAVAILABLE",
+            "Local history is not available on this server.",
+          );
+        }
+        const result = await deps.history.lineage({
+          scope: scopeResult.scope,
+          version: historyVersion,
+        });
+        if (!result.ok) {
+          if (result.reason === "deleted") {
+            throw new DataDeletedError({ scope: scopeResult.scope });
+          }
+          return errorResponse(
+            404,
+            "NOT_FOUND",
+            `Scope "${scopeResult.scope}" has no history`,
+          );
+        }
+        await deps.accessLogWriter.write({
+          logId: deps.createLogId?.() ?? crypto.randomUUID(),
+          grantId: authResult?.grantId ?? "owner",
+          builder: authResult?.builder ?? "unknown",
+          action: "lineage",
+          scope: scopeResult.scope,
+          timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+          ipAddress:
+            request.headers.get("x-forwarded-for") ??
+            request.headers.get("x-real-ip") ??
+            "unknown",
+          userAgent: request.headers.get("user-agent") ?? "unknown",
+        });
+        const { proof, ...data } = result.value;
+        return jsonResponse({ data, proof });
+      }
       if (!deps.serverOwner) {
         throw new ServerNotConfiguredError({
           reason: "serverOwner is required to resolve the data point id",
@@ -2794,11 +3005,11 @@ export async function handlePersonalServerDataRequest(
     logContext.route = `${request.method} ${options.basePath ?? "/v1/data"}/:scope`;
 
     if (request.method === "GET") {
-      // Stream names are read names only while stream-sync reads are on; with
-      // the flag off every read answers as before.
-      const scopeResult = deps.streamSyncRead
-        ? parseDataReadScopeContract(scopeParam)
-        : parseDataScopeContract(scopeParam);
+      // The account mode chooses the read surface, not reader availability.
+      const scopeResult =
+        mode === "switched"
+          ? parseDataReadScopeContract(scopeParam)
+          : parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       logContext.detail = {
         ...logContext.detail,
@@ -2818,21 +3029,26 @@ export async function handlePersonalServerDataRequest(
           'view must be "stored" or absent',
         );
       }
-      const selectedEntry = deps.storage.findEntry({
-        scope: scopeResult.scope,
-        fileId: fileIdParam,
-        at: atParam,
-      });
+      const selectedEntry =
+        mode === "unswitched"
+          ? deps.storage.findEntry({
+              scope: scopeResult.scope,
+              fileId: fileIdParam,
+              at: atParam,
+            })
+          : undefined;
       // Holds the base64-encoded gateway payForOperation response body when
       // X402 succeeds — emitted on the final read response as X-PAYMENT-RESPONSE.
       let paymentResponseHeader: string | undefined;
       const grantId = selectedGrantId(request, url);
       const wantsRawContent = url.searchParams.get("content") === "raw";
       const inProcess = options.inProcess;
-      // An in-process paid read settles last. Auth checks the grant without
-      // charging here; `settle` runs the charging auth once the read is known
-      // to be served, after every refusal. HTTP never takes this path.
-      const settleLast = inProcess !== undefined && !inProcess.metadataOnly;
+      // Check the grant without charging before resolving a switched read.
+      // Settlement receives the exact served head, never a legacy lookup.
+      // In-process legacy reads also settle only after their refusal gates.
+      const settleLast =
+        (mode === "switched" || inProcess !== undefined) &&
+        !inProcess?.metadataOnly;
       const authInput = {
         request,
         scope: scopeResult.scope,
@@ -2842,10 +3058,11 @@ export async function handlePersonalServerDataRequest(
       };
       const authResult = await deps.auth.authorizeBuilderRead({
         ...authInput,
-        ...(inProcess?.metadataOnly || settleLast
+        ...(mode === "unknown" || inProcess?.metadataOnly || settleLast
           ? { metadataOnly: true }
           : {}),
       });
+      if (mode === "unknown") return accountModeUnknownResponse();
       // `served` is the stream head the read decision chose and validated.
       // It is passed through as is: settlement never looks the head up again.
       const settle = async (
@@ -2862,29 +3079,120 @@ export async function handlePersonalServerDataRequest(
       // `?view=stored` asks for the stored file's body, so it never reads the
       // canonical view either.
       const latest =
-        fileIdParam === undefined && atParam === undefined && view === null
+        mode === "unswitched" &&
+        fileIdParam === undefined &&
+        atParam === undefined &&
+        view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
-      // Stream-sync (§2.10): the one eligibility rule decides between the
-      // stream view, the existing body and a refusal. Explicit versions stay
-      // legacy history, but a deleted connector serves nothing at all.
+      // On serves database stream views or a refusal, including historical
+      // selectors. Only Off reaches the separate legacy body path below.
       const latestRead =
         fileIdParam === undefined && atParam === undefined && view === null;
-      // What only the owner is told when the existing path answers a stream
-      // read: local runs the writer will not publish.
-      let ownerNotes: OwnerNotes | undefined;
-      if (deps.streamSyncRead) {
-        const decision = await deps.streamSyncRead.resolve({
-          scope: scopeResult.scope,
-          connection: latestRead ? url.searchParams.get("connection") : null,
-          cursor: latestRead ? url.searchParams.get("cursor") : null,
-          legacyFile: Boolean(selectedEntry) || latest?.kind === "canonical",
-          isOwnerView: isOwnerView(authResult),
-        });
+      if (mode === "switched") {
+        let ownerNotes: OwnerNotes | undefined;
+        if (!deps.streamSyncRead) {
+          return errorResponse(
+            503,
+            "STREAM_READ_UNAVAILABLE",
+            "Stream reads are not available",
+          );
+        }
+        let historical: ReadDecision | undefined;
+        if (!latestRead) {
+          let selected:
+            { scope: string; version: number; observedAt: number } | undefined;
+          const body = await deps.streamSyncRead.olderVersions?.read(
+            scopeResult.scope,
+            { fileId: fileIdParam, at: atParam },
+            (head) => {
+              selected = head;
+            },
+          );
+          if (!body || body === "gone")
+            return errorResponse(
+              410,
+              "STREAM_HISTORY_UNAVAILABLE",
+              "Older versions are not available",
+            );
+          if (!selected) {
+            await body.cancel();
+            return errorResponse(
+              503,
+              "STREAM_READ_UNAVAILABLE",
+              "The selected stream head is unavailable",
+            );
+          }
+          const head = selected;
+          const encoder = new TextEncoder();
+          const reader = body.getReader();
+          let started = false;
+          const wrapped = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              if (!started) {
+                started = true;
+                controller.enqueue(
+                  encoder.encode(
+                    JSON.stringify({
+                      version: "1.0",
+                      scope: scopeResult.scope,
+                      collectedAt: new Date(head.observedAt).toISOString(),
+                    }).slice(0, -1) + ',"data":{"records":',
+                  ),
+                );
+                return;
+              }
+              try {
+                const chunk = await reader.read();
+                if (chunk.done) {
+                  controller.enqueue(encoder.encode("}}"));
+                  controller.close();
+                  reader.releaseLock();
+                } else controller.enqueue(chunk.value);
+              } catch (error) {
+                controller.error(error);
+                reader.releaseLock();
+              }
+            },
+            async cancel(reason) {
+              try {
+                await reader.cancel(reason);
+              } finally {
+                reader.releaseLock();
+              }
+            },
+          });
+          historical = {
+            kind: "view",
+            connector: "",
+            ns: "",
+            cursor: "",
+            served: head,
+            body: wrapped,
+          };
+        }
+        const decision =
+          historical ??
+          (await deps.streamSyncRead.resolve({
+            scope: scopeResult.scope,
+            connection: latestRead ? url.searchParams.get("connection") : null,
+            cursor: latestRead ? url.searchParams.get("cursor") : null,
+            legacyFile: false,
+            isOwnerView: isOwnerView(authResult),
+          }));
+        if (decision.kind === "local_pending") {
+          await decision.body.cancel();
+          return errorResponse(
+            404,
+            "STREAM_DATA_NOT_FOUND",
+            "No complete stream data is available for this scope",
+            decision,
+          );
+        }
         if (decision.kind === "unavailable" && decision.reason === "deleted") {
           throw new DataDeletedError({ scope: scopeResult.scope });
         }
-        if (latestRead) {
+        if (latestRead || historical) {
           if (
             decision.kind === "pass" ||
             decision.kind === "legacy" ||
@@ -2894,11 +3202,7 @@ export async function handlePersonalServerDataRequest(
           }
           const refusal = streamSyncRefusal(decision);
           if (refusal) return refusal;
-          if (
-            inProcess &&
-            wantsRawContent &&
-            (decision.kind === "view" || decision.kind === "local_pending")
-          ) {
+          if (inProcess && wantsRawContent && decision.kind === "view") {
             // A view has no raw bytes. Refused before any charge, log or
             // fulfilment, so a caller never pays for a read it cannot use.
             await decision.body.cancel();
@@ -2910,21 +3214,6 @@ export async function handlePersonalServerDataRequest(
               },
               { status: 409 },
             );
-          }
-          if (decision.kind === "local_pending") {
-            // Owner-only and unregistered: nothing to bill and no version to
-            // bind in an access record.
-            const checked = await validateStreamBody(decision, inProcess);
-            await settle();
-            notifyDataRead(deps, { scope: scopeResult.scope });
-            return serveStreamSyncView(deps, request, {
-              scope: scopeResult.scope,
-              grantId,
-              authResult,
-              decision: checked,
-              paymentResponseHeader: undefined,
-              inProcess,
-            });
           }
           if (decision.kind === "view") {
             notifyDataRead(deps, { scope: scopeResult.scope });
@@ -2976,6 +3265,12 @@ export async function handlePersonalServerDataRequest(
             });
           }
         }
+        return errorResponse(
+          404,
+          "STREAM_DATA_NOT_FOUND",
+          "No complete stream data is available for this scope",
+          ownerNotes,
+        );
       }
 
       // The deletion history comes with the body the view chose, never from
@@ -3039,7 +3334,7 @@ export async function handlePersonalServerDataRequest(
         paymentResponseHeader = paid.paymentResponseHeader;
       }
 
-      const headers = ownerNoteHeaders(ownerNotes);
+      const headers: Record<string, string> = {};
       if (ownApp) headers["X-Vana-Payment-Exemption"] = "own-app";
       headers["X-Vana-Data-Source"] =
         latest?.kind === "canonical" ? "canonical" : "legacy";
@@ -3067,7 +3362,7 @@ export async function handlePersonalServerDataRequest(
             // 404, when that is why.
             await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
           }
-          return contractErrorResponse(result, ownerNotes);
+          return contractErrorResponse(result);
         }
         envelope = result.envelope;
         servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
@@ -3097,12 +3392,9 @@ export async function handlePersonalServerDataRequest(
       }
       // A JSON read is checked against the body it will serve, before it pays.
       if (inProcess && !wantsRawContent) {
-        await inProcess.validateBody?.(
-          withOwnerBody(servedEnvelope, ownerNotes),
-          {
-            fromStreamView: false,
-          },
-        );
+        await inProcess.validateBody?.(servedEnvelope, {
+          fromStreamView: false,
+        });
       }
       // Every refusal above has run; only a read that will be served pays.
       await settle();
@@ -3192,7 +3484,7 @@ export async function handlePersonalServerDataRequest(
         });
         return response;
       }
-      const response = jsonResponse(withOwnerBody(servedEnvelope, ownerNotes), {
+      const response = jsonResponse(servedEnvelope, {
         headers,
       });
       reportReadFulfillment();
@@ -3212,12 +3504,10 @@ export async function handlePersonalServerDataRequest(
       } else {
         await deps.auth.authorizeOwner(request);
       }
-      // A switched account refuses every legacy write here, verified builder
-      // or not: a delegated write is a legacy write too.
-      const refusal = refuseLegacyWrite(deps.accountStorageMode);
-      if (refusal) {
+      const modeRefusal = legacyMutationRefusal(mode);
+      if (modeRefusal) {
         await writeAuth?.releaseProof?.();
-        return refusal;
+        return modeRefusal;
       }
       // `?supersede=legacy`: once this write commits, delete the scope's
       // older legacy-form versions (see supersedeLegacyVersions). It deletes
@@ -3501,12 +3791,22 @@ export async function handlePersonalServerDataRequest(
 
     if (request.method === "DELETE") {
       await deps.auth.authorizeOwner(request);
-      // A switched account's stream rows are the data: a legacy scope delete
-      // would leave them readable, so it is refused before any change (409,
-      // point to the connection delete). An unanswered account is 503.
-      const mode = deps.accountStorageMode?.read() ?? "unknown";
-      if (mode === "switched") return switchedDeleteRefusalResponse();
+      // A data set is not a connection, and mapping one to streams needs the
+      // bindings (C2). Once the account is switched the connection delete is
+      // the way to erase data, so this refuses every client, one that declares
+      // stream sync included.
       if (mode === "unknown") return accountModeUnknownResponse();
+      if (mode === "switched") {
+        const control = /^pdpp\.[^.~]+~[0-9a-f]{16}$/.test(scopeParam);
+        if (!control) return switchedDeleteRefusalResponse();
+        const response = errorResponse(
+          409,
+          "STREAM_SYNC_CONTROL_SCOPE",
+          "Delete the connection instead of an individual data scope",
+        );
+        response.headers.set("cache-control", "no-store");
+        return response;
+      }
       const cascade = url.searchParams.get("cascade");
       if (cascade !== null && cascade !== "lineage") {
         throw new InvalidCascadeError({ cascade });

@@ -1,9 +1,12 @@
+import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 /**
  * Sync routes — endpoints for triggering and monitoring the sync engine.
  * All endpoints require owner authentication.
  */
 
+import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import { Hono } from "hono";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { Logger } from "pino";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import {
@@ -23,6 +26,12 @@ export interface SyncRouteDeps {
   accessToken?: string;
   tokenStore?: TokenStore;
   syncManager: SyncManager | null; // null when sync disabled
+  localSync?: LocalSync | (() => Promise<LocalSync>);
+  accountStorageMode?: OwnedAccountStorageMode;
+  /** Resolve a file selector without reading its body until its connection synced. */
+  localFile?: (
+    id: string,
+  ) => Promise<{ connectionId: string; read: () => Promise<Response> } | null>;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
@@ -36,6 +45,51 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     devToken: deps.devToken,
     accessToken: deps.accessToken,
     tokenStore: deps.tokenStore,
+  });
+
+  const local = async () => {
+    const mode = deps.accountStorageMode?.read();
+    if (mode === "unknown")
+      throw new ProtocolError(
+        503,
+        "ACCOUNT_MODE_UNKNOWN",
+        "Waiting for the account storage mode",
+      );
+    if (!deps.localSync)
+      throw new ProtocolError(
+        503,
+        "STREAM_READ_UNAVAILABLE",
+        "Stream sync is unavailable",
+      );
+    return typeof deps.localSync === "function"
+      ? deps.localSync()
+      : deps.localSync;
+  };
+  const legacy = () =>
+    deps.accountStorageMode
+      ? deps.accountStorageMode.read() === "unswitched"
+      : !deps.localSync;
+  app.post("/trigger", async (c, next) => {
+    if (legacy()) return next();
+    await auth.authorizeOwner(c.req.raw);
+    await (await local()).cycle();
+    return c.json({ status: "started", message: "Sync triggered" }, 202);
+  });
+  app.get("/status", async (c, next) => {
+    if (legacy()) return next();
+    await auth.authorizeOwner(c.req.raw);
+    return c.json(await (await local()).listing.status());
+  });
+  app.post("/file/:id", async (c, next) => {
+    if (legacy()) return next();
+    await auth.authorizeOwner(c.req.raw);
+    const file = await deps.localFile?.(c.req.param("id"));
+    if (!file)
+      return c.json({ error: { errorCode: "STREAM_DATA_NOT_FOUND" } }, 404);
+    const result = await (await local()).syncConnection(file.connectionId);
+    if (result?.error)
+      return c.json({ error: { errorCode: "STREAM_READ_UNAVAILABLE" } }, 503);
+    return file.read();
   });
 
   app.all("*", (c) =>

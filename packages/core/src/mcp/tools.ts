@@ -2203,9 +2203,12 @@ function memoryWriteError(err: unknown, scope: string): McpToolResult {
         error:
           err.status === 401 || err.status === 403
             ? "unauthorized"
-            : err.status === 412
-              ? "write_conflict"
-              : "write_failed",
+            : err.status === 409 &&
+                detail.errorCode === "STREAM_SYNC_WRITE_UNAVAILABLE"
+              ? "write_unavailable"
+              : err.status === 412
+                ? "write_conflict"
+                : "write_failed",
         status: err.status,
         scope,
         ...(detail.errorCode ? { errorCode: detail.errorCode } : {}),

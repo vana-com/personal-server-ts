@@ -185,6 +185,7 @@ it("preserves the readable baseline through an authenticated transition, incompl
     );
   const transition = create();
   const app = pdppInstanceBindingRoutes({
+    accountStorageMode: { owner: "0xowner", read: () => "unswitched" },
     store,
     ownerSubjectId: "0xowner",
     configuredMethods: new Map([[instance, ["anthropic"]]]),

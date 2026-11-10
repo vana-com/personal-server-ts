@@ -1,4 +1,9 @@
 import Database from "better-sqlite3";
+import {
+  createRecordQuery,
+  type SqlDriver,
+  type SqlValue,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import { describe, it, expect, vi } from "vitest";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import {
@@ -35,6 +40,375 @@ const declarations = createStreamDeclarationRegistry([
     requiredFields: ["id"],
   },
 ]);
+
+describe("PS-2 D.8 local record routes", () => {
+  it("reads keys and stamps through RecordQuery, expires old changes, and refuses switched writes", async () => {
+    const db = new Database(":memory:");
+    try {
+      db.exec(`
+        CREATE TABLE records (
+          connection_id TEXT, stream TEXT, record_key TEXT, pk_hash TEXT,
+          body TEXT, stamp_o INTEGER
+        );
+        CREATE TABLE record_changes (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          connection_id TEXT, stream TEXT, record_key TEXT, pk_hash TEXT, op TEXT
+        );
+      `);
+      const stamp = Date.parse("2026-09-02T00:00:00Z");
+      const insert = db.prepare(
+        "INSERT INTO records VALUES (?, 'playlists', ?, ?, ?, ?)",
+      );
+      for (const [key, time] of [
+        ["b", stamp],
+        ["a", stamp + 1000],
+        ["c", stamp - 1000],
+      ] as const) {
+        insert.run(
+          "inst_1",
+          key,
+          key,
+          JSON.stringify({ id: key, name: key, private_field: "hidden" }),
+          time,
+        );
+        db.prepare(
+          "INSERT INTO record_changes(connection_id, stream, record_key, pk_hash, op) VALUES (?, 'playlists', ?, ?, 'upsert')",
+        ).run("inst_1", key, key);
+      }
+      const driver: SqlDriver = {
+        info: { sqliteVersion: "3.22.0", host: "node", persistent: false },
+        async query<R extends Record<string, SqlValue>>(
+          sql: string,
+          params: readonly SqlValue[] = [],
+        ) {
+          return db.prepare(sql).all(...params) as R[];
+        },
+        async batch(statements) {
+          return db.transaction(() => ({
+            changes: statements.map(
+              ({ sql, params = [] }) => db.prepare(sql).run(...params).changes,
+            ),
+          }))();
+        },
+        async close() {
+          db.close();
+        },
+      };
+      const recordQuery = createRecordQuery(driver);
+      const listRecords = vi.spyOn(recordQuery, "listRecords");
+      const getRecord = vi.spyOn(recordQuery, "getRecord");
+      const changesSince = vi.spyOn(recordQuery, "changesSince");
+      const store = createMemoryRecordStore();
+      const legacy = [
+        "listRecords",
+        "getRecord",
+        "changesSince",
+        "ingestBatch",
+      ] as const;
+      const legacyCalls = legacy.map((name) => vi.spyOn(store, name));
+      const replaceStream = vi.fn();
+      let mode: "switched" | "unswitched" | "unknown" = "switched";
+      const readMode = vi.fn(() => mode);
+      const deps: Partial<PdppRecordsRouteDeps> = {
+        store,
+        recordQuery,
+        accountStorageMode: { owner: "sub_1", read: readMode },
+        bindingStore: {
+          getInstanceBinding: () => ({ sourceId: "src_1", deletedAt: null }),
+          storeBlobBytesForInstance: vi.fn(),
+          replaceStream,
+        },
+      };
+      const tokens: Record<string, PdppTokenContext> = {
+        owner: {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+        client: {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant(),
+        },
+      };
+      const { app } = buildApp(tokens, deps);
+      const headers = { Authorization: "Bearer owner" };
+      const path = "/streams/playlists/records";
+
+      const first = await app.request(path + "?limit=2", { headers });
+      expect(first.status).toBe(200);
+      const firstBody = await first.json();
+      expect(firstBody.data.map((row: { id: string }) => row.id)).toEqual([
+        "a",
+        "b",
+      ]);
+      expect(
+        firstBody.data.map((row: { emitted_at: string }) => row.emitted_at),
+      ).toEqual([
+        new Date(stamp + 1000).toISOString(),
+        new Date(stamp).toISOString(),
+      ]);
+      expect(firstBody.next_cursor).toBe("b");
+      expect(firstBody.has_more).toBe(true);
+      expect(listRecords).toHaveBeenCalledWith({
+        connectionId: "inst_1",
+        stream: "playlists",
+        cursor: undefined,
+        limit: 2,
+      });
+      expect(readMode).toHaveBeenCalledTimes(1);
+      const second = await app.request(path + "?limit=2&cursor=b", { headers });
+      expect(
+        (await second.json()).data.map((row: { id: string }) => row.id),
+      ).toEqual(["c"]);
+
+      const single = await app.request(path + "/a", { headers });
+      expect(single.status).toBe(200);
+      expect((await single.json()).emitted_at).toBe(
+        new Date(stamp + 1000).toISOString(),
+      );
+      expect(getRecord).toHaveBeenCalledWith({
+        connectionId: "inst_1",
+        stream: "playlists",
+        recordKey: "a",
+      });
+      expect((await app.request(path + "/missing", { headers })).status).toBe(
+        404,
+      );
+
+      const changed = await app.request(path + "?changes_since=0&limit=2", {
+        headers,
+      });
+      const changeBody = await changed.json();
+      expect(changed.status).toBe(200);
+      expect(changeBody.data.map((row: { id: string }) => row.id)).toEqual([
+        "b",
+        "a",
+      ]);
+      expect(changeBody.data[1].emitted_at).toBe(
+        new Date(stamp + 1000).toISOString(),
+      );
+      expect(changeBody.next_cursor).toBe("2");
+      expect(changeBody.next_changes_since).toBe("2");
+      expect(changesSince).toHaveBeenCalledWith({
+        connectionId: "inst_1",
+        stream: "playlists",
+        cursor: 0,
+        limit: 2,
+      });
+      const rest = await app.request(path + "?changes_since=0&cursor=2", {
+        headers,
+      });
+      expect(
+        (await rest.json()).data.map((row: { id: string }) => row.id),
+      ).toEqual(["c"]);
+      db.prepare(
+        "INSERT INTO record_changes(connection_id, stream, record_key, pk_hash, op) VALUES ('inst_1', 'playlists', 'removed', 'removed', 'remove')",
+      ).run();
+      const removal = await app.request(path + "?changes_since=3", { headers });
+      const removed = (await removal.json()).data[0];
+      expect(removed.id).toBe("removed");
+      expect(removed.deleted).toBe(true);
+      expect(removed.emitted_at).toBeNull();
+      for (const cursor of ["", "-1", "1x", "9007199254740992"]) {
+        const invalid = await app.request(path + "?changes_since=" + cursor, {
+          headers,
+        });
+        expect(invalid.status).toBe(400);
+        expect((await invalid.json()).error.code).toBe("invalid_cursor");
+      }
+      db.prepare("DELETE FROM record_changes WHERE seq <= 2").run();
+      const expired = await app.request(path + "?changes_since=0", { headers });
+      expect(expired.status).toBe(410);
+      expect((await expired.json()).error.code).toBe("cursor_expired");
+
+      // Both routes refuse before parsing an invalid body or consulting storage.
+      for (const route of ["ingest", "replace"]) {
+        for (const header of [undefined, "1"]) {
+          const refused = await app.request(path + "/" + route, {
+            method: "POST",
+            headers: {
+              ...headers,
+              ...(header && { "vana-stream-sync-client": header }),
+            },
+            body: "not json",
+          });
+          expect(refused.status).toBe(426);
+          expect((await refused.json()).errorCode).toBe("update_required");
+          expect(refused.headers.get("Request-Id")).toMatch(/^req_/);
+        }
+      }
+      for (const call of legacyCalls) expect(call).not.toHaveBeenCalled();
+      expect(replaceStream).not.toHaveBeenCalled();
+
+      const clientHeaders = { Authorization: "Bearer client" };
+      // Grant listing now needs the same frozen-snapshot port production supplies.
+      // The base app deliberately omits it to keep testing unavailable history below.
+      const clientListing = buildApp(tokens, {
+        ...deps,
+        recordHistory: async () => ({
+          data: [
+            {
+              instance: "inst_1",
+              stream: "playlists",
+              recordKey: "a",
+              data: { id: "a", name: "a", private_field: "hidden" },
+              version: 1,
+              emittedAt: new Date(stamp + 1000).toISOString(),
+              deleted: false,
+            },
+          ],
+          hasMore: false,
+        }),
+      }).app;
+      const client = await clientListing.request(path, {
+        headers: clientHeaders,
+      });
+      expect(client.status).toBe(200);
+      expect(Object.keys((await client.json()).data[0].data).sort()).toEqual([
+        "id",
+        "name",
+      ]);
+      const clientSingle = await app.request(path + "/a?fields=id", {
+        headers: clientHeaders,
+      });
+      expect(Object.keys((await clientSingle.json()).data)).toEqual(["id"]);
+      const clientChanges = await app.request(path + "?changes_since=2", {
+        headers: clientHeaders,
+      });
+      expect(clientChanges.status).toBe(503);
+
+      // Identical keys in distinct connections survive a one-row page boundary.
+      insert.run(
+        "inst_2",
+        "a",
+        "a",
+        JSON.stringify({ id: "a", name: "other" }),
+        stamp,
+      );
+      const multi = buildApp(
+        {
+          owner: { ...tokens.owner, instanceIds: ["inst_1", "inst_2"] },
+        },
+        { ...deps, instancesForSubject: () => ["inst_1", "inst_2"] },
+      ).app;
+      const multiFirst = await multi.request(path + "?limit=1", { headers });
+      const multiBody = await multiFirst.json();
+      expect(multiBody.data[0].id).toBe("a");
+      const multiNext = await multi.request(
+        path + "?limit=1&cursor=" + encodeURIComponent(multiBody.next_cursor),
+        { headers },
+      );
+      expect((await multiNext.json()).data[0].id).toBe("a");
+
+      // Presence of a query is not the account mode; neither legacy state uses it.
+      for (const state of ["unknown", "unswitched"] as const) {
+        mode = state;
+        listRecords.mockClear();
+        const legacyRead = await app.request(path, { headers });
+        expect(legacyRead.status).toBe(state === "unknown" ? 503 : 200);
+        expect(listRecords).not.toHaveBeenCalled();
+      }
+      mode = "unknown";
+      const paused = await app.request(path + "/ingest", {
+        method: "POST",
+        headers,
+        body: "not json",
+      });
+      expect(paused.status).toBe(503);
+      mode = "switched";
+      const missingQuery = buildApp(tokens, {
+        ...deps,
+        recordQuery: undefined,
+      }).app;
+      const missing = await missingQuery.request(path, { headers });
+      expect(missing.status).toBe(503);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("grant-safe database change history", () => {
+  it("passes authorized fields and both-horizon visibility to the history port and only projects the response", async () => {
+    const history = vi.fn(
+      async (
+        _stream: string,
+        options: Parameters<
+          NonNullable<PdppRecordsRouteDeps["recordHistory"]>
+        >[1],
+      ) => {
+        expect(options.instanceIds).toEqual(["inst_1"]);
+        expect(options.fields).toEqual(["id", "name"]);
+        const row = {
+          instance: "inst_1",
+          stream: "playlists",
+          recordKey: "allowed",
+          data: {
+            id: "allowed",
+            name: "safe",
+            captured_at: "2026-02-01T00:00:00Z",
+            private_field: "hidden",
+          },
+          version: 1,
+          emittedAt: "2026-02-01T00:00:00Z",
+          deleted: false as const,
+        };
+        expect(options.isVisible?.(row)).toBe(true);
+        expect(
+          options.isVisible?.({
+            ...row,
+            data: { ...row.data, captured_at: "2025-02-01T00:00:00Z" },
+          }),
+        ).toBe(false);
+        return {
+          data: [row],
+          hasMore: false,
+          nextChangesSince: "opaque-history-horizon",
+        };
+      },
+    );
+    const grant = clientGrant({
+      time_constraint: { field: "captured_at", since: "2026-01-01T00:00:00Z" },
+    });
+    const query = {
+      listRecords: vi.fn(),
+      getRecord: vi.fn(),
+      changesSince: vi.fn(),
+      streamRecords: vi.fn(),
+    } as never;
+    const store = createMemoryRecordStore();
+    const legacy = vi.spyOn(store, "changesSince");
+    const { app } = buildApp(
+      {
+        client: {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant,
+        },
+      },
+      {
+        store,
+        recordQuery: query,
+        recordHistory: history,
+        accountStorageMode: { owner: "sub_1", read: () => "switched" },
+      },
+    );
+    const response = await app.request(
+      "/streams/playlists/records?changes_since=opaque-prior-horizon",
+      { headers: { Authorization: "Bearer client" } },
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.data[0].data).toEqual({ id: "allowed", name: "safe" });
+    expect(body.next_changes_since).toBe("opaque-history-horizon");
+    expect(history).toHaveBeenCalledTimes(1);
+    expect(legacy).not.toHaveBeenCalled();
+  });
+});
 
 describe("pdpp records route body caps", () => {
   it("sets record and blob ingest request caps to 512 MiB", () => {
@@ -78,6 +452,7 @@ function buildApp(
       auth,
       declarations,
       ownerSubjectId: "sub_1",
+      accountStorageMode: { owner: "sub_1", read: () => "unswitched" },
       instancesForSubject: () => ["inst_1"],
       ...deps,
     }),

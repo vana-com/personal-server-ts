@@ -1,8 +1,7 @@
 /**
  * The MCP read and the HTTP data read serve the same stream-sync view.
  *
- * Real: the stream-sync read service (core `Fixture`: real publish, heads,
- * parts, import and view), the data route, the MCP route and its in-process
+ * Real: the SQLite composition (heads, parts, apply and resolver), the data route, the MCP route and its in-process
  * read client, the connection store and grant checks. Stubbed: the gateway
  * (grant lookup only) and the access log, as in the existing route tests.
  */
@@ -18,12 +17,10 @@ import {
   createMcpConnection,
   type McpConnectionStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
-import { testOwnerKey } from "@opendatalabs/personal-server-ts-core/stream-sync-read/testing";
 import {
   fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
-  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type {
   GatewayClient,
@@ -31,10 +28,7 @@ import type {
 } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/api";
-import {
-  Fixture,
-  masterKey,
-} from "../../../core/src/stream-sync-read/service-fixture.js";
+import { databaseReadFixture } from "../localdb/read-fixture.test-utils.js";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { dataRoutes } from "./data.js";
@@ -112,16 +106,10 @@ function accessLog(): AccessLogWriter {
  * and its `post_likes` row, read through the real service.
  */
 async function streamView(): Promise<StreamSyncReadPort> {
-  const fx = new Fixture(await testOwnerKey(masterKey(31)));
-  fx.overlay.connector = "meta";
-  const ns = await fx.key.ns("meta", "account-1");
-  await fx.activate("meta", ns);
-  await fx.publish({
-    connector: "meta",
-    ns,
-    stream: "posts",
-    generation: 1,
-    records: [
+  const { remote, local } = await databaseReadFixture("meta");
+  await remote.head(
+    "posts",
+    [
       {
         id: "p1",
         media_url: "https://media.test/p1.jpg",
@@ -130,23 +118,22 @@ async function streamView(): Promise<StreamSyncReadPort> {
         taken_at: "2026-11-01T00:00:00Z",
       },
     ],
-    primaryKey: ["id"],
-    complete: true,
-  });
-  await fx.publish({
-    connector: "meta",
-    ns,
-    stream: "post_likes",
-    generation: 1,
-    records: [
-      { post_id: "p1", liker_ordinal: 0, user_id: "u1", username: "liker" },
-    ],
-    primaryKey: ["post_id", "liker_ordinal"],
-    complete: true,
-  });
-  const service = await fx.service();
-  await fx.sync(service);
-  return service;
+    { profile: { key: "meta", version: "1" } },
+  );
+  await remote.head(
+    "post_likes",
+    [{ post_id: "p1", liker_ordinal: 0, user_id: "u1", username: "liker" }],
+    {
+      profile: { key: "meta", version: "1" },
+      primaryKey: ["post_id", "liker_ordinal"],
+    },
+  );
+  await local.apply();
+  return {
+    resolve: (input) => local.resolver.resolve(input),
+    listScopes: (input) => local.listing.listScopes(input),
+    olderVersions: local.olderVersions,
+  };
 }
 
 /** Every `caption` string in a parsed read payload, in order. */
@@ -193,12 +180,31 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
   let http: Hono;
   let mcp: Hono;
   let token: string;
+  let mode: "switched" | "unswitched";
 
   beforeEach(async () => {
+    mode = "switched";
     dataDir = await mkdtemp(join(tmpdir(), "mcp-stream-sync-read-"));
     const indexManager = createIndexManager(initializeDatabase(":memory:"));
     store = createInMemoryMcpConnectionStore();
-    const view = await streamView();
+    const view = Object.assign(await streamView(), {
+      listScopes: async ({
+        canRead,
+      }: {
+        canRead: (scope: string) => boolean | Promise<boolean>;
+      }) =>
+        (await canRead(SCOPE))
+          ? [
+              {
+                scope: SCOPE,
+                connector: "fixture",
+                ns: "",
+                records: 1,
+                updatedAt: Date.parse("2026-11-01T00:00:00Z"),
+              },
+            ]
+          : [],
+    });
     const created = await createMcpConnection(
       { displayName: "Claude" },
       { store, publicOrigin: SERVER_ORIGIN },
@@ -208,7 +214,7 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
     const hierarchyOptions = { dataDir };
 
     http = dataRoutes({
-      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      accountStorageMode: { owner: ownerWallet.address, read: () => mode },
       legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
@@ -238,6 +244,7 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
         connectionStore: store,
         indexManager,
         hierarchyOptions,
+        accountStorageMode: { owner: ownerWallet.address, read: () => mode },
         streamSyncRead: view,
         oauthApprovalUrl: "https://app-dev.vana.org/mcp/connect/claude",
         localApprovalPort: LOOPBACK_PORT,
@@ -350,11 +357,13 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
       uri: `/${SCOPE}`,
       body: new TextEncoder().encode(bodyText),
     });
+    mode = "unswitched";
     const ingest = await http.request(`/${SCOPE}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: auth },
       body: bodyText,
     });
+    mode = "switched";
     expect(ingest.ok).toBe(true);
   }
 
@@ -370,11 +379,13 @@ describe("MCP and HTTP reads serve the same stream-sync view", () => {
       uri: `/${SCOPE}`,
       body: new TextEncoder().encode(bodyText),
     });
+    mode = "unswitched";
     const ingest = await http.request(`/${SCOPE}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: auth },
       body: bodyText,
     });
+    mode = "switched";
     expect(ingest.ok).toBe(true);
 
     const httpCaptions = captionsIn(await httpRead());

@@ -1,3 +1,4 @@
+import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
 /**
  * Proves `createIndexedDbPsLiteRuntime` composes its identity/config/sync/auth
  * over INJECTED persistence ports (the Mobile native path) instead of the
@@ -9,12 +10,15 @@ import {
   createSwitchedIndexedDbPsLiteRuntime,
   createUnswitchedIndexedDbPsLiteRuntime,
 } from "./test-support/unswitched-runtime.js";
-import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import { IDBFactory } from "fake-indexeddb";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
-import { createIndexedDbStreamSyncFiles } from "./stream-sync-files.js";
+import {
+  createMemoryStreamSyncRegistry,
+  createMemoryStreamSyncBlobs,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
 import {
@@ -274,15 +278,10 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
     const resolve = vi.fn((d: string) =>
       d === digest ? { connector: "c", version: "1", streams: [] } : null,
     );
-    const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
+    const context = await createSwitchedIndexedDbPsLiteRuntime(
       options({
         streamSyncDeclarations: resolve,
-        streamSyncFiles: () =>
-          createIndexedDbStreamSyncFiles({
-            dbName: "intake-files",
-            factory: new IDBFactory(),
-            keyRange: IDBKeyRange,
-          }),
+        localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
         configDefaults: {
           gateway: { url: "https://gateway.local" },
           sync: { enabled: true },
@@ -290,15 +289,18 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
         },
       }),
     );
+    const { streamSyncIntake } = context;
     expect(streamSyncIntake).not.toBeNull();
     const unknown = `sha256:${"cd".repeat(32)}`;
     await expect(
       begin(ownerAddress, streamSyncIntake!, unknown),
     ).rejects.toMatchObject({ code: "unknown_artifact" });
     expect(resolve).toHaveBeenCalledWith(unknown);
+    await context.syncManager?.stop();
+    await context.closeStreamSync?.();
   });
 
-  it("is null with streamSync.write off", async () => {
+  it("refuses intake while Account is Off regardless of the old write flag", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     const { streamSyncIntake } = await createUnswitchedIndexedDbPsLiteRuntime(
       options({
@@ -308,7 +310,13 @@ describe("createIndexedDbPsLiteRuntime run intake", () => {
         },
       }),
     );
-    expect(streamSyncIntake).toBeNull();
+    expect(streamSyncIntake).not.toBeNull();
+    await expect(
+      begin(ownerAddress, streamSyncIntake!, digest),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "STREAM_SYNC_NOT_ENABLED",
+    });
   });
 });
 
@@ -331,51 +339,53 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
       }),
     );
     const dbName = `ps-lite-own-reads-${Math.random()}`;
-    const { runtime, streamSyncWriter } =
-      await createSwitchedIndexedDbPsLiteRuntime({
-        streamSyncDeclaredStreams: () => [],
-        ownerAddress,
-        ownerSignature,
-        dbName,
-        storageDbName: `${dbName}-storage`,
-        gateway: createMockPsLiteGateway(),
-        auth: createBearerTokenPsLiteAuth({
-          ownerToken: "owner-token",
-          builderToken: "builder-token",
-        }),
-        active: true,
-        streamSyncFiles: () =>
-          createIndexedDbStreamSyncFiles({
-            dbName: `${dbName}-streams`,
-            factory: new IDBFactory(),
-            keyRange: IDBKeyRange,
-          }),
-        configDefaults: {
-          gateway: { url: "https://gateway.local" },
-          sync: { enabled: true },
-          streamSync: { write: true, read: true },
-        },
-      });
-    const writer = streamSyncWriter!;
-    await writer.refreshControls();
-    await writer.beginRun({
-      runId: "run-1",
+    const context = await createSwitchedIndexedDbPsLiteRuntime({
+      streamSyncDeclaredStreams: () => [],
+      ownerAddress,
+      ownerSignature,
+      dbName,
+      storageDbName: `${dbName}-storage`,
+      gateway: createMockPsLiteGateway(),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+      active: true,
+      localDb: { openDriver: async () => openBetterSqlite3(":memory:") },
+      streamSyncRegistry: createMemoryStreamSyncRegistry(),
+      streamSyncBlobs: createMemoryStreamSyncBlobs(),
+      streamSyncDeclarations: () => ({
+        connector: "acme",
+        version: "1.0.0",
+        streams: [
+          { name: "items", semantics: "mutable_state", primaryKey: ["id"] },
+        ],
+      }),
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: true },
+        streamSync: { write: true, read: true },
+      },
+    });
+    await context.streamSyncIntake!.begin("run-1", {
       connector: "acme",
-      userConnect: false,
+      artifactDigest: "fixture",
+      owner: { address: ownerAddress, leaseId: null },
       observedAt: Date.now(),
-      identity: "none",
-      checkpointUsed: null,
     });
-    await writer.declareStream("run-1", "items", {
-      primaryKey: ["id"],
-      profile: { key: null, version: "1.0.0" },
+    await context.streamSyncIntake!.batch("run-1", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "a", v: 1 } }],
     });
-    await writer.append("run-1", "items", { id: "a", v: 1 });
-    await writer.finishRun("run-1", {
-      checkpointCandidate: { cursor: "run-1" },
+    await context.streamSyncIntake!.end("run-1", {
+      outcome: "succeeded",
+      coveredStreams: ["items"],
+      provenFullStreams: ["items"],
+      lastBatch: 0,
     });
+    await context.localSync!.cycle();
 
-    const read = await runtime.fetch(
+    const read = await context.runtime.fetch(
       new Request("https://ps.local/v1/data/pdpp.acme.items", {
         headers: { Authorization: "Bearer owner-token" },
       }),
@@ -384,6 +394,8 @@ describe("createIndexedDbPsLiteRuntime own-write reads", () => {
     await expect(read.json()).resolves.toMatchObject({
       data: { records: [{ id: "a", v: 1 }] },
     });
+    await context.syncManager?.stop();
+    await context.closeStreamSync?.();
   });
 });
 

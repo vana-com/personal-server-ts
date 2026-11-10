@@ -1,3 +1,4 @@
+import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 /**
  * Stream-sync read counts for the owner (diagnostics).
  *
@@ -15,7 +16,9 @@
  * Only the owner may call it. With `streamSync.read` off the route answers 404.
  */
 
+import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import { Hono } from "hono";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { liveStreamCounts } from "@opendatalabs/personal-server-ts-core/stream-sync-read";
 import type { StreamSyncReadPort } from "@opendatalabs/personal-server-ts-core/api";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
@@ -30,6 +33,8 @@ export interface StreamSyncReadStatusRouteDeps {
   accessToken?: string;
   tokenStore?: TokenStore;
   /** Absent when `streamSync.read` is off: every call answers 404. */
+  localSync?: LocalSync | (() => Promise<LocalSync>);
+  accountStorageMode?: OwnedAccountStorageMode;
   streamSyncRead: StreamSyncReadPort | undefined;
 }
 
@@ -48,7 +53,28 @@ export function streamSyncReadStatusRoutes(
 
   app.get("/", async (c) => {
     await auth.authorizeOwner(c.req.raw);
-    const status = deps.streamSyncRead?.status?.();
+    const mode = deps.accountStorageMode?.read();
+    if (mode === "unknown")
+      throw new ProtocolError(
+        503,
+        "ACCOUNT_MODE_UNKNOWN",
+        "Waiting for the account storage mode",
+      );
+    if (mode === "switched" && !deps.localSync)
+      throw new ProtocolError(
+        503,
+        "STREAM_READ_UNAVAILABLE",
+        "Stream sync is unavailable",
+      );
+    const local =
+      deps.localSync && deps.accountStorageMode?.read() !== "unswitched"
+        ? typeof deps.localSync === "function"
+          ? await deps.localSync()
+          : deps.localSync
+        : undefined;
+    const status = local
+      ? await local.listing.status()
+      : deps.streamSyncRead?.status?.();
     if (!status) {
       // An expected state while a diagnostic polls: answered here, not thrown,
       // so the global error handler does not log a warning per request.
@@ -68,6 +94,9 @@ export function streamSyncReadStatusRoutes(
       listed: status.listed,
       streams,
       issues: status.issues.length,
+      ...(local && {
+        olderVersionReads: local.olderVersions.counts(),
+      }),
     });
   });
 

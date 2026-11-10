@@ -1,3 +1,4 @@
+import type { ConnectionLink } from "@opendatalabs/personal-server-ts-core/localdb";
 /**
  * Boot the PDPP Resource Server for a real Personal Server.
  *
@@ -114,6 +115,7 @@ export function resolveReplication(
 }
 
 export interface PdppRecordsDeps {
+  connectionLink?: ConnectionLink;
   store: PdppRecordStore;
   /** See `AppDeps.pdpp.reads`. */
   reads: PdppReplicaReads;
@@ -394,6 +396,19 @@ export function createPdppRecordsDeps(
   );
 
   return {
+    // Existing installations have one account per verified source. All registered
+    // handles of that source share its identity-less namespace on every device.
+    // Future multi-account registration must supply an explicit namespace here.
+    connectionLink: (instance, stream) => {
+      const binding = store.getInstanceBinding(instance);
+      if (binding.deletedAt !== null || binding.sourceId === null) return null;
+      const source = sources.find(
+        (candidate) => candidate.sourceId === binding.sourceId,
+      );
+      if (!source || !sourceRegistry.get(stream, source.sourceId)) return null;
+      const connector = source.sourceId.split("/").filter(Boolean).at(-1);
+      return connector ? { connector, namespace: "" } : null;
+    },
     store,
     // Without a replica receiver every reader reads the canonical store.
     reads: options.replica?.reads ?? (() => store),

@@ -1,3 +1,4 @@
+import type { PdppTokenContext } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
@@ -15,10 +16,11 @@ import {
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
-type BlobReadStore = Pick<
+export type BlobReadStore = Pick<
   PdppReplicaReadStore,
   "getBlobMeta" | "findBlobReferences" | "getRecord" | "getBlobBytes"
 > & {
+  validate?: () => Promise<boolean>;
   withReadSnapshot?<T>(read: () => T): T;
 };
 export interface PdppBlobsRouteDeps {
@@ -30,6 +32,10 @@ export interface PdppBlobsRouteDeps {
    * a host, in tests: then every token class reads `store`.
    */
   reads?: (reader: ReplicaReader) => BlobReadStore;
+  prepareReads?: (
+    context: PdppTokenContext,
+    blobId: string,
+  ) => Promise<BlobReadStore>;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
@@ -73,6 +79,10 @@ function jsonError(
 
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
+  app.onError((error, c) => {
+    if (error instanceof PdppError) return jsonError(c, error, requestId());
+    throw error;
+  });
   const readsFor = deps.reads ?? (() => deps.store);
 
   /**
@@ -91,7 +101,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         ok: true;
         store: BlobReadStore;
         meta: NonNullable<ReturnType<BlobReadStore["getBlobMeta"]>>;
-        runIfReadable(read: () => void): boolean;
+        runIfReadable(read: () => void): Promise<boolean>;
         readBytes(): Uint8Array | undefined | Promise<Uint8Array | undefined>;
       }
   > {
@@ -142,9 +152,9 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       }
     }
 
-    const store: BlobReadStore = readsFor(
-      context.tokenKind === "owner" ? "owner" : "grant",
-    );
+    const store: BlobReadStore = deps.prepareReads
+      ? await deps.prepareReads(context, blobId)
+      : readsFor(context.tokenKind === "owner" ? "owner" : "grant");
     const authorizedMeta = () => {
       const meta = store.getBlobMeta(blobId);
       if (!meta) return undefined;
@@ -204,7 +214,10 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     };
     const inSnapshot = <T>(read: () => T) =>
       store.withReadSnapshot ? store.withReadSnapshot(read) : read();
-    const meta = inSnapshot(authorizedMeta);
+    const meta =
+      store.validate && !(await store.validate())
+        ? undefined
+        : inSnapshot(authorizedMeta);
     const notFound = () =>
       jsonError(
         c,
@@ -216,12 +229,14 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       ok: true,
       store,
       meta,
-      runIfReadable: (read) =>
-        inSnapshot(() => {
+      runIfReadable: async (read) => {
+        if (store.validate && !(await store.validate())) return false;
+        return inSnapshot(() => {
           if (!authorizedMeta()) return false;
           read();
           return true;
-        }),
+        });
+      },
       readBytes: () => {
         if (!deps.reads && deps.readBlobBytes)
           return authorizedMeta() ? deps.readBlobBytes(blobId) : undefined;
@@ -289,14 +304,14 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     let offset = 0;
     const body = new ReadableStream<Uint8Array>(
       {
-        pull(controller) {
+        async pull(controller) {
           if (offset >= bytes.byteLength) {
             controller.close();
             return;
           }
           const end = Math.min(offset + chunkSize, bytes.byteLength);
           const chunk = bytes.subarray(offset, end);
-          if (!authz.runIfReadable(() => controller.enqueue(chunk))) {
+          if (!(await authz.runIfReadable(() => controller.enqueue(chunk)))) {
             controller.error(new Error("blob visibility changed during read"));
             return;
           }

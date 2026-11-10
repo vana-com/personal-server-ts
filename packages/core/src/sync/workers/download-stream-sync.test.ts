@@ -4,10 +4,6 @@ import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataPointFeedRecord } from "../../ports/index.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
-import { createMemoryStreamSyncReadFiles } from "../../stream-sync-read/memory-files.js";
-import { createStreamSyncReadKeys } from "../../stream-sync-read/keys.js";
-import { masterKey } from "../../stream-sync-read/service-fixture.js";
-import { StreamSyncReadService } from "../../stream-sync-read/service.js";
 import { downloadAll, downloadOne, downloadScopes } from "./download.js";
 
 const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
@@ -123,36 +119,12 @@ describe("download worker routing of stream-sync rows", () => {
     expect(t.download).not.toHaveBeenCalled();
   });
 
-  it("hands every listed physical row to the stream-sync read side before the cursor moves", async () => {
-    const t = deps([
-      ...PHYSICAL,
-      row("instagram.profile", { deletedAt: DELETED_AT }),
-    ]);
-    const service = await StreamSyncReadService.open({
-      files: createMemoryStreamSyncReadFiles(),
-      blobs: { get: async () => null },
-      keys: await createStreamSyncReadKeys(await masterKey(7)),
-      logger: { info() {}, warn() {}, error() {} },
-    });
-    const observe = vi.spyOn(service, "observe");
-    let observedBeforeCursor = false;
-    t.cursor.write.mockImplementation(async () => {
-      observedBeforeCursor = observe.mock.calls.length === 1;
-    });
-    await downloadAll({ ...t.deps, streamSync: service });
-    expect(observe).toHaveBeenCalledWith(PHYSICAL, {
-      fromStart: true,
-      lastPage: false,
-    });
-    expect(observedBeforeCursor).toBe(true);
-    // The legacy row still reaches the legacy deletion memory.
-    expect(t.scopeDeletions.markDeleted).toHaveBeenCalledTimes(1);
-    expect(t.scopeDeletions.markDeleted.mock.calls[0]![0]).toBe(
-      "instagram.profile",
-    );
-    expect(service.status().connections.map((c) => [c.ns, c.control])).toEqual([
-      ["", "foreign"],
-      [NS, "deleted"],
-    ]);
+  it("applies the database download port instead of the legacy feed", async () => {
+    const t = deps(PHYSICAL);
+    const apply = vi.fn(async () => {});
+    await downloadAll({ ...t.deps, localSync: { apply } });
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(t.deps.dataPointFeed.listDataPointsByOwner).not.toHaveBeenCalled();
+    expect(t.download).not.toHaveBeenCalled();
   });
 });
