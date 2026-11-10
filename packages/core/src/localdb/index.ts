@@ -83,3 +83,8 @@ export {
   type RequirementsAnswer,
   type SinceFieldSource,
 } from "./requirements.js";
+
+export {
+  createLinkedRecordQuery,
+  type ConnectionLink,
+} from "./connection-link.js";

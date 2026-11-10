@@ -1,4 +1,8 @@
 import {
+  createLinkedRecordQuery,
+  type ConnectionLink,
+} from "./connection-link.js";
+import {
   RunIntakeError,
   type ResolveArtifact,
   type RunIntake,
@@ -34,6 +38,7 @@ export interface LocalSync {
   readonly resolver: LocalResolver;
   readonly listing: LocalListing;
   readonly query: RecordQuery;
+  recordsFor(link: ConnectionLink): RecordQuery;
   readonly history: LocalHistory;
   readonly olderVersions: OlderVersions;
   readonly blobs: BlobStore;
@@ -168,6 +173,7 @@ export function createLocalSync(
     }),
     listing: createLocalListing(listingDeps, () => olderVersions.counts()),
     query,
+    recordsFor: (link) => createLinkedRecordQuery(deps.db, link),
     history: createLocalHistory(deps, {
       olderVersionReads: options.olderVersionReads,
     }),

@@ -2,6 +2,7 @@ import type {
   LocalSync,
   LocalHistory,
   RecordQuery,
+  ConnectionLink,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ouraRoutes } from "./routes/oura.js";
 import {
@@ -317,6 +318,7 @@ export interface AppDeps {
    * resolution, and stream declarations are mutually required).
    */
   pdpp?: {
+    connectionLink?: ConnectionLink;
     store: PdppRecordStore;
     /**
      * Required reader capability for every canonical-derived response:
@@ -394,15 +396,18 @@ export function createApp(deps: AppDeps): Hono {
           lineage: async (input) => (await localSync()).history.lineage(input),
         }
       : undefined);
+  const linkedQuery = async () => {
+    const local = await localSync!();
+    return local.recordsFor(deps.pdpp?.connectionLink ?? (() => null));
+  };
   const recordQuery: RecordQuery | undefined = localSync
     ? {
-        listRecords: async (input) =>
-          (await localSync()).query.listRecords(input),
-        getRecord: async (input) => (await localSync()).query.getRecord(input),
+        listRecords: async (input) => (await linkedQuery()).listRecords(input),
+        getRecord: async (input) => (await linkedQuery()).getRecord(input),
         changesSince: async (input) =>
-          (await localSync()).query.changesSince(input),
+          (await linkedQuery()).changesSince(input),
         async *streamRecords(connection, stream) {
-          yield* (await localSync()).query.streamRecords(connection, stream);
+          yield* (await linkedQuery()).streamRecords(connection, stream);
         },
       }
     : undefined;
