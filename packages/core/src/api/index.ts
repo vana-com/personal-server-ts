@@ -1901,6 +1901,85 @@ export async function handlePersonalServerScopeUploadAppend(
   });
 }
 
+/**
+ * Receives the grantee label of an authorized data read: the first 12 hex
+ * chars of sha256(lowercased builder address), "owner" for owner reads, or
+ * undefined. This is a pseudonym, not an anonymous id: builders are a small
+ * public set, so anyone holding their addresses can map it back.
+ */
+export type PersonalServerReadGranteeObserver = (
+  granteeRef: Promise<string | undefined>,
+) => void;
+
+// Symbol.for, not a module-local symbol: a bundle that loads two copies of
+// core must still find the observer. Nothing on the wire can set it.
+const READ_GRANTEE_OBSERVER = Symbol.for(
+  "@opendatalabs/personal-server-ts-core/read-grantee-observer",
+);
+
+/**
+ * In-process only: asks the data read handler to report the grantee label
+ * for this exact Request object. Used by the PS-Lite relay for telemetry; the
+ * Node server never attaches one, so no requester can switch it on.
+ */
+export function attachPersonalServerReadGranteeObserver(
+  request: Request,
+  observer: PersonalServerReadGranteeObserver,
+): void {
+  Object.defineProperty(request, READ_GRANTEE_OBSERVER, {
+    value: observer,
+    configurable: true,
+  });
+}
+
+function readGranteeObserverOf(
+  request: Request,
+): PersonalServerReadGranteeObserver | undefined {
+  const observer = (request as unknown as Record<symbol, unknown>)[
+    READ_GRANTEE_OBSERVER
+  ];
+  return typeof observer === "function"
+    ? (observer as PersonalServerReadGranteeObserver)
+    : undefined;
+}
+
+async function granteeRefFor(
+  authResult: PersonalServerReadAuthResult | void,
+): Promise<string | undefined> {
+  if (
+    authResult?.grantId === "owner" ||
+    authResult?.grantId === "policy-bypass"
+  ) {
+    return "owner";
+  }
+  const builder = authResult?.builder;
+  if (typeof builder !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(builder)) {
+    return undefined;
+  }
+  const digest = await sha256Hex(
+    new TextEncoder().encode(builder.toLowerCase()),
+  );
+  return digest.slice(2, 14);
+}
+
+/**
+ * Hands the grantee label to an attached observer without blocking or
+ * failing the read: hashing runs off the response path and every error is
+ * swallowed.
+ */
+function notifyReadGrantee(
+  request: Request,
+  authResult: PersonalServerReadAuthResult | void,
+): void {
+  const observer = readGranteeObserverOf(request);
+  if (!observer) return;
+  try {
+    observer(granteeRefFor(authResult).catch(() => undefined));
+  } catch {
+    // Telemetry only: an observer fault never affects the read.
+  }
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -2232,6 +2311,7 @@ export async function handlePersonalServerDataRequest(
         fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
         at: atParam,
       });
+      notifyReadGrantee(request, authResult);
 
       // Select the body after auth and before deletion or payment. A file's
       // version and re-add marker authorize that file, not canonical rows.
