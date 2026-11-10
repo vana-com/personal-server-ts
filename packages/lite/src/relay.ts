@@ -71,6 +71,14 @@ export type PsLiteReadOutcome =
 export type PsLiteAppVisibility = "visible" | "hidden" | "unknown";
 
 interface PsLiteReadEventIds {
+  /**
+   * Epoch ms when the fact happened on the device: the request was parsed
+   * (`ps_read_received`) or the response was handed to the socket or given up
+   * (`ps_read_finished`). Taken at that moment, not when the hook runs: the
+   * hook is deferred to a later task, which in a suspended WebView may be the
+   * moment the app resumes.
+   */
+  at: number;
   /** `<streamRef or local uuid>:<seq>`; random, never derived from user data. */
   readRef: string;
   /** Relay-generated per-TCP-stream UUID from `stream.open` (old relays: absent). */
@@ -110,8 +118,12 @@ export type PsLiteReadEvent =
       bytesOut: number;
       gzip: boolean;
       durationMs: number;
-      /** The app was hidden at any point between received and finished. */
-      hiddenDuring: boolean;
+      /**
+       * The app was hidden at any point between received and finished. Absent
+       * when the visibility source never knew (`appVisibility` "unknown"
+       * throughout), so an unknowing host cannot look like a visible one.
+       */
+      hiddenDuring?: boolean;
     });
 
 export type PsLiteRelayStatus =
@@ -246,9 +258,10 @@ interface StreamState {
 }
 
 interface ReadTracker {
-  ids: PsLiteReadEventIds;
+  ids: Omit<PsLiteReadEventIds, "at">;
   startedAt: number;
-  hiddenDuring: boolean;
+  /** undefined until the visibility source reports visible or hidden. */
+  hiddenDuring: boolean | undefined;
   done: boolean;
 }
 
@@ -422,6 +435,25 @@ export function startPsLiteRelayClient(
     }
   };
 
+  // The host decides where visibility comes from (see
+  // PsLiteRelayClientOptions.appVisibility); the document is the default.
+  const appVisibility = (): PsLiteAppVisibility => {
+    try {
+      const state = options.appVisibility
+        ? options.appVisibility()
+        : documentVisibility();
+      return state === "visible" || state === "hidden" ? state : "unknown";
+    } catch {
+      return "unknown";
+    }
+  };
+  const sampleHidden = (tracker: ReadTracker) => {
+    const visibility = appVisibility();
+    if (visibility === "hidden") tracker.hiddenDuring = true;
+    else if (visibility === "visible") tracker.hiddenDuring ??= false;
+    return visibility;
+  };
+
   const beginRead = (
     stream: StreamState,
     request: ParsedHttpRequest,
@@ -430,7 +462,6 @@ export function startPsLiteRelayClient(
     stream.requestSeq += 1;
     const scope = relayReadScope(request);
     if (scope === undefined) return undefined;
-    const visibility = appVisibility();
     const tracker: ReadTracker = {
       ids: {
         readRef: `${stream.streamRef ?? crypto.randomUUID()}:${seq}`,
@@ -440,12 +471,14 @@ export function startPsLiteRelayClient(
         method: request.method.toUpperCase(),
       },
       startedAt: Date.now(),
-      hiddenDuring: visibility === "hidden",
+      hiddenDuring: undefined,
       done: false,
     };
+    const visibility = sampleHidden(tracker);
     stream.activeRead = tracker;
     const received: PsLiteReadEvent = {
       type: "ps_read_received",
+      at: tracker.startedAt,
       ...tracker.ids,
       appVisibility: visibility,
     };
@@ -457,8 +490,9 @@ export function startPsLiteRelayClient(
   const finishRead = (tracker: ReadTracker | undefined, result: ReadFinish) => {
     if (!tracker || tracker.done) return;
     tracker.done = true;
-    if (appVisibility() === "hidden") tracker.hiddenDuring = true;
-    const durationMs = Math.max(0, Date.now() - tracker.startedAt);
+    sampleHidden(tracker);
+    const finishedAt = Date.now();
+    const durationMs = Math.max(0, finishedAt - tracker.startedAt);
     const hiddenDuring = tracker.hiddenDuring;
     // Keep only what the empty check can use: a body over the cap is never
     // empty, so a large body is not held while the event waits.
@@ -482,6 +516,7 @@ export function startPsLiteRelayClient(
       );
       return {
         type: "ps_read_finished",
+        at: finishedAt,
         ...tracker.ids,
         ...(granteeRef ? { granteeRef } : {}),
         ...(status !== undefined ? { status } : {}),
@@ -489,13 +524,16 @@ export function startPsLiteRelayClient(
         bytesOut,
         gzip,
         durationMs,
-        hiddenDuring,
+        ...(hiddenDuring !== undefined ? { hiddenDuring } : {}),
       };
     });
   };
 
-  // hidden_during: a read in flight while the page/webview goes hidden.
-  const visibilityDocument = readVisibilityDocument();
+  // hidden_during: a read in flight while the page/webview goes hidden. Only
+  // the document's own events when the document is the visibility source.
+  const visibilityDocument = options.appVisibility
+    ? undefined
+    : readVisibilityDocument();
   const onVisibilityChange = () => {
     if (visibilityDocument?.visibilityState !== "hidden") return;
     for (const stream of streams.values()) {
@@ -1226,7 +1264,7 @@ function readVisibilityDocument(): VisibilityDocument | undefined {
   return candidate as VisibilityDocument;
 }
 
-function appVisibility(): PsLiteAppVisibility {
+function documentVisibility(): PsLiteAppVisibility {
   const state = (globalThis as { document?: { visibilityState?: unknown } })
     .document?.visibilityState;
   return state === "visible" || state === "hidden" ? state : "unknown";

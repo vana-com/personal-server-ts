@@ -1141,6 +1141,7 @@ describe("read-reliability events", () => {
     ]);
     expect(events[0]).toEqual({
       type: "ps_read_received",
+      at: expect.any(Number),
       readRef: `${streamRef}:0`,
       streamRef,
       connTag,
@@ -1159,14 +1160,84 @@ describe("read-reliability events", () => {
       status: 200,
       outcome: "ok",
       gzip: false,
-      hiddenDuring: false,
     });
+    // No document here: the visibility source never knew, so no hiddenDuring
+    // rather than a false "visible throughout".
+    expect("hiddenDuring" in finished).toBe(false);
     if (finished.type !== "ps_read_finished") throw new Error("unreachable");
     expect(finished.bytesOut).toBe(
       new TextEncoder().encode(wireText(sockets[0])).length,
     );
     expect(finished.durationMs).toBeGreaterThanOrEqual(0);
+    // `at` is when the fact happened, not when the deferred hook ran.
+    expect(finished.at).toBeGreaterThanOrEqual(events[0].at);
+    expect(finished.at - events[0].at).toBe(finished.durationMs);
     expect(JSON.stringify(events)).not.toContain("g-1");
+  });
+
+  it("stamps `at` when the fact happens, not when the deferred hook runs", async () => {
+    let now = 1_762_770_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      let release!: (response: Response) => void;
+      const { sockets, events } = startEventClient(
+        () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          }),
+      );
+      await sendRequest(sockets[0], "/v1/data/a.b");
+      expect(events[0].at).toBe(1_762_770_000_000);
+      now = 1_762_770_000_750;
+      release(json({ data: 1 }));
+      // Let the response be written (finishRead runs there) ...
+      const closed = () =>
+        sockets[0].sent.some(
+          (message) =>
+            typeof message === "string" &&
+            JSON.parse(message).type === "stream.close",
+        );
+      for (let tick = 0; tick < 200 && !closed(); tick += 1) {
+        await flushRelayTasks();
+      }
+      // ... then move the clock before the deferred hook runs: the event must
+      // keep the finish time, not the dispatch time.
+      now = 1_762_770_009_000;
+      await flushEvents();
+      expect(events[1]).toMatchObject({
+        at: 1_762_770_000_750,
+        durationMs: 750,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("uses the host's visibility source and omits hiddenDuring while it is unknown", async () => {
+    // A document is present but is not the app (headless WebView): the host
+    // says so and the document is ignored.
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("document", {
+      visibilityState: "visible",
+      addEventListener: (_: string, listener: () => void) =>
+        listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) =>
+        listeners.delete(listener),
+    });
+    let visibility: "visible" | "hidden" | "unknown" = "unknown";
+    const { sockets, events } = startEventClient(
+      async () => json({ data: 1 }),
+      { appVisibility: () => visibility },
+    );
+    expect(listeners.size).toBe(0);
+    await sendRequest(sockets[0], "/v1/data/a.b");
+    expect(events[0]).toMatchObject({ appVisibility: "unknown" });
+    expect("hiddenDuring" in events[1]).toBe(false);
+
+    visibility = "hidden";
+    await sendRequest(sockets[0], "/v1/data/a.b", { streamId: 2 });
+    expect(events[2]).toMatchObject({ appVisibility: "hidden" });
+    expect(events[3]).toMatchObject({ hiddenDuring: true });
   });
 
   it("falls back to a local uuid read ref when the relay sends no (or a bad) streamRef", async () => {
