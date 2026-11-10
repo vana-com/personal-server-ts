@@ -299,135 +299,152 @@ it("legacy-access-symlink-and-orphan-held", async () => {
   symlinkSync(f.file, join(f.root, "data", "link.json"));
   await expect(collect(access.copies())).rejects.toThrow("legacy_path_refused");
 });
-it("legacy-access-intent-survives-reopen-and-reconciles-without-erase", async () => {
-  const f = await fixture();
-  let access = await openLegacyAccess(f.options);
-  const [source] = await collect(access.sources());
-  const [copy] = await collect(access.copies());
-  await f.local.batch([
-    {
-      sql: "INSERT INTO connections (connection_id,connector,ns,generation,control_state) VALUES ('control','spotify','known',1,'active')",
-    },
-  ]);
-  const unexpected = async (): Promise<never> => {
-    throw new Error("unexpected external call");
-  };
-  let op = 0;
-  const deps: LocalSyncDeps = {
-    db: f.local,
-    queue: connectionQueue(),
-    ownerAddress: "0xabc",
-    registry: {
-      read: unexpected,
-      post: unexpected,
-      listControlRows: unexpected,
-      listStreamRows: unexpected,
-    },
-    blobs: { get: unexpected, put: unexpected },
-    keys: {
-      namespaceHmac: unexpected,
-      encrypt: unexpected,
-      encryptPart: unexpected,
-      decrypt: unexpected,
-    },
-    signer: { signAddData: unexpected },
-    logger: { info() {}, warn() {} },
-    now: () => 2,
-    newOp: () => `op-${++op}`,
-  };
-  await importLegacySource(
-    deps,
-    createImportLedger(f.local),
-    source as ImportSource,
-  );
-  await f.local.batch([
-    { sql: "UPDATE stream_state SET publish_watermark = 100" },
-  ]);
-  const projector = createImportProjectionReader(
-    deps,
-    "2026-01-01T00:00:00.000Z",
-    async function* () {
-      yield source as ImportSource;
-    },
-    access.copyRecords,
-  );
-  const proofAccess = {
-    ...access,
-    readBack: async (exact: typeof copy) => [
-      await readBackLegacyImport(
-        deps,
-        source as ImportSource,
-        projector,
-        exact!,
-      ),
-    ],
-  };
-  expect(
-    (await retireLegacyCopies(deps, proofAccess, { reportFile: () => {} }))
-      .ready,
-  ).toBe(1);
-  expect(existsSync(f.file)).toBe(true);
-  const originalBatch = f.local.batch.bind(f.local);
-  f.local.batch = async (statements) => {
-    if (
-      statements.some(
-        (s) =>
-          s.sql.includes("UPDATE import_ledger") && s.params?.[0] === "retired",
-      )
-    )
-      throw new Error("crash after unlink");
-    return originalBatch(statements);
-  };
-  await expect(
-    retireLegacyCopies(deps, proofAccess, {
-      streamSync: { retireLegacy: true },
-      reportFile: () => {},
-    }),
-  ).rejects.toThrow("crash after unlink");
-  expect(existsSync(f.file)).toBe(false);
-  expect(await f.eraseLedger.has(copy!)).toBe(true);
-  f.local.batch = originalBatch;
-  await access.close();
-  // Close both databases, then create fresh handles and adapters.
-  await f.local.close();
-  drivers.splice(drivers.indexOf(f.local), 1);
-  f.db.close();
-  const local = await openLocalDb(
-    openBetterSqlite3(join(f.root, "local.sqlite")),
-    { owner: "0xabc", network: "test", deviceId: "device" },
-  );
-  drivers.push(local);
-  const raw = initializeDatabase(join(f.root, "index.db"));
-  natives.push(raw);
-  const journal = createLegacyEraseLedger(local, () => 3);
-  Object.assign(deps, { db: local });
-  access = await openLegacyAccess({
-    ...f.options,
-    db: raw,
-    eraseLedger: journal,
-  });
-  const erase = vi.spyOn(access, "erase");
-  const reports: LegacyRetireFileReport[] = [];
-  const result = await retireLegacyCopies(
-    deps,
-    {
-      ...access,
-      readBack: async () => {
-        throw new Error("absent copy cannot be read");
+it.each(["after-unlink", "before-receipt"])(
+  "legacy-access-crash-reopen-reconciliation: %s",
+  async (crashPoint) => {
+    const f = await fixture();
+    let access = await openLegacyAccess(f.options);
+    const [source] = await collect(access.sources());
+    const [copy] = await collect(access.copies());
+    await f.local.batch([
+      {
+        sql: "INSERT INTO connections (connection_id,connector,ns,generation,control_state) VALUES ('control','spotify','known',1,'active')",
       },
-    },
-    { streamSync: { retireLegacy: true }, reportFile: (r) => reports.push(r) },
-  );
-  expect(result).toMatchObject({ ready: 1, deleted: 0 });
-  expect(erase).not.toHaveBeenCalled();
-  expect(reports).toEqual([
-    { file: copy!.id, decision: "retired", reason: "erase-reconciled" },
-  ]);
-  expect(await collect(journal.pending())).toEqual([]);
-  expect(await local.query("SELECT state FROM import_ledger")).toEqual([
-    { state: "retired" },
-  ]);
-});
+    ]);
+    const unexpected = async (): Promise<never> => {
+      throw new Error("unexpected external call");
+    };
+    let op = 0;
+    const deps: LocalSyncDeps = {
+      db: f.local,
+      queue: connectionQueue(),
+      ownerAddress: "0xabc",
+      registry: {
+        read: unexpected,
+        post: unexpected,
+        listControlRows: unexpected,
+        listStreamRows: unexpected,
+      },
+      blobs: { get: unexpected, put: unexpected },
+      keys: {
+        namespaceHmac: unexpected,
+        encrypt: unexpected,
+        encryptPart: unexpected,
+        decrypt: unexpected,
+      },
+      signer: { signAddData: unexpected },
+      logger: { info() {}, warn() {} },
+      now: () => 2,
+      newOp: () => `op-${++op}`,
+    };
+    await importLegacySource(
+      deps,
+      createImportLedger(f.local),
+      source as ImportSource,
+    );
+    await f.local.batch([
+      { sql: "UPDATE stream_state SET publish_watermark = 100" },
+    ]);
+    const projector = createImportProjectionReader(
+      deps,
+      "2026-01-01T00:00:00.000Z",
+      async function* () {
+        yield source as ImportSource;
+      },
+      access.copyRecords,
+    );
+    const proofAccess = {
+      ...access,
+      readBack: async (exact: typeof copy) => [
+        await readBackLegacyImport(
+          deps,
+          source as ImportSource,
+          projector,
+          exact!,
+        ),
+      ],
+    };
+    expect(
+      (await retireLegacyCopies(deps, proofAccess, { reportFile: () => {} }))
+        .ready,
+    ).toBe(1);
+    expect(existsSync(f.file)).toBe(true);
+    const originalBatch = f.local.batch.bind(f.local);
+    if (crashPoint === "after-unlink")
+      f.db.exec(
+        "CREATE TRIGGER fixture_crash BEFORE DELETE ON data_files BEGIN SELECT RAISE(ABORT,'crash after unlink'); END",
+      );
+    f.local.batch = async (statements) => {
+      if (
+        crashPoint === "before-receipt" &&
+        statements.some(
+          (s) =>
+            s.sql.includes("UPDATE import_ledger") &&
+            s.params?.[0] === "retired",
+        )
+      )
+        throw new Error("crash after unlink");
+      return originalBatch(statements);
+    };
+    await expect(
+      retireLegacyCopies(deps, proofAccess, {
+        streamSync: { retireLegacy: true },
+        reportFile: () => {},
+      }),
+    ).rejects.toThrow("crash after unlink");
+    expect(existsSync(f.file)).toBe(false);
+    expect(await f.eraseLedger.has(copy!)).toBe(true);
+    f.local.batch = originalBatch;
+    await access.close();
+    // Close both databases, then create fresh handles and adapters.
+    await f.local.close();
+    drivers.splice(drivers.indexOf(f.local), 1);
+    f.db.close();
+    const local = await openLocalDb(
+      openBetterSqlite3(join(f.root, "local.sqlite")),
+      { owner: "0xabc", network: "test", deviceId: "device" },
+    );
+    drivers.push(local);
+    const raw = initializeDatabase(join(f.root, "index.db"));
+    natives.push(raw);
+    if (crashPoint === "after-unlink") raw.exec("DROP TRIGGER fixture_crash");
+    const journal = createLegacyEraseLedger(local, () => 3);
+    Object.assign(deps, { db: local });
+    access = await openLegacyAccess({
+      ...f.options,
+      db: raw,
+      eraseLedger: journal,
+    });
+    const erase = vi.spyOn(access, "erase");
+    const reports: LegacyRetireFileReport[] = [];
+    const result = await retireLegacyCopies(
+      deps,
+      {
+        ...access,
+        readBack: async () => {
+          throw new Error("absent copy cannot be read");
+        },
+      },
+      {
+        streamSync: { retireLegacy: true },
+        reportFile: (r) => reports.push(r),
+      },
+    );
+    expect(result).toMatchObject({ ready: 1, deleted: 0 });
+    expect(erase).not.toHaveBeenCalled();
+    expect(reports).toEqual([
+      { file: copy!.id, decision: "retired", reason: "erase-reconciled" },
+    ]);
+    expect(await collect(journal.pending())).toEqual([]);
+    expect(raw.prepare("SELECT count(*) AS n FROM data_files").get()).toEqual({
+      n: 0,
+    });
+    expect(await collect(access.copies())).toEqual([]);
+    expect(await local.query("SELECT state FROM import_ledger")).toEqual([
+      { state: "retired" },
+    ]);
+  },
+);
 it("legacy-access-missing-file-without-intent-is-held-inventory", async () => {
   const f = await fixture();
   const access = await openLegacyAccess(f.options);

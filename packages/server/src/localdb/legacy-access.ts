@@ -543,7 +543,35 @@ export async function openLegacyAccess(
     erasedWithIntent,
     async finishErase(copy) {
       await authorized();
-      await eraseLedger.finish(copy);
+      await safePath(copy.path, true);
+      await withScopeLock(copy.dataSet, () =>
+        options.legacyWriteSeal.remove(async () => {
+          await authorized();
+          if (!(await eraseLedger.has(copy)))
+            throw new Error("erase_intent_missing");
+          try {
+            await lstat(copy.path);
+            throw new Error("copy_changed");
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+          // The index and intent live in separate databases. Atomically check and
+          // remove the exact index row first; retain intent until that commit.
+          // A crash between commits is safe to retry with an already-absent row.
+          db.transaction(() => {
+            const entry = index.findByPath(relative(dataRoot, copy.path));
+            if (entry) {
+              const id = createHash("sha256")
+                .update(canonicalJson([copy.path, entry.id]))
+                .digest("hex");
+              if (id !== copy.id || entry.scope !== copy.dataSet)
+                throw new Error("copy_changed");
+              index.deleteByPath(relative(dataRoot, copy.path));
+            }
+          }).immediate();
+          await eraseLedger.finish(copy);
+        }),
+      );
     },
     async close() {
       closed = true;
