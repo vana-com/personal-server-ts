@@ -1,4 +1,8 @@
-import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  PS_GRANTEE_REF_HEADER,
+  PS_LITE_RELAY_READ_HEADER,
+  type PersonalServerReadFulfillmentReporter,
+} from "@opendatalabs/personal-server-ts-core/api";
 import {
   handlePsLiteBridgeRequest,
   type PsLiteBridgeRequest,
@@ -42,7 +46,63 @@ export interface PsLiteRelayClientOptions {
   reconnectInitialDelayMs?: number;
   /** Max reconnect backoff delay (ms). Default 30_000. */
   reconnectMaxDelayMs?: number;
+  /**
+   * Read-reliability telemetry hook: one `ps_read_received` and one
+   * `ps_read_finished` per relayed `/v1/data/<scope>` read. Hosts forward the
+   * events to their analytics; a throwing hook never affects the relay.
+   */
+  onReadEvent?: (event: PsLiteReadEvent) => void;
 }
+
+/** How a relayed read ended, as seen by the PS-Lite relay client. */
+export type PsLiteReadOutcome =
+  | "ok"
+  | "empty"
+  | "denied"
+  | "payment_required"
+  | "not_found"
+  | "error"
+  | "handler_error"
+  | "tls_error"
+  | "stream_closed";
+
+export type PsLiteAppVisibility = "visible" | "hidden" | "unknown";
+
+interface PsLiteReadEventIds {
+  /** `<streamRef or local uuid>:<seq>`; random, never derived from user data. */
+  readRef: string;
+  /** Relay-generated per-TCP-stream UUID from `stream.open` (old relays: absent). */
+  streamRef?: string;
+  /** Random 16-hex tag of the WebSocket connection that carried the read. */
+  connTag: string;
+  /** Scope from the request path (`/v1/data/<scope>`), query dropped. */
+  scope: string;
+  method: string;
+}
+
+/**
+ * Read telemetry emitted by the relay client. Carries no data content, no
+ * addresses, grant ids, sessionId, IPs or SNI.
+ */
+export type PsLiteReadEvent =
+  | (PsLiteReadEventIds & {
+      type: "ps_read_received";
+      appVisibility: PsLiteAppVisibility;
+    })
+  | (PsLiteReadEventIds & {
+      type: "ps_read_finished";
+      /** First 12 hex of sha256(lowercased grantee), "owner", or absent. */
+      granteeRef?: string;
+      /** HTTP status written; absent when no response was produced. */
+      status?: number;
+      outcome: PsLiteReadOutcome;
+      /** Plaintext HTTP response bytes written (head + body, after gzip). */
+      bytesOut: number;
+      gzip: boolean;
+      durationMs: number;
+      /** The app was hidden at any point between received and finished. */
+      hiddenDuring: boolean;
+    });
 
 export type PsLiteRelayStatus =
   "connecting" | "connected" | "disconnected" | "closed" | "replaced" | "error";
@@ -57,6 +117,8 @@ export type PsLiteRelayStatus =
 export interface PsLiteRelayStatusDetail {
   code?: number;
   reason?: string;
+  /** Random 16-hex tag of the current WebSocket connection (`?tag=`). */
+  connTag?: string;
 }
 
 /**
@@ -164,11 +226,34 @@ interface StreamState {
   ready: boolean;
   handling: boolean;
   tls?: PsLiteRelayTlsStream;
+  /** Relay-generated stream id from `stream.open`, when the relay sends one. */
+  streamRef?: string;
+  /** connTag of the socket this stream arrived on. */
+  connTag: string;
+  /** HTTP requests seen on this stream (read_ref suffix). */
+  requestSeq: number;
+  activeRead?: ReadTracker;
 }
+
+interface ReadTracker {
+  ids: PsLiteReadEventIds;
+  startedAt: number;
+  hiddenDuring: boolean;
+  done: boolean;
+}
+
+type ReadFinish = {
+  outcome: PsLiteReadOutcome;
+  status?: number;
+  granteeRef?: string;
+  bytesOut?: number;
+  gzip?: boolean;
+};
 
 interface ControlMessage {
   type: string;
   streamId?: number;
+  streamRef?: unknown;
   issueToken?: string;
   reason?: string;
 }
@@ -184,8 +269,10 @@ interface ParsedHttpRequest {
 export function psLiteRelayControlUrl(
   sessionId: string,
   controlUrl = DEFAULT_CONTROL_URL,
+  connTag?: string,
 ): string {
-  return `${controlUrl.replace(/\/+$/, "")}/browser/${sessionId}`;
+  const base = `${controlUrl.replace(/\/+$/, "")}/browser/${sessionId}`;
+  return connTag ? `${base}?tag=${encodeURIComponent(connTag)}` : base;
 }
 
 export function psLiteRelayPublicUrl(
@@ -264,8 +351,108 @@ export function startPsLiteRelayClient(
   let unansweredPingSentAt: number | undefined;
   let lastHeartbeatCheckAt = 0;
   let heartbeatGraceUsed = false;
+  // Fresh per WebSocket connection; joins device and relay telemetry.
+  let connTag = randomConnTag();
 
   const log = (line: string) => options.logger?.(line);
+
+  const emitStatus = (
+    status: PsLiteRelayStatus,
+    detail?: PsLiteRelayStatusDetail,
+  ) => options.onStatus?.(status, { ...detail, connTag });
+
+  const emitReadEvent = (event: PsLiteReadEvent) => {
+    if (!options.onReadEvent) return;
+    try {
+      options.onReadEvent(event);
+    } catch (error) {
+      log(
+        `relay read event hook failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+
+  const beginRead = (
+    stream: StreamState,
+    request: ParsedHttpRequest,
+  ): ReadTracker | undefined => {
+    const seq = stream.requestSeq;
+    stream.requestSeq += 1;
+    const scope = relayReadScope(request);
+    if (scope === undefined) return undefined;
+    const visibility = appVisibility();
+    const tracker: ReadTracker = {
+      ids: {
+        readRef: `${stream.streamRef ?? crypto.randomUUID()}:${seq}`,
+        ...(stream.streamRef ? { streamRef: stream.streamRef } : {}),
+        connTag: stream.connTag,
+        scope,
+        method: request.method.toUpperCase(),
+      },
+      startedAt: Date.now(),
+      hiddenDuring: visibility === "hidden",
+      done: false,
+    };
+    stream.activeRead = tracker;
+    emitReadEvent({
+      type: "ps_read_received",
+      ...tracker.ids,
+      appVisibility: visibility,
+    });
+    return tracker;
+  };
+
+  const finishRead = (tracker: ReadTracker | undefined, result: ReadFinish) => {
+    if (!tracker || tracker.done) return;
+    tracker.done = true;
+    if (appVisibility() === "hidden") tracker.hiddenDuring = true;
+    emitReadEvent({
+      type: "ps_read_finished",
+      ...tracker.ids,
+      ...(result.granteeRef ? { granteeRef: result.granteeRef } : {}),
+      ...(result.status !== undefined ? { status: result.status } : {}),
+      outcome: result.outcome,
+      bytesOut: result.bytesOut ?? 0,
+      gzip: result.gzip ?? false,
+      durationMs: Math.max(0, Date.now() - tracker.startedAt),
+      hiddenDuring: tracker.hiddenDuring,
+    });
+  };
+
+  // hidden_during: a read in flight while the page/webview goes hidden.
+  const visibilityDocument = readVisibilityDocument();
+  const onVisibilityChange = () => {
+    if (visibilityDocument?.visibilityState !== "hidden") return;
+    for (const stream of streams.values()) {
+      if (stream.activeRead && !stream.activeRead.done) {
+        stream.activeRead.hiddenDuring = true;
+      }
+    }
+  };
+  let visibilityListening = false;
+  if (visibilityDocument) {
+    try {
+      visibilityDocument.addEventListener(
+        "visibilitychange",
+        onVisibilityChange,
+      );
+      visibilityListening = true;
+    } catch {
+      // No listener: hiddenDuring falls back to the received/finished samples.
+    }
+  }
+  const stopVisibilityListener = () => {
+    if (!visibilityListening || !visibilityDocument) return;
+    visibilityListening = false;
+    try {
+      visibilityDocument.removeEventListener(
+        "visibilitychange",
+        onVisibilityChange,
+      );
+    } catch {
+      // Ignore.
+    }
+  };
 
   const isLive = (stream: StreamState) =>
     !closed &&
@@ -289,6 +476,8 @@ export function startPsLiteRelayClient(
   const disposeStream = (stream: StreamState) => {
     if (stream.closed) return;
     stream.closed = true;
+    // A read still in flight when its stream dies never reaches the wire.
+    finishRead(stream.activeRead, { outcome: "stream_closed" });
     if (streams.get(stream.streamId) === stream) {
       streams.delete(stream.streamId);
       pendingStreamData.delete(stream.streamId);
@@ -313,21 +502,22 @@ export function startPsLiteRelayClient(
     pendingStreamData.clear();
   };
 
+  /** Returns false when the stream died before the last chunk was sent. */
   const writePlaintextResponse = (
     stream: StreamState,
     responseBytes: Uint8Array,
-  ) => {
-    if (!isLive(stream)) return;
+  ): boolean => {
+    if (!isLive(stream)) return false;
     if (!stream.tls) {
       for (const chunk of chunks(responseBytes, RESPONSE_CHUNK_BYTES)) {
         sendData(stream, chunk);
       }
-      return;
+      return isLive(stream);
     }
 
     const responseChunks = chunks(responseBytes, RESPONSE_CHUNK_BYTES);
     for (let index = 0; index < responseChunks.length; index += 1) {
-      if (!isLive(stream)) return;
+      if (!isLive(stream)) return false;
       const step = stream.tls.writePlaintext(
         responseChunks[index],
         index === responseChunks.length - 1,
@@ -338,6 +528,7 @@ export function startPsLiteRelayClient(
         }
       }
     }
+    return isLive(stream);
   };
 
   const drainHttpRequests = async (stream: StreamState) => {
@@ -348,12 +539,31 @@ export function startPsLiteRelayClient(
       }
 
       stream.plaintext = stream.plaintext.slice(parsed.consumedBytes);
-      const response = await handleRelayHttpRequest(
-        options.runtime,
-        parsed.request,
-        origin,
-      );
-      if (!isLive(stream)) return;
+      const read = beginRead(stream, parsed.request);
+      let relayed: RelayHttpResult;
+      try {
+        relayed = await handleRelayHttpRequest(
+          options.runtime,
+          parsed.request,
+          origin,
+          Boolean(read),
+        );
+      } catch (error) {
+        finishRead(read, { outcome: "handler_error" });
+        throw error;
+      }
+      const { response } = relayed;
+      const finish = (outcome: PsLiteReadOutcome): ReadFinish => ({
+        outcome,
+        status: relayed.status,
+        granteeRef: relayed.granteeRef,
+        bytesOut: response.length,
+        gzip: relayed.gzip,
+      });
+      if (!isLive(stream)) {
+        finishRead(read, { ...finish("stream_closed"), bytesOut: 0 });
+        return;
+      }
       // `response` is a binary (latin1) string: buildHttpResponse appends the
       // body via bytesToBinary, so each char code 0x00–0xFF is one body byte.
       // It must be turned back into bytes the same way (binaryToBytes), NOT
@@ -361,7 +571,26 @@ export function startPsLiteRelayClient(
       // 2-byte sequence, corrupting binary payloads (e.g. OpenPGP-encrypted
       // files fail downstream with "not a valid OpenPGP message"). ASCII/JSON
       // bodies survive UTF-8, which is why only encrypted binary downloads broke.
-      writePlaintextResponse(stream, binaryToBytes(response));
+      let written: boolean;
+      try {
+        written = writePlaintextResponse(stream, binaryToBytes(response));
+      } catch (error) {
+        finishRead(read, { ...finish("tls_error"), bytesOut: 0 });
+        throw error;
+      }
+      // Finish before closeStream: disposal would report stream_closed.
+      finishRead(
+        read,
+        written
+          ? finish(
+              classifyReadOutcome(
+                relayed.status,
+                relayed.plainBody,
+                relayed.contentType,
+              ),
+            )
+          : finish("stream_closed"),
+      );
       closeStream(stream, "http_response_sent");
       return;
     }
@@ -400,7 +629,7 @@ export function startPsLiteRelayClient(
     }
   };
 
-  const openStream = async (streamId: number) => {
+  const openStream = async (streamId: number, streamRef?: string) => {
     const previous = streams.get(streamId);
     if (previous) disposeStream(previous);
     const stream: StreamState = {
@@ -410,6 +639,9 @@ export function startPsLiteRelayClient(
       closed: false,
       ready: !tls,
       handling: false,
+      ...(streamRef ? { streamRef } : {}),
+      connTag,
+      requestSeq: 0,
     };
     // Register before awaiting creation so cancellation can invalidate it.
     streams.set(streamId, stream);
@@ -441,7 +673,7 @@ export function startPsLiteRelayClient(
   const handleControl = (message: ControlMessage) => {
     if (message.type === "session.ready") {
       issueToken = message.issueToken;
-      options.onStatus?.("connected");
+      emitStatus("connected");
       if (tls && tls.prepare) {
         void tls
           .prepare({
@@ -465,7 +697,7 @@ export function startPsLiteRelayClient(
       message.type === "stream.open" &&
       typeof message.streamId === "number"
     ) {
-      void openStream(message.streamId);
+      void openStream(message.streamId, parseStreamRef(message.streamRef));
       return;
     }
 
@@ -586,19 +818,23 @@ export function startPsLiteRelayClient(
       return;
     }
     issueToken = undefined;
-    socket = createSocket(options.webSocketFactory, controlUrl);
+    connTag = randomConnTag();
+    socket = createSocket(
+      options.webSocketFactory,
+      psLiteRelayControlUrl(options.sessionId, baseControlUrl, connTag),
+    );
     const currentSocket = socket;
     const isCurrent = () => !closed && socket === currentSocket;
     const acceptsFrames = () =>
       isCurrent() && currentSocket.readyState === currentSocket.OPEN;
     socket.binaryType = "arraybuffer";
-    options.onStatus?.("connecting");
+    emitStatus("connecting");
 
     socket.onopen = () => {
       if (!acceptsFrames()) return;
       reconnectAttempts = 0;
       startHeartbeat();
-      options.onStatus?.("connected");
+      emitStatus("connected");
     };
     socket.onmessage = (event) => {
       if (!acceptsFrames()) return;
@@ -616,7 +852,8 @@ export function startPsLiteRelayClient(
       issueToken = undefined;
       const detail = { code: event?.code, reason: event?.reason };
       if (closed) {
-        options.onStatus?.("closed", detail);
+        stopVisibilityListener();
+        emitStatus("closed", detail);
         return;
       }
       if (event?.code === RELAY_CLOSE_SESSION_REPLACED) {
@@ -624,6 +861,7 @@ export function startPsLiteRelayClient(
         // Reconnecting would evict it and start a session tug-of-war, so this
         // client steps down for good and lets the host surface the handoff.
         closed = true;
+        stopVisibilityListener();
         // Cancel any reconnect already scheduled by an earlier drop so a
         // pending timer can't fire connect() after we've stepped down.
         if (reconnectTimer !== undefined) {
@@ -631,17 +869,17 @@ export function startPsLiteRelayClient(
           reconnectTimer = undefined;
         }
         log("relay session replaced by another connection — not reconnecting");
-        options.onStatus?.("replaced", detail);
+        emitStatus("replaced", detail);
         return;
       }
-      options.onStatus?.("disconnected", detail);
+      emitStatus("disconnected", detail);
       scheduleReconnect();
     };
     socket.onerror = () => {
       if (!isCurrent() || currentSocket.readyState > currentSocket.OPEN) {
         return;
       }
-      options.onStatus?.("error");
+      emitStatus("error");
     };
   }
 
@@ -673,6 +911,7 @@ export function startPsLiteRelayClient(
       if (closed) return;
       closed = true;
       stopHeartbeat();
+      stopVisibilityListener();
       if (reconnectTimer !== undefined) {
         clearTimeout(reconnectTimer);
         reconnectTimer = undefined;
@@ -683,17 +922,35 @@ export function startPsLiteRelayClient(
   };
 }
 
+interface RelayHttpResult {
+  /** Full HTTP/1.1 response as a binary (latin1) string. */
+  response: string;
+  status: number;
+  /** Body before gzip, for the empty-result check. */
+  plainBody: Uint8Array;
+  contentType?: string;
+  gzip: boolean;
+  granteeRef?: string;
+}
+
 async function handleRelayHttpRequest(
   runtime: PsLiteRuntime,
   request: ParsedHttpRequest,
   origin: string,
-): Promise<string> {
+  isRead: boolean,
+): Promise<RelayHttpResult> {
+  // The grantee-ref handshake headers are internal: a wire request may never
+  // set them, and the response header never reaches the wire.
+  const headers = { ...request.headers };
+  delete headers[PS_LITE_RELAY_READ_HEADER];
+  delete headers[PS_GRANTEE_REF_HEADER];
+  if (isRead) headers[PS_LITE_RELAY_READ_HEADER] = "1";
   const bridgeRequest: PsLiteBridgeRequest = {
     requestId: crypto.randomUUID(),
     method: request.method,
     path: request.path,
     query: request.query,
-    headers: request.headers,
+    headers,
     body: encodeBase64(request.body),
   };
   const bridgeResponse = await handlePsLiteBridgeRequest(
@@ -703,6 +960,19 @@ async function handleRelayHttpRequest(
       origin,
     },
   );
+  const responseHeaders = { ...bridgeResponse.headers };
+  let granteeRef: string | undefined;
+  for (const key of Object.keys(responseHeaders)) {
+    if (key.toLowerCase() === PS_GRANTEE_REF_HEADER) {
+      granteeRef = responseHeaders[key];
+      delete responseHeaders[key];
+    }
+  }
+  const wireResponse: PsLiteBridgeResponse = {
+    ...bridgeResponse,
+    headers: responseHeaders,
+  };
+  const contentType = headerValue(responseHeaders, "content-type");
   // Large exports (e.g. chatgpt.conversations) are big JSON streamed over the
   // relay's WebSocket tunnel; an uncompressed body inflates transfer time and the
   // window for a mid-stream drop (truncated read → UND_ERR_RES_CONTENT_LENGTH_MISMATCH).
@@ -712,7 +982,13 @@ async function handleRelayHttpRequest(
   const acceptsGzip = (request.headers["accept-encoding"] ?? "").includes(
     "gzip",
   );
-  const alreadyEncoded = Boolean(bridgeResponse.headers?.["content-encoding"]);
+  const alreadyEncoded = Boolean(responseHeaders["content-encoding"]);
+  const base = {
+    status: bridgeResponse.status,
+    plainBody: bodyBytes,
+    ...(contentType !== undefined ? { contentType } : {}),
+    ...(granteeRef ? { granteeRef } : {}),
+  };
   if (
     acceptsGzip &&
     !alreadyEncoded &&
@@ -720,12 +996,134 @@ async function handleRelayHttpRequest(
     typeof CompressionStream !== "undefined"
   ) {
     const gzipped = await gzipBytes(bodyBytes);
-    return buildHttpResponse(bridgeResponse, {
-      bodyOverride: gzipped,
-      contentEncoding: "gzip",
-    });
+    return {
+      ...base,
+      gzip: true,
+      response: buildHttpResponse(wireResponse, {
+        bodyOverride: gzipped,
+        contentEncoding: "gzip",
+      }),
+    };
   }
-  return buildHttpResponse(bridgeResponse, { bodyOverride: bodyBytes });
+  return {
+    ...base,
+    gzip: false,
+    response: buildHttpResponse(wireResponse, { bodyOverride: bodyBytes }),
+  };
+}
+
+function headerValue(
+  headers: Record<string, string>,
+  name: string,
+): string | undefined {
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name) return value;
+  }
+  return undefined;
+}
+
+const DATA_PATH_PREFIX = "/v1/data/";
+
+/** Scope of a relayed read, or undefined when the request is not a read. */
+function relayReadScope(request: ParsedHttpRequest): string | undefined {
+  const method = request.method.toUpperCase();
+  if (method !== "GET" && method !== "HEAD") return undefined;
+  if (!request.path.startsWith(DATA_PATH_PREFIX)) return undefined;
+  const segment = request.path.slice(DATA_PATH_PREFIX.length).split("/")[0];
+  if (!segment) return undefined;
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+// Bodies larger than this are never "empty"; skip parsing them.
+const EMPTY_CHECK_MAX_BYTES = 64 * 1024;
+
+function classifyReadOutcome(
+  status: number,
+  body: Uint8Array,
+  contentType?: string,
+): PsLiteReadOutcome {
+  if (status === 401 || status === 403) return "denied";
+  if (status === 402) return "payment_required";
+  if (status === 404) return "not_found";
+  if (status >= 400) return "error";
+  if (status < 200 || status >= 300) return "ok";
+  return isEmptyJsonBody(body, contentType) ? "empty" : "ok";
+}
+
+function isEmptyJsonBody(body: Uint8Array, contentType?: string): boolean {
+  if (body.length === 0 || body.length > EMPTY_CHECK_MAX_BYTES) return false;
+  if (contentType !== undefined && !/json/i.test(contentType)) return false;
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return false;
+  }
+  if (isEmptyValue(value)) return true;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (!("data" in record)) return false;
+    const data = record.data;
+    if (isEmptyValue(data)) return true;
+    // `{ data: { sleep: [], readiness: [] } }`: every collection empty.
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      const values = Object.values(data as Record<string, unknown>);
+      return values.length > 0 && values.every(isEmptyValue);
+    }
+  }
+  return false;
+}
+
+function isEmptyValue(value: unknown): boolean {
+  if (value === null || value === undefined || value === "") return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") {
+    return Object.keys(value as Record<string, unknown>).length === 0;
+  }
+  return false;
+}
+
+function parseStreamRef(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Za-z0-9-]{1,64}$/.test(value)
+    ? value
+    : undefined;
+}
+
+function randomConnTag(): string {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  let hex = "";
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+interface VisibilityDocument {
+  visibilityState?: string;
+  addEventListener(type: string, listener: () => void): void;
+  removeEventListener(type: string, listener: () => void): void;
+}
+
+function readVisibilityDocument(): VisibilityDocument | undefined {
+  const candidate = (globalThis as { document?: unknown }).document as
+    Partial<VisibilityDocument> | undefined;
+  if (
+    !candidate ||
+    typeof candidate.addEventListener !== "function" ||
+    typeof candidate.removeEventListener !== "function"
+  ) {
+    return undefined;
+  }
+  return candidate as VisibilityDocument;
+}
+
+function appVisibility(): PsLiteAppVisibility {
+  const state = (globalThis as { document?: { visibilityState?: unknown } })
+    .document?.visibilityState;
+  return state === "visible" || state === "hidden" ? state : "unknown";
 }
 
 // Responses below this size aren't worth the gzip overhead, and small reads
