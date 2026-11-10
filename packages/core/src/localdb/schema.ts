@@ -140,4 +140,10 @@ END;`,
     `ALTER TABLE runs ADD COLUMN begin_response TEXT`,
     `ALTER TABLE runs ADD COLUMN end_response TEXT`,
   ],
+  [
+    // Staging checks every new row for a key conflict with rows already staged
+    // by the connection's runs. Without this index each check scans all staged
+    // rows, so a batch costs more than the one before it.
+    `CREATE INDEX run_rows_by_key ON run_rows(stream, record_key)`,
+  ],
 ];

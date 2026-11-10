@@ -9,7 +9,10 @@ import type {
   BeginRequest,
   IntakeDeclarations,
 } from "../../../core/src/stream-sync/intake.js";
-import { createRunIntakeStore } from "../../../core/src/localdb/run-intake.js";
+import {
+  createRunIntakeStore,
+  STAGED_KEY_CONFLICTS,
+} from "../../../core/src/localdb/run-intake.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.js";
@@ -372,4 +375,40 @@ it("rejects restricted scopes before syncing and clamps a future producer clock"
     declaration,
   );
   expect(await f.db.query("SELECT o FROM runs")).toEqual([{ o: 300100 }]);
+});
+
+describe("run intake staging cost", () => {
+  // Staging a row checks that no staged row of the same connection shares its
+  // key with a different primary-key hash. That check must search by key; a
+  // scan makes every batch cost more than the one before it, so a large run
+  // blocks the event loop for minutes.
+  it("checks staged-row key conflicts by index search, never by scan", async () => {
+    const f = await fixture();
+    for (const conflict of STAGED_KEY_CONFLICTS) {
+      const plan = await f.db.query<{ detail: string }>(
+        `EXPLAIN QUERY PLAN SELECT ${conflict.replace(/NEW\.(\w+)/g, "'$1'")}`,
+      );
+      const details = plan.map((row) => row.detail);
+      expect(details.some((detail) => /^SEARCH x\b/.test(detail))).toBe(true);
+      expect(details.filter((detail) => /^SCAN x\b/.test(detail))).toEqual([]);
+    }
+  });
+
+  it("stages equal batches in near-constant time", async () => {
+    const f = await fixture();
+    await f.store.begin("run", request, declaration);
+    const rows = (batch: number) =>
+      Array.from({ length: 4000 }, (_, i) => ({
+        stream: "items",
+        data: { id: `r${batch}-${i}`, text: "x".repeat(200) },
+      }));
+    const timed: number[] = [];
+    for (let batch = 0; batch < 4; batch += 1) {
+      const started = performance.now();
+      await f.store.batch("run", { batch, records: rows(batch) });
+      timed.push(performance.now() - started);
+    }
+    // The last two batches must both stay near the first; a scan makes them 4x and 6x it.
+    expect(Math.min(timed[2]!, timed[3]!) / timed[0]!).toBeLessThan(2);
+  }, 60_000);
 });
